@@ -77,6 +77,24 @@ fn current_generic_decl() -> Value {
         .unwrap_or(Value::Object(None))
 }
 
+fn reflective_type_variable_name(ctx: &mut dyn NativeContext, tv: ObjectRef) -> Option<String> {
+    let cname = ctx
+        .class_name_of_id(ctx.class_id_of_object(tv))
+        .unwrap_or_default();
+    if cname == "java/lang/reflect/TypeVariable" {
+        if let Value::Object(Some(s)) = ctx.get_field(tv, 0) {
+            return ctx.read_string(s);
+        }
+    }
+    match ctx.get_field_by_name(tv, "name") {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => match ctx.get_field(tv, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        },
+    }
+}
+
 /// Resolve a type-variable USE named `name` to the REAL `TypeVariable` object
 /// declared by `decl` (a `Class`/`Method`/`Constructor` mirror) via its
 /// `getTypeParameters()`. The returned object is the same
@@ -107,11 +125,7 @@ fn resolve_declared_type_variable(
     let len = ctx.array_length(arr);
     for i in 0..len {
         if let Value::Object(Some(tv)) = ctx.get_array_element(arr, i) {
-            let tv_name = match ctx.get_field_by_name(tv, "name") {
-                Value::Object(Some(s)) => ctx.read_string(s),
-                _ => None,
-            };
-            if tv_name.as_deref() == Some(name) {
+            if reflective_type_variable_name(ctx, tv).as_deref() == Some(name) {
                 return Some(Value::Object(Some(tv)));
             }
         }
@@ -367,7 +381,7 @@ fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
             // WildcardType: field 0 = upperBounds, field 1 = lowerBounds
             let wt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/WildcardType", 2);
             let upper = new_type_array(ctx, 1);
-            let bound_val = type_sig_to_java(ctx, sig);
+            let bound_val = typesig_to_real_type(ctx, sig);
             ctx.set_array_element(upper, 0, bound_val);
             ctx.set_field(wt, 0, Value::Object(Some(upper)));
             let lower = new_type_array(ctx, 0);
@@ -383,7 +397,7 @@ fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
             }
             ctx.set_field(wt, 0, Value::Object(Some(upper)));
             let lower = new_type_array(ctx, 1);
-            let bound_val = type_sig_to_java(ctx, sig);
+            let bound_val = typesig_to_real_type(ctx, sig);
             ctx.set_array_element(lower, 0, bound_val);
             ctx.set_field(wt, 1, Value::Object(Some(lower)));
             Value::Object(Some(wt))
@@ -445,7 +459,7 @@ pub fn type_param_to_java(
     } else {
         let bounds_arr = new_type_array(ctx, bound_sigs.len());
         for (i, bs) in bound_sigs.iter().enumerate() {
-            let val = type_sig_to_java(ctx, bs);
+            let val = typesig_to_real_type(ctx, bs);
             ctx.set_array_element(bounds_arr, i, val);
         }
         ctx.set_field(tv, 1, Value::Object(Some(bounds_arr)));

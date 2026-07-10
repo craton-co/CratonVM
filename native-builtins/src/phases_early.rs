@@ -8491,6 +8491,130 @@ fn stpe_legacy_slot_init(ctx: &mut dyn NativeContext, this: ObjectRef, cores: i3
     }
 }
 
+/// Which real `BlockingQueue` a plain `ThreadPoolExecutor` built by an
+/// `Executors.*` factory shortcut should use — mirrors the queue type real
+/// JDK bytecode picks for each factory (see `java.util.concurrent.Executors`).
+pub(crate) enum TpeQueueKind {
+    /// `newFixedThreadPool`/`newSingleThreadExecutor`: unbounded `LinkedBlockingQueue`.
+    Linked,
+    /// `newCachedThreadPool`: zero-capacity rendezvous `SynchronousQueue`.
+    Synchronous,
+}
+
+fn tpe_new_queue(ctx: &mut dyn NativeContext, kind: TpeQueueKind) -> Option<ObjectRef> {
+    let class_name = match kind {
+        TpeQueueKind::Linked => "java/util/concurrent/LinkedBlockingQueue",
+        TpeQueueKind::Synchronous => "java/util/concurrent/SynchronousQueue",
+    };
+    match ctx.new_object_initialized(class_name, "()V", &[]) {
+        Ok(Some(Value::Object(Some(q)))) => Some(q),
+        _ => None,
+    }
+}
+
+fn tpe_time_unit_by_name(ctx: &mut dyn NativeContext, name: &str) -> Option<ObjectRef> {
+    let cid = ctx
+        .ensure_class_initialized("java/util/concurrent/TimeUnit")
+        .ok()?;
+    let idx = ctx.static_field_index_by_name(cid, name)?;
+    match ctx.get_static_field(cid, idx) {
+        Value::Object(Some(unit)) => Some(unit),
+        _ => None,
+    }
+}
+
+/// BUG FIX (2026-07-10, ES executors-factory mainlock NPE, layer 2): drive a
+/// genuinely real `ThreadPoolExecutor` construction for
+/// `Executors.newFixedThreadPool`/`newCachedThreadPool`/`newSingleThreadExecutor`,
+/// the same pattern `initialize_real_scheduled_thread_pool_executor` already
+/// uses for `ScheduledThreadPoolExecutor`. `this` must already be allocated
+/// with the real class's field layout (via `alloc_concurrent_synthetic`);
+/// this invokes the real `ThreadPoolExecutor(int, int, long, TimeUnit,
+/// BlockingQueue[, ThreadFactory])V` constructor via `invoke_special`, which
+/// itself fills in `ctl`/`workQueue`/`mainLock`/`workers`/`termination` (and,
+/// when no `ThreadFactory` is supplied, calls the real JDK
+/// `Executors.defaultThreadFactory()`/`defaultHandler` internally — no
+/// different from what happens when user bytecode calls `new
+/// ThreadPoolExecutor(...)` directly). This is what makes
+/// `drop_real_layout_synthetic`'s "every ThreadPoolExecutor-tagged object is
+/// real" assumption actually hold for these factory shortcuts, instead of
+/// just for direct `new ThreadPoolExecutor(...)` calls.
+/// Falls back to the old two-slot legacy write if queue/unit construction
+/// fails, so callers never see a fully-uninitialized object.
+/// See docs/known-issues/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe.md.
+pub(crate) fn initialize_real_thread_pool_executor(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    core_pool_size: i32,
+    max_pool_size: i32,
+    keep_alive: i64,
+    keep_alive_unit_name: &str,
+    queue_kind: TpeQueueKind,
+    thread_factory: Option<ObjectRef>,
+) -> MethodCallResult {
+    let core_pool_size = core_pool_size.max(0);
+    let max_pool_size = max_pool_size.max(core_pool_size).max(1);
+    let pin_base = ctx.pin_native_root(this);
+    let factory_pin = thread_factory.map(|factory| ctx.pin_native_root(factory));
+
+    let Some(queue) = tpe_new_queue(ctx, queue_kind) else {
+        let this = ctx.read_native_pin(pin_base, this);
+        stpe_legacy_slot_init(ctx, this, core_pool_size.max(1));
+        ctx.unpin_native_roots(pin_base);
+        return Ok(None);
+    };
+    let queue_pin = ctx.pin_native_root(queue);
+
+    let Some(unit) = tpe_time_unit_by_name(ctx, keep_alive_unit_name) else {
+        let this = ctx.read_native_pin(pin_base, this);
+        let queue = ctx.read_native_pin(queue_pin, queue);
+        stpe_legacy_slot_init(ctx, this, core_pool_size.max(1));
+        ctx.set_field_by_name(this, "workQueue", Value::Object(Some(queue)));
+        ctx.unpin_native_roots(pin_base);
+        return Ok(None);
+    };
+    let unit_pin = ctx.pin_native_root(unit);
+
+    let this_arg = ctx.read_native_pin(pin_base, this);
+    let queue_arg = ctx.read_native_pin(queue_pin, queue);
+    let unit_arg = ctx.read_native_pin(unit_pin, unit);
+
+    let result = if let Some(factory) = thread_factory {
+        let factory_arg = ctx.read_native_pin(factory_pin.unwrap_or(pin_base), factory);
+        ctx.invoke_special(
+            "java/util/concurrent/ThreadPoolExecutor",
+            "<init>",
+            "(IIJLjava/util/concurrent/TimeUnit;Ljava/util/concurrent/BlockingQueue;Ljava/util/concurrent/ThreadFactory;)V",
+            &[
+                Value::Object(Some(this_arg)),
+                Value::Int(core_pool_size),
+                Value::Int(max_pool_size),
+                Value::Long(keep_alive),
+                Value::Object(Some(unit_arg)),
+                Value::Object(Some(queue_arg)),
+                Value::Object(Some(factory_arg)),
+            ],
+        )
+    } else {
+        ctx.invoke_special(
+            "java/util/concurrent/ThreadPoolExecutor",
+            "<init>",
+            "(IIJLjava/util/concurrent/TimeUnit;Ljava/util/concurrent/BlockingQueue;)V",
+            &[
+                Value::Object(Some(this_arg)),
+                Value::Int(core_pool_size),
+                Value::Int(max_pool_size),
+                Value::Long(keep_alive),
+                Value::Object(Some(unit_arg)),
+                Value::Object(Some(queue_arg)),
+            ],
+        )
+    };
+
+    ctx.unpin_native_roots(pin_base);
+    result.map(|_| None)
+}
+
 pub(crate) fn initialize_real_scheduled_thread_pool_executor(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -8844,7 +8968,21 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
     // already-synthetic-aware natives registered on ThreadPoolExecutor in
     // lib.rs (executor_has_real_workers() correctly identifies this as
     // synthetic and takes the safe branch instead of touching mainLock).
-    // See docs/known-issues/elasticsearch-suite/ES-FAIL-20260710-executors-factory-mistagged-stpe-mainlock-npe.md.
+    //
+    // LAYER 2 FIX (2026-07-10): the above was necessary but insufficient —
+    // native-api/src/registry.rs's `drop_real_layout_synthetic` gate drops
+    // *every* ThreadPoolExecutor-tagged native at registration time
+    // (including the synthetic-aware submit/execute/shutdown/etc. above),
+    // on the assumption that any ThreadPoolExecutor-tagged object is
+    // genuinely real. That assumption was false for these factory-made
+    // objects (only 2 legacy slots ever got written; ctl/workQueue/mainLock
+    // stayed null), so real inherited bytecode NPE'd. Fixed by actually
+    // driving the real `ThreadPoolExecutor(...)` constructor below via
+    // `initialize_real_thread_pool_executor` (same pattern already used for
+    // ScheduledThreadPoolExecutor construction) — these objects are now
+    // genuinely real, so the drop_real_layout_synthetic assumption holds and
+    // real submit/execute/shutdown/shutdownNow bytecode runs end-to-end.
+    // See docs/known-issues/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe.md.
     r.register(
         ex,
         "newFixedThreadPool",
@@ -8859,8 +8997,16 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                 "java/util/concurrent/ThreadPoolExecutor",
                 2,
             );
-            ctx.set_field(sv, 0, Value::Int(ps));
-            ctx.set_field(sv, 1, Value::Int(0));
+            initialize_real_thread_pool_executor(
+                ctx,
+                sv,
+                ps,
+                ps,
+                0,
+                "MILLISECONDS",
+                TpeQueueKind::Linked,
+                None,
+            )?;
             Ok(Some(Value::Object(Some(sv))))
         },
     );
@@ -8874,8 +9020,16 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                 "java/util/concurrent/ThreadPoolExecutor",
                 2,
             );
-            ctx.set_field(sv, 0, Value::Int(0));
-            ctx.set_field(sv, 1, Value::Int(0));
+            initialize_real_thread_pool_executor(
+                ctx,
+                sv,
+                0,
+                i32::MAX,
+                60,
+                "SECONDS",
+                TpeQueueKind::Synchronous,
+                None,
+            )?;
             Ok(Some(Value::Object(Some(sv))))
         },
     );
@@ -8883,14 +9037,26 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         ex,
         "newCachedThreadPool",
         "(Ljava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/ExecutorService;",
-        |ctx, _args| {
+        |ctx, args| {
+            let factory = match args.first() {
+                Some(Value::Object(Some(f))) => Some(*f),
+                _ => None,
+            };
             let sv = alloc_concurrent_synthetic(
                 ctx,
                 "java/util/concurrent/ThreadPoolExecutor",
                 2,
             );
-            ctx.set_field(sv, 0, Value::Int(0));
-            ctx.set_field(sv, 1, Value::Int(0));
+            initialize_real_thread_pool_executor(
+                ctx,
+                sv,
+                0,
+                i32::MAX,
+                60,
+                "SECONDS",
+                TpeQueueKind::Synchronous,
+                factory,
+            )?;
             Ok(Some(Value::Object(Some(sv))))
         },
     );
@@ -8904,8 +9070,16 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                 "java/util/concurrent/ThreadPoolExecutor",
                 2,
             );
-            ctx.set_field(sv, 0, Value::Int(1));
-            ctx.set_field(sv, 1, Value::Int(0));
+            initialize_real_thread_pool_executor(
+                ctx,
+                sv,
+                1,
+                1,
+                0,
+                "MILLISECONDS",
+                TpeQueueKind::Linked,
+                None,
+            )?;
             Ok(Some(Value::Object(Some(sv))))
         },
     );

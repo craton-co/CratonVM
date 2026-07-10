@@ -1712,6 +1712,53 @@ fn randomized_thread_group(ctx: &mut dyn NativeContext, thread: ObjectRef) -> Me
     ctx.invoke_virtual(thread, "getThreadGroup", "()Ljava/lang/ThreadGroup;", &[])
 }
 
+/// Best-effort thread name for the `IllegalStateException` messages below —
+/// mirrors `com.carrotsearch.randomizedtesting.Threads.threadName(Thread)`
+/// closely enough for a human-readable diagnostic; exact wording doesn't
+/// matter for correctness (only the exception *class* does, see below).
+fn randomized_thread_name(ctx: &mut dyn NativeContext, thread: ObjectRef) -> String {
+    match ctx.invoke_virtual(thread, "getName", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(name)))) => {
+            ctx.read_string(name).unwrap_or_else(|| "<unknown>".to_string())
+        }
+        _ => "<unknown>".to_string(),
+    }
+}
+
+/// `RandomizedContext.context(Thread)` never returns null in real-JDK
+/// bytecode — a missing context is always an `IllegalStateException` (see
+/// the decompiled `context(Thread)` bytecode this mirrors). Callers such as
+/// `AssertingCodec.<init>` (Lucene test framework) rely on that: they wrap
+/// `RandomizedContext.current().getTargetClass()` in
+/// `catch (IllegalStateException e) { targetClass = null; }` to tolerate
+/// running outside a randomized-test thread (e.g. from a static class
+/// initializer). Returning a plain `null` here instead of throwing skips
+/// that catch block — the very next `invokevirtual getTargetClass()` then
+/// NPEs on the null receiver, and the *wrong* exception type propagates
+/// uncaught out of the static initializer as `ExceptionInInitializerError`,
+/// crashing test classes that would otherwise gracefully no-op (e.g.
+/// `ES815BitFlatVectorFormatTests` and the other ES93 BFloat16 vector codec
+/// tests during `<clinit>`).
+fn randomized_no_context_error(
+    ctx: &mut dyn NativeContext,
+    thread: ObjectRef,
+    terminated: bool,
+) -> MethodCallFailed {
+    let thread_name = randomized_thread_name(ctx, thread);
+    let message = if terminated {
+        format!("No context for a terminated thread: {thread_name}")
+    } else {
+        format!(
+            "No context information for thread: {thread_name}. Is this thread running under a \
+             RandomizedRunner runner context? Add @RunWith(RandomizedRunner.class) to your test \
+             class. Make sure your code accesses random contexts within @BeforeClass and \
+             @AfterClass boundary (for example, static test class initializers are not \
+             permitted to access random contexts)."
+        )
+    };
+    RuntimeError::IllegalStateException { message }.into()
+}
+
 fn randomized_context_for_thread(
     ctx: &mut dyn NativeContext,
     thread: ObjectRef,
@@ -1719,7 +1766,7 @@ fn randomized_context_for_thread(
     let group_result = randomized_thread_group(ctx, thread)?;
     let group = match group_result {
         Some(Value::Object(Some(group))) => group,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(randomized_no_context_error(ctx, thread, true)),
     };
     let key = RandomizedContextCacheKey {
         vm: ctx.vm_identity(),
@@ -1732,7 +1779,7 @@ fn randomized_context_for_thread(
 
     let contexts = match randomized_context_static_contexts(ctx) {
         Some(contexts) => contexts,
-        None => return Ok(Some(Value::Object(None))),
+        None => return Err(randomized_no_context_error(ctx, thread, false)),
     };
     let mut current_group = group;
     loop {
@@ -1758,7 +1805,7 @@ fn randomized_context_for_thread(
         )?;
         current_group = match parent_result {
             Some(Value::Object(Some(parent))) => parent,
-            _ => return Ok(Some(Value::Object(None))),
+            _ => return Err(randomized_no_context_error(ctx, thread, false)),
         };
     }
 }
@@ -22110,6 +22157,52 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // but test VMs use real-JDK mode and still need the print capture natives.
     register_test_harness_natives(registry);
 
+    // OutputStreamWriter(OutputStream, CharsetEncoder) -- real bytecode for
+    // this specific constructor overload produces a writer that emits ZERO
+    // bytes for every character written (confirmed by isolated probe: the
+    // (OutputStream, Charset) and (OutputStream, String) overloads work
+    // correctly, only the CharsetEncoder-accepting one is broken). This
+    // silently corrupted org.apache.catalina.util.URLEncoder.encode(String,
+    // Charset) -- which builds its OutputStreamWriter this exact way to
+    // percent-encode unsafe characters -- dropping every encoded character
+    // instead of emitting "%XX", observed as Tomcat manager's "war=" deploy
+    // parameter having every '/' silently stripped. Root cause not fully
+    // understood (a real-bytecode-only bug, no interpreter fix attempted
+    // here); work around by delegating to the proven-working (OutputStream,
+    // Charset) constructor on the same object, reading the Charset off the
+    // caller-supplied CharsetEncoder via its own real charset() accessor.
+    // This loses the caller's chosen malformed-input / unmappable-character
+    // error actions (REPORT vs REPLACE), which no caller in this codebase's
+    // test suites has been observed to depend on.
+    registry.register(
+        "java/io/OutputStreamWriter",
+        "<init>",
+        "(Ljava/io/OutputStream;Ljava/nio/charset/CharsetEncoder;)V",
+        |ctx, args| {
+            let this = args.first().copied().unwrap_or(Value::Object(None));
+            let stream = args.get(1).copied().unwrap_or(Value::Object(None));
+            let encoder = match args.get(2) {
+                Some(Value::Object(Some(e))) => Some(*e),
+                _ => None,
+            };
+            let charset = match encoder {
+                Some(e) => ctx
+                    .invoke_virtual(e, "charset", "()Ljava/nio/charset/Charset;", &[])
+                    .ok()
+                    .flatten()
+                    .unwrap_or(Value::Object(None)),
+                None => Value::Object(None),
+            };
+            ctx.invoke_special(
+                "java/io/OutputStreamWriter",
+                "<init>",
+                "(Ljava/io/OutputStream;Ljava/nio/charset/Charset;)V",
+                &[this, stream, charset],
+            )?;
+            Ok(None)
+        },
+    );
+
     // Real-JDK mode does not call the full synthetic/experimental
     // `register_builtins` surface, but JBoss Marshalling calls
     // `sun.reflect.ReflectionFactory` directly for serialization hooks.
@@ -25748,6 +25841,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 ctx.class_name_of_id(cid).as_deref(),
                 Some("java/lang/reflect/GenericArrayType")
                     | Some("java/lang/reflect/ParameterizedType")
+                    | Some("java/lang/reflect/TypeVariable")
                     | Some("java/lang/reflect/WildcardType")
             );
             if is_reflect {
@@ -60722,14 +60816,20 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         "newThread",
         "(Ljava/lang/Runnable;)Ljava/lang/Thread;",
         |ctx, args| {
+            // BUG FIX (2026-07-10, ES executors-factory mainlock NPE, layer 2
+            // residual): this used to allocate a real-shaped Thread object via
+            // alloc_concurrent_synthetic and then poke 5 legacy synthetic
+            // slots — the exact same half-real pattern that made
+            // ThreadPoolExecutor's mainLock/ctl/workQueue null (see
+            // initialize_real_thread_pool_executor in phases_early.rs). A
+            // Thread built this way never runs the real constructor, so
+            // start()/start0() operate on an uninitialized `holder` and the
+            // worker never actually runs — real ThreadPoolExecutor.execute()
+            // silently never executes submitted tasks. Drive the real
+            // Thread(Runnable) constructor instead so start() works.
+            // See docs/known-issues/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe.md.
             let runnable = args.get(1).copied().unwrap_or(Value::Object(None));
-            let thread = alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5);
-            let name = ctx.create_string("pool-thread");
-            ctx.set_field(thread, 0, Value::Object(Some(name)));
-            ctx.set_field(thread, 1, Value::Int(5));
-            ctx.set_field(thread, 3, runnable);
-            ctx.set_field(thread, 4, Value::Int(0));
-            Ok(Some(Value::Object(Some(thread))))
+            ctx.new_object_initialized("java/lang/Thread", "(Ljava/lang/Runnable;)V", &[runnable])
         },
     );
     registry.set_category(__prev_cat);
@@ -72283,7 +72383,7 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         .class_name_of_id(handler_cid)
         .unwrap_or_else(|| "java/lang/reflect/InvocationHandler".to_string());
 
-    // CRATONVM_REAL_ANNOTATIONS: when the proxy's InvocationHandler is the
+    // Real annotations: when the proxy's InvocationHandler is the
     // synthetic AnnotationProxy carrying the member data, the generated `$ProxyN`
     // method bodies reach here (the cached/dead-code dispatch path that a 2nd
     // call site falls into, bypassing `proxy_invoke_handler_shared`). Calling
@@ -72321,7 +72421,7 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                     Some(arr) if ctx.array_length(arr) > 0 => ctx.get_array_element(arr, 0),
                     _ => Value::Object(None),
                 };
-                // Under CRATONVM_REAL_ANNOTATIONS every annotation is a real
+                // In real-annotation mode every annotation is a real
                 // `$ProxyN`, so the `other` argument is typically ALSO a real
                 // proxy (not a bare AnnotationProxy) — unwrap it to its
                 // AnnotationProxy handler (slot 0) before comparing, mirroring

@@ -104,7 +104,7 @@ that redirect to real JDK bytecode:
 | Synthetic ReentrantLock / AQS | ON (synthetic) | `CRATONVM_REAL_AQS` → use real JDK |
 | Synthetic socket layer | ON (synthetic) | `CRATONVM_REAL_NET_SOCKETS` → use real JDK |
 | Synthetic RandomAccessFile | ON (synthetic) | `CRATONVM_REAL_RAF=1` → use real JDK |
-| Synthetic annotation dispatch | ON (synthetic) | `CRATONVM_REAL_ANNOTATIONS` → use real JDK |
+| Synthetic annotation dispatch | OFF by default | `CRATONVM_SYNTHETIC_ANNOTATIONS=1` or `CRATONVM_REAL_ANNOTATIONS=0` → use legacy synthetic annotation objects |
 
 ---
 
@@ -218,7 +218,7 @@ for one subsystem while everything else stays on synthetic paths.
 | `CRATONVM_REAL_NET_SOCKETS` | → real | `sun/nio/ch/Net`, socket layer |
 | `CRATONVM_REAL_AQS` | → real | AbstractQueuedSynchronizer → ReentrantLock etc. |
 | `CRATONVM_REAL_RAF=1` | → real | RandomAccessFile |
-| `CRATONVM_REAL_ANNOTATIONS` | → real | Annotation dispatch |
+| `CRATONVM_REAL_ANNOTATIONS=0` | → synthetic | Annotation dispatch opt-out |
 | `CRATONVM_ECLIPSE_REAL=1` | → real | Eclipse JDT-specific natives |
 
 ---

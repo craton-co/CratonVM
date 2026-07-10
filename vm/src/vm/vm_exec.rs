@@ -1647,10 +1647,28 @@ impl<'a> NativeContextImpl<'a> {
         // `is_object_address`, and they can only over-retain (the young sweep
         // runs non-moving while any thread is in JIT, so nothing is relocated).
         if !moving_young_precise_only {
+            let jit_scan_start = snapshot.len();
             crate::jit::conservative_roots::scan_active_jit_frames(
                 &self.shared.heap,
                 &mut snapshot,
             );
+            // G1 pin-in-place, cross-thread half (same as the safepoint path
+            // in `update_root_snapshot`): the note above — "they can only
+            // over-retain (the young sweep runs non-moving while any thread
+            // is in JIT, so nothing is relocated)" — is GENERATIONAL-only.
+            // G1 always evacuates, so this blocked thread's conservative JIT
+            // roots must also PIN their regions out of the collection set;
+            // the spill slots holding them cannot be rewritten. Replace
+            // semantics per thread; entry dropped at thread exit.
+            if self.shared.heap.is_g1() {
+                let addrs: Vec<usize> = snapshot[jit_scan_start..]
+                    .iter()
+                    .map(|r| r.as_ptr() as usize)
+                    .collect();
+                cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&addrs);
+            }
+        } else if self.shared.heap.is_g1() {
+            cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&[]);
         }
         // Shadow-stack precise roots (mirrors the same fold in
         // `update_root_snapshot`): under `CRATONVM_SHADOW_STACK` the moving
@@ -4821,6 +4839,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     None
                 }
             };
+
+            // SATB (G1MARK-2): drain this thread's per-thread SATB buffer
+            // BEFORE the thread dies. The buffer is `thread_local!`; when the
+            // OS thread exits, its TLS destructor drops the only strong Arc
+            // and the registry prunes the dead Weak — any unflushed entries
+            // (up to 255 overwritten references logged since the last
+            // safepoint) vanish. SATB entries are OLD reference values the
+            // MARKER needs, not the logging thread: a dying thread that
+            // overwrote the last snapshot-visible path to an object would
+            // take its only gray-source to the grave, and cleanup could then
+            // free a live region. Cheap no-op when no marking cycle is
+            // active.
+            shared_arc.heap.flush_thread_satb();
 
             // CRIT (multi-thread STW deadlock / undercount): transition from
             // alive mutator to dead thread through the blocked-region protocol.

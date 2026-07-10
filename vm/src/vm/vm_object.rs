@@ -884,6 +884,21 @@ pub fn set_static_shared(shared: &SharedVm, class_id: ClassId, field_index: usiz
     if field_index >= fields.len() {
         fields.resize(field_index + 1, Value::Int(0));
     }
+    // SATB pre-barrier for the overwritten static reference, centralized here
+    // so EVERY caller is covered. Statics live in this Rust-side table, not
+    // the heap, so the collectors' internal `set_field` pre-barrier never
+    // sees them. The interpreter's putstatic and the JIT static helper fire
+    // their own barrier before calling in (double-logging an old value only
+    // re-grays — harmless), but reflection `Field.set`, `Unsafe`/`VarHandle`
+    // static stores and `MethodHandle` REF_putStatic dispatch all reached
+    // this function raw: during concurrent marking, a static holding the
+    // last snapshot-visible path to an object could be overwritten with no
+    // SATB log — final remark re-scans the (new) static and misses the old
+    // referent → cleanup frees a live region (hidden-pointer SATB hole).
+    // `satb_barrier` is a cheap no-op when no marking cycle is active.
+    if let Value::Object(Some(_)) = fields[field_index] {
+        shared.heap.satb_barrier(fields[field_index]);
+    }
     fields[field_index] = value;
 }
 
