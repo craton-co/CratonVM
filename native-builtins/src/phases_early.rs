@@ -5078,6 +5078,9 @@ fn enum_range_elements(ctx: &mut dyn NativeContext, from: Value, to: Value) -> V
 }
 
 fn enum_set_elements(ctx: &mut dyn NativeContext, set: ObjectRef) -> Vec<Value> {
+    if let Some(elems) = real_enum_set_elements(ctx, set) {
+        return elems;
+    }
     if let Ok(Some(Value::Object(Some(arr)))) =
         ctx.invoke_virtual(set, "toArray", "()[Ljava/lang/Object;", &[])
     {
@@ -5095,6 +5098,111 @@ fn enum_set_elements(ctx: &mut dyn NativeContext, set: ObjectRef) -> Vec<Value> 
     (0..size.min(ctx.array_length(arr)))
         .map(|i| ctx.get_array_element(arr, i))
         .collect()
+}
+
+fn real_enum_set_elements(ctx: &mut dyn NativeContext, set: ObjectRef) -> Option<Vec<Value>> {
+    let cls = ctx
+        .class_name_of_id(ctx.class_id_of_object(set))
+        .unwrap_or_default();
+    match cls.as_str() {
+        "java/util/RegularEnumSet" => real_regular_enum_set_elements(ctx, set),
+        "java/util/JumboEnumSet" => real_jumbo_enum_set_elements(ctx, set),
+        _ => None,
+    }
+}
+
+fn real_enum_set_universe(ctx: &mut dyn NativeContext, set: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(set, "universe") {
+        Value::Object(Some(universe)) => Some(universe),
+        _ => None,
+    }
+}
+
+fn real_regular_enum_set_elements(
+    ctx: &mut dyn NativeContext,
+    set: ObjectRef,
+) -> Option<Vec<Value>> {
+    let universe = real_enum_set_universe(ctx, set)?;
+    let bits = match ctx.get_field_by_name(set, "elements") {
+        Value::Long(bits) => bits as u64,
+        Value::Int(bits) => bits as u64,
+        _ => 0,
+    };
+    let len = ctx.array_length(universe).min(64);
+    let mut elems = Vec::new();
+    for i in 0..len {
+        if ((bits >> i) & 1) != 0 {
+            let elem = ctx.get_array_element(universe, i);
+            if !matches!(elem, Value::Object(None)) {
+                elems.push(elem);
+            }
+        }
+    }
+    Some(elems)
+}
+
+fn real_jumbo_enum_set_elements(ctx: &mut dyn NativeContext, set: ObjectRef) -> Option<Vec<Value>> {
+    let universe = real_enum_set_universe(ctx, set)?;
+    let words = match ctx.get_field_by_name(set, "elements") {
+        Value::Object(Some(words)) => words,
+        _ => return Some(Vec::new()),
+    };
+    let universe_len = ctx.array_length(universe);
+    let mut elems = Vec::new();
+    for word_idx in 0..ctx.array_length(words) {
+        let bits = match ctx.get_array_element(words, word_idx) {
+            Value::Long(bits) => bits as u64,
+            Value::Int(bits) => bits as u64,
+            _ => 0,
+        };
+        if bits == 0 {
+            continue;
+        }
+        for bit in 0..64 {
+            let enum_idx = word_idx * 64 + bit;
+            if enum_idx >= universe_len {
+                break;
+            }
+            if ((bits >> bit) & 1) != 0 {
+                let elem = ctx.get_array_element(universe, enum_idx);
+                if !matches!(elem, Value::Object(None)) {
+                    elems.push(elem);
+                }
+            }
+        }
+    }
+    Some(elems)
+}
+
+fn enum_values_to_object_array(ctx: &mut dyn NativeContext, elems: &[Value]) -> ObjectRef {
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, elems.len());
+    for (i, elem) in elems.iter().copied().enumerate() {
+        ctx.set_array_element(arr, i, elem);
+    }
+    arr
+}
+
+fn enum_values_to_typed_array(
+    ctx: &mut dyn NativeContext,
+    elems: &[Value],
+    template: Value,
+) -> ObjectRef {
+    let size = elems.len();
+    let target = match template {
+        Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
+        Value::Object(Some(arr)) => {
+            let comp_cid = ctx.class_id_of_object(arr);
+            ctx.new_ref_array(comp_cid, size)
+        }
+        _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, size),
+    };
+    for (i, elem) in elems.iter().copied().enumerate() {
+        ctx.set_array_element(target, i, elem);
+    }
+    if ctx.array_length(target) > size {
+        ctx.set_array_element(target, size, Value::Object(None));
+    }
+    target
 }
 
 fn enum_universe_for_value(ctx: &mut dyn NativeContext, value: Value) -> Vec<Value> {
@@ -5267,6 +5375,9 @@ fn native_es_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 fn enum_set_copy_source_values(ctx: &mut dyn NativeContext, src: ObjectRef) -> Vec<Value> {
+    if let Some(elems) = real_enum_set_elements(ctx, src) {
+        return elems;
+    }
     let arr = match ctx.invoke_virtual(src, "toArray", "()[Ljava/lang/Object;", &[]) {
         Ok(Some(Value::Object(Some(arr)))) => arr,
         _ => return Vec::new(),
@@ -5492,6 +5603,11 @@ fn native_es_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 fn native_es_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if let Some(elems) = real_enum_set_elements(ctx, this) {
+        return Ok(Some(Value::Object(Some(enum_values_to_object_array(
+            ctx, &elems,
+        )))));
+    }
     if let Some(backing) = es_get_backing(ctx, this) {
         let size = match ctx.get_field(backing, 1) {
             Value::Int(n) => n as usize,
@@ -5520,6 +5636,11 @@ fn native_es_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 fn native_es_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let template = args.get(1).copied().unwrap_or(Value::Object(None));
+    if let Some(elems) = real_enum_set_elements(ctx, this) {
+        return Ok(Some(Value::Object(Some(enum_values_to_typed_array(
+            ctx, &elems, template,
+        )))));
+    }
     let backing = match es_get_backing(ctx, this) {
         Some(b) => b,
         None => {

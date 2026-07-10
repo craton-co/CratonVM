@@ -23836,6 +23836,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             _ => None,
         };
         ctx.set_field_by_name(this, "name", name);
+        let tid = next_java_thread_tid();
+        ctx.set_field_by_name(this, "tid", Value::Long(tid));
+        if let Some(tid_slot) = ctx.resolve_field_index("java/lang/Thread", "tid") {
+            ctx.set_field(this, tid_slot, Value::Long(tid));
+        }
         // JDK 17 keeps the Runnable directly on Thread.target and has no
         // Thread$FieldHolder. Seed the direct field before attempting the newer
         // holder layout so app-created threads still run on that JDK shape.
@@ -38378,6 +38383,15 @@ fn thread_next_tid_offset() -> usize {
     let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
     map.entry(offset).or_insert(1);
     offset
+}
+
+fn next_java_thread_tid() -> i64 {
+    let offset = thread_next_tid_offset();
+    let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
+    let entry = map.entry(offset).or_insert(1);
+    let tid = (*entry).max(1);
+    *entry = tid.saturating_add(1);
+    tid
 }
 
 /// Lock the shard that owns `key` in a `usize`-keyed sharded map.
