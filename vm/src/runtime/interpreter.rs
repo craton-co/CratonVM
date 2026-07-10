@@ -42,6 +42,7 @@
 
 use std::sync::Arc;
 
+use cratonvm_reader::class_access_flags::MethodAccessFlags;
 use cratonvm_reader::constant_pool::ConstantPoolEntry;
 use cratonvm_reader::instruction::Instruction;
 use tracing::trace;
@@ -16404,6 +16405,45 @@ fn helpful_npe_opcode_message_parts(
     helpful_npe::combine_opt(action, expr.as_ref())
 }
 
+/// Resolve a Java 11+ private-method call encoded as `invokevirtual`.
+///
+/// Private methods are not virtual dispatch targets even when modern classfiles
+/// encode the call with opcode 0xb6. Dispatch must stay pinned to the resolved
+/// constant-pool target; otherwise a subclass/private-static helper with the
+/// same name and descriptor can be selected by receiver-class lookup.
+fn resolved_private_invokevirtual_target(
+    shared: &SharedVm,
+    current_class_id: ClassId,
+    method_class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> Option<(ClassId, Arc<str>)> {
+    let target_class_id = lookup_loader_initiated(shared, current_class_id, method_class_name)
+        .or_else(|| {
+            shared
+                .class_manager
+                .read()
+                .get_loaded_class_id(method_class_name)
+        })?;
+
+    let cm = shared.class_manager.read();
+    let store = &cm.class_store;
+    let (method, declaring_id) = crate::classloading::find_method_recursive(
+        target_class_id,
+        method_name,
+        method_descriptor,
+        store,
+    )?;
+    if !method.access_flags.contains(MethodAccessFlags::PRIVATE) {
+        return None;
+    }
+    let declaring_name = store
+        .get(declaring_id)
+        .map(|c| Arc::clone(&c.name))
+        .unwrap_or_else(|| Arc::from(method_class_name));
+    Some((declaring_id, declaring_name))
+}
+
 /// Variant of `execute_invoke` that knows whether the source bytecode was
 /// `invokeinterface`. Only invokeinterface call sites pass `is_interface=true`;
 /// invokevirtual / invokespecial pass `false`. The flag gates γ's CP-resolved-
@@ -16594,8 +16634,22 @@ fn execute_invoke_kind(
         );
     }
 
+    let private_virtual_target =
+        if !is_special && matches!(args.first(), Some(Value::Object(Some(_)))) {
+            resolved_private_invokevirtual_target(
+                shared,
+                current_class_id,
+                &method_class_name,
+                &method_name,
+                &method_descriptor,
+            )
+        } else {
+            None
+        };
+    let effectively_special = is_special || private_virtual_target.is_some();
+
     // Check for lambda proxy dispatch
-    if !is_special {
+    if !effectively_special {
         if let Value::Object(Some(obj_ref)) = &args[0] {
             let obj_class_id = shared.heap.class_id_of(*obj_ref);
             if let Some(result) = try_lambda_dispatch(
@@ -16625,7 +16679,7 @@ fn execute_invoke_kind(
     // Capture receiver class_id for virtual cache population.
     // Arrays are redirected to java/lang/Object, so skip caching for them
     // to avoid polluting the inline cache with the wrong target.
-    let receiver_class_id = if !is_special {
+    let receiver_class_id = if !effectively_special {
         match &args[0] {
             Value::Object(Some(obj_ref)) => {
                 if shared.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array {
@@ -16644,6 +16698,8 @@ fn execute_invoke_kind(
     // invoke_class: Arc<str> — cheap clone, derefs to &str for all downstream calls.
     let invoke_class: Arc<str> = if is_special {
         method_class_name
+    } else if let Some((_declaring_id, declaring_name)) = &private_virtual_target {
+        Arc::clone(declaring_name)
     } else {
         match &args[0] {
             Value::Object(Some(obj_ref)) => {
@@ -17497,9 +17553,11 @@ fn execute_invoke_kind(
     // frame-push path (NO extra recursion), unlike routing through the recursive
     // `invoke_on_class_shared`. Gated + divergence-only → byte-identical in the
     // default (gate-off) / single-class-per-name case.
-    let dispatch_override: Option<ClassId> = if !is_special
-        && crate::runtime::env_cache::loader_aware_resolution()
+    let dispatch_override: Option<ClassId> = if let Some((declaring_id, _)) =
+        &private_virtual_target
     {
+        Some(*declaring_id)
+    } else if !is_special && crate::runtime::env_cache::loader_aware_resolution() {
         receiver_class_id.filter(|rcv_cid| {
             *rcv_cid != ClassId::new(0) && {
                 let cm = shared.class_manager.read();
@@ -17578,16 +17636,32 @@ fn execute_invoke_kind(
         CachedCallResult::FramePushed => {
             if is_special {
                 populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
-            } else if let Some(rcv_cid) = receiver_class_id {
-                populate_virtual_invoke_cache(thread, shared, current_class_id, cp_index, rcv_cid);
+            } else if private_virtual_target.is_none() {
+                if let Some(rcv_cid) = receiver_class_id {
+                    populate_virtual_invoke_cache(
+                        thread,
+                        shared,
+                        current_class_id,
+                        cp_index,
+                        rcv_cid,
+                    );
+                }
             }
             return Ok(CachedCallResult::FramePushed);
         }
         CachedCallResult::Handled => {
             if is_special {
                 populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
-            } else if let Some(rcv_cid) = receiver_class_id {
-                populate_virtual_invoke_cache(thread, shared, current_class_id, cp_index, rcv_cid);
+            } else if private_virtual_target.is_none() {
+                if let Some(rcv_cid) = receiver_class_id {
+                    populate_virtual_invoke_cache(
+                        thread,
+                        shared,
+                        current_class_id,
+                        cp_index,
+                        rcv_cid,
+                    );
+                }
             }
             return Ok(CachedCallResult::Handled);
         }
@@ -17641,8 +17715,10 @@ fn execute_invoke_kind(
     // Populate cache for future fast-path hits
     if is_special {
         populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
-    } else if let Some(rcv_cid) = receiver_class_id {
-        populate_virtual_invoke_cache(thread, shared, current_class_id, cp_index, rcv_cid);
+    } else if private_virtual_target.is_none() {
+        if let Some(rcv_cid) = receiver_class_id {
+            populate_virtual_invoke_cache(thread, shared, current_class_id, cp_index, rcv_cid);
+        }
     }
 
     Ok(CachedCallResult::Handled)
@@ -20348,7 +20424,31 @@ pub(crate) fn is_ffm_memory_layout_native_override(
     class_name == "java/lang/foreign/MemoryLayout"
         && matches!(
             (method_name, descriptor),
-            ("name", "()Ljava/util/Optional;")
+            (
+                "sequenceLayout",
+                "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/SequenceLayout;"
+            ) | (
+                "sequenceLayout",
+                "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
+            ) | (
+                "structLayout",
+                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/StructLayout;"
+            ) | (
+                "structLayout",
+                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
+            ) | (
+                "unionLayout",
+                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/UnionLayout;"
+            ) | (
+                "unionLayout",
+                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
+            ) | ("paddingLayout", "(J)Ljava/lang/foreign/PaddingLayout;")
+                | ("paddingLayout", "(J)Ljava/lang/foreign/MemoryLayout;")
+                | (
+                    "varHandle",
+                    "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;"
+                )
+                | ("name", "()Ljava/util/Optional;")
                 | (
                     "withName",
                     "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;"
@@ -28631,10 +28731,11 @@ fn execute_invokevirtual_vtable_fast(
     // acquiring `class_manager.read()`; that's only possible via the
     // already-populated `resolution_cache`. On a cold cache we return
     // `CacheMiss` and let the slow path populate it.
-    let (method_name, method_descriptor, num_params_slots) = {
+    let (method_class_name, method_name, method_descriptor, num_params_slots) = {
         let rc = shared.resolution_cache.read();
         match rc.get_method(caller_class_id, cp_index) {
             Some(rm) => (
+                Arc::clone(&rm.class_name),
                 Arc::clone(&rm.method_name),
                 Arc::clone(&rm.method_descriptor),
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
@@ -28683,6 +28784,18 @@ fn execute_invokevirtual_vtable_fast(
     // All-zero header = stale pointer from zeroed GC memory — fall back
     // to the slow path which has detailed recovery logic.
     if receiver_class_id == ClassId::new(0) {
+        return Ok(CachedCallResult::CacheMiss);
+    }
+
+    if resolved_private_invokevirtual_target(
+        shared,
+        caller_class_id,
+        &method_class_name,
+        &method_name,
+        &method_descriptor,
+    )
+    .is_some()
+    {
         return Ok(CachedCallResult::CacheMiss);
     }
 
@@ -31478,6 +31591,22 @@ mod tests {
         assert!(!is_ffm_symbol_lookup_native_override(
             "java/lang/foreign/Linker",
             "find",
+            descriptor
+        ));
+    }
+
+    #[test]
+    fn ffm_memory_layout_force_native_covers_varhandle() {
+        let descriptor =
+            "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;";
+        assert!(is_ffm_memory_layout_native_override(
+            "java/lang/foreign/MemoryLayout",
+            "varHandle",
+            descriptor
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/lang/foreign/MemoryLayout",
+            "varHandle",
             descriptor
         ));
     }

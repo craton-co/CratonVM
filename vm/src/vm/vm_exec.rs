@@ -425,6 +425,23 @@ pub fn unbox_poly_return(
     }
 }
 
+fn is_method_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
+    class_name == "java/lang/invoke/MethodHandle"
+        || class_name.starts_with("java/lang/invoke/MethodHandle")
+        || (class_name.starts_with("java/lang/invoke/") && class_name.contains("MethodHandle"))
+        || class_name == "java/lang/foreign/DowncallHandle"
+}
+
+fn is_var_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
+    class_name == "java/lang/invoke/VarHandle"
+        || class_name.starts_with("java/lang/invoke/VarHandle")
+        || (class_name.starts_with("java/lang/invoke/") && class_name.contains("VarHandle"))
+}
+
+fn prefers_exact_signature_polymorphic_receiver(class_name: &str) -> bool {
+    class_name == "java/lang/foreign/DowncallHandle"
+}
+
 // ---------------------------------------------------------------------------
 // Safe native callback invocation
 // ---------------------------------------------------------------------------
@@ -2282,6 +2299,16 @@ impl NativeThreadBlocker for VmNativeThreadBlocker {
             .thread_registry
             .mark_native_thread_unblocked(self.thread_id);
     }
+}
+
+fn resolve_thread_id_from_thread_obj(shared: &SharedVm, thread_obj: ObjectRef) -> Option<ThreadId> {
+    shared
+        .thread_registry
+        .find_thread_id_by_thread_obj(thread_obj)
+        .or_else(|| match shared.heap.get_field(thread_obj, 2) {
+            Value::Long(id) => Some(ThreadId(id as u64)),
+            _ => None,
+        })
 }
 
 impl<'a> NativeContext for NativeContextImpl<'a> {
@@ -4298,9 +4325,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     fn thread_start(&mut self, thread_obj: ObjectRef) -> MethodCallResult {
         let shared_arc = self.shared.get_arc();
         let tid = self.shared.thread_registry.next_thread_id();
+        let header = self.shared.heap.get_header(thread_obj);
 
-        // Read thread name from the Java Thread object (field 0)
-        let name = match self.shared.heap.get_field(thread_obj, 0) {
+        // Read thread name from the real-JDK `name` field, falling back to the
+        // legacy synthetic slot 0 layout.
+        let name_value = {
+            let cm = self.shared.class_manager.read();
+            resolve_field_index_in_hierarchy(header.class_id, "name", &cm.class_store)
+                .map(|slot| self.shared.heap.get_field(thread_obj, slot))
+        }
+        .unwrap_or_else(|| self.shared.heap.get_field(thread_obj, 0));
+        let name = match name_value {
             Value::Object(Some(str_ref)) => super::read_java_string(&self.shared.heap, str_ref)
                 .unwrap_or_else(|| format!("Thread-{}", tid.0)),
             _ => format!("Thread-{}", tid.0),
@@ -4319,7 +4354,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         //      threads created by `Thread.ofVirtual().start(r)` wouldn't
         //      release the carrier semaphore on `Thread.sleep`/`park`,
         //      starving the carrier pool under load (e.g. 10K vthreads).
-        let header = self.shared.heap.get_header(thread_obj);
         let is_virtual_synthetic = header.num_slots >= 5
             && matches!(self.shared.heap.get_field(thread_obj, 4), Value::Int(1));
         let is_virtual_real_jdk = {
@@ -4817,19 +4851,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn thread_join(&mut self, thread_obj: ObjectRef) -> MethodCallResult {
-        // Read ThreadId from field 2 of the Java Thread object (synthetic
-        // layout) or fall back to the registry's `(ObjectRef в†’ ThreadId)`
-        // map (real-JDK layout вЂ” see WP4.1 thread_start fix).
-        let tid = match self.shared.heap.get_field(thread_obj, 2) {
-            Value::Long(id) => ThreadId(id as u64),
-            _ => match self
-                .shared
-                .thread_registry
-                .find_thread_id_by_thread_obj(thread_obj)
-            {
-                Some(id) => id,
-                None => return Ok(None), // Unknown thread, nothing to join
-            },
+        let Some(tid) = resolve_thread_id_from_thread_obj(self.shared, thread_obj) else {
+            return Ok(None);
         };
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
@@ -4856,16 +4879,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn thread_is_alive(&self, thread_obj: ObjectRef) -> bool {
-        // Read ThreadId from field 2 (synthetic) or registry (real-JDK).
-        match self.shared.heap.get_field(thread_obj, 2) {
-            Value::Long(id) => self.shared.thread_registry.is_alive(ThreadId(id as u64)),
-            _ => self
-                .shared
-                .thread_registry
-                .find_thread_id_by_thread_obj(thread_obj)
-                .map(|id| self.shared.thread_registry.is_alive(id))
-                .unwrap_or(false),
-        }
+        resolve_thread_id_from_thread_obj(self.shared, thread_obj)
+            .map(|id| self.shared.thread_registry.is_alive(id))
+            .unwrap_or(false)
     }
 
     fn thread_run_state(&self, thread_obj: ObjectRef) -> u8 {
@@ -4874,13 +4890,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // RETAINS dead threads' entries (mark_dead only flips `alive`), so a
         // present-but-not-alive entry is TERMINATED, while a missing entry is a
         // thread that was never started (NEW).
-        let tid = match self.shared.heap.get_field(thread_obj, 2) {
-            Value::Long(id) => Some(ThreadId(id as u64)),
-            _ => self
-                .shared
-                .thread_registry
-                .find_thread_id_by_thread_obj(thread_obj),
-        };
+        let tid = resolve_thread_id_from_thread_obj(self.shared, thread_obj);
         match tid {
             None => 0, // NEW — never started
             Some(id) => {
@@ -4906,13 +4916,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // for a parked thread this is the blocking call site. Resolve line
         // numbers from the BCI now that we hold the ClassStore (so a dump still
         // gets source lines without paying for them at every deposit).
-        let tid = match self.shared.heap.get_field(thread_obj, 2) {
-            Value::Long(id) => Some(ThreadId(id as u64)),
-            _ => self
-                .shared
-                .thread_registry
-                .find_thread_id_by_thread_obj(thread_obj),
-        };
+        let tid = resolve_thread_id_from_thread_obj(self.shared, thread_obj);
         let Some(tid) = tid else {
             return Vec::new();
         };
@@ -5128,14 +5132,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn thread_interrupt(&mut self, thread_obj: ObjectRef) {
-        // Read ThreadId from field 2 (synthetic) or registry (real-JDK).
-        let tid = match self.shared.heap.get_field(thread_obj, 2) {
-            Value::Long(id) => Some(ThreadId(id as u64)),
-            _ => self
-                .shared
-                .thread_registry
-                .find_thread_id_by_thread_obj(thread_obj),
-        };
+        let tid = resolve_thread_id_from_thread_obj(self.shared, thread_obj);
         if let Some(tid) = tid {
             // Set the interrupted flag via the registry (cross-thread safe)
             self.shared.thread_registry.set_interrupted(tid, true);
@@ -5154,16 +5151,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     /// T1.5.1 вЂ” post an async exception to the target thread's
     /// registry slot. The target picks it up at its next safepoint.
     fn thread_post_async_exception(&mut self, thread_obj: ObjectRef, throwable: ObjectRef) -> bool {
-        let tid = match self.shared.heap.get_field(thread_obj, 2) {
-            Value::Long(id) => ThreadId(id as u64),
-            _ => match self
-                .shared
-                .thread_registry
-                .find_thread_id_by_thread_obj(thread_obj)
-            {
-                Some(id) => id,
-                None => return false,
-            },
+        let Some(tid) = resolve_thread_id_from_thread_obj(self.shared, thread_obj) else {
+            return false;
         };
         self.shared
             .thread_registry
@@ -13475,10 +13464,7 @@ fn invoke_on_class_shared_inner(
                     // DirectMethodHandle$Constructor, so its readValue silently
                     // failed. Recognise any java/lang/invoke class carrying
                     // "MethodHandle" in its name as a signature-polymorphic receiver.
-                    let is_mh = class_name == "java/lang/invoke/MethodHandle"
-                        || class_name.starts_with("java/lang/invoke/MethodHandle")
-                        || (class_name.starts_with("java/lang/invoke/")
-                            && class_name.contains("MethodHandle"));
+                    let is_mh = is_method_handle_signature_polymorphic_receiver(&class_name);
                     // Recognise any java/lang/invoke class carrying "VarHandle" in
                     // its name, not just ones literally prefixed "VarHandle" — the
                     // JEP 454 FFM API's `SegmentVarHandle` (used by
@@ -13486,10 +13472,7 @@ fn invoke_on_class_shared_inner(
                     // share that prefix, and previously fell through to normal
                     // method resolution and threw NoSuchMethodError. Mirrors the
                     // analogous `is_mh` broadening above.
-                    let is_vh = class_name == "java/lang/invoke/VarHandle"
-                        || class_name.starts_with("java/lang/invoke/VarHandle")
-                        || (class_name.starts_with("java/lang/invoke/")
-                            && class_name.contains("VarHandle"));
+                    let is_vh = is_var_handle_signature_polymorphic_receiver(&class_name);
                     if is_mh || is_vh {
                         let base = if is_mh {
                             "java/lang/invoke/MethodHandle"
@@ -13503,6 +13486,20 @@ fn invoke_on_class_shared_inner(
                             "([Ljava/lang/Object;)V",
                             "([Ljava/lang/Object;)Z",
                         ];
+                        let prefer_exact =
+                            prefers_exact_signature_polymorphic_receiver(&class_name);
+                        if prefer_exact {
+                            for poly_desc in &poly_descs {
+                                if let Some(cb) =
+                                    shared
+                                        .native_methods
+                                        .find(&class_name, method_name, poly_desc)
+                                {
+                                    let r = safe_native_call(shared, thread, cb, args)?;
+                                    return Ok(unbox_poly_return(shared, r, descriptor));
+                                }
+                            }
+                        }
                         for poly_desc in &poly_descs {
                             if let Some(cb) =
                                 shared.native_methods.find(base, method_name, poly_desc)
@@ -13511,15 +13508,17 @@ fn invoke_on_class_shared_inner(
                                 return Ok(unbox_poly_return(shared, r, descriptor));
                             }
                         }
-                        // Also try the exact class name
-                        for poly_desc in &poly_descs {
-                            if let Some(cb) =
-                                shared
-                                    .native_methods
-                                    .find(&class_name, method_name, poly_desc)
-                            {
-                                let r = safe_native_call(shared, thread, cb, args)?;
-                                return Ok(unbox_poly_return(shared, r, descriptor));
+                        if !prefer_exact {
+                            // Also try the exact class name
+                            for poly_desc in &poly_descs {
+                                if let Some(cb) =
+                                    shared
+                                        .native_methods
+                                        .find(&class_name, method_name, poly_desc)
+                                {
+                                    let r = safe_native_call(shared, thread, cb, args)?;
+                                    return Ok(unbox_poly_return(shared, r, descriptor));
+                                }
                             }
                         }
                     }
@@ -14641,6 +14640,28 @@ mod tests {
 
     fn test_shared() -> Arc<SharedVm> {
         Arc::new(SharedVm::new(VmConfig::default()))
+    }
+
+    #[test]
+    fn downcall_handle_uses_method_handle_signature_polymorphic_dispatch() {
+        assert!(is_method_handle_signature_polymorphic_receiver(
+            "java/lang/invoke/MethodHandle"
+        ));
+        assert!(is_method_handle_signature_polymorphic_receiver(
+            "java/lang/invoke/DirectMethodHandle$Constructor"
+        ));
+        assert!(is_method_handle_signature_polymorphic_receiver(
+            "java/lang/foreign/DowncallHandle"
+        ));
+        assert!(!is_method_handle_signature_polymorphic_receiver(
+            "java/lang/foreign/MemorySegment"
+        ));
+        assert!(prefers_exact_signature_polymorphic_receiver(
+            "java/lang/foreign/DowncallHandle"
+        ));
+        assert!(!prefers_exact_signature_polymorphic_receiver(
+            "java/lang/invoke/MethodHandle"
+        ));
     }
 
     #[test]

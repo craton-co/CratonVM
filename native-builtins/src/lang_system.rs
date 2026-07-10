@@ -942,13 +942,15 @@ pub(crate) fn native_thread_get_name(
             return Ok(Some(Value::Object(Some(name))));
         }
     };
-    // Try to read name from field 0
-    match ctx.get_field(this, 0) {
+    match ctx.get_field_by_name(this, "name") {
         Value::Object(Some(str_ref)) => Ok(Some(Value::Object(Some(str_ref)))),
-        _ => {
-            let name = ctx.create_string("main");
-            Ok(Some(Value::Object(Some(name))))
-        }
+        _ => match ctx.get_field(this, 0) {
+            Value::Object(Some(str_ref)) => Ok(Some(Value::Object(Some(str_ref)))),
+            _ => {
+                let name = ctx.create_string("main");
+                Ok(Some(Value::Object(Some(name))))
+            }
+        },
     }
 }
 
@@ -1300,19 +1302,31 @@ pub(crate) fn native_runtime_free_memory(
     Ok(Some(Value::Long(32 * 1024 * 1024))) // 32 MB estimate
 }
 
-/// `Runtime.version()` вЂ” returns a `java.lang.Runtime$Version` instance.
-/// WildFly / JBoss Modules reads `Runtime.version().feature()` during bootstrap.
+/// `Runtime.version()` returns a real initialized `Runtime$Version`.
+///
+/// The old lightweight object only satisfied native `feature()`/`build()` calls.
+/// Real bytecode such as `Runtime$Version.toString()` reads the private final
+/// `version` list, so construct via the JDK parser instead of returning raw
+/// zeroed fields.
 pub(crate) fn native_runtime_version(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let cid = ctx.ensure_class_initialized("java/lang/Runtime$Version")?;
-    let mut n = ctx.class_num_total_fields(cid);
-    if n == 0 {
-        n = 4;
-    }
-    let obj = ctx.alloc_object(cid, n);
-    Ok(Some(Value::Object(Some(obj))))
+    let version = ctx
+        .get_system_property("java.version")
+        .or_else(|| ctx.get_system_property("java.specification.version"))
+        .unwrap_or_else(|| "25".to_string());
+    let version_obj = ctx.create_string(version.trim());
+    let pin = ctx.pin_native_root(version_obj);
+    let arg = Value::Object(Some(ctx.read_native_pin(pin, version_obj)));
+    let result = ctx.invoke(
+        "java/lang/Runtime$Version",
+        "parse",
+        "(Ljava/lang/String;)Ljava/lang/Runtime$Version;",
+        &[arg],
+    );
+    ctx.unpin_native_roots(pin);
+    result
 }
 
 /// `Runtime.Version.feature()` вЂ” major Java specification version (e.g. 25).

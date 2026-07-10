@@ -47,11 +47,17 @@ surfaced three distinct, layered issues:
   default-release allocator is `native-builtins/src/lib.rs::alloc_heap_bytebuffer`;
   it now seeds `address = 16`, and the socket-read/bulk-get repro returns
   `HTTP/1.1 200 OK`.
-- OPEN: [`stringreader-read-never-advances-infinite-loop.md`](tomcat-08-07/stringreader-read-never-advances-infinite-loop.md)
-  — `StringReader.read()` never advances position, infinite-looping any
+- FIXED/RETIRED: [`stringreader-read-never-advances-infinite-loop-FIXED.md`](../internal/fixed-suite-bugs/stringreader-read-never-advances-infinite-loop-FIXED.md)
+  — `StringReader.read()` never advanced position, infinite-looping any
   `BufferedReader`/`StringReader`-based text parser (e.g.
-  `RewriteValve.parse()`). Same unresolved "phantom native" dispatch
-  mystery as the ByteBuffer bug above.
+  `RewriteValve.parse()`). Root cause: the live native (`native-io`'s
+  `register_string_rw_natives`, tagged `SyntheticStub`) wins dispatch over
+  real bytecode by default, but stored position/length in flat object field
+  slots that don't exist on real JDK 25's `StringReader` (rewritten to a
+  single `Reader` delegate) — the writes silently no-op'd. Fixed with a
+  GC-stable side table (`SR_STATE`, keyed by `identity_hash_code`), same
+  pattern as this file's `InputStreamReader` `ISR_PENDING` table.
+  `TestRewriteValve` now completes all 121 tests instead of hanging.
 - Updated: [`tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md`](tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md)
   now reflects all three findings.
 

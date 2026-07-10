@@ -10,7 +10,7 @@ use cratonvm_types::error::{
     LinkageError, MethodCallFailed, MethodCallResult, RuntimeError, VmError,
 };
 use cratonvm_types::ClassId;
-use cratonvm_types::{ObjectRef, Value};
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
 use crate::{native_cf_then_accept, native_cf_then_apply};
@@ -9459,7 +9459,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(n)) if *n >= 0 => *n as usize,
                 _ => usize::MAX,
             };
-            let _matcher = args.get(2).copied().unwrap_or(Value::Object(None));
+            let matcher = match args.get(2).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(o)) => Some(o),
+                _ => None,
+            };
             let mut paths = Vec::new();
             vfs_or_host_walk(&p, 0, max_depth, &mut paths);
             let mut vals = Vec::with_capacity(paths.len());
@@ -9475,7 +9478,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 };
                 let attrs_pin = ctx.pin_native_root(attrs);
                 let attrs = ctx.read_native_pin(attrs_pin, attrs);
-                let keep = !matches!(ctx.get_field(attrs, 3), Value::Int(v) if v != 0);
+                let ep_current = ctx.read_native_pin(ep_pin, ep);
+                let keep = if let Some(matcher) = matcher {
+                    match ctx.invoke_virtual(
+                        matcher,
+                        "test",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+                        &[Value::Object(Some(ep_current)), Value::Object(Some(attrs))],
+                    )? {
+                        Some(Value::Int(v)) => v != 0,
+                        _ => false,
+                    }
+                } else {
+                    !matches!(ctx.get_field(attrs, 3), Value::Int(v) if v != 0)
+                };
                 let ep = ctx.read_native_pin(ep_pin, ep);
                 ctx.unpin_native_roots(attrs_pin);
                 ctx.unpin_native_roots(ep_pin);
@@ -10043,9 +10059,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     let arr = ctx.new_array(ArrayElementType::Byte, data.len());
                     let stream = ctx.read_native_pin(stream_pin, stream);
                     ctx.unpin_native_roots(stream_pin);
-                    for (i, &b) in data.iter().enumerate() {
-                        ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-                    }
+                    ctx.write_byte_array_from(arr, 0, &data);
                     ctx.set_field_by_name(stream, "buf", Value::Object(Some(arr)));
                     ctx.set_field_by_name(stream, "pos", Value::Int(0));
                     ctx.set_field_by_name(stream, "mark", Value::Int(0));
@@ -10885,9 +10899,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 Ok(data) => {
                     use cratonvm_types::ArrayElementType;
                     let arr = ctx.new_array(ArrayElementType::Byte, data.len());
-                    for (i, &b) in data.iter().enumerate() {
-                        ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-                    }
+                    ctx.write_byte_array_from(arr, 0, &data);
                     Ok(Some(Value::Object(Some(arr))))
                 }
                 // NIO contract: missing file → NoSuchFileException (see
@@ -12334,9 +12346,15 @@ fn jar_bytes_cached(jar: &str) -> Option<std::sync::Arc<Vec<u8>>> {
 /// decompression) turns those into O(log N) binary-search / prefix scans, which
 /// is what makes walking a large classpath (the Hibernate suite's 241 jars)
 /// tractable in the interpreter.
-fn jar_index(jar: &str) -> Option<std::sync::Arc<Vec<String>>> {
+struct JarFsIndex {
+    names: Vec<String>,
+    sizes: std::collections::HashMap<String, u64>,
+    raw_names: std::collections::HashMap<String, String>,
+}
+
+fn jar_index(jar: &str) -> Option<std::sync::Arc<JarFsIndex>> {
     use std::sync::{Arc, Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Option<Arc<Vec<String>>>>>> =
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Option<Arc<JarFsIndex>>>>> =
         OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -12346,14 +12364,25 @@ fn jar_index(jar: &str) -> Option<std::sync::Arc<Vec<String>>> {
     let built = (|| {
         let bytes = jar_bytes_cached(jar)?;
         let cursor = std::io::Cursor::new(bytes.as_slice());
-        let zip = zip::ZipArchive::new(cursor).ok()?;
-        let mut names: Vec<String> = zip
-            .file_names()
-            .map(|s| s.trim_start_matches('/').to_string())
-            .collect();
+        let mut zip = zip::ZipArchive::new(cursor).ok()?;
+        let mut names = Vec::with_capacity(zip.len());
+        let mut sizes = std::collections::HashMap::with_capacity(zip.len());
+        let mut raw_names = std::collections::HashMap::with_capacity(zip.len());
+        for i in 0..zip.len() {
+            let f = zip.by_index(i).ok()?;
+            let raw = f.name().to_string();
+            let name = raw.trim_start_matches('/').to_string();
+            sizes.insert(name.clone(), f.size());
+            raw_names.insert(name.clone(), raw);
+            names.push(name);
+        }
         names.sort_unstable();
         names.dedup();
-        Some(Arc::new(names))
+        Some(Arc::new(JarFsIndex {
+            names,
+            sizes,
+            raw_names,
+        }))
     })();
     guard.insert(jar.to_string(), built.clone());
     built
@@ -12367,17 +12396,25 @@ fn jarfs_read_entry(jar: &str, entry: &str) -> std::io::Result<Vec<u8>> {
     let cursor = std::io::Cursor::new(jar_bytes.as_slice());
     let mut zip = zip::ZipArchive::new(cursor)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    let entry_name = if zip.file_names().any(|name| name == entry) {
-        entry.to_string()
-    } else {
-        format!("/{entry}")
-    };
+    let entry_name = jar_index(jar)
+        .and_then(|idx| idx.raw_names.get(entry).cloned())
+        .unwrap_or_else(|| entry.to_string());
     let mut f = zip
         .by_name(&entry_name)
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::NotFound))?;
     let mut buf = Vec::with_capacity(f.size().min(1 << 27) as usize);
     f.read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+fn jarfs_entry_size(jar: &str, entry: &str) -> std::io::Result<i64> {
+    let entry = entry.trim_start_matches('/');
+    let index = jar_index(jar).ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    index
+        .sizes
+        .get(entry)
+        .map(|size| *size as i64)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
 }
 
 fn jarfs_rewrite_entry(jar: &str, entry: &str, data: Option<&[u8]>) -> std::io::Result<()> {
@@ -12490,10 +12527,11 @@ fn jarfs_classify(jar: &str, entry: &str) -> JarFsKind {
     if entry.is_empty() {
         return JarFsKind::Dir;
     }
-    let names = match jar_index(jar) {
+    let index = match jar_index(jar) {
         Some(n) => n,
         None => return JarFsKind::Absent,
     };
+    let names = &index.names;
     // Exact entry → a regular file.
     if names.binary_search_by(|n| n.as_str().cmp(entry)).is_ok() {
         return JarFsKind::File;
@@ -12527,10 +12565,11 @@ fn jarfs_list_dir_classified(jar: &str, dir: &str) -> Vec<(String, bool)> {
     } else {
         format!("{dir}/")
     };
-    let names = match jar_index(jar) {
+    let index = match jar_index(jar) {
         Some(n) => n,
         None => return Vec::new(),
     };
+    let names = &index.names;
     let start = names.partition_point(|n| n.as_str() < prefix.as_str());
     let mut seen: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
     for name in &names[start..] {
@@ -12577,6 +12616,7 @@ fn jarfs_list_dir_classified(jar: &str, dir: &str) -> Vec<(String, bool)> {
 struct JrtImage {
     reader: cratonvm_reader::JImageReader,
     entries: Vec<String>,
+    entry_sizes: std::collections::HashMap<String, u64>,
 }
 
 fn jrt_image(java_home: &str) -> Option<std::sync::Arc<JrtImage>> {
@@ -12592,16 +12632,21 @@ fn jrt_image(java_home: &str) -> Option<std::sync::Arc<JrtImage>> {
     let built = cratonvm_reader::JImageReader::open(&modules_path)
         .ok()
         .map(|reader| {
-            let mut entries: Vec<String> = reader
-                .iter_entries()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(p, _, _)| p)
-                .filter(|p| p.starts_with('/'))
-                .collect();
+            let mut entries = Vec::new();
+            let mut entry_sizes = std::collections::HashMap::new();
+            for (p, _, size) in reader.iter_entries().unwrap_or_default() {
+                if p.starts_with('/') {
+                    entry_sizes.insert(p.clone(), size);
+                    entries.push(p);
+                }
+            }
             entries.sort_unstable();
             entries.dedup();
-            Arc::new(JrtImage { reader, entries })
+            Arc::new(JrtImage {
+                reader,
+                entries,
+                entry_sizes,
+            })
         });
     guard.insert(java_home.to_string(), built.clone());
     built
@@ -12623,7 +12668,9 @@ fn jrt_entry_to_image(entry: &str) -> Option<String> {
 }
 
 fn jrt_img_is_file(img: &JrtImage, path: &str) -> bool {
-    img.entries.binary_search(&path.to_string()).is_ok()
+    img.entries
+        .binary_search_by(|e| e.as_str().cmp(path))
+        .is_ok()
 }
 
 fn jrt_img_is_dir(img: &JrtImage, path: &str) -> bool {
@@ -12723,6 +12770,17 @@ fn jrtfs_list_dir_classified(java_home: &str, entry: &str) -> Vec<(String, bool)
         }
         None => Vec::new(),
     }
+}
+
+fn jrtfs_entry_size(java_home: &str, entry: &str) -> std::io::Result<i64> {
+    let img =
+        jrt_image(java_home).ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    let img_path = jrt_entry_to_image(entry)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    img.entry_sizes
+        .get(&img_path)
+        .map(|size| *size as i64)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
 }
 
 /// Read a jrt logical entry's bytes out of the jimage.
@@ -24069,6 +24127,9 @@ fn vh_set_volatile(
 
 /// Read the kind tag from a VarHandle (0=instance, 1=static, 2=array).
 fn vh_kind(ctx: &dyn NativeContext, vh: ObjectRef) -> i32 {
+    if crate::lang_invoke::p67_memory_segment_var_handle_width(ctx, vh).is_some() {
+        return VH_KIND_MEMORY_SEGMENT;
+    }
     if ctx.object_num_fields(vh) < VH_NUM_FIELDS {
         return 0;
     }
@@ -24266,9 +24327,8 @@ fn vh_memory_segment_target(
 }
 
 fn vh_memory_segment_get(ctx: &dyn NativeContext, vh: ObjectRef, args: &[Value]) -> Value {
-    let width = ctx
-        .get_field(vh, VH_FIELD_INDEX)
-        .as_int()
+    let width = crate::lang_invoke::p67_memory_segment_var_handle_width(ctx, vh)
+        .or_else(|| ctx.get_field(vh, VH_FIELD_INDEX).as_int())
         .unwrap_or(1)
         .clamp(1, 8) as i64;
     let little_endian = ctx
@@ -24329,9 +24389,8 @@ fn vh_memory_segment_get(ctx: &dyn NativeContext, vh: ObjectRef, args: &[Value])
 }
 
 fn vh_memory_segment_set(ctx: &dyn NativeContext, vh: ObjectRef, args: &[Value]) {
-    let width = ctx
-        .get_field(vh, VH_FIELD_INDEX)
-        .as_int()
+    let width = crate::lang_invoke::p67_memory_segment_var_handle_width(ctx, vh)
+        .or_else(|| ctx.get_field(vh, VH_FIELD_INDEX).as_int())
         .unwrap_or(1)
         .clamp(1, 8) as i64;
     let little_endian = ctx
@@ -25786,12 +25845,7 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         ctx.set_field(bfa, 2, Value::Object(Some(ft)));
         let (is_dir, size) = match jarfs_classify(&jar, &entry) {
             JarFsKind::Dir => (1, 0i64),
-            JarFsKind::File => (
-                0,
-                jarfs_read_entry(&jar, &entry)
-                    .map(|b| b.len() as i64)
-                    .unwrap_or(0),
-            ),
+            JarFsKind::File => (0, jarfs_entry_size(&jar, &entry).unwrap_or(0)),
             JarFsKind::Absent => {
                 // Real readAttributes throws NoSuchFileException (an
                 // IOException) for missing files; FileTreeWalker catches it
@@ -25817,12 +25871,7 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         ctx.set_field(bfa, 2, Value::Object(Some(ft)));
         let (is_dir, size) = match jrtfs_classify(&java_home, &entry) {
             JarFsKind::Dir => (1, 0i64),
-            JarFsKind::File => (
-                0,
-                jrtfs_read(&java_home, &entry)
-                    .map(|b| b.len() as i64)
-                    .unwrap_or(0),
-            ),
+            JarFsKind::File => (0, jrtfs_entry_size(&java_home, &entry).unwrap_or(0)),
             JarFsKind::Absent => {
                 return Err(RuntimeError::IOException {
                     message: format!("NoSuchFileException: {entry} in jrt:/"),
@@ -26314,12 +26363,19 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
-    r.register(md, "isAutomatic", "()Z", |_ctx, _args| {
+    r.register(md, "isAutomatic", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Value::Int(v) = ctx.get_field_by_name(this, "automatic") {
+            return Ok(Some(Value::Int(if v != 0 { 1 } else { 0 })));
+        }
         Ok(Some(Value::Int(0)))
     });
     r.register(md, "isOpen", "()Z", |ctx, args| {
-        // Bit 0 of the flags field (index 1) marks "open" modules.
         let this = obj_arg(args, 0)?;
+        if let Value::Int(v) = ctx.get_field_by_name(this, "open") {
+            return Ok(Some(Value::Int(if v != 0 { 1 } else { 0 })));
+        }
+        // Bit 0 of the synthetic flags field (index 1) marks "open" modules.
         if ctx.object_num_fields(this) > 1 {
             let flags = ctx.get_field(this, 1).as_int().unwrap_or(0);
             return Ok(Some(Value::Int(flags & 1)));
@@ -38191,13 +38247,10 @@ fn p67_memory_session(ctx: &mut dyn NativeContext) -> Value {
     Value::Object(Some(obj))
 }
 
-fn p67_layout_width(ctx: &dyn NativeContext, args: &[Value]) -> i32 {
-    let Some(Value::Object(Some(layout))) = args.first() else {
-        return 1;
-    };
-    match ctx.get_field(*layout, 0) {
+fn p67_layout_width_obj(ctx: &dyn NativeContext, layout: ObjectRef) -> i32 {
+    match ctx.get_field(layout, 0) {
         Value::Long(v) if (1..=8).contains(&v) => v as i32,
-        Value::Int(_) => match ctx.get_field(*layout, 1) {
+        Value::Int(_) => match ctx.get_field(layout, 1) {
             Value::Int(v) if (1..=8).contains(&v) => v,
             Value::Long(v) if (1..=8).contains(&v) => v as i32,
             _ => 1,
@@ -38206,12 +38259,95 @@ fn p67_layout_width(ctx: &dyn NativeContext, args: &[Value]) -> i32 {
     }
 }
 
-fn p67_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let width = p67_layout_width(ctx, args);
-    let little_endian = match args.first() {
-        Some(Value::Object(Some(layout))) => p67_layout_is_little(ctx, *layout),
-        _ => true,
+fn p67_layout_width(ctx: &dyn NativeContext, args: &[Value]) -> i32 {
+    let Some(Value::Object(Some(layout))) = args.first() else {
+        return 1;
     };
+    p67_layout_width_obj(ctx, *layout)
+}
+
+fn p67_string_value(ctx: &dyn NativeContext, value: Value) -> Option<String> {
+    match value {
+        Value::Object(Some(obj)) => ctx.read_string(obj).filter(|s| !s.is_empty()),
+        _ => None,
+    }
+}
+
+fn p67_path_element_group_name(ctx: &dyn NativeContext, elem: ObjectRef) -> Option<String> {
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(elem))
+        .unwrap_or_default();
+
+    if class_name == "java/lang/foreign/MemoryLayout$PathElement" {
+        if ctx.get_field(elem, 1).as_int() == Some(0) {
+            return p67_string_value(ctx, ctx.get_field(elem, 0));
+        }
+        return None;
+    }
+
+    if class_name.ends_with("LayoutPath$GroupElementByName")
+        || class_name.ends_with("GroupElementByName")
+    {
+        return p67_string_value(ctx, ctx.get_field_by_name(elem, "name"))
+            .or_else(|| p67_string_value(ctx, ctx.get_field(elem, 0)));
+    }
+
+    if let Some(name) = p67_string_value(ctx, ctx.get_field_by_name(elem, "name")) {
+        return Some(name);
+    }
+    if ctx.get_field(elem, 1).as_int() == Some(0) {
+        return p67_string_value(ctx, ctx.get_field(elem, 0));
+    }
+    None
+}
+
+fn p67_layout_named_member(
+    ctx: &dyn NativeContext,
+    layout: ObjectRef,
+    target_name: &str,
+) -> Option<ObjectRef> {
+    let members = match ctx.get_field(layout, 2) {
+        Value::Object(Some(arr)) => arr,
+        _ => return None,
+    };
+    for i in 0..ctx.array_length(members) {
+        let member = match ctx.get_array_element(members, i) {
+            Value::Object(Some(member)) => member,
+            _ => continue,
+        };
+        if p67_string_value(ctx, p67_layout_name_value(ctx, member)).as_deref() == Some(target_name)
+        {
+            return Some(member);
+        }
+    }
+    None
+}
+
+fn p67_memory_layout_path_target(
+    ctx: &dyn NativeContext,
+    layout: ObjectRef,
+    path_arr: ObjectRef,
+) -> ObjectRef {
+    let mut current = layout;
+    for i in 0..ctx.array_length(path_arr) {
+        let elem = match ctx.get_array_element(path_arr, i) {
+            Value::Object(Some(elem)) => elem,
+            _ => break,
+        };
+        let Some(name) = p67_path_element_group_name(ctx, elem) else {
+            break;
+        };
+        let Some(member) = p67_layout_named_member(ctx, current, &name) else {
+            break;
+        };
+        current = member;
+    }
+    current
+}
+
+fn p67_var_handle_for_layout(ctx: &mut dyn NativeContext, layout: ObjectRef) -> Value {
+    let width = p67_layout_width_obj(ctx, layout);
+    let little_endian = p67_layout_is_little(ctx, layout);
     let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
     ctx.set_field(
         vh,
@@ -38220,7 +38356,30 @@ fn p67_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     );
     ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(width));
     ctx.set_field(vh, VH_IS_STATIC, Value::Int(VH_KIND_MEMORY_SEGMENT));
+    crate::lang_invoke::register_p67_memory_segment_var_handle(ctx, vh, width);
     Value::Object(Some(vh))
+}
+
+fn p67_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    match args.first() {
+        Some(Value::Object(Some(layout))) => p67_var_handle_for_layout(ctx, *layout),
+        _ => {
+            let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
+            ctx.set_field(vh, VH_CLASS_OR_TARGET, Value::Int(1));
+            ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(1));
+            ctx.set_field(vh, VH_IS_STATIC, Value::Int(VH_KIND_MEMORY_SEGMENT));
+            Value::Object(Some(vh))
+        }
+    }
+}
+
+fn p67_memory_layout_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let target_layout = match args.get(1) {
+        Some(Value::Object(Some(path_arr))) => p67_memory_layout_path_target(ctx, this, *path_arr),
+        _ => this,
+    };
+    Ok(Some(p67_var_handle_for_layout(ctx, target_layout)))
 }
 
 fn p67_segment_parts(
@@ -39545,6 +39704,12 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
         p67_layout_with_name,
     );
+    r.register(
+        ml,
+        "varHandle",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;",
+        p67_memory_layout_var_handle,
+    );
     r.register(ml, "name", "()Ljava/util/Optional;", p67_layout_name);
 
     // Linker
@@ -39628,15 +39793,15 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "downcallHandle",
         "(Ljava/lang/foreign/MemorySegment;Ljava/lang/foreign/FunctionDescriptor;[Ljava/lang/foreign/Linker$Option;)Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
-            let addr_seg = obj_arg(args, 0)?;
-            let descriptor = obj_arg(args, 1)?;
+            let addr_seg = obj_arg(args, 1)?;
+            let descriptor = obj_arg(args, 2)?;
             let fn_addr = match ctx.get_field(addr_seg, 0) {
                 Value::Long(v) => v,
                 _ => 0,
             };
 
             let mut variadic_fixed: i64 = -1;
-            if let Some(Value::Object(Some(opts))) = args.get(2) {
+            if let Some(Value::Object(Some(opts))) = args.get(3) {
                 let n = ctx.array_length(*opts);
                 for i in 0..n {
                     if let Value::Object(Some(opt)) = ctx.get_array_element(*opts, i) {
@@ -39663,19 +39828,50 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(dh))))
         }
     );
+    let dh = "java/lang/foreign/DowncallHandle";
+    r.register(
+        dh,
+        "invoke",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        crate::panama::pe_downcall_invoke,
+    );
+    r.register(
+        dh,
+        "invokeExact",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        crate::panama::pe_downcall_invoke,
+    );
 
     // FunctionDescriptor
     let fd = "java/lang/foreign/FunctionDescriptor";
-    r.register(fd, "of", "(Ljava/lang/foreign/MemoryLayout;[Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/FunctionDescriptor;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 0);
-        Ok(Some(Value::Object(Some(obj))))
-    });
+    r.register(
+        fd,
+        "of",
+        "(Ljava/lang/foreign/MemoryLayout;[Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/FunctionDescriptor;",
+        |ctx, args| {
+            let return_layout = obj_arg(args, 0)?;
+            let params = match args.get(1) {
+                Some(Value::Object(Some(arr))) => *arr,
+                _ => ctx.new_array(ArrayElementType::Reference, 0),
+            };
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2);
+            ctx.set_field(obj, 0, Value::Object(Some(return_layout)));
+            ctx.set_field(obj, 1, Value::Object(Some(params)));
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
     r.register(
         fd,
         "ofVoid",
         "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/FunctionDescriptor;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 0);
+        |ctx, args| {
+            let params = match args.first() {
+                Some(Value::Object(Some(arr))) => *arr,
+                _ => ctx.new_array(ArrayElementType::Reference, 0),
+            };
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2);
+            ctx.set_field(obj, 0, Value::Object(None));
+            ctx.set_field(obj, 1, Value::Object(Some(params)));
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -52322,6 +52518,61 @@ fn tg_get_field(
         .unwrap_or(Value::Object(None))
 }
 
+fn tg_of_thread(ctx: &mut dyn NativeContext, thread: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(thread, "holder") {
+        Value::Object(Some(holder)) => match ctx.get_field_by_name(holder, "group") {
+            Value::Object(group) => group,
+            _ => None,
+        },
+        _ => match ctx.get_field_by_name(thread, "group") {
+            Value::Object(group) => group,
+            _ => None,
+        },
+    }
+}
+
+fn tg_matches_thread(
+    ctx: &mut dyn NativeContext,
+    requested: ObjectRef,
+    thread: ObjectRef,
+    recurse: bool,
+) -> bool {
+    let mut current = tg_of_thread(ctx, thread);
+    while let Some(group) = current {
+        if group == requested {
+            return true;
+        }
+        if !recurse {
+            break;
+        }
+        current = match tg_get_field(ctx, group, "parent", 1) {
+            Value::Object(parent) => parent,
+            _ => None,
+        };
+    }
+    false
+}
+
+fn tg_enumerate_threads(
+    ctx: &mut dyn NativeContext,
+    group: ObjectRef,
+    arr: ObjectRef,
+    recurse: bool,
+) -> i32 {
+    let arr_len = ctx.array_length(arr);
+    let mut count = 0usize;
+    for obj in ctx.enumerate_threads(usize::MAX) {
+        if count >= arr_len {
+            break;
+        }
+        if tg_matches_thread(ctx, group, obj, recurse) {
+            let _ = ctx.set_array_element(arr, count, Value::Object(Some(obj)));
+            count += 1;
+        }
+    }
+    count as i32
+}
+
 fn tg_set_field(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -52401,6 +52652,13 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
     let tg = "java/lang/ThreadGroup";
     r.register(tg, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let parent = {
+            let cur = ctx.current_thread_object();
+            match ctx.get_field_by_name(cur, "holder") {
+                Value::Object(Some(holder)) => ctx.get_field_by_name(holder, "group"),
+                _ => ctx.get_field_by_name(cur, "group"),
+            }
+        };
         tg_set_field(
             ctx,
             this,
@@ -52408,7 +52666,7 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
             0,
             args.get(1).copied().unwrap_or(Value::Object(None)),
         );
-        tg_set_field(ctx, this, "parent", 1, Value::Object(None));
+        tg_set_field(ctx, this, "parent", 1, parent);
         tg_set_field(ctx, this, "daemon", 2, Value::Int(0));
         tg_set_field(ctx, this, "maxPriority", 3, Value::Int(10));
         Ok(None)
@@ -52478,17 +52736,23 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(count)))
     });
     r.register(tg, "enumerate", "([Ljava/lang/Thread;)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
         let arr = match args.get(1) {
             Some(Value::Object(Some(a))) => *a,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let arr_len = ctx.array_length(arr);
-        let thread_objs = ctx.enumerate_threads(arr_len);
-        let count = thread_objs.len().min(arr_len);
-        for (i, obj) in thread_objs.into_iter().take(count).enumerate() {
-            let _ = ctx.set_array_element(arr, i, Value::Object(Some(obj)));
-        }
-        Ok(Some(Value::Int(count as i32)))
+        Ok(Some(Value::Int(tg_enumerate_threads(ctx, this, arr, true))))
+    });
+    r.register(tg, "enumerate", "([Ljava/lang/Thread;Z)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let arr = match args.get(1) {
+            Some(Value::Object(Some(a))) => *a,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let recurse = !matches!(args.get(2), Some(Value::Int(0)));
+        Ok(Some(Value::Int(tg_enumerate_threads(
+            ctx, this, arr, recurse,
+        ))))
     });
     r.register(tg, "getMaxPriority", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -61549,6 +61813,83 @@ mod cert_verify_bounds_security_tests {
         assert!(r2
             .find("java/util/zip/ZipOutputStream", "write", "([BII)V")
             .is_some());
+    }
+}
+
+#[cfg(test)]
+mod ffm_p67_layout_tests {
+    use super::*;
+    use crate::test_utils::mock_ctx;
+
+    fn object_ref(value: Value) -> ObjectRef {
+        match value {
+            Value::Object(Some(obj)) => obj,
+            other => panic!("expected object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_layout_varhandle_resolves_named_struct_member_width() {
+        let mut reg = NativeMethodRegistry::new();
+        register_p67_foreign_memory(&mut reg);
+        let mut ctx = mock_ctx();
+
+        let ptr_name = ctx.create_string("ptr");
+        let ptr_layout = p67_layout_object(&mut ctx, "java/lang/foreign/AddressLayout", 8, 8);
+        ctx.set_field(ptr_layout, 3, Value::Object(Some(ptr_name)));
+
+        let size_name = ctx.create_string("size");
+        let size_layout = p67_layout_object(&mut ctx, "java/lang/foreign/ValueLayout$OfLong", 8, 8);
+        ctx.set_field(size_layout, 3, Value::Object(Some(size_name)));
+
+        let members = ctx.new_array(ArrayElementType::Reference, 2);
+        ctx.set_array_element(members, 0, Value::Object(Some(ptr_layout)));
+        ctx.set_array_element(members, 1, Value::Object(Some(size_layout)));
+
+        let struct_layout = object_ref(
+            reg.find(
+                "java/lang/foreign/MemoryLayout",
+                "structLayout",
+                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/StructLayout;",
+            )
+            .expect("MemoryLayout.structLayout registered")(
+                &mut ctx,
+                &[Value::Object(Some(members))],
+            )
+            .expect("structLayout ok")
+            .expect("structLayout returned value"),
+        );
+
+        let path_name = ctx.create_string("size");
+        let path_elem =
+            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemoryLayout$PathElement", 2);
+        ctx.set_field(path_elem, 0, Value::Object(Some(path_name)));
+        ctx.set_field(path_elem, 1, Value::Int(0));
+        let path = ctx.new_array(ArrayElementType::Reference, 1);
+        ctx.set_array_element(path, 0, Value::Object(Some(path_elem)));
+
+        let vh = object_ref(
+            reg.find(
+                "java/lang/foreign/MemoryLayout",
+                "varHandle",
+                "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;",
+            )
+            .expect("MemoryLayout.varHandle registered")(
+                &mut ctx,
+                &[
+                    Value::Object(Some(struct_layout)),
+                    Value::Object(Some(path)),
+                ],
+            )
+            .expect("varHandle ok")
+            .expect("varHandle returned value"),
+        );
+
+        assert_eq!(ctx.get_field(vh, VH_FIELD_INDEX), Value::Int(8));
+        assert_eq!(
+            ctx.get_field(vh, VH_IS_STATIC),
+            Value::Int(VH_KIND_MEMORY_SEGMENT)
+        );
     }
 }
 

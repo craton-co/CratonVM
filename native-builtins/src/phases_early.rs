@@ -12,7 +12,7 @@ use crate::crypto::crypto_impl;
 use crate::lang_class::{mirror_class_id, native_class_is_record, native_class_is_sealed};
 use crate::lang_invoke::register_phase54_method_handle;
 use crate::lang_misc::register_phase53_record;
-use crate::lang_string::register_phase52_string_buffer;
+use crate::lang_string::{native_string_hash_code, register_phase52_string_buffer};
 use crate::{
     alloc_concurrent_synthetic, build_real_layout_string_hashset, native_noop,
     native_noop_with_this, native_return_false, native_return_zero,
@@ -22,6 +22,60 @@ use crate::{
     native_return_first_arg, native_return_null, native_synchronized_collection,
     native_synchronized_list, native_synchronized_map, native_synchronized_set,
 };
+
+fn object_array_element_hash_code(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+) -> Result<i32, MethodCallFailed> {
+    if ctx.object_is_array(obj) {
+        return Ok(ctx.identity_hash_code(obj));
+    }
+
+    match ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref() {
+        Some("java/lang/String") => {
+            match native_string_hash_code(ctx, &[Value::Object(Some(obj))])? {
+                Some(Value::Int(v)) => Ok(v),
+                _ => Ok(0),
+            }
+        }
+        Some(
+            "java/lang/Integer" | "java/lang/Byte" | "java/lang/Short" | "java/lang/Character",
+        ) => match ctx.get_field(obj, 0) {
+            Value::Int(v) => Ok(v),
+            _ => Ok(0),
+        },
+        Some("java/lang/Boolean") => match ctx.get_field(obj, 0) {
+            Value::Int(v) => Ok(if v != 0 { 1231 } else { 1237 }),
+            _ => Ok(1237),
+        },
+        Some("java/lang/Long") => match ctx.get_field(obj, 0) {
+            Value::Long(v) => Ok((v ^ ((v as u64 >> 32) as i64)) as i32),
+            _ => Ok(0),
+        },
+        Some("java/lang/Float") => match ctx.get_field(obj, 0) {
+            Value::Float(v) => {
+                let bits = if v.is_nan() { 0x7fc0_0000 } else { v.to_bits() };
+                Ok(bits as i32)
+            }
+            _ => Ok(0),
+        },
+        Some("java/lang/Double") => match ctx.get_field(obj, 0) {
+            Value::Double(v) => {
+                let bits = if v.is_nan() {
+                    0x7ff8_0000_0000_0000u64
+                } else {
+                    v.to_bits()
+                };
+                Ok((bits ^ (bits >> 32)) as i32)
+            }
+            _ => Ok(0),
+        },
+        _ => match ctx.invoke_virtual(obj, "hashCode", "()I", &[])? {
+            Some(Value::Int(v)) => Ok(v),
+            _ => Ok(0),
+        },
+    }
+}
 
 pub(crate) fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -1007,12 +1061,9 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(obj)) => {
                     let elem_pin = ctx.pin_native_root(obj);
                     let obj = ctx.read_native_pin(elem_pin, obj);
-                    let result = ctx.invoke_virtual(obj, "hashCode", "()I", &[]);
+                    let elem_hash = object_array_element_hash_code(ctx, obj);
                     ctx.unpin_native_roots(elem_pin);
-                    match result? {
-                        Some(Value::Int(v)) => v,
-                        _ => 0,
-                    }
+                    elem_hash?
                 }
                 Value::Object(None) | Value::Uninitialized => 0,
                 Value::Int(v) => v,
@@ -3139,70 +3190,19 @@ pub(crate) fn register_scanner_natives(r: &mut NativeMethodRegistry) {
     // close()
     r.register(sc, "close", "()V", |_ctx, _args| Ok(None));
 
-    // --- java.io.StringReader (1-field: source=0, position tracked via field 1) ---
-    let sr = "java/io/StringReader";
-    r.register(sr, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, args[1]);
-        Ok(None)
-    });
-    r.register(sr, "read", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let source = match ctx.get_field(this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        // Simple: return first char then consume
-        if source.is_empty() {
-            Ok(Some(Value::Int(-1)))
-        } else {
-            let ch = source.chars().next().unwrap_or('\0') as i32;
-            let rest = ctx.create_string(&source[ch.min(source.len() as i32) as usize..]);
-            ctx.set_field(this, 0, Value::Object(Some(rest)));
-            Ok(Some(Value::Int(ch)))
-        }
-    });
-    r.register(sr, "close", "()V", |_ctx, _args| Ok(None));
-
-    // --- java.io.StringWriter (1-field: buffer string) ---
-    let sw = "java/io/StringWriter";
-    r.register(sw, "<init>", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let empty = ctx.create_string("");
-        ctx.set_field(this, 0, Value::Object(Some(empty)));
-        Ok(None)
-    });
-    r.register(sw, "write", "(Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let existing = match ctx.get_field(this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let to_add = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let combined = format!("{}{}", existing, to_add);
-        let s = ctx.create_string(&combined);
-        ctx.set_field(this, 0, Value::Object(Some(s)));
-        Ok(None)
-    });
-    r.register(sw, "toString", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    r.register(
-        sw,
-        "getBuffer",
-        "()Ljava/lang/StringBuffer;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            // Return the string as-is (StringBuffer and String share representation)
-            Ok(Some(ctx.get_field(this, 0)))
-        },
-    );
-    r.register(sw, "flush", "()V", |_ctx, _args| Ok(None));
-    r.register(sw, "close", "()V", |_ctx, _args| Ok(None));
+    // java.io.StringReader / StringWriter registrations used to live here,
+    // but this function is only ever reached via `register_synthetic_overrides`
+    // (synthetic-jdk feature only), which itself runs BEFORE
+    // `native-io`'s `register_io_natives` in the vm_init.rs boot sequence —
+    // so `register_string_rw_natives` (native-io/src/lib.rs) always
+    // overwrote these entries in `NativeMethodRegistry`'s last-write-wins
+    // map, in every build configuration. They were dead code, and their
+    // buggy `read()` (`ch as i32` used as a byte index instead of
+    // `ch.len_utf8()`) sent an earlier investigation down a blind alley
+    // chasing a registration that could never run — see
+    // docs/known-issues/tomcat-08-07/stringreader-read-never-advances-infinite-loop.md.
+    // Removed rather than fixed in place; the real, live StringReader
+    // natives are `native_sr_*` in native-io/src/lib.rs.
     r.set_category(__prev_cat);
 }
 
@@ -5270,6 +5270,9 @@ fn native_es_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 fn enum_set_copy_source_values(ctx: &mut dyn NativeContext, src: ObjectRef) -> Vec<Value> {
+    if es_real_kind(ctx, src).is_some() {
+        return es_real_elements(ctx, src);
+    }
     let arr = match ctx.invoke_virtual(src, "toArray", "()[Ljava/lang/Object;", &[]) {
         Ok(Some(Value::Object(Some(arr)))) => arr,
         _ => return Vec::new(),
@@ -19528,6 +19531,46 @@ mod t2_tests {
             .wrapping_mul(31)
             .wrapping_add(11);
         assert_eq!(result.unwrap(), Some(Value::Int(expected)));
+    }
+
+    #[test]
+    fn t2_arrays_object_hash_code_uses_value_hash_for_jdk_wrappers() {
+        let mut ctx = mock_ctx();
+        let int_class = ctx.ensure_class_initialized("java/lang/Integer").unwrap();
+        let float_class = ctx.ensure_class_initialized("java/lang/Float").unwrap();
+        let string = ctx.create_string("field");
+        let int_obj = ctx.alloc_object(int_class, 1);
+        ctx.set_field(int_obj, 0, Value::Int(2));
+        let float_obj = ctx.alloc_object(float_class, 1);
+        ctx.set_field(float_obj, 0, Value::Float(0.0));
+        let arr = ctx.new_array(ArrayElementType::Reference, 5);
+        ctx.set_array_element(arr, 0, Value::Object(Some(string)));
+        ctx.set_array_element(arr, 1, Value::Object(Some(int_obj)));
+        ctx.set_array_element(arr, 2, Value::Object(Some(int_obj)));
+        ctx.set_array_element(arr, 3, Value::Object(None));
+        ctx.set_array_element(arr, 4, Value::Object(Some(float_obj)));
+
+        let mut registry = NativeMethodRegistry::new();
+        register_core_stdlib_extras(&mut registry);
+        let hash_code = registry
+            .find("java/util/Arrays", "hashCode", "([Ljava/lang/Object;)I")
+            .expect("Arrays.hashCode(Object[]) native should be registered");
+        let first = hash_code(&mut ctx, &[Value::Object(Some(arr))]);
+        let second = hash_code(&mut ctx, &[Value::Object(Some(arr))]);
+
+        let expected = 1i32
+            .wrapping_mul(31)
+            .wrapping_add(97_427_706)
+            .wrapping_mul(31)
+            .wrapping_add(2)
+            .wrapping_mul(31)
+            .wrapping_add(2)
+            .wrapping_mul(31)
+            .wrapping_add(0)
+            .wrapping_mul(31)
+            .wrapping_add(0);
+        assert_eq!(first.unwrap(), Some(Value::Int(expected)));
+        assert_eq!(second.unwrap(), Some(Value::Int(expected)));
     }
 
     static ATOMIC_REF_TARGET_OLD: AtomicUsize = AtomicUsize::new(0);

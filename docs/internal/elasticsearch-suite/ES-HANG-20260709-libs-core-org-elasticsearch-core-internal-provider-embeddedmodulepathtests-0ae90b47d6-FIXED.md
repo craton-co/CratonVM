@@ -1,6 +1,12 @@
 # ES HANG - libs/core org.elasticsearch.core.internal.provider.EmbeddedModulePathTests
 
-Status: OPEN
+Status: FIXED (2026-07-10)
+
+Resolution:
+- `Files.find` now honors its `BiPredicate`, avoiding broad synthetic streams that force module/package scanners to process unrelated entries.
+- Jar filesystem `readAttributes().size()` now uses cached central-directory metadata instead of reparsing the ZIP for every file.
+- VFS and ByteArrayInputStream hot byte-copy paths now use bulk byte-array helpers.
+- Verification: `probe-es-suite-inmemory-modulefinder-perf-r1-start16` passed `org.elasticsearch.core.internal.provider.EmbeddedModulePathTests` with CratonVM JIT on in 15.222 seconds (15 tests, 0 failures) using `/data/data/bin/cratonvm-es-suite-inmemory-modulefinder-perf-20260710-014300-r1`.
 
 Observed in:
 - Run: `es-nonpassed-rerun-20260708-191002`
