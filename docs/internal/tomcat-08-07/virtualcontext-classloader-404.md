@@ -252,3 +252,55 @@ apparently pre-existing bug (`ThreadGroup`/`Unsafe` field-offset mismatch
 surfacing via `InnocuousThread.<clinit>`) now blocks further progress and
 needs its own investigation. **Doc stays OPEN** — do not retire until
 `TestVirtualContext` actually runs clean.
+
+## 2026-07-09 final verification (still OPEN — VM bugs now fully resolved, blocker is fixture-only)
+
+Independently re-verified on `origin/dev` tip `ffd8dad7` (which now also
+includes commit `05175b4d`, landed separately by a concurrent session
+investigating the WebSocket close-delay doc, which fixed the exact
+`ThreadGroup`/`Unsafe` field-index bug flagged as the blocker above — see
+`docs/internal/fixed-suite-bugs/threadgroup-native-field-index-mismatch-FIXED.md`).
+Confirmed via a fresh build + boot-smoke test (`File.exists()`,
+`FileOutputStream` construct/write/close exercising the Cleaner path,
+`ThreadGroup.getName()`) that both the `File.FS` and `ThreadGroup` bugs are
+now fixed and the two independent fixes (`766b2b2e` and `05175b4d`, written
+by different sessions without knowledge of each other) coexist safely —
+`native_file_clinit` now sets `FS` unconditionally during `<clinit>`, so the
+older guarded backfill in `vm_util.rs` correctly detects `FS` is already set
+and no-ops on it. No conflict, no regression (full `cratonvm-native-builtins`
+suite still 2937 passed / 1 pre-existing unrelated failure / 6 ignored on the
+merged tip).
+
+Reran `TestVirtualContext` (both methods) against the real fixture with this
+build. **Both bootstrap bugs are confirmed gone** — no more `ClassCastException`
+from `InnocuousThread.<clinit>`, no more `File.FS` NPE. The test now starts
+Tomcat, reaches real test logic, and both methods fail identically at the
+**same fixture gap already identified in section 1 above**:
+
+```
+java.lang.IllegalArgumentException: Unable to create WebResourceSet from
+[.../test/webapp-virtual-webapp/target/classes]
+	at org.apache.catalina.webresources.StandardRoot.createWebResourceSet(StandardRoot.java:432)
+	at org.apache.catalina.loader.TestVirtualContext.testAdditionalWebInfClassesPaths(TestVirtualContext.java:209)
+...
+	at org.apache.catalina.loader.TestVirtualContext.testVirtualClassLoader(TestVirtualContext.java:71)
+```
+
+**This confirms the fixture gap (section 1) is now the ONLY remaining
+blocker** — both real VM bugs found during this investigation are fixed and
+verified, and the original classloader fix (`cb016825`) still cannot be
+exercised end-to-end until `/data/data/apps/tomcat/test/webapp-virtual-webapp`
+is compiled (`src/` exists, `target/classes` does not) and
+`/data/data/apps/tomcat/test/webapp-virtual-library` is re-vendored (entirely
+empty — no `src`, no `target`) from a clean upstream Tomcat checkout. This is
+a **host/fixture-staging task, not a VM code task** — did not touch the
+shared fixture (read-only per this doc's working convention), since a fix
+there affects every concurrent session using `/data/data/apps/tomcat`.
+
+**Doc stays OPEN.** Next session: either (a) repair the shared fixture (copy
+the two missing paths from a clean Tomcat source checkout, e.g.
+`/tmp/tomcat-src-ref` referenced in section 1, and compile
+`webapp-virtual-webapp` — coordinate since this is shared infra), or (b) reuse
+the `/tmp/vcloader_sandbox`-style private overlay workaround from section 1
+to get a final pass/fail on the original 404-vs-200 assertion without
+touching the shared fixture.

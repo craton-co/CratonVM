@@ -1,0 +1,117 @@
+diff --git a/native-builtins/src/serialization.rs b/native-builtins/src/serialization.rs
+--- a/native-builtins/src/serialization.rs
++++ b/native-builtins/src/serialization.rs
+@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::sync::Mutex;
+ 
+-use crate::lang_class::{create_constructor_object, create_method_object};
++use crate::lang_class::{
++    create_constructor_object, create_method_object, read_constructor_descriptor,
++};
+ use crate::lang_invoke::alloc_method_handle;
+ use crate::{alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
+ use cratonvm_native_api::{MethodMetadata, NativeContext, NativeMethodRegistry};
+@@ -3567,15 +3569,45 @@ fn install_serialization_constructor_accessor(
+     ctor_obj: ObjectRef,
+     target_mirror: ObjectRef,
+ ) {
++    let base_pin = ctx.pin_native_root(ctor_obj);
++    let target_mirror_pin = ctx.pin_native_root(target_mirror);
++
+     let target =
+         alloc_concurrent_synthetic(ctx, "java/lang/invoke/DirectMethodHandle$Constructor", 1);
++    let target_pin = ctx.pin_native_root(target);
++    let target_mirror = ctx.read_native_pin(target_mirror_pin, target_mirror);
+     ctx.set_field_by_name(target, "instanceClass", Value::Object(Some(target_mirror)));
+ 
+     let accessor = alloc_concurrent_synthetic(
+         ctx,
+         "jdk/internal/reflect/DirectConstructorHandleAccessor",
+         1,
+     );
++    let target = ctx.read_native_pin(target_pin, target);
++    let ctor_obj = ctx.read_native_pin(base_pin, ctor_obj);
+     ctx.set_field_by_name(accessor, "target", Value::Object(Some(target)));
+     ctx.set_field_by_name(
+         ctor_obj,
+         "constructorAccessor",
+         Value::Object(Some(accessor)),
+     );
++    ctx.unpin_native_roots(base_pin);
++}
++
++fn constructor_meta_from_constructor_object(
++    ctx: &dyn NativeContext,
++    ctor_obj: ObjectRef,
++) -> Option<MethodMetadata> {
++    let declaring_mirror = match ctx.get_field_by_name(ctor_obj, "clazz") {
++        Value::Object(Some(mirror)) => mirror,
++        _ => return None,
++    };
++    let declaring_class_id = class_id_of_mirror(ctx, declaring_mirror)?;
++    let descriptor = read_constructor_descriptor(ctx, ctor_obj)?;
++    let access_flags = match ctx.get_field_by_name(ctor_obj, "modifiers") {
++        Value::Int(flags) => flags as u16,
++        _ => 0,
++    };
++    Some(MethodMetadata {
++        name: "<init>".to_string(),
++        descriptor,
++        access_flags,
++        declaring_class_id,
++        exceptions: Vec::new(),
++    })
+ }
+ 
+ fn native_reflection_factory_new_constructor_for_serialization(
+@@ -3588,7 +3620,12 @@ fn native_reflection_factory_new_constructor_for_serialization(
+     };
+ 
+     let ctor_obj = match args.get(2) {
+-        Some(Value::Object(Some(ctor))) => *ctor,
++        Some(Value::Object(Some(ctor))) => match constructor_meta_from_constructor_object(ctx, *ctor)
++        {
++            Some(meta) => create_constructor_object(ctx, &meta),
++            None => return Ok(Some(Value::Object(None))),
++        },
+         _ => match find_serializable_constructor(ctx, class_id) {
+             Some((_, ctor_meta)) => create_constructor_object(ctx, &ctor_meta),
+             None => return Ok(Some(Value::Object(None))),
+@@ -6868,6 +6905,35 @@ mod wp02_tests {
+         assert_eq!(ctx.get_field(mh, 19), Value::Int(2));
+     }
+ 
++    #[test]
++    fn reflection_factory_two_arg_constructor_returns_widened_copy() {
++        let mut ctx = MockNativeContext::new();
++        let target = ctx.ensure_class_initialized("example/CtorTarget").unwrap();
++        let _ctor_class = ctx
++            .ensure_class_initialized("java/lang/reflect/Constructor")
++            .unwrap();
++        let incoming = create_constructor_object(
++            &mut ctx,
++            &mm("<init>", "()V", ACC_PUBLIC, target),
++        );
++        let target_mirror = ctx.get_class_mirror(target);
++
++        let result = native_reflection_factory_new_constructor_for_serialization(
++            &mut ctx,
++            &[
++                Value::Object(None),
++                Value::Object(Some(target_mirror)),
++                Value::Object(Some(incoming)),
++            ],
++        )
++        .expect("native must return normally");
++        let widened = match result {
++            Some(Value::Object(Some(ctor))) => ctor,
++            other => panic!("expected Constructor copy, got {:?}", other),
++        };
++
++        assert_ne!(widened, incoming);
++        assert_eq!(read_constructor_descriptor(&ctx, widened).as_deref(), Some("()V"));
++    }
++
+     #[test]
+     fn reflection_factory_serialization_methods_registered() {
+         let mut r = NativeMethodRegistry::new();

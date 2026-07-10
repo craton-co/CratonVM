@@ -2839,8 +2839,10 @@ pub struct NativeMethodRegistry {
     /// See docs/synthetic-vs-real-explained.md.
     drop_synthetic_stubs: bool,
     /// Real-JDK mode: drop synthetic natives whose hardcoded field-slot layout
-    /// corrupts the *real* JDK object. Currently `java/util/StringJoiner`, which
-    /// `native-collections::register_string_joiner_natives` registers with a fake
+    /// corrupts the *real* JDK object. Currently `java/util/StringJoiner`,
+    /// `java/io/StringReader`, `java/util/EnumSet`, `LinkedBlockingDeque`, and
+    /// `ScheduledThreadPoolExecutor`. `StringJoiner` is registered by
+    /// `native-collections::register_string_joiner_natives` with a fake
     /// 5-field layout (delim/prefix/suffix/elements-ArrayList/emptyValue) but
     /// bundles into `register_collections_natives` — a function real-JDK mode
     /// calls for the side-table collection natives. On a real StringJoiner (7
@@ -2848,7 +2850,25 @@ pub struct NativeMethodRegistry {
     /// `add` reads slot 3 (real `elts`, null) and no-ops, so `size` never moves
     /// and `toString` renders just prefix+suffix. The real bytecode is
     /// self-contained and correct, so we drop the synthetic surface and let it
-    /// run. Same mechanism as the `CRATONVM_REAL_NET_SOCKETS` Socket drop above,
+    /// run. `EnumSet` has the same problem in a more dangerous form: the
+    /// fallback native surface manufactures an abstract `java/util/EnumSet`
+    /// receiver with a two-field synthetic layout. In real-JDK mode that
+    /// receiver then bypasses or misroutes `add`/`size`/`iterator`, so
+    /// `EnumSet.of(...)` and `allOf(...)` on app enums return an empty object
+    /// with `iterator() == null`. Dropping the native surface lets the JDK
+    /// factories allocate the concrete `RegularEnumSet`/`JumboEnumSet` classes,
+    /// which CratonVM's real collection paths already handle. `LinkedBlockingDeque`
+    /// is registered as a SyntheticStub fallback by native-collections with the
+    /// four-slot fake blocking-queue layout; on a real JDK deque, that constructor
+    /// leaves real final fields such as `lock`/`notEmpty` null, and Tomcat's
+    /// `WriteBuffer.clear()` then fails in `LinkedBlockingDeque.clear()`.
+    /// `StringReader` has the same drift on modern JDKs: the real class wraps a
+    /// final `Reader r`, while the synthetic native constructor writes the old
+    /// `(content,pos,length)` slots, leaving `r` null before `mark()` delegates.
+    /// `Pattern`/`Matcher` have the same drift: the legacy regex natives allocate
+    /// real-layout objects but write the old synthetic slots, leaving fields such
+    /// as `Matcher.locals` uninitialized.
+    /// Same mechanism as the `CRATONVM_REAL_NET_SOCKETS` Socket drop above,
     /// but set by `vm_init`'s real-JDK arm (not env-gated). Off in synthetic mode
     /// (there the fake layout *is* the object layout). Surfaced via Spring
     /// `UriComponentsBuilder.pathSegment`, which dropped the URL path segment
@@ -3101,6 +3121,69 @@ impl NativeMethodRegistry {
                     | "java/util/concurrent/CountedCompleter"
             )
             && !keep_real_forkjointask_bridge
+        {
+            return;
+        }
+        // Real-JDK mode: drop synthetic `java/io/StringReader` natives. The
+        // fake surface uses the historical content/pos/length slot layout, but
+        // JDK 25 StringReader wraps a final `Reader r`; the fake constructor
+        // leaves that delegate null and real `mark()`/`read()` immediately NPE.
+        if self.drop_real_layout_synthetic && class_name == "java/io/StringReader" {
+            return;
+        }
+        // Real-JDK mode: drop every `java/util/EnumSet` native, including the
+        // SyntheticStub-tagged fallback surface. The real JDK factories are
+        // self-contained once `Class.getEnumConstantsShared` works, and they
+        // allocate concrete RegularEnumSet/JumboEnumSet receivers. Keeping even
+        // the fallback `noneOf`/`of` natives in real mode manufactures an
+        // abstract EnumSet object with the synthetic two-field layout; later
+        // virtual calls then either skip the synthetic methods or read the wrong
+        // layout, producing `size() == 0` and `iterator() == null` for non-JDK
+        // enums such as Log4j's StandardLevel and Jakarta DispatcherType.
+        if self.drop_real_layout_synthetic && class_name == "java/util/EnumSet" {
+            return;
+        }
+        // Real-JDK mode: drop the synthetic LinkedBlockingDeque fallback surface.
+        // Its constructor writes the native-collections four-slot queue layout
+        // (array/head/size/capacity). A real JDK LinkedBlockingDeque needs its
+        // own constructor to initialize `lock`, `notEmpty`, `notFull`, and the
+        // linked-node fields before methods such as `clear()` run.
+        if self.drop_real_layout_synthetic
+            && class_name == "java/util/concurrent/LinkedBlockingDeque"
+        {
+            return;
+        }
+        // Real-JDK mode: drop the synthetic ScheduledThreadPoolExecutor surface.
+        // The old constructors only wrote two synthetic slots, leaving real JDK
+        // ThreadPoolExecutor fields such as `workQueue` null; Tomcat's
+        // ContainerBase then failed in scheduleWithFixedDelay -> delayedExecute.
+        // Let the real STPE constructors and scheduling bytecode initialize the
+        // inherited executor state coherently.
+        if self.drop_real_layout_synthetic
+            && class_name == "java/util/concurrent/ScheduledThreadPoolExecutor"
+        {
+            return;
+        }
+        if self.drop_real_layout_synthetic
+            && class_name == "java/util/concurrent/Executors"
+            && matches!(
+                method_name,
+                "newScheduledThreadPool" | "newSingleThreadScheduledExecutor"
+            )
+        {
+            return;
+        }
+        // Real-JDK mode: drop legacy regex natives. They were written for the
+        // old synthetic two-field Pattern / six-field Matcher layout; on real
+        // OpenJDK objects they corrupt slots and bypass constructors, so later
+        // Pattern/Matcher bytecode observes impossible state (for example a
+        // Matcher whose `locals` field is not an int[]). Let the JDK regex
+        // bytecode own both object construction and matching in real mode.
+        if self.drop_real_layout_synthetic
+            && matches!(
+                class_name,
+                "java/util/regex/Pattern" | "java/util/regex/Matcher"
+            )
         {
             return;
         }
@@ -3756,6 +3839,105 @@ mod tests {
         assert!(registry
             .find("java/sql/PreparedStatement", "execute", "()Z")
             .is_some());
+    }
+
+    #[test]
+    fn real_layout_mode_drops_enumset_native_surface() {
+        let of_two_desc = "(Ljava/lang/Enum;Ljava/lang/Enum;)Ljava/util/EnumSet;";
+
+        let mut normal = NativeMethodRegistry::new();
+        normal.set_category(NativeKind::SyntheticStub);
+        normal.register("java/util/EnumSet", "of", of_two_desc, dummy_native);
+        assert!(normal
+            .find("java/util/EnumSet", "of", of_two_desc)
+            .is_some());
+
+        let mut real_layout = NativeMethodRegistry::new();
+        real_layout.set_drop_real_layout_synthetic(true);
+        real_layout.set_category(NativeKind::SyntheticStub);
+        real_layout.register("java/util/EnumSet", "of", of_two_desc, dummy_native);
+        assert!(real_layout
+            .find("java/util/EnumSet", "of", of_two_desc)
+            .is_none());
+
+        real_layout.set_category(NativeKind::Intrinsic);
+        real_layout.register("java/util/EnumSet", "size", "()I", dummy_native_2);
+        assert!(real_layout
+            .find("java/util/EnumSet", "size", "()I")
+            .is_none());
+
+        real_layout.register("java/util/HashSet", "size", "()I", dummy_native_2);
+        assert!(real_layout
+            .find("java/util/HashSet", "size", "()I")
+            .is_some());
+
+        real_layout.set_category(NativeKind::SyntheticStub);
+        real_layout.register(
+            "java/io/StringReader",
+            "<init>",
+            "(Ljava/lang/String;)V",
+            dummy_native,
+        );
+        assert!(real_layout
+            .find("java/io/StringReader", "<init>", "(Ljava/lang/String;)V")
+            .is_none());
+
+        real_layout.register(
+            "java/util/concurrent/LinkedBlockingDeque",
+            "<init>",
+            "()V",
+            dummy_native,
+        );
+        assert!(real_layout
+            .find("java/util/concurrent/LinkedBlockingDeque", "<init>", "()V")
+            .is_none());
+
+        real_layout.register(
+            "java/util/concurrent/ScheduledThreadPoolExecutor",
+            "<init>",
+            "(ILjava/util/concurrent/ThreadFactory;)V",
+            dummy_native,
+        );
+        assert!(real_layout
+            .find(
+                "java/util/concurrent/ScheduledThreadPoolExecutor",
+                "<init>",
+                "(ILjava/util/concurrent/ThreadFactory;)V",
+            )
+            .is_none());
+
+        real_layout.register(
+            "java/util/concurrent/Executors",
+            "newScheduledThreadPool",
+            "(I)Ljava/util/concurrent/ScheduledExecutorService;",
+            dummy_native,
+        );
+        assert!(real_layout
+            .find(
+                "java/util/concurrent/Executors",
+                "newScheduledThreadPool",
+                "(I)Ljava/util/concurrent/ScheduledExecutorService;",
+            )
+            .is_none());
+
+        real_layout.register(
+            "java/util/regex/Pattern",
+            "matcher",
+            "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;",
+            dummy_native,
+        );
+        assert!(real_layout
+            .find(
+                "java/util/regex/Pattern",
+                "matcher",
+                "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;",
+            )
+            .is_none());
+
+        real_layout.register("java/util/regex/Matcher", "matches", "()Z", dummy_native);
+        assert!(real_layout
+            .find("java/util/regex/Matcher", "matches", "()Z")
+            .is_none());
     }
 
     #[test]

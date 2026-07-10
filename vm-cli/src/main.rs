@@ -1929,12 +1929,11 @@ fn run() -> Result<()> {
 
     // Garbage-collector selection (`-XX:+UseG1GC` / `-XX:-UseG1GC` / any other
     // `-XX:+Use*GC`, normalized to `--XX:UseGc <name>`). Absent → keep the
-    // default (`Generational`, the safety net during G1 maturation). A
-    // recognized selector (`g1` | `generational`) sets `gc_algorithm`; an
-    // unsupported collector (Serial/Parallel/Z/Shenandoah/Epsilon) warns and
+    // default (`Generational`, the safety net during collector maturation). A
+    // recognized selector (`g1` | `z`/`zgc` | `generational`) sets `gc_algorithm`; an
+    // unsupported collector (Serial/Parallel/Shenandoah/Epsilon) warns and
     // falls back to Generational so a `java` drop-in keeps booting. G1 is
-    // already wired into the `GcBackend` dispatch (vm_init.rs) and the
-    // safepoint driver; this is the missing reachability edge. See
+    // wired into the safepoint driver; ZGC-real is a non-moving STW backend. See
     // docs/feature-designs/concurrent-gc-maturation.md §3.1.
     if let Some(sel) = &args.gc_selector {
         match cratonvm_vm::config::parse_gc_algorithm(sel) {
@@ -1942,8 +1941,8 @@ fn run() -> Result<()> {
             None => {
                 eprintln!(
                     "Warning: unsupported garbage collector -XX:+Use{sel}GC; CratonVM \
-                     implements G1 (-XX:+UseG1GC) and the default Generational collector. \
-                     Falling back to Generational."
+                     implements G1 (-XX:+UseG1GC), ZGC-real (-XX:+UseZGC), and the \
+                     default Generational collector. Falling back to Generational."
                 );
                 config.gc_algorithm = cratonvm_vm::config::GcAlgorithm::Generational;
             }
@@ -4599,17 +4598,33 @@ mod tests {
 
     #[test]
     fn hotspot_xx_unsupported_gc_is_forwarded_not_dropped() {
-        // Unsupported collectors are forwarded verbatim; the warn-and-fallback
-        // happens at config-apply time (`parse_gc_algorithm`), not here.
+        // Selectors are forwarded verbatim; support validation happens at
+        // config-apply time (`parse_gc_algorithm`), not here.
         for (flag, name) in [
             ("-XX:+UseParallelGC", "Parallel"),
             ("-XX:+UseSerialGC", "Serial"),
-            ("-XX:+UseZGC", "Z"),
             ("-XX:+UseShenandoahGC", "Shenandoah"),
         ] {
             let out = normalize_java_launcher_argv(argv(&["java", flag, "Main"]));
             assert_eq!(out, argv(&["java", "--XX:UseGc", name, "Main"]), "{flag}");
         }
+    }
+
+    #[test]
+    fn hotspot_xx_usezgc_normalizes_to_selector() {
+        let out = normalize_java_launcher_argv(argv(&["java", "-XX:+UseZGC", "Main"]));
+        assert_eq!(out, argv(&["java", "--XX:UseGc", "Z", "Main"]));
+    }
+
+    #[test]
+    fn hotspot_usezgc_reaches_clap_as_selector_after_pipeline() {
+        let argv0: Vec<String> = argv(&["java", "-XX:+UseZGC", "Main"]);
+        let stage1 = insert_program_args_separator(argv0);
+        let stage2 = normalize_java_launcher_argv(stage1);
+        let (stage3, _props) = extract_system_properties(stage2);
+        let (stage4, _hot) = extract_hotspot_flags(stage3);
+        let parsed = Args::try_parse_from(stage4).expect("clap must accept -XX:+UseZGC");
+        assert_eq!(parsed.gc_selector.as_deref(), Some("Z"));
     }
 
     #[test]

@@ -561,6 +561,21 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
+
+        // JSONSMART-PARSER.1 (2026-07-09) - Spring's JsonPathResultMatchersTests
+        // now reach json-smart parsing after the EnumSet bridge fix. The
+        // interpreter is correct (43/43), but the default JIT crashes inside
+        // emitted code after compiling parser cursor methods such as
+        // JSONParserString.read(), JSONParserString.readS(), and
+        // JSONParserBase.skipSpace(). Keep this small parser package
+        // interpreted under Conservative until the x64 lowering issue is
+        // narrowed. Liftable for diagnosis with
+        // CRATONVM_JIT_ALLOW_PACKAGES=net/minidev/json/parser/.
+        if class_name.starts_with("net/minidev/json/parser/")
+            && !package_allowed("net/minidev/json/parser/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
         // HIB-TEMPORAL.1 (2026-07-08) - Hibernate temporal suite residuals.
         // The `InstantTests` failure cluster was not a Hibernate data bug: with
         // default JIT, `DdlTypeImpl.getRawTypeName` saw a null `typeNamePattern`
@@ -726,6 +741,7 @@ fn should_skip_jit_internal(
         // is found and fixed, or until the EC `AllTests` run completes
         // cleanly under the allow-packages override.
         if class_name.starts_with("org/bouncycastle/")
+            && !is_bouncycastle_crypto_hotpath_carveout(class_name, method_name)
             && !package_allowed("org/bouncycastle/", allow_packages)
         {
             return Some(SkipReason::RustJvmTestFixture);
@@ -2578,6 +2594,42 @@ fn package_allowed(prefix: &str, allow_packages: &[&str]) -> bool {
         .any(|entry| !entry.is_empty() && prefix.starts_with(entry))
 }
 
+fn is_bouncycastle_crypto_hotpath_carveout(class_name: &str, method_name: &str) -> bool {
+    let is_crypto_hotpath = matches!(
+        class_name,
+        "org/bouncycastle/crypto/BufferedBlockCipher"
+            | "org/bouncycastle/crypto/DefaultBufferedBlockCipher"
+    ) || matches!(
+        class_name,
+        c if c.starts_with("org/bouncycastle/crypto/engines/")
+            || c.starts_with("org/bouncycastle/crypto/io/")
+            || c.starts_with("org/bouncycastle/crypto/modes/")
+            || c.starts_with("org/bouncycastle/crypto/paddings/")
+    );
+    if !is_crypto_hotpath {
+        return false;
+    }
+
+    // CAST key schedule code corrupts S-box indices when compiled in the full
+    // stream test; keep setup interpreted while allowing block operations.
+    if matches!(
+        class_name,
+        "org/bouncycastle/crypto/engines/CAST5Engine"
+            | "org/bouncycastle/crypto/engines/CAST6Engine"
+    ) && matches!(method_name, "init" | "setKey")
+    {
+        return false;
+    }
+
+    // NIST CTS mode hit a compiled processBytes watchdog during the same
+    // validation pass. It is not a dominant hot path, so keep it guarded.
+    if class_name == "org/bouncycastle/crypto/modes/NISTCTSBlockCipher" {
+        return false;
+    }
+
+    true
+}
+
 /// Parse the `CRATONVM_JIT_ALLOW_PACKAGES` env var into a list of allowed
 /// package prefixes. The result is cached at first call so repeated
 /// `should_skip_jit` invocations do not re-parse.
@@ -3190,6 +3242,49 @@ mod tests {
     }
 
     #[test]
+    fn json_smart_parser_package_stays_interpreted_for_spring_jsonpath() {
+        for (class_name, method) in [
+            ("net/minidev/json/parser/JSONParserString", "read"),
+            ("net/minidev/json/parser/JSONParserString", "readS"),
+            ("net/minidev/json/parser/JSONParserBase", "skipSpace"),
+        ] {
+            assert_eq!(
+                check(class_name, method, false, true, SkipPolicy::Conservative),
+                Some(SkipReason::RustJvmTestFixture),
+                "{class_name}.{method} must stay interpreted under the conservative policy"
+            );
+            assert_eq!(
+                check(class_name, method, false, true, SkipPolicy::Aggressive),
+                None,
+                "aggressive policy must lift the json-smart parser guard"
+            );
+            assert_eq!(
+                check_with(
+                    class_name,
+                    method,
+                    false,
+                    true,
+                    SkipPolicy::Conservative,
+                    &["net/minidev/json/parser/"],
+                ),
+                None,
+                "CRATONVM_JIT_ALLOW_PACKAGES=net/minidev/json/parser/ must lift the guard"
+            );
+        }
+        assert_eq!(
+            check(
+                "net/minidev/json/writer/JsonReaderI",
+                "read",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            None,
+            "the json-smart guard is intentionally limited to the parser package"
+        );
+    }
+
+    #[test]
     fn cratonvm_exc_hierarchy_lifted_after_retry() {
         // 2026-07-01 retry: the former NEW-1.4 reproducer now passes under
         // forced inline JIT, so this stale targeted ban must stay lifted.
@@ -3709,5 +3804,49 @@ mod tests {
             "getPasswordCredentialData"
         ));
         assert!(!is_known_miscompile("com/example/Foo", "bar"));
+    }
+
+    #[test]
+    fn bouncycastle_crypto_hotpath_carveout_keeps_math_ec_banned() {
+        assert_eq!(
+            check(
+                "org/bouncycastle/math/ec/ECPoint",
+                "normalize",
+                false,
+                true,
+                SkipPolicy::Conservative
+            ),
+            Some(SkipReason::RustJvmTestFixture)
+        );
+        assert_eq!(
+            check(
+                "org/bouncycastle/crypto/BufferedBlockCipher",
+                "getUpdateOutputSize",
+                false,
+                true,
+                SkipPolicy::Conservative
+            ),
+            None
+        );
+        assert_eq!(
+            check(
+                "org/bouncycastle/crypto/DefaultBufferedBlockCipher",
+                "getUpdateOutputSize",
+                false,
+                true,
+                SkipPolicy::Conservative
+            ),
+            None
+        );
+        assert_eq!(
+            check(
+                "org/bouncycastle/crypto/engines/CAST5Engine",
+                "init",
+                false,
+                true,
+                SkipPolicy::Conservative
+            ),
+            Some(SkipReason::RustJvmTestFixture)
+        );
     }
 }

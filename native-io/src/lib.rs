@@ -5835,6 +5835,10 @@ fn alloc_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef 
     // Real JDK Heap*Buffer backing array is named `hb`.
     ctx.set_field_by_name(obj, "hb", Value::Object(Some(array)));
     buf_write_metadata(ctx, obj, 0, capacity as i32, capacity as i32, -1);
+    // Real HeapByteBuffer.address is ARRAY_BYTE_BASE_OFFSET + offset. Bulk
+    // copy bytecode relies on this value when ScopedMemoryAccess hands the
+    // backing byte[] and offset to Unsafe.copyMemory.
+    ctx.set_field_by_name(obj, "address", Value::Long(16));
     obj
 }
 
@@ -7463,15 +7467,39 @@ fn native_fc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 }
 
 // ===========================================================================
-// StringReader — 3-field synthetic (field 0 = String content, field 1 = Int pos, field 2 = Int length)
+// StringReader — GC-stable side table (see SR_STATE below).
 // StringWriter — 2-field synthetic (field 0 = char[] buffer, field 1 = Int count)
 // ===========================================================================
 
-const SR_FIELD_CONTENT: usize = 0;
-const SR_FIELD_POS: usize = 1;
-const SR_FIELD_LENGTH: usize = 2;
 const SW_FIELD_BUF: usize = 0;
 const SW_FIELD_COUNT: usize = 1;
+
+// The `java/io/StringReader` natives below (registered unconditionally, not
+// gated on `synthetic-jdk`) used to store content/position/length in object
+// fields 0/1/2, matching the SYNTHETIC stub's 3 generic `_f0..2` slots. But
+// this native also wins dispatch against a REAL, bytecode-loaded
+// `java.io.StringReader` (`CRATONVM_REAL` is off by default — see
+// `RealSelector` in `env_cache.rs` — so a `SyntheticStub` native always
+// pre-empts real bytecode unless explicitly opted out of). Real JDK 25's
+// `StringReader` was rewritten to hold a single `private final Reader r`
+// delegate (`javap` confirms — no `str`/`next`/`length` fields survive), so
+// writing "field 1"/"field 2" landed on whatever slot the real class
+// actually declares there and silently discarded the `Value::Int` position
+// write (read back as `Value::Object(None)`, the zero value for a
+// reference-typed slot) — `read()` always saw `pos == 0` and returned the
+// same first character forever. Track state in a GC-stable side table
+// instead, exactly like `ISR_PENDING` above for `InputStreamReader`.
+static SR_STATE: OnceLock<Mutex<HashMap<i32, SrState>>> = OnceLock::new();
+
+#[derive(Default)]
+struct SrState {
+    units: Vec<u16>,
+    pos: usize,
+}
+
+fn sr_state() -> &'static Mutex<HashMap<i32, SrState>> {
+    SR_STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 // The synthetic StringWriter layout stores the content `char[]` at slot 0 and
 // the logical length at slot 1. The REAL `java.io.StringWriter` field layout is
@@ -7512,10 +7540,14 @@ fn sw_set_count(ctx: &mut dyn NativeContext, this: ObjectRef, count: usize) {
 fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // RDR-MIGRATION 2026-06-01: these StringReader natives use the synthetic
-    // 3-field layout (content/pos/length). Register them as SyntheticStub so
-    // fake-JDK StringReader links, while real JDK bytecode still wins when the
-    // class is loaded from a real java.base.
+    // RDR-MIGRATION 2026-06-01: these StringReader natives track state in the
+    // GC-stable `SR_STATE` side table (not object fields — see the comment
+    // above `SR_STATE`), so they work against either the synthetic stub or a
+    // real, bytecode-loaded `java.io.StringReader`. Registered as
+    // SyntheticStub for census purposes; note that (unlike the comment below
+    // once assumed) real JDK bytecode does NOT win by default — the
+    // `CRATONVM_REAL` differential switch must explicitly opt a class in for
+    // that (see `RealSelector` in `env_cache.rs`).
     registry.with_category(cratonvm_native_api::NativeKind::SyntheticStub, |registry| {
         let sr = "java/io/StringReader";
         registry.register(sr, "<init>", "(Ljava/lang/String;)V", native_sr_init);
@@ -7706,15 +7738,15 @@ fn native_sr_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let content = args[1];
-    // Get length from string
-    let len = match args[1] {
-        Value::Object(Some(s)) => ctx.read_string(s).map(|s| s.len()).unwrap_or(0),
-        _ => 0,
+    let units: Vec<u16> = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx
+            .read_string(*s)
+            .map(|s| s.encode_utf16().collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
     };
-    ctx.set_field(this, SR_FIELD_CONTENT, content);
-    ctx.set_field(this, SR_FIELD_POS, Value::Int(0));
-    ctx.set_field(this, SR_FIELD_LENGTH, Value::Int(len as i32));
+    let key = ctx.identity_hash_code(this);
+    sr_state().lock().insert(key, SrState { units, pos: 0 });
     Ok(None)
 }
 
@@ -7723,20 +7755,18 @@ fn native_sr_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let pos = match ctx.get_field(this, SR_FIELD_POS) {
-        Value::Int(p) => p as usize,
-        _ => 0,
+    let key = ctx.identity_hash_code(this);
+    let mut table = sr_state().lock();
+    let state = match table.get_mut(&key) {
+        Some(s) => s,
+        None => return Ok(Some(Value::Int(-1))),
     };
-    let content_str = match ctx.get_field(this, SR_FIELD_CONTENT) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(-1))),
-    };
-    let bytes: Vec<u16> = content_str.encode_utf16().collect();
-    if pos >= bytes.len() {
+    if state.pos >= state.units.len() {
         return Ok(Some(Value::Int(-1)));
     }
-    ctx.set_field(this, SR_FIELD_POS, Value::Int((pos + 1) as i32));
-    Ok(Some(Value::Int(bytes[pos] as i32)))
+    let ch = state.units[state.pos];
+    state.pos += 1;
+    Ok(Some(Value::Int(ch as i32)))
 }
 
 fn native_sr_read_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7756,24 +7786,25 @@ fn native_sr_read_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
-    let pos = match ctx.get_field(this, SR_FIELD_POS) {
-        Value::Int(p) => p as usize,
-        _ => 0,
+    let key = ctx.identity_hash_code(this);
+    let (to_read, chars) = {
+        let mut table = sr_state().lock();
+        let state = match table.get_mut(&key) {
+            Some(s) => s,
+            None => return Ok(Some(Value::Int(-1))),
+        };
+        if state.pos >= state.units.len() {
+            return Ok(Some(Value::Int(-1)));
+        }
+        let available = state.units.len() - state.pos;
+        let to_read = len.min(available);
+        let chars = state.units[state.pos..state.pos + to_read].to_vec();
+        state.pos += to_read;
+        (to_read, chars)
     };
-    let content_str = match ctx.get_field(this, SR_FIELD_CONTENT) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(-1))),
-    };
-    let chars: Vec<u16> = content_str.encode_utf16().collect();
-    if pos >= chars.len() {
-        return Ok(Some(Value::Int(-1)));
+    for (i, ch) in chars.into_iter().enumerate() {
+        ctx.set_array_element(buf, off + i, Value::Int(ch as i32));
     }
-    let available = chars.len() - pos;
-    let to_read = len.min(available);
-    for i in 0..to_read {
-        ctx.set_array_element(buf, off + i, Value::Int(chars[pos + i] as i32));
-    }
-    ctx.set_field(this, SR_FIELD_POS, Value::Int((pos + to_read) as i32));
     Ok(Some(Value::Int(to_read as i32)))
 }
 
@@ -7782,15 +7813,13 @@ fn native_sr_ready(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let pos = match ctx.get_field(this, SR_FIELD_POS) {
-        Value::Int(p) => p,
-        _ => 0,
-    };
-    let len = match ctx.get_field(this, SR_FIELD_LENGTH) {
-        Value::Int(l) => l,
-        _ => 0,
-    };
-    Ok(Some(Value::Int(if pos < len { 1 } else { 0 })))
+    let key = ctx.identity_hash_code(this);
+    let ready = sr_state()
+        .lock()
+        .get(&key)
+        .map(|s| s.pos < s.units.len())
+        .unwrap_or(false);
+    Ok(Some(Value::Int(if ready { 1 } else { 0 })))
 }
 
 fn native_sr_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7802,16 +7831,15 @@ fn native_sr_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    let pos = match ctx.get_field(this, SR_FIELD_POS) {
-        Value::Int(p) => p as i64,
-        _ => 0,
+    let key = ctx.identity_hash_code(this);
+    let mut table = sr_state().lock();
+    let state = match table.get_mut(&key) {
+        Some(s) => s,
+        None => return Ok(Some(Value::Long(0))),
     };
-    let len = match ctx.get_field(this, SR_FIELD_LENGTH) {
-        Value::Int(l) => l as i64,
-        _ => 0,
-    };
-    let skip = n.min(len - pos).max(0);
-    ctx.set_field(this, SR_FIELD_POS, Value::Int((pos + skip) as i32));
+    let remaining = (state.units.len() - state.pos) as i64;
+    let skip = n.clamp(0, remaining);
+    state.pos = (state.pos as i64 + skip) as usize;
     Ok(Some(Value::Long(skip)))
 }
 
@@ -7820,7 +7848,10 @@ fn native_sr_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    ctx.set_field(this, SR_FIELD_POS, Value::Int(0));
+    let key = ctx.identity_hash_code(this);
+    if let Some(state) = sr_state().lock().get_mut(&key) {
+        state.pos = 0;
+    }
     Ok(None)
 }
 
@@ -18291,6 +18322,17 @@ mod buffer_bounds_tests {
     fn make_bb(ctx: &mut MockNativeContext, cap: usize) -> ObjectRef {
         // alloc_byte_buffer leaves pos=0, lim=cap, cap=cap.
         alloc_byte_buffer(ctx, cap)
+    }
+
+    #[test]
+    fn allocated_heap_bytebuffer_sets_real_address() {
+        let mut ctx = MockNativeContext::new();
+        let bb = make_bb(&mut ctx, 8);
+        assert_eq!(ctx.get_field_by_name(bb, "position"), Value::Int(0));
+        assert_eq!(ctx.get_field_by_name(bb, "limit"), Value::Int(8));
+        assert_eq!(ctx.get_field_by_name(bb, "capacity"), Value::Int(8));
+        assert_eq!(ctx.get_field_by_name(bb, "mark"), Value::Int(-1));
+        assert_eq!(ctx.get_field_by_name(bb, "address"), Value::Long(16));
     }
 
     // --- B1: bulk get/put destination/source bounds ---

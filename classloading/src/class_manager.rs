@@ -2030,7 +2030,8 @@ impl ClassManager {
         //       the serialized field set so it is restored on read.
         // Slots 1 (interfaces `Class[]`) and 2 (identity-hash) stay native-only
         // (accessed by raw index, undeclared) so they are not serialized.
-        let (synthetic_interfaces, synthetic_fields): (
+        let iface_names = jdk_interfaces(name).to_vec();
+        let (mut synthetic_interfaces, synthetic_fields): (
             Vec<ClassId>,
             Vec<cratonvm_reader::field::ClassFileField>,
         ) = if name == "java/lang/reflect/Proxy$Instance" {
@@ -2078,7 +2079,7 @@ impl ClassManager {
                 synthetic_access_flags,
             ),
             superclass: synthetic_superclass,
-            interfaces: synthetic_interfaces,
+            interfaces: synthetic_interfaces.clone(),
             fields: synthetic_fields,
             methods: synthetic_stub_ctor_methods(name),
             first_field_index: 0,
@@ -2102,6 +2103,24 @@ impl ClassManager {
         };
         self.class_store.add(class);
         self.register_class_name(ClassLoaderId::Bootstrap, name, id);
+
+        // The class is registered now, so resolving its curated synthetic
+        // interfaces cannot recursively create the same class. This mirrors the
+        // other synthetic-stub path and keeps checkcast/instanceof honest for
+        // native-only helper classes such as Function$Identity.
+        for iface_name in iface_names {
+            if let Ok(iface_id) = self.load_class(iface_name) {
+                if !synthetic_interfaces.contains(&iface_id) {
+                    synthetic_interfaces.push(iface_id);
+                }
+            }
+        }
+        if !synthetic_interfaces.is_empty() {
+            if let Some(class) = self.class_store.get_mut(id) {
+                class.interfaces = synthetic_interfaces;
+            }
+        }
+
         id
     }
 
@@ -10492,12 +10511,13 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
         ]);
     }
     if name == "java/lang/Runtime$Version" {
-        out.push(ClassFileMethod {
+        let mk = |method: &str, descriptor: &str| ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
-            name: cratonvm_types::intern_arc("feature"),
-            descriptor: cratonvm_types::intern_arc("()I"),
+            name: cratonvm_types::intern_arc(method),
+            descriptor: cratonvm_types::intern_arc(descriptor),
             attributes: vec![],
-        });
+        };
+        out.extend([mk("feature", "()I"), mk("build", "()Ljava/util/Optional;")]);
     }
     if name == "java/lang/Enum" {
         let mk = |method: &str, descriptor: &str| ClassFileMethod {
@@ -11233,6 +11253,8 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
         out.extend([
             mk_ctor("(Ljava/lang/String;)V"),
             mk("toString", "()Ljava/lang/String;"),
+            mk("equals", "(Ljava/lang/Object;)Z"),
+            mk("hashCode", "()I"),
         ]);
     }
     if name == "java/lang/Thread" {
@@ -11682,6 +11704,25 @@ mod tests {
         cm.ensure_synthetic_class("java/lang/Object", 0);
         let arr_id = cm.ensure_synthetic_class("[Lcratonvm/synthetic/Foo;", 0);
         assert_eq!(cm.get_class(arr_id).and_then(|c| c.superclass), None);
+    }
+
+    #[test]
+    fn synthetic_function_identity_implements_function() {
+        let mut cm = ClassManager::new(&[], &[], &[]);
+        cm.ensure_synthetic_class("java/lang/Object", 0);
+        let function_id = cm.ensure_synthetic_class("java/util/function/Function", 0);
+        cm.ensure_synthetic_class("java/util/function/UnaryOperator", 0);
+        let identity_id = cm.ensure_synthetic_class("java/util/function/Function$Identity", 0);
+
+        let identity = cm
+            .get_class(identity_id)
+            .expect("Function$Identity stub should exist");
+        assert!(
+            identity.interfaces.iter().any(|id| *id == function_id)
+                || identity.is_subclass_of(function_id, &cm.class_store),
+            "Function$Identity must be assignable to Function"
+        );
+        assert!(cm.is_subclass_of(identity_id, function_id));
     }
 
     // --- H5: prohibited package-name guard ---

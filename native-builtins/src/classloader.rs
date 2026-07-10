@@ -6142,12 +6142,13 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
             Value::Object(Some(a)) => a,
             _ => return Ok(Some(Value::Int(-1))),
         };
-        for i in 0..n {
-            let b = ctx.get_array_element(arr, pos + i);
-            ctx.set_array_element(dst, off + i, b);
+        let mut bytes = vec![0u8; n];
+        let copied = ctx.read_byte_array_into(arr, pos, &mut bytes);
+        if copied > 0 {
+            ctx.write_byte_array_from(dst, off, &bytes[..copied]);
         }
-        ctx.set_field(this, 1, Value::Int((pos + n) as i32));
-        Ok(Some(Value::Int(n as i32)))
+        ctx.set_field(this, 1, Value::Int((pos + copied) as i32));
+        Ok(Some(Value::Int(copied as i32)))
     });
     r.register(bais, "available", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;

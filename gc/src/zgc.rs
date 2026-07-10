@@ -1480,7 +1480,7 @@ impl ZgcRealHeap {
     }
 
     /// Next identity hash code (never zero; wraps avoiding 0).
-    fn next_hash(&self) -> i32 {
+    pub fn next_hash(&self) -> i32 {
         let h = self.next_hash_code.fetch_add(1, Ordering::Relaxed);
         if h == 0 {
             self.next_hash_code.fetch_add(1, Ordering::Relaxed)
@@ -1505,6 +1505,132 @@ impl ZgcRealHeap {
         self.registry.lock().push(ptr as usize);
         self.allocated.fetch_add(size, Ordering::Relaxed);
         Some(ptr)
+    }
+
+    /// Try to allocate an object. Returns `None` on true heap exhaustion.
+    pub fn try_alloc_object(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
+        let fields_size = num_fields.checked_mul(SLOT_SIZE)?;
+        let total = HEADER_SIZE.checked_add(fields_size)?;
+        let ptr = self.alloc_raw(total)?;
+        let header = ObjectHeader::new(
+            class_id,
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            self.next_hash(),
+            0,
+            u32::try_from(num_fields).ok()?,
+        );
+        unsafe {
+            std::ptr::write(ptr as *mut ObjectHeader, header);
+            Some(ObjectRef::from_raw(ptr))
+        }
+    }
+
+    /// Try to allocate an array. Returns `None` on true heap exhaustion.
+    pub fn try_alloc_array(
+        &self,
+        class_id: ClassId,
+        element_type: ArrayElementType,
+        length: usize,
+    ) -> Option<ObjectRef> {
+        if length > ZGC_REAL_MAX_ARRAY_LENGTH {
+            return None;
+        }
+        let data_size = array_data_size(length, element_type).ok()?;
+        let total = HEADER_SIZE.checked_add(data_size)?;
+        let ptr = self.alloc_raw(total)?;
+        let len_u32 = u32::try_from(length).ok()?;
+        let header = ObjectHeader::new(
+            class_id,
+            ObjectKind::Array,
+            element_type,
+            self.next_hash(),
+            len_u32,
+            len_u32,
+        );
+        unsafe {
+            std::ptr::write(ptr as *mut ObjectHeader, header);
+            Some(ObjectRef::from_raw(ptr))
+        }
+    }
+
+    /// Allocate and pre-initialize primitive-typed slots from JVM descriptors.
+    pub fn alloc_object_with_descriptors(
+        &self,
+        class_id: ClassId,
+        num_fields: usize,
+        descriptor_bytes: &[u8],
+    ) -> ObjectRef {
+        let obj = self.alloc_object(class_id, num_fields);
+        for i in 0..num_fields {
+            let default = descriptor_bytes
+                .get(i)
+                .and_then(|&b| crate::heap::default_value_for_descriptor(b))
+                .unwrap_or(Value::Object(None));
+            self.set_field(obj, i, default);
+        }
+        obj
+    }
+
+    /// Fallible descriptor-aware object allocation.
+    pub fn try_alloc_object_with_descriptors(
+        &self,
+        class_id: ClassId,
+        num_fields: usize,
+        descriptor_bytes: &[u8],
+    ) -> Option<ObjectRef> {
+        let obj = self.try_alloc_object(class_id, num_fields)?;
+        for i in 0..num_fields {
+            let default = descriptor_bytes
+                .get(i)
+                .and_then(|&b| crate::heap::default_value_for_descriptor(b))
+                .unwrap_or(Value::Object(None));
+            self.set_field(obj, i, default);
+        }
+        Some(obj)
+    }
+
+    /// Validate that `addr` is exactly the base of a live object.
+    pub fn is_object_address(&self, addr: usize) -> Option<ObjectRef> {
+        if self.registry.lock().iter().any(|&base| base == addr) {
+            // SAFETY: the registry contains only live allocation bases.
+            Some(unsafe { ObjectRef::from_raw(addr as *mut u8) })
+        } else {
+            None
+        }
+    }
+
+    /// Loose containment check returning the base object for any address inside it.
+    pub fn is_heap_addr(&self, addr: usize) -> Option<ObjectRef> {
+        for &base in self.registry.lock().iter() {
+            let header = unsafe { &*(base as *const ObjectHeader) };
+            let size = Self::alloc_size(header);
+            let Some(end) = base.checked_add(size) else {
+                continue;
+            };
+            if addr >= base && addr < end {
+                // SAFETY: the registry contains only live allocation bases.
+                return Some(unsafe { ObjectRef::from_raw(base as *mut u8) });
+            }
+        }
+        None
+    }
+
+    /// Total backing arena capacity.
+    pub fn heap_capacity(&self) -> usize {
+        self.arena.lock().capacity()
+    }
+
+    /// Walk every live object and its allocation size.
+    pub fn walk_objects(&self) -> Vec<(*mut u8, usize)> {
+        self.registry
+            .lock()
+            .iter()
+            .map(|&base| {
+                let header = unsafe { &*(base as *const ObjectHeader) };
+                (base as *mut u8, Self::alloc_size(header))
+            })
+            .collect()
     }
 
     /// Header accessor (shared with the trait impl).

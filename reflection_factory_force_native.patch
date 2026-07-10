@@ -1,0 +1,123 @@
+diff --git a/vm/src/runtime/interpreter.rs b/vm/src/runtime/interpreter.rs
+--- a/vm/src/runtime/interpreter.rs
++++ b/vm/src/runtime/interpreter.rs
+@@ -19899,6 +19899,38 @@ pub(crate) fn is_count_down_latch_native_override(
+         )
+ }
+ 
++pub(crate) fn is_reflection_factory_serialization_native_override(
++    class_name: &str,
++    method_name: &str,
++    descriptor: &str,
++) -> bool {
++    matches!(
++        class_name,
++        "sun/reflect/ReflectionFactory" | "jdk/internal/reflect/ReflectionFactory"
++    ) && matches!(
++        (method_name, descriptor),
++        ("getReflectionFactory", "()Lsun/reflect/ReflectionFactory;")
++            | (
++                "getReflectionFactory",
++                "()Ljdk/internal/reflect/ReflectionFactory;"
++            )
++            | (
++                "newConstructorForSerialization",
++                "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;"
++            )
++            | (
++                "newConstructorForSerialization",
++                "(Ljava/lang/Class;Ljava/lang/reflect/Constructor;)Ljava/lang/reflect/Constructor;"
++            )
++            | (
++                "newConstructorForExternalization",
++                "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;"
++            )
++            | ("readObjectForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;")
++            | ("readObjectNoDataForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;")
++            | ("writeObjectForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;")
++            | ("readResolveForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;")
++            | ("writeReplaceForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;")
++            | ("hasStaticInitializerForSerialization", "(Ljava/lang/Class;)Z")
++    )
++}
++
+ fn force_native_over_real_jdk_bytecode(
+     class_name: &str,
+     method_name: &str,
+@@ -20464,6 +20496,15 @@ fn force_native_over_real_jdk_bytecode(
+     if is_count_down_latch_native_override(class_name, method_name, method_descriptor) {
+         return true;
+     }
++    // JBoss Marshalling calls real-JDK `sun.reflect.ReflectionFactory`
++    // bytecode to discover serialization hooks. On CratonVM the registered
++    // natives encode ObjectStreamClass's private/inheritable hook rules and
++    // must win over the bytecode body, or MethodHandle.invoke later tries to
++    // dispatch `java/lang/Object.readObject(ObjectInputStream)`.
++    if is_reflection_factory_serialization_native_override(class_name, method_name, method_descriptor) {
++        return true;
++    }
+     // Surefire fork bootstrap/teardown: bypass ServiceLoader decoder discovery
+     // and the acknowledgedExit semaphore path, both of which rely on JDK
+     // internals CratonVM shadows with registered natives.
+@@ -30375,6 +30416,39 @@ mod tests {
+             "()V"
+         ));
+     }
++
++    #[test]
++    fn reflection_factory_force_native_covers_serialization_surface() {
++        for class_name in [
++            "sun/reflect/ReflectionFactory",
++            "jdk/internal/reflect/ReflectionFactory",
++        ] {
++            for (name, descriptor) in [
++                ("newConstructorForSerialization", "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;"),
++                (
++                    "newConstructorForSerialization",
++                    "(Ljava/lang/Class;Ljava/lang/reflect/Constructor;)Ljava/lang/reflect/Constructor;",
++                ),
++                ("newConstructorForExternalization", "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;"),
++                ("readObjectForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"),
++                (
++                    "readObjectNoDataForSerialization",
++                    "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
++                ),
++                ("writeObjectForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"),
++                ("readResolveForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"),
++                ("writeReplaceForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"),
++                ("hasStaticInitializerForSerialization", "(Ljava/lang/Class;)Z"),
++            ] {
++                assert!(
++                    is_reflection_factory_serialization_native_override(class_name, name, descriptor),
++                    "{class_name}.{name}{descriptor} must route to the registered native"
++                );
++                assert!(force_native_over_real_jdk_bytecode(class_name, name, descriptor));
++            }
++        }
++        assert!(!is_reflection_factory_serialization_native_override(
++            "java/io/ObjectStreamClass",
++            "getReflector",
++            "(Ljava/lang/Class;)Ljava/lang/Object;"
++        ));
++    }
+ 
+     // -----------------------------------------------------------------------
+     // real-frame-deopt — IR-path deopt frame-value mapping (type source)
+diff --git a/vm/src/vm/vm_exec.rs b/vm/src/vm/vm_exec.rs
+--- a/vm/src/vm/vm_exec.rs
++++ b/vm/src/vm/vm_exec.rs
+@@ -10809,6 +10809,14 @@ pub fn invoke_on_class_shared_inner(
+                         || (class_name == "java/lang/reflect/Constructor"
+                             && method_name == "newInstance"
+                             && descriptor == "([Ljava/lang/Object;)Ljava/lang/Object;")
++                        // WF-RF: real-JDK ReflectionFactory serialization helpers are
++                        // concrete bytecode methods, but JBoss Marshalling depends on
++                        // ObjectStreamClass hook discovery semantics. Let the native
++                        // bridge in `serialization.rs` shadow the bytecode so absent
++                        // hooks return null instead of handles to Object.readObject.
++                        || crate::runtime::interpreter::is_reflection_factory_serialization_native_override(
++                            class_name, method_name, descriptor
++                        )
+                         // SPB.11: Our synthetic MethodDescriptor stores the
+                         // wrapped Method at slot 0 (real-JDK MD has a private
+                         // `method` field at a different layout). Force the

@@ -1,6 +1,14 @@
 # ES failure family - BFloat16 vector value becomes null
 
-Status: OPEN
+Status: FIXED (2026-07-10)
+
+Fix summary:
+- The null/vector readback failures were cleared by the same real-JDK vector storage fixes already landed for `updateDocument(Term, Iterable)J`, regex/runtime-version real-layout handling, and this branch's float-array raw-copy fix.
+- The last materialization problem was Lucene vector bytes being written as zeros through `FloatBuffer.put(float[])`; fixing `Unsafe.copyMemory` float-array byte encoding made the representative BFloat16 vector classes pass cleanly.
+
+Validation:
+- `/tmp/cratonvm-ES93HnswBFloat16VectorsFormatTests-floatview-r2-1783666860`: `OK (60 tests)`.
+- `/tmp/cratonvm-ES93ScalarQuantizedBFloat16VectorFormatTests-floatview-r2-1783666860`: `OK (54 tests)`.
 
 Signal:
 - `java.lang.IllegalArgumentException: vector value must not be null`

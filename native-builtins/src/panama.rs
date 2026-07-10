@@ -1674,7 +1674,7 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
 /// function per VM run the leak is bounded (typically a handful of
 /// Cifs) and matches HotSpot's own permanent FFI metadata. When a
 /// finalizer path lands, call `plf::free_cached_cif(field3)` from it.
-fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     use crate::panama_libffi as plf;
     use libffi::middle::{arg as ffi_arg, CodePtr};
 
