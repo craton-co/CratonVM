@@ -72,7 +72,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::arena::Arena;
 use crate::collector::{GarbageCollector, MonitorCleanup, StopTheWorldToken};
@@ -1398,7 +1398,15 @@ pub struct ZgcRealHeap {
     arena: Mutex<Arena>,
     /// Base address of every live allocation, in allocation order. Rebuilt
     /// (filtered to survivors) by each sweep.
-    registry: Mutex<Vec<usize>>,
+    /// Hash-set registry (ZGC-5/6 hardening): `is_object_address` is
+    /// consulted per conservative-root candidate (every operand-stack root
+    /// and JIT-frame qword), so membership must be O(1) — the previous
+    /// `Vec` linear scan made every GC's root collection O(roots × live)
+    /// and read as a hang at scale. The sweep also prunes DEAD bases
+    /// in place now (never wholesale-replaces the set), so an allocation
+    /// registered between the mark snapshot and the sweep publish can no
+    /// longer be silently dropped from the registry.
+    registry: Mutex<FxHashSet<usize>>,
     /// Monotonic identity-hash-code source (matches `Heap::next_hash`).
     next_hash_code: AtomicI32,
     /// Bytes of live+dead object payload currently outstanding (drops on
@@ -1457,7 +1465,7 @@ impl ZgcRealHeap {
         let cap = total_bytes.max(4096);
         Self {
             arena: Mutex::new(Arena::new(cap)),
-            registry: Mutex::new(Vec::new()),
+            registry: Mutex::new(FxHashSet::default()),
             next_hash_code: AtomicI32::new(1),
             allocated: AtomicUsize::new(0),
             gc_threshold: cap * ZGC_REAL_GC_THRESHOLD_PERCENT / 100,
@@ -1547,7 +1555,7 @@ impl ZgcRealHeap {
             unsafe { std::ptr::write_bytes(ptr, 0, size) };
             ptr
         };
-        self.registry.lock().push(ptr as usize);
+        self.registry.lock().insert(ptr as usize);
         self.allocated.fetch_add(size, Ordering::Relaxed);
         Some(ptr)
     }
@@ -1635,9 +1643,10 @@ impl ZgcRealHeap {
         Some(obj)
     }
 
-    /// Validate that `addr` is exactly the base of a live object.
+    /// Validate that `addr` is exactly the base of a live object. O(1) — hot
+    /// path for conservative-root validation (per candidate qword).
     pub fn is_object_address(&self, addr: usize) -> Option<ObjectRef> {
-        if self.registry.lock().iter().any(|&base| base == addr) {
+        if self.registry.lock().contains(&addr) {
             // SAFETY: the registry contains only live allocation bases.
             Some(unsafe { ObjectRef::from_raw(addr as *mut u8) })
         } else {
@@ -1647,6 +1656,12 @@ impl ZgcRealHeap {
 
     /// Loose containment check returning the base object for any address inside it.
     pub fn is_heap_addr(&self, addr: usize) -> Option<ObjectRef> {
+        // Fast path: an exact object base (the overwhelmingly common probe).
+        if self.registry.lock().contains(&addr) {
+            // SAFETY: the registry contains only live allocation bases.
+            return Some(unsafe { ObjectRef::from_raw(addr as *mut u8) });
+        }
+        // Interior pointers: fall back to the O(live) extent walk.
         for &base in self.registry.lock().iter() {
             let header = unsafe { &*(base as *const ObjectHeader) };
             let size = Self::alloc_size(header);
@@ -2042,8 +2057,15 @@ impl GarbageCollector for ZgcRealHeap {
         // ---- Mark phase --------------------------------------------------
         // Snapshot the registry of all live-or-dead allocations under the
         // lock, then release it: marking reads object bytes in place and
-        // does not allocate, so it needs no arena lock.
-        let all: Vec<usize> = self.registry.lock().clone();
+        // does not allocate, so it needs no arena lock. The set copy also
+        // serves as the mark-phase validation oracle (ZGC-4): child pointers
+        // pushed by `enumerate_references` come from raw field bytes, and a
+        // corrupt/stale slot must be SKIPPED, not have a mark bit written
+        // through it (a wild `header_mut` write inside an innocent object —
+        // or outside the arena entirely — then cascades as the garbage
+        // "object" is re-parsed for more children).
+        let registered: FxHashSet<usize> = self.registry.lock().clone();
+        let all: Vec<usize> = registered.iter().copied().collect();
 
         // Clear all mark bits first (objects may carry a stale bit from a
         // prior cycle's survivors).
@@ -2056,8 +2078,16 @@ impl GarbageCollector for ZgcRealHeap {
         for r in roots.iter() {
             work.push(r.as_ptr() as usize);
         }
+        let mut wild_skipped = 0usize;
         while let Some(addr) = work.pop() {
             if addr == 0 {
+                continue;
+            }
+            // ZGC-4: only registered allocation bases are objects. Roots are
+            // pre-filtered by is_object_address, but CHILD pointers are raw
+            // field bytes — skip anything that is not a current base.
+            if !registered.contains(&addr) {
+                wild_skipped += 1;
                 continue;
             }
             let header = self.header_mut(addr as *mut u8);
@@ -2067,6 +2097,13 @@ impl GarbageCollector for ZgcRealHeap {
             header.gc_flags |= GC_FLAG_MARKED;
             self.enumerate_references(addr as *mut u8, &mut work);
         }
+        if wild_skipped > 0 {
+            tracing::warn!(
+                target: "zgc",
+                wild_skipped,
+                "zgc mark: skipped non-registered child pointers (corrupt/stale ref slots)"
+            );
+        }
 
         // ---- Finalizer resurrection (see collect_garbage_with_finalizers):
         // mark dead-but-finalizable objects (and their subtrees) live so the
@@ -2074,7 +2111,6 @@ impl GarbageCollector for ZgcRealHeap {
         // closure so "unmarked" == dead, and before the sweep decides.
         let fin_candidates = std::mem::take(&mut *self.pending_finalizer_roots.lock());
         if !fin_candidates.is_empty() {
-            let registered: std::collections::HashSet<usize> = all.iter().copied().collect();
             let mut resurrected = Vec::new();
             for addr in fin_candidates {
                 if !registered.contains(&addr) {
@@ -2087,8 +2123,8 @@ impl GarbageCollector for ZgcRealHeap {
                 resurrected.push(addr); // non-moving: address unchanged
                 work.push(addr);
                 while let Some(a) = work.pop() {
-                    if a == 0 {
-                        continue;
+                    if a == 0 || !registered.contains(&a) {
+                        continue; // ZGC-4: same wild-child skip as the main loop
                     }
                     let h = self.header_mut(a as *mut u8);
                     if h.gc_flags & GC_FLAG_MARKED != 0 {
@@ -2131,7 +2167,7 @@ impl GarbageCollector for ZgcRealHeap {
         }
 
         // ---- Sweep phase -------------------------------------------------
-        let mut survivors: Vec<usize> = Vec::with_capacity(all.len());
+        let mut dead: Vec<usize> = Vec::new();
         let mut bytes_copied = 0usize; // "retained" bytes (non-moving)
         let mut bytes_freed = 0usize;
         let mut objects_copied = 0usize;
@@ -2144,7 +2180,6 @@ impl GarbageCollector for ZgcRealHeap {
                 if header.gc_flags & GC_FLAG_MARKED != 0 {
                     // Survivor: clear the mark bit for next cycle, keep it.
                     header.gc_flags &= !GC_FLAG_MARKED;
-                    survivors.push(base);
                     bytes_copied += size;
                     objects_copied += 1;
                 } else {
@@ -2157,6 +2192,7 @@ impl GarbageCollector for ZgcRealHeap {
                         arena.add_free_block(base - arena_base, size);
                     }
                     bytes_freed += size;
+                    dead.push(base);
                 }
             }
 
@@ -2194,8 +2230,18 @@ impl GarbageCollector for ZgcRealHeap {
             }
         }
 
-        // Publish the new registry and live-byte total.
-        *self.registry.lock() = survivors;
+        // Prune DEAD bases from the registry IN PLACE (never wholesale-
+        // replace it with the mark snapshot's survivors): an allocation
+        // registered by another path between the mark snapshot and this
+        // publish would be erased by a replacement — leaking its memory
+        // forever (unsweepable) and, worse, making is_object_address deny it
+        // so conservative rooting drops it while reachable.
+        {
+            let mut reg = self.registry.lock();
+            for d in &dead {
+                reg.remove(d);
+            }
+        }
         self.allocated.store(bytes_copied, Ordering::Relaxed);
         // Re-arm the trigger: require at least a quarter of the remaining
         // headroom (min 64 KiB) of NEW allocation before the next
@@ -2215,6 +2261,11 @@ impl GarbageCollector for ZgcRealHeap {
         // references need no fix-up and the pointer map is empty.
         let pointer_map: HashMap<usize, usize> = HashMap::new();
         monitors.remap_after_gc(&pointer_map);
+        // ZGC-3: `remap_after_gc` early-returns on the (always-empty) map,
+        // so hand the collector's EXACT dead-address list to the registry
+        // prune instead — reclaims monitor/cas-lock entries and prevents a
+        // recycled address from inheriting a dead object's monitor.
+        monitors.prune_dead(&dead);
 
         GcResult {
             stats: GcStats {
