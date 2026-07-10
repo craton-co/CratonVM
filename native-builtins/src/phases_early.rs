@@ -19637,8 +19637,32 @@ fn native_scanner_find_within_horizon_string_int(
 mod t2_tests {
     use super::*;
     use crate::test_utils::{mock_ctx, MockNativeContext};
-    use cratonvm_types::{ArrayElementType, ObjectRef};
+    use cratonvm_types::{ArrayElementType, ClassId, ObjectRef};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn t2_thread_local_object_values_are_global_rooted() {
+        let mut ctx = mock_ctx();
+        let obj1 = ctx.alloc_object(ClassId::new(41), 0);
+        let stored1 = tl_value_from_java(&mut ctx, Value::Object(Some(obj1)));
+        assert_eq!(ctx.global_root_count(), 1);
+        assert_eq!(tl_value_to_java(&ctx, stored1), Value::Object(Some(obj1)));
+
+        let obj2 = ctx.alloc_object(ClassId::new(42), 0);
+        let stored2 = tl_value_from_java(&mut ctx, Value::Object(Some(obj2)));
+        assert_eq!(ctx.global_root_count(), 2);
+
+        tl_drop_value_root(&mut ctx, stored1);
+        assert_eq!(ctx.global_root_count(), 1);
+        assert_eq!(tl_value_to_java(&ctx, stored2), Value::Object(Some(obj2)));
+
+        tl_drop_value_root(&mut ctx, stored2);
+        assert_eq!(ctx.global_root_count(), 0);
+
+        let plain = tl_value_from_java(&mut ctx, Value::Int(7));
+        assert_eq!(ctx.global_root_count(), 0);
+        assert_eq!(tl_value_to_java(&ctx, plain), Value::Int(7));
+    }
 
     // -----------------------------------------------------------------------
     // T2.3.13: StringTokenizer.countTokens — O(n) single pass

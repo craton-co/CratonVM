@@ -55372,6 +55372,995 @@ impl BcDigestKind {
     }
 }
 
+fn bc_gost3411_bad_state(message: &str) -> MethodCallFailed {
+    RuntimeError::IllegalStateException {
+        message: message.into(),
+    }
+    .into()
+}
+
+fn bc_gost3411_byte_field(
+    ctx: &dyn NativeContext,
+    digest: ObjectRef,
+    field: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    match ctx.get_field_by_name(digest, field) {
+        Value::Object(Some(o)) => Ok(o),
+        _ => Err(bc_gost3411_bad_state("GOST3411Digest: malformed state")),
+    }
+}
+
+fn bc_gost3411_read_32(
+    ctx: &dyn NativeContext,
+    digest: ObjectRef,
+    field: &str,
+) -> Result<[u8; 32], MethodCallFailed> {
+    let arr = bc_gost3411_byte_field(ctx, digest, field)?;
+    if ctx.array_length(arr) < 32 {
+        return Err(bc_gost3411_bad_state("GOST3411Digest: short state array"));
+    }
+    let mut out = [0u8; 32];
+    if ctx.read_byte_array_into(arr, 0, &mut out) != 32 {
+        return Err(bc_gost3411_bad_state(
+            "GOST3411Digest: failed to read state array",
+        ));
+    }
+    Ok(out)
+}
+
+fn bc_gost3411_write_field(
+    ctx: &mut dyn NativeContext,
+    digest: ObjectRef,
+    field: &str,
+    bytes: &[u8; 32],
+) -> Result<(), MethodCallFailed> {
+    let arr = bc_gost3411_byte_field(ctx, digest, field)?;
+    if ctx.array_length(arr) < bytes.len() || !ctx.write_byte_array_from(arr, 0, bytes) {
+        return Err(bc_gost3411_bad_state(
+            "GOST3411Digest: failed to write state array",
+        ));
+    }
+    Ok(())
+}
+
+fn bc_gost3411_read_c(
+    ctx: &dyn NativeContext,
+    digest: ObjectRef,
+) -> Result<[[u8; 32]; 4], MethodCallFailed> {
+    let c_arr = bc_gost3411_byte_field(ctx, digest, "C")?;
+    if ctx.array_length(c_arr) < 4 {
+        return Err(bc_gost3411_bad_state("GOST3411Digest: short C array"));
+    }
+    let mut out = [[0u8; 32]; 4];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let row = match ctx.get_array_element(c_arr, i) {
+            Value::Object(Some(o)) => o,
+            _ => return Err(bc_gost3411_bad_state("GOST3411Digest: malformed C row")),
+        };
+        if ctx.array_length(row) < 32 || ctx.read_byte_array_into(row, 0, slot) != 32 {
+            return Err(bc_gost3411_bad_state("GOST3411Digest: malformed C row"));
+        }
+    }
+    Ok(out)
+}
+
+fn bc_gost3411_read_sbox(
+    ctx: &dyn NativeContext,
+    digest: ObjectRef,
+) -> Result<[u8; 128], MethodCallFailed> {
+    let sbox_arr = bc_gost3411_byte_field(ctx, digest, "sBox")?;
+    if ctx.array_length(sbox_arr) != 128 {
+        return Err(bc_gost3411_bad_state("GOST3411Digest: malformed S-box"));
+    }
+    let mut out = [0u8; 128];
+    if ctx.read_byte_array_into(sbox_arr, 0, &mut out) != 128 {
+        return Err(bc_gost3411_bad_state(
+            "GOST3411Digest: failed to read S-box",
+        ));
+    }
+    Ok(out)
+}
+
+fn bc_gost3411_a(block: &mut [u8; 32]) {
+    let mut a = [0u8; 8];
+    for j in 0..8 {
+        a[j] = block[j] ^ block[j + 8];
+    }
+    block.copy_within(8..32, 0);
+    block[24..32].copy_from_slice(&a);
+}
+
+fn bc_gost3411_p(input: &[u8; 32]) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    for k in 0..8 {
+        key[4 * k] = input[k];
+        key[1 + 4 * k] = input[8 + k];
+        key[2 + 4 * k] = input[16 + k];
+        key[3 + 4 * k] = input[24 + k];
+    }
+    key
+}
+
+fn bc_gost3411_fw(block: &mut [u8; 32]) {
+    let mut words = [0u16; 16];
+    for (i, word) in words.iter_mut().enumerate() {
+        let lo = block[i * 2] as u16;
+        let hi = (block[i * 2 + 1] as u16) << 8;
+        *word = lo | hi;
+    }
+
+    let mut shifted = [0u16; 16];
+    shifted[..15].copy_from_slice(&words[1..]);
+    shifted[15] = words[0] ^ words[1] ^ words[2] ^ words[3] ^ words[12] ^ words[15];
+
+    for (i, word) in shifted.iter().enumerate() {
+        block[i * 2] = *word as u8;
+        block[i * 2 + 1] = (*word >> 8) as u8;
+    }
+}
+
+fn bc_gost28147_key(key: &[u8; 32]) -> [u32; 8] {
+    let mut out = [0u32; 8];
+    for i in 0..8 {
+        let o = i * 4;
+        out[i] = u32::from_le_bytes([key[o], key[o + 1], key[o + 2], key[o + 3]]);
+    }
+    out
+}
+
+fn bc_gost28147_main_step(sbox: &[u8; 128], n1: u32, key: u32) -> u32 {
+    let cm = key.wrapping_add(n1);
+    let mut om = 0u32;
+    for i in 0..8 {
+        let nibble = ((cm >> (i * 4)) & 0x0f) as usize;
+        om |= (sbox[i * 16 + nibble] as u32) << (i * 4);
+    }
+    om.rotate_left(11)
+}
+
+fn bc_gost28147_encrypt_block(sbox: &[u8; 128], key_bytes: &[u8; 32], input: &[u8]) -> [u8; 8] {
+    let key = bc_gost28147_key(key_bytes);
+    let mut n1 = u32::from_le_bytes([input[0], input[1], input[2], input[3]]);
+    let mut n2 = u32::from_le_bytes([input[4], input[5], input[6], input[7]]);
+
+    for _ in 0..3 {
+        for &k in &key {
+            let tmp = n1;
+            n1 = n2 ^ bc_gost28147_main_step(sbox, n1, k);
+            n2 = tmp;
+        }
+    }
+    for &k in key[1..8].iter().rev() {
+        let tmp = n1;
+        n1 = n2 ^ bc_gost28147_main_step(sbox, n1, k);
+        n2 = tmp;
+    }
+    n2 ^= bc_gost28147_main_step(sbox, n1, key[0]);
+
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&n1.to_le_bytes());
+    out[4..].copy_from_slice(&n2.to_le_bytes());
+    out
+}
+
+fn bc_gost3411_process_block(
+    ctx: &mut dyn NativeContext,
+    digest: ObjectRef,
+    input: ObjectRef,
+    in_off: usize,
+) -> MethodCallResult {
+    if in_off.saturating_add(32) > ctx.array_length(input) {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: in_off.saturating_add(31).min(i32::MAX as usize) as i32,
+        }
+        .into());
+    }
+
+    let mut h = bc_gost3411_read_32(ctx, digest, "H")?;
+    let c = bc_gost3411_read_c(ctx, digest)?;
+    let sbox = bc_gost3411_read_sbox(ctx, digest)?;
+
+    let mut m = [0u8; 32];
+    ctx.read_byte_array_into(input, in_off, &mut m);
+
+    let mut s = [0u8; 32];
+    let mut u = h;
+    let mut v = m;
+    let mut w = [0u8; 32];
+
+    for j in 0..32 {
+        w[j] = u[j] ^ v[j];
+    }
+    let key = bc_gost3411_p(&w);
+    s[0..8].copy_from_slice(&bc_gost28147_encrypt_block(&sbox, &key, &h[0..8]));
+
+    for i in 1..4 {
+        bc_gost3411_a(&mut u);
+        for j in 0..32 {
+            u[j] ^= c[i][j];
+        }
+        bc_gost3411_a(&mut v);
+        bc_gost3411_a(&mut v);
+        for j in 0..32 {
+            w[j] = u[j] ^ v[j];
+        }
+        let key = bc_gost3411_p(&w);
+        let off = i * 8;
+        s[off..off + 8].copy_from_slice(&bc_gost28147_encrypt_block(&sbox, &key, &h[off..off + 8]));
+    }
+
+    for _ in 0..12 {
+        bc_gost3411_fw(&mut s);
+    }
+    for n in 0..32 {
+        s[n] ^= m[n];
+    }
+    bc_gost3411_fw(&mut s);
+    for n in 0..32 {
+        s[n] ^= h[n];
+    }
+    for _ in 0..61 {
+        bc_gost3411_fw(&mut s);
+    }
+    h = s;
+
+    bc_gost3411_write_field(ctx, digest, "M", &m)?;
+    bc_gost3411_write_field(ctx, digest, "S", &s)?;
+    bc_gost3411_write_field(ctx, digest, "U", &u)?;
+    bc_gost3411_write_field(ctx, digest, "V", &v)?;
+    bc_gost3411_write_field(ctx, digest, "W", &w)?;
+    bc_gost3411_write_field(ctx, digest, "H", &h)?;
+    Ok(None)
+}
+
+/// Native fast-path for the GOST R 34.11-94 compression block used by
+/// BouncyCastle's legacy `GOST3411Digest`. The crypto regression suite runs the
+/// million-'a' digest under the standing `org/bouncycastle/*` JIT ban; the Java
+/// block function repeatedly reinitializes `GOST28147Engine` and spends more
+/// than a minute in interpreted byte loops. This keeps the ban intact while
+/// folding just the pure compression block.
+pub(crate) fn register_bc_gost3411_digest(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+
+    r.register(
+        "org/bouncycastle/crypto/digests/GOST3411Digest",
+        "processBlock",
+        "([BI)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let input = obj_arg(args, 1)?;
+            let in_off = match args.get(2) {
+                Some(Value::Int(v)) if *v >= 0 => *v as usize,
+                Some(Value::Int(v)) => {
+                    return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: *v }.into())
+                }
+                _ => 0,
+            };
+            bc_gost3411_process_block(ctx, this, input, in_off)
+        },
+    );
+
+    r.set_category(__prev_cat);
+}
+
+const BC_WHIRLPOOL_SBOX: [u8; 256] = [
+    0x18, 0x23, 0xc6, 0xe8, 0x87, 0xb8, 0x01, 0x4f, 0x36, 0xa6, 0xd2, 0xf5, 0x79, 0x6f, 0x91, 0x52,
+    0x60, 0xbc, 0x9b, 0x8e, 0xa3, 0x0c, 0x7b, 0x35, 0x1d, 0xe0, 0xd7, 0xc2, 0x2e, 0x4b, 0xfe, 0x57,
+    0x15, 0x77, 0x37, 0xe5, 0x9f, 0xf0, 0x4a, 0xda, 0x58, 0xc9, 0x29, 0x0a, 0xb1, 0xa0, 0x6b, 0x85,
+    0xbd, 0x5d, 0x10, 0xf4, 0xcb, 0x3e, 0x05, 0x67, 0xe4, 0x27, 0x41, 0x8b, 0xa7, 0x7d, 0x95, 0xd8,
+    0xfb, 0xee, 0x7c, 0x66, 0xdd, 0x17, 0x47, 0x9e, 0xca, 0x2d, 0xbf, 0x07, 0xad, 0x5a, 0x83, 0x33,
+    0x63, 0x02, 0xaa, 0x71, 0xc8, 0x19, 0x49, 0xd9, 0xf2, 0xe3, 0x5b, 0x88, 0x9a, 0x26, 0x32, 0xb0,
+    0xe9, 0x0f, 0xd5, 0x80, 0xbe, 0xcd, 0x34, 0x48, 0xff, 0x7a, 0x90, 0x5f, 0x20, 0x68, 0x1a, 0xae,
+    0xb4, 0x54, 0x93, 0x22, 0x64, 0xf1, 0x73, 0x12, 0x40, 0x08, 0xc3, 0xec, 0xdb, 0xa1, 0x8d, 0x3d,
+    0x97, 0x00, 0xcf, 0x2b, 0x76, 0x82, 0xd6, 0x1b, 0xb5, 0xaf, 0x6a, 0x50, 0x45, 0xf3, 0x30, 0xef,
+    0x3f, 0x55, 0xa2, 0xea, 0x65, 0xba, 0x2f, 0xc0, 0xde, 0x1c, 0xfd, 0x4d, 0x92, 0x75, 0x06, 0x8a,
+    0xb2, 0xe6, 0x0e, 0x1f, 0x62, 0xd4, 0xa8, 0x96, 0xf9, 0xc5, 0x25, 0x59, 0x84, 0x72, 0x39, 0x4c,
+    0x5e, 0x78, 0x38, 0x8c, 0xd1, 0xa5, 0xe2, 0x61, 0xb3, 0x21, 0x9c, 0x1e, 0x43, 0xc7, 0xfc, 0x04,
+    0x51, 0x99, 0x6d, 0x0d, 0xfa, 0xdf, 0x7e, 0x24, 0x3b, 0xab, 0xce, 0x11, 0x8f, 0x4e, 0xb7, 0xeb,
+    0x3c, 0x81, 0x94, 0xf7, 0xb9, 0x13, 0x2c, 0xd3, 0xe7, 0x6e, 0xc4, 0x03, 0x56, 0x44, 0x7f, 0xa9,
+    0x2a, 0xbb, 0xc1, 0x53, 0xdc, 0x0b, 0x9d, 0x6c, 0x31, 0x74, 0xf6, 0x46, 0xac, 0x89, 0x14, 0xe1,
+    0x16, 0x3a, 0x69, 0x09, 0x70, 0xb6, 0xd0, 0xed, 0xcc, 0x42, 0x98, 0xa4, 0x28, 0x5c, 0xf8, 0x86,
+];
+
+struct BcWhirlpoolTables {
+    c: [[u64; 256]; 8],
+    rc: [u64; 11],
+}
+
+fn bc_whirlpool_tables() -> &'static BcWhirlpoolTables {
+    static TABLES: std::sync::OnceLock<BcWhirlpoolTables> = std::sync::OnceLock::new();
+    TABLES.get_or_init(|| {
+        let mut c = [[0u64; 256]; 8];
+        for (i, &v1) in BC_WHIRLPOOL_SBOX.iter().enumerate() {
+            let v1 = v1 as u32;
+            let v2 = bc_whirlpool_mul_x(v1);
+            let v4 = bc_whirlpool_mul_x(v2);
+            let v5 = v4 ^ v1;
+            let v8 = bc_whirlpool_mul_x(v4);
+            let v9 = v8 ^ v1;
+
+            c[0][i] = bc_whirlpool_pack(v1, v1, v4, v1, v8, v5, v2, v9);
+            c[1][i] = bc_whirlpool_pack(v9, v1, v1, v4, v1, v8, v5, v2);
+            c[2][i] = bc_whirlpool_pack(v2, v9, v1, v1, v4, v1, v8, v5);
+            c[3][i] = bc_whirlpool_pack(v5, v2, v9, v1, v1, v4, v1, v8);
+            c[4][i] = bc_whirlpool_pack(v8, v5, v2, v9, v1, v1, v4, v1);
+            c[5][i] = bc_whirlpool_pack(v1, v8, v5, v2, v9, v1, v1, v4);
+            c[6][i] = bc_whirlpool_pack(v4, v1, v8, v5, v2, v9, v1, v1);
+            c[7][i] = bc_whirlpool_pack(v1, v4, v1, v8, v5, v2, v9, v1);
+        }
+
+        let mut rc = [0u64; 11];
+        for r in 1..=10 {
+            let i = 8 * (r - 1);
+            rc[r] = (c[0][i] & 0xff00_0000_0000_0000)
+                ^ (c[1][i + 1] & 0x00ff_0000_0000_0000)
+                ^ (c[2][i + 2] & 0x0000_ff00_0000_0000)
+                ^ (c[3][i + 3] & 0x0000_00ff_0000_0000)
+                ^ (c[4][i + 4] & 0x0000_0000_ff00_0000)
+                ^ (c[5][i + 5] & 0x0000_0000_00ff_0000)
+                ^ (c[6][i + 6] & 0x0000_0000_0000_ff00)
+                ^ (c[7][i + 7] & 0x0000_0000_0000_00ff);
+        }
+
+        BcWhirlpoolTables { c, rc }
+    })
+}
+
+fn bc_whirlpool_mul_x(input: u32) -> u32 {
+    (input << 1) ^ (0u32.wrapping_sub(input >> 7) & 0x011d)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bc_whirlpool_pack(
+    b7: u32,
+    b6: u32,
+    b5: u32,
+    b4: u32,
+    b3: u32,
+    b2: u32,
+    b1: u32,
+    b0: u32,
+) -> u64 {
+    ((b7 as u64) << 56)
+        ^ ((b6 as u64) << 48)
+        ^ ((b5 as u64) << 40)
+        ^ ((b4 as u64) << 32)
+        ^ ((b3 as u64) << 24)
+        ^ ((b2 as u64) << 16)
+        ^ ((b1 as u64) << 8)
+        ^ b0 as u64
+}
+
+fn bc_whirlpool_bad_state(message: &str) -> MethodCallFailed {
+    RuntimeError::IllegalStateException {
+        message: message.into(),
+    }
+    .into()
+}
+
+fn bc_whirlpool_array_field(
+    ctx: &dyn NativeContext,
+    digest: ObjectRef,
+    field: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    match ctx.get_field_by_name(digest, field) {
+        Value::Object(Some(o)) => Ok(o),
+        _ => Err(bc_whirlpool_bad_state("WhirlpoolDigest: malformed state")),
+    }
+}
+
+fn bc_whirlpool_read_long8(
+    ctx: &dyn NativeContext,
+    digest: ObjectRef,
+    field: &str,
+) -> Result<[u64; 8], MethodCallFailed> {
+    let arr = bc_whirlpool_array_field(ctx, digest, field)?;
+    if ctx.array_length(arr) < 8 {
+        return Err(bc_whirlpool_bad_state("WhirlpoolDigest: short long array"));
+    }
+    let mut out = [0u64; 8];
+    for (i, slot) in out.iter_mut().enumerate() {
+        match ctx.get_array_element(arr, i) {
+            Value::Long(v) => *slot = v as u64,
+            _ => return Err(bc_whirlpool_bad_state("WhirlpoolDigest: bad long array")),
+        }
+    }
+    Ok(out)
+}
+
+fn bc_whirlpool_write_long8(
+    ctx: &mut dyn NativeContext,
+    digest: ObjectRef,
+    field: &str,
+    values: &[u64; 8],
+) -> Result<(), MethodCallFailed> {
+    let arr = bc_whirlpool_array_field(ctx, digest, field)?;
+    if ctx.array_length(arr) < 8 {
+        return Err(bc_whirlpool_bad_state("WhirlpoolDigest: short long array"));
+    }
+    for (i, &value) in values.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Long(value as i64));
+    }
+    Ok(())
+}
+
+fn bc_whirlpool_read_buffer(
+    ctx: &dyn NativeContext,
+    digest: ObjectRef,
+) -> Result<[u8; 64], MethodCallFailed> {
+    let arr = bc_whirlpool_array_field(ctx, digest, "_buffer")?;
+    if ctx.array_length(arr) < 64 {
+        return Err(bc_whirlpool_bad_state("WhirlpoolDigest: short buffer"));
+    }
+    let mut out = [0u8; 64];
+    if ctx.read_byte_array_into(arr, 0, &mut out) != 64 {
+        return Err(bc_whirlpool_bad_state(
+            "WhirlpoolDigest: failed to read buffer",
+        ));
+    }
+    Ok(out)
+}
+
+fn bc_whirlpool_write_buffer(
+    ctx: &mut dyn NativeContext,
+    digest: ObjectRef,
+    buffer: &[u8; 64],
+) -> Result<(), MethodCallFailed> {
+    let arr = bc_whirlpool_array_field(ctx, digest, "_buffer")?;
+    if ctx.array_length(arr) < 64 || !ctx.write_byte_array_from(arr, 0, buffer) {
+        return Err(bc_whirlpool_bad_state(
+            "WhirlpoolDigest: failed to write buffer",
+        ));
+    }
+    Ok(())
+}
+
+fn bc_whirlpool_read_bit_count(
+    ctx: &dyn NativeContext,
+    digest: ObjectRef,
+) -> Result<[u8; 32], MethodCallFailed> {
+    let arr = bc_whirlpool_array_field(ctx, digest, "_bitCount")?;
+    if ctx.array_length(arr) < 32 {
+        return Err(bc_whirlpool_bad_state("WhirlpoolDigest: short bit count"));
+    }
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        match ctx.get_array_element(arr, i) {
+            Value::Int(v) => *slot = v as u8,
+            _ => return Err(bc_whirlpool_bad_state("WhirlpoolDigest: bad bit count")),
+        }
+    }
+    Ok(out)
+}
+
+fn bc_whirlpool_write_bit_count(
+    ctx: &mut dyn NativeContext,
+    digest: ObjectRef,
+    bit_count: &[u8; 32],
+) -> Result<(), MethodCallFailed> {
+    let arr = bc_whirlpool_array_field(ctx, digest, "_bitCount")?;
+    if ctx.array_length(arr) < 32 {
+        return Err(bc_whirlpool_bad_state("WhirlpoolDigest: short bit count"));
+    }
+    for (i, &value) in bit_count.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Int(value as i32));
+    }
+    Ok(())
+}
+
+fn bc_whirlpool_add_bits(bit_count: &mut [u8; 32], bytes: usize) {
+    let mut carry = (bytes as u128) * 8;
+    for slot in bit_count.iter_mut().rev() {
+        let sum = (*slot as u128) + (carry & 0xff);
+        *slot = sum as u8;
+        carry = (carry >> 8) + (sum >> 8);
+        if carry == 0 {
+            break;
+        }
+    }
+}
+
+fn bc_whirlpool_pack_block(buffer: &[u8; 64]) -> [u64; 8] {
+    let mut block = [0u64; 8];
+    for (i, slot) in block.iter_mut().enumerate() {
+        let off = i * 8;
+        *slot = u64::from_be_bytes([
+            buffer[off],
+            buffer[off + 1],
+            buffer[off + 2],
+            buffer[off + 3],
+            buffer[off + 4],
+            buffer[off + 5],
+            buffer[off + 6],
+            buffer[off + 7],
+        ]);
+    }
+    block
+}
+
+fn bc_whirlpool_process_block_inner(
+    hash: &mut [u64; 8],
+    k: &mut [u64; 8],
+    l: &mut [u64; 8],
+    block: &[u64; 8],
+    state: &mut [u64; 8],
+) {
+    let tables = bc_whirlpool_tables();
+    for i in 0..8 {
+        k[i] = hash[i];
+        state[i] = block[i] ^ k[i];
+    }
+
+    for round in 1..=10 {
+        for i in 0..8 {
+            l[i] = tables.c[0][((k[i] >> 56) & 0xff) as usize]
+                ^ tables.c[1][((k[(i + 7) & 7] >> 48) & 0xff) as usize]
+                ^ tables.c[2][((k[(i + 6) & 7] >> 40) & 0xff) as usize]
+                ^ tables.c[3][((k[(i + 5) & 7] >> 32) & 0xff) as usize]
+                ^ tables.c[4][((k[(i + 4) & 7] >> 24) & 0xff) as usize]
+                ^ tables.c[5][((k[(i + 3) & 7] >> 16) & 0xff) as usize]
+                ^ tables.c[6][((k[(i + 2) & 7] >> 8) & 0xff) as usize]
+                ^ tables.c[7][(k[(i + 1) & 7] & 0xff) as usize];
+        }
+        *k = *l;
+        k[0] ^= tables.rc[round];
+
+        for i in 0..8 {
+            l[i] = k[i]
+                ^ tables.c[0][((state[i] >> 56) & 0xff) as usize]
+                ^ tables.c[1][((state[(i + 7) & 7] >> 48) & 0xff) as usize]
+                ^ tables.c[2][((state[(i + 6) & 7] >> 40) & 0xff) as usize]
+                ^ tables.c[3][((state[(i + 5) & 7] >> 32) & 0xff) as usize]
+                ^ tables.c[4][((state[(i + 4) & 7] >> 24) & 0xff) as usize]
+                ^ tables.c[5][((state[(i + 3) & 7] >> 16) & 0xff) as usize]
+                ^ tables.c[6][((state[(i + 2) & 7] >> 8) & 0xff) as usize]
+                ^ tables.c[7][(state[(i + 1) & 7] & 0xff) as usize];
+        }
+        *state = *l;
+    }
+
+    for i in 0..8 {
+        hash[i] ^= state[i] ^ block[i];
+    }
+}
+
+fn bc_whirlpool_write_digest_state(
+    ctx: &mut dyn NativeContext,
+    digest: ObjectRef,
+    hash: &[u64; 8],
+    k: &[u64; 8],
+    l: &[u64; 8],
+    block: &[u64; 8],
+    state: &[u64; 8],
+) -> Result<(), MethodCallFailed> {
+    bc_whirlpool_write_long8(ctx, digest, "_hash", hash)?;
+    bc_whirlpool_write_long8(ctx, digest, "_K", k)?;
+    bc_whirlpool_write_long8(ctx, digest, "_L", l)?;
+    bc_whirlpool_write_long8(ctx, digest, "_block", block)?;
+    bc_whirlpool_write_long8(ctx, digest, "_state", state)?;
+    Ok(())
+}
+
+fn bc_whirlpool_native_process_block(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let mut hash = bc_whirlpool_read_long8(ctx, this, "_hash")?;
+    let mut k = bc_whirlpool_read_long8(ctx, this, "_K")?;
+    let mut l = bc_whirlpool_read_long8(ctx, this, "_L")?;
+    let block = bc_whirlpool_read_long8(ctx, this, "_block")?;
+    let mut state = bc_whirlpool_read_long8(ctx, this, "_state")?;
+    bc_whirlpool_process_block_inner(&mut hash, &mut k, &mut l, &block, &mut state);
+    bc_whirlpool_write_digest_state(ctx, this, &hash, &k, &l, &block, &state)?;
+    Ok(None)
+}
+
+fn bc_whirlpool_native_update_array(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let input = obj_arg(args, 1)?;
+    let in_off_i = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let len_i = match args.get(3) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    if len_i <= 0 {
+        return Ok(None);
+    }
+    if in_off_i < 0 {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: in_off_i }.into());
+    }
+    let in_off = in_off_i as usize;
+    let len = len_i as usize;
+    if in_off.saturating_add(len) > ctx.array_length(input) {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: in_off.saturating_add(len).min(i32::MAX as usize) as i32,
+        }
+        .into());
+    }
+
+    let mut data = vec![0u8; len];
+    ctx.read_byte_array_into(input, in_off, &mut data);
+
+    let mut buffer = bc_whirlpool_read_buffer(ctx, this)?;
+    let mut buffer_pos = match ctx.get_field_by_name(this, "_bufferPos") {
+        Value::Int(v) if (0..=64).contains(&v) => v as usize,
+        _ => {
+            return Err(bc_whirlpool_bad_state(
+                "WhirlpoolDigest: bad buffer position",
+            ))
+        }
+    };
+    let mut bit_count = bc_whirlpool_read_bit_count(ctx, this)?;
+    let mut hash = bc_whirlpool_read_long8(ctx, this, "_hash")?;
+    let mut k = bc_whirlpool_read_long8(ctx, this, "_K")?;
+    let mut l = bc_whirlpool_read_long8(ctx, this, "_L")?;
+    let mut block = bc_whirlpool_read_long8(ctx, this, "_block")?;
+    let mut state = bc_whirlpool_read_long8(ctx, this, "_state")?;
+
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let to_copy = (64 - buffer_pos).min(data.len() - pos);
+        buffer[buffer_pos..buffer_pos + to_copy].copy_from_slice(&data[pos..pos + to_copy]);
+        buffer_pos += to_copy;
+        pos += to_copy;
+
+        if buffer_pos == 64 {
+            block = bc_whirlpool_pack_block(&buffer);
+            bc_whirlpool_process_block_inner(&mut hash, &mut k, &mut l, &block, &mut state);
+            buffer_pos = 0;
+            buffer = [0u8; 64];
+        }
+    }
+
+    bc_whirlpool_add_bits(&mut bit_count, len);
+    bc_whirlpool_write_buffer(ctx, this, &buffer)?;
+    ctx.set_field_by_name(this, "_bufferPos", Value::Int(buffer_pos as i32));
+    bc_whirlpool_write_bit_count(ctx, this, &bit_count)?;
+    bc_whirlpool_write_digest_state(ctx, this, &hash, &k, &l, &block, &state)?;
+    Ok(None)
+}
+
+/// Native fast-path for BouncyCastle's table-based Whirlpool digest. Its
+/// `update(byte[], int, int)` implementation feeds large inputs through a
+/// byte-at-a-time interpreted loop under the BC JIT ban, so the million-'a'
+/// vector is dominated by VM dispatch rather than the digest itself.
+pub(crate) fn register_bc_whirlpool_digest(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+
+    let cls = "org/bouncycastle/crypto/digests/WhirlpoolDigest";
+    r.register(
+        cls,
+        "processBlock",
+        "()V",
+        bc_whirlpool_native_process_block,
+    );
+    r.register(cls, "update", "([BII)V", bc_whirlpool_native_update_array);
+
+    r.set_category(__prev_cat);
+}
+
+fn bc_poly1305_bad_state(message: &str) -> MethodCallFailed {
+    RuntimeError::IllegalStateException {
+        message: message.into(),
+    }
+    .into()
+}
+
+fn bc_poly1305_i32(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    field: &str,
+) -> Result<u32, MethodCallFailed> {
+    match ctx.get_field_by_name(this, field) {
+        Value::Int(v) => Ok(v as u32),
+        _ => Err(bc_poly1305_bad_state("Poly1305: malformed integer state")),
+    }
+}
+
+fn bc_poly1305_set_i32(ctx: &mut dyn NativeContext, this: ObjectRef, field: &str, value: u32) {
+    ctx.set_field_by_name(this, field, Value::Int(value as i32));
+}
+
+fn bc_poly1305_block(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    match ctx.get_field_by_name(this, "currentBlock") {
+        Value::Object(Some(o)) if ctx.array_length(o) >= 16 => Ok(o),
+        _ => Err(bc_poly1305_bad_state("Poly1305: malformed current block")),
+    }
+}
+
+fn bc_poly1305_read_block(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> Result<[u8; 16], MethodCallFailed> {
+    let arr = bc_poly1305_block(ctx, this)?;
+    let mut out = [0u8; 16];
+    if ctx.read_byte_array_into(arr, 0, &mut out) != 16 {
+        return Err(bc_poly1305_bad_state("Poly1305: failed to read block"));
+    }
+    Ok(out)
+}
+
+fn bc_poly1305_write_block(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    block: &[u8; 16],
+) -> Result<(), MethodCallFailed> {
+    let arr = bc_poly1305_block(ctx, this)?;
+    if !ctx.write_byte_array_from(arr, 0, block) {
+        return Err(bc_poly1305_bad_state("Poly1305: failed to write block"));
+    }
+    Ok(())
+}
+
+fn bc_poly1305_load_state(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> Result<([u32; 5], [u32; 5], [u32; 4]), MethodCallFailed> {
+    let h = [
+        bc_poly1305_i32(ctx, this, "h0")?,
+        bc_poly1305_i32(ctx, this, "h1")?,
+        bc_poly1305_i32(ctx, this, "h2")?,
+        bc_poly1305_i32(ctx, this, "h3")?,
+        bc_poly1305_i32(ctx, this, "h4")?,
+    ];
+    let r = [
+        bc_poly1305_i32(ctx, this, "r0")?,
+        bc_poly1305_i32(ctx, this, "r1")?,
+        bc_poly1305_i32(ctx, this, "r2")?,
+        bc_poly1305_i32(ctx, this, "r3")?,
+        bc_poly1305_i32(ctx, this, "r4")?,
+    ];
+    let k = [
+        bc_poly1305_i32(ctx, this, "k0")?,
+        bc_poly1305_i32(ctx, this, "k1")?,
+        bc_poly1305_i32(ctx, this, "k2")?,
+        bc_poly1305_i32(ctx, this, "k3")?,
+    ];
+    Ok((h, [r[0], r[1], r[2], r[3], r[4]], [k[0], k[1], k[2], k[3]]))
+}
+
+fn bc_poly1305_store_h(ctx: &mut dyn NativeContext, this: ObjectRef, h: &[u32; 5]) {
+    bc_poly1305_set_i32(ctx, this, "h0", h[0]);
+    bc_poly1305_set_i32(ctx, this, "h1", h[1]);
+    bc_poly1305_set_i32(ctx, this, "h2", h[2]);
+    bc_poly1305_set_i32(ctx, this, "h3", h[3]);
+    bc_poly1305_set_i32(ctx, this, "h4", h[4]);
+}
+
+fn bc_poly1305_le_u32(block: &[u8; 16], off: usize) -> u64 {
+    u32::from_le_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]]) as u64
+}
+
+fn bc_poly1305_process_block_inner(
+    h: &mut [u32; 5],
+    r: &[u32; 5],
+    s: &[u32; 5],
+    block: &[u8; 16],
+    full: bool,
+) {
+    let t0 = bc_poly1305_le_u32(block, 0);
+    let t1 = bc_poly1305_le_u32(block, 4);
+    let t2 = bc_poly1305_le_u32(block, 8);
+    let t3 = bc_poly1305_le_u32(block, 12);
+
+    h[0] = h[0].wrapping_add((t0 & 0x03ff_ffff) as u32);
+    h[1] = h[1].wrapping_add((((t1 << 32) | t0) >> 26 & 0x03ff_ffff) as u32);
+    h[2] = h[2].wrapping_add((((t2 << 32) | t1) >> 20 & 0x03ff_ffff) as u32);
+    h[3] = h[3].wrapping_add((((t3 << 32) | t2) >> 14 & 0x03ff_ffff) as u32);
+    h[4] = h[4].wrapping_add((t3 >> 8) as u32);
+    if full {
+        h[4] = h[4].wrapping_add(1 << 24);
+    }
+
+    let m = |a: u32, b: u32| -> u64 { (a as u64) * (b as u64) };
+    let tp0 = m(h[0], r[0]) + m(h[1], s[4]) + m(h[2], s[3]) + m(h[3], s[2]) + m(h[4], s[1]);
+    let mut tp1 = m(h[0], r[1]) + m(h[1], r[0]) + m(h[2], s[4]) + m(h[3], s[3]) + m(h[4], s[2]);
+    let mut tp2 = m(h[0], r[2]) + m(h[1], r[1]) + m(h[2], r[0]) + m(h[3], s[4]) + m(h[4], s[3]);
+    let mut tp3 = m(h[0], r[3]) + m(h[1], r[2]) + m(h[2], r[1]) + m(h[3], r[0]) + m(h[4], s[4]);
+    let mut tp4 = m(h[0], r[4]) + m(h[1], r[3]) + m(h[2], r[2]) + m(h[3], r[1]) + m(h[4], r[0]);
+
+    h[0] = (tp0 as u32) & 0x03ff_ffff;
+    tp1 += tp0 >> 26;
+    h[1] = (tp1 as u32) & 0x03ff_ffff;
+    tp2 += tp1 >> 26;
+    h[2] = (tp2 as u32) & 0x03ff_ffff;
+    tp3 += tp2 >> 26;
+    h[3] = (tp3 as u32) & 0x03ff_ffff;
+    tp4 += tp3 >> 26;
+    h[4] = (tp4 as u32) & 0x03ff_ffff;
+    h[0] = h[0].wrapping_add(((tp4 >> 26) as u32).wrapping_mul(5));
+    h[1] = h[1].wrapping_add(h[0] >> 26);
+    h[0] &= 0x03ff_ffff;
+}
+
+fn bc_poly1305_native_update(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let input = obj_arg(args, 1)?;
+    let in_off_i = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let len_i = match args.get(3) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    if len_i <= 0 {
+        return Ok(None);
+    }
+    if in_off_i < 0 {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: in_off_i }.into());
+    }
+    let in_off = in_off_i as usize;
+    let len = len_i as usize;
+    if in_off.saturating_add(len) > ctx.array_length(input) {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: in_off.saturating_add(len).min(i32::MAX as usize) as i32,
+        }
+        .into());
+    }
+
+    let mut data = vec![0u8; len];
+    ctx.read_byte_array_into(input, in_off, &mut data);
+    let (mut h, r, k) = bc_poly1305_load_state(ctx, this)?;
+    let s = [
+        0,
+        r[1].wrapping_mul(5),
+        r[2].wrapping_mul(5),
+        r[3].wrapping_mul(5),
+        r[4].wrapping_mul(5),
+    ];
+    let mut block = bc_poly1305_read_block(ctx, this)?;
+    let mut block_off = match ctx.get_field_by_name(this, "currentBlockOffset") {
+        Value::Int(v) if (0..=16).contains(&v) => v as usize,
+        _ => return Err(bc_poly1305_bad_state("Poly1305: bad block offset")),
+    };
+
+    let mut pos = 0usize;
+    while pos < data.len() {
+        if block_off == 16 {
+            bc_poly1305_process_block_inner(&mut h, &r, &s, &block, true);
+            block_off = 0;
+        }
+        let to_copy = (16 - block_off).min(data.len() - pos);
+        block[block_off..block_off + to_copy].copy_from_slice(&data[pos..pos + to_copy]);
+        block_off += to_copy;
+        pos += to_copy;
+        if block_off == 16 {
+            bc_poly1305_process_block_inner(&mut h, &r, &s, &block, true);
+            block_off = 0;
+        }
+    }
+
+    let _ = k;
+    bc_poly1305_store_h(ctx, this, &h);
+    bc_poly1305_write_block(ctx, this, &block)?;
+    ctx.set_field_by_name(this, "currentBlockOffset", Value::Int(block_off as i32));
+    Ok(None)
+}
+
+fn bc_poly1305_native_do_final(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let out_arr = obj_arg(args, 1)?;
+    let out_off_i = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    if out_off_i < 0 {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: out_off_i }.into());
+    }
+    let out_off = out_off_i as usize;
+    if out_off.saturating_add(16) > ctx.array_length(out_arr) {
+        return Err(bc_gost_throw_crypto_exception(
+            ctx,
+            "org/bouncycastle/crypto/OutputLengthException",
+            "Output buffer is too short.",
+        ));
+    }
+
+    let (mut h, r, k) = bc_poly1305_load_state(ctx, this)?;
+    let s = [
+        0,
+        r[1].wrapping_mul(5),
+        r[2].wrapping_mul(5),
+        r[3].wrapping_mul(5),
+        r[4].wrapping_mul(5),
+    ];
+    let mut block = bc_poly1305_read_block(ctx, this)?;
+    let block_off = match ctx.get_field_by_name(this, "currentBlockOffset") {
+        Value::Int(v) if (0..=16).contains(&v) => v as usize,
+        _ => return Err(bc_poly1305_bad_state("Poly1305: bad block offset")),
+    };
+    if block_off > 0 {
+        if block_off < 16 {
+            block[block_off] = 1;
+            for b in &mut block[block_off + 1..] {
+                *b = 0;
+            }
+        }
+        bc_poly1305_process_block_inner(&mut h, &r, &s, &block, block_off == 16);
+    }
+
+    h[1] = h[1].wrapping_add(h[0] >> 26);
+    h[0] &= 0x03ff_ffff;
+    h[2] = h[2].wrapping_add(h[1] >> 26);
+    h[1] &= 0x03ff_ffff;
+    h[3] = h[3].wrapping_add(h[2] >> 26);
+    h[2] &= 0x03ff_ffff;
+    h[4] = h[4].wrapping_add(h[3] >> 26);
+    h[3] &= 0x03ff_ffff;
+    h[0] = h[0].wrapping_add((h[4] >> 26).wrapping_mul(5));
+    h[4] &= 0x03ff_ffff;
+    h[1] = h[1].wrapping_add(h[0] >> 26);
+    h[0] &= 0x03ff_ffff;
+
+    let mut g0 = h[0].wrapping_add(5);
+    let mut b = g0 >> 26;
+    g0 &= 0x03ff_ffff;
+    let mut g1 = h[1].wrapping_add(b);
+    b = g1 >> 26;
+    g1 &= 0x03ff_ffff;
+    let mut g2 = h[2].wrapping_add(b);
+    b = g2 >> 26;
+    g2 &= 0x03ff_ffff;
+    let mut g3 = h[3].wrapping_add(b);
+    b = g3 >> 26;
+    g3 &= 0x03ff_ffff;
+    let g4 = h[4].wrapping_add(b).wrapping_sub(1 << 26);
+
+    let mask = (g4 >> 31).wrapping_sub(1);
+    let nmask = !mask;
+    h[0] = (h[0] & nmask) | (g0 & mask);
+    h[1] = (h[1] & nmask) | (g1 & mask);
+    h[2] = (h[2] & nmask) | (g2 & mask);
+    h[3] = (h[3] & nmask) | (g3 & mask);
+    h[4] = (h[4] & nmask) | (g4 & mask);
+
+    let mut f0 = (((h[0] | (h[1] << 26)) as u64) & 0xffff_ffff) + k[0] as u64;
+    let mut f1 = ((((h[1] >> 6) | (h[2] << 20)) as u64) & 0xffff_ffff) + k[1] as u64;
+    let mut f2 = ((((h[2] >> 12) | (h[3] << 14)) as u64) & 0xffff_ffff) + k[2] as u64;
+    let mut f3 = ((((h[3] >> 18) | (h[4] << 8)) as u64) & 0xffff_ffff) + k[3] as u64;
+
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&(f0 as u32).to_le_bytes());
+    f1 += f0 >> 32;
+    out[4..8].copy_from_slice(&(f1 as u32).to_le_bytes());
+    f2 += f1 >> 32;
+    out[8..12].copy_from_slice(&(f2 as u32).to_le_bytes());
+    f3 += f2 >> 32;
+    out[12..16].copy_from_slice(&(f3 as u32).to_le_bytes());
+    ctx.write_byte_array_from(out_arr, out_off, &out);
+
+    for field in ["h0", "h1", "h2", "h3", "h4"] {
+        bc_poly1305_set_i32(ctx, this, field, 0);
+    }
+    ctx.set_field_by_name(this, "currentBlockOffset", Value::Int(0));
+    Ok(Some(Value::Int(16)))
+}
+
+/// Native Poly1305 accumulator/update/finalization. BC's key setup remains in
+/// Java, but the block arithmetic and byte buffering are hot under the package
+/// JIT ban and feed both standalone Poly1305 and ChaCha20-Poly1305 tests.
+pub(crate) fn register_bc_poly1305(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+    let cls = "org/bouncycastle/crypto/macs/Poly1305";
+    r.register(cls, "update", "([BII)V", bc_poly1305_native_update);
+    r.register(cls, "doFinal", "([BI)I", bc_poly1305_native_do_final);
+    r.set_category(__prev_cat);
+}
+
 fn bc_digest_random_bad_state(message: &str) -> MethodCallFailed {
     RuntimeError::IllegalStateException {
         message: message.into(),
