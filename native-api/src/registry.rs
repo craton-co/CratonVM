@@ -2082,6 +2082,37 @@ pub trait NativeContext {
         self.invoke_virtual(receiver, method_name, descriptor, args)
     }
 
+    /// Invoke a virtual method on `receiver`, skipping the native-override
+    /// check entirely so a registered Rust native for this exact
+    /// (class, method, descriptor) triple is NOT re-entered — dispatch goes
+    /// straight to the receiver's real JDK bytecode.
+    ///
+    /// This exists for natives that must distinguish a genuinely-real object
+    /// from a same-named synthetic one by *instance* state rather than by
+    /// class name (registration is static/global and can't make that call).
+    /// The canonical example is `ThreadPoolExecutor.execute`/`submit`/
+    /// `shutdown`: CratonVM's synthetic `Executors.newSingleThreadExecutor()`
+    /// et al. stamp their 2-field placeholder with the REAL `ThreadPoolExecutor`
+    /// class name, so a real executor (e.g. the internal async worker pool in
+    /// `native-builtins`) and a synthetic one are indistinguishable by class
+    /// name alone. The native override checks `executor_has_real_workers`
+    /// per-instance and calls this method for a real receiver instead of
+    /// recursing back into itself via [`Self::invoke_virtual`] (which would
+    /// hit the same native registration again and loop forever).
+    ///
+    /// Default implementation falls back to [`Self::invoke_virtual`] — safe
+    /// for any context that has no such real/synthetic ambiguity to resolve
+    /// (mocks, tests, other native contexts).
+    fn invoke_virtual_bytecode_only(
+        &mut self,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        self.invoke_virtual(receiver, method_name, descriptor, args)
+    }
+
     /// Invoke a method with invokespecial semantics — *exactly* the resolved
     /// method on `class_name`, with no virtual dispatch and no interface
     /// retarget to the receiver's concrete class.
@@ -3198,24 +3229,25 @@ impl NativeMethodRegistry {
         {
             return;
         }
-        // Real-JDK mode: drop the synthetic `ThreadPoolExecutor` lifecycle/stat
-        // natives (`shutdownNow`, `shutdown`, `isShutdown`, `isTerminated`,
-        // `awaitTermination`, `getPoolSize`, `getActiveCount`, …). They assume a
-        // fake 2-field layout (`poolSize=0`, `isShutdown=1`) and, on a *real*
-        // `ThreadPoolExecutor`, corrupt slot 0/1 and lie. Critically, the
-        // synthetic `shutdownNow` returns an empty list WITHOUT interrupting the
-        // pool's worker threads — so a real worker blocked in
-        // `getTask()`/`BlockingQueue.take()` never terminates and a non-daemon
-        // executor (e.g. JUnit's `@Timeout(SEPARATE_THREAD)` preemptive-timeout
-        // executor) keeps the VM alive past `main()` (false "hang"). The real
-        // `ThreadPoolExecutor` bytecode runs end-to-end on CratonVM
-        // (submit/execute/addWorker/runWorker/getTask), so dropping these lets
-        // `shutdownNow` interrupt workers correctly. See `drop_real_layout_synthetic`.
-        if self.drop_real_layout_synthetic
-            && class_name == "java/util/concurrent/ThreadPoolExecutor"
-        {
-            return;
-        }
+        // NOTE: real-JDK mode used to drop EVERY native registered directly on
+        // `java/util/concurrent/ThreadPoolExecutor` here (submit/execute/
+        // shutdown included), on the theory that only genuinely-real
+        // `ThreadPoolExecutor` instances carry that class name. That's false:
+        // `Executors.newSingleThreadExecutor()`/`newFixedThreadPool()`/
+        // `newCachedThreadPool()` (registered on `Executors` below) also stamp
+        // their synthetic 2-field return object with this exact class name
+        // (see `alloc_concurrent_synthetic` call sites in
+        // `register_executor_natives`), so a class-name-keyed drop can't tell
+        // the two apart — it silently starved the synthetic objects' own
+        // `execute()`/`submit()` overrides too, sending them straight to real
+        // JDK bytecode that dereferences an uninitialized `ctl`
+        // (`AtomicInteger`) field and NPEs
+        // (`threadpoolexecutor-execute-npe-on-ctl-regression.md`). The
+        // real-vs-synthetic distinction now happens per-*instance*, inside
+        // `native_es_execute`/`native_es_submit_*`/the `shutdown` closures
+        // (`executor_has_real_workers`), which forward to real bytecode via
+        // `NativeContext::invoke_virtual_bytecode_only` for a genuinely-real
+        // receiver instead of relying on this registration-time filter.
         let key = native_method_hash(class_name, method_name, descriptor);
         // With 128-bit composite keys, collisions on our keyspace are
         // vanishingly unlikely. We keep a cheap `debug_assert!` as

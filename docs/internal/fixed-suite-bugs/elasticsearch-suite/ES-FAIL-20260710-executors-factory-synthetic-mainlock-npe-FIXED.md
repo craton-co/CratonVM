@@ -1,5 +1,41 @@
 # ES FAIL - Executors.newFixedThreadPool/newCachedThreadPool/newSingleThreadExecutor synthesize half-real objects; real shutdown()/submit() NPE on null mainLock/ctl
 
+Status: RESOLVED (2026-07-10) — Layer 2 fixed. Moved to `docs/internal/fixed-suite-bugs/`.
+
+## 2026-07-10 update (later same day) — Layer 2 fixed, via this doc's own suggested option 2
+
+A separate, parallel investigation (originally chasing
+`docs/known-issues/wildfly-domain-heap-corrupt-value-timeout.md`'s gating
+`ThreadPoolExecutor.execute()` NPE) independently converged on this exact
+same root cause and this doc's own "Suggested fix direction" option 2: move
+the `drop_real_layout_synthetic` real-vs-synthetic distinction from
+registration time (a per-*class* gate that can't see per-*object* state) to
+dispatch time.
+
+**Fix**, on branch `fix/wildfly-hib32-gate-20260710` (see
+`docs/internal/fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`
+for the full writeup):
+1. Removed the `class_name == "java/util/concurrent/ThreadPoolExecutor"`
+   registration-time drop from `NativeMethodRegistry::register()` entirely.
+2. Added `NativeContext::invoke_virtual_bytecode_only` — a real
+   bytecode-only dispatch escape hatch (calls `interpreter::execute`
+   directly, bypassing every native check, not just the primary one) — so
+   `native_es_execute`/`native_es_submit_*`/the `shutdown` closures can check
+   `executor_has_real_workers()` **per instance** at call time and forward a
+   genuinely-real receiver to real bytecode instead of relying on the
+   registration-time gate.
+
+**Verified** with this doc's own exact repro (`newFixedThreadPool(4)`,
+`submit(Runnable)`, `shutdown()`) against
+`cratonvm-wildfly-hib32-gate-20260710.exe`: no NPE, task runs, `getClass()`
+still correctly reports `java.util.concurrent.ThreadPoolExecutor`, clean
+exit. Also verified a genuinely-real `new ThreadPoolExecutor(...)` still
+gets real bytecode end-to-end (`execute()` on a real worker thread,
+`shutdown()`/`awaitTermination()` complete normally) — the original
+`drop_real_layout_synthetic` intent this doc's Layer 2 conflicted with.
+
+Old status (superseded, kept for history):
+
 Status: OPEN (partially fixed — see "What was fixed" below)
 
 Found: 2026-07-10, while retiring 3 `findNative`-crash-family docs for

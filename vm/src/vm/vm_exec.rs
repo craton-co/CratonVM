@@ -6552,6 +6552,53 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
+    fn invoke_virtual_bytecode_only(
+        &mut self,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        // Call straight into `interpreter::execute` — the actual "just run
+        // this bytecode, no native check" primitive that
+        // `invoke_on_class_shared_inner` itself falls back to once it has
+        // decided native doesn't apply. `invoke_on_class_shared` is NOT
+        // sufficient here: besides its primary `check_override` gate (which
+        // IS skipped for an ordinary concrete method like
+        // `ThreadPoolExecutor.execute`/`submit`/`shutdown`), it has a
+        // SECOND, unconditional native-registry check for any non-interface
+        // declaring class (`override_cb` in `invoke_on_class_shared_inner`,
+        // vm_exec.rs) that re-finds this exact native regardless of the
+        // first gate — routing through `invoke_on_class_shared` reintroduced
+        // infinite recursion (confirmed via a depth-counter probe: `execute`
+        // called itself on the same receiver until the native stack
+        // overflowed) instead of actually reaching bytecode.
+        let receiver = self.shared.heap.load_and_forward(receiver);
+        let class_id = self.shared.heap.class_id_of(receiver);
+        let declaring_class_id = {
+            let cm = self.shared.class_manager.read();
+            crate::classloading::find_method_recursive(
+                class_id,
+                method_name,
+                descriptor,
+                &cm.class_store,
+            )
+            .map(|(_, declaring_id)| declaring_id)
+            .unwrap_or(class_id)
+        };
+        let mut full_args = Vec::with_capacity(1 + args.len());
+        full_args.push(Value::Object(Some(receiver)));
+        full_args.extend_from_slice(args);
+        crate::runtime::interpreter::execute(
+            self.shared,
+            self.thread,
+            declaring_class_id,
+            method_name,
+            descriptor,
+            &full_args,
+        )
+    }
+
     fn class_annotations(&self, class_id: ClassId) -> Vec<crate::native::registry::AnnotationData> {
         let cm = self.shared.class_manager.read();
         let class = match cm.get_class(class_id) {

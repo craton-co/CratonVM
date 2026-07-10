@@ -57040,10 +57040,16 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        // Real ThreadPoolExecutor: don't write the synthetic shutdown slot
-        // (would corrupt a real field); its idle workers are stopped by
-        // shutdownNow() (which ExecutorService.close()/cleanup also calls).
-        if !executor_has_real_workers(ctx, this) {
+        // Real ThreadPoolExecutor: run the real bytecode so the pool's own
+        // shutdown state machine transitions correctly, instead of writing
+        // the synthetic 2-field placeholder's shutdown slot (would corrupt a
+        // real field) or silently no-op'ing. See
+        // `NativeContext::invoke_virtual_bytecode_only`'s doc for why this
+        // can't just re-call `execute`/`shutdown` via `invoke_virtual` (would
+        // recurse back into this same native).
+        if executor_has_real_workers(ctx, this) {
+            ctx.invoke_virtual_bytecode_only(this, "shutdown", "()V", &[])?;
+        } else {
             ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
         }
         Ok(None)
@@ -57082,10 +57088,16 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        // Real ThreadPoolExecutor: don't write the synthetic shutdown slot
-        // (would corrupt a real field); its idle workers are stopped by
-        // shutdownNow() (which ExecutorService.close()/cleanup also calls).
-        if !executor_has_real_workers(ctx, this) {
+        // Real ThreadPoolExecutor: run the real bytecode so the pool's own
+        // shutdown state machine transitions correctly, instead of writing
+        // the synthetic 2-field placeholder's shutdown slot (would corrupt a
+        // real field) or silently no-op'ing. See
+        // `NativeContext::invoke_virtual_bytecode_only`'s doc for why this
+        // can't just re-call `execute`/`shutdown` via `invoke_virtual` (would
+        // recurse back into this same native).
+        if executor_has_real_workers(ctx, this) {
+            ctx.invoke_virtual_bytecode_only(this, "shutdown", "()V", &[])?;
+        } else {
             ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
         }
         Ok(None)
@@ -57259,6 +57271,22 @@ fn native_new_cached_pool(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
 }
 
 fn native_es_submit_runnable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A genuinely-real ThreadPoolExecutor (e.g. one `new`'d directly by app
+    // code, or the internal async worker pool below) shares this exact class
+    // name with CratonVM's synthetic 2-field placeholder — dispatch straight
+    // to its real bytecode instead of the single-threaded synthetic model, via
+    // `invoke_virtual_bytecode_only` (plain `invoke_virtual` would recurse
+    // back into this same native). See that method's doc for the rationale.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if executor_has_real_workers(ctx, *this) {
+            return ctx.invoke_virtual_bytecode_only(
+                *this,
+                "submit",
+                "(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;",
+                &args[1..],
+            );
+        }
+    }
     // Execute the Runnable immediately (single-threaded model)
     if let Some(Value::Object(Some(runnable))) = args.get(1) {
         let _ = ctx.invoke_virtual(*runnable, "run", "()V", &[]);
@@ -57270,6 +57298,17 @@ fn native_es_submit_runnable(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn native_es_submit_callable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // See `native_es_submit_runnable` above — same real-vs-synthetic split.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if executor_has_real_workers(ctx, *this) {
+            return ctx.invoke_virtual_bytecode_only(
+                *this,
+                "submit",
+                "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
+                &args[1..],
+            );
+        }
+    }
     let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2);
     if let Some(Value::Object(Some(callable))) = args.get(1) {
         let result = ctx.invoke_virtual(*callable, "call", "()Ljava/lang/Object;", &[])?;
@@ -57284,15 +57323,35 @@ fn native_es_submit_callable(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn native_es_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A genuinely-real ThreadPoolExecutor shares this exact class name with
+    // CratonVM's synthetic 2-field placeholder (`Executors.newSingleThreadExecutor()`
+    // et al., AND the internal async worker pool this function itself hands
+    // work to below) — dispatch straight to real bytecode instead of the
+    // synthetic model. This is also what breaks the recursion: the async
+    // pool's own `execute()` call (via `spawn_runnable_on_real_thread` below)
+    // lands right back on this native, since its receiver's class is also
+    // "ThreadPoolExecutor" — routing it to `invoke_virtual_bytecode_only`
+    // (which skips native lookup) instead of looping back through
+    // `invoke_virtual`/this native again. See that method's doc for the
+    // full rationale.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if executor_has_real_workers(ctx, *this) {
+            return ctx.invoke_virtual_bytecode_only(
+                *this,
+                "execute",
+                "(Ljava/lang/Runnable;)V",
+                &args[1..],
+            );
+        }
+    }
     // HANGS-0706b: `Executor.execute(Runnable)` is a fire-and-forget contract --
     // callers are entitled to assume the submitted task runs independently of
     // the calling thread. The prior eager-inline body (`runnable.run()` on the
     // caller) silently violated that contract for every executor created via
     // `Executors.newSingleThreadExecutor()` / `newFixedThreadPool()` /
-    // `newCachedThreadPool()` (the only factories intercepted here -- see
-    // `native_new_single_thread` et al., always CratonVM's synthetic 2-field
-    // executor, never a real `ThreadPoolExecutor`). Any task that blocks
-    // waiting for a signal only the SUBMITTING thread can later deliver -- e.g.
+    // `newCachedThreadPool()` (CratonVM's synthetic 2-field executor). Any
+    // task that blocks waiting for a signal only the SUBMITTING thread can
+    // later deliver -- e.g.
     // Spring's `OutputStreamPublisher`/`SubscriberInputStream` Flow adapters,
     // whose `LockSupport.park()`/`resume()` handshake assumes the publisher
     // body runs on a thread other than the one calling `subscribe()` -- self-
