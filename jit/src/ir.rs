@@ -2964,6 +2964,7 @@ mod tests {
             ldc2w_ops: vec![],
             indy_ops: vec![],
             has_athrow: false,
+            has_newarray: false,
             ldc_ops: vec![],
         };
         assert!(ir_compatible(&scan));
@@ -2986,6 +2987,7 @@ mod tests {
             ldc2w_ops: vec![],
             indy_ops: vec![],
             has_athrow: false,
+            has_newarray: false,
             ldc_ops: vec![],
         };
         assert!(ir_compatible(&scan));
@@ -3008,6 +3010,7 @@ mod tests {
             ldc2w_ops: vec![],
             indy_ops: vec![],
             has_athrow: false,
+            has_newarray: false,
             ldc_ops: vec![],
         };
         // Too many invokes.
@@ -3035,6 +3038,7 @@ mod tests {
             ldc2w_ops: vec![],
             indy_ops: vec![],
             has_athrow: false,
+            has_newarray: false,
             ldc_ops: vec![],
         };
         assert!(ir_compatible_sized(&scan, 200));
@@ -3063,6 +3067,7 @@ mod tests {
             ldc2w_ops: vec![],
             indy_ops: vec![(0, 1)],
             has_athrow: false,
+            has_newarray: false,
             ldc_ops: vec![],
         };
         assert!(

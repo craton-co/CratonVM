@@ -13283,6 +13283,11 @@ fn invoke_on_class_shared_inner(
                             class_name,
                             method_name,
                             descriptor,
+                        )
+                        || crate::runtime::interpreter::is_bc_crypto_math_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
                         );
                     if check_override
                         && shared
