@@ -3559,6 +3559,53 @@ fn randomized_thread_group(ctx: &mut dyn NativeContext, thread: ObjectRef) -> Me
     ctx.invoke_virtual(thread, "getThreadGroup", "()Ljava/lang/ThreadGroup;", &[])
 }
 
+/// Best-effort thread name for the `IllegalStateException` messages below —
+/// mirrors `com.carrotsearch.randomizedtesting.Threads.threadName(Thread)`
+/// closely enough for a human-readable diagnostic; exact wording doesn't
+/// matter for correctness (only the exception *class* does, see below).
+fn randomized_thread_name(ctx: &mut dyn NativeContext, thread: ObjectRef) -> String {
+    match ctx.invoke_virtual(thread, "getName", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(name)))) => {
+            ctx.read_string(name).unwrap_or_else(|| "<unknown>".to_string())
+        }
+        _ => "<unknown>".to_string(),
+    }
+}
+
+/// `RandomizedContext.context(Thread)` never returns null in real-JDK
+/// bytecode — a missing context is always an `IllegalStateException` (see
+/// the decompiled `context(Thread)` bytecode this mirrors). Callers such as
+/// `AssertingCodec.<init>` (Lucene test framework) rely on that: they wrap
+/// `RandomizedContext.current().getTargetClass()` in
+/// `catch (IllegalStateException e) { targetClass = null; }` to tolerate
+/// running outside a randomized-test thread (e.g. from a static class
+/// initializer). Returning a plain `null` here instead of throwing skips
+/// that catch block — the very next `invokevirtual getTargetClass()` then
+/// NPEs on the null receiver, and the *wrong* exception type propagates
+/// uncaught out of the static initializer as `ExceptionInInitializerError`,
+/// crashing test classes that would otherwise gracefully no-op (e.g.
+/// `ES815BitFlatVectorFormatTests` and the other ES93 BFloat16 vector codec
+/// tests during `<clinit>`).
+fn randomized_no_context_error(
+    ctx: &mut dyn NativeContext,
+    thread: ObjectRef,
+    terminated: bool,
+) -> MethodCallFailed {
+    let thread_name = randomized_thread_name(ctx, thread);
+    let message = if terminated {
+        format!("No context for a terminated thread: {thread_name}")
+    } else {
+        format!(
+            "No context information for thread: {thread_name}. Is this thread running under a \
+             RandomizedRunner runner context? Add @RunWith(RandomizedRunner.class) to your test \
+             class. Make sure your code accesses random contexts within @BeforeClass and \
+             @AfterClass boundary (for example, static test class initializers are not \
+             permitted to access random contexts)."
+        )
+    };
+    RuntimeError::IllegalStateException { message }.into()
+}
+
 fn randomized_context_for_thread(
     ctx: &mut dyn NativeContext,
     thread: ObjectRef,
@@ -3566,7 +3613,7 @@ fn randomized_context_for_thread(
     let group_result = randomized_thread_group(ctx, thread)?;
     let group = match group_result {
         Some(Value::Object(Some(group))) => group,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(randomized_no_context_error(ctx, thread, true)),
     };
     let key = RandomizedContextCacheKey {
         vm: ctx.vm_identity(),
@@ -3579,7 +3626,7 @@ fn randomized_context_for_thread(
 
     let contexts = match randomized_context_static_contexts(ctx) {
         Some(contexts) => contexts,
-        None => return Ok(Some(Value::Object(None))),
+        None => return Err(randomized_no_context_error(ctx, thread, false)),
     };
     let mut current_group = group;
     loop {
@@ -3605,7 +3652,7 @@ fn randomized_context_for_thread(
         )?;
         current_group = match parent_result {
             Some(Value::Object(Some(parent))) => parent,
-            _ => return Ok(Some(Value::Object(None))),
+            _ => return Err(randomized_no_context_error(ctx, thread, false)),
         };
     }
 }
@@ -24263,6 +24310,52 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         native_jsp_servlet_handle_missing_resource,
     );
 
+    // OutputStreamWriter(OutputStream, CharsetEncoder) -- real bytecode for
+    // this specific constructor overload produces a writer that emits ZERO
+    // bytes for every character written (confirmed by isolated probe: the
+    // (OutputStream, Charset) and (OutputStream, String) overloads work
+    // correctly, only the CharsetEncoder-accepting one is broken). This
+    // silently corrupted org.apache.catalina.util.URLEncoder.encode(String,
+    // Charset) -- which builds its OutputStreamWriter this exact way to
+    // percent-encode unsafe characters -- dropping every encoded character
+    // instead of emitting "%XX", observed as Tomcat manager's "war=" deploy
+    // parameter having every '/' silently stripped. Root cause not fully
+    // understood (a real-bytecode-only bug, no interpreter fix attempted
+    // here); work around by delegating to the proven-working (OutputStream,
+    // Charset) constructor on the same object, reading the Charset off the
+    // caller-supplied CharsetEncoder via its own real charset() accessor.
+    // This loses the caller's chosen malformed-input / unmappable-character
+    // error actions (REPORT vs REPLACE), which no caller in this codebase's
+    // test suites has been observed to depend on.
+    registry.register(
+        "java/io/OutputStreamWriter",
+        "<init>",
+        "(Ljava/io/OutputStream;Ljava/nio/charset/CharsetEncoder;)V",
+        |ctx, args| {
+            let this = args.first().copied().unwrap_or(Value::Object(None));
+            let stream = args.get(1).copied().unwrap_or(Value::Object(None));
+            let encoder = match args.get(2) {
+                Some(Value::Object(Some(e))) => Some(*e),
+                _ => None,
+            };
+            let charset = match encoder {
+                Some(e) => ctx
+                    .invoke_virtual(e, "charset", "()Ljava/nio/charset/Charset;", &[])
+                    .ok()
+                    .flatten()
+                    .unwrap_or(Value::Object(None)),
+                None => Value::Object(None),
+            };
+            ctx.invoke_special(
+                "java/io/OutputStreamWriter",
+                "<init>",
+                "(Ljava/io/OutputStream;Ljava/nio/charset/Charset;)V",
+                &[this, stream, charset],
+            )?;
+            Ok(None)
+        },
+    );
+
     // Real-JDK mode does not call the full synthetic/experimental
     // `register_builtins` surface, but JBoss Marshalling calls
     // `sun.reflect.ReflectionFactory` directly for serialization hooks.
@@ -28151,6 +28244,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 ctx.class_name_of_id(cid).as_deref(),
                 Some("java/lang/reflect/GenericArrayType")
                     | Some("java/lang/reflect/ParameterizedType")
+                    | Some("java/lang/reflect/TypeVariable")
                     | Some("java/lang/reflect/WildcardType")
             );
             if is_reflect {
@@ -63129,14 +63223,20 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         "newThread",
         "(Ljava/lang/Runnable;)Ljava/lang/Thread;",
         |ctx, args| {
+            // BUG FIX (2026-07-10, ES executors-factory mainlock NPE, layer 2
+            // residual): this used to allocate a real-shaped Thread object via
+            // alloc_concurrent_synthetic and then poke 5 legacy synthetic
+            // slots — the exact same half-real pattern that made
+            // ThreadPoolExecutor's mainLock/ctl/workQueue null (see
+            // initialize_real_thread_pool_executor in phases_early.rs). A
+            // Thread built this way never runs the real constructor, so
+            // start()/start0() operate on an uninitialized `holder` and the
+            // worker never actually runs — real ThreadPoolExecutor.execute()
+            // silently never executes submitted tasks. Drive the real
+            // Thread(Runnable) constructor instead so start() works.
+            // See docs/known-issues/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe.md.
             let runnable = args.get(1).copied().unwrap_or(Value::Object(None));
-            let thread = alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5);
-            let name = ctx.create_string("pool-thread");
-            ctx.set_field(thread, 0, Value::Object(Some(name)));
-            ctx.set_field(thread, 1, Value::Int(5));
-            ctx.set_field(thread, 3, runnable);
-            ctx.set_field(thread, 4, Value::Int(0));
-            Ok(Some(Value::Object(Some(thread))))
+            ctx.new_object_initialized("java/lang/Thread", "(Ljava/lang/Runnable;)V", &[runnable])
         },
     );
     registry.set_category(__prev_cat);
@@ -63160,10 +63260,16 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        // Real ThreadPoolExecutor: don't write the synthetic shutdown slot
-        // (would corrupt a real field); its idle workers are stopped by
-        // shutdownNow() (which ExecutorService.close()/cleanup also calls).
-        if !executor_has_real_workers(ctx, this) {
+        // Real ThreadPoolExecutor: run the real bytecode so the pool's own
+        // shutdown state machine transitions correctly, instead of writing
+        // the synthetic 2-field placeholder's shutdown slot (would corrupt a
+        // real field) or silently no-op'ing. See
+        // `NativeContext::invoke_virtual_bytecode_only`'s doc for why this
+        // can't just re-call `execute`/`shutdown` via `invoke_virtual` (would
+        // recurse back into this same native).
+        if executor_has_real_workers(ctx, this) {
+            ctx.invoke_virtual_bytecode_only(this, "shutdown", "()V", &[])?;
+        } else {
             ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
         }
         Ok(None)
@@ -63202,10 +63308,16 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        // Real ThreadPoolExecutor: don't write the synthetic shutdown slot
-        // (would corrupt a real field); its idle workers are stopped by
-        // shutdownNow() (which ExecutorService.close()/cleanup also calls).
-        if !executor_has_real_workers(ctx, this) {
+        // Real ThreadPoolExecutor: run the real bytecode so the pool's own
+        // shutdown state machine transitions correctly, instead of writing
+        // the synthetic 2-field placeholder's shutdown slot (would corrupt a
+        // real field) or silently no-op'ing. See
+        // `NativeContext::invoke_virtual_bytecode_only`'s doc for why this
+        // can't just re-call `execute`/`shutdown` via `invoke_virtual` (would
+        // recurse back into this same native).
+        if executor_has_real_workers(ctx, this) {
+            ctx.invoke_virtual_bytecode_only(this, "shutdown", "()V", &[])?;
+        } else {
             ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
         }
         Ok(None)
@@ -63379,6 +63491,22 @@ fn native_new_cached_pool(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
 }
 
 fn native_es_submit_runnable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A genuinely-real ThreadPoolExecutor (e.g. one `new`'d directly by app
+    // code, or the internal async worker pool below) shares this exact class
+    // name with CratonVM's synthetic 2-field placeholder — dispatch straight
+    // to its real bytecode instead of the single-threaded synthetic model, via
+    // `invoke_virtual_bytecode_only` (plain `invoke_virtual` would recurse
+    // back into this same native). See that method's doc for the rationale.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if executor_has_real_workers(ctx, *this) {
+            return ctx.invoke_virtual_bytecode_only(
+                *this,
+                "submit",
+                "(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;",
+                &args[1..],
+            );
+        }
+    }
     // Execute the Runnable immediately (single-threaded model)
     if let Some(Value::Object(Some(runnable))) = args.get(1) {
         let _ = ctx.invoke_virtual(*runnable, "run", "()V", &[]);
@@ -63390,6 +63518,17 @@ fn native_es_submit_runnable(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn native_es_submit_callable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // See `native_es_submit_runnable` above — same real-vs-synthetic split.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if executor_has_real_workers(ctx, *this) {
+            return ctx.invoke_virtual_bytecode_only(
+                *this,
+                "submit",
+                "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
+                &args[1..],
+            );
+        }
+    }
     let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2);
     if let Some(Value::Object(Some(callable))) = args.get(1) {
         let result = ctx.invoke_virtual(*callable, "call", "()Ljava/lang/Object;", &[])?;
@@ -63404,15 +63543,35 @@ fn native_es_submit_callable(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn native_es_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A genuinely-real ThreadPoolExecutor shares this exact class name with
+    // CratonVM's synthetic 2-field placeholder (`Executors.newSingleThreadExecutor()`
+    // et al., AND the internal async worker pool this function itself hands
+    // work to below) — dispatch straight to real bytecode instead of the
+    // synthetic model. This is also what breaks the recursion: the async
+    // pool's own `execute()` call (via `spawn_runnable_on_real_thread` below)
+    // lands right back on this native, since its receiver's class is also
+    // "ThreadPoolExecutor" — routing it to `invoke_virtual_bytecode_only`
+    // (which skips native lookup) instead of looping back through
+    // `invoke_virtual`/this native again. See that method's doc for the
+    // full rationale.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if executor_has_real_workers(ctx, *this) {
+            return ctx.invoke_virtual_bytecode_only(
+                *this,
+                "execute",
+                "(Ljava/lang/Runnable;)V",
+                &args[1..],
+            );
+        }
+    }
     // HANGS-0706b: `Executor.execute(Runnable)` is a fire-and-forget contract --
     // callers are entitled to assume the submitted task runs independently of
     // the calling thread. The prior eager-inline body (`runnable.run()` on the
     // caller) silently violated that contract for every executor created via
     // `Executors.newSingleThreadExecutor()` / `newFixedThreadPool()` /
-    // `newCachedThreadPool()` (the only factories intercepted here -- see
-    // `native_new_single_thread` et al., always CratonVM's synthetic 2-field
-    // executor, never a real `ThreadPoolExecutor`). Any task that blocks
-    // waiting for a signal only the SUBMITTING thread can later deliver -- e.g.
+    // `newCachedThreadPool()` (CratonVM's synthetic 2-field executor). Any
+    // task that blocks waiting for a signal only the SUBMITTING thread can
+    // later deliver -- e.g.
     // Spring's `OutputStreamPublisher`/`SubscriberInputStream` Flow adapters,
     // whose `LockSupport.park()`/`resume()` handshake assumes the publisher
     // body runs on a thread other than the one calling `subscribe()` -- self-
@@ -63426,29 +63585,14 @@ fn native_es_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // apply the same fix here: hand the task to the shared bounded real
     // `ThreadPoolExecutor` so it runs on an actual worker thread and the
     // caller returns immediately, matching HotSpot's `execute()` semantics.
-    // Defense in depth: several independent interpreter dispatch points
-    // decide whether to force this native over real bytecode for
-    // `ThreadPoolExecutor.execute()`, each with its own receiver-real-check
-    // (see docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md).
-    // If this native is EVER reached for a genuinely real, bytecode-
-    // constructed `ThreadPoolExecutor` anyway (its real `workers` field is
-    // populated) -- e.g. this exact function's own shared async worker pool
-    // singleton (`async_worker_pool`, itself a real `ThreadPoolExecutor`)
-    // calling `.execute()` on itself via `spawn_runnable_on_real_thread`
-    // below -- do NOT hand off through `spawn_runnable_on_real_thread` again:
-    // that would call `pool.execute(...)`, which (if ALSO routed to this
-    // native) recurses forever and stack-overflows. Running the task inline
-    // here breaks that recursion; it only degrades a real pool's execute()
-    // to synchronous in the narrow case some dispatch path still lands here
-    // for a real receiver.
-    if let Some(Value::Object(Some(this))) = args.first() {
-        if executor_has_real_workers(ctx, *this) {
-            if let Some(Value::Object(Some(runnable))) = args.get(1) {
-                ctx.invoke_virtual(*runnable, "run", "()V", &[])?;
-            }
-            return Ok(None);
-        }
-    }
+    //
+    // (A second, now-redundant `executor_has_real_workers` guard used to
+    // live here — added by a parallel same-day fix as defense-in-depth,
+    // degrading a real receiver to synchronous inline execution. Removed:
+    // the check at the top of this function already returns before this
+    // point is ever reached for a real receiver, and does so via real
+    // bytecode — genuine async semantics — rather than a synchronous
+    // fallback.)
     if let Some(Value::Object(Some(runnable))) = args.get(1) {
         return spawn_runnable_on_real_thread(ctx, *runnable);
     }
@@ -74646,7 +74790,7 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         .class_name_of_id(handler_cid)
         .unwrap_or_else(|| "java/lang/reflect/InvocationHandler".to_string());
 
-    // CRATONVM_REAL_ANNOTATIONS: when the proxy's InvocationHandler is the
+    // Real annotations: when the proxy's InvocationHandler is the
     // synthetic AnnotationProxy carrying the member data, the generated `$ProxyN`
     // method bodies reach here (the cached/dead-code dispatch path that a 2nd
     // call site falls into, bypassing `proxy_invoke_handler_shared`). Calling
@@ -74684,7 +74828,7 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                     Some(arr) if ctx.array_length(arr) > 0 => ctx.get_array_element(arr, 0),
                     _ => Value::Object(None),
                 };
-                // Under CRATONVM_REAL_ANNOTATIONS every annotation is a real
+                // In real-annotation mode every annotation is a real
                 // `$ProxyN`, so the `other` argument is typically ALSO a real
                 // proxy (not a bare AnnotationProxy) — unwrap it to its
                 // AnnotationProxy handler (slot 0) before comparing, mirroring

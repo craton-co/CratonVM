@@ -139,7 +139,7 @@ fn thread_start_handoff_grace() -> std::time::Duration {
         let millis = std::env::var("CRATONVM_THREAD_START_GRACE_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(80);
+            .unwrap_or(0);
         std::time::Duration::from_millis(millis)
     })
 }
@@ -1647,10 +1647,28 @@ impl<'a> NativeContextImpl<'a> {
         // `is_object_address`, and they can only over-retain (the young sweep
         // runs non-moving while any thread is in JIT, so nothing is relocated).
         if !moving_young_precise_only {
+            let jit_scan_start = snapshot.len();
             crate::jit::conservative_roots::scan_active_jit_frames(
                 &self.shared.heap,
                 &mut snapshot,
             );
+            // G1 pin-in-place, cross-thread half (same as the safepoint path
+            // in `update_root_snapshot`): the note above — "they can only
+            // over-retain (the young sweep runs non-moving while any thread
+            // is in JIT, so nothing is relocated)" — is GENERATIONAL-only.
+            // G1 always evacuates, so this blocked thread's conservative JIT
+            // roots must also PIN their regions out of the collection set;
+            // the spill slots holding them cannot be rewritten. Replace
+            // semantics per thread; entry dropped at thread exit.
+            if self.shared.heap.is_g1() {
+                let addrs: Vec<usize> = snapshot[jit_scan_start..]
+                    .iter()
+                    .map(|r| r.as_ptr() as usize)
+                    .collect();
+                cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&addrs);
+            }
+        } else if self.shared.heap.is_g1() {
+            cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&[]);
         }
         // Shadow-stack precise roots (mirrors the same fold in
         // `update_root_snapshot`): under `CRATONVM_SHADOW_STACK` the moving
@@ -4822,6 +4840,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 }
             };
 
+            // SATB (G1MARK-2): drain this thread's per-thread SATB buffer
+            // BEFORE the thread dies. The buffer is `thread_local!`; when the
+            // OS thread exits, its TLS destructor drops the only strong Arc
+            // and the registry prunes the dead Weak — any unflushed entries
+            // (up to 255 overwritten references logged since the last
+            // safepoint) vanish. SATB entries are OLD reference values the
+            // MARKER needs, not the logging thread: a dying thread that
+            // overwrote the last snapshot-visible path to an object would
+            // take its only gray-source to the grave, and cleanup could then
+            // free a live region. Cheap no-op when no marking cycle is
+            // active.
+            shared_arc.heap.flush_thread_satb();
+
             // CRIT (multi-thread STW deadlock / undercount): transition from
             // alive mutator to dead thread through the blocked-region protocol.
             // `finish_after` serializes `mark_dead` with `request_stw_counted`,
@@ -4848,14 +4879,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
         self.shared.thread_registry.set_join_handle(tid, handle);
         if !is_executor_worker {
-            // Give newly-started plain Java workers a short handoff window before
-            // the parent immediately closes an async context or enters a tight
-            // timed wait. Spring's @Async tests expose this under OSR: diagnostic
-            // ring recording or the watchdog thread adds enough pacing; without
-            // it, a Mockito-backed SimpleAsyncTaskExecutor worker can be starved
-            // long enough to hang class execution. Do not apply this to real
-            // ThreadPoolExecutor workers: CompletableFuture concurrency-limit
-            // tests depend on their first tasks entering within a 10 ms window.
+            // Preserve HotSpot-like parent scheduling by default: Thread.start()
+            // should not sleep the submitting thread. The env knob remains for
+            // diagnosing legacy starvation cases, but a non-zero default lets
+            // tiny async tasks complete before callers can close/cancel them.
+            // Do not apply this to real ThreadPoolExecutor workers: CompletableFuture
+            // concurrency-limit tests depend on their first tasks entering within
+            // a 10 ms window.
             let grace = thread_start_handoff_grace();
             if grace.is_zero() {
                 std::thread::yield_now();
@@ -6550,6 +6580,53 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             }
             _ => result,
         }
+    }
+
+    fn invoke_virtual_bytecode_only(
+        &mut self,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        // Call straight into `interpreter::execute` — the actual "just run
+        // this bytecode, no native check" primitive that
+        // `invoke_on_class_shared_inner` itself falls back to once it has
+        // decided native doesn't apply. `invoke_on_class_shared` is NOT
+        // sufficient here: besides its primary `check_override` gate (which
+        // IS skipped for an ordinary concrete method like
+        // `ThreadPoolExecutor.execute`/`submit`/`shutdown`), it has a
+        // SECOND, unconditional native-registry check for any non-interface
+        // declaring class (`override_cb` in `invoke_on_class_shared_inner`,
+        // vm_exec.rs) that re-finds this exact native regardless of the
+        // first gate — routing through `invoke_on_class_shared` reintroduced
+        // infinite recursion (confirmed via a depth-counter probe: `execute`
+        // called itself on the same receiver until the native stack
+        // overflowed) instead of actually reaching bytecode.
+        let receiver = self.shared.heap.load_and_forward(receiver);
+        let class_id = self.shared.heap.class_id_of(receiver);
+        let declaring_class_id = {
+            let cm = self.shared.class_manager.read();
+            crate::classloading::find_method_recursive(
+                class_id,
+                method_name,
+                descriptor,
+                &cm.class_store,
+            )
+            .map(|(_, declaring_id)| declaring_id)
+            .unwrap_or(class_id)
+        };
+        let mut full_args = Vec::with_capacity(1 + args.len());
+        full_args.push(Value::Object(Some(receiver)));
+        full_args.extend_from_slice(args);
+        crate::runtime::interpreter::execute(
+            self.shared,
+            self.thread,
+            declaring_class_id,
+            method_name,
+            descriptor,
+            &full_args,
+        )
     }
 
     fn class_annotations(&self, class_id: ClassId) -> Vec<crate::native::registry::AnnotationData> {

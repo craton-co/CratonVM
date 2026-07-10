@@ -106,7 +106,10 @@ pub use gc::{
     install_class_info_hook, install_gc_finish_hook, install_gc_start_hook, resolve_class_info,
     ClassInfoHook, JvmtiGcHook,
 };
-pub use gen_heap::{GenerationalHeap, HeapStats, HeapStatsSnapshot};
+pub use gen_heap::{
+    jit_region_bounds_addr, GenerationalHeap, HeapStats, HeapStatsSnapshot, JitRegionBoundsTable,
+    JIT_REGION_BOUNDS,
+};
 pub use heap::{ArrayElementType, Heap, ObjectHeader, ObjectKind};
 pub use mark_bitmap::MarkBitmap;
 pub use reference::{

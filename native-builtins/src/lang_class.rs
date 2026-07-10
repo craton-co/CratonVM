@@ -9156,15 +9156,23 @@ pub fn gc_update_annotation_proxy_refs(pointer_map: &HashMap<usize, usize>) {
     }
 }
 
-/// CRATONVM_REAL_ANNOTATIONS (default-OFF): when set, annotation instances are
-/// materialised as REAL `$ProxyN` proxies that implement the annotation
-/// interface (so `annotation.getClass()` reports a `$ProxyN` class, matching
-/// HotSpot, instead of the annotation type), with the synthetic `AnnotationProxy`
-/// reused as the proxy's `InvocationHandler`. Gated because it re-shapes the
-/// representation of every annotation; needs wide soak before default-ON.
+/// Annotation instances are materialised as REAL `$ProxyN` proxies by default,
+/// matching HotSpot (`annotation.getClass()` is the generated proxy class, not
+/// the annotation interface). The synthetic `AnnotationProxy` still carries the
+/// member data and acts as the proxy's `InvocationHandler`. Set
+/// `CRATONVM_SYNTHETIC_ANNOTATIONS=1` or `CRATONVM_REAL_ANNOTATIONS=0` to retain
+/// the old bare-`AnnotationProxy` representation for debugging.
 fn real_annotations_enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var("CRATONVM_REAL_ANNOTATIONS").is_ok())
+    *E.get_or_init(|| {
+        if std::env::var_os("CRATONVM_SYNTHETIC_ANNOTATIONS").is_some() {
+            return false;
+        }
+        !matches!(
+            std::env::var("CRATONVM_REAL_ANNOTATIONS").ok().as_deref(),
+            Some("0") | Some("false") | Some("FALSE") | Some("off") | Some("OFF")
+        )
+    })
 }
 
 /// Wrap a synthetic `AnnotationProxy` data object (`handler`) in a real
@@ -9199,7 +9207,7 @@ fn wrap_annotation_in_real_proxy(
         crate::ProxyClassOutcome::Real(cid) => cid,
         // Gate-off degrade or a generation failure: fall back to the bare
         // AnnotationProxy. This annotation path degrades gracefully and is
-        // independently gated (CRATONVM_REAL_ANNOTATIONS) вЂ” it never throws,
+        // independently optional (see real_annotations_enabled) вЂ” it never throws,
         // even when the proxy STRICT mode is on.
         _ => return None,
     };
@@ -9844,7 +9852,7 @@ fn create_annotation_proxy(
     child_roots.push(names_arr);
     child_roots.push(values_arr);
 
-    // CRATONVM_REAL_ANNOTATIONS: hand back a real `$ProxyN` proxy that wraps
+    // Real annotations: hand back a real `$ProxyN` proxy that wraps
     // this AnnotationProxy as its InvocationHandler (so `getClass()` is a
     // `$ProxyN`). Falls back to the bare AnnotationProxy when generation fails.
     if real_annotations_enabled() {

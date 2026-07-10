@@ -40143,14 +40143,56 @@ pub(crate) fn render_type_name(ctx: &mut dyn NativeContext, val: &Value) -> Stri
                 format!("{}<{}>", raw_s, parts.join(", "))
             }
         }
+        "sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl" => {
+            let raw = ctx.get_field_by_name(obj, "rawType");
+            let raw_s = render_type_name(ctx, &raw);
+            let mut parts = Vec::new();
+            if let Value::Object(Some(arr)) = ctx.get_field_by_name(obj, "actualTypeArguments") {
+                for i in 0..ctx.array_length(arr) {
+                    let el = ctx.get_array_element(arr, i);
+                    parts.push(render_type_name(ctx, &el));
+                }
+            }
+            if parts.is_empty() {
+                raw_s
+            } else {
+                format!("{}<{}>", raw_s, parts.join(", "))
+            }
+        }
+        "org/springframework/core/ResolvableType$SyntheticParameterizedType" => {
+            let raw = ctx.get_field_by_name(obj, "rawType");
+            let raw_s = render_type_name(ctx, &raw);
+            let mut parts = Vec::new();
+            if let Value::Object(Some(arr)) = ctx.get_field_by_name(obj, "typeArguments") {
+                for i in 0..ctx.array_length(arr) {
+                    let el = ctx.get_array_element(arr, i);
+                    parts.push(render_type_name(ctx, &el));
+                }
+            }
+            if parts.is_empty() {
+                raw_s
+            } else {
+                format!("{}<{}>", raw_s, parts.join(", "))
+            }
+        }
         "java/lang/reflect/GenericArrayType" => {
             let comp = ctx.get_field(obj, 0);
+            format!("{}[]", render_type_name(ctx, &comp))
+        }
+        "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl" => {
+            let comp = ctx.get_field_by_name(obj, "genericComponentType");
             format!("{}[]", render_type_name(ctx, &comp))
         }
         "java/lang/reflect/TypeVariable" => match ctx.get_field(obj, 0) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "?".to_string()),
             _ => "?".to_string(),
         },
+        "sun/reflect/generics/reflectiveObjects/TypeVariableImpl" => {
+            match ctx.get_field_by_name(obj, "name") {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "?".to_string()),
+                _ => "?".to_string(),
+            }
+        }
         "java/lang/reflect/WildcardType" => {
             // upperBounds=0, lowerBounds=1
             if let Value::Object(Some(arr)) = ctx.get_field(obj, 1) {

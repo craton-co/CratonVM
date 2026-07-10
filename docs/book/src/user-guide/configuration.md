@@ -58,7 +58,7 @@ synthetic-vs-real difference.
 | `CRATONVM_NO_STUBS` | Drop every synthetic-stub native so calls fall through to real bytecode (or a clear `NoSuchMethodError`). Surfaces real gaps as errors. |
 | `CRATONVM_REAL_NET_SOCKETS` | Use real `java.net` socket bytecode instead of the synthetic socket layer. |
 | `CRATONVM_REAL_AQS` | Route `AbstractQueuedSynchronizer` / `ReentrantLock` through real `java.util.concurrent` bytecode. |
-| `CRATONVM_REAL_ANNOTATIONS` | Route annotation reflection through real JDK bytecode. |
+| `CRATONVM_REAL_ANNOTATIONS` | Annotation reflection uses real proxy-backed annotation objects by default; set to `0` to use the old synthetic representation. |
 | `CRATONVM_SYNTHETIC_*` (e.g. `_AQS`, `_RSA`, `_RAF`, …) | Per-subsystem force-synthetic opt-outs. |
 
 The real path is the default wherever a real JDK is present; the synthetic
