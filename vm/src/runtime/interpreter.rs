@@ -21366,6 +21366,33 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    // `Executors.newSingleThreadExecutor()`/`newFixedThreadPool()`/
+    // `newCachedThreadPool()` (native-builtins/src/lib.rs's
+    // `native_new_single_thread`/`native_new_fixed_pool`/`native_new_cached_pool`)
+    // allocate their return value under the REAL class name
+    // `java/util/concurrent/ThreadPoolExecutor` with only a 2-field synthetic
+    // layout (poolSize/isShutdown) — real fields like `ctl`/`workQueue`/
+    // `mainLock` are never set. `execute(Runnable)` is invoked via
+    // `invokeinterface Executor.execute`/`ExecutorService.execute` on these
+    // objects; once the interface call resolves to the concrete class's own
+    // real `ThreadPoolExecutor.execute()` bytecode (which the real class
+    // genuinely declares), that bytecode reads the never-initialized `ctl`
+    // AtomicInteger and NPEs immediately — observed killing WildFly's
+    // process-controller "Read thread" (org.jboss.as.process.protocol.
+    // ConnectionImpl$2, `readExecutor.execute(this)`) before host.xml is ever
+    // parsed. The registered native (`native_es_execute`, also registered
+    // directly on this class alongside the ExecutorService interface) runs
+    // the task immediately on the calling thread — correct for these
+    // synthetic single-purpose executors, and the behavior every prior
+    // session's test suite already validated against before this regression.
+    // Force it so real bytecode never sees the half-initialized receiver.
+    if class_name == "java/util/concurrent/ThreadPoolExecutor"
+        && method_name == "execute"
+        && method_descriptor == "(Ljava/lang/Runnable;)V"
+    {
+        return true;
+    }
+
     // `java.util.logging.Level.parse(String)` real bytecode resolves custom
     // and even standard level names through `KnownLevel.findByName`, which
     // on JDK 25 throws internally (a `Module`-null NPE the method's own
