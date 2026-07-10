@@ -942,13 +942,15 @@ pub(crate) fn native_thread_get_name(
             return Ok(Some(Value::Object(Some(name))));
         }
     };
-    // Try to read name from field 0
-    match ctx.get_field(this, 0) {
+    match ctx.get_field_by_name(this, "name") {
         Value::Object(Some(str_ref)) => Ok(Some(Value::Object(Some(str_ref)))),
-        _ => {
-            let name = ctx.create_string("main");
-            Ok(Some(Value::Object(Some(name))))
-        }
+        _ => match ctx.get_field(this, 0) {
+            Value::Object(Some(str_ref)) => Ok(Some(Value::Object(Some(str_ref)))),
+            _ => {
+                let name = ctx.create_string("main");
+                Ok(Some(Value::Object(Some(name))))
+            }
+        },
     }
 }
 

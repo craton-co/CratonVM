@@ -52322,6 +52322,61 @@ fn tg_get_field(
         .unwrap_or(Value::Object(None))
 }
 
+fn tg_of_thread(ctx: &mut dyn NativeContext, thread: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(thread, "holder") {
+        Value::Object(Some(holder)) => match ctx.get_field_by_name(holder, "group") {
+            Value::Object(group) => group,
+            _ => None,
+        },
+        _ => match ctx.get_field_by_name(thread, "group") {
+            Value::Object(group) => group,
+            _ => None,
+        },
+    }
+}
+
+fn tg_matches_thread(
+    ctx: &mut dyn NativeContext,
+    requested: ObjectRef,
+    thread: ObjectRef,
+    recurse: bool,
+) -> bool {
+    let mut current = tg_of_thread(ctx, thread);
+    while let Some(group) = current {
+        if group == requested {
+            return true;
+        }
+        if !recurse {
+            break;
+        }
+        current = match tg_get_field(ctx, group, "parent", 1) {
+            Value::Object(parent) => parent,
+            _ => None,
+        };
+    }
+    false
+}
+
+fn tg_enumerate_threads(
+    ctx: &mut dyn NativeContext,
+    group: ObjectRef,
+    arr: ObjectRef,
+    recurse: bool,
+) -> i32 {
+    let arr_len = ctx.array_length(arr);
+    let mut count = 0usize;
+    for obj in ctx.enumerate_threads(usize::MAX) {
+        if count >= arr_len {
+            break;
+        }
+        if tg_matches_thread(ctx, group, obj, recurse) {
+            let _ = ctx.set_array_element(arr, count, Value::Object(Some(obj)));
+            count += 1;
+        }
+    }
+    count as i32
+}
+
 fn tg_set_field(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -52401,6 +52456,13 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
     let tg = "java/lang/ThreadGroup";
     r.register(tg, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let parent = {
+            let cur = ctx.current_thread_object();
+            match ctx.get_field_by_name(cur, "holder") {
+                Value::Object(Some(holder)) => ctx.get_field_by_name(holder, "group"),
+                _ => ctx.get_field_by_name(cur, "group"),
+            }
+        };
         tg_set_field(
             ctx,
             this,
@@ -52408,7 +52470,7 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
             0,
             args.get(1).copied().unwrap_or(Value::Object(None)),
         );
-        tg_set_field(ctx, this, "parent", 1, Value::Object(None));
+        tg_set_field(ctx, this, "parent", 1, parent);
         tg_set_field(ctx, this, "daemon", 2, Value::Int(0));
         tg_set_field(ctx, this, "maxPriority", 3, Value::Int(10));
         Ok(None)
@@ -52478,17 +52540,23 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(count)))
     });
     r.register(tg, "enumerate", "([Ljava/lang/Thread;)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
         let arr = match args.get(1) {
             Some(Value::Object(Some(a))) => *a,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let arr_len = ctx.array_length(arr);
-        let thread_objs = ctx.enumerate_threads(arr_len);
-        let count = thread_objs.len().min(arr_len);
-        for (i, obj) in thread_objs.into_iter().take(count).enumerate() {
-            let _ = ctx.set_array_element(arr, i, Value::Object(Some(obj)));
-        }
-        Ok(Some(Value::Int(count as i32)))
+        Ok(Some(Value::Int(tg_enumerate_threads(ctx, this, arr, true))))
+    });
+    r.register(tg, "enumerate", "([Ljava/lang/Thread;Z)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let arr = match args.get(1) {
+            Some(Value::Object(Some(a))) => *a,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let recurse = !matches!(args.get(2), Some(Value::Int(0)));
+        Ok(Some(Value::Int(tg_enumerate_threads(
+            ctx, this, arr, recurse,
+        ))))
     });
     r.register(tg, "getMaxPriority", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;

@@ -5270,6 +5270,9 @@ fn native_es_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 fn enum_set_copy_source_values(ctx: &mut dyn NativeContext, src: ObjectRef) -> Vec<Value> {
+    if es_real_kind(ctx, src).is_some() {
+        return es_real_elements(ctx, src);
+    }
     let arr = match ctx.invoke_virtual(src, "toArray", "()[Ljava/lang/Object;", &[]) {
         Ok(Some(Value::Object(Some(arr)))) => arr,
         _ => return Vec::new(),
