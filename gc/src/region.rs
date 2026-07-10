@@ -196,11 +196,22 @@ impl Region {
 // G1-style region heap
 // ---------------------------------------------------------------------------
 
-/// G1-style region-based heap.
+/// G1-style region-based heap — UNUSED PROTOTYPE, do not wire up.
 ///
 /// The heap is divided into `num_regions` equal-sized regions. Allocation
 /// goes through a current allocation region (bump pointer). Collection
 /// selects a collection set (CSet) and evacuates live objects.
+///
+/// G1CORE-11: this type has no production consumer (the real region-based
+/// collector is `G1Collector` in `g1.rs`, reached through `VmHeap::G1`) and
+/// its evacuation rewrites reference slots CONSERVATIVELY — any 8-byte word
+/// that numerically equals a moved object's old address is rewritten, so an
+/// integer field that happens to alias a heap address is silently corrupted.
+/// It is kept only as reference material for its unit tests; it is not
+/// re-exported from the crate root.
+#[deprecated(
+    note = "unused prototype with unsound conservative slot rewriting — use G1Collector (VmHeap::G1) instead"
+)]
 pub struct RegionHeap {
     /// Contiguous backing storage.
     data: Vec<u8>,
@@ -220,6 +231,7 @@ pub struct RegionHeap {
     pub bitmap: MarkBitmap,
 }
 
+#[allow(deprecated)] // G1CORE-11: the type itself is deprecated; its impl stays for the tests.
 impl RegionHeap {
     /// Create a new region heap with the given total capacity and region size.
     pub fn new(total_capacity: usize, region_size: usize) -> Self {
@@ -964,6 +976,7 @@ fn update_object_refs(obj_addr: usize, header: &ObjectHeader, forwarding: &HashM
     }
 }
 
+#[allow(deprecated)] // G1CORE-11
 impl std::fmt::Debug for RegionHeap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RegionHeap")
@@ -983,6 +996,7 @@ impl std::fmt::Debug for RegionHeap {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(deprecated)] // G1CORE-11: tests exercise the deprecated prototype on purpose.
 mod tests {
     use super::*;
 
