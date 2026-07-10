@@ -43007,6 +43007,60 @@ fn native_objects_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(Some(Value::Int(if eq { 1 } else { 0 })))
 }
 
+fn native_objects_value_hash_code(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+) -> Result<i32, MethodCallFailed> {
+    if ctx.object_is_array(obj) {
+        return Ok(ctx.identity_hash_code(obj));
+    }
+
+    match ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref() {
+        Some("java/lang/String") => {
+            match native_string_hash_code(ctx, &[Value::Object(Some(obj))])? {
+                Some(Value::Int(v)) => Ok(v),
+                _ => Ok(0),
+            }
+        }
+        Some(
+            "java/lang/Integer" | "java/lang/Byte" | "java/lang/Short" | "java/lang/Character",
+        ) => match ctx.get_field(obj, 0) {
+            Value::Int(v) => Ok(v),
+            _ => Ok(0),
+        },
+        Some("java/lang/Boolean") => match ctx.get_field(obj, 0) {
+            Value::Int(v) => Ok(if v != 0 { 1231 } else { 1237 }),
+            _ => Ok(1237),
+        },
+        Some("java/lang/Long") => match ctx.get_field(obj, 0) {
+            Value::Long(v) => Ok((v ^ ((v as u64 >> 32) as i64)) as i32),
+            _ => Ok(0),
+        },
+        Some("java/lang/Float") => match ctx.get_field(obj, 0) {
+            Value::Float(v) => {
+                let bits = if v.is_nan() { 0x7fc0_0000 } else { v.to_bits() };
+                Ok(bits as i32)
+            }
+            _ => Ok(0),
+        },
+        Some("java/lang/Double") => match ctx.get_field(obj, 0) {
+            Value::Double(v) => {
+                let bits = if v.is_nan() {
+                    0x7ff8_0000_0000_0000u64
+                } else {
+                    v.to_bits()
+                };
+                Ok((bits ^ (bits >> 32)) as i32)
+            }
+            _ => Ok(0),
+        },
+        _ => match ctx.invoke_virtual(obj, "hashCode", "()I", &[])? {
+            Some(Value::Int(v)) => Ok(v),
+            _ => Ok(0),
+        },
+    }
+}
+
 fn native_objects_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if std::env::var_os("CRATONVM_DBG_OBJECTS").is_some() {
         eprintln!(
@@ -43015,7 +43069,9 @@ fn native_objects_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         );
     }
     match args.first() {
-        Some(Value::Object(Some(obj))) => Ok(Some(Value::Int(ctx.identity_hash_code(*obj)))),
+        Some(Value::Object(Some(obj))) => {
+            Ok(Some(Value::Int(native_objects_value_hash_code(ctx, *obj)?)))
+        }
         _ => Ok(Some(Value::Int(0))),
     }
 }
@@ -43030,9 +43086,21 @@ fn native_objects_hash(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     for i in 0..len {
         let elem = ctx.get_array_element(arr, i);
         let elem_hash = match elem {
-            Value::Object(Some(obj)) => ctx.identity_hash_code(obj),
+            Value::Object(Some(obj)) => native_objects_value_hash_code(ctx, obj)?,
             Value::Int(v) => v,
             Value::Long(v) => (v ^ (v >> 32)) as i32,
+            Value::Float(v) => {
+                let bits = if v.is_nan() { 0x7fc0_0000 } else { v.to_bits() };
+                bits as i32
+            }
+            Value::Double(v) => {
+                let bits = if v.is_nan() {
+                    0x7ff8_0000_0000_0000u64
+                } else {
+                    v.to_bits()
+                };
+                (bits ^ (bits >> 32)) as i32
+            }
             _ => 0,
         };
         result = result.wrapping_mul(31).wrapping_add(elem_hash);
