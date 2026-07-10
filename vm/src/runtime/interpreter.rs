@@ -20598,6 +20598,17 @@ pub(crate) fn is_bc_crypto_math_native_override(
             (method_name, descriptor),
             ("KeccakPermutation" | "KeccakExtract", "()V") | ("KeccakAbsorb", "([BI)V")
         ),
+        "org/bouncycastle/crypto/digests/GOST3411Digest" => {
+            method_name == "processBlock" && descriptor == "([BI)V"
+        }
+        "org/bouncycastle/crypto/digests/WhirlpoolDigest" => matches!(
+            (method_name, descriptor),
+            ("processBlock", "()V") | ("update", "([BII)V")
+        ),
+        "org/bouncycastle/crypto/macs/Poly1305" => matches!(
+            (method_name, descriptor),
+            ("update", "([BII)V") | ("doFinal", "([BI)I")
+        ),
         "org/bouncycastle/crypto/generators/SCrypt" => {
             method_name == "generate" && descriptor == "([B[BIIII)[B"
         }
@@ -21351,6 +21362,24 @@ fn force_native_over_real_jdk_bytecode(
     if class_name == "java/lang/Class"
         && (method_name == "getEnumConstants" || method_name == "getEnumConstantsShared")
         && method_descriptor == "()[Ljava/lang/Object;"
+    {
+        return true;
+    }
+
+    // `java.util.logging.Level.parse(String)` real bytecode resolves custom
+    // and even standard level names through `KnownLevel.findByName`, which
+    // on JDK 25 throws internally (a `Module`-null NPE the method's own
+    // catch-all reports as a generic `IllegalArgumentException: Bad level`)
+    // — see `docs/internal/gaps/kc16-blocker-map.md`'s KC16 investigation.
+    // This broke WildFly's own `host.xml`/`domain.xml` parsing of
+    // `<level name="WARN"/>` (org.jboss.logmanager's extended levels) before
+    // it ever reached a genuinely-unknown name. Force the registered native
+    // (`native_level_parse`, native-builtins/src/logmanager.rs), which
+    // answers from the standard + JBoss LogManager static Level constants
+    // directly, bypassing the broken registry lookup.
+    if class_name == "java/util/logging/Level"
+        && method_name == "parse"
+        && method_descriptor == "(Ljava/lang/String;)Ljava/util/logging/Level;"
     {
         return true;
     }
@@ -32663,20 +32692,12 @@ mod tests {
             ("sqr", "([II[I)V"),
         ] {
             assert!(is_bc_crypto_math_native_override(
-                x448_field,
-                name,
-                descriptor
+                x448_field, name, descriptor
             ));
             assert!(force_native_over_real_jdk_bytecode(
-                x448_field,
-                name,
-                descriptor
+                x448_field, name, descriptor
             ));
-            assert!(redefine_immune_forced_native(
-                x448_field,
-                name,
-                descriptor
-            ));
+            assert!(redefine_immune_forced_native(x448_field, name, descriptor));
         }
 
         let fp_point = "org/bouncycastle/math/ec/ECPoint$Fp";
@@ -32882,6 +32903,45 @@ mod tests {
                 "processBytes",
                 "([BII[BI)I"
             ));
+        }
+
+        let gost3411 = "org/bouncycastle/crypto/digests/GOST3411Digest";
+        assert!(is_bc_crypto_math_native_override(
+            gost3411,
+            "processBlock",
+            "([BI)V"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            gost3411,
+            "processBlock",
+            "([BI)V"
+        ));
+        assert!(redefine_immune_forced_native(
+            gost3411,
+            "processBlock",
+            "([BI)V"
+        ));
+
+        let whirlpool = "org/bouncycastle/crypto/digests/WhirlpoolDigest";
+        for (name, descriptor) in [("processBlock", "()V"), ("update", "([BII)V")] {
+            assert!(is_bc_crypto_math_native_override(
+                whirlpool, name, descriptor
+            ));
+            assert!(force_native_over_real_jdk_bytecode(
+                whirlpool, name, descriptor
+            ));
+            assert!(redefine_immune_forced_native(whirlpool, name, descriptor));
+        }
+
+        let poly1305 = "org/bouncycastle/crypto/macs/Poly1305";
+        for (name, descriptor) in [("update", "([BII)V"), ("doFinal", "([BI)I")] {
+            assert!(is_bc_crypto_math_native_override(
+                poly1305, name, descriptor
+            ));
+            assert!(force_native_over_real_jdk_bytecode(
+                poly1305, name, descriptor
+            ));
+            assert!(redefine_immune_forced_native(poly1305, name, descriptor));
         }
 
         let pkcs12 = "org/bouncycastle/crypto/generators/PKCS12ParametersGenerator";

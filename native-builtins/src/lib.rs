@@ -18669,6 +18669,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     crate::phases_late::register_bc_blake2s_digest(registry);
     // BouncyCastle Keccak absorb/extract/permutation fast-path for CSHAKE/KMAC.
     crate::phases_late::register_bc_keccak_digest(registry);
+    // BouncyCastle legacy GOST3411 compression-block fast-path for the
+    // million-'a' digest regression under the org/bouncycastle JIT ban.
+    crate::phases_late::register_bc_gost3411_digest(registry);
+    // BouncyCastle Whirlpool update/compression fast-path for the million-'a'
+    // digest regression under the same package JIT ban.
+    crate::phases_late::register_bc_whirlpool_digest(registry);
+    // BouncyCastle Poly1305 accumulator/finalization fast-path for standalone
+    // Poly1305 and ChaCha20-Poly1305 regression vectors under the BC JIT ban.
+    crate::phases_late::register_bc_poly1305(registry);
     // BouncyCastle SCrypt SMix/BlockMix fast-path for crypto regression.
     crate::phases_late::register_bc_scrypt_generator(registry);
     // BouncyCastle Argon2 block-round fast-path for crypto regression.
@@ -43799,16 +43808,13 @@ fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
     // (or the capital-P negated forms), and no `\Q...\E` quoted-literal
     // blocks, there's nothing to rewrite.
     let has_quote_block = pattern.contains("\\Q");
-    let has_all_class = pattern.contains("\\p{all}") || pattern.contains("\\P{all}");
-    if !has_quote_block
-        && !has_all_class
-        && !(pattern.contains("\\p{In")
-            || pattern.contains("\\P{In")
-            || pattern.contains("\\p{Is")
-            || pattern.contains("\\P{Is")
-            || pattern.contains("\\p{java")
-            || pattern.contains("\\P{java"))
-    {
+    // Any `\p{...}`/`\P{...}` needs the loop below: it covers Unicode
+    // block/script prefixes (In/Is), `Character.is*` names (java*), the
+    // `all` alias, AND the POSIX character classes (Alpha, Digit, XDigit,
+    // ...) handled by `map_java_character_property`, which don't share a
+    // common prefix so can't be cheaply pre-filtered individually.
+    let has_property_class = pattern.contains("\\p{") || pattern.contains("\\P{");
+    if !has_quote_block && !has_property_class {
         return std::borrow::Cow::Borrowed(pattern);
     }
     let mut out = String::with_capacity(pattern.len());
@@ -43883,6 +43889,52 @@ fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
             }
             i += 7;
             continue;
+        }
+        // Look for `\p{Name}` / `\P{Name}` POSIX character classes (Lower,
+        // Upper, ASCII, Alpha, Digit, Alnum, Punct, Graph, Print, Blank,
+        // Cntrl, XDigit, Space -- java.util.regex.Pattern javadoc, "POSIX
+        // character classes (US-ASCII only)"). Rust's `regex` crate only
+        // recognizes Unicode property names in `\p{...}` (no notion of
+        // "XDigit"/"Alpha"/etc.), so without this these patterns fail to
+        // compile in BOTH the `regex` and `fancy-regex` fallback, and
+        // `compile_java_regex` returns an Err. That Err was observed to
+        // silently corrupt `String.matches` (see `native_string_matches`'s
+        // literal-equality fallback on compile failure) -- e.g.
+        // `"5".matches("\\p{XDigit}+")` returned `false` instead of `true`,
+        // while `Pattern.matches("\\p{XDigit}+", "5")` (real bytecode,
+        // unaffected by this translation layer) correctly returned `true`.
+        // Found via Tomcat's `TestHttp2Limits.testPostWithTrailerHeadersSize0`.
+        // Checked before the `In`/`Is`/`java*` branches below since POSIX
+        // names never collide with those prefixes; unrecognized names fall
+        // through unchanged to let those branches (or the literal copy at
+        // the bottom) handle them. See `map_posix_character_class` for the
+        // US-ASCII-only rationale (matches Java's default; the rarely-used
+        // `UNICODE_CHARACTER_CLASS` flag is not special-cased here, same as
+        // the `java*` branch below).
+        if i + 3 < bytes.len()
+            && bytes[i] == b'\\'
+            && (bytes[i + 1] == b'p' || bytes[i + 1] == b'P')
+            && bytes[i + 2] == b'{'
+        {
+            if let Some(close_off) = pattern[i + 3..].find('}') {
+                let name = &pattern[i + 3..i + 3 + close_off];
+                if let Some(class_body) = map_posix_character_class(name) {
+                    let negated = bytes[i + 1] == b'P';
+                    if negated {
+                        out.push_str("[^");
+                        out.push_str(class_body);
+                        out.push(']');
+                    } else {
+                        out.push('[');
+                        out.push_str(class_body);
+                        out.push(']');
+                    }
+                    i = i + 3 + close_off + 1;
+                    continue;
+                }
+                // Not a POSIX name: fall through to the In/Is/java* checks
+                // below (or literal copy if none match either).
+            }
         }
         // Look for `\p{In` or `\p{Is` (both cases of p) followed by a name and `}`.
         // All matched bytes are ASCII so byte indexing is safe.
@@ -44052,6 +44104,32 @@ fn ascii_perl_classes(pattern: &str) -> String {
         i = end;
     }
     out
+}
+
+/// Map a Java POSIX character-class name (`\p{Name}` with no `In`/`Is`/`java`
+/// prefix) to a Rust regex character-class body. See the loop branch above
+/// for why this table exists. Always US-ASCII-only, matching Java's default.
+fn map_posix_character_class(name: &str) -> Option<&'static str> {
+    match name {
+        "Lower" => Some("a-z"),
+        "Upper" => Some("A-Z"),
+        "ASCII" => Some(r"\x00-\x7F"),
+        "Alpha" => Some("a-zA-Z"),
+        "Digit" => Some("0-9"),
+        "Alnum" => Some("a-zA-Z0-9"),
+        // `!"#$%&'()*+,-./` (\x21-\x2F) + `:;<=>?@` (\x3A-\x40) +
+        // `[\]^_`` (\x5B-\x60) + `{|}~` (\x7B-\x7E) -- printable ASCII
+        // minus letters and digits, as four contiguous byte ranges
+        // (sidesteps escaping `]`/`\`/`-` as literal bracket-class chars).
+        "Punct" => Some(r"\x21-\x2F\x3A-\x40\x5B-\x60\x7B-\x7E"),
+        "Graph" => Some(r"\x21-\x7E"),
+        "Print" => Some(r"\x20-\x7E"),
+        "Blank" => Some(" \t"),
+        "Cntrl" => Some(r"\x00-\x1F\x7F"),
+        "XDigit" => Some("0-9a-fA-F"),
+        "Space" => Some(r" \t\n\x0B\f\r"),
+        _ => None,
+    }
 }
 
 /// Map a Java Unicode block name (used after the `In` prefix in `\p{InXxx}`)

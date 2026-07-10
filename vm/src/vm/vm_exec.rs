@@ -4687,11 +4687,27 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                             .get_class(cid)
                             .map(|c| c.name.to_string())
                             .unwrap_or_else(|| format!("<unknown class_id={}>", cid.as_u32()));
+                        let to_string = invoke_on_class_shared(
+                            &shared_arc,
+                            &mut jvm_thread,
+                            cid,
+                            "toString",
+                            "()Ljava/lang/String;",
+                            &[Value::Object(Some(exc_ref))],
+                        )
+                        .ok()
+                        .flatten()
+                        .and_then(|v| match v {
+                            Value::Object(Some(s)) => super::read_java_string(&shared_arc.heap, s),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "<toString unavailable>".to_string());
                         eprintln!(
-                            "[dbg-uncaught] tid={} thread_name={:?} exc_class={} ptr={:p}",
+                            "[dbg-uncaught] tid={} thread_name={:?} exc_class={} exc={} ptr={:p}",
                             tid.0,
                             name,
                             cname,
+                            to_string,
                             exc_ref.as_ptr(),
                         );
                     }
