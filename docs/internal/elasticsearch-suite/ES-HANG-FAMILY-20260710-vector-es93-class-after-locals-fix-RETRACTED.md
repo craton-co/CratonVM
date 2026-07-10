@@ -1,6 +1,11 @@
 # ES hang family - ES93 vector class timeout after Matcher.locals fix
 
-Status: OPEN
+Status: RETRACTED (2026-07-10)
+
+Retraction summary:
+- The reported 300s suite-wrapper timeout was not a runtime hang. The full class simply runs longer than that under `--nojit` on this host.
+- Direct JUnitCore rerun of `ES93HnswScalarQuantizedBFloat16VectorsFormatTests` with the fixed locals/runtime-version binary completed successfully in 323.313s: `/tmp/cratonvm-es93-fullclass-junit-r2-repeat-1783663899`, `OK (57 tests)`.
+- Keep suite wrappers above this class's no-JIT runtime or run method-level probes when diagnosing new failures.
 
 Signal:
 - The previous class-level failure signatures are gone:

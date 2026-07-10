@@ -40959,7 +40959,11 @@ pub(crate) fn unsafe_array_read_bytes(
     while produced < n {
         let v = ctx.get_array_element(arr, elem_idx);
         let raw: u64 = match et {
-            cratonvm_types::ArrayElementType::Float => (v.as_int().unwrap_or(0) as u32) as u64,
+            cratonvm_types::ArrayElementType::Float => match v {
+                Value::Float(f) => f.to_bits() as u64,
+                Value::Int(i) => i as u32 as u64,
+                _ => 0,
+            },
             cratonvm_types::ArrayElementType::Double => match v {
                 Value::Long(l) => l as u64,
                 Value::Double(d) => d.to_bits(),
@@ -41061,9 +41065,8 @@ pub(crate) fn unsafe_array_write_bytes(
                 | cratonvm_types::ArrayElementType::Byte => Value::Int(raw as u8 as i8 as i32),
                 cratonvm_types::ArrayElementType::Char => Value::Int(raw as u16 as i32),
                 cratonvm_types::ArrayElementType::Short => Value::Int(raw as u16 as i16 as i32),
-                cratonvm_types::ArrayElementType::Int | cratonvm_types::ArrayElementType::Float => {
-                    Value::Int(raw as u32 as i32)
-                }
+                cratonvm_types::ArrayElementType::Int => Value::Int(raw as u32 as i32),
+                cratonvm_types::ArrayElementType::Float => Value::Float(f32::from_bits(raw as u32)),
                 cratonvm_types::ArrayElementType::Long
                 | cratonvm_types::ArrayElementType::Double => Value::Long(raw as i64),
                 cratonvm_types::ArrayElementType::Reference => unreachable!(),

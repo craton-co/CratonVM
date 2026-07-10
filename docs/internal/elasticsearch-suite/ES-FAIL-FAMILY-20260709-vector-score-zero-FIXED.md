@@ -1,6 +1,17 @@
 # ES failure family - vector scoring returns zero under CratonVM
 
-Status: OPEN
+Status: FIXED (2026-07-10)
+
+Fix summary:
+- The codec-format zero-score/vector-zero rows were the same float-array raw-copy bug as the codec-footer family: JDK `FloatBuffer.put(float[])` bulk-copied `float[]` source values through `Unsafe.copyMemory`, but CratonVM encoded `Value::Float` as zero.
+- `native-builtins/src/lib.rs` now byte-encodes `float[]` values from `Value::Float` and reconstructs `Value::Float` on raw byte writes.
+- A separate query-level residual remains open as `docs/known-issues/elasticsearch-suite/ES-FAIL-FAMILY-20260710-diversifying-children-ivfknn-docid-mismatch.md`; it no longer has the old zero-score shape.
+
+Validation:
+- `/tmp/cratonvm-ES940v1DiskBBQVectorsFormatTests-floatview-r2-1783666743`: `OK (52 tests)`.
+- `/tmp/cratonvm-ES93HnswBinaryQuantizedBFloat16VectorsFormatTests-floatview-r2-1783666797`: `OK (58 tests)`.
+- `/tmp/cratonvm-es93-flatvector-testRandom-floatview-r2-1783666504`: old `expected 0.074157976 but was 0.0` repro passed, `OK (2 tests)`.
+- `/tmp/cratonvm-es93-flatvector-testSortedIndex-floatview-r2-1783666545`, `/tmp/cratonvm-es93-flatvector-testMismatchedFields-floatview-r2-1783666545`, `/tmp/cratonvm-es93-flatvector-testIndexedValueNotAliased-floatview-r2-1783666545`: all passed, `OK (2 tests)` each.
 
 Signals:
 - `AssertionError: expected:<1.0> but was:<0.0>`

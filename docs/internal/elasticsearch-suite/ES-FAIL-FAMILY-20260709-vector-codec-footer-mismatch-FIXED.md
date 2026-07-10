@@ -1,6 +1,17 @@
 # ES failure family - vector codec footer/checksum corruption
 
-Status: OPEN
+Status: FIXED (2026-07-10)
+
+Fix summary:
+- Root cause was CratonVM's raw `Unsafe.copyMemory` primitive-array byte reader treating `float[]` elements as `Value::Int`; real Java float arrays store `Value::Float`, so `FloatBuffer.put(float[])` copied all-zero bytes into byte-backed vector files.
+- `native-builtins/src/lib.rs` now encodes `Value::Float` with `f32::to_bits()` in `unsafe_array_read_bytes` and reconstructs `Value::Float` in `unsafe_array_write_bytes`.
+- This fixes JDK `FloatBuffer.putArray` / `ScopedMemoryAccess.copyMemory` for byte-buffer float views, the path Lucene vector writers use.
+
+Validation:
+- `/tmp/bytebuffer-floatview-r2-1783666407`: `ByteBuffer.allocate(...).order(...).asFloatBuffer().put(float[])` now writes HotSpot-matching BE/LE bytes and reads back `0.074157976`, `-1.0`.
+- `/tmp/cratonvm-es93-flatvector-full-floatview-r2-1783666566`: `ES93FlatVectorFormatTests` passed, `OK (106 tests)`.
+- `/tmp/cratonvm-ES93FlatBFloat16VectorFormatTests-floatview-r2-1783666687`: `OK (53 tests)`.
+- `/tmp/cratonvm-ESNextOversamplingMetaTests-floatview-r2-1783666687`: `OK (53 tests)`.
 
 Signals:
 - `org.apache.lucene.index.CorruptIndexException: checksum status indeterminate`
