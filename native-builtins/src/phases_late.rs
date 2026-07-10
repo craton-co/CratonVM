@@ -24127,6 +24127,9 @@ fn vh_set_volatile(
 
 /// Read the kind tag from a VarHandle (0=instance, 1=static, 2=array).
 fn vh_kind(ctx: &dyn NativeContext, vh: ObjectRef) -> i32 {
+    if crate::lang_invoke::p67_memory_segment_var_handle_width(ctx, vh).is_some() {
+        return VH_KIND_MEMORY_SEGMENT;
+    }
     if ctx.object_num_fields(vh) < VH_NUM_FIELDS {
         return 0;
     }
@@ -24324,9 +24327,8 @@ fn vh_memory_segment_target(
 }
 
 fn vh_memory_segment_get(ctx: &dyn NativeContext, vh: ObjectRef, args: &[Value]) -> Value {
-    let width = ctx
-        .get_field(vh, VH_FIELD_INDEX)
-        .as_int()
+    let width = crate::lang_invoke::p67_memory_segment_var_handle_width(ctx, vh)
+        .or_else(|| ctx.get_field(vh, VH_FIELD_INDEX).as_int())
         .unwrap_or(1)
         .clamp(1, 8) as i64;
     let little_endian = ctx
@@ -24387,9 +24389,8 @@ fn vh_memory_segment_get(ctx: &dyn NativeContext, vh: ObjectRef, args: &[Value])
 }
 
 fn vh_memory_segment_set(ctx: &dyn NativeContext, vh: ObjectRef, args: &[Value]) {
-    let width = ctx
-        .get_field(vh, VH_FIELD_INDEX)
-        .as_int()
+    let width = crate::lang_invoke::p67_memory_segment_var_handle_width(ctx, vh)
+        .or_else(|| ctx.get_field(vh, VH_FIELD_INDEX).as_int())
         .unwrap_or(1)
         .clamp(1, 8) as i64;
     let little_endian = ctx
@@ -38246,13 +38247,10 @@ fn p67_memory_session(ctx: &mut dyn NativeContext) -> Value {
     Value::Object(Some(obj))
 }
 
-fn p67_layout_width(ctx: &dyn NativeContext, args: &[Value]) -> i32 {
-    let Some(Value::Object(Some(layout))) = args.first() else {
-        return 1;
-    };
-    match ctx.get_field(*layout, 0) {
+fn p67_layout_width_obj(ctx: &dyn NativeContext, layout: ObjectRef) -> i32 {
+    match ctx.get_field(layout, 0) {
         Value::Long(v) if (1..=8).contains(&v) => v as i32,
-        Value::Int(_) => match ctx.get_field(*layout, 1) {
+        Value::Int(_) => match ctx.get_field(layout, 1) {
             Value::Int(v) if (1..=8).contains(&v) => v,
             Value::Long(v) if (1..=8).contains(&v) => v as i32,
             _ => 1,
@@ -38261,12 +38259,95 @@ fn p67_layout_width(ctx: &dyn NativeContext, args: &[Value]) -> i32 {
     }
 }
 
-fn p67_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let width = p67_layout_width(ctx, args);
-    let little_endian = match args.first() {
-        Some(Value::Object(Some(layout))) => p67_layout_is_little(ctx, *layout),
-        _ => true,
+fn p67_layout_width(ctx: &dyn NativeContext, args: &[Value]) -> i32 {
+    let Some(Value::Object(Some(layout))) = args.first() else {
+        return 1;
     };
+    p67_layout_width_obj(ctx, *layout)
+}
+
+fn p67_string_value(ctx: &dyn NativeContext, value: Value) -> Option<String> {
+    match value {
+        Value::Object(Some(obj)) => ctx.read_string(obj).filter(|s| !s.is_empty()),
+        _ => None,
+    }
+}
+
+fn p67_path_element_group_name(ctx: &dyn NativeContext, elem: ObjectRef) -> Option<String> {
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(elem))
+        .unwrap_or_default();
+
+    if class_name == "java/lang/foreign/MemoryLayout$PathElement" {
+        if ctx.get_field(elem, 1).as_int() == Some(0) {
+            return p67_string_value(ctx, ctx.get_field(elem, 0));
+        }
+        return None;
+    }
+
+    if class_name.ends_with("LayoutPath$GroupElementByName")
+        || class_name.ends_with("GroupElementByName")
+    {
+        return p67_string_value(ctx, ctx.get_field_by_name(elem, "name"))
+            .or_else(|| p67_string_value(ctx, ctx.get_field(elem, 0)));
+    }
+
+    if let Some(name) = p67_string_value(ctx, ctx.get_field_by_name(elem, "name")) {
+        return Some(name);
+    }
+    if ctx.get_field(elem, 1).as_int() == Some(0) {
+        return p67_string_value(ctx, ctx.get_field(elem, 0));
+    }
+    None
+}
+
+fn p67_layout_named_member(
+    ctx: &dyn NativeContext,
+    layout: ObjectRef,
+    target_name: &str,
+) -> Option<ObjectRef> {
+    let members = match ctx.get_field(layout, 2) {
+        Value::Object(Some(arr)) => arr,
+        _ => return None,
+    };
+    for i in 0..ctx.array_length(members) {
+        let member = match ctx.get_array_element(members, i) {
+            Value::Object(Some(member)) => member,
+            _ => continue,
+        };
+        if p67_string_value(ctx, p67_layout_name_value(ctx, member)).as_deref() == Some(target_name)
+        {
+            return Some(member);
+        }
+    }
+    None
+}
+
+fn p67_memory_layout_path_target(
+    ctx: &dyn NativeContext,
+    layout: ObjectRef,
+    path_arr: ObjectRef,
+) -> ObjectRef {
+    let mut current = layout;
+    for i in 0..ctx.array_length(path_arr) {
+        let elem = match ctx.get_array_element(path_arr, i) {
+            Value::Object(Some(elem)) => elem,
+            _ => break,
+        };
+        let Some(name) = p67_path_element_group_name(ctx, elem) else {
+            break;
+        };
+        let Some(member) = p67_layout_named_member(ctx, current, &name) else {
+            break;
+        };
+        current = member;
+    }
+    current
+}
+
+fn p67_var_handle_for_layout(ctx: &mut dyn NativeContext, layout: ObjectRef) -> Value {
+    let width = p67_layout_width_obj(ctx, layout);
+    let little_endian = p67_layout_is_little(ctx, layout);
     let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
     ctx.set_field(
         vh,
@@ -38275,7 +38356,30 @@ fn p67_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     );
     ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(width));
     ctx.set_field(vh, VH_IS_STATIC, Value::Int(VH_KIND_MEMORY_SEGMENT));
+    crate::lang_invoke::register_p67_memory_segment_var_handle(ctx, vh, width);
     Value::Object(Some(vh))
+}
+
+fn p67_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    match args.first() {
+        Some(Value::Object(Some(layout))) => p67_var_handle_for_layout(ctx, *layout),
+        _ => {
+            let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
+            ctx.set_field(vh, VH_CLASS_OR_TARGET, Value::Int(1));
+            ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(1));
+            ctx.set_field(vh, VH_IS_STATIC, Value::Int(VH_KIND_MEMORY_SEGMENT));
+            Value::Object(Some(vh))
+        }
+    }
+}
+
+fn p67_memory_layout_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let target_layout = match args.get(1) {
+        Some(Value::Object(Some(path_arr))) => p67_memory_layout_path_target(ctx, this, *path_arr),
+        _ => this,
+    };
+    Ok(Some(p67_var_handle_for_layout(ctx, target_layout)))
 }
 
 fn p67_segment_parts(
@@ -39599,6 +39703,12 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "withName",
         "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
         p67_layout_with_name,
+    );
+    r.register(
+        ml,
+        "varHandle",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;",
+        p67_memory_layout_var_handle,
     );
     r.register(ml, "name", "()Ljava/util/Optional;", p67_layout_name);
 
@@ -61703,6 +61813,83 @@ mod cert_verify_bounds_security_tests {
         assert!(r2
             .find("java/util/zip/ZipOutputStream", "write", "([BII)V")
             .is_some());
+    }
+}
+
+#[cfg(test)]
+mod ffm_p67_layout_tests {
+    use super::*;
+    use crate::test_utils::mock_ctx;
+
+    fn object_ref(value: Value) -> ObjectRef {
+        match value {
+            Value::Object(Some(obj)) => obj,
+            other => panic!("expected object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_layout_varhandle_resolves_named_struct_member_width() {
+        let mut reg = NativeMethodRegistry::new();
+        register_p67_foreign_memory(&mut reg);
+        let mut ctx = mock_ctx();
+
+        let ptr_name = ctx.create_string("ptr");
+        let ptr_layout = p67_layout_object(&mut ctx, "java/lang/foreign/AddressLayout", 8, 8);
+        ctx.set_field(ptr_layout, 3, Value::Object(Some(ptr_name)));
+
+        let size_name = ctx.create_string("size");
+        let size_layout = p67_layout_object(&mut ctx, "java/lang/foreign/ValueLayout$OfLong", 8, 8);
+        ctx.set_field(size_layout, 3, Value::Object(Some(size_name)));
+
+        let members = ctx.new_array(ArrayElementType::Reference, 2);
+        ctx.set_array_element(members, 0, Value::Object(Some(ptr_layout)));
+        ctx.set_array_element(members, 1, Value::Object(Some(size_layout)));
+
+        let struct_layout = object_ref(
+            reg.find(
+                "java/lang/foreign/MemoryLayout",
+                "structLayout",
+                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/StructLayout;",
+            )
+            .expect("MemoryLayout.structLayout registered")(
+                &mut ctx,
+                &[Value::Object(Some(members))],
+            )
+            .expect("structLayout ok")
+            .expect("structLayout returned value"),
+        );
+
+        let path_name = ctx.create_string("size");
+        let path_elem =
+            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemoryLayout$PathElement", 2);
+        ctx.set_field(path_elem, 0, Value::Object(Some(path_name)));
+        ctx.set_field(path_elem, 1, Value::Int(0));
+        let path = ctx.new_array(ArrayElementType::Reference, 1);
+        ctx.set_array_element(path, 0, Value::Object(Some(path_elem)));
+
+        let vh = object_ref(
+            reg.find(
+                "java/lang/foreign/MemoryLayout",
+                "varHandle",
+                "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;",
+            )
+            .expect("MemoryLayout.varHandle registered")(
+                &mut ctx,
+                &[
+                    Value::Object(Some(struct_layout)),
+                    Value::Object(Some(path)),
+                ],
+            )
+            .expect("varHandle ok")
+            .expect("varHandle returned value"),
+        );
+
+        assert_eq!(ctx.get_field(vh, VH_FIELD_INDEX), Value::Int(8));
+        assert_eq!(
+            ctx.get_field(vh, VH_IS_STATIC),
+            Value::Int(VH_KIND_MEMORY_SEGMENT)
+        );
     }
 }
 
