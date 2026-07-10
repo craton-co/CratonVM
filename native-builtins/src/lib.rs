@@ -18597,16 +18597,83 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `Primes.implHasAnySmallFactors` otherwise runs interpreted and dominates
     // RSA key generation. Faithful single-word-mod reimplementation; see the fn doc.
     crate::phases_late::register_bc_primes_small_factors(registry);
+    // BouncyCastle binary-field EC uses LongArray for generic F2m arithmetic.
+    // Keep the org/bouncycastle JIT ban intact, but run the small polynomial
+    // multiply/square/reduce/inverse leaves natively so math-ec and EC crypto
+    // regression do not spend minutes in interpreted bit loops.
+    crate::phases_late::register_bc_long_array(registry);
+    // BouncyCastle generic prime-field EC uses ECFieldElement.Fp bytecode for
+    // every point add/double. Keep BC bytecode JIT-banned, but run the field
+    // arithmetic leaves with the same limb BigInteger core used by java.math.
+    crate::phases_late::register_bc_fp_field_element(registry);
+    // The generic prime-field point formulas remain hot in complete EC math
+    // tests after the field leaves are native; route just those methods natively.
+    crate::phases_late::register_bc_fp_point(registry);
+    // Same treatment for generic binary-field ECFieldElement.F2m wrappers: this
+    // avoids spending the math-ec suite in interpreted field-element glue around
+    // the native LongArray polynomial leaves.
+    crate::phases_late::register_bc_f2m_field_element(registry);
+    // Generic binary-field ECPoint.F2m add/double is the hot Lambda-projective
+    // point layer above the native F2m field-element leaves.
+    crate::phases_late::register_bc_f2m_point(registry);
+    // Keep the BC package JIT ban in place, but run the high-level Shamir JSF
+    // driver loop natively above the native EC point methods.
+    crate::phases_late::register_bc_ec_algorithms(registry);
+    // Custom SEC binary curves bypass ECFieldElement.F2m and call static
+    // SecT*Field kernels directly from point add/double code. Route those
+    // polynomial kernels through the same native GF(2^m) engine.
+    crate::phases_late::register_bc_sect_field_kernels(registry);
+    // The inherited ECPoint.timesPow2 loop otherwise spends complete binary
+    // curve tests in interpreted SecT*Point.twice glue around those kernels.
+    crate::phases_late::register_bc_sect_point_methods(registry);
     // BouncyCastle AESEngine single-block transform fast-path (Intrinsic). Same
     // JIT-ban rationale: the interpreted T-table AES otherwise dominates AESTest's
     // Monte-Carlo stress. Verbatim FIPS-197-validated port of encrypt/decryptBlock.
     crate::phases_late::register_bc_aes_engine(registry);
+    // CBC mode wrapper fast-path for AES-backed MAC/encryption loops. This keeps
+    // the BC JIT ban intact while avoiding interpreted CBC bytecode above the
+    // already-native AES block transform.
+    crate::phases_late::register_bc_cbc_block_cipher(registry);
+    // BouncyCastle GOST3412_2015Engine single-block transform fast-path
+    // (Intrinsic). Keeps the BC package JIT ban while removing the interpreted
+    // block-cipher loop that dominates GOST3412Test CTR stress.
+    crate::phases_late::register_bc_gost3412_engine(registry);
+    // BouncyCastle SM4Engine single-block transform fast-path for crypto regression.
+    crate::phases_late::register_bc_sm4_engine(registry);
+    // BouncyCastle XTEAEngine single-block transform fast-path for CipherStreamTest.
+    crate::phases_late::register_bc_xtea_engine(registry);
     // BouncyCastle Strings UTF-8 transcode fast-path (Intrinsic) — dominates
     // AESTest.testCounter's growing-string round-trips once AES is native.
     crate::phases_late::register_bc_strings_utf8(registry);
+    crate::phases_late::register_bc_arrays_helpers(registry);
+    crate::phases_late::register_bc_param_helpers(registry);
+    // BouncyCastle byte/int packing helpers used by block ciphers and digests.
+    crate::phases_late::register_bc_pack_helpers(registry);
+    // BouncyCastle X25519 field multiply fast-path for Ed25519/X25519 regression.
+    crate::phases_late::register_bc_x25519_field(registry);
+    // BouncyCastle X448 field multiply/square fast-path for Ed448 regression.
+    crate::phases_late::register_bc_x448_field(registry);
+    // BouncyCastle BLAKE2s compression leaf fast-path for Blake2xs XOF vectors.
+    crate::phases_late::register_bc_blake2s_digest(registry);
+    // BouncyCastle Keccak absorb/extract/permutation fast-path for CSHAKE/KMAC.
+    crate::phases_late::register_bc_keccak_digest(registry);
+    // BouncyCastle SCrypt SMix/BlockMix fast-path for crypto regression.
+    crate::phases_late::register_bc_scrypt_generator(registry);
+    // BouncyCastle Argon2 block-round fast-path for crypto regression.
+    crate::phases_late::register_bc_argon2_bytes_generator(registry);
+    // BouncyCastle PKCS#5 v2 PBKDF2/SHA-1 KDF fast-path for crypto regression.
+    crate::phases_late::register_bc_pkcs5s2_parameters_generator(registry);
+    // BouncyCastle PKCS#12 SHA-1 KDF fast-path for crypto regression vectors.
+    crate::phases_late::register_bc_pkcs12_parameters_generator(registry);
+    // BouncyCastle BCrypt expensive key schedule fast-path for crypto regression.
+    crate::phases_late::register_bc_bcrypt_generator(registry);
     // BouncyCastle CTR-mode (SICBlockCipher) per-byte loop fast-path (Intrinsic) —
     // the sole remaining hot frame in AESTest.testCounter once AES+Strings are native.
     crate::phases_late::register_bc_sic_ctr(registry);
+    // BouncyCastle DigestRandomGenerator synchronized PRNG fast-path
+    // (Intrinsic). This keeps the package JIT ban intact while avoiding the
+    // million-call interpreted monitor body in DigestRandomNumberTest.
+    crate::phases_late::register_bc_digest_random_generator(registry);
     // BouncyCastle ChaCha permutation fast-path (Intrinsic). Same JIT-ban
     // rationale: the interpreted ChaCha core (dozens of Integers.rotateLeft
     // calls per block) dominates the SPHINCS-256 PQC RegressionTest (PRG via
@@ -52581,6 +52648,11 @@ pub(crate) fn normalize_charset_name(name: &str) -> String {
 pub(crate) const BI_FIELD_VALUE: usize = 0; // Synthetic-mode: String decimal representation
 pub(crate) const BI_FIELD_SIGNUM: usize = 1; // Synthetic-mode: Int signum (-1, 0, or 1)
 
+fn bi_alloc_mag_array(ctx: &mut dyn NativeContext, len: usize) -> ObjectRef {
+    ctx.try_new_array(cratonvm_types::ArrayElementType::Int, len)
+        .unwrap_or_else(|| ctx.new_array(cratonvm_types::ArrayElementType::Int, len))
+}
+
 /// RBIGDEC.1 — Resolve the real-JDK BigInteger field layout if available.
 ///
 /// Returns `Some((signum_idx, mag_idx))` when the JDK class is loaded with the
@@ -52713,7 +52785,7 @@ pub(crate) fn bi_alloc(ctx: &mut dyn NativeContext, value: &str) -> ObjectRef {
         // Real-JDK layout: write signum + mag[].  This is the canonical
         // representation that bytecode reads via `getfield`.
         let mag_words = decimal_to_mag_words(value);
-        let mag_arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, mag_words.len());
+        let mag_arr = bi_alloc_mag_array(ctx, mag_words.len());
         let obj = ctx.read_native_pin(h, obj);
         for (i, w) in mag_words.iter().enumerate() {
             ctx.set_array_element(mag_arr, i, Value::Int(*w as i32));
@@ -52792,7 +52864,7 @@ pub(crate) fn bi_alloc_int(ctx: &mut dyn NativeContext, v: &crate::bigint::BigIn
     let signum = v.signum();
     if let Some((sig_i, mag_i)) = bi_layout(ctx) {
         let le = v.mag_le(); // little-endian limbs
-        let mag_arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, le.len());
+        let mag_arr = bi_alloc_mag_array(ctx, le.len());
         let obj = ctx.read_native_pin(h, obj);
         // little-endian limbs → big-endian array.
         for (i, &w) in le.iter().rev().enumerate() {
@@ -52800,12 +52872,14 @@ pub(crate) fn bi_alloc_int(ctx: &mut dyn NativeContext, v: &crate::bigint::BigIn
         }
         ctx.set_field(obj, sig_i, Value::Int(signum));
         ctx.set_field(obj, mag_i, Value::Object(Some(mag_arr)));
+        ctx.unpin_native_roots(h);
         obj
     } else {
         let s = ctx.create_string(&v.to_decimal());
         let obj = ctx.read_native_pin(h, obj);
         ctx.set_field(obj, BI_FIELD_VALUE, Value::Object(Some(s)));
         ctx.set_field(obj, BI_FIELD_SIGNUM, Value::Int(signum));
+        ctx.unpin_native_roots(h);
         obj
     }
 }
@@ -53416,7 +53490,9 @@ pub(crate) fn bi_mod_inverse_str(a: &str, m: &str) -> Option<String> {
 
 #[cfg(test)]
 mod biginteger_modpow_modinverse_tests {
-    use super::{bi_mod_inverse_str, bi_mod_pow_str};
+    use super::{bi_alloc_int, bi_mod_inverse_str, bi_mod_pow_str};
+    use crate::bigint::BigInt;
+    use crate::test_utils::mock_ctx;
 
     // --- modPow sign handling (the registered native delegates to these
     //     helpers; these tests pin the underlying arithmetic that the old
@@ -53483,6 +53559,16 @@ mod biginteger_modpow_modinverse_tests {
             bi_mod_inverse_str("2", "2305843009213693951"),
             Some("1152921504606846976".to_string())
         );
+    }
+
+    #[test]
+    fn bi_alloc_int_releases_native_pin() {
+        let mut ctx = mock_ctx();
+        let value = BigInt::from_decimal("123456789012345678901234567890");
+
+        assert_eq!(ctx.native_pin_count_for_test(), 0);
+        let _ = bi_alloc_int(&mut ctx, &value);
+        assert_eq!(ctx.native_pin_count_for_test(), 0);
     }
 }
 
