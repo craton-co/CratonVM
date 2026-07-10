@@ -139,7 +139,7 @@ fn thread_start_handoff_grace() -> std::time::Duration {
         let millis = std::env::var("CRATONVM_THREAD_START_GRACE_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
+            .unwrap_or(80);
         std::time::Duration::from_millis(millis)
     })
 }
@@ -423,23 +423,6 @@ pub fn unbox_poly_return(
         b'L' | b'[' => value,
         _ => value.map(|v| coerce_value_against_ret_char(v, ret, shared)),
     }
-}
-
-fn is_method_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
-    class_name == "java/lang/invoke/MethodHandle"
-        || class_name.starts_with("java/lang/invoke/MethodHandle")
-        || (class_name.starts_with("java/lang/invoke/") && class_name.contains("MethodHandle"))
-        || class_name == "java/lang/foreign/DowncallHandle"
-}
-
-fn is_var_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
-    class_name == "java/lang/invoke/VarHandle"
-        || class_name.starts_with("java/lang/invoke/VarHandle")
-        || (class_name.starts_with("java/lang/invoke/") && class_name.contains("VarHandle"))
-}
-
-fn prefers_exact_signature_polymorphic_receiver(class_name: &str) -> bool {
-    class_name == "java/lang/foreign/DowncallHandle"
 }
 
 // ---------------------------------------------------------------------------
@@ -1593,15 +1576,6 @@ impl<'a> NativeContextImpl<'a> {
         if let Some(r) = self.thread.native_pending_return {
             snapshot.push(r);
         }
-        // JNI local references (INT-5): this thread's `JNI_LOCAL_FRAMES`
-        // handles. A JNI native that obtained local refs and then re-entered
-        // Java (parking at a safepoint) or blocked leaves them populated —
-        // and a cross-thread collector marks this thread ONLY from this
-        // deposited snapshot, so an object reachable solely through a parked
-        // thread's JNI local was reclaimed. Thread-local storage; this
-        // deposit always runs on the owning thread. The wake-side remap is
-        // `update_local_refs_after_gc` in `check_post_block_gc_refs`.
-        crate::native::jni::collect_local_ref_roots(&mut snapshot);
         // This thread's own `java.lang.Thread` mirror (and any pending async
         // exception). They live in `JvmThread` fields, not on any frame, so the
         // frame scan never captures them — yet `Thread.currentThread()` hands
@@ -1656,28 +1630,10 @@ impl<'a> NativeContextImpl<'a> {
         // `is_object_address`, and they can only over-retain (the young sweep
         // runs non-moving while any thread is in JIT, so nothing is relocated).
         if !moving_young_precise_only {
-            let jit_scan_start = snapshot.len();
             crate::jit::conservative_roots::scan_active_jit_frames(
                 &self.shared.heap,
                 &mut snapshot,
             );
-            // G1 pin-in-place, cross-thread half (same as the safepoint path
-            // in `update_root_snapshot`): the note above — "they can only
-            // over-retain (the young sweep runs non-moving while any thread
-            // is in JIT, so nothing is relocated)" — is GENERATIONAL-only.
-            // G1 always evacuates, so this blocked thread's conservative JIT
-            // roots must also PIN their regions out of the collection set;
-            // the spill slots holding them cannot be rewritten. Replace
-            // semantics per thread; entry dropped at thread exit.
-            if self.shared.heap.is_g1() {
-                let addrs: Vec<usize> = snapshot[jit_scan_start..]
-                    .iter()
-                    .map(|r| r.as_ptr() as usize)
-                    .collect();
-                cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&addrs);
-            }
-        } else if self.shared.heap.is_g1() {
-            cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&[]);
         }
         // Shadow-stack precise roots (mirrors the same fold in
         // `update_root_snapshot`): under `CRATONVM_SHADOW_STACK` the moving
@@ -1836,13 +1792,6 @@ impl<'a> NativeContextImpl<'a> {
             for val in extra_refs.iter_mut() {
                 update_value_ref(val, &fixup);
             }
-            // JNI local references (INT-2, blocked-wake half): rewrite THIS
-            // thread's `JNI_LOCAL_FRAMES` handles through the composed fixup —
-            // a JNI native that blocked mid-call (monitor, join, park) and
-            // slept through moving collections must not resume with dangling
-            // local jobjects. The storage is thread-local, so this wake path
-            // is the only place that can reach this thread's handles.
-            crate::native::jni::update_local_refs_after_gc(&fixup);
         }
 
         // Refresh (don't clear) the snapshot: we are runnable again but may
@@ -2612,11 +2561,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         } else {
             h
         }
-    }
-
-    fn dbg_set_watch_cell(&mut self, addr: usize) {
-        cratonvm_gc::heap::set_dynamic_watch(addr);
-        crate::runtime::crash_handler::arm_generic_heap_watch(addr);
     }
 
     fn vm_identity(&self) -> usize {
@@ -3641,10 +3585,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn create_string_uninterned(&mut self, text: &str) -> ObjectRef {
         super::create_java_string_uninterned(self.shared, text)
-    }
-
-    fn init_string_from_units(&mut self, this: ObjectRef, units: &[u16]) -> bool {
-        super::populate_java_string_fields(self.shared, this, units)
     }
 
     fn read_string(&self, obj: ObjectRef) -> Option<String> {
@@ -4730,27 +4670,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                             .get_class(cid)
                             .map(|c| c.name.to_string())
                             .unwrap_or_else(|| format!("<unknown class_id={}>", cid.as_u32()));
-                        let to_string = invoke_on_class_shared(
-                            &shared_arc,
-                            &mut jvm_thread,
-                            cid,
-                            "toString",
-                            "()Ljava/lang/String;",
-                            &[Value::Object(Some(exc_ref))],
-                        )
-                        .ok()
-                        .flatten()
-                        .and_then(|v| match v {
-                            Value::Object(Some(s)) => super::read_java_string(&shared_arc.heap, s),
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| "<toString unavailable>".to_string());
                         eprintln!(
-                            "[dbg-uncaught] tid={} thread_name={:?} exc_class={} exc={} ptr={:p}",
+                            "[dbg-uncaught] tid={} thread_name={:?} exc_class={} ptr={:p}",
                             tid.0,
                             name,
                             cname,
-                            to_string,
                             exc_ref.as_ptr(),
                         );
                     }
@@ -4865,19 +4789,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 }
             };
 
-            // SATB (G1MARK-2): drain this thread's per-thread SATB buffer
-            // BEFORE the thread dies. The buffer is `thread_local!`; when the
-            // OS thread exits, its TLS destructor drops the only strong Arc
-            // and the registry prunes the dead Weak — any unflushed entries
-            // (up to 255 overwritten references logged since the last
-            // safepoint) vanish. SATB entries are OLD reference values the
-            // MARKER needs, not the logging thread: a dying thread that
-            // overwrote the last snapshot-visible path to an object would
-            // take its only gray-source to the grave, and cleanup could then
-            // free a live region. Cheap no-op when no marking cycle is
-            // active.
-            shared_arc.heap.flush_thread_satb();
-
             // CRIT (multi-thread STW deadlock / undercount): transition from
             // alive mutator to dead thread through the blocked-region protocol.
             // `finish_after` serializes `mark_dead` with `request_stw_counted`,
@@ -4904,13 +4815,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
         self.shared.thread_registry.set_join_handle(tid, handle);
         if !is_executor_worker {
-            // Preserve HotSpot-like parent scheduling by default: Thread.start()
-            // should not sleep the submitting thread. The env knob remains for
-            // diagnosing legacy starvation cases, but a non-zero default lets
-            // tiny async tasks complete before callers can close/cancel them.
-            // Do not apply this to real ThreadPoolExecutor workers: CompletableFuture
-            // concurrency-limit tests depend on their first tasks entering within
-            // a 10 ms window.
+            // Give newly-started plain Java workers a short handoff window before
+            // the parent immediately closes an async context or enters a tight
+            // timed wait. Spring's @Async tests expose this under OSR: diagnostic
+            // ring recording or the watchdog thread adds enough pacing; without
+            // it, a Mockito-backed SimpleAsyncTaskExecutor worker can be starved
+            // long enough to hang class execution. Do not apply this to real
+            // ThreadPoolExecutor workers: CompletableFuture concurrency-limit
+            // tests depend on their first tasks entering within a 10 ms window.
             let grace = thread_start_handoff_grace();
             if grace.is_zero() {
                 std::thread::yield_now();
@@ -6605,53 +6517,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             }
             _ => result,
         }
-    }
-
-    fn invoke_virtual_bytecode_only(
-        &mut self,
-        receiver: ObjectRef,
-        method_name: &str,
-        descriptor: &str,
-        args: &[Value],
-    ) -> MethodCallResult {
-        // Call straight into `interpreter::execute` — the actual "just run
-        // this bytecode, no native check" primitive that
-        // `invoke_on_class_shared_inner` itself falls back to once it has
-        // decided native doesn't apply. `invoke_on_class_shared` is NOT
-        // sufficient here: besides its primary `check_override` gate (which
-        // IS skipped for an ordinary concrete method like
-        // `ThreadPoolExecutor.execute`/`submit`/`shutdown`), it has a
-        // SECOND, unconditional native-registry check for any non-interface
-        // declaring class (`override_cb` in `invoke_on_class_shared_inner`,
-        // vm_exec.rs) that re-finds this exact native regardless of the
-        // first gate — routing through `invoke_on_class_shared` reintroduced
-        // infinite recursion (confirmed via a depth-counter probe: `execute`
-        // called itself on the same receiver until the native stack
-        // overflowed) instead of actually reaching bytecode.
-        let receiver = self.shared.heap.load_and_forward(receiver);
-        let class_id = self.shared.heap.class_id_of(receiver);
-        let declaring_class_id = {
-            let cm = self.shared.class_manager.read();
-            crate::classloading::find_method_recursive(
-                class_id,
-                method_name,
-                descriptor,
-                &cm.class_store,
-            )
-            .map(|(_, declaring_id)| declaring_id)
-            .unwrap_or(class_id)
-        };
-        let mut full_args = Vec::with_capacity(1 + args.len());
-        full_args.push(Value::Object(Some(receiver)));
-        full_args.extend_from_slice(args);
-        crate::runtime::interpreter::execute(
-            self.shared,
-            self.thread,
-            declaring_class_id,
-            method_name,
-            descriptor,
-            &full_args,
-        )
     }
 
     fn class_annotations(&self, class_id: ClassId) -> Vec<crate::native::registry::AnnotationData> {
@@ -8357,45 +8222,6 @@ pub fn invoke_or_native(
     // for both synthetic stubs AND real JDK classes.  Many JDK Java methods
     // (e.g. VM.getSavedProperty) depend on JVM-internal state we haven't set up,
     // so our Rust native registration must take priority over bytecode.
-    // `java/util/concurrent/ThreadPoolExecutor.execute(Runnable)`: the
-    // registered native (`native_es_execute`) assumes CratonVM's synthetic
-    // 2-field `Executors.new*ThreadPool()` receiver. It is NOT disambiguated
-    // by the general SyntheticStub/CRATONVM_REAL `real_protected_stub` logic
-    // below, because that check is CLASS-scoped and the real
-    // `ThreadPoolExecutor` *class* bytecode is always loaded regardless of
-    // whether a given *instance* is genuinely real or one of our synthetic
-    // stand-ins. A genuinely real, bytecode-constructed `ThreadPoolExecutor`
-    // (its own real `<init>` ran, so its real `workers` field is populated --
-    // e.g. `spawn_runnable_on_real_thread`'s own singleton async pool) must
-    // run its own real `execute()` bytecode here too, or calling `.execute()`
-    // on it from native code (via `ctx.invoke_virtual`) recurses back into
-    // this same native forever (a real stack overflow, confirmed via gdb).
-    // See docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md.
-    if effective_class == "java/util/concurrent/ThreadPoolExecutor"
-        && method_name == "execute"
-        && descriptor == "(Ljava/lang/Runnable;)V"
-    {
-        if let Some(Value::Object(Some(recv))) = args.first() {
-            let recv_class_id = shared.heap.class_id_of(*recv);
-            let has_real_workers = {
-                let cm = shared.class_manager.read();
-                resolve_field_index_in_hierarchy(recv_class_id, "workers", &cm.class_store)
-                    .map(|idx| matches!(shared.heap.get_field(*recv, idx), Value::Object(Some(_))))
-                    .unwrap_or(false)
-            };
-            if has_real_workers {
-                return invoke_on_class_shared(
-                    shared,
-                    thread,
-                    recv_class_id,
-                    method_name,
-                    descriptor,
-                    args,
-                );
-            }
-        }
-    }
-
     if let Some(callback) = shared
         .native_methods
         .find(effective_class, method_name, descriptor)
@@ -11554,21 +11380,10 @@ fn invoke_on_class_shared_inner(
                             && ((method_name == "findClass"
                                 && descriptor == "(Ljava/lang/String;)Ljava/lang/Class;")
                                 || (method_name == "findResource"
-                                    && descriptor == "(Ljava/lang/String;)Ljava/net/URL;")
+                                && descriptor == "(Ljava/lang/String;)Ljava/net/URL;")
                                 || (method_name == "findResources"
                                     && descriptor
-                                        == "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                                || (method_name == "<init>"
-                                    && matches!(
-                                        descriptor,
-                                        "([Ljava/net/URL;)V"
-                                            | "([Ljava/net/URL;Ljava/lang/ClassLoader;)V"
-                                            | "(Ljava/lang/String;[Ljava/net/URL;Ljava/lang/ClassLoader;)V"
-                                            | "([Ljava/net/URL;Ljava/lang/ClassLoader;Ljava/net/URLStreamHandlerFactory;)V"
-                                            | "(Ljava/lang/String;[Ljava/net/URL;Ljava/lang/ClassLoader;Ljava/net/URLStreamHandlerFactory;)V"
-                                            | "([Ljava/net/URL;Ljava/security/AccessControlContext;)V"
-                                            | "(Ljava/lang/String;[Ljava/net/URL;Ljava/lang/ClassLoader;Ljava/security/AccessControlContext;)V"
-                                    ))))
+                                        == "(Ljava/lang/String;)Ljava/util/Enumeration;")))
                         || (matches!(
                             class_name,
                             "jdk/internal/loader/URLClassPath" | "sun/misc/URLClassPath"
@@ -12389,37 +12204,6 @@ fn invoke_on_class_shared_inner(
                                 | "getLocalAddress"
                                 | "socket"
                             ))
-                        // SocketAdaptor address accessors need the same channel
-                        // shims: the real JDK bytecode returns the unresolved
-                        // InetSocketAddress we synthesize for accepted peers,
-                        // so Socket.getInetAddress() becomes null and Tomcat's
-                        // request remoteAddr/remoteHost population fails.
-                        || (class_name == "sun/nio/ch/SocketAdaptor"
-                            && matches!(method_name, "getInetAddress" | "getLocalAddress"))
-                        || (class_name == "java/net/Socket"
-                            && matches!(method_name, "getInetAddress" | "getLocalAddress"))
-                        // Jasper's embedded ECJ can surface a CratonVM-only
-                        // false-positive "must implement
-                        // ServletConfig.getInitParameterNames()" problem for
-                        // generated JSP classes. Let the narrow native
-                        // DefaultProblem.isError override demote only that
-                        // problem so Jasper still treats real ECJ errors as
-                        // fatal.
-                        || (matches!(
-                            class_name,
-                            "org/eclipse/jdt/internal/compiler/problem/DefaultProblem"
-                                | "org/eclipse/jdt/core/compiler/CategorizedProblem"
-                                | "org/eclipse/jdt/core/compiler/IProblem"
-                        )
-                            && method_name == "isError"
-                            && descriptor == "()Z")
-                        || (class_name == "org/apache/tomcat/util/buf/MessageBytes"
-                            && method_name == "toString"
-                            && descriptor == "()Ljava/lang/String;")
-                        || (class_name == "org/apache/jasper/servlet/JspServlet"
-                            && method_name == "handleMissingResource"
-                            && descriptor
-                                == "(Ljakarta/servlet/http/HttpServletRequest;Ljakarta/servlet/http/HttpServletResponse;Ljava/lang/String;)V")
                         // SelectableChannel.register — JDK bytecode walks
                         // SelectorProvider state we don't initialize.
                         || (matches!(
@@ -12796,26 +12580,6 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/util/concurrent/LinkedBlockingQueue"
                             && method_name == "clear"
                             && descriptor == "()V")
-                        || (class_name == "java/util/concurrent/LinkedBlockingDeque"
-                            && method_name == "clear"
-                            && descriptor == "()V")
-                        || (class_name == "java/io/BufferedInputStream"
-                            && matches!(
-                                (method_name, descriptor),
-                                ("read", "()I")
-                                    | ("read", "([BII)I")
-                                    | ("skip", "(J)J")
-                                    | ("available", "()I")
-                                    | ("mark", "(I)V")
-                                    | ("reset", "()V")
-                                    | ("markSupported", "()Z")
-                                    | ("close", "()V")
-                            ))
-                        || (matches!(class_name, "java/lang/Iterable" | "java/util/Collection" | "java/util/Set" | "java/util/EnumSet")
-                            && method_name == "iterator"
-                            && descriptor == "()Ljava/util/Iterator;")
-                        || (class_name == "java/util/Iterator"
-                            && matches!(method_name, "hasNext" | "next" | "remove"))
                         // Spring Reactor StepVerifier uses timed
                         // CountDownLatch.await during cancel/timeout tests. The
                         // real JDK latch parks through AQS/Unsafe machinery; the
@@ -13502,11 +13266,6 @@ fn invoke_on_class_shared_inner(
                             class_name,
                             method_name,
                             descriptor,
-                        )
-                        || crate::runtime::interpreter::is_bc_crypto_math_native_override(
-                            class_name,
-                            method_name,
-                            descriptor,
                         );
                     if check_override
                         && shared
@@ -13688,7 +13447,10 @@ fn invoke_on_class_shared_inner(
                     // DirectMethodHandle$Constructor, so its readValue silently
                     // failed. Recognise any java/lang/invoke class carrying
                     // "MethodHandle" in its name as a signature-polymorphic receiver.
-                    let is_mh = is_method_handle_signature_polymorphic_receiver(&class_name);
+                    let is_mh = class_name == "java/lang/invoke/MethodHandle"
+                        || class_name.starts_with("java/lang/invoke/MethodHandle")
+                        || (class_name.starts_with("java/lang/invoke/")
+                            && class_name.contains("MethodHandle"));
                     // Recognise any java/lang/invoke class carrying "VarHandle" in
                     // its name, not just ones literally prefixed "VarHandle" — the
                     // JEP 454 FFM API's `SegmentVarHandle` (used by
@@ -13696,7 +13458,10 @@ fn invoke_on_class_shared_inner(
                     // share that prefix, and previously fell through to normal
                     // method resolution and threw NoSuchMethodError. Mirrors the
                     // analogous `is_mh` broadening above.
-                    let is_vh = is_var_handle_signature_polymorphic_receiver(&class_name);
+                    let is_vh = class_name == "java/lang/invoke/VarHandle"
+                        || class_name.starts_with("java/lang/invoke/VarHandle")
+                        || (class_name.starts_with("java/lang/invoke/")
+                            && class_name.contains("VarHandle"));
                     if is_mh || is_vh {
                         let base = if is_mh {
                             "java/lang/invoke/MethodHandle"
@@ -13710,20 +13475,6 @@ fn invoke_on_class_shared_inner(
                             "([Ljava/lang/Object;)V",
                             "([Ljava/lang/Object;)Z",
                         ];
-                        let prefer_exact =
-                            prefers_exact_signature_polymorphic_receiver(&class_name);
-                        if prefer_exact {
-                            for poly_desc in &poly_descs {
-                                if let Some(cb) =
-                                    shared
-                                        .native_methods
-                                        .find(&class_name, method_name, poly_desc)
-                                {
-                                    let r = safe_native_call(shared, thread, cb, args)?;
-                                    return Ok(unbox_poly_return(shared, r, descriptor));
-                                }
-                            }
-                        }
                         for poly_desc in &poly_descs {
                             if let Some(cb) =
                                 shared.native_methods.find(base, method_name, poly_desc)
@@ -13732,17 +13483,15 @@ fn invoke_on_class_shared_inner(
                                 return Ok(unbox_poly_return(shared, r, descriptor));
                             }
                         }
-                        if !prefer_exact {
-                            // Also try the exact class name
-                            for poly_desc in &poly_descs {
-                                if let Some(cb) =
-                                    shared
-                                        .native_methods
-                                        .find(&class_name, method_name, poly_desc)
-                                {
-                                    let r = safe_native_call(shared, thread, cb, args)?;
-                                    return Ok(unbox_poly_return(shared, r, descriptor));
-                                }
+                        // Also try the exact class name
+                        for poly_desc in &poly_descs {
+                            if let Some(cb) =
+                                shared
+                                    .native_methods
+                                    .find(&class_name, method_name, poly_desc)
+                            {
+                                let r = safe_native_call(shared, thread, cb, args)?;
+                                return Ok(unbox_poly_return(shared, r, descriptor));
                             }
                         }
                     }
@@ -14353,52 +14102,6 @@ fn invoke_on_class_shared_inner(
         }
     }
 
-    if !is_native {
-        let class_name_for_force = shared
-            .class_manager
-            .read()
-            .get_class(declaring_class_id)
-            .map(|c| c.name.to_string())
-            .unwrap_or_default();
-        // See the identical guard + comment in `invoke_or_native` above: a
-        // genuinely real, bytecode-constructed `ThreadPoolExecutor` (real
-        // `workers` field populated) must keep running its own real
-        // `execute()` bytecode -- only CratonVM's synthetic 2-field
-        // `Executors.new*ThreadPool()` objects need the forced native. This
-        // call site (`invoke_on_class_shared_inner`) is a SEPARATE dispatch
-        // path from `invoke_or_native` (e.g. reached from the interpreter's
-        // reflection/initial-invoke routes) that independently consults
-        // `should_force_registered_native_over_bytecode`, so it needs its own
-        // copy of the receiver check. See docs/known-issues/
-        // threadpoolexecutor-execute-npe-on-ctl-regression.md.
-        let force_native_receiver_exempt = class_name_for_force
-            == "java/util/concurrent/ThreadPoolExecutor"
-            && method_name == "execute"
-            && matches!(args.first(), Some(Value::Object(Some(recv))) if {
-                let recv_class_id = shared.heap.class_id_of(*recv);
-                let cm = shared.class_manager.read();
-                resolve_field_index_in_hierarchy(recv_class_id, "workers", &cm.class_store)
-                    .map(|idx| matches!(shared.heap.get_field(*recv, idx), Value::Object(Some(_))))
-                    .unwrap_or(false)
-            });
-        if !force_native_receiver_exempt
-            && crate::runtime::interpreter::should_force_registered_native_over_bytecode(
-                shared,
-                &class_name_for_force,
-                method_name,
-                descriptor,
-            )
-        {
-            if let Some(callback) =
-                shared
-                    .native_methods
-                    .find(&class_name_for_force, method_name, descriptor)
-            {
-                return safe_native_call(shared, thread, callback, args);
-            }
-        }
-    }
-
     // --- ACC_SYNCHRONIZED: acquire monitor before execution ---
     // B9: scope the monitor release as an RAII guard so it runs on BOTH the
     // normal-return path AND a panic unwind through the interpreter call.
@@ -14910,28 +14613,6 @@ mod tests {
 
     fn test_shared() -> Arc<SharedVm> {
         Arc::new(SharedVm::new(VmConfig::default()))
-    }
-
-    #[test]
-    fn downcall_handle_uses_method_handle_signature_polymorphic_dispatch() {
-        assert!(is_method_handle_signature_polymorphic_receiver(
-            "java/lang/invoke/MethodHandle"
-        ));
-        assert!(is_method_handle_signature_polymorphic_receiver(
-            "java/lang/invoke/DirectMethodHandle$Constructor"
-        ));
-        assert!(is_method_handle_signature_polymorphic_receiver(
-            "java/lang/foreign/DowncallHandle"
-        ));
-        assert!(!is_method_handle_signature_polymorphic_receiver(
-            "java/lang/foreign/MemorySegment"
-        ));
-        assert!(prefers_exact_signature_polymorphic_receiver(
-            "java/lang/foreign/DowncallHandle"
-        ));
-        assert!(!prefers_exact_signature_polymorphic_receiver(
-            "java/lang/invoke/MethodHandle"
-        ));
     }
 
     #[test]

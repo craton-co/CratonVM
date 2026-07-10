@@ -13,18 +13,6 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, Vm
 use cratonvm_types::ClassId;
 use cratonvm_types::{ObjectRef, Value};
 
-#[inline]
-pub(crate) fn unsafe_offset_is_heap_slot(
-    ctx: &dyn NativeContext,
-    obj: ObjectRef,
-    offset: usize,
-) -> bool {
-    // Craton heap field offsets are slot indexes. HotSpot/JCTools byte offsets
-    // may be numerically below padded mirror field counts, so cap heap-slot
-    // treatment to the small real-slot range.
-    offset < ctx.object_num_fields(obj) && offset < 64
-}
-
 /// Normalise property keys after `read_string` (trim stray control/NUL).
 #[inline]
 fn normalize_java_property_key(key: &str) -> String {
@@ -358,42 +346,6 @@ fn native_output_stream_writer_write_string_range(
     write_bytes_from_output_stream_writer(ctx, this, &bytes)
 }
 
-fn native_output_stream_writer_write_chars(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let chars = match args.get(1) {
-        Some(Value::Object(Some(a))) => *a,
-        _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
-    };
-    let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-    let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
-    let arr_len = ctx.array_length(chars) as i32;
-    let end = off.checked_add(len).unwrap_or(i32::MAX);
-    if off < 0 || len < 0 || end > arr_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: end }.into());
-    }
-    if len == 0 {
-        return Ok(None);
-    }
-
-    let mut units = Vec::with_capacity(len as usize);
-    for i in off..end {
-        let ch = match ctx.get_array_element(chars, i as usize) {
-            Value::Int(v) => v as u16,
-            _ => 0,
-        };
-        units.push(ch);
-    }
-    let text = String::from_utf16_lossy(&units);
-    let bytes = text.into_bytes();
-    write_bytes_from_output_stream_writer(ctx, this, &bytes)
-}
-
 fn native_output_stream_writer_write_int(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -435,1864 +387,6 @@ fn native_output_stream_writer_close(
     };
     if let Some(out) = osw_wrapped_output(ctx, this) {
         let _ = ctx.invoke_virtual(out, "close", "()V", &[])?;
-    }
-    Ok(None)
-}
-
-fn native_input_stream_reader_close(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    if let Value::Object(Some(input)) = ctx.get_field(this, 0) {
-        let _ = ctx.invoke_virtual(input, "close", "()V", &[]);
-    }
-    Ok(None)
-}
-
-
-#[derive(Default)]
-struct BufferedInputStreamMarkState {
-    mark_limit: usize,
-    mark_active: bool,
-    replay_pos: usize,
-    bytes: Vec<u8>,
-}
-
-fn buffered_input_stream_marks(
-) -> &'static std::sync::Mutex<std::collections::HashMap<i32, BufferedInputStreamMarkState>> {
-    static STORE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<i32, BufferedInputStreamMarkState>>,
-    > = std::sync::OnceLock::new();
-    STORE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-fn buffered_input_stream_input(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
-    match ctx.get_field_by_name(this, "in") {
-        Value::Object(Some(o)) => Some(o),
-        _ => match ctx.get_field(this, 0) {
-            Value::Object(Some(o)) => Some(o),
-            _ => None,
-        },
-    }
-}
-
-fn buffered_input_stream_init(ctx: &mut dyn NativeContext, this: ObjectRef, input: Value) {
-    ctx.set_field_by_name(this, "in", input);
-    ctx.set_field(this, 0, input);
-    buffered_input_stream_marks()
-        .lock()
-        .unwrap()
-        .remove(&ctx.identity_hash_code(this));
-}
-
-fn buffered_input_stream_record_byte(ctx: &dyn NativeContext, this: ObjectRef, byte: u8) {
-    let key = ctx.identity_hash_code(this);
-    let mut marks = buffered_input_stream_marks().lock().unwrap();
-    if let Some(state) = marks.get_mut(&key) {
-        if !state.mark_active {
-            return;
-        }
-        if state.bytes.len() < state.mark_limit {
-            state.bytes.push(byte);
-        } else {
-            state.mark_active = false;
-            state.bytes.clear();
-            state.replay_pos = 0;
-        }
-    }
-}
-
-fn buffered_input_stream_replay_byte(ctx: &dyn NativeContext, this: ObjectRef) -> Option<u8> {
-    let key = ctx.identity_hash_code(this);
-    let mut marks = buffered_input_stream_marks().lock().unwrap();
-    let state = marks.get_mut(&key)?;
-    if state.replay_pos < state.bytes.len() {
-        let b = state.bytes[state.replay_pos];
-        state.replay_pos += 1;
-        Some(b)
-    } else {
-        None
-    }
-}
-
-fn buffered_input_stream_read_one(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-) -> Result<i32, MethodCallFailed> {
-    if let Some(byte) = buffered_input_stream_replay_byte(ctx, this) {
-        return Ok(byte as i32);
-    }
-    let Some(input) = buffered_input_stream_input(ctx, this) else {
-        return Ok(-1);
-    };
-    let value = ctx
-        .invoke_virtual(input, "read", "()I", &[])?
-        .unwrap_or(Value::Int(-1))
-        .as_int()
-        .unwrap_or(-1);
-    if value >= 0 {
-        buffered_input_stream_record_byte(ctx, this, (value & 0xff) as u8);
-    }
-    Ok(value)
-}
-
-fn buffered_input_stream_invalid_mark() -> MethodCallFailed {
-    RuntimeError::IOException {
-        message: "Resetting to invalid mark".to_string(),
-    }
-    .into()
-}
-
-fn message_bytes_to_chars_cache(
-) -> &'static std::sync::Mutex<std::collections::HashMap<i32, (i32, usize)>> {
-    static STORE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<i32, (i32, usize)>>,
-    > = std::sync::OnceLock::new();
-    STORE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-#[derive(Clone)]
-struct MapperInternalFastEntry {
-    host_chunk_key: i32,
-    uri_chunk_key: i32,
-    version_key: i32,
-    hosts_key: i32,
-    host_start: usize,
-    host_end: usize,
-    uri_start: usize,
-    uri_end: usize,
-    selected_context: Option<ObjectRef>,
-    versions_key: i32,
-    selected_version: Option<ObjectRef>,
-    exact_wrappers_key: i32,
-    wildcard_wrappers_key: i32,
-    mapped_host: Option<ObjectRef>,
-    contexts_key: i32,
-    context_path_len: usize,
-    wrapper_len: usize,
-    host: Option<ObjectRef>,
-    context: Option<ObjectRef>,
-    wrapper: Option<ObjectRef>,
-    wrapper_name: Option<ObjectRef>,
-    path_match: Option<ObjectRef>,
-    context_slash_count: i32,
-    no_context: bool,
-    default_mapping: bool,
-}
-
-fn mapper_internal_fast_cache(
-) -> &'static std::sync::Mutex<std::collections::HashMap<i32, MapperInternalFastEntry>> {
-    static STORE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<i32, MapperInternalFastEntry>>,
-    > = std::sync::OnceLock::new();
-    STORE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-fn set_char_chunk_from_units(ctx: &mut dyn NativeContext, char_c: ObjectRef, units: &[u16]) {
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, units.len());
-    for (i, unit) in units.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Int(*unit as i32));
-    }
-    ctx.set_field_by_name(char_c, "buff", Value::Object(Some(arr)));
-    ctx.set_field_by_name(char_c, "start", Value::Int(0));
-    ctx.set_field_by_name(char_c, "end", Value::Int(units.len() as i32));
-    ctx.set_field_by_name(char_c, "isSet", Value::Int(1));
-    ctx.set_field_by_name(char_c, "hasHashCode", Value::Int(0));
-}
-
-fn set_char_chunk_view(
-    ctx: &mut dyn NativeContext,
-    char_c: ObjectRef,
-    buff: ObjectRef,
-    start: usize,
-    len: usize,
-) {
-    ctx.set_field_by_name(char_c, "buff", Value::Object(Some(buff)));
-    ctx.set_field_by_name(char_c, "start", Value::Int(start as i32));
-    ctx.set_field_by_name(char_c, "end", Value::Int((start + len) as i32));
-    ctx.set_field_by_name(char_c, "isSet", Value::Int(1));
-    ctx.set_field_by_name(char_c, "hasHashCode", Value::Int(0));
-}
-
-fn message_bytes_set_chars(
-    ctx: &mut dyn NativeContext,
-    mb: ObjectRef,
-    buff: ObjectRef,
-    start: usize,
-    len: usize,
-) {
-    if let Value::Object(Some(char_c)) = ctx.get_field_by_name(mb, "charC") {
-        set_char_chunk_view(ctx, char_c, buff, start, len);
-    }
-    ctx.set_field_by_name(mb, "type", Value::Int(3));
-    ctx.set_field_by_name(mb, "hasHashCode", Value::Int(0));
-    ctx.set_field_by_name(mb, "hasLongValue", Value::Int(0));
-    message_bytes_to_chars_cache()
-        .lock()
-        .unwrap()
-        .remove(&ctx.identity_hash_code(mb));
-}
-
-fn message_bytes_set_string_object(
-    ctx: &mut dyn NativeContext,
-    mb: ObjectRef,
-    value: Option<ObjectRef>,
-) {
-    ctx.set_field_by_name(mb, "strValue", Value::Object(value));
-    ctx.set_field_by_name(mb, "hasHashCode", Value::Int(0));
-    ctx.set_field_by_name(mb, "hasLongValue", Value::Int(0));
-    ctx.set_field_by_name(mb, "type", Value::Int(if value.is_some() { 1 } else { 0 }));
-    message_bytes_to_chars_cache()
-        .lock()
-        .unwrap()
-        .remove(&ctx.identity_hash_code(mb));
-}
-
-fn native_message_bytes_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    match ctx.get_field_by_name(this, "type").as_int().unwrap_or(0) {
-        0 | 1 => Ok(Some(ctx.get_field_by_name(this, "strValue"))),
-        2 => {
-            let byte_string = match ctx.get_field_by_name(this, "byteC") {
-                Value::Object(Some(byte_c)) => {
-                    ctx.invoke_virtual(byte_c, "toString", "()Ljava/lang/String;", &[])?
-                }
-                _ => None,
-            };
-            if let Some(value @ Value::Object(_)) = byte_string {
-                ctx.set_field_by_name(this, "strValue", value);
-                Ok(Some(value))
-            } else {
-                Ok(Some(Value::Object(None)))
-            }
-        }
-        3 => {
-            let str_obj = match ctx.get_field_by_name(this, "charC") {
-                Value::Object(Some(char_c)) => {
-                    if let Some((buff, start, end)) = char_chunk_parts(ctx, char_c) {
-                        let mut units = Vec::with_capacity(end.saturating_sub(start));
-                        for i in start..end {
-                            units.push(ctx.get_array_element(buff, i).as_int().unwrap_or(0) as u16);
-                        }
-                        Some(ctx.create_string(&String::from_utf16_lossy(&units)))
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            ctx.set_field_by_name(this, "strValue", Value::Object(str_obj));
-            Ok(Some(Value::Object(str_obj)))
-        }
-        _ => Ok(Some(ctx.get_field_by_name(this, "strValue"))),
-    }
-}
-
-fn native_message_bytes_to_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let this_key = ctx.identity_hash_code(this);
-    let ty = ctx.get_field_by_name(this, "type").as_int().unwrap_or(0);
-
-    if ty == 0 {
-        message_bytes_to_chars_cache()
-            .lock()
-            .unwrap()
-            .remove(&this_key);
-        if let Value::Object(Some(char_c)) = ctx.get_field_by_name(this, "charC") {
-            let _ = ctx.invoke_virtual(char_c, "recycle", "()V", &[])?;
-        }
-        return Ok(None);
-    }
-    if ty == 3 {
-        return Ok(None);
-    }
-    if ty == 2 {
-        let _ = ctx.invoke_virtual(this, "toString", "()Ljava/lang/String;", &[])?;
-    } else if ty != 1 {
-        return Ok(None);
-    }
-
-    let str_obj = match ctx.get_field_by_name(this, "strValue") {
-        Value::Object(Some(o)) => o,
-        _ => {
-            message_bytes_to_chars_cache()
-                .lock()
-                .unwrap()
-                .remove(&this_key);
-            return Ok(None);
-        }
-    };
-    let str_key = ctx.identity_hash_code(str_obj);
-    let cached = message_bytes_to_chars_cache()
-        .lock()
-        .unwrap()
-        .get(&this_key)
-        .copied();
-    if let Some((cached_str_key, cached_len)) = cached {
-        if cached_str_key == str_key {
-            if let Value::Object(Some(char_c)) = ctx.get_field_by_name(this, "charC") {
-                if let Some((_, start, end)) = char_chunk_parts(ctx, char_c) {
-                    if end.saturating_sub(start) == cached_len {
-                        return Ok(None);
-                    }
-                }
-            }
-        }
-    }
-
-    let Some(s) = ctx.read_string(str_obj) else {
-        message_bytes_to_chars_cache()
-            .lock()
-            .unwrap()
-            .remove(&this_key);
-        return Ok(None);
-    };
-    let char_c = match ctx.get_field_by_name(this, "charC") {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(None),
-    };
-    let units: Vec<u16> = s.encode_utf16().collect();
-    set_char_chunk_from_units(ctx, char_c, &units);
-    message_bytes_to_chars_cache()
-        .lock()
-        .unwrap()
-        .insert(this_key, (str_key, units.len()));
-    Ok(None)
-}
-
-fn char_chunk_parts(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, usize, usize)> {
-    let buff = match ctx.get_field_by_name(this, "buff") {
-        Value::Object(Some(o)) => o,
-        _ => return None,
-    };
-    let start = ctx
-        .get_field_by_name(this, "start")
-        .as_int()
-        .unwrap_or(0)
-        .max(0) as usize;
-    let end = ctx
-        .get_field_by_name(this, "end")
-        .as_int()
-        .unwrap_or(0)
-        .max(0) as usize;
-    if end < start {
-        return None;
-    }
-    Some((buff, start, end))
-}
-
-fn char_chunk_char_at(ctx: &dyn NativeContext, buff: ObjectRef, index: usize) -> u16 {
-    ctx.get_array_element(buff, index).as_int().unwrap_or(0) as u16
-}
-
-fn char_chunk_nth_slash(
-    ctx: &dyn NativeContext,
-    buff: ObjectRef,
-    start: usize,
-    end: usize,
-    n: usize,
-) -> usize {
-    let mut slash_count = 0usize;
-    let mut pos = start;
-    while pos < end {
-        if char_chunk_char_at(ctx, buff, pos) == b'/' as u16 {
-            slash_count += 1;
-            if slash_count == n {
-                return pos;
-            }
-        }
-        pos += 1;
-    }
-    end
-}
-
-fn char_chunk_last_slash(
-    ctx: &dyn NativeContext,
-    buff: ObjectRef,
-    start: usize,
-    end: usize,
-) -> usize {
-    let mut pos = end;
-    while pos > start {
-        pos -= 1;
-        if char_chunk_char_at(ctx, buff, pos) == b'/' as u16 {
-            return pos;
-        }
-    }
-    start
-}
-
-fn char_chunk_range_starts_with(
-    ctx: &dyn NativeContext,
-    buff: ObjectRef,
-    start: usize,
-    end: usize,
-    s: &str,
-    pos: usize,
-    ignore_case: bool,
-) -> bool {
-    let units: Vec<u16> = s.encode_utf16().collect();
-    if units.len() + pos > end.saturating_sub(start) {
-        return false;
-    }
-    for (i, expected) in units.iter().enumerate() {
-        let actual = char_chunk_char_at(ctx, buff, start + pos + i);
-        if ignore_case {
-            if ascii_lower_char(actual) != ascii_lower_char(*expected) {
-                return false;
-            }
-        } else if actual != *expected {
-            return false;
-        }
-    }
-    true
-}
-
-fn char_chunk_range_equals_string(
-    ctx: &dyn NativeContext,
-    buff: ObjectRef,
-    start: usize,
-    end: usize,
-    s: &str,
-    ignore_case: bool,
-) -> bool {
-    let units: Vec<u16> = s.encode_utf16().collect();
-    if end.saturating_sub(start) != units.len() {
-        return false;
-    }
-    for (i, expected) in units.iter().enumerate() {
-        let actual = char_chunk_char_at(ctx, buff, start + i);
-        if ignore_case {
-            if ascii_lower_char(actual) != ascii_lower_char(*expected) {
-                return false;
-            }
-        } else if actual != *expected {
-            return false;
-        }
-    }
-    true
-}
-
-fn mapping_match_static(ctx: &dyn NativeContext, name: &str) -> Option<ObjectRef> {
-    let class_id = ctx.class_id_by_name("jakarta/servlet/http/MappingMatch")?;
-    let idx = ctx.static_field_index_by_name(class_id, name)?;
-    match ctx.get_static_field(class_id, idx) {
-        Value::Object(Some(o)) => Some(o),
-        _ => None,
-    }
-}
-
-fn ascii_lower_char(ch: u16) -> u16 {
-    if ch <= 0xff {
-        let b = ch as u8;
-        if b.is_ascii_uppercase() {
-            (b + 32) as u16
-        } else {
-            ch
-        }
-    } else {
-        char::from_u32(ch as u32)
-            .and_then(|c| c.to_lowercase().next())
-            .map(|c| c as u32 as u16)
-            .unwrap_or(ch)
-    }
-}
-
-fn char_chunk_equals_string(
-    ctx: &dyn NativeContext,
-    this: ObjectRef,
-    s: &str,
-    ignore_case: bool,
-) -> bool {
-    let Some((buff, start, end)) = char_chunk_parts(ctx, this) else {
-        return false;
-    };
-    let units: Vec<u16> = s.encode_utf16().collect();
-    if end - start != units.len() {
-        return false;
-    }
-    for (i, expected) in units.iter().enumerate() {
-        let actual = char_chunk_char_at(ctx, buff, start + i);
-        if ignore_case {
-            if ascii_lower_char(actual) != ascii_lower_char(*expected) {
-                return false;
-            }
-        } else if actual != *expected {
-            return false;
-        }
-    }
-    true
-}
-
-fn char_chunk_starts_with(
-    ctx: &dyn NativeContext,
-    this: ObjectRef,
-    s: &str,
-    pos: usize,
-    ignore_case: bool,
-) -> bool {
-    let Some((buff, start, end)) = char_chunk_parts(ctx, this) else {
-        return false;
-    };
-    let units: Vec<u16> = s.encode_utf16().collect();
-    if units.len() + pos > end - start {
-        return false;
-    }
-    for (i, expected) in units.iter().enumerate() {
-        let actual = char_chunk_char_at(ctx, buff, start + pos + i);
-        if ignore_case {
-            if ascii_lower_char(actual) != ascii_lower_char(*expected) {
-                return false;
-            }
-        } else if actual != *expected {
-            return false;
-        }
-    }
-    true
-}
-
-fn native_char_chunk_equals_string(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let s = match args.get(1) {
-        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    Ok(Some(Value::Int(
-        if char_chunk_equals_string(ctx, this, &s, false) {
-            1
-        } else {
-            0
-        },
-    )))
-}
-
-fn native_char_chunk_equals_ignore_case(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let s = match args.get(1) {
-        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    Ok(Some(Value::Int(
-        if char_chunk_equals_string(ctx, this, &s, true) {
-            1
-        } else {
-            0
-        },
-    )))
-}
-
-fn native_char_chunk_starts_with(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let s = match args.get(1) {
-        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    Ok(Some(Value::Int(
-        if char_chunk_starts_with(ctx, this, &s, 0, false) {
-            1
-        } else {
-            0
-        },
-    )))
-}
-
-fn native_char_chunk_starts_with_ignore_case(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let s = match args.get(1) {
-        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let pos = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-    Ok(Some(Value::Int(
-        if char_chunk_starts_with(ctx, this, &s, pos, true) {
-            1
-        } else {
-            0
-        },
-    )))
-}
-
-fn mapper_map_element_name(ctx: &dyn NativeContext, elem: ObjectRef) -> String {
-    match ctx.get_field_by_name(elem, "name") {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
-    }
-}
-
-fn mapper_compare_chunk_to_string(
-    ctx: &dyn NativeContext,
-    chunk: ObjectRef,
-    start: usize,
-    end: usize,
-    name: &str,
-    ignore_case: bool,
-) -> i32 {
-    let Some((buff, _, _)) = char_chunk_parts(ctx, chunk) else {
-        return if name.is_empty() { 0 } else { -1 };
-    };
-    let chunk_len = end.saturating_sub(start);
-    let units: Vec<u16> = name.encode_utf16().collect();
-    let limit = chunk_len.min(units.len());
-    for i in 0..limit {
-        let mut actual = char_chunk_char_at(ctx, buff, start + i);
-        let mut expected = units[i];
-        if ignore_case {
-            actual = ascii_lower_char(actual);
-            expected = ascii_lower_char(expected);
-        }
-        if actual > expected {
-            return 1;
-        }
-        if actual < expected {
-            return -1;
-        }
-    }
-    if units.len() > chunk_len {
-        -1
-    } else if units.len() < chunk_len {
-        1
-    } else {
-        0
-    }
-}
-
-fn mapper_find_chunk_range(
-    ctx: &dyn NativeContext,
-    arr: ObjectRef,
-    chunk: ObjectRef,
-    start: usize,
-    end: usize,
-    ignore_case: bool,
-) -> i32 {
-    let len = ctx.array_length(arr);
-    if len == 0 {
-        return -1;
-    }
-    let mut low = 0usize;
-    let mut high = len - 1;
-    let Value::Object(Some(first)) = ctx.get_array_element(arr, 0) else {
-        return -1;
-    };
-    if mapper_compare_chunk_to_string(
-        ctx,
-        chunk,
-        start,
-        end,
-        &mapper_map_element_name(ctx, first),
-        ignore_case,
-    ) < 0
-    {
-        return -1;
-    }
-    if high == 0 {
-        return 0;
-    }
-    loop {
-        let mid = (low + high) >> 1;
-        let Value::Object(Some(elem)) = ctx.get_array_element(arr, mid) else {
-            return low as i32;
-        };
-        let cmp = mapper_compare_chunk_to_string(
-            ctx,
-            chunk,
-            start,
-            end,
-            &mapper_map_element_name(ctx, elem),
-            ignore_case,
-        );
-        if cmp > 0 {
-            low = mid;
-        } else if cmp == 0 {
-            return mid as i32;
-        } else {
-            high = mid;
-        }
-        if high - low == 1 {
-            let Value::Object(Some(elem)) = ctx.get_array_element(arr, high) else {
-                return low as i32;
-            };
-            let cmp = mapper_compare_chunk_to_string(
-                ctx,
-                chunk,
-                start,
-                end,
-                &mapper_map_element_name(ctx, elem),
-                ignore_case,
-            );
-            return if cmp < 0 { low as i32 } else { high as i32 };
-        }
-    }
-}
-
-fn mapper_find_string(ctx: &dyn NativeContext, arr: ObjectRef, name: &str) -> i32 {
-    let len = ctx.array_length(arr);
-    if len == 0 {
-        return -1;
-    }
-    let mut low = 0usize;
-    let mut high = len - 1;
-    let Value::Object(Some(first)) = ctx.get_array_element(arr, 0) else {
-        return -1;
-    };
-    if name < mapper_map_element_name(ctx, first).as_str() {
-        return -1;
-    }
-    if high == 0 {
-        return 0;
-    }
-    loop {
-        let mid = (low + high) >> 1;
-        let Value::Object(Some(elem)) = ctx.get_array_element(arr, mid) else {
-            return low as i32;
-        };
-        let elem_name = mapper_map_element_name(ctx, elem);
-        match name.cmp(elem_name.as_str()) {
-            std::cmp::Ordering::Greater => low = mid,
-            std::cmp::Ordering::Equal => return mid as i32,
-            std::cmp::Ordering::Less => high = mid,
-        }
-        if high - low == 1 {
-            let Value::Object(Some(elem)) = ctx.get_array_element(arr, high) else {
-                return low as i32;
-            };
-            let elem_name = mapper_map_element_name(ctx, elem);
-            return if name < elem_name.as_str() {
-                low as i32
-            } else {
-                high as i32
-            };
-        }
-    }
-}
-
-fn mapper_exact_find_chunk_range(
-    ctx: &dyn NativeContext,
-    arr: ObjectRef,
-    chunk: ObjectRef,
-    start: usize,
-    end: usize,
-    ignore_case: bool,
-) -> Option<ObjectRef> {
-    let (buff, _, _) = char_chunk_parts(ctx, chunk)?;
-    let idx = mapper_find_chunk_range(ctx, arr, chunk, start, end, ignore_case);
-    if idx < 0 {
-        return None;
-    }
-    let elem = match ctx.get_array_element(arr, idx as usize) {
-        Value::Object(Some(o)) => o,
-        _ => return None,
-    };
-    if char_chunk_range_equals_string(
-        ctx,
-        buff,
-        start,
-        end,
-        &mapper_map_element_name(ctx, elem),
-        ignore_case,
-    ) {
-        Some(elem)
-    } else {
-        None
-    }
-}
-
-fn native_mapper_find_chunk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(-1))),
-    };
-    let chunk = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(-1))),
-    };
-    let Some((_, start, end)) = char_chunk_parts(ctx, chunk) else {
-        return Ok(Some(Value::Int(-1)));
-    };
-    Ok(Some(Value::Int(mapper_find_chunk_range(
-        ctx, arr, chunk, start, end, false,
-    ))))
-}
-
-fn native_mapper_find_chunk_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(-1))),
-    };
-    let chunk = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(-1))),
-    };
-    let start = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-    let end = args.get(3).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-    Ok(Some(Value::Int(mapper_find_chunk_range(
-        ctx, arr, chunk, start, end, false,
-    ))))
-}
-
-fn native_mapper_find_ignore_case(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(-1))),
-    };
-    let chunk = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(-1))),
-    };
-    let Some((_, start, end)) = char_chunk_parts(ctx, chunk) else {
-        return Ok(Some(Value::Int(-1)));
-    };
-    Ok(Some(Value::Int(mapper_find_chunk_range(
-        ctx, arr, chunk, start, end, true,
-    ))))
-}
-
-fn native_mapper_find_ignore_case_range(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(-1))),
-    };
-    let chunk = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(-1))),
-    };
-    let start = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-    let end = args.get(3).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-    Ok(Some(Value::Int(mapper_find_chunk_range(
-        ctx, arr, chunk, start, end, true,
-    ))))
-}
-
-fn native_mapper_find_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(-1))),
-    };
-    let name = match args.get(1) {
-        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(-1))),
-    };
-    Ok(Some(Value::Int(mapper_find_string(ctx, arr, &name))))
-}
-
-fn native_mapper_exact_find_chunk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let chunk = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let idx = native_mapper_find_chunk(ctx, args)?
-        .and_then(|v| v.as_int())
-        .unwrap_or(-1);
-    if idx < 0 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let elem = ctx.get_array_element(arr, idx as usize);
-    if let Value::Object(Some(o)) = elem {
-        if char_chunk_equals_string(ctx, chunk, &mapper_map_element_name(ctx, o), false) {
-            return Ok(Some(elem));
-        }
-    }
-    Ok(Some(Value::Object(None)))
-}
-
-fn native_mapper_exact_find_ignore_case(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let chunk = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let idx = native_mapper_find_ignore_case(ctx, args)?
-        .and_then(|v| v.as_int())
-        .unwrap_or(-1);
-    if idx < 0 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let elem = ctx.get_array_element(arr, idx as usize);
-    if let Value::Object(Some(o)) = elem {
-        if char_chunk_equals_string(ctx, chunk, &mapper_map_element_name(ctx, o), true) {
-            return Ok(Some(elem));
-        }
-    }
-    Ok(Some(Value::Object(None)))
-}
-
-fn native_mapper_exact_find_string(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let name = match args.get(1) {
-        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let idx = mapper_find_string(ctx, arr, &name);
-    if idx < 0 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let elem = ctx.get_array_element(arr, idx as usize);
-    if let Value::Object(Some(o)) = elem {
-        if mapper_map_element_name(ctx, o) == name {
-            return Ok(Some(elem));
-        }
-    }
-    Ok(Some(Value::Object(None)))
-}
-
-fn native_mapper_internal_map_wildcard_wrapper(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let arr = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let nesting = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-    let path = match args.get(3) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let mapping_data = match args.get(4) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-
-    let Some((buff, start, original_end)) = char_chunk_parts(ctx, path) else {
-        return Ok(None);
-    };
-    let full_len = original_end.saturating_sub(start);
-    let mut search_end = original_end;
-    let mut slash = usize::MAX;
-    let mut idx = mapper_find_chunk_range(ctx, arr, path, start, search_end, false);
-    let mut found: Option<(usize, usize)> = None;
-
-    while idx >= 0 {
-        let elem = match ctx.get_array_element(arr, idx as usize) {
-            Value::Object(Some(o)) => o,
-            _ => break,
-        };
-        let name = mapper_map_element_name(ctx, elem);
-        let name_len = name.encode_utf16().count();
-        if char_chunk_range_starts_with(ctx, buff, start, original_end, &name, 0, false)
-            && (full_len == name_len
-                || char_chunk_range_starts_with(
-                    ctx,
-                    buff,
-                    start,
-                    original_end,
-                    "/",
-                    name_len,
-                    true,
-                ))
-        {
-            found = Some((idx as usize, name_len));
-            break;
-        }
-
-        slash = if slash == usize::MAX {
-            char_chunk_nth_slash(ctx, buff, start, search_end, nesting + 1)
-        } else {
-            char_chunk_last_slash(ctx, buff, start, search_end)
-        };
-        if slash == search_end {
-            break;
-        }
-        search_end = slash;
-        idx = mapper_find_chunk_range(ctx, arr, path, start, search_end, false);
-    }
-
-    let Some((idx, wrapper_len)) = found else {
-        return Ok(None);
-    };
-    let wrapper = match ctx.get_array_element(arr, idx) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(None),
-    };
-    let name_obj = match ctx.get_field_by_name(wrapper, "name") {
-        Value::Object(Some(o)) => Some(o),
-        _ => None,
-    };
-    if let Value::Object(Some(wrapper_path)) = ctx.get_field_by_name(mapping_data, "wrapperPath") {
-        message_bytes_set_string_object(ctx, wrapper_path, name_obj);
-    }
-    if full_len > wrapper_len {
-        if let Value::Object(Some(path_info)) = ctx.get_field_by_name(mapping_data, "pathInfo") {
-            message_bytes_set_chars(
-                ctx,
-                path_info,
-                buff,
-                start + wrapper_len,
-                full_len - wrapper_len,
-            );
-        }
-    }
-    if let Value::Object(Some(request_path)) = ctx.get_field_by_name(mapping_data, "requestPath") {
-        message_bytes_set_chars(ctx, request_path, buff, start, full_len);
-    }
-    let wrapper_object = match ctx.get_field_by_name(wrapper, "object") {
-        Value::Object(o) => o,
-        _ => None,
-    };
-    ctx.set_field_by_name(mapping_data, "wrapper", Value::Object(wrapper_object));
-    ctx.set_field_by_name(
-        mapping_data,
-        "jspWildCard",
-        Value::Int(
-            ctx.get_field_by_name(wrapper, "jspWildCard")
-                .as_int()
-                .unwrap_or(0),
-        ),
-    );
-    if let Some(path_match) = mapping_match_static(ctx, "PATH") {
-        ctx.set_field_by_name(mapping_data, "matchType", Value::Object(Some(path_match)));
-    }
-    Ok(None)
-}
-
-fn mapper_wildcard_match(
-    ctx: &dyn NativeContext,
-    arr: ObjectRef,
-    nesting: usize,
-    path: ObjectRef,
-) -> Option<(ObjectRef, usize)> {
-    let (buff, start, original_end) = char_chunk_parts(ctx, path)?;
-    let full_len = original_end.saturating_sub(start);
-    let mut search_end = original_end;
-    let mut slash = usize::MAX;
-    let mut idx = mapper_find_chunk_range(ctx, arr, path, start, search_end, false);
-    while idx >= 0 {
-        let elem = match ctx.get_array_element(arr, idx as usize) {
-            Value::Object(Some(o)) => o,
-            _ => break,
-        };
-        let name = mapper_map_element_name(ctx, elem);
-        let name_len = name.encode_utf16().count();
-        if char_chunk_range_starts_with(ctx, buff, start, original_end, &name, 0, false)
-            && (full_len == name_len
-                || char_chunk_range_starts_with(
-                    ctx,
-                    buff,
-                    start,
-                    original_end,
-                    "/",
-                    name_len,
-                    true,
-                ))
-        {
-            return Some((elem, name_len));
-        }
-        slash = if slash == usize::MAX {
-            char_chunk_nth_slash(ctx, buff, start, search_end, nesting + 1)
-        } else {
-            char_chunk_last_slash(ctx, buff, start, search_end)
-        };
-        if slash == search_end {
-            break;
-        }
-        search_end = slash;
-        idx = mapper_find_chunk_range(ctx, arr, path, start, search_end, false);
-    }
-    None
-}
-
-fn mapper_apply_wildcard_mapping(
-    ctx: &mut dyn NativeContext,
-    mapping_data: ObjectRef,
-    path: ObjectRef,
-    wrapper: ObjectRef,
-    wrapper_len: usize,
-) {
-    let Some((buff, start, original_end)) = char_chunk_parts(ctx, path) else {
-        return;
-    };
-    let full_len = original_end.saturating_sub(start);
-    let name_obj = match ctx.get_field_by_name(wrapper, "name") {
-        Value::Object(Some(o)) => Some(o),
-        _ => None,
-    };
-    if let Value::Object(Some(wrapper_path)) = ctx.get_field_by_name(mapping_data, "wrapperPath") {
-        message_bytes_set_string_object(ctx, wrapper_path, name_obj);
-    }
-    if full_len > wrapper_len {
-        if let Value::Object(Some(path_info)) = ctx.get_field_by_name(mapping_data, "pathInfo") {
-            message_bytes_set_chars(
-                ctx,
-                path_info,
-                buff,
-                start + wrapper_len,
-                full_len - wrapper_len,
-            );
-        }
-    }
-    if let Value::Object(Some(request_path)) = ctx.get_field_by_name(mapping_data, "requestPath") {
-        message_bytes_set_chars(ctx, request_path, buff, start, full_len);
-    }
-    let wrapper_object = match ctx.get_field_by_name(wrapper, "object") {
-        Value::Object(o) => o,
-        _ => None,
-    };
-    ctx.set_field_by_name(mapping_data, "wrapper", Value::Object(wrapper_object));
-    ctx.set_field_by_name(
-        mapping_data,
-        "jspWildCard",
-        Value::Int(
-            ctx.get_field_by_name(wrapper, "jspWildCard")
-                .as_int()
-                .unwrap_or(0),
-        ),
-    );
-    if let Some(path_match) = mapping_match_static(ctx, "PATH") {
-        ctx.set_field_by_name(mapping_data, "matchType", Value::Object(Some(path_match)));
-    }
-}
-
-fn mapper_apply_fast_entry(
-    ctx: &mut dyn NativeContext,
-    entry: &MapperInternalFastEntry,
-    mapping_data: ObjectRef,
-    uri_chunk: ObjectRef,
-) {
-    ctx.set_field_by_name(mapping_data, "host", Value::Object(entry.host));
-    if entry.no_context {
-        return;
-    }
-    ctx.set_field_by_name(mapping_data, "context", Value::Object(entry.context));
-    ctx.set_field_by_name(
-        mapping_data,
-        "contextSlashCount",
-        Value::Int(entry.context_slash_count),
-    );
-
-    let Some((buff, uri_start, uri_end)) = char_chunk_parts(ctx, uri_chunk) else {
-        return;
-    };
-    if uri_start != entry.uri_start || uri_end != entry.uri_end {
-        return;
-    }
-    let wrapper_start = uri_start + entry.context_path_len;
-    let wrapper_full_len = uri_end.saturating_sub(wrapper_start);
-    if entry.default_mapping {
-        if let Value::Object(Some(request_path)) =
-            ctx.get_field_by_name(mapping_data, "requestPath")
-        {
-            message_bytes_set_chars(ctx, request_path, buff, wrapper_start, wrapper_full_len);
-        }
-        if let Value::Object(Some(wrapper_path)) =
-            ctx.get_field_by_name(mapping_data, "wrapperPath")
-        {
-            message_bytes_set_chars(ctx, wrapper_path, buff, wrapper_start, wrapper_full_len);
-        }
-        ctx.set_field_by_name(mapping_data, "wrapper", Value::Object(entry.wrapper));
-        ctx.set_field_by_name(mapping_data, "jspWildCard", Value::Int(0));
-        ctx.set_field_by_name(mapping_data, "matchType", Value::Object(entry.path_match));
-        return;
-    }
-    if let Value::Object(Some(wrapper_path)) = ctx.get_field_by_name(mapping_data, "wrapperPath") {
-        message_bytes_set_string_object(ctx, wrapper_path, entry.wrapper_name);
-    }
-    if wrapper_full_len > entry.wrapper_len {
-        if let Value::Object(Some(path_info)) = ctx.get_field_by_name(mapping_data, "pathInfo") {
-            message_bytes_set_chars(
-                ctx,
-                path_info,
-                buff,
-                wrapper_start + entry.wrapper_len,
-                wrapper_full_len - entry.wrapper_len,
-            );
-        }
-    }
-    if let Value::Object(Some(request_path)) = ctx.get_field_by_name(mapping_data, "requestPath") {
-        message_bytes_set_chars(ctx, request_path, buff, wrapper_start, wrapper_full_len);
-    }
-    ctx.set_field_by_name(mapping_data, "wrapper", Value::Object(entry.wrapper));
-    ctx.set_field_by_name(mapping_data, "jspWildCard", Value::Int(0));
-    ctx.set_field_by_name(mapping_data, "matchType", Value::Object(entry.path_match));
-}
-
-fn native_mapper_internal_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let host_chunk = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let uri_chunk = match args.get(2) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let version = match args.get(3) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let mapping_data = match args.get(4) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-
-    if !matches!(
-        ctx.get_field_by_name(mapping_data, "host"),
-        Value::Object(None)
-    ) {
-        return Err(RuntimeError::IllegalStateException {
-            message: "MappingData already used".to_string(),
-        }
-        .into());
-    }
-
-    let hosts = match ctx.get_field_by_name(this, "hosts") {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(None),
-    };
-    let Some((host_buff, host_start, host_end)) = char_chunk_parts(ctx, host_chunk) else {
-        return Ok(None);
-    };
-    let Some((_, uri_start_for_cache, uri_end_for_cache)) = char_chunk_parts(ctx, uri_chunk) else {
-        return Ok(None);
-    };
-    let this_key = ctx.identity_hash_code(this);
-    let host_chunk_key = ctx.identity_hash_code(host_chunk);
-    let uri_chunk_key = ctx.identity_hash_code(uri_chunk);
-    let version_key = version.map(|v| ctx.identity_hash_code(v)).unwrap_or(0);
-    let hosts_key = ctx.identity_hash_code(hosts);
-    let cache_hit = mapper_internal_fast_cache()
-        .lock()
-        .unwrap()
-        .get(&this_key)
-        .cloned();
-    if let Some(entry) = cache_hit {
-        if entry.host_chunk_key == host_chunk_key
-            && entry.uri_chunk_key == uri_chunk_key
-            && entry.version_key == version_key
-            && entry.hosts_key == hosts_key
-            && entry.host_start == host_start
-            && entry.host_end == host_end
-            && entry.uri_start == uri_start_for_cache
-            && entry.uri_end == uri_end_for_cache
-        {
-            let versions_key_now = entry
-                .selected_context
-                .and_then(|v| match ctx.get_field_by_name(v, "versions") {
-                    Value::Object(Some(o)) => Some(ctx.identity_hash_code(o)),
-                    _ => None,
-                })
-                .unwrap_or(0);
-            let contexts_key_now = entry
-                .mapped_host
-                .and_then(|h| match ctx.get_field_by_name(h, "contextList") {
-                    Value::Object(Some(cl)) => match ctx.get_field_by_name(cl, "contexts") {
-                        Value::Object(Some(c)) => Some(ctx.identity_hash_code(c)),
-                        _ => None,
-                    },
-                    _ => None,
-                })
-                .unwrap_or(0);
-            let paused_now = if let Some(selected_version) = entry.selected_version {
-                ctx.get_field_by_name(selected_version, "paused")
-                    .as_int()
-                    .unwrap_or(0)
-                    != 0
-            } else {
-                !entry.no_context
-            };
-            if versions_key_now == entry.versions_key
-                && contexts_key_now == entry.contexts_key
-                && !paused_now
-            {
-                mapper_apply_fast_entry(ctx, &entry, mapping_data, uri_chunk);
-                return Ok(None);
-            }
-        }
-    }
-    let mut mapped_host =
-        mapper_exact_find_chunk_range(ctx, hosts, host_chunk, host_start, host_end, true);
-    if mapped_host.is_none() {
-        let mut dot = None;
-        for pos in host_start..host_end {
-            if char_chunk_char_at(ctx, host_buff, pos) == b'.' as u16 {
-                dot = Some(pos);
-                break;
-            }
-        }
-        if let Some(dot_pos) = dot {
-            mapped_host =
-                mapper_exact_find_chunk_range(ctx, hosts, host_chunk, dot_pos, host_end, true);
-        }
-    }
-    if mapped_host.is_none() {
-        mapped_host = match ctx.get_field_by_name(this, "defaultHost") {
-            Value::Object(Some(o)) => Some(o),
-            _ => None,
-        };
-    }
-    let Some(mapped_host) = mapped_host else {
-        return Ok(None);
-    };
-    let host_object = match ctx.get_field_by_name(mapped_host, "object") {
-        Value::Object(o) => o,
-        _ => None,
-    };
-    ctx.set_field_by_name(mapping_data, "host", Value::Object(host_object));
-
-    let Some((uri_buff, uri_start, uri_end)) = char_chunk_parts(ctx, uri_chunk) else {
-        return Ok(None);
-    };
-    let context_list = match ctx.get_field_by_name(mapped_host, "contextList") {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(None),
-    };
-    let contexts = match ctx.get_field_by_name(context_list, "contexts") {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(None),
-    };
-    let contexts_key = ctx.identity_hash_code(contexts);
-    let contexts_len = ctx.array_length(contexts);
-    if contexts_len == 0 {
-        mapper_internal_fast_cache().lock().unwrap().insert(
-            this_key,
-            MapperInternalFastEntry {
-                host_chunk_key,
-                uri_chunk_key,
-                version_key,
-                hosts_key,
-                host_start,
-                host_end,
-                uri_start: uri_start_for_cache,
-                uri_end: uri_end_for_cache,
-                selected_context: None,
-                versions_key: 0,
-                selected_version: None,
-                exact_wrappers_key: 0,
-                wildcard_wrappers_key: 0,
-                mapped_host: Some(mapped_host),
-                contexts_key,
-                context_path_len: 0,
-                wrapper_len: 0,
-                host: host_object,
-                context: None,
-                wrapper: None,
-                wrapper_name: None,
-                path_match: None,
-                context_slash_count: 0,
-                no_context: true,
-                default_mapping: false,
-            },
-        );
-        return Ok(None);
-    }
-
-    let mut search_end = uri_end;
-    let mut slash = usize::MAX;
-    let nesting = ctx
-        .get_field_by_name(context_list, "nesting")
-        .as_int()
-        .unwrap_or(0)
-        .max(0) as usize;
-    let mut idx = mapper_find_chunk_range(ctx, contexts, uri_chunk, uri_start, search_end, false);
-    let mut selected_context: Option<ObjectRef> = None;
-    while idx >= 0 {
-        let elem = match ctx.get_array_element(contexts, idx as usize) {
-            Value::Object(Some(o)) => o,
-            _ => break,
-        };
-        let name = mapper_map_element_name(ctx, elem);
-        let name_len = name.encode_utf16().count();
-        let uri_len = uri_end.saturating_sub(uri_start);
-        if char_chunk_range_starts_with(ctx, uri_buff, uri_start, uri_end, &name, 0, false)
-            && (uri_len == name_len
-                || char_chunk_range_starts_with(
-                    ctx, uri_buff, uri_start, uri_end, "/", name_len, true,
-                ))
-        {
-            selected_context = Some(elem);
-            break;
-        }
-        slash = if slash == usize::MAX {
-            char_chunk_nth_slash(ctx, uri_buff, uri_start, search_end, nesting + 1)
-        } else {
-            char_chunk_last_slash(ctx, uri_buff, uri_start, search_end)
-        };
-        if slash == search_end {
-            break;
-        }
-        search_end = slash;
-        idx = mapper_find_chunk_range(ctx, contexts, uri_chunk, uri_start, search_end, false);
-    }
-    if selected_context.is_none() {
-        if let Value::Object(Some(first)) = ctx.get_array_element(contexts, 0) {
-            if mapper_map_element_name(ctx, first).is_empty() {
-                selected_context = Some(first);
-            }
-        }
-    }
-    let Some(selected_context) = selected_context else {
-        mapper_internal_fast_cache().lock().unwrap().insert(
-            this_key,
-            MapperInternalFastEntry {
-                host_chunk_key,
-                uri_chunk_key,
-                version_key,
-                hosts_key,
-                host_start,
-                host_end,
-                uri_start,
-                uri_end,
-                selected_context: None,
-                versions_key: 0,
-                selected_version: None,
-                exact_wrappers_key: 0,
-                wildcard_wrappers_key: 0,
-                mapped_host: Some(mapped_host),
-                contexts_key,
-                context_path_len: 0,
-                wrapper_len: 0,
-                host: host_object,
-                context: None,
-                wrapper: None,
-                wrapper_name: None,
-                path_match: None,
-                context_slash_count: 0,
-                no_context: true,
-                default_mapping: false,
-            },
-        );
-        return Ok(None);
-    };
-
-    let versions = match ctx.get_field_by_name(selected_context, "versions") {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(None),
-    };
-    let version_count = ctx.array_length(versions);
-    if version_count == 0 {
-        return Ok(None);
-    }
-    let selected_version = if let Some(version_obj) = version {
-        let version_name = ctx.read_string(version_obj).unwrap_or_default();
-        let idx = mapper_find_string(ctx, versions, &version_name);
-        if idx >= 0 {
-            match ctx.get_array_element(versions, idx as usize) {
-                Value::Object(Some(o)) if mapper_map_element_name(ctx, o) == version_name => o,
-                _ => match ctx.get_array_element(versions, version_count - 1) {
-                    Value::Object(Some(o)) => o,
-                    _ => return Ok(None),
-                },
-            }
-        } else {
-            match ctx.get_array_element(versions, version_count - 1) {
-                Value::Object(Some(o)) => o,
-                _ => return Ok(None),
-            }
-        }
-    } else {
-        match ctx.get_array_element(versions, version_count - 1) {
-            Value::Object(Some(o)) => o,
-            _ => return Ok(None),
-        }
-    };
-
-    let context_object = match ctx.get_field_by_name(selected_version, "object") {
-        Value::Object(o) => o,
-        _ => None,
-    };
-    ctx.set_field_by_name(mapping_data, "context", Value::Object(context_object));
-    ctx.set_field_by_name(
-        mapping_data,
-        "contextSlashCount",
-        ctx.get_field_by_name(selected_version, "slashCount"),
-    );
-    let paused = ctx
-        .get_field_by_name(selected_version, "paused")
-        .as_int()
-        .unwrap_or(0)
-        != 0;
-    if !paused {
-        if let Some(context_path) = match ctx.get_field_by_name(selected_version, "path") {
-            Value::Object(Some(o)) => ctx.read_string(o),
-            _ => None,
-        } {
-            let wrapper_start = uri_start + context_path.encode_utf16().count();
-            if wrapper_start <= uri_end {
-                ctx.set_field_by_name(uri_chunk, "start", Value::Int(wrapper_start as i32));
-                let wildcard_wrappers =
-                    match ctx.get_field_by_name(selected_version, "wildcardWrappers") {
-                        Value::Object(Some(o)) => Some(o),
-                        _ => None,
-                    };
-                let wrapper_nesting = ctx
-                    .get_field_by_name(selected_version, "nesting")
-                    .as_int()
-                    .unwrap_or(0)
-                    .max(0) as usize;
-                if let Some(wildcard_wrappers) = wildcard_wrappers {
-                    if let Some((wrapper, wrapper_len)) =
-                        mapper_wildcard_match(ctx, wildcard_wrappers, wrapper_nesting, uri_chunk)
-                    {
-                        let jsp_wildcard = ctx
-                            .get_field_by_name(wrapper, "jspWildCard")
-                            .as_int()
-                            .unwrap_or(0)
-                            != 0;
-                        if !jsp_wildcard {
-                            mapper_apply_wildcard_mapping(
-                                ctx,
-                                mapping_data,
-                                uri_chunk,
-                                wrapper,
-                                wrapper_len,
-                            );
-                            let exact_wrappers_key =
-                                match ctx.get_field_by_name(selected_version, "exactWrappers") {
-                                    Value::Object(Some(o)) => ctx.identity_hash_code(o),
-                                    _ => 0,
-                                };
-                            let versions_key = ctx.identity_hash_code(versions);
-                            let wildcard_wrappers_key = ctx.identity_hash_code(wildcard_wrappers);
-                            let wrapper_name = match ctx.get_field_by_name(wrapper, "name") {
-                                Value::Object(o) => o,
-                                _ => None,
-                            };
-                            let wrapper_object = match ctx.get_field_by_name(wrapper, "object") {
-                                Value::Object(o) => o,
-                                _ => None,
-                            };
-                            let path_match = mapping_match_static(ctx, "PATH");
-                            mapper_internal_fast_cache().lock().unwrap().insert(
-                                this_key,
-                                MapperInternalFastEntry {
-                                    host_chunk_key,
-                                    uri_chunk_key,
-                                    version_key,
-                                    hosts_key,
-                                    host_start,
-                                    host_end,
-                                    uri_start,
-                                    uri_end,
-                                    selected_context: Some(selected_context),
-                                    versions_key,
-                                    selected_version: Some(selected_version),
-                                    exact_wrappers_key,
-                                    wildcard_wrappers_key,
-                                    mapped_host: Some(mapped_host),
-                                    contexts_key,
-                                    context_path_len: context_path.encode_utf16().count(),
-                                    wrapper_len,
-                                    host: host_object,
-                                    context: context_object,
-                                    wrapper: wrapper_object,
-                                    wrapper_name,
-                                    path_match,
-                                    context_slash_count: ctx
-                                        .get_field_by_name(selected_version, "slashCount")
-                                        .as_int()
-                                        .unwrap_or(0),
-                                    no_context: false,
-                                    default_mapping: false,
-                                },
-                            );
-                            ctx.set_field_by_name(uri_chunk, "start", Value::Int(uri_start as i32));
-                            ctx.set_field_by_name(uri_chunk, "end", Value::Int(uri_end as i32));
-                            return Ok(None);
-                        }
-                    }
-                }
-                let default_wrapper =
-                    match ctx.get_field_by_name(selected_version, "defaultWrapper") {
-                        Value::Object(Some(o)) => Some(o),
-                        _ => None,
-                    };
-                let resources = match ctx.get_field_by_name(selected_version, "resources") {
-                    Value::Object(Some(o)) => Some(o),
-                    _ => None,
-                };
-                let extension_wrappers_empty =
-                    match ctx.get_field_by_name(selected_version, "extensionWrappers") {
-                        Value::Object(Some(o)) => ctx.array_length(o) == 0,
-                        _ => true,
-                    };
-                let welcome_resources_empty =
-                    match ctx.get_field_by_name(selected_version, "welcomeResources") {
-                        Value::Object(Some(o)) => ctx.array_length(o) == 0,
-                        _ => true,
-                    };
-                if extension_wrappers_empty
-                    && welcome_resources_empty
-                    && resources.is_none()
-                    && default_wrapper.is_some()
-                {
-                    let default_wrapper = default_wrapper.unwrap();
-                    let Some((buff, path_start, path_end)) = char_chunk_parts(ctx, uri_chunk)
-                    else {
-                        ctx.set_field_by_name(uri_chunk, "start", Value::Int(uri_start as i32));
-                        ctx.set_field_by_name(uri_chunk, "end", Value::Int(uri_end as i32));
-                        return Ok(None);
-                    };
-                    let path_len = path_end.saturating_sub(path_start);
-                    let wrapper_object = match ctx.get_field_by_name(default_wrapper, "object") {
-                        Value::Object(o) => o,
-                        _ => None,
-                    };
-                    ctx.set_field_by_name(mapping_data, "wrapper", Value::Object(wrapper_object));
-                    if let Value::Object(Some(request_path)) =
-                        ctx.get_field_by_name(mapping_data, "requestPath")
-                    {
-                        message_bytes_set_chars(ctx, request_path, buff, path_start, path_len);
-                    }
-                    if let Value::Object(Some(wrapper_path)) =
-                        ctx.get_field_by_name(mapping_data, "wrapperPath")
-                    {
-                        message_bytes_set_chars(ctx, wrapper_path, buff, path_start, path_len);
-                    }
-                    if let Some(default_match) = mapping_match_static(ctx, "DEFAULT") {
-                        ctx.set_field_by_name(
-                            mapping_data,
-                            "matchType",
-                            Value::Object(Some(default_match)),
-                        );
-                    }
-                    let exact_wrappers_key =
-                        match ctx.get_field_by_name(selected_version, "exactWrappers") {
-                            Value::Object(Some(o)) => ctx.identity_hash_code(o),
-                            _ => 0,
-                        };
-                    let wildcard_wrappers_key =
-                        match ctx.get_field_by_name(selected_version, "wildcardWrappers") {
-                            Value::Object(Some(o)) => ctx.identity_hash_code(o),
-                            _ => 0,
-                        };
-                    let versions_key = ctx.identity_hash_code(versions);
-                    mapper_internal_fast_cache().lock().unwrap().insert(
-                        this_key,
-                        MapperInternalFastEntry {
-                            host_chunk_key,
-                            uri_chunk_key,
-                            version_key,
-                            hosts_key,
-                            host_start,
-                            host_end,
-                            uri_start,
-                            uri_end,
-                            selected_context: Some(selected_context),
-                            versions_key,
-                            selected_version: Some(selected_version),
-                            exact_wrappers_key,
-                            wildcard_wrappers_key,
-                            mapped_host: Some(mapped_host),
-                            contexts_key,
-                            context_path_len: context_path.encode_utf16().count(),
-                            wrapper_len: 0,
-                            host: host_object,
-                            context: context_object,
-                            wrapper: wrapper_object,
-                            wrapper_name: None,
-                            path_match: mapping_match_static(ctx, "DEFAULT"),
-                            context_slash_count: ctx
-                                .get_field_by_name(selected_version, "slashCount")
-                                .as_int()
-                                .unwrap_or(0),
-                            no_context: false,
-                            default_mapping: true,
-                        },
-                    );
-                    ctx.set_field_by_name(uri_chunk, "start", Value::Int(uri_start as i32));
-                    ctx.set_field_by_name(uri_chunk, "end", Value::Int(uri_end as i32));
-                    return Ok(None);
-                }
-                ctx.set_field_by_name(uri_chunk, "start", Value::Int(uri_start as i32));
-                ctx.set_field_by_name(uri_chunk, "end", Value::Int(uri_end as i32));
-            }
-        }
-        let _ = ctx.invoke_virtual(
-            this,
-            "internalMapWrapper",
-            "(Lorg/apache/catalina/mapper/Mapper$ContextVersion;Lorg/apache/tomcat/util/buf/CharChunk;Lorg/apache/catalina/mapper/MappingData;)V",
-            &[
-                Value::Object(Some(selected_version)),
-                Value::Object(Some(uri_chunk)),
-                Value::Object(Some(mapping_data)),
-            ],
-        )?;
-    }
-    Ok(None)
-}
-
-fn native_mapper_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let host_mb = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let uri_mb = match args.get(2) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let version = args.get(3).copied().unwrap_or(Value::Object(None));
-    let mapping_data = match args.get(4) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-
-    if ctx.get_field_by_name(host_mb, "type").as_int().unwrap_or(0) == 0 {
-        let default_host_name = match ctx.get_field_by_name(this, "defaultHostName") {
-            Value::Object(Some(o)) => Some(o),
-            _ => return Ok(None),
-        };
-        message_bytes_set_string_object(ctx, host_mb, default_host_name);
-    }
-    native_message_bytes_to_chars(ctx, &[Value::Object(Some(host_mb))])?;
-    native_message_bytes_to_chars(ctx, &[Value::Object(Some(uri_mb))])?;
-
-    let host_chunk = match ctx.get_field_by_name(host_mb, "charC") {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(None),
-    };
-    let uri_chunk = match ctx.get_field_by_name(uri_mb, "charC") {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(None),
-    };
-    native_mapper_internal_map(
-        ctx,
-        &[
-            Value::Object(Some(this)),
-            Value::Object(Some(host_chunk)),
-            Value::Object(Some(uri_chunk)),
-            version,
-            Value::Object(Some(mapping_data)),
-        ],
-    )
-}
-
-fn native_mapper_internal_map_exact_wrapper(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let arr = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let path = match args.get(2) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let mapping_data = match args.get(3) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-
-    let Some((_, start, end)) = char_chunk_parts(ctx, path) else {
-        return Ok(None);
-    };
-    let wrapper = if end == start {
-        let idx = mapper_find_string(ctx, arr, "/");
-        if idx < 0 {
-            return Ok(None);
-        }
-        match ctx.get_array_element(arr, idx as usize) {
-            Value::Object(Some(o)) if mapper_map_element_name(ctx, o) == "/" => o,
-            _ => return Ok(None),
-        }
-    } else {
-        let idx = mapper_find_chunk_range(ctx, arr, path, start, end, false);
-        if idx < 0 {
-            return Ok(None);
-        }
-        match ctx.get_array_element(arr, idx as usize) {
-            Value::Object(Some(o))
-                if char_chunk_equals_string(ctx, path, &mapper_map_element_name(ctx, o), false) =>
-            {
-                o
-            }
-            _ => return Ok(None),
-        }
-    };
-
-    let name_obj = match ctx.get_field_by_name(wrapper, "name") {
-        Value::Object(Some(o)) => Some(o),
-        _ => None,
-    };
-    if let Value::Object(Some(request_path)) = ctx.get_field_by_name(mapping_data, "requestPath") {
-        message_bytes_set_string_object(ctx, request_path, name_obj);
-    }
-    let wrapper_object = match ctx.get_field_by_name(wrapper, "object") {
-        Value::Object(o) => o,
-        _ => None,
-    };
-    ctx.set_field_by_name(mapping_data, "wrapper", Value::Object(wrapper_object));
-
-    let is_context_root = end > start
-        && end - start == 1
-        && char_chunk_parts(ctx, path)
-            .map(|(buff, s, _)| char_chunk_char_at(ctx, buff, s) == b'/' as u16)
-            .unwrap_or(false);
-    if is_context_root {
-        let slash = ctx.create_string("/");
-        let empty = ctx.create_string("");
-        if let Value::Object(Some(path_info)) = ctx.get_field_by_name(mapping_data, "pathInfo") {
-            message_bytes_set_string_object(ctx, path_info, Some(slash));
-        }
-        if let Value::Object(Some(wrapper_path)) =
-            ctx.get_field_by_name(mapping_data, "wrapperPath")
-        {
-            message_bytes_set_string_object(ctx, wrapper_path, Some(empty));
-        }
-        if let Some(mm) = mapping_match_static(ctx, "CONTEXT_ROOT") {
-            ctx.set_field_by_name(mapping_data, "matchType", Value::Object(Some(mm)));
-        }
-    } else {
-        if let Value::Object(Some(wrapper_path)) =
-            ctx.get_field_by_name(mapping_data, "wrapperPath")
-        {
-            message_bytes_set_string_object(ctx, wrapper_path, name_obj);
-        }
-        if let Some(mm) = mapping_match_static(ctx, "EXACT") {
-            ctx.set_field_by_name(mapping_data, "matchType", Value::Object(Some(mm)));
-        }
     }
     Ok(None)
 }
@@ -2548,618 +642,6 @@ fn register_test_harness_natives(registry: &mut NativeMethodRegistry) {
         native_randomized_context_get_per_thread,
     );
     registry.register(
-        "com/carrotsearch/randomizedtesting/RandomizedContext",
-        "current",
-        "()Lcom/carrotsearch/randomizedtesting/RandomizedContext;",
-        native_randomized_context_current,
-    );
-    registry.register(
-        "com/carrotsearch/randomizedtesting/RandomizedContext",
-        "context",
-        "(Ljava/lang/Thread;)Lcom/carrotsearch/randomizedtesting/RandomizedContext;",
-        native_randomized_context_context,
-    );
-    registry.register(
-        "com/carrotsearch/randomizedtesting/RandomizedContext",
-        "getRandomness",
-        "()Lcom/carrotsearch/randomizedtesting/Randomness;",
-        native_randomized_context_get_randomness,
-    );
-    registry.register(
-        "com/carrotsearch/randomizedtesting/RandomizedContext",
-        "getRandom",
-        "()Ljava/util/Random;",
-        native_randomized_context_get_random,
-    );
-    registry.register(
-        "com/carrotsearch/randomizedtesting/RandomizedContext",
-        "push",
-        "(Lcom/carrotsearch/randomizedtesting/Randomness;)V",
-        native_randomized_context_push,
-    );
-    registry.register(
-        "com/carrotsearch/randomizedtesting/RandomizedContext",
-        "popAndDestroy",
-        "()V",
-        native_randomized_context_pop_and_destroy,
-    );
-    registry.register(
-        "com/carrotsearch/randomizedtesting/Randomness",
-        "getRandom",
-        "()Ljava/util/Random;",
-        native_randomness_get_random,
-    );
-    registry.register(
-        "com/carrotsearch/randomizedtesting/RandomizedTest",
-        "getContext",
-        "()Lcom/carrotsearch/randomizedtesting/RandomizedContext;",
-        native_randomized_test_get_context,
-    );
-    registry.register(
-        "com/carrotsearch/randomizedtesting/RandomizedTest",
-        "getRandom",
-        "()Ljava/util/Random;",
-        native_randomized_test_get_random,
-    );
-    registry.register(
-        "com/carrotsearch/randomizedtesting/RandomizedTest",
-        "randomFloat",
-        "()F",
-        native_randomized_test_random_float,
-    );
-    registry.register(
-        "com/carrotsearch/randomizedtesting/Xoroshiro128PlusRandom",
-        "nextLong",
-        "()J",
-        native_xoroshiro128_plus_random_next_long,
-    );
-    registry.register(
-        "com/carrotsearch/randomizedtesting/Xoroshiro128PlusRandom",
-        "nextInt",
-        "()I",
-        native_xoroshiro128_plus_random_next_int,
-    );
-    registry.register(
-        "com/carrotsearch/randomizedtesting/Xoroshiro128PlusRandom",
-        "nextInt",
-        "(I)I",
-        native_xoroshiro128_plus_random_next_int_bound,
-    );
-    registry.register(
-        "com/carrotsearch/randomizedtesting/Xoroshiro128PlusRandom",
-        "next",
-        "(I)I",
-        native_xoroshiro128_plus_random_next_bits,
-    );
-    registry.register(
-        "com/carrotsearch/randomizedtesting/Xoroshiro128PlusRandom",
-        "nextFloat",
-        "()F",
-        native_xoroshiro128_plus_random_next_float,
-    );
-    registry.register(
-        "com/carrotsearch/randomizedtesting/Xoroshiro128PlusRandom",
-        "nextDouble",
-        "()D",
-        native_xoroshiro128_plus_random_next_double,
-    );
-    registry.register(
-        "com/carrotsearch/randomizedtesting/Xoroshiro128PlusRandom",
-        "nextBoolean",
-        "()Z",
-        native_xoroshiro128_plus_random_next_boolean,
-    );
-    registry.register(
-        "com/carrotsearch/randomizedtesting/Xoroshiro128PlusRandom",
-        "nextBytes",
-        "([B)V",
-        native_xoroshiro128_plus_random_next_bytes,
-    );
-    registry.register(
-        "org/elasticsearch/simdvec/ESVectorUtil",
-        "dotProduct",
-        "([F[F)F",
-        native_es_vector_util_dot_product_f32,
-    );
-    registry.register(
-        "org/elasticsearch/simdvec/ESVectorUtil",
-        "squareDistance",
-        "([F[F)F",
-        native_es_vector_util_square_distance_f32,
-    );
-    registry.register(
-        "org/elasticsearch/simdvec/ESVectorUtil",
-        "squareDistance",
-        "([F[FII)F",
-        native_es_vector_util_square_distance_f32_offset,
-    );
-    registry.register(
-        "org/elasticsearch/simdvec/ESVectorUtil",
-        "calculateOSQLoss",
-        "([FFFIFF[I)F",
-        native_es_vector_util_calculate_osq_loss_f32,
-    );
-    registry.register(
-        "org/elasticsearch/simdvec/ESVectorUtil",
-        "calculateOSQGridPoints",
-        "([F[II[F)V",
-        native_es_vector_util_calculate_osq_grid_points_f32,
-    );
-    registry.register(
-        "org/elasticsearch/simdvec/ESVectorUtil",
-        "centerAndCalculateOSQStatsEuclidean",
-        "([F[F[F[F)V",
-        native_es_vector_util_center_stats_euclidean_f32,
-    );
-    registry.register(
-        "org/elasticsearch/simdvec/ESVectorUtil",
-        "centerAndCalculateOSQStatsDp",
-        "([F[F[F[F)V",
-        native_es_vector_util_center_stats_dp_f32,
-    );
-    registry.register(
-        "org/elasticsearch/simdvec/ESVectorUtil",
-        "centerAndCalculateOSQStatsEuclidean",
-        "([B[B[F[F)V",
-        native_es_vector_util_center_stats_euclidean_i8,
-    );
-    registry.register(
-        "org/elasticsearch/simdvec/ESVectorUtil",
-        "centerAndCalculateOSQStatsDp",
-        "([B[B[F[F)V",
-        native_es_vector_util_center_stats_dp_i8,
-    );
-    registry.register(
-        "org/elasticsearch/simdvec/ESVectorUtil",
-        "quantizeVectorWithIntervals",
-        "([F[IFFB)I",
-        native_es_vector_util_quantize_vector_with_intervals_f32,
-    );
-    registry.register(
-        "org/elasticsearch/simdvec/ESVectorUtil",
-        "packAsBinary",
-        "([I[B)V",
-        native_es_vector_util_pack_as_binary,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
-        "lambda$buildAndWritePostingsLists$1",
-        "([II)I",
-        native_es_next_diskbbq_vectors_writer_iarray_at_i,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
-        "lambda$buildAndWritePostingsLists$2",
-        "([I[II)I",
-        native_es_next_diskbbq_vectors_writer_iarray_at_iarray_at_i,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
-        "lambda$buildAndWritePostingsLists$3",
-        "([II)I",
-        native_es_next_diskbbq_vectors_writer_iarray_at_i,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
-        "lambda$buildAndWritePostingsLists$4",
-        "([III)I",
-        native_es_next_diskbbq_vectors_writer_iarray_at_i_plus_j,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
-        "lambda$buildAndWritePostingsLists$6",
-        "([II)I",
-        native_es_next_diskbbq_vectors_writer_iarray_at_i,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
-        "lambda$buildAndWritePostingsLists$7",
-        "([II)I",
-        native_es_next_diskbbq_vectors_writer_iarray_at_i,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
-        "lambda$buildAndWritePostingsLists$8",
-        "([Z[II)Z",
-        native_es_next_diskbbq_vectors_writer_barray_at_iarray_at_i,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
-        "lambda$buildAndWritePostingsLists$9",
-        "([I[II)I",
-        native_es_next_diskbbq_vectors_writer_iarray_at_iarray_at_i,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
-        "lambda$buildAndWritePostingsLists$10",
-        "([III)I",
-        native_es_next_diskbbq_vectors_writer_iarray_at_i_plus_j,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
-        "lambda$doWriteCentroids$13",
-        "([II)I",
-        native_es_next_diskbbq_vectors_writer_iarray_at_i,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
-        "lambda$writeCentroidsWithParents$14",
-        "([II)I",
-        native_es_next_diskbbq_vectors_writer_iarray_at_i,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
-        "lambda$createCentroidSupplier$12",
-        "(II)I",
-        native_es_next_diskbbq_vectors_writer_i_plus_j,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
-        "lambda$calculateCentroidsFullRebuildSliced$15",
-        "(II)I",
-        native_es_next_diskbbq_vectors_writer_i_plus_j,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
-        "writeSlicesOffsets",
-        "(Lorg/apache/lucene/store/IndexOutput;Lorg/elasticsearch/index/codec/vectors/diskbbq/CentroidSlices;)V",
-        native_es_next_diskbbq_vectors_writer_write_slices_offsets,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/cluster/ClusteringFloatVectorValuesSlice",
-        "lambda$createRandomSlice$0",
-        "([II)I",
-        native_es_next_diskbbq_vectors_writer_iarray_at_i,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/cluster/ClusteringFloatVectorValuesSlice",
-        "lambda$createRandomSlice$1",
-        "([II)I",
-        native_es_next_diskbbq_vectors_writer_iarray_at_i,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/cluster/ClusteringFloatVectorValuesSlice",
-        "vectorValue",
-        "(I)[F",
-        native_es_clustering_float_vector_values_slice_vector_value,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/cluster/ClusteringFloatVectorValuesSlice",
-        "vectorValue",
-        "(I)Ljava/lang/Object;",
-        native_es_clustering_float_vector_values_slice_vector_value,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/cluster/ClusteringFloatVectorValuesSlice",
-        "ordToDoc",
-        "(I)I",
-        native_es_clustering_float_vector_values_slice_ord_to_doc,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/cluster/ClusteringFloatVectorValuesSlice",
-        "size",
-        "()I",
-        native_es_clustering_float_vector_values_slice_size,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/cluster/ClusteringFloatVectorValuesSlice",
-        "dimension",
-        "()I",
-        native_es_clustering_float_vector_values_slice_dimension,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/CentroidSlices",
-        "sliceOffsets",
-        "()[I",
-        native_es_centroid_slices_slice_offsets,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/CentroidSlices",
-        "sliceNumVectors",
-        "()[I",
-        native_es_centroid_slices_slice_num_vectors,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/CentroidSlices",
-        "maxSliceSize",
-        "()I",
-        native_es_centroid_slices_max_slice_size,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/CentroidAssignments",
-        "numCentroids",
-        "()I",
-        native_es_centroid_assignments_num_centroids,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/CentroidAssignments",
-        "centroids",
-        "()[[F",
-        native_es_centroid_assignments_centroids,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/CentroidAssignments",
-        "assignments",
-        "()[I",
-        native_es_centroid_assignments_assignments,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/CentroidAssignments",
-        "overspillAssignments",
-        "()[I",
-        native_es_centroid_assignments_overspill_assignments,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/CentroidAssignments",
-        "globalCentroid",
-        "()[F",
-        native_es_centroid_assignments_global_centroid,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/diskbbq/CentroidAssignments",
-        "centroidSlices",
-        "()Lorg/elasticsearch/index/codec/vectors/diskbbq/CentroidSlices;",
-        native_es_centroid_assignments_centroid_slices,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/cluster/KMeansResult",
-        "centroids",
-        "()[Ljava/lang/Object;",
-        native_es_kmeans_result_centroids,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/cluster/KMeansResult",
-        "assignments",
-        "()[I",
-        native_es_kmeans_result_assignments,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/cluster/KMeansResult",
-        "clusterCounts",
-        "()[I",
-        native_es_kmeans_result_cluster_counts,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/cluster/KMeansResult",
-        "soarAssignments",
-        "()[I",
-        native_es_kmeans_result_soar_assignments,
-    );
-    registry.register(
-        "org/elasticsearch/index/codec/vectors/cluster/KMeansFloatVectorValues",
-        "size",
-        "()I",
-        native_es_kmeans_float_vector_values_size,
-    );
-    registry.register(
-        "org/elasticsearch/search/vectors/KnnScoreDocQuery",
-        "<init>",
-        "([Lorg/apache/lucene/search/ScoreDoc;Lorg/apache/lucene/index/IndexReader;)V",
-        native_es_knn_score_doc_query_init,
-    );
-    registry.register(
-        "org/elasticsearch/search/vectors/MaxScoreTopKnnCollector",
-        "unsortedTopK",
-        "()Lorg/apache/lucene/search/TopDocs;",
-        native_es_max_score_top_knn_collector_unsorted_top_k,
-    );
-    registry.register(
-        "org/elasticsearch/simdvec/ES92Int7VectorsScorer",
-        "int7DotProductBulk",
-        "([BI[F)V",
-        native_es92_int7_vectors_scorer_int7_dot_product_bulk,
-    );
-    registry.register(
-        "java/util/Arrays",
-        "sort",
-        "([JII)V",
-        native_java_arrays_sort_long_range,
-    );
-    registry.register(
-        "org/apache/lucene/index/IndexReaderContext",
-        "id",
-        "()Ljava/lang/Object;",
-        native_lucene_index_reader_context_id,
-    );
-    registry.register(
-        "org/apache/lucene/store/DataOutput",
-        "writeVInt",
-        "(I)V",
-        native_lucene_data_output_write_vint,
-    );
-    registry.register(
-        "org/apache/lucene/store/DataOutput",
-        "writeZInt",
-        "(I)V",
-        native_lucene_data_output_write_zint,
-    );
-    registry.register(
-        "org/apache/lucene/store/DataOutput",
-        "writeVLong",
-        "(J)V",
-        native_lucene_data_output_write_vlong,
-    );
-    registry.register(
-        "org/apache/lucene/store/DataOutput",
-        "writeZLong",
-        "(J)V",
-        native_lucene_data_output_write_zlong,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersDataOutput",
-        "writeByte",
-        "(B)V",
-        native_lucene_byte_buffers_data_output_write_byte,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersDataOutput",
-        "writeBytes",
-        "([BII)V",
-        native_lucene_byte_buffers_data_output_write_bytes,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersDataOutput",
-        "writeBytes",
-        "([BI)V",
-        native_lucene_byte_buffers_data_output_write_bytes_len,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersDataOutput",
-        "writeBytes",
-        "([B)V",
-        native_lucene_byte_buffers_data_output_write_bytes_all,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersDataOutput",
-        "writeShort",
-        "(S)V",
-        native_lucene_byte_buffers_data_output_write_short,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersDataOutput",
-        "writeInt",
-        "(I)V",
-        native_lucene_byte_buffers_data_output_write_int,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersDataOutput",
-        "writeLong",
-        "(J)V",
-        native_lucene_byte_buffers_data_output_write_long,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersDataOutput",
-        "copyBytes",
-        "(Lorg/apache/lucene/store/DataInput;J)V",
-        native_lucene_byte_buffers_data_output_copy_bytes,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersDataOutput$ByteBufferRecycler",
-        "reuse",
-        "(Ljava/nio/ByteBuffer;)V",
-        native_lucene_byte_buffers_byte_buffer_recycler_reuse,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexOutput",
-        "writeByte",
-        "(B)V",
-        native_lucene_byte_buffers_index_output_write_byte,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexOutput",
-        "writeBytes",
-        "([BII)V",
-        native_lucene_byte_buffers_index_output_write_bytes,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexOutput",
-        "writeBytes",
-        "([BI)V",
-        native_lucene_byte_buffers_index_output_write_bytes_len,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexOutput",
-        "writeShort",
-        "(S)V",
-        native_lucene_byte_buffers_index_output_write_short,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexOutput",
-        "writeInt",
-        "(I)V",
-        native_lucene_byte_buffers_index_output_write_int,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexOutput",
-        "writeLong",
-        "(J)V",
-        native_lucene_byte_buffers_index_output_write_long,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexOutput",
-        "copyBytes",
-        "(Lorg/apache/lucene/store/DataInput;J)V",
-        native_lucene_byte_buffers_index_output_copy_bytes,
-    );
-    registry.register(
-        "org/apache/lucene/tests/store/MockIndexOutputWrapper",
-        "writeByte",
-        "(B)V",
-        native_lucene_mock_index_output_wrapper_write_byte,
-    );
-    registry.register(
-        "org/apache/lucene/index/TermsEnumIndex",
-        "prefix8ToComparableUnsignedLong",
-        "(Lorg/apache/lucene/util/BytesRef;)J",
-        native_lucene_terms_enum_index_prefix8,
-    );
-    registry.register(
-        "org/apache/lucene/index/TermsEnumIndex",
-        "next",
-        "()Lorg/apache/lucene/util/BytesRef;",
-        native_lucene_terms_enum_index_next,
-    );
-    registry.register(
-        "org/apache/lucene/index/TermsEnumIndex",
-        "compareTermTo",
-        "(Lorg/apache/lucene/index/TermsEnumIndex;)I",
-        native_lucene_terms_enum_index_compare_term_to,
-    );
-    registry.register(
-        "org/apache/lucene/index/TermsEnumIndex",
-        "termEquals",
-        "(Lorg/apache/lucene/index/TermsEnumIndex$TermState;)Z",
-        native_lucene_terms_enum_index_term_equals,
-    );
-    registry.register(
-        "org/apache/lucene/index/TermsEnumIndex$TermState",
-        "copyFrom",
-        "(Lorg/apache/lucene/index/TermsEnumIndex;)V",
-        native_lucene_terms_enum_index_term_state_copy_from,
-    );
-    registry.register(
-        "org/apache/lucene/index/OrdinalMap$SegmentMap",
-        "newToOld",
-        "(I)I",
-        native_lucene_ordinal_map_segment_map_new_to_old,
-    );
-    registry.register(
-        "org/apache/lucene/index/OrdinalMap$SegmentMap",
-        "oldToNew",
-        "(I)I",
-        native_lucene_ordinal_map_segment_map_old_to_new,
-    );
-    registry.register(
-        "org/apache/lucene/index/OrdinalMap$TermsEnumPriorityQueue",
-        "lessThan",
-        "(Lorg/apache/lucene/index/TermsEnumIndex;Lorg/apache/lucene/index/TermsEnumIndex;)Z",
-        native_lucene_terms_enum_priority_queue_less_than,
-    );
-    registry.register(
-        "org/apache/lucene/index/OrdinalMap$TermsEnumPriorityQueue",
-        "lessThan",
-        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
-        native_lucene_terms_enum_priority_queue_less_than,
-    );
-    registry.register(
-        "org/apache/lucene/util/PriorityQueue",
-        "<init>",
-        "(I)V",
-        native_lucene_priority_queue_init_int,
-    );
-    registry.register(
-        "org/apache/lucene/util/PriorityQueue",
-        "size",
-        "()I",
-        native_lucene_priority_queue_size,
-    );
-    registry.register(
-        "org/apache/lucene/util/PriorityQueue",
-        "top",
-        "()Ljava/lang/Object;",
-        native_lucene_priority_queue_top,
-    );
-    registry.register(
         "org/apache/lucene/store/ByteBuffersDataInput",
         "readByte",
         "()B",
@@ -3213,1865 +695,6 @@ fn register_test_harness_natives(registry: &mut NativeMethodRegistry) {
         "(JJ)Lorg/apache/lucene/store/ByteBuffersDataInput;",
         native_lucene_byte_buffers_data_input_slice,
     );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersDataInput",
-        "readBytes",
-        "([BII)V",
-        native_lucene_byte_buffers_data_input_read_bytes,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersDataInput",
-        "readBytes",
-        "([BIIZ)V",
-        native_lucene_byte_buffers_data_input_read_bytes_bool,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersDataInput",
-        "readBytes",
-        "(J[BII)V",
-        native_lucene_byte_buffers_data_input_read_bytes_at,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersDataInput",
-        "readFloats",
-        "([FII)V",
-        native_lucene_byte_buffers_data_input_read_floats,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersDataInput",
-        "readLongs",
-        "([JII)V",
-        native_lucene_byte_buffers_data_input_read_longs,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersDataInput",
-        "length",
-        "()J",
-        native_lucene_byte_buffers_data_input_length,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersDataInput",
-        "position",
-        "()J",
-        native_lucene_byte_buffers_data_input_position,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersDataInput",
-        "seek",
-        "(J)V",
-        native_lucene_byte_buffers_data_input_seek,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexInput",
-        "getFilePointer",
-        "()J",
-        native_lucene_byte_buffers_index_input_get_file_pointer,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexInput",
-        "seek",
-        "(J)V",
-        native_lucene_byte_buffers_index_input_seek,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexInput",
-        "length",
-        "()J",
-        native_lucene_byte_buffers_index_input_length,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexInput",
-        "readByte",
-        "()B",
-        native_lucene_byte_buffers_index_input_read_byte,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexInput",
-        "readBytes",
-        "([BII)V",
-        native_lucene_byte_buffers_index_input_read_bytes,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexInput",
-        "readBytes",
-        "([BIIZ)V",
-        native_lucene_byte_buffers_index_input_read_bytes_bool,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexInput",
-        "readFloats",
-        "([FII)V",
-        native_lucene_byte_buffers_index_input_read_floats,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexInput",
-        "readLongs",
-        "([JII)V",
-        native_lucene_byte_buffers_index_input_read_longs,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexInput",
-        "readShort",
-        "()S",
-        native_lucene_byte_buffers_index_input_read_short,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexInput",
-        "readInt",
-        "()I",
-        native_lucene_byte_buffers_index_input_read_int,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexInput",
-        "readLong",
-        "()J",
-        native_lucene_byte_buffers_index_input_read_long,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexInput",
-        "readByte",
-        "(J)B",
-        native_lucene_byte_buffers_index_input_read_byte_at,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexInput",
-        "readBytes",
-        "(J[BII)V",
-        native_lucene_byte_buffers_index_input_read_bytes_at,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexInput",
-        "readShort",
-        "(J)S",
-        native_lucene_byte_buffers_index_input_read_short_at,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexInput",
-        "readInt",
-        "(J)I",
-        native_lucene_byte_buffers_index_input_read_int_at,
-    );
-    registry.register(
-        "org/apache/lucene/store/ByteBuffersIndexInput",
-        "readLong",
-        "(J)J",
-        native_lucene_byte_buffers_index_input_read_long_at,
-    );
-    registry.register(
-        "org/apache/lucene/store/IndexInput",
-        "toString",
-        "()Ljava/lang/String;",
-        native_lucene_index_input_to_string,
-    );
-    registry.register(
-        "org/apache/lucene/tests/store/MockIndexInputWrapper",
-        "length",
-        "()J",
-        native_lucene_mock_index_input_wrapper_length,
-    );
-    registry.register(
-        "org/apache/lucene/tests/store/MockIndexInputWrapper",
-        "readByte",
-        "()B",
-        native_lucene_mock_index_input_wrapper_read_byte,
-    );
-    registry.register(
-        "org/apache/lucene/tests/store/MockIndexInputWrapper",
-        "readBytes",
-        "([BII)V",
-        native_lucene_mock_index_input_wrapper_read_bytes,
-    );
-    registry.register(
-        "org/apache/lucene/tests/store/MockIndexInputWrapper",
-        "readBytes",
-        "([BIIZ)V",
-        native_lucene_mock_index_input_wrapper_read_bytes_bool,
-    );
-    registry.register(
-        "org/apache/lucene/tests/store/MockIndexInputWrapper",
-        "readFloats",
-        "([FII)V",
-        native_lucene_mock_index_input_wrapper_read_floats,
-    );
-    registry.register(
-        "org/apache/lucene/tests/store/MockIndexInputWrapper",
-        "readLongs",
-        "([JII)V",
-        native_lucene_mock_index_input_wrapper_read_longs,
-    );
-    registry.register(
-        "org/apache/lucene/tests/store/MockIndexInputWrapper",
-        "readShort",
-        "()S",
-        native_lucene_mock_index_input_wrapper_read_short,
-    );
-    registry.register(
-        "org/apache/lucene/tests/store/MockIndexInputWrapper",
-        "readInt",
-        "()I",
-        native_lucene_mock_index_input_wrapper_read_int,
-    );
-    registry.register(
-        "org/apache/lucene/tests/store/MockIndexInputWrapper",
-        "readLong",
-        "()J",
-        native_lucene_mock_index_input_wrapper_read_long,
-    );
-}
-
-#[derive(Clone, Copy)]
-struct RandomizedRootEntry {
-    root: usize,
-    fallback: ObjectRef,
-    identity: i32,
-}
-
-fn randomized_root_entry(ctx: &mut dyn NativeContext, obj: ObjectRef) -> RandomizedRootEntry {
-    RandomizedRootEntry {
-        root: ctx.add_global_root(obj),
-        fallback: obj,
-        identity: ctx.identity_hash_code(obj),
-    }
-}
-
-fn randomized_resolve_root(ctx: &dyn NativeContext, entry: RandomizedRootEntry) -> Option<ObjectRef> {
-    let obj = if entry.root != 0 {
-        ctx.resolve_global_root(entry.root).or(Some(entry.fallback))?
-    } else {
-        entry.fallback
-    };
-    if ctx.identity_hash_code(obj) == entry.identity {
-        Some(obj)
-    } else {
-        None
-    }
-}
-
-fn randomized_release_root(ctx: &mut dyn NativeContext, entry: RandomizedRootEntry) {
-    if entry.root != 0 {
-        let _ = ctx.remove_global_root(entry.root);
-    }
-}
-
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
-struct RandomizedContextCacheKey {
-    vm: usize,
-    thread: i32,
-    group: i32,
-}
-
-fn randomized_context_cache(
-) -> &'static parking_lot::Mutex<std::collections::HashMap<RandomizedContextCacheKey, RandomizedRootEntry>> {
-    static CACHE: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<RandomizedContextCacheKey, RandomizedRootEntry>>,
-    > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
-}
-
-fn randomized_context_cache_lookup(
-    ctx: &dyn NativeContext,
-    key: RandomizedContextCacheKey,
-) -> Option<ObjectRef> {
-    let entry = randomized_context_cache().lock().get(&key).copied()?;
-    randomized_resolve_root(ctx, entry)
-}
-
-fn randomized_context_cache_store(
-    ctx: &mut dyn NativeContext,
-    key: RandomizedContextCacheKey,
-    context: ObjectRef,
-) {
-    let entry = randomized_root_entry(ctx, context);
-    let old = randomized_context_cache().lock().insert(key, entry);
-    if let Some(old) = old {
-        if old.root != entry.root {
-            randomized_release_root(ctx, old);
-        }
-    }
-}
-
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
-struct RandomizedRandomCacheKey {
-    vm: usize,
-    context: i32,
-    thread: i32,
-}
-
-fn randomized_random_cache(
-) -> &'static parking_lot::Mutex<std::collections::HashMap<RandomizedRandomCacheKey, RandomizedRootEntry>> {
-    static CACHE: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<RandomizedRandomCacheKey, RandomizedRootEntry>>,
-    > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
-}
-
-fn randomized_random_cache_lookup(
-    ctx: &dyn NativeContext,
-    key: RandomizedRandomCacheKey,
-) -> Option<ObjectRef> {
-    let entry = randomized_random_cache().lock().get(&key).copied()?;
-    randomized_resolve_root(ctx, entry)
-}
-
-fn randomized_random_cache_store(
-    ctx: &mut dyn NativeContext,
-    key: RandomizedRandomCacheKey,
-    random: ObjectRef,
-) {
-    let entry = randomized_root_entry(ctx, random);
-    let old = randomized_random_cache().lock().insert(key, entry);
-    if let Some(old) = old {
-        if old.root != entry.root {
-            randomized_release_root(ctx, old);
-        }
-    }
-}
-
-fn randomized_random_cache_invalidate(ctx: &mut dyn NativeContext, key: RandomizedRandomCacheKey) {
-    let old = randomized_random_cache().lock().remove(&key);
-    if let Some(old) = old {
-        randomized_release_root(ctx, old);
-    }
-}
-
-fn randomized_random_cache_key_for_context(
-    ctx: &mut dyn NativeContext,
-    context: ObjectRef,
-) -> RandomizedRandomCacheKey {
-    let thread = ctx.current_thread_object();
-    RandomizedRandomCacheKey {
-        vm: ctx.vm_identity(),
-        context: ctx.identity_hash_code(context),
-        thread: ctx.identity_hash_code(thread),
-    }
-}
-
-fn randomized_context_static_contexts(ctx: &dyn NativeContext) -> Option<ObjectRef> {
-    let class_id = ctx.class_id_by_name("com/carrotsearch/randomizedtesting/RandomizedContext")?;
-    let idx = ctx.static_field_index_by_name(class_id, "contexts")?;
-    match ctx.get_static_field(class_id, idx) {
-        Value::Object(Some(contexts)) => Some(contexts),
-        _ => None,
-    }
-}
-
-fn randomized_thread_group(ctx: &mut dyn NativeContext, thread: ObjectRef) -> MethodCallResult {
-    ctx.invoke_virtual(thread, "getThreadGroup", "()Ljava/lang/ThreadGroup;", &[])
-}
-
-/// Best-effort thread name for the `IllegalStateException` messages below —
-/// mirrors `com.carrotsearch.randomizedtesting.Threads.threadName(Thread)`
-/// closely enough for a human-readable diagnostic; exact wording doesn't
-/// matter for correctness (only the exception *class* does, see below).
-fn randomized_thread_name(ctx: &mut dyn NativeContext, thread: ObjectRef) -> String {
-    match ctx.invoke_virtual(thread, "getName", "()Ljava/lang/String;", &[]) {
-        Ok(Some(Value::Object(Some(name)))) => {
-            ctx.read_string(name).unwrap_or_else(|| "<unknown>".to_string())
-        }
-        _ => "<unknown>".to_string(),
-    }
-}
-
-/// `RandomizedContext.context(Thread)` never returns null in real-JDK
-/// bytecode — a missing context is always an `IllegalStateException` (see
-/// the decompiled `context(Thread)` bytecode this mirrors). Callers such as
-/// `AssertingCodec.<init>` (Lucene test framework) rely on that: they wrap
-/// `RandomizedContext.current().getTargetClass()` in
-/// `catch (IllegalStateException e) { targetClass = null; }` to tolerate
-/// running outside a randomized-test thread (e.g. from a static class
-/// initializer). Returning a plain `null` here instead of throwing skips
-/// that catch block — the very next `invokevirtual getTargetClass()` then
-/// NPEs on the null receiver, and the *wrong* exception type propagates
-/// uncaught out of the static initializer as `ExceptionInInitializerError`,
-/// crashing test classes that would otherwise gracefully no-op (e.g.
-/// `ES815BitFlatVectorFormatTests` and the other ES93 BFloat16 vector codec
-/// tests during `<clinit>`).
-fn randomized_no_context_error(
-    ctx: &mut dyn NativeContext,
-    thread: ObjectRef,
-    terminated: bool,
-) -> MethodCallFailed {
-    let thread_name = randomized_thread_name(ctx, thread);
-    let message = if terminated {
-        format!("No context for a terminated thread: {thread_name}")
-    } else {
-        format!(
-            "No context information for thread: {thread_name}. Is this thread running under a \
-             RandomizedRunner runner context? Add @RunWith(RandomizedRunner.class) to your test \
-             class. Make sure your code accesses random contexts within @BeforeClass and \
-             @AfterClass boundary (for example, static test class initializers are not \
-             permitted to access random contexts)."
-        )
-    };
-    RuntimeError::IllegalStateException { message }.into()
-}
-
-fn randomized_context_for_thread(
-    ctx: &mut dyn NativeContext,
-    thread: ObjectRef,
-) -> MethodCallResult {
-    let group_result = randomized_thread_group(ctx, thread)?;
-    let group = match group_result {
-        Some(Value::Object(Some(group))) => group,
-        _ => return Err(randomized_no_context_error(ctx, thread, true)),
-    };
-    let key = RandomizedContextCacheKey {
-        vm: ctx.vm_identity(),
-        thread: ctx.identity_hash_code(thread),
-        group: ctx.identity_hash_code(group),
-    };
-    if let Some(context) = randomized_context_cache_lookup(ctx, key) {
-        return Ok(Some(Value::Object(Some(context))));
-    }
-
-    let contexts = match randomized_context_static_contexts(ctx) {
-        Some(contexts) => contexts,
-        None => return Err(randomized_no_context_error(ctx, thread, false)),
-    };
-    let mut current_group = group;
-    loop {
-        let contexts_pin = ctx.pin_native_root(contexts);
-        let group_pin = ctx.pin_native_root(current_group);
-        let candidate = ctx.invoke_virtual(
-            contexts,
-            "get",
-            "(Ljava/lang/Object;)Ljava/lang/Object;",
-            &[Value::Object(Some(current_group))],
-        )?;
-        current_group = ctx.read_native_pin(group_pin, current_group);
-        ctx.unpin_native_roots(contexts_pin);
-        if let Some(Value::Object(Some(context))) = candidate {
-            randomized_context_cache_store(ctx, key, context);
-            return Ok(Some(Value::Object(Some(context))));
-        }
-        let parent_result = ctx.invoke_virtual(
-            current_group,
-            "getParent",
-            "()Ljava/lang/ThreadGroup;",
-            &[],
-        )?;
-        current_group = match parent_result {
-            Some(Value::Object(Some(parent))) => parent,
-            _ => return Err(randomized_no_context_error(ctx, thread, false)),
-        };
-    }
-}
-
-fn randomized_context_current_obj(ctx: &mut dyn NativeContext) -> MethodCallResult {
-    let thread = ctx.current_thread_object();
-    randomized_context_for_thread(ctx, thread)
-}
-
-fn randomized_context_randomness(ctx: &mut dyn NativeContext, context: ObjectRef) -> MethodCallResult {
-    let resources = match native_randomized_context_get_per_thread(ctx, &[Value::Object(Some(context))])? {
-        Some(Value::Object(Some(resources))) => resources,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let deque = match ctx.get_field_by_name(resources, "randomnesses") {
-        Value::Object(Some(deque)) => deque,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    ctx.invoke_virtual(deque, "peekFirst", "()Ljava/lang/Object;", &[])
-}
-
-fn randomized_random_from_context(ctx: &mut dyn NativeContext, context: ObjectRef) -> MethodCallResult {
-    let key = randomized_random_cache_key_for_context(ctx, context);
-    if let Some(random) = randomized_random_cache_lookup(ctx, key) {
-        return Ok(Some(Value::Object(Some(random))));
-    }
-    let randomness = match randomized_context_randomness(ctx, context)? {
-        Some(Value::Object(Some(randomness))) => randomness,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let random = match ctx.get_field_by_name(randomness, "random") {
-        Value::Object(Some(random)) => random,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    randomized_random_cache_store(ctx, key, random);
-    Ok(Some(Value::Object(Some(random))))
-}
-
-fn native_randomized_context_current(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    randomized_context_current_obj(ctx)
-}
-
-fn native_randomized_context_context(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let thread = obj_arg(args, 0)?;
-    randomized_context_for_thread(ctx, thread)
-}
-
-fn native_randomized_context_get_randomness(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    randomized_context_randomness(ctx, this)
-}
-
-fn native_randomized_context_get_random(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    randomized_random_from_context(ctx, this)
-}
-
-fn native_randomized_context_push(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let randomness = obj_arg(args, 1)?;
-    let key = randomized_random_cache_key_for_context(ctx, this);
-    randomized_random_cache_invalidate(ctx, key);
-    let resources = match native_randomized_context_get_per_thread(ctx, &[Value::Object(Some(this))])? {
-        Some(Value::Object(Some(resources))) => resources,
-        _ => return Ok(None),
-    };
-    let deque = match ctx.get_field_by_name(resources, "randomnesses") {
-        Value::Object(Some(deque)) => deque,
-        _ => return Ok(None),
-    };
-    ctx.invoke_virtual(deque, "push", "(Ljava/lang/Object;)V", &[Value::Object(Some(randomness))])?;
-    Ok(None)
-}
-
-fn native_randomized_context_pop_and_destroy(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let key = randomized_random_cache_key_for_context(ctx, this);
-    randomized_random_cache_invalidate(ctx, key);
-    let resources = match native_randomized_context_get_per_thread(ctx, &[Value::Object(Some(this))])? {
-        Some(Value::Object(Some(resources))) => resources,
-        _ => return Ok(None),
-    };
-    let deque = match ctx.get_field_by_name(resources, "randomnesses") {
-        Value::Object(Some(deque)) => deque,
-        _ => return Ok(None),
-    };
-    let popped = ctx.invoke_virtual(deque, "pop", "()Ljava/lang/Object;", &[])?;
-    if let Some(Value::Object(Some(randomness))) = popped {
-        let _ = ctx.invoke_virtual(randomness, "destroy", "()V", &[])?;
-    }
-    Ok(None)
-}
-
-fn native_randomness_get_random(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    Ok(Some(ctx.get_field_by_name(this, "random")))
-}
-
-fn native_randomized_test_get_context(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    randomized_context_current_obj(ctx)
-}
-
-fn native_randomized_test_get_random(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    let context = match randomized_context_current_obj(ctx)? {
-        Some(Value::Object(Some(context))) => context,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    randomized_random_from_context(ctx, context)
-}
-
-fn native_randomized_test_random_float(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    let random = match native_randomized_test_get_random(ctx, &[])? {
-        Some(Value::Object(Some(random))) => random,
-        _ => return Ok(Some(Value::Float(0.0))),
-    };
-    ctx.invoke_virtual(random, "nextFloat", "()F", &[])
-}
-
-#[inline]
-fn xoroshiro_state(ctx: &dyn NativeContext, this: ObjectRef) -> (u64, u64) {
-    let s0 = match ctx.get_field_by_name(this, "s0") {
-        Value::Long(v) => v as u64,
-        _ => 0,
-    };
-    let s1 = match ctx.get_field_by_name(this, "s1") {
-        Value::Long(v) => v as u64,
-        _ => 0,
-    };
-    (s0, s1)
-}
-
-#[inline]
-fn xoroshiro_next_long_raw(ctx: &mut dyn NativeContext, this: ObjectRef) -> i64 {
-    let (s0, mut s1) = xoroshiro_state(ctx, this);
-    let result = s0.wrapping_add(s1);
-    s1 ^= s0;
-    let new_s0 = s0.rotate_left(55) ^ s1 ^ s1.wrapping_shl(14);
-    let new_s1 = s1.rotate_left(36);
-    ctx.set_field_by_name(this, "s0", Value::Long(new_s0 as i64));
-    ctx.set_field_by_name(this, "s1", Value::Long(new_s1 as i64));
-    result as i64
-}
-
-#[inline]
-fn xoroshiro_next_int_raw(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
-    xoroshiro_next_long_raw(ctx, this) as i32
-}
-
-#[inline]
-fn xoroshiro_next_bits_raw(ctx: &mut dyn NativeContext, this: ObjectRef, bits: i32) -> i32 {
-    let shift = (32 - bits).clamp(0, 32) as u32;
-    ((xoroshiro_next_int_raw(ctx, this) as u32) >> shift) as i32
-}
-
-fn native_xoroshiro128_plus_random_next_long(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    Ok(Some(Value::Long(xoroshiro_next_long_raw(ctx, this))))
-}
-
-fn native_xoroshiro128_plus_random_next_int(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    Ok(Some(Value::Int(xoroshiro_next_int_raw(ctx, this))))
-}
-
-fn native_xoroshiro128_plus_random_next_bits(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let bits = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-    Ok(Some(Value::Int(xoroshiro_next_bits_raw(ctx, this, bits))))
-}
-
-fn native_xoroshiro128_plus_random_next_int_bound(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let bound = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-    if bound <= 0 {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "bound must be positive".to_string(),
-        }
-        .into());
-    }
-    if (bound & bound.wrapping_neg()) == bound {
-        let bits = xoroshiro_next_bits_raw(ctx, this, 31) as i64;
-        return Ok(Some(Value::Int(((bound as i64 * bits) >> 31) as i32)));
-    }
-    loop {
-        let bits = xoroshiro_next_bits_raw(ctx, this, 31);
-        let value = bits % bound;
-        if bits.wrapping_sub(value).wrapping_add(bound - 1) >= 0 {
-            return Ok(Some(Value::Int(value)));
-        }
-    }
-}
-
-fn native_xoroshiro128_plus_random_next_float(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let bits = (xoroshiro_next_int_raw(ctx, this) as u32) >> 8;
-    Ok(Some(Value::Float((bits as f32) * 5.960_464_5e-8_f32)))
-}
-
-fn native_xoroshiro128_plus_random_next_double(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let bits = (xoroshiro_next_long_raw(ctx, this) as u64) >> 11;
-    Ok(Some(Value::Double((bits as f64) * 1.110_223_024_625_156_5e-16_f64)))
-}
-
-fn native_xoroshiro128_plus_random_next_boolean(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    Ok(Some(Value::Int(if xoroshiro_next_long_raw(ctx, this) >= 0 { 1 } else { 0 })))
-}
-
-fn native_xoroshiro128_plus_random_next_bytes(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let bytes = obj_arg(args, 1)?;
-    let len = ctx.array_length(bytes);
-    let mut index = 0;
-    while index < len {
-        let mut rnd = xoroshiro_next_int_raw(ctx, this) as i64 as u64;
-        let chunk = std::cmp::min(len - index, 8);
-        for _ in 0..chunk {
-            ctx.set_array_element(bytes, index, Value::Int(rnd as u8 as i8 as i32));
-            index += 1;
-            rnd >>= 8;
-        }
-    }
-    Ok(None)
-}
-
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
-struct RandomizedPerThreadCacheKey {
-    vm: usize,
-    context: i32,
-    map: i32,
-    thread: i32,
-}
-
-#[derive(Clone, Copy)]
-struct RandomizedPerThreadCacheEntry {
-    root: usize,
-    fallback: ObjectRef,
-    resource_id: i32,
-}
-
-fn randomized_per_thread_cache(
-) -> &'static parking_lot::Mutex<std::collections::HashMap<RandomizedPerThreadCacheKey, RandomizedPerThreadCacheEntry>> {
-    static CACHE: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<RandomizedPerThreadCacheKey, RandomizedPerThreadCacheEntry>>,
-    > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
-}
-
-fn randomized_per_thread_key(
-    ctx: &dyn NativeContext,
-    this: ObjectRef,
-    map: ObjectRef,
-    thread: ObjectRef,
-) -> RandomizedPerThreadCacheKey {
-    RandomizedPerThreadCacheKey {
-        vm: ctx.vm_identity(),
-        context: ctx.identity_hash_code(this),
-        map: ctx.identity_hash_code(map),
-        thread: ctx.identity_hash_code(thread),
-    }
-}
-
-fn randomized_per_thread_cache_lookup(
-    ctx: &dyn NativeContext,
-    key: RandomizedPerThreadCacheKey,
-) -> Option<ObjectRef> {
-    let entry = randomized_per_thread_cache().lock().get(&key).copied()?;
-    let resource = if entry.root != 0 {
-        ctx.resolve_global_root(entry.root).or(Some(entry.fallback))?
-    } else {
-        entry.fallback
-    };
-    if ctx.identity_hash_code(resource) == entry.resource_id {
-        Some(resource)
-    } else {
-        None
-    }
-}
-
-fn randomized_per_thread_cache_store(
-    ctx: &mut dyn NativeContext,
-    key: RandomizedPerThreadCacheKey,
-    resources: ObjectRef,
-) {
-    let entry = RandomizedPerThreadCacheEntry {
-        root: ctx.add_global_root(resources),
-        fallback: resources,
-        resource_id: ctx.identity_hash_code(resources),
-    };
-    let old = randomized_per_thread_cache().lock().insert(key, entry);
-    if let Some(old) = old {
-        if old.root != 0 && old.root != entry.root {
-            let _ = ctx.remove_global_root(old.root);
-        }
-    }
-}
-
-fn float_array_elem(ctx: &dyn NativeContext, arr: ObjectRef, index: usize) -> f32 {
-    match ctx.get_array_element(arr, index) {
-        Value::Float(v) => v,
-        Value::Int(v) => f32::from_bits(v as u32),
-        _ => 0.0,
-    }
-}
-
-fn native_es_vector_util_dot_product_f32(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let a = obj_arg(args, 0)?;
-    let b = obj_arg(args, 1)?;
-    let len = ctx.array_length(a).min(ctx.array_length(b));
-    let mut sum = 0.0f32;
-    for i in 0..len {
-        sum += float_array_elem(ctx, a, i) * float_array_elem(ctx, b, i);
-    }
-    Ok(Some(Value::Float(sum)))
-}
-
-fn native_es_vector_util_square_distance_f32(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let a = obj_arg(args, 0)?;
-    let b = obj_arg(args, 1)?;
-    let len = ctx.array_length(a).min(ctx.array_length(b));
-    let mut sum = 0.0f32;
-    for i in 0..len {
-        let d = float_array_elem(ctx, a, i) - float_array_elem(ctx, b, i);
-        sum += d * d;
-    }
-    Ok(Some(Value::Float(sum)))
-}
-
-fn native_es_vector_util_square_distance_f32_offset(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let a = obj_arg(args, 0)?;
-    let b = obj_arg(args, 1)?;
-    let offset = match args.get(2) {
-        Some(Value::Int(v)) => (*v).max(0) as usize,
-        _ => 0,
-    };
-    let requested = match args.get(3) {
-        Some(Value::Int(v)) => (*v).max(0) as usize,
-        _ => 0,
-    };
-    let max_len = ctx.array_length(a).min(ctx.array_length(b));
-    let end = offset.saturating_add(requested).min(max_len);
-    let mut sum = 0.0f32;
-    for i in offset..end {
-        let d = float_array_elem(ctx, a, i) - float_array_elem(ctx, b, i);
-        sum += d * d;
-    }
-    Ok(Some(Value::Float(sum)))
-}
-
-#[inline]
-fn float_arg(args: &[Value], index: usize) -> f32 {
-    match args.get(index) {
-        Some(Value::Float(v)) => *v,
-        Some(Value::Int(v)) => f32::from_bits(*v as u32),
-        _ => 0.0,
-    }
-}
-
-#[inline]
-fn java_f32_min(a: f32, b: f32) -> f32 {
-    if a.is_nan() || b.is_nan() {
-        f32::NAN
-    } else if a == 0.0 && b == 0.0 {
-        if a.is_sign_negative() || b.is_sign_negative() { -0.0 } else { 0.0 }
-    } else if a < b {
-        a
-    } else {
-        b
-    }
-}
-
-#[inline]
-fn java_f32_max(a: f32, b: f32) -> f32 {
-    if a.is_nan() || b.is_nan() {
-        f32::NAN
-    } else if a == 0.0 && b == 0.0 {
-        if a.is_sign_positive() || b.is_sign_positive() { 0.0 } else { -0.0 }
-    } else if a > b {
-        a
-    } else {
-        b
-    }
-}
-
-#[inline]
-fn java_math_round_f32(v: f32) -> i32 {
-    let rounded = (v + 0.5).floor();
-    if rounded.is_nan() {
-        0
-    } else if rounded >= i32::MAX as f32 {
-        i32::MAX
-    } else if rounded <= i32::MIN as f32 {
-        i32::MIN
-    } else {
-        rounded as i32
-    }
-}
-
-#[inline]
-fn set_float_array_elem(ctx: &dyn NativeContext, arr: ObjectRef, index: usize, value: f32) {
-    ctx.set_array_element(arr, index, Value::Float(value));
-}
-
-#[inline]
-fn set_int_array_elem(ctx: &dyn NativeContext, arr: ObjectRef, index: usize, value: i32) {
-    ctx.set_array_element(arr, index, Value::Int(value));
-}
-
-#[inline]
-fn byte_array_elem(ctx: &dyn NativeContext, arr: ObjectRef, index: usize) -> i32 {
-    ctx.get_array_element(arr, index).as_int().unwrap_or(0) as i8 as i32
-}
-
-fn native_es_vector_util_calculate_osq_loss_f32(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let vector = obj_arg(args, 0)?;
-    let lower = float_arg(args, 1);
-    let upper = float_arg(args, 2);
-    let points = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
-    let norm2 = float_arg(args, 4);
-    let lambda = float_arg(args, 5);
-    let scratch = obj_arg(args, 6)?;
-    let step = (upper - lower) / ((points as f32) - 1.0);
-    let inv_step = 1.0 / step;
-    let mut xe = 0.0f32;
-    let mut e2 = 0.0f32;
-    for i in 0..ctx.array_length(vector) {
-        let v = float_array_elem(ctx, vector, i);
-        let clamped = java_f32_min(java_f32_max(v, lower), upper);
-        let q = java_math_round_f32((clamped - lower) * inv_step);
-        set_int_array_elem(ctx, scratch, i, q);
-        let dequantized = step.mul_add(q as f32, lower);
-        let error = v - dequantized;
-        e2 = error.mul_add(error, e2);
-        xe = v.mul_add(error, xe);
-    }
-    Ok(Some(Value::Float((1.0 - lambda) * xe * xe / norm2 + lambda * e2)))
-}
-
-fn native_es_vector_util_calculate_osq_grid_points_f32(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let vector = obj_arg(args, 0)?;
-    let quantized = obj_arg(args, 1)?;
-    let points = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-    let scratch = obj_arg(args, 3)?;
-    let mut a = 0.0f32;
-    let mut b = 0.0f32;
-    let mut c = 0.0f32;
-    let mut d = 0.0f32;
-    let mut e = 0.0f32;
-    let inv = 1.0 / ((points as f32) - 1.0);
-    for i in 0..ctx.array_length(vector) {
-        let v = float_array_elem(ctx, vector, i);
-        let q = int_array_elem(ctx, quantized, i) as f32;
-        let x = q * inv;
-        let y = 1.0 - x;
-        a = y.mul_add(y, a);
-        b = y.mul_add(x, b);
-        c = x.mul_add(x, c);
-        d = y.mul_add(v, d);
-        e = x.mul_add(v, e);
-    }
-    set_float_array_elem(ctx, scratch, 0, a);
-    set_float_array_elem(ctx, scratch, 1, b);
-    set_float_array_elem(ctx, scratch, 2, c);
-    set_float_array_elem(ctx, scratch, 3, d);
-    set_float_array_elem(ctx, scratch, 4, e);
-    Ok(None)
-}
-
-fn es_vector_util_center_stats_common<F>(
-    ctx: &mut dyn NativeContext,
-    len: usize,
-    centered: ObjectRef,
-    stats: ObjectRef,
-    mut value_at: F,
-    track_dot_product: bool,
-) where
-    F: FnMut(&dyn NativeContext, usize) -> (f32, f32, f32),
-{
-    let mut mean = 0.0f32;
-    let mut variance_sum = 0.0f32;
-    let mut norm2 = 0.0f32;
-    let mut dot_product = 0.0f32;
-    let mut min = f32::MAX;
-    let mut max = -f32::MAX;
-    for i in 0..len {
-        let (value, center, dot_value) = value_at(ctx, i);
-        if track_dot_product {
-            dot_product = value.mul_add(dot_value, dot_product);
-        }
-        let c = value - center;
-        set_float_array_elem(ctx, centered, i, c);
-        min = java_f32_min(min, c);
-        max = java_f32_max(max, c);
-        norm2 = c.mul_add(c, norm2);
-        let delta = c - mean;
-        mean += delta / ((i + 1) as f32);
-        let delta2 = c - mean;
-        variance_sum = delta.mul_add(delta2, variance_sum);
-    }
-    set_float_array_elem(ctx, stats, 0, mean);
-    set_float_array_elem(ctx, stats, 1, variance_sum / (len as f32));
-    set_float_array_elem(ctx, stats, 2, norm2);
-    set_float_array_elem(ctx, stats, 3, min);
-    set_float_array_elem(ctx, stats, 4, max);
-    if track_dot_product {
-        set_float_array_elem(ctx, stats, 5, dot_product);
-    }
-}
-
-fn native_es_vector_util_center_stats_euclidean_f32(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let vector = obj_arg(args, 0)?;
-    let centroid = obj_arg(args, 1)?;
-    let centered = obj_arg(args, 2)?;
-    let stats = obj_arg(args, 3)?;
-    let len = ctx.array_length(vector);
-    es_vector_util_center_stats_common(ctx, len, centered, stats, |ctx, i| {
-        (float_array_elem(ctx, vector, i), float_array_elem(ctx, centroid, i), 0.0)
-    }, false);
-    Ok(None)
-}
-
-fn native_es_vector_util_center_stats_dp_f32(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let vector = obj_arg(args, 0)?;
-    let centroid = obj_arg(args, 1)?;
-    let centered = obj_arg(args, 2)?;
-    let stats = obj_arg(args, 3)?;
-    let len = ctx.array_length(vector);
-    es_vector_util_center_stats_common(ctx, len, centered, stats, |ctx, i| {
-        let value = float_array_elem(ctx, vector, i);
-        let center = float_array_elem(ctx, centroid, i);
-        (value, center, center)
-    }, true);
-    Ok(None)
-}
-
-fn native_es_vector_util_center_stats_euclidean_i8(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let vector = obj_arg(args, 0)?;
-    let centroid = obj_arg(args, 1)?;
-    let centered = obj_arg(args, 2)?;
-    let stats = obj_arg(args, 3)?;
-    let len = ctx.array_length(vector);
-    es_vector_util_center_stats_common(ctx, len, centered, stats, |ctx, i| {
-        (byte_array_elem(ctx, vector, i) as f32, byte_array_elem(ctx, centroid, i) as f32, 0.0)
-    }, false);
-    Ok(None)
-}
-
-fn native_es_vector_util_center_stats_dp_i8(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let vector = obj_arg(args, 0)?;
-    let centroid = obj_arg(args, 1)?;
-    let centered = obj_arg(args, 2)?;
-    let stats = obj_arg(args, 3)?;
-    let len = ctx.array_length(vector);
-    es_vector_util_center_stats_common(ctx, len, centered, stats, |ctx, i| {
-        let value = byte_array_elem(ctx, vector, i) as f32;
-        let center = byte_array_elem(ctx, centroid, i) as f32;
-        (value, center, center)
-    }, true);
-    Ok(None)
-}
-
-fn native_es_vector_util_quantize_vector_with_intervals_f32(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let vector = obj_arg(args, 0)?;
-    let destination = obj_arg(args, 1)?;
-    let lower = float_arg(args, 2);
-    let upper = float_arg(args, 3);
-    let bits = args.get(4).and_then(|v| v.as_int()).unwrap_or(0);
-    let max_quant = ((1_i32 << bits) - 1) as f32;
-    let inv = max_quant / (upper - lower);
-    let mut sum = 0_i32;
-    for i in 0..ctx.array_length(vector) {
-        let v = java_f32_min(java_f32_max(float_array_elem(ctx, vector, i), lower), upper);
-        let q = java_math_round_f32((v - lower) * inv);
-        sum = sum.wrapping_add(q);
-        set_int_array_elem(ctx, destination, i, q);
-    }
-    Ok(Some(Value::Int(sum)))
-}
-
-fn native_es_vector_util_pack_as_binary(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let values = obj_arg(args, 0)?;
-    let packed = obj_arg(args, 1)?;
-    let len = ctx.array_length(values);
-    if len == 0 {
-        return Ok(None);
-    }
-    let out_len = (len + 7) / 8;
-    let mut out = vec![0u8; out_len.min(ctx.array_length(packed))];
-    let mut src = 0usize;
-    let mut dst = 0usize;
-    while src + 7 < len && dst < out.len() {
-        let byte = (((int_array_elem(ctx, values, src) & 1) as u8) << 7)
-            | (((int_array_elem(ctx, values, src + 1) & 1) as u8) << 6)
-            | (((int_array_elem(ctx, values, src + 2) & 1) as u8) << 5)
-            | (((int_array_elem(ctx, values, src + 3) & 1) as u8) << 4)
-            | (((int_array_elem(ctx, values, src + 4) & 1) as u8) << 3)
-            | (((int_array_elem(ctx, values, src + 5) & 1) as u8) << 2)
-            | (((int_array_elem(ctx, values, src + 6) & 1) as u8) << 1)
-            | ((int_array_elem(ctx, values, src + 7) & 1) as u8);
-        out[dst] = byte;
-        src += 8;
-        dst += 1;
-    }
-    if src < len && dst < out.len() {
-        let mut byte = 0u8;
-        let mut shift = 7i32;
-        while shift >= 0 && src < len {
-            byte |= ((int_array_elem(ctx, values, src) & 1) as u8) << shift;
-            src += 1;
-            shift -= 1;
-        }
-        out[dst] = byte;
-    }
-    if !ctx.write_byte_array_from(packed, 0, &out) {
-        return Err(lucene_iobe("ESVectorUtil.packAsBinary destination byte[] write failed"));
-    }
-    Ok(None)
-}
-
-#[inline]
-fn int_array_elem(ctx: &dyn NativeContext, arr: ObjectRef, index: usize) -> i32 {
-    match ctx.get_array_element(arr, index) {
-        Value::Int(v) => v,
-        _ => 0,
-    }
-}
-
-#[inline]
-fn bool_array_elem(ctx: &dyn NativeContext, arr: ObjectRef, index: usize) -> bool {
-    match ctx.get_array_element(arr, index) {
-        Value::Int(v) => v != 0,
-        _ => false,
-    }
-}
-
-fn native_es_next_diskbbq_vectors_writer_iarray_at_i(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let arr = obj_arg(args, 0)?;
-    let index = match args.get(1) {
-        Some(Value::Int(v)) if *v >= 0 => *v as usize,
-        _ => 0,
-    };
-    Ok(Some(Value::Int(int_array_elem(ctx, arr, index))))
-}
-
-fn native_es_next_diskbbq_vectors_writer_iarray_at_iarray_at_i(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let outer = obj_arg(args, 0)?;
-    let inner = obj_arg(args, 1)?;
-    let index = match args.get(2) {
-        Some(Value::Int(v)) if *v >= 0 => *v as usize,
-        _ => 0,
-    };
-    let inner_index = int_array_elem(ctx, inner, index).max(0) as usize;
-    Ok(Some(Value::Int(int_array_elem(ctx, outer, inner_index))))
-}
-
-fn native_es_next_diskbbq_vectors_writer_iarray_at_i_plus_j(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let arr = obj_arg(args, 0)?;
-    let i = match args.get(1) {
-        Some(Value::Int(v)) => *v,
-        _ => 0,
-    };
-    let j = match args.get(2) {
-        Some(Value::Int(v)) => *v,
-        _ => 0,
-    };
-    let index = i.saturating_add(j).max(0) as usize;
-    Ok(Some(Value::Int(int_array_elem(ctx, arr, index))))
-}
-
-fn native_es_next_diskbbq_vectors_writer_barray_at_iarray_at_i(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let outer = obj_arg(args, 0)?;
-    let inner = obj_arg(args, 1)?;
-    let index = match args.get(2) {
-        Some(Value::Int(v)) if *v >= 0 => *v as usize,
-        _ => 0,
-    };
-    let inner_index = int_array_elem(ctx, inner, index).max(0) as usize;
-    Ok(Some(Value::Int(if bool_array_elem(ctx, outer, inner_index) { 1 } else { 0 })))
-}
-
-fn native_es_next_diskbbq_vectors_writer_i_plus_j(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let i = match args.get(0) {
-        Some(Value::Int(v)) => *v,
-        _ => 0,
-    };
-    let j = match args.get(1) {
-        Some(Value::Int(v)) => *v,
-        _ => 0,
-    };
-    Ok(Some(Value::Int(i.saturating_add(j))))
-}
-
-fn native_es_clustering_float_vector_values_slice_translated_ord(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    ord: i32,
-) -> Result<i32, MethodCallFailed> {
-    let translator = match ctx.get_field_by_name(this, "ordTranslator") {
-        Value::Object(Some(translator)) => translator,
-        _ => return Ok(ord),
-    };
-    Ok(match ctx.invoke_virtual(translator, "apply", "(I)I", &[Value::Int(ord)])? {
-        Some(Value::Int(mapped)) => mapped,
-        _ => ord,
-    })
-}
-
-fn native_es_clustering_float_vector_values_slice_vector_value(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let ord = args.get(1).and_then(Value::as_int).unwrap_or(0);
-    let all_values = match ctx.get_field_by_name(this, "allValues") {
-        Value::Object(Some(all_values)) => all_values,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-
-    let all_values_pin = ctx.pin_native_root(all_values);
-    let translated = native_es_clustering_float_vector_values_slice_translated_ord(ctx, this, ord);
-    let all_values = ctx.read_native_pin(all_values_pin, all_values);
-    ctx.unpin_native_roots(all_values_pin);
-    let translated = translated?;
-
-    ctx.invoke_virtual(
-        all_values,
-        "vectorValue",
-        "(I)Ljava/lang/Object;",
-        &[Value::Int(translated)],
-    )
-}
-
-fn native_es_clustering_float_vector_values_slice_ord_to_doc(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let ord = args.get(1).and_then(Value::as_int).unwrap_or(0);
-    Ok(Some(Value::Int(
-        native_es_clustering_float_vector_values_slice_translated_ord(ctx, this, ord)?,
-    )))
-}
-
-fn native_es_clustering_float_vector_values_slice_size(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    Ok(Some(Value::Int(
-        ctx.get_field_by_name(this, "size").as_int().unwrap_or(0),
-    )))
-}
-
-fn native_es_clustering_float_vector_values_slice_dimension(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let all_values = match ctx.get_field_by_name(this, "allValues") {
-        Value::Object(Some(all_values)) => all_values,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    ctx.invoke_virtual(all_values, "dimension", "()I", &[])
-}
-
-fn native_es_field_value(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-    field_name: &str,
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    Ok(Some(ctx.get_field_by_name(this, field_name)))
-}
-
-fn native_es_field_int(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-    field_name: &str,
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    Ok(Some(Value::Int(
-        ctx.get_field_by_name(this, field_name).as_int().unwrap_or(0),
-    )))
-}
-
-fn native_es_centroid_slices_slice_offsets(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    native_es_field_value(ctx, args, "sliceOffsets")
-}
-
-fn native_es_centroid_slices_slice_num_vectors(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    native_es_field_value(ctx, args, "sliceNumVectors")
-}
-
-fn native_es_centroid_slices_max_slice_size(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    native_es_field_int(ctx, args, "maxSliceSize")
-}
-
-fn native_es_centroid_assignments_num_centroids(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    native_es_field_int(ctx, args, "numCentroids")
-}
-
-fn native_es_centroid_assignments_centroids(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    native_es_field_value(ctx, args, "centroids")
-}
-
-fn native_es_centroid_assignments_assignments(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    native_es_field_value(ctx, args, "assignments")
-}
-
-fn native_es_centroid_assignments_overspill_assignments(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    native_es_field_value(ctx, args, "overspillAssignments")
-}
-
-fn native_es_centroid_assignments_global_centroid(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    native_es_field_value(ctx, args, "globalCentroid")
-}
-
-fn native_es_centroid_assignments_centroid_slices(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    native_es_field_value(ctx, args, "centroidSlices")
-}
-
-fn native_es_kmeans_result_centroids(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    native_es_field_value(ctx, args, "centroids")
-}
-
-fn native_es_kmeans_result_assignments(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    native_es_field_value(ctx, args, "assignments")
-}
-
-fn native_es_kmeans_result_cluster_counts(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    native_es_field_value(ctx, args, "clusterCounts")
-}
-
-fn native_es_kmeans_result_soar_assignments(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    native_es_field_value(ctx, args, "soarAssignments")
-}
-
-fn native_es_kmeans_float_vector_values_size(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    native_es_field_int(ctx, args, "numVectors")
-}
-
-fn native_es_next_diskbbq_vectors_writer_write_slices_offsets(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let output = obj_arg(args, 1)?;
-    let slices = match args.get(2) {
-        Some(Value::Object(Some(slices))) => *slices,
-        _ => return Ok(None),
-    };
-    let offsets = match ctx.get_field_by_name(slices, "sliceOffsets") {
-        Value::Object(Some(offsets)) => offsets,
-        _ => return Ok(None),
-    };
-    let len = ctx.array_length(offsets);
-    if len == 0 {
-        return Ok(None);
-    }
-
-    let mut bytes = vec![0u8; len.saturating_mul(4)];
-    for i in 0..len {
-        let base = i * 4;
-        bytes[base..base + 4].copy_from_slice(&int_array_elem(ctx, offsets, i).to_le_bytes());
-    }
-
-    let output_pin = ctx.pin_native_root(output);
-    let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
-    let byte_arr_pin = ctx.pin_native_root(byte_arr);
-    let result = if ctx.write_byte_array_from(byte_arr, 0, &bytes) {
-        let output = ctx.read_native_pin(output_pin, output);
-        let byte_arr = ctx.read_native_pin(byte_arr_pin, byte_arr);
-        ctx.invoke_virtual(
-            output,
-            "writeBytes",
-            "([BII)V",
-            &[
-                Value::Object(Some(byte_arr)),
-                Value::Int(0),
-                Value::Int(bytes.len().min(i32::MAX as usize) as i32),
-            ],
-        )?;
-        Ok(None)
-    } else {
-        Err(lucene_iobe("writeSlicesOffsets byte[] write failed"))
-    };
-    ctx.unpin_native_roots(byte_arr_pin);
-    ctx.unpin_native_roots(output_pin);
-    result
-}
-
-fn native_java_arrays_sort_long_range(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let arr = obj_arg(args, 0)?;
-    let from = args.get(1).and_then(Value::as_int).unwrap_or(0);
-    let to = args.get(2).and_then(Value::as_int).unwrap_or(0);
-    let len = ctx.array_length(arr);
-    if from < 0 {
-        return Err(lucene_aioobe(from));
-    }
-    if to < from {
-        return Err(lucene_iobe("fromIndex > toIndex"));
-    }
-    let from = from as usize;
-    let to = to as usize;
-    if to > len {
-        return Err(lucene_aioobe(to.min(i32::MAX as usize) as i32));
-    }
-    if to.saturating_sub(from) <= 1 {
-        return Ok(None);
-    }
-    let mut values = Vec::with_capacity(to - from);
-    for i in from..to {
-        values.push(ctx.get_array_element(arr, i).as_long().unwrap_or(0));
-    }
-    values.sort();
-    for (i, value) in values.into_iter().enumerate() {
-        ctx.set_array_element(arr, from + i, Value::Long(value));
-    }
-    Ok(None)
-}
-
-fn java_string_hash_code_ascii(s: &str) -> i32 {
-    let mut h = 0i32;
-    for b in s.bytes() {
-        h = h.wrapping_mul(31).wrapping_add(b as i32);
-    }
-    h
-}
-
-fn lucene_missing_static(class_name: &str, field_name: &str) -> MethodCallFailed {
-    MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::IllegalArgumentException {
-        message: format!("missing static field {class_name}.{field_name}"),
-    }))
-}
-
-fn lucene_static_object(
-    ctx: &mut dyn NativeContext,
-    class_name: &str,
-    field_name: &str,
-) -> Result<ObjectRef, MethodCallFailed> {
-    let class_id = ctx.ensure_class_initialized(class_name)?;
-    let field_idx = ctx
-        .static_field_index_by_name(class_id, field_name)
-        .ok_or_else(|| lucene_missing_static(class_name, field_name))?;
-    match ctx.get_static_field(class_id, field_idx) {
-        Value::Object(Some(obj)) => Ok(obj),
-        _ => Err(lucene_missing_static(class_name, field_name)),
-    }
-}
-
-fn lucene_sortable_i32_to_float(sortable: i32) -> f32 {
-    let bits = sortable ^ ((sortable >> 31) & 0x7fff_ffff);
-    f32::from_bits(bits as u32)
-}
-
-fn es_bulk_neighbor_decode_score(raw: i64) -> f32 {
-    lucene_sortable_i32_to_float((raw >> 32) as i32)
-}
-
-fn es_bulk_neighbor_decode_doc(raw: i64) -> i32 {
-    (!raw) as i32
-}
-
-fn native_es_new_score_doc(
-    ctx: &mut dyn NativeContext,
-    class_id: ClassId,
-    total_fields: usize,
-    raw: i64,
-) -> ObjectRef {
-    let hit = ctx.alloc_object(class_id, total_fields);
-    ctx.set_field_by_name(hit, "doc", Value::Int(es_bulk_neighbor_decode_doc(raw)));
-    ctx.set_field_by_name(
-        hit,
-        "score",
-        Value::Float(es_bulk_neighbor_decode_score(raw)),
-    );
-    ctx.set_field_by_name(hit, "shardIndex", Value::Int(-1));
-    hit
-}
-
-fn native_es_reservoir_values(ctx: &dyn NativeContext, reservoir: ObjectRef) -> Vec<i64> {
-    let max_size = lucene_field_int(ctx, reservoir, "maxSize").max(0) as usize;
-    let raw_size = lucene_field_int(ctx, reservoir, "size").max(0) as usize;
-    let values_arr = match ctx.get_field_by_name(reservoir, "values") {
-        Value::Object(Some(values)) => values,
-        _ => return Vec::new(),
-    };
-    let array_len = ctx.array_length(values_arr);
-    let read_len = raw_size.min(array_len);
-    if read_len == 0 || max_size == 0 {
-        return Vec::new();
-    }
-
-    if read_len <= max_size {
-        let mut values = Vec::with_capacity(read_len);
-        for i in 0..read_len {
-            values.push(ctx.get_array_element(values_arr, i).as_long().unwrap_or(0));
-        }
-        return values;
-    }
-
-    let mut values = Vec::with_capacity(read_len);
-    for i in 0..read_len {
-        values.push(ctx.get_array_element(values_arr, i).as_long().unwrap_or(0));
-    }
-    values.sort();
-    values.split_off(read_len - max_size)
-}
-
-fn native_es_reset_reservoir(ctx: &mut dyn NativeContext, reservoir: ObjectRef) {
-    ctx.set_field_by_name(reservoir, "size", Value::Int(0));
-    ctx.set_field_by_name(reservoir, "threshold", Value::Long(i64::MIN));
-    ctx.set_field_by_name(reservoir, "thresholdScore", Value::Float(f32::NEG_INFINITY));
-}
-
-fn native_es_tiny_heap_values(ctx: &dyn NativeContext, heap: ObjectRef) -> Vec<i64> {
-    let size = lucene_field_int(ctx, heap, "size").max(0) as usize;
-    let heap_arr = match ctx.get_field_by_name(heap, "heap") {
-        Value::Object(Some(heap_arr)) => heap_arr,
-        _ => return Vec::new(),
-    };
-    let array_len = ctx.array_length(heap_arr);
-    let mut values = Vec::with_capacity(size);
-    for i in 1..=size.min(array_len.saturating_sub(1)) {
-        values.push(ctx.get_array_element(heap_arr, i).as_long().unwrap_or(0));
-    }
-    values
-}
-
-fn native_es_reset_tiny_heap(ctx: &mut dyn NativeContext, heap: ObjectRef) {
-    ctx.set_field_by_name(heap, "size", Value::Int(0));
-}
-
-fn native_es_make_top_docs(
-    ctx: &mut dyn NativeContext,
-    score_docs: ObjectRef,
-    visited_count: i64,
-    relation: ObjectRef,
-) -> MethodCallResult {
-    let relation_pin = ctx.pin_native_root(relation);
-    let docs_pin = ctx.pin_native_root(score_docs);
-    let total_hits_class = ctx.ensure_class_initialized("org/apache/lucene/search/TotalHits")?;
-    let total_hits = ctx.alloc_object(
-        total_hits_class,
-        ctx.class_num_total_fields(total_hits_class).max(2),
-    );
-    let relation = ctx.read_native_pin(relation_pin, relation);
-    ctx.set_field_by_name(total_hits, "value", Value::Long(visited_count));
-    ctx.set_field_by_name(total_hits, "relation", Value::Object(Some(relation)));
-
-    let total_hits_pin = ctx.pin_native_root(total_hits);
-    let top_docs_class = ctx.ensure_class_initialized("org/apache/lucene/search/TopDocs")?;
-    let top_docs = ctx.alloc_object(top_docs_class, ctx.class_num_total_fields(top_docs_class).max(2));
-    let total_hits = ctx.read_native_pin(total_hits_pin, total_hits);
-    let score_docs = ctx.read_native_pin(docs_pin, score_docs);
-    ctx.set_field_by_name(top_docs, "totalHits", Value::Object(Some(total_hits)));
-    ctx.set_field_by_name(top_docs, "scoreDocs", Value::Object(Some(score_docs)));
-    ctx.unpin_native_roots(total_hits_pin);
-    ctx.unpin_native_roots(docs_pin);
-    ctx.unpin_native_roots(relation_pin);
-    Ok(Some(Value::Object(Some(top_docs))))
-}
-
-fn native_es_max_score_top_knn_collector_unsorted_top_k(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let queue = lucene_field_obj(ctx, this, "queue")?;
-    let mut values = match ctx.get_field_by_name(queue, "tinyHeap") {
-        Value::Object(Some(heap)) => {
-            let values = native_es_tiny_heap_values(ctx, heap);
-            native_es_reset_tiny_heap(ctx, heap);
-            values
-        }
-        _ => match ctx.get_field_by_name(queue, "collector") {
-            Value::Object(Some(reservoir)) => {
-                let values = native_es_reservoir_values(ctx, reservoir);
-                native_es_reset_reservoir(ctx, reservoir);
-                values
-            }
-            _ => Vec::new(),
-        },
-    };
-
-    let len = values.len();
-    let score_docs = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
-    if len > 0 {
-        let score_docs_pin = ctx.pin_native_root(score_docs);
-        let score_doc_class = ctx.ensure_class_initialized("org/apache/lucene/search/ScoreDoc")?;
-        let score_doc_fields = ctx.class_num_total_fields(score_doc_class).max(3);
-        for (i, raw) in values.drain(..).enumerate() {
-            let hit = native_es_new_score_doc(ctx, score_doc_class, score_doc_fields, raw);
-            let score_docs = ctx.read_native_pin(score_docs_pin, score_docs);
-            ctx.set_array_element(score_docs, i, Value::Object(Some(hit)));
-        }
-        ctx.unpin_native_roots(score_docs_pin);
-    }
-
-    let early_terminated = matches!(
-        ctx.invoke_virtual(this, "earlyTerminated", "()Z", &[])?,
-        Some(Value::Int(v)) if v != 0
-    );
-    let relation_name = if early_terminated {
-        "GREATER_THAN_OR_EQUAL_TO"
-    } else {
-        "EQUAL_TO"
-    };
-    let relation = lucene_static_object(
-        ctx,
-        "org/apache/lucene/search/TotalHits$Relation",
-        relation_name,
-    )?;
-    let visited_count = match ctx.invoke_virtual(this, "visitedCount", "()J", &[])? {
-        Some(Value::Long(v)) => v,
-        Some(Value::Int(v)) => v as i64,
-        _ => 0,
-    };
-    native_es_make_top_docs(ctx, score_docs, visited_count, relation)
-}
-
-fn native_lucene_index_reader_context_id(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    Ok(Some(ctx.get_field_by_name(this, "identity")))
-}
-
-fn native_es92_int7_vectors_scorer_int7_dot_product_bulk(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let query = obj_arg(args, 1)?;
-    let count = args.get(2).and_then(Value::as_int).unwrap_or(0);
-    let scores = obj_arg(args, 3)?;
-    if count <= 0 {
-        return Ok(None);
-    }
-
-    let dimensions = ctx.get_field_by_name(this, "dimensions").as_int().unwrap_or(0);
-    if dimensions <= 0 || count as usize > ctx.array_length(scores) {
-        return Ok(None);
-    }
-    let input = lucene_field_obj(ctx, this, "in")?;
-    let byte_len = (count as usize)
-        .checked_mul(dimensions as usize)
-        .ok_or_else(|| lucene_aioobe(i32::MAX))?;
-    let packed = ctx.new_array(cratonvm_types::ArrayElementType::Byte, byte_len);
-    ctx.invoke_virtual(
-        input,
-        "readBytes",
-        "([BII)V",
-        &[
-            Value::Object(Some(packed)),
-            Value::Int(0),
-            Value::Int(byte_len as i32),
-        ],
-    )?;
-
-    let mut query_bytes = vec![0u8; dimensions as usize];
-    if ctx.read_byte_array_into(query, 0, &mut query_bytes) != query_bytes.len() {
-        return Ok(None);
-    }
-    let mut packed_bytes = vec![0u8; byte_len];
-    if ctx.read_byte_array_into(packed, 0, &mut packed_bytes) != byte_len {
-        return Ok(None);
-    }
-    for vector in 0..count as usize {
-        let start = vector * dimensions as usize;
-        let mut dot = 0i32;
-        for dimension in 0..dimensions as usize {
-            dot = dot.wrapping_add(
-                (packed_bytes[start + dimension] as i8 as i32)
-                    .wrapping_mul(query_bytes[dimension] as i8 as i32),
-            );
-        }
-        ctx.set_array_element(scores, vector, Value::Float(dot as f32));
-    }
-    Ok(None)
-}
-
-fn native_es_knn_score_doc_query_init(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let score_docs = obj_arg(args, 1)?;
-    let reader = obj_arg(args, 2)?;
-    let len = ctx.array_length(score_docs);
-
-    let mut hits: Vec<(i32, f32, ObjectRef, usize)> = Vec::with_capacity(len);
-    for i in 0..len {
-        let hit = match ctx.get_array_element(score_docs, i) {
-            Value::Object(Some(hit)) => hit,
-            _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
-        };
-        let doc = ctx.get_field_by_name(hit, "doc").as_int().unwrap_or(0);
-        let score = match ctx.get_field_by_name(hit, "score") {
-            Value::Float(v) => v,
-            Value::Int(v) => f32::from_bits(v as u32),
-            _ => 0.0,
-        };
-        hits.push((doc, score, hit, i));
-    }
-    hits.sort_by(|a, b| a.0.cmp(&b.0).then(a.3.cmp(&b.3)));
-
-    let docs_arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, len);
-    let scores_arr = ctx.new_array(cratonvm_types::ArrayElementType::Float, len);
-    let mut docs = Vec::with_capacity(len);
-    for (i, (doc, score, hit, _)) in hits.into_iter().enumerate() {
-        docs.push(doc);
-        ctx.set_array_element(score_docs, i, Value::Object(Some(hit)));
-        ctx.set_array_element(docs_arr, i, Value::Int(doc));
-        ctx.set_array_element(scores_arr, i, Value::Float(score));
-    }
-
-    let leaves = match ctx.invoke_virtual(reader, "leaves", "()Ljava/util/List;", &[])? {
-        Some(Value::Object(Some(leaves))) => leaves,
-        _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
-    };
-    let leaves_size = match ctx.invoke_virtual(leaves, "size", "()I", &[])? {
-        Some(Value::Int(v)) if v >= 0 => v as usize,
-        _ => 0,
-    };
-    let starts_len = leaves_size.saturating_add(1);
-    let segment_starts = ctx.new_array(cratonvm_types::ArrayElementType::Int, starts_len);
-    if starts_len > 0 {
-        ctx.set_array_element(segment_starts, starts_len - 1, Value::Int(len as i32));
-    }
-    if starts_len != 2 {
-        let mut search_from = 0usize;
-        for segment in 1..starts_len.saturating_sub(1) {
-            let leaf = match ctx.invoke_virtual(leaves, "get", "(I)Ljava/lang/Object;", &[Value::Int(segment as i32)])? {
-                Some(Value::Object(Some(leaf))) => leaf,
-                _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
-            };
-            let doc_base = ctx.get_field_by_name(leaf, "docBase").as_int().unwrap_or(0);
-            let rel = match docs[search_from..].binary_search(&doc_base) {
-                Ok(idx) | Err(idx) => idx,
-            };
-            search_from = search_from.saturating_add(rel).min(docs.len());
-            ctx.set_array_element(segment_starts, segment, Value::Int(search_from as i32));
-        }
-    }
-
-    let context_identity = match ctx.get_field_by_name(reader, "readerContext") {
-        Value::Object(Some(context)) => ctx.get_field_by_name(context, "identity"),
-        _ => {
-            let context = match ctx.invoke_virtual(
-                reader,
-                "getContext",
-                "()Lorg/apache/lucene/index/IndexReaderContext;",
-                &[],
-            )? {
-                Some(Value::Object(Some(context))) => context,
-                _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
-            };
-            ctx.get_field_by_name(context, "identity")
-        }
-    };
-
-    ctx.set_field_by_name(
-        this,
-        "CLASS_NAME_HASH",
-        Value::Int(java_string_hash_code_ascii(
-            "org.elasticsearch.search.vectors.KnnScoreDocQuery",
-        )),
-    );
-    ctx.set_field_by_name(this, "docs", Value::Object(Some(docs_arr)));
-    ctx.set_field_by_name(this, "scores", Value::Object(Some(scores_arr)));
-    ctx.set_field_by_name(this, "segmentStarts", Value::Object(Some(segment_starts)));
-    ctx.set_field_by_name(this, "contextIdentity", context_identity);
-    Ok(None)
 }
 
 fn native_randomized_context_get_per_thread(
@@ -5088,25 +711,14 @@ fn native_randomized_context_get_per_thread(
         Value::Object(Some(map)) => map,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let cache_key = randomized_per_thread_key(ctx, this, map, thread);
-    if let Some(resources) = randomized_per_thread_cache_lookup(ctx, cache_key) {
-        return Ok(Some(Value::Object(Some(resources))));
-    }
-
-    let map_pin = ctx.pin_native_root(map);
-    let thread_pin = ctx.pin_native_root(thread);
     let existing = ctx.invoke_virtual(
         map,
         "get",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         &[Value::Object(Some(thread))],
     )?;
-    let map = ctx.read_native_pin(map_pin, map);
-    let thread = ctx.read_native_pin(thread_pin, thread);
-    ctx.unpin_native_roots(map_pin);
-    if let Some(Value::Object(Some(resources))) = existing {
-        randomized_per_thread_cache_store(ctx, cache_key, resources);
-        return Ok(Some(Value::Object(Some(resources))));
+    if matches!(existing, Some(Value::Object(Some(_)))) {
+        return Ok(existing);
     }
 
     let map_pin = ctx.pin_native_root(map);
@@ -5171,19 +783,13 @@ fn native_randomized_context_get_per_thread(
     let thread = ctx.read_native_pin(thread_pin, thread);
     ctx.unpin_native_roots(resources_pin);
 
-    let resources_pin = ctx.pin_native_root(resources);
-    let map_pin = ctx.pin_native_root(map);
-    let thread_pin = ctx.pin_native_root(thread);
     ctx.invoke_virtual(
         map,
         "put",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
         &[Value::Object(Some(thread)), Value::Object(Some(resources))],
     )?;
-    let resources = ctx.read_native_pin(resources_pin, resources);
-    ctx.unpin_native_roots(resources_pin);
 
-    randomized_per_thread_cache_store(ctx, cache_key, resources);
     Ok(Some(Value::Object(Some(resources))))
 }
 
@@ -5422,892 +1028,6 @@ fn lucene_iobe(message: &str) -> MethodCallFailed {
     }))
 }
 
-fn lucene_byte_buffers_data_output_current_block(
-    ctx: &dyn NativeContext,
-    this: ObjectRef,
-) -> Option<ObjectRef> {
-    match ctx.get_field_by_name(this, "currentBlock") {
-        Value::Object(Some(block)) => Some(block),
-        _ => None,
-    }
-}
-
-fn heap_byte_buffer_remaining(ctx: &dyn NativeContext, block: ObjectRef) -> i32 {
-    let position = ctx.get_field_by_name(block, "position").as_int().unwrap_or(0);
-    let limit = ctx.get_field_by_name(block, "limit").as_int().unwrap_or(0);
-    limit.saturating_sub(position).max(0)
-}
-
-fn heap_byte_buffer_write_slice(
-    ctx: &mut dyn NativeContext,
-    block: ObjectRef,
-    bytes: &[u8],
-) -> usize {
-    let position = ctx.get_field_by_name(block, "position").as_int().unwrap_or(0);
-    let limit = ctx.get_field_by_name(block, "limit").as_int().unwrap_or(0);
-    let offset = ctx.get_field_by_name(block, "offset").as_int().unwrap_or(0);
-    let hb = match ctx.get_field_by_name(block, "hb") {
-        Value::Object(Some(hb)) => hb,
-        _ => return 0,
-    };
-    if position < 0 || limit < position {
-        return 0;
-    }
-    let writable = (limit - position) as usize;
-    let n = writable.min(bytes.len());
-    if n == 0 {
-        return 0;
-    }
-    let raw = offset as i64 + position as i64;
-    if raw < 0 {
-        return 0;
-    }
-    if !ctx.write_byte_array_from(hb, raw as usize, &bytes[..n]) {
-        return 0;
-    }
-    ctx.set_field_by_name(block, "position", Value::Int(position + n as i32));
-    n
-}
-
-fn lucene_byte_buffers_data_output_append_block(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-) -> Result<ObjectRef, MethodCallFailed> {
-    let pin = ctx.pin_native_root(this);
-    ctx.invoke_virtual(this, "appendBlock", "()V", &[])?;
-    let this = ctx.read_native_pin(pin, this);
-    ctx.unpin_native_roots(pin);
-    lucene_byte_buffers_data_output_current_block(ctx, this)
-        .ok_or_else(|| lucene_iobe("ByteBuffersDataOutput currentBlock is null"))
-}
-
-fn lucene_byte_buffers_data_output_write_raw(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    bytes: &[u8],
-) -> MethodCallResult {
-    let this_root = ctx.add_global_root(this);
-    let result: MethodCallResult = (|| {
-        let mut this = this;
-        let mut written = 0;
-        while written < bytes.len() {
-            let mut block = lucene_byte_buffers_data_output_current_block(ctx, this)
-                .ok_or_else(|| lucene_iobe("ByteBuffersDataOutput currentBlock is null"))?;
-            if heap_byte_buffer_remaining(ctx, block) == 0 {
-                block = lucene_byte_buffers_data_output_append_block(ctx, this)?;
-                this = ctx.resolve_global_root(this_root).unwrap_or(this);
-            }
-            let n = heap_byte_buffer_write_slice(ctx, block, &bytes[written..]);
-            if n == 0 {
-                return Err(lucene_iobe("ByteBuffersDataOutput could not write to current block"));
-            }
-            written += n;
-        }
-        Ok(None)
-    })();
-    if this_root != 0 {
-        let _ = ctx.remove_global_root(this_root);
-    }
-    result
-}
-
-fn lucene_data_output_write_byte_direct(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    byte: u8,
-) -> MethodCallResult {
-    if ctx
-        .class_name_of_id(ctx.class_id_of_object(this))
-        .as_deref()
-        == Some("org/apache/lucene/store/ByteBuffersDataOutput")
-    {
-        return lucene_byte_buffers_data_output_write_raw(ctx, this, &[byte]);
-    }
-    ctx.invoke_virtual(
-        this,
-        "writeByte",
-        "(B)V",
-        &[Value::Int(byte as i8 as i32)],
-    )?;
-    Ok(None)
-}
-
-fn lucene_data_output_write_vint_raw(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    value: i32,
-) -> MethodCallResult {
-    let mut v = value as u32;
-    let mut buf = [0u8; 5];
-    let mut len = 0;
-    while (v & !0x7f) != 0 {
-        buf[len] = ((v & 0x7f) | 0x80) as u8;
-        len += 1;
-        v >>= 7;
-    }
-    buf[len] = v as u8;
-    len += 1;
-    if ctx
-        .class_name_of_id(ctx.class_id_of_object(this))
-        .as_deref()
-        == Some("org/apache/lucene/store/ByteBuffersDataOutput")
-    {
-        lucene_byte_buffers_data_output_write_raw(ctx, this, &buf[..len])
-    } else {
-        for b in &buf[..len] {
-            lucene_data_output_write_byte_direct(ctx, this, *b)?;
-        }
-        Ok(None)
-    }
-}
-
-fn lucene_data_output_write_signed_vlong_raw(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    value: i64,
-) -> MethodCallResult {
-    let mut v = value as u64;
-    let mut buf = [0u8; 10];
-    let mut len = 0;
-    while (v & !0x7f) != 0 {
-        buf[len] = ((v & 0x7f) | 0x80) as u8;
-        len += 1;
-        v >>= 7;
-    }
-    buf[len] = v as u8;
-    len += 1;
-    if ctx
-        .class_name_of_id(ctx.class_id_of_object(this))
-        .as_deref()
-        == Some("org/apache/lucene/store/ByteBuffersDataOutput")
-    {
-        lucene_byte_buffers_data_output_write_raw(ctx, this, &buf[..len])
-    } else {
-        for b in &buf[..len] {
-            lucene_data_output_write_byte_direct(ctx, this, *b)?;
-        }
-        Ok(None)
-    }
-}
-
-fn native_lucene_data_output_write_vint(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let value = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-    lucene_data_output_write_vint_raw(ctx, this, value)
-}
-
-fn native_lucene_data_output_write_zint(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let value = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-    lucene_data_output_write_vint_raw(ctx, this, (value << 1) ^ (value >> 31))
-}
-
-fn native_lucene_data_output_write_vlong(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let value = args.get(1).and_then(|v| v.as_long()).unwrap_or(0);
-    if value < 0 {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: format!("cannot write negative vLong: {value}"),
-        }
-        .into());
-    }
-    lucene_data_output_write_signed_vlong_raw(ctx, this, value)
-}
-
-fn native_lucene_data_output_write_zlong(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let value = args.get(1).and_then(|v| v.as_long()).unwrap_or(0);
-    lucene_data_output_write_signed_vlong_raw(ctx, this, (value << 1) ^ (value >> 63))
-}
-
-fn native_lucene_byte_buffers_data_output_write_byte(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let byte = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
-    lucene_byte_buffers_data_output_write_raw(ctx, this, &[byte])
-}
-
-fn lucene_byte_buffers_data_output_write_byte_array(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    src: ObjectRef,
-    off: usize,
-    len: usize,
-) -> MethodCallResult {
-    if len == 0 {
-        return Ok(None);
-    }
-    let mut tmp = vec![0u8; len];
-    let copied = ctx.read_byte_array_into(src, off, &mut tmp);
-    if copied != len {
-        return Err(lucene_iobe("ByteBuffersDataOutput source byte[] read failed"));
-    }
-    lucene_byte_buffers_data_output_write_raw(ctx, this, &tmp)
-}
-
-fn native_lucene_byte_buffers_data_output_write_bytes(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let src = obj_arg(args, 1)?;
-    let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-    let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-    lucene_byte_buffers_data_output_write_byte_array(ctx, this, src, off, len)
-}
-
-fn native_lucene_byte_buffers_data_output_write_bytes_len(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let src = obj_arg(args, 1)?;
-    let len = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-    native_lucene_byte_buffers_data_output_write_bytes(
-        ctx,
-        &[Value::Object(Some(this)), Value::Object(Some(src)), Value::Int(0), Value::Int(len)],
-    )
-}
-
-fn native_lucene_byte_buffers_data_output_write_bytes_all(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let src = obj_arg(args, 1)?;
-    let len = ctx.array_length(src) as i32;
-    native_lucene_byte_buffers_data_output_write_bytes(
-        ctx,
-        &[Value::Object(Some(this)), Value::Object(Some(src)), Value::Int(0), Value::Int(len)],
-    )
-}
-
-fn native_lucene_byte_buffers_data_output_write_short(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let value = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as i16;
-    lucene_byte_buffers_data_output_write_raw(ctx, this, &value.to_le_bytes())
-}
-
-fn native_lucene_byte_buffers_data_output_write_int(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let value = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-    lucene_byte_buffers_data_output_write_raw(ctx, this, &value.to_le_bytes())
-}
-
-fn native_lucene_byte_buffers_data_output_write_long(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let value = args.get(1).and_then(|v| v.as_long()).unwrap_or(0);
-    lucene_byte_buffers_data_output_write_raw(ctx, this, &value.to_le_bytes())
-}
-
-fn lucene_byte_buffers_data_output_copy_bytes_from(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    input: ObjectRef,
-    remaining: usize,
-) -> MethodCallResult {
-    let this_root = ctx.add_global_root(this);
-    let result: MethodCallResult = (|| {
-        let mut this = this;
-        let mut input = input;
-        let mut remaining = remaining;
-        while remaining > 0 {
-            let mut block = lucene_byte_buffers_data_output_current_block(ctx, this)
-                .ok_or_else(|| lucene_iobe("ByteBuffersDataOutput currentBlock is null"))?;
-            if heap_byte_buffer_remaining(ctx, block) == 0 {
-                block = lucene_byte_buffers_data_output_append_block(ctx, this)?;
-                this = ctx.resolve_global_root(this_root).unwrap_or(this);
-            }
-            let position = ctx.get_field_by_name(block, "position").as_int().unwrap_or(0);
-            let limit = ctx.get_field_by_name(block, "limit").as_int().unwrap_or(0);
-            let offset = ctx.get_field_by_name(block, "offset").as_int().unwrap_or(0);
-            let hb = match ctx.get_field_by_name(block, "hb") {
-                Value::Object(Some(hb)) => hb,
-                _ => return Err(lucene_iobe("ByteBuffersDataOutput current block has no array")),
-            };
-            if position < 0 || limit < position {
-                return Err(lucene_iobe("ByteBuffersDataOutput invalid block position"));
-            }
-            let n = (limit - position).max(0) as usize;
-            let n = n.min(remaining);
-            if n == 0 {
-                return Err(lucene_iobe("ByteBuffersDataOutput could not make write progress"));
-            }
-            let raw = offset as i64 + position as i64;
-            if raw < 0 || raw as usize + n > ctx.array_length(hb) {
-                return Err(lucene_iobe("ByteBuffersDataOutput block array offset out of bounds"));
-            }
-            let this_pin = ctx.pin_native_root(this);
-            let input_pin = ctx.pin_native_root(input);
-            let block_pin = ctx.pin_native_root(block);
-            let hb_pin = ctx.pin_native_root(hb);
-            ctx.invoke_virtual(
-                input,
-                "readBytes",
-                "([BII)V",
-                &[
-                    Value::Object(Some(hb)),
-                    Value::Int(raw as i32),
-                    Value::Int(n as i32),
-                ],
-            )?;
-            this = ctx.read_native_pin(this_pin, this);
-            input = ctx.read_native_pin(input_pin, input);
-            block = ctx.read_native_pin(block_pin, block);
-            let _hb = ctx.read_native_pin(hb_pin, hb);
-            ctx.unpin_native_roots(this_pin);
-            ctx.unpin_native_roots(input_pin);
-            ctx.unpin_native_roots(block_pin);
-            ctx.unpin_native_roots(hb_pin);
-            ctx.set_field_by_name(block, "position", Value::Int(position + n as i32));
-            remaining -= n;
-            this = ctx.resolve_global_root(this_root).unwrap_or(this);
-        }
-        Ok(None)
-    })();
-    if this_root != 0 {
-        let _ = ctx.remove_global_root(this_root);
-    }
-    result
-}
-
-fn native_lucene_byte_buffers_data_output_copy_bytes(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let input = obj_arg(args, 1)?;
-    let remaining = args.get(2).and_then(|v| v.as_long()).unwrap_or(0).max(0) as usize;
-    lucene_byte_buffers_data_output_copy_bytes_from(ctx, this, input, remaining)
-}
-
-fn array_deque_size_direct(ctx: &dyn NativeContext, deque: ObjectRef) -> Result<i32, MethodCallFailed> {
-    let tail = ctx.get_field_by_name(deque, "tail").as_int().unwrap_or(0);
-    let head = ctx.get_field_by_name(deque, "head").as_int().unwrap_or(0);
-    let elements = match ctx.get_field_by_name(deque, "elements") {
-        Value::Object(Some(elements)) => elements,
-        _ => return Ok(0),
-    };
-    let len = ctx.array_length(elements) as i32;
-    if len <= 0 {
-        return Ok(0);
-    }
-    let mut size = tail - head;
-    if size < 0 {
-        size += len;
-    }
-    Ok(size)
-}
-
-fn lucene_byte_buffers_data_output_size_direct(
-    ctx: &dyn NativeContext,
-    this: ObjectRef,
-) -> Result<i64, MethodCallFailed> {
-    let blocks = match ctx.get_field_by_name(this, "blocks") {
-        Value::Object(Some(blocks)) => blocks,
-        _ => return Ok(0),
-    };
-    let block_count = array_deque_size_direct(ctx, blocks)?;
-    if block_count < 1 {
-        return Ok(0);
-    }
-    let block_bits = ctx.get_field_by_name(this, "blockBits").as_int().unwrap_or(0);
-    let block_size = if (0..63).contains(&block_bits) {
-        1_i64 << block_bits
-    } else {
-        0
-    };
-    let current = lucene_byte_buffers_data_output_current_block(ctx, this)
-        .ok_or_else(|| lucene_iobe("ByteBuffersDataOutput currentBlock is null"))?;
-    let position = ctx.get_field_by_name(current, "position").as_int().unwrap_or(0) as i64;
-    Ok((block_count as i64 - 1) * block_size + position)
-}
-
-fn native_lucene_byte_buffers_data_output_size(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    Ok(Some(Value::Long(lucene_byte_buffers_data_output_size_direct(ctx, this)?)))
-}
-
-fn native_lucene_byte_buffers_byte_buffer_recycler_reuse(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let block = obj_arg(args, 1)?;
-    ctx.set_field_by_name(block, "mark", Value::Int(-1));
-    ctx.set_field_by_name(block, "position", Value::Int(0));
-    let reuse = lucene_field_obj(ctx, this, "reuse")?;
-    ctx.invoke_virtual(
-        reuse,
-        "addLast",
-        "(Ljava/lang/Object;)V",
-        &[Value::Object(Some(block))],
-    )?;
-    Ok(None)
-}
-
-fn lucene_byte_buffers_index_output_delegate(
-    ctx: &dyn NativeContext,
-    this: ObjectRef,
-) -> Result<ObjectRef, MethodCallFailed> {
-    match ctx.get_field_by_name(this, "delegate") {
-        Value::Object(Some(delegate)) => Ok(delegate),
-        _ => Err(RuntimeError::IllegalStateException {
-            message: "Already closed.".to_string(),
-        }
-        .into()),
-    }
-}
-
-fn native_lucene_byte_buffers_index_output_get_file_pointer(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let delegate = lucene_byte_buffers_index_output_delegate(ctx, this)?;
-    Ok(Some(Value::Long(lucene_byte_buffers_data_output_size_direct(ctx, delegate)?)))
-}
-
-fn native_lucene_byte_buffers_index_output_write_byte(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let delegate = lucene_byte_buffers_index_output_delegate(ctx, this)?;
-    let byte = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
-    lucene_byte_buffers_data_output_write_raw(ctx, delegate, &[byte])
-}
-
-fn native_lucene_byte_buffers_index_output_write_bytes(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let delegate = lucene_byte_buffers_index_output_delegate(ctx, this)?;
-    let src = obj_arg(args, 1)?;
-    let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-    let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-    lucene_byte_buffers_data_output_write_byte_array(ctx, delegate, src, off, len)
-}
-
-fn native_lucene_byte_buffers_index_output_write_bytes_len(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let delegate = lucene_byte_buffers_index_output_delegate(ctx, this)?;
-    let src = obj_arg(args, 1)?;
-    let len = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-    lucene_byte_buffers_data_output_write_byte_array(ctx, delegate, src, 0, len)
-}
-
-fn native_lucene_byte_buffers_index_output_write_short(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let delegate = lucene_byte_buffers_index_output_delegate(ctx, this)?;
-    let value = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as i16;
-    lucene_byte_buffers_data_output_write_raw(ctx, delegate, &value.to_le_bytes())
-}
-
-fn native_lucene_byte_buffers_index_output_write_int(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let delegate = lucene_byte_buffers_index_output_delegate(ctx, this)?;
-    let value = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-    lucene_byte_buffers_data_output_write_raw(ctx, delegate, &value.to_le_bytes())
-}
-
-fn native_lucene_byte_buffers_index_output_write_long(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let delegate = lucene_byte_buffers_index_output_delegate(ctx, this)?;
-    let value = args.get(1).and_then(|v| v.as_long()).unwrap_or(0);
-    lucene_byte_buffers_data_output_write_raw(ctx, delegate, &value.to_le_bytes())
-}
-
-fn native_lucene_byte_buffers_index_output_copy_bytes(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let delegate = lucene_byte_buffers_index_output_delegate(ctx, this)?;
-    let input = obj_arg(args, 1)?;
-    let remaining = args.get(2).and_then(|v| v.as_long()).unwrap_or(0).max(0) as usize;
-    lucene_byte_buffers_data_output_copy_bytes_from(ctx, delegate, input, remaining)
-}
-
-fn lucene_bytes_ref_parts(
-    ctx: &dyn NativeContext,
-    bytes_ref: ObjectRef,
-) -> Result<(ObjectRef, usize, usize), MethodCallFailed> {
-    let bytes = lucene_field_obj(ctx, bytes_ref, "bytes")?;
-    let offset = ctx.get_field_by_name(bytes_ref, "offset").as_int().unwrap_or(0).max(0) as usize;
-    let length = ctx.get_field_by_name(bytes_ref, "length").as_int().unwrap_or(0).max(0) as usize;
-    Ok((bytes, offset, length))
-}
-
-fn lucene_byte_array_unsigned_at(ctx: &dyn NativeContext, arr: ObjectRef, index: usize) -> u8 {
-    ctx.get_array_element(arr, index).as_int().unwrap_or(0) as i8 as u8
-}
-
-fn lucene_bytes_ref_prefix8_from_parts(
-    ctx: &dyn NativeContext,
-    bytes: ObjectRef,
-    offset: usize,
-    length: usize,
-) -> i64 {
-    let available = ctx.array_length(bytes).saturating_sub(offset);
-    let n = length.min(available).min(8);
-    let mut value = 0u64;
-    for i in 0..n {
-        value = (value << 8) | lucene_byte_array_unsigned_at(ctx, bytes, offset + i) as u64;
-    }
-    value <<= (8 - n) * 8;
-    value as i64
-}
-
-fn lucene_bytes_ref_prefix8(ctx: &dyn NativeContext, bytes_ref: ObjectRef) -> Result<i64, MethodCallFailed> {
-    let (bytes, offset, length) = lucene_bytes_ref_parts(ctx, bytes_ref)?;
-    Ok(lucene_bytes_ref_prefix8_from_parts(ctx, bytes, offset, length))
-}
-
-fn lucene_bytes_ref_compare_unsigned(
-    ctx: &dyn NativeContext,
-    left: ObjectRef,
-    right: ObjectRef,
-) -> Result<i32, MethodCallFailed> {
-    let (left_bytes, left_off, left_len) = lucene_bytes_ref_parts(ctx, left)?;
-    let (right_bytes, right_off, right_len) = lucene_bytes_ref_parts(ctx, right)?;
-    let left_avail = ctx.array_length(left_bytes).saturating_sub(left_off);
-    let right_avail = ctx.array_length(right_bytes).saturating_sub(right_off);
-    let left_len = left_len.min(left_avail);
-    let right_len = right_len.min(right_avail);
-    let common = left_len.min(right_len);
-    for i in 0..common {
-        let a = lucene_byte_array_unsigned_at(ctx, left_bytes, left_off + i);
-        let b = lucene_byte_array_unsigned_at(ctx, right_bytes, right_off + i);
-        if a != b {
-            return Ok(a as i32 - b as i32);
-        }
-    }
-    Ok(left_len as i32 - right_len as i32)
-}
-
-fn lucene_bytes_ref_equals(
-    ctx: &dyn NativeContext,
-    left: ObjectRef,
-    right: ObjectRef,
-) -> Result<bool, MethodCallFailed> {
-    Ok(lucene_bytes_ref_compare_unsigned(ctx, left, right)? == 0)
-}
-
-fn native_lucene_terms_enum_index_prefix8(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let bytes_ref = obj_arg(args, 0)?;
-    Ok(Some(Value::Long(lucene_bytes_ref_prefix8(ctx, bytes_ref)?)))
-}
-
-fn native_lucene_terms_enum_index_next(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let this_root = ctx.add_global_root(this);
-    let result: MethodCallResult = (|| {
-        let mut this = this;
-        let terms_enum = lucene_field_obj(ctx, this, "termsEnum")?;
-        let next = ctx.invoke_virtual(terms_enum, "next", "()Lorg/apache/lucene/util/BytesRef;", &[])?;
-        this = ctx.resolve_global_root(this_root).unwrap_or(this);
-        let current = match next {
-            Some(Value::Object(obj)) => obj,
-            _ => None,
-        };
-        ctx.set_field_by_name(this, "currentTerm", Value::Object(current));
-        let prefix = match current {
-            Some(bytes_ref) => lucene_bytes_ref_prefix8(ctx, bytes_ref)?,
-            None => 0,
-        };
-        ctx.set_field_by_name(this, "currentTermPrefix8", Value::Long(prefix));
-        Ok(Some(Value::Object(current)))
-    })();
-    if this_root != 0 {
-        let _ = ctx.remove_global_root(this_root);
-    }
-    result
-}
-
-fn native_lucene_terms_enum_index_compare_term_to(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let other = obj_arg(args, 1)?;
-    let left_prefix = ctx.get_field_by_name(this, "currentTermPrefix8").as_long().unwrap_or(0) as u64;
-    let right_prefix = ctx.get_field_by_name(other, "currentTermPrefix8").as_long().unwrap_or(0) as u64;
-    if left_prefix != right_prefix {
-        return Ok(Some(Value::Int(if left_prefix < right_prefix { -1 } else { 1 })));
-    }
-    let left_term = lucene_field_obj(ctx, this, "currentTerm")?;
-    let right_term = lucene_field_obj(ctx, other, "currentTerm")?;
-    Ok(Some(Value::Int(lucene_bytes_ref_compare_unsigned(ctx, left_term, right_term)?)))
-}
-
-fn native_lucene_terms_enum_index_term_equals(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let state = obj_arg(args, 1)?;
-    let left_prefix = ctx.get_field_by_name(this, "currentTermPrefix8").as_long().unwrap_or(0);
-    let right_prefix = ctx.get_field_by_name(state, "termPrefix8").as_long().unwrap_or(0);
-    if left_prefix != right_prefix {
-        return Ok(Some(Value::Int(0)));
-    }
-    let current = lucene_field_obj(ctx, this, "currentTerm")?;
-    let builder = lucene_field_obj(ctx, state, "term")?;
-    let builder_ref = lucene_field_obj(ctx, builder, "ref")?;
-    Ok(Some(Value::Int(if lucene_bytes_ref_equals(ctx, current, builder_ref)? { 1 } else { 0 })))
-}
-
-fn native_lucene_terms_enum_index_term_state_copy_from(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let state = obj_arg(args, 0)?;
-    let index = obj_arg(args, 1)?;
-    let state_root = ctx.add_global_root(state);
-    let index_root = ctx.add_global_root(index);
-    let result: MethodCallResult = (|| {
-        let mut state = state;
-        let mut index = index;
-        let src = lucene_field_obj(ctx, index, "currentTerm")?;
-        let (src_bytes, src_off, src_len) = lucene_bytes_ref_parts(ctx, src)?;
-        let builder = lucene_field_obj(ctx, state, "term")?;
-        let mut builder_ref = lucene_field_obj(ctx, builder, "ref")?;
-        let mut dst_bytes = lucene_field_obj(ctx, builder_ref, "bytes")?;
-        if ctx.array_length(dst_bytes) < src_len {
-            ctx.invoke_virtual(builder, "growNoCopy", "(I)V", &[Value::Int(src_len as i32)])?;
-            state = ctx.resolve_global_root(state_root).unwrap_or(state);
-            index = ctx.resolve_global_root(index_root).unwrap_or(index);
-            let builder = lucene_field_obj(ctx, state, "term")?;
-            builder_ref = lucene_field_obj(ctx, builder, "ref")?;
-            dst_bytes = lucene_field_obj(ctx, builder_ref, "bytes")?;
-        }
-        if ctx.array_length(dst_bytes) < src_len {
-            return Err(lucene_iobe("TermsEnumIndex.TermState copy destination too small"));
-        }
-        let mut tmp = vec![0u8; src_len];
-        let copied = ctx.read_byte_array_into(src_bytes, src_off, &mut tmp);
-        if copied != src_len {
-            return Err(lucene_iobe("TermsEnumIndex.TermState source copy failed"));
-        }
-        if !ctx.write_byte_array_from(dst_bytes, 0, &tmp) {
-            return Err(lucene_iobe("TermsEnumIndex.TermState destination copy failed"));
-        }
-        ctx.set_field_by_name(builder_ref, "offset", Value::Int(0));
-        ctx.set_field_by_name(builder_ref, "length", Value::Int(src_len as i32));
-        let prefix = ctx.get_field_by_name(index, "currentTermPrefix8").as_long().unwrap_or(0);
-        ctx.set_field_by_name(state, "termPrefix8", Value::Long(prefix));
-        Ok(None)
-    })();
-    if state_root != 0 {
-        let _ = ctx.remove_global_root(state_root);
-    }
-    if index_root != 0 {
-        let _ = ctx.remove_global_root(index_root);
-    }
-    result
-}
-
-fn native_lucene_ordinal_map_segment_map_new_to_old(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let index = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-    let arr = lucene_field_obj(ctx, this, "newToOld")?;
-    Ok(Some(Value::Int(ctx.get_array_element(arr, index).as_int().unwrap_or(0))))
-}
-
-fn native_lucene_ordinal_map_segment_map_old_to_new(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let index = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-    let arr = lucene_field_obj(ctx, this, "oldToNew")?;
-    Ok(Some(Value::Int(ctx.get_array_element(arr, index).as_int().unwrap_or(0))))
-}
-
-fn native_lucene_terms_enum_priority_queue_less_than(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let left = obj_arg(args, 1)?;
-    let right = obj_arg(args, 2)?;
-    let cmp = native_lucene_terms_enum_index_compare_term_to(
-        ctx,
-        &[Value::Object(Some(left)), Value::Object(Some(right))],
-    )?;
-    Ok(Some(Value::Int(if matches!(cmp, Some(Value::Int(v)) if v < 0) { 1 } else { 0 })))
-}
-
-fn native_lucene_priority_queue_init_int(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let max_size = args.get(1).and_then(Value::as_int).unwrap_or(0);
-    if max_size < 0 {
-        return Err(lucene_iobe("maxSize must be non-negative"));
-    }
-    let heap_len = if max_size == 0 {
-        2usize
-    } else {
-        (max_size as usize)
-            .checked_add(1)
-            .ok_or_else(|| lucene_iobe("maxSize is too large"))?
-    };
-    let heap = ctx.new_array(cratonvm_types::ArrayElementType::Reference, heap_len);
-    ctx.set_field_by_name(this, "size", Value::Int(0));
-    ctx.set_field_by_name(this, "maxSize", Value::Int(max_size));
-    ctx.set_field_by_name(this, "heap", Value::Object(Some(heap)));
-    Ok(None)
-}
-
-fn native_lucene_priority_queue_size(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    Ok(Some(Value::Int(ctx.get_field_by_name(this, "size").as_int().unwrap_or(0))))
-}
-
-fn native_lucene_priority_queue_top(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let heap = lucene_field_obj(ctx, this, "heap")?;
-    Ok(Some(ctx.get_array_element(heap, 1)))
-}
-
-fn native_lucene_mock_index_output_wrapper_write_byte(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let byte = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
-    let this_root = ctx.add_global_root(this);
-    let result: MethodCallResult = (|| {
-        let mut this = this;
-        if ctx.get_field_by_name(this, "closed").as_int().unwrap_or(0) != 0 {
-            return Err(RuntimeError::IllegalStateException {
-                message: "Already closed.".to_string(),
-            }
-            .into());
-        }
-        let dir = lucene_field_obj(ctx, this, "dir")?;
-        if ctx.get_field_by_name(dir, "crashed").as_int().unwrap_or(0) != 0 {
-            return Err(RuntimeError::IOException {
-                message: "MockDirectoryWrapper has crashed".to_string(),
-            }
-            .into());
-        }
-
-        // Rare disk-full simulation is deliberately left to Lucene's Java body.
-        if ctx.get_field_by_name(dir, "maxSize").as_long().unwrap_or(0) != 0 {
-            let single = lucene_field_obj(ctx, this, "singleByte")?;
-            if !ctx.write_byte_array_from(single, 0, &[byte]) {
-                return Err(lucene_iobe("MockIndexOutputWrapper singleByte write failed"));
-            }
-            return ctx.invoke_virtual(
-                this,
-                "writeBytes",
-                "([BII)V",
-                &[
-                    Value::Object(Some(single)),
-                    Value::Int(0),
-                    Value::Int(1),
-                ],
-            );
-        }
-
-        if let Value::Object(Some(random)) = ctx.get_field_by_name(dir, "randomState") {
-            let split = ctx.invoke_virtual(random, "nextInt", "(I)I", &[Value::Int(200)])?;
-            this = ctx.resolve_global_root(this_root).unwrap_or(this);
-            if matches!(split, Some(Value::Int(0))) {
-                ctx.invoke("java/lang/Thread", "yield", "()V", &[])?;
-                this = ctx.resolve_global_root(this_root).unwrap_or(this);
-            }
-        }
-
-        let out = lucene_field_obj(ctx, this, "out")?;
-        ctx.invoke_virtual(
-            out,
-            "writeByte",
-            "(B)V",
-            &[Value::Int(byte as i8 as i32)],
-        )?;
-        this = ctx.resolve_global_root(this_root).unwrap_or(this);
-
-        let dir = lucene_field_obj(ctx, this, "dir")?;
-        ctx.invoke_virtual(dir, "maybeThrowDeterministicException", "()V", &[])?;
-        this = ctx.resolve_global_root(this_root).unwrap_or(this);
-
-        if ctx.get_field_by_name(this, "first").as_int().unwrap_or(0) != 0 {
-            ctx.set_field_by_name(this, "first", Value::Int(0));
-            let dir = lucene_field_obj(ctx, this, "dir")?;
-            let name = lucene_field_obj(ctx, this, "name")?;
-            ctx.invoke_virtual(
-                dir,
-                "maybeThrowIOException",
-                "(Ljava/lang/String;)V",
-                &[Value::Object(Some(name))],
-            )?;
-        }
-        Ok(None)
-    })();
-    if this_root != 0 {
-        let _ = ctx.remove_global_root(this_root);
-    }
-    result
-}
-
 fn lucene_field_int(ctx: &dyn NativeContext, obj: ObjectRef, name: &str) -> i32 {
     ctx.get_field_by_name(obj, name).as_int().unwrap_or(0)
 }
@@ -6450,623 +1170,6 @@ fn lucene_bbdin_read_at_bytes(
         out[i] = lucene_bbdin_read_abs(ctx, this, absolute_pos + i as i64)?;
     }
     Ok(out)
-}
-
-fn lucene_bbdin_copy_abs_to_array(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    mut absolute_pos: i64,
-    dst: ObjectRef,
-    mut dst_off: usize,
-    mut len: usize,
-) -> MethodCallResult {
-    let blocks = lucene_field_obj(ctx, this, "blocks")?;
-    let block_bits = lucene_field_int(ctx, this, "blockBits");
-    let block_mask = lucene_field_int(ctx, this, "blockMask");
-    if !(0..63).contains(&block_bits) {
-        return Err(lucene_iobe("invalid ByteBuffersDataInput blockBits"));
-    }
-    while len > 0 {
-        if absolute_pos < 0 {
-            return Err(lucene_eof());
-        }
-        let block_index = ((absolute_pos as u64) >> (block_bits as u32)) as usize;
-        if block_index >= ctx.array_length(blocks) {
-            return Err(lucene_eof());
-        }
-        let block = match ctx.get_array_element(blocks, block_index) {
-            Value::Object(Some(block)) => block,
-            _ => return Err(lucene_eof()),
-        };
-        let block_offset = if block_mask < 0 {
-            absolute_pos as usize
-        } else {
-            ((absolute_pos as u64) & (block_mask as u32 as u64)) as usize
-        };
-        let limit = lucene_field_int(ctx, block, "limit").max(0) as usize;
-        if block_offset >= limit {
-            return Err(lucene_eof());
-        }
-        let n = len.min(limit - block_offset);
-        let hb = lucene_field_obj(ctx, block, "hb")?;
-        let array_offset = lucene_field_int(ctx, block, "offset") as i64;
-        let raw_index = array_offset
-            .checked_add(block_offset as i64)
-            .ok_or_else(lucene_eof)?;
-        if raw_index < 0 || raw_index as usize + n > ctx.array_length(hb) {
-            return Err(lucene_eof());
-        }
-        let mut tmp = vec![0u8; n];
-        if ctx.read_byte_array_into(hb, raw_index as usize, &mut tmp) != n {
-            return Err(lucene_eof());
-        }
-        if !ctx.write_byte_array_from(dst, dst_off, &tmp) {
-            return Err(lucene_iobe("ByteBuffersDataInput destination byte[] write failed"));
-        }
-        absolute_pos += n as i64;
-        dst_off += n;
-        len -= n;
-    }
-    Ok(None)
-}
-
-fn lucene_bbdin_copy_abs_to_vec(
-    ctx: &dyn NativeContext,
-    this: ObjectRef,
-    mut absolute_pos: i64,
-    dst: &mut [u8],
-) -> MethodCallResult {
-    let blocks = lucene_field_obj(ctx, this, "blocks")?;
-    let block_bits = lucene_field_int(ctx, this, "blockBits");
-    let block_mask = lucene_field_int(ctx, this, "blockMask");
-    if !(0..63).contains(&block_bits) {
-        return Err(lucene_iobe("invalid ByteBuffersDataInput blockBits"));
-    }
-    let mut written = 0usize;
-    while written < dst.len() {
-        if absolute_pos < 0 {
-            return Err(lucene_eof());
-        }
-        let block_index = ((absolute_pos as u64) >> (block_bits as u32)) as usize;
-        if block_index >= ctx.array_length(blocks) {
-            return Err(lucene_eof());
-        }
-        let block = match ctx.get_array_element(blocks, block_index) {
-            Value::Object(Some(block)) => block,
-            _ => return Err(lucene_eof()),
-        };
-        let block_offset = if block_mask < 0 {
-            absolute_pos as usize
-        } else {
-            ((absolute_pos as u64) & (block_mask as u32 as u64)) as usize
-        };
-        let limit = lucene_field_int(ctx, block, "limit").max(0) as usize;
-        if block_offset >= limit {
-            return Err(lucene_eof());
-        }
-        let n = (dst.len() - written).min(limit - block_offset);
-        let hb = lucene_field_obj(ctx, block, "hb")?;
-        let array_offset = lucene_field_int(ctx, block, "offset") as i64;
-        let raw_index = array_offset
-            .checked_add(block_offset as i64)
-            .ok_or_else(lucene_eof)?;
-        if raw_index < 0 || raw_index as usize + n > ctx.array_length(hb) {
-            return Err(lucene_eof());
-        }
-        if ctx.read_byte_array_into(hb, raw_index as usize, &mut dst[written..written + n]) != n {
-            return Err(lucene_eof());
-        }
-        absolute_pos += n as i64;
-        written += n;
-    }
-    Ok(None)
-}
-
-fn lucene_array_read_range(
-    ctx: &dyn NativeContext,
-    arr: ObjectRef,
-    off: i32,
-    len: i32,
-) -> Result<Option<(usize, usize)>, MethodCallFailed> {
-    if len <= 0 {
-        return Ok(None);
-    }
-    if off < 0 {
-        return Err(lucene_aioobe(off));
-    }
-    let off = off as usize;
-    let len = len as usize;
-    let end = off
-        .checked_add(len)
-        .ok_or_else(|| lucene_aioobe(i32::MAX))?;
-    if end > ctx.array_length(arr) {
-        return Err(lucene_aioobe(end.min(i32::MAX as usize) as i32));
-    }
-    Ok(Some((off, len)))
-}
-
-fn lucene_bbdin_read_primitive_bytes(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    byte_len: usize,
-) -> Result<Vec<u8>, MethodCallFailed> {
-    if byte_len == 0 {
-        return Ok(Vec::new());
-    }
-    let pos = lucene_field_long(ctx, this, "pos");
-    let offset = lucene_field_long(ctx, this, "offset");
-    let length = lucene_field_long(ctx, this, "length");
-    if pos < offset || (pos - offset) as i128 + byte_len as i128 > length as i128 {
-        return Err(lucene_eof());
-    }
-    let new_pos = pos
-        .checked_add(byte_len as i64)
-        .ok_or_else(lucene_eof)?;
-    let mut bytes = vec![0u8; byte_len];
-    lucene_bbdin_copy_abs_to_vec(ctx, this, pos, &mut bytes)?;
-    ctx.set_field_by_name(this, "pos", Value::Long(new_pos));
-    Ok(bytes)
-}
-
-fn native_lucene_byte_buffers_data_input_read_floats(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = lucene_bbdin_this(args)?;
-    let dst = obj_arg(args, 1)?;
-    let off = args.get(2).and_then(Value::as_int).unwrap_or(0);
-    let len = args.get(3).and_then(Value::as_int).unwrap_or(0);
-    let Some((off, len)) = lucene_array_read_range(ctx, dst, off, len)? else {
-        return Ok(None);
-    };
-    let byte_len = len
-        .checked_mul(4)
-        .ok_or_else(|| lucene_aioobe(i32::MAX))?;
-    let bytes = lucene_bbdin_read_primitive_bytes(ctx, this, byte_len)?;
-    for i in 0..len {
-        let j = i * 4;
-        let bits = i32::from_le_bytes([bytes[j], bytes[j + 1], bytes[j + 2], bytes[j + 3]]);
-        ctx.set_array_element(dst, off + i, Value::Float(f32::from_bits(bits as u32)));
-    }
-    Ok(None)
-}
-
-fn native_lucene_byte_buffers_data_input_read_longs(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = lucene_bbdin_this(args)?;
-    let dst = obj_arg(args, 1)?;
-    let off = args.get(2).and_then(Value::as_int).unwrap_or(0);
-    let len = args.get(3).and_then(Value::as_int).unwrap_or(0);
-    let Some((off, len)) = lucene_array_read_range(ctx, dst, off, len)? else {
-        return Ok(None);
-    };
-    let byte_len = len
-        .checked_mul(8)
-        .ok_or_else(|| lucene_aioobe(i32::MAX))?;
-    let bytes = lucene_bbdin_read_primitive_bytes(ctx, this, byte_len)?;
-    for i in 0..len {
-        let j = i * 8;
-        ctx.set_array_element(
-            dst,
-            off + i,
-            Value::Long(i64::from_le_bytes([
-                bytes[j],
-                bytes[j + 1],
-                bytes[j + 2],
-                bytes[j + 3],
-                bytes[j + 4],
-                bytes[j + 5],
-                bytes[j + 6],
-                bytes[j + 7],
-            ])),
-        );
-    }
-    Ok(None)
-}
-
-fn lucene_bbdin_read_bytes_common(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    dst: ObjectRef,
-    dst_off: usize,
-    len: usize,
-    update_pos: bool,
-    relative_pos: i64,
-) -> MethodCallResult {
-    if len == 0 {
-        return Ok(None);
-    }
-    let length = lucene_field_long(ctx, this, "length");
-    let offset = lucene_field_long(ctx, this, "offset");
-    if relative_pos < 0 || (relative_pos as i128) + (len as i128) > length as i128 {
-        return Err(lucene_eof());
-    }
-    let absolute_pos = offset
-        .checked_add(relative_pos)
-        .ok_or_else(lucene_eof)?;
-    lucene_bbdin_copy_abs_to_array(ctx, this, absolute_pos, dst, dst_off, len)?;
-    if update_pos {
-        ctx.set_field_by_name(this, "pos", Value::Long(absolute_pos + len as i64));
-    }
-    Ok(None)
-}
-
-fn native_lucene_byte_buffers_data_input_read_bytes(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = lucene_bbdin_this(args)?;
-    let dst = obj_arg(args, 1)?;
-    let off = args.get(2).and_then(Value::as_int).unwrap_or(0).max(0) as usize;
-    let len = args.get(3).and_then(Value::as_int).unwrap_or(0).max(0) as usize;
-    let relative_pos = lucene_field_long(ctx, this, "pos") - lucene_field_long(ctx, this, "offset");
-    lucene_bbdin_read_bytes_common(ctx, this, dst, off, len, true, relative_pos)
-}
-
-fn native_lucene_byte_buffers_data_input_read_bytes_bool(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    native_lucene_byte_buffers_data_input_read_bytes(ctx, args)
-}
-
-fn native_lucene_byte_buffers_data_input_read_bytes_at(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = lucene_bbdin_this(args)?;
-    let relative_pos = args.get(1).and_then(Value::as_long).unwrap_or(0);
-    let dst = obj_arg(args, 2)?;
-    let off = args.get(3).and_then(Value::as_int).unwrap_or(0).max(0) as usize;
-    let len = args.get(4).and_then(Value::as_int).unwrap_or(0).max(0) as usize;
-    lucene_bbdin_read_bytes_common(ctx, this, dst, off, len, false, relative_pos)
-}
-
-fn native_lucene_byte_buffers_data_input_length(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = lucene_bbdin_this(args)?;
-    Ok(Some(Value::Long(lucene_field_long(ctx, this, "length"))))
-}
-
-fn native_lucene_byte_buffers_data_input_position(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = lucene_bbdin_this(args)?;
-    Ok(Some(Value::Long(lucene_field_long(ctx, this, "pos") - lucene_field_long(ctx, this, "offset"))))
-}
-
-fn native_lucene_byte_buffers_data_input_seek(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = lucene_bbdin_this(args)?;
-    let relative_pos = args.get(1).and_then(Value::as_long).unwrap_or(0);
-    let length = lucene_field_long(ctx, this, "length");
-    if relative_pos > length {
-        ctx.set_field_by_name(this, "pos", Value::Long(length));
-        return Err(lucene_eof());
-    }
-    let absolute_pos = lucene_field_long(ctx, this, "offset")
-        .checked_add(relative_pos)
-        .ok_or_else(lucene_eof)?;
-    ctx.set_field_by_name(this, "pos", Value::Long(absolute_pos));
-    Ok(None)
-}
-
-fn lucene_byte_buffers_index_input_delegate(
-    ctx: &dyn NativeContext,
-    this: ObjectRef,
-) -> Result<ObjectRef, MethodCallFailed> {
-    match ctx.get_field_by_name(this, "in") {
-        Value::Object(Some(input)) => Ok(input),
-        _ => Err(RuntimeError::IllegalStateException {
-            message: "Already closed.".to_string(),
-        }
-        .into()),
-    }
-}
-
-fn native_lucene_byte_buffers_index_input_get_file_pointer(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    native_lucene_byte_buffers_data_input_position(ctx, &[Value::Object(Some(input))])
-}
-
-fn native_lucene_byte_buffers_index_input_seek(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    native_lucene_byte_buffers_data_input_seek(ctx, &[Value::Object(Some(input)), args.get(1).copied().unwrap_or(Value::Long(0))])
-}
-
-fn native_lucene_byte_buffers_index_input_length(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    native_lucene_byte_buffers_data_input_length(ctx, &[Value::Object(Some(input))])
-}
-
-fn native_lucene_byte_buffers_index_input_read_byte(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    native_lucene_byte_buffers_data_input_read_byte(ctx, &[Value::Object(Some(input))])
-}
-
-fn native_lucene_byte_buffers_index_input_read_bytes(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    native_lucene_byte_buffers_data_input_read_bytes(
-        ctx,
-        &[
-            Value::Object(Some(input)),
-            args.get(1).copied().unwrap_or(Value::Object(None)),
-            args.get(2).copied().unwrap_or(Value::Int(0)),
-            args.get(3).copied().unwrap_or(Value::Int(0)),
-        ],
-    )
-}
-
-fn native_lucene_byte_buffers_index_input_read_bytes_bool(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    native_lucene_byte_buffers_index_input_read_bytes(ctx, args)
-}
-
-fn native_lucene_byte_buffers_index_input_read_floats(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    native_lucene_byte_buffers_data_input_read_floats(
-        ctx,
-        &[
-            Value::Object(Some(input)),
-            args.get(1).copied().unwrap_or(Value::Object(None)),
-            args.get(2).copied().unwrap_or(Value::Int(0)),
-            args.get(3).copied().unwrap_or(Value::Int(0)),
-        ],
-    )
-}
-
-fn native_lucene_byte_buffers_index_input_read_longs(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    native_lucene_byte_buffers_data_input_read_longs(
-        ctx,
-        &[
-            Value::Object(Some(input)),
-            args.get(1).copied().unwrap_or(Value::Object(None)),
-            args.get(2).copied().unwrap_or(Value::Int(0)),
-            args.get(3).copied().unwrap_or(Value::Int(0)),
-        ],
-    )
-}
-
-fn native_lucene_byte_buffers_index_input_read_short(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    native_lucene_byte_buffers_data_input_read_short(ctx, &[Value::Object(Some(input))])
-}
-
-fn native_lucene_byte_buffers_index_input_read_int(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    native_lucene_byte_buffers_data_input_read_int(ctx, &[Value::Object(Some(input))])
-}
-
-fn native_lucene_byte_buffers_index_input_read_long(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    native_lucene_byte_buffers_data_input_read_long(ctx, &[Value::Object(Some(input))])
-}
-
-fn native_lucene_byte_buffers_index_input_read_byte_at(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    native_lucene_byte_buffers_data_input_read_byte_at(ctx, &[Value::Object(Some(input)), args.get(1).copied().unwrap_or(Value::Long(0))])
-}
-
-fn native_lucene_byte_buffers_index_input_read_bytes_at(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    native_lucene_byte_buffers_data_input_read_bytes_at(
-        ctx,
-        &[
-            Value::Object(Some(input)),
-            args.get(1).copied().unwrap_or(Value::Long(0)),
-            args.get(2).copied().unwrap_or(Value::Object(None)),
-            args.get(3).copied().unwrap_or(Value::Int(0)),
-            args.get(4).copied().unwrap_or(Value::Int(0)),
-        ],
-    )
-}
-
-fn native_lucene_byte_buffers_index_input_read_short_at(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    native_lucene_byte_buffers_data_input_read_short_at(ctx, &[Value::Object(Some(input)), args.get(1).copied().unwrap_or(Value::Long(0))])
-}
-
-fn native_lucene_byte_buffers_index_input_read_int_at(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    native_lucene_byte_buffers_data_input_read_int_at(ctx, &[Value::Object(Some(input)), args.get(1).copied().unwrap_or(Value::Long(0))])
-}
-
-fn native_lucene_byte_buffers_index_input_read_long_at(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    native_lucene_byte_buffers_data_input_read_long_at(ctx, &[Value::Object(Some(input)), args.get(1).copied().unwrap_or(Value::Long(0))])
-}
-
-fn native_lucene_index_input_to_string(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    Ok(Some(ctx.get_field_by_name(this, "resourceDescription")))
-}
-
-fn lucene_mock_index_input_delegate(
-    ctx: &dyn NativeContext,
-    this: ObjectRef,
-) -> Result<ObjectRef, MethodCallFailed> {
-    if ctx.get_field_by_name(this, "closed").as_int().unwrap_or(0) != 0 {
-        return Err(RuntimeError::IllegalStateException {
-            message: "Abusing closed IndexInput!".to_string(),
-        }
-        .into());
-    }
-    if let Value::Object(Some(parent)) = ctx.get_field_by_name(this, "parent") {
-        if ctx.get_field_by_name(parent, "closed").as_int().unwrap_or(0) != 0 {
-            return Err(RuntimeError::IllegalStateException {
-                message: "Abusing clone of a closed IndexInput!".to_string(),
-            }
-            .into());
-        }
-    }
-    lucene_field_obj(ctx, this, "in")
-}
-
-fn native_lucene_mock_index_input_wrapper_length(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_mock_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    ctx.invoke_virtual(input, "length", "()J", &[])
-}
-
-fn native_lucene_mock_index_input_wrapper_read_byte(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_mock_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    ctx.invoke_virtual(input, "readByte", "()B", &[])
-}
-
-fn native_lucene_mock_index_input_wrapper_read_bytes(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_mock_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    ctx.invoke_virtual(
-        input,
-        "readBytes",
-        "([BII)V",
-        &[
-            args.get(1).copied().unwrap_or(Value::Object(None)),
-            args.get(2).copied().unwrap_or(Value::Int(0)),
-            args.get(3).copied().unwrap_or(Value::Int(0)),
-        ],
-    )
-}
-
-fn native_lucene_mock_index_input_wrapper_read_bytes_bool(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_mock_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    ctx.invoke_virtual(
-        input,
-        "readBytes",
-        "([BIIZ)V",
-        &[
-            args.get(1).copied().unwrap_or(Value::Object(None)),
-            args.get(2).copied().unwrap_or(Value::Int(0)),
-            args.get(3).copied().unwrap_or(Value::Int(0)),
-            args.get(4).copied().unwrap_or(Value::Int(0)),
-        ],
-    )
-}
-
-fn native_lucene_mock_index_input_wrapper_read_floats(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_mock_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    ctx.invoke_virtual(
-        input,
-        "readFloats",
-        "([FII)V",
-        &[
-            args.get(1).copied().unwrap_or(Value::Object(None)),
-            args.get(2).copied().unwrap_or(Value::Int(0)),
-            args.get(3).copied().unwrap_or(Value::Int(0)),
-        ],
-    )
-}
-
-fn native_lucene_mock_index_input_wrapper_read_longs(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_mock_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    ctx.invoke_virtual(
-        input,
-        "readLongs",
-        "([JII)V",
-        &[
-            args.get(1).copied().unwrap_or(Value::Object(None)),
-            args.get(2).copied().unwrap_or(Value::Int(0)),
-            args.get(3).copied().unwrap_or(Value::Int(0)),
-        ],
-    )
-}
-
-fn native_lucene_mock_index_input_wrapper_read_short(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_mock_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    ctx.invoke_virtual(input, "readShort", "()S", &[])
-}
-
-fn native_lucene_mock_index_input_wrapper_read_int(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_mock_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    ctx.invoke_virtual(input, "readInt", "()I", &[])
-}
-
-fn native_lucene_mock_index_input_wrapper_read_long(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let input = lucene_mock_index_input_delegate(ctx, obj_arg(args, 0)?)?;
-    ctx.invoke_virtual(input, "readLong", "()J", &[])
 }
 
 fn native_lucene_byte_buffers_data_input_read_byte(
@@ -8602,11 +2705,6 @@ mod context_class_loader_tests {
 /// Reference layout: field 0 = referent (Object or null), field 1 = queue
 pub(crate) const REF_FIELD_REFERENT: usize = 0;
 pub(crate) const REF_FIELD_QUEUE: usize = 1;
-/// Real-JDK `java.lang.ref.Reference` layout slot 2: the `next` field
-/// (queue linkage). References with fewer than 3 fields (legacy synthetic
-/// shape) fall back to referent-slot linkage — see
-/// `reference::ref_next_slot`.
-pub(crate) const REF_FIELD_NEXT: usize = 2;
 
 /// ReferenceQueue layout: field 0 = head of linked list, field 1 = size
 pub(crate) const RQ_FIELD_HEAD: usize = 0;
@@ -20042,29 +14140,6 @@ fn native_byte_buffer_wrap_bytes(ctx: &mut dyn NativeContext, args: &[Value]) ->
     )
 }
 
-fn native_float_buffer_order(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let order_name = match args.first() {
-        Some(Value::Object(Some(this))) => {
-            let cname = ctx
-                .class_name_of_id(ctx.class_id_of_object(*this))
-                .unwrap_or_default();
-            if cname.ends_with("FloatBufferB") || cname.ends_with("FloatBufferRB") {
-                "BIG_ENDIAN"
-            } else if cname.ends_with("FloatBufferL") || cname.ends_with("FloatBufferRL") {
-                "LITTLE_ENDIAN"
-            } else {
-                "NATIVE_ORDER"
-            }
-        }
-        _ => "NATIVE_ORDER",
-    };
-    Ok(Some(Value::Object(Some(lucene_static_object(
-        ctx,
-        "java/nio/ByteOrder",
-        order_name,
-    )?))))
-}
-
 fn spring_map_get_key(
     ctx: &mut dyn NativeContext,
     map: ObjectRef,
@@ -23994,305 +18069,6 @@ fn register_liquibase_checksum_intrinsics(registry: &mut NativeMethodRegistry) {
     );
 }
 
-fn register_ecj_problem_overrides(registry: &mut NativeMethodRegistry) {
-    fn ecj_problem_is_error(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-        let this = obj_arg(args, 0)?;
-        let severity = ctx
-            .get_field_by_name(this, "severity")
-            .as_int()
-            .unwrap_or(0);
-        let message = match ctx.get_field_by_name(this, "message") {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-
-        if message.contains("ServletConfig") && message.contains("getInitParameterNames") {
-            return Ok(Some(Value::Int(0)));
-        }
-
-        Ok(Some(Value::Int(if (severity & 1) != 0 { 1 } else { 0 })))
-    }
-
-    for owner in [
-        "org/eclipse/jdt/internal/compiler/problem/DefaultProblem",
-        "org/eclipse/jdt/core/compiler/CategorizedProblem",
-        "org/eclipse/jdt/core/compiler/IProblem",
-    ] {
-        registry.register(owner, "isError", "()Z", ecj_problem_is_error);
-    }
-}
-
-fn char_array_to_string(ctx: &dyn NativeContext, arr: ObjectRef) -> String {
-    let len = ctx.array_length(arr);
-    let mut units = Vec::with_capacity(len);
-    for i in 0..len {
-        units.push(ctx.get_array_element(arr, i).as_int().unwrap_or(0) as u16);
-    }
-    String::from_utf16_lossy(&units)
-}
-
-fn ecj_class_file_relative_path(
-    ctx: &mut dyn NativeContext,
-    class_file: ObjectRef,
-) -> Option<String> {
-    let compound = match ctx
-        .invoke_virtual(class_file, "getCompoundName", "()[[C", &[])
-        .ok()
-        .flatten()
-    {
-        Some(Value::Object(Some(o))) => o,
-        _ => return None,
-    };
-    let mut parts = Vec::new();
-    for i in 0..ctx.array_length(compound) {
-        if let Value::Object(Some(chars)) = ctx.get_array_element(compound, i) {
-            parts.push(char_array_to_string(ctx, chars));
-        }
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(format!("{}.class", parts.join("/")))
-    }
-}
-
-fn ecj_class_file_bytes(ctx: &mut dyn NativeContext, class_file: ObjectRef) -> Option<Vec<u8>> {
-    let bytes_arr = match ctx
-        .invoke_virtual(class_file, "getBytes", "()[B", &[])
-        .ok()
-        .flatten()
-    {
-        Some(Value::Object(Some(o))) => o,
-        _ => return None,
-    };
-    let mut bytes = vec![0u8; ctx.array_length(bytes_arr)];
-    let copied = ctx.read_byte_array_into(bytes_arr, 0, &mut bytes);
-    bytes.truncate(copied);
-    Some(bytes)
-}
-
-fn write_ecj_class_bytes(path: &str, bytes: &[u8]) {
-    let path = std::path::Path::new(path);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, bytes);
-}
-
-fn native_jasper_jdtcompiler_accept_result(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let errors = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let output_dir = match args.get(2) {
-        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => String::new(),
-    };
-    let result = match args.get(3) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-
-    if matches!(
-        ctx.invoke_virtual(result, "hasProblems", "()Z", &[])?,
-        Some(Value::Int(v)) if v != 0
-    ) {
-        if let Some(Value::Object(Some(problems))) = ctx.invoke_virtual(
-            result,
-            "getProblems",
-            "()[Lorg/eclipse/jdt/core/compiler/CategorizedProblem;",
-            &[],
-        )? {
-            for i in 0..ctx.array_length(problems) {
-                let Value::Object(Some(problem)) = ctx.get_array_element(problems, i) else {
-                    continue;
-                };
-                if matches!(
-                    ctx.invoke_virtual(problem, "isError", "()Z", &[])?,
-                    Some(Value::Int(v)) if v != 0
-                ) {
-                    let _ = ctx.invoke_virtual(
-                        errors,
-                        "add",
-                        "(Ljava/lang/Object;)Z",
-                        &[Value::Object(Some(problem))],
-                    )?;
-                }
-            }
-        }
-    }
-
-    if matches!(
-        ctx.invoke_virtual(errors, "isEmpty", "()Z", &[])?,
-        Some(Value::Int(v)) if v == 0
-    ) {
-        return Ok(None);
-    }
-
-    let class_files = match ctx.invoke_virtual(
-        result,
-        "getClassFiles",
-        "()[Lorg/eclipse/jdt/internal/compiler/ClassFile;",
-        &[],
-    )? {
-        Some(Value::Object(Some(o))) => o,
-        _ => return Ok(None),
-    };
-
-    let expected_class_file = match ctx.get_field_by_name(this, "ctxt") {
-        Value::Object(Some(ctxt)) => {
-            match ctx.invoke_virtual(ctxt, "getClassFileName", "()Ljava/lang/String;", &[])? {
-                Some(Value::Object(Some(s))) => ctx.read_string(s),
-                _ => None,
-            }
-        }
-        _ => None,
-    };
-
-    for i in 0..ctx.array_length(class_files) {
-        let Value::Object(Some(class_file)) = ctx.get_array_element(class_files, i) else {
-            continue;
-        };
-        let Some(bytes) = ecj_class_file_bytes(ctx, class_file) else {
-            continue;
-        };
-        if let Some(rel) = ecj_class_file_relative_path(ctx, class_file) {
-            if !output_dir.is_empty() {
-                write_ecj_class_bytes(&format!("{output_dir}/{rel}"), &bytes);
-            }
-        }
-        if let Some(path) = expected_class_file.as_deref() {
-            write_ecj_class_bytes(path, &bytes);
-        }
-    }
-    Ok(None)
-}
-
-fn native_ecj_compiler_requestor_accept_result(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let result = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-
-    if matches!(
-        ctx.invoke_virtual(result, "hasErrors", "()Z", &[])?,
-        Some(Value::Int(v)) if v != 0
-    ) {
-        return Ok(None);
-    }
-
-    let source_file = match ctx.invoke_virtual(result, "getFileName", "()[C", &[])? {
-        Some(Value::Object(Some(chars))) => char_array_to_string(ctx, chars),
-        _ => String::new(),
-    };
-    let class_files = match ctx.invoke_virtual(
-        result,
-        "getClassFiles",
-        "()[Lorg/eclipse/jdt/internal/compiler/ClassFile;",
-        &[],
-    )? {
-        Some(Value::Object(Some(o))) => o,
-        _ => return Ok(None),
-    };
-
-    for i in 0..ctx.array_length(class_files) {
-        let Value::Object(Some(class_file)) = ctx.get_array_element(class_files, i) else {
-            continue;
-        };
-        let Some(bytes) = ecj_class_file_bytes(ctx, class_file) else {
-            continue;
-        };
-        if let Some(rel) = ecj_class_file_relative_path(ctx, class_file) {
-            let rel_java = rel.strip_suffix(".class").unwrap_or(&rel).to_string() + ".java";
-            if let Some(prefix) = source_file.strip_suffix(&rel_java) {
-                let prefix = prefix.trim_end_matches('/');
-                write_ecj_class_bytes(&format!("{prefix}/{rel}"), &bytes);
-            }
-        }
-        if let Some(path) = source_file.strip_suffix(".java") {
-            write_ecj_class_bytes(&format!("{path}.class"), &bytes);
-        }
-    }
-    Ok(None)
-}
-
-fn native_jsp_servlet_handle_missing_resource(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let response = match args.get(2) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let jsp = match args.get(3) {
-        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => String::new(),
-    };
-    let context = match ctx.get_field_by_name(this, "context") {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(None),
-    };
-    let jsp_string = ctx.create_string(&jsp);
-    let real_path = match ctx.invoke_virtual(
-        context,
-        "getRealPath",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        &[Value::Object(Some(jsp_string))],
-    )? {
-        Some(Value::Object(Some(s))) => ctx.read_string(s),
-        _ => None,
-    };
-    if let Some(path) = real_path {
-        if let Ok(body) = std::fs::read_to_string(&path) {
-            let body = if jsp.ends_with("/jsp/include/include.jsp") {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                format!(
-                    "<html><body>In place evaluation of another JSP which gives you the current time: {now}\n\
-                     To get the current time in ms\n\
-                     by including the output of another JSP: {now}\n:-)</body></html>"
-                )
-            } else if jsp.ends_with("/jsp/forward/forward.jsp") {
-                "<html><body>VM Memory usage</body></html>".to_string()
-            } else {
-                body
-            };
-            let _ = ctx.invoke_virtual(response, "setStatus", "(I)V", &[Value::Int(200)])?;
-            let writer =
-                match ctx.invoke_virtual(response, "getWriter", "()Ljava/io/PrintWriter;", &[])? {
-                    Some(Value::Object(Some(w))) => w,
-                    _ => return Ok(None),
-                };
-            let body_obj = ctx.create_string(&body);
-            let _ = ctx.invoke_virtual(
-                writer,
-                "write",
-                "(Ljava/lang/String;)V",
-                &[Value::Object(Some(body_obj))],
-            )?;
-            return Ok(None);
-        }
-    }
-    let msg = ctx.create_string(&format!("JSP file [{jsp}] not found"));
-    let _ = ctx.invoke_virtual(
-        response,
-        "sendError",
-        "(ILjava/lang/String;)V",
-        &[Value::Int(404), Value::Object(Some(msg))],
-    )?;
-    Ok(None)
-}
-
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     let before = registry.len();
     // These are the ACC_NATIVE methods with no bytecode — they ARE the real
@@ -24307,59 +18083,6 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Integration-test harness support. These classes are not part of the JDK,
     // but test VMs use real-JDK mode and still need the print capture natives.
     register_test_harness_natives(registry);
-    register_ecj_problem_overrides(registry);
-    registry.register(
-        "org/apache/jasper/servlet/JspServlet",
-        "handleMissingResource",
-        "(Ljakarta/servlet/http/HttpServletRequest;Ljakarta/servlet/http/HttpServletResponse;Ljava/lang/String;)V",
-        native_jsp_servlet_handle_missing_resource,
-    );
-
-    // OutputStreamWriter(OutputStream, CharsetEncoder) -- real bytecode for
-    // this specific constructor overload produces a writer that emits ZERO
-    // bytes for every character written (confirmed by isolated probe: the
-    // (OutputStream, Charset) and (OutputStream, String) overloads work
-    // correctly, only the CharsetEncoder-accepting one is broken). This
-    // silently corrupted org.apache.catalina.util.URLEncoder.encode(String,
-    // Charset) -- which builds its OutputStreamWriter this exact way to
-    // percent-encode unsafe characters -- dropping every encoded character
-    // instead of emitting "%XX", observed as Tomcat manager's "war=" deploy
-    // parameter having every '/' silently stripped. Root cause not fully
-    // understood (a real-bytecode-only bug, no interpreter fix attempted
-    // here); work around by delegating to the proven-working (OutputStream,
-    // Charset) constructor on the same object, reading the Charset off the
-    // caller-supplied CharsetEncoder via its own real charset() accessor.
-    // This loses the caller's chosen malformed-input / unmappable-character
-    // error actions (REPORT vs REPLACE), which no caller in this codebase's
-    // test suites has been observed to depend on.
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "<init>",
-        "(Ljava/io/OutputStream;Ljava/nio/charset/CharsetEncoder;)V",
-        |ctx, args| {
-            let this = args.first().copied().unwrap_or(Value::Object(None));
-            let stream = args.get(1).copied().unwrap_or(Value::Object(None));
-            let encoder = match args.get(2) {
-                Some(Value::Object(Some(e))) => Some(*e),
-                _ => None,
-            };
-            let charset = match encoder {
-                Some(e) => ctx
-                    .invoke_virtual(e, "charset", "()Ljava/nio/charset/Charset;", &[])
-                    .ok()
-                    .flatten()
-                    .unwrap_or(Value::Object(None)),
-                None => Value::Object(None),
-            };
-            ctx.invoke_special(
-                "java/io/OutputStreamWriter",
-                "<init>",
-                "(Ljava/io/OutputStream;Ljava/nio/charset/Charset;)V",
-                &[this, stream, charset],
-            )?;
-            Ok(None)
-        },
-    );
 
     // Real-JDK mode does not call the full synthetic/experimental
     // `register_builtins` surface, but JBoss Marshalling calls
@@ -24535,12 +18258,6 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             native_coding_error_action_to_string,
         );
     });
-    // Real-JDK mode still allocates synthetic `java/nio/ByteBuffer` objects for
-    // `ByteBuffer.allocate*`; those receivers are stamped with the abstract
-    // ByteBuffer class, so abstract instance methods such as `put(int, byte)`
-    // need the S2 native surface in the essential registry too. Keep this to
-    // ByteBuffer + ByteOrder rather than enabling the full synthetic NIO stack.
-    servlet::register_s2_bytebuffer_essentials(registry);
     registry.register(
         "java/util/logging/Level",
         "<clinit>",
@@ -24580,82 +18297,72 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
 
     // The fake-JDK WildFly launcher can resolve java.util.concurrent locks as
     // synthetic stubs before any real AQS bytecode is available. Tag these as
-    // SyntheticStub and keep the dispatcher honest. In default real-JDK mode,
-    // however, these registrations must not exist: several dispatch paths can
-    // see a registered native before they have enough class context to prefer
-    // real AQS bytecode, which lets the legacy monitor-backed ReentrantLock /
-    // Condition bridge steal LinkedBlockingQueue's real lock operations and hang
-    // executor shutdown. Keep the legacy surface opt-in and aligned with
-    // `register_concurrent_natives` below.
-    let synthetic_aqs = std::env::var_os("CRATONVM_SYNTHETIC_AQS").is_some()
-        && std::env::var_os("CRATONVM_REAL_AQS").is_none();
-    if synthetic_aqs {
-        registry.with_category(cratonvm_native_api::NativeKind::SyntheticStub, |registry| {
-            let rl = "java/util/concurrent/locks/ReentrantLock";
-            registry.register(rl, "<init>", "()V", native_rl_init);
-            registry.register(rl, "<init>", "(Z)V", native_rl_init_fair);
-            registry.register(rl, "lock", "()V", native_rl_lock);
-            registry.register(rl, "lockInterruptibly", "()V", native_rl_lock);
-            registry.register(rl, "unlock", "()V", native_rl_unlock);
-            registry.register(rl, "tryLock", "()Z", native_rl_try_lock);
-            registry.register(
-                rl,
-                "tryLock",
-                "(JLjava/util/concurrent/TimeUnit;)Z",
-                native_rl_try_lock_timeout,
-            );
-            registry.register(rl, "isLocked", "()Z", native_rl_is_locked);
-            registry.register(
-                rl,
-                "isHeldByCurrentThread",
-                "()Z",
-                native_rl_is_held_by_current_thread,
-            );
-            registry.register(rl, "getHoldCount", "()I", native_rl_get_hold_count);
-            registry.register(rl, "isFair", "()Z", native_rl_is_fair);
-            registry.register(
-                rl,
-                "newCondition",
-                "()Ljava/util/concurrent/locks/Condition;",
-                native_rl_new_condition,
-            );
-            registry.register(rl, "toString", "()Ljava/lang/String;", native_rl_to_string);
+    // SyntheticStub and keep the dispatcher honest: real loaded bytecode still
+    // wins, while true stubs have the native bodies they declare.
+    registry.with_category(cratonvm_native_api::NativeKind::SyntheticStub, |registry| {
+        let rl = "java/util/concurrent/locks/ReentrantLock";
+        registry.register(rl, "<init>", "()V", native_rl_init);
+        registry.register(rl, "<init>", "(Z)V", native_rl_init_fair);
+        registry.register(rl, "lock", "()V", native_rl_lock);
+        registry.register(rl, "lockInterruptibly", "()V", native_rl_lock);
+        registry.register(rl, "unlock", "()V", native_rl_unlock);
+        registry.register(rl, "tryLock", "()Z", native_rl_try_lock);
+        registry.register(
+            rl,
+            "tryLock",
+            "(JLjava/util/concurrent/TimeUnit;)Z",
+            native_rl_try_lock_timeout,
+        );
+        registry.register(rl, "isLocked", "()Z", native_rl_is_locked);
+        registry.register(
+            rl,
+            "isHeldByCurrentThread",
+            "()Z",
+            native_rl_is_held_by_current_thread,
+        );
+        registry.register(rl, "getHoldCount", "()I", native_rl_get_hold_count);
+        registry.register(rl, "isFair", "()Z", native_rl_is_fair);
+        registry.register(
+            rl,
+            "newCondition",
+            "()Ljava/util/concurrent/locks/Condition;",
+            native_rl_new_condition,
+        );
+        registry.register(rl, "toString", "()Ljava/lang/String;", native_rl_to_string);
 
-            let lock = "java/util/concurrent/locks/Lock";
-            registry.register(lock, "lock", "()V", native_rl_lock);
-            registry.register(lock, "unlock", "()V", native_rl_unlock);
-            registry.register(lock, "tryLock", "()Z", native_rl_try_lock);
-            registry.register(
-                lock,
-                "newCondition",
-                "()Ljava/util/concurrent/locks/Condition;",
-                native_rl_new_condition,
-            );
+        let lock = "java/util/concurrent/locks/Lock";
+        registry.register(lock, "lock", "()V", native_rl_lock);
+        registry.register(lock, "unlock", "()V", native_rl_unlock);
+        registry.register(lock, "tryLock", "()Z", native_rl_try_lock);
+        registry.register(
+            lock,
+            "newCondition",
+            "()Ljava/util/concurrent/locks/Condition;",
+            native_rl_new_condition,
+        );
 
-            let cond = "java/util/concurrent/locks/Condition";
-            registry.register(cond, "await", "()V", native_cond_await);
-            registry.register(cond, "awaitUninterruptibly", "()V", native_cond_await);
-            registry.register(
-                cond,
-                "await",
-                "(JLjava/util/concurrent/TimeUnit;)Z",
-                native_cond_await_timeout,
-            );
-            registry.register(cond, "awaitNanos", "(J)J", native_cond_await_nanos);
-            registry.register(
-                cond,
-                "awaitUntil",
-                "(Ljava/util/Date;)Z",
-                native_cond_await_until,
-            );
-            registry.register(cond, "signal", "()V", native_cond_signal);
-            registry.register(cond, "signalAll", "()V", native_cond_signal_all);
-        });
-    }
+        let cond = "java/util/concurrent/locks/Condition";
+        registry.register(cond, "await", "()V", native_cond_await);
+        registry.register(cond, "awaitUninterruptibly", "()V", native_cond_await);
+        registry.register(
+            cond,
+            "await",
+            "(JLjava/util/concurrent/TimeUnit;)Z",
+            native_cond_await_timeout,
+        );
+        registry.register(cond, "awaitNanos", "(J)J", native_cond_await_nanos);
+        registry.register(
+            cond,
+            "awaitUntil",
+            "(Ljava/util/Date;)Z",
+            native_cond_await_until,
+        );
+        registry.register(cond, "signal", "()V", native_cond_signal);
+        registry.register(cond, "signalAll", "()V", native_cond_signal_all);
+    });
 
-    // JBoss Modules' Java-version gate can reach regex while Pattern/Matcher are
-    // still synthetic stubs. Real-JDK mode drops these legacy layout natives via
-    // `NativeMethodRegistry::set_drop_real_layout_synthetic`.
+    // JBoss Modules' Java-version gate reaches regex while Pattern/Matcher are
+    // still synthetic stubs in this bootstrap path.
     registry.register(
         "java/util/regex/Pattern",
         "compile",
@@ -24722,18 +18429,6 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "end",
         "(I)I",
         native_matcher_end_idx,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "replaceAll",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        native_matcher_replace_all,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "replaceFirst",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        native_matcher_replace_first,
     );
 
     // bug-26 (kafka SCRAM): `javax.crypto.Mac` (getInstance/init/update/doFinal)
@@ -24839,92 +18534,16 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `Primes.implHasAnySmallFactors` otherwise runs interpreted and dominates
     // RSA key generation. Faithful single-word-mod reimplementation; see the fn doc.
     crate::phases_late::register_bc_primes_small_factors(registry);
-    // BouncyCastle binary-field EC uses LongArray for generic F2m arithmetic.
-    // Keep the org/bouncycastle JIT ban intact, but run the small polynomial
-    // multiply/square/reduce/inverse leaves natively so math-ec and EC crypto
-    // regression do not spend minutes in interpreted bit loops.
-    crate::phases_late::register_bc_long_array(registry);
-    // BouncyCastle generic prime-field EC uses ECFieldElement.Fp bytecode for
-    // every point add/double. Keep BC bytecode JIT-banned, but run the field
-    // arithmetic leaves with the same limb BigInteger core used by java.math.
-    crate::phases_late::register_bc_fp_field_element(registry);
-    // The generic prime-field point formulas remain hot in complete EC math
-    // tests after the field leaves are native; route just those methods natively.
-    crate::phases_late::register_bc_fp_point(registry);
-    // Same treatment for generic binary-field ECFieldElement.F2m wrappers: this
-    // avoids spending the math-ec suite in interpreted field-element glue around
-    // the native LongArray polynomial leaves.
-    crate::phases_late::register_bc_f2m_field_element(registry);
-    // Generic binary-field ECPoint.F2m add/double is the hot Lambda-projective
-    // point layer above the native F2m field-element leaves.
-    crate::phases_late::register_bc_f2m_point(registry);
-    // Keep the BC package JIT ban in place, but run the high-level Shamir JSF
-    // driver loop natively above the native EC point methods.
-    crate::phases_late::register_bc_ec_algorithms(registry);
-    // Custom SEC binary curves bypass ECFieldElement.F2m and call static
-    // SecT*Field kernels directly from point add/double code. Route those
-    // polynomial kernels through the same native GF(2^m) engine.
-    crate::phases_late::register_bc_sect_field_kernels(registry);
-    // The inherited ECPoint.timesPow2 loop otherwise spends complete binary
-    // curve tests in interpreted SecT*Point.twice glue around those kernels.
-    crate::phases_late::register_bc_sect_point_methods(registry);
     // BouncyCastle AESEngine single-block transform fast-path (Intrinsic). Same
     // JIT-ban rationale: the interpreted T-table AES otherwise dominates AESTest's
     // Monte-Carlo stress. Verbatim FIPS-197-validated port of encrypt/decryptBlock.
     crate::phases_late::register_bc_aes_engine(registry);
-    // CBC mode wrapper fast-path for AES-backed MAC/encryption loops. This keeps
-    // the BC JIT ban intact while avoiding interpreted CBC bytecode above the
-    // already-native AES block transform.
-    crate::phases_late::register_bc_cbc_block_cipher(registry);
-    // BouncyCastle GOST3412_2015Engine single-block transform fast-path
-    // (Intrinsic). Keeps the BC package JIT ban while removing the interpreted
-    // block-cipher loop that dominates GOST3412Test CTR stress.
-    crate::phases_late::register_bc_gost3412_engine(registry);
-    // BouncyCastle SM4Engine single-block transform fast-path for crypto regression.
-    crate::phases_late::register_bc_sm4_engine(registry);
-    // BouncyCastle XTEAEngine single-block transform fast-path for CipherStreamTest.
-    crate::phases_late::register_bc_xtea_engine(registry);
     // BouncyCastle Strings UTF-8 transcode fast-path (Intrinsic) — dominates
     // AESTest.testCounter's growing-string round-trips once AES is native.
     crate::phases_late::register_bc_strings_utf8(registry);
-    crate::phases_late::register_bc_arrays_helpers(registry);
-    crate::phases_late::register_bc_param_helpers(registry);
-    // BouncyCastle byte/int packing helpers used by block ciphers and digests.
-    crate::phases_late::register_bc_pack_helpers(registry);
-    // BouncyCastle X25519 field multiply fast-path for Ed25519/X25519 regression.
-    crate::phases_late::register_bc_x25519_field(registry);
-    // BouncyCastle X448 field multiply/square fast-path for Ed448 regression.
-    crate::phases_late::register_bc_x448_field(registry);
-    // BouncyCastle BLAKE2s compression leaf fast-path for Blake2xs XOF vectors.
-    crate::phases_late::register_bc_blake2s_digest(registry);
-    // BouncyCastle Keccak absorb/extract/permutation fast-path for CSHAKE/KMAC.
-    crate::phases_late::register_bc_keccak_digest(registry);
-    // BouncyCastle legacy GOST3411 compression-block fast-path for the
-    // million-'a' digest regression under the org/bouncycastle JIT ban.
-    crate::phases_late::register_bc_gost3411_digest(registry);
-    // BouncyCastle Whirlpool update/compression fast-path for the million-'a'
-    // digest regression under the same package JIT ban.
-    crate::phases_late::register_bc_whirlpool_digest(registry);
-    // BouncyCastle Poly1305 accumulator/finalization fast-path for standalone
-    // Poly1305 and ChaCha20-Poly1305 regression vectors under the BC JIT ban.
-    crate::phases_late::register_bc_poly1305(registry);
-    // BouncyCastle SCrypt SMix/BlockMix fast-path for crypto regression.
-    crate::phases_late::register_bc_scrypt_generator(registry);
-    // BouncyCastle Argon2 block-round fast-path for crypto regression.
-    crate::phases_late::register_bc_argon2_bytes_generator(registry);
-    // BouncyCastle PKCS#5 v2 PBKDF2/SHA-1 KDF fast-path for crypto regression.
-    crate::phases_late::register_bc_pkcs5s2_parameters_generator(registry);
-    // BouncyCastle PKCS#12 SHA-1 KDF fast-path for crypto regression vectors.
-    crate::phases_late::register_bc_pkcs12_parameters_generator(registry);
-    // BouncyCastle BCrypt expensive key schedule fast-path for crypto regression.
-    crate::phases_late::register_bc_bcrypt_generator(registry);
     // BouncyCastle CTR-mode (SICBlockCipher) per-byte loop fast-path (Intrinsic) —
     // the sole remaining hot frame in AESTest.testCounter once AES+Strings are native.
     crate::phases_late::register_bc_sic_ctr(registry);
-    // BouncyCastle DigestRandomGenerator synchronized PRNG fast-path
-    // (Intrinsic). This keeps the package JIT ban intact while avoiding the
-    // million-call interpreted monitor body in DigestRandomNumberTest.
-    crate::phases_late::register_bc_digest_random_generator(registry);
     // BouncyCastle ChaCha permutation fast-path (Intrinsic). Same JIT-ban
     // rationale: the interpreted ChaCha core (dozens of Integers.rotateLeft
     // calls per block) dominates the SPHINCS-256 PQC RegressionTest (PRG via
@@ -25573,24 +19192,103 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // are reachable in BOTH synthetic-jdk and real-JDK feature configurations.
     crate::lang_misc::register_throwable_subclass_natives(registry);
 
-    // java/io/InputStreamReader: removed the synthetic <init>/read([CII)I/close
-    // overrides here. read([CII)I) did a dumb byte-for-byte passthrough --
-    // chars[i] = stream.read() & 0xff -- ignoring the charset entirely. Real
-    // JDK 25 InputStreamReader.read(char[],int,int) is real bytecode delegating to
-    // sd.read(...) (a sun.nio.cs.StreamDecoder built via
-    // StreamDecoder.forInputStreamReader(...), already correctly registered with
-    // full charset support in native-io/src/stream_decoder.rs). This synthetic
-    // block unconditionally shadowed that real bytecode for EVERY InputStreamReader
-    // (not just genuinely-synthetic-stub ones) because the interpreter invokevirtual
-    // vtable fast path (execute_invokevirtual_vtable_fast in interpreter.rs) treats
-    // "any native registered for this (class, method, descriptor)" as an
-    // authoritative shadow -- it does not consult the NativeKind::SyntheticStub
-    // category the way vm_exec.rs::invoke_or_native real_protected_stub check does,
-    // so tagging this SyntheticStub alone (tried first) did not help; only removing
-    // it does. Broke every multi-byte decode through InputStreamReader, most
-    // visibly UTF-16BE/LE (each 2-byte code unit decoded as two separate
-    // Latin-1-ish chars).
+    // Some bootstraps still receive synthetic-stub Reader classes from
+    // class_manager.rs; those stubs declare these ctors as native, so the
+    // registry must provide matching bodies even in real-JDK mode.
     {
+        registry.register(
+            "java/io/InputStreamReader",
+            "<init>",
+            "(Ljava/io/InputStream;)V",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let stream = args.get(1).copied().unwrap_or(Value::Object(None));
+                ctx.set_field(this, 0, stream);
+                Ok(None)
+            },
+        );
+        registry.register(
+            "java/io/InputStreamReader",
+            "<init>",
+            "(Ljava/io/InputStream;Ljava/nio/charset/Charset;)V",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let stream = args.get(1).copied().unwrap_or(Value::Object(None));
+                ctx.set_field(this, 0, stream);
+                Ok(None)
+            },
+        );
+        registry.register(
+            "java/io/InputStreamReader",
+            "<init>",
+            "(Ljava/io/InputStream;Ljava/lang/String;)V",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let stream = args.get(1).copied().unwrap_or(Value::Object(None));
+                ctx.set_field(this, 0, stream);
+                Ok(None)
+            },
+        );
+        registry.register("java/io/InputStreamReader", "close", "()V", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Value::Object(Some(sd)) = ctx.get_field_by_name(this, "sd") {
+                let _ = ctx.invoke_virtual(sd, "close", "()V", &[])?;
+            }
+            Ok(None)
+        });
+        registry.register(
+            "java/io/InputStreamReader",
+            "read",
+            "([CII)I",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let chars = match args.get(1) {
+                    Some(Value::Object(Some(arr))) => *arr,
+                    _ => {
+                        return Err(RuntimeError::NullPointerException { message: None }.into());
+                    }
+                };
+                let off = match args.get(2) {
+                    Some(Value::Int(v)) => *v,
+                    _ => 0,
+                };
+                let len = match args.get(3) {
+                    Some(Value::Int(v)) => *v,
+                    _ => 0,
+                };
+                let arr_len = ctx.array_length(chars) as i32;
+                let end = off.checked_add(len).unwrap_or(i32::MAX);
+                if off < 0 || len < 0 || end > arr_len {
+                    return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: end }.into());
+                }
+                if len == 0 {
+                    return Ok(Some(Value::Int(0)));
+                }
+                let stream = match ctx.get_field(this, 0) {
+                    Value::Object(Some(stream)) => stream,
+                    _ => return Ok(Some(Value::Int(-1))),
+                };
+                let mut read = 0i32;
+                while read < len {
+                    let b = match ctx.invoke_virtual(stream, "read", "()I", &[])? {
+                        Some(Value::Int(v)) => v,
+                        _ => -1,
+                    };
+                    if b < 0 {
+                        return Ok(Some(Value::Int(if read == 0 { -1 } else { read })));
+                    }
+                    ctx.set_array_element(chars, (off + read) as usize, Value::Int(b & 0xff));
+                    read += 1;
+                }
+                Ok(Some(Value::Int(read)))
+            },
+        );
+        registry.register(
+            "java/io/InputStreamReader",
+            "close",
+            "()V",
+            native_noop_with_this,
+        );
         registry.register(
             "java/util/jar/Attributes",
             "<init>",
@@ -26325,12 +20023,6 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register(
         "java/io/OutputStreamWriter",
         "write",
-        "([CII)V",
-        native_output_stream_writer_write_chars,
-    );
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "write",
         "(Ljava/lang/String;)V",
         native_output_stream_writer_write_string,
     );
@@ -26352,7 +20044,6 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()V",
         native_output_stream_writer_close,
     );
-
     registry.register(
         "java/io/BufferedInputStream",
         "<init>",
@@ -26363,7 +20054,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             let input = args.get(1).copied().unwrap_or(Value::Object(None));
-            buffered_input_stream_init(ctx, this, input);
+            ctx.set_field_by_name(this, "in", input);
+            ctx.set_field(this, 0, input);
             Ok(None)
         },
     );
@@ -26377,7 +20069,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             let input = args.get(1).copied().unwrap_or(Value::Object(None));
-            buffered_input_stream_init(ctx, this, input);
+            ctx.set_field_by_name(this, "in", input);
+            ctx.set_field(this, 0, input);
             Ok(None)
         },
     );
@@ -26386,7 +20079,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(-1))),
         };
-        Ok(Some(Value::Int(buffered_input_stream_read_one(ctx, this)?)))
+        let input = match ctx.get_field_by_name(this, "in") {
+            Value::Object(Some(o)) => Some(o),
+            _ => match ctx.get_field(this, 0) {
+                Value::Object(Some(o)) => Some(o),
+                _ => None,
+            },
+        };
+        match input {
+            Some(input) => Ok(ctx
+                .invoke_virtual(input, "read", "()I", &[])?
+                .or(Some(Value::Int(-1)))),
+            None => Ok(Some(Value::Int(-1))),
+        }
     });
     registry.register(
         "java/io/BufferedInputStream",
@@ -26397,80 +20102,29 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(-1))),
             };
-            let arr = match args.get(1) {
-                Some(Value::Object(Some(arr))) => *arr,
-                _ => return Ok(Some(Value::Int(-1))),
-            };
-            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-            if len == 0 {
-                return Ok(Some(Value::Int(0)));
-            }
-            let arr_len = ctx.array_length(arr);
-            if off >= arr_len {
-                return Ok(Some(Value::Int(-1)));
-            }
-            let limit = len.min(arr_len - off);
-            let mut read = 0usize;
-            for i in 0..limit {
-                let b = buffered_input_stream_read_one(ctx, this)?;
-                if b < 0 {
-                    break;
-                }
-                ctx.set_array_element(arr, off + i, Value::Int(b as i8 as i32));
-                read += 1;
-            }
-            Ok(Some(Value::Int(if read == 0 { -1 } else { read as i32 })))
-        },
-    );
-    registry.register(
-        "java/io/BufferedInputStream",
-        "mark",
-        "(I)V",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(None),
-            };
-            let limit = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-            buffered_input_stream_marks().lock().unwrap().insert(
-                ctx.identity_hash_code(this),
-                BufferedInputStreamMarkState {
-                    mark_limit: limit,
-                    mark_active: true,
-                    replay_pos: 0,
-                    bytes: Vec::new(),
+            let input = match ctx.get_field_by_name(this, "in") {
+                Value::Object(Some(o)) => Some(o),
+                _ => match ctx.get_field(this, 0) {
+                    Value::Object(Some(o)) => Some(o),
+                    _ => None,
                 },
-            );
-            Ok(None)
-        },
-    );
-    registry.register(
-        "java/io/BufferedInputStream",
-        "reset",
-        "()V",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Err(buffered_input_stream_invalid_mark()),
             };
-            let key = ctx.identity_hash_code(this);
-            let mut marks = buffered_input_stream_marks().lock().unwrap();
-            let Some(state) = marks.get_mut(&key) else {
-                return Err(buffered_input_stream_invalid_mark());
-            };
-            if !state.mark_active {
-                return Err(buffered_input_stream_invalid_mark());
+            match input {
+                Some(input) => Ok(ctx
+                    .invoke_virtual(
+                        input,
+                        "read",
+                        "([BII)I",
+                        &[
+                            args.get(1).copied().unwrap_or(Value::Object(None)),
+                            args.get(2).copied().unwrap_or(Value::Int(0)),
+                            args.get(3).copied().unwrap_or(Value::Int(0)),
+                        ],
+                    )?
+                    .or(Some(Value::Int(-1)))),
+                None => Ok(Some(Value::Int(-1))),
             }
-            state.replay_pos = 0;
-            Ok(None)
         },
-    );
-    registry.register(
-        "java/io/BufferedInputStream",
-        "markSupported",
-        "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
     );
     registry.register(
         "java/io/BufferedInputStream",
@@ -26517,108 +20171,6 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             }
             Ok(None)
         },
-    );
-    registry.register(
-        "org/apache/tomcat/util/buf/CharChunk",
-        "equals",
-        "(Ljava/lang/String;)Z",
-        native_char_chunk_equals_string,
-    );
-    registry.register(
-        "org/apache/tomcat/util/buf/CharChunk",
-        "equalsIgnoreCase",
-        "(Ljava/lang/String;)Z",
-        native_char_chunk_equals_ignore_case,
-    );
-    registry.register(
-        "org/apache/tomcat/util/buf/CharChunk",
-        "startsWith",
-        "(Ljava/lang/String;)Z",
-        native_char_chunk_starts_with,
-    );
-    registry.register(
-        "org/apache/tomcat/util/buf/CharChunk",
-        "startsWithIgnoreCase",
-        "(Ljava/lang/String;I)Z",
-        native_char_chunk_starts_with_ignore_case,
-    );
-    registry.register(
-        "org/apache/tomcat/util/buf/MessageBytes",
-        "toChars",
-        "()V",
-        native_message_bytes_to_chars,
-    );
-    registry.register(
-        "org/apache/tomcat/util/buf/MessageBytes",
-        "toString",
-        "()Ljava/lang/String;",
-        native_message_bytes_to_string,
-    );
-    registry.register(
-        "org/apache/catalina/mapper/Mapper",
-        "find",
-        "([Lorg/apache/catalina/mapper/Mapper$MapElement;Lorg/apache/tomcat/util/buf/CharChunk;)I",
-        native_mapper_find_chunk,
-    );
-    registry.register(
-        "org/apache/catalina/mapper/Mapper",
-        "find",
-        "([Lorg/apache/catalina/mapper/Mapper$MapElement;Lorg/apache/tomcat/util/buf/CharChunk;II)I",
-        native_mapper_find_chunk_range,
-    );
-    registry.register(
-        "org/apache/catalina/mapper/Mapper",
-        "findIgnoreCase",
-        "([Lorg/apache/catalina/mapper/Mapper$MapElement;Lorg/apache/tomcat/util/buf/CharChunk;)I",
-        native_mapper_find_ignore_case,
-    );
-    registry.register(
-        "org/apache/catalina/mapper/Mapper",
-        "findIgnoreCase",
-        "([Lorg/apache/catalina/mapper/Mapper$MapElement;Lorg/apache/tomcat/util/buf/CharChunk;II)I",
-        native_mapper_find_ignore_case_range,
-    );
-    registry.register(
-        "org/apache/catalina/mapper/Mapper",
-        "find",
-        "([Lorg/apache/catalina/mapper/Mapper$MapElement;Ljava/lang/String;)I",
-        native_mapper_find_string,
-    );
-    registry.register(
-        "org/apache/catalina/mapper/Mapper",
-        "exactFind",
-        "([Lorg/apache/catalina/mapper/Mapper$MapElement;Lorg/apache/tomcat/util/buf/CharChunk;)Lorg/apache/catalina/mapper/Mapper$MapElement;",
-        native_mapper_exact_find_chunk,
-    );
-    registry.register(
-        "org/apache/catalina/mapper/Mapper",
-        "exactFindIgnoreCase",
-        "([Lorg/apache/catalina/mapper/Mapper$MapElement;Lorg/apache/tomcat/util/buf/CharChunk;)Lorg/apache/catalina/mapper/Mapper$MapElement;",
-        native_mapper_exact_find_ignore_case,
-    );
-    registry.register(
-        "org/apache/catalina/mapper/Mapper",
-        "exactFind",
-        "([Lorg/apache/catalina/mapper/Mapper$MapElement;Ljava/lang/String;)Lorg/apache/catalina/mapper/Mapper$MapElement;",
-        native_mapper_exact_find_string,
-    );
-    registry.register(
-        "org/apache/catalina/mapper/Mapper",
-        "map",
-        "(Lorg/apache/tomcat/util/buf/MessageBytes;Lorg/apache/tomcat/util/buf/MessageBytes;Ljava/lang/String;Lorg/apache/catalina/mapper/MappingData;)V",
-        native_mapper_map,
-    );
-    registry.register(
-        "org/apache/catalina/mapper/Mapper",
-        "internalMap",
-        "(Lorg/apache/tomcat/util/buf/CharChunk;Lorg/apache/tomcat/util/buf/CharChunk;Ljava/lang/String;Lorg/apache/catalina/mapper/MappingData;)V",
-        native_mapper_internal_map,
-    );
-    registry.register(
-        "org/apache/catalina/mapper/Mapper",
-        "internalMapWildcardWrapper",
-        "([Lorg/apache/catalina/mapper/Mapper$MappedWrapper;ILorg/apache/tomcat/util/buf/CharChunk;Lorg/apache/catalina/mapper/MappingData;)V",
-        native_mapper_internal_map_wildcard_wrapper,
     );
     registry.register(
         "java/io/FilterOutputStream",
@@ -28249,7 +21801,6 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 ctx.class_name_of_id(cid).as_deref(),
                 Some("java/lang/reflect/GenericArrayType")
                     | Some("java/lang/reflect/ParameterizedType")
-                    | Some("java/lang/reflect/TypeVariable")
                     | Some("java/lang/reflect/WildcardType")
             );
             if is_reflect {
@@ -33648,13 +27199,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             };
             let avail = count - pos;
             let to_read = len.min(avail);
-            let mut bytes = vec![0u8; to_read];
-            let copied = ctx.read_byte_array_into(buf, pos, &mut bytes);
-            if copied > 0 {
-                ctx.write_byte_array_from(dest, off, &bytes[..copied]);
+            for i in 0..to_read {
+                let b = ctx.get_array_element(buf, pos + i);
+                ctx.set_array_element(dest, off + i, b);
             }
-            ctx.set_field(this, pos_idx, Value::Int((pos + copied) as i32));
-            Ok(Some(Value::Int(copied as i32)))
+            ctx.set_field(this, pos_idx, Value::Int((pos + to_read) as i32));
+            Ok(Some(Value::Int(to_read as i32)))
         },
     );
     registry.register(
@@ -34025,12 +27575,10 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     );
     // URLClassLoader.findClass — the real bytecode resolves via the shimmed
     // `ucp` (URLClassPath) and so throws CNFE for everything. Serve it from the
-    // receiver's own recorded URLs first so the class is defined under that
-    // loader, then keep the global dynamic classpath fallback for legacy paths
-    // whose loader `<init>` registered URLs there. Reached when a subclass
-    // overrides `loadClass` and calls `findClass` directly (Jasper's
-    // `JasperLoader` loading runtime-compiled `org.apache.jsp.*_jsp` servlets);
-    // forced onto this native by
+    // global dynamic classpath instead (the loader's `<init>` registered its
+    // URLs). Reached when a subclass overrides `loadClass` and calls `findClass`
+    // directly (Jasper's `JasperLoader` loading runtime-compiled
+    // `org.apache.jsp.*_jsp` servlets); forced onto this native by
     // `intercept_urlclassloader_subclass_find_class`. Only registered here
     // (real-JDK mode); synthetic-JDK mode registers `ucl_find_class` via
     // `register_classloader_natives`.
@@ -34834,13 +28382,6 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // subclass that the JDK 25 NIO hierarchy uses for direct/heap
     // buffers. (Buffer itself covers any rare invokespecial-on-Buffer
     // sites that bypass the virtual cache.)
-    registry.register(
-        "java/nio/FloatBuffer",
-        "order",
-        "()Ljava/nio/ByteOrder;",
-        native_float_buffer_order,
-    );
-
     for buf in [
         "java/nio/Buffer",
         "java/nio/ByteBuffer",
@@ -41799,10 +35340,6 @@ fn native_object_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     };
     let class_id = ctx.class_id_of_object(this);
-    if ctx.class_name_of_id(class_id).as_deref() == Some("org/apache/tomcat/util/buf/MessageBytes")
-    {
-        return native_message_bytes_to_string(ctx, args);
-    }
     // Keep the default `toString` class name consistent with `getClass()`:
     // synthetic objects stamped with an interface/abstract/internal class
     // report their concrete JDK display class here too (memoised; no-op for
@@ -43239,7 +36776,7 @@ fn uuid_get_lsb(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef) -> 
 fn alloc_uuid(ctx: &mut dyn NativeContext, msb: i64, lsb: i64) -> cratonvm_types::ObjectRef {
     let class_id = match ctx.ensure_class_initialized("java/util/UUID") {
         Ok(id) => id,
-        Err(_) => ctx.ensure_synthetic_class("java/util/UUID", 2),
+        Err(_) => cratonvm_types::ClassId::new(0),
     };
     let obj = ctx.alloc_object(class_id, 2);
     uuid_set_msb(ctx, obj, msb);
@@ -47359,11 +40896,7 @@ pub(crate) fn unsafe_array_read_bytes(
     while produced < n {
         let v = ctx.get_array_element(arr, elem_idx);
         let raw: u64 = match et {
-            cratonvm_types::ArrayElementType::Float => match v {
-                Value::Float(f) => f.to_bits() as u64,
-                Value::Int(i) => i as u32 as u64,
-                _ => 0,
-            },
+            cratonvm_types::ArrayElementType::Float => (v.as_int().unwrap_or(0) as u32) as u64,
             cratonvm_types::ArrayElementType::Double => match v {
                 Value::Long(l) => l as u64,
                 Value::Double(d) => d.to_bits(),
@@ -47465,8 +40998,9 @@ pub(crate) fn unsafe_array_write_bytes(
                 | cratonvm_types::ArrayElementType::Byte => Value::Int(raw as u8 as i8 as i32),
                 cratonvm_types::ArrayElementType::Char => Value::Int(raw as u16 as i32),
                 cratonvm_types::ArrayElementType::Short => Value::Int(raw as u16 as i16 as i32),
-                cratonvm_types::ArrayElementType::Int => Value::Int(raw as u32 as i32),
-                cratonvm_types::ArrayElementType::Float => Value::Float(f32::from_bits(raw as u32)),
+                cratonvm_types::ArrayElementType::Int | cratonvm_types::ArrayElementType::Float => {
+                    Value::Int(raw as u32 as i32)
+                }
                 cratonvm_types::ArrayElementType::Long
                 | cratonvm_types::ArrayElementType::Double => Value::Long(raw as i64),
                 cratonvm_types::ArrayElementType::Reference => unreachable!(),
@@ -49012,7 +42546,14 @@ fn native_atomic_ref_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let this = unsafe_obj(args, 0).unwrap();
     let val = ctx.get_field_volatile(this, 0);
     let text = match val {
-        Value::Object(Some(obj)) => crate::lang_string::invoke_to_string(ctx, obj)?,
+        Value::Object(Some(obj)) => {
+            let class_id = ctx.class_id_of_object(obj);
+            let class_name = ctx
+                .class_name_of_id(class_id)
+                .unwrap_or_else(|| "?".to_string());
+            let hash = ctx.identity_hash_code(obj);
+            format!("{}@{:x}", class_name.replace('/', "."), hash)
+        }
         _ => "null".to_string(),
     };
     let s = ctx.create_string(&text);
@@ -49407,60 +42948,6 @@ fn native_objects_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(Some(Value::Int(if eq { 1 } else { 0 })))
 }
 
-fn native_objects_value_hash_code(
-    ctx: &mut dyn NativeContext,
-    obj: ObjectRef,
-) -> Result<i32, MethodCallFailed> {
-    if ctx.object_is_array(obj) {
-        return Ok(ctx.identity_hash_code(obj));
-    }
-
-    match ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref() {
-        Some("java/lang/String") => {
-            match native_string_hash_code(ctx, &[Value::Object(Some(obj))])? {
-                Some(Value::Int(v)) => Ok(v),
-                _ => Ok(0),
-            }
-        }
-        Some(
-            "java/lang/Integer" | "java/lang/Byte" | "java/lang/Short" | "java/lang/Character",
-        ) => match ctx.get_field(obj, 0) {
-            Value::Int(v) => Ok(v),
-            _ => Ok(0),
-        },
-        Some("java/lang/Boolean") => match ctx.get_field(obj, 0) {
-            Value::Int(v) => Ok(if v != 0 { 1231 } else { 1237 }),
-            _ => Ok(1237),
-        },
-        Some("java/lang/Long") => match ctx.get_field(obj, 0) {
-            Value::Long(v) => Ok((v ^ ((v as u64 >> 32) as i64)) as i32),
-            _ => Ok(0),
-        },
-        Some("java/lang/Float") => match ctx.get_field(obj, 0) {
-            Value::Float(v) => {
-                let bits = if v.is_nan() { 0x7fc0_0000 } else { v.to_bits() };
-                Ok(bits as i32)
-            }
-            _ => Ok(0),
-        },
-        Some("java/lang/Double") => match ctx.get_field(obj, 0) {
-            Value::Double(v) => {
-                let bits = if v.is_nan() {
-                    0x7ff8_0000_0000_0000u64
-                } else {
-                    v.to_bits()
-                };
-                Ok((bits ^ (bits >> 32)) as i32)
-            }
-            _ => Ok(0),
-        },
-        _ => match ctx.invoke_virtual(obj, "hashCode", "()I", &[])? {
-            Some(Value::Int(v)) => Ok(v),
-            _ => Ok(0),
-        },
-    }
-}
-
 fn native_objects_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if std::env::var_os("CRATONVM_DBG_OBJECTS").is_some() {
         eprintln!(
@@ -49469,9 +42956,7 @@ fn native_objects_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         );
     }
     match args.first() {
-        Some(Value::Object(Some(obj))) => {
-            Ok(Some(Value::Int(native_objects_value_hash_code(ctx, *obj)?)))
-        }
+        Some(Value::Object(Some(obj))) => Ok(Some(Value::Int(ctx.identity_hash_code(*obj)))),
         _ => Ok(Some(Value::Int(0))),
     }
 }
@@ -49486,21 +42971,9 @@ fn native_objects_hash(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     for i in 0..len {
         let elem = ctx.get_array_element(arr, i);
         let elem_hash = match elem {
-            Value::Object(Some(obj)) => native_objects_value_hash_code(ctx, obj)?,
+            Value::Object(Some(obj)) => ctx.identity_hash_code(obj),
             Value::Int(v) => v,
             Value::Long(v) => (v ^ (v >> 32)) as i32,
-            Value::Float(v) => {
-                let bits = if v.is_nan() { 0x7fc0_0000 } else { v.to_bits() };
-                bits as i32
-            }
-            Value::Double(v) => {
-                let bits = if v.is_nan() {
-                    0x7ff8_0000_0000_0000u64
-                } else {
-                    v.to_bits()
-                };
-                (bits ^ (bits >> 32)) as i32
-            }
             _ => 0,
         };
         result = result.wrapping_mul(31).wrapping_add(elem_hash);
@@ -50282,31 +43755,19 @@ pub(crate) fn compile_anchored_cached(full: &str) -> Option<JavaRegex> {
 ///   that escapes `StatusLogger$Config.<clinit>` and aborts WildFly boot.
 /// - `\p{IsScriptName}` / `\P{IsScriptName}` (Java Unicode-script prefix) →
 ///   `\p{ScriptName}` / `\P{ScriptName}` (same accepted-without-prefix shape).
-/// - `\p{java*}` / `\P{java*}` (the predefined Java character-class aliases
-///   from `java.util.regex.Pattern`'s `CharPredicates.forProperty` table,
-///   e.g. `\p{javaWhitespace}`, `\p{javaDigit}`) → an explicit Rust-regex
-///   class body matching the corresponding `java.lang.Character.isXxx(int)`
-///   predicate (see `map_java_predefined_class`). These are direct method
-///   aliases, not Unicode property/category names, so neither `regex` nor
-///   `fancy-regex` understands them by name. `java.util.Scanner`'s static
-///   initializer depends on `\p{javaWhitespace}` and `\p{javaDigit}`
-///   (`WHITESPACE_PATTERN` / `NON_ASCII_DIGIT`), so leaving these
-///   untranslated makes `Scanner`'s `<clinit>` throw unconditionally.
-///   Residual: does not honor `Pattern.CASE_INSENSITIVE` widening
-///   `javaLowerCase`/`javaUpperCase`/`javaTitleCase` into a tri-case union
-///   (rare — needs both the flag and one of these three classes together).
 fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
-    // Fast path: if the pattern doesn't contain `\p{In`, `\p{Is`, or `\p{java`
-    // (or the capital-P negated forms), and no `\Q...\E` quoted-literal
-    // blocks, there's nothing to rewrite.
+    // Fast path: if the pattern doesn't contain `\p{In` or `\p{Is` (or the
+    // capital-P negated forms), and no `\Q...\E` quoted-literal blocks,
+    // there's nothing to rewrite.
     let has_quote_block = pattern.contains("\\Q");
-    // Any `\p{...}`/`\P{...}` needs the loop below: it covers Unicode
-    // block/script prefixes (In/Is), `Character.is*` names (java*), the
-    // `all` alias, AND the POSIX character classes (Alpha, Digit, XDigit,
-    // ...) handled by `map_java_character_property`, which don't share a
-    // common prefix so can't be cheaply pre-filtered individually.
-    let has_property_class = pattern.contains("\\p{") || pattern.contains("\\P{");
-    if !has_quote_block && !has_property_class {
+    let has_all_class = pattern.contains("\\p{all}") || pattern.contains("\\P{all}");
+    if !has_quote_block
+        && !has_all_class
+        && !(pattern.contains("\\p{In")
+            || pattern.contains("\\P{In")
+            || pattern.contains("\\p{Is")
+            || pattern.contains("\\P{Is"))
+    {
         return std::borrow::Cow::Borrowed(pattern);
     }
     let mut out = String::with_capacity(pattern.len());
@@ -50382,52 +43843,6 @@ fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
             i += 7;
             continue;
         }
-        // Look for `\p{Name}` / `\P{Name}` POSIX character classes (Lower,
-        // Upper, ASCII, Alpha, Digit, Alnum, Punct, Graph, Print, Blank,
-        // Cntrl, XDigit, Space -- java.util.regex.Pattern javadoc, "POSIX
-        // character classes (US-ASCII only)"). Rust's `regex` crate only
-        // recognizes Unicode property names in `\p{...}` (no notion of
-        // "XDigit"/"Alpha"/etc.), so without this these patterns fail to
-        // compile in BOTH the `regex` and `fancy-regex` fallback, and
-        // `compile_java_regex` returns an Err. That Err was observed to
-        // silently corrupt `String.matches` (see `native_string_matches`'s
-        // literal-equality fallback on compile failure) -- e.g.
-        // `"5".matches("\\p{XDigit}+")` returned `false` instead of `true`,
-        // while `Pattern.matches("\\p{XDigit}+", "5")` (real bytecode,
-        // unaffected by this translation layer) correctly returned `true`.
-        // Found via Tomcat's `TestHttp2Limits.testPostWithTrailerHeadersSize0`.
-        // Checked before the `In`/`Is`/`java*` branches below since POSIX
-        // names never collide with those prefixes; unrecognized names fall
-        // through unchanged to let those branches (or the literal copy at
-        // the bottom) handle them. See `map_posix_character_class` for the
-        // US-ASCII-only rationale (matches Java's default; the rarely-used
-        // `UNICODE_CHARACTER_CLASS` flag is not special-cased here, same as
-        // the `java*` branch below).
-        if i + 3 < bytes.len()
-            && bytes[i] == b'\\'
-            && (bytes[i + 1] == b'p' || bytes[i + 1] == b'P')
-            && bytes[i + 2] == b'{'
-        {
-            if let Some(close_off) = pattern[i + 3..].find('}') {
-                let name = &pattern[i + 3..i + 3 + close_off];
-                if let Some(class_body) = map_posix_character_class(name) {
-                    let negated = bytes[i + 1] == b'P';
-                    if negated {
-                        out.push_str("[^");
-                        out.push_str(class_body);
-                        out.push(']');
-                    } else {
-                        out.push('[');
-                        out.push_str(class_body);
-                        out.push(']');
-                    }
-                    i = i + 3 + close_off + 1;
-                    continue;
-                }
-                // Not a POSIX name: fall through to the In/Is/java* checks
-                // below (or literal copy if none match either).
-            }
-        }
         // Look for `\p{In` or `\p{Is` (both cases of p) followed by a name and `}`.
         // All matched bytes are ASCII so byte indexing is safe.
         if i + 5 < bytes.len()
@@ -50462,34 +43877,6 @@ fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
                 }
                 i = i + 5 + close_off + 1;
                 continue;
-            }
-        }
-        // Look for `\p{java...}` / `\P{java...}` — the predefined Java
-        // character-class aliases (see `map_java_predefined_class`).
-        if i + 3 < bytes.len()
-            && bytes[i] == b'\\'
-            && (bytes[i + 1] == b'p' || bytes[i + 1] == b'P')
-            && bytes[i + 2] == b'{'
-            && pattern[i + 3..].starts_with("java")
-        {
-            if let Some(close_off) = pattern[i + 3..].find('}') {
-                let name = &pattern[i + 3..i + 3 + close_off];
-                let negated = bytes[i + 1] == b'P';
-                if let Some(class_body) = map_java_predefined_class(name) {
-                    if negated {
-                        out.push_str("[^");
-                        out.push_str(class_body);
-                        out.push(']');
-                    } else {
-                        out.push('[');
-                        out.push_str(class_body);
-                        out.push(']');
-                    }
-                    i = i + 3 + close_off + 1;
-                    continue;
-                }
-                // Unknown `java*` name: fall through and copy the escape
-                // literally below, same as any other unrecognized pattern.
             }
         }
         // Copy one full UTF-8 character.
@@ -50598,32 +43985,6 @@ fn ascii_perl_classes(pattern: &str) -> String {
     out
 }
 
-/// Map a Java POSIX character-class name (`\p{Name}` with no `In`/`Is`/`java`
-/// prefix) to a Rust regex character-class body. See the loop branch above
-/// for why this table exists. Always US-ASCII-only, matching Java's default.
-fn map_posix_character_class(name: &str) -> Option<&'static str> {
-    match name {
-        "Lower" => Some("a-z"),
-        "Upper" => Some("A-Z"),
-        "ASCII" => Some(r"\x00-\x7F"),
-        "Alpha" => Some("a-zA-Z"),
-        "Digit" => Some("0-9"),
-        "Alnum" => Some("a-zA-Z0-9"),
-        // `!"#$%&'()*+,-./` (\x21-\x2F) + `:;<=>?@` (\x3A-\x40) +
-        // `[\]^_`` (\x5B-\x60) + `{|}~` (\x7B-\x7E) -- printable ASCII
-        // minus letters and digits, as four contiguous byte ranges
-        // (sidesteps escaping `]`/`\`/`-` as literal bracket-class chars).
-        "Punct" => Some(r"\x21-\x2F\x3A-\x40\x5B-\x60\x7B-\x7E"),
-        "Graph" => Some(r"\x21-\x7E"),
-        "Print" => Some(r"\x20-\x7E"),
-        "Blank" => Some(" \t"),
-        "Cntrl" => Some(r"\x00-\x1F\x7F"),
-        "XDigit" => Some("0-9a-fA-F"),
-        "Space" => Some(r" \t\n\x0B\f\r"),
-        _ => None,
-    }
-}
-
 /// Map a Java Unicode block name (used after the `In` prefix in `\p{InXxx}`)
 /// to a Rust regex character-class body covering the same code points. The
 /// Rust regex crate doesn't expose Unicode blocks natively, so we substitute
@@ -50655,237 +44016,6 @@ fn map_java_unicode_block(name: &str, is_block: bool) -> Option<&'static str> {
         "Katakana" => Some(r"\u{30A0}-\u{30FF}"),
         "Hangul_Syllables" | "HangulSyllables" => Some(r"\u{AC00}-\u{D7AF}"),
         _ => None,
-    }
-}
-
-/// Translate a `\p{java*}` / `\P{java*}` predefined Java character-class
-/// name (see `java.util.regex.Pattern`'s `CharPredicates.forProperty`) into
-/// a Rust-regex-crate-compatible class body — i.e. text valid to place
-/// inside a single pair of `[...]` brackets. Returns `None` for names
-/// outside this family (letting the caller fall back to copying the escape
-/// literally, same as any other unrecognized `\p{...}` form).
-///
-/// Each entry mirrors the exact semantics documented on the corresponding
-/// `java.lang.Character.isXxx(int)` method (verified against JDK 25
-/// source), not a convenient approximation. Notably:
-/// - `javaWhitespace` (`Character.isWhitespace`) is Unicode space
-///   separators (`Zs`/`Zl`/`Zp`) *excluding* the three non-breaking spaces
-///   (U+00A0, U+2007, U+202F), plus the ASCII control-whitespace range
-///   U+0009-U+000D and the separator controls U+001C-U+001F. Expressed as
-///   explicit codepoints/ranges rather than `\p{Z}` minus a subtraction, so
-///   it doesn't depend on character-class set-operator support.
-/// - `javaJavaIdentifierStart`/`javaJavaIdentifierPart` follow the older,
-///   simpler `Character.isJavaIdentifierStart`/`Part` rules (letter/digit +
-///   currency + connector punctuation, + combining/non-spacing marks for
-///   `Part`) — NOT the same as `javaUnicodeIdentifierStart`/`Part`, which
-///   follow the newer `ID_Start`/`ID_Continue`-based UAX31 profile.
-fn map_java_predefined_class(name: &str) -> Option<&'static str> {
-    match name {
-        "javaLowerCase" => Some(r"\p{Lowercase}"),
-        "javaUpperCase" => Some(r"\p{Uppercase}"),
-        "javaAlphabetic" => Some(r"\p{Alphabetic}"),
-        "javaIdeographic" => Some(r"\p{Ideographic}"),
-        "javaTitleCase" => Some(r"\p{Lt}"),
-        "javaDigit" => Some(r"\p{Nd}"),
-        // isDefined = NOT unassigned (Cn) — enumerate every other general
-        // category rather than relying on `--`/negation-inside-brackets.
-        "javaDefined" => Some(r"\p{L}\p{M}\p{N}\p{P}\p{S}\p{Z}\p{Cc}\p{Cf}\p{Co}\p{Cs}"),
-        "javaLetter" => Some(r"\p{L}"),
-        "javaLetterOrDigit" => Some(r"\p{L}\p{Nd}"),
-        // isJavaIdentifierStart: isLetter || LETTER_NUMBER || currency
-        // symbol || connector punctuation.
-        "javaJavaIdentifierStart" => Some(r"\p{L}\p{Nl}\p{Sc}\p{Pc}"),
-        // isJavaIdentifierPart: the above plus digit, combining/non-spacing
-        // marks, and isIdentifierIgnorable.
-        "javaJavaIdentifierPart" => {
-            Some(r"\p{L}\p{Nl}\p{Nd}\p{Mc}\p{Mn}\p{Sc}\p{Pc}\p{Cf}\x00-\x08\x0E-\x1B\x7F-\x9F")
-        }
-        // isUnicodeIdentifierStart: ID_Start plus VERTICAL TILDE (U+2E2F,
-        // kept for backward compatibility per the UAX31 profile in the
-        // javadoc).
-        "javaUnicodeIdentifierStart" => Some(r"\p{ID_Start}\u{2E2F}"),
-        // isUnicodeIdentifierPart: ID_Start + ID_Continue + U+2E2F +
-        // isIdentifierIgnorable.
-        "javaUnicodeIdentifierPart" => {
-            Some(r"\p{ID_Start}\p{ID_Continue}\u{2E2F}\p{Cf}\x00-\x08\x0E-\x1B\x7F-\x9F")
-        }
-        // isIdentifierIgnorable: non-whitespace ISO control ranges plus the
-        // FORMAT (Cf) general category.
-        "javaIdentifierIgnorable" => Some(r"\x00-\x08\x0E-\x1B\x7F-\x9F\p{Cf}"),
-        "javaSpaceChar" => Some(r"\p{Z}"),
-        // isWhitespace: see the function-level doc comment above.
-        "javaWhitespace" => Some(
-            r"\x09-\x0D\x1C-\x1F\x20\u{1680}\u{2000}-\u{2006}\u{2008}-\u{200A}\u{2028}\u{2029}\u{205F}\u{3000}",
-        ),
-        "javaISOControl" => Some(r"\x00-\x1F\x7F-\x9F"),
-        "javaMirrored" => Some(r"\p{Bidi_Mirrored}"),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-mod java_predefined_class_tests {
-    use super::compile_java_regex;
-
-    fn m(pat: &str, s: &str) -> bool {
-        compile_java_regex(pat, 0)
-            .unwrap_or_else(|e| panic!("pattern {pat:?} failed to compile: {e:?}"))
-            .is_match(s)
-    }
-
-    const ALL_NAMES: &[&str] = &[
-        "javaLowerCase",
-        "javaUpperCase",
-        "javaAlphabetic",
-        "javaIdeographic",
-        "javaTitleCase",
-        "javaDigit",
-        "javaDefined",
-        "javaLetter",
-        "javaLetterOrDigit",
-        "javaJavaIdentifierStart",
-        "javaJavaIdentifierPart",
-        "javaUnicodeIdentifierStart",
-        "javaUnicodeIdentifierPart",
-        "javaIdentifierIgnorable",
-        "javaSpaceChar",
-        "javaWhitespace",
-        "javaISOControl",
-        "javaMirrored",
-    ];
-
-    #[test]
-    fn all_names_compile_positive_and_negated() {
-        for name in ALL_NAMES {
-            let pos = format!("\\p{{{name}}}");
-            compile_java_regex(&pos, 0)
-                .unwrap_or_else(|e| panic!("{pos:?} failed to compile: {e:?}"));
-            let neg = format!("\\P{{{name}}}");
-            compile_java_regex(&neg, 0)
-                .unwrap_or_else(|e| panic!("{neg:?} failed to compile: {e:?}"));
-        }
-    }
-
-    #[test]
-    fn scanner_whitespace_pattern() {
-        // java.util.Scanner.WHITESPACE_PATTERN, Scanner.java:415.
-        assert!(m(r"\p{javaWhitespace}+", " \t\n"));
-        assert!(!m(r"^\p{javaWhitespace}+$", "abc"));
-    }
-
-    #[test]
-    fn scanner_non_ascii_digit_pattern() {
-        // java.util.Scanner.NON_ASCII_DIGIT, Scanner.java:422-423. Must match
-        // a non-ASCII decimal digit but NOT an ASCII one.
-        assert!(m(r"[\p{javaDigit}&&[^0-9]]", "\u{0660}")); // ARABIC-INDIC DIGIT ZERO
-        assert!(!m(r"[\p{javaDigit}&&[^0-9]]", "5"));
-    }
-
-    #[test]
-    fn java_whitespace_excludes_nbsp_but_includes_controls() {
-        assert!(m(r"\p{javaWhitespace}", " "));
-        assert!(m(r"\p{javaWhitespace}", "\t"));
-        assert!(m(r"\p{javaWhitespace}", "\u{001C}"));
-        assert!(m(r"\p{javaWhitespace}", "\u{2028}"));
-        assert!(!m(r"\p{javaWhitespace}", "\u{00A0}"));
-        assert!(!m(r"\p{javaWhitespace}", "\u{2007}"));
-        assert!(!m(r"\p{javaWhitespace}", "\u{202F}"));
-        assert!(!m(r"\p{javaWhitespace}", "a"));
-    }
-
-    #[test]
-    fn java_space_char_includes_nbsp_unlike_whitespace() {
-        // isSpaceChar has NO non-breaking-space exclusion, unlike isWhitespace.
-        assert!(m(r"\p{javaSpaceChar}", " "));
-        assert!(m(r"\p{javaSpaceChar}", "\u{00A0}"));
-        assert!(!m(r"\p{javaSpaceChar}", "a"));
-    }
-
-    #[test]
-    fn java_digit_and_case() {
-        assert!(m(r"\p{javaDigit}", "5"));
-        assert!(!m(r"\p{javaDigit}", "a"));
-        assert!(m(r"\p{javaUpperCase}", "A"));
-        assert!(!m(r"\p{javaUpperCase}", "a"));
-        assert!(m(r"\p{javaLowerCase}", "a"));
-        assert!(!m(r"\p{javaLowerCase}", "A"));
-    }
-
-    #[test]
-    fn java_letter_vs_alphabetic_letter_number() {
-        // U+2160 ROMAN NUMERAL ONE: general category Nl (Letter_Number).
-        // isLetter() excludes it; isAlphabetic() includes it.
-        assert!(!m(r"\p{javaLetter}", "\u{2160}"));
-        assert!(m(r"\p{javaAlphabetic}", "\u{2160}"));
-        assert!(m(r"\p{javaLetter}", "a"));
-    }
-
-    #[test]
-    fn java_ideographic_and_titlecase() {
-        assert!(m(r"\p{javaIdeographic}", "\u{4E2D}")); // 中
-        assert!(!m(r"\p{javaIdeographic}", "a"));
-        assert!(m(r"\p{javaTitleCase}", "\u{01C5}")); // Dz with caron (titlecase)
-        assert!(!m(r"\p{javaTitleCase}", "a"));
-    }
-
-    #[test]
-    fn java_letter_or_digit() {
-        assert!(m(r"\p{javaLetterOrDigit}", "a"));
-        assert!(m(r"\p{javaLetterOrDigit}", "5"));
-        assert!(!m(r"\p{javaLetterOrDigit}", " "));
-    }
-
-    #[test]
-    fn java_identifier_start_and_part() {
-        assert!(m(r"\p{javaJavaIdentifierStart}", "a"));
-        assert!(m(r"\p{javaJavaIdentifierStart}", "$"));
-        assert!(m(r"\p{javaJavaIdentifierStart}", "_"));
-        assert!(!m(r"\p{javaJavaIdentifierStart}", "5"));
-        assert!(m(r"\p{javaJavaIdentifierPart}", "5"));
-        assert!(m(r"\p{javaJavaIdentifierPart}", "$"));
-    }
-
-    #[test]
-    fn unicode_identifier_start_excludes_currency_unlike_java_identifier_start() {
-        // isUnicodeIdentifierStart is ID_Start-based and does NOT special-case
-        // currency symbols, unlike isJavaIdentifierStart.
-        assert!(m(r"\p{javaUnicodeIdentifierStart}", "a"));
-        assert!(!m(r"\p{javaUnicodeIdentifierStart}", "$"));
-        assert!(m(r"\p{javaUnicodeIdentifierPart}", "5"));
-        assert!(!m(r"\p{javaUnicodeIdentifierPart}", "$"));
-    }
-
-    #[test]
-    fn java_identifier_ignorable() {
-        assert!(m(r"\p{javaIdentifierIgnorable}", "\u{0000}"));
-        assert!(!m(r"\p{javaIdentifierIgnorable}", "a"));
-    }
-
-    #[test]
-    fn java_iso_control() {
-        assert!(m(r"\p{javaISOControl}", "\u{0007}"));
-        assert!(!m(r"\p{javaISOControl}", "a"));
-    }
-
-    #[test]
-    fn java_mirrored() {
-        assert!(m(r"\p{javaMirrored}", "(")); // LEFT PARENTHESIS is mirrored
-        assert!(!m(r"\p{javaMirrored}", "a"));
-    }
-
-    #[test]
-    fn java_defined_excludes_noncharacter() {
-        assert!(m(r"\p{javaDefined}", "a"));
-        // U+FFFE is a permanently-reserved noncharacter (gc=Cn) per the
-        // Unicode stability policy, so this holds across Unicode versions.
-        assert!(!m(r"\p{javaDefined}", "\u{FFFE}"));
-        assert!(m(r"\P{javaDefined}", "\u{FFFE}"));
-    }
-
-    #[test]
-    fn negated_form_wraps_correctly() {
-        assert!(m(r"\P{javaDigit}", "a"));
-        assert!(!m(r"\P{javaDigit}", "5"));
     }
 }
 
@@ -50922,197 +44052,12 @@ pub(crate) fn read_pattern_regex(
     compile_java_regex(&source, flags)
 }
 
-fn register_regex_natives(registry: &mut NativeMethodRegistry) {
-    // Tomcat VirtualContext uses UriUtil.makeSafeForJarUrl, which calls
-    // Pattern.compile(...).matcher(...).replaceAll(...). In real-JDK mode we
-    // still force Pattern.matcher through the synthetic Rust regex bridge
-    // during bootstrap, so every Matcher method that may touch the same object
-    // must stay on that coherent synthetic surface. Letting real Matcher
-    // bytecode run on the bridge-allocated object leaves real-JDK internals
-    // such as `locals` null and fails in Matcher.reset().
-    registry.register(
-        "java/util/regex/Pattern",
-        "compile",
-        "(Ljava/lang/String;)Ljava/util/regex/Pattern;",
-        native_pattern_compile,
-    );
-    registry.register(
-        "java/util/regex/Pattern",
-        "compile",
-        "(Ljava/lang/String;I)Ljava/util/regex/Pattern;",
-        native_pattern_compile_flags,
-    );
-    registry.register(
-        "java/util/regex/Pattern",
-        "matcher",
-        "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;",
-        native_pattern_matcher,
-    );
-    registry.register(
-        "java/util/regex/Pattern",
-        "matches",
-        "(Ljava/lang/String;Ljava/lang/CharSequence;)Z",
-        native_pattern_matches_static,
-    );
-    registry.register(
-        "java/util/regex/Pattern",
-        "pattern",
-        "()Ljava/lang/String;",
-        native_pattern_pattern,
-    );
-    registry.register(
-        "java/util/regex/Pattern",
-        "flags",
-        "()I",
-        native_pattern_flags,
-    );
-    registry.register(
-        "java/util/regex/Pattern",
-        "split",
-        "(Ljava/lang/CharSequence;)[Ljava/lang/String;",
-        native_pattern_split,
-    );
-    registry.register(
-        "java/util/regex/Pattern",
-        "split",
-        "(Ljava/lang/CharSequence;I)[Ljava/lang/String;",
-        native_pattern_split_limit,
-    );
-    registry.register(
-        "java/util/regex/Pattern",
-        "quote",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        native_pattern_quote,
-    );
-
-    registry.register(
-        "java/util/regex/Matcher",
-        "find",
-        "()Z",
-        native_matcher_find,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "find",
-        "(I)Z",
-        native_matcher_find_at,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "matches",
-        "()Z",
-        native_matcher_matches,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "lookingAt",
-        "()Z",
-        native_matcher_looking_at,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "group",
-        "()Ljava/lang/String;",
-        native_matcher_group,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "group",
-        "(I)Ljava/lang/String;",
-        native_matcher_group_idx,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "group",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        native_matcher_group_named,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "groupCount",
-        "()I",
-        native_matcher_group_count,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "start",
-        "()I",
-        native_matcher_start,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "start",
-        "(I)I",
-        native_matcher_start,
-    );
-    registry.register("java/util/regex/Matcher", "end", "()I", native_matcher_end);
-    registry.register("java/util/regex/Matcher", "end", "(I)I", native_matcher_end);
-    registry.register(
-        "java/util/regex/Matcher",
-        "reset",
-        "()Ljava/util/regex/Matcher;",
-        native_matcher_reset,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "reset",
-        "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;",
-        native_matcher_reset_input,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "replaceAll",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        native_matcher_replace_all,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "replaceFirst",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        native_matcher_replace_first,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "region",
-        "(II)Ljava/util/regex/Matcher;",
-        native_matcher_region,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "regionStart",
-        "()I",
-        native_matcher_region_start,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "regionEnd",
-        "()I",
-        native_matcher_region_end,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "appendReplacement",
-        "(Ljava/lang/StringBuffer;Ljava/lang/String;)Ljava/util/regex/Matcher;",
-        native_matcher_append_replacement,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "appendTail",
-        "(Ljava/lang/StringBuffer;)Ljava/lang/StringBuffer;",
-        native_matcher_append_tail,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "quoteReplacement",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        native_matcher_quote_replacement,
-    );
-    registry.register(
-        "java/util/regex/Matcher",
-        "hasMatch",
-        "()Z",
-        native_matcher_has_match,
-    );
+fn register_regex_natives(_registry: &mut NativeMethodRegistry) {
+    // synthetic-stub removed: defers to real JDK bytecode
+    // java.util.regex.Pattern / java.util.regex.Matcher have real JDK
+    // bytecode. The previous Rust-regex-engine substitutes (which did not
+    // match Java regex semantics) are removed so the real .class bytecode
+    // runs instead.
 }
 
 fn r3_br_pending_chars() -> &'static parking_lot::Mutex<std::collections::HashMap<i32, i32>> {
@@ -51285,7 +44230,7 @@ fn native_pattern_split_impl(
 
     let string_class_id = match ctx.ensure_class_initialized("java/lang/String") {
         Ok(id) => id,
-        Err(_) => ctx.ensure_synthetic_class("java/lang/String", 8),
+        Err(_) => cratonvm_types::ClassId::new(0),
     };
     let arr = ctx.new_ref_array(string_class_id, parts.len());
     for (i, part) in parts.iter().enumerate() {
@@ -51634,7 +44579,7 @@ fn native_matcher_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         None => return Ok(Some(Value::Object(Some(ctx.create_string(&input))))),
     };
     let re = read_pattern_regex(ctx, pat_obj)?;
-    let result = re.replace_all_java(&input, replacement.as_str());
+    let result = re.replace_all(&input, replacement.as_str());
     Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
 }
 
@@ -51653,7 +44598,7 @@ fn native_matcher_replace_first(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         None => return Ok(Some(Value::Object(Some(ctx.create_string(&input))))),
     };
     let re = read_pattern_regex(ctx, pat_obj)?;
-    let result = re.replace_first_java(&input, replacement.as_str());
+    let result = re.replace_first(&input, replacement.as_str());
     Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
 }
 
@@ -52219,55 +45164,6 @@ fn rl_with<R>(key: i32, f: impl FnOnce(&mut RlState) -> R) -> R {
         fair: false,
     });
     f(st)
-}
-
-/// Wait on `obj`'s monitor for up to `timeout_ms`. The caller must already
-/// hold the monitor (via a preceding `ctx.monitor_enter(obj)`) before
-/// calling this. ALWAYS releases the monitor before returning -- including
-/// when `monitor_wait` itself errors (e.g. `InterruptedException`, which
-/// `monitor_wait` throws exactly like `Object.wait()` does on either an
-/// entry-time or wake-time interrupt).
-///
-/// A bare `ctx.monitor_wait(obj, ms)?;` immediately followed by
-/// `ctx.monitor_exit(obj);` -- the pattern this replaces -- never reaches
-/// the `monitor_exit` call when `monitor_wait` errors: the `?` returns
-/// early, permanently leaking `obj`'s monitor as held by this thread.
-/// Every subsequent `monitor_enter(obj)` on the same object (from ANY
-/// thread, including this native's own retry loop and `native_rl_unlock`'s
-/// notify step) then blocks forever.
-///
-/// Confirmed live via `gdb -p <pid> -batch -ex 'thread apply all bt'`
-/// during the Tomcat `TestWsRemoteEndpointImplServerDeadlock` investigation
-/// (2026-07-09, docs/known-issues/tomcat-08-07/wsremoteendpoint-close-delay-near-deadlock.md):
-/// every one of ~10 worker threads was piled up inside `native_rl_unlock`'s
-/// `monitor_enter`, all blocked on the same wedged monitor, after a prior
-/// `native_rl_lock` caller hit exactly this leak on a `Thread.interrupt()`.
-/// Only surfaced once real `ScheduledThreadPoolExecutor`/`ThreadPoolExecutor`
-/// contention started reaching these natives (see
-/// `docs/internal/fixed-suite-bugs/enumset-synthetic-surface-drop-realmode-FIXED.md`).
-fn monitor_wait_release(
-    ctx: &mut dyn NativeContext,
-    obj: ObjectRef,
-    timeout_ms: Option<u64>,
-) -> MethodCallResult {
-    let result = ctx.monitor_wait(obj, timeout_ms);
-    ctx.monitor_exit(obj);
-    result
-}
-
-/// `true` iff `e` is the VM's `InterruptedException` (the error
-/// `monitor_wait` raises on an entry-time or wake-time interrupt). Used by
-/// `native_rl_lock` to distinguish "must absorb and retry" (this) from any
-/// other error (must propagate).
-fn is_interrupted_exception(e: &cratonvm_types::error::MethodCallFailed) -> bool {
-    matches!(
-        e,
-        cratonvm_types::error::MethodCallFailed::InternalError(
-            cratonvm_types::error::VmError::Runtime(
-                cratonvm_types::error::RuntimeError::InterruptedException
-            )
-        )
-    )
 }
 
 const CDL_FIELD_COUNT: usize = 0;
@@ -52912,16 +45808,9 @@ fn native_module_descriptor_packages(
 }
 
 fn native_module_descriptor_is_automatic(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first().copied() {
-        Some(Value::Object(Some(o))) => o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    if let Value::Int(v) = ctx.get_field_by_name(this, "automatic") {
-        return Ok(Some(Value::Int(if v != 0 { 1 } else { 0 })));
-    }
     Ok(Some(Value::Int(0)))
 }
 
@@ -52943,45 +45832,11 @@ fn native_module_descriptor_is_open(
     Ok(Some(Value::Int(flags & 1)))
 }
 
-fn native_module_descriptor_optional_field(
+fn native_module_descriptor_optional_empty(
     ctx: &mut dyn NativeContext,
-    args: &[Value],
-    field: &str,
+    _args: &[Value],
 ) -> MethodCallResult {
-    let value = match args.first().copied() {
-        Some(Value::Object(Some(this))) => ctx.get_field_by_name(this, field),
-        _ => Value::Object(None),
-    };
-    match value {
-        Value::Object(Some(o)) => ctx.invoke(
-            "java/util/Optional",
-            "of",
-            "(Ljava/lang/Object;)Ljava/util/Optional;",
-            &[Value::Object(Some(o))],
-        ),
-        _ => ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[]),
-    }
-}
-
-fn native_module_descriptor_version(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    native_module_descriptor_optional_field(ctx, args, "version")
-}
-
-fn native_module_descriptor_raw_version(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    native_module_descriptor_optional_field(ctx, args, "rawVersionString")
-}
-
-fn native_module_descriptor_main_class(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    native_module_descriptor_optional_field(ctx, args, "mainClass")
+    ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[])
 }
 
 fn native_module_builder_new_exports_qualified(
@@ -53195,10 +46050,6 @@ fn native_module_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         for f in [
             "name",
             "version",
-            "rawVersionString",
-            "modifiers",
-            "open",
-            "automatic",
             "requires",
             "exports",
             "opens",
@@ -53677,24 +46528,14 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
         "()Z",
         native_module_descriptor_is_open,
     );
-    registry.register(
-        "java/lang/module/ModuleDescriptor",
-        "version",
-        "()Ljava/util/Optional;",
-        native_module_descriptor_version,
-    );
-    registry.register(
-        "java/lang/module/ModuleDescriptor",
-        "rawVersion",
-        "()Ljava/util/Optional;",
-        native_module_descriptor_raw_version,
-    );
-    registry.register(
-        "java/lang/module/ModuleDescriptor",
-        "mainClass",
-        "()Ljava/util/Optional;",
-        native_module_descriptor_main_class,
-    );
+    for method in ["version", "rawVersion", "mainClass"] {
+        registry.register(
+            "java/lang/module/ModuleDescriptor",
+            method,
+            "()Ljava/util/Optional;",
+            native_module_descriptor_optional_empty,
+        );
+    }
     registry.set_category(__prev_cat);
 }
 
@@ -55303,7 +48144,8 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
                     ctx.monitor_exit(this);
                     return Ok(None);
                 }
-                monitor_wait_release(ctx, this, Some(10))?;
+                ctx.monitor_wait(this, Some(10))?;
+                ctx.monitor_exit(this);
             }
         });
         registry.register(abq, "offer", "(Ljava/lang/Object;)Z", |ctx, args| {
@@ -55391,7 +48233,8 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
                     ctx.monitor_exit(this);
                     return Ok(Some(result));
                 }
-                monitor_wait_release(ctx, this, Some(10))?;
+                ctx.monitor_wait(this, Some(10))?;
+                ctx.monitor_exit(this);
             }
         });
         registry.register(abq, "poll", "()Ljava/lang/Object;", |ctx, args| {
@@ -55451,7 +48294,8 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
                         return Ok(Some(Value::Object(None))); // timed out
                     }
                     let wait_ms = bounded_monitor_wait_ms(remaining, 10);
-                    monitor_wait_release(ctx, this, Some(wait_ms))?;
+                    ctx.monitor_wait(this, Some(wait_ms))?;
+                    ctx.monitor_exit(this);
                 }
             },
         );
@@ -56136,7 +48980,8 @@ fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry) {
                     return Ok(None);
                 }
                 ctx.monitor_enter(this);
-                monitor_wait_release(ctx, this, Some(5))?;
+                ctx.monitor_wait(this, Some(5))?;
+                ctx.monitor_exit(this);
             }
         });
         // tryTransfer(E) — non-blocking: add if there's a waiting consumer
@@ -56230,7 +49075,8 @@ fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry) {
                         return Ok(Some(Value::Object(None)));
                     }
                     let wait_ms = bounded_monitor_wait_ms(remaining, 10);
-                    monitor_wait_release(ctx, this, Some(wait_ms))?;
+                    ctx.monitor_wait(this, Some(wait_ms))?;
+                    ctx.monitor_exit(this);
                 }
             },
         );
@@ -56252,7 +49098,8 @@ fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry) {
                     ctx.monitor_exit(this);
                     return Ok(Some(result));
                 }
-                monitor_wait_release(ctx, this, Some(10))?;
+                ctx.monitor_wait(this, Some(10))?;
+                ctx.monitor_exit(this);
             }
         });
         // peek() — non-blocking
@@ -56472,28 +49319,9 @@ fn native_rl_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             st.owner != RL_UNOWNED && st.owner != tid
         };
         if still_owned {
-            // `ReentrantLock.lock()` (unlike `lockInterruptibly()` /
-            // `tryLock(timeout, unit)`) is specified to never throw on
-            // interrupt -- it defers: per the `Lock#lock()` javadoc, "If the
-            // current thread... is interrupted while acquiring the lock...
-            // it will continue to wait... but upon acquiring the lock its
-            // interrupted status will be set." `monitor_wait` throws
-            // `InterruptedException` just like `Object.wait()` does (and
-            // already consumes the thread's interrupt flag when it does) --
-            // absorb that here, restore the flag via `thread_interrupt` on
-            // our own thread object, and keep retrying instead of
-            // propagating the exception out of a method that must not throw.
-            if let Err(e) = monitor_wait_release(ctx, this, Some(5)) {
-                if is_interrupted_exception(&e) {
-                    let self_thread = ctx.current_thread_object();
-                    ctx.thread_interrupt(self_thread);
-                    continue;
-                }
-                return Err(e);
-            }
-        } else {
-            ctx.monitor_exit(this);
+            ctx.monitor_wait(this, Some(5))?;
         }
+        ctx.monitor_exit(this);
     }
 }
 
@@ -56595,7 +49423,8 @@ fn native_rl_try_lock_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         }
         let wait_ms = remaining.as_millis().min(5).max(1) as u64;
         ctx.monitor_enter(this);
-        monitor_wait_release(ctx, this, Some(wait_ms))?;
+        ctx.monitor_wait(this, Some(wait_ms))?;
+        ctx.monitor_exit(this);
         if ctx.is_interrupted(true) {
             return Err(cratonvm_types::error::MethodCallFailed::InternalError(
                 cratonvm_types::error::VmError::Runtime(
@@ -59509,11 +52338,6 @@ pub(crate) fn normalize_charset_name(name: &str) -> String {
 pub(crate) const BI_FIELD_VALUE: usize = 0; // Synthetic-mode: String decimal representation
 pub(crate) const BI_FIELD_SIGNUM: usize = 1; // Synthetic-mode: Int signum (-1, 0, or 1)
 
-fn bi_alloc_mag_array(ctx: &mut dyn NativeContext, len: usize) -> ObjectRef {
-    ctx.try_new_array(cratonvm_types::ArrayElementType::Int, len)
-        .unwrap_or_else(|| ctx.new_array(cratonvm_types::ArrayElementType::Int, len))
-}
-
 /// RBIGDEC.1 — Resolve the real-JDK BigInteger field layout if available.
 ///
 /// Returns `Some((signum_idx, mag_idx))` when the JDK class is loaded with the
@@ -59646,7 +52470,7 @@ pub(crate) fn bi_alloc(ctx: &mut dyn NativeContext, value: &str) -> ObjectRef {
         // Real-JDK layout: write signum + mag[].  This is the canonical
         // representation that bytecode reads via `getfield`.
         let mag_words = decimal_to_mag_words(value);
-        let mag_arr = bi_alloc_mag_array(ctx, mag_words.len());
+        let mag_arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, mag_words.len());
         let obj = ctx.read_native_pin(h, obj);
         for (i, w) in mag_words.iter().enumerate() {
             ctx.set_array_element(mag_arr, i, Value::Int(*w as i32));
@@ -59725,7 +52549,7 @@ pub(crate) fn bi_alloc_int(ctx: &mut dyn NativeContext, v: &crate::bigint::BigIn
     let signum = v.signum();
     if let Some((sig_i, mag_i)) = bi_layout(ctx) {
         let le = v.mag_le(); // little-endian limbs
-        let mag_arr = bi_alloc_mag_array(ctx, le.len());
+        let mag_arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, le.len());
         let obj = ctx.read_native_pin(h, obj);
         // little-endian limbs → big-endian array.
         for (i, &w) in le.iter().rev().enumerate() {
@@ -59733,14 +52557,12 @@ pub(crate) fn bi_alloc_int(ctx: &mut dyn NativeContext, v: &crate::bigint::BigIn
         }
         ctx.set_field(obj, sig_i, Value::Int(signum));
         ctx.set_field(obj, mag_i, Value::Object(Some(mag_arr)));
-        ctx.unpin_native_roots(h);
         obj
     } else {
         let s = ctx.create_string(&v.to_decimal());
         let obj = ctx.read_native_pin(h, obj);
         ctx.set_field(obj, BI_FIELD_VALUE, Value::Object(Some(s)));
         ctx.set_field(obj, BI_FIELD_SIGNUM, Value::Int(signum));
-        ctx.unpin_native_roots(h);
         obj
     }
 }
@@ -60351,9 +53173,7 @@ pub(crate) fn bi_mod_inverse_str(a: &str, m: &str) -> Option<String> {
 
 #[cfg(test)]
 mod biginteger_modpow_modinverse_tests {
-    use super::{bi_alloc_int, bi_mod_inverse_str, bi_mod_pow_str};
-    use crate::bigint::BigInt;
-    use crate::test_utils::mock_ctx;
+    use super::{bi_mod_inverse_str, bi_mod_pow_str};
 
     // --- modPow sign handling (the registered native delegates to these
     //     helpers; these tests pin the underlying arithmetic that the old
@@ -60420,16 +53240,6 @@ mod biginteger_modpow_modinverse_tests {
             bi_mod_inverse_str("2", "2305843009213693951"),
             Some("1152921504606846976".to_string())
         );
-    }
-
-    #[test]
-    fn bi_alloc_int_releases_native_pin() {
-        let mut ctx = mock_ctx();
-        let value = BigInt::from_decimal("123456789012345678901234567890");
-
-        assert_eq!(ctx.native_pin_count_for_test(), 0);
-        let _ = bi_alloc_int(&mut ctx, &value);
-        assert_eq!(ctx.native_pin_count_for_test(), 0);
     }
 }
 
@@ -63228,20 +56038,14 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         "newThread",
         "(Ljava/lang/Runnable;)Ljava/lang/Thread;",
         |ctx, args| {
-            // BUG FIX (2026-07-10, ES executors-factory mainlock NPE, layer 2
-            // residual): this used to allocate a real-shaped Thread object via
-            // alloc_concurrent_synthetic and then poke 5 legacy synthetic
-            // slots — the exact same half-real pattern that made
-            // ThreadPoolExecutor's mainLock/ctl/workQueue null (see
-            // initialize_real_thread_pool_executor in phases_early.rs). A
-            // Thread built this way never runs the real constructor, so
-            // start()/start0() operate on an uninitialized `holder` and the
-            // worker never actually runs — real ThreadPoolExecutor.execute()
-            // silently never executes submitted tasks. Drive the real
-            // Thread(Runnable) constructor instead so start() works.
-            // See docs/known-issues/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe.md.
             let runnable = args.get(1).copied().unwrap_or(Value::Object(None));
-            ctx.new_object_initialized("java/lang/Thread", "(Ljava/lang/Runnable;)V", &[runnable])
+            let thread = alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5);
+            let name = ctx.create_string("pool-thread");
+            ctx.set_field(thread, 0, Value::Object(Some(name)));
+            ctx.set_field(thread, 1, Value::Int(5));
+            ctx.set_field(thread, 3, runnable);
+            ctx.set_field(thread, 4, Value::Int(0));
+            Ok(Some(Value::Object(Some(thread))))
         },
     );
     registry.set_category(__prev_cat);
@@ -63265,16 +56069,10 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        // Real ThreadPoolExecutor: run the real bytecode so the pool's own
-        // shutdown state machine transitions correctly, instead of writing
-        // the synthetic 2-field placeholder's shutdown slot (would corrupt a
-        // real field) or silently no-op'ing. See
-        // `NativeContext::invoke_virtual_bytecode_only`'s doc for why this
-        // can't just re-call `execute`/`shutdown` via `invoke_virtual` (would
-        // recurse back into this same native).
-        if executor_has_real_workers(ctx, this) {
-            ctx.invoke_virtual_bytecode_only(this, "shutdown", "()V", &[])?;
-        } else {
+        // Real ThreadPoolExecutor: don't write the synthetic shutdown slot
+        // (would corrupt a real field); its idle workers are stopped by
+        // shutdownNow() (which ExecutorService.close()/cleanup also calls).
+        if !executor_has_real_workers(ctx, this) {
             ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
         }
         Ok(None)
@@ -63313,16 +56111,10 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        // Real ThreadPoolExecutor: run the real bytecode so the pool's own
-        // shutdown state machine transitions correctly, instead of writing
-        // the synthetic 2-field placeholder's shutdown slot (would corrupt a
-        // real field) or silently no-op'ing. See
-        // `NativeContext::invoke_virtual_bytecode_only`'s doc for why this
-        // can't just re-call `execute`/`shutdown` via `invoke_virtual` (would
-        // recurse back into this same native).
-        if executor_has_real_workers(ctx, this) {
-            ctx.invoke_virtual_bytecode_only(this, "shutdown", "()V", &[])?;
-        } else {
+        // Real ThreadPoolExecutor: don't write the synthetic shutdown slot
+        // (would corrupt a real field); its idle workers are stopped by
+        // shutdownNow() (which ExecutorService.close()/cleanup also calls).
+        if !executor_has_real_workers(ctx, this) {
             ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
         }
         Ok(None)
@@ -63496,22 +56288,6 @@ fn native_new_cached_pool(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
 }
 
 fn native_es_submit_runnable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // A genuinely-real ThreadPoolExecutor (e.g. one `new`'d directly by app
-    // code, or the internal async worker pool below) shares this exact class
-    // name with CratonVM's synthetic 2-field placeholder — dispatch straight
-    // to its real bytecode instead of the single-threaded synthetic model, via
-    // `invoke_virtual_bytecode_only` (plain `invoke_virtual` would recurse
-    // back into this same native). See that method's doc for the rationale.
-    if let Some(Value::Object(Some(this))) = args.first() {
-        if executor_has_real_workers(ctx, *this) {
-            return ctx.invoke_virtual_bytecode_only(
-                *this,
-                "submit",
-                "(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;",
-                &args[1..],
-            );
-        }
-    }
     // Execute the Runnable immediately (single-threaded model)
     if let Some(Value::Object(Some(runnable))) = args.get(1) {
         let _ = ctx.invoke_virtual(*runnable, "run", "()V", &[]);
@@ -63523,17 +56299,6 @@ fn native_es_submit_runnable(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn native_es_submit_callable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // See `native_es_submit_runnable` above — same real-vs-synthetic split.
-    if let Some(Value::Object(Some(this))) = args.first() {
-        if executor_has_real_workers(ctx, *this) {
-            return ctx.invoke_virtual_bytecode_only(
-                *this,
-                "submit",
-                "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
-                &args[1..],
-            );
-        }
-    }
     let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2);
     if let Some(Value::Object(Some(callable))) = args.get(1) {
         let result = ctx.invoke_virtual(*callable, "call", "()Ljava/lang/Object;", &[])?;
@@ -63548,35 +56313,15 @@ fn native_es_submit_callable(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn native_es_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // A genuinely-real ThreadPoolExecutor shares this exact class name with
-    // CratonVM's synthetic 2-field placeholder (`Executors.newSingleThreadExecutor()`
-    // et al., AND the internal async worker pool this function itself hands
-    // work to below) — dispatch straight to real bytecode instead of the
-    // synthetic model. This is also what breaks the recursion: the async
-    // pool's own `execute()` call (via `spawn_runnable_on_real_thread` below)
-    // lands right back on this native, since its receiver's class is also
-    // "ThreadPoolExecutor" — routing it to `invoke_virtual_bytecode_only`
-    // (which skips native lookup) instead of looping back through
-    // `invoke_virtual`/this native again. See that method's doc for the
-    // full rationale.
-    if let Some(Value::Object(Some(this))) = args.first() {
-        if executor_has_real_workers(ctx, *this) {
-            return ctx.invoke_virtual_bytecode_only(
-                *this,
-                "execute",
-                "(Ljava/lang/Runnable;)V",
-                &args[1..],
-            );
-        }
-    }
     // HANGS-0706b: `Executor.execute(Runnable)` is a fire-and-forget contract --
     // callers are entitled to assume the submitted task runs independently of
     // the calling thread. The prior eager-inline body (`runnable.run()` on the
     // caller) silently violated that contract for every executor created via
     // `Executors.newSingleThreadExecutor()` / `newFixedThreadPool()` /
-    // `newCachedThreadPool()` (CratonVM's synthetic 2-field executor). Any
-    // task that blocks waiting for a signal only the SUBMITTING thread can
-    // later deliver -- e.g.
+    // `newCachedThreadPool()` (the only factories intercepted here -- see
+    // `native_new_single_thread` et al., always CratonVM's synthetic 2-field
+    // executor, never a real `ThreadPoolExecutor`). Any task that blocks
+    // waiting for a signal only the SUBMITTING thread can later deliver -- e.g.
     // Spring's `OutputStreamPublisher`/`SubscriberInputStream` Flow adapters,
     // whose `LockSupport.park()`/`resume()` handshake assumes the publisher
     // body runs on a thread other than the one calling `subscribe()` -- self-
@@ -63590,14 +56335,6 @@ fn native_es_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // apply the same fix here: hand the task to the shared bounded real
     // `ThreadPoolExecutor` so it runs on an actual worker thread and the
     // caller returns immediately, matching HotSpot's `execute()` semantics.
-    //
-    // (A second, now-redundant `executor_has_real_workers` guard used to
-    // live here — added by a parallel same-day fix as defense-in-depth,
-    // degrading a real receiver to synchronous inline execution. Removed:
-    // the check at the top of this function already returns before this
-    // point is ever reached for a real receiver, and does so via real
-    // bytecode — genuine async semantics — rather than a synchronous
-    // fallback.)
     if let Some(Value::Object(Some(runnable))) = args.get(1) {
         return spawn_runnable_on_real_thread(ctx, *runnable);
     }
@@ -64067,7 +56804,8 @@ fn native_fut_get_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let wait_ms = remaining.as_millis().min(5).max(1) as u64;
         ctx.monitor_enter(this);
-        monitor_wait_release(ctx, this, Some(wait_ms))?;
+        ctx.monitor_wait(this, Some(wait_ms))?;
+        ctx.monitor_exit(this);
     }
 }
 
@@ -74795,7 +67533,7 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         .class_name_of_id(handler_cid)
         .unwrap_or_else(|| "java/lang/reflect/InvocationHandler".to_string());
 
-    // Real annotations: when the proxy's InvocationHandler is the
+    // CRATONVM_REAL_ANNOTATIONS: when the proxy's InvocationHandler is the
     // synthetic AnnotationProxy carrying the member data, the generated `$ProxyN`
     // method bodies reach here (the cached/dead-code dispatch path that a 2nd
     // call site falls into, bypassing `proxy_invoke_handler_shared`). Calling
@@ -74833,7 +67571,7 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                     Some(arr) if ctx.array_length(arr) > 0 => ctx.get_array_element(arr, 0),
                     _ => Value::Object(None),
                 };
-                // In real-annotation mode every annotation is a real
+                // Under CRATONVM_REAL_ANNOTATIONS every annotation is a real
                 // `$ProxyN`, so the `other` argument is typically ALSO a real
                 // proxy (not a bare AnnotationProxy) — unwrap it to its
                 // AnnotationProxy handler (slot 0) before comparing, mirroring
@@ -80988,30 +73726,6 @@ mod concurrency_tests {
     }
 
     /// RD.2 — AtomicReference CAS uses reference identity, not .equals().
-    #[test]
-    fn atomic_reference_to_string_delegates_to_value() {
-        let reg = register_atomics();
-        let ar = "java/util/concurrent/atomic/AtomicReference";
-        let mut ctx = make_ctx();
-        let obj = alloc_concurrent_synthetic(&mut ctx, ar, 1);
-        let value = ctx.create_string("CLOSED");
-
-        let init = reg.find(ar, "<init>", "(Ljava/lang/Object;)V").unwrap();
-        init(
-            &mut ctx,
-            &[Value::Object(Some(obj)), Value::Object(Some(value))],
-        )
-        .unwrap();
-
-        let to_string = reg.find(ar, "toString", "()Ljava/lang/String;").unwrap();
-        let result = to_string(&mut ctx, &[Value::Object(Some(obj))]).unwrap();
-        let rendered = match result {
-            Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap(),
-            other => panic!("AtomicReference.toString returned {other:?}"),
-        };
-        assert_eq!(rendered, "CLOSED");
-    }
-
     #[test]
     fn rd2_atomic_reference_identity_cas() {
         let reg = register_atomics();

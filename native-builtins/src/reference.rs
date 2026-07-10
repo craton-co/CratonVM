@@ -27,7 +27,21 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::Value;
 
-use crate::{REF_FIELD_QUEUE, REF_FIELD_REFERENT, RQ_FIELD_HEAD, RQ_FIELD_SIZE};
+use crate::{REF_FIELD_NEXT, REF_FIELD_QUEUE, REF_FIELD_REFERENT, RQ_FIELD_HEAD, RQ_FIELD_SIZE};
+
+/// Queue-linkage slot for a Reference: the real-JDK `next` field (slot 2 of
+/// referent/queue/next/discovered) when the object has one; the legacy
+/// referent-slot fallback otherwise (old synthetic 2-field shape). Reusing
+/// the REFERENT slot as the next pointer made `get()` on an
+/// enqueued-but-unpolled WeakReference return the NEXT queue element instead
+/// of null. Both the enqueue and poll sides must agree, so they share this.
+fn ref_next_slot(ctx: &mut dyn NativeContext, ref_obj: cratonvm_types::ObjectRef) -> usize {
+    if ctx.object_num_fields(ref_obj) > REF_FIELD_NEXT {
+        REF_FIELD_NEXT
+    } else {
+        REF_FIELD_REFERENT
+    }
+}
 
 /// Register every `java.lang.ref.*` native. Called from
 /// `register_essential_natives` in `lib.rs`.
@@ -307,12 +321,16 @@ fn native_ref_enqueue(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let queue = ctx.get_field(this, REF_FIELD_QUEUE);
     match queue {
         Value::Object(Some(q)) => {
-            // Push this reference onto the queue's linked list head
+            // JDK 9+ semantics: `enqueue()` clears the referent before
+            // adding to the queue.
+            ctx.set_field(this, REF_FIELD_REFERENT, Value::Object(None));
+            // Push this reference onto the queue's linked list head,
+            // linked through the `next` slot (see `ref_next_slot` — NOT
+            // the referent, which must keep reading null after enqueue).
             let old_head = ctx.get_field(q, RQ_FIELD_HEAD);
             ctx.set_field(q, RQ_FIELD_HEAD, Value::Object(Some(this)));
-            // Use the referent field as a "next" pointer for queued references
-            // (referent is cleared when enqueued anyway)
-            ctx.set_field(this, REF_FIELD_REFERENT, old_head);
+            let next_slot = ref_next_slot(ctx, this);
+            ctx.set_field(this, next_slot, old_head);
             // Increment size
             let size = match ctx.get_field(q, RQ_FIELD_SIZE) {
                 Value::Int(v) => v,
@@ -405,11 +423,17 @@ fn native_rq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let head = ctx.get_field(this, RQ_FIELD_HEAD);
     match head {
         Value::Object(Some(ref_obj)) => {
-            // Pop from linked list — the reference's referent field is used as "next"
-            let next = ctx.get_field(ref_obj, REF_FIELD_REFERENT);
+            // Pop from linked list — linked through the `next` slot (or the
+            // legacy referent-slot fallback; see `ref_next_slot`).
+            let next_slot = ref_next_slot(ctx, ref_obj);
+            let next = ctx.get_field(ref_obj, next_slot);
             ctx.set_field(this, RQ_FIELD_HEAD, next);
-            // Clear the popped reference's referent
-            ctx.set_field(ref_obj, REF_FIELD_REFERENT, Value::Object(None));
+            // Detach the popped reference from the list and clear its
+            // enqueued state (JDK: poll sets queue = null, so isEnqueued()
+            // reads false afterwards). The referent stays whatever it was —
+            // null for GC-cleared/enqueued references.
+            ctx.set_field(ref_obj, next_slot, Value::Object(None));
+            ctx.set_field(ref_obj, REF_FIELD_QUEUE, Value::Object(None));
             // Decrement size
             let size = match ctx.get_field(this, RQ_FIELD_SIZE) {
                 Value::Int(v) => v,
