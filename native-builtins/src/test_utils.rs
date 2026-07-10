@@ -772,6 +772,12 @@ impl MockNativeContext {
         }
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn global_root_count(&self) -> usize {
+        // SAFETY: single-threaded test code.
+        unsafe { (&*self.global_roots.get()).len() }
+    }
+
     /// CGLIB-η: read the `loader_id` of the most recent
     /// `define_class_full` call. `None` if no call has been made yet.
     #[allow(dead_code)]

@@ -35529,6 +35529,7 @@ mod tests {
             &[Value::Object(Some(tl)), Value::Object(Some(s))],
         )
         .unwrap();
+        assert_eq!(shared.jni_global_refs.lock().count(), 1);
         // get returns the value
         let val = call_native(
             &shared,
@@ -35541,6 +35542,35 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(val, Value::Object(Some(s)));
+        // replacing an object-valued ThreadLocal drops the old root
+        let s2 = {
+            let mut ctx = NativeContextImpl {
+                shared: &shared,
+                thread: &mut thread,
+            };
+            ctx.create_string("world")
+        };
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ThreadLocal",
+            "set",
+            "(Ljava/lang/Object;)V",
+            &[Value::Object(Some(tl)), Value::Object(Some(s2))],
+        )
+        .unwrap();
+        assert_eq!(shared.jni_global_refs.lock().count(), 1);
+        let val = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ThreadLocal",
+            "get",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(tl))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(val, Value::Object(Some(s2)));
         // remove clears it
         call_native(
             &shared,
@@ -35551,6 +35581,7 @@ mod tests {
             &[Value::Object(Some(tl))],
         )
         .unwrap();
+        assert_eq!(shared.jni_global_refs.lock().count(), 0);
         let val = call_native(
             &shared,
             &mut thread,
@@ -35562,6 +35593,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(val, Value::Object(None));
+        assert_eq!(shared.jni_global_refs.lock().count(), 0);
     }
 
     #[test]

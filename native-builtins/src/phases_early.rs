@@ -3391,7 +3391,7 @@ const TL_FIELD_VALUE: usize = 0;
 
 std::thread_local! {
     /// Per-OS-thread map: TL identity hash → value held by this thread.
-    static TL_MAP: std::cell::RefCell<rustc_hash::FxHashMap<i32, Value>> =
+    static TL_MAP: std::cell::RefCell<rustc_hash::FxHashMap<i32, ThreadLocalStoredValue>> =
         std::cell::RefCell::new(rustc_hash::FxHashMap::default());
     /// One-shot flag: has this OS thread drained any inherited ITL entries
     /// queued for the Java Thread it is running? Reset path: not needed
@@ -3432,12 +3432,50 @@ pub(crate) fn tl_inheritable_ids() -> &'static parking_lot::Mutex<rustc_hash::Fx
 /// Map from a child Java Thread's identity hash → snapshot of inherited
 /// (TL idhash → value) entries to seed when that thread first accesses
 /// any ThreadLocal. Consumed (drained) exactly once per OS thread.
-pub(crate) fn tl_inherited_pending(
-) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, rustc_hash::FxHashMap<i32, Value>>> {
+pub(crate) fn tl_inherited_pending() -> &'static parking_lot::Mutex<
+    rustc_hash::FxHashMap<i32, rustc_hash::FxHashMap<i32, ThreadLocalStoredValue>>,
+> {
     static S: std::sync::OnceLock<
-        parking_lot::Mutex<rustc_hash::FxHashMap<i32, rustc_hash::FxHashMap<i32, Value>>>,
+        parking_lot::Mutex<
+            rustc_hash::FxHashMap<i32, rustc_hash::FxHashMap<i32, ThreadLocalStoredValue>>,
+        >,
     > = std::sync::OnceLock::new();
     S.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ThreadLocalStoredValue {
+    Root { handle: usize, fallback: ObjectRef },
+    Plain(Value),
+}
+
+#[inline]
+fn tl_value_to_java(ctx: &dyn NativeContext, stored: ThreadLocalStoredValue) -> Value {
+    match stored {
+        ThreadLocalStoredValue::Root { handle, fallback } => ctx
+            .resolve_global_root(handle)
+            .map(|obj| Value::Object(Some(obj)))
+            .unwrap_or(Value::Object(Some(fallback))),
+        ThreadLocalStoredValue::Plain(value) => value,
+    }
+}
+
+#[inline]
+fn tl_value_from_java(ctx: &mut dyn NativeContext, value: Value) -> ThreadLocalStoredValue {
+    match value {
+        Value::Object(Some(obj)) => ThreadLocalStoredValue::Root {
+            handle: ctx.add_global_root(obj),
+            fallback: obj,
+        },
+        other => ThreadLocalStoredValue::Plain(other),
+    }
+}
+
+#[inline]
+fn tl_drop_value_root(ctx: &mut dyn NativeContext, stored: ThreadLocalStoredValue) {
+    if let ThreadLocalStoredValue::Root { handle, .. } = stored {
+        let _ = ctx.remove_global_root(handle);
+    }
 }
 
 /// On the first TL access from this OS thread, drain any inherited ITL
@@ -3456,7 +3494,11 @@ fn drain_inherited_for_current_thread(ctx: &mut dyn NativeContext) {
         TL_MAP.with(|m| {
             let mut map = m.borrow_mut();
             for (k, v) in entries {
-                map.entry(k).or_insert(v);
+                if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(k) {
+                    slot.insert(v);
+                } else {
+                    tl_drop_value_root(ctx, v);
+                }
             }
         });
     }
@@ -3528,7 +3570,7 @@ fn native_tl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     drain_inherited_for_current_thread(ctx);
     let key = tl_key(ctx, this);
     if let Some(v) = TL_MAP.with(|m| m.borrow().get(&key).copied()) {
-        return Ok(Some(v));
+        return Ok(Some(tl_value_to_java(ctx, v)));
     }
     // Miss path: if a supplier was registered via `withInitial`, invoke it
     // on the current thread, cache the result, and return.
@@ -3544,10 +3586,11 @@ fn native_tl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         let initial = ctx
             .invoke_virtual(s, "get", "()Ljava/lang/Object;", &[])?
             .unwrap_or(Value::Object(None));
+        let stored = tl_value_from_java(ctx, initial);
         TL_MAP.with(|m| {
-            m.borrow_mut().insert(key, initial);
+            m.borrow_mut().insert(key, stored);
         });
-        return Ok(Some(initial));
+        return Ok(Some(tl_value_to_java(ctx, stored)));
     }
     // JDK ThreadLocal.get() calls initialValue() on first access and caches
     // even a null result. Mockito's ThreadSafeMockingProgress uses an
@@ -3556,10 +3599,11 @@ fn native_tl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let initial = ctx
         .invoke_virtual(this, "initialValue", "()Ljava/lang/Object;", &[])?
         .unwrap_or(Value::Object(None));
+    let stored = tl_value_from_java(ctx, initial);
     TL_MAP.with(|m| {
-        m.borrow_mut().insert(key, initial);
+        m.borrow_mut().insert(key, stored);
     });
-    Ok(Some(initial))
+    Ok(Some(tl_value_to_java(ctx, stored)))
 }
 
 fn native_tl_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3567,9 +3611,11 @@ fn native_tl_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     drain_inherited_for_current_thread(ctx);
     let val = args.get(1).copied().unwrap_or(Value::Object(None));
     let key = tl_key(ctx, this);
-    TL_MAP.with(|m| {
-        m.borrow_mut().insert(key, val);
-    });
+    let stored = tl_value_from_java(ctx, val);
+    let old = TL_MAP.with(|m| m.borrow_mut().insert(key, stored));
+    if let Some(old) = old {
+        tl_drop_value_root(ctx, old);
+    }
     Ok(None)
 }
 
@@ -3577,9 +3623,10 @@ fn native_tl_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let this = obj_arg(args, 0)?;
     drain_inherited_for_current_thread(ctx);
     let key = tl_key(ctx, this);
-    TL_MAP.with(|m| {
-        m.borrow_mut().remove(&key);
-    });
+    let old = TL_MAP.with(|m| m.borrow_mut().remove(&key));
+    if let Some(old) = old {
+        tl_drop_value_root(ctx, old);
+    }
     Ok(None)
 }
 
@@ -3618,17 +3665,21 @@ fn native_tl_with_initial(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// first `get()` will invoke its own supplier copy. That matches JDK
 /// semantics: `InheritableThreadLocal` inherits only set values, and
 /// `withInitial` ThreadLocals are not inheritable by default anyway.
-pub(crate) fn snapshot_inheritable_tl_entries() -> Option<rustc_hash::FxHashMap<i32, Value>> {
+pub(crate) fn snapshot_inheritable_tl_entries(
+    ctx: &mut dyn NativeContext,
+) -> Option<rustc_hash::FxHashMap<i32, ThreadLocalStoredValue>> {
     let inheritable = tl_inheritable_ids().lock();
     if inheritable.is_empty() {
         return None;
     }
-    let snap: rustc_hash::FxHashMap<i32, Value> = TL_MAP.with(|m| {
+    let snap: rustc_hash::FxHashMap<i32, ThreadLocalStoredValue> = TL_MAP.with(|m| {
         let map = m.borrow();
-        map.iter()
-            .filter(|(k, _)| inheritable.contains(k))
-            .map(|(k, v)| (*k, *v))
-            .collect()
+        let mut snap = rustc_hash::FxHashMap::default();
+        for (k, v) in map.iter().filter(|(k, _)| inheritable.contains(k)) {
+            let value = tl_value_to_java(ctx, *v);
+            snap.insert(*k, tl_value_from_java(ctx, value));
+        }
+        snap
     });
     if snap.is_empty() {
         None
@@ -3642,7 +3693,7 @@ pub(crate) fn snapshot_inheritable_tl_entries() -> Option<rustc_hash::FxHashMap<
 /// `drain_inherited_for_current_thread`.
 pub(crate) fn queue_inherited_tl_for_child(
     child_thread_hash: i32,
-    snapshot: rustc_hash::FxHashMap<i32, Value>,
+    snapshot: rustc_hash::FxHashMap<i32, ThreadLocalStoredValue>,
 ) {
     tl_inherited_pending()
         .lock()
@@ -19361,8 +19412,32 @@ fn native_scanner_find_within_horizon_string_int(
 mod t2_tests {
     use super::*;
     use crate::test_utils::{mock_ctx, MockNativeContext};
-    use cratonvm_types::{ArrayElementType, ObjectRef};
+    use cratonvm_types::{ArrayElementType, ClassId, ObjectRef};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn t2_thread_local_object_values_are_global_rooted() {
+        let mut ctx = mock_ctx();
+        let obj1 = ctx.alloc_object(ClassId::new(41), 0);
+        let stored1 = tl_value_from_java(&mut ctx, Value::Object(Some(obj1)));
+        assert_eq!(ctx.global_root_count(), 1);
+        assert_eq!(tl_value_to_java(&ctx, stored1), Value::Object(Some(obj1)));
+
+        let obj2 = ctx.alloc_object(ClassId::new(42), 0);
+        let stored2 = tl_value_from_java(&mut ctx, Value::Object(Some(obj2)));
+        assert_eq!(ctx.global_root_count(), 2);
+
+        tl_drop_value_root(&mut ctx, stored1);
+        assert_eq!(ctx.global_root_count(), 1);
+        assert_eq!(tl_value_to_java(&ctx, stored2), Value::Object(Some(obj2)));
+
+        tl_drop_value_root(&mut ctx, stored2);
+        assert_eq!(ctx.global_root_count(), 0);
+
+        let plain = tl_value_from_java(&mut ctx, Value::Int(7));
+        assert_eq!(ctx.global_root_count(), 0);
+        assert_eq!(tl_value_to_java(&ctx, plain), Value::Int(7));
+    }
 
     // -----------------------------------------------------------------------
     // T2.3.13: StringTokenizer.countTokens — O(n) single pass

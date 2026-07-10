@@ -438,10 +438,7 @@ fn native_input_stream_reader_close(
     Ok(None)
 }
 
-fn native_output_stream_write_all(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_output_stream_write_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -18657,6 +18654,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     crate::phases_late::register_bc_blake2s_digest(registry);
     // BouncyCastle Keccak absorb/extract/permutation fast-path for CSHAKE/KMAC.
     crate::phases_late::register_bc_keccak_digest(registry);
+    // BouncyCastle legacy GOST3411 compression-block fast-path for the
+    // million-'a' digest regression under the org/bouncycastle JIT ban.
+    crate::phases_late::register_bc_gost3411_digest(registry);
+    // BouncyCastle Whirlpool update/compression fast-path for the million-'a'
+    // digest regression under the same package JIT ban.
+    crate::phases_late::register_bc_whirlpool_digest(registry);
+    // BouncyCastle Poly1305 accumulator/finalization fast-path for standalone
+    // Poly1305 and ChaCha20-Poly1305 regression vectors under the BC JIT ban.
+    crate::phases_late::register_bc_poly1305(registry);
     // BouncyCastle SCrypt SMix/BlockMix fast-path for crypto regression.
     crate::phases_late::register_bc_scrypt_generator(registry);
     // BouncyCastle Argon2 block-round fast-path for crypto regression.
