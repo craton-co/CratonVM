@@ -95,16 +95,35 @@ consider keying inflated monitors by identity hash instead of address.
 Affects all moving collections; Generational is only shielded by its
 non-moving-under-JIT sweep.
 
+SHARPENED (2026-07-10, INT-3 validation): the BinaryTrees(16) wrong total
+reproduces SINGLE-THREADED under G1+JIT (~89.3k vs HotSpot 14723759;
+run-varying; 100% exact with `--nojit`), identical with the INT-3 takeover
+on and off — so this family has a single-threaded component (deep-recursion
+JIT frame roots vs. evacuation, despite the wave-1 initiator pin-in-place)
+that the multi-thread barrier/monitor races above cannot explain. The
+earlier "single-threaded runs are 100% exact" note was measured on the
+churn probes, not on deep recursion. Also: Gen+JIT BinaryTrees(16)
+produces no output within 600s on BOTH the wave-3 dev binary and the INT-3
+binary (pre-existing; JIT-frame-scan throughput class, cf. BUG-01).
+
 ## 2. G1/ZGC: STW hang risk when a JIT thread never polls (INT-3)
 `stw_take_over_and_wait` falls back to a plain unbounded `wait_for_all()`
 for non-Generational backends (`supports_jit_tlab_skip()` was
 Generational-only). A compiled loop that neither allocates nor re-enters
 the interpreter never arrives → whole-VM livelock under G1/ZGC + JIT.
 
-**G1 core fix IMPLEMENTED (2026-07-10, branch
-`claude/xenodochial-bun-89be77`) — pending Linux load validation
-(MTChurn/BinaryTrees G1+JIT, `/data/data/gcprobes-0710`); do not treat as
-fixed until that passes.** The xt-takeover now engages under G1:
+**G1 core fix LANDED + LOAD-VALIDATED (2026-07-10, Azure probe host,
+binary `gcprobes-0710/cratonvm-int3g1xt`).** Validation: new `SpinPoll`
+probe (4 threads in a compiled, allocation-free, never-polling spin while
+main forces 60 G1 GCs — the exact INT-3 shape) is HotSpot-exact 4/4 with
+per-pause takeover telemetry (`linux took over tid=… 9 conservative
+roots` + `pin_regions={0}` every young pause; the legacy path on the same
+binary instead runs GC against stale snapshots — the corruption mode);
+MTChurn G1+JIT 10/10 exact; ChurnCheck/CopyChurn/HumongousCheck/RefCheck
+HotSpot-identical on G1; Generational unchanged (MTChurn 5/5, SpinPoll
+exact); gc lib suite 775/775 on Linux. BinaryTrees G1+JIT stays wrong
+pre- AND post-fix — that is finding 1's (sharpened) single-threaded
+component, see above. The xt-takeover now engages under G1:
 (a) frozen peers' un-retired TLAB tails are published to the G1 heap
 (`G1Collector::set_jit_tlab_skip_regions`) and every linear region walker
 (all 9 `gap_filler_len` sites) strides over them; (b) regions holding a
