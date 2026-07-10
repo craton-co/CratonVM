@@ -2031,7 +2031,11 @@ fn sha1(data: &[u8]) -> [u8; 20] {
 /// `issuer_spki_der`/`issuer_subject_der` (either the next cert up the chain,
 /// or the matched trust anchor's own cert when `subject` is signed directly
 /// by the anchor).
-fn build_cert_id(subject: &ParsedCert, issuer_subject_der: &[u8], issuer_spki_der: &[u8]) -> Option<CertId> {
+fn build_cert_id(
+    subject: &ParsedCert,
+    issuer_subject_der: &[u8],
+    issuer_spki_der: &[u8],
+) -> Option<CertId> {
     // issuer_key_hash = SHA-1 over the raw key bits (the SubjectPublicKeyInfo
     // BIT STRING's content, minus its leading unused-bits-count byte) — NOT
     // over the whole SPKI SEQUENCE. RFC 6960 §4.1.1 defines this as
@@ -2059,7 +2063,10 @@ fn der_encode_length(len: usize, out: &mut Vec<u8>) {
         out.push(len as u8);
     } else {
         let bytes = len.to_be_bytes();
-        let first_nonzero = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len() - 1);
+        let first_nonzero = bytes
+            .iter()
+            .position(|&b| b != 0)
+            .unwrap_or(bytes.len() - 1);
         let sig = &bytes[first_nonzero..];
         out.push(0x80 | sig.len() as u8);
         out.extend_from_slice(sig);
@@ -2189,33 +2196,40 @@ fn parse_ocsp_response(der: &[u8]) -> Result<BasicOcspResponse, String> {
             6 => "unauthorized",
             _ => "unknown-status",
         };
-        return Err(format!("responder returned non-successful status: {name} ({status_code})"));
+        return Err(format!(
+            "responder returned non-successful status: {name} ({status_code})"
+        ));
     }
     let rb_outer = read_tlv(status.rest).map_err(|e| format!("responseBytes: {e}"))?;
     if rb_outer.tag != TAG_CONTEXT_0 {
         return Err("successful response with no responseBytes".to_string());
     }
-    let rb = read_tlv_tagged(rb_outer.content, TAG_SEQUENCE).map_err(|e| format!("ResponseBytes: {e}"))?;
-    let response_type = read_tlv_tagged(rb.content, TAG_OID).map_err(|e| format!("responseType: {e}"))?;
+    let rb = read_tlv_tagged(rb_outer.content, TAG_SEQUENCE)
+        .map_err(|e| format!("ResponseBytes: {e}"))?;
+    let response_type =
+        read_tlv_tagged(rb.content, TAG_OID).map_err(|e| format!("responseType: {e}"))?;
     if response_type.content != OID_OCSP_BASIC_RESPONSE {
         return Err("unsupported OCSP responseType (not id-pkix-ocsp-basic)".to_string());
     }
-    let response_octets =
-        read_tlv_tagged(response_type.rest, TAG_OCTET_STRING).map_err(|e| format!("response: {e}"))?;
+    let response_octets = read_tlv_tagged(response_type.rest, TAG_OCTET_STRING)
+        .map_err(|e| format!("response: {e}"))?;
 
     // BasicOCSPResponse ::= SEQUENCE { tbsResponseData, signatureAlgorithm,
     //   signature BIT STRING, certs [0] EXPLICIT SEQUENCE OF Certificate OPTIONAL }
-    let basic =
-        read_tlv_tagged(response_octets.content, TAG_SEQUENCE).map_err(|e| format!("BasicOCSPResponse: {e}"))?;
-    let tbs_response_data =
-        read_tlv_tagged(basic.content, TAG_SEQUENCE).map_err(|e| format!("tbsResponseData: {e}"))?;
+    let basic = read_tlv_tagged(response_octets.content, TAG_SEQUENCE)
+        .map_err(|e| format!("BasicOCSPResponse: {e}"))?;
+    let tbs_response_data = read_tlv_tagged(basic.content, TAG_SEQUENCE)
+        .map_err(|e| format!("tbsResponseData: {e}"))?;
     let tbs_response_data_der = tbs_response_data.full.to_vec();
 
-    let sig_alg = read_tlv_tagged(tbs_response_data.rest, TAG_SEQUENCE).map_err(|e| format!("signatureAlgorithm: {e}"))?;
-    let sig_alg_oid = read_tlv_tagged(sig_alg.content, TAG_OID).map_err(|e| format!("sigAlg OID: {e}"))?;
+    let sig_alg = read_tlv_tagged(tbs_response_data.rest, TAG_SEQUENCE)
+        .map_err(|e| format!("signatureAlgorithm: {e}"))?;
+    let sig_alg_oid =
+        read_tlv_tagged(sig_alg.content, TAG_OID).map_err(|e| format!("sigAlg OID: {e}"))?;
     let signature_algorithm_oid = sig_alg_oid.content.to_vec();
 
-    let sig_bs = read_tlv_tagged(sig_alg.rest, TAG_BIT_STRING).map_err(|e| format!("signature: {e}"))?;
+    let sig_bs =
+        read_tlv_tagged(sig_alg.rest, TAG_BIT_STRING).map_err(|e| format!("signature: {e}"))?;
     let signature = if sig_bs.content.is_empty() {
         Vec::new()
     } else {
@@ -2251,10 +2265,12 @@ fn parse_ocsp_response(der: &[u8]) -> Result<BasicOcspResponse, String> {
     let responder_id = read_tlv(rd_cursor).map_err(|e| format!("responderID: {e}"))?;
     rd_cursor = responder_id.rest;
     // producedAt GeneralizedTime
-    let produced_at = read_tlv_tagged(rd_cursor, TAG_GENERALIZED_TIME).map_err(|e| format!("producedAt: {e}"))?;
+    let produced_at =
+        read_tlv_tagged(rd_cursor, TAG_GENERALIZED_TIME).map_err(|e| format!("producedAt: {e}"))?;
     rd_cursor = produced_at.rest;
     // responses SEQUENCE OF SingleResponse
-    let responses_seq = read_tlv_tagged(rd_cursor, TAG_SEQUENCE).map_err(|e| format!("responses: {e}"))?;
+    let responses_seq =
+        read_tlv_tagged(rd_cursor, TAG_SEQUENCE).map_err(|e| format!("responses: {e}"))?;
 
     let mut responses = Vec::new();
     let mut sc = responses_seq.content;
@@ -2268,14 +2284,16 @@ fn parse_ocsp_response(der: &[u8]) -> Result<BasicOcspResponse, String> {
 
         // CertID ::= SEQUENCE { hashAlgorithm, issuerNameHash OCTET STRING,
         //   issuerKeyHash OCTET STRING, serialNumber INTEGER }
-        let cert_id = read_tlv_tagged(sr.content, TAG_SEQUENCE).map_err(|e| format!("CertID: {e}"))?;
-        let hash_alg = read_tlv_tagged(cert_id.content, TAG_SEQUENCE).map_err(|e| format!("CertID.hashAlgorithm: {e}"))?;
-        let issuer_name_hash =
-            read_tlv_tagged(hash_alg.rest, TAG_OCTET_STRING).map_err(|e| format!("issuerNameHash: {e}"))?;
-        let issuer_key_hash =
-            read_tlv_tagged(issuer_name_hash.rest, TAG_OCTET_STRING).map_err(|e| format!("issuerKeyHash: {e}"))?;
-        let serial =
-            read_tlv_tagged(issuer_key_hash.rest, TAG_INTEGER).map_err(|e| format!("CertID.serialNumber: {e}"))?;
+        let cert_id =
+            read_tlv_tagged(sr.content, TAG_SEQUENCE).map_err(|e| format!("CertID: {e}"))?;
+        let hash_alg = read_tlv_tagged(cert_id.content, TAG_SEQUENCE)
+            .map_err(|e| format!("CertID.hashAlgorithm: {e}"))?;
+        let issuer_name_hash = read_tlv_tagged(hash_alg.rest, TAG_OCTET_STRING)
+            .map_err(|e| format!("issuerNameHash: {e}"))?;
+        let issuer_key_hash = read_tlv_tagged(issuer_name_hash.rest, TAG_OCTET_STRING)
+            .map_err(|e| format!("issuerKeyHash: {e}"))?;
+        let serial = read_tlv_tagged(issuer_key_hash.rest, TAG_INTEGER)
+            .map_err(|e| format!("CertID.serialNumber: {e}"))?;
         let cert_id_serial = serial.content.to_vec();
 
         // certStatus ::= CHOICE { good [0] IMPLICIT NULL (primitive, 0x80),
@@ -2334,7 +2352,11 @@ fn verify_ocsp_response_signature(
                 let Some(pk) = crate::crypto_impl::parse_rsa_public_key(spki) else {
                     return false;
                 };
-                crate::crypto_impl::Rsa::verify_sha256(&pk, &resp.tbs_response_data_der, &resp.signature)
+                crate::crypto_impl::Rsa::verify_sha256(
+                    &pk,
+                    &resp.tbs_response_data_der,
+                    &resp.signature,
+                )
             }
             oid if oid == OID_SIG_ECDSA_SHA256 => {
                 let Some(pk) = crate::crypto_impl::parse_ecdsa_public_key(spki) else {
@@ -2348,20 +2370,31 @@ fn verify_ocsp_response_signature(
     };
 
     if let Some(pinned_der) = explicit_responder_cert_der {
-        let pinned = parse_certificate(pinned_der).map_err(|e| format!("pinned responder cert: {e}"))?;
+        let pinned =
+            parse_certificate(pinned_der).map_err(|e| format!("pinned responder cert: {e}"))?;
         return if verify_with_spki(&pinned.spki_der) {
             Ok(())
         } else {
-            Err("OCSP response signature does not verify against the pinned responder cert".to_string())
+            Err(
+                "OCSP response signature does not verify against the pinned responder cert"
+                    .to_string(),
+            )
         };
     }
 
     if let Some(signer_der) = resp.certs.first() {
         let signer = parse_certificate(signer_der).map_err(|e| format!("responder cert: {e}"))?;
         if !verify_with_spki(&signer.spki_der) {
-            return Err("OCSP response signature does not verify against embedded responder cert".to_string());
+            return Err(
+                "OCSP response signature does not verify against embedded responder cert"
+                    .to_string(),
+            );
         }
-        if !signer.ext_key_usage.iter().any(|eku| eku.as_slice() == OID_KP_OCSP_SIGNING) {
+        if !signer
+            .ext_key_usage
+            .iter()
+            .any(|eku| eku.as_slice() == OID_KP_OCSP_SIGNING)
+        {
             return Err("embedded OCSP responder cert lacks id-kp-OCSPSigning EKU".to_string());
         }
         // The delegated responder cert must itself be signed by the same CA
@@ -2371,7 +2404,9 @@ fn verify_ocsp_response_signature(
         }
         return match verify_one_signature(0, &signer, issuer_spki_der) {
             Ok(()) => Ok(()),
-            Err(e) => Err(format!("embedded responder cert not signed by issuing CA: {e}")),
+            Err(e) => Err(format!(
+                "embedded responder cert not signed by issuing CA: {e}"
+            )),
         };
     }
 
@@ -2394,7 +2429,11 @@ fn verify_ocsp_response_signature(
 /// `HttpURLConnection` surface — considerably more machinery than a
 /// single-shot, same-process, plain-HTTP POST needs, and neither exposes a
 /// `pub` entry point at the byte-in/byte-out granularity this call wants.
-fn ocsp_http_post(responder_url: &str, request_der: &[u8], timeout: Duration) -> Result<Vec<u8>, String> {
+fn ocsp_http_post(
+    responder_url: &str,
+    request_der: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
     let rest = responder_url
         .strip_prefix("http://")
         .ok_or_else(|| format!("unsupported OCSP responder URL scheme: {responder_url}"))?;
@@ -2446,7 +2485,8 @@ fn ocsp_http_post(responder_url: &str, request_der: &[u8], timeout: Duration) ->
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or_else(|| "OCSP HTTP response: no header terminator".to_string())?;
-    let head = std::str::from_utf8(&all[..sep]).map_err(|e| format!("OCSP HTTP response headers: {e}"))?;
+    let head =
+        std::str::from_utf8(&all[..sep]).map_err(|e| format!("OCSP HTTP response headers: {e}"))?;
     let mut lines = head.split("\r\n");
     let status_line = lines.next().unwrap_or("");
     let status: i32 = status_line
@@ -2531,7 +2571,8 @@ fn check_ocsp(
         .or_else(|| subject.ocsp_responder_uri.clone());
     let Some(responder_url) = responder_url else {
         return OcspOutcome::Indeterminate(
-            "no OCSP responder URI (no PKIXRevocationChecker override and no AIA extension)".to_string(),
+            "no OCSP responder URI (no PKIXRevocationChecker override and no AIA extension)"
+                .to_string(),
         );
     };
 
@@ -2543,12 +2584,18 @@ fn check_ocsp(
 
     let response_der = match ocsp_http_post(&responder_url, &request_der, timeout) {
         Ok(bytes) => bytes,
-        Err(e) => return OcspOutcome::Indeterminate(format!("OCSP request to {responder_url} failed: {e}")),
+        Err(e) => {
+            return OcspOutcome::Indeterminate(format!(
+                "OCSP request to {responder_url} failed: {e}"
+            ))
+        }
     };
 
     let parsed = match parse_ocsp_response(&response_der) {
         Ok(p) => p,
-        Err(e) => return OcspOutcome::Indeterminate(format!("OCSP response from {responder_url}: {e}")),
+        Err(e) => {
+            return OcspOutcome::Indeterminate(format!("OCSP response from {responder_url}: {e}"))
+        }
     };
 
     let explicit_cert = revocation.responder_cert_der.as_deref();
@@ -2600,7 +2647,11 @@ fn check_revocation(
     // anchor itself. When the anchor is presented in-chain (last_is_anchor),
     // that final entry is excluded; otherwise every parsed cert is checked
     // (the true anchor lives outside `parsed`/`chain` entirely).
-    let checked_count = if last_is_anchor { n.saturating_sub(1) } else { n };
+    let checked_count = if last_is_anchor {
+        n.saturating_sub(1)
+    } else {
+        n
+    };
 
     // 30s is generous for a same-host/LAN OCSP responder and matches the
     // ballpark of real-JDK's `com.sun.security.ocsp.timeout` default (15s) —
@@ -2615,12 +2666,21 @@ fn check_revocation(
         }
         let subject = &parsed[i];
         let (issuer_subject_der, issuer_spki_der): (&[u8], &[u8]) = if i + 1 < n {
-            (parsed[i + 1].subject_der.as_slice(), parsed[i + 1].spki_der.as_slice())
+            (
+                parsed[i + 1].subject_der.as_slice(),
+                parsed[i + 1].spki_der.as_slice(),
+            )
         } else {
             (anchor.subject_der.as_slice(), anchor.spki_der.as_slice())
         };
 
-        let outcome = check_ocsp(subject, issuer_subject_der, issuer_spki_der, revocation, timeout);
+        let outcome = check_ocsp(
+            subject,
+            issuer_subject_der,
+            issuer_spki_der,
+            revocation,
+            timeout,
+        );
         if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
             eprintln!(
                 "[dbg-tls-auth] check_revocation cert_index={} outcome={:?}",
@@ -3112,7 +3172,10 @@ fn tmf_engine_init_params(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// bytecode object silently no-ops or misreads. Calling its genuine getters
 /// is the same "real reflection-style" approach `extract_pkix_trust_anchor_ders`
 /// already uses for `getTrustAnchors()`/`getTrustedCert()`/`getEncoded()`.
-fn extract_revocation_config(ctx: &mut dyn NativeContext, mfp: ObjectRef) -> Option<RevocationConfig> {
+fn extract_revocation_config(
+    ctx: &mut dyn NativeContext,
+    mfp: ObjectRef,
+) -> Option<RevocationConfig> {
     let params = match ctx.invoke_virtual(
         mfp,
         "getParameters",
@@ -3122,10 +3185,11 @@ fn extract_revocation_config(ctx: &mut dyn NativeContext, mfp: ObjectRef) -> Opt
         Ok(Some(Value::Object(Some(p)))) => p,
         _ => return None,
     };
-    let checkers = match ctx.invoke_virtual(params, "getCertPathCheckers", "()Ljava/util/List;", &[]) {
-        Ok(Some(Value::Object(Some(l)))) => l,
-        _ => return None,
-    };
+    let checkers =
+        match ctx.invoke_virtual(params, "getCertPathCheckers", "()Ljava/util/List;", &[]) {
+            Ok(Some(Value::Object(Some(l)))) => l,
+            _ => return None,
+        };
     let iter_obj = match ctx.invoke_virtual(checkers, "iterator", "()Ljava/util/Iterator;", &[]) {
         Ok(Some(Value::Object(Some(it)))) => it,
         _ => return None,
@@ -3173,7 +3237,10 @@ fn is_pkix_revocation_checker(ctx: &mut dyn NativeContext, obj: ObjectRef) -> bo
 /// Read a confirmed `PKIXRevocationChecker` object's configuration via its
 /// public getters: `getOcspResponder()` (URI), `getOcspResponderCert()`
 /// (X509Certificate), `getOptions()` (`Set<Option>`).
-fn read_revocation_checker_config(ctx: &mut dyn NativeContext, checker: ObjectRef) -> RevocationConfig {
+fn read_revocation_checker_config(
+    ctx: &mut dyn NativeContext,
+    checker: ObjectRef,
+) -> RevocationConfig {
     let mut cfg = RevocationConfig::default();
 
     if let Ok(Some(Value::Object(Some(uri)))) =
@@ -5521,12 +5588,18 @@ mod tests {
         // OCSPRequest ::= SEQUENCE { tbsRequest TBSRequest }
         let outer = read_tlv_tagged(&req, TAG_SEQUENCE).expect("outer SEQUENCE");
         let tbs = read_tlv_tagged(outer.content, TAG_SEQUENCE).expect("tbsRequest SEQUENCE");
-        let request_list = read_tlv_tagged(tbs.content, TAG_SEQUENCE).expect("requestList SEQUENCE");
-        let request = read_tlv_tagged(request_list.content, TAG_SEQUENCE).expect("Request SEQUENCE");
+        let request_list =
+            read_tlv_tagged(tbs.content, TAG_SEQUENCE).expect("requestList SEQUENCE");
+        let request =
+            read_tlv_tagged(request_list.content, TAG_SEQUENCE).expect("Request SEQUENCE");
         let cert_id = read_tlv_tagged(request.content, TAG_SEQUENCE).expect("CertID SEQUENCE");
-        let hash_alg = read_tlv_tagged(cert_id.content, TAG_SEQUENCE).expect("hashAlgorithm SEQUENCE");
+        let hash_alg =
+            read_tlv_tagged(cert_id.content, TAG_SEQUENCE).expect("hashAlgorithm SEQUENCE");
         let oid = read_tlv_tagged(hash_alg.content, TAG_OID).expect("hashAlgorithm OID");
-        assert_eq!(oid.content, OID_SHA1, "CertID must use SHA-1 per RFC 6960 convention");
+        assert_eq!(
+            oid.content, OID_SHA1,
+            "CertID must use SHA-1 per RFC 6960 convention"
+        );
         // `oid.rest` is the hashAlgorithm's NULL parameter, still inside the
         // hashAlgorithm SEQUENCE; issuerNameHash is `hash_alg.rest` (CertID's
         // next sibling field, after the whole hashAlgorithm SEQUENCE).
@@ -5685,7 +5758,10 @@ mod tests {
         let wrong_spki = Rsa::public_key_to_der(&other_pk);
         let err = verify_ocsp_response_signature(&parsed, &wrong_spki, None)
             .expect_err("signature must NOT verify against an unrelated key");
-        assert!(err.contains("does not verify"), "unexpected error text: {err}");
+        assert!(
+            err.contains("does not verify"),
+            "unexpected error text: {err}"
+        );
     }
 
     #[test]

@@ -3921,11 +3921,13 @@ pub(crate) fn native_character_is_iso_control(
         Some(Value::Int(v)) => *v,
         _ => -1,
     };
-    Ok(Some(Value::Int(if (0x00..=0x1F).contains(&cp) || (0x7F..=0x9F).contains(&cp) {
-        1
-    } else {
-        0
-    })))
+    Ok(Some(Value::Int(
+        if (0x00..=0x1F).contains(&cp) || (0x7F..=0x9F).contains(&cp) {
+            1
+        } else {
+            0
+        },
+    )))
 }
 
 pub(crate) fn native_character_static_to_string(
@@ -4250,7 +4252,10 @@ fn strip_java_float_type_suffix(s: &str) -> &str {
 
     let numeric = &s[..s.len() - 1];
     let has_digit = numeric.bytes().any(|b| b.is_ascii_digit());
-    let suffix_follows_number = matches!(numeric.as_bytes().last().copied(), Some(b'0'..=b'9') | Some(b'.'));
+    let suffix_follows_number = matches!(
+        numeric.as_bytes().last().copied(),
+        Some(b'0'..=b'9') | Some(b'.')
+    );
     if has_digit && suffix_follows_number {
         numeric
     } else {

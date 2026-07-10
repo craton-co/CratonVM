@@ -77,9 +77,9 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -90,9 +90,16 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, Vm
 use cratonvm_types::{ObjectRef, Value};
 
 use crate::xnio_conduits::{
+    alloc_sink_channel_obj, alloc_source_channel_obj, notify_registered_sources_readable,
+    register_sink_channel, register_source_channel, remember_sink_io_thread,
+    remember_sink_paired_source, remember_source_io_thread, ConduitTransport,
     SETTER_FIELD_CHANNEL_HANDLE, SETTER_FIELD_LISTENER_SLOT_INDEX, SETTER_NUM_SLOTS,
 };
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::xnio_io_thread::{
+    lookup_iot_worker_mirror, remember_iot_worker_mirror, IOT_FIELD_ID, IOT_FIELD_STATE,
+    IOT_FIELD_WORKER_HANDLE, IOT_NUM_SLOTS, STATE_RUNNING as IOT_STATE_RUNNING,
+};
+use crate::{alloc_concurrent_synthetic, obj_arg, spawn_runnable_on_real_thread};
 
 // ---------------------------------------------------------------------------
 // Class names & field offsets (mirrored in class_manager.rs)
@@ -104,7 +111,10 @@ pub(crate) const CLS_NIO_XNIO: &str = "org/xnio/nio/NioXnio";
 pub(crate) const CLS_NIO_XNIO_WORKER: &str = "org/xnio/nio/NioXnioWorker";
 pub(crate) const CLS_OPTION_MAP: &str = "org/xnio/OptionMap";
 const CLS_ACCEPTING_CHANNEL: &str = "org/xnio/channels/AcceptingChannel";
+const CLS_CONNECTED_CHANNEL: &str = "org/xnio/channels/ConnectedChannel";
 const CLS_SIMPLE_ACCEPTING_CHANNEL: &str = "org/xnio/channels/SimpleAcceptingChannel";
+const CLS_ACCEPT_PUMP: &str = "cratonvm/xnio/AcceptPump";
+const CLS_SOURCE_POLLER: &str = "cratonvm/xnio/SourcePoller";
 const CLS_SUSPENDABLE_ACCEPT_CHANNEL: &str = "org/xnio/channels/SuspendableAcceptChannel";
 const CLS_BOUND_CHANNEL: &str = "org/xnio/channels/BoundChannel";
 const CLS_CLOSEABLE_CHANNEL: &str = "org/xnio/channels/CloseableChannel";
@@ -145,6 +155,11 @@ const ACCEPT_FIELD_RESUMED: usize = 4;
 const ACCEPT_FIELD_WORKER: usize = 5;
 const ACCEPT_FIELD_LISTENER_ID: usize = 6;
 const ACCEPT_NUM_SLOTS: usize = 7;
+
+const ACCEPT_PUMP_FIELD_CHANNEL: usize = 0;
+const ACCEPT_PUMP_NUM_SLOTS: usize = 1;
+const SOURCE_POLLER_NUM_SLOTS: usize = 0;
+const SOURCE_POLLER_INTERVAL_MS: u64 = 10;
 
 // State ordinals (mirrors the bits Java side inspects).
 pub(crate) const WORKER_STATE_RUNNING: i32 = 0;
@@ -667,9 +682,93 @@ fn remove_worker(id: u64) {
         .remove(&id);
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct WorkerObjKey {
+    vm: usize,
+    identity: i32,
+}
+
+fn worker_obj_key(ctx: &dyn NativeContext, obj: ObjectRef) -> WorkerObjKey {
+    WorkerObjKey {
+        vm: ctx.vm_identity(),
+        identity: ctx.identity_hash_code(obj),
+    }
+}
+
+fn worker_object_registry() -> &'static Mutex<HashMap<WorkerObjKey, u64>> {
+    static REG: OnceLock<Mutex<HashMap<WorkerObjKey, u64>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_worker_object(ctx: &dyn NativeContext, obj: ObjectRef, worker: &Arc<XnioWorker>) {
+    worker_object_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(worker_obj_key(ctx, obj), worker.id);
+}
+
+fn lookup_worker_object(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<Arc<XnioWorker>> {
+    let key = worker_obj_key(ctx, obj);
+    let id = worker_object_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .copied()?;
+    lookup_worker(id)
+}
+
+fn adopt_worker_object(ctx: &dyn NativeContext, obj: ObjectRef) -> Arc<XnioWorker> {
+    if let Some(worker) = lookup_worker_object(ctx, obj) {
+        return worker;
+    }
+    let xnio = Xnio::get_instance();
+    let worker = xnio.create_worker(OptionMap::default());
+    register_worker(worker.clone());
+    remember_worker_object(ctx, obj, &worker);
+    worker
+}
+
 // ---------------------------------------------------------------------------
 // Java ↔ Rust glue — natives registered with the method registry.
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+struct StreamConnectionAddresses {
+    local: Option<SocketAddr>,
+    peer: Option<SocketAddr>,
+}
+
+fn stream_connection_address_registry(
+) -> &'static Mutex<HashMap<WorkerObjKey, StreamConnectionAddresses>> {
+    static REG: OnceLock<Mutex<HashMap<WorkerObjKey, StreamConnectionAddresses>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_stream_connection_addresses(
+    ctx: &dyn NativeContext,
+    conn: ObjectRef,
+    local: Option<SocketAddr>,
+    peer: Option<SocketAddr>,
+) {
+    stream_connection_address_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            worker_obj_key(ctx, conn),
+            StreamConnectionAddresses { local, peer },
+        );
+}
+
+fn stream_connection_addresses(
+    ctx: &dyn NativeContext,
+    conn: ObjectRef,
+) -> Option<StreamConnectionAddresses> {
+    stream_connection_address_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&worker_obj_key(ctx, conn))
+        .copied()
+}
 
 static NEXT_ACCEPTING_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -695,6 +794,36 @@ fn remove_accepting_listener(id: u64) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&id);
+}
+
+fn accepting_pending_registry() -> &'static Mutex<HashMap<u64, VecDeque<TcpStream>>> {
+    static REG: OnceLock<Mutex<HashMap<u64, VecDeque<TcpStream>>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn clone_accepting_listener(id: u64) -> Option<TcpListener> {
+    accepting_listener_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+        .and_then(|listener| listener.try_clone().ok())
+}
+
+fn push_pending_accept(id: u64, stream: TcpStream) {
+    accepting_pending_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(id)
+        .or_default()
+        .push_back(stream);
+}
+
+fn pop_pending_accept(id: u64) -> Option<TcpStream> {
+    accepting_pending_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(&id)
+        .and_then(VecDeque::pop_front)
 }
 
 /// Allocate the Java `Xnio` mirror (singleton) — lazily created.
@@ -728,20 +857,30 @@ fn alloc_worker_mirror(
         WORKER_FIELD_OPTIONS_HANDLE,
         Value::Long(worker.id as i64),
     );
+    remember_worker_object(ctx, obj, worker);
     obj
 }
 
 /// Read the registered Rust worker out of a Java `XnioWorker` mirror.
 fn read_worker(ctx: &dyn NativeContext, this: ObjectRef) -> Option<Arc<XnioWorker>> {
     let id = match ctx.get_field(this, WORKER_FIELD_OPTIONS_HANDLE) {
-        Value::Long(v) => v as u64,
-        _ => return None,
+        Value::Long(v) => Some(v as u64),
+        _ => None,
     };
-    lookup_worker(id)
+    id.and_then(lookup_worker)
+        .or_else(|| lookup_worker_object(ctx, this))
+        .or_else(|| Some(adopt_worker_object(ctx, this)))
 }
 
 /// Update the Java mirror's state ordinal after a transition.
 fn reflect_worker_state(ctx: &dyn NativeContext, this: ObjectRef, worker: &Arc<XnioWorker>) {
+    let has_synthetic_handle = matches!(
+        ctx.get_field(this, WORKER_FIELD_OPTIONS_HANDLE),
+        Value::Long(id) if lookup_worker(id as u64).is_some()
+    );
+    if !has_synthetic_handle {
+        return;
+    }
     let ord = if worker.is_terminated() {
         WORKER_STATE_TERMINATED
     } else if worker.is_shutdown() {
@@ -814,18 +953,21 @@ fn decode_xnio_bind_address(
         Ok(Some(Value::Int(v))) if (0..=u16::MAX as i32).contains(&v) => Some(v as u16),
         _ => None,
     };
-    let host_via_method = match ctx.invoke_virtual(
-        addr,
-        "getHostString",
-        "()Ljava/lang/String;",
-        &[],
-    ) {
-        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
-        _ => None,
-    };
+    let host_via_method =
+        match ctx.invoke_virtual(addr, "getHostString", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+            _ => None,
+        };
     if let Some(port) = port_via_method {
         let host = host_via_method.unwrap_or_else(|| "0.0.0.0".to_string());
-        return Ok((if host.is_empty() { "0.0.0.0".to_string() } else { host }, port));
+        return Ok((
+            if host.is_empty() {
+                "0.0.0.0".to_string()
+            } else {
+                host
+            },
+            port,
+        ));
     }
 
     let holder = match ctx.get_field_by_name(addr, "holder") {
@@ -848,9 +990,18 @@ fn decode_xnio_bind_address(
     }
     .unwrap_or_else(|| "0.0.0.0".to_string());
     let Some(port) = port else {
-        return Err(mcf_io("XnioWorker.createTcpConnectionServer: invalid bind address"));
+        return Err(mcf_io(
+            "XnioWorker.createTcpConnectionServer: invalid bind address",
+        ));
     };
-    Ok((if host.is_empty() { "0.0.0.0".to_string() } else { host }, port))
+    Ok((
+        if host.is_empty() {
+            "0.0.0.0".to_string()
+        } else {
+            host
+        },
+        port,
+    ))
 }
 
 fn alloc_accepting_channel_mirror(
@@ -861,13 +1012,21 @@ fn alloc_accepting_channel_mirror(
     listener_id: u64,
 ) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, CLS_ACCEPTING_CHANNEL, ACCEPT_NUM_SLOTS);
-    ctx.set_field(obj, ACCEPT_FIELD_LOCAL_ADDRESS, Value::Object(Some(local_address)));
+    ctx.set_field(
+        obj,
+        ACCEPT_FIELD_LOCAL_ADDRESS,
+        Value::Object(Some(local_address)),
+    );
     ctx.set_field(obj, ACCEPT_FIELD_ACCEPT_LISTENER, accept_listener);
     ctx.set_field(obj, ACCEPT_FIELD_CLOSE_LISTENER, Value::Object(None));
     ctx.set_field(obj, ACCEPT_FIELD_OPEN, Value::Int(1));
     ctx.set_field(obj, ACCEPT_FIELD_RESUMED, Value::Int(0));
     ctx.set_field(obj, ACCEPT_FIELD_WORKER, Value::Object(Some(worker)));
-    ctx.set_field(obj, ACCEPT_FIELD_LISTENER_ID, Value::Long(listener_id as i64));
+    ctx.set_field(
+        obj,
+        ACCEPT_FIELD_LISTENER_ID,
+        Value::Long(listener_id as i64),
+    );
     obj
 }
 
@@ -895,14 +1054,44 @@ fn native_xnio_create_tcp_connection_server(
     })?;
     let _ = listener.set_nonblocking(true);
     let listener_id = register_accepting_listener(listener);
-    let channel = alloc_accepting_channel_mirror(
-        ctx,
-        worker,
-        bind_addr,
-        accept_listener,
-        listener_id,
-    );
+    let channel =
+        alloc_accepting_channel_mirror(ctx, worker, bind_addr, accept_listener, listener_id);
+    let channel_pin = ctx.pin_native_root(channel);
+    let _ = start_accept_pump(ctx, channel, listener_id);
+    let channel = ctx.read_native_pin(channel_pin, channel);
+    ctx.unpin_native_roots(channel_pin);
     Ok(Some(Value::Object(Some(channel))))
+}
+
+fn start_accept_pump(
+    ctx: &mut dyn NativeContext,
+    channel: ObjectRef,
+    listener_id: u64,
+) -> MethodCallResult {
+    let pump = alloc_concurrent_synthetic(ctx, CLS_ACCEPT_PUMP, ACCEPT_PUMP_NUM_SLOTS);
+    ctx.set_field(
+        pump,
+        ACCEPT_PUMP_FIELD_CHANNEL,
+        Value::Object(Some(channel)),
+    );
+    let name = ctx.create_string(&format!("cratonvm-xnio-accept-{listener_id}"));
+    let pump_pin = ctx.pin_native_root(pump);
+    let name_pin = ctx.pin_native_root(name);
+    let pump = ctx.read_native_pin(pump_pin, pump);
+    let name = ctx.read_native_pin(name_pin, name);
+    let thread = ctx.new_object_initialized(
+        "java/lang/Thread",
+        "(Ljava/lang/Runnable;Ljava/lang/String;)V",
+        &[Value::Object(Some(pump)), Value::Object(Some(name))],
+    );
+    ctx.unpin_native_roots(pump_pin);
+    let thread = match thread? {
+        Some(Value::Object(Some(thread))) => thread,
+        _ => return Ok(None),
+    };
+    let _ = ctx.invoke_virtual(thread, "setDaemon", "(Z)V", &[Value::Int(1)]);
+    let _ = ctx.invoke_virtual(thread, "start", "()V", &[]);
+    Ok(None)
 }
 
 fn make_accepting_listener_setter(
@@ -910,7 +1099,8 @@ fn make_accepting_listener_setter(
     channel: ObjectRef,
     listener_slot: usize,
 ) -> ObjectRef {
-    let setter = alloc_concurrent_synthetic(ctx, "org/xnio/ChannelListener$Setter", SETTER_NUM_SLOTS);
+    let setter =
+        alloc_concurrent_synthetic(ctx, "org/xnio/ChannelListener$Setter", SETTER_NUM_SLOTS);
     ctx.set_field(
         setter,
         SETTER_FIELD_CHANNEL_HANDLE,
@@ -942,8 +1132,215 @@ fn native_accepting_get_close_setter(
     Ok(Some(Value::Object(Some(setter))))
 }
 
-fn native_accepting_accept(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(None)))
+fn source_poller_started_vms() -> &'static Mutex<HashSet<usize>> {
+    static REG: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn ensure_source_poller_started(ctx: &mut dyn NativeContext) {
+    let vm = ctx.vm_identity();
+    {
+        let mut started = source_poller_started_vms()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !started.insert(vm) {
+            return;
+        }
+    }
+
+    let poller = alloc_concurrent_synthetic(ctx, CLS_SOURCE_POLLER, SOURCE_POLLER_NUM_SLOTS);
+    let name = ctx.create_string(&format!("cratonvm-xnio-source-poll-{vm}"));
+    let poller_pin = ctx.pin_native_root(poller);
+    let name_pin = ctx.pin_native_root(name);
+    let poller = ctx.read_native_pin(poller_pin, poller);
+    let name = ctx.read_native_pin(name_pin, name);
+    let thread = ctx.new_object_initialized(
+        "java/lang/Thread",
+        "(Ljava/lang/Runnable;Ljava/lang/String;)V",
+        &[Value::Object(Some(poller)), Value::Object(Some(name))],
+    );
+    ctx.unpin_native_roots(poller_pin);
+    ctx.unpin_native_roots(name_pin);
+
+    let thread = match thread {
+        Ok(Some(Value::Object(Some(thread)))) => thread,
+        _ => {
+            source_poller_started_vms()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&vm);
+            return;
+        }
+    };
+    let _ = ctx.invoke_virtual(thread, "setDaemon", "(Z)V", &[Value::Int(1)]);
+    let _ = ctx.invoke_virtual(thread, "start", "()V", &[]);
+}
+
+fn alloc_stream_connection_for_tcp(
+    ctx: &mut dyn NativeContext,
+    io_thread: ObjectRef,
+    stream: TcpStream,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let local_addr = stream.local_addr().ok();
+    let peer_addr = stream.peer_addr().ok();
+    let io_thread_pin = ctx.pin_native_root(io_thread);
+    let _ = stream.set_nonblocking(true);
+    let source_stream = stream
+        .try_clone()
+        .map_err(|e| mcf_io(format!("AcceptingChannel.accept: clone stream failed: {e}")))?;
+    let source_id = register_source_channel(ConduitTransport::Tcp(source_stream));
+    let sink_id = register_sink_channel(ConduitTransport::Tcp(stream));
+    if std::env::var_os("CRATONVM_DBG_XNIO_TCP").is_some() {
+        eprintln!("[cratonvm:xnio-tcp] accepted_stream source_id={source_id} sink_id={sink_id}");
+    }
+
+    let close_ref = match ctx.new_object_initialized(
+        "java/util/concurrent/atomic/AtomicReference",
+        "()V",
+        &[],
+    )? {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            return Err(mcf_runtime(
+                "StreamConnection: failed to allocate close listener ref",
+            ))
+        }
+    };
+    let close_pin = ctx.pin_native_root(close_ref);
+
+    let source_obj = alloc_source_channel_obj(ctx, source_id);
+    let source_pin = ctx.pin_native_root(source_obj);
+    let sink_obj = alloc_sink_channel_obj(ctx, sink_id);
+    let sink_pin = ctx.pin_native_root(sink_obj);
+    let conn = alloc_concurrent_synthetic(ctx, "org/xnio/StreamConnection", 5);
+    let conn_pin = ctx.pin_native_root(conn);
+
+    let close_ref = ctx.read_native_pin(close_pin, close_ref);
+    let source_obj = ctx.read_native_pin(source_pin, source_obj);
+    let sink_obj = ctx.read_native_pin(sink_pin, sink_obj);
+    let conn = ctx.read_native_pin(conn_pin, conn);
+    let io_thread = ctx.read_native_pin(io_thread_pin, io_thread);
+    ctx.set_field_by_name(conn, "thread", Value::Object(Some(io_thread)));
+    ctx.set_field_by_name(conn, "state", Value::Int(0));
+    remember_source_io_thread(ctx, source_obj, io_thread);
+    remember_sink_io_thread(ctx, sink_obj, io_thread);
+    remember_sink_paired_source(ctx, sink_obj, source_obj);
+    ctx.set_field_by_name(conn, "sourceChannel", Value::Object(Some(source_obj)));
+    ctx.set_field_by_name(conn, "sinkChannel", Value::Object(Some(sink_obj)));
+    ctx.set_field_by_name(conn, "closeListener", Value::Object(Some(close_ref)));
+    remember_stream_connection_addresses(ctx, conn, local_addr, peer_addr);
+    ensure_source_poller_started(ctx);
+    let conn = ctx.read_native_pin(conn_pin, conn);
+    ctx.unpin_native_roots(io_thread_pin);
+    Ok(conn)
+}
+
+fn native_accepting_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let listener_id = match ctx.get_field(this, ACCEPT_FIELD_LISTENER_ID) {
+        Value::Long(id) if id > 0 => id as u64,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let Some(stream) = pop_pending_accept(listener_id) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let io_thread = match native_accepting_get_io_thread(ctx, &[Value::Object(Some(this))])? {
+        Some(Value::Object(Some(io_thread))) => io_thread,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let conn = alloc_stream_connection_for_tcp(ctx, io_thread, stream)?;
+    Ok(Some(Value::Object(Some(conn))))
+}
+
+fn accept_pump_blocked_sleep(
+    ctx: &mut dyn NativeContext,
+    channel: ObjectRef,
+    duration: Duration,
+) -> ObjectRef {
+    notify_registered_sources_readable(ctx, false, None);
+    let mut blocked_refs = [Value::Object(Some(channel))];
+    ctx.begin_blocking_region();
+    thread::sleep(duration);
+    ctx.end_blocking_region_refs(&mut blocked_refs);
+    let channel = blocked_refs[0].as_object().unwrap_or(channel);
+    notify_registered_sources_readable(ctx, false, None);
+    channel
+}
+
+fn native_source_poller_run(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    loop {
+        notify_registered_sources_readable(ctx, false, None);
+
+        let mut refs: [Value; 0] = [];
+        ctx.begin_blocking_region();
+        thread::sleep(Duration::from_millis(SOURCE_POLLER_INTERVAL_MS));
+        ctx.end_blocking_region_refs(&mut refs);
+    }
+}
+
+fn native_accept_pump_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let pump = obj_arg(args, 0)?;
+    let channel = match ctx.get_field(pump, ACCEPT_PUMP_FIELD_CHANNEL) {
+        Value::Object(Some(channel)) => channel,
+        _ => return Ok(None),
+    };
+    let channel_pin = ctx.pin_native_root(channel);
+    let mut channel = channel;
+    loop {
+        channel = ctx.read_native_pin(channel_pin, channel);
+        let open = matches!(ctx.get_field(channel, ACCEPT_FIELD_OPEN), Value::Int(v) if v != 0);
+        if !open {
+            break;
+        }
+        let listener_id = match ctx.get_field(channel, ACCEPT_FIELD_LISTENER_ID) {
+            Value::Long(id) if id > 0 => id as u64,
+            _ => break,
+        };
+        let resumed =
+            matches!(ctx.get_field(channel, ACCEPT_FIELD_RESUMED), Value::Int(v) if v != 0);
+        if !resumed {
+            channel = accept_pump_blocked_sleep(ctx, channel, Duration::from_millis(10));
+            continue;
+        }
+        let Some(listener) = clone_accepting_listener(listener_id) else {
+            break;
+        };
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                let _ = stream.set_nonblocking(true);
+                if std::env::var_os("CRATONVM_DBG_XNIO_TCP").is_some() {
+                    eprintln!(
+                        "[cratonvm:xnio-tcp] accept_pump listener_id={listener_id} peer={peer}"
+                    );
+                }
+                push_pending_accept(listener_id, stream);
+                channel = ctx.read_native_pin(channel_pin, channel);
+                if let Value::Object(Some(accept_listener)) =
+                    ctx.get_field(channel, ACCEPT_FIELD_ACCEPT_LISTENER)
+                {
+                    let _ = ctx.invoke_virtual(
+                        accept_listener,
+                        "handleEvent",
+                        "(Ljava/nio/channels/Channel;)V",
+                        &[Value::Object(Some(channel))],
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                channel = accept_pump_blocked_sleep(ctx, channel, Duration::from_millis(10));
+            }
+            Err(e) => {
+                if std::env::var_os("CRATONVM_DBG_XNIO_TCP").is_some() {
+                    eprintln!(
+                        "[cratonvm:xnio-tcp] accept_pump listener_id={listener_id} error={e}"
+                    );
+                }
+                channel = accept_pump_blocked_sleep(ctx, channel, Duration::from_millis(100));
+            }
+        }
+    }
+    ctx.unpin_native_roots(channel_pin);
+    Ok(None)
 }
 
 fn native_accepting_get_local_address(
@@ -952,6 +1349,69 @@ fn native_accepting_get_local_address(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     Ok(Some(ctx.get_field(this, ACCEPT_FIELD_LOCAL_ADDRESS)))
+}
+
+fn new_inet_socket_address_value(
+    ctx: &mut dyn NativeContext,
+    addr: SocketAddr,
+) -> MethodCallResult {
+    let host = ctx.create_string(&addr.ip().to_string());
+    ctx.new_object_initialized(
+        "java/net/InetSocketAddress",
+        "(Ljava/lang/String;I)V",
+        &[Value::Object(Some(host)), Value::Int(addr.port() as i32)],
+    )
+}
+
+fn native_connected_get_peer_address(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    match stream_connection_addresses(ctx, this).and_then(|a| a.peer) {
+        Some(addr) => new_inet_socket_address_value(ctx, addr),
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_connected_get_local_address(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    match stream_connection_addresses(ctx, this).and_then(|a| a.local) {
+        Some(addr) => new_inet_socket_address_value(ctx, addr),
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_connected_get_io_thread(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(ctx.get_field_by_name(this, "thread")))
+}
+
+fn io_thread_worker_mirror(ctx: &dyn NativeContext, io_thread: ObjectRef) -> Option<ObjectRef> {
+    if let Some(worker) = lookup_iot_worker_mirror(ctx, io_thread) {
+        return Some(worker);
+    }
+    for field in ["worker", "workerHandle"] {
+        if let Value::Object(Some(worker)) = ctx.get_field_by_name(io_thread, field) {
+            return Some(worker);
+        }
+    }
+    match ctx.get_field(io_thread, IOT_FIELD_WORKER_HANDLE) {
+        Value::Object(Some(worker)) => Some(worker),
+        _ => None,
+    }
+}
+
+fn native_connected_get_worker(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let worker = match ctx.get_field_by_name(this, "thread") {
+        Value::Object(Some(io_thread)) => io_thread_worker_mirror(ctx, io_thread),
+        _ => None,
+    };
+    Ok(Some(Value::Object(worker)))
 }
 
 fn native_accepting_suspend_accepts(
@@ -981,7 +1441,10 @@ fn native_accepting_is_accept_resumed(
     Ok(Some(Value::Int(if resumed { 1 } else { 0 })))
 }
 
-fn native_accepting_wakeup_accepts(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_accepting_wakeup_accepts(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     Ok(None)
 }
 
@@ -1000,7 +1463,9 @@ fn native_accepting_get_worker(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 fn native_accepting_get_io_thread(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     match ctx.get_field(this, ACCEPT_FIELD_WORKER) {
-        Value::Object(Some(worker)) => native_worker_get_io_thread(ctx, &[Value::Object(Some(worker))]),
+        Value::Object(Some(worker)) => {
+            native_worker_get_io_thread(ctx, &[Value::Object(Some(worker))])
+        }
         _ => Ok(Some(Value::Object(None))),
     }
 }
@@ -1045,13 +1510,27 @@ fn native_worker_get_io_thread(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let this = obj_arg(args, 0)?;
     let worker = read_worker(ctx, this)
         .ok_or_else(|| mcf_runtime("XnioWorker.getIoThread: not registered"))?;
-    // We return a stub XnioIoThread mirror — T19.7.c will replace this
-    // with its real mirror class.
     let handle = worker.get_io_thread();
-    let obj = alloc_concurrent_synthetic(ctx, "org/xnio/XnioIoThread", 2);
-    ctx.set_field(obj, 0, Value::Int(handle.id as i32));
-    ctx.set_field(obj, 1, Value::Long(worker.id as i64));
+    let this_pin = ctx.pin_native_root(this);
+    let obj = alloc_concurrent_synthetic(ctx, "org/xnio/XnioIoThread", IOT_NUM_SLOTS);
+    let this = ctx.read_native_pin(this_pin, this);
+    set_io_thread_mirror_fields(ctx, obj, this, handle.id);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(obj))))
+}
+
+fn set_io_thread_mirror_fields(
+    ctx: &mut dyn NativeContext,
+    io_thread: ObjectRef,
+    worker: ObjectRef,
+    id: usize,
+) {
+    remember_iot_worker_mirror(ctx, io_thread, worker);
+    ctx.set_field_by_name(io_thread, "id", Value::Long(id as i64));
+    ctx.set_field_by_name(io_thread, "number", Value::Int(id as i32));
+    ctx.set_field_by_name(io_thread, "workerHandle", Value::Object(Some(worker)));
+    ctx.set_field_by_name(io_thread, "worker", Value::Object(Some(worker)));
+    ctx.set_field_by_name(io_thread, "state", Value::Int(IOT_STATE_RUNNING));
 }
 
 fn native_worker_get_io_threads(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1061,9 +1540,8 @@ fn native_worker_get_io_threads(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let count = worker.io_threads.len();
     let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), count);
     for (i, h) in worker.io_threads.iter().enumerate() {
-        let obj = alloc_concurrent_synthetic(ctx, "org/xnio/XnioIoThread", 2);
-        ctx.set_field(obj, 0, Value::Int(h.id as i32));
-        ctx.set_field(obj, 1, Value::Long(worker.id as i64));
+        let obj = alloc_concurrent_synthetic(ctx, "org/xnio/XnioIoThread", IOT_NUM_SLOTS);
+        set_io_thread_mirror_fields(ctx, obj, this, h.id);
         ctx.set_array_element(arr, i, Value::Object(Some(obj)));
     }
     Ok(Some(Value::Object(Some(arr))))
@@ -1073,22 +1551,26 @@ fn native_worker_get_io_threads(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 
 fn native_worker_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    let runnable = match args.get(1) {
+        Some(Value::Object(Some(runnable))) => *runnable,
+        _ => {
+            return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException {
+                    message: Some("XnioWorker.execute: null Runnable".to_string()),
+                },
+            )));
+        }
+    };
     let worker =
         read_worker(ctx, this).ok_or_else(|| mcf_runtime("XnioWorker.execute: not registered"))?;
-    // We can't capture the bytecode Runnable across threads in the
-    // synthetic path (no JvmThread handle here).  Instead submit a
-    // no-op and let the bytecode layer post-process the result.  The
-    // Rust-facing `execute` API (tested) does the real work.
-    let submitted = worker.execute(|| {});
-    if submitted.is_err() {
+    if worker.is_shutdown() {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::IllegalStateException {
                 message: "XnioWorker.execute: worker is shutdown".to_string(),
             },
         )));
     }
-    let _ = args.get(1);
-    Ok(None)
+    spawn_runnable_on_real_thread(ctx, runnable)
 }
 
 // --- XnioWorker.shutdown / shutdownNow ---
@@ -1155,6 +1637,134 @@ fn native_worker_get_mxbean(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Me
     Ok(Some(Value::Object(None)))
 }
 
+fn native_worker_get_bind_address_table(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if let Value::Object(Some(table)) = ctx.get_field_by_name(this, "bindAddressTable") {
+        return Ok(Some(Value::Object(Some(table))));
+    }
+
+    let this_pin = ctx.pin_native_root(this);
+    let table_result =
+        ctx.new_object_initialized("org/wildfly/common/net/CidrAddressTable", "()V", &[]);
+    let this = ctx.read_native_pin(this_pin, this);
+    match table_result {
+        Ok(Some(Value::Object(Some(table)))) => {
+            ctx.set_field_by_name(this, "bindAddressTable", Value::Object(Some(table)));
+            ctx.unpin_native_roots(this_pin);
+            Ok(Some(Value::Object(Some(table))))
+        }
+        Ok(other) => {
+            ctx.unpin_native_roots(this_pin);
+            Ok(other)
+        }
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            Err(e)
+        }
+    }
+}
+
+fn native_iot_open_tcp_stream_connection(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let io_thread = obj_arg(args, 0)?;
+    let destination = obj_arg(args, 2)?;
+    let open_listener = args.get(3).copied().unwrap_or(Value::Object(None));
+    let bind_listener = args.get(4).copied().unwrap_or(Value::Object(None));
+
+    let (host, port) = decode_xnio_bind_address(ctx, destination)?;
+    let stream = TcpStream::connect((host.as_str(), port)).map_err(|e| {
+        mcf_io(format!(
+            "XnioIoThread.openTcpStreamConnection: connect {host}:{port} failed: {e}"
+        ))
+    })?;
+    let local_addr = stream.local_addr().ok();
+    let peer_addr = stream.peer_addr().ok();
+    let io_thread_pin = ctx.pin_native_root(io_thread);
+    let _ = stream.set_nonblocking(true);
+    let source_stream = stream.try_clone().map_err(|e| {
+        mcf_io(format!(
+            "XnioIoThread.openTcpStreamConnection: clone stream failed: {e}"
+        ))
+    })?;
+
+    let source_id = register_source_channel(ConduitTransport::Tcp(source_stream));
+    let sink_id = register_sink_channel(ConduitTransport::Tcp(stream));
+    if std::env::var_os("CRATONVM_DBG_XNIO_TCP").is_some() {
+        eprintln!(
+            "[cratonvm:xnio-tcp] open_tcp_stream host={host} port={port} source_id={source_id} sink_id={sink_id}"
+        );
+    }
+
+    let close_ref = match ctx.new_object_initialized(
+        "java/util/concurrent/atomic/AtomicReference",
+        "()V",
+        &[],
+    )? {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            return Err(mcf_runtime(
+                "StreamConnection: failed to allocate close listener ref",
+            ))
+        }
+    };
+    let close_pin = ctx.pin_native_root(close_ref);
+
+    let source_obj = alloc_source_channel_obj(ctx, source_id);
+    let source_pin = ctx.pin_native_root(source_obj);
+    let sink_obj = alloc_sink_channel_obj(ctx, sink_id);
+    let sink_pin = ctx.pin_native_root(sink_obj);
+
+    let conn = alloc_concurrent_synthetic(ctx, "org/xnio/StreamConnection", 5);
+    let conn_pin = ctx.pin_native_root(conn);
+
+    let close_ref = ctx.read_native_pin(close_pin, close_ref);
+    let source_obj = ctx.read_native_pin(source_pin, source_obj);
+    let sink_obj = ctx.read_native_pin(sink_pin, sink_obj);
+    let conn = ctx.read_native_pin(conn_pin, conn);
+    let io_thread = ctx.read_native_pin(io_thread_pin, io_thread);
+    ctx.set_field_by_name(conn, "thread", Value::Object(Some(io_thread)));
+    ctx.set_field_by_name(conn, "state", Value::Int(0));
+    remember_source_io_thread(ctx, source_obj, io_thread);
+    remember_sink_io_thread(ctx, sink_obj, io_thread);
+    remember_sink_paired_source(ctx, sink_obj, source_obj);
+    ctx.set_field_by_name(conn, "sourceChannel", Value::Object(Some(source_obj)));
+    ctx.set_field_by_name(conn, "sinkChannel", Value::Object(Some(sink_obj)));
+    ctx.set_field_by_name(conn, "closeListener", Value::Object(Some(close_ref)));
+    remember_stream_connection_addresses(ctx, conn, local_addr, peer_addr);
+    ensure_source_poller_started(ctx);
+
+    if let Value::Object(Some(listener)) = bind_listener {
+        let _ = ctx.invoke_virtual(
+            listener,
+            "handleEvent",
+            "(Ljava/nio/channels/Channel;)V",
+            &[Value::Object(Some(conn))],
+        );
+    }
+    if let Value::Object(Some(listener)) = open_listener {
+        let _ = ctx.invoke_virtual(
+            listener,
+            "handleEvent",
+            "(Ljava/nio/channels/Channel;)V",
+            &[Value::Object(Some(conn))],
+        );
+    }
+
+    let conn = ctx.read_native_pin(conn_pin, conn);
+    let future = ctx.new_object_initialized(
+        "org/xnio/FinishedIoFuture",
+        "(Ljava/lang/Object;)V",
+        &[Value::Object(Some(conn))],
+    );
+    ctx.unpin_native_roots(io_thread_pin);
+    future
+}
+
 // Small helper for the runtime-error path above.
 fn mcf_runtime(msg: &str) -> MethodCallFailed {
     MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::IllegalStateException {
@@ -1173,6 +1783,45 @@ fn mcf_io<S: Into<String>>(message: S) -> MethodCallFailed {
 // Registration — called from `lib.rs` after the WildFly Undertow natives so
 // T19.7 subsystems see the Xnio / XnioWorker surface.
 // ---------------------------------------------------------------------------
+
+fn register_connected_channel_surface(r: &mut NativeMethodRegistry, cls: &str) {
+    r.register(
+        cls,
+        "getPeerAddress",
+        "()Ljava/net/SocketAddress;",
+        native_connected_get_peer_address,
+    );
+    r.register(
+        cls,
+        "getPeerAddress",
+        "(Ljava/lang/Class;)Ljava/net/SocketAddress;",
+        native_connected_get_peer_address,
+    );
+    r.register(
+        cls,
+        "getLocalAddress",
+        "()Ljava/net/SocketAddress;",
+        native_connected_get_local_address,
+    );
+    r.register(
+        cls,
+        "getLocalAddress",
+        "(Ljava/lang/Class;)Ljava/net/SocketAddress;",
+        native_connected_get_local_address,
+    );
+    r.register(
+        cls,
+        "getIoThread",
+        "()Lorg/xnio/XnioIoThread;",
+        native_connected_get_io_thread,
+    );
+    r.register(
+        cls,
+        "getWorker",
+        "()Lorg/xnio/XnioWorker;",
+        native_connected_get_worker,
+    );
+}
 
 fn register_accepting_channel_surface(r: &mut NativeMethodRegistry, cls: &str) {
     r.register(
@@ -1217,11 +1866,26 @@ fn register_accepting_channel_surface(r: &mut NativeMethodRegistry, cls: &str) {
         "(Ljava/lang/Class;)Ljava/net/SocketAddress;",
         native_accepting_get_local_address,
     );
-    r.register(cls, "suspendAccepts", "()V", native_accepting_suspend_accepts);
+    r.register(
+        cls,
+        "suspendAccepts",
+        "()V",
+        native_accepting_suspend_accepts,
+    );
     r.register(cls, "resumeAccepts", "()V", native_accepting_resume_accepts);
-    r.register(cls, "isAcceptResumed", "()Z", native_accepting_is_accept_resumed);
+    r.register(
+        cls,
+        "isAcceptResumed",
+        "()Z",
+        native_accepting_is_accept_resumed,
+    );
     r.register(cls, "wakeupAccepts", "()V", native_accepting_wakeup_accepts);
-    r.register(cls, "awaitAcceptable", "()V", native_accepting_await_acceptable);
+    r.register(
+        cls,
+        "awaitAcceptable",
+        "()V",
+        native_accepting_await_acceptable,
+    );
     r.register(
         cls,
         "awaitAcceptable",
@@ -1269,6 +1933,16 @@ fn register_accepting_channel_surface(r: &mut NativeMethodRegistry, cls: &str) {
 }
 
 pub fn register_xnio_worker_natives(r: &mut NativeMethodRegistry) {
+    for cls in [
+        "org/xnio/StreamConnection",
+        "org/xnio/Connection",
+        CLS_CONNECTED_CHANNEL,
+        CLS_BOUND_CHANNEL,
+    ] {
+        register_connected_channel_surface(r, cls);
+    }
+    r.register(CLS_ACCEPT_PUMP, "run", "()V", native_accept_pump_run);
+    r.register(CLS_SOURCE_POLLER, "run", "()V", native_source_poller_run);
     r.register(
         CLS_XNIO,
         "getInstance",
@@ -1293,12 +1967,33 @@ pub fn register_xnio_worker_natives(r: &mut NativeMethodRegistry) {
         "(Lorg/xnio/XnioWorker$Builder;)Lorg/xnio/XnioWorker;",
         native_xnio_build_worker,
     );
+    r.register(
+        CLS_XNIO_WORKER,
+        "createTcpConnectionServer",
+        "(Ljava/net/InetSocketAddress;Lorg/xnio/ChannelListener;Lorg/xnio/OptionMap;)Lorg/xnio/channels/AcceptingChannel;",
+        native_xnio_create_tcp_connection_server,
+    );
     for cls in [CLS_XNIO_WORKER, CLS_NIO_XNIO_WORKER] {
         r.register(
             cls,
-            "createTcpConnectionServer",
-            "(Ljava/net/InetSocketAddress;Lorg/xnio/ChannelListener;Lorg/xnio/OptionMap;)Lorg/xnio/channels/AcceptingChannel;",
-            native_xnio_create_tcp_connection_server,
+            "chooseThread",
+            "()Lorg/xnio/XnioIoThread;",
+            native_worker_get_io_thread,
+        );
+        r.register(
+            cls,
+            "getBindAddressTable",
+            "()Lorg/wildfly/common/net/CidrAddressTable;",
+            native_worker_get_bind_address_table,
+        );
+    }
+
+    for cls in ["org/xnio/XnioIoThread", "org/xnio/nio/WorkerThread"] {
+        r.register(
+            cls,
+            "openTcpStreamConnection",
+            "(Ljava/net/InetSocketAddress;Ljava/net/InetSocketAddress;Lorg/xnio/ChannelListener;Lorg/xnio/ChannelListener;Lorg/xnio/OptionMap;)Lorg/xnio/IoFuture;",
+            native_iot_open_tcp_stream_connection,
         );
     }
 
@@ -1398,7 +2093,41 @@ pub fn register_xnio_worker_natives(r: &mut NativeMethodRegistry) {
 mod tests {
     use super::*;
     use crate::test_utils::mock_ctx;
-    use std::sync::atomic::AtomicI32;
+    use crate::xnio_conduits::{
+        drop_source_channel, Pipe, SRC_FIELD_READ_LISTENER, SRC_FIELD_READ_READY_FLAG,
+        SRC_FIELD_READ_SUSPENDED,
+    };
+    use std::sync::atomic::{AtomicI32, AtomicUsize};
+
+    static NATIVE_EXECUTE_EXPECTED_RUNNABLE: AtomicUsize = AtomicUsize::new(0);
+    static NATIVE_EXECUTE_SEEN_RUNNABLE: AtomicUsize = AtomicUsize::new(0);
+
+    fn native_execute_runnable_hook(
+        _ctx: &mut crate::test_utils::MockNativeContext,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> Option<MethodCallResult> {
+        let expected = NATIVE_EXECUTE_EXPECTED_RUNNABLE.load(Ordering::SeqCst);
+        if expected == 0 {
+            return None;
+        }
+        let receiver_matches = receiver.as_ptr() as usize == expected;
+        let arg_matches = matches!(
+            args.first(),
+            Some(Value::Object(Some(arg))) if arg.as_ptr() as usize == expected
+        );
+        if receiver_matches && method_name == "run" && descriptor == "()V" {
+            NATIVE_EXECUTE_SEEN_RUNNABLE.fetch_add(1, Ordering::SeqCst);
+            return Some(Ok(None));
+        }
+        if arg_matches && method_name == "execute" && descriptor == "(Ljava/lang/Runnable;)V" {
+            NATIVE_EXECUTE_SEEN_RUNNABLE.fetch_add(1, Ordering::SeqCst);
+            return Some(Ok(None));
+        }
+        None
+    }
 
     #[test]
     fn t19_7_b_xnio_get_instance_returns_singleton() {
@@ -1512,6 +2241,35 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         w.shutdown_now();
         assert!(w.await_termination(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn t19_7_b_native_execute_runs_java_runnable() {
+        let w = XnioWorker::new(
+            "t19_7_b_native_exec",
+            OptionMap {
+                worker_io_threads: Some(1),
+                worker_task_core_threads: Some(1),
+            },
+        );
+        let mut ctx = mock_ctx();
+        let mirror = alloc_worker_mirror(&mut ctx, CLS_XNIO_WORKER, &w);
+        register_worker(w.clone());
+        let runnable = ctx.fresh_object_ref();
+        NATIVE_EXECUTE_EXPECTED_RUNNABLE.store(runnable.as_ptr() as usize, Ordering::SeqCst);
+        NATIVE_EXECUTE_SEEN_RUNNABLE.store(0, Ordering::SeqCst);
+        ctx.set_invoke_virtual_hook(native_execute_runnable_hook);
+
+        native_worker_execute(
+            &mut ctx,
+            &[Value::Object(Some(mirror)), Value::Object(Some(runnable))],
+        )
+        .expect("native execute should accept runnable");
+
+        assert_eq!(NATIVE_EXECUTE_SEEN_RUNNABLE.load(Ordering::SeqCst), 1);
+        NATIVE_EXECUTE_EXPECTED_RUNNABLE.store(0, Ordering::SeqCst);
+        w.shutdown_now();
+        assert!(w.await_termination(Duration::from_secs(2)));
     }
 
     #[test]
@@ -1665,6 +2423,25 @@ mod tests {
     }
 
     #[test]
+    fn wf_domain_real_nio_worker_is_adopted_without_slot_handle() {
+        let mut ctx = mock_ctx();
+        let realish =
+            alloc_concurrent_synthetic(&mut ctx, CLS_NIO_XNIO_WORKER, WORKER_NUM_SLOTS + 1);
+        ctx.set_field(realish, WORKER_FIELD_OPTIONS_HANDLE, Value::Object(None));
+
+        let worker = read_worker(&ctx, realish).expect("adopt real worker");
+        let same_worker = read_worker(&ctx, realish).expect("read adopted worker");
+
+        assert!(Arc::ptr_eq(&worker, &same_worker));
+        assert!(matches!(
+            ctx.get_field(realish, WORKER_FIELD_OPTIONS_HANDLE),
+            Value::Object(None)
+        ));
+        worker.shutdown_now();
+        assert!(worker.await_termination(Duration::from_secs(2)));
+    }
+
+    #[test]
     fn t19_7_b_register_natives_registers_all() {
         let mut r = NativeMethodRegistry::new();
         register_xnio_worker_natives(&mut r);
@@ -1681,6 +2458,9 @@ mod tests {
         assert!(r
             .find(CLS_XNIO_WORKER, "getIoThread", "()Lorg/xnio/XnioIoThread;")
             .is_some());
+        assert!(r
+            .find(CLS_XNIO_WORKER, "chooseThread", "()Lorg/xnio/XnioIoThread;")
+            .is_some());
         assert!(r.find(CLS_XNIO_WORKER, "shutdown", "()V").is_some());
         assert!(r
             .find(CLS_XNIO_WORKER, "awaitTermination", "(J)Z")
@@ -1690,6 +2470,13 @@ mod tests {
             .find(
                 CLS_NIO_XNIO_WORKER,
                 "getIoThread",
+                "()Lorg/xnio/XnioIoThread;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                CLS_NIO_XNIO_WORKER,
+                "chooseThread",
                 "()Lorg/xnio/XnioIoThread;"
             )
             .is_some());
@@ -1705,6 +2492,13 @@ mod tests {
                 CLS_ACCEPTING_CHANNEL,
                 "getAcceptSetter",
                 "()Lorg/xnio/ChannelListener$Setter;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                "org/xnio/StreamConnection",
+                "getWorker",
+                "()Lorg/xnio/XnioWorker;"
             )
             .is_some());
     }
@@ -1751,16 +2545,14 @@ mod tests {
             Value::Int(1)
         );
 
-        let setter = match native_accepting_get_accept_setter(
-            &mut ctx,
-            &[Value::Object(Some(channel))],
-        )
-        .unwrap()
-        .unwrap()
-        {
-            Value::Object(Some(o)) => o,
-            other => panic!("expected setter, got {:?}", other),
-        };
+        let setter =
+            match native_accepting_get_accept_setter(&mut ctx, &[Value::Object(Some(channel))])
+                .unwrap()
+                .unwrap()
+            {
+                Value::Object(Some(o)) => o,
+                other => panic!("expected setter, got {:?}", other),
+            };
         assert_eq!(
             ctx.get_field(setter, SETTER_FIELD_CHANNEL_HANDLE),
             Value::Object(Some(channel))
@@ -1772,6 +2564,161 @@ mod tests {
 
         native_accepting_close(&mut ctx, &[Value::Object(Some(channel))]).unwrap();
         assert_eq!(ctx.get_field(channel, ACCEPT_FIELD_OPEN), Value::Int(0));
+        worker.shutdown_now();
+        assert!(worker.await_termination(Duration::from_secs(2)));
+    }
+
+    fn mark_source_read_listener_invoked(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        _receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> Option<MethodCallResult> {
+        if method_name == "handleEvent" && descriptor == "(Ljava/nio/channels/Channel;)V" {
+            if let Some(Value::Object(Some(source))) = args.first().copied() {
+                ctx.set_field(source, SRC_FIELD_READ_READY_FLAG, Value::Int(2));
+            }
+            return Some(Ok(None));
+        }
+        None
+    }
+
+    #[test]
+    fn wf_domain_accept_pump_sleep_polls_registered_sources() {
+        let mut ctx = mock_ctx();
+        let pipe = Arc::new(Pipe::new(1024));
+        pipe.push(b"x");
+        let source_id = register_source_channel(ConduitTransport::Pipe(pipe));
+        let source = alloc_source_channel_obj(&mut ctx, source_id);
+        ctx.set_field(source, SRC_FIELD_READ_SUSPENDED, Value::Int(0));
+        let listener = alloc_concurrent_synthetic(&mut ctx, "org/xnio/ChannelListener", 0);
+        ctx.set_field(
+            source,
+            SRC_FIELD_READ_LISTENER,
+            Value::Object(Some(listener)),
+        );
+        ctx.set_invoke_virtual_hook(mark_source_read_listener_invoked);
+
+        let channel = alloc_concurrent_synthetic(&mut ctx, CLS_ACCEPTING_CHANNEL, ACCEPT_NUM_SLOTS);
+        let retained = accept_pump_blocked_sleep(&mut ctx, channel, Duration::from_millis(0));
+
+        assert_eq!(retained, channel);
+        assert_eq!(
+            ctx.get_field(source, SRC_FIELD_READ_READY_FLAG),
+            Value::Int(2)
+        );
+        drop_source_channel(source_id);
+    }
+
+    #[test]
+    fn wf_domain_outbound_tcp_stream_starts_source_poller() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener local addr");
+        let accepted = Arc::new(AtomicBool::new(false));
+        let accepted_for_thread = accepted.clone();
+        let accept_thread = thread::spawn(move || {
+            if let Ok((_stream, _peer)) = listener.accept() {
+                accepted_for_thread.store(true, Ordering::SeqCst);
+            }
+        });
+
+        fn synthetic_inet_socket_address_getters(
+            ctx: &mut crate::test_utils::MockNativeContext,
+            receiver: ObjectRef,
+            method_name: &str,
+            descriptor: &str,
+            _args: &[Value],
+        ) -> Option<MethodCallResult> {
+            match (method_name, descriptor) {
+                ("getPort", "()I") => Some(Ok(Some(ctx.get_field(receiver, 1)))),
+                ("getHostString", "()Ljava/lang/String;") => {
+                    Some(Ok(Some(ctx.get_field(receiver, 0))))
+                }
+                _ => None,
+            }
+        }
+
+        let mut ctx = mock_ctx();
+        ctx.set_invoke_virtual_hook(synthetic_inet_socket_address_getters);
+        let vm = ctx.vm_identity();
+        source_poller_started_vms()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&vm);
+
+        let worker = XnioWorker::new(
+            "wf_domain_outbound_poller",
+            OptionMap {
+                worker_io_threads: Some(1),
+                worker_task_core_threads: Some(1),
+            },
+        );
+        register_worker(worker.clone());
+        let worker_mirror = alloc_worker_mirror(&mut ctx, CLS_XNIO_WORKER, &worker);
+        let io_thread =
+            match native_worker_get_io_thread(&mut ctx, &[Value::Object(Some(worker_mirror))])
+                .unwrap()
+                .unwrap()
+            {
+                Value::Object(Some(o)) => o,
+                other => panic!("expected XnioIoThread mirror, got {:?}", other),
+            };
+        let destination = alloc_concurrent_synthetic(&mut ctx, "java/net/InetSocketAddress", 2);
+        let host = ctx.create_string("127.0.0.1");
+        ctx.set_field(destination, 0, Value::Object(Some(host)));
+        ctx.set_field(destination, 1, Value::Int(addr.port() as i32));
+
+        let result = native_iot_open_tcp_stream_connection(
+            &mut ctx,
+            &[
+                Value::Object(Some(io_thread)),
+                Value::Object(None),
+                Value::Object(Some(destination)),
+                Value::Object(None),
+                Value::Object(None),
+                Value::Object(None),
+            ],
+        );
+        assert!(
+            result.is_ok(),
+            "openTcpStreamConnection must succeed: {result:?}"
+        );
+        assert!(source_poller_started_vms()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&vm));
+
+        let _ = accept_thread.join();
+        assert!(accepted.load(Ordering::SeqCst));
+        worker.shutdown_now();
+        assert!(worker.await_termination(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn wf_domain_stream_connection_worker_identity_uses_io_thread_mirror() {
+        let mut ctx = mock_ctx();
+        let worker = XnioWorker::new("wf_domain_stream_worker_identity", OptionMap::default());
+        register_worker(worker.clone());
+        let worker_mirror = alloc_worker_mirror(&mut ctx, CLS_XNIO_WORKER, &worker);
+
+        let io_thread =
+            match native_worker_get_io_thread(&mut ctx, &[Value::Object(Some(worker_mirror))])
+                .unwrap()
+                .unwrap()
+            {
+                Value::Object(Some(o)) => o,
+                other => panic!("expected XnioIoThread mirror, got {:?}", other),
+            };
+        assert_eq!(
+            io_thread_worker_mirror(&ctx, io_thread),
+            Some(worker_mirror)
+        );
+        assert!(matches!(
+            ctx.get_field_by_name(io_thread, "number"),
+            Value::Int(_) | Value::Long(_)
+        ));
+
         worker.shutdown_now();
         assert!(worker.await_termination(Duration::from_secs(2)));
     }

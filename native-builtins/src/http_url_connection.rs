@@ -150,7 +150,7 @@ fn real_results() -> &'static Mutex<HashMap<i32, RealResult>> {
 /// state a real carrier needs (method, request headers, doOutput) in this
 /// identity-keyed side-table, mirroring the established
 /// `net_phase_e::stream_owner_table` precedent for real-JDK carrier objects.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 struct RealReq {
     method: String,                 // empty => "GET"
     headers: Vec<(String, String)>, // ordered; setRequestProperty replaces, addRequestProperty appends
@@ -160,6 +160,20 @@ struct RealReq {
     // these in synthetic slots, so they live here keyed by object identity.
     connect_timeout_ms: Option<i32>,
     read_timeout_ms: Option<i32>,
+    follow_redirects: bool,
+}
+
+impl Default for RealReq {
+    fn default() -> Self {
+        Self {
+            method: String::new(),
+            headers: Vec::new(),
+            do_output: false,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
+            follow_redirects: true,
+        }
+    }
 }
 
 fn real_reqs() -> &'static Mutex<HashMap<i32, RealReq>> {
@@ -272,16 +286,12 @@ fn huc_real_perform(
         }
         return Ok(st);
     }
-    let parsed = match parse_url(url_str) {
-        Ok(p) => p,
-        Err(_) => return Ok(-1),
-    };
     let req = real_reqs()
         .lock()
         .ok()
         .and_then(|t| t.get(&key).cloned())
         .unwrap_or_default();
-    let method = if req.method.is_empty() {
+    let mut method = if req.method.is_empty() {
         "GET".to_string()
     } else {
         req.method.clone()
@@ -298,28 +308,54 @@ fn huc_real_perform(
         Some(v) if v > 0 => Duration::from_millis(v as u64),
         _ => Duration::from_secs(60),
     };
-    let body = real_body_bytes(ctx, this);
-    // FIX (client-cipher-restriction): resolve any real caller-installed
-    // SSLSocketFactory BEFORE calling perform — the up-call needs `ctx`,
-    // which isn't available (and TLS handshakes/up-calls aren't the kind of
-    // bounded, ctx-free work a blocking region exists for) once inside one.
-    let established_https_stream = if parsed.scheme == "https" {
-        huc_upcall_create_socket_if_custom_factory(ctx, &parsed.host, parsed.port)?
-    } else {
-        None
-    };
-    // `perform` manages its own (fine-grained) blocking regions internally —
-    // see its doc — so this caller must not wrap the whole call in one.
-    let resp = perform(
-        ctx,
-        &parsed,
-        &method,
-        &req.headers,
-        &body,
-        connect_to,
-        read_to,
-        established_https_stream,
-    );
+    let original_body = real_body_bytes(ctx, this);
+    let mut body = original_body.clone();
+    let mut current_url = url_str.to_string();
+    let mut final_resp = None;
+    for redirect_count in 0..=20 {
+        let parsed = match parse_url(&current_url) {
+            Ok(p) => p,
+            Err(_) => return Ok(-1),
+        };
+        let established_https_stream = if parsed.scheme == "https" {
+            huc_upcall_create_socket_if_custom_factory(ctx, &parsed.host, parsed.port)?
+        } else {
+            None
+        };
+        let resp = perform(
+            ctx,
+            &parsed,
+            &method,
+            &req.headers,
+            &body,
+            connect_to,
+            read_to,
+            established_https_stream,
+        );
+        match resp {
+            Ok((status, headers, resp_body))
+                if req.follow_redirects && is_redirect_status(status) && redirect_count < 20 =>
+            {
+                if let Some(location) = header_value(&headers, "Location") {
+                    current_url = resolve_redirect_url(&parsed, &location);
+                    if status == 303
+                        || ((status == 301 || status == 302) && method != "GET" && method != "HEAD")
+                    {
+                        method = "GET".to_string();
+                        body.clear();
+                    }
+                    continue;
+                }
+                final_resp = Some(Ok((status, headers, resp_body)));
+                break;
+            }
+            other => {
+                final_resp = Some(other);
+                break;
+            }
+        }
+    }
+    let resp = final_resp.unwrap_or_else(|| Ok((310, Vec::new(), Vec::new())));
     match resp {
         Ok((status, headers, body)) => {
             if let Ok(mut t) = real_results().lock() {
@@ -356,11 +392,13 @@ fn huc_real_perform(
         // silently reports "-1" for a rejected/aborted handshake, and several
         // Tomcat tests specifically assert on catching that exception type
         // (e.g. a required client certificate that was not presented).
-        Err(ref e) if e.starts_with(TLS_HANDSHAKE_FAILURE_SENTINEL) => Err(crate::phases_early::throw_jca_exc(
-            ctx,
-            "javax/net/ssl/SSLHandshakeException",
-            e.trim_start_matches(TLS_HANDSHAKE_FAILURE_SENTINEL),
-        )),
+        Err(ref e) if e.starts_with(TLS_HANDSHAKE_FAILURE_SENTINEL) => {
+            Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/net/ssl/SSLHandshakeException",
+                e.trim_start_matches(TLS_HANDSHAKE_FAILURE_SENTINEL),
+            ))
+        }
         // Other I/O failures (premature EOF, connection refused) follow the
         // real JDK's `getResponseCode` contract of returning -1.
         Err(_) => Ok(-1),
@@ -565,6 +603,37 @@ struct Url1 {
     userinfo: Option<String>,
 }
 
+fn is_redirect_status(status: i32) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.clone())
+}
+
+fn resolve_redirect_url(base: &Url1, location: &str) -> String {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        return location.to_string();
+    }
+    let default_port: u16 = if base.scheme == "https" { 443 } else { 80 };
+    let prefix = if base.port == default_port {
+        format!("{}://{}", base.scheme, base.host)
+    } else {
+        format!("{}://{}:{}", base.scheme, base.host, base.port)
+    };
+    if location.starts_with('/') {
+        return format!("{prefix}{location}");
+    }
+    let base_dir = match base.path.rfind('/') {
+        Some(0) | None => "/",
+        Some(i) => &base.path[..=i],
+    };
+    format!("{prefix}{base_dir}{location}")
+}
+
 fn parse_url(url: &str) -> Result<Url1, String> {
     let (scheme, rest) = if let Some(r) = url.strip_prefix("https://") {
         ("https".to_string(), r)
@@ -623,7 +692,6 @@ fn build_request(
     }
     let mut has_user_agent = false;
     let mut has_content_length = false;
-    let mut has_connection = false;
     let mut has_content_type = false;
     let mut has_authorization = false;
     for (k, v) in headers {
@@ -633,9 +701,6 @@ fn build_request(
         }
         if lk == "content-length" {
             has_content_length = true;
-        }
-        if lk == "connection" {
-            has_connection = true;
         }
         if lk == "content-type" {
             has_content_type = true;
@@ -673,10 +738,6 @@ fn build_request(
     // never parsed as parameters).
     if !has_content_type && is_output_method {
         out.extend_from_slice(b"Content-Type: application/x-www-form-urlencoded\r\n");
-    }
-    if !has_connection {
-        // HttpURLConnection in real-JDK defaults to closing the connection.
-        out.extend_from_slice(b"Connection: close\r\n");
     }
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(body);
@@ -1233,14 +1294,12 @@ fn perform(
         drop(active_ctx_guard);
         outcome
     } else {
-        ctx.begin_blocking_region();
         let mut s = tcp;
         let result = (|| -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
             s.write_all(&req).map_err(|e| format!("write: {e}"))?;
             s.flush().map_err(|e| format!("flush: {e}"))?;
             read_response(&mut s, head)
         })();
-        ctx.end_blocking_region();
         result
     }
 }
@@ -1642,7 +1701,10 @@ fn huc_get_output_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(Some(Value::Object(Some(baos))))
 }
 
-pub(crate) fn huc_get_header_field_named(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn huc_get_header_field_named(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let name = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
@@ -1790,15 +1852,15 @@ fn content_length_of(headers: &[(String, String)], body_len: usize) -> i64 {
         .unwrap_or(body_len as i64)
 }
 
-pub(crate) fn huc_get_content_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn huc_get_content_length(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if let Some(url_str) = huc_real_object_url(ctx, this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
             huc_real_perform(ctx, this, &url_str)?;
-            let n = content_length_of(
-                &huc_real_headers(ctx, this),
-                huc_real_body(ctx, this).len(),
-            );
+            let n = content_length_of(&huc_real_headers(ctx, this), huc_real_body(ctx, this).len());
             return Ok(Some(Value::Int(n as i32)));
         }
     }
@@ -1812,15 +1874,15 @@ pub(crate) fn huc_get_content_length(ctx: &mut dyn NativeContext, args: &[Value]
     Ok(Some(Value::Int(n)))
 }
 
-pub(crate) fn huc_get_content_length_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn huc_get_content_length_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if let Some(url_str) = huc_real_object_url(ctx, this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
             huc_real_perform(ctx, this, &url_str)?;
-            let n = content_length_of(
-                &huc_real_headers(ctx, this),
-                huc_real_body(ctx, this).len(),
-            );
+            let n = content_length_of(&huc_real_headers(ctx, this), huc_real_body(ctx, this).len());
             return Ok(Some(Value::Long(n)));
         }
     }
@@ -2100,6 +2162,9 @@ fn huc_set_instance_follow_redirects(
     let this = obj_arg(args, 0)?;
     let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
     if is_real_carrier(ctx, this) {
+        with_real_req(ctx, this, |req| {
+            req.follow_redirects = v != 0;
+        });
         return Ok(None);
     }
     ctx.set_field(this, HUC_INSTANCE_FOLLOW_REDIRECTS, Value::Int(v));
@@ -2112,7 +2177,15 @@ fn huc_get_instance_follow_redirects(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if is_real_carrier(ctx, this) {
-        return Ok(Some(Value::Int(1)));
+        let follow = real_reqs()
+            .lock()
+            .ok()
+            .and_then(|t| {
+                t.get(&ctx.identity_hash_code(this))
+                    .map(|req| req.follow_redirects)
+            })
+            .unwrap_or(true);
+        return Ok(Some(Value::Int(if follow { 1 } else { 0 })));
     }
     Ok(Some(ctx.get_field(this, HUC_INSTANCE_FOLLOW_REDIRECTS)))
 }
@@ -2408,7 +2481,6 @@ mod http_url_connection_tests {
         assert!(s.starts_with("GET /foo HTTP/1.1\r\n"));
         assert!(s.contains("Host: example.com\r\n"));
         assert!(s.contains("User-Agent: Java/CratonVM\r\n"));
-        assert!(s.contains("Connection: close\r\n"));
     }
 
     #[test]

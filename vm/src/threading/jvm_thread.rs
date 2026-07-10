@@ -125,7 +125,10 @@ fn parklat_enabled() -> bool {
 fn parklat_now_nanos() -> u64 {
     use std::sync::OnceLock;
     static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as u64
 }
 
 impl ParkState {

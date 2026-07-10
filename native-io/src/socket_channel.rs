@@ -829,7 +829,10 @@ fn sc_is_connection_pending(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(v) => v,
         None => return Ok(Some(Value::Int(0))),
     };
-    let pending = matches!(tcp_registry().read().get(&id), Some(TcpHandle::Connecting(_)));
+    let pending = matches!(
+        tcp_registry().read().get(&id),
+        Some(TcpHandle::Connecting(_))
+    );
     Ok(Some(Value::Int(if pending { 1 } else { 0 })))
 }
 
@@ -990,12 +993,7 @@ fn sc_remote_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     if let Some((host, port)) = cf_remote(ctx, this) {
         if port > 0 {
-            let h = ctx.create_string(&host);
-            return ctx.new_object_initialized(
-                "java/net/InetSocketAddress",
-                "(Ljava/lang/String;I)V",
-                &[Value::Object(Some(h)), Value::Int(port)],
-            );
+            return new_resolved_inet_socket_address(ctx, &host, port);
         }
     }
     Ok(Some(Value::Object(None)))
@@ -1022,12 +1020,7 @@ fn sc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let Some(addr) = local else {
         return Ok(Some(Value::Object(None)));
     };
-    let h = ctx.create_string(&addr.ip().to_string());
-    ctx.new_object_initialized(
-        "java/net/InetSocketAddress",
-        "(Ljava/lang/String;I)V",
-        &[Value::Object(Some(h)), Value::Int(addr.port() as i32)],
-    )
+    new_resolved_inet_socket_address(ctx, &addr.ip().to_string(), addr.port() as i32)
 }
 
 // ---------------------------------------------------------------------------
@@ -2138,7 +2131,12 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             "(Ljava/net/SocketOption;)Ljava/lang/Object;",
             sc_get_option,
         );
-        r.register(c, "supportedOptions", "()Ljava/util/Set;", sc_supported_options);
+        r.register(
+            c,
+            "supportedOptions",
+            "()Ljava/util/Set;",
+            sc_supported_options,
+        );
     }
 
     // -- ServerSocketChannel factory + lifecycle --
@@ -2217,7 +2215,12 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             "(Ljava/net/SocketOption;)Ljava/lang/Object;",
             sc_get_option,
         );
-        r.register(c, "supportedOptions", "()Ljava/util/Set;", sc_supported_options);
+        r.register(
+            c,
+            "supportedOptions",
+            "()Ljava/util/Set;",
+            sc_supported_options,
+        );
         r.register(
             c,
             "getLocalAddress",

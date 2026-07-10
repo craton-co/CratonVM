@@ -1,0 +1,96 @@
+diff --git a/vm/src/vm/vm_exec.rs b/vm/src/vm/vm_exec.rs
+--- a/vm/src/vm/vm_exec.rs
++++ b/vm/src/vm/vm_exec.rs
+@@ -10617,6 +10617,37 @@ pub fn invoke_on_class_shared(
+     invoke_on_class_shared_inner(shared, thread, class_id, method_name, descriptor, args, false)
+ }
+ 
++fn jboss_marshalling_ser_methods_caller(thread: &JvmThread) -> bool {
++    thread.frames.last().is_some_and(|f| {
++        f.class_name() == "org/jboss/marshalling/reflect/JDKSpecific$SerMethods"
++            && matches!(
++                f.method_name(),
++                "callReadObject"
++                    | "callReadObjectNoData"
++                    | "callWriteObject"
++                    | "callReadResolve"
++                    | "callWriteReplace"
++            )
++    })
++}
++
++fn object_serialization_hook_neutral_result(
++    method_name: &str,
++    descriptor: &str,
++    args: &[Value],
++) -> Option<Option<Value>> {
++    match (method_name, descriptor) {
++        ("readObject", "(Ljava/io/ObjectInputStream;)V")
++        | ("readObjectNoData", "()V")
++        | ("writeObject", "(Ljava/io/ObjectOutputStream;)V") => Some(None),
++        ("readResolve", "()Ljava/lang/Object;")
++        | ("writeReplace", "()Ljava/lang/Object;") => {
++            Some(Some(args.first().copied().unwrap_or(Value::Object(None))))
++        }
++        _ => None,
++    }
++}
++
+ fn invoke_on_class_shared_inner(
+     shared: &SharedVm,
+     thread: &mut JvmThread,
+@@ -13355,6 +13386,22 @@ fn invoke_on_class_shared_inner(
+                         );
+                     }
+                 }
++                if class_name == "java/lang/Object" && jboss_marshalling_ser_methods_caller(thread)
++                {
++                    if let Some(result) =
++                        object_serialization_hook_neutral_result(method_name, descriptor, args)
++                    {
++                        if std::env::var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some() {
++                            eprintln!(
++                                "[rf-ser] neutral Object serialization hook {}{} caller={}",
++                                method_name,
++                                descriptor,
++                                thread.frames.last().map(|f| f.method_name()).unwrap_or("")
++                            );
++                        }
++                        return Ok(result);
++                    }
++                }
++
+                 // Diagnostic aid: a NoSuchMethodError against a
+                 // `is_synthetic_stub` class is almost always a masked
+                 // classpath gap, not a genuine method-resolution bug — the
+@@ -14014,6 +14061,29 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn object_serialization_hook_neutral_result_matches_objectstream_hooks() {
++        assert_eq!(
++            object_serialization_hook_neutral_result(
++                "readObject",
++                "(Ljava/io/ObjectInputStream;)V",
++                &[]
++            ),
++            Some(None)
++        );
++        assert_eq!(
++            object_serialization_hook_neutral_result(
++                "writeReplace",
++                "()Ljava/lang/Object;",
++                &[Value::Object(None)]
++            ),
++            Some(Some(Value::Object(None)))
++        );
++        assert_eq!(
++            object_serialization_hook_neutral_result("clone", "()Ljava/lang/Object;", &[]),
++            None
++        );
++    }
++
+     #[test]
+     fn coerce_aligned_long_to_ref_does_not_fabricate_objectref() {
+         // vm-vmexec-coerce: a non-zero, 8-aligned `Value::Long` (e.g. a hash /

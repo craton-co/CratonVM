@@ -43,7 +43,7 @@ Representative matrix:
 - CratonVM --nojit: 1 PASS, 10 FAIL, 3 HANG. The pass is `RestClientGzipCompressionTests`; the HANG rows are `ES812PostingsFormatTests`, `FloatRandomBinaryDocValuesRangeQueryTests`, and `IVFKnnFloatSlicedVectorQueryTests` at the 600s timeout.
 
 Known-issue docs added or updated from this investigation:
-- `ES-FAIL-FAMILY-20260709-foreign-memorylayout-varhandle.md`
+- `../internal/elasticsearch-suite/ES-FAIL-FAMILY-20260709-foreign-memorylayout-varhandle-FIXED.md`
 - `ES-FAIL-FAMILY-20260709-vector-score-zero.md`
 - `ES-FAIL-FAMILY-20260709-vector-codec-footer-mismatch.md`
 - `ES-FAIL-FAMILY-20260709-vector-value-null.md`

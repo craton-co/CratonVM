@@ -45,6 +45,15 @@ public class GenericReflectionTest {
     static List<String> users;
     static Map<String, Integer> counts;
 
+    interface Search<I, O> {
+    }
+
+    interface Create<I, O> {
+        default O create(I body) {
+            return null;
+        }
+    }
+
     // --- Test methods ---
 
     // Test 1: Class with type parameters has non-empty getTypeParameters()
@@ -229,6 +238,32 @@ public class GenericReflectionTest {
         }
     }
 
+    // Test 15: Method generic accessors on generic default methods must use
+    // the Signature attribute and keep same-named variables declaration-scoped.
+    public static int testSameNamedInterfaceTypeVariables() {
+        try {
+            Method m = Create.class.getDeclaredMethod("create", Object.class);
+            Type[] bodyTypes = m.getGenericParameterTypes();
+            if (bodyTypes.length != 1) return 0;
+            if (!(bodyTypes[0] instanceof TypeVariable)) return 0;
+            TypeVariable<?> bodyType = (TypeVariable<?>) bodyTypes[0];
+
+            Type returnType = m.getGenericReturnType();
+            if (!(returnType instanceof TypeVariable)) return 0;
+            TypeVariable<?> outputType = (TypeVariable<?>) returnType;
+
+            TypeVariable<?> createI = Create.class.getTypeParameters()[0];
+            TypeVariable<?> createO = Create.class.getTypeParameters()[1];
+            TypeVariable<?> searchI = Search.class.getTypeParameters()[0];
+            if (!bodyType.equals(createI)) return 0;
+            if (!outputType.equals(createO)) return 0;
+            if (bodyType.equals(searchI)) return 0;
+            return 1;
+        } catch (Throwable ex) {
+            return 0;
+        }
+    }
+
     // --- Entry points ---
     public static void testClassParams() { Util.tempPrint(testClassTypeParams()); }
     public static void testMultiParams() { Util.tempPrint(testMultipleTypeParams()); }
@@ -244,4 +279,5 @@ public class GenericReflectionTest {
     public static void testParamField()  { Util.tempPrint(testParameterizedField()); }
     public static void testTwoArgField() { Util.tempPrint(testTwoArgParameterizedField()); }
     public static void testWildExtends() { Util.tempPrint(testWildcardExtendsNumber()); }
+    public static void testSameNamedVars() { Util.tempPrint(testSameNamedInterfaceTypeVariables()); }
 }

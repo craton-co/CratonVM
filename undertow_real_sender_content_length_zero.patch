@@ -1,0 +1,51 @@
+diff --git a/native-builtins/src/wildfly_undertow.rs b/native-builtins/src/wildfly_undertow.rs
+--- a/native-builtins/src/wildfly_undertow.rs
++++ b/native-builtins/src/wildfly_undertow.rs
+@@ -1120,6 +1120,36 @@ fn native_exchange_get_response_sender(
+     }
+ }
+ 
++fn real_exchange_force_empty_response_body(
++    ctx: &mut dyn NativeContext,
++    exchange: ObjectRef,
++) -> MethodCallResult {
++    let Some(Value::Object(Some(headers))) =
++        native_exchange_get_response_headers(ctx, &[Value::Object(Some(exchange))])?
++    else {
++        return Ok(None);
++    };
++    let name_text = ctx.create_string("Content-Length");
++    let name = match ctx.new_object_initialized(
++        CLS_HTTP_STRING,
++        "(Ljava/lang/String;)V",
++        &[Value::Object(Some(name_text))],
++    )? {
++        Some(Value::Object(Some(o))) => o,
++        _ => name_text,
++    };
++    let zero = ctx.create_string("0");
++    let _ = native_header_map_put(
++        ctx,
++        &[
++            Value::Object(Some(headers)),
++            Value::Object(Some(name)),
++            Value::Object(Some(zero)),
++        ],
++    )?;
++    Ok(None)
++}
++
+ fn native_sender_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+     let this = obj_arg(args, 0)?;
+     // The sender's slot 0 is its back-pointer to the exchange.
+@@ -1135,8 +1166,10 @@ fn native_sender_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
+         // HeaderMap. Writing a body String there corrupts
+         // `closeAndFlushResponse()` into `String.put(HttpString, String)`.
+         if !exchange_uses_real_layout(ctx, exchange, "responseHeaders") {
+             ctx.set_field(exchange, EX_FIELD_REQUEST_BODY, body_v);
++        } else {
++            real_exchange_force_empty_response_body(ctx, exchange)?;
+         }
+     }
+     Ok(None)
+ }

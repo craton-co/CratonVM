@@ -1100,46 +1100,47 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
     let mut ldc2w_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `ldc2_w` (0x14)
     let mut indy_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `invokedynamic` (0xba)
     let mut has_athrow = false; // RBC.6 — method contains 0xbf
-    // BUG-LQB-SCOPE: earliest bytecode pc of any instruction with an
-    // observable, non-idempotent side effect (putfield/putstatic, an array
-    // store, or any invoke* — a callee can mutate arbitrary state). The
-    // `invokedynamic` (0xba) arm below lowers to an UNCONDITIONAL jump to the
-    // shared uncommon-trap deopt stub (reason 8, `UnreachedCode`) — control
-    // never returns from the trap into JIT-compiled code, and the VM's
-    // fallback for that trap (when no precise resume snapshot exists, which
-    // is unconditionally true for reason 8 as of the 2026-07-07 Groovy-
-    // regression revert — see
-    // docs/known-issues/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression.md)
-    // is to RE-EXECUTE THE WHOLE METHOD FROM ITS INTERPRETER ENTRY. Any
-    // side-effecting bytecode positioned BEFORE the indy in program order
-    // already ran for real once under the (aborted) JIT attempt, so the
-    // interpreter's from-scratch re-run executes it a SECOND time — a
-    // genuine double-execution, not just a performance cost. Confirmed via a
-    // minimal standalone repro (`enter()`-shaped method: `counter++;
-    // ...concat via invokedynamic...`) invoked from a JIT-compiled caller:
-    // the counter field was incremented twice per logical call. This is the
-    // root cause of the Liquibase `Scope` "Cannot end scope X when currently
-    // at scope root" corruption (docs/known-issues/keycloak-07-04/
-    // testsuite-model-liquibase-scope-corruption.md) — `Scope.enter()`-style
-    // methods perform a `putstatic`/field mutation before a string-concat
-    // `invokedynamic`, so the ThreadLocal-tracked scope stack gets pushed
-    // twice for one logical `Scope.enter()` call once such a helper method
-    // gets JIT-compiled and reached from a JIT-compiled (or otherwise
-    // JIT-dispatching) caller.
-    //
-    // Fix: track the earliest such pc; after the scan, if it precedes any
-    // `invokedynamic` site, refuse to compile the WHOLE method (return
-    // `None`, same fail-safe posture as the RBC.6 athrow+exception-table
-    // gate below) rather than emit unconditional-trap codegen that can
-    // double-execute already-committed work. This only affects methods that
-    // have both a live invokedynamic AND an earlier side effect in raw
-    // bytecode-pc order — the overwhelmingly common case (an
-    // `assert cond : "msg" + x;` message-concat sitting on a dead branch
-    // near the end of a method, unrelated to any earlier field/array
-    // mutation reachability) is unaffected and still compiles at full JIT
-    // speed; methods that fail this new gate simply stay fully interpreted
-    // (correct, just not JIT-accelerated), matching the scanner's existing
-    // "when in doubt, don't compile" philosophy.
+    let mut has_newarray = false; // Primitive array allocation (0xbc)
+                                  // BUG-LQB-SCOPE: earliest bytecode pc of any instruction with an
+                                  // observable, non-idempotent side effect (putfield/putstatic, an array
+                                  // store, or any invoke* — a callee can mutate arbitrary state). The
+                                  // `invokedynamic` (0xba) arm below lowers to an UNCONDITIONAL jump to the
+                                  // shared uncommon-trap deopt stub (reason 8, `UnreachedCode`) — control
+                                  // never returns from the trap into JIT-compiled code, and the VM's
+                                  // fallback for that trap (when no precise resume snapshot exists, which
+                                  // is unconditionally true for reason 8 as of the 2026-07-07 Groovy-
+                                  // regression revert — see
+                                  // docs/known-issues/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression.md)
+                                  // is to RE-EXECUTE THE WHOLE METHOD FROM ITS INTERPRETER ENTRY. Any
+                                  // side-effecting bytecode positioned BEFORE the indy in program order
+                                  // already ran for real once under the (aborted) JIT attempt, so the
+                                  // interpreter's from-scratch re-run executes it a SECOND time — a
+                                  // genuine double-execution, not just a performance cost. Confirmed via a
+                                  // minimal standalone repro (`enter()`-shaped method: `counter++;
+                                  // ...concat via invokedynamic...`) invoked from a JIT-compiled caller:
+                                  // the counter field was incremented twice per logical call. This is the
+                                  // root cause of the Liquibase `Scope` "Cannot end scope X when currently
+                                  // at scope root" corruption (docs/known-issues/keycloak-07-04/
+                                  // testsuite-model-liquibase-scope-corruption.md) — `Scope.enter()`-style
+                                  // methods perform a `putstatic`/field mutation before a string-concat
+                                  // `invokedynamic`, so the ThreadLocal-tracked scope stack gets pushed
+                                  // twice for one logical `Scope.enter()` call once such a helper method
+                                  // gets JIT-compiled and reached from a JIT-compiled (or otherwise
+                                  // JIT-dispatching) caller.
+                                  //
+                                  // Fix: track the earliest such pc; after the scan, if it precedes any
+                                  // `invokedynamic` site, refuse to compile the WHOLE method (return
+                                  // `None`, same fail-safe posture as the RBC.6 athrow+exception-table
+                                  // gate below) rather than emit unconditional-trap codegen that can
+                                  // double-execute already-committed work. This only affects methods that
+                                  // have both a live invokedynamic AND an earlier side effect in raw
+                                  // bytecode-pc order — the overwhelmingly common case (an
+                                  // `assert cond : "msg" + x;` message-concat sitting on a dead branch
+                                  // near the end of a method, unrelated to any earlier field/array
+                                  // mutation reachability) is unaffected and still compiles at full JIT
+                                  // speed; methods that fail this new gate simply stay fully interpreted
+                                  // (correct, just not JIT-accelerated), matching the scanner's existing
+                                  // "when in doubt, don't compile" philosophy.
     let mut first_committing_side_effect_pc: Option<usize> = None;
     let mut pc = 0;
     while pc < code_len {
@@ -1404,6 +1405,11 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 }
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 field_ops.push((pc, cp_idx));
+                // Default getfield codegen routes through the checked helper,
+                // which needs the hidden SharedVm pointer. Reserving the
+                // context slot is harmless when raw inlining is explicitly
+                // enabled.
+                needs_heap = true;
                 pc += 3;
             }
             // putfield — object field write. A reference-typed putfield
@@ -1436,6 +1442,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 if pc + 1 >= code_len {
                     return None;
                 }
+                has_newarray = true;
                 needs_heap = true;
                 pc += 2;
             }
@@ -1794,6 +1801,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
         ldc2w_ops,
         indy_ops,
         has_athrow,
+        has_newarray,
     })
 }
 
@@ -1830,6 +1838,8 @@ pub struct JitScanResult {
     /// stashes the exception and returns the deopt sentinel; it cannot
     /// branch to an in-method handler), and never via OSR.
     pub has_athrow: bool,
+    /// The method contains primitive `newarray` (0xbc).
+    pub has_newarray: bool,
 }
 
 /// Check if a bytecode method can be JIT-compiled (backward-compatible wrapper).
@@ -2119,6 +2129,71 @@ pub fn inline_putfield_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_INLINE_PUTFIELD").is_some())
+}
+
+/// Opt-IN inline `getfield` fast path (`CRATONVM_JIT_INLINE_GETFIELD`).
+///
+/// The raw inline path can only null-check the receiver before reading object
+/// headers/field cells — no plausibility or containment validation at all.
+/// Kept as an explicit opt-in for A/B measurement; the production default is
+/// the GUARDED inline path below (`guarded_inline_getfield_enabled`), which
+/// validates the receiver against the published heap-region bounds before the
+/// raw load and falls back to the checked helper otherwise.
+pub fn inline_getfield_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_INLINE_GETFIELD").is_some())
+}
+
+/// Default-ON guarded inline `getfield` (perf/throughput-20260710).
+///
+/// The 2026-07-09 hardening (`Fix JIT getfield receiver validation`,
+/// 85baa4219) routed EVERY default-path JIT `getfield` through the checked
+/// `jit_getfield` helper. That closed the stale/garbage-receiver SIGSEGV
+/// (Tomcat DoHead rc=139) but put a full helper round-trip — boundary note,
+/// `is_object_address` region walk + header validation, 16-byte atomic cell
+/// read — on one of the hottest ops the JIT emits: bintrees-16 regressed
+/// 4.7x, and every field-heavy JIT workload (commons-math `Dfp`, Tomcat
+/// serving) pays it on each field read.
+///
+/// The guarded inline path keeps the property that actually stops the SIGSEGV
+/// — never dereference a receiver outside the always-mapped GC arenas — at
+/// inline-check cost: null/alignment bit-tests plus the same three-region
+/// `[base, end)` containment check that `is_object_address` uses as its
+/// gate, reading the GC's process-global `JIT_REGION_BOUNDS` table whose
+/// address the helpers table carries in `region_bounds_addr`. Receivers that
+/// pass are raw-loaded inline (a mapped-arena read cannot fault); everything
+/// else — null, unaligned garbage, out-of-heap bits, or a backend that does
+/// not publish bounds (G1/ZGC → table all zeros) — branches to the checked
+/// helper, preserving its NPE / `i64::MIN`-sentinel semantics exactly.
+///
+/// `CRATONVM_JIT_GETFIELD_HELPER=1` restores the helper-only 2026-07-09
+/// behaviour for bisection.
+pub fn guarded_inline_getfield_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_GETFIELD_HELPER").is_none())
+}
+
+/// Default-ON inline self-recursion stack check (perf/throughput-20260710).
+///
+/// A method with direct self-recursive call sites reserves one frame slot,
+/// fills it once in the prologue from the leaf `jit_native_stack_floor`
+/// helper, and each self-call site emits `CMP RSP, [rbp - floor_slot]; JA
+/// <skip>` -- bypassing the `self_call_stack_guard` helper CALL (and its
+/// safepoint spill / shadow push+reload bracketing) on the common path. The
+/// helper call remains verbatim as the fallback and still owns the catchable
+/// StackOverflowError raise; OSR trampolines initialise the slot to
+/// `usize::MAX` so OSR-entered frames always take the helper.
+/// `CRATONVM_JIT_INLINE_SELF_GUARD=0` restores the helper-per-call shape for
+/// bisection.
+pub fn inline_self_guard_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| match std::env::var("CRATONVM_JIT_INLINE_SELF_GUARD") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    })
 }
 
 /// Step 1 of `docs/feature-designs/precise-jit-maps-default.md` — opt-IN
@@ -6668,6 +6743,10 @@ struct Compiler {
     /// Frame offset where allocation-heavy methods cache this invocation's
     /// `*mut JvmThread` for inline TLAB `new`. 0 when no cache slot is reserved.
     jit_thread_slot_off: i32,
+    /// Frame slot holding the prologue-cached native-stack floor for the
+    /// inline self-call check (`0` = not reserved -> sites emit the plain
+    /// guard-helper CALL).
+    stack_floor_slot_off: i32,
     /// Frame offset of the first XMM save slot (from RBP).
     xmm_saved_base: i32,
     /// Resolved multianewarray metadata: (bytecode_pc, leaf_element_type_code).
@@ -7607,6 +7686,7 @@ impl Compiler {
         helpers: JitRuntimeHelpers,
         num_scalar_slots: usize,
         cache_jit_thread_for_inline_new: bool,
+        reserve_stack_floor: bool,
     ) -> Self {
         // Compact arrays: byte[] uses 1-byte elements, int[] uses 4-byte, ref[] uses 8-byte.
         // Each local takes 8 bytes: [rbp - 8], [rbp - 16], ...
@@ -7657,7 +7737,14 @@ impl Compiler {
         // has no paired reload). OSR entries zero both slots (clobber-free) so
         // the null-guards make those frames skip shadow tracking safely.
         let shadow_slots = if shadow_enabled { 3 } else { 0 };
-        let jit_thread_slots = if cache_jit_thread_for_inline_new { 1 } else { 0 };
+        let jit_thread_slots = if cache_jit_thread_for_inline_new {
+            1
+        } else {
+            0
+        };
+        // Inline self-recursion check: one slot for the prologue-cached
+        // native-stack floor.
+        let stack_floor_slots = if reserve_stack_floor { 1 } else { 0 };
         let extra_slots = (if needs_heap { 1 } else { 0 })
             + num_hoists
             + num_arith_hoists
@@ -7665,6 +7752,7 @@ impl Compiler {
             + num_scalar_slots
             + (if precise_maps { 1 } else { 0 })
             + jit_thread_slots
+            + stack_floor_slots
             + shadow_slots;
         let total_locals = num_locals.saturating_add(extra_slots);
         // Shadow-stack thread-pointer cache slot: the ABSOLUTE last reserved
@@ -7697,13 +7785,24 @@ impl Compiler {
         // slots when those gates are on, so the reserved slots never alias.
         let sp_id_slot_off: i32 = if precise_maps {
             // Cast: value to i32 (encoding immediate/displacement)
-            (total_locals as i32 - shadow_slots as i32 - jit_thread_slots as i32)
-                .saturating_mul(8)
+            (total_locals as i32 - shadow_slots as i32 - jit_thread_slots as i32).saturating_mul(8)
         } else {
             0
         };
         let jit_thread_slot_off: i32 = if cache_jit_thread_for_inline_new {
             (total_locals as i32 - shadow_slots as i32).saturating_mul(8)
+        } else {
+            0
+        };
+        // Inline self-recursion floor slot: sits below the sp-id slot (which
+        // itself sits below the cached JIT-thread + shadow slots), so the
+        // reserved tail slots never alias.
+        let stack_floor_slot_off: i32 = if reserve_stack_floor {
+            (total_locals as i32
+                - shadow_slots as i32
+                - jit_thread_slots as i32
+                - (if precise_maps { 1 } else { 0 }))
+            .saturating_mul(8)
         } else {
             0
         };
@@ -7870,6 +7969,7 @@ impl Compiler {
             needs_heap,
             heap_local_offset,
             jit_thread_slot_off,
+            stack_floor_slot_off,
             xmm_saved_base,
             multianewarray_info,
             field_info,
@@ -12311,6 +12411,12 @@ impl Compiler {
             self.emit_call_absolute(self.helpers.get_current_thread);
             self.emit_store_local(self.jit_thread_slot_off, RAX);
         }
+        // Inline self-recursion check: cache this thread's native-stack floor
+        // once per invocation (leaf helper -- reads TLS only, cannot GC).
+        if self.stack_floor_slot_off != 0 && self.helpers.native_stack_floor_fn != 0 {
+            self.emit_call_absolute(self.helpers.native_stack_floor_fn);
+            self.emit_store_local(self.stack_floor_slot_off, RAX);
+        }
         // spring-bug-10 watchpoint: arm a HW data breakpoint on this frame's
         // savebase slot (rbp - savebase_off) by calling the registered helper.
         // Prologue position = no ABI args staged yet, so clobbering ARG_REGS[0]
@@ -12913,6 +13019,72 @@ impl Compiler {
     ///
     /// Returns the bumped object pointer (or the slow-path result) in RAX.
     /// Caller emits the safepoint oop map and pushes RAX.
+    /// Guarded inline `getfield` receiver check (see
+    /// [`guarded_inline_getfield_enabled`]). The receiver must already be in
+    /// RAX. Emits, in order:
+    ///
+    ///   1. `TEST RAX,RAX; JZ slow` — null receiver takes the helper path so
+    ///      the checked helper's NPE semantics (pending-NPE + `i64::MIN`
+    ///      sentinel) are preserved bit-for-bit.
+    ///   2. `MOV RCX,RAX; AND RCX,7; JNZ slow` — object headers are 8-byte
+    ///      aligned; truncated/garbage receiver bits with low bits set can
+    ///      never be a real object (mirrors `plausible_heap_pointer`).
+    ///   3. Three `[base, end)` containment checks against the GC's
+    ///      process-global `JIT_REGION_BOUNDS` table (young-from / young-to /
+    ///      old), the same first gate `jit_getfield`'s `is_object_address`
+    ///      applies. An empty or unpublished region is `[0, 0)` and matches
+    ///      nothing, so a backend that doesn't publish bounds sends every
+    ///      receiver down the helper path.
+    ///
+    /// On fall-through the receiver points inside a live arena, whose backing
+    /// stays mapped for the heap's lifetime — a raw field-cell load cannot
+    /// fault, so the caller may emit the direct MOV sequence. Returns the
+    /// patch offsets that the caller MUST patch to its helper slow path.
+    /// Clobbers RCX and RDX; preserves RAX (the receiver).
+    /// Emit `CMP reg, [rbp - offset]` against a frame local (same rbp-relative
+    /// addressing as [`Self::emit_load_local`]). Used by the inline self-call
+    /// stack check (`CMP RSP, [rbp - floor_slot]`).
+    fn emit_cmp_r64_rbp_local(&mut self, reg: u8, offset: i32) {
+        self.rex_w_r(reg);
+        self.buf.emit_byte(0x3B); // CMP r64, r/m64
+        self.modrm_rbp_disp(reg, offset);
+    }
+
+    fn emit_guarded_getfield_receiver_check(&mut self, bounds_addr: usize) -> Vec<usize> {
+        let mut slow: Vec<usize> = Vec::new();
+        // 1. null → slow (helper throws the NPE).
+        self.emit_test_r64_r64(RAX);
+        slow.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+        // 2. alignment: low 3 bits must be clear.
+        self.emit_mov_r64_r64(RCX, RAX);
+        self.emit_and_r64_imm8(RCX, 7);
+        slow.push(self.emit_jcc_rel32_patch(0x85)); // JNZ
+        // 3. region containment. RDX = &JIT_REGION_BOUNDS (six usize words:
+        //    [b0, e0, b1, e1, b2, e2]).
+        self.emit_mov_imm64(RDX, bounds_addr as i64);
+        // region 0: RAX >= b0 && RAX < e0 → ok
+        self.emit_cmp_r64_mem_disp32(RAX, RDX, 0);
+        let below_b0 = self.emit_jcc_rel32_patch(0x82); // JB → try region 1
+        self.emit_cmp_r64_mem_disp32(RAX, RDX, 8);
+        let ok0 = self.emit_jcc_rel32_patch(0x82); // JB → in region 0
+        self.patch_rel32_to_here(below_b0);
+        // region 1
+        self.emit_cmp_r64_mem_disp32(RAX, RDX, 16);
+        let below_b1 = self.emit_jcc_rel32_patch(0x82); // JB → try region 2
+        self.emit_cmp_r64_mem_disp32(RAX, RDX, 24);
+        let ok1 = self.emit_jcc_rel32_patch(0x82); // JB → in region 1
+        self.patch_rel32_to_here(below_b1);
+        // region 2 — last chance: outside → slow.
+        self.emit_cmp_r64_mem_disp32(RAX, RDX, 32);
+        slow.push(self.emit_jcc_rel32_patch(0x82)); // JB → slow
+        self.emit_cmp_r64_mem_disp32(RAX, RDX, 40);
+        slow.push(self.emit_jcc_rel32_patch(0x83)); // JAE → slow
+        // fall-through / ok: receiver is inside a published live region.
+        self.patch_rel32_to_here(ok0);
+        self.patch_rel32_to_here(ok1);
+        slow
+    }
+
     fn emit_inline_tlab_new(
         &mut self,
         class_id_raw: u32,
@@ -13330,8 +13502,13 @@ impl Compiler {
         let callee_num_args = site.callee_num_args;
         let callee_max_locals = site.callee_max_locals;
         let _return_type = site.return_type;
+        let (callee_param_jvm_slots, callee_param_slot_span) =
+            crate::compute_param_jvm_slots(&site.descriptor, site.callee_is_static);
+        if callee_param_jvm_slots.len() != callee_num_args {
+            return false;
+        }
 
-        let callee_locals_size = callee_max_locals.max(callee_num_args);
+        let callee_locals_size = callee_max_locals.max(callee_param_slot_span);
         // Allocate callee locals in caller's spill area.
         let Some(callee_local_base) = self.reserve_spill_slots(callee_locals_size) else {
             return false;
@@ -13346,16 +13523,25 @@ impl Compiler {
             return false;
         }
 
-        // Store args into callee locals (in reverse order from stack)
+        // Store args into the callee's JVM local slots. Category-2 parameters
+        // consume two JVM slots while the JIT operand stack carries one i64
+        // value, so the descriptor-derived slot map must mirror the normal
+        // prologue layout (`(JJI)J` -> slots 0, 2, 4).
         for i in (0..callee_num_args).rev() {
             let slot = self.pop_stack();
-            let local_off = callee_local_base + (i as i32) * 8; // Cast: x86-64 immediate encoding
+            let local_idx = callee_param_jvm_slots[i];
+            let local_off = callee_local_base + (local_idx as i32) * 8; // Cast: x86-64 immediate encoding
             self.load_slot_to_reg(RAX, slot);
             self.emit_store_local(local_off, RAX);
         }
 
-        // Zero-init remaining callee locals
-        for i in callee_num_args..callee_locals_size {
+        // Zero-init every non-parameter callee local. Do not start at
+        // `callee_num_args`: that compact arg count is not a JVM local index
+        // when category-2 parameters are present.
+        for i in 0..callee_locals_size {
+            if callee_param_jvm_slots.contains(&i) {
+                continue;
+            }
             let local_off = callee_local_base + (i as i32) * 8; // Cast: x86-64 immediate encoding
             self.emit_xor_reg_self(RAX);
             self.emit_store_local(local_off, RAX);
@@ -14199,13 +14385,21 @@ impl Compiler {
                     // CP index here silently mismatched — a multi-field
                     // callee could pick another field op's `field_index`
                     // and read/write the wrong slot. Look up by `cpc`.
-                    if let Some((_, field_index, _type_tag)) =
+                    if let Some((_, field_index, type_tag)) =
                         site.field_info.iter().find(|(p, _, _)| *p == cpc).copied()
                     {
                         let obj_slot = self.pop_stack();
-                        self.load_slot_to_reg(ARG_REGS[0], obj_slot);
-                        self.emit_mov_imm32_sx(ARG_REGS[1], field_index as i32); // Cast: x86-64 immediate encoding
+                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                        self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+                        self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
                         self.emit_call_absolute(self.helpers.getfield);
+                        // The checked helper returns the `i64::MIN` deopt/NPE
+                        // sentinel on a bad (stale/corrupt) receiver instead of a
+                        // real field value — without this guard the sentinel is
+                        // pushed and treated as legitimate data, turning what used
+                        // to be an immediate SIGSEGV into silent corruption/hangs
+                        // downstream. Mirrors the invoke-site guard below.
+                        self.emit_post_invoke_exception_check(type_tag);
                         self.push_from_rax();
                     } else {
                         // Cannot resolve field — bail out
@@ -19358,7 +19552,11 @@ impl Compiler {
                     } else if let Some(&(c_off, c_is_ref)) = self
                         .compact_field_off
                         .get(&pc)
-                        .filter(|_| std::env::var_os("DISABLE_INLINE_GETFIELD").is_none())
+                        .filter(|_| {
+                            inline_getfield_enabled()
+                                || (guarded_inline_getfield_enabled()
+                                    && self.helpers.region_bounds_addr != 0)
+                        })
                     {
                         if std::env::var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
                             eprintln!(
@@ -19397,13 +19595,31 @@ impl Compiler {
                             .unwrap_or((pc, 0, b'I'));
                         let cell_off = (HEADER_SIZE + c_off as usize) as i32; // Cast: x86-64 disp32
                         let legacy_cell_off = (HEADER_SIZE + field_index * SLOT_SIZE) as i32; // Cast: disp32
+                                                                                              // GUARDED (default) vs RAW (CRATONVM_JIT_INLINE_GETFIELD):
+                                                                                              // raw keeps the historical null→0 inline semantics; guarded
+                                                                                              // routes null/implausible receivers to the checked helper
+                                                                                              // (NPE + i64::MIN sentinel) and flushes the scratch cache
+                                                                                              // up-front because its slow path CALLs out.
+                        let raw_mode = inline_getfield_enabled();
+                        if !raw_mode {
+                            self.flush_scratch_registers();
+                        }
                         let obj_slot = self.pop_stack();
                         self.load_slot_to_reg(RAX, obj_slot);
-                        // Null check: TEST RAX,RAX; JZ <null> (result 0).
-                        self.emit_test_r64_r64(RAX);
-                        let null_patch = self.emit_jcc_rel32_patch(0x84); // JE
-                                                                          // Per-object compactness: gc_flags byte @21 & GC_FLAG_COMPACT.
-                                                                          // Zero ⇒ legacy 16-byte-cell object → uniform-layout read.
+                        let (slow_patches, null_patch) = if raw_mode {
+                            // Null check: TEST RAX,RAX; JZ <null> (result 0).
+                            self.emit_test_r64_r64(RAX);
+                            (Vec::new(), Some(self.emit_jcc_rel32_patch(0x84))) // JE
+                        } else {
+                            (
+                                self.emit_guarded_getfield_receiver_check(
+                                    self.helpers.region_bounds_addr,
+                                ),
+                                None,
+                            )
+                        };
+                        // Per-object compactness: gc_flags byte @21 & GC_FLAG_COMPACT.
+                        // Zero ⇒ legacy 16-byte-cell object → uniform-layout read.
                         self.emit_mov_r32_mem_disp32(RCX, RAX, 21);
                         self.emit_and_r64_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT as i8);
                         let legacy_patch = self.emit_jcc_rel32_patch(0x84); // JZ → legacy
@@ -19475,9 +19691,24 @@ impl Compiler {
                             }
                         }
                         let done_legacy_patch = self.emit_jmp_rel32_patch();
-                        // --- null path: RAX := 0 ---
-                        self.patch_rel32_to_here(null_patch);
-                        self.emit_xor_reg_self(RAX);
+                        if let Some(null_patch) = null_patch {
+                            // RAW mode null path: RAX := 0 (historical semantics).
+                            self.patch_rel32_to_here(null_patch);
+                            self.emit_xor_reg_self(RAX);
+                        } else {
+                            // GUARDED slow path: null / unaligned / out-of-heap
+                            // receiver → the checked helper, whose NPE +
+                            // i64::MIN-sentinel semantics match the helper-only
+                            // arm below exactly.
+                            for p in slow_patches {
+                                self.patch_rel32_to_here(p);
+                            }
+                            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                            self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+                            self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
+                            self.emit_call_absolute(self.helpers.getfield);
+                            self.emit_post_invoke_exception_check(type_tag);
+                        }
                         // join
                         self.patch_rel32_to_here(done_compact_patch);
                         self.patch_rel32_to_here(done_legacy_patch);
@@ -19496,12 +19727,20 @@ impl Compiler {
                     } else if let Some(&info_idx) = self
                         .field_info_idx
                         .get(&pc)
-                        .filter(|_| std::env::var_os("DISABLE_INLINE_GETFIELD").is_none())
-                        // Compact layout: a reference field is an 8-byte pointer
-                        // and a primitive field sits at a packed offset, so the
-                        // baked `HEADER + index*SLOT_SIZE` 16-byte-cell load is
-                        // wrong. Route to the compact-aware `jit_getfield` helper.
-                        .filter(|_| !cratonvm_types::compact_ref_fields_enabled())
+                        // RAW inline (opt-in) only when the compact layout is
+                        // globally off: a compact receiver's reference field is an
+                        // 8-byte pointer and a primitive field sits at a packed
+                        // offset, so the baked `HEADER + index*SLOT_SIZE`
+                        // 16-byte-cell load is wrong for it. The GUARDED default
+                        // handles compact-on by testing the per-object
+                        // GC_FLAG_COMPACT bit and routing compact receivers to the
+                        // compact-aware `jit_getfield` helper.
+                        .filter(|_| {
+                            (inline_getfield_enabled()
+                                && !cratonvm_types::compact_ref_fields_enabled())
+                                || (guarded_inline_getfield_enabled()
+                                    && self.helpers.region_bounds_addr != 0)
+                        })
                     {
                         // Inline field load — the field index and type tag are
                         // statically resolved (`field_info` was built from
@@ -19525,14 +19764,39 @@ impl Compiler {
                         // (layout pinned by `field_cell_layout_matches_value_enum`).
                         let (_, field_index, type_tag) = self.field_info[info_idx];
                         let cell_off = (HEADER_SIZE + field_index * SLOT_SIZE) as i32; // Cast: x86-64 disp32
+                                                                                       // GUARDED (default) vs RAW (opt-in, compact-off only) —
+                                                                                       // see the compact arm above for the mode contract.
+                        let raw_mode = inline_getfield_enabled()
+                            && !cratonvm_types::compact_ref_fields_enabled();
+                        if !raw_mode {
+                            self.flush_scratch_registers();
+                        }
                         let obj_slot = self.pop_stack();
                         // Receiver → RAX.
                         self.load_slot_to_reg(RAX, obj_slot);
-                        // Null check: TEST RAX,RAX; JZ <null-path>. On null we
-                        // skip the load entirely and leave RAX = 0, matching
-                        // `jit_getfield`'s early `return 0`.
-                        self.emit_test_r64_r64(RAX);
-                        let null_patch = self.emit_jcc_rel32_patch(0x84); // JE
+                        let (mut slow_patches, null_patch) = if raw_mode {
+                            // Null check: TEST RAX,RAX; JZ <null-path>. On null we
+                            // skip the load entirely and leave RAX = 0, matching
+                            // `jit_getfield`'s early `return 0`.
+                            self.emit_test_r64_r64(RAX);
+                            (Vec::new(), Some(self.emit_jcc_rel32_patch(0x84))) // JE
+                        } else {
+                            (
+                                self.emit_guarded_getfield_receiver_check(
+                                    self.helpers.region_bounds_addr,
+                                ),
+                                None,
+                            )
+                        };
+                        if !raw_mode && cratonvm_types::compact_ref_fields_enabled() {
+                            // Per-object compact receiver → helper: this pc has no
+                            // registered compact offset (or the class layout didn't
+                            // match), so the uniform 16-byte-cell load below is only
+                            // valid for a legacy-laid-out object. gc_flags byte @21.
+                            self.emit_mov_r32_mem_disp32(RCX, RAX, 21);
+                            self.emit_and_r64_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT as i8);
+                            slow_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNZ
+                        }
                         match type_tag {
                             b'J' | b'D' | b'L' | b'[' => {
                                 // 8-byte payload: MOV RAX, [RAX + cell + 8].
@@ -19564,9 +19828,23 @@ impl Compiler {
                             }
                         }
                         let done_patch = self.emit_jmp_rel32_patch();
-                        // Null path: RAX := 0.
-                        self.patch_rel32_to_here(null_patch);
-                        self.emit_xor_reg_self(RAX);
+                        if let Some(null_patch) = null_patch {
+                            // RAW mode null path: RAX := 0.
+                            self.patch_rel32_to_here(null_patch);
+                            self.emit_xor_reg_self(RAX);
+                        } else {
+                            // GUARDED slow path: null / unaligned / out-of-heap /
+                            // compact-flagged receiver → the checked helper (same
+                            // NPE + sentinel semantics as the helper-only arm).
+                            for p in slow_patches {
+                                self.patch_rel32_to_here(p);
+                            }
+                            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                            self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+                            self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
+                            self.emit_call_absolute(self.helpers.getfield);
+                            self.emit_post_invoke_exception_check(type_tag);
+                        }
                         // Join: result in RAX.
                         self.patch_rel32_to_here(done_patch);
                         self.push_from_rax();
@@ -19586,14 +19864,42 @@ impl Compiler {
                             self.mark_top_as_oop();
                         }
                         pc += 3;
-                    } else {
-                        // No statically-resolved field metadata for this
-                        // getfield PC — fall back to the runtime helper.
+                    } else if let Some(&info_idx) = self.field_info_idx.get(&pc) {
+                        // Statically resolved field, but the raw inline path
+                        // is disabled. Route through the checked helper while
+                        // preserving the resolved slot index and oop marking.
+                        let (_, field_index, type_tag) = self.field_info[info_idx];
                         self.flush_scratch_registers();
                         let obj_slot = self.pop_stack();
-                        self.load_slot_to_reg(ARG_REGS[0], obj_slot);
-                        self.emit_mov_imm32_sx(ARG_REGS[1], 0); // Cast: x86-64 immediate encoding
+                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                        self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+                        self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32);
                         self.emit_call_absolute(self.helpers.getfield);
+                        // See the inlined-callee getfield site above: the checked
+                        // helper's `i64::MIN` sentinel must be caught here, before
+                        // it's pushed/tagged as a live value, or a bad receiver
+                        // silently corrupts execution instead of throwing.
+                        self.emit_post_invoke_exception_check(type_tag);
+                        self.push_from_rax();
+                        if type_tag == b'L' || type_tag == b'[' {
+                            self.mark_top_as_oop();
+                        }
+                        pc += 3;
+                    } else {
+                        // No statically-resolved field metadata for this
+                        // getfield PC — fall back to the runtime helper. The
+                        // field's real type is unknown here, so pass `b'J'` to
+                        // force the ambiguity-safe (peek-dispatch_threw) sentinel
+                        // check unconditionally — safe for every type, since a
+                        // non-J/D/F field can never legitimately produce
+                        // `i64::MIN` anyway.
+                        self.flush_scratch_registers();
+                        let obj_slot = self.pop_stack();
+                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                        self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+                        self.emit_mov_imm32_sx(ARG_REGS[2], 0); // Cast: x86-64 immediate encoding
+                        self.emit_call_absolute(self.helpers.getfield);
+                        self.emit_post_invoke_exception_check(b'J');
                         self.push_from_rax();
                         pc += 3;
                     }
@@ -21721,20 +22027,47 @@ impl Compiler {
                         // vm_ptr frame slot is what the guard is called with.
                         // Unwired helper (tests, historical callers): emits
                         // nothing, byte-identical legacy code.
-                        let guard_skip_patch = if self.helpers.self_call_stack_guard != 0
-                            && self.needs_heap
-                        {
-                            self.emit_pre_safepoint_spill();
-                            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                            self.emit_call_absolute(self.helpers.self_call_stack_guard);
-                            if self.precise_maps || self.shadow_enabled {
-                                self.emit_oop_map_for_safepoint();
-                            }
-                            self.emit_test_r64_r64(RAX);
-                            Some(self.emit_jcc_rel32_patch(0x85)) // JNE merge
-                        } else {
-                            None
-                        };
+                        let guard_skip_patch =
+                            if self.helpers.self_call_stack_guard != 0 && self.needs_heap {
+                                // perf/throughput-20260710 -- INLINE floor fast
+                                // path: the prologue cached this thread's
+                                // native-stack floor in a frame slot, so the
+                                // common case is:
+                                //   CMP RSP, [rbp - floor_slot]
+                                //   JA  <skip helper guard>   (headroom ok)
+                                // OSR-entered frames have the slot initialised
+                                // to usize::MAX by the trampoline (`RSP > MAX`
+                                // is unsatisfiable), so they always take the
+                                // helper. The skipped block is the guard CALL
+                                // plus its safepoint spill and shadow
+                                // push/reload bracketing (skipped TOGETHER, so
+                                // the shadow stack stays balanced); the
+                                // recursive CALL below still emits its own
+                                // spill + oop map, so GC coverage of the
+                                // actual recursion is unchanged. This constant
+                                // was the dominant per-level cost of
+                                // fib/binarytrees-style recursion.
+                                let fast_skip = if self.stack_floor_slot_off != 0 {
+                                    self.emit_cmp_r64_rbp_local(RSP, self.stack_floor_slot_off);
+                                    Some(self.emit_jcc_rel32_patch(0x87)) // JA
+                                } else {
+                                    None
+                                };
+                                self.emit_pre_safepoint_spill();
+                                self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                                self.emit_call_absolute(self.helpers.self_call_stack_guard);
+                                if self.precise_maps || self.shadow_enabled {
+                                    self.emit_oop_map_for_safepoint();
+                                }
+                                self.emit_test_r64_r64(RAX);
+                                let jne_merge = Some(self.emit_jcc_rel32_patch(0x85)); // JNE merge
+                                if let Some(skip) = fast_skip {
+                                    self.patch_rel32_to_here(skip);
+                                }
+                                jne_merge
+                            } else {
+                                None
+                            };
                         // Round-8 wave-3 HIGH fix: stack-arg setup for
                         // self-recursive direct calls past ARG_REGS.
                         let total_sub = self.emit_stack_arg_setup(&arg_slots, self.needs_heap);
@@ -23267,8 +23600,28 @@ impl Compiler {
                             //      fits in ARG_REGS.
                             let needs_ctx_arg_count = n + 1; // vm_ptr + n receiver/params
                             let args_fit = n >= 1 && needs_ctx_arg_count <= ARG_REGS.len();
-                            let pic_inline = pic_ptr.is_some() && args_fit;
-                            let mic_inline = !pic_inline && mic_ptr.is_some() && args_fit;
+                            // Spring SpEL's flawed-pattern threshold test drives
+                            // catastrophic regex backtracking through the mutually
+                            // recursive BmpCharPropertyGreedy/GroupHead pair. The
+                            // raw inline IC direct-call path skips the dispatch
+                            // helper's frame bookkeeping for that recursion shape
+                            // and short-circuits the search after only ~2k
+                            // CharSequence accesses. Keep just this pair on the
+                            // helper path; the helper can still call compiled
+                            // callees, but preserves the backtracking state.
+                            let regex_backtracking_frame = self
+                                .method_label
+                                .starts_with("java/util/regex/Pattern$BmpCharPropertyGreedy.match")
+                                || self
+                                    .method_label
+                                    .starts_with("java/util/regex/Pattern$GroupHead.match");
+                            let inline_virtual_ic_allowed = !regex_backtracking_frame;
+                            let pic_inline =
+                                inline_virtual_ic_allowed && pic_ptr.is_some() && args_fit;
+                            let mic_inline = inline_virtual_ic_allowed
+                                && !pic_inline
+                                && mic_ptr.is_some()
+                                && args_fit;
                             // `.done` patches collected from each emitted
                             // fast-path. Multiple in PIC's case (one per
                             // slot), one in MIC's, none if neither inline
@@ -24726,7 +25079,7 @@ pub fn compile(
         // Compact field info staged by the caller (interpreter execute/OSR);
         // empty for tests/AOT → legacy/helper field path.
         PENDING_COMPACT_FIELD_INFO.with(|c| std::mem::take(&mut *c.borrow_mut())),
-        "", // method_key: legacy/test wrapper disables the per-bci de-spec consult
+        "",         // method_key: legacy/test wrapper disables the per-bci de-spec consult
         Vec::new(), // indy_info: legacy/test wrapper passes no invokedynamic sites
     )
 }
@@ -24860,7 +25213,12 @@ pub fn compile_with_param_slots(
     // operand depth); the total is bounded by `MAX_INLINE_BUDGET`.
     let inline_stack_reserve: usize = inline_sites
         .values()
-        .map(|s| s.callee_max_locals.saturating_add(s.callee_code_len))
+        .map(|s| {
+            let (_, param_span) = crate::compute_param_jvm_slots(&s.descriptor, s.callee_is_static);
+            s.callee_max_locals
+                .max(param_span)
+                .saturating_add(s.callee_code_len)
+        })
         .sum();
     let max_stack = max_stack
         .saturating_add(max_invoke_args)
@@ -25132,6 +25490,35 @@ pub fn compile_with_param_slots(
         && new_info.iter().any(|(_, _, num_fields, _, _)| {
             HEADER_SIZE + num_fields.saturating_mul(SLOT_SIZE) <= 256
         });
+    // Inline self-recursion stack check: a raw self-call site is an
+    // `invokestatic` pc with neither an invoke-info entry nor a direct-call
+    // plan (the exact condition the 0xb8 arm's "Self-recursive call"
+    // else-branch keys on -- `try_compile` deliberately skips creating invoke
+    // metadata for them). When one exists, reserve the floor frame slot so
+    // each such site can do the two-instruction `CMP RSP, [rbp - floor]`
+    // instead of a `self_call_stack_guard` helper CALL per recursion level.
+    // The walk uses `bytecode_len_at`; a desync past a variable-length switch
+    // can at worst set the flag spuriously, which only reserves an unused
+    // slot + one prologue helper call (never unsound).
+    let reserve_stack_floor = needs_heap
+        && helpers.self_call_stack_guard != 0
+        && helpers.native_stack_floor_fn != 0
+        && inline_self_guard_enabled()
+        && {
+            let mut found = false;
+            let mut pc = 0usize;
+            while pc < code_len {
+                if code[pc] == 0xb8
+                    && !invoke_info.iter().any(|(p, _)| *p == pc)
+                    && !direct_calls.iter().any(|(p, _)| *p == pc)
+                {
+                    found = true;
+                    break;
+                }
+                pc += bytecode_len_at(code, pc);
+            }
+            found
+        };
 
     let mut compiler = Compiler::new(
         method_key.to_string(),
@@ -25150,6 +25537,7 @@ pub fn compile_with_param_slots(
         *helpers,
         num_scalar_slots,
         cache_jit_thread_for_inline_new,
+        reserve_stack_floor,
     );
     compiler.param_jvm_slots = param_jvm_slots.to_vec();
     compiler.param_slot_span = param_slot_span;
@@ -25541,6 +25929,7 @@ pub fn compile_with_param_slots(
     cm.osr_xmm_saved_base = compiler.xmm_saved_base;
     cm.osr_heap_local_offset = compiler.heap_local_offset;
     cm.jit_thread_slot_off = compiler.jit_thread_slot_off;
+    cm.stack_floor_slot_off = compiler.stack_floor_slot_off;
     cm.osr_frame_record = compiler.helpers.frame_record;
 
     // T1.1.a — transfer precise oop maps collected during codegen.
@@ -25915,6 +26304,7 @@ mod tests {
             test_helpers(),
             0,
             false,
+            false,
         );
 
         assert!(matches!(compiler.push_stack(), Some(StackSlot::Frame(_))));
@@ -25945,7 +26335,7 @@ mod tests {
 
     // SAFETY: Called from JIT-compiled code which passes a valid heap-allocated object pointer
     // and a field index that is bounds-checked within the function body before any dereference.
-    unsafe extern "C" fn stub_getfield(obj_ptr: i64, field_index: i64) -> i64 {
+    unsafe extern "C" fn stub_getfield(_vm_ptr: i64, obj_ptr: i64, field_index: i64) -> i64 {
         if obj_ptr == 0 {
             return 0;
         }
@@ -26122,6 +26512,8 @@ mod tests {
             // Unwired (0) — the self-call arm emits the legacy direct CALL
             // with no stack guard, keeping these tests byte-identical.
             self_call_stack_guard: 0,
+            region_bounds_addr: 0,
+            native_stack_floor_fn: 0,
         }
     }
 
@@ -26668,7 +27060,10 @@ mod tests {
         // getfield (0xb4) is now JIT-compatible
         let code: Vec<u8> = vec![0x2a, 0xb4, 0x00, 0x01, 0xac, 0, 0];
         let result = jit_scan(&code, 5, "(Ljava/lang/Object;)I").unwrap();
-        assert!(!result.needs_heap); // getfield doesn't need heap
+        assert!(
+            result.needs_heap,
+            "default checked getfield helper needs the hidden VM pointer"
+        );
         assert_eq!(result.field_ops.len(), 1);
         assert_eq!(result.field_ops[0], (1, 1)); // pc=1, cp_idx=1
 
@@ -26691,6 +27086,7 @@ mod tests {
         let pure_code: Vec<u8> = vec![0x1a, 0x1b, 0x60, 0xac, 0, 0]; // iload_0, iload_1, iadd, ireturn
         let result = jit_scan(&pure_code, 4, "(II)I").unwrap();
         assert!(!result.needs_heap);
+        assert!(!result.has_newarray);
         assert!(result.multianewarray_ops.is_empty());
 
         // Method with newarray needs heap
@@ -26705,6 +27101,7 @@ mod tests {
         ];
         let result = jit_scan(&array_code, 7, "(I)I").unwrap();
         assert!(result.needs_heap);
+        assert!(result.has_newarray);
     }
 
     #[test]
@@ -29274,6 +29671,114 @@ mod tests {
         assert_eq!(result, -123);
     }
 
+    /// Guarded inline getfield (perf/throughput-20260710): with a non-zero
+    /// `region_bounds_addr` the default arm emits the inline receiver guard +
+    /// raw field load, falling back to the checked helper only for receivers
+    /// that fail the guard. Uses a test-local bounds table so the pass/fail
+    /// routing is deterministic (the process-global table is owned by
+    /// whichever real heap ran last and is zeroed on heap drop):
+    ///
+    ///   * receiver inside the published range → inline raw load (the marker
+    ///     helper is NOT called);
+    ///   * table zeroed / null receiver / unaligned receiver → the helper IS
+    ///     called (asserted via a marker stub that returns a constant no raw
+    ///     load could produce).
+    #[test]
+    fn test_getfield_guarded_inline_fast_and_fallback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static TEST_BOUNDS: [AtomicUsize; 6] = [
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        ];
+        /// Marker helper: returns a constant that a raw field-cell load of the
+        /// test object can never produce, so routing is observable.
+        unsafe extern "C" fn marker_getfield(_vm: i64, _obj: i64, _idx: i64) -> i64 {
+            424242
+        }
+
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0xb4, 0x00, 0x01, // 1: getfield #1
+            0xac, // 4: ireturn
+            0, 0,
+        ];
+        let code_len = 5;
+        let field_info = vec![(1usize, 0usize, b'I')];
+        let mut helpers = test_helpers();
+        helpers.getfield = marker_getfield as *const () as usize;
+        helpers.region_bounds_addr = TEST_BOUNDS.as_ptr() as usize;
+        let compiled = compile(
+            &code,
+            code_len,
+            1,
+            1,
+            false,
+            Vec::new(),
+            field_info,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(), // pic_slots — no PIC sites
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &helpers,
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None, // string_layout
+        )
+        .unwrap();
+
+        use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
+        let heap = GenerationalHeap::new();
+        let obj = heap.alloc_object(ClassId::new(0), 2);
+        heap.set_field(obj, 0, Value::Int(42));
+        let obj_addr = obj.as_ptr() as usize;
+
+        // 1. Publish a range covering the object → guard passes → inline raw
+        //    load reads the real cell, the marker helper is NOT called.
+        TEST_BOUNDS[0].store(obj_addr & !0xFFF, Ordering::Release);
+        TEST_BOUNDS[1].store((obj_addr & !0xFFF) + 0x10000, Ordering::Release);
+        // SAFETY: JIT-compiled code from valid bytecode; executable mmap region.
+        let result = unsafe { compiled.try_call(&[obj_addr as i64]).expect("jit call") };
+        assert_eq!(result, 42, "in-bounds receiver must take the inline path");
+
+        // 2. Unaligned receiver (inside the range) → guard fails → helper.
+        // SAFETY: as above; the guard rejects the pointer before any deref.
+        let result = unsafe {
+            compiled
+                .try_call(&[(obj_addr + 1) as i64])
+                .expect("jit call")
+        };
+        assert_eq!(result, 424242, "unaligned receiver must route to the helper");
+
+        // 3. Zero the table (what GenerationalHeap::drop does) → out-of-heap
+        //    receiver → helper.
+        TEST_BOUNDS[0].store(0, Ordering::Release);
+        TEST_BOUNDS[1].store(0, Ordering::Release);
+        // SAFETY: as above.
+        let result = unsafe { compiled.try_call(&[obj_addr as i64]).expect("jit call") };
+        assert_eq!(
+            result, 424242,
+            "receiver outside every published region must route to the helper"
+        );
+
+        // 4. Null receiver → helper (which owns the NPE semantics in prod).
+        // SAFETY: as above.
+        let result = unsafe { compiled.try_call(&[0]).expect("jit call") };
+        assert_eq!(result, 424242, "null receiver must route to the helper");
+    }
+
     #[test]
     fn test_getfield_long() {
         // Method: long getY(Object this) { return this.y; }
@@ -30068,7 +30573,7 @@ mod tests {
             heap.set_field(obj, 0, Value::Int(v));
             // Helper reference result.
             // SAFETY: obj is a live heap object with field index 0 in bounds.
-            let helper = unsafe { stub_getfield(obj.as_ptr() as i64, 0) };
+            let helper = unsafe { stub_getfield(0, obj.as_ptr() as i64, 0) };
             // SAFETY: executing JIT-compiled machine code produced from valid bytecode.
             let inline = unsafe {
                 compiled
@@ -34894,6 +35399,20 @@ mod tests {
         let mut callee_code = callee_bytecode.to_vec();
         callee_code.push(0); // padding
         callee_code.push(0);
+        let declared_args = if callee_is_static {
+            callee_num_args
+        } else {
+            callee_num_args.saturating_sub(1)
+        };
+        let descriptor = format!(
+            "({}){}",
+            "I".repeat(declared_args),
+            if return_type == b'V' {
+                "V".to_string()
+            } else {
+                "I".to_string()
+            }
+        );
         crate::InlineSite {
             callee_code,
             callee_code_len: callee_bytecode.len(),
@@ -34908,7 +35427,7 @@ mod tests {
             needs_heap: false,
             class_name: "Test".to_string(),
             method_name: "inlined".to_string(),
-            descriptor: "()I".to_string(),
+            descriptor,
             elided_invoke_pcs: Vec::new(),
         }
     }
@@ -34936,10 +35455,10 @@ mod tests {
 
         let mut callee = make_inline_site(
             &[0x2a, 0xb7, 0x00, 0x02, 0xb1], // aload_0; invokespecial #2; return
-            1,     // max_locals (receiver)
-            1,     // num_args (receiver)
-            false, // instance method
-            b'V',  // void return
+            1,                               // max_locals (receiver)
+            1,                               // num_args (receiver)
+            false,                           // instance method
+            b'V',                            // void return
         );
         callee.elided_invoke_pcs = vec![1];
 
@@ -34973,13 +35492,7 @@ mod tests {
         ];
         let caller_len = 6;
 
-        let callee = make_inline_site(
-            &[0x2a, 0xb7, 0x00, 0x02, 0xb1],
-            1,
-            1,
-            false,
-            b'V',
-        );
+        let callee = make_inline_site(&[0x2a, 0xb7, 0x00, 0x02, 0xb1], 1, 1, false, b'V');
         // elided_invoke_pcs deliberately empty.
 
         let mut sites = HashMap::new();
@@ -35383,6 +35896,83 @@ mod tests {
                 compiled.try_call(&[-7i32 as i64]).expect("test JIT call"),
                 -14
             ); // Cast: JIT ABI convention
+        }
+    }
+
+    #[test]
+    fn s31_inline_category2_params_use_jvm_local_slots() {
+        // Mirrors Bouncy Castle Bits.bitPermuteStep(JJI)J:
+        //   long x -> local 0/1, long m -> local 2/3, int s -> local 4.
+        // The inline emitter used to deposit the three JIT args compactly into
+        // locals 0, 1, 2, so `lload_2` read the shift count and `iload 4` read
+        // zero. That miscompiled Interleave.expand64To128 after tiered inlining.
+        let callee_bc: Vec<u8> = vec![
+            0x1e, // 0: lload_0
+            0x1e, // 1: lload_0
+            0x15, 0x04, // 2: iload 4
+            0x7d, // 4: lushr
+            0x83, // 5: lxor
+            0x20, // 6: lload_2
+            0x7f, // 7: land
+            0x37, 0x05, // 8: lstore 5
+            0x16, 0x05, // 10: lload 5
+            0x16, 0x05, // 12: lload 5
+            0x15, 0x04, // 14: iload 4
+            0x79, // 16: lshl
+            0x83, // 17: lxor
+            0x1e, // 18: lload_0
+            0x83, // 19: lxor
+            0xad, // 20: lreturn
+        ];
+
+        let caller_code: Vec<u8> = vec![
+            0x1a, // 0: iload_0 (x, represented as i64 in this JIT ABI)
+            0x1b, // 1: iload_1 (m)
+            0x1c, // 2: iload_2 (s)
+            0xb8, 0x00, 0x01, // 3: invokestatic
+            0xad, // 6: lreturn
+            0, 0,
+        ];
+        let caller_len = 7;
+
+        let mut callee = make_inline_site(&callee_bc, 7, 3, true, b'J');
+        callee.descriptor = "(JJI)J".to_string();
+        let mut sites = HashMap::new();
+        sites.insert(3, callee);
+
+        let compiled = compile_with_inlines(&caller_code, caller_len, 3, 3, sites)
+            .expect("category-2 inline callee must compile");
+
+        let expect = |x: i64, m: i64, s: i64| -> i64 {
+            let x = x as u64;
+            let m = m as u64;
+            let s = (s as u32) & 0x3f;
+            let t = (x ^ (x >> s)) & m;
+            (x ^ t ^ (t << s)) as i64
+        };
+
+        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        unsafe {
+            let cases = [
+                (0x0123_4567_89ab_cdef_i64, 0x0000_ffff_0000_0000_i64, 16_i64),
+                (
+                    0x8000_0000_0000_0001_u64 as i64,
+                    0x2222_2222_2222_2222_i64,
+                    1_i64,
+                ),
+                (
+                    0xfedc_ba98_7654_3210_u64 as i64,
+                    0x0c0c_0c0c_0c0c_0c0c_i64,
+                    2_i64,
+                ),
+            ];
+            for (x, m, s) in cases {
+                assert_eq!(
+                    compiled.try_call(&[x, m, s]).expect("test JIT call"),
+                    expect(x, m, s)
+                );
+            }
         }
     }
 

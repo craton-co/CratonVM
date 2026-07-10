@@ -24,6 +24,7 @@ thread_local! {
     /// `Class.getGenericInterfaces`, …) sets this to the declaring class/method
     /// for the duration of its conversion via [`GenericDeclScope`].
     static GENERIC_DECL_SCOPE: Cell<Option<ObjectRef>> = const { Cell::new(None) };
+    static TYPE_PARAM_BUILD_SCOPE: Cell<Option<ObjectRef>> = const { Cell::new(None) };
 }
 
 /// RAII guard installing the current [`GENERIC_DECL_SCOPE`] and restoring the
@@ -46,12 +47,52 @@ impl Drop for GenericDeclScope {
     }
 }
 
+struct TypeParamBuildScope(Option<ObjectRef>);
+
+impl TypeParamBuildScope {
+    fn new(decl: Value) -> Self {
+        let r = match decl {
+            Value::Object(Some(o)) => Some(o),
+            _ => None,
+        };
+        TypeParamBuildScope(TYPE_PARAM_BUILD_SCOPE.with(|c| c.replace(r)))
+    }
+}
+
+impl Drop for TypeParamBuildScope {
+    fn drop(&mut self) {
+        TYPE_PARAM_BUILD_SCOPE.with(|c| c.set(self.0));
+    }
+}
+
+fn is_building_type_params_for(decl: ObjectRef) -> bool {
+    TYPE_PARAM_BUILD_SCOPE.with(|c| c.get() == Some(decl))
+}
+
 /// The current generic-declaration scope as a `Value` (null when unset).
 fn current_generic_decl() -> Value {
     GENERIC_DECL_SCOPE
         .with(|c| c.get())
         .map(|o| Value::Object(Some(o)))
         .unwrap_or(Value::Object(None))
+}
+
+fn reflective_type_variable_name(ctx: &mut dyn NativeContext, tv: ObjectRef) -> Option<String> {
+    let cname = ctx
+        .class_name_of_id(ctx.class_id_of_object(tv))
+        .unwrap_or_default();
+    if cname == "java/lang/reflect/TypeVariable" {
+        if let Value::Object(Some(s)) = ctx.get_field(tv, 0) {
+            return ctx.read_string(s);
+        }
+    }
+    match ctx.get_field_by_name(tv, "name") {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => match ctx.get_field(tv, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        },
+    }
 }
 
 /// Resolve a type-variable USE named `name` to the REAL `TypeVariable` object
@@ -69,6 +110,9 @@ fn resolve_declared_type_variable(
     decl: ObjectRef,
     name: &str,
 ) -> Option<Value> {
+    if is_building_type_params_for(decl) {
+        return None;
+    }
     let arr = match ctx.invoke_virtual(
         decl,
         "getTypeParameters",
@@ -81,11 +125,7 @@ fn resolve_declared_type_variable(
     let len = ctx.array_length(arr);
     for i in 0..len {
         if let Value::Object(Some(tv)) = ctx.get_array_element(arr, i) {
-            let tv_name = match ctx.get_field_by_name(tv, "name") {
-                Value::Object(Some(s)) => ctx.read_string(s),
-                _ => None,
-            };
-            if tv_name.as_deref() == Some(name) {
+            if reflective_type_variable_name(ctx, tv).as_deref() == Some(name) {
                 return Some(Value::Object(Some(tv)));
             }
         }
@@ -341,7 +381,7 @@ fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
             // WildcardType: field 0 = upperBounds, field 1 = lowerBounds
             let wt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/WildcardType", 2);
             let upper = new_type_array(ctx, 1);
-            let bound_val = type_sig_to_java(ctx, sig);
+            let bound_val = typesig_to_real_type(ctx, sig);
             ctx.set_array_element(upper, 0, bound_val);
             ctx.set_field(wt, 0, Value::Object(Some(upper)));
             let lower = new_type_array(ctx, 0);
@@ -357,7 +397,7 @@ fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
             }
             ctx.set_field(wt, 0, Value::Object(Some(upper)));
             let lower = new_type_array(ctx, 1);
-            let bound_val = type_sig_to_java(ctx, sig);
+            let bound_val = typesig_to_real_type(ctx, sig);
             ctx.set_array_element(lower, 0, bound_val);
             ctx.set_field(wt, 1, Value::Object(Some(lower)));
             Value::Object(Some(wt))
@@ -394,6 +434,7 @@ pub fn type_param_to_java(
     // Bounds may reference type variables (e.g. `<T extends Comparable<T>>`);
     // their declaration is this same generic declaration.
     let _scope = GenericDeclScope::new(generic_decl);
+    let _build_scope = TypeParamBuildScope::new(generic_decl);
     let tv = alloc_concurrent_synthetic(ctx, "java/lang/reflect/TypeVariable", 3);
     let name_str = ctx.create_string(&tp.name);
     ctx.set_field(tv, 0, Value::Object(Some(name_str)));
@@ -418,7 +459,7 @@ pub fn type_param_to_java(
     } else {
         let bounds_arr = new_type_array(ctx, bound_sigs.len());
         for (i, bs) in bound_sigs.iter().enumerate() {
-            let val = type_sig_to_java(ctx, bs);
+            let val = typesig_to_real_type(ctx, bs);
             ctx.set_array_element(bounds_arr, i, val);
         }
         ctx.set_field(tv, 1, Value::Object(Some(bounds_arr)));

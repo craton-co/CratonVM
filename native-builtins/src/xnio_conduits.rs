@@ -64,18 +64,21 @@
 //!
 //! | Class                                                  | # | Slots                                                                 |
 //! |--------------------------------------------------------|---|-----------------------------------------------------------------------|
-//! | `org/xnio/conduits/ConduitStreamSourceChannel`         | 5 | channel_id, selection_key, read_listener, read_ready_flag, read_susp  |
-//! | `org/xnio/conduits/ConduitStreamSinkChannel`           | 6 | channel_id, selection_key, write_listener, write_ready_flag, write_susp, buffered_bytes |
+//! | `org/xnio/conduits/ConduitStreamSourceChannel`         | 6 | channel_id, selection_key, read_listener, read_ready_flag, read_susp, io_thread |
+//! | `org/xnio/conduits/ConduitStreamSinkChannel`           | 7 | channel_id, selection_key, write_listener, write_ready_flag, write_susp, buffered_bytes, io_thread |
 //! | `org/xnio/ChannelListener$Setter`                      | 2 | channel_handle, listener_slot_index                                   |
 
 #![allow(clippy::too_many_arguments)]
 
 use std::collections::HashMap;
+use std::fmt::Write as FmtWrite;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
@@ -89,6 +92,10 @@ use crate::{alloc_concurrent_synthetic, obj_arg};
 
 const CLS_SOURCE: &str = "org/xnio/conduits/ConduitStreamSourceChannel";
 const CLS_SINK: &str = "org/xnio/conduits/ConduitStreamSinkChannel";
+const CLS_STREAM_SOURCE_CONDUIT: &str = "org/xnio/conduits/StreamSourceConduit";
+const CLS_STREAM_SINK_CONDUIT: &str = "org/xnio/conduits/StreamSinkConduit";
+const CLS_SOURCE_CONDUIT: &str = "org/xnio/conduits/SourceConduit";
+const CLS_SINK_CONDUIT: &str = "org/xnio/conduits/SinkConduit";
 const CLS_LISTENER: &str = "org/xnio/ChannelListener";
 const CLS_LISTENER_SETTER: &str = "org/xnio/ChannelListener$Setter";
 
@@ -102,7 +109,8 @@ pub(crate) const SRC_FIELD_SELECTION_KEY: usize = 1;
 pub(crate) const SRC_FIELD_READ_LISTENER: usize = 2;
 pub(crate) const SRC_FIELD_READ_READY_FLAG: usize = 3;
 pub(crate) const SRC_FIELD_READ_SUSPENDED: usize = 4;
-pub(crate) const SRC_NUM_SLOTS: usize = 5;
+pub(crate) const SRC_FIELD_IO_THREAD: usize = 5;
+pub(crate) const SRC_NUM_SLOTS: usize = 6;
 
 // ConduitStreamSinkChannel
 pub(crate) const SINK_FIELD_CHANNEL_ID: usize = 0;
@@ -111,7 +119,8 @@ pub(crate) const SINK_FIELD_WRITE_LISTENER: usize = 2;
 pub(crate) const SINK_FIELD_WRITE_READY_FLAG: usize = 3;
 pub(crate) const SINK_FIELD_WRITE_SUSPENDED: usize = 4;
 pub(crate) const SINK_FIELD_BUFFERED_BYTES: usize = 5;
-pub(crate) const SINK_NUM_SLOTS: usize = 6;
+pub(crate) const SINK_FIELD_IO_THREAD: usize = 6;
+pub(crate) const SINK_NUM_SLOTS: usize = 7;
 
 // ChannelListener$Setter
 pub(crate) const SETTER_FIELD_CHANNEL_HANDLE: usize = 0;
@@ -130,6 +139,40 @@ const BB_FIELD_ARRAY: usize = 0;
 const BB_FIELD_POS: usize = 1;
 const BB_FIELD_LIMIT: usize = 2;
 const BB_FIELD_CAPACITY: usize = 3;
+
+const CHANNEL_LISTENER_HANDLE_EVENT_DESC: &str = "(Ljava/nio/channels/Channel;)V";
+
+// The native TCP bridge has no selector thread yet. After a flushed request,
+// poll briefly for the peer's response and fire the read listener from the
+// caller thread once bytes are actually visible on the socket.
+const READ_NOTIFY_RETRY_DELAYS_MS: [u64; 9] = [0, 5, 20, 50, 100, 250, 500, 1000, 2000];
+const READ_NOTIFY_POST_LISTENER_RETRY_DELAYS_MS: [u64; 11] =
+    [0, 5, 20, 50, 100, 250, 500, 1000, 2000, 5000, 10000];
+fn xnio_tcp_dbg_enabled() -> bool {
+    std::env::var_os("CRATONVM_DBG_XNIO_TCP").is_some()
+}
+
+macro_rules! xnio_tcp_dbg {
+    ($($arg:tt)*) => {{
+        if xnio_tcp_dbg_enabled() {
+            eprintln!("[cratonvm:xnio-tcp] {}", format_args!($($arg)*));
+        }
+    }};
+}
+
+fn preview_bytes(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for (i, b) in bytes.iter().take(96).enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let _ = FmtWrite::write_fmt(&mut out, format_args!("{b:02x}"));
+    }
+    if bytes.len() > 96 {
+        out.push_str(" ...");
+    }
+    out
+}
 
 // ---------------------------------------------------------------------------
 // Conduit channel registry
@@ -271,6 +314,200 @@ fn next_channel_id() -> u64 {
     N.fetch_add(1, Ordering::Relaxed)
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ConduitObjKey {
+    vm: usize,
+    identity: i32,
+}
+
+fn conduit_obj_key(ctx: &dyn NativeContext, obj: ObjectRef) -> ConduitObjKey {
+    ConduitObjKey {
+        vm: ctx.vm_identity(),
+        identity: ctx.identity_hash_code(obj),
+    }
+}
+
+fn source_obj_registry() -> &'static Mutex<HashMap<ConduitObjKey, u64>> {
+    static R: OnceLock<Mutex<HashMap<ConduitObjKey, u64>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn source_obj_handle_by_id_registry() -> &'static Mutex<HashMap<(usize, u64), usize>> {
+    static R: OnceLock<Mutex<HashMap<(usize, u64), usize>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn sink_obj_registry() -> &'static Mutex<HashMap<ConduitObjKey, u64>> {
+    static R: OnceLock<Mutex<HashMap<ConduitObjKey, u64>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_source_obj(ctx: &mut dyn NativeContext, obj: ObjectRef, id: u64) {
+    source_obj_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(conduit_obj_key(ctx, obj), id);
+    let handle = ctx.add_global_root(obj);
+    if handle != 0 {
+        source_obj_handle_by_id_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((ctx.vm_identity(), id), handle);
+    }
+}
+
+fn remember_sink_obj(ctx: &dyn NativeContext, obj: ObjectRef, id: u64) {
+    sink_obj_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(conduit_obj_key(ctx, obj), id);
+}
+
+fn source_id_by_obj(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<u64> {
+    source_obj_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&conduit_obj_key(ctx, obj))
+        .copied()
+}
+
+fn sink_id_by_obj(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<u64> {
+    sink_obj_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&conduit_obj_key(ctx, obj))
+        .copied()
+}
+
+fn source_obj_handles_by_id(ctx: &dyn NativeContext) -> Vec<(u64, usize)> {
+    let vm = ctx.vm_identity();
+    source_obj_handle_by_id_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(|((entry_vm, id), handle)| (*entry_vm == vm).then_some((*id, *handle)))
+        .collect()
+}
+
+fn sink_paired_source_registry() -> &'static Mutex<HashMap<ConduitObjKey, usize>> {
+    static R: OnceLock<Mutex<HashMap<ConduitObjKey, usize>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn remember_sink_paired_source(
+    ctx: &mut dyn NativeContext,
+    sink: ObjectRef,
+    source: ObjectRef,
+) {
+    let handle = ctx.add_global_root(source);
+    let raw_conduit = match ctx.get_field_by_name(sink, "conduit") {
+        Value::Object(Some(conduit)) if conduit.as_ptr() != sink.as_ptr() => Some(conduit),
+        _ => None,
+    };
+    if handle != 0 {
+        let mut registry = sink_paired_source_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry.insert(conduit_obj_key(ctx, sink), handle);
+        if let Some(raw_conduit) = raw_conduit {
+            registry.insert(conduit_obj_key(ctx, raw_conduit), handle);
+        }
+    } else {
+        ctx.set_field(sink, SINK_FIELD_SELECTION_KEY, Value::Object(Some(source)));
+        if let Some(raw_conduit) = raw_conduit {
+            ctx.set_field(
+                raw_conduit,
+                SINK_FIELD_SELECTION_KEY,
+                Value::Object(Some(source)),
+            );
+        }
+    }
+}
+
+fn paired_source_of(ctx: &dyn NativeContext, sink: ObjectRef) -> Option<ObjectRef> {
+    let handle = sink_paired_source_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&conduit_obj_key(ctx, sink))
+        .copied();
+    handle.and_then(|h| ctx.resolve_global_root(h)).or_else(|| {
+        match ctx.get_field(sink, SINK_FIELD_SELECTION_KEY) {
+            Value::Object(Some(source)) => Some(source),
+            _ => None,
+        }
+    })
+}
+
+fn channel_io_thread_registry() -> &'static Mutex<HashMap<ConduitObjKey, usize>> {
+    static R: OnceLock<Mutex<HashMap<ConduitObjKey, usize>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn raw_conduit_of(ctx: &dyn NativeContext, channel: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(channel, "conduit") {
+        Value::Object(Some(conduit)) if conduit.as_ptr() != channel.as_ptr() => Some(conduit),
+        _ => None,
+    }
+}
+
+fn remember_channel_io_thread(
+    ctx: &mut dyn NativeContext,
+    channel: ObjectRef,
+    slot: usize,
+    io_thread: ObjectRef,
+) {
+    ctx.set_field(channel, slot, Value::Object(Some(io_thread)));
+    let raw_conduit = raw_conduit_of(ctx, channel);
+    if let Some(raw_conduit) = raw_conduit {
+        ctx.set_field(raw_conduit, slot, Value::Object(Some(io_thread)));
+    }
+
+    let handle = ctx.add_global_root(io_thread);
+    if handle != 0 {
+        let mut registry = channel_io_thread_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry.insert(conduit_obj_key(ctx, channel), handle);
+        if let Some(raw_conduit) = raw_conduit {
+            registry.insert(conduit_obj_key(ctx, raw_conduit), handle);
+        }
+    }
+}
+
+pub(crate) fn remember_source_io_thread(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    io_thread: ObjectRef,
+) {
+    remember_channel_io_thread(ctx, source, SRC_FIELD_IO_THREAD, io_thread);
+}
+
+pub(crate) fn remember_sink_io_thread(
+    ctx: &mut dyn NativeContext,
+    sink: ObjectRef,
+    io_thread: ObjectRef,
+) {
+    remember_channel_io_thread(ctx, sink, SINK_FIELD_IO_THREAD, io_thread);
+}
+
+fn channel_io_thread_of(
+    ctx: &dyn NativeContext,
+    channel: ObjectRef,
+    slot: usize,
+) -> Option<ObjectRef> {
+    let handle = channel_io_thread_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&conduit_obj_key(ctx, channel))
+        .copied();
+    handle
+        .and_then(|h| ctx.resolve_global_root(h))
+        .or_else(|| match ctx.get_field(channel, slot) {
+            Value::Object(Some(io_thread)) => Some(io_thread),
+            _ => None,
+        })
+}
+
 /// Register a new source channel for the given transport. Returns the id.
 pub fn register_source_channel(transport: ConduitTransport) -> u64 {
     let id = next_channel_id();
@@ -332,6 +569,10 @@ pub fn drop_source_channel(id: u64) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&id);
+    source_obj_handle_by_id_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(_, entry_id), _| *entry_id != id);
 }
 
 /// Drop a sink channel. Called on `shutdownWrites` + close.
@@ -407,62 +648,103 @@ fn bb_remaining(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
 /// Produce a `Result<Vec<u8>, ...>` of up to `n` bytes read from the heap
 /// byte[] backing the ByteBuffer. Fails with `BufferOverflow` if the array
 /// is missing or smaller than `position + n`.
+fn bb_array_offset(ctx: &dyn NativeContext, buf: ObjectRef) -> usize {
+    match ctx.get_field_by_name(buf, "offset") {
+        Value::Int(v) if v >= 0 => v as usize,
+        _ => 0,
+    }
+}
+
+fn bb_direct_addr(ctx: &dyn NativeContext, buf: ObjectRef, pos: usize) -> Option<i64> {
+    match ctx.get_field_by_name(buf, "address") {
+        Value::Long(addr) if addr > 0 => addr.checked_add(pos as i64),
+        _ => None,
+    }
+}
+
 fn read_bytes_from_buffer(
     ctx: &dyn NativeContext,
     buf: ObjectRef,
     n: i32,
 ) -> Result<Vec<u8>, RuntimeError> {
     let pos = bb_position(ctx, buf) as usize;
-    // Try synthetic heap array first.
+    let offset = bb_array_offset(ctx, buf);
     let arr = ctx.get_field(buf, BB_FIELD_ARRAY);
     let arr_obj = match arr {
-        Value::Object(Some(a)) => a,
-        _ => {
-            // Fall back to JDK-named `hb` (HeapByteBuffer's byte[] field).
-            match ctx.get_field_by_name(buf, "hb") {
-                Value::Object(Some(a)) => a,
-                _ => return Err(buf_overflow("write: ByteBuffer has no backing array")),
+        Value::Object(Some(a)) => Some(a),
+        _ => match ctx.get_field_by_name(buf, "hb") {
+            Value::Object(Some(a)) => Some(a),
+            _ => None,
+        },
+    };
+    if let Some(arr_obj) = arr_obj {
+        let start = offset.saturating_add(pos);
+        let len = ctx.array_length(arr_obj);
+        if start + (n as usize) > len {
+            return Err(buf_overflow("write: buffer slice out of range"));
+        }
+        let mut out = Vec::with_capacity(n as usize);
+        for i in 0..(n as usize) {
+            match ctx.get_array_element(arr_obj, start + i) {
+                Value::Int(v) => out.push((v & 0xff) as u8),
+                _ => out.push(0),
             }
         }
-    };
-    let len = ctx.array_length(arr_obj);
-    if pos + (n as usize) > len {
-        return Err(buf_overflow("write: buffer slice out of range"));
+        return Ok(out);
     }
-    let mut out = Vec::with_capacity(n as usize);
-    for i in 0..(n as usize) {
-        match ctx.get_array_element(arr_obj, pos + i) {
-            Value::Int(v) => out.push((v & 0xff) as u8),
-            _ => out.push(0),
+
+    if let Some(addr) = bb_direct_addr(ctx, buf, pos) {
+        let mut out = vec![0u8; n as usize];
+        if ctx.copy_from_native_memory(addr, &mut out) {
+            return Ok(out);
         }
+        return Err(buf_overflow("write: invalid direct ByteBuffer address"));
     }
-    Ok(out)
+
+    Err(buf_overflow(
+        "write: ByteBuffer has no backing array or direct address",
+    ))
 }
 
-/// Write `bytes` into the heap byte[] backing the ByteBuffer at `position`.
-/// Fails with `BufferOverflow` if the array is missing or too small.
+/// Write `bytes` into the ByteBuffer at `position`, supporting both heap and
+/// direct buffers.
 fn write_bytes_into_buffer(
-    ctx: &dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     buf: ObjectRef,
     bytes: &[u8],
 ) -> Result<(), RuntimeError> {
     let pos = bb_position(ctx, buf) as usize;
+    let offset = bb_array_offset(ctx, buf);
     let arr = ctx.get_field(buf, BB_FIELD_ARRAY);
     let arr_obj = match arr {
-        Value::Object(Some(a)) => a,
+        Value::Object(Some(a)) => Some(a),
         _ => match ctx.get_field_by_name(buf, "hb") {
-            Value::Object(Some(a)) => a,
-            _ => return Err(buf_overflow("read: ByteBuffer has no backing array")),
+            Value::Object(Some(a)) => Some(a),
+            _ => None,
         },
     };
-    let len = ctx.array_length(arr_obj);
-    if pos + bytes.len() > len {
-        return Err(buf_overflow("read: buffer slice out of range"));
+    if let Some(arr_obj) = arr_obj {
+        let start = offset.saturating_add(pos);
+        let len = ctx.array_length(arr_obj);
+        if start + bytes.len() > len {
+            return Err(buf_overflow("read: buffer slice out of range"));
+        }
+        for (i, b) in bytes.iter().enumerate() {
+            ctx.set_array_element(arr_obj, start + i, Value::Int(*b as i32));
+        }
+        return Ok(());
     }
-    for (i, b) in bytes.iter().enumerate() {
-        ctx.set_array_element(arr_obj, pos + i, Value::Int(*b as i32));
+
+    if let Some(addr) = bb_direct_addr(ctx, buf, pos) {
+        if ctx.copy_to_native_memory(addr, bytes) {
+            return Ok(());
+        }
+        return Err(buf_overflow("read: invalid direct ByteBuffer address"));
     }
-    Ok(())
+
+    Err(buf_overflow(
+        "read: ByteBuffer has no backing array or direct address",
+    ))
 }
 
 fn buf_overflow(msg: impl Into<String>) -> RuntimeError {
@@ -552,10 +834,24 @@ pub fn source_channel_read(
     }
     let mut scratch = vec![0u8; remaining as usize];
     let n = match transport_read(&ch.transport, &mut scratch) {
-        Ok(0) => return Ok(-1),
-        Ok(n) => n as i32,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(0),
+        Ok(0) => {
+            xnio_tcp_dbg!("source_read id={src_id} eof");
+            return Ok(-1);
+        }
+        Ok(n) => {
+            xnio_tcp_dbg!(
+                "source_read id={src_id} n={} bytes={}",
+                n,
+                preview_bytes(&scratch[..n])
+            );
+            n as i32
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            xnio_tcp_dbg!("source_read id={src_id} would_block");
+            return Ok(0);
+        }
         Err(e) => {
+            xnio_tcp_dbg!("source_read id={src_id} error={e}");
             return Err(RuntimeError::IOException {
                 message: format!("IOException: read: {e}"),
             });
@@ -596,9 +892,15 @@ pub fn sink_channel_write(
         return Ok(0);
     }
     let src = read_bytes_from_buffer(ctx, buf, remaining)?;
+    xnio_tcp_dbg!(
+        "sink_write id={sink_id} attempt={} bytes={}",
+        src.len(),
+        preview_bytes(&src)
+    );
     let n = match transport_write(&ch.transport, &src) {
         Ok(n) => n as i32,
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            xnio_tcp_dbg!("sink_write id={sink_id} would_block attempt={}", src.len());
             // Kernel buffer full — Undertow should `resumeWrites` + retry.
             // Round-9 HIGH-2: buffered_bytes is a single-variable counter
             // read by `flush()`; AcqRel matches its role as a RMW that both
@@ -613,6 +915,13 @@ pub fn sink_channel_write(
             });
         }
     };
+    let written = n.max(0).min(src.len() as i32) as usize;
+    xnio_tcp_dbg!(
+        "sink_write id={sink_id} wrote={} of={} bytes={}",
+        n,
+        src.len(),
+        preview_bytes(&src[..written])
+    );
     if n < 0 || n > remaining {
         tracing::error!(target: "xnio::conduits", n, remaining, "write returned out-of-range count");
         return Ok(0);
@@ -697,7 +1006,7 @@ pub fn dispatch_channel_event<K: SelectionKeyLike>(
                         ctx.invoke_virtual(
                             l,
                             "handleEvent",
-                            "(Lorg/xnio/channels/Channel;)V",
+                            CHANNEL_LISTENER_HANDLE_EVENT_DESC,
                             &[Value::Object(Some(src_obj))],
                         )
                     }));
@@ -743,7 +1052,7 @@ pub fn dispatch_channel_event<K: SelectionKeyLike>(
                         ctx.invoke_virtual(
                             l,
                             "handleEvent",
-                            "(Lorg/xnio/channels/Channel;)V",
+                            CHANNEL_LISTENER_HANDLE_EVENT_DESC,
                             &[Value::Object(Some(sink_obj))],
                         )
                     }));
@@ -771,17 +1080,186 @@ pub fn dispatch_channel_event<K: SelectionKeyLike>(
 // ---------------------------------------------------------------------------
 
 fn source_id_of(ctx: &dyn NativeContext, this: ObjectRef) -> Option<u64> {
-    match ctx.get_field(this, SRC_FIELD_CHANNEL_ID) {
+    source_id_by_obj(ctx, this).or_else(|| match ctx.get_field(this, SRC_FIELD_CHANNEL_ID) {
         Value::Long(v) if v > 0 => Some(v as u64),
         _ => None,
-    }
+    })
 }
 
 fn sink_id_of(ctx: &dyn NativeContext, this: ObjectRef) -> Option<u64> {
-    match ctx.get_field(this, SINK_FIELD_CHANNEL_ID) {
+    sink_id_by_obj(ctx, this).or_else(|| match ctx.get_field(this, SINK_FIELD_CHANNEL_ID) {
         Value::Long(v) if v > 0 => Some(v as u64),
         _ => None,
+    })
+}
+
+fn source_has_pending_data(id: u64) -> bool {
+    let ch = match get_source_channel(id) {
+        Some(ch) => ch,
+        None => return false,
+    };
+    match &ch.transport {
+        ConduitTransport::Tcp(stream) => {
+            let mut one = [0u8; 1];
+            match stream.peek(&mut one) {
+                Ok(_) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+                Err(_) => true,
+            }
+        }
+        ConduitTransport::Pipe(pipe) => {
+            let has_bytes = pipe
+                .buf
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .front()
+                .is_some();
+            has_bytes || pipe.eof.load(Ordering::Acquire)
+        }
     }
+}
+
+fn source_read_suspended(ctx: &dyn NativeContext, source: ObjectRef, id: u64) -> bool {
+    if matches!(ctx.get_field(source, SRC_FIELD_READ_SUSPENDED), Value::Int(v) if v != 0) {
+        return true;
+    }
+    get_source_channel(id)
+        .map(|ch| ch.read_suspended.load(Ordering::Acquire))
+        .unwrap_or(true)
+}
+
+fn invoke_source_read_listener(ctx: &mut dyn NativeContext, source: ObjectRef) -> bool {
+    let listener = match ctx.get_field(source, SRC_FIELD_READ_LISTENER) {
+        Value::Object(Some(o)) => o,
+        _ => return false,
+    };
+    if let Err(e) = ctx.invoke_virtual(
+        listener,
+        "handleEvent",
+        CHANNEL_LISTENER_HANDLE_EVENT_DESC,
+        &[Value::Object(Some(source))],
+    ) {
+        xnio_tcp_dbg!("source_read_listener_error error={e:?}");
+    }
+    true
+}
+
+fn invoke_sink_write_listener(ctx: &mut dyn NativeContext, sink: ObjectRef) -> bool {
+    let listener = match ctx.get_field(sink, SINK_FIELD_WRITE_LISTENER) {
+        Value::Object(Some(o)) => o,
+        _ => return false,
+    };
+    if let Err(e) = ctx.invoke_virtual(
+        listener,
+        "handleEvent",
+        CHANNEL_LISTENER_HANDLE_EVENT_DESC,
+        &[Value::Object(Some(sink))],
+    ) {
+        xnio_tcp_dbg!("sink_write_listener_error error={e:?}");
+    }
+    true
+}
+
+fn notify_source_readable(ctx: &mut dyn NativeContext, source: ObjectRef, retry: bool) {
+    let delays: &[u64] = if retry {
+        &READ_NOTIFY_RETRY_DELAYS_MS
+    } else {
+        &[0]
+    };
+    notify_source_readable_with_delays(ctx, source, retry, delays);
+}
+
+fn notify_source_readable_with_delays(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    retry: bool,
+    delays: &[u64],
+) {
+    let id = match source_id_of(ctx, source) {
+        Some(id) => id,
+        None => return,
+    };
+
+    for delay in delays {
+        if *delay > 0 {
+            thread::sleep(Duration::from_millis(*delay));
+        }
+        let suspended = source_read_suspended(ctx, source, id);
+        let pending = source_has_pending_data(id);
+        xnio_tcp_dbg!(
+            "notify_source id={id} retry={retry} delay_ms={} suspended={suspended} pending={pending}",
+            *delay
+        );
+        if suspended || !pending {
+            continue;
+        }
+        ctx.set_field(source, SRC_FIELD_READ_READY_FLAG, Value::Int(1));
+        if let Some(ch) = get_source_channel(id) {
+            ch.read_ready.store(true, Ordering::Release);
+        }
+        let fired = invoke_source_read_listener(ctx, source);
+        xnio_tcp_dbg!("notify_source id={id} fired_listener={fired}");
+        return;
+    }
+}
+
+fn notify_paired_source_readable(ctx: &mut dyn NativeContext, sink: ObjectRef, retry: bool) {
+    let Some(source) = paired_source_of(ctx, sink) else {
+        return;
+    };
+    notify_source_readable(ctx, source, retry);
+}
+
+fn notify_paired_source_readable_with_delays(
+    ctx: &mut dyn NativeContext,
+    sink: ObjectRef,
+    retry: bool,
+    delays: &[u64],
+) {
+    let Some(source) = paired_source_of(ctx, sink) else {
+        return;
+    };
+    notify_source_readable_with_delays(ctx, source, retry, delays);
+}
+
+pub(crate) fn notify_registered_sources_readable(
+    ctx: &mut dyn NativeContext,
+    retry: bool,
+    skip_id: Option<u64>,
+) {
+    let handles = source_obj_handles_by_id(ctx);
+    for (id, handle) in handles {
+        if Some(id) == skip_id {
+            continue;
+        }
+        let Some(source) = ctx.resolve_global_root(handle) else {
+            continue;
+        };
+        notify_source_readable(ctx, source, retry);
+    }
+}
+
+fn notify_sources_after_sink_write(ctx: &mut dyn NativeContext, sink: ObjectRef) {
+    let paired = paired_source_of(ctx, sink);
+    let paired_id = paired.and_then(|source| source_id_of(ctx, source));
+    if let Some(source) = paired {
+        notify_source_readable(ctx, source, false);
+    }
+    notify_registered_sources_readable(ctx, false, paired_id);
+}
+
+fn with_sink_conduit_delegate(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    method_name: &str,
+    descriptor: &str,
+    call_args: &[Value],
+) -> Option<MethodCallResult> {
+    let conduit = match ctx.get_field_by_name(this, "conduit") {
+        Value::Object(Some(conduit)) if conduit.as_ptr() != this.as_ptr() => conduit,
+        _ => return None,
+    };
+    Some(ctx.invoke_virtual(conduit, method_name, descriptor, call_args))
 }
 
 fn native_source_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -862,9 +1340,21 @@ fn native_source_resume_reads(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     ctx.set_field(this, SRC_FIELD_READ_SUSPENDED, Value::Int(0));
     if let Some(id) = source_id_of(ctx, this) {
         if let Some(ch) = get_source_channel(id) {
-            // Round-9 HIGH-2: Release — paired with Acquire in dispatch.
+            // Round-9 HIGH-2: Release -- paired with Acquire in dispatch.
             ch.read_suspended.store(false, Ordering::Release);
         }
+    }
+    let listener = match ctx.get_field(this, SRC_FIELD_READ_LISTENER) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    };
+    if let Some(listener) = listener {
+        let _ = ctx.invoke_virtual(
+            listener,
+            "handleEvent",
+            CHANNEL_LISTENER_HANDLE_EVENT_DESC,
+            &[Value::Object(Some(this))],
+        );
     }
     Ok(None)
 }
@@ -897,20 +1387,106 @@ fn native_source_shutdown_reads(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 // Natives — sink-side
 // ---------------------------------------------------------------------------
 
+fn native_source_is_read_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let shutdown = source_id_of(ctx, this)
+        .and_then(get_source_channel)
+        .map(|ch| ch.shutdown.load(Ordering::Acquire))
+        .unwrap_or(false);
+    Ok(Some(Value::Int(if shutdown { 1 } else { 0 })))
+}
+
+fn native_source_is_read_resumed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let resumed = source_id_of(ctx, this)
+        .and_then(get_source_channel)
+        .map(|ch| !ch.read_suspended.load(Ordering::Acquire))
+        .unwrap_or_else(
+            || !matches!(ctx.get_field(this, SRC_FIELD_READ_SUSPENDED), Value::Int(v) if v != 0),
+        );
+    Ok(Some(Value::Int(if resumed { 1 } else { 0 })))
+}
+
+fn native_return_null(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+fn native_source_get_read_thread(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(Value::Object(channel_io_thread_of(
+        ctx,
+        this,
+        SRC_FIELD_IO_THREAD,
+    ))))
+}
+
+fn native_sink_get_write_thread(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(Value::Object(channel_io_thread_of(
+        ctx,
+        this,
+        SINK_FIELD_IO_THREAD,
+    ))))
+}
+
+fn native_channel_get_worker(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    io_thread_slot: usize,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let Some(io_thread) = channel_io_thread_of(ctx, this, io_thread_slot) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    match ctx.invoke_virtual(io_thread, "getWorker", "()Lorg/xnio/XnioWorker;", &[]) {
+        Ok(Some(value)) => Ok(Some(value)),
+        Ok(None) => Ok(Some(Value::Object(None))),
+        Err(err) => Err(err),
+    }
+}
+
+fn native_source_get_worker(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_channel_get_worker(ctx, args, SRC_FIELD_IO_THREAD)
+}
+
+fn native_sink_get_worker(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_channel_get_worker(ctx, args, SINK_FIELD_IO_THREAD)
+}
+
+fn native_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(None)
+}
+
 fn native_sink_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if let Some(result) =
+        with_sink_conduit_delegate(ctx, this, "write", "(Ljava/nio/ByteBuffer;)I", &args[1..])
+    {
+        return result;
+    }
     let buf = match args.get(1).copied() {
         Some(Value::Object(Some(o))) => o,
         _ => return Err(ioex("write: null ByteBuffer")),
     };
     let id = sink_id_of(ctx, this).ok_or_else(|| ioex("write: channel not registered"))?;
-    sink_channel_write(ctx, id, buf)
-        .map(|n| Some(Value::Int(n)))
-        .map_err(Into::into)
+    let n = sink_channel_write(ctx, id, buf)?;
+    if n > 0 {
+        notify_sources_after_sink_write(ctx, this);
+    }
+    Ok(Some(Value::Int(n)))
 }
 
 fn native_sink_write_gather(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if let Some(result) = with_sink_conduit_delegate(
+        ctx,
+        this,
+        "write",
+        "([Ljava/nio/ByteBuffer;II)J",
+        &args[1..],
+    ) {
+        return result;
+    }
     let bufs = match args.get(1).copied() {
         Some(Value::Object(Some(o))) => o,
         _ => return Err(ioex("gather write: null array")),
@@ -932,6 +1508,9 @@ fn native_sink_write_gather(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             break; // would-block — next iteration must wait for OP_WRITE
         }
         total += n as i64;
+    }
+    if total > 0 {
+        notify_sources_after_sink_write(ctx, this);
     }
     Ok(Some(Value::Long(total)))
 }
@@ -957,11 +1536,26 @@ fn native_sink_get_write_listener(ctx: &mut dyn NativeContext, args: &[Value]) -
 
 fn native_sink_resume_writes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if let Some(result) = with_sink_conduit_delegate(ctx, this, "resumeWrites", "()V", &[]) {
+        result?;
+    }
     ctx.set_field(this, SINK_FIELD_WRITE_SUSPENDED, Value::Int(0));
+    ctx.set_field(this, SINK_FIELD_WRITE_READY_FLAG, Value::Int(1));
     if let Some(id) = sink_id_of(ctx, this) {
         if let Some(ch) = get_sink_channel(id) {
-            // Round-9 HIGH-2: Release — paired with Acquire in dispatch.
+            // Round-9 HIGH-2: Release - paired with Acquire in dispatch.
             ch.write_suspended.store(false, Ordering::Release);
+            ch.write_ready.store(true, Ordering::Release);
+        }
+        let fired = invoke_sink_write_listener(ctx, this);
+        xnio_tcp_dbg!("resume_writes id={id} fired_listener={fired}");
+        if fired {
+            notify_paired_source_readable_with_delays(
+                ctx,
+                this,
+                true,
+                &READ_NOTIFY_POST_LISTENER_RETRY_DELAYS_MS,
+            );
         }
     }
     Ok(None)
@@ -969,34 +1563,79 @@ fn native_sink_resume_writes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
 fn native_sink_suspend_writes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if let Some(result) = with_sink_conduit_delegate(ctx, this, "suspendWrites", "()V", &[]) {
+        result?;
+    }
     ctx.set_field(this, SINK_FIELD_WRITE_SUSPENDED, Value::Int(1));
     if let Some(id) = sink_id_of(ctx, this) {
         if let Some(ch) = get_sink_channel(id) {
-            // Round-9 HIGH-2: Release — paired with Acquire in dispatch.
+            // Round-9 HIGH-2: Release - paired with Acquire in dispatch.
             ch.write_suspended.store(true, Ordering::Release);
         }
     }
     Ok(None)
 }
 
-fn native_sink_shutdown_writes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
+fn shutdown_sink_transport(ctx: &mut dyn NativeContext, this: ObjectRef) {
     if let Some(id) = sink_id_of(ctx, this) {
         if let Some(ch) = get_sink_channel(id) {
-            // Round-9 HIGH-2: Release — paired with Acquire in
+            // Round-9 HIGH-2: Release - paired with Acquire in
             // sink_channel_write.
             ch.shutdown.store(true, Ordering::Release);
             transport_shutdown_write(&ch.transport);
         }
     }
+}
+
+fn native_sink_shutdown_writes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if let Some(result) = with_sink_conduit_delegate(ctx, this, "terminateWrites", "()V", &[]) {
+        return result;
+    }
+    shutdown_sink_transport(ctx, this);
     Ok(None)
 }
 
-/// `flush()` — return true if the internal buffered-byte count is zero and
+fn native_sink_truncate_writes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if let Some(result) = with_sink_conduit_delegate(ctx, this, "truncateWrites", "()V", &[]) {
+        return result;
+    }
+    shutdown_sink_transport(ctx, this);
+    Ok(None)
+}
+
+/// `flush()` - return true if the internal buffered-byte count is zero and
 /// the underlying transport has been drained. With no local staging buffer
 /// we just report `buffered_bytes == 0`.
+fn native_sink_is_write_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if let Some(result) = with_sink_conduit_delegate(ctx, this, "isWriteShutdown", "()Z", &[]) {
+        return result;
+    }
+    let shutdown = sink_id_of(ctx, this)
+        .and_then(get_sink_channel)
+        .map(|ch| ch.shutdown.load(Ordering::Acquire))
+        .unwrap_or(false);
+    Ok(Some(Value::Int(if shutdown { 1 } else { 0 })))
+}
+
+fn native_sink_is_write_resumed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let resumed = sink_id_of(ctx, this)
+        .and_then(get_sink_channel)
+        .map(|ch| !ch.write_suspended.load(Ordering::Acquire))
+        .unwrap_or_else(
+            || !matches!(ctx.get_field(this, SINK_FIELD_WRITE_SUSPENDED), Value::Int(v) if v != 0),
+        );
+    Ok(Some(Value::Int(if resumed { 1 } else { 0 })))
+}
+
 fn native_sink_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if let Some(result) = with_sink_conduit_delegate(ctx, this, "flush", "()Z", &[]) {
+        return result;
+    }
     let id = match sink_id_of(ctx, this) {
         Some(v) => v,
         None => return Ok(Some(Value::Int(1))), // channel already gone — treat as drained
@@ -1008,12 +1647,38 @@ fn native_sink_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // Round-9 HIGH-2: Acquire — paired with the AcqRel RMW in
     // sink_channel_write that publishes the buffered count.
     let drained = ch.buffered_bytes.load(Ordering::Acquire) == 0;
+    xnio_tcp_dbg!("sink_flush id={id} drained={drained}");
+    if drained {
+        notify_paired_source_readable(ctx, this, true);
+    }
     Ok(Some(Value::Int(if drained { 1 } else { 0 })))
 }
 
 // ---------------------------------------------------------------------------
 // Natives — ChannelListener$Setter
 // ---------------------------------------------------------------------------
+
+fn native_channel_get_self_conduit(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    match ctx.get_field_by_name(this, "conduit") {
+        Value::Object(Some(conduit)) => Ok(Some(Value::Object(Some(conduit)))),
+        _ => {
+            ctx.set_field_by_name(this, "conduit", Value::Object(Some(this)));
+            Ok(Some(Value::Object(Some(this))))
+        }
+    }
+}
+
+fn native_channel_set_conduit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if let Some(Value::Object(Some(conduit))) = args.get(1).copied() {
+        ctx.set_field_by_name(this, "conduit", Value::Object(Some(conduit)));
+    }
+    Ok(None)
+}
 
 fn native_setter_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // this = ChannelListener$Setter; arg 1 = ChannelListener
@@ -1036,14 +1701,33 @@ fn native_setter_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // Test-only helpers to inflate a source / sink channel as a Java object.
 // ---------------------------------------------------------------------------
 
+fn alloc_source_conduit_obj(ctx: &mut dyn NativeContext, id: u64) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, CLS_STREAM_SOURCE_CONDUIT, SRC_NUM_SLOTS);
+    remember_source_obj(ctx, obj, id);
+    ctx.set_field(obj, SRC_FIELD_CHANNEL_ID, Value::Long(id as i64));
+    ctx.set_field(obj, SRC_FIELD_READ_SUSPENDED, Value::Int(1));
+    obj
+}
+
+fn alloc_sink_conduit_obj(ctx: &mut dyn NativeContext, id: u64) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, CLS_STREAM_SINK_CONDUIT, SINK_NUM_SLOTS);
+    remember_sink_obj(ctx, obj, id);
+    ctx.set_field(obj, SINK_FIELD_CHANNEL_ID, Value::Long(id as i64));
+    ctx.set_field(obj, SINK_FIELD_WRITE_SUSPENDED, Value::Int(1));
+    obj
+}
+
 /// Allocate a Java-side `ConduitStreamSourceChannel` and bind it to the given
 /// channel id. Public (but `#[doc(hidden)]`) so integration tests in other
 /// crates can stand up a conduit without threading a full Selector in.
 #[doc(hidden)]
 pub fn alloc_source_channel_obj(ctx: &mut dyn NativeContext, id: u64) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, CLS_SOURCE, SRC_NUM_SLOTS);
+    let conduit = alloc_source_conduit_obj(ctx, id);
+    remember_source_obj(ctx, obj, id);
     ctx.set_field(obj, SRC_FIELD_CHANNEL_ID, Value::Long(id as i64));
     ctx.set_field(obj, SRC_FIELD_READ_SUSPENDED, Value::Int(1)); // start suspended
+    ctx.set_field_by_name(obj, "conduit", Value::Object(Some(conduit)));
     obj
 }
 
@@ -1051,8 +1735,11 @@ pub fn alloc_source_channel_obj(ctx: &mut dyn NativeContext, id: u64) -> ObjectR
 #[doc(hidden)]
 pub fn alloc_sink_channel_obj(ctx: &mut dyn NativeContext, id: u64) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, CLS_SINK, SINK_NUM_SLOTS);
+    let conduit = alloc_sink_conduit_obj(ctx, id);
+    remember_sink_obj(ctx, obj, id);
     ctx.set_field(obj, SINK_FIELD_CHANNEL_ID, Value::Long(id as i64));
     ctx.set_field(obj, SINK_FIELD_WRITE_SUSPENDED, Value::Int(1));
+    ctx.set_field_by_name(obj, "conduit", Value::Object(Some(conduit)));
     obj
 }
 
@@ -1083,6 +1770,18 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(
         CLS_SOURCE,
+        "getConduit",
+        "()Lorg/xnio/conduits/StreamSourceConduit;",
+        native_channel_get_self_conduit,
+    );
+    r.register(
+        CLS_SOURCE,
+        "setConduit",
+        "(Lorg/xnio/conduits/StreamSourceConduit;)V",
+        native_channel_set_conduit,
+    );
+    r.register(
+        CLS_SOURCE,
         "setReadListener",
         "(Lorg/xnio/ChannelListener;)V",
         native_source_set_read_listener,
@@ -1106,6 +1805,193 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
         "()V",
         native_source_shutdown_reads,
     );
+    r.register(
+        CLS_SOURCE,
+        "terminateReads",
+        "()V",
+        native_source_shutdown_reads,
+    );
+    r.register(
+        CLS_SOURCE,
+        "isReadShutdown",
+        "()Z",
+        native_source_is_read_shutdown,
+    );
+    r.register(CLS_SOURCE, "wakeupReads", "()V", native_source_resume_reads);
+    r.register(
+        CLS_SOURCE,
+        "isReadResumed",
+        "()Z",
+        native_source_is_read_resumed,
+    );
+    r.register(CLS_SOURCE, "awaitReadable", "()V", native_noop);
+    r.register(
+        CLS_SOURCE,
+        "awaitReadable",
+        "(JLjava/util/concurrent/TimeUnit;)V",
+        native_noop,
+    );
+    r.register(
+        CLS_SOURCE,
+        "getReadThread",
+        "()Lorg/xnio/XnioIoThread;",
+        native_source_get_read_thread,
+    );
+    r.register(
+        CLS_SOURCE,
+        "setReadReadyHandler",
+        "(Lorg/xnio/conduits/ReadReadyHandler;)V",
+        native_noop,
+    );
+    r.register(
+        CLS_SOURCE,
+        "getWorker",
+        "()Lorg/xnio/XnioWorker;",
+        native_source_get_worker,
+    );
+    r.register(
+        CLS_SOURCE,
+        "transferTo",
+        "(JLjava/nio/ByteBuffer;Lorg/xnio/channels/StreamSinkChannel;)J",
+        native_source_transfer_to,
+    );
+
+    // ---- StreamSourceConduit raw shim ----
+    r.register(
+        CLS_STREAM_SOURCE_CONDUIT,
+        "read",
+        "(Ljava/nio/ByteBuffer;)I",
+        native_source_read,
+    );
+    r.register(
+        CLS_STREAM_SOURCE_CONDUIT,
+        "read",
+        "([Ljava/nio/ByteBuffer;II)J",
+        native_source_read_scatter,
+    );
+    r.register(
+        CLS_STREAM_SOURCE_CONDUIT,
+        "transferTo",
+        "(JLjava/nio/ByteBuffer;Lorg/xnio/channels/StreamSinkChannel;)J",
+        native_source_transfer_to,
+    );
+    r.register(
+        CLS_STREAM_SOURCE_CONDUIT,
+        "terminateReads",
+        "()V",
+        native_source_shutdown_reads,
+    );
+    r.register(
+        CLS_STREAM_SOURCE_CONDUIT,
+        "isReadShutdown",
+        "()Z",
+        native_source_is_read_shutdown,
+    );
+    r.register(
+        CLS_STREAM_SOURCE_CONDUIT,
+        "wakeupReads",
+        "()V",
+        native_source_resume_reads,
+    );
+    r.register(
+        CLS_STREAM_SOURCE_CONDUIT,
+        "isReadResumed",
+        "()Z",
+        native_source_is_read_resumed,
+    );
+    r.register(
+        CLS_STREAM_SOURCE_CONDUIT,
+        "awaitReadable",
+        "()V",
+        native_noop,
+    );
+    r.register(
+        CLS_STREAM_SOURCE_CONDUIT,
+        "awaitReadable",
+        "(JLjava/util/concurrent/TimeUnit;)V",
+        native_noop,
+    );
+    r.register(
+        CLS_STREAM_SOURCE_CONDUIT,
+        "getReadThread",
+        "()Lorg/xnio/XnioIoThread;",
+        native_source_get_read_thread,
+    );
+    r.register(
+        CLS_STREAM_SOURCE_CONDUIT,
+        "setReadReadyHandler",
+        "(Lorg/xnio/conduits/ReadReadyHandler;)V",
+        native_noop,
+    );
+    r.register(
+        CLS_STREAM_SOURCE_CONDUIT,
+        "getWorker",
+        "()Lorg/xnio/XnioWorker;",
+        native_source_get_worker,
+    );
+
+    // ---- SourceConduit parent raw shim ----
+    r.register(
+        CLS_SOURCE_CONDUIT,
+        "suspendReads",
+        "()V",
+        native_source_suspend_reads,
+    );
+    r.register(
+        CLS_SOURCE_CONDUIT,
+        "resumeReads",
+        "()V",
+        native_source_resume_reads,
+    );
+    r.register(
+        CLS_SOURCE_CONDUIT,
+        "terminateReads",
+        "()V",
+        native_source_shutdown_reads,
+    );
+    r.register(
+        CLS_SOURCE_CONDUIT,
+        "isReadShutdown",
+        "()Z",
+        native_source_is_read_shutdown,
+    );
+    r.register(
+        CLS_SOURCE_CONDUIT,
+        "wakeupReads",
+        "()V",
+        native_source_resume_reads,
+    );
+    r.register(
+        CLS_SOURCE_CONDUIT,
+        "isReadResumed",
+        "()Z",
+        native_source_is_read_resumed,
+    );
+    r.register(CLS_SOURCE_CONDUIT, "awaitReadable", "()V", native_noop);
+    r.register(
+        CLS_SOURCE_CONDUIT,
+        "awaitReadable",
+        "(JLjava/util/concurrent/TimeUnit;)V",
+        native_noop,
+    );
+    r.register(
+        CLS_SOURCE_CONDUIT,
+        "getReadThread",
+        "()Lorg/xnio/XnioIoThread;",
+        native_source_get_read_thread,
+    );
+    r.register(
+        CLS_SOURCE_CONDUIT,
+        "setReadReadyHandler",
+        "(Lorg/xnio/conduits/ReadReadyHandler;)V",
+        native_noop,
+    );
+    r.register(
+        CLS_SOURCE_CONDUIT,
+        "getWorker",
+        "()Lorg/xnio/XnioWorker;",
+        native_source_get_worker,
+    );
 
     // ---- ConduitStreamSinkChannel ----
     r.register(
@@ -1128,6 +2014,18 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(
         CLS_SINK,
+        "getConduit",
+        "()Lorg/xnio/conduits/StreamSinkConduit;",
+        native_channel_get_self_conduit,
+    );
+    r.register(
+        CLS_SINK,
+        "setConduit",
+        "(Lorg/xnio/conduits/StreamSinkConduit;)V",
+        native_channel_set_conduit,
+    );
+    r.register(
+        CLS_SINK,
         "setWriteListener",
         "(Lorg/xnio/ChannelListener;)V",
         native_sink_set_write_listener,
@@ -1147,6 +2045,232 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
         native_sink_shutdown_writes,
     );
     r.register(CLS_SINK, "flush", "()Z", native_sink_flush);
+    r.register(
+        CLS_SINK,
+        "terminateWrites",
+        "()V",
+        native_sink_shutdown_writes,
+    );
+    r.register(
+        CLS_SINK,
+        "truncateWrites",
+        "()V",
+        native_sink_truncate_writes,
+    );
+    r.register(
+        CLS_SINK,
+        "isWriteShutdown",
+        "()Z",
+        native_sink_is_write_shutdown,
+    );
+    r.register(CLS_SINK, "wakeupWrites", "()V", native_sink_resume_writes);
+    r.register(
+        CLS_SINK,
+        "isWriteResumed",
+        "()Z",
+        native_sink_is_write_resumed,
+    );
+    r.register(CLS_SINK, "awaitWritable", "()V", native_noop);
+    r.register(
+        CLS_SINK,
+        "awaitWritable",
+        "(JLjava/util/concurrent/TimeUnit;)V",
+        native_noop,
+    );
+    r.register(
+        CLS_SINK,
+        "getWriteThread",
+        "()Lorg/xnio/XnioIoThread;",
+        native_sink_get_write_thread,
+    );
+    r.register(
+        CLS_SINK,
+        "setWriteReadyHandler",
+        "(Lorg/xnio/conduits/WriteReadyHandler;)V",
+        native_noop,
+    );
+    r.register(
+        CLS_SINK,
+        "getWorker",
+        "()Lorg/xnio/XnioWorker;",
+        native_sink_get_worker,
+    );
+    r.register(
+        CLS_SINK,
+        "transferFrom",
+        "(Lorg/xnio/channels/StreamSourceChannel;JLjava/nio/ByteBuffer;)J",
+        native_sink_transfer_from,
+    );
+    r.register(
+        CLS_SINK,
+        "writeFinal",
+        "(Ljava/nio/ByteBuffer;)I",
+        native_sink_write,
+    );
+    r.register(
+        CLS_SINK,
+        "writeFinal",
+        "([Ljava/nio/ByteBuffer;II)J",
+        native_sink_write_gather,
+    );
+
+    // ---- StreamSinkConduit raw shim ----
+    r.register(
+        CLS_STREAM_SINK_CONDUIT,
+        "write",
+        "(Ljava/nio/ByteBuffer;)I",
+        native_sink_write,
+    );
+    r.register(
+        CLS_STREAM_SINK_CONDUIT,
+        "write",
+        "([Ljava/nio/ByteBuffer;II)J",
+        native_sink_write_gather,
+    );
+    r.register(CLS_STREAM_SINK_CONDUIT, "flush", "()Z", native_sink_flush);
+    r.register(
+        CLS_STREAM_SINK_CONDUIT,
+        "terminateWrites",
+        "()V",
+        native_sink_shutdown_writes,
+    );
+    r.register(
+        CLS_STREAM_SINK_CONDUIT,
+        "truncateWrites",
+        "()V",
+        native_sink_truncate_writes,
+    );
+    r.register(
+        CLS_STREAM_SINK_CONDUIT,
+        "isWriteShutdown",
+        "()Z",
+        native_sink_is_write_shutdown,
+    );
+    r.register(
+        CLS_STREAM_SINK_CONDUIT,
+        "wakeupWrites",
+        "()V",
+        native_sink_resume_writes,
+    );
+    r.register(
+        CLS_STREAM_SINK_CONDUIT,
+        "isWriteResumed",
+        "()Z",
+        native_sink_is_write_resumed,
+    );
+    r.register(CLS_STREAM_SINK_CONDUIT, "awaitWritable", "()V", native_noop);
+    r.register(
+        CLS_STREAM_SINK_CONDUIT,
+        "awaitWritable",
+        "(JLjava/util/concurrent/TimeUnit;)V",
+        native_noop,
+    );
+    r.register(
+        CLS_STREAM_SINK_CONDUIT,
+        "getWriteThread",
+        "()Lorg/xnio/XnioIoThread;",
+        native_sink_get_write_thread,
+    );
+    r.register(
+        CLS_STREAM_SINK_CONDUIT,
+        "setWriteReadyHandler",
+        "(Lorg/xnio/conduits/WriteReadyHandler;)V",
+        native_noop,
+    );
+    r.register(
+        CLS_STREAM_SINK_CONDUIT,
+        "getWorker",
+        "()Lorg/xnio/XnioWorker;",
+        native_sink_get_worker,
+    );
+    r.register(
+        CLS_STREAM_SINK_CONDUIT,
+        "transferFrom",
+        "(Lorg/xnio/channels/StreamSourceChannel;JLjava/nio/ByteBuffer;)J",
+        native_sink_transfer_from,
+    );
+    r.register(
+        CLS_STREAM_SINK_CONDUIT,
+        "writeFinal",
+        "(Ljava/nio/ByteBuffer;)I",
+        native_sink_write,
+    );
+    r.register(
+        CLS_STREAM_SINK_CONDUIT,
+        "writeFinal",
+        "([Ljava/nio/ByteBuffer;II)J",
+        native_sink_write_gather,
+    );
+
+    // ---- SinkConduit parent raw shim ----
+    r.register(
+        CLS_SINK_CONDUIT,
+        "suspendWrites",
+        "()V",
+        native_sink_suspend_writes,
+    );
+    r.register(
+        CLS_SINK_CONDUIT,
+        "resumeWrites",
+        "()V",
+        native_sink_resume_writes,
+    );
+    r.register(
+        CLS_SINK_CONDUIT,
+        "terminateWrites",
+        "()V",
+        native_sink_shutdown_writes,
+    );
+    r.register(
+        CLS_SINK_CONDUIT,
+        "truncateWrites",
+        "()V",
+        native_sink_truncate_writes,
+    );
+    r.register(
+        CLS_SINK_CONDUIT,
+        "isWriteShutdown",
+        "()Z",
+        native_sink_is_write_shutdown,
+    );
+    r.register(
+        CLS_SINK_CONDUIT,
+        "wakeupWrites",
+        "()V",
+        native_sink_resume_writes,
+    );
+    r.register(
+        CLS_SINK_CONDUIT,
+        "isWriteResumed",
+        "()Z",
+        native_sink_is_write_resumed,
+    );
+    r.register(CLS_SINK_CONDUIT, "awaitWritable", "()V", native_noop);
+    r.register(
+        CLS_SINK_CONDUIT,
+        "awaitWritable",
+        "(JLjava/util/concurrent/TimeUnit;)V",
+        native_noop,
+    );
+    r.register(
+        CLS_SINK_CONDUIT,
+        "getWriteThread",
+        "()Lorg/xnio/XnioIoThread;",
+        native_sink_get_write_thread,
+    );
+    r.register(
+        CLS_SINK_CONDUIT,
+        "setWriteReadyHandler",
+        "(Lorg/xnio/conduits/WriteReadyHandler;)V",
+        native_noop,
+    );
+    r.register(
+        CLS_SINK_CONDUIT,
+        "getWorker",
+        "()Lorg/xnio/XnioWorker;",
+        native_sink_get_worker,
+    );
+    r.register(CLS_SINK_CONDUIT, "flush", "()Z", native_sink_flush);
 
     // ---- ChannelListener$Setter ----
     r.register(
@@ -1222,6 +2346,68 @@ mod tests {
         fn sink_attachment(&self) -> Option<(u64, ObjectRef)> {
             self.sink
         }
+    }
+
+    fn mark_sink_write_listener_invoked(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        _receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> Option<MethodCallResult> {
+        if method_name == "handleEvent" && descriptor == CHANNEL_LISTENER_HANDLE_EVENT_DESC {
+            if let Some(Value::Object(Some(sink))) = args.first().copied() {
+                ctx.set_field(sink, SINK_FIELD_WRITE_READY_FLAG, Value::Int(2));
+            }
+            return Some(Ok(None));
+        }
+        None
+    }
+
+    fn mark_source_read_listener_invoked(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        _receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> Option<MethodCallResult> {
+        if method_name == "handleEvent" && descriptor == CHANNEL_LISTENER_HANDLE_EVENT_DESC {
+            if let Some(Value::Object(Some(source))) = args.first().copied() {
+                ctx.set_field(source, SRC_FIELD_READ_READY_FLAG, Value::Int(2));
+            }
+            return Some(Ok(None));
+        }
+        None
+    }
+
+    fn sink_listener_makes_paired_source_pending_then_marks_reads(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        _receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> Option<MethodCallResult> {
+        if method_name != "handleEvent" || descriptor != CHANNEL_LISTENER_HANDLE_EVENT_DESC {
+            return None;
+        }
+        let Some(Value::Object(Some(channel))) = args.first().copied() else {
+            return Some(Ok(None));
+        };
+        if sink_id_of(ctx, channel).is_some() {
+            ctx.set_field(channel, SINK_FIELD_WRITE_READY_FLAG, Value::Int(2));
+            if let Some(source) = paired_source_of(ctx, channel) {
+                if let Some(id) = source_id_of(ctx, source) {
+                    if let Some(ch) = get_source_channel(id) {
+                        if let ConduitTransport::Pipe(pipe) = &ch.transport {
+                            pipe.push(b"r");
+                        }
+                    }
+                }
+            }
+        } else if source_id_of(ctx, channel).is_some() {
+            ctx.set_field(channel, SRC_FIELD_READ_READY_FLAG, Value::Int(2));
+        }
+        Some(Ok(None))
     }
 
     // ---- Test 1: source channel read returns bytes from the socket ----
@@ -1573,6 +2759,200 @@ mod tests {
             other => panic!("expected listener installed, got {other:?}"),
         }
         drop_source_channel(id);
+    }
+
+    // ---- Extra: resumeWrites fires the channel write listener ----
+    #[test]
+    fn t19_7_d_resume_writes_fires_channel_listener() {
+        let mut ctx = mock_ctx();
+        let pipe = Arc::new(Pipe::new(1024));
+        let id = register_sink_channel(ConduitTransport::Pipe(pipe));
+        let ch_obj = alloc_sink_channel_obj(&mut ctx, id);
+        let listener = ctx.create_string("write-listener");
+        native_sink_set_write_listener(
+            &mut ctx,
+            &[Value::Object(Some(ch_obj)), Value::Object(Some(listener))],
+        )
+        .unwrap();
+        ctx.set_invoke_virtual_hook(mark_sink_write_listener_invoked);
+
+        native_sink_resume_writes(&mut ctx, &[Value::Object(Some(ch_obj))]).unwrap();
+
+        assert_eq!(
+            ctx.get_field(ch_obj, SINK_FIELD_WRITE_SUSPENDED),
+            Value::Int(0)
+        );
+        assert_eq!(
+            ctx.get_field(ch_obj, SINK_FIELD_WRITE_READY_FLAG),
+            Value::Int(2)
+        );
+        let reg = get_sink_channel(id).unwrap();
+        assert!(!reg.write_suspended.load(Ordering::Acquire));
+        assert!(reg.write_ready.load(Ordering::Acquire));
+        drop_sink_channel(id);
+    }
+
+    // ---- Extra: resumeWrites retries paired reads after listener writes ----
+    #[test]
+    fn t19_7_d_resume_writes_retries_paired_source_after_listener() {
+        let mut ctx = mock_ctx();
+        let source_pipe = Arc::new(Pipe::new(1024));
+        let sink_pipe = Arc::new(Pipe::new(1024));
+        let source_id = register_source_channel(ConduitTransport::Pipe(source_pipe));
+        let sink_id = register_sink_channel(ConduitTransport::Pipe(sink_pipe));
+        let source = alloc_source_channel_obj(&mut ctx, source_id);
+        let sink = alloc_sink_channel_obj(&mut ctx, sink_id);
+        remember_sink_paired_source(&mut ctx, sink, source);
+
+        ctx.set_field(source, SRC_FIELD_READ_SUSPENDED, Value::Int(0));
+        let read_listener = ctx.create_string("read-listener");
+        native_source_set_read_listener(
+            &mut ctx,
+            &[
+                Value::Object(Some(source)),
+                Value::Object(Some(read_listener)),
+            ],
+        )
+        .unwrap();
+        let write_listener = ctx.create_string("write-listener");
+        native_sink_set_write_listener(
+            &mut ctx,
+            &[
+                Value::Object(Some(sink)),
+                Value::Object(Some(write_listener)),
+            ],
+        )
+        .unwrap();
+        ctx.set_invoke_virtual_hook(sink_listener_makes_paired_source_pending_then_marks_reads);
+
+        native_sink_resume_writes(&mut ctx, &[Value::Object(Some(sink))]).unwrap();
+
+        assert_eq!(
+            ctx.get_field(sink, SINK_FIELD_WRITE_READY_FLAG),
+            Value::Int(2)
+        );
+        assert_eq!(
+            ctx.get_field(source, SRC_FIELD_READ_READY_FLAG),
+            Value::Int(2),
+            "resumeWrites should poll the paired source after its write listener returns"
+        );
+
+        drop_source_channel(source_id);
+        drop_sink_channel(sink_id);
+    }
+
+    // ---- Extra: sink writes wake peer sources, not just their paired source ----
+    #[test]
+    fn t19_7_d_sink_write_wakes_registered_peer_source_with_pending_data() {
+        let mut ctx = mock_ctx();
+        let own_pipe = Arc::new(Pipe::new(1024));
+        let peer_pipe = Arc::new(Pipe::new(1024));
+        let own_source_id = register_source_channel(ConduitTransport::Pipe(own_pipe));
+        let peer_source_id = register_source_channel(ConduitTransport::Pipe(peer_pipe.clone()));
+        let sink_id = register_sink_channel(ConduitTransport::Pipe(peer_pipe));
+        let own_source = alloc_source_channel_obj(&mut ctx, own_source_id);
+        let peer_source = alloc_source_channel_obj(&mut ctx, peer_source_id);
+        let sink = alloc_sink_channel_obj(&mut ctx, sink_id);
+        remember_sink_paired_source(&mut ctx, sink, own_source);
+
+        ctx.set_field(own_source, SRC_FIELD_READ_SUSPENDED, Value::Int(0));
+        ctx.set_field(peer_source, SRC_FIELD_READ_SUSPENDED, Value::Int(0));
+        let listener = ctx.create_string("peer-read-listener");
+        native_source_set_read_listener(
+            &mut ctx,
+            &[
+                Value::Object(Some(peer_source)),
+                Value::Object(Some(listener)),
+            ],
+        )
+        .unwrap();
+        ctx.set_invoke_virtual_hook(mark_source_read_listener_invoked);
+
+        let buf = make_byte_buffer(&mut ctx, 3);
+        let arr = match ctx.get_field(buf, BB_FIELD_ARRAY) {
+            Value::Object(Some(o)) => o,
+            _ => panic!("missing backing array"),
+        };
+        for (idx, b) in b"cap".iter().enumerate() {
+            ctx.set_array_element(arr, idx, Value::Int(*b as i32));
+        }
+        ctx.set_field(buf, BB_FIELD_LIMIT, Value::Int(3));
+
+        let n = native_sink_write(
+            &mut ctx,
+            &[Value::Object(Some(sink)), Value::Object(Some(buf))],
+        )
+        .unwrap()
+        .unwrap()
+        .as_int()
+        .unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(
+            ctx.get_field(peer_source, SRC_FIELD_READ_READY_FLAG),
+            Value::Int(2),
+            "peer source listener should fire when the sink makes bytes pending"
+        );
+        assert_eq!(
+            ctx.get_field(own_source, SRC_FIELD_READ_READY_FLAG),
+            Value::Int(0),
+            "paired same-side source had no pending bytes"
+        );
+
+        drop_source_channel(own_source_id);
+        drop_source_channel(peer_source_id);
+        drop_sink_channel(sink_id);
+    }
+
+    // ---- Extra: channel IO-thread mirrors round-trip through raw conduits ----
+    #[test]
+    fn t19_7_d_channel_io_thread_round_trips_through_raw_conduits() {
+        let mut ctx = mock_ctx();
+        let pipe = Arc::new(Pipe::new(1024));
+        let source_id = register_source_channel(ConduitTransport::Pipe(pipe.clone()));
+        let sink_id = register_sink_channel(ConduitTransport::Pipe(pipe));
+        let source = alloc_source_channel_obj(&mut ctx, source_id);
+        let sink = alloc_sink_channel_obj(&mut ctx, sink_id);
+        let io_thread = ctx.fresh_object_ref();
+
+        remember_source_io_thread(&mut ctx, source, io_thread);
+        remember_sink_io_thread(&mut ctx, sink, io_thread);
+
+        assert_eq!(
+            native_source_get_read_thread(&mut ctx, &[Value::Object(Some(source))])
+                .unwrap()
+                .unwrap(),
+            Value::Object(Some(io_thread))
+        );
+        assert_eq!(
+            native_sink_get_write_thread(&mut ctx, &[Value::Object(Some(sink))])
+                .unwrap()
+                .unwrap(),
+            Value::Object(Some(io_thread))
+        );
+
+        // The mock context does not model the real XNIO "conduit" field
+        // by name, so allocate raw conduit mirrors directly for this half of
+        // the regression. Production channels still remember both surfaces
+        // when the named field resolves.
+        let source_conduit = alloc_source_conduit_obj(&mut ctx, source_id);
+        let sink_conduit = alloc_sink_conduit_obj(&mut ctx, sink_id);
+        remember_source_io_thread(&mut ctx, source_conduit, io_thread);
+        remember_sink_io_thread(&mut ctx, sink_conduit, io_thread);
+        assert_eq!(
+            native_source_get_read_thread(&mut ctx, &[Value::Object(Some(source_conduit))])
+                .unwrap()
+                .unwrap(),
+            Value::Object(Some(io_thread))
+        );
+        assert_eq!(
+            native_sink_get_write_thread(&mut ctx, &[Value::Object(Some(sink_conduit))])
+                .unwrap()
+                .unwrap(),
+            Value::Object(Some(io_thread))
+        );
+
+        drop_source_channel(source_id);
+        drop_sink_channel(sink_id);
     }
 
     // ---- Extra: out-of-range ByteBuffer bounds are rejected ----

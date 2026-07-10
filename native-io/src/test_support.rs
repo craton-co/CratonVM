@@ -23,6 +23,7 @@ use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 /// A recorded `invoke_virtual` call.
 #[derive(Debug, Clone)]
 pub(crate) struct InvokeCall {
+    pub declared_class: Option<String>,
     pub method_name: String,
     pub descriptor: String,
     pub args: Vec<Value>,
@@ -44,6 +45,7 @@ pub(crate) struct MockNativeContext {
     heap: UnsafeCell<Vec<HeapEntry>>,
     ptr_to_index: UnsafeCell<HashMap<usize, usize>>,
     named_fields: UnsafeCell<HashMap<(usize, String), Value>>,
+    field_reads: UnsafeCell<Vec<(usize, usize)>>,
     next_ptr: usize,
     pub scripts: Vec<InvokeScript>,
     pub calls: UnsafeCell<Vec<InvokeCall>>,
@@ -68,6 +70,7 @@ impl MockNativeContext {
             heap: UnsafeCell::new(Vec::new()),
             ptr_to_index: UnsafeCell::new(HashMap::new()),
             named_fields: UnsafeCell::new(HashMap::new()),
+            field_reads: UnsafeCell::new(Vec::new()),
             next_ptr: 8,
             scripts: Vec::new(),
             calls: UnsafeCell::new(Vec::new()),
@@ -182,6 +185,14 @@ impl MockNativeContext {
     pub(crate) fn recorded_calls(&self) -> &[InvokeCall] {
         unsafe { &*self.calls.get() }
     }
+
+    pub(crate) fn field_read_count(&self, obj: ObjectRef, index: usize) -> usize {
+        let ptr = obj.as_ptr() as usize;
+        unsafe { &*self.field_reads.get() }
+            .iter()
+            .filter(|(read_obj, read_index)| *read_obj == ptr && *read_index == index)
+            .count()
+    }
 }
 
 impl NativeContext for MockNativeContext {
@@ -212,6 +223,7 @@ impl NativeContext for MockNativeContext {
         }
     }
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
+        unsafe { &mut *self.field_reads.get() }.push((obj.as_ptr() as usize, index));
         match &self.heap_ref()[self.entry_index(obj)] {
             HeapEntry::Object { fields } => fields.get(index).copied().unwrap_or(Value::Int(0)),
             _ => Value::Int(0),
@@ -258,11 +270,37 @@ impl NativeContext for MockNativeContext {
         // Record the call so tests can assert on it.
         let calls = unsafe { &mut *self.calls.get() };
         calls.push(InvokeCall {
+            declared_class: None,
             method_name: method_name.to_string(),
             descriptor: descriptor.to_string(),
             args: args.to_vec(),
         });
         // Find the first matching script (FIFO per key).
+        if let Some(pos) = self
+            .scripts
+            .iter()
+            .position(|s| s.method_name == method_name && s.descriptor == descriptor)
+        {
+            return self.scripts.remove(pos).result;
+        }
+        Ok(None)
+    }
+
+    fn invoke_virtual_declared(
+        &mut self,
+        declared_class: &str,
+        _receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let calls = unsafe { &mut *self.calls.get() };
+        calls.push(InvokeCall {
+            declared_class: Some(declared_class.to_string()),
+            method_name: method_name.to_string(),
+            descriptor: descriptor.to_string(),
+            args: args.to_vec(),
+        });
         if let Some(pos) = self
             .scripts
             .iter()

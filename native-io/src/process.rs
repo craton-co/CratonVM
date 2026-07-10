@@ -67,8 +67,9 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
+use cratonvm_native_api::fd_table::FdId;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::{ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
@@ -103,10 +104,22 @@ fn exit_cache() -> &'static Mutex<HashMap<i64, ExitCache>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn pipe_cache() -> &'static Mutex<HashMap<i64, PipeFds>> {
+    static T: OnceLock<Mutex<HashMap<i64, PipeFds>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ExitCache {
     pid: i64,
     exit_code: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PipeFds {
+    stdin_fd: i32,
+    stdout_fd: i32,
+    stderr_fd: i32,
 }
 
 /// Field layout on the synthetic `java/lang/Process` object.
@@ -136,6 +149,8 @@ const PROC_FIELD_COUNT: usize = 6;
 /// first seen as picocli's terminal-width probe failing during
 /// `junit-platform-console --help` (docs/gaps/gap-anonymous-object-getinputstream.md).
 const SYNTHETIC_PROCESS_CLASS: &str = "cratonvm/synthetic/Process";
+const SYNTHETIC_PROCESS_INPUT_STREAM: &str = "cratonvm/synthetic/ProcessPipeInputStream";
+const SYNTHETIC_PROCESS_OUTPUT_STREAM: &str = "cratonvm/synthetic/ProcessPipeOutputStream";
 
 fn pb_debug_enabled() -> bool {
     std::env::var_os("CRATONVM_DBG_PB").is_some()
@@ -202,7 +217,9 @@ fn stdin_stdio(spec: &StdioRedirect) -> Result<(Stdio, bool), RuntimeError> {
         StdioRedirect::Null => Ok((Stdio::null(), false)),
         StdioRedirect::ReadFile(path) => Ok((Stdio::from(open_redirect_input(path)?), false)),
         StdioRedirect::WriteFile { path, .. } => Err(RuntimeError::IOException {
-            message: format!("ProcessBuilder.redirectInput cannot read from output redirect: {path}"),
+            message: format!(
+                "ProcessBuilder.redirectInput cannot read from output redirect: {path}"
+            ),
         }),
     }
 }
@@ -254,13 +271,17 @@ fn configure_stdio(
             }
             StdioRedirect::WriteFile { path, append } => {
                 let file = open_redirect_output(path, *append)?;
-                let file2 = file.try_clone().map_err(|e| redirect_io_error("redirectError", path, e))?;
+                let file2 = file
+                    .try_clone()
+                    .map_err(|e| redirect_io_error("redirectError", path, e))?;
                 command.stdout(Stdio::from(file));
                 command.stderr(Stdio::from(file2));
                 Ok((stdin_piped, false, false, None))
             }
             StdioRedirect::ReadFile(path) => Err(RuntimeError::IOException {
-                message: format!("ProcessBuilder.redirectOutput cannot write to input redirect: {path}"),
+                message: format!(
+                    "ProcessBuilder.redirectOutput cannot write to input redirect: {path}"
+                ),
             }),
         }
     } else {
@@ -552,6 +573,14 @@ fn spawn_and_wrap_with_redirects(
             exit_code: None,
         },
     );
+    pipe_cache().lock().insert(
+        handle,
+        PipeFds {
+            stdin_fd,
+            stdout_fd,
+            stderr_fd,
+        },
+    );
 
     // Allocate the synthetic Process under its own named class (see
     // SYNTHETIC_PROCESS_CLASS) and populate its 6 fields.
@@ -591,7 +620,7 @@ pub fn wait_for_handle(handle: i64) -> i32 {
     };
     let status = match child.wait() {
         Ok(s) => s,
-        Err(_) => return -1,
+        Err(_e) => return -1,
     };
     // On Unix, `ExitStatus::code()` returns None if terminated by
     // signal; map that to 128 + signum pattern as HotSpot does.
@@ -621,6 +650,9 @@ pub fn try_exit_handle(handle: i64) -> Option<i32> {
     // Cached?
     if let Some(cache) = exit_cache().lock().get(&handle) {
         if let Some(code) = cache.exit_code {
+            if pb_debug_enabled() {
+                eprintln!("[PB-TRY-CACHED] handle={handle} code={code}");
+            }
             return Some(code);
         }
     }
@@ -644,6 +676,9 @@ pub fn try_exit_handle(handle: i64) -> Option<i32> {
             table.remove(&handle);
             if let Some(cache) = exit_cache().lock().get_mut(&handle) {
                 cache.exit_code = Some(code);
+            }
+            if pb_debug_enabled() {
+                eprintln!("[PB-TRY-EXIT] handle={handle} code={code} status={status:?}");
             }
             Some(code)
         }
@@ -1405,6 +1440,221 @@ fn alloc_process_handle(ctx: &mut dyn NativeContext, pid: Value) -> ObjectRef {
     obj
 }
 
+fn pipe_io_err(err: impl std::fmt::Display) -> MethodCallFailed {
+    RuntimeError::IOException {
+        message: err.to_string(),
+    }
+    .into()
+}
+
+fn pipe_array_bounds(off: i32, len: i32, arr_len: usize) -> Result<(), MethodCallFailed> {
+    if off < 0 || len < 0 {
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::ArrayIndexOutOfBoundsException {
+                index: if off < 0 { off } else { len },
+            },
+        )));
+    }
+    match (off as usize).checked_add(len as usize) {
+        Some(end) if end <= arr_len => Ok(()),
+        _ => Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::ArrayIndexOutOfBoundsException {
+                index: off.saturating_add(len),
+            },
+        ))),
+    }
+}
+
+fn alloc_pipe_stream(ctx: &mut dyn NativeContext, class_name: &str, fd_id: i32) -> Value {
+    let class_id = ctx.ensure_synthetic_class(class_name, 1);
+    let stream = ctx.alloc_object(class_id, 1);
+    ctx.set_field(stream, 0, Value::Int(fd_id));
+    Value::Object(Some(stream))
+}
+
+fn pipe_fd(ctx: &dyn NativeContext, this: ObjectRef) -> Option<FdId> {
+    match ctx.get_field(this, 0) {
+        Value::Int(v) if v >= 0 => Some(v as FdId),
+        _ => None,
+    }
+}
+
+fn native_pipe_output_write_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let b = match args.get(1) {
+        Some(Value::Int(v)) => *v as u8,
+        _ => 0,
+    };
+    if let Some(fd) = pipe_fd(ctx, this) {
+        ctx.fd_table().write_byte(fd, b).map_err(pipe_io_err)?;
+    }
+    Ok(None)
+}
+
+fn native_pipe_output_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let arr = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(None),
+    };
+    let off = args.get(2).and_then(Value::as_int).unwrap_or(0);
+    let len = args.get(3).and_then(Value::as_int).unwrap_or(0);
+    pipe_array_bounds(off, len, ctx.array_length(arr))?;
+    let off = off as usize;
+    let len = len as usize;
+    if let Some(fd) = pipe_fd(ctx, this) {
+        let mut buf = vec![0u8; len];
+        ctx.read_byte_array_into(arr, off, &mut buf);
+        ctx.fd_table().write_bytes(fd, &buf).map_err(pipe_io_err)?;
+    }
+    Ok(None)
+}
+
+fn native_pipe_output_write_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let arr = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(None),
+    };
+    let len = ctx.array_length(arr) as i32;
+    native_pipe_output_write_bytes(
+        ctx,
+        &[
+            Value::Object(Some(this)),
+            Value::Object(Some(arr)),
+            Value::Int(0),
+            Value::Int(len),
+        ],
+    )
+}
+
+fn native_pipe_output_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    if let Some(fd) = pipe_fd(ctx, this) {
+        ctx.fd_table().flush(fd).map_err(pipe_io_err)?;
+    }
+    Ok(None)
+}
+
+fn native_pipe_output_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    if let Some(fd) = pipe_fd(ctx, this) {
+        let _ = ctx.fd_table().flush(fd);
+        let _ = ctx.fd_table().close(fd);
+        ctx.set_field(this, 0, Value::Int(-1));
+    }
+    Ok(None)
+}
+
+fn native_pipe_input_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let Some(fd) = pipe_fd(ctx, this) else {
+        return Ok(Some(Value::Int(-1)));
+    };
+    ctx.begin_blocking_region();
+    let result = ctx.fd_table().read_byte(fd);
+    ctx.end_blocking_region();
+    let result = result.map_err(pipe_io_err)?;
+    Ok(Some(Value::Int(result)))
+}
+
+fn native_pipe_input_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let arr = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let off = args.get(2).and_then(Value::as_int).unwrap_or(0);
+    let len = args.get(3).and_then(Value::as_int).unwrap_or(0);
+    pipe_array_bounds(off, len, ctx.array_length(arr))?;
+    if len == 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    let Some(fd) = pipe_fd(ctx, this) else {
+        return Ok(Some(Value::Int(-1)));
+    };
+    let mut buf = vec![0u8; len as usize];
+    let mut held = args.to_vec();
+    ctx.begin_blocking_region();
+    let n = ctx.fd_table().read_bytes(fd, &mut buf);
+    ctx.end_blocking_region_refs(&mut held);
+    let n = n.map_err(pipe_io_err)?;
+    if n == 0 {
+        return Ok(Some(Value::Int(-1)));
+    }
+    let arr = match held.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    ctx.write_byte_array_from(arr, off as usize, &buf[..n]);
+    Ok(Some(Value::Int(n as i32)))
+}
+
+fn native_pipe_input_read_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let arr = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let len = ctx.array_length(arr) as i32;
+    native_pipe_input_read_bytes(
+        ctx,
+        &[
+            Value::Object(Some(this)),
+            Value::Object(Some(arr)),
+            Value::Int(0),
+            Value::Int(len),
+        ],
+    )
+}
+
+fn native_pipe_input_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let n = pipe_fd(ctx, this)
+        .and_then(|fd| ctx.fd_table().available(fd).ok())
+        .unwrap_or(0);
+    Ok(Some(Value::Int(n as i32)))
+}
+
+fn native_pipe_input_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    if let Some(fd) = pipe_fd(ctx, this) {
+        let _ = ctx.fd_table().close(fd);
+        ctx.set_field(this, 0, Value::Int(-1));
+    }
+    Ok(None)
+}
+
 /// `java.lang.Process.pid()J`
 fn native_process_pid(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
@@ -1445,11 +1695,37 @@ fn wrap_fd_in_stream(
     };
     ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd_id));
     ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd_id as i64));
-    ctx.new_object_initialized(
+    let stream = match ctx.new_object_initialized(
         stream_class,
         "(Ljava/io/FileDescriptor;)V",
         &[Value::Object(Some(fd_obj))],
-    )
+    )? {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            return Err(RuntimeError::IOException {
+                message: format!("Process stream: {stream_class} construction failed"),
+            }
+            .into())
+        }
+    };
+    // Some real-JDK stream constructors touch the descriptor during
+    // initialization. Re-seed the descriptor after construction so the
+    // fd-table id remains recoverable when the stream is later written/read.
+    ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd_id));
+    ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd_id as i64));
+
+    // Some early WildFly process-controller paths reach this wrapper before
+    // the real stream constructor has reliably populated FileInputStream.fd /
+    // FileOutputStream.fd. Seed it explicitly so the fd-based stream natives
+    // recover the child pipe instead of falling through to legacy slot probes.
+    if let Some(fd_slot) = ctx.resolve_field_index(stream_class, "fd") {
+        ctx.set_field(stream, fd_slot, Value::Object(Some(fd_obj)));
+    }
+    ctx.set_field_by_name(stream, "fd", Value::Object(Some(fd_obj)));
+    if !matches!(ctx.get_field_by_name(stream, "fd"), Value::Object(Some(_))) {
+        ctx.set_field(stream, 0, Value::Int(fd_id));
+    }
+    Ok(Some(Value::Object(Some(stream))))
 }
 
 /// Shared body of the three `java.lang.Process` stream getters: read the
@@ -1472,11 +1748,24 @@ fn process_stream(
             .into())
         }
     };
-    let fd_id = match ctx.get_field(this, fd_field) {
+    let mut fd_id = match ctx.get_field(this, fd_field) {
         Value::Int(v) => v,
         _ => -1,
     };
-    wrap_fd_in_stream(ctx, fd_id, stream_class)
+    if fd_id < 0 {
+        let handle = handle_of(ctx, this);
+        if handle != 0 {
+            if let Some(pipes) = pipe_cache().lock().get(&handle).copied() {
+                fd_id = match fd_field {
+                    PROC_FIELD_STDIN_FD => pipes.stdin_fd,
+                    PROC_FIELD_STDOUT_FD => pipes.stdout_fd,
+                    PROC_FIELD_STDERR_FD => pipes.stderr_fd,
+                    _ => -1,
+                };
+            }
+        }
+    }
+    Ok(Some(alloc_pipe_stream(ctx, stream_class, fd_id)))
 }
 
 /// `java.lang.Process.getInputStream()Ljava/io/InputStream;` — the child's
@@ -1485,7 +1774,12 @@ fn native_process_get_input_stream(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    process_stream(ctx, args, PROC_FIELD_STDOUT_FD, "java/io/FileInputStream")
+    process_stream(
+        ctx,
+        args,
+        PROC_FIELD_STDOUT_FD,
+        SYNTHETIC_PROCESS_INPUT_STREAM,
+    )
 }
 
 /// `java.lang.Process.getErrorStream()Ljava/io/InputStream;` — the child's
@@ -1494,7 +1788,12 @@ fn native_process_get_error_stream(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    process_stream(ctx, args, PROC_FIELD_STDERR_FD, "java/io/FileInputStream")
+    process_stream(
+        ctx,
+        args,
+        PROC_FIELD_STDERR_FD,
+        SYNTHETIC_PROCESS_INPUT_STREAM,
+    )
 }
 
 /// `java.lang.Process.getOutputStream()Ljava/io/OutputStream;` — the child's
@@ -1503,7 +1802,12 @@ fn native_process_get_output_stream(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    process_stream(ctx, args, PROC_FIELD_STDIN_FD, "java/io/FileOutputStream")
+    process_stream(
+        ctx,
+        args,
+        PROC_FIELD_STDIN_FD,
+        SYNTHETIC_PROCESS_OUTPUT_STREAM,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1679,6 +1983,68 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
             native_process_get_output_stream,
         );
     }
+
+    registry.register(
+        SYNTHETIC_PROCESS_OUTPUT_STREAM,
+        "write",
+        "(I)V",
+        native_pipe_output_write_byte,
+    );
+    registry.register(
+        SYNTHETIC_PROCESS_OUTPUT_STREAM,
+        "write",
+        "([BII)V",
+        native_pipe_output_write_bytes,
+    );
+    registry.register(
+        SYNTHETIC_PROCESS_OUTPUT_STREAM,
+        "write",
+        "([B)V",
+        native_pipe_output_write_array,
+    );
+    registry.register(
+        SYNTHETIC_PROCESS_OUTPUT_STREAM,
+        "flush",
+        "()V",
+        native_pipe_output_flush,
+    );
+    registry.register(
+        SYNTHETIC_PROCESS_OUTPUT_STREAM,
+        "close",
+        "()V",
+        native_pipe_output_close,
+    );
+
+    registry.register(
+        SYNTHETIC_PROCESS_INPUT_STREAM,
+        "read",
+        "()I",
+        native_pipe_input_read,
+    );
+    registry.register(
+        SYNTHETIC_PROCESS_INPUT_STREAM,
+        "read",
+        "([BII)I",
+        native_pipe_input_read_bytes,
+    );
+    registry.register(
+        SYNTHETIC_PROCESS_INPUT_STREAM,
+        "read",
+        "([B)I",
+        native_pipe_input_read_array,
+    );
+    registry.register(
+        SYNTHETIC_PROCESS_INPUT_STREAM,
+        "available",
+        "()I",
+        native_pipe_input_available,
+    );
+    registry.register(
+        SYNTHETIC_PROCESS_INPUT_STREAM,
+        "close",
+        "()V",
+        native_pipe_input_close,
+    );
 
     // ProcessBuilder.start — route through the real spawn path.  This
     // overrides the synthetic stub from phases_late.
@@ -2010,7 +2376,11 @@ mod tests {
 
         let result = native_process_wait_for_timeout(
             &mut ctx,
-            &[Value::Object(Some(proc_ref)), Value::Long(20), Value::Object(None)],
+            &[
+                Value::Object(Some(proc_ref)),
+                Value::Long(20),
+                Value::Object(None),
+            ],
         )
         .unwrap()
         .unwrap();

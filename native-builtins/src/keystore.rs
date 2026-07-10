@@ -196,12 +196,7 @@ pub fn keystore_set_cert_entry(id: i32, alias: &str, cert_der: Vec<u8>) -> bool 
 /// to `keystore_set_pending_km_identity` -- so `KeyManagerFactory.init`
 /// found no identity to stage for the TLS layer. Returns true if the store
 /// existed.
-pub fn keystore_set_key_entry(
-    id: i32,
-    alias: &str,
-    key_der: Vec<u8>,
-    chain: Vec<Vec<u8>>,
-) -> bool {
+pub fn keystore_set_key_entry(id: i32, alias: &str, key_der: Vec<u8>, chain: Vec<Vec<u8>>) -> bool {
     let mut g = registry().write();
     if let Some(store) = g.stores.get_mut(&id) {
         store.entries.insert(
@@ -1380,7 +1375,7 @@ fn engine_get_certificate_chain(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 
     let cls_id = match ctx.ensure_class_initialized("java/security/cert/X509Certificate") {
         Ok(c) => c,
-        Err(_) => cratonvm_types::ClassId::new(0),
+        Err(_) => ctx.ensure_synthetic_class("java/security/cert/X509Certificate", 8),
     };
     let arr = ctx.new_ref_array(cls_id, chain.len());
     for (i, der) in chain.iter().enumerate() {
@@ -1400,7 +1395,7 @@ fn engine_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 
     let cls_id = match ctx.ensure_class_initialized("java/lang/String") {
         Ok(c) => c,
-        Err(_) => cratonvm_types::ClassId::new(0),
+        Err(_) => ctx.ensure_synthetic_class("java/lang/String", 8),
     };
     let arr = ctx.new_ref_array(cls_id, aliases.len());
     for (i, a) in aliases.iter().enumerate() {

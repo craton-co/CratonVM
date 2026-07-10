@@ -57,7 +57,6 @@ fn resolve_class_resource_name(
     name.to_string()
 }
 
-
 fn byte_array_to_vec(ctx: &dyn NativeContext, arr: ObjectRef) -> Vec<u8> {
     let len = ctx.array_length(arr);
     let mut bytes = Vec::with_capacity(len);
@@ -92,10 +91,13 @@ fn spring_mock_response_get_content_as_string(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let charset = match ctx.invoke_virtual(this, "getCharacterEncoding", "()Ljava/lang/String;", &[]) {
-        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_else(|| "UTF-8".to_string()),
-        _ => "UTF-8".to_string(),
-    };
+    let charset =
+        match ctx.invoke_virtual(this, "getCharacterEncoding", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => {
+                ctx.read_string(s).unwrap_or_else(|| "UTF-8".to_string())
+            }
+            _ => "UTF-8".to_string(),
+        };
     let bytes = spring_mock_response_content_bytes(ctx, this)?;
     let text = crate::charset::decode_str_named(&charset, &bytes);
     Ok(Some(Value::Object(Some(ctx.create_string(&text)))))
@@ -107,15 +109,15 @@ fn spring_mock_response_get_content_as_string_charset(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let charset = match args.get(1) {
-        Some(Value::Object(Some(cs))) => charset_name_from_object(ctx, *cs).unwrap_or_else(|| "UTF-8".to_string()),
+        Some(Value::Object(Some(cs))) => {
+            charset_name_from_object(ctx, *cs).unwrap_or_else(|| "UTF-8".to_string())
+        }
         _ => "UTF-8".to_string(),
     };
     let bytes = spring_mock_response_content_bytes(ctx, this)?;
     let text = crate::charset::decode_str_named(&charset, &bytes);
     Ok(Some(Value::Object(Some(ctx.create_string(&text)))))
 }
-
-
 
 fn jython_py_bool(ctx: &mut dyn NativeContext, value: bool) -> MethodCallResult {
     if let Some(py_cid) = ctx.class_id_by_name("org/python/core/Py") {
@@ -132,7 +134,6 @@ fn jython_py_bool(ctx: &mut dyn NativeContext, value: bool) -> MethodCallResult 
         &[Value::Int(if value { 1 } else { 0 })],
     )
 }
-
 
 fn jython_py_none(ctx: &mut dyn NativeContext) -> Value {
     if let Some(py_cid) = ctx.class_id_by_name("org/python/core/Py") {
@@ -170,7 +171,8 @@ fn jython_pystringmap_put_all(
         return false;
     }
     if !matches!(
-        ctx.class_name_of_id(ctx.class_id_of_object(source)).as_deref(),
+        ctx.class_name_of_id(ctx.class_id_of_object(source))
+            .as_deref(),
         Some("org/python/core/PyStringMap" | "org/python/core/PyDictionary")
     ) {
         return false;
@@ -190,7 +192,6 @@ fn jython_pystringmap_put_all(
     .is_ok()
 }
 
-
 fn jython_new_pystringmap(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     match ctx.new_object_initialized("org/python/core/PyStringMap", "()V", &[])? {
         Some(Value::Object(Some(obj))) => Ok(obj),
@@ -201,7 +202,10 @@ fn jython_new_pystringmap(ctx: &mut dyn NativeContext) -> Result<ObjectRef, Meth
     }
 }
 
-fn jython_new_pyinteger(ctx: &mut dyn NativeContext, value: i32) -> Result<ObjectRef, MethodCallFailed> {
+fn jython_new_pyinteger(
+    ctx: &mut dyn NativeContext,
+    value: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     match ctx.new_object_initialized("org/python/core/PyInteger", "(I)V", &[Value::Int(value)])? {
         Some(Value::Object(Some(obj))) => Ok(obj),
         _ => Err(RuntimeError::IllegalStateException {
@@ -319,7 +323,10 @@ fn jython_pymodule_package_lookup(
     let full_name = format!("{module_name}.{attr}");
     let package_manager = ctx
         .class_id_by_name("org/python/core/PySystemState")
-        .and_then(|cid| ctx.static_field_index_by_name(cid, "packageManager").map(|idx| (cid, idx)))
+        .and_then(|cid| {
+            ctx.static_field_index_by_name(cid, "packageManager")
+                .map(|idx| (cid, idx))
+        })
         .and_then(|(cid, idx)| match ctx.get_static_field(cid, idx) {
             Value::Object(Some(obj)) => Some(obj),
             _ => None,
@@ -497,7 +504,6 @@ fn jython_pyobject_invoke_one(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     )
 }
 
-
 fn jython_sre_const_value(attr: &str) -> Option<i32> {
     match attr {
         "MAGIC" => Some(20031017),
@@ -550,14 +556,20 @@ fn jython_pyobject_isnot(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     jython_py_bool(ctx, lhs.as_ptr() != rhs.as_ptr())
 }
 
-fn jython_py_string_value(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef) -> Option<String> {
+fn jython_py_string_value(
+    ctx: &mut dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+) -> Option<String> {
     match ctx.get_field_by_name(obj, "string") {
         Value::Object(Some(s)) => ctx.read_string(s),
         _ => None,
     }
 }
 
-fn jython_py_integer_value(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef) -> Option<i64> {
+fn jython_py_integer_value(
+    ctx: &mut dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+) -> Option<i64> {
     let class_name = ctx.class_name_of_id(ctx.class_id_of_object(obj))?;
     if class_name != "org/python/core/PyInteger"
         && class_name != "org/python/core/PyIntegerDerived"
@@ -637,8 +649,6 @@ pub(crate) fn register_jython_pyobject_natives(r: &mut NativeMethodRegistry) {
         jython_pyobject_ne,
     );
 }
-
-
 
 fn jython_find_module_getattr(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let receiver = obj_arg(args, 0)?;
@@ -720,7 +730,10 @@ pub(crate) fn register_jython_imp_natives(r: &mut NativeMethodRegistry) {
 fn jython_current_thread_system_state(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
     let mapping = ctx
         .class_id_by_name("org/python/core/Py")
-        .and_then(|py_cid| ctx.static_field_index_by_name(py_cid, "threadStateMapping").map(|idx| (py_cid, idx)))
+        .and_then(|py_cid| {
+            ctx.static_field_index_by_name(py_cid, "threadStateMapping")
+                .map(|idx| (py_cid, idx))
+        })
         .and_then(|(py_cid, idx)| match ctx.get_static_field(py_cid, idx) {
             Value::Object(Some(mapping)) => Some(mapping),
             _ => None,
@@ -754,10 +767,11 @@ fn jython_py_get_or_create_system_state(ctx: &mut dyn NativeContext) -> MethodCa
             if let Value::Object(Some(obj)) = ctx.get_static_field(py_cid, idx) {
                 return Ok(Some(Value::Object(Some(obj))));
             }
-            let state = match ctx.new_object_initialized("org/python/core/PySystemState", "()V", &[])? {
-                Some(Value::Object(Some(obj))) => obj,
-                _ => return Ok(Some(Value::Object(None))),
-            };
+            let state =
+                match ctx.new_object_initialized("org/python/core/PySystemState", "()V", &[])? {
+                    Some(Value::Object(Some(obj))) => obj,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
             ctx.set_static_field(py_cid, idx, Value::Object(Some(state)));
             return Ok(Some(Value::Object(Some(state))));
         }
@@ -798,7 +812,9 @@ fn jython_py_get_thread_state(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     }
 
     let sys_state = match requested_state {
-        Value::Object(None) => jython_py_get_or_create_system_state(ctx)?.unwrap_or(Value::Object(None)),
+        Value::Object(None) => {
+            jython_py_get_or_create_system_state(ctx)?.unwrap_or(Value::Object(None))
+        }
         v => v,
     };
     ctx.new_object_initialized(
@@ -808,11 +824,17 @@ fn jython_py_get_thread_state(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     )
 }
 
-fn jython_py_get_thread_state_noarg(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn jython_py_get_thread_state_noarg(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     jython_py_get_thread_state(ctx, &[Value::Object(None)])
 }
 
-fn jython_py_import_site_if_selected(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn jython_py_import_site_if_selected(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     if let Some(options_cid) = ctx.class_id_by_name("org/python/core/Options") {
         if let Some(idx) = ctx.static_field_index_by_name(options_cid, "importSite") {
             ctx.set_static_field(options_cid, idx, Value::Int(0));
@@ -878,7 +900,6 @@ pub(crate) fn register_spring_mock_response_natives(r: &mut NativeMethodRegistry
     }
 }
 
-
 fn native_bool(value: Option<Value>) -> bool {
     matches!(value, Some(Value::Int(v)) if v != 0)
 }
@@ -929,12 +950,7 @@ fn java_list_size(ctx: &mut dyn NativeContext, list: ObjectRef) -> Option<i32> {
 
 fn java_list_get(ctx: &mut dyn NativeContext, list: ObjectRef, index: i32) -> Option<ObjectRef> {
     match ctx
-        .invoke_virtual(
-            list,
-            "get",
-            "(I)Ljava/lang/Object;",
-            &[Value::Int(index)],
-        )
+        .invoke_virtual(list, "get", "(I)Ljava/lang/Object;", &[Value::Int(index)])
         .ok()
         .flatten()
     {
@@ -1018,15 +1034,11 @@ fn script_engine_manager_get_engine(
         }
     }
 
-    let factories = match ctx.invoke_virtual(
-        manager,
-        "getEngineFactories",
-        "()Ljava/util/List;",
-        &[],
-    )? {
-        Some(Value::Object(Some(factories))) => factories,
-        _ => return Ok(Some(Value::Object(None))),
-    };
+    let factories =
+        match ctx.invoke_virtual(manager, "getEngineFactories", "()Ljava/util/List;", &[])? {
+            Some(Value::Object(Some(factories))) => factories,
+            _ => return Ok(Some(Value::Object(None))),
+        };
     let Some(size) = java_list_size(ctx, factories) else {
         return Ok(Some(Value::Object(None)));
     };
@@ -2345,6 +2357,55 @@ fn s2_bb_limit(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
 fn s2_bb_cap(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
     ctx.get_field(buf, BB_CAP).as_int().unwrap_or(0)
 }
+
+/// Read a ByteBuffer's `mark`, preferring the real-JDK named field.
+///
+/// `Buffer`'s actual real-JDK field order is `mark(0), position(1),
+/// limit(2), capacity(3), address(4)` (see `t27_tls.rs`'s `bb_view` doc
+/// comment / the FIXED bug it documents for the same class of issue). The
+/// indexed `BB_MARK = 4` constant used throughout this file for the
+/// synthetic-mode layout (`array, pos, limit, cap, mark, order`) therefore
+/// lands on real field 4 — `address` (a `long`) — for real-JDK-mode
+/// `ByteBuffer` objects, NOT `mark` (real field 0). `position`/`limit`/
+/// `capacity` happen to align (real indices 1/2/3 match `BB_POS`/`BB_LIMIT`/
+/// `BB_CAP`), which is what let this go unnoticed: only `mark`/`reset` were
+/// silently broken (every `reset()` on a real ByteBuffer threw
+/// `InvalidMarkException`, even immediately after a matching `mark()` —
+/// found via Tomcat's `TestHttp2Limits`, whose HTTP/2 header-block-fragment
+/// buffering hits this mark/reset idiom on every request). Falls back to
+/// the indexed slot for genuinely synthetic (non-real-JDK) buffer objects
+/// that have no `mark` field to resolve by name.
+#[inline]
+fn s2_bb_get_mark(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
+    match ctx.get_field_by_name(buf, "mark") {
+        Value::Int(m) => m,
+        _ => ctx.get_field(buf, BB_MARK).as_int().unwrap_or(-1),
+    }
+}
+
+/// Write a ByteBuffer's `mark` to both the real-JDK named field and the
+/// synthetic indexed slot. See `s2_bb_get_mark` for why the named field is
+/// authoritative for real-JDK-mode objects.
+#[inline]
+fn s2_bb_set_mark(ctx: &mut dyn NativeContext, buf: ObjectRef, value: i32) {
+    // Only fall back to the indexed synthetic slot when there is truly no
+    // real `mark` field to resolve by name (a genuinely synthetic buffer
+    // class, e.g. when the real JDK class failed to load). For real-JDK
+    // ByteBuffer/DirectByteBuffer objects, index 4 aliases the real
+    // `address` field (`Buffer{mark,position,limit,capacity,address}`) —
+    // for `DirectByteBuffer` specifically, `address` is the actual native
+    // memory pointer backing the buffer, so writing our `mark` value there
+    // unconditionally corrupts it, crashing the very next `get`/`put` with
+    // a wild-pointer SIGSEGV (found via a `ByteBuffer.allocateDirect` +
+    // `mark()`/`put()` repro while fixing the heap-buffer InvalidMarkException
+    // bug above). `get_field_by_name` returns `Value::Object(None)` only when
+    // field resolution itself fails (see `vm_exec.rs::get_field_by_name`),
+    // which distinguishes "no such field" from "real int field valued 0".
+    match ctx.get_field_by_name(buf, "mark") {
+        Value::Object(None) => ctx.set_field(buf, BB_MARK, Value::Int(value)),
+        _ => ctx.set_field_by_name(buf, "mark", Value::Int(value)),
+    }
+}
 #[inline]
 fn s2_bb_order(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
     ctx.get_field(buf, BB_ORDER).as_int().unwrap_or(0)
@@ -3195,6 +3256,11 @@ pub(crate) fn register_s2_nio(r: &mut NativeMethodRegistry) {
     register_s2_selector(r);
 }
 
+pub(crate) fn register_s2_bytebuffer_essentials(r: &mut NativeMethodRegistry) {
+    register_s2_bytebuffer(r);
+    register_s2_byteorder(r);
+}
+
 // ---- ByteBuffer ------------------------------------------------------------
 
 #[allow(clippy::too_many_lines)]
@@ -3324,11 +3390,34 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             //    aliasing the native memory.
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, cap);
             let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 8);
+            // Real-JDK named `mark` field (mirrors `bb_write_hb`) — deliberately
+            // NOT also written via the indexed BB_MARK fallback below. Real
+            // `Buffer`'s field order is `mark(0), position(1), limit(2),
+            // capacity(3), address(4)`, so index 4 — this file's synthetic-mode
+            // BB_MARK slot — aliases `address` (the actual native memory
+            // pointer) for a real-JDK `DirectByteBuffer`, NOT `mark`.
+            // Without this by-name write, `mark` starts at its generic
+            // zero-init default (`Value::Object(None)`, indistinguishable from
+            // "field doesn't exist"), so `s2_bb_get_mark`'s by-name-first probe
+            // misreads that as "no such field" on the FIRST `mark()` call and
+            // falls back to the indexed slot, silently overwriting `address`
+            // with the mark value — the next `put`/`get` then computes a
+            // garbage target address and SIGSEGVs (found chasing the
+            // ByteBuffer.mark()/reset() InvalidMarkException fix above through
+            // to a `ByteBuffer.allocateDirect` + `mark()` + `put()` repro).
+            // Skipping the indexed write here means a *genuinely* synthetic
+            // (non-real-JDK) ByteBuffer class would leave `mark` unusable —
+            // accepted: this whole module is real-JDK-mode-only in practice.
+            ctx.set_field_by_name(buf, "position", Value::Int(0));
+            ctx.set_field_by_name(buf, "limit", Value::Int(cap as i32));
+            ctx.set_field_by_name(buf, "capacity", Value::Int(cap as i32));
+            ctx.set_field_by_name(buf, "mark", Value::Int(-1));
+            // Synthetic-mode indexed fallback (array/order/native-id/direct-flag
+            // only — NOT mark, see above).
             ctx.set_field(buf, BB_ARRAY, Value::Object(Some(arr)));
             ctx.set_field(buf, BB_POS, Value::Int(0));
             ctx.set_field(buf, BB_LIMIT, Value::Int(cap as i32));
             ctx.set_field(buf, BB_CAP, Value::Int(cap as i32));
-            ctx.set_field(buf, BB_MARK, Value::Int(-1));
             ctx.set_field(buf, BB_ORDER, Value::Int(0));
             ctx.set_field(buf, BB_NATIVE_ID, Value::Long(alloc_id));
             ctx.set_field(buf, BB_DIRECT_FLAG, Value::Int(1));
@@ -3769,7 +3858,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             let pos = s2_bb_pos(ctx, this);
             ctx.set_field(this, BB_LIMIT, Value::Int(pos));
             ctx.set_field(this, BB_POS, Value::Int(0));
-            ctx.set_field(this, BB_MARK, Value::Int(-1));
+            s2_bb_set_mark(ctx, this, -1);
             Ok(Some(Value::Object(Some(this))))
         });
         r.register(bb, "clear", ret, |ctx, args| {
@@ -3777,25 +3866,25 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             let cap = s2_bb_cap(ctx, this);
             ctx.set_field(this, BB_POS, Value::Int(0));
             ctx.set_field(this, BB_LIMIT, Value::Int(cap));
-            ctx.set_field(this, BB_MARK, Value::Int(-1));
+            s2_bb_set_mark(ctx, this, -1);
             Ok(Some(Value::Object(Some(this))))
         });
         r.register(bb, "rewind", ret, |ctx, args| {
             let this = obj_arg(args, 0)?;
             ctx.set_field(this, BB_POS, Value::Int(0));
-            ctx.set_field(this, BB_MARK, Value::Int(-1));
+            s2_bb_set_mark(ctx, this, -1);
             Ok(Some(Value::Object(Some(this))))
         });
         r.register(bb, "mark", ret, |ctx, args| {
             let this = obj_arg(args, 0)?;
             let pos = s2_bb_pos(ctx, this);
-            ctx.set_field(this, BB_MARK, Value::Int(pos));
+            s2_bb_set_mark(ctx, this, pos);
             Ok(Some(Value::Object(Some(this))))
         });
     }
     r.register(bb, "reset", "()Ljava/nio/Buffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let mark = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+        let mark = s2_bb_get_mark(ctx, this);
         if mark < 0 {
             return Err(RuntimeError::IllegalStateException {
                 message: "InvalidMarkException".into(),
@@ -3862,7 +3951,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         }
         ctx.set_field(this, BB_POS, Value::Int(n as i32));
         ctx.set_field(this, BB_LIMIT, Value::Int(cap));
-        ctx.set_field(this, BB_MARK, Value::Int(-1));
+        s2_bb_set_mark(ctx, this, -1);
         Ok(Some(Value::Object(Some(this))))
     });
 
@@ -4397,9 +4486,13 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
         }
         let mut tmp = vec![0u8; cap];
         let n = {
-            let mut reg = s2_registry().lock();
-            if let Some(stream) = reg.streams.get_mut(&sock_id) {
-                match (&**stream).read(&mut tmp) {
+            let stream = {
+                let reg = s2_registry().lock();
+                reg.streams.get(&sock_id).cloned()
+            };
+            if let Some(stream) = stream {
+                let mut stream_ref = &*stream;
+                match stream_ref.read(&mut tmp) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
@@ -4434,9 +4527,13 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Int(0)));
         }
         let n = {
-            let mut reg = s2_registry().lock();
-            if let Some(stream) = reg.streams.get_mut(&sock_id) {
-                match (&**stream).write(&data) {
+            let stream = {
+                let reg = s2_registry().lock();
+                reg.streams.get(&sock_id).cloned()
+            };
+            if let Some(stream) = stream {
+                let mut stream_ref = &*stream;
+                match stream_ref.write(&data) {
                     Ok(n) => n as i32,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
                     Err(_) => -1,

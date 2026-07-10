@@ -151,6 +151,10 @@ struct Lowerer<'a> {
     /// operands already in XMM0/XMM1 and the result read back from XMM0.
     frem: usize,
     drem: usize,
+    /// Address of the checked `jit_getfield` helper. When present, `Op::Load`
+    /// instance-field reads route through it so receivers are validated against
+    /// the live heap before any object-header dereference.
+    getfield: usize,
     /// True iff the graph contains an `Op::Call` — then the method takes the VM
     /// context pointer as a hidden first argument (`try_call_with_context`), and
     /// the prologue stores it to `context_slot_off` + shifts the Java params.
@@ -210,6 +214,9 @@ impl<'a> Lowerer<'a> {
                 // inputs = [ctrl, mem, args…]
                 max_call_args = max_call_args.max(n.inputs.len().saturating_sub(2));
             }
+            if helpers.getfield != 0 && matches!(n.op, Op::Load(_)) {
+                needs_context = true;
+            }
         }
 
         // Frame layout (rbp downward): locals, [context slot], spills, [args
@@ -260,6 +267,7 @@ impl<'a> Lowerer<'a> {
             dispatch_threw: helpers.dispatch_threw,
             frem: helpers.jit_frem,
             drem: helpers.jit_drem,
+            getfield: helpers.getfield,
             needs_context,
             context_slot_off,
             args_stage_top_off,
@@ -1291,28 +1299,52 @@ impl<'a> Lowerer<'a> {
                     Op::Const(v) => v,
                     _ => 0,
                 };
-                // Byte displacement of the field's 32-bit Int payload within
-                // the object: HEADER_SIZE + field_index*SLOT_SIZE +
-                // FIELD_CELL_PAYLOAD32_OFFSET (the same arithmetic the
-                // single-pass inline getfield uses).
-                let disp = HEADER_SIZE as i32
-                    + (field_index as i32) * SLOT_SIZE as i32
-                    + FIELD_CELL_PAYLOAD32_OFFSET as i32;
-                // Receiver pointer → RAX (64-bit; a Param slot holds the full
-                // pointer the prologue stored from the argument register).
-                self.load_to_rax(self.slot_of(base));
-                // TEST RAX,RAX ; JE +9 → null path (the trailing XOR EAX,EAX).
-                self.buf.emit(&[0x48, 0x85, 0xC0]);
-                self.buf.emit(&[0x74, 0x09]);
-                // MOVSXD RAX, [RAX + disp32]  (sign-extend the Int payload).
-                self.buf.emit(&[0x48, 0x63, 0x80]);
-                self.buf.emit(&disp.to_le_bytes());
-                // JMP +2 → done (skip the null path).
-                self.buf.emit(&[0xEB, 0x02]);
-                // null path: RAX := 0, matching `jit_getfield`'s null guard.
-                self.buf.emit(&[0x31, 0xC0]);
-                // done: spill the result.
-                self.store_rax(slot);
+                if self.getfield != 0 {
+                    self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
+                    self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
+                    self.emit_mov_reg_imm64(CALL_ARG_REGS[2], field_index as i64 as u64);
+                    self.emit_mov_reg_imm64(RAX, self.getfield as u64);
+                    self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+                    // The checked `jit_getfield` helper returns the `i64::MIN`
+                    // deopt/NPE sentinel (with the pending-NPE flag set) on a bad
+                    // receiver instead of a legitimate field value. `Op::Load`
+                    // only ever represents an int-category field (see the doc
+                    // comment above), where `i64::MIN` can never be a genuine
+                    // result, so a plain compare-and-bail is unambiguous — mirrors
+                    // the non-J/D branch of `Op::Call`'s post-dispatch check
+                    // below. Without this, a bad receiver silently corrupts
+                    // execution instead of throwing (crash → hang conversion).
+                    self.emit_mov_reg_imm64(R10, i64::MIN as u64);
+                    self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
+                    self.buf.emit(&[0x0F, 0x84]); // JE rel32 → shared bail stub
+                    let exc_patch = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    self.call_exc_patches.push(exc_patch);
+                    self.store_rax(slot);
+                } else {
+                    // Byte displacement of the field's 32-bit Int payload within
+                    // the object: HEADER_SIZE + field_index*SLOT_SIZE +
+                    // FIELD_CELL_PAYLOAD32_OFFSET (the same arithmetic the
+                    // single-pass inline getfield uses).
+                    let disp = HEADER_SIZE as i32
+                        + (field_index as i32) * SLOT_SIZE as i32
+                        + FIELD_CELL_PAYLOAD32_OFFSET as i32;
+                    // Receiver pointer → RAX (64-bit; a Param slot holds the full
+                    // pointer the prologue stored from the argument register).
+                    self.load_to_rax(self.slot_of(base));
+                    // TEST RAX,RAX ; JE +9 → null path (the trailing XOR EAX,EAX).
+                    self.buf.emit(&[0x48, 0x85, 0xC0]);
+                    self.buf.emit(&[0x74, 0x09]);
+                    // MOVSXD RAX, [RAX + disp32]  (sign-extend the Int payload).
+                    self.buf.emit(&[0x48, 0x63, 0x80]);
+                    self.buf.emit(&disp.to_le_bytes());
+                    // JMP +2 → done (skip the null path).
+                    self.buf.emit(&[0xEB, 0x02]);
+                    // null path: RAX := 0, matching `jit_getfield`'s null guard.
+                    self.buf.emit(&[0x31, 0xC0]);
+                    // done: spill the result.
+                    self.store_rax(slot);
+                }
             }
             // putfield write — `Op::Store`. The IR builder emits only
             // `Op::Store(MemKind::Int)` (int-category instance fields). Inline

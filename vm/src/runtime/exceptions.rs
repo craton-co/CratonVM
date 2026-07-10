@@ -1537,6 +1537,16 @@ pub fn throw_linkage_error(
     error: LinkageError,
 ) -> MethodCallFailed {
     let (class_name, detail) = linkage_throwable(&error);
+    if std::env::var_os("CRATONVM_DBG_VERIFY_ERROR").is_some() {
+        if let LinkageError::VerifyError {
+            class_name,
+            method_name,
+            message,
+        } = &error
+        {
+            eprintln!("[cratonvm-verify] {class_name}.{method_name}: {message}");
+        }
+    }
     match create_exception_object(shared, thread, class_name, Some(&detail)) {
         Ok(obj_ref) => MethodCallFailed::ExceptionThrown(obj_ref),
         Err(_) => MethodCallFailed::InternalError(VmError::Linkage(error)),

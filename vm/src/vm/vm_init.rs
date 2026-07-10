@@ -1179,6 +1179,8 @@ impl SharedVm {
         let gc_backend = match config.gc_algorithm {
             crate::config::GcAlgorithm::Generational => GcBackend::Generational,
             crate::config::GcAlgorithm::G1 => GcBackend::G1,
+            #[cfg(feature = "zgc")]
+            crate::config::GcAlgorithm::Zgc => GcBackend::Zgc,
         };
         let g1_overrides = G1ConfigOverrides {
             region_size: config.g1_region_size,
@@ -1283,8 +1285,8 @@ impl SharedVm {
                 // Override with native implementation to avoid ReentrantLock field layout mismatch
                 // between synthetic natives and real JDK classes
                 // [Bridge] This contiguous run of inline registers (drainTo x3,
-                // ScheduledThreadPoolExecutor.<init>, AtomicBoolean.<init>) all
-                // implement real behavior over the JDK/synthetic field layouts.
+                // AtomicBoolean.<init>) implements real behavior over the
+                // JDK/synthetic field layouts.
                 // Restored to __prev_bridge just before register_io_natives below.
                 let __prev_bridge = native_methods.current_category();
                 native_methods.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -1414,24 +1416,11 @@ impl SharedVm {
                         Ok(Some(cratonvm_types::Value::Int(to_drain)))
                     },
                 );
-                native_methods.register(
-                    "java/util/concurrent/ScheduledThreadPoolExecutor",
-                    "<init>",
-                    "(ILjava/util/concurrent/ThreadFactory;)V",
-                    |ctx, args| {
-                        let this = match args.first() {
-                            Some(cratonvm_types::Value::Object(Some(o))) => *o,
-                            _ => return Ok(None),
-                        };
-                        let cores = match args.get(1) {
-                            Some(cratonvm_types::Value::Int(v)) => *v,
-                            _ => 1,
-                        };
-                        ctx.set_field(this, 0, cratonvm_types::Value::Int(cores));
-                        ctx.set_field(this, 1, cratonvm_types::Value::Int(0));
-                        Ok(None)
-                    },
-                );
+                // Do not override ScheduledThreadPoolExecutor constructors in
+                // real-JDK mode. The real constructors initialize the inherited
+                // ThreadPoolExecutor state (`ctl`, `workQueue`, `mainLock`,
+                // `workers`) coherently. A two-slot synthetic poke here leaves
+                // `getQueue()` null and breaks Tomcat ContainerBase startup.
                 // CopyOnWriteArrayList addIfAbsent/contains/bulkRemove are registered
                 // by `register_collections_natives` with real-JDK field resolution.
                 // Do not register a synthetic two-slot layout here — it corrupts
@@ -4116,7 +4105,16 @@ impl SharedVm {
         if let Some(&obj) = locks.get(&class_id) {
             return obj;
         }
-        let obj = self.heap.alloc_object(class_id, 0);
+        // This object is only a monitor token; it is not a real instance of
+        // `class_id`. Keeping its heap header as java/lang/Object avoids
+        // creating zero-slot "instances" of fieldful classes, which the GC
+        // reports as undersized object layouts when scanning class-lock roots.
+        let lock_class_id = self
+            .class_manager
+            .read()
+            .get_loaded_class_id("java/lang/Object")
+            .unwrap_or(ClassId::new(0));
+        let obj = self.heap.alloc_object(lock_class_id, 0);
         locks.insert(class_id, obj);
         obj
     }
@@ -4753,6 +4751,42 @@ pub struct Vm {
 }
 
 impl Vm {
+    /// Mark the primordial launcher thread as parked outside Java bytecode.
+    ///
+    /// After `main()` returns the CLI may still wait for non-daemon Java
+    /// threads. That wait runs in Rust, so the main thread will not reach an
+    /// interpreter safepoint; publish its roots/frame trace and enter the same
+    /// blocked-region protocol native waits use.
+    pub fn begin_main_thread_blocking_region(&mut self, state: &'static str) {
+        self.main_thread.set_vm_state(state);
+        self.main_thread.tlab.retire();
+        {
+            let ctx = crate::vm::vm_exec::NativeContextImpl {
+                shared: &self.shared,
+                thread: &mut self.main_thread,
+            };
+            ctx.deposit_root_snapshot();
+        }
+        if self.shared.gc_barrier.mark_blocked_region_enter() {
+            let _ = self
+                .shared
+                .gc_barrier
+                .arrive_and_wait(self.main_thread.thread_id);
+        }
+    }
+
+    /// Leave a region opened by [`Self::begin_main_thread_blocking_region`].
+    pub fn end_main_thread_blocking_region(&mut self) {
+        self.shared.gc_barrier.mark_blocked_region_leave();
+        let mut ctx = crate::vm::vm_exec::NativeContextImpl {
+            shared: &self.shared,
+            thread: &mut self.main_thread,
+        };
+        ctx.check_post_block_gc();
+        self.main_thread
+            .set_vm_state("vm-main:blocking-region-returned");
+    }
+
     /// Create a new VM with the given configuration.
     pub fn new(config: VmConfig) -> Self {
         let shared = Arc::new(SharedVm::new(config));
@@ -4818,6 +4852,14 @@ impl Vm {
         shared
             .thread_registry
             .set_root_snapshot(ThreadId(0), main_thread.root_snapshot.clone());
+        // Match spawned threads: the watchdog summary and cross-thread stack
+        // probes must see the primordial thread's parked Java frames too.
+        shared
+            .thread_registry
+            .set_frame_trace(ThreadId(0), main_thread.frame_trace.clone());
+        shared
+            .thread_registry
+            .set_vm_state(ThreadId(0), main_thread.vm_state.clone());
         // Share blocked-region GC state so initiators can maintain the main
         // thread's roots while it parks in a blocking native (wait/join/park)
         shared
@@ -5439,6 +5481,8 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
         let gc_name = match self.config.gc_algorithm {
             crate::config::GcAlgorithm::Generational => "UseGenerationalGC",
             crate::config::GcAlgorithm::G1 => "UseG1GC",
+            #[cfg(feature = "zgc")]
+            crate::config::GcAlgorithm::Zgc => "UseZGC",
         };
         flags.push(format!("-XX:+{}", gc_name));
         flags.push(format!("-XX:MaxHeapSize={}", self.config.max_heap_size));
@@ -5860,6 +5904,26 @@ mod tests {
         let lock_a = shared.get_class_lock_object(ClassId::new(1));
         let lock_b = shared.get_class_lock_object(ClassId::new(2));
         assert_ne!(lock_a.as_ptr(), lock_b.as_ptr());
+    }
+
+    #[test]
+    fn class_lock_object_for_fieldful_class_is_plain_zero_slot_object() {
+        let shared = SharedVm::new(VmConfig::default());
+        let fieldful_id = shared
+            .class_manager
+            .write()
+            .ensure_synthetic_class("cratonvm/test/FieldfulStaticLockTarget", 3);
+        let object_id = shared
+            .class_manager
+            .read()
+            .get_loaded_class_id("java/lang/Object")
+            .unwrap_or(ClassId::new(0));
+
+        let lock = shared.get_class_lock_object(fieldful_id);
+        let header = shared.heap.get_header(lock);
+
+        assert_eq!(header.class_id, object_id);
+        assert_eq!(header.num_slots, 0);
     }
 
     // -----------------------------------------------------------------------

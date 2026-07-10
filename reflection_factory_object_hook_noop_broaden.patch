@@ -1,0 +1,38 @@
+diff --git a/vm/src/vm/vm_exec.rs b/vm/src/vm/vm_exec.rs
+--- a/vm/src/vm/vm_exec.rs
++++ b/vm/src/vm/vm_exec.rs
+@@ -10617,21 +10617,6 @@ pub fn invoke_on_class_shared_no_retarget(
+     )
+ }
+ 
+-fn jboss_marshalling_ser_methods_caller(thread: &JvmThread) -> bool {
+-    thread.frames.last().is_some_and(|f| {
+-        f.class_name() == "org/jboss/marshalling/reflect/JDKSpecific$SerMethods"
+-            && matches!(
+-                f.method_name(),
+-                "callReadObject"
+-                    | "callReadObjectNoData"
+-                    | "callWriteObject"
+-                    | "callReadResolve"
+-                    | "callWriteReplace"
+-            )
+-    })
+-}
+-
+ fn object_serialization_hook_neutral_result(
+     method_name: &str,
+     descriptor: &str,
+@@ -13389,10 +13374,7 @@ fn invoke_on_class_shared_inner(
+                         );
+                     }
+                 }
+-                if class_name == "java/lang/Object" && jboss_marshalling_ser_methods_caller(thread)
+-                {
+-                    if let Some(result) =
+-                        object_serialization_hook_neutral_result(method_name, descriptor, args)
+-                    {
++                if class_name == "java/lang/Object" {
++                    if let Some(result) = object_serialization_hook_neutral_result(method_name, descriptor, args) {
+                         if std::env::var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some() {
+                             eprintln!(
+                                 "[rf-ser] neutral Object serialization hook {}{} caller={}",

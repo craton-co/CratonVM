@@ -513,6 +513,18 @@ fn mock_stamped_lock_field_slot(class_name: Option<&str>, name: &str) -> Option<
     }
 }
 
+fn mock_undertow_exchange_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
+    match (class_name, name) {
+        (Some("io/undertow/server/HttpServerExchange"), "requestHeaders") => Some(2),
+        (Some("io/undertow/server/HttpServerExchange"), "responseHeaders") => Some(3),
+        (Some("io/undertow/server/HttpServerExchange"), "state") => Some(18),
+        (Some("io/undertow/server/HttpServerExchange"), "requestMethod") => Some(19),
+        (Some("io/undertow/server/HttpServerExchange"), "requestURI") => Some(21),
+        (Some("io/undertow/server/HttpServerExchange"), "sender") => Some(30),
+        _ => None,
+    }
+}
+
 pub(crate) type InvokeVirtualHook =
     fn(&mut MockNativeContext, ObjectRef, &str, &str, &[Value]) -> Option<MethodCallResult>;
 
@@ -540,6 +552,11 @@ pub(crate) struct MockNativeContext {
     /// Per-native-call roots for tests that simulate a moving GC during
     /// `invoke_virtual` callbacks.
     native_pin_roots: UnsafeCell<Vec<ObjectRef>>,
+    /// Process-global-style roots used by natives that need object handles
+    /// across callbacks. The mock does not move objects, but implementing the
+    /// API keeps tests on the same path as the real VM.
+    global_roots: UnsafeCell<HashMap<usize, ObjectRef>>,
+    next_global_root: UnsafeCell<usize>,
     /// NEW-8: tracks class IDs that have been marked as hidden via
     /// `set_class_hidden`. Consulted by the `is_class_hidden` override.
     hidden_classes: UnsafeCell<std::collections::HashSet<u32>>,
@@ -700,6 +717,8 @@ impl MockNativeContext {
             invoke_virtual_result: UnsafeCell::new(None),
             invoke_virtual_hook: UnsafeCell::new(None),
             native_pin_roots: UnsafeCell::new(Vec::new()),
+            global_roots: UnsafeCell::new(HashMap::new()),
+            next_global_root: UnsafeCell::new(1),
             hidden_classes: UnsafeCell::new(std::collections::HashSet::new()),
             last_defined_class_name: UnsafeCell::new(None),
             class_flags_override: UnsafeCell::new(HashMap::new()),
@@ -751,6 +770,12 @@ impl MockNativeContext {
         unsafe {
             *self.frame_class_ids_override.get() = frame_class_ids;
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn global_root_count(&self) -> usize {
+        // SAFETY: single-threaded test code.
+        unsafe { (&*self.global_roots.get()).len() }
     }
 
     /// CGLIB-η: read the `loader_id` of the most recent
@@ -1156,6 +1181,7 @@ impl NativeContext for MockNativeContext {
                 .or_else(|| mock_h2_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_liquibase_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_stamped_lock_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_undertow_exchange_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_jdk_field_slot(field_name))
         };
         match slot {
@@ -1178,6 +1204,7 @@ impl NativeContext for MockNativeContext {
                 .or_else(|| mock_h2_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_liquibase_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_stamped_lock_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_undertow_exchange_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_jdk_field_slot(field_name))
         };
         if let Some(slot) = slot {
@@ -1187,8 +1214,8 @@ impl NativeContext for MockNativeContext {
         // the field doesn't exist in the class hierarchy).
     }
 
-    fn resolve_field_index(&self, _class_name: &str, _field_name: &str) -> Option<usize> {
-        None // Mock has no class metadata
+    fn resolve_field_index(&self, class_name: &str, field_name: &str) -> Option<usize> {
+        mock_undertow_exchange_field_slot(Some(class_name), field_name)
     }
 
     fn method_exists(&self, _class_name: &str, _method_name: &str, _descriptor: &str) -> bool {
@@ -1820,6 +1847,24 @@ impl NativeContext for MockNativeContext {
         if base < roots.len() {
             roots.truncate(base);
         }
+    }
+
+    fn add_global_root(&mut self, obj: ObjectRef) -> usize {
+        let next = unsafe { &mut *self.next_global_root.get() };
+        let handle = *next;
+        *next = next.saturating_add(1).max(1);
+        unsafe { &mut *self.global_roots.get() }.insert(handle, obj);
+        handle
+    }
+
+    fn resolve_global_root(&self, handle: usize) -> Option<ObjectRef> {
+        unsafe { &*self.global_roots.get() }.get(&handle).copied()
+    }
+
+    fn remove_global_root(&mut self, handle: usize) -> bool {
+        unsafe { &mut *self.global_roots.get() }
+            .remove(&handle)
+            .is_some()
     }
 
     fn get_scoped_value(&self, _key_id: u64) -> Option<Value> {

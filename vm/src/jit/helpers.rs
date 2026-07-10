@@ -1626,12 +1626,23 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     if crate::runtime::interpreter::gc_overhead_limit_exceeded(vm) {
         return jit_newarray_oom(vm, length as usize);
     }
-    // Retry after GC. On a second failure the heap is genuinely exhausted —
-    // surface a catchable `java/lang/OutOfMemoryError` exactly as the
-    // interpreter's `gc_alloc_array` does, instead of the old non-fallible
-    // `alloc_array` (which would abort the process on a real OOM).
-    let Some(obj_ref) = heap.try_alloc_array(ClassId::new(0), elem_type, length as usize) else {
-        return jit_newarray_oom(vm, length as usize);
+    // Retry after GC. On a second failure, try a G1 last-ditch full mark
+    // cycle (dead humongous spans need cleanup, not a young pause) and retry
+    // once more; then the heap is genuinely exhausted — surface a catchable
+    // `java/lang/OutOfMemoryError` exactly as the interpreter's
+    // `gc_alloc_array` does, instead of the old non-fallible `alloc_array`
+    // (which would abort the process on a real OOM).
+    let obj_ref = match heap.try_alloc_array(ClassId::new(0), elem_type, length as usize) {
+        Some(o) => o,
+        None => {
+            if !jit_g1_last_ditch_full_cycle(vm) {
+                return jit_newarray_oom(vm, length as usize);
+            }
+            match heap.try_alloc_array(ClassId::new(0), elem_type, length as usize) {
+                Some(o) => o,
+                None => return jit_newarray_oom(vm, length as usize),
+            }
+        }
     };
     jit_newarray_finish(obj_ref, atype, length)
 }
@@ -1662,6 +1673,28 @@ fn jit_newarray_oom(vm: &SharedVm, length: usize) -> i64 {
         vm,
         &format!("Java heap space (alloc_array length {})", length),
     )
+}
+
+/// G1 last-ditch full mark cycle on allocation failure — see the
+/// interpreter's `g1_force_full_cycle`: young pauses cannot reclaim dead
+/// Old/humongous spans, only a completed mark cycle's cleanup can. Returns
+/// `true` when the cycle was attempted (caller should retry the allocation
+/// once before surfacing OOM).
+#[cold]
+fn jit_g1_last_ditch_full_cycle(vm: &SharedVm) -> bool {
+    if !vm.heap.is_g1() {
+        return false;
+    }
+    // SAFETY: called only from the JIT allocation slow-path helpers, on a
+    // mutator thread that entered compiled code through the JIT entry
+    // trampoline — the same contract as the surrounding `jit_thread_mut`
+    // calls in those helpers.
+    if let Some((thread, _guard)) = unsafe { jit_thread_mut() } {
+        crate::runtime::interpreter::g1_force_full_cycle(vm, thread);
+        true
+    } else {
+        false
+    }
 }
 
 /// Shared OOM signal for the fallible JIT allocation helpers — `jit_newarray`
@@ -2004,11 +2037,30 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     // abort in alloc_young. The `new` codegen's emit_post_alloc_oom_check bails
     // on the 0/null sentinel and routes the OOME through the method's exception
     // table (matching the interpreter's gc_alloc_object).
-    let Some(obj_ref) = heap.try_alloc_object_full(class_id, num_fields as usize) else {
-        return jit_alloc_oom(
-            vm,
-            &format!("Java heap space (new_object class_id {class_id_raw} fields {num_fields})"),
-        );
+    let obj_ref = match heap.try_alloc_object_full(class_id, num_fields as usize) {
+        Some(o) => o,
+        None => {
+            // G1 last-ditch full cycle + one retry (see jit_newarray).
+            if !jit_g1_last_ditch_full_cycle(vm) {
+                return jit_alloc_oom(
+                    vm,
+                    &format!(
+                        "Java heap space (new_object class_id {class_id_raw} fields {num_fields})"
+                    ),
+                );
+            }
+            match heap.try_alloc_object_full(class_id, num_fields as usize) {
+                Some(o) => o,
+                None => {
+                    return jit_alloc_oom(
+                        vm,
+                        &format!(
+                            "Java heap space (new_object class_id {class_id_raw} fields {num_fields})"
+                        ),
+                    )
+                }
+            }
+        }
     };
     // Initialize primitive-typed fields to proper JVM default values.
     // Zero memory reads as Object(None) which is wrong for int/long/float/double fields.
@@ -2129,15 +2181,32 @@ pub unsafe extern "C" fn jit_anewarray_object(
     // abort in alloc_young. The `anewarray` codegen's emit_post_alloc_oom_check
     // bails on the 0/null sentinel and routes the OOME through the method's
     // exception table (matching the interpreter's gc_alloc_array).
-    let Some(arr) =
-        heap.try_alloc_array_full(class_id, ArrayElementType::Reference, length as usize)
-    else {
-        return jit_alloc_oom(
-            vm,
-            &format!(
-                "Java heap space (anewarray component {component_class_id_raw} length {length})"
-            ),
-        );
+    let arr = match heap.try_alloc_array_full(class_id, ArrayElementType::Reference, length as usize)
+    {
+        Some(a) => a,
+        None => {
+            // G1 last-ditch full cycle + one retry (see jit_newarray).
+            if !jit_g1_last_ditch_full_cycle(vm) {
+                return jit_alloc_oom(
+                    vm,
+                    &format!(
+                        "Java heap space (anewarray component {component_class_id_raw} length {length})"
+                    ),
+                );
+            }
+            match heap.try_alloc_array_full(class_id, ArrayElementType::Reference, length as usize)
+            {
+                Some(a) => a,
+                None => {
+                    return jit_alloc_oom(
+                        vm,
+                        &format!(
+                            "Java heap space (anewarray component {component_class_id_raw} length {length})"
+                        ),
+                    )
+                }
+            }
+        }
     };
     arr.as_ptr() as i64
 }
@@ -2594,10 +2663,14 @@ unsafe fn jit_field_cell_ptr(obj_ptr: i64, field_index: i64) -> *mut u8 {
     (obj_ptr as *mut u8).add(HEADER_SIZE + off)
 }
 
-// SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
-// to a live object. field_index is the resolved field slot index within the object layout.
-// ptr::read is used because Value may contain non-Copy variants (ObjectRef).
-pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
+// SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
+// obj_ptr may be 0 (null), a valid heap pointer, or stale/corrupt raw bits from
+// a miscompiled JIT frame; this helper validates it against the live heap before
+// reading any object header. field_index is the resolved field slot index within
+// the object layout. ptr::read is used because Value may contain non-Copy
+// variants (ObjectRef).
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -2614,6 +2687,11 @@ pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
         // Flag the pending NPE (drained on every JIT method return — see
         // `take_jit_pending_npe` in runtime/interpreter.rs) and return the
         // `i64::MIN` deopt sentinel, mirroring `jit_arraylength`.
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+    let vm = &*(vm_ptr as *const SharedVm);
+    if vm.heap.is_object_address(obj_ptr as usize).is_none() {
         set_jit_pending_npe();
         return i64::MIN;
     }
@@ -3443,6 +3521,10 @@ pub unsafe extern "C" fn jit_checkcast(
     }
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
+    let obj_ref = match vm.heap.is_object_address(obj_ptr as usize) {
+        Some(r) => r,
+        None => return 0,
+    };
     // SAFETY: class_name_ptr is non-null (checked above) and class_name_len > 0.
     // The pointer comes from the JIT string table which outlives this call.
     let class_name = match std::str::from_utf8(std::slice::from_raw_parts(
@@ -3452,8 +3534,6 @@ pub unsafe extern "C" fn jit_checkcast(
         Ok(s) => s,
         Err(_) => return 0,
     };
-    // SAFETY: obj_ptr is non-null (checked above) and points to a live heap object.
-    let obj_ref = ObjectRef::from_raw(obj_ptr as usize as *mut u8);
     let obj_class_id = vm.heap.class_id_of(obj_ref);
     // checkcast: lenient (SBR-03).
     if jit_typecheck_resolve(vm, obj_class_id, obj_ref, class_name, true) {
@@ -5444,6 +5524,27 @@ mod tests {
     }
 
     #[test]
+    fn jit_checkcast_non_heap_ptr_returns_zero() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+
+        let vm = SharedVm::new(VmConfig::default());
+        let target = "java/lang/Object";
+        // SAFETY: vm points to a live SharedVm and target is a valid UTF-8
+        // string. The fake receiver is aligned and pointer-shaped, but outside
+        // the VM heap; jit_checkcast must reject it before any header read.
+        let result = unsafe {
+            jit_checkcast(
+                &vm as *const SharedVm as i64,
+                0x1000,
+                target.as_ptr(),
+                target.len() as i64,
+            )
+        };
+        assert_eq!(result, 0);
+    }
+
+    #[test]
     fn jit_instanceof_null_ptr_returns_zero() {
         // SAFETY: Passing all-zero/null arguments exercises the null-object fast path;
         // no heap pointers are dereferenced.
@@ -5834,7 +5935,7 @@ mod tests {
         // deopt sentinel, mirroring `jit_arraylength`.
         let _ = take_jit_pending_npe(); // clear any prior state
                                         // SAFETY: obj_ptr is 0 (null), so the function returns early without dereferencing.
-        let result = unsafe { jit_getfield(0, 0) };
+        let result = unsafe { jit_getfield(0, 0, 0) };
         assert_eq!(
             result,
             i64::MIN,
@@ -5859,27 +5960,54 @@ mod tests {
         use crate::vm::SharedVm;
         let _ = take_jit_pending_npe();
         let vm_box: Box<SharedVm> = Box::new(SharedVm::new(VmConfig::default()));
+        let vm_ptr = (&*vm_box as *const SharedVm) as i64;
         // Object with exactly 2 reference fields (num_slots == 2).
         let obj = vm_box.heap.alloc_object(ClassId::new(0), 2);
         let obj_ptr = obj.as_ptr() as i64;
         // SAFETY: obj_ptr is a live 2-field object; slot indices 2 and 5 are
         // out of range so the helper takes the bounds-check arm and never
         // dereferences past the object. A negative index is likewise rejected.
-        let oob_hi = unsafe { jit_getfield(obj_ptr, 2) };
+        let oob_hi = unsafe { jit_getfield(vm_ptr, obj_ptr, 2) };
         assert_eq!(
             oob_hi, 0,
             "getfield on an out-of-range slot must not read OOB"
         );
         // SAFETY: `obj_ptr` is a valid test object header built above; `jit_getfield`
         // bounds-checks the slot index and returns 0 rather than reading OOB.
-        let oob_far = unsafe { jit_getfield(obj_ptr, 5) };
+        let oob_far = unsafe { jit_getfield(vm_ptr, obj_ptr, 5) };
         assert_eq!(oob_far, 0, "getfield far past num_slots must not read OOB");
-        let oob_neg = unsafe { jit_getfield(obj_ptr, -1) };
+        let oob_neg = unsafe { jit_getfield(vm_ptr, obj_ptr, -1) };
         assert_eq!(oob_neg, 0, "getfield on a negative slot must not read OOB");
         assert!(
             !take_jit_pending_npe(),
             "an in-range receiver with an OOB slot must not raise NPE"
         );
+    }
+
+    #[test]
+    fn jit_getfield_rejects_pointer_shaped_non_heap_receiver() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+
+        let _ = take_jit_pending_npe();
+        let vm_box: Box<SharedVm> = Box::new(SharedVm::new(VmConfig::default()));
+        let vm_ptr = (&*vm_box as *const SharedVm) as i64;
+        // Aligned, above the null guard, and below 47 bits: it passes the
+        // context-free plausibility filter, but it is not a heap address in
+        // this VM. This is the Tomcat rc=139 shape where generated code had
+        // stale/truncated receiver bits before getfield.
+        let mut bad_receiver = 0x1000_i64;
+        while vm_box
+            .heap
+            .is_object_address(bad_receiver as usize)
+            .is_some()
+        {
+            bad_receiver += 0x1000;
+        }
+        assert!(cratonvm_types::plausible_heap_pointer(bad_receiver as u64));
+        let result = unsafe { jit_getfield(vm_ptr, bad_receiver, 0) };
+        assert_eq!(result, i64::MIN);
+        assert!(take_jit_pending_npe());
     }
 
     #[test]
@@ -5890,12 +6018,13 @@ mod tests {
         use crate::vm::SharedVm;
         let _ = take_jit_pending_npe();
         let vm_box: Box<SharedVm> = Box::new(SharedVm::new(VmConfig::default()));
+        let vm_ptr = (&*vm_box as *const SharedVm) as i64;
         let obj = vm_box.heap.alloc_object(ClassId::new(0), 2);
         // Write via the interpreter path (the helper read must observe it).
         vm_box.heap.set_field(obj, 1, Value::Int(0x5A5A));
         let obj_ptr = obj.as_ptr() as i64;
         // SAFETY: obj_ptr is a live 2-field object; slot 1 is in bounds.
-        let v = unsafe { jit_getfield(obj_ptr, 1) };
+        let v = unsafe { jit_getfield(vm_ptr, obj_ptr, 1) };
         assert_eq!(
             v, 0x5A5A,
             "in-bounds getfield must read back the stored value"
@@ -5922,6 +6051,7 @@ mod tests {
         use std::sync::Arc;
 
         let vm_box: Arc<SharedVm> = Arc::new(SharedVm::new(VmConfig::default()));
+        let vm_ptr = Arc::as_ptr(&vm_box) as i64;
         let obj = vm_box.heap.alloc_object(ClassId::new(0), 1);
         let obj_ptr = obj.as_ptr() as i64;
 
@@ -5957,7 +6087,7 @@ mod tests {
                 while !stop.load(Ordering::Acquire) {
                     // SAFETY: obj_ptr is a live, single-field object; slot 0
                     // is in bounds.
-                    let v = unsafe { jit_getfield(obj_ptr, 0) } as i32;
+                    let v = unsafe { jit_getfield(vm_ptr, obj_ptr, 0) } as i32;
                     if v == A {
                         seen_a += 1;
                     } else if v == B {
@@ -6411,6 +6541,30 @@ fn compute_self_call_stack_floor(sp_now: usize) -> usize {
     }
 }
 
+/// Leaf floor query for the INLINE self-recursion check: get-or-compute the
+/// current OS thread's native-stack floor (the same TLS value
+/// `jit_self_call_stack_guard` consults). Called ONCE from the prologue of a
+/// method with direct self-recursive call sites; each site then compares RSP
+/// against the frame-cached value inline. Touches no VM state and never GCs
+/// (no scan-cache boundary note needed — a leaf like `jit_get_current_thread`).
+///
+/// SAFETY: no arguments, reads only this thread's TLS + stack bounds.
+#[no_mangle]
+pub unsafe extern "C" fn jit_native_stack_floor() -> i64 {
+    let probe = 0u8;
+    let sp_now = &probe as *const u8 as usize;
+    JIT_SELF_CALL_STACK_FLOOR.with(|f| {
+        let v = f.get();
+        if v != usize::MAX {
+            v
+        } else {
+            let computed = compute_self_call_stack_floor(sp_now);
+            f.set(computed);
+            computed
+        }
+    }) as i64
+}
+
 /// The self-call stack guard baked before every direct self-recursive CALL.
 /// Returns `0` (proceed) or the `i64::MIN` deopt sentinel with a catchable
 /// `java/lang/StackOverflowError` stashed in `JIT_PENDING_EXCEPTION`.
@@ -6480,7 +6634,7 @@ fn ra_is_reset(ra: usize) -> bool {
 /// just publishes its current savebase address; the watcher keeps DR0 pinned to
 /// it (reset is called at a stable stack depth, so this is steady-state idle).
 #[cfg(windows)]
-mod savebase_watcher {
+pub(crate) mod savebase_watcher {
     use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 
     pub static ARM_ADDR: AtomicUsize = AtomicUsize::new(0);
@@ -6752,6 +6906,13 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         // BUG-1 companion — native-stack headroom guard enabling direct
         // (non-dispatch) self-recursive CALLs. See `jit_self_call_stack_guard`.
         self_call_stack_guard: jit_self_call_stack_guard as *const () as usize,
+        // Guarded inline getfield — address of the GC's process-global region
+        // bounds table. Non-zero even under G1/ZGC (the table just stays
+        // all-zero there, so every guard falls through to the checked helper).
+        region_bounds_addr: cratonvm_gc::jit_region_bounds_addr(),
+        // Inline self-recursion check — leaf floor-query helper (see the
+        // jit-api field doc; prologue-called once per self-recursive method).
+        native_stack_floor_fn: jit_native_stack_floor as *const () as usize,
     }
 }
 

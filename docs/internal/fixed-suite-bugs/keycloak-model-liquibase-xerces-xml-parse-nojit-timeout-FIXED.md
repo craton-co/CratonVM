@@ -152,5 +152,5 @@ The still-open `RealmModelTest` residual after Liquibase completion is tracked
 separately as:
 
 ```text
-docs/known-issues/keycloak-model-realmmodeltest-h2-auth-after-liquibase-nojit.md
+docs/internal/fixed-suite-bugs/keycloak-model-realmmodeltest-h2-auth-after-liquibase-nojit-FIXED.md
 ```

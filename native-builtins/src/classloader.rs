@@ -2979,6 +2979,58 @@ fn cl_get_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     cl_get_resources_impl(ctx, args, true)
 }
 
+fn url_external_form_string(ctx: &mut dyn NativeContext, url: ObjectRef) -> Option<String> {
+    let p_url = ctx.pin_native_root(url);
+    let url_live = ctx.read_native_pin(p_url, url);
+    let result = ctx.invoke_virtual(url_live, "toExternalForm", "()Ljava/lang/String;", &[]);
+    let out = match result {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+        _ => None,
+    };
+    ctx.unpin_native_roots(p_url);
+    out
+}
+
+fn collect_url_enumeration_strings(
+    ctx: &mut dyn NativeContext,
+    enumeration: ObjectRef,
+    out: &mut Vec<String>,
+) {
+    const MAX_RESOURCE_ENUMERATION: usize = 16_384;
+    let p_enum = ctx.pin_native_root(enumeration);
+    for _ in 0..MAX_RESOURCE_ENUMERATION {
+        let enumeration = ctx.read_native_pin(p_enum, enumeration);
+        let has_more = match ctx.invoke_virtual(enumeration, "hasMoreElements", "()Z", &[]) {
+            Ok(Some(Value::Int(v))) => v != 0,
+            _ => false,
+        };
+        if !has_more {
+            break;
+        }
+
+        let enumeration = ctx.read_native_pin(p_enum, enumeration);
+        let next = ctx.invoke_virtual(enumeration, "nextElement", "()Ljava/lang/Object;", &[]);
+        if let Ok(Some(Value::Object(Some(url)))) = next {
+            if let Some(s) = url_external_form_string(ctx, url) {
+                out.push(s);
+            }
+        }
+    }
+    ctx.unpin_native_roots(p_enum);
+}
+
+fn enumeration_from_url_strings(ctx: &mut dyn NativeContext, urls: &[String]) -> ObjectRef {
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
+    for (i, u) in urls.iter().enumerate() {
+        let url_obj = crate::jboss_module_loader::build_synthetic_url(ctx, u);
+        ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
+    }
+    let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+    ctx.set_field(enm, 0, Value::Object(Some(arr)));
+    ctx.set_field(enm, 1, Value::Int(0));
+    enm
+}
+
 /// `allow_delegate` = whether a non-builtin `ClassLoader` receiver may be
 /// dispatched to its `findResources(String)` override. It MUST be `false` when we
 /// are already serving `findResources` (see `ucl_find_resources`): a loader that
@@ -3071,37 +3123,58 @@ fn cl_get_resources_impl(
             if is_classloader_instance(ctx, this_ref) {
                 let class_id = ctx.class_id_of_object(this_ref);
                 if let Some(class_name) = ctx.class_name_of_id(class_id) {
-                    if !is_builtin_loader_class(&class_name)
-                        && loader_overrides_find_resources(ctx, this_ref)
-                    {
-                        // The loader actually OVERRIDES findResources (e.g. ES
-                        // EmbeddedImplClassLoader, JBoss ModuleClassLoader): run
-                        // its override, which reads its own resource roots.
-                        //
-                        // A loader that does NOT override findResources inherits
-                        // the default (empty) implementation. The real JDK
-                        // `ClassLoader.getResources` = parent.getResources(name)
-                        // ++ this.findResources(name); for such a loader that is
-                        // just parent.getResources. Delegating to the empty
-                        // default here dropped the parent's results entirely —
-                        // e.g. Spring's CandidateComponentsTestClassLoader, which
-                        // overrides only getResources (calling super.getResources)
-                        // to disable the component index, saw ZERO classpath
-                        // resources and every scan-based component scan returned
-                        // empty. So we skip this branch and fall through to the
-                        // flat classpath scan below, which stands in for the
-                        // builtin parent's getResources. Mirrors the parent-first
-                        // delegation already done in the singular `cl_get_resource`.
-                        let pin = ctx.pin_native_root(this_ref);
-                        let name_arg = Value::Object(Some(ctx.create_string(&name)));
-                        let this_ref = ctx.read_native_pin(pin, this_ref);
-                        ctx.unpin_native_roots(pin);
-                        return ctx.invoke_virtual(
-                            this_ref,
-                            "findResources",
-                            "(Ljava/lang/String;)Ljava/util/Enumeration;",
-                            &[name_arg],
-                        );
+                    if !is_builtin_loader_class(&class_name) {
+                        // Real `ClassLoader.getResources` is parent-first:
+                        // parent.getResources(name) followed by this loader's
+                        // findResources(name). The previous native returned only
+                        // the findResources override; for URLClassLoader
+                        // subclasses such as JasperLoader that meant only the
+                        // JSP scratch-dir URLs were visible, while virtual
+                        // WEB-INF/classes resources in the webapp parent
+                        // disappeared from classpathGetResources.jsp.
+                        let p_this = ctx.pin_native_root(this_ref);
+                        let mut delegated_urls = Vec::new();
+
+                        let name_for_parent = Value::Object(Some(ctx.create_string(&name)));
+                        let this_live = ctx.read_native_pin(p_this, this_ref);
+                        let parent = ctx.get_field_by_name(this_live, "parent");
+                        if let Value::Object(Some(parent_ref)) = parent {
+                            let p_parent = ctx.pin_native_root(parent_ref);
+                            let parent_live = ctx.read_native_pin(p_parent, parent_ref);
+                            if let Ok(Some(Value::Object(Some(parent_enum)))) = ctx.invoke_virtual(
+                                parent_live,
+                                "getResources",
+                                "(Ljava/lang/String;)Ljava/util/Enumeration;",
+                                &[name_for_parent],
+                            ) {
+                                collect_url_enumeration_strings(
+                                    ctx,
+                                    parent_enum,
+                                    &mut delegated_urls,
+                                );
+                            }
+                            ctx.unpin_native_roots(p_parent);
+                        }
+
+                        let this_live = ctx.read_native_pin(p_this, this_ref);
+                        if loader_overrides_find_resources(ctx, this_live) {
+                            let name_for_find = Value::Object(Some(ctx.create_string(&name)));
+                            let this_live = ctx.read_native_pin(p_this, this_ref);
+                            if let Ok(Some(Value::Object(Some(own_enum)))) = ctx.invoke_virtual(
+                                this_live,
+                                "findResources",
+                                "(Ljava/lang/String;)Ljava/util/Enumeration;",
+                                &[name_for_find],
+                            ) {
+                                collect_url_enumeration_strings(ctx, own_enum, &mut delegated_urls);
+                            }
+                        }
+                        ctx.unpin_native_roots(p_this);
+
+                        if !delegated_urls.is_empty() {
+                            let enm = enumeration_from_url_strings(ctx, &delegated_urls);
+                            return Ok(Some(Value::Object(Some(enm))));
+                        }
                     }
                 }
             }
@@ -3193,14 +3266,7 @@ fn cl_get_resources_impl(
     // are registered unconditionally by `register_enumeration_impl_natives`
     // so this works in both synthetic-JDK and real-JDK modes without
     // relying on java.util.Vector's internal layout.
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
-    for (i, u) in urls.iter().enumerate() {
-        let url_obj = crate::jboss_module_loader::build_synthetic_url(ctx, u);
-        ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
-    }
-    let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
-    ctx.set_field(enm, 0, Value::Object(Some(arr)));
-    ctx.set_field(enm, 1, Value::Int(0));
+    let enm = enumeration_from_url_strings(ctx, &urls);
     Ok(Some(Value::Object(Some(enm))))
 }
 
@@ -3452,21 +3518,26 @@ pub fn register_enumeration_impl_natives(r: &mut NativeMethodRegistry) {
         let len = ctx.array_length(arr);
         Ok(Some(Value::Int(if idx < len { 1 } else { 0 })))
     });
-    r.register(anon_enm, "nextElement", "()Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
-        let arr = match ctx.get_field(this, 0) {
-            Value::Object(Some(a)) => a,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let len = ctx.array_length(arr);
-        if idx >= len {
-            return Ok(Some(Value::Object(None)));
-        }
-        let elem = ctx.get_array_element(arr, idx);
-        ctx.set_field(this, 1, Value::Int((idx + 1) as i32));
-        Ok(Some(elem))
-    });
+    r.register(
+        anon_enm,
+        "nextElement",
+        "()Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
+            let arr = match ctx.get_field(this, 0) {
+                Value::Object(Some(a)) => a,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let len = ctx.array_length(arr);
+            if idx >= len {
+                return Ok(Some(Value::Object(None)));
+            }
+            let elem = ctx.get_array_element(arr, idx);
+            ctx.set_field(this, 1, Value::Int((idx + 1) as i32));
+            Ok(Some(elem))
+        },
+    );
     r.register(anon_enm, "hasNext", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
@@ -3857,6 +3928,11 @@ fn ucl_find_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let class_name = ctx.read_string(name_obj).unwrap_or_default();
+    let internal = class_name.replace('.', "/");
+    if let Some(result) = ucl_try_define_local_class(ctx, this, &internal) {
+        return result;
+    }
     cl_load_class_base_delegation(ctx, this, name_obj)
 }
 
@@ -4177,6 +4253,64 @@ fn loader_local_resource_urls(
         return Vec::new();
     }
     cratonvm_classloading::ClassPath::new(&paths).find_all_resource_urls(resource_name)
+}
+
+/// Try to resolve `URLClassLoader.findClass(name)` from the receiver's own
+/// URL set and define the resulting class under that receiver's loader
+/// namespace. Returns `None` when the receiver's URLs do not contain the class,
+/// leaving callers free to use their historical fallback path.
+pub(crate) fn ucl_try_define_local_class(
+    ctx: &mut dyn NativeContext,
+    loader: ObjectRef,
+    internal_name: &str,
+) -> Option<MethodCallResult> {
+    if let Some(mirror) = find_loaded_class_for_loader(ctx, loader, internal_name) {
+        return Some(Ok(Some(Value::Object(Some(mirror)))));
+    }
+
+    let resource_name = format!("{internal_name}.class");
+    let paths = loader_constructor_url_paths(ctx, loader);
+    if paths.is_empty() {
+        return None;
+    }
+    let bytes = cratonvm_classloading::ClassPath::new(&paths).find_resource(&resource_name)?;
+
+    let loader_pin = ctx.pin_native_root(loader);
+    let loader_live = ctx.read_native_pin(loader_pin, loader);
+    let loader_id = loader_namespace_id(ctx, loader_live);
+    let opts = cratonvm_native_api::DefineClassFull::default();
+    let define_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.define_class_full(internal_name, &bytes, loader_id, opts)
+    }));
+
+    let result = match define_result {
+        Ok(Ok(cid)) => {
+            let loader_live = ctx.read_native_pin(loader_pin, loader);
+            register_defining_loader(cid.as_u32(), loader_live);
+            let mirror = ctx.get_class_mirror(cid);
+            Ok(Some(Value::Object(Some(mirror))))
+        }
+        Ok(Err(msg)) => {
+            tracing::warn!("URLClassLoader.findClass({internal_name}) define failed: {msg}");
+            Err(cratonvm_types::error::LinkageError::ClassFormatError {
+                class_name: internal_name.to_string(),
+                message: format!("URLClassLoader.findClass: {msg}"),
+            }
+            .into())
+        }
+        Err(_) => {
+            tracing::error!(
+                "URLClassLoader.findClass({internal_name}) panicked while defining local class"
+            );
+            Err(cratonvm_types::error::LinkageError::ClassFormatError {
+                class_name: internal_name.to_string(),
+                message: "URLClassLoader.findClass: panic inside backend".into(),
+            }
+            .into())
+        }
+    };
+    ctx.unpin_native_roots(loader_pin);
+    Some(result)
 }
 
 /// `jdk.internal.loader.URLClassPath.addURL(URL)` for real-JDK mode.
@@ -4598,12 +4732,11 @@ fn lk_ensure_initialized(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             .into());
         }
     };
-    let class_id =
-        crate::lang_class::mirror_class_id(ctx, target_class).ok_or_else(|| {
-            cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "Lookup.ensureInitialized target is not a Class mirror".to_string(),
-            }
-        })?;
+    let class_id = crate::lang_class::mirror_class_id(ctx, target_class).ok_or_else(|| {
+        cratonvm_types::error::RuntimeError::IllegalArgumentException {
+            message: "Lookup.ensureInitialized target is not a Class mirror".to_string(),
+        }
+    })?;
     ctx.initialize_class(class_id).map_err(|message| {
         cratonvm_types::error::MethodCallFailed::InternalError(
             cratonvm_types::error::VmError::Internal {
@@ -6009,12 +6142,13 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
             Value::Object(Some(a)) => a,
             _ => return Ok(Some(Value::Int(-1))),
         };
-        for i in 0..n {
-            let b = ctx.get_array_element(arr, pos + i);
-            ctx.set_array_element(dst, off + i, b);
+        let mut bytes = vec![0u8; n];
+        let copied = ctx.read_byte_array_into(arr, pos, &mut bytes);
+        if copied > 0 {
+            ctx.write_byte_array_from(dst, off, &bytes[..copied]);
         }
-        ctx.set_field(this, 1, Value::Int((pos + n) as i32));
-        Ok(Some(Value::Int(n as i32)))
+        ctx.set_field(this, 1, Value::Int((pos + copied) as i32));
+        Ok(Some(Value::Int(copied as i32)))
     });
     r.register(bais, "available", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -6099,6 +6233,59 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
                 .unwrap_or(0);
             ctx.set_field(stream, 1, Value::Int(pos + 1));
             Some((b & 0xFF) as u8)
+        } else if cname == "java/io/BufferedInputStream" {
+            let pos = ctx
+                .get_field_by_name(stream, "pos")
+                .as_int()
+                .unwrap_or(0)
+                .max(0) as usize;
+            let count = ctx
+                .get_field_by_name(stream, "count")
+                .as_int()
+                .unwrap_or(0)
+                .max(0) as usize;
+            if pos < count {
+                if let Value::Object(Some(buf)) = ctx.get_field_by_name(stream, "buf") {
+                    let b = ctx.get_array_element(buf, pos).as_int().unwrap_or(0);
+                    ctx.set_field_by_name(stream, "pos", Value::Int((pos + 1) as i32));
+                    return Some((b & 0xFF) as u8);
+                }
+            }
+            let inner = match ctx.get_field_by_name(stream, "in") {
+                Value::Object(Some(inner)) => Some(inner),
+                _ => match ctx.get_field(stream, 0) {
+                    Value::Object(Some(inner)) => Some(inner),
+                    _ => None,
+                },
+            }?;
+            let b = dis_read_byte(ctx, inner)?;
+            let markpos = ctx
+                .get_field_by_name(stream, "markpos")
+                .as_int()
+                .unwrap_or(-1);
+            if markpos >= 0 {
+                if let Value::Object(Some(buf)) = ctx.get_field_by_name(stream, "buf") {
+                    let cap = ctx.array_length(buf);
+                    let count = ctx
+                        .get_field_by_name(stream, "count")
+                        .as_int()
+                        .unwrap_or(0)
+                        .max(0) as usize;
+                    let marklimit = ctx
+                        .get_field_by_name(stream, "marklimit")
+                        .as_int()
+                        .unwrap_or(0)
+                        .max(0) as usize;
+                    if count < cap && count.saturating_sub(markpos as usize) < marklimit {
+                        ctx.set_array_element(buf, count, Value::Int(b as i8 as i32));
+                        ctx.set_field_by_name(stream, "count", Value::Int((count + 1) as i32));
+                        ctx.set_field_by_name(stream, "pos", Value::Int((count + 1) as i32));
+                    } else {
+                        ctx.set_field_by_name(stream, "markpos", Value::Int(-1));
+                    }
+                }
+            }
+            Some(b)
         } else {
             // FilterInputStream: field 0 = in
             match ctx.get_field(stream, 0) {
@@ -6418,12 +6605,31 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let stream = args.get(1).copied().unwrap_or(Value::Object(None));
         ctx.set_field(this, 0, stream); // in
+        ctx.set_field_by_name(this, "in", stream);
+        let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 8192);
+        ctx.set_field_by_name(this, "initialSize", Value::Int(8192));
+        ctx.set_field_by_name(this, "buf", Value::Object(Some(buf)));
+        ctx.set_field_by_name(this, "count", Value::Int(0));
+        ctx.set_field_by_name(this, "pos", Value::Int(0));
+        ctx.set_field_by_name(this, "markpos", Value::Int(-1));
+        ctx.set_field_by_name(this, "marklimit", Value::Int(0));
+        ctx.set_field(this, 1, Value::Object(Some(buf)));
         Ok(None)
     });
     r.register(bis, "<init>", "(Ljava/io/InputStream;I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let stream = args.get(1).copied().unwrap_or(Value::Object(None));
+        let size = args.get(2).and_then(Value::as_int).unwrap_or(8192).max(1);
         ctx.set_field(this, 0, stream); // in
+        ctx.set_field_by_name(this, "in", stream);
+        let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, size as usize);
+        ctx.set_field_by_name(this, "initialSize", Value::Int(size));
+        ctx.set_field_by_name(this, "buf", Value::Object(Some(buf)));
+        ctx.set_field_by_name(this, "count", Value::Int(0));
+        ctx.set_field_by_name(this, "pos", Value::Int(0));
+        ctx.set_field_by_name(this, "markpos", Value::Int(-1));
+        ctx.set_field_by_name(this, "marklimit", Value::Int(0));
+        ctx.set_field(this, 1, Value::Object(Some(buf)));
         Ok(None)
     });
     r.register(bis, "read", "()I", |ctx, args| {
@@ -6446,6 +6652,38 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
             ctx.set_array_element(dst, off + i, Value::Int(b as i8 as i32));
         }
         Ok(Some(Value::Int(bytes.len() as i32)))
+    });
+    r.register(bis, "skip", "(J)J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let n = args.get(1).and_then(Value::as_long).unwrap_or(0).max(0) as usize;
+        let bytes = dis_read_n(ctx, this, n);
+        Ok(Some(Value::Long(bytes.len() as i64)))
+    });
+    r.register(bis, "mark", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let readlimit = args.get(1).and_then(Value::as_int).unwrap_or(0).max(0);
+        let pos = ctx
+            .get_field_by_name(this, "pos")
+            .as_int()
+            .unwrap_or(0)
+            .max(0);
+        ctx.set_field_by_name(this, "marklimit", Value::Int(readlimit));
+        ctx.set_field_by_name(this, "markpos", Value::Int(pos));
+        Ok(None)
+    });
+    r.register(bis, "reset", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let markpos = ctx
+            .get_field_by_name(this, "markpos")
+            .as_int()
+            .unwrap_or(-1);
+        if markpos >= 0 {
+            ctx.set_field_by_name(this, "pos", Value::Int(markpos));
+        }
+        Ok(None)
+    });
+    r.register(bis, "markSupported", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(1)))
     });
     r.register(bis, "available", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;

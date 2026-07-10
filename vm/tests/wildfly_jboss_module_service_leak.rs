@@ -37,9 +37,7 @@ fn fixture_dir() -> PathBuf {
 fn wildfly_dist_modules() -> PathBuf {
     std::env::var("WILDFLY_DIST_MODULES")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from("/data/data/wildfly-dist/wildfly-32.0.1.Final/modules")
-        })
+        .unwrap_or_else(|_| PathBuf::from("/data/data/wildfly-dist/wildfly-32.0.1.Final/modules"))
 }
 
 /// The `org.jboss.as.controller` module's jar — needed on the probe's own
@@ -47,13 +45,15 @@ fn wildfly_dist_modules() -> PathBuf {
 /// resolves without going through module-scoped class loading (the probe
 /// itself isn't loaded by any ModuleClassLoader).
 fn controller_jar(modules_root: &Path) -> Option<PathBuf> {
-    let dir = modules_root
-        .join("system/layers/base/org/jboss/as/controller/main");
-    std::fs::read_dir(&dir).ok()?.filter_map(|e| e.ok()).find_map(|e| {
-        let p = e.path();
-        let is_jar = p.extension().and_then(|s| s.to_str()) == Some("jar");
-        is_jar.then_some(p)
-    })
+    let dir = modules_root.join("system/layers/base/org/jboss/as/controller/main");
+    std::fs::read_dir(&dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .find_map(|e| {
+            let p = e.path();
+            let is_jar = p.extension().and_then(|s| s.to_str()) == Some("jar");
+            is_jar.then_some(p)
+        })
 }
 
 fn cratonvm_binary() -> Option<PathBuf> {
@@ -65,7 +65,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -113,7 +117,13 @@ fn ensure_probe_compiled() -> bool {
 /// Runs the probe for one module, returning the comma-joined provider
 /// class names it discovered (or the `ERROR:...` string the probe emits
 /// on a caught Throwable).
-fn run_probe(bin: &Path, modules_root: &Path, cp: &str, module_name: &str, service: &str) -> String {
+fn run_probe(
+    bin: &Path,
+    modules_root: &Path,
+    cp: &str,
+    module_name: &str,
+    service: &str,
+) -> String {
     let output = Command::new(bin)
         .env("CRATONVM_JBOSS_MP_ROOT", modules_root)
         .arg("-cp")
@@ -147,11 +157,15 @@ fn jboss_module_service_provider_lookup_is_module_scoped() {
         return;
     }
     let Some(ctrl_jar) = controller_jar(&modules_root) else {
-        eprintln!("[wildfly_jboss_module_service_leak] org.jboss.as.controller jar not found; skipping");
+        eprintln!(
+            "[wildfly_jboss_module_service_leak] org.jboss.as.controller jar not found; skipping"
+        );
         return;
     };
     if !ensure_probe_compiled() {
-        eprintln!("[wildfly_jboss_module_service_leak] probe compile failed (javac on PATH?); skipping");
+        eprintln!(
+            "[wildfly_jboss_module_service_leak] probe compile failed (javac on PATH?); skipping"
+        );
         return;
     }
     let Some(bin) = cratonvm_binary() else {
@@ -166,7 +180,13 @@ fn jboss_module_service_provider_lookup_is_module_scoped() {
     const SERVICE: &str = "org.jboss.as.controller.Extension";
 
     let jmx = run_probe(&bin, &modules_root, &cp, "org.jboss.as.jmx", SERVICE);
-    let cm = run_probe(&bin, &modules_root, &cp, "org.wildfly.extension.core-management", SERVICE);
+    let cm = run_probe(
+        &bin,
+        &modules_root,
+        &cp,
+        "org.wildfly.extension.core-management",
+        SERVICE,
+    );
 
     assert_eq!(
         jmx, "org.jboss.as.jmx.JMXExtension",

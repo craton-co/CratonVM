@@ -341,7 +341,12 @@ fn native_readBytes0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         return Ok(Some(Value::Int(-1)));
     }
     // AUDIT 2026-05-17: bulk write via NativeContext intrinsic.
-    ctx.write_byte_array_from(arr, off, &buf[..n]);
+    if !ctx.write_byte_array_from(arr, off, &buf[..n]) {
+        return Err(io_err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "readBytes0: failed to copy bytes into Java array",
+        )));
+    }
     Ok(Some(Value::Int(n as i32)))
 }
 
@@ -394,7 +399,13 @@ fn native_writeBytes0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     }
     let mut buf = vec![0u8; len];
     // AUDIT 2026-05-17: bulk read via NativeContext intrinsic.
-    ctx.read_byte_array_into(arr, off, &mut buf);
+    let copied = ctx.read_byte_array_into(arr, off, &mut buf);
+    if copied != len {
+        return Err(io_err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "writeBytes0: failed to copy full Java array range",
+        )));
+    }
     let fd = match read_fd(ctx, this) {
         Some(fd) => fd,
         None => return Ok(None),
@@ -618,6 +629,67 @@ mod tests {
 
     /// "r" mode must open the underlying file read-only: a write fails at
     /// the OS level (justifying why RAF "r" rejects writes).
+    #[test]
+    fn raf_native_read_write_bytes_roundtrip_nonzero_payload() {
+        use crate::test_support::MockNativeContext;
+        use cratonvm_native_api::NativeContext;
+        use cratonvm_types::ArrayElementType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raf-bytes.bin");
+        let path_s = path.to_str().unwrap().to_string();
+
+        let mut ctx = MockNativeContext::new();
+        let this = ctx.alloc_object(0);
+        let fd_obj = ctx.alloc_object(0);
+        ctx.set_field_by_name(this, "fd", Value::Object(Some(fd_obj)));
+        let path_obj = ctx.attach_string(&path_s);
+
+        native_open0(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(path_obj)),
+                Value::Int(O_RDWR),
+            ],
+        )
+        .unwrap();
+
+        let src = ctx.new_array(ArrayElementType::Byte, 4);
+        for (i, b) in [0x11_i32, 0x22, 0x33, 0x44].into_iter().enumerate() {
+            ctx.set_array_element(src, i, Value::Int(b));
+        }
+        native_writeBytes0(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(src)),
+                Value::Int(0),
+                Value::Int(4),
+            ],
+        )
+        .unwrap();
+        native_seek0(&mut ctx, &[Value::Object(Some(this)), Value::Long(0)]).unwrap();
+
+        let dst = ctx.new_array(ArrayElementType::Byte, 4);
+        let n = native_readBytes0(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+                Value::Int(4),
+            ],
+        )
+        .unwrap();
+        assert_eq!(n, Some(Value::Int(4)));
+        for (i, b) in [0x11_i32, 0x22, 0x33, 0x44].into_iter().enumerate() {
+            assert_eq!(ctx.get_array_element(dst, i), Value::Int(b));
+        }
+
+        native_close0(&mut ctx, &[Value::Object(Some(this))]).unwrap();
+    }
+
     #[test]
     fn open_options_read_only_rejects_write() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();

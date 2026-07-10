@@ -89,6 +89,8 @@ fn arrays_helpers() -> JitRuntimeHelpers {
         jit_frem: s,
         jit_drem: s,
         self_call_stack_guard: 0,
+        region_bounds_addr: 0,
+        native_stack_floor_fn: 0,
     }
 }
 

@@ -2747,6 +2747,13 @@ mod tests {
         let mut fi = HashMap::new();
         fi.insert(1usize, (0usize, b'I'));
         builder.set_field_info(fi);
+        if cratonvm_types::compact_ref_fields_enabled() {
+            assert!(
+                builder.build(&code, 5).is_none(),
+                "compact field layout must bail to the checked single-pass path"
+            );
+            return;
+        }
         let graph = builder.build(&code, 5).expect("IR build failed");
         let has_load = graph.nodes.iter().any(|n| matches!(n.op, Op::Load(_)));
         assert!(has_load, "getfield should emit an Op::Load node");
@@ -2775,6 +2782,13 @@ mod tests {
         let mut fi = HashMap::new();
         fi.insert(2usize, (0usize, b'I'));
         builder.set_field_info(fi);
+        if cratonvm_types::compact_ref_fields_enabled() {
+            assert!(
+                builder.build(&code, 6).is_none(),
+                "compact field layout must bail to the checked single-pass path"
+            );
+            return;
+        }
         let graph = builder.build(&code, 6).expect("IR build failed");
         let store = graph
             .nodes
@@ -2803,6 +2817,13 @@ mod tests {
         fi.insert(1usize, (0usize, b'I')); // getfield pc 1
         fi.insert(7usize, (0usize, b'I')); // putfield pc 7
         builder.set_field_info(fi);
+        if cratonvm_types::compact_ref_fields_enabled() {
+            assert!(
+                builder.build(&code, 12).is_none(),
+                "compact field layout must bail to the checked single-pass path"
+            );
+            return;
+        }
         let graph = builder.build(&code, 12).expect("IR build failed");
         let store = graph
             .nodes
@@ -2943,6 +2964,7 @@ mod tests {
             ldc2w_ops: vec![],
             indy_ops: vec![],
             has_athrow: false,
+            has_newarray: false,
             ldc_ops: vec![],
         };
         assert!(ir_compatible(&scan));
@@ -2965,6 +2987,7 @@ mod tests {
             ldc2w_ops: vec![],
             indy_ops: vec![],
             has_athrow: false,
+            has_newarray: false,
             ldc_ops: vec![],
         };
         assert!(ir_compatible(&scan));
@@ -2987,6 +3010,7 @@ mod tests {
             ldc2w_ops: vec![],
             indy_ops: vec![],
             has_athrow: false,
+            has_newarray: false,
             ldc_ops: vec![],
         };
         // Too many invokes.
@@ -3014,6 +3038,7 @@ mod tests {
             ldc2w_ops: vec![],
             indy_ops: vec![],
             has_athrow: false,
+            has_newarray: false,
             ldc_ops: vec![],
         };
         assert!(ir_compatible_sized(&scan, 200));
@@ -3042,6 +3067,7 @@ mod tests {
             ldc2w_ops: vec![],
             indy_ops: vec![(0, 1)],
             has_athrow: false,
+            has_newarray: false,
             ldc_ops: vec![],
         };
         assert!(

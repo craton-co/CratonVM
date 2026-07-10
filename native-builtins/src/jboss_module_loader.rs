@@ -559,7 +559,11 @@ pub(crate) fn resolve_module(root: &Path, name: &str) -> Result<ResolvedModule, 
     let mx = parse_module_xml(&module_xml_path).map_err(|e| RuntimeError::IOException {
         message: format!("failed to parse {}: {}", module_xml_path.display(), e),
     })?;
-    if let Some(target) = mx.alias_target.as_deref().filter(|target| !target.is_empty()) {
+    if let Some(target) = mx
+        .alias_target
+        .as_deref()
+        .filter(|target| !target.is_empty())
+    {
         if target == name {
             return Err(RuntimeError::IllegalArgumentException {
                 message: format!("module alias {name} points to itself"),
@@ -2019,7 +2023,9 @@ pub(crate) fn module_service_provider_names(module_name: &str, service_name: &st
     collect_module_service_provider_names(&roots, &resource)
 }
 
-fn alloc_initialized_array_list(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_initialized_array_list(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
     let al_cls = "java/util/ArrayList";
     let al_cid = ctx.ensure_class_initialized(al_cls).map_err(|_| {
         MethodCallFailed::InternalError(VmError::Internal {
@@ -2113,7 +2119,10 @@ pub(crate) fn native_module_find_services(
                 "java/util/ServiceLoader",
                 "load",
                 "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/util/ServiceLoader;",
-                &[Value::Object(Some(service_class)), Value::Object(Some(loader))],
+                &[
+                    Value::Object(Some(service_class)),
+                    Value::Object(Some(loader)),
+                ],
             )
         }
     };
@@ -2891,14 +2900,18 @@ pub(crate) fn native_boot_holder_priv_action_run(
     Ok(Some(Value::Object(Some(loader))))
 }
 
-
 fn module_name_arg(ctx: &mut dyn NativeContext, value: Option<&Value>) -> Option<String> {
     match value {
         Some(Value::Object(Some(s))) => {
             if let Some(name) = ctx.read_string(*s) {
                 return Some(name);
             }
-            match ctx.invoke_virtual(*s, "toString", "()Ljava/lang/String;", &[Value::Object(Some(*s))]) {
+            match ctx.invoke_virtual(
+                *s,
+                "toString",
+                "()Ljava/lang/String;",
+                &[Value::Object(Some(*s))],
+            ) {
                 Ok(Some(Value::Object(Some(text)))) => ctx.read_string(text),
                 _ => None,
             }
@@ -2915,7 +2928,9 @@ pub(crate) fn native_module_load_service_from_caller_module_loader(
         Some(name) if !name.is_empty() => name,
         _ => {
             return Err(RuntimeError::NullPointerException {
-                message: Some("Module.loadServiceFromCallerModuleLoader: module name is null".to_string()),
+                message: Some(
+                    "Module.loadServiceFromCallerModuleLoader: module name is null".to_string(),
+                ),
             }
             .into());
         }
@@ -2924,7 +2939,9 @@ pub(crate) fn native_module_load_service_from_caller_module_loader(
         Some(Value::Object(Some(c))) => Value::Object(Some(*c)),
         _ => {
             return Err(RuntimeError::NullPointerException {
-                message: Some("Module.loadServiceFromCallerModuleLoader: service is null".to_string()),
+                message: Some(
+                    "Module.loadServiceFromCallerModuleLoader: service is null".to_string(),
+                ),
             }
             .into());
         }
@@ -3574,7 +3591,10 @@ mod tests {
         let sep = if cfg!(windows) { ';' } else { ':' };
         let raw = format!("/tmp/added-one{sep}/tmp/added-two{sep}/opt/wildfly/modules");
         let entries = split_module_path_entries(&raw);
-        assert_eq!(entries, vec!["/tmp/added-one", "/tmp/added-two", "/opt/wildfly/modules"]);
+        assert_eq!(
+            entries,
+            vec!["/tmp/added-one", "/tmp/added-two", "/opt/wildfly/modules"]
+        );
     }
 
     // -----------------------------------------------------------------
@@ -4709,7 +4729,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn t19_h16_service_roots_only_include_service_imports() {
         let _g = TEST_LOCK.lock();
@@ -4742,16 +4761,8 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert!(names.iter().any(|n| n == "start.jar"), "got {:?}", names);
-        assert!(
-            names.iter().any(|n| n == "imported.jar"),
-            "got {:?}",
-            names
-        );
-        assert!(
-            names.iter().any(|n| n == "exported.jar"),
-            "got {:?}",
-            names
-        );
+        assert!(names.iter().any(|n| n == "imported.jar"), "got {:?}", names);
+        assert!(names.iter().any(|n| n == "exported.jar"), "got {:?}", names);
         assert!(
             !names.iter().any(|n| n == "hidden.jar"),
             "service roots must not include ordinary deps; got {:?}",
@@ -4772,9 +4783,8 @@ mod tests {
         // -- is covered verbatim. Skips (rather than fails) when the
         // distribution isn't staged on this machine.
         let _g = TEST_LOCK.lock();
-        let real_root = std::path::Path::new(
-            "/data/data/wildfly-dist/wildfly-32.0.1.Final/modules",
-        );
+        let real_root =
+            std::path::Path::new("/data/data/wildfly-dist/wildfly-32.0.1.Final/modules");
         if !real_root.is_dir() {
             eprintln!(
                 "wildfly_jboss_modules_service_provider_leak_real_dist_scoping: \
@@ -4784,10 +4794,8 @@ mod tests {
             return;
         }
         setup_test_env(real_root);
-        let jmx = module_service_provider_names(
-            "org.jboss.as.jmx",
-            "org.jboss.as.controller.Extension",
-        );
+        let jmx =
+            module_service_provider_names("org.jboss.as.jmx", "org.jboss.as.controller.Extension");
         let cm = module_service_provider_names(
             "org.wildfly.extension.core-management",
             "org.jboss.as.controller.Extension",

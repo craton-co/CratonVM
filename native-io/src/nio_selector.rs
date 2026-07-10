@@ -1888,9 +1888,9 @@ fn refresh_selector_handles(ctx: &mut dyn NativeContext, id: i32) {
             ks.handle = handle;
             #[cfg(target_os = "linux")]
             let epoll_update = st.epoll_fd.and_then(|efd| {
-                ks.handle.os_handle().map(|os| {
-                    (efd, os, ks.handle.is_listener(), ks.interest_ops)
-                })
+                ks.handle
+                    .os_handle()
+                    .map(|os| (efd, os, ks.handle.is_listener(), ks.interest_ops))
             });
             st.keys.insert(new_fd, ks);
             #[cfg(target_os = "linux")]
@@ -2811,7 +2811,10 @@ fn eventfd0_native(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallR
     {
         let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         if fd < 0 {
-            return Err(ioex(format!("eventfd: {}", std::io::Error::last_os_error())));
+            return Err(ioex(format!(
+                "eventfd: {}",
+                std::io::Error::last_os_error()
+            )));
         }
         return Ok(Some(Value::Int(fd as i32)));
     }
@@ -2902,7 +2905,10 @@ fn fd_close_int_fd_native(_ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         if fd >= 0 {
             let rc = unsafe { libc::close(fd) };
             if rc < 0 {
-                return Err(ioex(format!("closeIntFD: {}", std::io::Error::last_os_error())));
+                return Err(ioex(format!(
+                    "closeIntFD: {}",
+                    std::io::Error::last_os_error()
+                )));
             }
         }
         return Ok(None);
@@ -2917,7 +2923,9 @@ fn fd_close_int_fd_native(_ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 fn epoll_event_size_native(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     #[cfg(target_os = "linux")]
     {
-        return Ok(Some(Value::Int(std::mem::size_of::<libc::epoll_event>() as i32)));
+        return Ok(Some(Value::Int(
+            std::mem::size_of::<libc::epoll_event>() as i32
+        )));
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -3026,7 +3034,6 @@ fn epoll_wait_native(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
     }
 }
 
-
 fn netty_epoll_unavailable_native(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
@@ -3045,10 +3052,7 @@ fn netty_epoll_register_unix_native(
     Ok(Some(Value::Int(0)))
 }
 
-fn netty_epoll_false_native(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn netty_epoll_false_native(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Int(0)))
 }
 
@@ -3117,10 +3121,7 @@ fn netty_epoll_const_epollout(_ctx: &mut dyn NativeContext, _args: &[Value]) -> 
     Ok(Some(Value::Int(epollout_const())))
 }
 
-fn netty_epoll_const_epollrdhup(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn netty_epoll_const_epollrdhup(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Int(epollrdhup_const())))
 }
 
@@ -3375,9 +3376,24 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
     // implementation actually performs the syscall; on Windows / macOS
     // the methods return an IOException, which matches the JDK's behavior
     // when EPoll is unavailable.
-    r.register("sun/nio/ch/EPoll", "eventSize", "()I", epoll_event_size_native);
-    r.register("sun/nio/ch/EPoll", "eventsOffset", "()I", epoll_events_offset_native);
-    r.register("sun/nio/ch/EPoll", "dataOffset", "()I", epoll_data_offset_native);
+    r.register(
+        "sun/nio/ch/EPoll",
+        "eventSize",
+        "()I",
+        epoll_event_size_native,
+    );
+    r.register(
+        "sun/nio/ch/EPoll",
+        "eventsOffset",
+        "()I",
+        epoll_events_offset_native,
+    );
+    r.register(
+        "sun/nio/ch/EPoll",
+        "dataOffset",
+        "()I",
+        epoll_data_offset_native,
+    );
     r.register(
         "sun/nio/ch/EPoll",
         "epollCreate",
@@ -3401,19 +3417,37 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
     // explicitly so Reactor/Netty falls back to the JDK NIO selector path instead
     // of half-initializing native epoll and then dropping event-loop tasks.
     let netty_epoll = "io/netty/channel/epoll/Native";
-    r.register(netty_epoll, "registerUnix", "()I", netty_epoll_register_unix_native);
-    r.register(netty_epoll, "sizeofEpollEvent", "()I", epoll_event_size_native);
-    r.register(netty_epoll, "offsetofEpollData", "()I", epoll_data_offset_native);
+    r.register(
+        netty_epoll,
+        "registerUnix",
+        "()I",
+        netty_epoll_register_unix_native,
+    );
+    r.register(
+        netty_epoll,
+        "sizeofEpollEvent",
+        "()I",
+        epoll_event_size_native,
+    );
+    r.register(
+        netty_epoll,
+        "offsetofEpollData",
+        "()I",
+        epoll_data_offset_native,
+    );
     r.register(
         netty_epoll,
         "isSupportingUdpSegment",
         "()Z",
         netty_epoll_false_native,
     );
-    for (name, sig) in [("epollCreate", "()I"), ("eventFd", "()I"), ("timerFd", "()I")] {
+    for (name, sig) in [
+        ("epollCreate", "()I"),
+        ("eventFd", "()I"),
+        ("timerFd", "()I"),
+    ] {
         r.register(netty_epoll, name, sig, netty_epoll_unavailable_native);
     }
-
 
     // Netty's shared Unix helper initializes even when the native epoll transport
     // is unavailable. Keep its static IPv6 probes harmless so the NIO transport
@@ -3425,20 +3459,44 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         "(Z)Z",
         netty_unix_socket_false_native,
     );
-    r.register(netty_unix_socket, "isIPv6", "(I)Z", netty_unix_socket_false_native);
-
+    r.register(
+        netty_unix_socket,
+        "isIPv6",
+        "(I)Z",
+        netty_unix_socket_false_native,
+    );
 
     let netty_epoll_static = "io/netty/channel/epoll/NativeStaticallyReferencedJniMethods";
-    r.register(netty_epoll_static, "epollin", "()I", netty_epoll_const_epollin);
-    r.register(netty_epoll_static, "epollout", "()I", netty_epoll_const_epollout);
+    r.register(
+        netty_epoll_static,
+        "epollin",
+        "()I",
+        netty_epoll_const_epollin,
+    );
+    r.register(
+        netty_epoll_static,
+        "epollout",
+        "()I",
+        netty_epoll_const_epollout,
+    );
     r.register(
         netty_epoll_static,
         "epollrdhup",
         "()I",
         netty_epoll_const_epollrdhup,
     );
-    r.register(netty_epoll_static, "epollet", "()I", netty_epoll_const_epollet);
-    r.register(netty_epoll_static, "epollerr", "()I", netty_epoll_const_epollerr);
+    r.register(
+        netty_epoll_static,
+        "epollet",
+        "()I",
+        netty_epoll_const_epollet,
+    );
+    r.register(
+        netty_epoll_static,
+        "epollerr",
+        "()I",
+        netty_epoll_const_epollerr,
+    );
     r.register(
         netty_epoll_static,
         "tcpMd5SigMaxKeyLen",

@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
 //! System, Runtime, ProcessBuilder, and Thread native method implementations.
@@ -693,7 +693,7 @@ pub(crate) fn native_thread_start0(
     // `drain_inherited_for_current_thread` in phases_early.rs). We do
     // this *before* spawning so there's no race between parent's
     // post-start mutations and the child's drain.
-    if let Some(snap) = crate::phases_early::snapshot_inheritable_tl_entries() {
+    if let Some(snap) = crate::phases_early::snapshot_inheritable_tl_entries(ctx) {
         let child_hash = ctx.identity_hash_code(this);
         crate::phases_early::queue_inherited_tl_for_child(child_hash, snap);
     }
@@ -797,7 +797,7 @@ pub(crate) fn native_thread_join_timed(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
@@ -852,7 +852,13 @@ pub(crate) fn native_thread_join_timed(
             ));
         }
         let sleep_time = remaining.min(std::time::Duration::from_millis(2));
+        let mut blocked_refs = [Value::Object(Some(this))];
+        ctx.begin_blocking_region();
         std::thread::sleep(sleep_time);
+        ctx.end_blocking_region_refs(&mut blocked_refs);
+        if let Value::Object(Some(cur)) = blocked_refs[0] {
+            this = cur;
+        }
     }
     Ok(None)
 }
@@ -936,13 +942,15 @@ pub(crate) fn native_thread_get_name(
             return Ok(Some(Value::Object(Some(name))));
         }
     };
-    // Try to read name from field 0
-    match ctx.get_field(this, 0) {
+    match ctx.get_field_by_name(this, "name") {
         Value::Object(Some(str_ref)) => Ok(Some(Value::Object(Some(str_ref)))),
-        _ => {
-            let name = ctx.create_string("main");
-            Ok(Some(Value::Object(Some(name))))
-        }
+        _ => match ctx.get_field(this, 0) {
+            Value::Object(Some(str_ref)) => Ok(Some(Value::Object(Some(str_ref)))),
+            _ => {
+                let name = ctx.create_string("main");
+                Ok(Some(Value::Object(Some(name))))
+            }
+        },
     }
 }
 
@@ -971,7 +979,7 @@ pub(crate) fn native_system_get_property(
     let key = crate::property_key_from_java_string(ctx, key_obj);
     match ctx
         .get_system_property(&key)
-        .or_else(|| crate::bootstrap_property_fallback(&key))
+        .or_else(|| crate::system_property_fallback(ctx, &key))
     {
         Some(val) => {
             let result = ctx.create_string(&val);
@@ -993,7 +1001,7 @@ pub(crate) fn native_system_get_property_default(
     let key = crate::property_key_from_java_string(ctx, key_obj);
     match ctx
         .get_system_property(&key)
-        .or_else(|| crate::bootstrap_property_fallback(&key))
+        .or_else(|| crate::system_property_fallback(ctx, &key))
     {
         Some(val) => {
             let result = ctx.create_string(&val);
@@ -1167,6 +1175,12 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
         native_runtime_version_feature,
     );
     registry.register(
+        "java/lang/Runtime$Version",
+        "build",
+        "()Ljava/util/Optional;",
+        native_runtime_version_build,
+    );
+    registry.register(
         "java/lang/Runtime",
         "addShutdownHook",
         "(Ljava/lang/Thread;)V",
@@ -1249,7 +1263,7 @@ pub(crate) fn native_runtime_get_runtime(
 ) -> MethodCallResult {
     let class_id = match ctx.ensure_class_initialized("java/lang/Runtime") {
         Ok(id) => id,
-        Err(_) => cratonvm_types::ClassId::new(0),
+        Err(_) => ctx.ensure_synthetic_class("java/lang/Runtime", 8),
     };
     let obj = ctx.alloc_object(class_id, 0);
     Ok(Some(Value::Object(Some(obj))))
@@ -1288,19 +1302,31 @@ pub(crate) fn native_runtime_free_memory(
     Ok(Some(Value::Long(32 * 1024 * 1024))) // 32 MB estimate
 }
 
-/// `Runtime.version()` вЂ” returns a `java.lang.Runtime$Version` instance.
-/// WildFly / JBoss Modules reads `Runtime.version().feature()` during bootstrap.
+/// `Runtime.version()` returns a real initialized `Runtime$Version`.
+///
+/// The old lightweight object only satisfied native `feature()`/`build()` calls.
+/// Real bytecode such as `Runtime$Version.toString()` reads the private final
+/// `version` list, so construct via the JDK parser instead of returning raw
+/// zeroed fields.
 pub(crate) fn native_runtime_version(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let cid = ctx.ensure_class_initialized("java/lang/Runtime$Version")?;
-    let mut n = ctx.class_num_total_fields(cid);
-    if n == 0 {
-        n = 4;
-    }
-    let obj = ctx.alloc_object(cid, n);
-    Ok(Some(Value::Object(Some(obj))))
+    let version = ctx
+        .get_system_property("java.version")
+        .or_else(|| ctx.get_system_property("java.specification.version"))
+        .unwrap_or_else(|| "25".to_string());
+    let version_obj = ctx.create_string(version.trim());
+    let pin = ctx.pin_native_root(version_obj);
+    let arg = Value::Object(Some(ctx.read_native_pin(pin, version_obj)));
+    let result = ctx.invoke(
+        "java/lang/Runtime$Version",
+        "parse",
+        "(Ljava/lang/String;)Ljava/lang/Runtime$Version;",
+        &[arg],
+    );
+    ctx.unpin_native_roots(pin);
+    result
 }
 
 /// `Runtime.Version.feature()` вЂ” major Java specification version (e.g. 25).
@@ -1323,6 +1349,19 @@ pub(crate) fn native_runtime_version_feature(
         })
         .unwrap_or(25);
     Ok(Some(Value::Int(v)))
+}
+
+/// `Runtime.Version.build()` - optional build number.
+///
+/// CratonVM's lightweight `Runtime.version()` object does not populate the real
+/// JDK `build` field, so the real accessor would return null. Returning
+/// `Optional.empty()` matches a valid version object and keeps callers from
+/// treating the VM metadata as malformed.
+pub(crate) fn native_runtime_version_build(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[])
 }
 
 pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2458,12 +2497,33 @@ pub(crate) fn native_system_init_phase1(
             let fis_class_id = ctx.ensure_class_initialized("java/io/FileInputStream")?;
             let num_fields = ctx.class_num_total_fields(fis_class_id).max(2);
             let new_in = ctx.alloc_object(fis_class_id, num_fields);
-            // Stdin fd id is 0; encode as `Int(1)` so `coerce_field_value_by_descriptor`
-            // does not collapse it to `Object(None)` on the way into the slot.
-            ctx.set_field(new_in, 1, Value::Int(1));
+            let fd_class_id = ctx.ensure_class_initialized("java/io/FileDescriptor")?;
+            let fd_fields = ctx.class_num_total_fields(fd_class_id).max(2);
+            let fd_obj = ctx.alloc_object(fd_class_id, fd_fields);
+            ctx.set_field_by_name(fd_obj, "fd", Value::Int(0));
+            ctx.set_field_by_name(fd_obj, "handle", Value::Long(0));
+            ctx.set_field_by_name(new_in, "fd", Value::Object(Some(fd_obj)));
+            if !matches!(ctx.get_field_by_name(new_in, "fd"), Value::Object(Some(_))) {
+                // Legacy synthetic fallback: encode stdin as `fd + 1` so the
+                // reference-slot coercion path cannot collapse fd 0 to null.
+                ctx.set_field(new_in, 1, Value::Int(1));
+            }
             ctx.cache_system_stdin(new_in);
             new_in
         };
+        let fd_obj = match ctx.get_field_by_name(in_obj, "fd") {
+            Value::Object(Some(fd_obj)) => fd_obj,
+            _ => {
+                let fd_class_id = ctx.ensure_class_initialized("java/io/FileDescriptor")?;
+                let fd_fields = ctx.class_num_total_fields(fd_class_id).max(2);
+                let fd_obj = ctx.alloc_object(fd_class_id, fd_fields);
+                ctx.set_field_by_name(in_obj, "fd", Value::Object(Some(fd_obj)));
+                fd_obj
+            }
+        };
+        ctx.set_field_by_name(fd_obj, "fd", Value::Int(0));
+        ctx.set_field_by_name(fd_obj, "handle", Value::Long(0));
+        ctx.cache_system_stdin(in_obj);
         ctx.set_static_field_by_name("java/lang/System", "in", Value::Object(Some(in_obj)));
     }
 
@@ -3049,6 +3109,30 @@ fn preload_supertypes_via_loader(ctx: &mut dyn NativeContext, loader_obj: Object
     ctx.unpin_native_roots(p_loader);
 }
 
+fn same_loader_already_defined_mirror(
+    ctx: &mut dyn NativeContext,
+    loader_obj: ObjectRef,
+    internal_name: &str,
+    loader_id: u32,
+    msg: &str,
+) -> Option<ObjectRef> {
+    if internal_name.is_empty() || !msg.contains("already defined") {
+        return None;
+    }
+    if let Some(mirror) =
+        crate::classloader::find_loaded_class_for_loader(ctx, loader_obj, internal_name)
+    {
+        return Some(mirror);
+    }
+    if loader_id != 0 {
+        if let Some(class_id) = ctx.class_id_defined_by_loader_exact(internal_name, loader_id) {
+            crate::classloader::register_defining_loader(class_id.as_u32(), loader_obj);
+            return Some(ctx.get_class_mirror(class_id));
+        }
+    }
+    None
+}
+
 pub(crate) fn native_classloader_define_class1(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3158,6 +3242,13 @@ pub(crate) fn native_classloader_define_class1(
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {
+            if let Some(Value::Object(Some(loader_obj))) = args.first() {
+                if let Some(mirror) =
+                    same_loader_already_defined_mirror(ctx, *loader_obj, &name, loader_id, &msg)
+                {
+                    return Ok(Some(Value::Object(Some(mirror))));
+                }
+            }
             tracing::warn!("ClassLoader.defineClass1({name}) failed: {msg}");
             Err(define_class_format_error(&name, "defineClass1", msg))
         }
@@ -3241,6 +3332,13 @@ pub(crate) fn native_classloader_define_class2(
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {
+            if let Some(Value::Object(Some(loader_obj))) = args.first() {
+                if let Some(mirror) =
+                    same_loader_already_defined_mirror(ctx, *loader_obj, &name, loader_id, &msg)
+                {
+                    return Ok(Some(Value::Object(Some(mirror))));
+                }
+            }
             tracing::warn!("ClassLoader.defineClass2({name}) failed: {msg}");
             Err(define_class_format_error(&name, "defineClass2", msg))
         }
@@ -3368,6 +3466,19 @@ pub(crate) fn native_classloader_define_class0(
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {
+            if !hidden {
+                if let Some(Value::Object(Some(loader_obj))) = args.first() {
+                    if let Some(mirror) = same_loader_already_defined_mirror(
+                        ctx,
+                        *loader_obj,
+                        &effective_name,
+                        loader_id,
+                        &msg,
+                    ) {
+                        return Ok(Some(Value::Object(Some(mirror))));
+                    }
+                }
+            }
             tracing::warn!("ClassLoader.defineClass0({effective_name}) failed: {msg}");
             Err(define_class_format_error(
                 &effective_name,

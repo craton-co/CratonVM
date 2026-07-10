@@ -144,6 +144,7 @@ p384 = "0.13"
 p521 = "0.13"
 aes-gcm = "0.10"
 aes = "0.8"
+argon2 = "0.5.3"
 cbc = { version = "0.1", features = ["std"] }
 ctr = "0.9"
 chacha20poly1305 = "0.10"

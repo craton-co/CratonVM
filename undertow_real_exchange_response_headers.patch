@@ -1,0 +1,126 @@
+diff --git a/native-builtins/src/test_utils.rs b/native-builtins/src/test_utils.rs
+--- a/native-builtins/src/test_utils.rs
++++ b/native-builtins/src/test_utils.rs
+@@ -263,6 +263,18 @@ fn mock_lucene_field_slot(class_name: Option<&str>, name: &str) -> Option<usize>
+     }
+ }
+ 
++fn mock_undertow_exchange_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
++    match (class_name, name) {
++        (Some("io/undertow/server/HttpServerExchange"), "requestHeaders") => Some(2),
++        (Some("io/undertow/server/HttpServerExchange"), "responseHeaders") => Some(3),
++        (Some("io/undertow/server/HttpServerExchange"), "state") => Some(18),
++        (Some("io/undertow/server/HttpServerExchange"), "requestMethod") => Some(19),
++        (Some("io/undertow/server/HttpServerExchange"), "requestURI") => Some(21),
++        (Some("io/undertow/server/HttpServerExchange"), "sender") => Some(30),
++        _ => None,
++    }
++}
++
+ pub(crate) type InvokeVirtualHook =
+     fn(&mut MockNativeContext, ObjectRef, &str, &str, &[Value]) -> Option<MethodCallResult>;
+ 
+@@ -890,6 +902,7 @@ impl NativeContext for MockNativeContext {
+             mock_classloader_field_slot(class_name.as_deref(), field_name)
+                 .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
+                 .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
++                .or_else(|| mock_undertow_exchange_field_slot(class_name.as_deref(), field_name))
+                 .or_else(|| mock_jdk_field_slot(field_name))
+         };
+         match slot {
+@@ -908,8 +921,9 @@ impl NativeContext for MockNativeContext {
+             mock_classloader_field_slot(class_name.as_deref(), field_name)
+                 .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
+                 .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
++                .or_else(|| mock_undertow_exchange_field_slot(class_name.as_deref(), field_name))
+                 .or_else(|| mock_jdk_field_slot(field_name))
+         };
+         if let Some(slot) = slot {
+             self.set_field(obj, slot, value);
+         }
+@@ -918,8 +932,8 @@ impl NativeContext for MockNativeContext {
+         // the field doesn't exist in the class hierarchy).
+     }
+ 
+-    fn resolve_field_index(&self, _class_name: &str, _field_name: &str) -> Option<usize> {
+-        None // Mock has no class metadata
++    fn resolve_field_index(&self, class_name: &str, field_name: &str) -> Option<usize> {
++        mock_undertow_exchange_field_slot(Some(class_name), field_name)
+     }
+ 
+     fn method_exists(&self, _class_name: &str, _method_name: &str, _descriptor: &str) -> bool {
+diff --git a/native-builtins/src/wildfly_undertow.rs b/native-builtins/src/wildfly_undertow.rs
+--- a/native-builtins/src/wildfly_undertow.rs
++++ b/native-builtins/src/wildfly_undertow.rs
+@@ -1017,7 +1017,6 @@ fn exchange_header_map_or_create(
+         let map = alloc_header_map_for_exchange(ctx)?;
+         let this = ctx.read_native_pin(this_pin, this);
+         ctx.set_field_by_name(this, field_name, Value::Object(Some(map)));
+-        ctx.set_field(this, synthetic_slot, Value::Object(Some(map)));
+         ctx.unpin_native_roots(this_pin);
+         Ok(Some(Value::Object(Some(map))))
+     } else {
+@@ -1127,10 +1126,14 @@ fn native_sender_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
+         _ => return Ok(None),
+     };
+     if let Some(body_v) = args.get(1).copied() {
+-        // Store directly into EX_FIELD_RESPONSE_SENDER's body slot — we
+-        // reuse the request_body field for response body as well to
+-        // avoid growing the synthetic layout.
+-        ctx.set_field(exchange, EX_FIELD_REQUEST_BODY, body_v);
++        // Synthetic exchanges use slot 3 as a test-only response body stash.
++        // Real Undertow's `HttpServerExchange` inherits one field from
++        // `AbstractAttachable`, making slot 3 its actual `responseHeaders`
++        // HeaderMap. Writing a body String there corrupts
++        // `closeAndFlushResponse()` into `String.put(HttpString, String)`.
++        if !class_has_field(ctx, CLS_EXCHANGE, "responseHeaders") {
++            ctx.set_field(exchange, EX_FIELD_REQUEST_BODY, body_v);
++        }
+     }
+     Ok(None)
+ }
+@@ -1850,6 +1853,44 @@ mod tests {
+         assert!(s.ends_with("\r\n\r\nHello"));
+     }
+ 
++    #[test]
++    fn t19_2_d_real_exchange_sender_send_preserves_response_headers() {
++        let mut ctx = mock_ctx();
++        let exchange_cid = ctx.ensure_class_initialized(CLS_EXCHANGE).unwrap();
++        let ex = ctx.alloc_object(exchange_cid, 31);
++        let header_map = ctx.fresh_object_ref();
++        ctx.set_field_by_name(ex, "responseHeaders", Value::Object(Some(header_map)));
++
++        let got = native_exchange_get_response_headers(&mut ctx, &[Value::Object(Some(ex))])
++            .unwrap()
++            .unwrap();
++        assert_eq!(got, Value::Object(Some(header_map)));
++
++        let sender = match native_exchange_get_response_sender(&mut ctx, &[Value::Object(Some(ex))])
++            .unwrap()
++            .unwrap()
++        {
++            Value::Object(Some(sender)) => sender,
++            other => panic!("expected sender, got {other:?}"),
++        };
++        let body = ctx.create_string("management auth response");
++        native_sender_send(
++            &mut ctx,
++            &[Value::Object(Some(sender)), Value::Object(Some(body))],
++        )
++        .unwrap();
++
++        assert_eq!(
++            ctx.get_field_by_name(ex, "responseHeaders"),
++            Value::Object(Some(header_map)),
++            "real Undertow responseHeaders must not be overwritten by Sender.send body storage",
++        );
++        let got = native_exchange_get_response_headers(&mut ctx, &[Value::Object(Some(ex))])
++            .unwrap()
++            .unwrap();
++        assert_eq!(got, Value::Object(Some(header_map)));
++    }
++
+     #[test]
+     fn t19_2_d_listener_service_get_bound_address_after_start() {
+         let mut ctx = mock_ctx();

@@ -95,7 +95,7 @@
 #![allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -1104,30 +1104,91 @@ fn rejected_execution(message: impl Into<String>) -> MethodCallFailed {
     }))
 }
 
+fn iot_id(ctx: &dyn NativeContext, this: ObjectRef) -> u64 {
+    match ctx.get_field(this, IOT_FIELD_ID) {
+        Value::Long(v) if v > 0 => return v as u64,
+        Value::Int(v) if v > 0 => return v as u64,
+        _ => {}
+    }
+    for field in ["id", "number"] {
+        match ctx.get_field_by_name(this, field) {
+            Value::Long(v) if v > 0 => return v as u64,
+            Value::Int(v) if v > 0 => return v as u64,
+            _ => {}
+        }
+    }
+    0
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct IoThreadMirrorKey {
+    vm: usize,
+    identity: i32,
+}
+
+fn io_thread_mirror_key(ctx: &dyn NativeContext, io_thread: ObjectRef) -> IoThreadMirrorKey {
+    IoThreadMirrorKey {
+        vm: ctx.vm_identity(),
+        identity: ctx.identity_hash_code(io_thread),
+    }
+}
+
+fn io_thread_worker_mirror_registry() -> &'static Mutex<HashMap<IoThreadMirrorKey, ObjectRef>> {
+    static REG: OnceLock<Mutex<HashMap<IoThreadMirrorKey, ObjectRef>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn remember_iot_worker_mirror(
+    ctx: &dyn NativeContext,
+    io_thread: ObjectRef,
+    worker: ObjectRef,
+) {
+    io_thread_worker_mirror_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(io_thread_mirror_key(ctx, io_thread), worker);
+}
+
+pub fn lookup_iot_worker_mirror(
+    ctx: &dyn NativeContext,
+    io_thread: ObjectRef,
+) -> Option<ObjectRef> {
+    io_thread_worker_mirror_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&io_thread_mirror_key(ctx, io_thread))
+        .copied()
+}
+
+fn iot_worker_mirror(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if let Some(worker) = lookup_iot_worker_mirror(ctx, this) {
+        return Some(worker);
+    }
+    for field in ["worker", "workerHandle"] {
+        if let Value::Object(Some(worker)) = ctx.get_field_by_name(this, field) {
+            return Some(worker);
+        }
+    }
+    match ctx.get_field(this, IOT_FIELD_WORKER_HANDLE) {
+        Value::Object(Some(worker)) => Some(worker),
+        _ => None,
+    }
+}
+
 /// `org.xnio.XnioIoThread.getId()J` — returns the stable id.
 fn native_iot_get_id(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let id = match ctx.get_field(this, IOT_FIELD_ID) {
-        Value::Long(v) => v,
-        _ => 0,
-    };
-    Ok(Some(Value::Long(id)))
+    Ok(Some(Value::Long(iot_id(ctx, this) as i64)))
 }
 
 /// `org.xnio.XnioIoThread.getWorker()Lorg/xnio/XnioWorker;`
 fn native_iot_get_worker(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    // T19.7.b stores the parent-worker mirror in IOT_FIELD_WORKER_HANDLE;
-    // for standalone tests it may be Int(0) / null — in that case we
-    // allocate a fresh stub XnioWorker mirror so the return value is
-    // non-null.
-    match ctx.get_field(this, IOT_FIELD_WORKER_HANDLE) {
-        Value::Object(Some(o)) => Ok(Some(Value::Object(Some(o)))),
-        _ => {
-            let stub = alloc_concurrent_synthetic(ctx, "org/xnio/XnioWorker", 4);
-            Ok(Some(Value::Object(Some(stub))))
-        }
+    if let Some(worker) = iot_worker_mirror(ctx, this) {
+        return Ok(Some(Value::Object(Some(worker))));
     }
+    let stub = alloc_concurrent_synthetic(ctx, "org/xnio/XnioWorker", 4);
+    Ok(Some(Value::Object(Some(stub))))
 }
 
 /// `org.xnio.XnioIoThread.execute(Ljava/lang/Runnable;)V`
@@ -1155,10 +1216,7 @@ fn native_iot_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             .into())
         }
     };
-    let id = match ctx.get_field(this, IOT_FIELD_ID) {
-        Value::Long(v) => v as u64,
-        _ => 0,
-    };
+    let id = iot_id(ctx, this);
     let raw_ptr = runnable.as_ptr() as usize;
     // Record dispatch (test hook) and, for a known thread, keep the queue
     // bookkeeping honest by rejecting when the loop's queue is at cap.
@@ -1211,10 +1269,7 @@ fn native_iot_execute_after(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // TimeUnit arg at index 3 is a mirror; for synthetic mode we
     // default to MILLISECONDS. Real-JDK mode should have converted to
     // nanos/millis already via TimeUnit.toMillis, but we accept either.
-    let id = match ctx.get_field(this, IOT_FIELD_ID) {
-        Value::Long(v) => v as u64,
-        _ => 0,
-    };
+    let id = iot_id(ctx, this);
     let handle = match lookup_io_thread(id) {
         Some(h) => h,
         None => {
@@ -1256,10 +1311,7 @@ fn native_iot_execute_at_time(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Long(v)) => *v,
         _ => now_ms(),
     };
-    let id = match ctx.get_field(this, IOT_FIELD_ID) {
-        Value::Long(v) => v as u64,
-        _ => 0,
-    };
+    let id = iot_id(ctx, this);
     let handle = match lookup_io_thread(id) {
         Some(h) => h,
         None => return Ok(Some(Value::Object(Some(make_key_mirror(ctx, 0)?)))),
@@ -1290,11 +1342,12 @@ fn native_iot_current_thread(ctx: &mut dyn NativeContext, _args: &[Value]) -> Me
         Some(handle) => {
             // We do not hold a persistent mirror ref on the handle (would
             // leak). Instead, allocate a fresh mirror shell that carries
-            // the thread id in IOT_FIELD_ID — subsequent getId/getWorker
-            // calls re-resolve through the registry.
+            // the thread id/number so later getId() calls can re-resolve
+            // through the registry.
             let mirror = alloc_concurrent_synthetic(ctx, CLS_NIO_IO_THREAD, IOT_NUM_SLOTS);
-            ctx.set_field(mirror, IOT_FIELD_ID, Value::Long(handle.id as i64));
-            ctx.set_field(mirror, IOT_FIELD_STATE, Value::Int(STATE_RUNNING));
+            ctx.set_field_by_name(mirror, "id", Value::Long(handle.id as i64));
+            ctx.set_field_by_name(mirror, "number", Value::Int(handle.id as i32));
+            ctx.set_field_by_name(mirror, "state", Value::Int(STATE_RUNNING));
             Ok(Some(Value::Object(Some(mirror))))
         }
         None => Ok(Some(Value::Object(None))),

@@ -327,7 +327,10 @@ fn is_object_inherited_method(ctx: &dyn NativeContext, method_obj: ObjectRef) ->
 /// across repeated allocating calls, and the two allocations below can move
 /// them again (native stale-local family), so each element is re-read from
 /// its pin right before it is stored.
-fn alloc_array_list_from(ctx: &mut dyn NativeContext, elements: &[(usize, ObjectRef)]) -> ObjectRef {
+fn alloc_array_list_from(
+    ctx: &mut dyn NativeContext,
+    elements: &[(usize, ObjectRef)],
+) -> ObjectRef {
     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
     // Pin across the backing-array allocation below — a moving young GC
     // there would relocate the fresh list (native stale-local family).
@@ -780,7 +783,10 @@ fn native_converting_method_from(ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(Value::Object(Some(cvt))))
 }
 
-fn converting_method_param_mappings(ctx: &mut dyn NativeContext, method_obj: ObjectRef) -> ObjectRef {
+fn converting_method_param_mappings(
+    ctx: &mut dyn NativeContext,
+    method_obj: ObjectRef,
+) -> ObjectRef {
     // Pin across the class-load and the reflective invokes below — a moving
     // young GC there would relocate `method_obj` (native stale-local family);
     // in particular the first invoke can move it before the fallback invoke
@@ -879,8 +885,9 @@ fn primitive_or_primitive_array_class_mirror(ctx: &dyn NativeContext, type_obj: 
 
 fn primitive_or_primitive_array_name(name: &str) -> bool {
     match name {
-        "boolean" | "byte" | "char" | "double" | "float" | "int" | "long" | "short"
-        | "void" => true,
+        "boolean" | "byte" | "char" | "double" | "float" | "int" | "long" | "short" | "void" => {
+            true
+        }
         s if s.starts_with('[') => {
             let elem = s.trim_start_matches('[');
             matches!(

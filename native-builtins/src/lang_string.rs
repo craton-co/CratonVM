@@ -1403,15 +1403,24 @@ pub(crate) fn sb_state(
     this: cratonvm_types::ObjectRef,
 ) -> (Option<cratonvm_types::ObjectRef>, i32) {
     let buf = match ctx.get_field(this, 0) {
-        Value::Object(Some(arr)) => Some(arr),
+        Value::Object(Some(arr))
+            if ctx.object_is_array(arr)
+                && ctx.heap_element_type_of(arr) == cratonvm_types::ArrayElementType::Char =>
+        {
+            Some(arr)
+        }
         _ => None,
     };
-    let count = match ctx.get_field(this, 2) {
-        Value::Int(v) => v,
-        _ => match ctx.get_field(this, 1) {
+    let count = if ctx.object_num_fields(this) >= 3 {
+        match ctx.get_field(this, 2) {
             Value::Int(v) => v,
             _ => 0,
-        },
+        }
+    } else {
+        match ctx.get_field(this, 1) {
+            Value::Int(v) => v,
+            _ => 0,
+        }
     };
     (buf, count)
 }
@@ -1468,15 +1477,18 @@ pub(crate) fn sb_ensure_capacity(
     use cratonvm_types::ArrayElementType;
 
     let (buf, count) = sb_state(ctx, this);
-    let count = count as usize;
     let old_cap = buf.map_or(0, |b| ctx.array_length(b));
+    let count = (count.max(0) as usize).min(old_cap);
 
     if count + additional <= old_cap {
         return (this, buf.unwrap());
     }
 
     // Grow: max(old_cap * 2 + 2, count + additional)
-    let new_cap = std::cmp::max(old_cap * 2 + 2, count + additional);
+    let new_cap = std::cmp::max(
+        old_cap.saturating_mul(2).saturating_add(2),
+        count + additional,
+    );
 
     // Pin `this` before `ctx.new_array` — allocation can trigger a moving GC
     // that relocates `this`, making the Rust-local copy stale.
@@ -1493,7 +1505,11 @@ pub(crate) fn sb_ensure_capacity(
     // collapses 2N virtual trait dispatches into one bulk call on the
     // StringBuilder grow path.
     if let Value::Object(Some(old_buf)) = ctx.get_field(this, 0) {
-        let _ = ctx.bulk_array_copy(old_buf, 0, new_buf, 0, count);
+        if ctx.object_is_array(old_buf)
+            && ctx.heap_element_type_of(old_buf) == cratonvm_types::ArrayElementType::Char
+        {
+            let _ = ctx.bulk_array_copy(old_buf, 0, new_buf, 0, count);
+        }
     }
 
     ctx.set_field(this, 0, Value::Object(Some(new_buf)));
@@ -2558,9 +2574,10 @@ pub(crate) fn native_sb_reverse(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 /// Helper: read the current content of a StringBuilder as a Vec<u16>.
 pub(crate) fn sb_read_chars(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef) -> Vec<u16> {
     let (buf, count) = sb_state(ctx, this);
-    let count = count as usize;
+    let count = count.max(0) as usize;
     let mut chars = Vec::with_capacity(count);
     if let Some(buf) = buf {
+        let count = count.min(ctx.array_length(buf));
         for i in 0..count {
             let val = ctx.get_array_element(buf, i);
             chars.push(match val {
@@ -3570,7 +3587,7 @@ pub(crate) fn native_string_concat(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn native_string_split(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    native_string_split_impl(ctx, args, -1)
+    native_string_split_impl(ctx, args, 0)
 }
 
 pub(crate) fn native_string_split_limit(
@@ -3602,7 +3619,7 @@ pub(crate) fn native_string_split_private(
 fn string_array_from_parts(ctx: &mut dyn NativeContext, parts: &[String]) -> MethodCallResult {
     let string_class_id = match ctx.ensure_class_initialized("java/lang/String") {
         Ok(id) => id,
-        Err(_) => cratonvm_types::ClassId::new(0),
+        Err(_) => ctx.ensure_synthetic_class("java/lang/String", 8),
     };
     let arr = ctx.new_ref_array(string_class_id, parts.len());
     for (i, part) in parts.iter().enumerate() {
@@ -3685,6 +3702,47 @@ fn native_string_split_with_delimiters(
     string_array_from_parts(ctx, &parts)
 }
 
+fn is_java_ascii_regex_whitespace(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | 0x0b | b'\x0c' | b'\r')
+}
+
+fn split_on_whitespace_comma(s: &str, limit: i32) -> Vec<String> {
+    let bytes = s.as_bytes();
+    let limited = limit > 0;
+    let mut parts = Vec::new();
+    let mut last = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if limited && parts.len() + 1 >= limit as usize {
+            break;
+        }
+        if bytes[i] == b',' {
+            let mut start = i;
+            while start > last && is_java_ascii_regex_whitespace(bytes[start - 1]) {
+                start -= 1;
+            }
+            parts.push(s[last..start].to_string());
+            i += 1;
+            while i < bytes.len() && is_java_ascii_regex_whitespace(bytes[i]) {
+                i += 1;
+            }
+            last = i;
+        } else {
+            i += 1;
+        }
+    }
+    parts.push(s[last..].to_string());
+    if limit == 0 {
+        while parts.last().map(|p| p.is_empty()).unwrap_or(false) {
+            parts.pop();
+        }
+        if parts.is_empty() {
+            parts.push(String::new());
+        }
+    }
+    parts
+}
+
 pub(crate) fn native_string_split_impl(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3700,6 +3758,15 @@ pub(crate) fn native_string_split_impl(
     };
     let s = ctx.read_string(this).unwrap_or_default();
     let delim = ctx.read_string(delim_obj).unwrap_or_default();
+
+    // Keycloak's model runner uses `String.split("\\s*,\\s*")` to parse
+    // comma-separated provider parameters. Keep this common Java shorthand
+    // regex on a direct path so it does not depend on the heavier regex bridge
+    // during early test-suite bootstrap.
+    if delim == r"\s*,\s*" {
+        let parts = split_on_whitespace_comma(&s, limit);
+        return string_array_from_parts(ctx, &parts);
+    }
 
     let parts: Vec<String> = if delim.is_empty() {
         // Empty delimiter: split each character (like Java regex "")
@@ -4260,7 +4327,7 @@ pub(crate) fn native_string_lines(ctx: &mut dyn NativeContext, args: &[Value]) -
     // Use the Stream pattern from collections
     let stream_class_id = match ctx.ensure_class_initialized("java/util/stream/Stream") {
         Ok(id) => id,
-        Err(_) => cratonvm_types::ClassId::new(0),
+        Err(_) => ctx.ensure_synthetic_class("java/util/stream/Stream", 1),
     };
     let stream = ctx.alloc_object(stream_class_id, 1);
     let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), elements.len());
@@ -4982,7 +5049,9 @@ pub(crate) fn native_string_region_matches_ic(
     let s_units: Vec<u16> = s.encode_utf16().collect();
     let o_units: Vec<u16> = other.encode_utf16().collect();
 
-    if toffset.checked_add(len).map_or(true, |end| end > s_units.len())
+    if toffset
+        .checked_add(len)
+        .map_or(true, |end| end > s_units.len())
         || ooffset
             .checked_add(len)
             .map_or(true, |end| end > o_units.len())
@@ -5059,7 +5128,9 @@ pub(crate) fn native_string_region_matches(
     let s_units: Vec<u16> = s.encode_utf16().collect();
     let o_units: Vec<u16> = other.encode_utf16().collect();
 
-    if toffset.checked_add(len).map_or(true, |end| end > s_units.len())
+    if toffset
+        .checked_add(len)
+        .map_or(true, |end| end > s_units.len())
         || ooffset
             .checked_add(len)
             .map_or(true, |end| end > o_units.len())

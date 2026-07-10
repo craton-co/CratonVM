@@ -44,6 +44,9 @@
 //! * `JavaLangReflectAccess.copyMethod` / `copyField` /
 //!   `copyConstructor` — delegate to existing lang_class natives.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
@@ -317,12 +320,125 @@ fn jla_blocked_on(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRe
 }
 
 fn jla_get_carrier_thread_local(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    match args.get(1) {
-        Some(Value::Object(Some(tl))) => {
-            ctx.invoke_virtual(*tl, "get", "()Ljava/lang/Object;", &[])
-        }
-        _ => Ok(Some(Value::Object(None))),
+    let Some(Value::Object(Some(tl))) = args.get(1) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let key = ctx.identity_hash_code(*tl);
+    if let Some(value) = {
+        let table = carrier_thread_locals()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        table.get(&key).copied()
+    } {
+        return Ok(Some(match value {
+            CarrierThreadLocalValue::Root(handle) => ctx
+                .resolve_global_root(handle)
+                .map(|obj| Value::Object(Some(obj)))
+                .unwrap_or(Value::Object(None)),
+            CarrierThreadLocalValue::Plain(value) => value,
+        }));
     }
+
+    let pin = ctx.pin_native_root(*tl);
+    let init = ctx.invoke_virtual(
+        ctx.read_native_pin(pin, *tl),
+        "initialValue",
+        "()Ljava/lang/Object;",
+        &[],
+    )?;
+    ctx.unpin_native_roots(pin);
+    let value = init.unwrap_or(Value::Object(None));
+    let stored = carrier_value_from_java(ctx, value);
+    let old = carrier_thread_locals()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, stored);
+    if let Some(old) = old {
+        drop_carrier_value_root(ctx, old);
+    }
+    Ok(Some(match stored {
+        CarrierThreadLocalValue::Root(handle) => ctx
+            .resolve_global_root(handle)
+            .map(|obj| Value::Object(Some(obj)))
+            .unwrap_or(Value::Object(None)),
+        CarrierThreadLocalValue::Plain(value) => value,
+    }))
+}
+
+#[derive(Clone, Copy)]
+enum CarrierThreadLocalValue {
+    Root(usize),
+    Plain(Value),
+}
+
+static CARRIER_THREAD_LOCALS: OnceLock<Mutex<HashMap<i32, CarrierThreadLocalValue>>> =
+    OnceLock::new();
+
+fn carrier_thread_locals() -> &'static Mutex<HashMap<i32, CarrierThreadLocalValue>> {
+    CARRIER_THREAD_LOCALS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn drop_carrier_value_root(ctx: &mut dyn NativeContext, value: CarrierThreadLocalValue) {
+    if let CarrierThreadLocalValue::Root(handle) = value {
+        let _ = ctx.remove_global_root(handle);
+    }
+}
+
+fn carrier_value_from_java(ctx: &mut dyn NativeContext, value: Value) -> CarrierThreadLocalValue {
+    match value {
+        Value::Object(Some(obj)) => CarrierThreadLocalValue::Root(ctx.add_global_root(obj)),
+        other => CarrierThreadLocalValue::Plain(other),
+    }
+}
+
+fn jla_set_carrier_thread_local(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(tl))) = args.get(1) else {
+        return Ok(None);
+    };
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    let key = ctx.identity_hash_code(*tl);
+    let new_value = carrier_value_from_java(ctx, value);
+    let old = carrier_thread_locals()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, new_value);
+    if let Some(old) = old {
+        drop_carrier_value_root(ctx, old);
+    }
+    Ok(None)
+}
+
+fn jla_remove_carrier_thread_local(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(Value::Object(Some(tl))) = args.get(1) else {
+        return Ok(None);
+    };
+    let key = ctx.identity_hash_code(*tl);
+    let old = carrier_thread_locals()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+    if let Some(old) = old {
+        drop_carrier_value_root(ctx, old);
+    }
+    Ok(None)
+}
+
+fn jla_is_carrier_thread_local_present(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(Value::Object(Some(tl))) = args.get(1) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let key = ctx.identity_hash_code(*tl);
+    let present = carrier_thread_locals()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&key);
+    Ok(Some(Value::Int(present as i32)))
 }
 
 fn jla_set_cause(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -836,6 +952,24 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         owner,
+        "setCarrierThreadLocal",
+        "(Ljdk/internal/misc/CarrierThreadLocal;Ljava/lang/Object;)V",
+        jla_set_carrier_thread_local,
+    );
+    registry.register(
+        owner,
+        "removeCarrierThreadLocal",
+        "(Ljdk/internal/misc/CarrierThreadLocal;)V",
+        jla_remove_carrier_thread_local,
+    );
+    registry.register(
+        owner,
+        "isCarrierThreadLocalPresent",
+        "(Ljdk/internal/misc/CarrierThreadLocal;)Z",
+        jla_is_carrier_thread_local_present,
+    );
+    registry.register(
+        owner,
         "setCause",
         "(Ljava/lang/Throwable;Ljava/lang/Throwable;)V",
         jla_set_cause,
@@ -1006,6 +1140,24 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "getCarrierThreadLocal",
         "(Ljdk/internal/misc/CarrierThreadLocal;)Ljava/lang/Object;",
         jla_get_carrier_thread_local,
+    );
+    registry.register(
+        iface,
+        "setCarrierThreadLocal",
+        "(Ljdk/internal/misc/CarrierThreadLocal;Ljava/lang/Object;)V",
+        jla_set_carrier_thread_local,
+    );
+    registry.register(
+        iface,
+        "removeCarrierThreadLocal",
+        "(Ljdk/internal/misc/CarrierThreadLocal;)V",
+        jla_remove_carrier_thread_local,
+    );
+    registry.register(
+        iface,
+        "isCarrierThreadLocalPresent",
+        "(Ljdk/internal/misc/CarrierThreadLocal;)Z",
+        jla_is_carrier_thread_local_present,
     );
     // BootLoader.<clinit> invokes these via `invokeinterface JavaLangAccess`.
     registry.register(
@@ -2366,21 +2518,34 @@ mod tests {
     fn java_lang_access_carrier_thread_local_registered() {
         let mut r = NativeMethodRegistry::new();
         register_wp1_4_shared_secrets(&mut r);
-        let desc = "(Ljdk/internal/misc/CarrierThreadLocal;)Ljava/lang/Object;";
-        assert!(
-            r.find("java/lang/System$1", "getCarrierThreadLocal", desc)
-                .is_some(),
-            "JavaLangAccess.getCarrierThreadLocal not registered on java/lang/System$1"
-        );
-        assert!(
-            r.find(
-                "jdk/internal/access/JavaLangAccess",
+        for (name, desc) in [
+            (
                 "getCarrierThreadLocal",
-                desc,
-            )
-            .is_some(),
-            "JavaLangAccess.getCarrierThreadLocal not registered on interface fallback"
-        );
+                "(Ljdk/internal/misc/CarrierThreadLocal;)Ljava/lang/Object;",
+            ),
+            (
+                "setCarrierThreadLocal",
+                "(Ljdk/internal/misc/CarrierThreadLocal;Ljava/lang/Object;)V",
+            ),
+            (
+                "removeCarrierThreadLocal",
+                "(Ljdk/internal/misc/CarrierThreadLocal;)V",
+            ),
+            (
+                "isCarrierThreadLocalPresent",
+                "(Ljdk/internal/misc/CarrierThreadLocal;)Z",
+            ),
+        ] {
+            assert!(
+                r.find("java/lang/System$1", name, desc).is_some(),
+                "JavaLangAccess.{name}{desc} not registered on java/lang/System$1"
+            );
+            assert!(
+                r.find("jdk/internal/access/JavaLangAccess", name, desc)
+                    .is_some(),
+                "JavaLangAccess.{name}{desc} not registered on interface fallback"
+            );
+        }
     }
 
     #[test]

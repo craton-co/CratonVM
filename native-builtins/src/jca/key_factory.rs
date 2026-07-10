@@ -1889,12 +1889,18 @@ fn kf_get_key_spec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     let spec_class = match args.get(2) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Err(throw_invalid_key_spec(ctx, "keySpec class must not be null")),
+        _ => {
+            return Err(throw_invalid_key_spec(
+                ctx,
+                "keySpec class must not be null",
+            ))
+        }
     };
-    let spec_class_name = match ctx.invoke_virtual(spec_class, "getName", "()Ljava/lang/String;", &[])? {
-        Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
-    };
+    let spec_class_name =
+        match ctx.invoke_virtual(spec_class, "getName", "()Ljava/lang/String;", &[])? {
+            Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
     match spec_class_name.as_str() {
         "java.security.spec.X509EncodedKeySpec" => {
             let der = match ctx.invoke_virtual(key, "getEncoded", "()[B", &[])? {
@@ -1964,7 +1970,12 @@ fn kf_get_key_spec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             let pin_key = ctx.pin_native_root(key);
             let result = (|| {
                 let key_r = ctx.read_native_pin(pin_key, key);
-                let w = match ctx.invoke_virtual(key_r, "getW", "()Ljava/security/spec/ECPoint;", &[])? {
+                let w = match ctx.invoke_virtual(
+                    key_r,
+                    "getW",
+                    "()Ljava/security/spec/ECPoint;",
+                    &[],
+                )? {
                     Some(Value::Object(Some(o))) => o,
                     _ => return Err(throw_invalid_key_spec(ctx, "Key is not an EC public key")),
                 };

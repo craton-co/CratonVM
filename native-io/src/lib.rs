@@ -1301,17 +1301,68 @@ fn fis_get_fd(ctx: &dyn NativeContext, this: ObjectRef) -> Option<FdId> {
             _ => {}
         }
     }
+    if let Value::Object(Some(fd_obj)) = ctx.get_field(this, 0) {
+        match ctx.get_field_by_name(fd_obj, "fd") {
+            Value::Int(v) if v >= 0 => return Some(v as FdId),
+            _ => {}
+        }
+        match ctx.get_field_by_name(fd_obj, "handle") {
+            Value::Long(v) if v >= 0 => return Some(v as FdId),
+            _ => {}
+        }
+    }
     // Legacy synthetic layouts.
     match ctx.get_field(this, 0) {
         Value::Int(v) if v >= 0 => return Some(v as FdId),
         _ => {}
     }
     // `System.in`: slot 1 holds `fd+1` (0 means "unset").
-    match ctx.get_field(this, 1) {
-        Value::Int(v) if v > 0 => return Some((v - 1) as FdId),
-        _ => {}
+    if ctx.object_num_fields(this) > 1 {
+        match ctx.get_field(this, 1) {
+            Value::Int(v) if v > 0 => return Some((v - 1) as FdId),
+            _ => {}
+        }
+    }
+    if ctx
+        .get_system_stream("in")
+        .is_some_and(|stdin| stdin == this)
+    {
+        return Some(0);
     }
     None
+}
+
+fn fis_ensure_fd_object(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if let Some(fd_obj) = fis_fd_object(ctx, this) {
+        return Some(fd_obj);
+    }
+    match ctx.new_object("java/io/FileDescriptor") {
+        Ok(Some(Value::Object(Some(fd_obj)))) => {
+            ctx.set_field_by_name(this, "fd", Value::Object(Some(fd_obj)));
+            Some(fd_obj)
+        }
+        _ => None,
+    }
+}
+
+fn fis_backfill_constructor_fields(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    path_obj: Option<ObjectRef>,
+) {
+    let _ = fis_ensure_fd_object(ctx, this);
+    if let Some(path_obj) = path_obj {
+        ctx.set_field_by_name(this, "path", Value::Object(Some(path_obj)));
+    }
+    if !matches!(
+        ctx.get_field_by_name(this, "closeLock"),
+        Value::Object(Some(_))
+    ) {
+        if let Ok(Some(Value::Object(Some(lock)))) = ctx.new_object("java/lang/Object") {
+            ctx.set_field_by_name(this, "closeLock", Value::Object(Some(lock)));
+        }
+    }
+    ctx.set_field_by_name(this, "closed", Value::Int(0));
 }
 
 fn native_fis_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1325,8 +1376,12 @@ fn native_fis_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             }))
         }
     };
-    let path = match args.get(1) {
-        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+    let path_obj = match args.get(1) {
+        Some(Value::Object(Some(s))) => Some(*s),
+        _ => None,
+    };
+    let path = match path_obj {
+        Some(s) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
     let path = validated_path(&path)?;
@@ -1334,6 +1389,13 @@ fn native_fis_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         .fd_table()
         .open_read(&path)
         .map_err(|_| file_not_found(&path))?;
+    // Defensive real-layout backfill for the SyntheticStub constructor path.
+    // The default real-JDK constructor allocates `fd`, `closeLock`, and `path`
+    // before calling open0. If a dispatch path accidentally takes the native
+    // `<init>(String)` fallback, those fields are still unset; populate them so
+    // the public real bytecode (`read(...) -> readBytes`, `getFD`, `close`) sees
+    // the same shape as HotSpot rather than an empty/closed stream.
+    fis_backfill_constructor_fields(ctx, this, path_obj);
     fis_set_fd(ctx, this, fd);
     Ok(None)
 }
@@ -1617,15 +1679,27 @@ fn fos_get_fd(ctx: &dyn NativeContext, this: ObjectRef) -> Option<FdId> {
             _ => {}
         }
     }
+    if let Value::Object(Some(fd_obj)) = ctx.get_field(this, 0) {
+        match ctx.get_field_by_name(fd_obj, "fd") {
+            Value::Int(v) if v >= 0 => return Some(v as FdId),
+            _ => {}
+        }
+        match ctx.get_field_by_name(fd_obj, "handle") {
+            Value::Long(v) if v >= 0 => return Some(v as FdId),
+            _ => {}
+        }
+    }
     // Legacy synthetic layout.
     match ctx.get_field(this, 0) {
         Value::Int(v) if v >= 0 => return Some(v as FdId),
         _ => {}
     }
     // `System.out`/`System.err`: slot 1 holds `fd+1`.
-    match ctx.get_field(this, 1) {
-        Value::Int(v) if v > 0 => return Some((v - 1) as FdId),
-        _ => {}
+    if ctx.object_num_fields(this) > 1 {
+        match ctx.get_field(this, 1) {
+            Value::Int(v) if v > 0 => return Some((v - 1) as FdId),
+            _ => {}
+        }
     }
     None
 }
@@ -2677,6 +2751,23 @@ const BAIS_FIELD_POS: usize = 1; // int pos
 const BAIS_FIELD_MARK: usize = 2; // int mark
 const BAIS_FIELD_COUNT: usize = 3; // int count
 
+fn input_stream_has_bais_layout(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    if ctx.object_num_fields(obj) <= BAIS_FIELD_COUNT {
+        return false;
+    }
+
+    let cid = ctx.class_id_of_object(obj);
+    let class_name = ctx.class_name_of_id(cid).unwrap_or_default();
+    if class_name == "java/io/ByteArrayInputStream" || class_name == "java/io/InputStream" {
+        return true;
+    }
+
+    match ctx.class_id_by_name("java/io/ByteArrayInputStream") {
+        Some(bais_cid) => ctx.is_subclass(cid, bais_cid),
+        None => false,
+    }
+}
+
 fn native_bais_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -2725,6 +2816,17 @@ fn native_bais_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    if let Some(result) = maybe_socket_input_stream_read(
+        ctx,
+        this,
+        args,
+        cratonvm_native_api::socket_input_stream_read::get_read_one(),
+    ) {
+        return result;
+    }
+    if !input_stream_has_bais_layout(ctx, this) {
+        return Ok(Some(Value::Int(-1)));
+    }
     let data = match ctx.get_field(this, BAIS_FIELD_DATA) {
         Value::Object(Some(arr)) => arr,
         _ => return Ok(Some(Value::Int(-1))),
@@ -2746,6 +2848,27 @@ fn native_bais_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     ctx.set_field(this, BAIS_FIELD_POS, Value::Int(pos + 1));
     Ok(Some(Value::Int(byte_val)))
+}
+
+fn maybe_socket_input_stream_read(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    args: &[Value],
+    hook: Option<cratonvm_native_api::NativeCallback>,
+) -> Option<MethodCallResult> {
+    let cls_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default();
+    if cls_name == "java/net/Socket$SocketInputStream" {
+        return Some(match hook {
+            Some(cb) => cb(ctx, args),
+            None => Err(RuntimeError::IOException {
+                message: "SocketInputStream read hook not installed".into(),
+            }
+            .into()),
+        });
+    }
+    None
 }
 
 fn boxed_long(ctx: &mut dyn NativeContext, val: i64) -> ObjectRef {
@@ -2805,6 +2928,14 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(arr))) => *arr,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    if let Some(result) = maybe_socket_input_stream_read(
+        ctx,
+        this,
+        args,
+        cratonvm_native_api::socket_input_stream_read::get_read_bytes(),
+    ) {
+        return result;
+    }
     let off = match args.get(2) {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -2849,14 +2980,14 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let cls_name = ctx
         .class_name_of_id(ctx.class_id_of_object(this))
         .unwrap_or_default();
-    let is_bais = cls_name == "java/io/ByteArrayInputStream";
+    let has_bais_layout = input_stream_has_bais_layout(ctx, this);
     // Mockito subclass mocks inherit concrete InputStream helpers; let Mockito's
     // default-answer machinery own those inherited methods instead of spinning
     // here on the mock's default read() == 0.
     if cls_name.contains("$MockitoMock$") {
         return Ok(Some(Value::Int(0)));
     }
-    if !is_bais {
+    if !has_bais_layout {
         if cls_name == "org/hibernate/orm/test/lob/JpaLargeBlobTest$LobInputStream" {
             return hibernate_jpa_large_blob_read_bytes(ctx, this, buf, off, len);
         }
@@ -2943,6 +3074,14 @@ fn native_bais_read_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    if let Some(result) = maybe_socket_input_stream_read(
+        ctx,
+        this,
+        args,
+        cratonvm_native_api::socket_input_stream_read::get_read_array(),
+    ) {
+        return result;
+    }
     let buf = match args.get(1) {
         Some(Value::Object(Some(arr))) => *arr,
         _ => return Ok(Some(Value::Int(-1))),
@@ -2991,6 +3130,9 @@ fn native_bais_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    if !input_stream_has_bais_layout(ctx, this) {
+        return Ok(Some(Value::Int(0)));
+    }
     let pos = match ctx.get_field(this, BAIS_FIELD_POS) {
         Value::Int(v) => v,
         _ => 0,
@@ -3007,6 +3149,9 @@ fn native_bais_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Long(0))),
     };
+    if !input_stream_has_bais_layout(ctx, this) {
+        return Ok(Some(Value::Long(0)));
+    }
     let n = match args.get(1) {
         Some(Value::Long(v)) => *v,
         _ => 0,
@@ -3031,6 +3176,9 @@ fn native_bais_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    if !input_stream_has_bais_layout(ctx, this) {
+        return Ok(None);
+    }
     let mark = match ctx.get_field(this, BAIS_FIELD_MARK) {
         Value::Int(v) => v,
         _ => 0,
@@ -3074,6 +3222,37 @@ fn receiver_is_baos(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
         cid = ctx.superclass_of(c);
     }
     false
+}
+
+const PROCESS_PIPE_OUTPUT_STREAM: &str = "cratonvm/synthetic/ProcessPipeOutputStream";
+
+fn receiver_is_process_pipe_output(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let mut cid = Some(ctx.class_id_of_object(this));
+    while let Some(c) = cid {
+        if ctx.class_name_of_id(c).as_deref() == Some(PROCESS_PIPE_OUTPUT_STREAM) {
+            return true;
+        }
+        cid = ctx.superclass_of(c);
+    }
+    false
+}
+
+fn process_pipe_output_fd(ctx: &dyn NativeContext, this: ObjectRef) -> Option<FdId> {
+    if !receiver_is_process_pipe_output(ctx, this) {
+        return None;
+    }
+    match ctx.get_field(this, 0) {
+        Value::Int(v) if v >= 0 => Some(v as FdId),
+        _ => None,
+    }
+}
+
+fn process_pipe_output_close(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    if let Some(fd) = process_pipe_output_fd(ctx, this) {
+        let _ = ctx.fd_table().flush(fd);
+        let _ = ctx.fd_table().close(fd);
+        ctx.set_field(this, 0, Value::Int(-1));
+    }
 }
 
 fn native_baos_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3134,6 +3313,12 @@ fn native_baos_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    if let Some(fd) = process_pipe_output_fd(ctx, this) {
+        ctx.fd_table()
+            .write_byte(fd, (byte_val & 0xFF) as u8)
+            .map_err(io_err)?;
+        return Ok(None);
+    }
     // Registered on the base `java/io/OutputStream` class as a fallback for
     // synthetic streams with the BAOS layout. For non-BAOS receivers,
     // `baos_ensure_capacity` below would allocate a fresh byte[] and write
@@ -3172,14 +3357,23 @@ fn native_baos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(arr))) => *arr,
         _ => return Ok(None),
     };
-    let off = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+    let off_i = match args.get(2) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let len = match args.get(3) {
-        Some(Value::Int(v)) => *v as usize,
+    let len_i = match args.get(3) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    check_array_bounds(off_i, len_i, ctx.array_length(buf))?;
+    let off = off_i as usize;
+    let len = len_i as usize;
+    if let Some(fd) = process_pipe_output_fd(ctx, this) {
+        let mut bytes = vec![0u8; len];
+        ctx.read_byte_array_into(buf, off, &mut bytes);
+        ctx.fd_table().write_bytes(fd, &bytes).map_err(io_err)?;
+        return Ok(None);
+    }
     // This native is registered on the base `java/io/OutputStream` class as
     // a fallback for synthetic streams that have the
     // ByteArrayOutputStream layout in slots 0..1 (`data:[B`, `count:int`).
@@ -3345,8 +3539,13 @@ fn native_baos_to_string_charset(ctx: &mut dyn NativeContext, args: &[Value]) ->
     native_baos_to_string(ctx, args)
 }
 
-fn native_baos_close(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None) // no-op
+fn native_baos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    process_pipe_output_close(ctx, this);
+    Ok(None)
 }
 
 /// `java.io.FilterOutputStream.close()` — flush this stream, then close the
@@ -3366,13 +3565,20 @@ fn native_filteros_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // close the wrapped stream so its close()/finish() runs.
     let _ = ctx.invoke_virtual(this, "flush", "()V", &[]);
     if let Value::Object(Some(out)) = ctx.get_field(this, 0) {
-        let _ = ctx.invoke_virtual(out, "close", "()V", &[]);
+        let _ = ctx.invoke_virtual_declared("java/io/OutputStream", out, "close", "()V", &[]);
     }
     Ok(None)
 }
 
-fn native_baos_flush(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None) // no-op
+fn native_baos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    if let Some(fd) = process_pipe_output_fd(ctx, this) {
+        ctx.fd_table().flush(fd).map_err(io_err)?;
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -4660,14 +4866,11 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         #[cfg(unix)]
         pub const SIZEOF_FAMILY: i32 = std::mem::size_of::<libc::sa_family_t>() as i32;
         #[cfg(unix)]
-        pub const OFFSET_FAMILY: i32 =
-            std::mem::offset_of!(libc::sockaddr_in, sin_family) as i32;
+        pub const OFFSET_FAMILY: i32 = std::mem::offset_of!(libc::sockaddr_in, sin_family) as i32;
         #[cfg(unix)]
-        pub const OFFSET_SIN4_PORT: i32 =
-            std::mem::offset_of!(libc::sockaddr_in, sin_port) as i32;
+        pub const OFFSET_SIN4_PORT: i32 = std::mem::offset_of!(libc::sockaddr_in, sin_port) as i32;
         #[cfg(unix)]
-        pub const OFFSET_SIN4_ADDR: i32 =
-            std::mem::offset_of!(libc::sockaddr_in, sin_addr) as i32;
+        pub const OFFSET_SIN4_ADDR: i32 = std::mem::offset_of!(libc::sockaddr_in, sin_addr) as i32;
         #[cfg(unix)]
         pub const OFFSET_SIN6_PORT: i32 =
             std::mem::offset_of!(libc::sockaddr_in6, sin6_port) as i32;
@@ -4716,12 +4919,18 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // are provided as literals in `sockaddr_abi` below (note AF_INET6 is
     // 23 on Windows vs 10 on Linux).
     use sockaddr_abi as sa;
-    registry.register("sun/nio/ch/NativeSocketAddress", "AFINET", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(sa::AF_INET)))
-    });
-    registry.register("sun/nio/ch/NativeSocketAddress", "AFINET6", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(sa::AF_INET6)))
-    });
+    registry.register(
+        "sun/nio/ch/NativeSocketAddress",
+        "AFINET",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(sa::AF_INET))),
+    );
+    registry.register(
+        "sun/nio/ch/NativeSocketAddress",
+        "AFINET6",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(sa::AF_INET6))),
+    );
     registry.register(
         "sun/nio/ch/NativeSocketAddress",
         "sizeofSockAddr4",
@@ -5626,6 +5835,10 @@ fn alloc_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef 
     // Real JDK Heap*Buffer backing array is named `hb`.
     ctx.set_field_by_name(obj, "hb", Value::Object(Some(array)));
     buf_write_metadata(ctx, obj, 0, capacity as i32, capacity as i32, -1);
+    // Real HeapByteBuffer.address is ARRAY_BYTE_BASE_OFFSET + offset. Bulk
+    // copy bytecode relies on this value when ScopedMemoryAccess hands the
+    // backing byte[] and offset to Unsafe.copyMemory.
+    ctx.set_field_by_name(obj, "address", Value::Long(16));
     obj
 }
 
@@ -5645,9 +5858,9 @@ fn bb_state(
                 other => {
                     return Err(MethodCallFailed::InternalError(VmError::Internal {
                         message: format!(
-                            "ByteBuffer missing backing array (field {} returned {:?} for object {:?})",
-                            BB_FIELD_ARRAY, other, this
-                        ),
+                        "ByteBuffer missing backing array (field {} returned {:?} for object {:?})",
+                        BB_FIELD_ARRAY, other, this
+                    ),
                     }))
                 }
             },
@@ -7254,15 +7467,39 @@ fn native_fc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 }
 
 // ===========================================================================
-// StringReader — 3-field synthetic (field 0 = String content, field 1 = Int pos, field 2 = Int length)
+// StringReader — GC-stable side table (see SR_STATE below).
 // StringWriter — 2-field synthetic (field 0 = char[] buffer, field 1 = Int count)
 // ===========================================================================
 
-const SR_FIELD_CONTENT: usize = 0;
-const SR_FIELD_POS: usize = 1;
-const SR_FIELD_LENGTH: usize = 2;
 const SW_FIELD_BUF: usize = 0;
 const SW_FIELD_COUNT: usize = 1;
+
+// The `java/io/StringReader` natives below (registered unconditionally, not
+// gated on `synthetic-jdk`) used to store content/position/length in object
+// fields 0/1/2, matching the SYNTHETIC stub's 3 generic `_f0..2` slots. But
+// this native also wins dispatch against a REAL, bytecode-loaded
+// `java.io.StringReader` (`CRATONVM_REAL` is off by default — see
+// `RealSelector` in `env_cache.rs` — so a `SyntheticStub` native always
+// pre-empts real bytecode unless explicitly opted out of). Real JDK 25's
+// `StringReader` was rewritten to hold a single `private final Reader r`
+// delegate (`javap` confirms — no `str`/`next`/`length` fields survive), so
+// writing "field 1"/"field 2" landed on whatever slot the real class
+// actually declares there and silently discarded the `Value::Int` position
+// write (read back as `Value::Object(None)`, the zero value for a
+// reference-typed slot) — `read()` always saw `pos == 0` and returned the
+// same first character forever. Track state in a GC-stable side table
+// instead, exactly like `ISR_PENDING` above for `InputStreamReader`.
+static SR_STATE: OnceLock<Mutex<HashMap<i32, SrState>>> = OnceLock::new();
+
+#[derive(Default)]
+struct SrState {
+    units: Vec<u16>,
+    pos: usize,
+}
+
+fn sr_state() -> &'static Mutex<HashMap<i32, SrState>> {
+    SR_STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 // The synthetic StringWriter layout stores the content `char[]` at slot 0 and
 // the logical length at slot 1. The REAL `java.io.StringWriter` field layout is
@@ -7303,10 +7540,14 @@ fn sw_set_count(ctx: &mut dyn NativeContext, this: ObjectRef, count: usize) {
 fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // RDR-MIGRATION 2026-06-01: these StringReader natives use the synthetic
-    // 3-field layout (content/pos/length). Register them as SyntheticStub so
-    // fake-JDK StringReader links, while real JDK bytecode still wins when the
-    // class is loaded from a real java.base.
+    // RDR-MIGRATION 2026-06-01: these StringReader natives track state in the
+    // GC-stable `SR_STATE` side table (not object fields — see the comment
+    // above `SR_STATE`), so they work against either the synthetic stub or a
+    // real, bytecode-loaded `java.io.StringReader`. Registered as
+    // SyntheticStub for census purposes; note that (unlike the comment below
+    // once assumed) real JDK bytecode does NOT win by default — the
+    // `CRATONVM_REAL` differential switch must explicitly opt a class in for
+    // that (see `RealSelector` in `env_cache.rs`).
     registry.with_category(cratonvm_native_api::NativeKind::SyntheticStub, |registry| {
         let sr = "java/io/StringReader";
         registry.register(sr, "<init>", "(Ljava/lang/String;)V", native_sr_init);
@@ -7401,9 +7642,11 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
     // every OTHER Writer subclass — keep it under `synthetic-jdk` only (same
     // base-class hazard the `Reader.read` migration above fixed).
     #[cfg(feature = "synthetic-jdk")]
-    registry.register("java/io/Writer", "write", "(I)V", native_sw_write_int);
-    registry.register("java/io/Writer", "flush", "()V", native_noop_void);
-    registry.register("java/io/Writer", "close", "()V", native_noop_void);
+    {
+        registry.register("java/io/Writer", "write", "(I)V", native_sw_write_int);
+        registry.register("java/io/Writer", "flush", "()V", native_noop_void);
+        registry.register("java/io/Writer", "close", "()V", native_noop_void);
+    }
     registry.set_category(__prev_cat);
 }
 
@@ -7495,15 +7738,15 @@ fn native_sr_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let content = args[1];
-    // Get length from string
-    let len = match args[1] {
-        Value::Object(Some(s)) => ctx.read_string(s).map(|s| s.len()).unwrap_or(0),
-        _ => 0,
+    let units: Vec<u16> = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx
+            .read_string(*s)
+            .map(|s| s.encode_utf16().collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
     };
-    ctx.set_field(this, SR_FIELD_CONTENT, content);
-    ctx.set_field(this, SR_FIELD_POS, Value::Int(0));
-    ctx.set_field(this, SR_FIELD_LENGTH, Value::Int(len as i32));
+    let key = ctx.identity_hash_code(this);
+    sr_state().lock().insert(key, SrState { units, pos: 0 });
     Ok(None)
 }
 
@@ -7512,20 +7755,18 @@ fn native_sr_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let pos = match ctx.get_field(this, SR_FIELD_POS) {
-        Value::Int(p) => p as usize,
-        _ => 0,
+    let key = ctx.identity_hash_code(this);
+    let mut table = sr_state().lock();
+    let state = match table.get_mut(&key) {
+        Some(s) => s,
+        None => return Ok(Some(Value::Int(-1))),
     };
-    let content_str = match ctx.get_field(this, SR_FIELD_CONTENT) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(-1))),
-    };
-    let bytes: Vec<u16> = content_str.encode_utf16().collect();
-    if pos >= bytes.len() {
+    if state.pos >= state.units.len() {
         return Ok(Some(Value::Int(-1)));
     }
-    ctx.set_field(this, SR_FIELD_POS, Value::Int((pos + 1) as i32));
-    Ok(Some(Value::Int(bytes[pos] as i32)))
+    let ch = state.units[state.pos];
+    state.pos += 1;
+    Ok(Some(Value::Int(ch as i32)))
 }
 
 fn native_sr_read_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7545,24 +7786,25 @@ fn native_sr_read_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
-    let pos = match ctx.get_field(this, SR_FIELD_POS) {
-        Value::Int(p) => p as usize,
-        _ => 0,
+    let key = ctx.identity_hash_code(this);
+    let (to_read, chars) = {
+        let mut table = sr_state().lock();
+        let state = match table.get_mut(&key) {
+            Some(s) => s,
+            None => return Ok(Some(Value::Int(-1))),
+        };
+        if state.pos >= state.units.len() {
+            return Ok(Some(Value::Int(-1)));
+        }
+        let available = state.units.len() - state.pos;
+        let to_read = len.min(available);
+        let chars = state.units[state.pos..state.pos + to_read].to_vec();
+        state.pos += to_read;
+        (to_read, chars)
     };
-    let content_str = match ctx.get_field(this, SR_FIELD_CONTENT) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(-1))),
-    };
-    let chars: Vec<u16> = content_str.encode_utf16().collect();
-    if pos >= chars.len() {
-        return Ok(Some(Value::Int(-1)));
+    for (i, ch) in chars.into_iter().enumerate() {
+        ctx.set_array_element(buf, off + i, Value::Int(ch as i32));
     }
-    let available = chars.len() - pos;
-    let to_read = len.min(available);
-    for i in 0..to_read {
-        ctx.set_array_element(buf, off + i, Value::Int(chars[pos + i] as i32));
-    }
-    ctx.set_field(this, SR_FIELD_POS, Value::Int((pos + to_read) as i32));
     Ok(Some(Value::Int(to_read as i32)))
 }
 
@@ -7571,15 +7813,13 @@ fn native_sr_ready(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let pos = match ctx.get_field(this, SR_FIELD_POS) {
-        Value::Int(p) => p,
-        _ => 0,
-    };
-    let len = match ctx.get_field(this, SR_FIELD_LENGTH) {
-        Value::Int(l) => l,
-        _ => 0,
-    };
-    Ok(Some(Value::Int(if pos < len { 1 } else { 0 })))
+    let key = ctx.identity_hash_code(this);
+    let ready = sr_state()
+        .lock()
+        .get(&key)
+        .map(|s| s.pos < s.units.len())
+        .unwrap_or(false);
+    Ok(Some(Value::Int(if ready { 1 } else { 0 })))
 }
 
 fn native_sr_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7591,16 +7831,15 @@ fn native_sr_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    let pos = match ctx.get_field(this, SR_FIELD_POS) {
-        Value::Int(p) => p as i64,
-        _ => 0,
+    let key = ctx.identity_hash_code(this);
+    let mut table = sr_state().lock();
+    let state = match table.get_mut(&key) {
+        Some(s) => s,
+        None => return Ok(Some(Value::Long(0))),
     };
-    let len = match ctx.get_field(this, SR_FIELD_LENGTH) {
-        Value::Int(l) => l as i64,
-        _ => 0,
-    };
-    let skip = n.min(len - pos).max(0);
-    ctx.set_field(this, SR_FIELD_POS, Value::Int((pos + skip) as i32));
+    let remaining = (state.units.len() - state.pos) as i64;
+    let skip = n.clamp(0, remaining);
+    state.pos = (state.pos as i64 + skip) as usize;
     Ok(Some(Value::Long(skip)))
 }
 
@@ -7609,7 +7848,10 @@ fn native_sr_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    ctx.set_field(this, SR_FIELD_POS, Value::Int(0));
+    let key = ctx.identity_hash_code(this);
+    if let Some(state) = sr_state().lock().get_mut(&key) {
+        state.pos = 0;
+    }
     Ok(None)
 }
 
@@ -7844,6 +8086,23 @@ const DOS_FIELD_OUT: usize = 0;
 // Access `written` by NAME so the native and real bytecode agree on the slot.
 const DOS_WRITTEN_FIELD: &str = "written";
 
+#[derive(Default)]
+struct DisSideBuffer {
+    bytes: Vec<u8>,
+    pos: usize,
+}
+
+fn dis_side_buffers() -> &'static Mutex<HashMap<i32, DisSideBuffer>> {
+    static BUFS: OnceLock<Mutex<HashMap<i32, DisSideBuffer>>> = OnceLock::new();
+    BUFS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn dis_side_key(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
+    ctx.identity_hash_code(this)
+}
+
+const DIS_SIDE_BUFFER_SIZE: usize = 8192;
+
 fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -7924,16 +8183,90 @@ fn dis_read_one(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
 ) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
+    let key = dis_side_key(ctx, this);
+    {
+        let mut bufs = dis_side_buffers().lock();
+        if let Some(state) = bufs.get_mut(&key) {
+            if state.pos < state.bytes.len() {
+                let b = state.bytes[state.pos];
+                state.pos += 1;
+                if state.pos >= state.bytes.len() {
+                    bufs.remove(&key);
+                }
+                return Ok(b as i32);
+            }
+            bufs.remove(&key);
+        }
+    }
+
     let inner = match ctx.get_field(this, DIS_FIELD_IN) {
         Value::Object(Some(s)) => s,
         _ => return Ok(-1),
     };
-    // Delegate to the inner stream's read() via invoke_virtual
-    let result = ctx.invoke_virtual(inner, "read", "()I", &[])?;
-    match result {
-        Some(Value::Int(v)) => Ok(v),
-        _ => Ok(-1),
+    let tmp = ctx.new_array(ArrayElementType::Byte, DIS_SIDE_BUFFER_SIZE);
+    let this_pin = ctx.pin_native_root(this);
+    let tmp_pin = ctx.pin_native_root(tmp);
+    let result = match ctx.invoke_virtual(
+        inner,
+        "read",
+        "([BII)I",
+        &[
+            Value::Object(Some(tmp)),
+            Value::Int(0),
+            Value::Int(DIS_SIDE_BUFFER_SIZE as i32),
+        ],
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
+    let tmp = ctx.read_native_pin(tmp_pin, tmp);
+    let n = match result {
+        Some(Value::Int(v)) if v > 0 => v as usize,
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(-1);
+        }
+    };
+    let mut bytes = vec![0u8; n];
+    ctx.read_byte_array_into(tmp, 0, &mut bytes);
+    ctx.unpin_native_roots(this_pin);
+    let first = bytes[0];
+    if n > 1 {
+        dis_side_buffers()
+            .lock()
+            .insert(key, DisSideBuffer { bytes, pos: 1 });
     }
+    Ok(first as i32)
+}
+
+fn dis_read_exact(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    len: usize,
+) -> Result<Vec<u8>, MethodCallFailed> {
+    let this_pin = ctx.pin_native_root(this);
+    let mut this = this;
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        let b = match dis_read_one(ctx, this) {
+            Ok(v) => v,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
+        this = ctx.read_native_pin(this_pin, this);
+        if b < 0 {
+            ctx.unpin_native_roots(this_pin);
+            return Err(eof_exception());
+        }
+        out.push(b as u8);
+    }
+    ctx.unpin_native_roots(this_pin);
+    Ok(out)
 }
 
 fn native_dis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7962,52 +8295,36 @@ fn native_dis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    if len == 0 {
+    if len <= 0 {
         return Ok(Some(Value::Int(0)));
     }
-    // Delegate bulk read to inner stream
-    let inner = match ctx.get_field(this, DIS_FIELD_IN) {
-        Value::Object(Some(s)) => s,
-        _ => return Ok(Some(Value::Int(-1))),
-    };
-    // PIN: `this`/`buf` are re-used after the re-entrant `invoke_virtual`
-    // calls below, which run real bytecode and can trigger a moving GC --
-    // an unpinned `ObjectRef` goes stale and the eventual `set_array_element`
-    // then writes through a dangling pointer (see
-    // docs/known-issues/hib-jpalargeblobtest-object-read-nosuchmethod.md).
     let this_pin = ctx.pin_native_root(this);
     let buf_pin = ctx.pin_native_root(buf);
-    let result = match ctx.invoke_virtual(
-        inner,
-        "read",
-        "([BII)I",
-        &[Value::Object(Some(buf)), Value::Int(off), Value::Int(len)],
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            ctx.unpin_native_roots(this_pin);
-            return Err(e);
-        }
-    };
-    let this = ctx.read_native_pin(this_pin, this);
-    let buf = ctx.read_native_pin(buf_pin, buf);
-    let out = match result {
-        Some(Value::Int(v)) if v > 0 => Ok(Some(Value::Int(v))),
-        Some(Value::Int(0)) => {
-            // Bulk returned 0 — try single byte
-            let b = dis_read_one(ctx, this)?;
-            let buf = ctx.read_native_pin(buf_pin, buf);
-            if b == -1 {
-                Ok(Some(Value::Int(-1)))
-            } else {
-                ctx.set_array_element(buf, off as usize, Value::Int(b));
-                Ok(Some(Value::Int(1)))
+    let mut this = this;
+    let mut buf = buf;
+    let mut read = 0usize;
+    for i in 0..(len as usize) {
+        let b = match dis_read_one(ctx, this) {
+            Ok(v) => v,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
             }
+        };
+        this = ctx.read_native_pin(this_pin, this);
+        buf = ctx.read_native_pin(buf_pin, buf);
+        if b < 0 {
+            break;
         }
-        _ => Ok(Some(Value::Int(-1))),
-    };
+        ctx.set_array_element(buf, off as usize + i, Value::Int(b));
+        read += 1;
+    }
     ctx.unpin_native_roots(this_pin);
-    out
+    if read == 0 {
+        Ok(Some(Value::Int(-1)))
+    } else {
+        Ok(Some(Value::Int(read as i32)))
+    }
 }
 
 fn native_dis_read_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8015,8 +8332,8 @@ fn native_dis_read_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let b = dis_read_one(ctx, this)?;
-    Ok(Some(Value::Int(if b != 0 { 1 } else { 0 })))
+    let bytes = dis_read_exact(ctx, this, 1)?;
+    Ok(Some(Value::Int(if bytes[0] != 0 { 1 } else { 0 })))
 }
 
 fn native_dis_read_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8024,8 +8341,8 @@ fn native_dis_read_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let b = dis_read_one(ctx, this)?;
-    Ok(Some(Value::Int(b as i8 as i32)))
+    let bytes = dis_read_exact(ctx, this, 1)?;
+    Ok(Some(Value::Int(bytes[0] as i8 as i32)))
 }
 
 fn native_dis_read_unsigned_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8033,8 +8350,8 @@ fn native_dis_read_unsigned_byte(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let b = dis_read_one(ctx, this)?;
-    Ok(Some(Value::Int(b & 0xFF)))
+    let bytes = dis_read_exact(ctx, this, 1)?;
+    Ok(Some(Value::Int(bytes[0] as i32)))
 }
 
 fn native_dis_read_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8042,10 +8359,9 @@ fn native_dis_read_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let b0 = dis_read_one(ctx, this)?;
-    let b1 = dis_read_one(ctx, this)?;
-    let val = ((b0 & 0xFF) << 8) | (b1 & 0xFF);
-    Ok(Some(Value::Int(val as i16 as i32)))
+    let bytes = dis_read_exact(ctx, this, 2)?;
+    let val = i16::from_be_bytes([bytes[0], bytes[1]]);
+    Ok(Some(Value::Int(val as i32)))
 }
 
 fn native_dis_read_unsigned_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8053,10 +8369,9 @@ fn native_dis_read_unsigned_short(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let b0 = dis_read_one(ctx, this)?;
-    let b1 = dis_read_one(ctx, this)?;
-    let val = ((b0 & 0xFF) << 8) | (b1 & 0xFF);
-    Ok(Some(Value::Int(val)))
+    let bytes = dis_read_exact(ctx, this, 2)?;
+    let val = u16::from_be_bytes([bytes[0], bytes[1]]);
+    Ok(Some(Value::Int(val as i32)))
 }
 
 fn native_dis_read_char(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8068,19 +8383,10 @@ fn native_dis_read_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let mut val: i32 = 0;
-    for _ in 0..4 {
-        let b = dis_read_one(ctx, this)?;
-        if b < 0 {
-            return Err(MethodCallFailed::InternalError(VmError::Runtime(
-                RuntimeError::EOFException {
-                    message: "Unexpected EOF".to_string(),
-                },
-            )));
-        }
-        val = (val << 8) | (b & 0xFF);
-    }
-    Ok(Some(Value::Int(val)))
+    let bytes = dis_read_exact(ctx, this, 4)?;
+    Ok(Some(Value::Int(i32::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3],
+    ]))))
 }
 
 fn native_dis_read_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8088,12 +8394,10 @@ fn native_dis_read_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let mut val: i64 = 0;
-    for _ in 0..8 {
-        let b = dis_read_one(ctx, this)?;
-        val = (val << 8) | ((b & 0xFF) as i64);
-    }
-    Ok(Some(Value::Long(val)))
+    let bytes = dis_read_exact(ctx, this, 8)?;
+    Ok(Some(Value::Long(i64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]))))
 }
 
 fn native_dis_read_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8135,61 +8439,9 @@ fn native_dis_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let b0 = dis_read_one(ctx, this)?;
-    let b1 = dis_read_one(ctx, this)?;
-    let len = (((b0 & 0xFF) as usize) << 8) | ((b1 & 0xFF) as usize);
-    // Read all UTF bytes in bulk via a temporary array
-    let tmp_arr = ctx.new_array(ArrayElementType::Byte, len);
-    let inner = match ctx.get_field(this, DIS_FIELD_IN) {
-        Value::Object(Some(s)) => s,
-        _ => {
-            // Fallback: byte-by-byte
-            let mut bytes = Vec::with_capacity(len);
-            for _ in 0..len {
-                let b = dis_read_one(ctx, this)?;
-                bytes.push(b as u8);
-            }
-            let s = decode_modified_utf8(&bytes).map_err(|e| {
-                cratonvm_types::error::RuntimeError::IOException {
-                    message: format!("readUTF: {e}"),
-                }
-            })?;
-            let result = ctx.create_string(&s);
-            return Ok(Some(Value::Object(Some(result))));
-        }
-    };
-    // Bulk read via inner stream's read([BII)I
-    let mut filled = 0usize;
-    while filled < len {
-        let remaining = (len - filled) as i32;
-        let n = ctx.invoke_virtual(
-            inner,
-            "read",
-            "([BII)I",
-            &[
-                Value::Object(Some(tmp_arr)),
-                Value::Int(filled as i32),
-                Value::Int(remaining),
-            ],
-        )?;
-        match n {
-            Some(Value::Int(v)) if v > 0 => filled += v as usize,
-            _ => {
-                // Fallback: fill remaining byte-by-byte
-                for i in filled..len {
-                    let b = dis_read_one(ctx, this)?;
-                    ctx.set_array_element(tmp_arr, i, Value::Int(b));
-                }
-                filled = len;
-            }
-        }
-    }
-    // Extract bytes from array
-    let mut bytes = Vec::with_capacity(len);
-    for i in 0..len {
-        let b = ctx.get_array_element(tmp_arr, i).as_int().unwrap_or(0);
-        bytes.push(b as u8);
-    }
+    let len_bytes = dis_read_exact(ctx, this, 2)?;
+    let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+    let bytes = dis_read_exact(ctx, this, len)?;
     let s = decode_modified_utf8(&bytes).map_err(|e| {
         cratonvm_types::error::RuntimeError::IOException {
             message: format!("readUTF: {e}"),
@@ -8378,36 +8630,12 @@ fn dis_read_fully_impl(
     off: usize,
     len: usize,
 ) -> MethodCallResult {
-    let inner = match ctx.get_field(this, DIS_FIELD_IN) {
-        Value::Object(Some(s)) => s,
-        _ => return Err(eof_exception()),
-    };
-    // Same stale-local hazard as native_bais_read_bytes/native_dis_read_bytes:
-    // every invoke_virtual below can run bytecode and trigger a moving GC.
-    // Keep all object refs reused after those calls as native roots and reload
-    // them before any further dispatch or array store.
     let this_pin = ctx.pin_native_root(this);
     let buf_pin = ctx.pin_native_root(buf);
-    let inner_pin = ctx.pin_native_root(inner);
     let mut this = this;
     let mut buf = buf;
-    let mut inner = inner;
-    let mut filled = 0usize;
-    let out = loop {
-        if filled >= len {
-            break Ok(None);
-        }
-        let remaining = (len - filled) as i32;
-        let n = match ctx.invoke_virtual(
-            inner,
-            "read",
-            "([BII)I",
-            &[
-                Value::Object(Some(buf)),
-                Value::Int((off + filled) as i32),
-                Value::Int(remaining),
-            ],
-        ) {
+    for i in 0..len {
+        let b = match dis_read_one(ctx, this) {
             Ok(v) => v,
             Err(e) => {
                 ctx.unpin_native_roots(this_pin);
@@ -8416,36 +8644,14 @@ fn dis_read_fully_impl(
         };
         this = ctx.read_native_pin(this_pin, this);
         buf = ctx.read_native_pin(buf_pin, buf);
-        inner = ctx.read_native_pin(inner_pin, inner);
-        match n {
-            Some(Value::Int(v)) if v > 0 => {
-                filled += v as usize;
-            }
-            _ => {
-                // EOF (0 or -1) before all bytes were delivered → byte-by-byte fallback.
-                // dis_read_one returns -1 on EOF; we throw EOFException if that happens.
-                for i in filled..len {
-                    let b = match dis_read_one(ctx, this) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            ctx.unpin_native_roots(this_pin);
-                            return Err(e);
-                        }
-                    };
-                    this = ctx.read_native_pin(this_pin, this);
-                    buf = ctx.read_native_pin(buf_pin, buf);
-                    if b < 0 {
-                        ctx.unpin_native_roots(this_pin);
-                        return Err(eof_exception());
-                    }
-                    ctx.set_array_element(buf, off + i, Value::Int(b));
-                }
-                break Ok(None);
-            }
+        if b < 0 {
+            ctx.unpin_native_roots(this_pin);
+            return Err(eof_exception());
         }
-    };
+        ctx.set_array_element(buf, off + i, Value::Int(b));
+    }
     ctx.unpin_native_roots(this_pin);
-    out
+    Ok(None)
 }
 
 fn native_dis_skip_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8460,27 +8666,24 @@ fn native_dis_skip_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if n <= 0 {
         return Ok(Some(Value::Int(0)));
     }
-    // Delegate to inner stream's skip()
-    let inner = match ctx.get_field(this, DIS_FIELD_IN) {
-        Value::Object(Some(s)) => s,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let mut total_skipped: i64 = 0;
+    let this_pin = ctx.pin_native_root(this);
+    let mut this = this;
+    let mut total_skipped = 0i64;
     while total_skipped < n {
-        let remaining = n - total_skipped;
-        let result = ctx.invoke_virtual(inner, "skip", "(J)J", &[Value::Long(remaining)])?;
-        match result {
-            Some(Value::Long(s)) if s > 0 => total_skipped += s,
-            _ => {
-                // skip returned 0 — try reading one byte to check for EOF
-                let b = dis_read_one(ctx, this)?;
-                if b == -1 {
-                    break;
-                }
-                total_skipped += 1;
+        let b = match dis_read_one(ctx, this) {
+            Ok(v) => v,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
             }
+        };
+        this = ctx.read_native_pin(this_pin, this);
+        if b < 0 {
+            break;
         }
+        total_skipped += 1;
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(total_skipped as i32)))
 }
 
@@ -8550,7 +8753,7 @@ fn native_dos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(None),
     };
     if let Value::Object(Some(inner)) = ctx.get_field(this, DOS_FIELD_OUT) {
-        ctx.invoke_virtual(inner, "flush", "()V", &[])?;
+        ctx.invoke_virtual_declared("java/io/OutputStream", inner, "flush", "()V", &[])?;
     }
     Ok(None)
 }
@@ -8563,8 +8766,8 @@ fn native_dos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(None),
     };
     if let Value::Object(Some(inner)) = ctx.get_field(this, DOS_FIELD_OUT) {
-        let _ = ctx.invoke_virtual(inner, "flush", "()V", &[]);
-        ctx.invoke_virtual(inner, "close", "()V", &[])?;
+        let _ = ctx.invoke_virtual_declared("java/io/OutputStream", inner, "flush", "()V", &[]);
+        ctx.invoke_virtual_declared("java/io/OutputStream", inner, "close", "()V", &[])?;
     }
     Ok(None)
 }
@@ -10759,6 +10962,173 @@ fn bos_slots(ctx: &dyn NativeContext) -> (usize, usize, usize) {
     (out, buf, count)
 }
 
+fn bos_has_buffer_slots(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    buf_slot: usize,
+    count_slot: usize,
+) -> bool {
+    let fields = ctx.object_num_fields(this);
+    buf_slot < fields && count_slot < fields
+}
+
+fn bos_inner(ctx: &dyn NativeContext, this: ObjectRef, out_slot: usize) -> Option<ObjectRef> {
+    if out_slot >= ctx.object_num_fields(this) {
+        return None;
+    }
+    match ctx.get_field(this, out_slot) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct BosSideBuffer {
+    bytes: Vec<u8>,
+    capacity: usize,
+}
+
+fn bos_side_buffers() -> &'static Mutex<HashMap<i32, BosSideBuffer>> {
+    static BUFS: OnceLock<Mutex<HashMap<i32, BosSideBuffer>>> = OnceLock::new();
+    BUFS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn bos_side_key(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
+    ctx.identity_hash_code(this)
+}
+
+fn bos_side_init(ctx: &mut dyn NativeContext, this: ObjectRef, capacity: usize) {
+    let key = bos_side_key(ctx, this);
+    let capacity = capacity.max(1);
+    bos_side_buffers().lock().insert(
+        key,
+        BosSideBuffer {
+            bytes: Vec::with_capacity(capacity),
+            capacity,
+        },
+    );
+}
+
+fn bos_side_flush(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    out_slot: usize,
+    flush_inner: bool,
+) -> MethodCallResult {
+    let key = bos_side_key(ctx, this);
+    let bytes = {
+        let mut bufs = bos_side_buffers().lock();
+        bufs.get_mut(&key)
+            .map(|state| std::mem::take(&mut state.bytes))
+            .unwrap_or_default()
+    };
+    let Some(inner) = bos_inner(ctx, this, out_slot) else {
+        return Ok(None);
+    };
+    if !bytes.is_empty() {
+        let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+        for (idx, b) in bytes.iter().enumerate() {
+            ctx.set_array_element(arr, idx, Value::Int(*b as i32));
+        }
+        ctx.invoke_virtual(
+            inner,
+            "write",
+            "([BII)V",
+            &[
+                Value::Object(Some(arr)),
+                Value::Int(0),
+                Value::Int(bytes.len() as i32),
+            ],
+        )?;
+    }
+    if flush_inner {
+        ctx.invoke_virtual(inner, "flush", "()V", &[])?;
+    }
+    Ok(None)
+}
+
+fn bos_side_write_byte(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    out_slot: usize,
+    byte_val: i32,
+) -> MethodCallResult {
+    let key = bos_side_key(ctx, this);
+    let should_flush = {
+        let mut bufs = bos_side_buffers().lock();
+        let state = bufs.entry(key).or_insert_with(|| BosSideBuffer {
+            bytes: Vec::with_capacity(8192),
+            capacity: 8192,
+        });
+        state.bytes.len() >= state.capacity
+    };
+    if should_flush {
+        bos_side_flush(ctx, this, out_slot, false)?;
+    }
+    let mut bufs = bos_side_buffers().lock();
+    let state = bufs.entry(key).or_insert_with(|| BosSideBuffer {
+        bytes: Vec::with_capacity(8192),
+        capacity: 8192,
+    });
+    state.bytes.push((byte_val & 0xFF) as u8);
+    Ok(None)
+}
+
+fn bos_side_write_bulk(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    out_slot: usize,
+    src: ObjectRef,
+    off: usize,
+    len: usize,
+) -> MethodCallResult {
+    let key = bos_side_key(ctx, this);
+    let capacity = {
+        let mut bufs = bos_side_buffers().lock();
+        let state = bufs.entry(key).or_insert_with(|| BosSideBuffer {
+            bytes: Vec::with_capacity(8192),
+            capacity: 8192,
+        });
+        state.capacity
+    };
+    if len >= capacity {
+        bos_side_flush(ctx, this, out_slot, false)?;
+        if let Some(inner) = bos_inner(ctx, this, out_slot) {
+            ctx.invoke_virtual(
+                inner,
+                "write",
+                "([BII)V",
+                &[
+                    Value::Object(Some(src)),
+                    Value::Int(off as i32),
+                    Value::Int(len as i32),
+                ],
+            )?;
+        }
+        return Ok(None);
+    }
+
+    let needs_flush = {
+        let bufs = bos_side_buffers().lock();
+        bufs.get(&key)
+            .map(|state| len > state.capacity.saturating_sub(state.bytes.len()))
+            .unwrap_or(false)
+    };
+    if needs_flush {
+        bos_side_flush(ctx, this, out_slot, false)?;
+    }
+
+    let mut bytes = vec![0u8; len];
+    ctx.read_byte_array_into(src, off, &mut bytes);
+    let mut bufs = bos_side_buffers().lock();
+    let state = bufs.entry(key).or_insert_with(|| BosSideBuffer {
+        bytes: Vec::with_capacity(capacity),
+        capacity,
+    });
+    state.bytes.extend_from_slice(&bytes);
+    Ok(None)
+}
+
 fn register_buffered_stream_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -11094,9 +11464,15 @@ fn native_bos_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let inner = args.get(1).cloned().unwrap_or(Value::Object(None));
     let buf = ctx.new_array(ArrayElementType::Byte, 8192);
     let (out_slot, buf_slot, count_slot) = bos_slots(ctx);
-    ctx.set_field(this, out_slot, inner);
-    ctx.set_field(this, buf_slot, Value::Object(Some(buf)));
-    ctx.set_field(this, count_slot, Value::Int(0));
+    if out_slot < ctx.object_num_fields(this) {
+        ctx.set_field(this, out_slot, inner);
+    }
+    if bos_has_buffer_slots(ctx, this, buf_slot, count_slot) {
+        ctx.set_field(this, buf_slot, Value::Object(Some(buf)));
+        ctx.set_field(this, count_slot, Value::Int(0));
+    } else {
+        bos_side_init(ctx, this, 8192);
+    }
     Ok(None)
 }
 
@@ -11112,9 +11488,15 @@ fn native_bos_init_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let buf = ctx.new_array(ArrayElementType::Byte, size.max(1) as usize);
     let (out_slot, buf_slot, count_slot) = bos_slots(ctx);
-    ctx.set_field(this, out_slot, inner);
-    ctx.set_field(this, buf_slot, Value::Object(Some(buf)));
-    ctx.set_field(this, count_slot, Value::Int(0));
+    if out_slot < ctx.object_num_fields(this) {
+        ctx.set_field(this, out_slot, inner);
+    }
+    if bos_has_buffer_slots(ctx, this, buf_slot, count_slot) {
+        ctx.set_field(this, buf_slot, Value::Object(Some(buf)));
+        ctx.set_field(this, count_slot, Value::Int(0));
+    } else {
+        bos_side_init(ctx, this, size.max(1) as usize);
+    }
     Ok(None)
 }
 
@@ -11152,6 +11534,10 @@ fn native_bos_write_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => 0,
     };
     let (_out_slot, buf_slot, count_slot) = bos_slots(ctx);
+    if !bos_has_buffer_slots(ctx, this, buf_slot, count_slot) {
+        let (out_slot, _, _) = bos_slots(ctx);
+        return bos_side_write_byte(ctx, this, out_slot, byte_val);
+    }
     let count = match ctx.get_field(this, count_slot) {
         Value::Int(v) => v,
         _ => 0,
@@ -11218,6 +11604,9 @@ fn native_bos_write_bulk_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // native_bos_write_locked). OutputStreamPublisherTests.chunkSize() (chunk
     // size 3, writes of "foo"/"bar"/"baz") got "foo","b","arb","a","z".
     let (out_slot, buf_slot, count_slot) = bos_slots(ctx);
+    if !bos_has_buffer_slots(ctx, this, buf_slot, count_slot) {
+        return bos_side_write_bulk(ctx, this, out_slot, src, off, len);
+    }
     let buf_len = match ctx.get_field(this, buf_slot) {
         Value::Object(Some(b)) => ctx.array_length(b),
         _ => return Ok(None),
@@ -11276,6 +11665,9 @@ fn native_bos_flush_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(None),
     };
     let (out_slot, buf_slot, count_slot) = bos_slots(ctx);
+    if !bos_has_buffer_slots(ctx, this, buf_slot, count_slot) {
+        return bos_side_flush(ctx, this, out_slot, true);
+    }
     let count = match ctx.get_field(this, count_slot) {
         Value::Int(v) => v,
         _ => 0,
@@ -11333,9 +11725,10 @@ fn native_bos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // 2) Close the inner stream (matches the JDK
     //    `try (out) {}` block in BufferedOutputStream.close).
     let (out_slot, _, _) = bos_slots(ctx);
-    if let Value::Object(Some(inner)) = ctx.get_field(this, out_slot) {
-        ctx.invoke_virtual(inner, "close", "()V", &[])?;
+    if let Some(inner) = bos_inner(ctx, this, out_slot) {
+        ctx.invoke_virtual_declared("java/io/OutputStream", inner, "close", "()V", &[])?;
     }
+    bos_side_buffers().lock().remove(&bos_side_key(ctx, this));
     Ok(None)
 }
 
@@ -14068,15 +14461,12 @@ fn native_afc_provider_open(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let path_obj = obj_arg92(args, 1)?;
     let path_str = validated_path(&read_path_str(ctx, path_obj))?;
     let option_array_value = match args.get(2) {
-        Some(Value::Object(Some(set_obj))) => match ctx.invoke_virtual(
-            *set_obj,
-            "toArray",
-            "()[Ljava/lang/Object;",
-            &[],
-        )? {
-            Some(Value::Object(Some(arr))) => Value::Object(Some(arr)),
-            _ => Value::Object(None),
-        },
+        Some(Value::Object(Some(set_obj))) => {
+            match ctx.invoke_virtual(*set_obj, "toArray", "()[Ljava/lang/Object;", &[])? {
+                Some(Value::Object(Some(arr))) => Value::Object(Some(arr)),
+                _ => Value::Object(None),
+            }
+        }
         _ => Value::Object(None),
     };
     let options = parse_afc_open_options(ctx, Some(&option_array_value))?;
@@ -16259,6 +16649,31 @@ mod io_tests {
         assert!(r.find(dos, "writeLong", "(J)V").is_some());
     }
 
+    #[test]
+    fn data_output_stream_close_uses_declared_outputstream_for_inner_close() {
+        let mut ctx = MockNativeContext::new();
+        let dos = ctx.alloc_object(1);
+        let inner = ctx.alloc_object_with_class(0, "java/lang/Object");
+        ctx.set_field(dos, DOS_FIELD_OUT, Value::Object(Some(inner)));
+
+        native_dos_close(&mut ctx, &[Value::Object(Some(dos))]).unwrap();
+
+        let calls = ctx.recorded_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0].declared_class.as_deref(),
+            Some("java/io/OutputStream")
+        );
+        assert_eq!(calls[0].method_name, "flush");
+        assert_eq!(calls[0].descriptor, "()V");
+        assert_eq!(
+            calls[1].declared_class.as_deref(),
+            Some("java/io/OutputStream")
+        );
+        assert_eq!(calls[1].method_name, "close");
+        assert_eq!(calls[1].descriptor, "()V");
+    }
+
     // BufferedReader / BufferedWriter overrides are synthetic-jdk only;
     // real-JDK mode uses the JDK's own bytecode (see the
     // `#[cfg(feature = "synthetic-jdk")]` block around line ~3036).
@@ -17832,6 +18247,21 @@ mod bais_layout_tests {
     }
 
     #[test]
+    fn foreign_input_stream_does_not_probe_bais_slots() {
+        let mut ctx = MockNativeContext::new();
+        let text_io = ctx.alloc_object_with_class(1, "org/python/core/io/TextIOInputStream");
+
+        let available = native_bais_available(&mut ctx, &[Value::Object(Some(text_io))]).unwrap();
+        assert_eq!(available, Some(Value::Int(0)));
+        let read = native_bais_read(&mut ctx, &[Value::Object(Some(text_io))]).unwrap();
+        assert_eq!(read, Some(Value::Int(-1)));
+
+        assert_eq!(ctx.field_read_count(text_io, BAIS_FIELD_DATA), 0);
+        assert_eq!(ctx.field_read_count(text_io, BAIS_FIELD_POS), 0);
+        assert_eq!(ctx.field_read_count(text_io, BAIS_FIELD_COUNT), 0);
+    }
+
+    #[test]
     fn skip_advances_within_count() {
         let mut ctx = MockNativeContext::new();
         let (this, _) = make_bais(&mut ctx, b"abcdefgh");
@@ -17892,6 +18322,17 @@ mod buffer_bounds_tests {
     fn make_bb(ctx: &mut MockNativeContext, cap: usize) -> ObjectRef {
         // alloc_byte_buffer leaves pos=0, lim=cap, cap=cap.
         alloc_byte_buffer(ctx, cap)
+    }
+
+    #[test]
+    fn allocated_heap_bytebuffer_sets_real_address() {
+        let mut ctx = MockNativeContext::new();
+        let bb = make_bb(&mut ctx, 8);
+        assert_eq!(ctx.get_field_by_name(bb, "position"), Value::Int(0));
+        assert_eq!(ctx.get_field_by_name(bb, "limit"), Value::Int(8));
+        assert_eq!(ctx.get_field_by_name(bb, "capacity"), Value::Int(8));
+        assert_eq!(ctx.get_field_by_name(bb, "mark"), Value::Int(-1));
+        assert_eq!(ctx.get_field_by_name(bb, "address"), Value::Long(16));
     }
 
     // --- B1: bulk get/put destination/source bounds ---

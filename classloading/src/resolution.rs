@@ -1239,10 +1239,7 @@ impl CachedInvokeTarget {
                 gate,
                 supersede_epoch,
                 ..
-            } => {
-                gate.is_stale()
-                    || *supersede_epoch != crate::class_manager::jit_supersede_epoch()
-            }
+            } => gate.is_stale() || *supersede_epoch != crate::class_manager::jit_supersede_epoch(),
         }
     }
 }

@@ -3,8 +3,9 @@
 
 //! Unified heap abstraction for the VM.
 //!
-//! `VmHeap` wraps the available GC implementations (GenerationalHeap, G1Collector)
-//! behind a single type, so the VM code doesn't need to be generic or use trait objects.
+//! `VmHeap` wraps the available GC implementations (GenerationalHeap, G1Collector,
+//! and ZgcRealHeap when enabled) behind a single type, so the VM code doesn't
+//! need to be generic or use trait objects.
 
 use crate::collector::{GarbageCollector, MonitorCleanup};
 use crate::concurrent_mark::{ConcurrentGcPhase, ConcurrentGcState};
@@ -15,6 +16,8 @@ use crate::gen_heap::GenerationalHeap;
 use crate::heap::{ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE};
 use crate::old_gen::OldGen;
 use crate::satb::SatbQueue;
+#[cfg(feature = "zgc")]
+use crate::zgc::ZgcRealHeap;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -64,6 +67,9 @@ pub enum GcBackend {
     Generational,
     /// G1 (Garbage-First) region-based collector.
     G1,
+    /// ZGC-real memory-backed stop-the-world collector.
+    #[cfg(feature = "zgc")]
+    Zgc,
 }
 
 /// Explicit G1 tuning overrides wired from the `-XX:` knobs, applied by
@@ -192,6 +198,8 @@ fn clear_pending_pre_barrier() {
 pub enum VmHeap {
     Generational(GenerationalHeap),
     G1(G1State),
+    #[cfg(feature = "zgc")]
+    Zgc(ZgcRealHeap),
 }
 
 // Safety: both inner types are already Send + Sync.
@@ -204,6 +212,8 @@ macro_rules! dispatch {
         match $self {
             VmHeap::Generational(h) => h.$method($($arg),*),
             VmHeap::G1(h) => h.$method($($arg),*),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.$method($($arg),*),
         }
     };
 }
@@ -252,6 +262,8 @@ impl VmHeap {
                 }
                 VmHeap::G1(G1State::new(config))
             }
+            #[cfg(feature = "zgc")]
+            GcBackend::Zgc => VmHeap::Zgc(ZgcRealHeap::with_capacity(total_bytes)),
         }
     }
 
@@ -277,6 +289,20 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.try_alloc_object(class_id, num_fields),
             VmHeap::G1(h) => h.try_alloc_object(class_id, num_fields),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.try_alloc_object(class_id, num_fields),
+        }
+    }
+
+    /// Try to allocate directly in the old generation. This is only available
+    /// for the generational heap; other heap implementations return `None` so
+    /// callers can fall back to their normal allocation path.
+    pub fn try_alloc_object_old(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
+        match self {
+            VmHeap::Generational(h) => h.try_alloc_object_old(class_id, num_fields),
+            VmHeap::G1(_) => None,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => None,
         }
     }
 
@@ -288,6 +314,8 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.try_alloc_object_full(class_id, num_fields),
             VmHeap::G1(h) => h.try_alloc_object(class_id, num_fields),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.try_alloc_object(class_id, num_fields),
         }
     }
 
@@ -304,6 +332,8 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.try_alloc_array_full(class_id, element_type, length),
             VmHeap::G1(h) => h.try_alloc_array(class_id, element_type, length),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.try_alloc_array(class_id, element_type, length),
         }
     }
 
@@ -313,6 +343,8 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.dbg_first_young_small_ref(),
             VmHeap::G1(_) => None,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => None,
         }
     }
 
@@ -337,6 +369,10 @@ impl VmHeap {
             VmHeap::G1(h) => {
                 h.alloc_object_with_descriptors(class_id, num_fields, descriptor_bytes)
             }
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => {
+                h.alloc_object_with_descriptors(class_id, num_fields, descriptor_bytes)
+            }
         }
     }
 
@@ -354,6 +390,10 @@ impl VmHeap {
             VmHeap::G1(h) => {
                 h.try_alloc_object_with_descriptors(class_id, num_fields, descriptor_bytes)
             }
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => {
+                h.try_alloc_object_with_descriptors(class_id, num_fields, descriptor_bytes)
+            }
         }
     }
 
@@ -366,6 +406,8 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.try_alloc_array(class_id, element_type, length),
             VmHeap::G1(h) => h.try_alloc_array(class_id, element_type, length),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.try_alloc_array(class_id, element_type, length),
         }
     }
 
@@ -391,6 +433,8 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.is_object_address(addr),
             VmHeap::G1(h) => h.is_object_address(addr),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.is_object_address(addr),
         }
     }
 
@@ -432,6 +476,8 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.is_heap_addr(addr),
             VmHeap::G1(h) => h.is_heap_addr(addr),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.is_heap_addr(addr),
         }
     }
 
@@ -690,6 +736,8 @@ impl VmHeap {
                 .pin_region_for_addr(obj.as_ptr() as usize)
                 .into_iter()
                 .collect(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => Vec::new(),
         }
     }
 
@@ -710,6 +758,8 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.get_array_element_unboxing(obj, index),
             VmHeap::G1(h) => h.get_array_element(obj, index),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.get_array_element(obj, index),
         }
     }
 
@@ -746,6 +796,17 @@ impl VmHeap {
                     // Char elements decode to `Value::Int(u16 as i32)`; mask
                     // back to the 16-bit code unit. `i < len` so the index is
                     // always in bounds and `get_array_element` returns `Ok`.
+                    if let Ok(v) = h.get_array_element(obj, i) {
+                        *slot = v.as_int().unwrap_or(0) as u16;
+                    }
+                }
+                out
+            }
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => {
+                let len = h.array_length(obj);
+                let mut out = vec![0u16; len];
+                for (i, slot) in out.iter_mut().enumerate() {
                     if let Ok(v) = h.get_array_element(obj, i) {
                         *slot = v.as_int().unwrap_or(0) as u16;
                     }
@@ -792,6 +853,8 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.needs_gc(),
             VmHeap::G1(h) => h.needs_gc(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.needs_gc(),
         }
     }
 
@@ -808,6 +871,8 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.collect_garbage(stw, roots, monitors),
             VmHeap::G1(h) => h.collect_garbage(stw, roots, monitors),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.collect_garbage(stw, roots, monitors),
         }
     }
 
@@ -833,6 +898,11 @@ impl VmHeap {
                 let result = h.collect_garbage(stw, roots, monitors);
                 (result, Vec::new())
             }
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => {
+                let result = h.collect_garbage(stw, roots, monitors);
+                (result, Vec::new())
+            }
         }
     }
 
@@ -850,6 +920,8 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.write_barrier(obj, stored_value),
             VmHeap::G1(h) => h.write_barrier(obj, stored_value),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.write_barrier(obj, stored_value),
         }
     }
 
@@ -873,6 +945,8 @@ impl VmHeap {
                 <GenerationalHeap as GarbageCollector>::write_barrier_pre(h, slot, old)
             }
             VmHeap::G1(h) => <G1Collector as GarbageCollector>::write_barrier_pre(h, slot, old),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => <ZgcRealHeap as GarbageCollector>::write_barrier_pre(h, slot, old),
         }
     }
 
@@ -880,6 +954,8 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.allocated_bytes(),
             VmHeap::G1(h) => h.allocated_bytes(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.allocated_bytes(),
         }
     }
 
@@ -898,6 +974,8 @@ impl VmHeap {
                 s.minor_gc_count + s.major_gc_count
             }
             VmHeap::G1(h) => h.collection_count(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.gc_count() as u64,
         }
     }
 
@@ -909,6 +987,8 @@ impl VmHeap {
                 h.young_semi_capacity() + h.old_gen_capacity()
             }
             VmHeap::G1(h) => h.heap_capacity(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.heap_capacity(),
         }
     }
 
@@ -921,6 +1001,8 @@ impl VmHeap {
                 (from, cap)
             }
             VmHeap::G1(h) => h.eden_stats(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => (0, 0),
         }
     }
 
@@ -933,6 +1015,8 @@ impl VmHeap {
                 (used, cap)
             }
             VmHeap::G1(h) => h.old_gen_stats(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => (h.allocated_bytes(), h.heap_capacity()),
         }
     }
 
@@ -950,6 +1034,8 @@ impl VmHeap {
                     h.satb_pre_barrier(obj_ref.as_ptr() as usize);
                 }
             }
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => {}
         }
     }
 
@@ -981,6 +1067,8 @@ impl VmHeap {
                     }
                 }
             }
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => {}
         }
     }
 
@@ -989,6 +1077,8 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.old_gen_needs_gc(),
             VmHeap::G1(_) => false, // G1 manages its own concurrent marking
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => false,
         }
     }
 
@@ -997,6 +1087,8 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.old_gen_info(),
             VmHeap::G1(_) => (0, 0),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => (0, 0),
         }
     }
 
@@ -1006,6 +1098,8 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => Some(h.old_gen_lock()),
             VmHeap::G1(_) => None,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => None,
         }
     }
 
@@ -1018,6 +1112,8 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.collect_young_to_old_roots(),
             VmHeap::G1(_) => Vec::new(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => Vec::new(),
         }
     }
 
@@ -1030,6 +1126,8 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.enable_concurrent_gc(satb_queue, gc_state),
             VmHeap::G1(_) => {} // G1 has built-in concurrent marking
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => {}
         }
     }
 
@@ -1063,6 +1161,14 @@ impl VmHeap {
                     Some(())
                 }
             }
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => {
+                if self.needs_gc() {
+                    None
+                } else {
+                    Some(())
+                }
+            }
         }
     }
 
@@ -1081,6 +1187,8 @@ impl VmHeap {
             VmHeap::Generational(h) => h.young_bump_headroom(size),
             // G1's Eden is region-granular; reuse the reserve signal.
             VmHeap::G1(_) => !self.needs_gc(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => !self.needs_gc(),
         }
     }
 
@@ -1096,6 +1204,8 @@ impl VmHeap {
             // G1 refills carve whole-region chunks from Eden; the reserve
             // signal is the applicable "room without forcing a GC" answer.
             VmHeap::G1(_) => !self.needs_gc(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => !self.needs_gc(),
         }
     }
 
@@ -1113,6 +1223,8 @@ impl VmHeap {
                     && g1.marking_threshold_bytes() > 0
             }
             VmHeap::Generational(_) => false,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => false,
         }
     }
 
@@ -1121,6 +1233,8 @@ impl VmHeap {
         match self {
             VmHeap::G1(g1) => g1.gc_state.is_marking_active(),
             VmHeap::Generational(_) => false,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => false,
         }
     }
 
@@ -1176,6 +1290,8 @@ impl VmHeap {
         match self {
             VmHeap::G1(g1) => g1.concurrent_mark_step(work_amount),
             VmHeap::Generational(_) => true,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => true,
         }
     }
 
@@ -1317,6 +1433,10 @@ impl VmHeap {
                 // but log that GC logging was requested.
                 tracing::info!("[GC] Verbose GC logging enabled (generational collector)");
             }
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => {
+                tracing::info!("[GC] Verbose GC logging enabled (ZGC-real collector)");
+            }
         }
     }
 
@@ -1345,6 +1465,8 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.refill_tlab(requested_size),
             VmHeap::G1(h) => h.refill_tlab(requested_size),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => None,
         }
     }
 
@@ -1371,10 +1493,10 @@ impl VmHeap {
             // `GenerationalHeap::is_live_young_survivor` for the soundness
             // argument (STW-window-only, zeroed-span discriminator,
             // moving-collection compatibility).
-            VmHeap::Generational(h) => {
-                h.is_old_gen_addr(addr) || h.is_live_young_survivor(addr)
-            }
+            VmHeap::Generational(h) => h.is_old_gen_addr(addr) || h.is_live_young_survivor(addr),
             VmHeap::G1(h) => h.is_addr_in_live_region(addr),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.is_heap_addr(addr).is_some(),
         }
     }
 
@@ -1386,6 +1508,8 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.is_in_young_either(addr as *const u8),
             VmHeap::G1(_) => false,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => false,
         }
     }
 

@@ -524,10 +524,7 @@ pub(crate) fn build_engine_client_config_with_identity(
                 provider: Arc::new(rustls::crypto::ring::default_provider()),
             });
             return build_client_config_with_revocation_and_resolver(
-                roots,
-                alpn,
-                revocation,
-                resolver,
+                roots, alpn, revocation, resolver,
             );
         }
     }
@@ -801,8 +798,8 @@ fn sniff_private_key_pem_header(der: &[u8]) -> &'static str {
         }
         let after_version = tlv_value_offset(der, after_outer)?;
         match der.get(after_version) {
-            Some(0x30) => Some("PRIVATE KEY"),     // PKCS#8 AlgorithmIdentifier
-            Some(0x04) => Some("EC PRIVATE KEY"),  // SEC1 privateKey OCTET STRING
+            Some(0x30) => Some("PRIVATE KEY"),    // PKCS#8 AlgorithmIdentifier
+            Some(0x04) => Some("EC PRIVATE KEY"), // SEC1 privateKey OCTET STRING
             Some(0x02) => Some("RSA PRIVATE KEY"), // PKCS#1 modulus INTEGER
             _ => None,
         }
@@ -828,7 +825,10 @@ pub fn install_identity_from_der(key_pkcs8_der: &[u8], chain_der: &[Vec<u8>]) {
         eprintln!(
             "[dbg-tls-hs] install_identity_from_der: key_der_len={} full_hex={} sniffed_header={}",
             key_pkcs8_der.len(),
-            key_pkcs8_der.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+            key_pkcs8_der
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>(),
             __sniffed
         );
     }
@@ -1256,9 +1256,13 @@ impl rustls::client::danger::ServerCertVerifier for OcspAwareServerCertVerifier 
         // never weaken this: OCSP checking only runs on an already-trusted
         // chain, same ordering `x509_manager::validate_chain` uses (revocation
         // is its "Step 7", after signature verification).
-        let verified =
-            self.inner
-                .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)?;
+        let verified = self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
 
         let mut chain_der: Vec<Vec<u8>> = Vec::with_capacity(1 + intermediates.len());
         chain_der.push(end_entity.as_ref().to_vec());
@@ -1289,8 +1293,14 @@ impl rustls::client::danger::ServerCertVerifier for OcspAwareServerCertVerifier 
         // DOES end in a self-signed cert, that cert is its own issuer, so
         // `parsed.last()` already carries the right subject/SPKI either way.
         let anchor_like = crate::x509_manager::AnchorInfo {
-            subject_der: parsed.last().map(|c| c.issuer_der.clone()).unwrap_or_default(),
-            spki_der: parsed.last().map(|c| c.spki_der.clone()).unwrap_or_default(),
+            subject_der: parsed
+                .last()
+                .map(|c| c.issuer_der.clone())
+                .unwrap_or_default(),
+            spki_der: parsed
+                .last()
+                .map(|c| c.spki_der.clone())
+                .unwrap_or_default(),
             full_cert_der: None,
         };
         // The last presented cert's issuer is outside `parsed` (it wasn't
@@ -1625,10 +1635,11 @@ fn is_abstract_method_error(
     result: &Result<Option<Value>, cratonvm_types::error::MethodCallFailed>,
 ) -> bool {
     match result {
-        Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc)) => ctx
-            .class_name_of_id(ctx.class_id_of_object(*exc))
-            .as_deref()
-            == Some("java/lang/AbstractMethodError"),
+        Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc)) => {
+            ctx.class_name_of_id(ctx.class_id_of_object(*exc))
+                .as_deref()
+                == Some("java/lang/AbstractMethodError")
+        }
         _ => false,
     }
 }
@@ -1657,7 +1668,10 @@ impl JavaKeyManagerResolver {
         sigschemes: &[SignatureScheme],
     ) -> Option<Arc<CertifiedKey>> {
         let dbg = std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok();
-        let mut km_list = ctx_key_managers_table().lock().get(&self.km_ctx_key)?.clone();
+        let mut km_list = ctx_key_managers_table()
+            .lock()
+            .get(&self.km_ctx_key)?
+            .clone();
         if dbg {
             eprintln!(
                 "[dbg-tls-auth] JavaKeyManagerResolver::resolve km_ctx_key={} km_count={} root_hint_subjects={} sigschemes={:?}",
@@ -1672,7 +1686,10 @@ impl JavaKeyManagerResolver {
         }
         let key_types = key_types_from_sigschemes(sigschemes);
         if dbg {
-            eprintln!("[dbg-tls-auth] JavaKeyManagerResolver key_types={:?}", key_types);
+            eprintln!(
+                "[dbg-tls-auth] JavaKeyManagerResolver key_types={:?}",
+                key_types
+            );
         }
         let key_type_arr = materialize_java_string_array(ctx, &key_types);
         let issuers_arr = build_issuer_principals(ctx, root_hint_subjects);
@@ -1683,7 +1700,10 @@ impl JavaKeyManagerResolver {
         // `apps_h2.rs`/`atomic_updater.rs` batch-pin pattern: keep each
         // individual handle (not assumed-sequential arithmetic), unpin the
         // whole batch via the FIRST handle at the end.
-        let pins: Vec<usize> = km_list.iter().map(|&obj| ctx.pin_native_root(obj)).collect();
+        let pins: Vec<usize> = km_list
+            .iter()
+            .map(|&obj| ctx.pin_native_root(obj))
+            .collect();
         let first_pin = pins[0];
 
         let result = (|| {
@@ -1941,7 +1961,9 @@ fn cipher_provider_for(enabled: &[String]) -> Arc<rustls::crypto::CryptoProvider
 /// leave an existing connection alone instead of tearing it down for a
 /// restriction that cannot actually be enforced through rustls.
 pub(crate) fn any_cipher_mappable(ciphers: &[String]) -> bool {
-    ciphers.iter().any(|n| java_cipher_name_to_suite(n).is_some())
+    ciphers
+        .iter()
+        .any(|n| java_cipher_name_to_suite(n).is_some())
 }
 
 /// A `ClientCertVerifier` that accepts any structurally-valid, correctly
@@ -3113,7 +3135,11 @@ mod tests {
         let mut out = Vec::new();
         let n = bb_read_into(&mut ctx, bb, &mut out, 64);
         assert_eq!(n, 3);
-        assert_eq!(out, vec![11, 12, 13], "must read hb[offset+pos..offset+lim]");
+        assert_eq!(
+            out,
+            vec![11, 12, 13],
+            "must read hb[offset+pos..offset+lim]"
+        );
         assert_eq!(
             ctx.get_field_by_name(bb, "position").as_int(),
             Some(4),
@@ -3136,7 +3162,11 @@ mod tests {
         let mut ctx = crate::test_utils::mock_ctx();
         let mut native: Vec<u8> = (0u8..32).collect();
         let bb = alloc_concurrent_synthetic(&mut ctx, "java/nio/DirectByteBuffer", 8);
-        ctx.set_field_by_name(bb, "address", Value::Long(native.as_mut_ptr() as usize as i64));
+        ctx.set_field_by_name(
+            bb,
+            "address",
+            Value::Long(native.as_mut_ptr() as usize as i64),
+        );
         ctx.set_field_by_name(bb, "position", Value::Int(2));
         ctx.set_field_by_name(bb, "limit", Value::Int(7));
         ctx.set_field_by_name(bb, "capacity", Value::Int(32));
@@ -3167,7 +3197,11 @@ mod tests {
         let mut ctx = crate::test_utils::mock_ctx();
         let mut native: Vec<u8> = (10u8..18).collect(); // 8 bytes
         let bb = alloc_concurrent_synthetic(&mut ctx, "java/nio/DirectByteBuffer", 8);
-        ctx.set_field_by_name(bb, "address", Value::Long(native.as_mut_ptr() as usize as i64));
+        ctx.set_field_by_name(
+            bb,
+            "address",
+            Value::Long(native.as_mut_ptr() as usize as i64),
+        );
         ctx.set_field_by_name(bb, "position", Value::Int(0));
         ctx.set_field_by_name(bb, "limit", Value::Int(64)); // lies past cap
         ctx.set_field_by_name(bb, "capacity", Value::Int(8));
@@ -3206,7 +3240,11 @@ mod tests {
         let n = bb_read_into(&mut ctx, bb, &mut out, 64);
         assert_eq!(n, 2);
         assert_eq!(out, vec![41, 42]);
-        assert_eq!(ctx.get_field(bb, 1).as_int(), Some(3), "slot-1 pos advanced");
+        assert_eq!(
+            ctx.get_field(bb, 1).as_int(),
+            Some(3),
+            "slot-1 pos advanced"
+        );
     }
 
     /// A shape we cannot resolve must move zero bytes (and not panic).
@@ -4730,8 +4768,7 @@ fn bb_bytes_range(
             }
             // SAFETY: bounded by `cap` — see `bb_get_byte`.
             unsafe {
-                std::slice::from_raw_parts((addr as usize + from) as *const u8, end - from)
-                    .to_vec()
+                std::slice::from_raw_parts((addr as usize + from) as *const u8, end - from).to_vec()
             }
         }
         BbBacking::Unresolved => Vec::new(),
@@ -5046,8 +5083,9 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                             .as_ref()
                             .map(|r| !r.root_ders.is_empty())
                             .unwrap_or(false);
-                    let request =
-                        state.need_client_auth || state.want_client_auth || speculative_optional_auth;
+                    let request = state.need_client_auth
+                        || state.want_client_auth
+                        || speculative_optional_auth;
                     let client_ca = if request {
                         let trust_roots = state
                             .trust_roots_override
@@ -5337,7 +5375,10 @@ fn engine_run_trust_check(
         _ => "RSA",
     };
 
-    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), pending.peer_chain_der.len());
+    let arr = ctx.new_ref_array(
+        cratonvm_types::ClassId::new(0),
+        pending.peer_chain_der.len(),
+    );
     for (i, der) in pending.peer_chain_der.iter().enumerate() {
         let mirror = crate::keystore::make_x509_mirror(ctx, "peer", der);
         ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
@@ -6386,7 +6427,7 @@ fn do_unwrap(
                 return Err(RuntimeError::IOException {
                     message: "engine handle missing".into(),
                 }
-                .into())
+                .into());
             }
         };
         let mut plaintext: Vec<u8> = Vec::new();

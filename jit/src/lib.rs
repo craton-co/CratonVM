@@ -1133,6 +1133,11 @@ pub struct CompiledMethod {
     /// Normal entry initializes this in the prologue; OSR entry initializes it
     /// in the trampoline because it jumps past that prologue. 0 when unused.
     pub jit_thread_slot_off: i32,
+    /// Frame slot of the prologue-cached native-stack floor for the inline
+    /// self-call check. OSR trampolines initialise it to `usize::MAX`
+    /// (`RSP > MAX` is unsatisfiable) so OSR-entered frames always take the
+    /// out-of-line guard helper. `0` = not reserved.
+    pub stack_floor_slot_off: i32,
     /// OSR metadata: optional `jit_frame_record` helper pointer. Normal method
     /// entry records exact RBP from the JIT prologue; OSR bypasses that
     /// prologue, so the trampoline records its own RBP after `mov rbp, rsp`.
@@ -1433,6 +1438,7 @@ impl CompiledMethod {
             osr_xmm_saved_base: 0,
             osr_heap_local_offset: 0,
             jit_thread_slot_off: 0,
+            stack_floor_slot_off: 0,
             osr_frame_record: 0,
             shadow_thread_slot_off: 0,
             shadow_savetop_slot_off: 0,
@@ -1492,6 +1498,7 @@ impl CompiledMethod {
             osr_xmm_saved_base: 0,
             osr_heap_local_offset: 0,
             jit_thread_slot_off: 0,
+            stack_floor_slot_off: 0,
             osr_frame_record: 0,
             shadow_thread_slot_off: 0,
             shadow_savetop_slot_off: 0,
@@ -1893,6 +1900,7 @@ impl CompiledMethod {
             self.osr_xmm_saved_base,
             self.osr_heap_local_offset,
             self.jit_thread_slot_off,
+            self.stack_floor_slot_off,
             self.osr_frame_record,
             self.needs_context,
             dead_mask,
@@ -1954,6 +1962,7 @@ unsafe fn emit_osr_trampoline(
     xmm_saved_base: i32,
     heap_local_offset: i32,
     jit_thread_slot_off: i32,
+    stack_floor_slot_off: i32,
     frame_record: usize,
     needs_context: bool,
     dead_mask: u64,
@@ -2094,6 +2103,22 @@ unsafe fn emit_osr_trampoline(
         tramp.emit_byte(0x89);
         tramp.emit_byte(0x85 | ((arg2_reg & 7) << 3));
         tramp.emit(&neg_off.to_le_bytes());
+    }
+
+    // Inline self-recursion check: OSR bypasses the compiled prologue that
+    // caches the native-stack floor, so initialise the slot to usize::MAX
+    // (`MOV qword [rbp - off], -1` -- imm32 sign-extends). `RSP > MAX` is
+    // unsatisfiable, so every self-call site in an OSR-entered frame takes
+    // the out-of-line guard helper (safe, merely slower). Leaving the slot
+    // uninitialised could skip the guard on garbage and miss a
+    // StackOverflowError.
+    if stack_floor_slot_off != 0 {
+        let neg_off = -stack_floor_slot_off;
+        tramp.emit_byte(0x48); // REX.W
+        tramp.emit_byte(0xC7); // MOV r/m64, imm32 (sign-extended)
+        tramp.emit_byte(0x85); // mod=10, reg=/0, rm=rbp
+        tramp.emit(&neg_off.to_le_bytes());
+        tramp.emit(&(-1i32).to_le_bytes());
     }
 
     // OSR bypasses the compiled method's normal prologue, including the exact
@@ -2298,6 +2323,7 @@ unsafe fn osr_trampoline(
     xmm_saved_base: i32,
     heap_local_offset: i32,
     jit_thread_slot_off: i32,
+    stack_floor_slot_off: i32,
     frame_record: usize,
     needs_context: bool,
     dead_mask: u64,
@@ -2341,6 +2367,7 @@ unsafe fn osr_trampoline(
                 xmm_saved_base,
                 heap_local_offset,
                 jit_thread_slot_off,
+                stack_floor_slot_off,
                 frame_record,
                 needs_context,
                 dead_mask,
@@ -6496,14 +6523,12 @@ fn try_compile_inner(
     // (docs/known-issues/jasper-jdt-parser-arrayindexoutofbounds.md): an
     // always-deopting reference-array `System.arraycopy` call inside a method
     // with a live `this` made every single invocation re-run from entry.
-    let param_oop_mask = if x64::precise_jit_maps_enabled()
-        || x64::moving_young_enabled()
-        || deopt_real_enabled()
-    {
-        compute_param_oop_mask(&cached.method_descriptor, cached.is_static)
-    } else {
-        0
-    };
+    let param_oop_mask =
+        if x64::precise_jit_maps_enabled() || x64::moving_young_enabled() || deopt_real_enabled() {
+            compute_param_oop_mask(&cached.method_descriptor, cached.is_static)
+        } else {
+            0
+        };
 
     // deopt-osr Step 9 follow-up (c): the per-bci de-spec key for this method
     // (same `"<class>.<method>:<descriptor>"` form the deopt log / method_epochs
@@ -7389,10 +7414,7 @@ mod tests {
     #[test]
     fn snakeyaml_emitter_emit_final_guard_is_exact() {
         assert_eq!(
-            snakeyaml_emitter_emit_jit_deny_prefix(
-                "org/yaml/snakeyaml/emitter/Emitter",
-                "emit",
-            ),
+            snakeyaml_emitter_emit_jit_deny_prefix("org/yaml/snakeyaml/emitter/Emitter", "emit",),
             Some("org/yaml/snakeyaml/emitter/")
         );
         assert_eq!(
@@ -7610,7 +7632,7 @@ mod tests {
         let c2 = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, true, false, false, false, false, false,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         let c2_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
         assert!(c2.is_some(), "optimize=true (C2) must compile `add`");
@@ -7624,7 +7646,7 @@ mod tests {
         let c1 = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, false, false, false, false, false, false,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         let c1_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
         assert!(
@@ -7711,13 +7733,18 @@ mod tests {
             false,
             false,
             false,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(c2.is_some(), "optimize=true (C2) must compile `get`");
+        let expected_ir_compiles = if cratonvm_types::compact_ref_fields_enabled() {
+            0
+        } else {
+            1
+        };
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
-            1,
-            "an int getfield method must route through the IR pipeline"
+            expected_ir_compiles,
+            "compact field layout bails to single-pass; legacy layout routes int getfield through IR"
         );
 
         // Without the field resolver the builder cannot resolve the field, so
@@ -7728,7 +7755,7 @@ mod tests {
         let _ = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, true, false, false, false, false, false,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -7956,6 +7983,13 @@ mod tests {
         fi.insert(10usize, (0usize, b'I')); // putfield field 0
         fi.insert(13usize, (0usize, b'I')); // getfield field 0
         builder.set_field_info(fi);
+        if cratonvm_types::compact_ref_fields_enabled() {
+            assert!(
+                builder.build(&code, 17).is_none(),
+                "compact field layout must bail to the checked single-pass path"
+            );
+            return;
+        }
         let mut graph = builder.build(&code, 17).expect("IR build");
         assert!(
             graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
@@ -8027,6 +8061,13 @@ mod tests {
         fi.insert(11usize, (0usize, b'I')); // putfield field 0
         fi.insert(15usize, (0usize, b'I')); // getfield field 0
         builder.set_field_info(fi);
+        if cratonvm_types::compact_ref_fields_enabled() {
+            assert!(
+                builder.build(&code, 19).is_none(),
+                "compact field layout must bail to the checked single-pass path"
+            );
+            return;
+        }
         let mut graph = builder
             .build(&code, 19)
             .expect("IR build must succeed with astore lowered");
@@ -8156,14 +8197,33 @@ mod tests {
             false,
             false,
             false,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
-        assert!(r.is_some(), "an elidable `new` method must compile via IR");
-        assert_eq!(
-            IR_LOWER_COMPILES.with(|c| c.get()),
-            1,
-            "the elidable `new` method must route through the IR pipeline"
-        );
+        if cratonvm_types::compact_ref_fields_enabled() {
+            // Compact field layout bails the IR builder on `new`/getfield/putfield
+            // (see the ir.rs field-op tests) before it ever reaches the
+            // elidable-`<init>` check, and this test deliberately supplies no
+            // `cp_invoke_resolver` (a correctly-elided `new` should never need
+            // single-pass's invoke resolution) — so there is no fallback and the
+            // compile bails entirely.
+            assert!(
+                r.is_none(),
+                "compact field layout must bail to the checked single-pass path, \
+                 which this test starves of a cp_invoke_resolver on purpose"
+            );
+            assert_eq!(
+                IR_LOWER_COMPILES.with(|c| c.get()),
+                0,
+                "compact field layout bails the IR pipeline before the elidable `new` can route through it"
+            );
+        } else {
+            assert!(r.is_some(), "an elidable `new` method must compile via IR");
+            assert_eq!(
+                IR_LOWER_COMPILES.with(|c| c.get()),
+                1,
+                "the elidable `new` method must route through the IR pipeline"
+            );
+        }
 
         // Without it → the builder bails on the `invokespecial` → not the IR path.
         IR_LOWER_COMPILES.with(|c| c.set(0));
@@ -8189,7 +8249,7 @@ mod tests {
             false,
             false,
             false,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -8262,7 +8322,7 @@ mod tests {
             false, // ir_emit_long
             false, // ir_emit_virtual_calls
             false, // ir_emit_fp
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None,  // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(
             with.is_some(),
@@ -8302,7 +8362,7 @@ mod tests {
             false, // ir_emit_long OFF
             false, // ir_emit_virtual_calls OFF
             false, // ir_emit_fp OFF
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None,  // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -8376,7 +8436,7 @@ mod tests {
             false, // ir_emit_long
             false, // ir_emit_virtual_calls OFF
             false, // ir_emit_fp OFF
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None,  // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(
             with.is_some(),
@@ -8418,7 +8478,7 @@ mod tests {
             false, // ir_emit_long OFF
             false, // ir_emit_virtual_calls OFF
             false, // ir_emit_fp OFF
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None,  // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -8462,7 +8522,7 @@ mod tests {
         let with = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, true, false, false, true, false, false,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(with.is_some(), "long method must compile with ir_emit_long");
         assert_eq!(
@@ -8476,7 +8536,7 @@ mod tests {
         let _without = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, true, false, false, false, false, false,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -8519,7 +8579,7 @@ mod tests {
         let with = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, true, false, false, false, false, true,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(with.is_some(), "FP method must compile with ir_emit_fp");
         assert_eq!(
@@ -8533,7 +8593,7 @@ mod tests {
         let _without = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, true, false, false, false, false, false,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -8606,7 +8666,7 @@ mod tests {
             false, // ir_emit_long
             true,  // ir_emit_virtual_calls ON
             false, // ir_emit_fp OFF
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None,  // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(
             with.is_some(),
@@ -8648,7 +8708,7 @@ mod tests {
             false, // ir_emit_long
             false, // ir_emit_virtual_calls OFF
             false, // ir_emit_fp OFF
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None,  // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -9516,9 +9576,7 @@ mod tests {
             desc.clone(),
             CompiledMethod::new(buf),
         );
-        let cm = cache
-            .get(&class, &method, &desc)
-            .expect("compiled method");
+        let cm = cache.get(&class, &method, &desc).expect("compiled method");
         let entry = cm.entry_ptr() as usize;
         register_jit_code_range(entry, cm.code_len(), Arc::as_ptr(&cm) as usize);
         drop(cm);
@@ -9762,7 +9820,7 @@ mod tests {
                     false,
                     false,
                     false,
-                None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+                    None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
                 )?;
                 assert_eq!(
                     compiled_b._jit_invoke_infos.len(),
@@ -9795,7 +9853,7 @@ mod tests {
             false,
             false,
             false,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         )
         .expect("A should compile");
 

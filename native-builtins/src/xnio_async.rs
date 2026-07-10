@@ -400,7 +400,7 @@ fn xnio_obj_key_for(ctx: &dyn NativeContext, obj: ObjectRef) -> usize {
     if let Some(slot) = slots.iter().find(|s| s.last_ptr == ptr) {
         return pack_xnio_obj_key(hash, slot.generation);
     }
-    if hash != 0 && slots.len() == 1 {
+    if slots.len() == 1 {
         slots[0].last_ptr = ptr;
         return pack_xnio_obj_key(hash, slots[0].generation);
     }
@@ -1227,11 +1227,9 @@ fn native_option_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let (inner, key, default_val) = option_map_get_key(ctx, args)?;
 
     match inner.entries.get(&key) {
-        Some(OptionValue::Int(n)) => Ok(Some(crate::lang_class::box_value(
-            ctx,
-            Value::Int(*n),
-            "I",
-        ))),
+        Some(OptionValue::Int(n)) => {
+            Ok(Some(crate::lang_class::box_value(ctx, Value::Int(*n), "I")))
+        }
         Some(OptionValue::Long(n)) => Ok(Some(crate::lang_class::box_value(
             ctx,
             Value::Long(*n),
@@ -1743,9 +1741,37 @@ fn native_iof_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 // Natives: FutureResult (producer side)
 // ---------------------------------------------------------------------------
 
-/// `FutureResult.<init>()V` — allocate the paired future + producer.
+fn future_result_real_io_future(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(this, "ioFuture") {
+        Value::Object(Some(io_future)) => Some(io_future),
+        _ => None,
+    }
+}
+
+fn future_result_has_real_layout(ctx: &dyn NativeContext) -> bool {
+    ctx.resolve_field_index("org/xnio/FutureResult", "ioFuture")
+        .is_some()
+}
+
+/// `FutureResult.<init>()V` - allocate the paired future + producer.
 fn native_future_result_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if future_result_has_real_layout(ctx) {
+        let pin = ctx.pin_native_root(this);
+        let io_future = match ctx.new_object_initialized(
+            "org/xnio/FutureResult$1",
+            "(Lorg/xnio/FutureResult;)V",
+            &[Value::Object(Some(this))],
+        )? {
+            Some(Value::Object(Some(obj))) => obj,
+            _ => return Err(ise("FutureResult.<init>: failed to allocate ioFuture")),
+        };
+        let this = ctx.read_native_pin(pin, this);
+        ctx.unpin_native_roots(pin);
+        ctx.set_field_by_name(this, "ioFuture", Value::Object(Some(io_future)));
+        return Ok(None);
+    }
+
     let inner = IoFutureInner::new_waiting();
     let h = register_future(inner.clone());
     ctx.set_field(this, FR_FUTURE_HANDLE, Value::Long(h));
@@ -1766,6 +1792,9 @@ fn native_future_result_get_future(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if let Some(io_future) = future_result_real_io_future(ctx, this) {
+        return Ok(Some(Value::Object(Some(io_future))));
+    }
     let inner = inner_from_fr(ctx, this)?;
     // Rebuild a JVM IoFuture object pointing at the same Arc.
     let obj = alloc_io_future(ctx, inner);
@@ -1779,6 +1808,15 @@ fn native_future_result_set_result(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let value = args.get(1).copied().unwrap_or(Value::Object(None));
+    if let Some(io_future) = future_result_real_io_future(ctx, this) {
+        return ctx.invoke_virtual_declared(
+            "org/xnio/AbstractIoFuture",
+            io_future,
+            "setResult",
+            "(Ljava/lang/Object;)Z",
+            &[value],
+        );
+    }
     let inner = inner_from_fr(ctx, this)?;
     if !inner.try_transition(STATUS_DONE) {
         return Ok(Some(Value::Int(0)));
@@ -1805,6 +1843,15 @@ fn native_future_result_set_exception(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let exc = args.get(1).copied().unwrap_or(Value::Object(None));
+    if let Some(io_future) = future_result_real_io_future(ctx, this) {
+        return ctx.invoke_virtual_declared(
+            "org/xnio/AbstractIoFuture",
+            io_future,
+            "setException",
+            "(Ljava/io/IOException;)Z",
+            &[exc],
+        );
+    }
     let inner = inner_from_fr(ctx, this)?;
     if !inner.try_transition(STATUS_FAILED) {
         return Ok(Some(Value::Int(0)));
@@ -1846,6 +1893,15 @@ fn native_future_result_set_cancelled(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if let Some(io_future) = future_result_real_io_future(ctx, this) {
+        return ctx.invoke_virtual_declared(
+            "org/xnio/AbstractIoFuture",
+            io_future,
+            "setCancelled",
+            "()Z",
+            &[],
+        );
+    }
     let inner = inner_from_fr(ctx, this)?;
     if !inner.try_transition(STATUS_CANCELLED) {
         return Ok(Some(Value::Int(0)));

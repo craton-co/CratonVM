@@ -187,11 +187,28 @@ pub(crate) struct SsSide {
     pub listener_id: i32,
 }
 
-// Socket and ServerSocket side-table state must survive object relocation.
-// Key these maps by identity hash rather than ObjectRef so a moving GC cannot
-// make an established socket look unconnected after its object address changes.
-fn sock_side_table() -> &'static Mutex<HashMap<i32, SockSide>> {
-    static T: OnceLock<Mutex<HashMap<i32, SockSide>>> = OnceLock::new();
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct NativeObjKey {
+    vm: usize,
+    identity: i32,
+}
+
+fn native_obj_key(ctx: &dyn NativeContext, obj: ObjectRef) -> NativeObjKey {
+    NativeObjKey {
+        vm: ctx.vm_identity(),
+        identity: ctx.identity_hash_code(obj),
+    }
+}
+
+// GC note (gc-followups-20260706): Socket state used to be keyed by the raw
+// ObjectRef address. A moving GC can relocate a connected Socket between
+// connect()/accept() and a later getInputStream()/getOutputStream(), making the
+// lookup miss and default to stream_id=-1 ("not connected"). Key Socket state
+// by VM identity + System.identityHashCode instead; both are stable across
+// relocation, and the payload contains only plain integers. ServerSocket /
+// DatagramSocket / InetAddress side tables still need the same treatment.
+fn sock_side_table() -> &'static Mutex<HashMap<NativeObjKey, SockSide>> {
+    static T: OnceLock<Mutex<HashMap<NativeObjKey, SockSide>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -200,10 +217,8 @@ fn ss_side_table() -> &'static Mutex<HashMap<i32, SsSide>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn sock_get(ctx: &dyn NativeContext, this: ObjectRef) -> SockSide {
-    let key = ctx.identity_hash_code(this);
-    let t = sock_side_table().lock();
-    t.get(&key).copied().unwrap_or(SockSide {
+fn sock_default() -> SockSide {
+    SockSide {
         host_id: 0,
         port: 0,
         local_port: 0,
@@ -211,21 +226,21 @@ fn sock_get(ctx: &dyn NativeContext, this: ObjectRef) -> SockSide {
         stream_id: -1,
         input_shutdown: 0,
         output_shutdown: 0,
-    })
+    }
+}
+
+fn sock_get(ctx: &dyn NativeContext, this: ObjectRef) -> SockSide {
+    let t = sock_side_table().lock();
+    t.get(&native_obj_key(ctx, this))
+        .copied()
+        .unwrap_or_else(sock_default)
 }
 
 fn sock_set<F: FnOnce(&mut SockSide)>(ctx: &dyn NativeContext, this: ObjectRef, f: F) {
-    let key = ctx.identity_hash_code(this);
     let mut t = sock_side_table().lock();
-    let entry = t.entry(key).or_insert(SockSide {
-        host_id: 0,
-        port: 0,
-        local_port: 0,
-        closed: 0,
-        stream_id: -1,
-        input_shutdown: 0,
-        output_shutdown: 0,
-    });
+    let entry = t
+        .entry(native_obj_key(ctx, this))
+        .or_insert_with(sock_default);
     f(entry);
 }
 
@@ -293,9 +308,23 @@ pub(crate) fn sock_set_for_create(
     port: i32,
     stream_id: i32,
 ) {
+    sock_set_for_create_with_local_port(ctx, this, port, 0, stream_id);
+}
+
+/// Same as [`sock_set_for_create`] but also records the real local (client)
+/// port, for callers that already resolved it from the live `TcpStream`
+/// (e.g. `phases_early.rs`'s `phase52_socket_connect`) instead of always
+/// defaulting to 0.
+pub(crate) fn sock_set_for_create_with_local_port(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    port: i32,
+    local_port: i32,
+    stream_id: i32,
+) {
     sock_set(ctx, this, |s| {
         s.port = port;
-        s.local_port = 0;
+        s.local_port = local_port;
         s.closed = 0;
         s.stream_id = stream_id;
     });
@@ -452,6 +481,15 @@ pub(crate) fn alloc_inet_address_external(
     ip: &str,
 ) -> ObjectRef {
     alloc_inet_address(ctx, host, ip)
+}
+
+/// `pub(crate)` re-export of [`resolve_host`] for sibling modules that need
+/// to resolve a hostname/literal to an IP string without duplicating the
+/// IPv4/IPv6-literal-then-DNS-fallback logic (used by `phases_early.rs`'s
+/// synthetic `InetSocketAddress(String,int)` constructor — see its call site
+/// for why an unconditionally-unresolved address is wrong there).
+pub(crate) fn resolve_host_external(host: &str) -> Option<String> {
+    resolve_host(host).ok().map(|ip| ip.to_string())
 }
 
 /// Read an InetAddress's `(hostName, ipAddress)` from the side table.
@@ -781,7 +819,24 @@ fn jar_url_conn_ext(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
     ext
 }
 
+fn file_url_path(url: &str) -> Option<String> {
+    let raw = url.strip_prefix("file:")?;
+    let without_host = raw.strip_prefix("//").unwrap_or(raw);
+    let path = if cfg!(windows) {
+        without_host.trim_start_matches('/').to_string()
+    } else {
+        without_host.to_string()
+    };
+    Some(path)
+}
+
 fn synthetic_resource_url_content_len(ctx: &mut dyn NativeContext, url: &str) -> i64 {
+    if let Some(path) = file_url_path(url) {
+        return std::fs::metadata(path)
+            .map(|m| m.len() as i64)
+            .unwrap_or(-1);
+    }
+
     let resource = if let Some(rest) = url.strip_prefix("jrt:") {
         let path = rest.trim_start_matches('/');
         match path.split_once('/') {
@@ -800,6 +855,22 @@ fn synthetic_resource_url_content_len(ctx: &mut dyn NativeContext, url: &str) ->
     ctx.find_resource(resource)
         .map(|bytes| bytes.len() as i64)
         .unwrap_or(-1)
+}
+
+fn synthetic_resource_url_last_modified(url: &str) -> i64 {
+    let Some(path) = file_url_path(url) else {
+        return 0;
+    };
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    let Ok(modified) = meta.modified() else {
+        return 0;
+    };
+    match modified.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis().min(i64::MAX as u128) as i64,
+        Err(_) => 0,
+    }
 }
 
 /// `JarURLConnection.getJarEntry()` — build the `java/util/jar/JarEntry` for the
@@ -1040,6 +1111,21 @@ fn java_byte_array_to_vec(
         });
     }
     Ok(out)
+}
+
+fn socket_dbg_bytes(data: &[u8]) -> String {
+    let preview_len = data.len().min(32);
+    let mut preview = String::new();
+    for (idx, byte) in data.iter().take(preview_len).enumerate() {
+        if idx != 0 {
+            preview.push(' ');
+        }
+        preview.push_str(&format!("{byte:02x}"));
+    }
+    if data.len() > preview_len {
+        preview.push_str(" ...");
+    }
+    preview
 }
 
 fn copy_bytes_into_java_array(
@@ -1345,9 +1431,7 @@ pub(crate) fn uri_equals(ctx: &dyn NativeContext, a: ObjectRef, b: ObjectRef) ->
                     // case-insensitive (RFC 3986 §3.2.2 — host is
                     // case-insensitive; this is the fix for the WHATWG
                     // IPv6-casing case above).
-                    a_user == b_user
-                        && opt_str_eq_ignore_case(&a_host, &b_host)
-                        && a_port == b_port
+                    a_user == b_user && opt_str_eq_ignore_case(&a_host, &b_host) && a_port == b_port
                 }
                 // Registry-based (or unparsable) authority: compare the raw
                 // authority string exactly, matching JDK's fallback branch.
@@ -1689,10 +1773,7 @@ fn uri_split(
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) =>
         {
-            (
-                Some(without_frag[..i].to_string()),
-                &without_frag[i + 1..],
-            )
+            (Some(without_frag[..i].to_string()), &without_frag[i + 1..])
         }
         _ => (None, without_frag),
     };
@@ -2009,13 +2090,9 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         let mut raw_path = parsed;
         if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "path") {
             if let Some(v) = ctx.read_string(s) {
-                let relative_without_authority = !raw.starts_with('/')
-                    && !raw.starts_with("//")
-                    && raw.find(':').is_none();
-                if !v.is_empty()
-                    && v != raw
-                    && !(relative_without_authority && v != raw_path)
-                {
+                let relative_without_authority =
+                    !raw.starts_with('/') && !raw.starts_with("//") && raw.find(':').is_none();
+                if !v.is_empty() && v != raw && !(relative_without_authority && v != raw_path) {
                     raw_path = v;
                 }
             }
@@ -2037,13 +2114,9 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         let mut raw_path = parsed;
         if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "path") {
             if let Some(v) = ctx.read_string(s) {
-                let relative_without_authority = !raw.starts_with('/')
-                    && !raw.starts_with("//")
-                    && raw.find(':').is_none();
-                if !v.is_empty()
-                    && v != raw
-                    && !(relative_without_authority && v != raw_path)
-                {
+                let relative_without_authority =
+                    !raw.starts_with('/') && !raw.starts_with("//") && raw.find(':').is_none();
+                if !v.is_empty() && v != raw && !(relative_without_authority && v != raw_path) {
                     raw_path = v;
                 }
             }
@@ -2424,7 +2497,11 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        Ok(Some(Value::Int(if uri_equals(ctx, this, other) { 1 } else { 0 })))
+        Ok(Some(Value::Int(if uri_equals(ctx, this, other) {
+            1
+        } else {
+            0
+        })))
     });
 
     // hashCode() — must agree with `equals` (see `uri_hash_code`): hashing the
@@ -2650,6 +2727,12 @@ fn re1_socket_read_stream(
     let n = read_result.map_err(|e| ioex(format!("Socket read failed: {e}")))?;
     if dbg {
         eprintln!("[dbg-sock] read: sid={stream_id} got={n}");
+        if std::env::var_os("CRATONVM_DBG_SOCK_BYTES").is_some() && n != 0 {
+            eprintln!(
+                "[dbg-sock-bytes] read: sid={stream_id} data={}",
+                socket_dbg_bytes(&tmp[..n])
+            );
+        }
     }
     if n == 0 {
         return Ok(Some(Value::Int(-1)));
@@ -2697,8 +2780,58 @@ fn re1_socket_write_stream(
             "[dbg-sock] write: sid={stream_id} sent={} bytes",
             data.len()
         );
+        if std::env::var_os("CRATONVM_DBG_SOCK_BYTES").is_some() {
+            eprintln!(
+                "[dbg-sock-bytes] write: sid={stream_id} data={}",
+                socket_dbg_bytes(&data)
+            );
+        }
     }
     Ok(None)
+}
+
+fn native_socket_input_stream_read_bytes(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let owner =
+        stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
+    let buf = obj_arg(args, 1)?;
+    let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+    let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+    re1_socket_read_stream(ctx, owner, buf, off, len)
+}
+
+fn native_socket_input_stream_read_array(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let owner =
+        stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
+    let buf = obj_arg(args, 1)?;
+    let len = ctx.array_length(buf) as i32;
+    re1_socket_read_stream(ctx, owner, buf, 0, len)
+}
+
+fn native_socket_input_stream_read_one(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let owner =
+        stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
+    let one = ctx.new_array(ArrayElementType::Byte, 1);
+    let r = re1_socket_read_stream(ctx, owner, one, 0, 1)?;
+    match r {
+        Some(Value::Int(-1)) => Ok(Some(Value::Int(-1))),
+        Some(Value::Int(_)) => {
+            let b = ctx.get_array_element(one, 0).as_int().unwrap_or(0);
+            Ok(Some(Value::Int(b & 0xff)))
+        }
+        _ => Ok(Some(Value::Int(-1))),
+    }
 }
 
 /// The real `java.net.Socket` constructor initializes `socketLock = new Object()`
@@ -2757,16 +2890,63 @@ fn re1_connect_socket(
     .map_err(|e| ioex(format!("ConnectException: {host}:{port}: {e}")))?;
     let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
     let stream_id = s2_alloc_stream(stream);
+    let pin_base = ctx.pin_native_root(this);
     let host_str = ctx.create_string(host);
-    ctx.set_field(this, SOCK_HOST, Value::Object(Some(host_str)));
-    sock_set(ctx, this, |s| {
+    let this_now = ctx.read_native_pin(pin_base, this);
+    ctx.set_field(this_now, SOCK_HOST, Value::Object(Some(host_str)));
+    sock_set(ctx, this_now, |s| {
         s.port = port;
         s.local_port = local_port;
         s.closed = 0;
         s.stream_id = stream_id;
     });
-    let _ = re1_init_socket_locks(ctx, this);
+    let _ = re1_init_socket_locks(ctx, this_now);
+    ctx.unpin_native_roots(pin_base);
     Ok(None)
+}
+
+fn re1_socket_adaptor_inet(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    local: bool,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let sc = match ctx.get_field_by_name(this, "sc") {
+        Value::Object(Some(sc)) => sc,
+        _ => return Ok(None),
+    };
+    let method = if local {
+        "getLocalAddress"
+    } else {
+        "getRemoteAddress"
+    };
+    let socket_addr = match ctx.invoke_virtual(sc, method, "()Ljava/net/SocketAddress;", &[])? {
+        Some(Value::Object(Some(addr))) => addr,
+        _ => return Ok(None),
+    };
+
+    if let Ok(Some(Value::Object(Some(addr)))) =
+        ctx.invoke_virtual(socket_addr, "getAddress", "()Ljava/net/InetAddress;", &[])
+    {
+        return Ok(Some(addr));
+    }
+
+    let host = match ctx.invoke_virtual(socket_addr, "getHostString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let host = if host.is_empty() {
+        match ctx.invoke_virtual(socket_addr, "getHostName", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        }
+    } else {
+        host
+    };
+    if host.is_empty() {
+        return Ok(None);
+    }
+    let ip = host.trim_matches(&['[', ']'][..]);
+    Ok(Some(alloc_inet_address(ctx, ip, ip)))
 }
 
 fn register_re1_socket(r: &mut NativeMethodRegistry) {
@@ -3047,6 +3227,9 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         "()Ljava/net/InetAddress;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            if let Some(addr) = re1_socket_adaptor_inet(ctx, this, false)? {
+                return Ok(Some(Value::Object(Some(addr))));
+            }
             let host = read_field_string_or(ctx, this, SOCK_HOST, "");
             if host.is_empty() {
                 return Ok(Some(Value::Object(None)));
@@ -3080,7 +3263,11 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         sock,
         "getLocalAddress",
         "()Ljava/net/InetAddress;",
-        |ctx, _args| {
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Some(addr) = re1_socket_adaptor_inet(ctx, this, true)? {
+                return Ok(Some(Value::Object(Some(addr))));
+            }
             let ia = alloc_inet_address(ctx, "localhost", "127.0.0.1");
             Ok(Some(Value::Object(Some(ia))))
         },
@@ -3121,15 +3308,12 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     );
 
     let sis = "java/net/Socket$SocketInputStream";
-    r.register(sis, "read", "([BII)I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let owner =
-            stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
-        let buf = obj_arg(args, 1)?;
-        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
-        re1_socket_read_stream(ctx, owner, buf, off, len)
-    });
+    r.register(
+        sis,
+        "read",
+        "([BII)I",
+        native_socket_input_stream_read_bytes,
+    );
     // read([B)I — MUST be registered directly. Without it, `in.read(byte[])`
     // falls to the default java.io.InputStream.read(byte[]) bytecode, which
     // reads ONE byte then loops single-byte read() to fill the ENTIRE array,
@@ -3138,29 +3322,17 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     // A single bulk read returning whatever is currently available (>=1 byte)
     // is the correct InputStream.read(byte[]) contract and unblocks every
     // server-side request read (okhttp MockWebServer, loopback HTTP). BUG-04.
-    r.register(sis, "read", "([B)I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let owner =
-            stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
-        let buf = obj_arg(args, 1)?;
-        let len = ctx.array_length(buf) as i32;
-        re1_socket_read_stream(ctx, owner, buf, 0, len)
-    });
-    r.register(sis, "read", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let owner =
-            stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
-        let one = ctx.new_array(ArrayElementType::Byte, 1);
-        let r = re1_socket_read_stream(ctx, owner, one, 0, 1)?;
-        match r {
-            Some(Value::Int(-1)) => Ok(Some(Value::Int(-1))),
-            Some(Value::Int(_)) => {
-                let b = ctx.get_array_element(one, 0).as_int().unwrap_or(0);
-                Ok(Some(Value::Int(b & 0xff)))
-            }
-            _ => Ok(Some(Value::Int(-1))),
-        }
-    });
+    r.register(sis, "read", "([B)I", native_socket_input_stream_read_array);
+    r.register(sis, "read", "()I", native_socket_input_stream_read_one);
+    cratonvm_native_api::socket_input_stream_read::set_read_bytes(
+        native_socket_input_stream_read_bytes,
+    );
+    cratonvm_native_api::socket_input_stream_read::set_read_array(
+        native_socket_input_stream_read_array,
+    );
+    cratonvm_native_api::socket_input_stream_read::set_read_one(
+        native_socket_input_stream_read_one,
+    );
     r.register(sis, "close", "()V", |_ctx, _args| Ok(None));
     r.register(sis, "available", "()I", |_ctx, args| {
         // Real BufferedReader.readLine asks via available()? No — it calls
@@ -4109,9 +4281,23 @@ fn http_perform_request(
             _ => headers,
         };
         let resp = if https {
-            http_exchange_tls(&host, port, &path, &current_method, eff_headers, &current_body)?
+            http_exchange_tls(
+                &host,
+                port,
+                &path,
+                &current_method,
+                eff_headers,
+                &current_body,
+            )?
         } else {
-            http_exchange_plain(&host, port, &path, &current_method, eff_headers, &current_body)?
+            http_exchange_plain(
+                &host,
+                port,
+                &path,
+                &current_method,
+                eff_headers,
+                &current_body,
+            )?
         };
         match resp.status {
             301 | 302 | 303 | 307 | 308 => {
@@ -4171,14 +4357,10 @@ fn http_build_request(
         let _ = write!(&mut out, "Host: {host}:{port}\r\n");
     }
     let mut has_content_length = false;
-    let mut has_connection = false;
     let mut has_user_agent = false;
     for (k, v) in headers {
         if k.eq_ignore_ascii_case("content-length") {
             has_content_length = true;
-        }
-        if k.eq_ignore_ascii_case("connection") {
-            has_connection = true;
         }
         if k.eq_ignore_ascii_case("user-agent") {
             has_user_agent = true;
@@ -4187,9 +4369,6 @@ fn http_build_request(
     }
     if !has_user_agent {
         out.extend_from_slice(b"User-Agent: cratonvm-phaseE/1.0\r\n");
-    }
-    if !has_connection {
-        out.extend_from_slice(b"Connection: close\r\n");
     }
     if !has_content_length && (!body.is_empty() || matches!(method, "POST" | "PUT" | "PATCH")) {
         let _ = write!(&mut out, "Content-Length: {}\r\n", body.len());
@@ -5181,7 +5360,17 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // which is swallowed and forces a wrong `../.` home fallback.
             let ext = {
                 let s5 = read_field_string_or(ctx, this, 5, "");
-                let s = if s5.contains(':') {
+                // `s5.contains(':')` alone false-positives on a real-JDK
+                // URL's field 5 (`authority`, e.g. "localhost:8080" — always
+                // has a colon), skipping the toExternalForm() fallback below
+                // and leaving `ext` as the bare authority. That misses both
+                // the `jar:` and `http(s)://` prefix checks, so every real
+                // http(s) URL fell to the generic URLConnection carrier and
+                // `(HttpURLConnection) url.openConnection()` threw
+                // ClassCastException everywhere (e.g. Tomcat's
+                // TomcatBaseTest.methodUrl). Use the same synthetic-vs-real
+                // discriminator as the openStream/toExternalForm paths above.
+                let s = if field5_is_full_url(&s5) {
                     s5
                 } else {
                     match ctx.invoke_virtual(this, "toExternalForm", "()Ljava/lang/String;", &[]) {
@@ -5481,17 +5670,22 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     r.register("java/net/URLConnection", "connect", "()V", |_ctx, _args| {
         Ok(None)
     });
-    r.register("java/net/URLConnection", "getContentLength", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let url = huc_url_string(ctx, this);
-        let len = synthetic_resource_url_content_len(ctx, &url);
-        let v = if len < 0 || len > i32::MAX as i64 {
-            -1
-        } else {
-            len as i32
-        };
-        Ok(Some(Value::Int(v)))
-    });
+    r.register(
+        "java/net/URLConnection",
+        "getContentLength",
+        "()I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let url = huc_url_string(ctx, this);
+            let len = synthetic_resource_url_content_len(ctx, &url);
+            let v = if len < 0 || len > i32::MAX as i64 {
+                -1
+            } else {
+                len as i32
+            };
+            Ok(Some(Value::Int(v)))
+        },
+    );
     r.register(
         "java/net/URLConnection",
         "getContentLengthLong",
@@ -5499,7 +5693,21 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let url = huc_url_string(ctx, this);
-            Ok(Some(Value::Long(synthetic_resource_url_content_len(ctx, &url))))
+            Ok(Some(Value::Long(synthetic_resource_url_content_len(
+                ctx, &url,
+            ))))
+        },
+    );
+    r.register(
+        "java/net/URLConnection",
+        "getLastModified",
+        "()J",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let url = huc_url_string(ctx, this);
+            Ok(Some(Value::Long(synthetic_resource_url_last_modified(
+                &url,
+            ))))
         },
     );
     // URLConnection.getInputStream — defer to URL.openStream by reading
@@ -6669,10 +6877,7 @@ fn re5_replay_subscription_request(
 /// `Flow.Subscription.cancel()` for the one-shot replay subscription: mark
 /// cancelled and drop the parked references. Idempotent; a cancel after
 /// delivery is a no-op (the fields are already cleared).
-fn re5_replay_subscription_cancel(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn re5_replay_subscription_cancel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if matches!(ctx.get_field(this, RE5_SUB_STATE), Value::Int(0)) {
         ctx.set_field(this, RE5_SUB_STATE, Value::Int(2));
@@ -6756,8 +6961,7 @@ fn re5_drive_body_handler(
         }
         Some((ctx.pin_native_root(arr), arr))
     };
-    let subscription =
-        alloc_concurrent_synthetic(ctx, RE5_REPLAY_SUBSCRIPTION, RE5_SUB_NUM_FIELDS);
+    let subscription = alloc_concurrent_synthetic(ctx, RE5_REPLAY_SUBSCRIPTION, RE5_SUB_NUM_FIELDS);
     {
         let subscriber_now = ctx.read_native_pin(subscriber_pin, subscriber);
         ctx.set_field(
@@ -8180,7 +8384,9 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let rid = connect_result.map_err(|e| ioex(format!("TLS connect: {e}")))?;
             let id = crate::servlet::RUSTLS_SOCK_ID_BASE + rid;
             let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
+            let pin_base = ctx.pin_native_root(sock);
             let host_s = ctx.create_string(&host);
+            let sock = ctx.read_native_pin(pin_base, sock);
             ctx.set_field(sock, SOCK_HOST, Value::Object(Some(host_s)));
             sock_set(ctx, sock, |s| {
                 s.port = port;
@@ -8188,6 +8394,8 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 s.closed = 0;
                 s.stream_id = id;
             });
+            let sock = ctx.read_native_pin(pin_base, sock);
+            ctx.unpin_native_roots(pin_base);
             if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
                 eprintln!(
                     "[dbg-tls-sock] thread={:?} net_phase_e createSocket(String,int) built sock={:?} stream_id={}",
@@ -8289,7 +8497,8 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // T19.H1: see the matching comment on `createSocket` above — this
             // reconnect blocks on real network I/O too and must announce it.
             ctx.begin_blocking_region();
-            let connect_result = crate::t27_tls::rustls_client_connect(cfg, &host, side.port as u16);
+            let connect_result =
+                crate::t27_tls::rustls_client_connect(cfg, &host, side.port as u16);
             ctx.end_blocking_region();
             match connect_result {
                 Ok(rid) => {
@@ -8663,7 +8872,11 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
             Some(Value::Int(i)) => i,
             _ => 0,
         };
-        Ok(Some(Value::Int(if name == "lo" || index == 1 { 1 } else { 0 })))
+        Ok(Some(Value::Int(if name == "lo" || index == 1 {
+            1
+        } else {
+            0
+        })))
     });
     r.register(ni, "isP2P0", "(Ljava/lang/String;I)Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
@@ -10338,6 +10551,28 @@ mod tests {
     }
 
     #[test]
+    fn re1_socket_side_table_is_identity_keyed() {
+        let mut ctx = MockNativeContext::new();
+        let sock = match ctx.new_object("java/net/Socket").unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected socket object, got {other:?}"),
+        };
+
+        sock_set(&ctx, sock, |s| {
+            s.port = 9999;
+            s.stream_id = 123;
+        });
+
+        let side = sock_get(&ctx, sock);
+        assert_eq!(side.port, 9999);
+        assert_eq!(side.stream_id, 123);
+        assert_eq!(
+            native_obj_key(&ctx, sock).identity,
+            ctx.identity_hash_code(sock)
+        );
+    }
+
+    #[test]
     fn re2_tcp_listener_binds_and_accepts() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -10519,7 +10754,11 @@ mod tests {
     ) -> ObjectRef {
         let subscription =
             alloc_concurrent_synthetic(ctx, RE5_REPLAY_SUBSCRIPTION, RE5_SUB_NUM_FIELDS);
-        ctx.set_field(subscription, RE5_SUB_SUBSCRIBER, Value::Object(Some(subscriber)));
+        ctx.set_field(
+            subscription,
+            RE5_SUB_SUBSCRIBER,
+            Value::Object(Some(subscriber)),
+        );
         ctx.set_field(subscription, RE5_SUB_BODY, Value::Object(None));
         ctx.set_field(subscription, RE5_SUB_STATE, Value::Int(0));
         subscription

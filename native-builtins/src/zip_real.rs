@@ -117,7 +117,6 @@ fn read_byte_array(ctx: &dyn NativeContext, arr: ObjectRef, off: usize, len: usi
     out
 }
 
-
 fn write_byte_array(ctx: &mut dyn NativeContext, arr: ObjectRef, off: usize, data: &[u8]) -> usize {
     let arr_len = ctx.array_length(arr);
     let mut written = 0usize;
@@ -146,7 +145,8 @@ fn defl_zlib_compress(data: &[u8], level: i32, zlib_header: bool) -> Option<Vec<
     use std::os::raw::{c_char, c_int, c_ulong};
 
     type CompressBound = unsafe extern "C" fn(c_ulong) -> c_ulong;
-    type Compress2 = unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong, c_int) -> c_int;
+    type Compress2 =
+        unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong, c_int) -> c_int;
 
     unsafe fn sym<T>(handle: *mut c_void, name: &'static [u8]) -> Option<T> {
         let ptr = libc::dlsym(handle, name.as_ptr() as *const c_char);
@@ -508,14 +508,10 @@ fn defl_deflate_bytes_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         }
 
         if flush_code == 4 && !st.finished && st.pending_output.is_empty() {
-            st.pending_output = defl_compress_finished(
-                &st.pending_input,
-                st.level,
-                st.zlib_header,
-            )
-            .map_err(|e| RuntimeError::IOException {
-                message: format!("Deflater compression failed: {}", e),
-            })?;
+            st.pending_output = defl_compress_finished(&st.pending_input, st.level, st.zlib_header)
+                .map_err(|e| RuntimeError::IOException {
+                    message: format!("Deflater compression failed: {}", e),
+                })?;
             st.pending_input.clear();
             st.finished = true;
         }

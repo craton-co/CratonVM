@@ -425,7 +425,10 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd"))?;
         match &*entry {
-            FileEntry::Stdin(stdin) => stdin.lock().read(buf),
+            FileEntry::Stdin(stdin) => {
+                let n = stdin.lock().read(buf)?;
+                Ok(n)
+            }
             FileEntry::FileRead(reader) => reader.lock().read(buf),
             // WP1.12 — subprocess stdout/stderr bulk read.
             FileEntry::ChildStdoutPipe(p) => p.lock().read(buf),

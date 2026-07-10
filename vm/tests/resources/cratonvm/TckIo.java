@@ -280,6 +280,19 @@ public class TckIo {
         } catch (Exception e) { return 0; }
     }
 
+    public static int sr_readCharArrayMultiline() {
+        try {
+            String s = "line1\nline2\nline3";
+            StringReader sr = new StringReader(s);
+            char[] buf = new char[64];
+            int n = sr.read(buf, 0, buf.length);
+            if (n != s.length()) return 0;
+            if (!s.equals(new String(buf, 0, n))) return 0;
+            if (sr.read(buf, 0, buf.length) != -1) return 0;
+            return 1;
+        } catch (Exception e) { return 0; }
+    }
+
     // ===================================================================
     // java.nio.ByteBuffer tests
     // ===================================================================

@@ -12,7 +12,7 @@ use crate::crypto::crypto_impl;
 use crate::lang_class::{mirror_class_id, native_class_is_record, native_class_is_sealed};
 use crate::lang_invoke::register_phase54_method_handle;
 use crate::lang_misc::register_phase53_record;
-use crate::lang_string::register_phase52_string_buffer;
+use crate::lang_string::{native_string_hash_code, register_phase52_string_buffer};
 use crate::{
     alloc_concurrent_synthetic, build_real_layout_string_hashset, native_noop,
     native_noop_with_this, native_return_false, native_return_zero,
@@ -22,6 +22,60 @@ use crate::{
     native_return_first_arg, native_return_null, native_synchronized_collection,
     native_synchronized_list, native_synchronized_map, native_synchronized_set,
 };
+
+fn object_array_element_hash_code(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+) -> Result<i32, MethodCallFailed> {
+    if ctx.object_is_array(obj) {
+        return Ok(ctx.identity_hash_code(obj));
+    }
+
+    match ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref() {
+        Some("java/lang/String") => {
+            match native_string_hash_code(ctx, &[Value::Object(Some(obj))])? {
+                Some(Value::Int(v)) => Ok(v),
+                _ => Ok(0),
+            }
+        }
+        Some(
+            "java/lang/Integer" | "java/lang/Byte" | "java/lang/Short" | "java/lang/Character",
+        ) => match ctx.get_field(obj, 0) {
+            Value::Int(v) => Ok(v),
+            _ => Ok(0),
+        },
+        Some("java/lang/Boolean") => match ctx.get_field(obj, 0) {
+            Value::Int(v) => Ok(if v != 0 { 1231 } else { 1237 }),
+            _ => Ok(1237),
+        },
+        Some("java/lang/Long") => match ctx.get_field(obj, 0) {
+            Value::Long(v) => Ok((v ^ ((v as u64 >> 32) as i64)) as i32),
+            _ => Ok(0),
+        },
+        Some("java/lang/Float") => match ctx.get_field(obj, 0) {
+            Value::Float(v) => {
+                let bits = if v.is_nan() { 0x7fc0_0000 } else { v.to_bits() };
+                Ok(bits as i32)
+            }
+            _ => Ok(0),
+        },
+        Some("java/lang/Double") => match ctx.get_field(obj, 0) {
+            Value::Double(v) => {
+                let bits = if v.is_nan() {
+                    0x7ff8_0000_0000_0000u64
+                } else {
+                    v.to_bits()
+                };
+                Ok((bits ^ (bits >> 32)) as i32)
+            }
+            _ => Ok(0),
+        },
+        _ => match ctx.invoke_virtual(obj, "hashCode", "()I", &[])? {
+            Some(Value::Int(v)) => Ok(v),
+            _ => Ok(0),
+        },
+    }
+}
 
 pub(crate) fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -298,8 +352,16 @@ fn native_collections_singleton_set(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // Create as ArrayList-backed set (simplified)
-    native_collections_singleton_list(ctx, args)
+    let elem = args.first().copied().unwrap_or(Value::Object(None));
+    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1);
+    let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))])?;
+    cratonvm_native_collections::native_map_put_pub(
+        ctx,
+        &[Value::Object(Some(map)), elem, Value::Object(None)],
+    )?;
+    ctx.set_field(set, 0, Value::Object(Some(map)));
+    Ok(Some(Value::Object(Some(set))))
 }
 
 fn native_collections_singleton_map(
@@ -999,12 +1061,9 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(obj)) => {
                     let elem_pin = ctx.pin_native_root(obj);
                     let obj = ctx.read_native_pin(elem_pin, obj);
-                    let result = ctx.invoke_virtual(obj, "hashCode", "()I", &[]);
+                    let elem_hash = object_array_element_hash_code(ctx, obj);
                     ctx.unpin_native_roots(elem_pin);
-                    match result? {
-                        Some(Value::Int(v)) => v,
-                        _ => 0,
-                    }
+                    elem_hash?
                 }
                 Value::Object(None) | Value::Uninitialized => 0,
                 Value::Int(v) => v,
@@ -1914,12 +1973,15 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "singleton",
         "(Ljava/lang/Object;)Ljava/util/Set;",
         |ctx, args| {
-            let _elem = args.first().cloned().unwrap_or(Value::Object(None));
-            let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-            ctx.set_field(set, 0, Value::Object(None));
-            ctx.set_field(set, 1, Value::Int(1));
-            ctx.set_field(set, 2, Value::Int(16));
-            // Simple: store element, won't iterate properly but satisfies contains/size
+            let elem = args.first().cloned().unwrap_or(Value::Object(None));
+            let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1);
+            let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))])?;
+            cratonvm_native_collections::native_map_put_pub(
+                ctx,
+                &[Value::Object(Some(map)), elem, Value::Object(None)],
+            )?;
+            ctx.set_field(set, 0, Value::Object(Some(map)));
             Ok(Some(Value::Object(Some(set))))
         },
     );
@@ -3128,70 +3190,19 @@ pub(crate) fn register_scanner_natives(r: &mut NativeMethodRegistry) {
     // close()
     r.register(sc, "close", "()V", |_ctx, _args| Ok(None));
 
-    // --- java.io.StringReader (1-field: source=0, position tracked via field 1) ---
-    let sr = "java/io/StringReader";
-    r.register(sr, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, args[1]);
-        Ok(None)
-    });
-    r.register(sr, "read", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let source = match ctx.get_field(this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        // Simple: return first char then consume
-        if source.is_empty() {
-            Ok(Some(Value::Int(-1)))
-        } else {
-            let ch = source.chars().next().unwrap_or('\0') as i32;
-            let rest = ctx.create_string(&source[ch.min(source.len() as i32) as usize..]);
-            ctx.set_field(this, 0, Value::Object(Some(rest)));
-            Ok(Some(Value::Int(ch)))
-        }
-    });
-    r.register(sr, "close", "()V", |_ctx, _args| Ok(None));
-
-    // --- java.io.StringWriter (1-field: buffer string) ---
-    let sw = "java/io/StringWriter";
-    r.register(sw, "<init>", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let empty = ctx.create_string("");
-        ctx.set_field(this, 0, Value::Object(Some(empty)));
-        Ok(None)
-    });
-    r.register(sw, "write", "(Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let existing = match ctx.get_field(this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let to_add = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let combined = format!("{}{}", existing, to_add);
-        let s = ctx.create_string(&combined);
-        ctx.set_field(this, 0, Value::Object(Some(s)));
-        Ok(None)
-    });
-    r.register(sw, "toString", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    r.register(
-        sw,
-        "getBuffer",
-        "()Ljava/lang/StringBuffer;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            // Return the string as-is (StringBuffer and String share representation)
-            Ok(Some(ctx.get_field(this, 0)))
-        },
-    );
-    r.register(sw, "flush", "()V", |_ctx, _args| Ok(None));
-    r.register(sw, "close", "()V", |_ctx, _args| Ok(None));
+    // java.io.StringReader / StringWriter registrations used to live here,
+    // but this function is only ever reached via `register_synthetic_overrides`
+    // (synthetic-jdk feature only), which itself runs BEFORE
+    // `native-io`'s `register_io_natives` in the vm_init.rs boot sequence —
+    // so `register_string_rw_natives` (native-io/src/lib.rs) always
+    // overwrote these entries in `NativeMethodRegistry`'s last-write-wins
+    // map, in every build configuration. They were dead code, and their
+    // buggy `read()` (`ch as i32` used as a byte index instead of
+    // `ch.len_utf8()`) sent an earlier investigation down a blind alley
+    // chasing a registration that could never run — see
+    // docs/known-issues/tomcat-08-07/stringreader-read-never-advances-infinite-loop.md.
+    // Removed rather than fixed in place; the real, live StringReader
+    // natives are `native_sr_*` in native-io/src/lib.rs.
     r.set_category(__prev_cat);
 }
 
@@ -3378,14 +3389,52 @@ fn atomic_reference_update_with_operator(
 // the live set of ThreadLocals, which is small for typical applications.
 const TL_FIELD_VALUE: usize = 0;
 
+#[derive(Clone, Copy)]
+pub(crate) enum ThreadLocalValue {
+    Root { handle: usize, fallback: ObjectRef },
+    Plain(Value),
+}
+
 std::thread_local! {
     /// Per-OS-thread map: TL identity hash → value held by this thread.
-    static TL_MAP: std::cell::RefCell<rustc_hash::FxHashMap<i32, Value>> =
+    static TL_MAP: std::cell::RefCell<rustc_hash::FxHashMap<i32, ThreadLocalValue>> =
         std::cell::RefCell::new(rustc_hash::FxHashMap::default());
     /// One-shot flag: has this OS thread drained any inherited ITL entries
     /// queued for the Java Thread it is running? Reset path: not needed
     /// because OS threads are 1:1 with Java threads in CratonVM.
     static TL_INHERITED_DRAINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn tl_value_from_java(ctx: &mut dyn NativeContext, value: Value) -> ThreadLocalValue {
+    match value {
+        Value::Object(Some(obj)) => ThreadLocalValue::Root {
+            handle: ctx.add_global_root(obj),
+            fallback: obj,
+        },
+        other => ThreadLocalValue::Plain(other),
+    }
+}
+
+fn tl_value_to_java(ctx: &dyn NativeContext, value: ThreadLocalValue) -> Value {
+    match value {
+        ThreadLocalValue::Root { handle, fallback } => {
+            let obj = if handle != 0 {
+                ctx.resolve_global_root(handle).unwrap_or(fallback)
+            } else {
+                fallback
+            };
+            Value::Object(Some(obj))
+        }
+        ThreadLocalValue::Plain(value) => value,
+    }
+}
+
+fn tl_drop_value_root(ctx: &mut dyn NativeContext, value: ThreadLocalValue) {
+    if let ThreadLocalValue::Root { handle, .. } = value {
+        if handle != 0 {
+            let _ = ctx.remove_global_root(handle);
+        }
+    }
 }
 
 /// `withInitial` suppliers, keyed by the ThreadLocal's JLS identity hash.
@@ -3421,10 +3470,13 @@ pub(crate) fn tl_inheritable_ids() -> &'static parking_lot::Mutex<rustc_hash::Fx
 /// Map from a child Java Thread's identity hash → snapshot of inherited
 /// (TL idhash → value) entries to seed when that thread first accesses
 /// any ThreadLocal. Consumed (drained) exactly once per OS thread.
-pub(crate) fn tl_inherited_pending(
-) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, rustc_hash::FxHashMap<i32, Value>>> {
+pub(crate) fn tl_inherited_pending() -> &'static parking_lot::Mutex<
+    rustc_hash::FxHashMap<i32, rustc_hash::FxHashMap<i32, ThreadLocalValue>>,
+> {
     static S: std::sync::OnceLock<
-        parking_lot::Mutex<rustc_hash::FxHashMap<i32, rustc_hash::FxHashMap<i32, Value>>>,
+        parking_lot::Mutex<
+            rustc_hash::FxHashMap<i32, rustc_hash::FxHashMap<i32, ThreadLocalValue>>,
+        >,
     > = std::sync::OnceLock::new();
     S.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
@@ -3445,7 +3497,14 @@ fn drain_inherited_for_current_thread(ctx: &mut dyn NativeContext) {
         TL_MAP.with(|m| {
             let mut map = m.borrow_mut();
             for (k, v) in entries {
-                map.entry(k).or_insert(v);
+                match map.entry(k) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(v);
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        tl_drop_value_root(ctx, v);
+                    }
+                }
             }
         });
     }
@@ -3461,7 +3520,12 @@ pub(crate) fn register_thread_local_natives(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let c = "java/lang/ThreadLocal";
     r.register(c, "<init>", "()V", native_tl_init);
-    r.register(c, "initialValue", "()Ljava/lang/Object;", native_tl_initial_value);
+    r.register(
+        c,
+        "initialValue",
+        "()Ljava/lang/Object;",
+        native_tl_initial_value,
+    );
     r.register(c, "get", "()Ljava/lang/Object;", native_tl_get);
     r.register(c, "set", "(Ljava/lang/Object;)V", native_tl_set);
     r.register(c, "remove", "()V", native_tl_remove);
@@ -3512,7 +3576,7 @@ fn native_tl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     drain_inherited_for_current_thread(ctx);
     let key = tl_key(ctx, this);
     if let Some(v) = TL_MAP.with(|m| m.borrow().get(&key).copied()) {
-        return Ok(Some(v));
+        return Ok(Some(tl_value_to_java(ctx, v)));
     }
     // Miss path: if a supplier was registered via `withInitial`, invoke it
     // on the current thread, cache the result, and return.
@@ -3520,30 +3584,27 @@ fn native_tl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         .lock()
         .get(&key)
         .map(|&(skey, cached)| {
-            // Re-read the CURRENT (post-GC) address — the var-handle-root
-            // registry entry is remapped after a move, this raw copy is not.
+            // Re-read the current post-GC address; this raw copy is not remapped.
             ctx.read_var_handle_root(skey).unwrap_or(cached)
         });
     if let Some(s) = supplier {
         let initial = ctx
             .invoke_virtual(s, "get", "()Ljava/lang/Object;", &[])?
             .unwrap_or(Value::Object(None));
+        let stored = tl_value_from_java(ctx, initial);
         TL_MAP.with(|m| {
-            m.borrow_mut().insert(key, initial);
+            m.borrow_mut().insert(key, stored);
         });
-        return Ok(Some(initial));
+        return Ok(Some(tl_value_to_java(ctx, stored)));
     }
-    // JDK ThreadLocal.get() calls initialValue() on first access and caches
-    // even a null result. Mockito's ThreadSafeMockingProgress uses an
-    // anonymous ThreadLocal subclass rather than ThreadLocal.withInitial(), so
-    // skipping this virtual call leaves its per-thread state uninitialized.
     let initial = ctx
         .invoke_virtual(this, "initialValue", "()Ljava/lang/Object;", &[])?
         .unwrap_or(Value::Object(None));
+    let stored = tl_value_from_java(ctx, initial);
     TL_MAP.with(|m| {
-        m.borrow_mut().insert(key, initial);
+        m.borrow_mut().insert(key, stored);
     });
-    Ok(Some(initial))
+    Ok(Some(tl_value_to_java(ctx, stored)))
 }
 
 fn native_tl_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3551,9 +3612,11 @@ fn native_tl_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     drain_inherited_for_current_thread(ctx);
     let val = args.get(1).copied().unwrap_or(Value::Object(None));
     let key = tl_key(ctx, this);
-    TL_MAP.with(|m| {
-        m.borrow_mut().insert(key, val);
-    });
+    let stored = tl_value_from_java(ctx, val);
+    let old = TL_MAP.with(|m| m.borrow_mut().insert(key, stored));
+    if let Some(old) = old {
+        tl_drop_value_root(ctx, old);
+    }
     Ok(None)
 }
 
@@ -3561,40 +3624,29 @@ fn native_tl_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let this = obj_arg(args, 0)?;
     drain_inherited_for_current_thread(ctx);
     let key = tl_key(ctx, this);
-    TL_MAP.with(|m| {
-        m.borrow_mut().remove(&key);
-    });
+    let old = TL_MAP.with(|m| m.borrow_mut().remove(&key));
+    if let Some(old) = old {
+        tl_drop_value_root(ctx, old);
+    }
     Ok(None)
 }
 
 fn native_tl_with_initial(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Allocate a SuppliedThreadLocal, register the supplier in the side
-    // table (so every thread can lazily invoke it on first read), and
-    // eagerly seed the creating thread so the call-site sees a value
-    // without an extra invoke round-trip.
+    // table so every thread invokes it lazily on first read. HotSpot does
+    // not call Supplier.get() from withInitial() itself; eager evaluation can
+    // initialize method-reference implementation classes too early.
     let supplier = match args.first() {
         Some(Value::Object(Some(s))) => *s,
         _ => return Ok(Some(Value::Object(None))),
     };
     let tl = alloc_concurrent_synthetic(ctx, "java/lang/ThreadLocal", 1);
     let key = ctx.identity_hash_code(tl);
-    // Keep the supplier alive + registry-remapped across GC moves
-    // (VarHandle-root pattern); key computed on the just-registered address,
-    // no allocation in between. NOTE: `supplier` was read from args BEFORE
-    // the `alloc_concurrent_synthetic` above; registration keys off the
-    // address as currently seen, matching the pre-existing exposure of raw
-    // arg refs across allocations in this native.
     ctx.register_var_handle_root(supplier);
     let skey = ctx.identity_hash_code(supplier);
     tl_with_initial_suppliers()
         .lock()
         .insert(key, (skey, supplier));
-    let initial = ctx
-        .invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])?
-        .unwrap_or(Value::Object(None));
-    TL_MAP.with(|m| {
-        m.borrow_mut().insert(key, initial);
-    });
     Ok(Some(Value::Object(Some(tl))))
 }
 
@@ -3608,16 +3660,21 @@ fn native_tl_with_initial(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// first `get()` will invoke its own supplier copy. That matches JDK
 /// semantics: `InheritableThreadLocal` inherits only set values, and
 /// `withInitial` ThreadLocals are not inheritable by default anyway.
-pub(crate) fn snapshot_inheritable_tl_entries() -> Option<rustc_hash::FxHashMap<i32, Value>> {
+pub(crate) fn snapshot_inheritable_tl_entries(
+    ctx: &mut dyn NativeContext,
+) -> Option<rustc_hash::FxHashMap<i32, ThreadLocalValue>> {
     let inheritable = tl_inheritable_ids().lock();
     if inheritable.is_empty() {
         return None;
     }
-    let snap: rustc_hash::FxHashMap<i32, Value> = TL_MAP.with(|m| {
+    let snap: rustc_hash::FxHashMap<i32, ThreadLocalValue> = TL_MAP.with(|m| {
         let map = m.borrow();
         map.iter()
             .filter(|(k, _)| inheritable.contains(k))
-            .map(|(k, v)| (*k, *v))
+            .map(|(k, v)| {
+                let java_value = tl_value_to_java(ctx, *v);
+                (*k, tl_value_from_java(ctx, java_value))
+            })
             .collect()
     });
     if snap.is_empty() {
@@ -3632,7 +3689,7 @@ pub(crate) fn snapshot_inheritable_tl_entries() -> Option<rustc_hash::FxHashMap<
 /// `drain_inherited_for_current_thread`.
 pub(crate) fn queue_inherited_tl_for_child(
     child_thread_hash: i32,
-    snapshot: rustc_hash::FxHashMap<i32, Value>,
+    snapshot: rustc_hash::FxHashMap<i32, ThreadLocalValue>,
 ) {
     tl_inherited_pending()
         .lock()
@@ -4713,6 +4770,22 @@ fn native_bs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 const ES_FIELD_ELEMENTS: usize = 0;
 const ES_FIELD_TYPE: usize = 1;
 
+fn enum_set_backing_list(ctx: &mut dyn NativeContext, arr: ObjectRef, size: i32) -> ObjectRef {
+    let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let arr_value = Value::Object(Some(arr));
+    ctx.set_field(backing, 0, arr_value);
+    ctx.set_field(backing, 1, Value::Int(size));
+    ctx.set_field_by_name(backing, "elementData", arr_value);
+    ctx.set_field_by_name(backing, "size", Value::Int(size));
+    if let Some(slot) = ctx.resolve_field_index("java/util/ArrayList", "elementData") {
+        ctx.set_field(backing, slot, arr_value);
+    }
+    if let Some(slot) = ctx.resolve_field_index("java/util/ArrayList", "size") {
+        ctx.set_field(backing, slot, Value::Int(size));
+    }
+    backing
+}
+
 fn register_enum_set_natives_with_category(
     r: &mut NativeMethodRegistry,
     kind: cratonvm_native_api::NativeKind,
@@ -4730,8 +4803,8 @@ fn register_enum_set_natives_with_category(
         c,
         "allOf",
         "(Ljava/lang/Class;)Ljava/util/EnumSet;",
-        native_es_none_of,
-    ); // simplified
+        native_es_all_of,
+    );
     r.register(
         c,
         "of",
@@ -4753,6 +4826,12 @@ fn register_enum_set_natives_with_category(
     r.register(
         c,
         "of",
+        "(Ljava/lang/Enum;Ljava/lang/Enum;Ljava/lang/Enum;Ljava/lang/Enum;)Ljava/util/EnumSet;",
+        native_es_of_four,
+    );
+    r.register(
+        c,
+        "of",
         "(Ljava/lang/Enum;[Ljava/lang/Enum;)Ljava/util/EnumSet;",
         native_es_of_varargs,
     );
@@ -4768,7 +4847,14 @@ fn register_enum_set_natives_with_category(
         "(Ljava/util/Collection;)Ljava/util/EnumSet;",
         native_es_copy_of,
     );
+    r.register(
+        c,
+        "complementOf",
+        "(Ljava/util/EnumSet;)Ljava/util/EnumSet;",
+        native_es_complement_of,
+    );
     r.register(c, "add", "(Ljava/lang/Object;)Z", native_es_add);
+    r.register(c, "addAll", "(Ljava/util/Collection;)Z", native_es_add_all);
     r.register(c, "remove", "(Ljava/lang/Object;)Z", native_es_remove);
     r.register(c, "contains", "(Ljava/lang/Object;)Z", native_es_contains);
     r.register(c, "size", "()I", native_es_size);
@@ -4809,28 +4895,138 @@ pub(crate) fn register_enum_set_stub_natives(r: &mut NativeMethodRegistry) {
     register_enum_set_natives_with_category(r, cratonvm_native_api::NativeKind::SyntheticStub);
 }
 
-fn native_es_none_of(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn enum_constants_array_for_class(
+    ctx: &mut dyn NativeContext,
+    enum_class: ObjectRef,
+) -> Option<ObjectRef> {
+    match crate::lang_class::native_class_get_enum_constants(
+        ctx,
+        &[Value::Object(Some(enum_class))],
+    ) {
+        Ok(Some(Value::Object(Some(arr)))) => Some(arr),
+        _ => None,
+    }
+}
+
+fn try_jdk_enum_set_none_of(
+    ctx: &mut dyn NativeContext,
+    enum_class: ObjectRef,
+) -> Option<ObjectRef> {
+    if ctx.is_class_synthetic_stub("java/util/EnumSet") {
+        return None;
+    }
+    let universe = enum_constants_array_for_class(ctx, enum_class)?;
+    let impl_class = if ctx.array_length(universe) <= 64 {
+        "java/util/RegularEnumSet"
+    } else {
+        "java/util/JumboEnumSet"
+    };
+    match ctx.new_object_initialized(
+        impl_class,
+        "(Ljava/lang/Class;[Ljava/lang/Enum;)V",
+        &[
+            Value::Object(Some(enum_class)),
+            Value::Object(Some(universe)),
+        ],
+    ) {
+        Ok(Some(Value::Object(Some(set)))) => Some(set),
+        _ => None,
+    }
+}
+
+fn synthetic_enum_set_from_array(
+    ctx: &mut dyn NativeContext,
+    enum_type: Value,
+    src: Option<ObjectRef>,
+    len: usize,
+) -> MethodCallResult {
+    let src_pin = src.map(|s| ctx.pin_native_root(s));
     let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-    let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    ctx.set_field(backing, 0, Value::Object(Some(arr)));
-    ctx.set_field(backing, 1, Value::Int(0));
+    let es_pin = ctx.pin_native_root(es);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len.max(4));
+    let arr_pin = ctx.pin_native_root(arr);
+    if let Some(src) = src {
+        let src_cur = ctx.read_native_pin(src_pin.unwrap_or(0), src);
+        let copy = len.min(ctx.array_length(src_cur));
+        let arr_cur = ctx.read_native_pin(arr_pin, arr);
+        for i in 0..copy {
+            let v = ctx.get_array_element(src_cur, i);
+            ctx.set_array_element(arr_cur, i, v);
+        }
+    }
+    let es = ctx.read_native_pin(es_pin, es);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    let backing = enum_set_backing_list(ctx, arr, len as i32);
     ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
-    ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
+    ctx.set_field(es, ES_FIELD_TYPE, enum_type);
+    ctx.unpin_native_roots(src_pin.unwrap_or(es_pin));
     Ok(Some(Value::Object(Some(es))))
+}
+
+fn synthetic_enum_set_from_values(
+    ctx: &mut dyn NativeContext,
+    enum_type: Value,
+    elems: &[Value],
+) -> MethodCallResult {
+    let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
+    let es_pin = ctx.pin_native_root(es);
+    let arr = ctx.new_array(
+        cratonvm_types::ArrayElementType::Reference,
+        elems.len().max(4),
+    );
+    let arr_pin = ctx.pin_native_root(arr);
+    let arr_cur = ctx.read_native_pin(arr_pin, arr);
+    for (i, elem) in elems.iter().enumerate() {
+        ctx.set_array_element(arr_cur, i, *elem);
+    }
+    let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let es = ctx.read_native_pin(es_pin, es);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.set_field(backing, 0, Value::Object(Some(arr)));
+    ctx.set_field(backing, 1, Value::Int(elems.len() as i32));
+    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
+    ctx.set_field(es, ES_FIELD_TYPE, enum_type);
+    ctx.unpin_native_roots(es_pin);
+    Ok(Some(Value::Object(Some(es))))
+}
+
+fn native_es_none_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let enum_type = args.first().copied().unwrap_or(Value::Object(None));
+    if let Value::Object(Some(enum_class)) = enum_type {
+        if let Some(set) = try_jdk_enum_set_none_of(ctx, enum_class) {
+            return Ok(Some(Value::Object(Some(set))));
+        }
+    }
+    synthetic_enum_set_from_array(ctx, enum_type, None, 0)
+}
+
+fn native_es_all_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let enum_type = args.first().copied().unwrap_or(Value::Object(None));
+    if let Value::Object(Some(enum_class)) = enum_type {
+        if let Some(set) = try_jdk_enum_set_none_of(ctx, enum_class) {
+            let set_pin = ctx.pin_native_root(set);
+            let set_cur = ctx.read_native_pin(set_pin, set);
+            if ctx.invoke_virtual(set_cur, "addAll", "()V", &[]).is_ok() {
+                let set_cur = ctx.read_native_pin(set_pin, set_cur);
+                ctx.unpin_native_roots(set_pin);
+                return Ok(Some(Value::Object(Some(set_cur))));
+            }
+            ctx.unpin_native_roots(set_pin);
+        }
+        if let Some(constants) = enum_constants_array_for_class(ctx, enum_class) {
+            let len = ctx.array_length(constants);
+            return synthetic_enum_set_from_array(ctx, enum_type, Some(constants), len);
+        }
+    }
+    synthetic_enum_set_from_array(ctx, enum_type, None, 0)
 }
 
 fn native_es_of_one(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let elem = args.first().copied().unwrap_or(Value::Object(None));
-    let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
-    ctx.set_array_element(arr, 0, elem);
-    let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    ctx.set_field(backing, 0, Value::Object(Some(arr)));
-    ctx.set_field(backing, 1, Value::Int(1));
-    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
-    ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
-    Ok(Some(Value::Object(Some(es))))
+    if let Some(set) = try_jdk_enum_set_of_elements(ctx, &[elem]) {
+        return Ok(Some(Value::Object(Some(set))));
+    }
+    synthetic_enum_set_from_values(ctx, Value::Object(None), &[elem])
 }
 
 /// Build a real JDK `EnumSet` via `noneOf(first.getClass())` + `add` for each
@@ -4844,10 +5040,7 @@ fn try_jdk_enum_set_of_elements(ctx: &mut dyn NativeContext, elems: &[Value]) ->
     let Value::Object(Some(en1)) = first else {
         return None;
     };
-    let enum_class = match ctx.invoke_virtual(en1, "getClass", "()Ljava/lang/Class;", &[]) {
-        Ok(Some(Value::Object(Some(c)))) => c,
-        _ => return None,
-    };
+    let enum_class = enum_declaring_class_from_object(ctx, en1)?;
     let set = match ctx.invoke(
         "java/util/EnumSet",
         "noneOf",
@@ -4870,6 +5063,119 @@ fn try_jdk_enum_set_of_elements(ctx: &mut dyn NativeContext, elems: &[Value]) ->
     Some(set)
 }
 
+fn enum_value_ordinal(ctx: &mut dyn NativeContext, value: Value) -> Option<i32> {
+    let Value::Object(Some(obj)) = value else {
+        return None;
+    };
+    if let Ok(Some(Value::Int(n))) = ctx.invoke_virtual(obj, "ordinal", "()I", &[]) {
+        return Some(n);
+    }
+    match ctx.get_field_by_name(obj, "ordinal") {
+        Value::Int(n) => Some(n),
+        _ => match ctx.get_field(obj, 1) {
+            Value::Int(n) => Some(n),
+            _ => None,
+        },
+    }
+}
+
+fn enum_range_elements(ctx: &mut dyn NativeContext, from: Value, to: Value) -> Vec<Value> {
+    let Some(from_ord) = enum_value_ordinal(ctx, from) else {
+        return vec![from, to];
+    };
+    let Some(to_ord) = enum_value_ordinal(ctx, to) else {
+        return vec![from, to];
+    };
+    let (Value::Object(Some(from_obj)), Value::Object(Some(_))) = (from, to) else {
+        return vec![from, to];
+    };
+    let enum_cid = ctx.class_id_of_object(from_obj);
+    let constants = match ctx
+        .static_field_index_by_name(enum_cid, "$VALUES")
+        .map(|idx| ctx.get_static_field(enum_cid, idx))
+    {
+        Some(Value::Object(Some(a))) => a,
+        _ => {
+            let enum_class =
+                match ctx.invoke_virtual(from_obj, "getClass", "()Ljava/lang/Class;", &[]) {
+                    Ok(Some(Value::Object(Some(c)))) => c,
+                    _ => return vec![from, to],
+                };
+            match ctx.invoke_virtual(enum_class, "getEnumConstants", "()[Ljava/lang/Object;", &[]) {
+                Ok(Some(Value::Object(Some(a)))) => a,
+                _ => return vec![from, to],
+            }
+        }
+    };
+    let mut elems = Vec::new();
+    let len = ctx.array_length(constants);
+    for i in 0..len {
+        let elem = ctx.get_array_element(constants, i);
+        if let Some(ord) = enum_value_ordinal(ctx, elem) {
+            if ord >= from_ord && ord <= to_ord {
+                elems.push(elem);
+            }
+        }
+    }
+    if elems.is_empty() {
+        vec![from, to]
+    } else {
+        elems
+    }
+}
+
+fn enum_set_elements(ctx: &mut dyn NativeContext, set: ObjectRef) -> Vec<Value> {
+    if es_real_kind(ctx, set).is_some() {
+        return es_real_elements(ctx, set);
+    }
+    if let Ok(Some(Value::Object(Some(arr)))) =
+        ctx.invoke_virtual(set, "toArray", "()[Ljava/lang/Object;", &[])
+    {
+        return (0..ctx.array_length(arr))
+            .map(|i| ctx.get_array_element(arr, i))
+            .collect();
+    }
+    let Some(backing) = es_get_backing(ctx, set) else {
+        return Vec::new();
+    };
+    let size = ctx.get_field(backing, 1).as_int().unwrap_or(0).max(0) as usize;
+    let Value::Object(Some(arr)) = ctx.get_field(backing, 0) else {
+        return Vec::new();
+    };
+    (0..size.min(ctx.array_length(arr)))
+        .map(|i| ctx.get_array_element(arr, i))
+        .collect()
+}
+
+fn enum_universe_for_value(ctx: &mut dyn NativeContext, value: Value) -> Vec<Value> {
+    let Value::Object(Some(obj)) = value else {
+        return Vec::new();
+    };
+    let enum_cid = ctx.class_id_of_object(obj);
+    if let Some(Value::Object(Some(values))) = ctx
+        .static_field_index_by_name(enum_cid, "$VALUES")
+        .map(|idx| ctx.get_static_field(enum_cid, idx))
+    {
+        return (0..ctx.array_length(values))
+            .map(|i| ctx.get_array_element(values, i))
+            .collect();
+    }
+    let enum_class = match ctx.invoke_virtual(obj, "getClass", "()Ljava/lang/Class;", &[]) {
+        Ok(Some(Value::Object(Some(c)))) => c,
+        _ => return Vec::new(),
+    };
+    match ctx.invoke_virtual(enum_class, "getEnumConstants", "()[Ljava/lang/Object;", &[]) {
+        Ok(Some(Value::Object(Some(values)))) => (0..ctx.array_length(values))
+            .map(|i| ctx.get_array_element(values, i))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn enum_values_same(a: Value, b: Value) -> bool {
+    matches!((a, b), (Value::Object(Some(x)), Value::Object(Some(y))) if x.as_ptr() == y.as_ptr())
+}
+
 /// `EnumSet.of(E, E)` — same linkage gap as the 3-arg overload on some JDK
 /// loads; mirror the `noneOf` + `add` bridge used by [`native_es_of_three`].
 pub(crate) fn native_es_of_two(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4882,9 +5188,7 @@ pub(crate) fn native_es_of_two(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
     ctx.set_array_element(arr, 0, e1);
     ctx.set_array_element(arr, 1, e2);
-    let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    ctx.set_field(backing, 0, Value::Object(Some(arr)));
-    ctx.set_field(backing, 1, Value::Int(2));
+    let backing = enum_set_backing_list(ctx, arr, 2);
     ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
     ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
     Ok(Some(Value::Object(Some(es))))
@@ -4908,9 +5212,30 @@ pub(crate) fn native_es_of_three(ctx: &mut dyn NativeContext, args: &[Value]) ->
     ctx.set_array_element(arr, 0, e1);
     ctx.set_array_element(arr, 1, e2);
     ctx.set_array_element(arr, 2, e3);
-    let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    ctx.set_field(backing, 0, Value::Object(Some(arr)));
-    ctx.set_field(backing, 1, Value::Int(3));
+    let backing = enum_set_backing_list(ctx, arr, 3);
+    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
+    ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
+    Ok(Some(Value::Object(Some(es))))
+}
+
+/// `EnumSet.of(E, E, E, E)` — same bridge as the other fixed-arity overloads.
+pub(crate) fn native_es_of_four(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let e1 = args.first().copied().unwrap_or(Value::Object(None));
+    let e2 = args.get(1).copied().unwrap_or(Value::Object(None));
+    let e3 = args.get(2).copied().unwrap_or(Value::Object(None));
+    let e4 = args.get(3).copied().unwrap_or(Value::Object(None));
+
+    if let Some(set) = try_jdk_enum_set_of_elements(ctx, &[e1, e2, e3, e4]) {
+        return Ok(Some(Value::Object(Some(set))));
+    }
+
+    let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
+    ctx.set_array_element(arr, 0, e1);
+    ctx.set_array_element(arr, 1, e2);
+    ctx.set_array_element(arr, 2, e3);
+    ctx.set_array_element(arr, 3, e4);
+    let backing = enum_set_backing_list(ctx, arr, 4);
     ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
     ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
     Ok(Some(Value::Object(Some(es))))
@@ -4940,9 +5265,7 @@ pub(crate) fn native_es_of_varargs(
     for (i, elem) in elems.iter().enumerate() {
         ctx.set_array_element(arr, i, *elem);
     }
-    let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    ctx.set_field(backing, 0, Value::Object(Some(arr)));
-    ctx.set_field(backing, 1, Value::Int(elems.len() as i32));
+    let backing = enum_set_backing_list(ctx, arr, elems.len() as i32);
     ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
     ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
     Ok(Some(Value::Object(Some(es))))
@@ -4951,28 +5274,138 @@ pub(crate) fn native_es_of_varargs(
 pub(crate) fn native_es_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let from = args.first().copied().unwrap_or(Value::Object(None));
     let to = args.get(1).copied().unwrap_or(Value::Object(None));
-    if let Some(set) = try_jdk_enum_set_of_elements(ctx, &[from, to]) {
+    let elems = enum_range_elements(ctx, from, to);
+    if let Some(set) = try_jdk_enum_set_of_elements(ctx, &elems) {
         return Ok(Some(Value::Object(Some(set))));
     }
     let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
-    ctx.set_array_element(arr, 0, from);
-    let mut size = 1;
-    if from != to {
-        ctx.set_array_element(arr, 1, to);
-        size = 2;
+    let arr = ctx.new_array(
+        cratonvm_types::ArrayElementType::Reference,
+        elems.len().max(4),
+    );
+    for (i, elem) in elems.iter().enumerate() {
+        ctx.set_array_element(arr, i, *elem);
     }
-    let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    ctx.set_field(backing, 0, Value::Object(Some(arr)));
-    ctx.set_field(backing, 1, Value::Int(size));
+    let backing = enum_set_backing_list(ctx, arr, elems.len() as i32);
     ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
     ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
     Ok(Some(Value::Object(Some(es))))
 }
 
-fn native_es_copy_of(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Simplified: return empty set
-    native_es_none_of(ctx, &[])
+fn native_es_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let src = obj_arg(args, 0)?;
+    let elems = enum_set_copy_source_values(ctx, src);
+
+    if !elems.is_empty() {
+        if let Some(set) = try_jdk_enum_set_of_elements(ctx, &elems) {
+            return Ok(Some(Value::Object(Some(set))));
+        }
+        let enum_type = enum_class_from_value(ctx, elems[0]).unwrap_or(Value::Object(None));
+        return synthetic_enum_set_from_values(ctx, enum_type, &elems);
+    }
+
+    if let Some(enum_type) = enum_set_element_type(ctx, src) {
+        if let Value::Object(Some(enum_class)) = enum_type {
+            if let Some(set) = try_jdk_enum_set_none_of(ctx, enum_class) {
+                return Ok(Some(Value::Object(Some(set))));
+            }
+        }
+        return synthetic_enum_set_from_values(ctx, enum_type, &[]);
+    }
+
+    synthetic_enum_set_from_values(ctx, Value::Object(None), &[])
+}
+
+fn enum_set_copy_source_values(ctx: &mut dyn NativeContext, src: ObjectRef) -> Vec<Value> {
+    if es_real_kind(ctx, src).is_some() {
+        return es_real_elements(ctx, src);
+    }
+    let arr = match ctx.invoke_virtual(src, "toArray", "()[Ljava/lang/Object;", &[]) {
+        Ok(Some(Value::Object(Some(arr)))) => arr,
+        _ => return Vec::new(),
+    };
+    let len = ctx.array_length(arr);
+    let mut elems = Vec::with_capacity(len);
+    for i in 0..len {
+        let elem = ctx.get_array_element(arr, i);
+        if !matches!(elem, Value::Object(None)) {
+            elems.push(elem);
+        }
+    }
+    elems
+}
+
+fn enum_class_from_value(ctx: &mut dyn NativeContext, value: Value) -> Option<Value> {
+    let Value::Object(Some(elem)) = value else {
+        return None;
+    };
+    enum_declaring_class_from_object(ctx, elem).map(|class| Value::Object(Some(class)))
+}
+
+fn enum_declaring_class_from_object(
+    ctx: &mut dyn NativeContext,
+    elem: cratonvm_types::ObjectRef,
+) -> Option<cratonvm_types::ObjectRef> {
+    match ctx.invoke_virtual(elem, "getDeclaringClass", "()Ljava/lang/Class;", &[]) {
+        Ok(Some(Value::Object(Some(class)))) => Some(class),
+        _ => match ctx.invoke_virtual(elem, "getClass", "()Ljava/lang/Class;", &[]) {
+            Ok(Some(Value::Object(Some(class)))) => Some(class),
+            _ => None,
+        },
+    }
+}
+
+fn enum_set_element_type(ctx: &mut dyn NativeContext, set: ObjectRef) -> Option<Value> {
+    let cls = ctx
+        .class_name_of_id(ctx.class_id_of_object(set))
+        .unwrap_or_default();
+    if cls == "java/util/RegularEnumSet" || cls == "java/util/JumboEnumSet" {
+        match ctx.get_field_by_name(set, "elementType") {
+            Value::Object(Some(enum_class)) => return Some(Value::Object(Some(enum_class))),
+            _ => {}
+        }
+    }
+    match ctx.get_field(set, ES_FIELD_TYPE) {
+        Value::Object(Some(enum_class)) => Some(Value::Object(Some(enum_class))),
+        _ => None,
+    }
+}
+
+fn native_es_complement_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let source = obj_arg(args, 0)?;
+    let source_elems = enum_set_elements(ctx, source);
+    let Some(seed) = source_elems
+        .iter()
+        .copied()
+        .find(|v| matches!(v, Value::Object(Some(_))))
+    else {
+        return native_es_none_of(ctx, &[]);
+    };
+    let elems: Vec<Value> = enum_universe_for_value(ctx, seed)
+        .into_iter()
+        .filter(|candidate| {
+            !source_elems
+                .iter()
+                .copied()
+                .any(|present| enum_values_same(*candidate, present))
+        })
+        .collect();
+
+    if let Some(set) = try_jdk_enum_set_of_elements(ctx, &elems) {
+        return Ok(Some(Value::Object(Some(set))));
+    }
+    let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
+    let arr = ctx.new_array(
+        cratonvm_types::ArrayElementType::Reference,
+        elems.len().max(4),
+    );
+    for (i, elem) in elems.iter().enumerate() {
+        ctx.set_array_element(arr, i, *elem);
+    }
+    let backing = enum_set_backing_list(ctx, arr, elems.len() as i32);
+    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
+    ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
+    Ok(Some(Value::Object(Some(es))))
 }
 
 fn es_get_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
@@ -4982,19 +5415,242 @@ fn es_get_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<Object
     }
 }
 
+fn es_real_kind(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<&'static str> {
+    match ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .as_deref()
+    {
+        Some("java/util/RegularEnumSet") => Some("regular"),
+        Some("java/util/JumboEnumSet") => Some("jumbo"),
+        _ => None,
+    }
+}
+
+fn es_enum_ordinal(ctx: &mut dyn NativeContext, elem: Value) -> Option<usize> {
+    let ord = enum_value_ordinal(ctx, elem)?;
+    if ord >= 0 {
+        Some(ord as usize)
+    } else {
+        None
+    }
+}
+
+fn es_real_contains_ordinal(ctx: &mut dyn NativeContext, this: ObjectRef, ord: usize) -> bool {
+    let word = ord / 64;
+    let bit = 1u64 << (ord & 63);
+    match ctx.get_field_by_name(this, "elements") {
+        Value::Long(mask) if word == 0 => ((mask as u64) & bit) != 0,
+        Value::Int(mask) if word == 0 => ((mask as u32 as u64) & bit) != 0,
+        Value::Object(Some(words)) => {
+            if word >= ctx.array_length(words) {
+                return false;
+            }
+            match ctx.get_array_element(words, word) {
+                Value::Long(mask) => ((mask as u64) & bit) != 0,
+                Value::Int(mask) => ((mask as u32 as u64) & bit) != 0,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn es_real_add_ordinal(ctx: &mut dyn NativeContext, this: ObjectRef, ord: usize) -> bool {
+    let word = ord / 64;
+    let bit = 1u64 << (ord & 63);
+    match ctx.get_field_by_name(this, "elements") {
+        Value::Long(mask) if word == 0 => {
+            let old = mask as u64;
+            let new = old | bit;
+            if new != old {
+                ctx.set_field_by_name(this, "elements", Value::Long(new as i64));
+                true
+            } else {
+                false
+            }
+        }
+        Value::Int(mask) if word == 0 => {
+            let old = mask as u32 as u64;
+            let new = old | bit;
+            if new != old {
+                ctx.set_field_by_name(this, "elements", Value::Long(new as i64));
+                true
+            } else {
+                false
+            }
+        }
+        Value::Object(Some(words)) => {
+            if word >= ctx.array_length(words) {
+                return false;
+            }
+            let old = match ctx.get_array_element(words, word) {
+                Value::Long(mask) => mask as u64,
+                Value::Int(mask) => mask as u32 as u64,
+                _ => 0,
+            };
+            let new = old | bit;
+            if new != old {
+                ctx.set_array_element(words, word, Value::Long(new as i64));
+                let size = es_real_size(ctx, this);
+                ctx.set_field_by_name(this, "size", Value::Int(size));
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn es_real_remove_ordinal(ctx: &mut dyn NativeContext, this: ObjectRef, ord: usize) -> bool {
+    let word = ord / 64;
+    let bit = 1u64 << (ord & 63);
+    match ctx.get_field_by_name(this, "elements") {
+        Value::Long(mask) if word == 0 => {
+            let old = mask as u64;
+            let new = old & !bit;
+            if new != old {
+                ctx.set_field_by_name(this, "elements", Value::Long(new as i64));
+                true
+            } else {
+                false
+            }
+        }
+        Value::Int(mask) if word == 0 => {
+            let old = mask as u32 as u64;
+            let new = old & !bit;
+            if new != old {
+                ctx.set_field_by_name(this, "elements", Value::Long(new as i64));
+                true
+            } else {
+                false
+            }
+        }
+        Value::Object(Some(words)) => {
+            if word >= ctx.array_length(words) {
+                return false;
+            }
+            let old = match ctx.get_array_element(words, word) {
+                Value::Long(mask) => mask as u64,
+                Value::Int(mask) => mask as u32 as u64,
+                _ => 0,
+            };
+            let new = old & !bit;
+            if new != old {
+                ctx.set_array_element(words, word, Value::Long(new as i64));
+                let size = es_real_size(ctx, this);
+                ctx.set_field_by_name(this, "size", Value::Int(size));
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn es_real_size(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
+    match ctx.get_field_by_name(this, "elements") {
+        Value::Long(mask) => (mask as u64).count_ones() as i32,
+        Value::Int(mask) => (mask as u32).count_ones() as i32,
+        Value::Object(Some(words)) => {
+            let mut size = 0i32;
+            for i in 0..ctx.array_length(words) {
+                size += match ctx.get_array_element(words, i) {
+                    Value::Long(mask) => (mask as u64).count_ones() as i32,
+                    Value::Int(mask) => (mask as u32).count_ones() as i32,
+                    _ => 0,
+                };
+            }
+            size
+        }
+        _ => ctx.get_field_by_name(this, "size").as_int().unwrap_or(0),
+    }
+}
+
+fn es_real_clear(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    match ctx.get_field_by_name(this, "elements") {
+        Value::Long(_) | Value::Int(_) => {
+            ctx.set_field_by_name(this, "elements", Value::Long(0));
+        }
+        Value::Object(Some(words)) => {
+            for i in 0..ctx.array_length(words) {
+                ctx.set_array_element(words, i, Value::Long(0));
+            }
+            ctx.set_field_by_name(this, "size", Value::Int(0));
+        }
+        _ => {}
+    }
+}
+
+fn es_real_elements(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    let universe = match ctx.get_field_by_name(this, "universe") {
+        Value::Object(Some(universe)) => universe,
+        _ => return Vec::new(),
+    };
+    let mut elems = Vec::new();
+    for ord in 0..ctx.array_length(universe) {
+        if es_real_contains_ordinal(ctx, this, ord) {
+            let elem = ctx.get_array_element(universe, ord);
+            if !matches!(elem, Value::Object(None)) {
+                elems.push(elem);
+            }
+        }
+    }
+    elems
+}
+
 pub(crate) fn native_es_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    if es_real_kind(ctx, this).is_some() {
+        let modified = es_enum_ordinal(ctx, elem)
+            .map(|ord| es_real_add_ordinal(ctx, this, ord))
+            .unwrap_or(false);
+        return Ok(Some(Value::Int(i32::from(modified))));
+    }
     if let Some(backing) = es_get_backing(ctx, this) {
         // Delegate to ArrayList add
         cratonvm_native_collections::native_al_add(ctx, &[Value::Object(Some(backing)), elem])?;
+        return Ok(Some(Value::Int(1)));
     }
-    Ok(Some(Value::Int(1)))
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_es_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let coll = match args.get(1).copied() {
+        Some(Value::Object(Some(coll))) => coll,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elems = if let Ok(Some(Value::Object(Some(arr)))) =
+        ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[])
+    {
+        (0..ctx.array_length(arr))
+            .map(|i| ctx.get_array_element(arr, i))
+            .collect::<Vec<_>>()
+    } else {
+        enum_set_elements(ctx, coll)
+    };
+    let mut modified = false;
+    for elem in elems {
+        if matches!(elem, Value::Object(Some(_))) {
+            native_es_add(ctx, &[Value::Object(Some(this)), elem])?;
+            modified = true;
+        }
+    }
+    Ok(Some(Value::Int(i32::from(modified))))
 }
 
 fn native_es_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let _elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    if es_real_kind(ctx, this).is_some() {
+        let modified = es_enum_ordinal(ctx, elem)
+            .map(|ord| es_real_remove_ordinal(ctx, this, ord))
+            .unwrap_or(false);
+        return Ok(Some(Value::Int(i32::from(modified))));
+    }
     if let Some(backing) = es_get_backing(ctx, this) {
         let size = match ctx.get_field(backing, 1) {
             Value::Int(n) => n,
@@ -5011,19 +5667,27 @@ fn native_es_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
 fn native_es_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let _elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    if es_real_kind(ctx, this).is_some() {
+        let contained = es_enum_ordinal(ctx, elem)
+            .map(|ord| es_real_contains_ordinal(ctx, this, ord))
+            .unwrap_or(false);
+        return Ok(Some(Value::Int(i32::from(contained))));
+    }
     if let Some(backing) = es_get_backing(ctx, this) {
-        let size = match ctx.get_field(backing, 1) {
-            Value::Int(n) => n,
-            _ => 0,
-        };
-        return Ok(Some(Value::Int(if size > 0 { 1 } else { 0 })));
+        return cratonvm_native_collections::native_al_contains(
+            ctx,
+            &[Value::Object(Some(backing)), elem],
+        );
     }
     Ok(Some(Value::Int(0)))
 }
 
 fn native_es_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if es_real_kind(ctx, this).is_some() {
+        return Ok(Some(Value::Int(es_real_size(ctx, this))));
+    }
     if let Some(backing) = es_get_backing(ctx, this) {
         let size = match ctx.get_field(backing, 1) {
             Value::Int(n) => n,
@@ -5036,6 +5700,13 @@ fn native_es_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 
 fn native_es_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if es_real_kind(ctx, this).is_some() {
+        return Ok(Some(Value::Int(if es_real_size(ctx, this) == 0 {
+            1
+        } else {
+            0
+        })));
+    }
     if let Some(backing) = es_get_backing(ctx, this) {
         let size = match ctx.get_field(backing, 1) {
             Value::Int(n) => n,
@@ -5048,6 +5719,10 @@ fn native_es_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 fn native_es_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if es_real_kind(ctx, this).is_some() {
+        es_real_clear(ctx, this);
+        return Ok(None);
+    }
     if let Some(backing) = es_get_backing(ctx, this) {
         ctx.set_field(backing, 1, Value::Int(0));
     }
@@ -5056,31 +5731,44 @@ fn native_es_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 fn native_es_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    let cls = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default();
+    if cls == "java/util/RegularEnumSet" || cls == "java/util/JumboEnumSet" {
+        return cratonvm_native_collections::native_al_iterator(ctx, args);
+    }
     if let Some(backing) = es_get_backing(ctx, this) {
-        // Create snapshot iterator
         let size = match ctx.get_field(backing, 1) {
-            Value::Int(n) => n as usize,
+            Value::Int(n) if n > 0 => n as usize,
             _ => 0,
         };
         let data = match ctx.get_field(backing, 0) {
-            Value::Object(Some(o)) => o,
-            _ => return Ok(Some(Value::Object(None))),
+            Value::Object(Some(o)) => Some(o),
+            _ => None,
         };
         let snap = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
-        for i in 0..size {
-            let v = ctx.get_array_element(data, i);
-            ctx.set_array_element(snap, i, v);
+        if let Some(data) = data {
+            for i in 0..size.min(ctx.array_length(data)) {
+                let v = ctx.get_array_element(data, i);
+                ctx.set_array_element(snap, i, v);
+            }
         }
-        let itr = alloc_concurrent_synthetic(ctx, "java/util/EnumSet$Itr", 2);
-        ctx.set_field(itr, 0, Value::Object(Some(snap)));
-        ctx.set_field(itr, 1, Value::Int(0));
-        return Ok(Some(Value::Object(Some(itr))));
+        return cratonvm_native_collections::make_iterator_from_array(ctx, snap, size);
     }
-    Ok(Some(Value::Object(None)))
+    let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+    cratonvm_native_collections::make_iterator_from_array(ctx, empty, 0)
 }
 
 fn native_es_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if es_real_kind(ctx, this).is_some() {
+        let elems = es_real_elements(ctx, this);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, elems.len());
+        for (i, elem) in elems.iter().enumerate() {
+            ctx.set_array_element(arr, i, *elem);
+        }
+        return Ok(Some(Value::Object(Some(arr))));
+    }
     if let Some(backing) = es_get_backing(ctx, this) {
         let size = match ctx.get_field(backing, 1) {
             Value::Int(n) => n as usize,
@@ -5109,21 +5797,34 @@ fn native_es_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 fn native_es_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let template = args.get(1).copied().unwrap_or(Value::Object(None));
-    let backing = match es_get_backing(ctx, this) {
-        Some(b) => b,
-        None => {
-            // No backing — return the template (or an empty Object[]).
-            return Ok(Some(template));
+    let real_elems = if es_real_kind(ctx, this).is_some() {
+        Some(es_real_elements(ctx, this))
+    } else {
+        None
+    };
+    let backing = if real_elems.is_some() {
+        None
+    } else {
+        match es_get_backing(ctx, this) {
+            Some(b) => Some(b),
+            None => {
+                // No backing: return the template (or an empty Object[]).
+                return Ok(Some(template));
+            }
         }
     };
-    let size = match ctx.get_field(backing, 1) {
-        Value::Int(n) => n.max(0) as usize,
-        _ => 0,
-    };
-    let data = match ctx.get_field(backing, 0) {
+    let size = real_elems.as_ref().map_or_else(
+        || match backing.map(|b| ctx.get_field(b, 1)) {
+            Some(Value::Int(n)) => n.max(0) as usize,
+            _ => 0,
+        },
+        |elems| elems.len(),
+    );
+    let data = backing.and_then(|b| match ctx.get_field(b, 0) {
         Value::Object(Some(o)) => Some(o),
         _ => None,
-    };
+    });
+
     // Pick destination: reuse template if big enough, else allocate fresh
     // with the same component as template (or a plain Object[] if template
     // is null).
@@ -5136,7 +5837,11 @@ fn native_es_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         }
         _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, size),
     };
-    if let Some(d) = data {
+    if let Some(elems) = real_elems {
+        for (i, elem) in elems.iter().enumerate().take(size) {
+            ctx.set_array_element(target, i, *elem);
+        }
+    } else if let Some(d) = data {
         let copy = size.min(ctx.array_length(d));
         for i in 0..copy {
             ctx.set_array_element(target, i, ctx.get_array_element(d, i));
@@ -5183,6 +5888,31 @@ fn native_es_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 // EnumMap — 3-field synthetic (same as HashMap: buckets=0, size=1, capacity=2)
 // Simplified: delegates to HashMap implementation
 // ---------------------------------------------------------------------------
+/// Registers only `EnumMap.<init>(Class)` — safe to call from the essential
+/// (both-mode) registration path. `<init>` runs via invokespecial, where a
+/// registered native always wins over bytecode (see `native_em_init`'s
+/// comment), so this narrow registration is what lets early bootstrap (e.g.
+/// logging, before the synthetic phase-50 registrations land) see a working
+/// synthetic EnumMap. The rest of `register_enum_map_natives` (put/get/size/
+/// etc) must stay synthetic-mode-only: those are normal invokevirtual calls
+/// that already run correctly against real EnumMap bytecode once `<init>`
+/// leaves the object properly initialized, and registering them on the
+/// concrete class defeats `try_delegate_real_collection`'s real-JDK fallback
+/// (its `invoke_special` resolves straight back to this same native, the
+/// re-entrancy guard trips, and the caller gets a stale synthetic answer —
+/// e.g. `EnumMap.size()`/`get()` reporting empty after a real `put()`).
+pub(crate) fn register_enum_map_init_native(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+    r.register(
+        "java/util/EnumMap",
+        "<init>",
+        "(Ljava/lang/Class;)V",
+        native_em_init,
+    );
+    r.set_category(__prev_cat);
+}
+
 pub(crate) fn register_enum_map_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
@@ -5192,25 +5922,25 @@ pub(crate) fn register_enum_map_natives(r: &mut NativeMethodRegistry) {
         c,
         "put",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        cratonvm_native_collections::native_map_put_pub,
+        native_em_put,
     );
     r.register(
         c,
         "get",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
-        cratonvm_native_collections::native_map_get_pub,
+        native_em_get,
     );
     r.register(
         c,
         "remove",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
-        cratonvm_native_collections::native_map_remove_pub,
+        native_em_remove,
     );
     r.register(
         c,
         "containsKey",
         "(Ljava/lang/Object;)Z",
-        cratonvm_native_collections::native_map_contains_key_pub,
+        native_em_contains_key,
     );
     r.register(
         c,
@@ -5218,24 +5948,9 @@ pub(crate) fn register_enum_map_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Z",
         cratonvm_native_collections::native_map_contains_value_pub,
     );
-    r.register(
-        c,
-        "size",
-        "()I",
-        cratonvm_native_collections::native_map_size_pub,
-    );
-    r.register(
-        c,
-        "isEmpty",
-        "()Z",
-        cratonvm_native_collections::native_map_is_empty_pub,
-    );
-    r.register(
-        c,
-        "clear",
-        "()V",
-        cratonvm_native_collections::native_map_clear_pub,
-    );
+    r.register(c, "size", "()I", native_em_size);
+    r.register(c, "isEmpty", "()Z", native_em_is_empty);
+    r.register(c, "clear", "()V", native_em_clear);
     r.register(
         c,
         "keySet",
@@ -5282,12 +5997,198 @@ pub(crate) fn register_enum_map_natives(r: &mut NativeMethodRegistry) {
 
 fn native_em_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // `<init>` is dispatched via invokespecial, where a registered native
+    // ALWAYS wins over bytecode (see `invoke_special_shared`'s "Native
+    // override always wins" priority) — unlike invokevirtual calls such as
+    // `put`/`get`, which prefer real bytecode unless force-listed. This
+    // native was promoted into the essential (both-mode) registration set
+    // so early logging bootstrap can see a synthetic EnumMap before the
+    // synthetic phase-50 registrations land, but that means it *also* fires
+    // for a real `java/util/EnumMap` loaded from the real JDK in real-JDK
+    // mode, where the hardcoded buckets/size/capacity indices below don't
+    // match the real class's keyType/keyUniverse/vals/size/entrySet field
+    // layout — clobbering `keyType` (real field index 2, not 0) with a
+    // buckets array and coercing `keyUniverse`/`vals` (ref-typed fields hit
+    // with `Value::Int`) to null, so `EnumMap.put`'s real-bytecode
+    // `typeCheck` sees `keyType == null` and throws ClassCastException.
+    // Mirror the real constructor's semantics by field name instead.
+    if !ctx.is_class_synthetic_stub("java/util/EnumMap") {
+        let key_type = args.get(1).copied().unwrap_or(Value::Object(None));
+        let universe = match key_type {
+            Value::Object(Some(enum_class)) => {
+                match ctx.invoke_virtual(
+                    enum_class,
+                    "getEnumConstants",
+                    "()[Ljava/lang/Object;",
+                    &[],
+                ) {
+                    Ok(Some(Value::Object(Some(universe)))) => universe,
+                    _ => enum_constants_array_for_class(ctx, enum_class).unwrap_or_else(|| {
+                        ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0)
+                    }),
+                }
+            }
+            _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
+        };
+        let vals = ctx.new_array(
+            cratonvm_types::ArrayElementType::Reference,
+            ctx.array_length(universe),
+        );
+        ctx.set_field_by_name(this, "keyType", key_type);
+        ctx.set_field_by_name(this, "keyUniverse", Value::Object(Some(universe)));
+        ctx.set_field_by_name(this, "vals", Value::Object(Some(vals)));
+        ctx.set_field_by_name(this, "size", Value::Int(0));
+        ctx.set_field_by_name(this, "entrySet", Value::Object(None));
+        return Ok(None);
+    }
     let cap = 16;
     let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
     ctx.set_field(this, 0, Value::Object(Some(buckets)));
     ctx.set_field(this, 1, Value::Int(0));
     ctx.set_field(this, 2, Value::Int(cap as i32));
     Ok(None)
+}
+
+fn em_real_vals(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if ctx.is_class_synthetic_stub("java/util/EnumMap") {
+        return None;
+    }
+    match ctx.get_field_by_name(this, "vals") {
+        Value::Object(Some(vals)) => Some(vals),
+        _ => None,
+    }
+}
+
+fn em_enum_ordinal(ctx: &mut dyn NativeContext, key: Value) -> Option<usize> {
+    let Value::Object(Some(enum_obj)) = key else {
+        return None;
+    };
+    match ctx.invoke_virtual(enum_obj, "ordinal", "()I", &[]) {
+        Ok(Some(Value::Int(n))) if n >= 0 => return Some(n as usize),
+        _ => {}
+    }
+    match ctx.get_field_by_name(enum_obj, "ordinal") {
+        Value::Int(n) if n >= 0 => Some(n as usize),
+        _ => None,
+    }
+}
+
+fn native_em_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if let Some(vals) = em_real_vals(ctx, this) {
+        let key = args.get(1).copied().unwrap_or(Value::Object(None));
+        let value = args.get(2).copied().unwrap_or(Value::Object(None));
+        let Some(idx) = em_enum_ordinal(ctx, key) else {
+            return Ok(Some(Value::Object(None)));
+        };
+        if idx >= ctx.array_length(vals) {
+            return Ok(Some(Value::Object(None)));
+        }
+        let old = ctx.get_array_element(vals, idx);
+        ctx.set_array_element(vals, idx, value);
+        if matches!(old, Value::Object(None)) && !matches!(value, Value::Object(None)) {
+            let size = ctx
+                .get_field_by_name(this, "size")
+                .as_int()
+                .unwrap_or(0)
+                .saturating_add(1);
+            ctx.set_field_by_name(this, "size", Value::Int(size));
+        }
+        return Ok(Some(old));
+    }
+    cratonvm_native_collections::native_map_put_pub(ctx, args)
+}
+
+fn native_em_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if let Some(vals) = em_real_vals(ctx, this) {
+        let key = args.get(1).copied().unwrap_or(Value::Object(None));
+        let Some(idx) = em_enum_ordinal(ctx, key) else {
+            return Ok(Some(Value::Object(None)));
+        };
+        if idx >= ctx.array_length(vals) {
+            return Ok(Some(Value::Object(None)));
+        }
+        return Ok(Some(ctx.get_array_element(vals, idx)));
+    }
+    cratonvm_native_collections::native_map_get_pub(ctx, args)
+}
+
+fn native_em_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if let Some(vals) = em_real_vals(ctx, this) {
+        let key = args.get(1).copied().unwrap_or(Value::Object(None));
+        let Some(idx) = em_enum_ordinal(ctx, key) else {
+            return Ok(Some(Value::Object(None)));
+        };
+        if idx >= ctx.array_length(vals) {
+            return Ok(Some(Value::Object(None)));
+        }
+        let old = ctx.get_array_element(vals, idx);
+        ctx.set_array_element(vals, idx, Value::Object(None));
+        if !matches!(old, Value::Object(None)) {
+            let size = ctx
+                .get_field_by_name(this, "size")
+                .as_int()
+                .unwrap_or(0)
+                .saturating_sub(1);
+            ctx.set_field_by_name(this, "size", Value::Int(size));
+        }
+        return Ok(Some(old));
+    }
+    cratonvm_native_collections::native_map_remove_pub(ctx, args)
+}
+
+fn native_em_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if let Some(vals) = em_real_vals(ctx, this) {
+        let key = args.get(1).copied().unwrap_or(Value::Object(None));
+        let Some(idx) = em_enum_ordinal(ctx, key) else {
+            return Ok(Some(Value::Int(0)));
+        };
+        if idx >= ctx.array_length(vals) {
+            return Ok(Some(Value::Int(0)));
+        }
+        return Ok(Some(Value::Int(
+            if matches!(ctx.get_array_element(vals, idx), Value::Object(None)) {
+                0
+            } else {
+                1
+            },
+        )));
+    }
+    cratonvm_native_collections::native_map_contains_key_pub(ctx, args)
+}
+
+fn native_em_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if em_real_vals(ctx, this).is_some() {
+        return Ok(Some(Value::Int(
+            ctx.get_field_by_name(this, "size").as_int().unwrap_or(0),
+        )));
+    }
+    cratonvm_native_collections::native_map_size_pub(ctx, args)
+}
+
+fn native_em_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if em_real_vals(ctx, this).is_some() {
+        let size = ctx.get_field_by_name(this, "size").as_int().unwrap_or(0);
+        return Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })));
+    }
+    cratonvm_native_collections::native_map_is_empty_pub(ctx, args)
+}
+
+fn native_em_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if let Some(vals) = em_real_vals(ctx, this) {
+        for i in 0..ctx.array_length(vals) {
+            ctx.set_array_element(vals, i, Value::Object(None));
+        }
+        ctx.set_field_by_name(this, "size", Value::Int(0));
+        return Ok(None);
+    }
+    cratonvm_native_collections::native_map_clear_pub(ctx, args)
 }
 
 fn native_em_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -5507,9 +6408,147 @@ pub(crate) fn register_phase51_natives(registry: &mut NativeMethodRegistry) {
     register_timer_natives(registry);
     register_forkjoin_natives(registry);
     register_scheduled_executor_natives(registry);
+    register_qname_natives(registry);
     register_timeunit_natives(registry);
     register_object_stream_natives(registry);
     registry.set_category(__prev_cat);
+}
+
+fn qname_value_or_empty(ctx: &mut dyn NativeContext, v: Option<Value>) -> ObjectRef {
+    match v {
+        Some(Value::Object(Some(s))) => s,
+        _ => ctx.create_string(""),
+    }
+}
+
+fn qname_parts_table(
+) -> &'static std::sync::Mutex<std::collections::HashMap<i32, (String, String, String)>> {
+    static T: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<i32, (String, String, String)>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn qname_set_parts(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    namespace_uri: ObjectRef,
+    local_part: ObjectRef,
+    prefix: ObjectRef,
+) {
+    let namespace_uri_text = ctx.read_string(namespace_uri).unwrap_or_default();
+    let local_part_text = ctx.read_string(local_part).unwrap_or_default();
+    let prefix_text = ctx.read_string(prefix).unwrap_or_default();
+    if let Ok(mut table) = qname_parts_table().lock() {
+        table.insert(
+            ctx.identity_hash_code(this),
+            (namespace_uri_text, local_part_text, prefix_text),
+        );
+    }
+    ctx.set_field_by_name(this, "namespaceURI", Value::Object(Some(namespace_uri)));
+    ctx.set_field_by_name(this, "localPart", Value::Object(Some(local_part)));
+    ctx.set_field_by_name(this, "prefix", Value::Object(Some(prefix)));
+}
+
+fn qname_part_text(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    name: &str,
+    slot: usize,
+    index: usize,
+) -> String {
+    if let Ok(table) = qname_parts_table().lock() {
+        if let Some(parts) = table.get(&ctx.identity_hash_code(this)) {
+            return match index {
+                0 => parts.0.clone(),
+                1 => parts.1.clone(),
+                _ => parts.2.clone(),
+            };
+        }
+    }
+    match ctx.get_field_by_name(this, name) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ if ctx.object_num_fields(this) > slot => match ctx.get_field(this, slot) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
+fn qname_part(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    name: &str,
+    slot: usize,
+    index: usize,
+) -> Value {
+    let text = qname_part_text(ctx, this, name, slot, index);
+    Value::Object(Some(ctx.create_string(&text)))
+}
+
+pub(crate) fn register_qname_natives(r: &mut NativeMethodRegistry) {
+    let c = "javax/xml/namespace/QName";
+    r.register(c, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let local = qname_value_or_empty(ctx, args.get(1).copied());
+        let empty_ns = ctx.create_string("");
+        let empty_prefix = ctx.create_string("");
+        qname_set_parts(ctx, this, empty_ns, local, empty_prefix);
+        Ok(None)
+    });
+    r.register(
+        c,
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ns = qname_value_or_empty(ctx, args.get(1).copied());
+            let local = qname_value_or_empty(ctx, args.get(2).copied());
+            let prefix = ctx.create_string("");
+            qname_set_parts(ctx, this, ns, local, prefix);
+            Ok(None)
+        },
+    );
+    r.register(
+        c,
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ns = qname_value_or_empty(ctx, args.get(1).copied());
+            let local = qname_value_or_empty(ctx, args.get(2).copied());
+            let prefix = qname_value_or_empty(ctx, args.get(3).copied());
+            qname_set_parts(ctx, this, ns, local, prefix);
+            Ok(None)
+        },
+    );
+    r.register(c, "getNamespaceURI", "()Ljava/lang/String;", |ctx, args| {
+        Ok(Some(qname_part(
+            ctx,
+            obj_arg(args, 0)?,
+            "namespaceURI",
+            0,
+            0,
+        )))
+    });
+    r.register(c, "getLocalPart", "()Ljava/lang/String;", |ctx, args| {
+        Ok(Some(qname_part(ctx, obj_arg(args, 0)?, "localPart", 1, 1)))
+    });
+    r.register(c, "getPrefix", "()Ljava/lang/String;", |ctx, args| {
+        Ok(Some(qname_part(ctx, obj_arg(args, 0)?, "prefix", 2, 2)))
+    });
+    r.register(c, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let ns = qname_part_text(ctx, this, "namespaceURI", 0, 0);
+        let local = qname_part_text(ctx, this, "localPart", 1, 1);
+        let text = if ns.is_empty() {
+            local
+        } else {
+            format!("{{{ns}}}{local}")
+        };
+        Ok(Some(Value::Object(Some(ctx.create_string(&text)))))
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -7412,23 +8451,285 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 // ScheduledExecutorService — stubs
 // ---------------------------------------------------------------------------
+
+fn stpe_new_delayed_work_queue(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    match ctx.new_object_initialized(
+        "java/util/concurrent/ScheduledThreadPoolExecutor$DelayedWorkQueue",
+        "()V",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(q)))) => Some(q),
+        _ => match ctx.new_object_initialized(
+            "java/util/concurrent/PriorityBlockingQueue",
+            "()V",
+            &[],
+        ) {
+            Ok(Some(Value::Object(Some(q)))) => Some(q),
+            _ => None,
+        },
+    }
+}
+
+fn stpe_time_unit_millis(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    let cid = ctx
+        .ensure_class_initialized("java/util/concurrent/TimeUnit")
+        .ok()?;
+    let idx = ctx.static_field_index_by_name(cid, "MILLISECONDS")?;
+    match ctx.get_static_field(cid, idx) {
+        Value::Object(Some(unit)) => Some(unit),
+        _ => None,
+    }
+}
+
+fn stpe_legacy_slot_init(ctx: &mut dyn NativeContext, this: ObjectRef, cores: i32) {
+    let cores = cores.max(1);
+    if ctx.object_num_fields(this) > 0 {
+        ctx.set_field(this, 0, Value::Int(cores));
+    }
+    if ctx.object_num_fields(this) > 1 {
+        ctx.set_field(this, 1, Value::Int(0));
+    }
+}
+
+/// Which real `BlockingQueue` a plain `ThreadPoolExecutor` built by an
+/// `Executors.*` factory shortcut should use — mirrors the queue type real
+/// JDK bytecode picks for each factory (see `java.util.concurrent.Executors`).
+pub(crate) enum TpeQueueKind {
+    /// `newFixedThreadPool`/`newSingleThreadExecutor`: unbounded `LinkedBlockingQueue`.
+    Linked,
+    /// `newCachedThreadPool`: zero-capacity rendezvous `SynchronousQueue`.
+    Synchronous,
+}
+
+fn tpe_new_queue(ctx: &mut dyn NativeContext, kind: TpeQueueKind) -> Option<ObjectRef> {
+    let class_name = match kind {
+        TpeQueueKind::Linked => "java/util/concurrent/LinkedBlockingQueue",
+        TpeQueueKind::Synchronous => "java/util/concurrent/SynchronousQueue",
+    };
+    match ctx.new_object_initialized(class_name, "()V", &[]) {
+        Ok(Some(Value::Object(Some(q)))) => Some(q),
+        _ => None,
+    }
+}
+
+fn tpe_time_unit_by_name(ctx: &mut dyn NativeContext, name: &str) -> Option<ObjectRef> {
+    let cid = ctx
+        .ensure_class_initialized("java/util/concurrent/TimeUnit")
+        .ok()?;
+    let idx = ctx.static_field_index_by_name(cid, name)?;
+    match ctx.get_static_field(cid, idx) {
+        Value::Object(Some(unit)) => Some(unit),
+        _ => None,
+    }
+}
+
+/// BUG FIX (2026-07-10, ES executors-factory mainlock NPE, layer 2): drive a
+/// genuinely real `ThreadPoolExecutor` construction for
+/// `Executors.newFixedThreadPool`/`newCachedThreadPool`/`newSingleThreadExecutor`,
+/// the same pattern `initialize_real_scheduled_thread_pool_executor` already
+/// uses for `ScheduledThreadPoolExecutor`. `this` must already be allocated
+/// with the real class's field layout (via `alloc_concurrent_synthetic`);
+/// this invokes the real `ThreadPoolExecutor(int, int, long, TimeUnit,
+/// BlockingQueue[, ThreadFactory])V` constructor via `invoke_special`, which
+/// itself fills in `ctl`/`workQueue`/`mainLock`/`workers`/`termination` (and,
+/// when no `ThreadFactory` is supplied, calls the real JDK
+/// `Executors.defaultThreadFactory()`/`defaultHandler` internally — no
+/// different from what happens when user bytecode calls `new
+/// ThreadPoolExecutor(...)` directly). This is what makes
+/// `drop_real_layout_synthetic`'s "every ThreadPoolExecutor-tagged object is
+/// real" assumption actually hold for these factory shortcuts, instead of
+/// just for direct `new ThreadPoolExecutor(...)` calls.
+/// Falls back to the old two-slot legacy write if queue/unit construction
+/// fails, so callers never see a fully-uninitialized object.
+/// See docs/known-issues/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe.md.
+pub(crate) fn initialize_real_thread_pool_executor(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    core_pool_size: i32,
+    max_pool_size: i32,
+    keep_alive: i64,
+    keep_alive_unit_name: &str,
+    queue_kind: TpeQueueKind,
+    thread_factory: Option<ObjectRef>,
+) -> MethodCallResult {
+    let core_pool_size = core_pool_size.max(0);
+    let max_pool_size = max_pool_size.max(core_pool_size).max(1);
+    let pin_base = ctx.pin_native_root(this);
+    let factory_pin = thread_factory.map(|factory| ctx.pin_native_root(factory));
+
+    let Some(queue) = tpe_new_queue(ctx, queue_kind) else {
+        let this = ctx.read_native_pin(pin_base, this);
+        stpe_legacy_slot_init(ctx, this, core_pool_size.max(1));
+        ctx.unpin_native_roots(pin_base);
+        return Ok(None);
+    };
+    let queue_pin = ctx.pin_native_root(queue);
+
+    let Some(unit) = tpe_time_unit_by_name(ctx, keep_alive_unit_name) else {
+        let this = ctx.read_native_pin(pin_base, this);
+        let queue = ctx.read_native_pin(queue_pin, queue);
+        stpe_legacy_slot_init(ctx, this, core_pool_size.max(1));
+        ctx.set_field_by_name(this, "workQueue", Value::Object(Some(queue)));
+        ctx.unpin_native_roots(pin_base);
+        return Ok(None);
+    };
+    let unit_pin = ctx.pin_native_root(unit);
+
+    let this_arg = ctx.read_native_pin(pin_base, this);
+    let queue_arg = ctx.read_native_pin(queue_pin, queue);
+    let unit_arg = ctx.read_native_pin(unit_pin, unit);
+
+    let result = if let Some(factory) = thread_factory {
+        let factory_arg = ctx.read_native_pin(factory_pin.unwrap_or(pin_base), factory);
+        ctx.invoke_special(
+            "java/util/concurrent/ThreadPoolExecutor",
+            "<init>",
+            "(IIJLjava/util/concurrent/TimeUnit;Ljava/util/concurrent/BlockingQueue;Ljava/util/concurrent/ThreadFactory;)V",
+            &[
+                Value::Object(Some(this_arg)),
+                Value::Int(core_pool_size),
+                Value::Int(max_pool_size),
+                Value::Long(keep_alive),
+                Value::Object(Some(unit_arg)),
+                Value::Object(Some(queue_arg)),
+                Value::Object(Some(factory_arg)),
+            ],
+        )
+    } else {
+        ctx.invoke_special(
+            "java/util/concurrent/ThreadPoolExecutor",
+            "<init>",
+            "(IIJLjava/util/concurrent/TimeUnit;Ljava/util/concurrent/BlockingQueue;)V",
+            &[
+                Value::Object(Some(this_arg)),
+                Value::Int(core_pool_size),
+                Value::Int(max_pool_size),
+                Value::Long(keep_alive),
+                Value::Object(Some(unit_arg)),
+                Value::Object(Some(queue_arg)),
+            ],
+        )
+    };
+
+    ctx.unpin_native_roots(pin_base);
+    result.map(|_| None)
+}
+
+pub(crate) fn initialize_real_scheduled_thread_pool_executor(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    cores: i32,
+    thread_factory: Option<ObjectRef>,
+) -> MethodCallResult {
+    let cores = cores.max(1);
+    let pin_base = ctx.pin_native_root(this);
+    let factory_pin = thread_factory.map(|factory| ctx.pin_native_root(factory));
+
+    let Some(queue) = stpe_new_delayed_work_queue(ctx) else {
+        let this = ctx.read_native_pin(pin_base, this);
+        stpe_legacy_slot_init(ctx, this, cores);
+        ctx.unpin_native_roots(pin_base);
+        return Ok(None);
+    };
+    let queue_pin = ctx.pin_native_root(queue);
+
+    let Some(unit) = stpe_time_unit_millis(ctx) else {
+        let this = ctx.read_native_pin(pin_base, this);
+        let queue = ctx.read_native_pin(queue_pin, queue);
+        stpe_legacy_slot_init(ctx, this, cores);
+        ctx.set_field_by_name(this, "workQueue", Value::Object(Some(queue)));
+        ctx.unpin_native_roots(pin_base);
+        return Ok(None);
+    };
+    let unit_pin = ctx.pin_native_root(unit);
+
+    let this_arg = ctx.read_native_pin(pin_base, this);
+    let queue_arg = ctx.read_native_pin(queue_pin, queue);
+    let unit_arg = ctx.read_native_pin(unit_pin, unit);
+    let result = if let Some(factory) = thread_factory {
+        let factory_arg = ctx.read_native_pin(factory_pin.unwrap_or(pin_base), factory);
+        ctx.invoke_special(
+            "java/util/concurrent/ThreadPoolExecutor",
+            "<init>",
+            "(IIJLjava/util/concurrent/TimeUnit;Ljava/util/concurrent/BlockingQueue;Ljava/util/concurrent/ThreadFactory;)V",
+            &[
+                Value::Object(Some(this_arg)),
+                Value::Int(cores),
+                Value::Int(i32::MAX),
+                Value::Long(10),
+                Value::Object(Some(unit_arg)),
+                Value::Object(Some(queue_arg)),
+                Value::Object(Some(factory_arg)),
+            ],
+        )
+    } else {
+        ctx.invoke_special(
+            "java/util/concurrent/ThreadPoolExecutor",
+            "<init>",
+            "(IIJLjava/util/concurrent/TimeUnit;Ljava/util/concurrent/BlockingQueue;)V",
+            &[
+                Value::Object(Some(this_arg)),
+                Value::Int(cores),
+                Value::Int(i32::MAX),
+                Value::Long(10),
+                Value::Object(Some(unit_arg)),
+                Value::Object(Some(queue_arg)),
+            ],
+        )
+    };
+
+    let this = ctx.read_native_pin(pin_base, this);
+    if result.is_ok() {
+        ctx.set_field_by_name(
+            this,
+            "continueExistingPeriodicTasksAfterShutdown",
+            Value::Int(0),
+        );
+        ctx.set_field_by_name(
+            this,
+            "executeExistingDelayedTasksAfterShutdown",
+            Value::Int(1),
+        );
+        ctx.set_field_by_name(this, "removeOnCancel", Value::Int(0));
+    }
+    ctx.unpin_native_roots(pin_base);
+    result.map(|_| None)
+}
+
 pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let ses = "java/util/concurrent/ScheduledThreadPoolExecutor";
     r.register(ses, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ps = match args.get(1) {
+        let cores = match args.get(1) {
             Some(Value::Int(v)) => *v,
             _ => 1,
         };
-        ctx.set_field(this, 0, Value::Int(ps));
-        ctx.set_field(this, 1, Value::Int(0));
-        Ok(Some(Value::Object(None)))
+        initialize_real_scheduled_thread_pool_executor(ctx, this, cores, None)
     });
+    r.register(
+        ses,
+        "<init>",
+        "(ILjava/util/concurrent/ThreadFactory;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let cores = match args.get(1) {
+                Some(Value::Int(v)) => *v,
+                _ => 1,
+            };
+            let factory = match args.get(2) {
+                Some(Value::Object(Some(factory))) => Some(*factory),
+                _ => None,
+            };
+            initialize_real_scheduled_thread_pool_executor(ctx, this, cores, factory)
+        },
+    );
     r.register(ses, "shutdown", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 1, Value::Int(1));
+        if ctx.object_num_fields(this) > 1 {
+            ctx.set_field(this, 1, Value::Int(1));
+        }
         Ok(Some(Value::Object(None)))
     });
     r.register(ses, "shutdownNow", "()Ljava/util/List;", |ctx, _args| {
@@ -7438,19 +8739,63 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         ctx.set_field(list, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(list))))
     });
+    r.register(
+        ses,
+        "setContinueExistingPeriodicTasksAfterShutdownPolicy",
+        "(Z)V",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(
+        ses,
+        "setExecuteExistingDelayedTasksAfterShutdownPolicy",
+        "(Z)V",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(ses, "setRemoveOnCancelPolicy", "(Z)V", |_ctx, _args| {
+        Ok(Some(Value::Object(None)))
+    });
+    r.register(
+        ses,
+        "getContinueExistingPeriodicTasksAfterShutdownPolicy",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    r.register(
+        ses,
+        "getExecuteExistingDelayedTasksAfterShutdownPolicy",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(1))),
+    );
+    r.register(ses, "getRemoveOnCancelPolicy", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(ses, "execute", "(Ljava/lang/Runnable;)V", |ctx, args| {
+        if let Some(Value::Object(Some(task))) = args.get(1).copied() {
+            ctx.invoke_virtual(task, "run", "()V", &[])?;
+        }
+        Ok(None)
+    });
     r.register(ses, "isShutdown", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let shut = match ctx.get_field(this, 1) {
-            Value::Int(v) => v,
-            _ => 0,
+        let shut = if ctx.object_num_fields(this) > 1 {
+            match ctx.get_field(this, 1) {
+                Value::Int(v) => v,
+                _ => 0,
+            }
+        } else {
+            0
         };
         Ok(Some(Value::Int(shut)))
     });
     r.register(ses, "isTerminated", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let shut = match ctx.get_field(this, 1) {
-            Value::Int(v) => v,
-            _ => 0,
+        let shut = if ctx.object_num_fields(this) > 1 {
+            match ctx.get_field(this, 1) {
+                Value::Int(v) => v,
+                _ => 0,
+            }
+        } else {
+            0
         };
         Ok(Some(Value::Int(shut)))
     });
@@ -7499,7 +8844,9 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                     break;
                 }
                 let chunk = remaining.min(std::time::Duration::from_millis(25));
+                ctx.begin_blocking_region();
                 std::thread::sleep(chunk);
+                ctx.end_blocking_region();
             }
             Ok(Some(Value::Int(1)))
         },
@@ -7510,7 +8857,11 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
     // fork shutdown sequencing.
     r.register(ses, "getCorePoolSize", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        if ctx.object_num_fields(this) > 0 {
+            Ok(Some(ctx.get_field(this, 0)))
+        } else {
+            Ok(Some(Value::Int(1)))
+        }
     });
     r.register(ses, "getPoolSize", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
@@ -7562,23 +8913,8 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
     );
     r.register(
         ex,
-        "newSingleThreadScheduledExecutor",
-        "()Ljava/util/concurrent/ScheduledExecutorService;",
-        |ctx, _args| {
-            let sv = alloc_concurrent_synthetic(
-                ctx,
-                "java/util/concurrent/ScheduledThreadPoolExecutor",
-                2,
-            );
-            ctx.set_field(sv, 0, Value::Int(1));
-            ctx.set_field(sv, 1, Value::Int(0));
-            Ok(Some(Value::Object(Some(sv))))
-        },
-    );
-    r.register(
-        ex,
-        "newFixedThreadPool",
-        "(I)Ljava/util/concurrent/ExecutorService;",
+        "newScheduledThreadPool",
+        "(ILjava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/ScheduledExecutorService;",
         |ctx, args| {
             let ps = match args.first() {
                 Some(Value::Int(v)) => *v,
@@ -7596,16 +8932,104 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
     );
     r.register(
         ex,
-        "newCachedThreadPool",
-        "()Ljava/util/concurrent/ExecutorService;",
+        "newSingleThreadScheduledExecutor",
+        "()Ljava/util/concurrent/ScheduledExecutorService;",
         |ctx, _args| {
             let sv = alloc_concurrent_synthetic(
                 ctx,
                 "java/util/concurrent/ScheduledThreadPoolExecutor",
                 2,
             );
-            ctx.set_field(sv, 0, Value::Int(0));
+            ctx.set_field(sv, 0, Value::Int(1));
             ctx.set_field(sv, 1, Value::Int(0));
+            Ok(Some(Value::Object(Some(sv))))
+        },
+    );
+// BUG FIX (2026-07-10, es-storedscripts-retire): these Executors factory
+    // registrations (newFixedThreadPool, newCachedThreadPool x2,
+    // newSingleThreadExecutor below) were copy-pasted from the
+    // newScheduledThreadPool/newSingleThreadScheduledExecutor blocks above
+    // and never had their allocated class corrected: each one synthesized an
+    // object tagged java/util/concurrent/ScheduledThreadPoolExecutor instead
+    // of plain java/util/concurrent/ThreadPoolExecutor. Real JDK
+    // newFixedThreadPool()/newCachedThreadPool()/newSingleThreadExecutor()
+    // never return an STPE. Because register_executors_scheduled_natives
+    // (native_stpe_*) is gated off in real-JDK mode (see
+    // docs/internal/tomcat-suite-bugs/11-stpe-mainlock-npe-teardown-regression.md),
+    // no native shadowed these mistagged objects' methods, so real inherited
+    // ScheduledThreadPoolExecutor/ThreadPoolExecutor bytecode ran against a
+    // 2-field synthetic object whose ctl/workQueue/mainLock/workers fields
+    // were never initialised -- NPE ("Cannot invoke ReentrantLock.lock()
+    // because mainLock is null") on shutdown(), or on ctl.get() via
+    // submit()/schedule() (STPE.submit delegates through schedule()).
+    // Tagging the object ThreadPoolExecutor (matching the sibling
+    // registration in native-builtins/src/lib.rs::native_new_fixed_pool)
+    // routes shutdown()/shutdownNow()/isShutdown() through the
+    // already-synthetic-aware natives registered on ThreadPoolExecutor in
+    // lib.rs (executor_has_real_workers() correctly identifies this as
+    // synthetic and takes the safe branch instead of touching mainLock).
+    //
+    // LAYER 2 FIX (2026-07-10): the above was necessary but insufficient —
+    // native-api/src/registry.rs's `drop_real_layout_synthetic` gate drops
+    // *every* ThreadPoolExecutor-tagged native at registration time
+    // (including the synthetic-aware submit/execute/shutdown/etc. above),
+    // on the assumption that any ThreadPoolExecutor-tagged object is
+    // genuinely real. That assumption was false for these factory-made
+    // objects (only 2 legacy slots ever got written; ctl/workQueue/mainLock
+    // stayed null), so real inherited bytecode NPE'd. Fixed by actually
+    // driving the real `ThreadPoolExecutor(...)` constructor below via
+    // `initialize_real_thread_pool_executor` (same pattern already used for
+    // ScheduledThreadPoolExecutor construction) — these objects are now
+    // genuinely real, so the drop_real_layout_synthetic assumption holds and
+    // real submit/execute/shutdown/shutdownNow bytecode runs end-to-end.
+    // See docs/known-issues/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe.md.
+    r.register(
+        ex,
+        "newFixedThreadPool",
+        "(I)Ljava/util/concurrent/ExecutorService;",
+        |ctx, args| {
+            let ps = match args.first() {
+                Some(Value::Int(v)) => *v,
+                _ => 1,
+            };
+            let sv = alloc_concurrent_synthetic(
+                ctx,
+                "java/util/concurrent/ThreadPoolExecutor",
+                2,
+            );
+            initialize_real_thread_pool_executor(
+                ctx,
+                sv,
+                ps,
+                ps,
+                0,
+                "MILLISECONDS",
+                TpeQueueKind::Linked,
+                None,
+            )?;
+            Ok(Some(Value::Object(Some(sv))))
+        },
+    );
+    r.register(
+        ex,
+        "newCachedThreadPool",
+        "()Ljava/util/concurrent/ExecutorService;",
+        |ctx, _args| {
+            let sv = alloc_concurrent_synthetic(
+                ctx,
+                "java/util/concurrent/ThreadPoolExecutor",
+                2,
+            );
+            initialize_real_thread_pool_executor(
+                ctx,
+                sv,
+                0,
+                i32::MAX,
+                60,
+                "SECONDS",
+                TpeQueueKind::Synchronous,
+                None,
+            )?;
             Ok(Some(Value::Object(Some(sv))))
         },
     );
@@ -7613,14 +9037,26 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         ex,
         "newCachedThreadPool",
         "(Ljava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/ExecutorService;",
-        |ctx, _args| {
+        |ctx, args| {
+            let factory = match args.first() {
+                Some(Value::Object(Some(f))) => Some(*f),
+                _ => None,
+            };
             let sv = alloc_concurrent_synthetic(
                 ctx,
-                "java/util/concurrent/ScheduledThreadPoolExecutor",
+                "java/util/concurrent/ThreadPoolExecutor",
                 2,
             );
-            ctx.set_field(sv, 0, Value::Int(0));
-            ctx.set_field(sv, 1, Value::Int(0));
+            initialize_real_thread_pool_executor(
+                ctx,
+                sv,
+                0,
+                i32::MAX,
+                60,
+                "SECONDS",
+                TpeQueueKind::Synchronous,
+                factory,
+            )?;
             Ok(Some(Value::Object(Some(sv))))
         },
     );
@@ -7631,11 +9067,19 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         |ctx, _args| {
             let sv = alloc_concurrent_synthetic(
                 ctx,
-                "java/util/concurrent/ScheduledThreadPoolExecutor",
+                "java/util/concurrent/ThreadPoolExecutor",
                 2,
             );
-            ctx.set_field(sv, 0, Value::Int(1));
-            ctx.set_field(sv, 1, Value::Int(0));
+            initialize_real_thread_pool_executor(
+                ctx,
+                sv,
+                1,
+                1,
+                0,
+                "MILLISECONDS",
+                TpeQueueKind::Linked,
+                None,
+            )?;
             Ok(Some(Value::Object(Some(sv))))
         },
     );
@@ -8994,13 +10438,7 @@ fn p52_hex_val(b: u8) -> Option<u8> {
 // ---------------------------------------------------------------------------
 // java.net.InetSocketAddress — holder-shaped synthetic
 // ---------------------------------------------------------------------------
-fn p52_isa_set(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    host: Value,
-    addr: Value,
-    port: i32,
-) {
+fn p52_isa_set(ctx: &mut dyn NativeContext, this: ObjectRef, host: Value, addr: Value, port: i32) {
     let holder =
         alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3);
     ctx.set_field(holder, 0, host);
@@ -9092,7 +10530,26 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         let this = obj_arg(args, 0)?;
         let host = obj_arg(args, 1)?;
         let port = args[2].as_int().unwrap_or(0);
-        p52_isa_set(ctx, this, Value::Object(Some(host)), Value::Object(None), port);
+        // Real JDK resolves the hostname via `InetAddress.getByName(host)`
+        // here, falling back to an unresolved address only on
+        // UnknownHostException. Leaving `addr` unconditionally null made
+        // EVERY `new InetSocketAddress(String,int)` permanently unresolved
+        // (`getAddress()` always null, `isUnresolved()` always true), even
+        // for trivially-resolvable literals like "127.0.0.1" — this broke
+        // `sun.nio.ch.SocketAdaptor.getInetAddress()` (its private
+        // `remoteAddress()` builds one of these from the channel's peer IP
+        // string), which in turn NPE'd `RemoteCIDRValve.isAllowed` on any
+        // Tomcat context configured with that valve (e.g. the examples
+        // webapp's `META-INF/context.xml`).
+        let host_str = ctx.read_string(host).unwrap_or_default();
+        let addr = crate::net_phase_e::resolve_host_external(&host_str)
+            .map(|ip| {
+                Value::Object(Some(crate::net_phase_e::alloc_inet_address_external(
+                    ctx, &host_str, &ip,
+                )))
+            })
+            .unwrap_or(Value::Object(None));
+        p52_isa_set(ctx, this, Value::Object(Some(host)), addr, port);
         Ok(Some(Value::Object(None)))
     });
     r.register(isa, "<init>", "(Ljava/net/InetAddress;I)V", |ctx, args| {
@@ -9111,7 +10568,13 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
             let host = obj_arg(args, 0)?;
             let port = args[1].as_int().unwrap_or(0);
             let obj = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 3);
-            p52_isa_set(ctx, obj, Value::Object(Some(host)), Value::Object(None), port);
+            p52_isa_set(
+                ctx,
+                obj,
+                Value::Object(Some(host)),
+                Value::Object(None),
+                port,
+            );
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -9218,9 +10681,164 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
     r.set_category(__prev_cat);
 }
 
+fn phase52_alloc_socket(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let sock = alloc_concurrent_synthetic(ctx, "java/net/Socket", 5);
+    let empty = ctx.create_string("");
+    ctx.set_field(sock, SOCK_HOST, Value::Object(Some(empty)));
+    ctx.set_field(sock, SOCK_PORT, Value::Int(0));
+    ctx.set_field(sock, SOCK_LOCAL_PORT, Value::Int(0));
+    ctx.set_field(sock, SOCK_CLOSED, Value::Int(0));
+    ctx.set_field(sock, SOCK_STREAM_ID, Value::Int(-1));
+    sock
+}
+
+fn phase52_socket_connect(
+    ctx: &mut dyn NativeContext,
+    host_value: Value,
+    port_value: Value,
+) -> MethodCallResult {
+    let sock = phase52_alloc_socket(ctx);
+    let host = match host_value {
+        Value::Object(Some(s)) => ctx
+            .read_string(s)
+            .unwrap_or_else(|| "127.0.0.1".to_string()),
+        _ => "127.0.0.1".to_string(),
+    };
+    let port = port_value.as_int().unwrap_or(0);
+    let host_obj = ctx.create_string(&host);
+    ctx.set_field(sock, SOCK_HOST, Value::Object(Some(host_obj)));
+    ctx.set_field(sock, SOCK_PORT, Value::Int(port));
+
+    match std::net::TcpStream::connect(format!("{host}:{port}")) {
+        Ok(stream) => {
+            let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
+            let id = crate::servlet::s2_alloc_stream(stream);
+            ctx.set_field(sock, SOCK_STREAM_ID, Value::Int(id));
+            ctx.set_field(sock, SOCK_LOCAL_PORT, Value::Int(local_port));
+            // FIX (SocketFactory.createSocket "not connected" split-brain):
+            // `Socket.getOutputStream`/`getInputStream`/`isConnected` (registered
+            // in net_phase_e.rs) read connect state from an identity-keyed side
+            // table, not these raw fields (see net_phase_e.rs's SockSide doc
+            // comment) -- the same collision `sock_set_for_create` was added to
+            // fix for `SSLSocketFactory.createSocket`. This factory path never
+            // populated that side table, so a socket obtained via
+            // `SocketFactory.getDefault().createSocket(host, port)` connected
+            // for real but every later side-table-backed accessor saw the
+            // default stream_id=-1 ("not connected"). Populate it here too.
+            crate::net_phase_e::sock_set_for_create_with_local_port(
+                ctx, sock, port, local_port, id,
+            );
+            Ok(Some(Value::Object(Some(sock))))
+        }
+        Err(e) => Err(RuntimeError::IOException {
+            message: format!("SocketFactory.createSocket failed: {host}:{port}: {e}"),
+        }
+        .into()),
+    }
+}
+
 pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let sf = "javax/net/SocketFactory";
+    r.register(
+        sf,
+        "getDefault",
+        "()Ljavax/net/SocketFactory;",
+        |ctx, _args| {
+            let obj = alloc_concurrent_synthetic(ctx, "javax/net/SocketFactory", 0);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+    r.register(sf, "createSocket", "()Ljava/net/Socket;", |ctx, _args| {
+        Ok(Some(Value::Object(Some(phase52_alloc_socket(ctx)))))
+    });
+    r.register(
+        sf,
+        "createSocket",
+        "(Ljava/lang/String;I)Ljava/net/Socket;",
+        |ctx, args| {
+            let host = args.get(1).copied().unwrap_or(Value::Object(None));
+            let port = args.get(2).copied().unwrap_or(Value::Int(0));
+            phase52_socket_connect(ctx, host, port)
+        },
+    );
+    r.register(
+        sf,
+        "createSocket",
+        "(Ljava/net/InetAddress;I)Ljava/net/Socket;",
+        |ctx, args| {
+            let host = match args.get(1).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(addr)) => ctx
+                    .invoke_virtual(addr, "getHostAddress", "()Ljava/lang/String;", &[])
+                    .ok()
+                    .flatten()
+                    .unwrap_or(Value::Object(None)),
+                _ => Value::Object(None),
+            };
+            let port = args.get(2).copied().unwrap_or(Value::Int(0));
+            phase52_socket_connect(ctx, host, port)
+        },
+    );
+    r.register(
+        sf,
+        "createSocket",
+        "(Ljava/lang/String;ILjava/net/InetAddress;I)Ljava/net/Socket;",
+        |ctx, args| {
+            let host = args.get(1).copied().unwrap_or(Value::Object(None));
+            let port = args.get(2).copied().unwrap_or(Value::Int(0));
+            phase52_socket_connect(ctx, host, port)
+        },
+    );
+    r.register(
+        sf,
+        "createSocket",
+        "(Ljava/net/InetAddress;ILjava/net/InetAddress;I)Ljava/net/Socket;",
+        |ctx, args| {
+            let host = match args.get(1).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(addr)) => ctx
+                    .invoke_virtual(addr, "getHostAddress", "()Ljava/lang/String;", &[])
+                    .ok()
+                    .flatten()
+                    .unwrap_or(Value::Object(None)),
+                _ => Value::Object(None),
+            };
+            let port = args.get(2).copied().unwrap_or(Value::Int(0));
+            phase52_socket_connect(ctx, host, port)
+        },
+    );
+    let sock = "java/net/Socket";
+    r.register(
+        sock,
+        "getRemoteSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let host = ctx.get_field(this, SOCK_HOST);
+            let port = ctx.get_field(this, SOCK_PORT);
+            ctx.new_object_initialized(
+                "java/net/InetSocketAddress",
+                "(Ljava/lang/String;I)V",
+                &[host, port],
+            )
+        },
+    );
+    r.register(
+        sock,
+        "getLocalSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let host = Value::Object(Some(ctx.create_string("127.0.0.1")));
+            let port = ctx.get_field(this, SOCK_LOCAL_PORT);
+            ctx.new_object_initialized(
+                "java/net/InetSocketAddress",
+                "(Ljava/lang/String;I)V",
+                &[host, port],
+            )
+        },
+    );
+
     let ssf = "javax/net/ServerSocketFactory";
     r.register(
         ssf,
@@ -9231,9 +10849,12 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
             Ok(Some(Value::Object(Some(obj))))
         },
     );
-    r.register(ssf, "createServerSocket", "()Ljava/net/ServerSocket;", |ctx, _args| {
-        ctx.new_object_initialized("java/net/ServerSocket", "()V", &[])
-    });
+    r.register(
+        ssf,
+        "createServerSocket",
+        "()Ljava/net/ServerSocket;",
+        |ctx, _args| ctx.new_object_initialized("java/net/ServerSocket", "()V", &[]),
+    );
     r.register(
         ssf,
         "createServerSocket",
@@ -13309,6 +14930,36 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
             }
         },
     );
+    r.register(
+        sock,
+        "getRemoteSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let host = ctx.get_field(this, SOCK_HOST);
+            let port = ctx.get_field(this, SOCK_PORT);
+            ctx.new_object_initialized(
+                "java/net/InetSocketAddress",
+                "(Ljava/lang/String;I)V",
+                &[host, port],
+            )
+        },
+    );
+    r.register(
+        sock,
+        "getLocalSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let host = Value::Object(Some(ctx.create_string("127.0.0.1")));
+            let port = ctx.get_field(this, SOCK_LOCAL_PORT);
+            ctx.new_object_initialized(
+                "java/net/InetSocketAddress",
+                "(Ljava/lang/String;I)V",
+                &[host, port],
+            )
+        },
+    );
 
     // getInputStream() → returns a SocketInputStream backed by stream_id
     r.register(
@@ -13567,11 +15218,17 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Int(-1)));
         }
         let mut buf = [0u8; 1];
-        let mut reg = s2_registry().lock();
-        if let Some(stream) = reg.streams.get_mut(&sid) {
-            match (&**stream).read(&mut buf) {
+        let stream = {
+            let reg = s2_registry().lock();
+            reg.streams.get(&sid).cloned()
+        };
+        if let Some(stream) = stream {
+            let mut stream_ref = &*stream;
+            match stream_ref.read(&mut buf) {
                 Ok(0) => Ok(Some(Value::Int(-1))),
                 Ok(_) => Ok(Some(Value::Int(buf[0] as i32))),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(Some(Value::Int(0))),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(Some(Value::Int(0))),
                 Err(_) => Ok(Some(Value::Int(-1))),
             }
         } else {
@@ -13583,17 +15240,26 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         let arr = obj_arg(args, 1)?;
         let off = args[2].as_int().unwrap_or(0) as usize;
         let len = args[3].as_int().unwrap_or(0) as usize;
+        if len == 0 {
+            return Ok(Some(Value::Int(0)));
+        }
         let sid = ctx.get_field(this, SIO_STREAM_ID).as_int().unwrap_or(-1);
         if sid < 0 {
             return Ok(Some(Value::Int(-1)));
         }
         let mut tmp = vec![0u8; len];
         let n = {
-            let mut reg = s2_registry().lock();
-            if let Some(stream) = reg.streams.get_mut(&sid) {
-                match (&**stream).read(&mut tmp) {
+            let stream = {
+                let reg = s2_registry().lock();
+                reg.streams.get(&sid).cloned()
+            };
+            if let Some(stream) = stream {
+                let mut stream_ref = &*stream;
+                match stream_ref.read(&mut tmp) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => 0,
                     Err(_) => -1,
                 }
             } else {
@@ -13611,17 +15277,26 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let arr = obj_arg(args, 1)?;
         let len = ctx.array_length(arr) as usize;
+        if len == 0 {
+            return Ok(Some(Value::Int(0)));
+        }
         let sid = ctx.get_field(this, SIO_STREAM_ID).as_int().unwrap_or(-1);
         if sid < 0 {
             return Ok(Some(Value::Int(-1)));
         }
         let mut tmp = vec![0u8; len];
         let n = {
-            let mut reg = s2_registry().lock();
-            if let Some(stream) = reg.streams.get_mut(&sid) {
-                match (&**stream).read(&mut tmp) {
+            let stream = {
+                let reg = s2_registry().lock();
+                reg.streams.get(&sid).cloned()
+            };
+            if let Some(stream) = stream {
+                let mut stream_ref = &*stream;
+                match stream_ref.read(&mut tmp) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => 0,
                     Err(_) => -1,
                 }
             } else {
@@ -13670,9 +15345,13 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
             }
             .into());
         }
-        let mut reg = s2_registry().lock();
-        if let Some(stream) = reg.streams.get_mut(&sid) {
-            let _ = (&**stream).write_all(&[b]);
+        let stream = {
+            let reg = s2_registry().lock();
+            reg.streams.get(&sid).cloned()
+        };
+        if let Some(stream) = stream {
+            let mut stream_ref = &*stream;
+            let _ = stream_ref.write_all(&[b]);
         }
         Ok(Some(Value::Object(None)))
     });
@@ -13693,9 +15372,13 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
             let v = ctx.get_array_element(arr, off + i).as_int().unwrap_or(0);
             data.push(v as u8);
         }
-        let mut reg = s2_registry().lock();
-        if let Some(stream) = reg.streams.get_mut(&sid) {
-            let _ = (&**stream).write_all(&data);
+        let stream = {
+            let reg = s2_registry().lock();
+            reg.streams.get(&sid).cloned()
+        };
+        if let Some(stream) = stream {
+            let mut stream_ref = &*stream;
+            let _ = stream_ref.write_all(&data);
         }
         Ok(Some(Value::Object(None)))
     });
@@ -13715,9 +15398,13 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
             let v = ctx.get_array_element(arr, i).as_int().unwrap_or(0);
             data.push(v as u8);
         }
-        let mut reg = s2_registry().lock();
-        if let Some(stream) = reg.streams.get_mut(&sid) {
-            let _ = (&**stream).write_all(&data);
+        let stream = {
+            let reg = s2_registry().lock();
+            reg.streams.get(&sid).cloned()
+        };
+        if let Some(stream) = stream {
+            let mut stream_ref = &*stream;
+            let _ = stream_ref.write_all(&data);
         }
         Ok(Some(Value::Object(None)))
     });
@@ -13725,9 +15412,13 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let sid = ctx.get_field(this, SIO_STREAM_ID).as_int().unwrap_or(-1);
         if sid >= 0 {
-            let mut reg = s2_registry().lock();
-            if let Some(stream) = reg.streams.get_mut(&sid) {
-                let _ = (&**stream).flush();
+            let stream = {
+                let reg = s2_registry().lock();
+                reg.streams.get(&sid).cloned()
+            };
+            if let Some(stream) = stream {
+                let mut stream_ref = &*stream;
+                let _ = stream_ref.flush();
             }
         }
         Ok(Some(Value::Object(None)))
@@ -15440,15 +17131,10 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 5, args[1]);
         Ok(Some(Value::Object(None)))
     });
-    r.register(
-        lr,
-        "getParameters",
-        "()[Ljava/lang/Object;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 6)))
-        },
-    );
+    r.register(lr, "getParameters", "()[Ljava/lang/Object;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 6)))
+    });
     r.register(
         lr,
         "setParameters",
@@ -15519,16 +17205,11 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 11)))
     });
-    r.register(
-        lr,
-        "setThrown",
-        "(Ljava/lang/Throwable;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 11, args[1]);
-            Ok(Some(Value::Object(None)))
-        },
-    );
+    r.register(lr, "setThrown", "(Ljava/lang/Throwable;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 11, args[1]);
+        Ok(Some(Value::Object(None)))
+    });
 
     // --- Handler (abstract base, 1-field: level=0) ---
     let handler = "java/util/logging/Handler";
@@ -16903,8 +18584,75 @@ pub fn register_arrays_support_natives(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int(-1)))
     });
+    // Direct native for mismatch(char[], char[], int). ECJ's
+    // CharOperation.equals delegates to Arrays.equals(char[]), which reaches
+    // this helper for class-file attribute names such as ModuleHashes. Running
+    // the JDK bytecode here depends on Unsafe.getLongUnaligned over char[] and
+    // can incorrectly report long equal ranges.
+    r.register(c, "mismatch", "([C[CI)I", |ctx, args| {
+        let a = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(-1))),
+        };
+        let b = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(-1))),
+        };
+        let length = match args.get(2) {
+            Some(Value::Int(v)) => (*v).max(0) as usize,
+            _ => 0,
+        };
+        let a_len = ctx.array_length(a);
+        let b_len = ctx.array_length(b);
+        let n = length.min(a_len).min(b_len);
+        for i in 0..n {
+            let va = ctx.get_array_element(a, i);
+            let vb = ctx.get_array_element(b, i);
+            if va != vb {
+                return Ok(Some(Value::Int(i as i32)));
+            }
+        }
+        Ok(Some(Value::Int(-1)))
+    });
     // Direct native for mismatch(byte[], int, byte[], int, int)
     r.register(c, "mismatch", "([BI[BII)I", |ctx, args| {
+        let a = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(-1))),
+        };
+        let a_from = match args.get(1) {
+            Some(Value::Int(v)) => (*v).max(0) as usize,
+            _ => 0,
+        };
+        let b = match args.get(2) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(-1))),
+        };
+        let b_from = match args.get(3) {
+            Some(Value::Int(v)) => (*v).max(0) as usize,
+            _ => 0,
+        };
+        let length = match args.get(4) {
+            Some(Value::Int(v)) => (*v).max(0) as usize,
+            _ => 0,
+        };
+        let a_len = ctx.array_length(a);
+        let b_len = ctx.array_length(b);
+        let n = length
+            .min(a_len.saturating_sub(a_from))
+            .min(b_len.saturating_sub(b_from));
+        for i in 0..n {
+            let va = ctx.get_array_element(a, a_from + i);
+            let vb = ctx.get_array_element(b, b_from + i);
+            if va != vb {
+                return Ok(Some(Value::Int(i as i32)));
+            }
+        }
+        Ok(Some(Value::Int(-1)))
+    });
+    // Direct native for mismatch(char[], int, char[], int, int), same rationale
+    // as the whole-array char[] overload above.
+    r.register(c, "mismatch", "([CI[CII)I", |ctx, args| {
         let a = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(-1))),
@@ -18063,8 +19811,32 @@ fn native_scanner_find_within_horizon_string_int(
 mod t2_tests {
     use super::*;
     use crate::test_utils::{mock_ctx, MockNativeContext};
-    use cratonvm_types::{ArrayElementType, ObjectRef};
+    use cratonvm_types::{ArrayElementType, ClassId, ObjectRef};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn t2_thread_local_object_values_are_global_rooted() {
+        let mut ctx = mock_ctx();
+        let obj1 = ctx.alloc_object(ClassId::new(41), 0);
+        let stored1 = tl_value_from_java(&mut ctx, Value::Object(Some(obj1)));
+        assert_eq!(ctx.global_root_count(), 1);
+        assert_eq!(tl_value_to_java(&ctx, stored1), Value::Object(Some(obj1)));
+
+        let obj2 = ctx.alloc_object(ClassId::new(42), 0);
+        let stored2 = tl_value_from_java(&mut ctx, Value::Object(Some(obj2)));
+        assert_eq!(ctx.global_root_count(), 2);
+
+        tl_drop_value_root(&mut ctx, stored1);
+        assert_eq!(ctx.global_root_count(), 1);
+        assert_eq!(tl_value_to_java(&ctx, stored2), Value::Object(Some(obj2)));
+
+        tl_drop_value_root(&mut ctx, stored2);
+        assert_eq!(ctx.global_root_count(), 0);
+
+        let plain = tl_value_from_java(&mut ctx, Value::Int(7));
+        assert_eq!(ctx.global_root_count(), 0);
+        assert_eq!(tl_value_to_java(&ctx, plain), Value::Int(7));
+    }
 
     // -----------------------------------------------------------------------
     // T2.3.13: StringTokenizer.countTokens — O(n) single pass
@@ -18233,6 +20005,46 @@ mod t2_tests {
             .wrapping_mul(31)
             .wrapping_add(11);
         assert_eq!(result.unwrap(), Some(Value::Int(expected)));
+    }
+
+    #[test]
+    fn t2_arrays_object_hash_code_uses_value_hash_for_jdk_wrappers() {
+        let mut ctx = mock_ctx();
+        let int_class = ctx.ensure_class_initialized("java/lang/Integer").unwrap();
+        let float_class = ctx.ensure_class_initialized("java/lang/Float").unwrap();
+        let string = ctx.create_string("field");
+        let int_obj = ctx.alloc_object(int_class, 1);
+        ctx.set_field(int_obj, 0, Value::Int(2));
+        let float_obj = ctx.alloc_object(float_class, 1);
+        ctx.set_field(float_obj, 0, Value::Float(0.0));
+        let arr = ctx.new_array(ArrayElementType::Reference, 5);
+        ctx.set_array_element(arr, 0, Value::Object(Some(string)));
+        ctx.set_array_element(arr, 1, Value::Object(Some(int_obj)));
+        ctx.set_array_element(arr, 2, Value::Object(Some(int_obj)));
+        ctx.set_array_element(arr, 3, Value::Object(None));
+        ctx.set_array_element(arr, 4, Value::Object(Some(float_obj)));
+
+        let mut registry = NativeMethodRegistry::new();
+        register_core_stdlib_extras(&mut registry);
+        let hash_code = registry
+            .find("java/util/Arrays", "hashCode", "([Ljava/lang/Object;)I")
+            .expect("Arrays.hashCode(Object[]) native should be registered");
+        let first = hash_code(&mut ctx, &[Value::Object(Some(arr))]);
+        let second = hash_code(&mut ctx, &[Value::Object(Some(arr))]);
+
+        let expected = 1i32
+            .wrapping_mul(31)
+            .wrapping_add(97_427_706)
+            .wrapping_mul(31)
+            .wrapping_add(2)
+            .wrapping_mul(31)
+            .wrapping_add(2)
+            .wrapping_mul(31)
+            .wrapping_add(0)
+            .wrapping_mul(31)
+            .wrapping_add(0);
+        assert_eq!(first.unwrap(), Some(Value::Int(expected)));
+        assert_eq!(second.unwrap(), Some(Value::Int(expected)));
     }
 
     static ATOMIC_REF_TARGET_OLD: AtomicUsize = AtomicUsize::new(0);

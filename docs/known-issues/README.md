@@ -4,6 +4,136 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-10 ES suite-wide RandomizedRunner CCE FIXED (bisected to `aa21e334`); new pre-existing StringJoiner content bug filed
+
+- FIXED/RETIRED: [`ES-FAIL-20260710-randomizedrunner-classmodel-modifier-stringjoiner-cce-FIXED.md`](../internal/elasticsearch-suite/ES-FAIL-20260710-randomizedrunner-classmodel-modifier-stringjoiner-cce-FIXED.md) — every `RandomizedRunner`-based ES test class failed at bootstrap with `ClassCastException: ArrayList cannot be cast to String[]` in `Modifier.toString`/`StringJoiner.add`, blocking the whole suite. Bisected to dev `aa21e334` ("Fix Spring SpEL evaluation edge cases"), which made `StringJoiner` yield to real bytecode for the first time at the interpreter's own dispatch loop — exposing a deterministic heap-reference-integrity defect (`gen_heap::read_slot` "corrupt Value cell"/`HIB-CV-32` guard) in real `StringJoiner.add()`'s `elts[size++]=elt` bytecode pattern that does not reproduce for an equivalent user-defined class (ruled out via two standalone `MicroProbe` repros). Fixed by excluding `java/util/StringJoiner` from the new dispatch check's allowlist, reverting only that one class at that one dispatch point back to its proven-safe pre-`aa21e334` behavior (`vm/src/vm/vm_exec.rs`'s separate, older allowlist for the same class is untouched). Verified: the doc's exact repro (6 classes) now 6/6 PASS; a 60-class broader sweep matches a prior session's pre-regression baseline byte-for-byte (zero new failures).
+- OPEN (new, pre-existing, unrelated to the above): [`stringjoiner-synthetic-native-real-jdk-field-mismatch.md`](stringjoiner-synthetic-native-real-jdk-field-mismatch.md) — `StringJoiner`'s `SyntheticStub` native uses a legacy 5-field layout that doesn't match the real JDK's actual 7-field layout, so in real-JDK mode it silently produces wrong content (`Modifier.toString()`/any `StringJoiner.toString()` returns `""` instead of the joined string) — confirmed present identically on dev `4b08ffad`, well before `aa21e334`, i.e. not a new regression, just newly noticed. Non-crashing, low urgency.
+- FIXED/RETIRED (same root cause, found concurrently by a different session): [`junit-consolelauncher-picocli-classcastexception-arraylist-stringarray-FIXED.md`](../internal/fixed-suite-bugs/junit-consolelauncher-picocli-classcastexception-arraylist-stringarray-FIXED.md) — identical `ArrayList`→`String[]` CCE via `StringJoiner.add`←`Modifier.toString`←`Field.toGenericString`, reached through picocli's `CommandLine$Model$TypedMember.getToString` instead of `RandomizedRunner`'s `ClassModel`. That session's bisection window `(8cdc1c011..c3c2b9ee2]` contains `aa21e334`, confirming the same root cause; not independently re-run against its own commons-math/picocli repro (no commons-math test classpath available on the collection host), so reopen if that specific repro still fails.
+
+## 2026-07-10 Executors factory mainlock NPE FIXED (layer 2); two unrelated dev regressions found while verifying
+
+Fixed the layer-2 residual left open in the `Executors.new*ThreadPool()` mainlock/ctl NPE doc, and
+found two independent, pre-existing regressions on dev while trying to verify it suite-wide.
+
+- FIXED/RETIRED: [`ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe-FIXED.md`](../internal/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe-FIXED.md) — `Executors.newFixedThreadPool`/`newCachedThreadPool`(x2)/`newSingleThreadExecutor` now drive the real `ThreadPoolExecutor(...)` constructor (`initialize_real_thread_pool_executor`, mirroring the existing `ScheduledThreadPoolExecutor` real-init pattern) instead of a fake 2-field layout, and `ThreadFactory.newThread(Runnable)` now drives the real `Thread(Runnable)` constructor instead of a fake 5-field layout (the latter meant a real pool's worker never actually ran submitted tasks even once the pool itself became real). Verified via an extended standalone probe (all 4 factories, custom `ThreadFactory`, `submit`/`execute`/`shutdown`/`shutdownNow`/`awaitTermination`, `shutdownNow()` correctly interrupting a blocked worker) and the ES `storedscripts` cluster (8/9 classes now pass; the 9th has an unrelated pre-existing serialization bug).
+- FIXED/RETIRED: [`threadpoolexecutor-shutdown-npe-on-mainlock-synthetic-executor-FIXED.md`](../internal/fixed-suite-bugs/threadpoolexecutor-shutdown-npe-on-mainlock-synthetic-executor-FIXED.md) — filed independently and concurrently alongside `306cd352`'s `execute()`-dispatch fix; resolved as a side effect of the above, since these objects are now genuinely real and that fix's own receiver-aware checks correctly treat them as such.
+- OPEN (new, blocking suite-wide verification): [`elasticsearch-suite/ES-FAIL-20260710-randomizedrunner-classmodel-modifier-stringjoiner-cce.md`](elasticsearch-suite/ES-FAIL-20260710-randomizedrunner-classmodel-modifier-stringjoiner-cce.md) — every `RandomizedRunner`-based ES test class (i.e. essentially the whole suite) now fails at bootstrap with `ClassCastException: ArrayList cannot be cast to String[]` in `Modifier.toString`/`StringJoiner.add`, before any test method runs. Bisected to dev commit `aa21e334` ("Fix Spring SpEL evaluation edge cases"); absent at the immediately-prior commit `4b08ffad`. Unrelated to the fix above (reproduces identically with or without it).
+- FIXED/RETIRED: [`threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md`](../internal/threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md) — root cause was the fourth, unpatched dispatch path this doc's own analysis suspected: `try_stackless_invoke`'s direct native lookup. Fixed the same day by generalizing the registry-drop-removal approach (see the `ThreadPoolExecutor` regression entry below) — verified with this doc's own `ExecProbe3.java`, now printing 3 distinct worker threads instead of one.
+
+## 2026-07-10 TestEncodingDetector fully green: UTF-16/prolog-conflict residual retired
+
+- FIXED/RETIRED: [`encodingdetector-utf16-and-conflicting-prolog-residuals-FIXED.md`](../internal/fixed-suite-bugs/encodingdetector-utf16-and-conflicting-prolog-residuals-FIXED.md) — both residual clusters traced to the same root cause: synthetic `BufferedInputStream`/`InputStreamReader` overrides (added in `45cc4f4f`) unconditionally shadowed real JDK 25 bytecode for every instance, not just genuinely-synthetic-stub ones, because the interpreter's `invokevirtual` vtable fast path doesn't consult the `NativeKind::SyntheticStub` category the way `vm_exec.rs`'s `real_protected_stub` check does. `BufferedInputStream.reset()` was a silent no-op (broke `EncodingDetector`'s mark/reread-with-detected-encoding sequence); `InputStreamReader.read([CII)I` ignored the charset entirely (broke every UTF-16BE/LE decode). Removed both native overrides — real bytecode already implements them correctly. `org.apache.jasper.compiler.TestEncodingDetector`: `OK (22 tests)`, matching HotSpot exactly.
+
+## 2026-07-10 WildFly corrupt-Value doc: `Level.parse` FIXED, new `ThreadPoolExecutor.execute()` regression found (OPEN, blocking)
+
+Investigating `wildfly-domain-heap-corrupt-value-timeout.md`'s front-line
+residuals surfaced two unrelated, earlier-gating bugs before those residuals
+could be reached again:
+
+- FIXED: [`java-util-logging-level-parse-throws-for-all-names-FIXED.md`](../internal/fixed-suite-bugs/java-util-logging-level-parse-throws-for-all-names-FIXED.md) — `java.util.logging.Level.parse(String)` threw `IllegalArgumentException` for *every* name, including standard JDK constants (`Level.parse("WARNING")` itself failed), due to a JDK-25 `KnownLevel`/module-synthesis gap. Broke WildFly's own `host.xml`/`domain.xml` parsing of `<level name="WARN"/>`. Fixed with a targeted native override.
+- FIXED/RETIRED: [`threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`](../internal/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md) (execute) + [`threadpoolexecutor-shutdown-npe-on-mainlock-synthetic-executor-FIXED.md`](../internal/fixed-suite-bugs/threadpoolexecutor-shutdown-npe-on-mainlock-synthetic-executor-FIXED.md) (submit/shutdown) + [`threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md`](../internal/threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md) (real-executor async semantics) — `Executors.newSingleThreadExecutor()`/`newFixedThreadPool()`/`newCachedThreadPool()` return objects whose `.execute(Runnable)`/`.submit(...)`/`.shutdown()` used to NPE on `ThreadPoolExecutor`'s uninitialized `ctl`/`mainLock` fields, and separately any real `ThreadPoolExecutor.execute()` had degraded to synchronous dispatch — root cause was a registration-time drop in `native-api/src/registry.rs` (not the originally-bisected `f28d6ae6`; that was a red herring) that starved these synthetic objects' native overrides, compounded by a fourth, unpatched dispatch path (`try_stackless_invoke`) once a narrower fix tried to make the drop receiver-aware. Three overlapping fixes landed the same day from parallel sessions (`fix/tpe-npe-dispatch-20260710` for `execute()`'s NPE, this session's own Executors-real-init fix for `submit`/`shutdown`, then `fix/wildfly-hib32-gate-20260710` generalizing the dispatch fix and closing the async-semantics gap); see the FIXED docs for the reconciliation.
+
+## 2026-07-10 Tomcat NIO/HTTP2 bare-assertions doc RETIRED; ByteBuffer.mark()/reset() found broken for real-JDK objects (FIXED); 1 narrow residual split off
+
+Fixed the doc's own `\p{XDigit}` regex residual, and — while root-causing
+the other two — found and fixed an unrelated, much bigger bug:
+`ByteBuffer.mark()`/`reset()` were completely broken for real-JDK
+`ByteBuffer`/`DirectByteBuffer` objects (`InvalidMarkException` on every
+`reset()`, even right after a matching `mark()`; SIGSEGV on direct buffers
+after the first `mark()` call). This explained both the `TestHttp2Limits`
+regression and the previously-unexplained Jasper JSP failure in
+`TestHttp11Processor`.
+
+- FIXED/RETIRED: [`nonblockingapi-http11processor-http2limits-bare-assertions-FIXED.md`](../internal/fixed-suite-bugs/nonblockingapi-http11processor-http2limits-bare-assertions-FIXED.md) — 5/6 of the doc's originally-failing methods now pass (`testDelayedNBWrite`, `testPipelining`, `testWithTEChunkedWithCL`, `testHeaderLimits100x32`, `testPostWithTrailerHeadersSize0`); root cause and fix for both the regex gap and the `ByteBuffer` bug are in the doc's final section.
+- OPEN (new, split off): [`tomcat-08-07/nonblockingreadignoreisready-async-error-response-completion-gap.md`](tomcat-08-07/nonblockingreadignoreisready-async-error-response-completion-gap.md) — `TestNonBlockingAPI.testNonBlockingReadIgnoreIsReady`'s Java-level `onError`/`onComplete` callback sequence is confirmed byte-for-byte identical to HotSpot (via socket-capture + log diff), but CratonVM then writes zero bytes to the socket where HotSpot's container commits an implicit `200` response. Narrowed but not root-caused; low priority (narrow, deliberately-adversarial test scenario).
+
+## 2026-07-10 ES storedscripts crash trio FIXED; Object.contains signal gone (masked); new Executors factory mainLock NPE found (OPEN, partially fixed)
+
+Re-verified the 3 `findNative`-crash-family docs for
+`org.elasticsearch.action.admin.cluster.storedscripts.{GetScriptContextResponseTests,GetStoredScriptResponseTests,ScriptContextInfoSerializingTests}`
+on current `dev` per their own note ("re-run on current dev before assigning ownership"). All three crashes are CONFIRMED fixed (now `rc=1`, all 8 tests parsed instead of `rc=139`/0 parsed), and investigating `ScriptContextInfoSerializingTests`'s extra `Object.contains`/`Objects.equals` dispatch signal surfaced an unrelated, real bug:
+
+- FIXED/RETIRED: [`ES-CRASH-20260709-server-org-elasticsearch-action-admin-cluster-storedscripts-getscriptcontextresponsetests-0b8ba47253-FIXED.md`](../internal/fixed-suite-bugs/ES-CRASH-20260709-server-org-elasticsearch-action-admin-cluster-storedscripts-getscriptcontextresponsetests-0b8ba47253-FIXED.md), [`...getstoredscriptresponsetests-1a2b5efa27-FIXED.md`](../internal/fixed-suite-bugs/ES-CRASH-20260709-server-org-elasticsearch-action-admin-cluster-storedscripts-getstoredscriptresponsetests-1a2b5efa27-FIXED.md), [`...scriptcontextinfoserializingtests-e2cdec4d58-FIXED.md`](../internal/fixed-suite-bugs/ES-CRASH-20260709-server-org-elasticsearch-action-admin-cluster-storedscripts-scriptcontextinfoserializingtests-e2cdec4d58-FIXED.md) — the same already-fixed `findNative`/Panama crash family as the tdigest retirement below; rebuilding `dev` and rerunning each doc's repro (index adjusted for `others.tsv` drift — see the docs) confirms no crash and no `System$1.findNative` `NoSuchMethodError`.
+- `ScriptContextInfoSerializingTests`'s extra signal (`NoSuchMethodError method="java/lang/Object.contains(...)Z" caller="java/util/Objects.equals(...)"`, on `testConcurrentEquals`/`testConcurrentToXContent`) does **not** reproduce on current `dev` — but this could not be cleanly confirmed as "fixed" rather than "masked": both affected tests now die *earlier*, in a newly-identified, unrelated `Executors` factory bug (next bullet), before ever reaching the `a.equals(b)` call site that produced the original signal. Static review of the vtable/dispatch fast paths (`vm/src/runtime/vtable.rs::lookup_slot`, `vm/src/runtime/interpreter.rs::execute_invokevirtual_{vtable_fast,cached}`) found the receiver-class/name/descriptor verification intact on all of them, and the original signal fired shortly after the (now-fixed) `findNative` crash in the same process, consistent with it having been collateral of that crash cascade rather than a standing bug — but this is not proven with a clean direct re-exercise. See the `ScriptContextInfoSerializingTests` FIXED doc above for the full writeup; should it resurface once the executor bug below is fixed, it needs its own fresh repro.
+- FIXED/RETIRED: [`ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe-FIXED.md`](../internal/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe-FIXED.md) — all 3 classes' `testConcurrentSerialization`/`testConcurrentHashCode`/`testConcurrentEquals`/`testConcurrentToXContent` (from `AbstractWireTestCase`) used to fail with `NullPointerException: ... because "mainLock" is null`. Layer 1 (class-tag mistagging) was fixed the same session this doc was filed; Layer 2 (the `drop_real_layout_synthetic` registration-time gate) is now fixed too — see the FIXED doc for the cross-reference to the actual fix.
+
+## 2026-07-10 TestEncodingDetector retired; UTF-16/prolog-conflict residual split off
+
+- FIXED/RETIRED: [`encodingdetector-jsp-encoding-500-failures-FIXED.md`](../internal/fixed-suite-bugs/encodingdetector-jsp-encoding-500-failures-FIXED.md) - the StAX prolog-encoding fix (`1b60c103`) was already merged; verifying it end-to-end against the real `TestEncodingDetector` class required also picking up a concurrent session's fix for two independent blockers (`FileInputStream.<init>(String)` native-fallback backfill gap; `defineClass1` duplicate-define during repeated Tomcat webapp stop/start in one process, commit `45cc4f4f`). With both merged, the class went from 22/22 failing to 5/22 failing.
+- OPEN (new, split off): [`tomcat-08-07/encodingdetector-utf16-and-conflicting-prolog-residuals.md`](tomcat-08-07/encodingdetector-utf16-and-conflicting-prolog-residuals.md) — the remaining 5/22: 3 deliberately-invalid BOM/prolog-conflict fixtures now return 200 instead of HotSpot's 500, and 2 plain-`.jsp` UTF-16 (no-prolog) cases either decode garbled or hang.
+
+## 2026-07-10 ES tdigest SortingDigestTests crash FIXED, 2 new correctness residuals found (OPEN)
+
+Re-verified `ES-CRASH-20260709-libs-tdigest-org-elasticsearch-tdigest-sortingdigesttests-0249530511.md` on current `dev` per its own note ("re-run on current dev before assigning ownership"). The crash is CONFIRMED fixed, and with it gone the tests now run far enough to expose two independent, previously-hidden bugs:
+
+- FIXED/RETIRED: [`ES-CRASH-20260709-libs-tdigest-org-elasticsearch-tdigest-sortingdigesttests-0249530511-FIXED.md`](../internal/fixed-suite-bugs/ES-CRASH-20260709-libs-tdigest-org-elasticsearch-tdigest-sortingdigesttests-0249530511-FIXED.md) — `JavaLangAccess.findNative(ClassLoader, String)J` is already registered on `java/lang/System$1`/`JavaLangAccess` with the exact crashing descriptor; rebuilding `dev` and rerunning the doc's exact repro confirms the `NoSuchMethodError` and `rc=139` crash no longer occur (now `rc=1`, all 20 tests parsed).
+- OPEN (new): [`ES-FAIL-20260710-libs-tdigest-sortingdigesttests-residual-correctness.md`](elasticsearch-suite/ES-FAIL-20260710-libs-tdigest-sortingdigesttests-residual-correctness.md) — `SortingDigestTests` still FAILs 6/20 tests, but with **different failures depending on `-Jit on` vs `-Jit off`**: JIT-on shows wrong quantile values plus an `ArrayIndexOutOfBoundsException` on an identical garbage index (`7598259162470311681`) recurring across two unrelated arrays (smells like one stale 64-bit slot read as an index); JIT-off instead shows a `NoSuchMethodError: java/lang/Object.get(I)D` (receiver-identity loss dispatching a lambda passed as `java.util.function.Function`) and a repeated `ClassCastException` on log4j's `ReusableParameterizedMessage`. Neither cluster is root-caused yet.
+
+## 2026-07-09 Tomcat AsyncContext JULI LogManager note retired
+
+- FIXED/RETIRED: [`asynccontext-logmanager-getlogger-null-FIXED.md`](../internal/fixed-suite-bugs/asynccontext-logmanager-getlogger-null-FIXED.md) - `LogManager.addLogger(Logger)` now indexes real-JDK/JULI logger objects by their real `name` field instead of assuming synthetic slot 0 contains the name. The focused native regression passes, and a uniquely named Azure release binary (`/data/data/cratonvm-probes/bin/cratonvm-tomcat-async-logmanager-20260709`) passes a real-VM probe that performs the Tomcat-shaped `addLogger` -> `getLogger(name)` -> `setLevel` sequence for `org.apache.catalina.core.AsyncContextImpl`. The full Tomcat runner was unavailable on the host because the backup fixture lacked `test/` and `output/` artifacts, so future suite reruns should treat this as fixture confirmation rather than an open VM mechanism.
+
+## 2026-07-09 Tomcat WebSocket close-delay repro blocked by 3 environment bugs (2 fixed, 1 new open)
+
+While chasing `wsremoteendpoint-close-delay-near-deadlock.md`, found the
+real-JDK-mode Tomcat repro no longer starts at all (regression vs. the
+2026-07-07 evidence in that doc). Root-caused and fixed two of three
+blockers; the third is a new open issue:
+
+- FIXED/RETIRED: [`file-fs-native-clinit-never-set-FIXED.md`](../internal/fixed-suite-bugs/file-fs-native-clinit-never-set-FIXED.md) — `native_file_clinit` (the native override for `java/io/File.<clinit>`) never set the `FS` field, so any real-bytecode `File` method not in the `check_override` allow-list (`isInvalid()` and everything built on it — `length()`, `delete()`, `mkdir()`, `list()`, …) NPE'd. 100% reproducible; broke Tomcat's `Digester`/`mbeans-descriptors.xml` bootstrap on every real-JDK-mode `Tomcat.start()`.
+- FIXED/RETIRED: [`threadgroup-native-field-index-mismatch-FIXED.md`](../internal/fixed-suite-bugs/threadgroup-native-field-index-mismatch-FIXED.md) — the native `java.lang.ThreadGroup` accessors used a stale/swapped field-index layout (`name`/`parent` swapped vs. the real JDK 25 class layout), corrupting every VM-bootstrapped `ThreadGroup`. Broke `jdk.internal.misc.InnocuousThread.<clinit>` (`Cleaner.create()`) with a `ClassCastException`, failing `StandardServer` init before any application code ran.
+- OPEN (new): [`enumset-of-broken-for-non-jdk-enums.md`](enumset-of-broken-for-non-jdk-enums.md) — `EnumSet.of(...)` silently returns a broken/empty, non-iterable set for non-JDK enums (e.g. `jakarta.servlet.DispatcherType`). Current blocker: Tomcat's `WsServerContainer` constructor uses this exact pattern for filter-dispatcher-type registration, so every websocket-enabled `StandardContext` fails to start. Root-cause narrowed to two candidates in the doc, not yet fixed.
+
+The original websocket close-delay bug itself remains OPEN and
+unconfirmed at the I/O level — see the doc's 2026-07-09 addendum for the
+strengthened (but not yet empirically verified) root-cause hypothesis
+(a bounded 20s blocking-send timeout expiring rather than a permanent
+deadlock, `CountDownLatch` ruled out, socket write-readiness path now the
+leading suspect) and the concrete next steps once the `EnumSet` blocker
+above is cleared.
+
+## 2026-07-09 AccessLogValve/RewriteValve re-verify: 2 severe regressions FIXED, 1 new foundational bug found (OPEN)
+
+Re-verified `tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md`
+in isolation (`-Parallel 1`, idle Azure host) per its own recommendation.
+Both classes are CONFIRMED genuine bugs, not contention. Investigating them
+surfaced three distinct, layered issues:
+
+- FIXED: `URL.openConnection()` returned the wrong carrier type
+  (`ClassCastException`) for any real http(s) URL, due to a field-5
+  (authority) parsing bug introduced by commit `b0dd2e72` (2026-07-07).
+  Huge blast radius — anything doing `(HttpURLConnection)
+  url.openConnection()` on a real-bytecode URL was broken. Fixed in
+  `net_phase_e.rs`, verified byte-identical to HotSpot.
+- FIXED/RETIRED: [`bytebuffer-address-unset-aioobe.md`](../internal/tomcat-08-07/bytebuffer-address-unset-aioobe.md)
+  ? `ByteBuffer.allocate()`'s synthetic carrier did not set
+  `Buffer.address`, so any bulk `get(byte[])`/`put(byte[])` threw
+  `ArrayIndexOutOfBoundsException` via `Unsafe.copyMemory`. The live
+  default-release allocator is `native-builtins/src/lib.rs::alloc_heap_bytebuffer`;
+  it now seeds `address = 16`, and the socket-read/bulk-get repro returns
+  `HTTP/1.1 200 OK`.
+- FIXED/RETIRED: [`stringreader-read-never-advances-infinite-loop-FIXED.md`](../internal/fixed-suite-bugs/stringreader-read-never-advances-infinite-loop-FIXED.md)
+  — `StringReader.read()` never advanced position, infinite-looping any
+  `BufferedReader`/`StringReader`-based text parser (e.g.
+  `RewriteValve.parse()`). Root cause: the live native (`native-io`'s
+  `register_string_rw_natives`, tagged `SyntheticStub`) wins dispatch over
+  real bytecode by default, but stored position/length in flat object field
+  slots that don't exist on real JDK 25's `StringReader` (rewritten to a
+  single `Reader` delegate) — the writes silently no-op'd. Fixed with a
+  GC-stable side table (`SR_STATE`, keyed by `identity_hash_code`), same
+  pattern as this file's `InputStreamReader` `ISR_PENDING` table.
+  `TestRewriteValve` now completes all 121 tests instead of hanging.
+- Updated: [`tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md`](tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md)
+  now reflects all three findings.
+
+## 2026-07-09 Spring suite genuine-bug list, updated (125, down from 159)
+
+- [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](CRATONVM-SPRING-GENUINE-BUGLIST-125.md) — full per-test-method detail for 125 CratonVM-unique Spring failures (HotSpot passes, CratonVM doesn't), cross-referenced against a clean HotSpot baseline with the classpath-dump gap fixed (spring-websocket/oxm/jms/orm/core-test jars were never built — `./gradlew jar testFixturesJar testClasses` fixed it). Down from 159 two dev commits ago: 65 newly fixed (entire SpEL cluster + spring-jms module), 31 "newly broken" are **not** new regressions — root-caused to the already-tracked HIB-CV-32 batch/load-dependent heap-corruption family (25/31 SIGSEGV, one test confirmed passing standalone but ABEND under full-suite load).
+
+## 2026-07-09 BC-java `asn1-regression` X9Test SIGSEGV retired
+
+- FIXED/RETIRED: [`bc-asn1-x9test-array-descriptor-of-checkcast-sigsegv-FIXED.md`](../internal/fixed-suite-bugs/bc-asn1-x9test-array-descriptor-of-checkcast-sigsegv-FIXED.md) - the interpreter now keeps popped `checkcast`/`instanceof` receivers pinned through the full type-check, including array descriptor handling, and the JIT `checkcast` helper rejects non-heap pointer-shaped receivers before reading object headers. `X9Test` now reports `X9: Okay`; the full ASN.1 regression run gets past X9 and only hits the unrelated `X500Name` Turkish-locale residual.
+
 ## 2026-07-09 BC-java `asn1-regression` StackOverflowError retired
 
 - FIXED/RETIRED: [`bc-asn1-pkcs12test-indefinitelengthinputstream-stackoverflow-FIXED.md`](../internal/fixed-suite-bugs/bc-asn1-pkcs12test-indefinitelengthinputstream-stackoverflow-FIXED.md) - the base `InputStream.read([BII)` native no longer redispatches an explicit `super.read([BII)` call back to the receiver's three-arg override. The committed reduced probe covers the Bouncy Castle-shaped recursion and the earlier normal virtual-dispatch case; the local checkout does not include `apps/bc-java`, so full-suite rerun remains fixture validation rather than an open known issue.
@@ -26,7 +156,8 @@ angles**; this index is the consolidated map. Read it first.
 - FIXED: [`keycloak-model-protobuf-metadata-cache-config-missing-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-protobuf-metadata-cache-config-missing-FIXED.md) - real `DefaultCacheManager` cache-existence/configuration-definition calls now delegate into Infinispan's real `ConfigurationManager`, so the internal `___protobuf_metadata` cache configuration is present when internal caches start. The same fix chain also closed the exposed FFM `SymbolLookup`, default C-runtime lookup, StampedLock view-unlock, Liquibase pipeline-order, and Xerces `CMStateSet` hotspots.
 - FIXED: [`keycloak-model-liquibase-xerces-xml-parse-nojit-timeout-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-liquibase-xerces-xml-parse-nojit-timeout-FIXED.md) - the no-JIT Liquibase/Xerces XML parse watchdog point is gone after native fast paths for XMLChar, XMLLimitAnalyzer, XSSimpleTypeDecl normalization, XSDKey identity, `XMLEntityScanner.scanQName`/content/space handling, opti DOM getters, and RangeToken sorting. The 2026-07-09 scanQName follow-up also fixed the downstream empty-rawname `skipString` failure and the exposed H2 `BitSet.clone`/`Object.clone` dispatch failure.
 - FIXED/RETIRED: [`keycloak-model-liquibase-checksum-status-nojit-timeout-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-liquibase-checksum-status-nojit-timeout-FIXED.md) - after the checksum filter, H2 DDL hotpath, and `ColumnConfig.getSerializableFieldValue` shortcuts, `RealmModelTest` no longer hits the Liquibase checksum/status/update timeout or the earlier `SnapshotGeneratorFactory` comparator failure. The 2026-07-09 no-JIT validation ran all 195 Liquibase changesets and logged database-update completion before failing later.
-- OPEN: [`keycloak-model-realmmodeltest-h2-auth-after-liquibase-nojit.md`](keycloak-model-realmmodeltest-h2-auth-after-liquibase-nojit.md) - current terminal residual after Liquibase completes: Hibernate bootstrap of `JdbcEnvironment` fails through H2 with `Wrong user name or password [28000-240]`. Treat as a fresh Keycloak credential-propagation residual, with `docs/internal/hibernate-bugs/HIB-CV-06-emf-bootstrap-db-connect.md` as prior art.
+- FIXED/RETIRED: [`keycloak-model-realmmodeltest-h2-auth-after-liquibase-nojit-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-realmmodeltest-h2-auth-after-liquibase-nojit-FIXED.md) - the later H2 auth/bootstrap residual is closed. The final Azure no-JIT run `verify-realmmodel-h2-auth-fixed-jdk25-20260709-123713-r109-final-candidate-700` passed `RealmModelTest` 3/3 in 352.304s with no H2 auth failure, no post-Liquibase timeout, and no localization `Map.forEach` NPE.
+- FIXED/RETIRED: [`keycloak-model-realmmodeltest-post-infinispan-liquibase-timeout-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-realmmodeltest-post-infinispan-liquibase-timeout-FIXED.md) - the broader post-Infinispan tracker is closed by the same full-class no-JIT validation.
 
 ## 2026-07-07 Five new Spring non-passed-rerun bugs (Azure host, dev, real-JDK/JIT-on)
 
@@ -57,7 +188,7 @@ Also confirmed (not new, corroborating evidence only):
 ## 2026-07-08 Keycloak RealmModelTest `fullName` note retired; H2 auth residual remains open
 
 - FIXED/RETIRED: [Infinispan ProtoStream `FileDescriptor.fullName` decode error](../internal/fixed-suite-bugs/keycloak-model-infinispan-jit-adjacent-decode-error-fullname-FIXED.md) - the exact default-JIT `decode error at pc=51 in fullName...` no longer reproduces on current `dev`. The residual pass fixed the later real-`DefaultCacheManager.defineConfiguration` delegation gap, real-JDK `StampedLock` lock-view/native coherence, Windows C-runtime symbol lookup for Panama symbol lookup, and added a conservative RxJava3 JIT skip after `CRATONVM_JIT_DENY=io/reactivex/` proved it clears the Infinispan publisher wait.
-- OPEN: [Keycloak `RealmModelTest` post-Infinispan tracker](keycloak-model-realmmodeltest-post-infinispan-liquibase-timeout.md) - with those layers fixed, CratonVM reaches and now completes Liquibase changelog work. The active specific follow-up is the [post-Liquibase H2 auth failure](keycloak-model-realmmodeltest-h2-auth-after-liquibase-nojit.md), not the old ProtoStream `fullName` decode failure or the fixed Xerces/checksum Liquibase timeouts.
+- FIXED/RETIRED: [Keycloak `RealmModelTest` post-Infinispan tracker](../internal/fixed-suite-bugs/keycloak-model-realmmodeltest-post-infinispan-liquibase-timeout-FIXED.md) - the broad tracker is now closed by the 2026-07-10 no-JIT `RealmModelTest` pass; the active H2 auth follow-up moved to [`keycloak-model-realmmodeltest-h2-auth-after-liquibase-nojit-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-realmmodeltest-h2-auth-after-liquibase-nojit-FIXED.md).
 
 ## 2026-07-08 `InPredicateTest` LHM NSME and stale timeout notes retired
 
@@ -157,8 +288,8 @@ All three verified against their real Keycloak classes via the suite runner; no 
 - The historical JIT-only ProtoStream `fullName` decode residual is now
   retired to
   [`docs/internal/fixed-suite-bugs/keycloak-model-infinispan-jit-adjacent-decode-error-fullname-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-infinispan-jit-adjacent-decode-error-fullname-FIXED.md).
-  The current open follow-up from the deeper `RealmModelTest` path is
-  [keycloak-model-realmmodeltest-post-infinispan-liquibase-timeout.md](keycloak-model-realmmodeltest-post-infinispan-liquibase-timeout.md).
+  The deeper `RealmModelTest` follow-up is now retired to
+  [`keycloak-model-realmmodeltest-post-infinispan-liquibase-timeout-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-realmmodeltest-post-infinispan-liquibase-timeout-FIXED.md).
   The sibling `--nojit` STW shutdown hang that surfaced alongside the old
   decode note is fixed and retired to
   [`docs/internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md).

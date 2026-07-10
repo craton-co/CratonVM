@@ -205,9 +205,7 @@ impl Arena {
                     align,
                     SMALL_TIER_SCAN_BUDGET,
                 )
-                .or_else(|| {
-                    Self::first_fit(&mut self.free_large, base, size, align, usize::MAX)
-                })
+                .or_else(|| Self::first_fit(&mut self.free_large, base, size, align, usize::MAX))
             } else {
                 Self::first_fit(&mut self.free_large, base, size, align, usize::MAX)
             };

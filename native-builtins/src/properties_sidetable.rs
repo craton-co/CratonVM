@@ -372,7 +372,10 @@ fn parse_properties_text_strict(raw: &str) -> Result<Vec<(String, String)>, ()> 
     parse_properties_text_inner(raw, true)
 }
 
-fn parse_properties_text_inner(raw: &str, strict_unicode: bool) -> Result<Vec<(String, String)>, ()> {
+fn parse_properties_text_inner(
+    raw: &str,
+    strict_unicode: bool,
+) -> Result<Vec<(String, String)>, ()> {
     let mut out = Vec::new();
     let mut iter = raw.split('\n').peekable();
     let mut continued = String::new();
@@ -1280,6 +1283,14 @@ fn native_properties_get_property_1(
     // UnresolvableSystemProperty). The synthetic `System.getProperties()` object
     // is marked via `mark_system_props`, so it still resolves system keys.
     if !is_system_props(ctx, this) {
+        if key == "jboss.home.dir" {
+            if let Some(v) = ctx
+                .get_system_property(&key)
+                .or_else(|| super::system_property_fallback(ctx, &key))
+            {
+                return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+            }
+        }
         tracing::debug!(
             target: "cratonvm_vm::props_sidetable",
             ?this, key = %key,
@@ -1294,7 +1305,7 @@ fn native_properties_get_property_1(
     );
     match ctx
         .get_system_property(&key)
-        .or_else(|| super::bootstrap_property_fallback(&key))
+        .or_else(|| super::system_property_fallback(ctx, &key))
     {
         Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
         None => Ok(Some(Value::Object(None))),
@@ -1604,14 +1615,15 @@ fn native_properties_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// Native `Properties.get(Object)Object` — Hashtable-style read path used
 /// by callers that bypass `getProperty` (e.g. Spring's
 /// `PropertySourcesPropertyResolver` calling `Properties.get(key)` on the
-/// `MapPropertySource` backed by `System.getProperties()`).
+/// `MapPropertySource` backed by `System.getProperties()`, or H2 reading JDBC
+/// connection credentials from an ordinary `Properties`).
 ///
 /// JDK 25's `Properties.get` (Properties.java:1338) reads from a private
 /// `ConcurrentHashMap<Object, Object> map` field that's only populated by
 /// `Properties.<init>`'s body.  Our synthetic Properties allocations don't
 /// run that body, so `map` is null and the bytecode NPEs.  Override the
 /// method here to consult the side-table (and fall back to system
-/// properties for the System.getProperties() case), mirroring how
+/// properties only for the System.getProperties() case), mirroring how
 /// `getProperty` already routes around the broken bytecode path.
 ///
 /// Returns `null` when the key is absent — matches `Hashtable.get`
@@ -1645,9 +1657,17 @@ fn native_properties_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             }
         }
     }
+    // Match real `Properties`: ordinary instances do not consult global system
+    // properties. The system-property fallback is only for the synthetic,
+    // marked singleton returned by `System.getProperties()`. Without this gate,
+    // `new Properties().get("password")` could return a global system property
+    // and pollute H2/Hibernate credential lookups that use the Map-style API.
+    if !is_system_props(ctx, this) {
+        return Ok(Some(Value::Object(None)));
+    }
     match ctx
         .get_system_property(&key)
-        .or_else(|| super::bootstrap_property_fallback(&key))
+        .or_else(|| super::system_property_fallback(ctx, &key))
     {
         Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
         None => Ok(Some(Value::Object(None))),

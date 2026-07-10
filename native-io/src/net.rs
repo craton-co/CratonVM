@@ -1225,6 +1225,9 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     let len = int_arg(args, 2);
     let len_usize = validate_native_range("read0", addr, len)?;
+    if len_usize == 0 {
+        return Ok(Some(Value::Int(0)));
+    }
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("read0: FileDescriptor has no fd id"))?;
     dbgnet!("read0 fd={fd:#x} len={len} addr={addr:#x}");
@@ -1283,6 +1286,9 @@ fn net_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     let len = int_arg(args, 2);
     let len_usize = validate_native_range("write0", addr, len)?;
+    if len_usize == 0 {
+        return Ok(Some(Value::Int(0)));
+    }
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("write0: FileDescriptor has no fd id"))?;
     dbgnet!("write0 fd={fd:#x} len={len} addr={addr:#x}");
@@ -1903,7 +1909,9 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(0)))
         });
         r.register(lso, "setIpDontFragment0", "(IZZ)V", |_c, _a| Ok(None));
-        r.register(lso, "getQuickAck0", "(I)Z", |_c, _a| Ok(Some(Value::Int(0))));
+        r.register(lso, "getQuickAck0", "(I)Z", |_c, _a| {
+            Ok(Some(Value::Int(0)))
+        });
         r.register(lso, "setQuickAck0", "(IZ)V", |_c, _a| Ok(None));
         r.register(lso, "getSoPeerCred0", "(I)J", |_c, _a| {
             Ok(Some(Value::Long(-1)))

@@ -1,0 +1,45 @@
+diff --git a/vm/src/vm/vm_exec.rs b/vm/src/vm/vm_exec.rs
+--- a/vm/src/vm/vm_exec.rs
++++ b/vm/src/vm/vm_exec.rs
+@@ -6082,16 +6082,28 @@
+                             })?
+                         }
+                     };
+-                    let mut init_args = Vec::with_capacity(1 + full_args.len());
+-                    init_args.push(Value::Object(Some(new_obj)));
+-                    init_args.extend_from_slice(&full_args);
+-                    invoke_on_class_shared(
+-                        self.shared,
+-                        self.thread,
+-                        class_id,
+-                        &lcs.impl_handle.member_name,
+-                        &lcs.impl_handle.descriptor,
+-                        &init_args,
+-                    )?;
+-                    Ok(Some(Value::Object(Some(new_obj))))
++                    let new_obj_pin = self.thread.native_pin_roots.len();
++                    self.thread.native_pin_roots.push(new_obj);
++                    let init_result = {
++                        let mut init_args = Vec::with_capacity(1 + full_args.len());
++                        init_args.push(Value::Object(Some(new_obj)));
++                        init_args.extend_from_slice(&full_args);
++                        invoke_on_class_shared(
++                            self.shared,
++                            self.thread,
++                            class_id,
++                            &lcs.impl_handle.member_name,
++                            &lcs.impl_handle.descriptor,
++                            &init_args,
++                        )
++                    };
++                    let forwarded = self
++                        .thread
++                        .native_pin_roots
++                        .get(new_obj_pin)
++                        .copied()
++                        .unwrap_or(new_obj);
++                    self.thread.native_pin_roots.truncate(new_obj_pin);
++                    init_result?;
++                    Ok(Some(Value::Object(Some(forwarded))))
+                 }
+                 _ => {

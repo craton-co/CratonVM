@@ -452,8 +452,7 @@ pub fn ensure_class_initialized_shared(
                     // is unset; any wake (notify, timeout, spurious) falls
                     // through to the outer loop's state re-check.
                     if !*guard {
-                        let _result =
-                            cvar.wait_for(&mut guard, std::time::Duration::from_secs(30));
+                        let _result = cvar.wait_for(&mut guard, std::time::Duration::from_secs(30));
                     }
                     drop(guard);
                     drop(blk);
@@ -2082,7 +2081,7 @@ impl<'a> crate::classloading::vtype::ClassHierarchy for ClassStoreHierarchy<'a> 
             }
         }
 
-        "java/lang/Object".to_string()
+        crate::classloading::static_common_superclass_lookup(a, b)
     }
 
     fn is_interface(&self, name: &str) -> bool {
@@ -2160,22 +2159,111 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             // `System.getProperties()`'s real `map` (`ConcurrentHashMap`)
             // field, which is null on the synthetic system-properties
             // singleton, so the read partway through `<clinit>` NPEs and
-            // gets swallowed — leaving whichever of the four static fields
-            // were assigned before the throw correct and the rest at their
-            // zero-init default. Backfill deterministically; these are pure
-            // platform constants (same value every time), so an
-            // unconditional overwrite is always correct.
+            // gets swallowed — leaving `File.FS` null and whichever separator
+            // statics were assigned before the throw correct while the rest
+            // stay at their zero-init default. Backfill deterministically.
             let sep_char = std::path::MAIN_SEPARATOR;
             let path_sep_char = if cfg!(windows) { ';' } else { ':' };
             let sep_str = super::vm_object::create_java_string(shared, &sep_char.to_string());
             let path_sep_str =
                 super::vm_object::create_java_string(shared, &path_sep_char.to_string());
+            let set_instance_by_name =
+                |obj: ObjectRef, obj_class_id: ClassId, field_name: &str, value: Value| {
+                    let cm = shared.class_manager.read();
+                    if let Some(cls) = cm.get_class(obj_class_id) {
+                        let mut instance_idx = 0usize;
+                        for f in &cls.fields {
+                            if !f.is_static() {
+                                if &*f.name == field_name {
+                                    drop(cm);
+                                    shared.heap.set_field(obj, instance_idx, value);
+                                    return true;
+                                }
+                                instance_idx += 1;
+                            }
+                        }
+                    }
+                    false
+                };
+
             let mut n = 0;
+            #[cfg(windows)]
+            let fs_class_name = "java/io/WinNTFileSystem";
+            #[cfg(not(windows))]
+            let fs_class_name = "java/io/UnixFileSystem";
+            let fs_class_id = shared.load_class_concurrent(fs_class_name).ok();
+            let fs_class = fs_class_id.and_then(|id| {
+                let cm = shared.class_manager.read();
+                cm.get_class(id).map(|cls| {
+                    let fields = cls.fields.iter().filter(|f| !f.is_static()).count();
+                    (id, fields)
+                })
+            });
+            if let Some((fs_class_id, fs_fields)) = fs_class {
+                if let Some(fs_obj) = shared.heap.try_alloc_object(fs_class_id, fs_fields) {
+                    let (java_home, user_dir) = {
+                        let props = shared.system_properties.read();
+                        (
+                            props.get("java.home").cloned().unwrap_or_default(),
+                            props
+                                .get("user.dir")
+                                .cloned()
+                                .or_else(|| {
+                                    std::env::current_dir()
+                                        .ok()
+                                        .map(|p| p.to_string_lossy().into_owned())
+                                })
+                                .unwrap_or_else(|| ".".to_string()),
+                        )
+                    };
+                    let java_home_str = super::vm_object::create_java_string(shared, &java_home);
+                    let user_dir_str = super::vm_object::create_java_string(shared, &user_dir);
+                    let alt_sep_char = if sep_char == '\\' { '/' } else { '\\' };
+
+                    let _ = set_instance_by_name(
+                        fs_obj,
+                        fs_class_id,
+                        "slash",
+                        Value::Int(sep_char as i32),
+                    );
+                    let _ = set_instance_by_name(
+                        fs_obj,
+                        fs_class_id,
+                        "colon",
+                        Value::Int(path_sep_char as i32),
+                    );
+                    let _ = set_instance_by_name(
+                        fs_obj,
+                        fs_class_id,
+                        "semicolon",
+                        Value::Int(path_sep_char as i32),
+                    );
+                    let _ = set_instance_by_name(
+                        fs_obj,
+                        fs_class_id,
+                        "altSlash",
+                        Value::Int(alt_sep_char as i32),
+                    );
+                    let _ = set_instance_by_name(
+                        fs_obj,
+                        fs_class_id,
+                        "javaHome",
+                        Value::Object(Some(java_home_str)),
+                    );
+                    let _ = set_instance_by_name(
+                        fs_obj,
+                        fs_class_id,
+                        "userDir",
+                        Value::Object(Some(user_dir_str)),
+                    );
+                    n += set_static_by_name("FS", Value::Object(Some(fs_obj))) as i32;
+                }
+            }
             n += set_static_by_name("separatorChar", Value::Int(sep_char as i32)) as i32;
             n += set_static_by_name("separator", Value::Object(Some(sep_str))) as i32;
             n += set_static_by_name("pathSeparatorChar", Value::Int(path_sep_char as i32)) as i32;
             n += set_static_by_name("pathSeparator", Value::Object(Some(path_sep_str))) as i32;
-            tracing::warn!("Post-clinit fixup: File separator/pathSeparator populated ({n}/4)");
+            tracing::warn!("Post-clinit fixup: File fs/separator/pathSeparator populated ({n}/5)");
         }
         // (Removed) "org/jboss/modules/Module" arm.
         //
@@ -2531,7 +2619,9 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             };
             let ordinal_idx = find_instance_field_index("ordinal").unwrap_or(0);
             let name_idx = find_instance_field_index("name");
-            let alloc_fields = num_fields.max(ordinal_idx + 1).max(name_idx.map_or(0, |i| i + 1));
+            let alloc_fields = num_fields
+                .max(ordinal_idx + 1)
+                .max(name_idx.map_or(0, |i| i + 1));
 
             let mut filled = 0usize;
             for (ord, &name) in NAMES.iter().enumerate() {
@@ -2541,7 +2631,9 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 let Some(obj) = shared.heap.try_alloc_object(class_id, alloc_fields) else {
                     continue;
                 };
-                shared.heap.set_field(obj, ordinal_idx, Value::Int(ord as i32));
+                shared
+                    .heap
+                    .set_field(obj, ordinal_idx, Value::Int(ord as i32));
                 if let Some(name_idx) = name_idx {
                     let nm = super::vm_object::create_java_string(shared, name);
                     shared
@@ -2566,10 +2658,11 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 {
                     for (i, &name) in NAMES.iter().enumerate() {
                         if let Some(Value::Object(Some(o))) = read_static_named(name) {
-                            let _ =
-                                shared
-                                    .heap
-                                    .set_array_element(values_arr, i, Value::Object(Some(o)));
+                            let _ = shared.heap.set_array_element(
+                                values_arr,
+                                i,
+                                Value::Object(Some(o)),
+                            );
                         }
                     }
                     if !set_static_by_name("$VALUES", Value::Object(Some(values_arr))) {
@@ -3257,6 +3350,23 @@ mod tests {
         assert_eq!(
             hierarchy.common_superclass("com/unknown/A", "com/unknown/B"),
             "java/lang/Object"
+        );
+    }
+
+    #[test]
+    fn hierarchy_common_superclass_xstream_exception_siblings() {
+        let shared = test_shared();
+        let cm = shared.class_manager.read();
+        let hierarchy = ClassStoreHierarchy {
+            store: &cm.class_store,
+        };
+        use crate::classloading::vtype::ClassHierarchy;
+        assert_eq!(
+            hierarchy.common_superclass(
+                "com/thoughtworks/xstream/converters/reflection/ObjectAccessException",
+                "com/thoughtworks/xstream/converters/ConversionException",
+            ),
+            "com/thoughtworks/xstream/converters/ErrorWritingException"
         );
     }
 
