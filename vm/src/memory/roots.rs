@@ -277,6 +277,23 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     `crate::native::jni::update_local_refs_after_gc` (gc.rs).
     crate::native::jni::collect_local_ref_roots(&mut roots);
 
+    // 9c. JNI keep-alive pin set (INT-10): arrays checked out via
+    //     GetPrimitiveArrayCritical / Get<Type>ArrayElements. Native code
+    //     holds a detached COPY of the body (so relocation is safe), but the
+    //     copy-back at Release targets the OBJECT — which must therefore
+    //     stay alive even when its only other reference was dropped while
+    //     the native held the copy. Previously this set was spliced only
+    //     into the semispace `Heap` backend; generational/G1/ZGC relied on
+    //     the (initiator-only) JNI-local scan above. The matching re-key
+    //     after a move is `cratonvm_gc::pinned::update_after_gc` (gc.rs).
+    if cratonvm_gc::pinned::any_pinned() {
+        for addr in cratonvm_gc::pinned::pinned_addrs() {
+            if let Some(obj) = shared.heap.is_object_address(addr) {
+                roots.push(obj);
+            }
+        }
+    }
+
     // 10. Thread-local ObjectRefs — java_thread_obj, pending_async_exception
     if let Some(ref obj_ref) = thread.java_thread_obj {
         roots.push(*obj_ref);

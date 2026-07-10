@@ -12959,6 +12959,63 @@ impl Compiler {
         self.patch_rel32_to_here(done);
     }
 
+    /// `TEST BYTE [base+disp8], imm8` -- checks a per-object header flag byte
+    /// (e.g. `GC_FLAG_COMPACT`) without needing any scratch register: the
+    /// memory operand is read and discarded by the CPU, `base` and the
+    /// flags register are the only things touched.
+    fn emit_test_mem8_imm8(&mut self, base: u8, disp8: i32, imm8: u8) {
+        if base >= 8 {
+            self.buf.emit(&[0x41]); // REX.B (extend ModRM.rm to r8-r15)
+        }
+        self.buf.emit(&[0xF6, 0x40 | (base & 7), disp8 as u8, imm8]);
+    }
+
+    /// Load a String receiver's `value` field (the backing `byte[]`/`char[]`
+    /// ref) from `base` into `dst`, correctly handling BOTH object layouts
+    /// that can coexist for `java/lang/String` at runtime:
+    ///
+    ///   * compact-ref-field layout (`compact_offset` as computed by
+    ///     `StringFieldLayout::new` is already correct -- see its doc
+    ///     comment for the offset derivation and the BUG-ES-TASKINFO-20260710
+    ///     history);
+    ///   * a LEGACY-laid-out instance of the same class -- per the getfield
+    ///     (opcode 0xb4) inline path's own comment, "a class with a
+    ///     registered compact layout may still have LEGACY-laid-out
+    ///     instances" (e.g. an allocation whose field count didn't match the
+    ///     registered `CompactLayout` at alloc time). `String.value` is
+    ///     always field index 0, the class's *only* reference field before
+    ///     `coder`/`hash`, so a legacy instance's corresponding `Value` cell
+    ///     sits exactly `SLOT_SIZE - REF_FIELD_SIZE` (8) bytes later than
+    ///     `compact_offset` -- uniformly, regardless of which field.
+    ///
+    /// Dispatches per-object via the `GC_FLAG_COMPACT` header-bit (byte
+    /// offset 21), exactly mirroring the getfield 0xb4 inline path. No
+    /// scratch register needed.
+    fn emit_load_string_value_ptr(&mut self, dst: u8, base: u8, compact_offset: i32) {
+        self.emit_test_mem8_imm8(base, 21, cratonvm_types::GC_FLAG_COMPACT);
+        let legacy = self.emit_jcc_rel32_patch(0x84); // JZ (flag clear => legacy)
+        self.emit_mov_r64_mem_disp32(dst, base, compact_offset);
+        let done = self.emit_jmp_rel32_patch();
+        self.patch_rel32_to_here(legacy);
+        self.emit_mov_r64_mem_disp32(dst, base, compact_offset + 8);
+        self.patch_rel32_to_here(done);
+    }
+
+    /// Sign-extended 32-bit field load (`String.coder` / `String.hash`) with
+    /// the same compact/legacy dual handling as
+    /// [`Self::emit_load_string_value_ptr`] (see its doc comment). `coder`
+    /// and `hash` are always non-negative in practice, so sign- vs
+    /// zero-extension is behaviourally identical here.
+    fn emit_load_string_i32_field(&mut self, dst: u8, base: u8, compact_offset: i32) {
+        self.emit_test_mem8_imm8(base, 21, cratonvm_types::GC_FLAG_COMPACT);
+        let legacy = self.emit_jcc_rel32_patch(0x84);
+        self.emit_movsxd_r64_mem_disp32(dst, base, compact_offset);
+        let done = self.emit_jmp_rel32_patch();
+        self.patch_rel32_to_here(legacy);
+        self.emit_movsxd_r64_mem_disp32(dst, base, compact_offset + 8);
+        self.patch_rel32_to_here(done);
+    }
+
     /// Emit a 32-bit register-to-register ALU op `dst op= src` for the
     /// STRING_SEARCH intrinsics. `opcode` is the primary opcode of the
     /// `r/m32, r32` form (0x01 ADD, 0x29 SUB, 0x39 CMP, 0x89 MOV, 0x31
@@ -22332,20 +22389,18 @@ impl Compiler {
                                 }
 
                                 // RCX = value (byte[]) ref. Null → deopt.
-                                self.emit_mov_r64_mem_disp32(
+                                self.emit_load_string_value_ptr(
                                     RCX,
                                     RAX,
-                                    // Cast: fixed struct/layout offset to i32 instruction displacement
                                     layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                                 );
                                 self.emit_test_r64_r64(RCX);
                                 bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
 
                                 // R10D = coder (0 LATIN1 / 1 UTF16).
-                                self.emit_movsxd_r64_mem_disp32(
+                                self.emit_load_string_i32_field(
                                     R10,
                                     RAX,
-                                    // Cast: fixed struct/layout offset to i32 instruction displacement
                                     layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                                 );
 
@@ -22358,11 +22413,10 @@ impl Compiler {
                                     // back — the returned value is identical
                                     // either way, the cache is a
                                     // non-observable optimisation.)
-                                    self.emit_movsxd_r64_mem_disp32(
+                                    self.emit_load_string_i32_field(
                                         RAX,
                                         RAX,
                                         layout.hash_cell_offset
-                                            // Cast: fixed struct/layout offset to i32 instruction displacement
                                             + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                                     );
                                     // TEST EAX,EAX ; JNZ cached_done
@@ -22384,11 +22438,10 @@ impl Compiler {
                                     // re-pop is not possible. Instead keep value
                                     // ptr safe: recompute from recv_slot.
                                     self.load_slot_to_reg(RDX, recv_slot);
-                                    self.emit_mov_r64_mem_disp32(
+                                    self.emit_load_string_value_ptr(
                                         RDX,
                                         RDX,
                                         layout.value_cell_offset
-                                            // Cast: fixed struct/layout offset to i32 instruction displacement
                                             + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                                     );
                                     // h = 0 (EAX) ; i = 0 (R8D).
@@ -22591,16 +22644,14 @@ impl Compiler {
                             bail.push(self.emit_jcc_rel32_patch(0x85)); // JNE
 
                             // R8 = this.value, R9 = other.value (byte[] refs).
-                            self.emit_mov_r64_mem_disp32(
+                            self.emit_load_string_value_ptr(
                                 R8,
                                 RAX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
-                            self.emit_mov_r64_mem_disp32(
+                            self.emit_load_string_value_ptr(
                                 R9,
                                 RDX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             // Null value array on either side → deopt.
@@ -22611,20 +22662,22 @@ impl Compiler {
 
                             // coder mismatch → deopt.
                             // MOV ECX,[RAX+coder] ; CMP ECX,[RDX+coder]
-                            self.emit_mov_r32_mem_disp32(
+                            self.emit_load_string_i32_field(
                                 RCX,
                                 RAX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
-                            // CMP ECX,[RDX+disp32]: 3B /r, ModRM
-                            // mod=10(disp32) reg=ECX(001) r/m=RDX(010) = 0x8A.
-                            self.buf.emit(&[0x3B, 0x8A]);
-                            self.buf.emit(
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
-                                &(layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32)
-                                    .to_le_bytes(),
+                            // other.coder may come from a legacy-laid-out `other`
+                            // independently of `this` -- load it through the
+                            // same compact/legacy-aware helper (R11 is free
+                            // here) instead of a raw CMP-with-memory-operand,
+                            // then compare register-to-register.
+                            self.emit_load_string_i32_field(
+                                R11,
+                                RDX,
+                                layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
+                            self.emit_alu_r32_r32(0x39, RCX, R11); // CMP ECX,R11D
                             bail.push(self.emit_jcc_rel32_patch(0x85)); // JNE
 
                             // value-array length mismatch → result 0.
@@ -22734,33 +22787,29 @@ impl Compiler {
                             self.emit_test_r64_r64(RDX);
                             bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
                                                                         // R8 = this.value, R9 = other.value; null → deopt.
-                            self.emit_mov_r64_mem_disp32(
+                            self.emit_load_string_value_ptr(
                                 R8,
                                 RAX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
                             bail.push(self.emit_jcc_rel32_patch(0x84));
-                            self.emit_mov_r64_mem_disp32(
+                            self.emit_load_string_value_ptr(
                                 R9,
                                 RDX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC9]); // TEST R9,R9
                             bail.push(self.emit_jcc_rel32_patch(0x84));
                             // R10 = this.coder, R11 = other.coder.
-                            self.emit_movsxd_r64_mem_disp32(
+                            self.emit_load_string_i32_field(
                                 R10,
                                 RAX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
-                            self.emit_movsxd_r64_mem_disp32(
+                            self.emit_load_string_i32_field(
                                 R11,
                                 RDX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
 
@@ -22871,19 +22920,17 @@ impl Compiler {
                             self.emit_test_r64_r64(RAX);
                             bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
                                                                         // R8 = this.value; null → deopt.
-                            self.emit_mov_r64_mem_disp32(
+                            self.emit_load_string_value_ptr(
                                 R8,
                                 RAX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
                             bail.push(self.emit_jcc_rel32_patch(0x84));
                             // R10 = this.coder.
-                            self.emit_movsxd_r64_mem_disp32(
+                            self.emit_load_string_i32_field(
                                 R10,
                                 RAX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
                             // R9D = needle = ch & 0xFFFF.
@@ -22971,33 +23018,29 @@ impl Compiler {
                             self.load_slot_to_reg(RDX, needle_slot);
                             self.emit_test_r64_r64(RDX);
                             bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
-                            self.emit_mov_r64_mem_disp32(
+                            self.emit_load_string_value_ptr(
                                 R8,
                                 RAX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
                             bail.push(self.emit_jcc_rel32_patch(0x84));
-                            self.emit_mov_r64_mem_disp32(
+                            self.emit_load_string_value_ptr(
                                 R9,
                                 RDX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC9]); // TEST R9,R9
                             bail.push(self.emit_jcc_rel32_patch(0x84));
                             // R10 = haystack coder, R11 = needle coder.
-                            self.emit_movsxd_r64_mem_disp32(
+                            self.emit_load_string_i32_field(
                                 R10,
                                 RAX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
-                            self.emit_movsxd_r64_mem_disp32(
+                            self.emit_load_string_i32_field(
                                 R11,
                                 RDX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
 

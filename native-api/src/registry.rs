@@ -990,6 +990,36 @@ pub trait NativeContext {
         self.create_string(text)
     }
 
+    /// Populate an *already-allocated* `java/lang/String` object's backing
+    /// fields directly from raw UTF-16 code `units`, using the same
+    /// Latin1-fits-in-a-byte bulk scan + little-endian compact-string layout
+    /// as [`create_string`](Self::create_string). Unlike `create_string`,
+    /// this does NOT allocate the `String` object itself and does NOT touch
+    /// the intern pool — it exists for native `<init>` overrides
+    /// (`String(char[])`, `String(char[], int, int)`) that intercept
+    /// construction *after* `new` has already allocated `this`: a
+    /// constructor native must mutate `this` in place, not return a
+    /// different object identity.
+    ///
+    /// Preserves raw code units byte-for-byte (including unpaired
+    /// surrogates), unlike routing through a Rust `&str`, which cannot
+    /// represent those. Returns `false` only on backing-array allocation
+    /// failure (heap exhaustion) — the caller should surface a catchable
+    /// `OutOfMemoryError`.
+    ///
+    /// Default impl (mock/test contexts, which treat strings as opaque
+    /// objects): stores the units in a plain `char[]` at field 0 via the
+    /// generic array/field primitives. The VM override replaces this with
+    /// the exact compact-string layout used by every other String natively.
+    fn init_string_from_units(&mut self, this: ObjectRef, units: &[u16]) -> bool {
+        let arr = self.new_array(ArrayElementType::Char, units.len());
+        for (i, &u) in units.iter().enumerate() {
+            self.set_array_element(arr, i, Value::Int(u as i32));
+        }
+        self.set_field(this, 0, Value::Object(Some(arr)));
+        true
+    }
+
     /// Read a Java String object back to a Rust String.
     fn read_string(&self, obj: ObjectRef) -> Option<String>;
 

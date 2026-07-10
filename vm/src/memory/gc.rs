@@ -49,6 +49,23 @@ pub fn update_all_roots(
         return;
     }
 
+    // JNI local references (INT-2): rewrite THIS thread's `JNI_LOCAL_FRAMES`
+    // handles through the pointer map. The scan half
+    // (`jni::collect_local_ref_roots`, roots.rs) has always kept the objects
+    // alive, so a moving collection RELOCATES them — but this matching remap
+    // half had no production caller (only a #[cfg(test)] one), leaving every
+    // JNI local a dangling from-space pointer after any moving GC. The
+    // storage is thread-local, so this covers the GC-initiating thread; the
+    // safepoint-resume and blocked-wake paths call it for their own threads
+    // (`apply_pointer_map_to_thread` / `check_post_block_gc`).
+    crate::native::jni::update_local_refs_after_gc(pointer_map);
+
+    // JNI keep-alive pin set (INT-10): re-key checked-out-array pins whose
+    // object moved this collection, so the matching Release/unpin (keyed by
+    // the object base) still finds them and `is_pinned` answers correctly
+    // for the object's new address.
+    cratonvm_gc::pinned::update_after_gc(pointer_map);
+
     // BUG-03 trace (gated CRATONVM_DBG_BUG03): per-GC coverage for main (tid 0).
     // Logs, at each relocating GC, whether main's Thread mirror moves THIS GC and
     // who the initiator is + main's blocked state — to find the GC where the mirror

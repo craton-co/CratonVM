@@ -594,3 +594,108 @@ string via `new String(char[])` right before sending it — the interpreter
 cost of that one conversion can alone exceed a short test-harness timeout,
 producing a confusing "silent empty response, no error logged" symptom that
 looks like a connector bug but isn't.
+
+## 2026-07-10: `String(char[])`/`String(char[], int, int)` native intrinsic landed — root cause from the previous section FIXED
+
+Implemented the fix the previous section left open: a CratonVM native intrinsic
+for `java.lang.String`'s `char[]` constructors, replacing the interpreted
+per-character `StringUTF16.compress`/`toBytes` loop with a bulk Rust
+implementation.
+
+**What changed** (branch `fix/string-char-array-ctor-intrinsic-20260710`,
+merged to `dev`):
+- `vm/src/vm/vm_object.rs`: extracted `populate_java_string_fields(shared,
+  str_obj, units)` out of `try_alloc_java_string_object_from_units` — the same
+  Latin1-fits-in-a-byte bulk scan + little-endian compact-string layout, now
+  reusable against an *already-allocated* `String` object (not just a
+  freshly-allocated one).
+- `native-api/src/registry.rs`: new `NativeContext::init_string_from_units`
+  trait method (default impl for mock/test contexts; VM override calls
+  `populate_java_string_fields`).
+- `native-builtins/src/lang_string.rs`: two new natives,
+  `native_string_init_from_char_array` (`<init>([C)V`) and
+  `native_string_init_from_char_array_range` (`<init>([CII)V`), registered in
+  `register_string_utf16_natives`. Both bulk-read the source `char[]` via
+  `NativeContext::read_char_array_into` (a single `copy_nonoverlapping` in the
+  VM's override) and hand the raw `u16` units straight to
+  `init_string_from_units` — no Rust `String`/`char` round-trip, so lone
+  surrogates round-trip byte-for-byte exactly like the real JDK bytecode did.
+  The range constructor replicates `checkBoundsOffCount`'s exact bounds-check
+  semantics (factored into a shared `bounds_off_count_violation` helper) and
+  both replicate the real constructors' `NullPointerException`-on-null-array
+  behavior.
+
+**Verification:**
+1. A 43-case Java probe (null array, empty array, ASCII/Latin1, the 0xFF/0x100
+   compact-string coder boundary, non-Latin1 (UTF16 coder), lone/unpaired
+   surrogate round-tripping via `toCharArray()`, the 3-arg range constructor
+   (substring semantics, zero count, full range), all 4 bounds-violation
+   SIOOBE cases, downstream native consistency (`substring`, `indexOf`,
+   `concat`, `StringBuilder.append`, `String.valueOf(char[])`,
+   `String.copyValueOf(char[])`), and the actual bug scenario at scale (a
+   10,000,000-element `char[]`, both all-Latin1 and all-non-Latin1) — all 43
+   pass.
+2. Measured perf on the same 10M-char arrays that took **5.1-6.5s** before
+   this fix: **71ms** (Latin1 path) and **127ms** (UTF16 path) — roughly a
+   **40-90x** speedup, comfortably under the Tomcat connector's 3-second read
+   timeout that started this whole investigation.
+3. Rust unit tests: `cratonvm-vm --lib vm_object::` (28/28 pass, including the
+   existing `create_and_read_string*` family, now exercising the refactored
+   `populate_java_string_fields` code path) and `cratonvm-native-builtins
+   lang_string::` (80/80 pass).
+4. Re-ran `org.apache.catalina.core.TestSwallowAbortedUploads` on the Azure
+   Linux host, comparing a same-commit baseline binary (without this fix)
+   against the patched one, isolating just the 3 `AbortedPOSTClient` methods
+   (`testAbortedPOSTOKSwallow`, `testAbortedPOST413Swallow`,
+   `testAbortedPOSTOKNoSwallow`) via a small `Request.method(...)`-based
+   single-method JUnit runner (the class as a whole hits an unrelated
+   pre-existing crash on `testChunkedPUTNoLimit` — see below — before reaching
+   a full-class summary):
+
+   | | baseline (no fix) | patched |
+   |---|---|---|
+   | `client.getResponseLine()` | `null` (connector timed out, no bytes ever arrived) | non-null (a real response line arrives) |
+   | wall time | 5.7s – 10.7s (over the 3s connector timeout) | 0.35s – 0.46s after warmup (well under it) |
+
+   **The specific root cause this doc identified — the interpreter-speed
+   connector timeout — is confirmed fixed.** The client no longer stalls
+   building the request string long enough to trip Tomcat's read timeout.
+
+   **However, the 3 `AbortedPOSTClient` tests still fail**, for a *different*
+   reason than before: `client.getResponseLine()` now returns a non-null but
+   blank/space-filled string instead of a real `HTTP/1.1 200 OK`-style status
+   line, so the `client.isResponse200()`/`isResponse413()` assertions still
+   fail. This is a **separate, pre-existing bug** in the server's response to
+   this specific large-body swallow-upload scenario, newly *reachable* (not
+   newly *caused*) now that the timeout no longer masks it earlier — matching
+   what the "2026-07-10: bisected" section above already anticipated
+   ("a different, not-yet-diagnosed bug, newly visible once the NPE isn't
+   masking it"). Not investigated further here — flagged as a fresh follow-up
+   for whoever picks this up next; the char[]-constructor performance problem
+   this section exists for is closed.
+
+   Also confirmed, byte-for-byte identical on both the baseline and the
+   patched binary (i.e. **definitely pre-existing, unrelated to this fix**):
+   running the full `TestSwallowAbortedUploads` class via `JUnitCore` (not the
+   isolated single-method runner) crashes the whole VM process on
+   `testChunkedPUTNoLimit` with `Exception in thread "main"
+   java/lang/Thread` / `NullPointerException: charset`, alongside a
+   `cratonvm_gc::gen_heap` "corrupt header" warning
+   (`mark_young: rejecting object ... implausible extent 40`) — a GC/heap
+   integrity issue triggered by that test's malformed-request payload, not by
+   `String(char[])`. Also worth a dedicated follow-up.
+5. Ran 20 `org.springframework.util`/`util.xml` test classes (heavy String
+   usage — `StringUtilsTests`, `AntPathMatcherTests`,
+   `PropertyPlaceholderHelperTests`, `ObjectUtilsTests`, etc.) against the
+   patched binary: 17/20 fully clean. The 3 with failures
+   (`StringUtilsTests`, `ObjectUtilsTests`, `ExponentialBackOffTests`) were
+   re-run against the same-commit baseline binary and fail *identically*
+   (same methods, same assertion messages) — confirmed pre-existing
+   (a `HIB-CV-32`-family array-formatting/heap-integrity gap unrelated to
+   `char[]`-to-`String` construction), not a regression from this change.
+
+**No known regressions from this change.** The two issues surfaced during
+verification (the blank swallow-upload response, and the
+`testChunkedPUTNoLimit` crash) both reproduce identically without this fix
+and are unrelated to `String(char[])`/`StringUTF16` — left open as separate
+follow-ups rather than expanding this change's scope.
