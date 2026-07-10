@@ -1718,6 +1718,41 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field_by_name(this, "ownerType")))
         },
     );
+    registry.register(pti_real, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let s = crate::phases_late::render_type_name(ctx, &Value::Object(Some(this)));
+        Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+    });
+    registry.register(
+        pti_real,
+        "getTypeName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let s = crate::phases_late::render_type_name(ctx, &Value::Object(Some(this)));
+            Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+        },
+    );
+
+    // Spring's ResolvableType creates its own ParameterizedType wrapper. Its
+    // bytecode getTypeName() path currently loses the first type argument while
+    // joining names, so render the same field shape directly.
+    let spring_spt = "org/springframework/core/ResolvableType$SyntheticParameterizedType";
+    registry.register(spring_spt, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let s = crate::phases_late::render_type_name(ctx, &Value::Object(Some(this)));
+        Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+    });
+    registry.register(
+        spring_spt,
+        "getTypeName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let s = crate::phases_late::render_type_name(ctx, &Value::Object(Some(this)));
+            Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+        },
+    );
 
     // Same field-resolution issue affects TypeVariableImpl / WildcardTypeImpl /
     // GenericArrayTypeImpl. Provide field-by-name natives so they keep working
@@ -2085,6 +2120,25 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(wti_bounds_reified(ctx, this, "bounds")))
         },
     );
+    registry.register(tvi_real, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(match ctx.get_field_by_name(this, "name") {
+            Value::Object(Some(s)) => Value::Object(Some(s)),
+            _ => Value::Object(Some(ctx.create_string("?"))),
+        }))
+    });
+    registry.register(
+        tvi_real,
+        "getTypeName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(match ctx.get_field_by_name(this, "name") {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("?"))),
+            }))
+        },
+    );
     let wti_real = "sun/reflect/generics/reflectiveObjects/WildcardTypeImpl";
     registry.register(
         wti_real,
@@ -2146,6 +2200,30 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
             } else {
                 Ok(Some(Value::Object(None)))
             }
+        },
+    );
+    registry.register(
+        "java/lang/reflect/TypeVariable",
+        "toString",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("?"))),
+            }))
+        },
+    );
+    registry.register(
+        "java/lang/reflect/TypeVariable",
+        "getTypeName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("?"))),
+            }))
         },
     );
     // JDK `TypeVariableImpl.equals` compares by (genericDeclaration, name);

@@ -4075,6 +4075,67 @@ fn ensure_static_field_declaring_class_initialized(
     ctx.ensure_class_initialized_with_class_id(class_id)
 }
 
+fn reject_array_field_receiver(
+    ctx: &dyn NativeContext,
+    receiver: cratonvm_types::ObjectRef,
+    operation: &str,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    if ctx.heap_kind_of(receiver) == cratonvm_types::ObjectKind::Array {
+        return Err(illegal_arg_exc(format!(
+            "{operation}: object is not an instance of declaring class"
+        )));
+    }
+    Ok(())
+}
+
+fn dbg_field_get_enabled() -> bool {
+    std::env::var("CRATONVM_DBG_FIELD_GET").is_ok()
+}
+
+fn dbg_field_get(
+    ctx: &mut dyn NativeContext,
+    operation: &str,
+    field_obj: cratonvm_types::ObjectRef,
+    is_static: bool,
+    class_id: cratonvm_types::ClassId,
+    slot: usize,
+    descriptor: &str,
+    receiver: Option<cratonvm_types::ObjectRef>,
+) {
+    if !dbg_field_get_enabled() {
+        return;
+    }
+    let class_name = ctx
+        .class_name_of_id(class_id)
+        .unwrap_or_else(|| format!("<class-id:{}>", class_id.as_u32()));
+    let field_name = match ctx.get_field_by_name(field_obj, "name") {
+        Value::Object(Some(name_obj)) => ctx
+            .read_string(name_obj)
+            .unwrap_or_else(|| "<unreadable>".to_string()),
+        Value::Object(None) => "<null>".to_string(),
+        other => format!("<non-string:{other:?}>"),
+    };
+    let recv_text = match receiver {
+        Some(recv) => format!(
+            " receiver_kind={:?} receiver_cid={:?}",
+            ctx.heap_kind_of(recv),
+            ctx.class_id_of_object(recv)
+        ),
+        None => String::new(),
+    };
+    eprintln!(
+        "[FIELDGET] op={} static={} class={} cid={} field={} slot={} desc={}{}",
+        operation,
+        is_static,
+        class_name,
+        class_id.as_u32(),
+        field_name,
+        slot,
+        descriptor,
+        recv_text
+    );
+}
+
 // --- Field.get(Object) / Field.set(Object, Object) ---
 
 pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4110,6 +4171,17 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // for non-volatile fields so the plain-read path stays cheap.
     volatile_load_fence(modifiers);
 
+    dbg_field_get(
+        ctx,
+        "Field.get",
+        this,
+        is_static,
+        class_id,
+        slot,
+        &descriptor,
+        receiver,
+    );
+
     let raw_value = if is_static {
         ensure_static_field_declaring_class_initialized(ctx, class_id)?;
         ctx.get_static_field(class_id, slot)
@@ -4120,6 +4192,7 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
                     message: Some("Field.get: null receiver for instance field".to_string()),
                 },
             )?;
+        reject_array_field_receiver(ctx, recv, "Field.get")?;
         ctx.get_field(recv, slot)
     };
 
@@ -4167,6 +4240,17 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 
     // WP2.1-field вЂ” volatile-aware write fences (no-op for non-volatile).
     volatile_store_fence_pre(modifiers);
+    dbg_field_get(
+        ctx,
+        "Field.set",
+        this,
+        is_static,
+        class_id,
+        slot,
+        &descriptor,
+        receiver,
+    );
+
     if is_static {
         ensure_static_field_declaring_class_initialized(ctx, class_id)?;
         ctx.set_static_field(class_id, slot, coerced);
@@ -4177,6 +4261,7 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
                     message: Some("Field.set: null receiver for instance field".to_string()),
                 },
             )?;
+        reject_array_field_receiver(ctx, recv, "Field.set")?;
         ctx.set_field(recv, slot, coerced);
     }
     volatile_store_fence_post(modifiers);
@@ -4258,6 +4343,17 @@ fn field_get_raw(
     // WP2.1-field вЂ” volatile-aware read fence (no-op for non-volatile).
     volatile_load_fence(modifiers);
 
+    dbg_field_get(
+        ctx,
+        "Field typed getter",
+        this,
+        is_static,
+        class_id,
+        slot,
+        _descriptor.as_str(),
+        receiver,
+    );
+
     if is_static {
         ensure_static_field_declaring_class_initialized(ctx, class_id)?;
         Ok(ctx.get_static_field(class_id, slot))
@@ -4270,6 +4366,7 @@ fn field_get_raw(
                     ),
                 },
             )?;
+        reject_array_field_receiver(ctx, recv, "Field typed getter")?;
         Ok(ctx.get_field(recv, slot))
     }
 }
@@ -8867,6 +8964,25 @@ fn annotation_proxy_cache() -> &'static Mutex<FxHashMap<(u32, String), ObjectRef
     C.get_or_init(|| Mutex::new(FxHashMap::default()))
 }
 
+fn annotation_proxy_child_roots() -> &'static Mutex<FxHashMap<usize, Vec<ObjectRef>>> {
+    static C: OnceLock<Mutex<FxHashMap<usize, Vec<ObjectRef>>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+fn remember_annotation_proxy_child_roots(proxy: ObjectRef, roots: Vec<ObjectRef>) {
+    annotation_proxy_child_roots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(proxy.as_ptr() as usize, roots);
+}
+
+fn forget_annotation_proxy_child_roots(proxy: ObjectRef) {
+    annotation_proxy_child_roots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(proxy.as_ptr() as usize));
+}
+
 // ---------------------------------------------------------------------------
 // Last-created-proxy interfaces array (Pattern-A fix, bug nb-lib-gckeys В§2)
 //
@@ -8948,11 +9064,15 @@ fn cached_annotation_proxy(
         );
     }
     let proxy = create_annotation_proxy(ctx, ann, container_loader);
-    *annotation_proxy_cache()
+    let mut guard = annotation_proxy_cache()
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(key)
-        .or_insert(proxy)
+        .unwrap_or_else(|e| e.into_inner());
+    let cached = *guard.entry(key).or_insert(proxy);
+    drop(guard);
+    if cached.as_ptr() != proxy.as_ptr() {
+        forget_annotation_proxy_child_roots(proxy);
+    }
+    cached
 }
 
 /// GC root scan for the annotation-proxy cache (companion to
@@ -8963,6 +9083,16 @@ pub fn gc_scan_annotation_proxy_roots(out: &mut Vec<ObjectRef>) {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     out.extend(guard.values().copied());
+    drop(guard);
+
+    let child_guard = annotation_proxy_child_roots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for roots in child_guard.values() {
+        out.extend(roots.iter().copied());
+    }
+    drop(child_guard);
+
     // bug nb-lib-gckeys В§2: also root the last-proxy interfaces array so the
     // shared-mirror `Class.getInterfaces()` fallback never dereferences a
     // reclaimed/relocated array.
@@ -8992,6 +9122,25 @@ pub fn gc_update_annotation_proxy_refs(pointer_map: &HashMap<usize, usize>) {
         }
     }
     drop(guard);
+
+    let mut child_guard = annotation_proxy_child_roots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut remapped = FxHashMap::default();
+    for (proxy_addr, mut roots) in child_guard.drain() {
+        for root in roots.iter_mut() {
+            let old_addr = root.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *root = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+        let new_proxy_addr = *pointer_map.get(&proxy_addr).unwrap_or(&proxy_addr);
+        remapped.insert(new_proxy_addr, roots);
+    }
+    *child_guard = remapped;
+    drop(child_guard);
+
     // bug nb-lib-gckeys В§2: remap the last-proxy interfaces array alongside
     // the annotation-proxy cache (it shares this hook). Without the repoint
     // the shared-mirror `getInterfaces()` would hand back a stale pointer.
@@ -9558,6 +9707,7 @@ fn create_annotation_proxy(
         ANN_PROXY_FIELDS,
     );
     let desc_str = ctx.create_string(&ann.type_descriptor);
+    let mut child_roots = vec![desc_str];
     ctx.set_field(proxy, ANN_PROXY_TYPE_DESC, Value::Object(Some(desc_str)));
 
     let mut ann_class_id_opt = None;
@@ -9595,6 +9745,7 @@ fn create_annotation_proxy(
         });
         if let Some((cid, mirror)) = cid_mirror {
             ann_class_id_opt = Some(cid);
+            child_roots.push(mirror);
             ctx.set_field(proxy, ANN_PROXY_TYPE_MIRROR, Value::Object(Some(mirror)));
         } else if std::env::var("CRATONVM_IAE_TRACE").is_ok() {
             eprintln!("ANN-PROXY-NULL-MIRROR: annotation={} type_descriptor={} class_name={class_name} вЂ” type mirror NOT set (class load failed)",
@@ -9690,6 +9841,8 @@ fn create_annotation_proxy(
         ANN_PROXY_ELEM_VALUES,
         Value::Object(Some(values_arr)),
     );
+    child_roots.push(names_arr);
+    child_roots.push(values_arr);
 
     // CRATONVM_REAL_ANNOTATIONS: hand back a real `$ProxyN` proxy that wraps
     // this AnnotationProxy as its InvocationHandler (so `getClass()` is a
@@ -9701,6 +9854,7 @@ fn create_annotation_proxy(
             }
         }
     }
+    remember_annotation_proxy_child_roots(proxy, child_roots);
     proxy
 }
 

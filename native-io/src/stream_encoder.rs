@@ -258,7 +258,16 @@ pub(crate) fn alloc_stream_encoder(
 ) -> ObjectRef {
     let cid = match ctx.ensure_class_initialized("sun/nio/cs/StreamEncoder") {
         Ok(c) => c,
-        Err(_) => ClassId::new(0),
+        // See the matching fix in stream_decoder.rs's alloc_stream_decoder:
+        // `ClassId::new(0)` is `java/lang/Object` (zero declared fields), so
+        // falling back to it here would mint an encoder object with no
+        // usable "out"/"closed" fields and no real `write`/`flush` methods,
+        // the write-side sibling of the readLine `NoSuchMethodError:
+        // java/lang/Object.read([CII)I` bug. `ensure_synthetic_class` retries
+        // loading the real class first (this always succeeds for a real JDK
+        // bootstrap class like this one) and only degrades to a stub with
+        // the requested field count as a last resort.
+        Err(_) => ctx.ensure_synthetic_class("sun/nio/cs/StreamEncoder", 12),
     };
     // `alloc_object` clamps the slot count up to the resolved real class's
     // total declared instance-field count, so `0` here is fine — the object

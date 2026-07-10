@@ -1615,14 +1615,15 @@ fn native_properties_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// Native `Properties.get(Object)Object` — Hashtable-style read path used
 /// by callers that bypass `getProperty` (e.g. Spring's
 /// `PropertySourcesPropertyResolver` calling `Properties.get(key)` on the
-/// `MapPropertySource` backed by `System.getProperties()`).
+/// `MapPropertySource` backed by `System.getProperties()`, or H2 reading JDBC
+/// connection credentials from an ordinary `Properties`).
 ///
 /// JDK 25's `Properties.get` (Properties.java:1338) reads from a private
 /// `ConcurrentHashMap<Object, Object> map` field that's only populated by
 /// `Properties.<init>`'s body.  Our synthetic Properties allocations don't
 /// run that body, so `map` is null and the bytecode NPEs.  Override the
 /// method here to consult the side-table (and fall back to system
-/// properties for the System.getProperties() case), mirroring how
+/// properties only for the System.getProperties() case), mirroring how
 /// `getProperty` already routes around the broken bytecode path.
 ///
 /// Returns `null` when the key is absent — matches `Hashtable.get`
@@ -1655,6 +1656,14 @@ fn native_properties_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 return Ok(Some(v));
             }
         }
+    }
+    // Match real `Properties`: ordinary instances do not consult global system
+    // properties. The system-property fallback is only for the synthetic,
+    // marked singleton returned by `System.getProperties()`. Without this gate,
+    // `new Properties().get("password")` could return a global system property
+    // and pollute H2/Hibernate credential lookups that use the Map-style API.
+    if !is_system_props(ctx, this) {
+        return Ok(Some(Value::Object(None)));
     }
     match ctx
         .get_system_property(&key)

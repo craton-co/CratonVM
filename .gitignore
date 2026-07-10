@@ -1,4 +1,6 @@
 target/
+target-*/
+**/.fingerprint/
 **/*.rs.bk
 *.swp
 *.swo

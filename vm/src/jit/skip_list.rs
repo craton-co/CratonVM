@@ -541,6 +541,37 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
+
+        // JASPER-JDT.3 (2026-07-10) - a second, independent Eclipse JDT
+        // miscompile family, this one in the AST/flow-analysis package
+        // rather than JASPER-JDT.2's parser package. Real Tomcat FORM-auth
+        // repro (`TestFormAuthenticatorA/B/C` forwarding to the login-page
+        // JSP): `Servlet.service()` intermittently threw `JasperException:
+        // Unable to compile class for JSP` with root cause
+        // `ArrayIndexOutOfBoundsException: Index 1 out of bounds for
+        // length 1` — reported stack frame was
+        // `QualifiedNameReference.analyseCode(QualifiedNameReference.java:170)`,
+        // which is JUST a trivial 3-arg-to-4-arg delegating wrapper
+        // (`return analyseCode(scope, ctx, info, true);`, no array access
+        // of its own) — i.e. the JIT lost/mis-attributed the inlined
+        // callee's own frame, the same symptom shape as JASPER-JDT.2's
+        // "size varies run to run" AIOOBEs. `--nojit` never reproduces (0/8
+        // hits across repeated full-class runs vs. consistent hits with JIT
+        // on); `CRATONVM_JIT_BISECT_SKIP=.../QualifiedNameReference.analyseCode`
+        // alone eliminates it (confirmed clean across 3 repeat runs). Not
+        // yet root-caused to a specific backend bug (unlike JASPER-JDT.2's
+        // three fully-diagnosed getfield/deopt/arraycopy bugs) — the AST
+        // package's many `analyseCode` overrides likely share a similar
+        // "small final-array-length loop across an inlined overload
+        // boundary" shape, so interpret the whole `ast` package rather than
+        // just this one class, mirroring JASPER-JDT.2's package-wide scope.
+        // Liftable for diagnosis with
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/eclipse/jdt/internal/compiler/ast/`.
+        if class_name.starts_with("org/eclipse/jdt/internal/compiler/ast/")
+            && !package_allowed("org/eclipse/jdt/internal/compiler/ast/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
         if is_elasticsearch_suite_jit_fragile_cluster(class_name, method_name)
             && !package_allowed(class_name, allow_packages)
         {
