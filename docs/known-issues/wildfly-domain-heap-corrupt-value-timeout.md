@@ -1034,3 +1034,43 @@ update recommended, and for `ContentCleanerService` specifically, trace
 which capability's `Supplier` resolves to the wrong type first (add tracing
 in `jboss_msc.rs`'s capability-injection path rather than guessing further
 from bytecode alone).
+
+
+## 2026-07-10 update (Azure host session, later same day) — one real blocker found+fixed (Cleaner), a second found but not yet fixed (Host Controller SIGSEGV); the four residuals still not reached
+
+Continued directly from the "gate is fixed" update above, now with Azure host access
+(`victor@20.83.144.174`, branch `fix/wildfly-residuals-20260710`, worktree per the standing
+isolated-worktree workflow). Re-ran this doc's own harness recipe (pristine WildFly 32.0.1.Final,
+`bin/domain.sh`, `CRATONVM_MSC_REAL_START=1`).
+
+**Confirmed the gate fix works**: process-controller/Host-Controller handshake now completes
+cleanly (no more `ThreadPoolExecutor` NPE killing the process-controller's read thread).
+
+**New blocker #1, found and FIXED**: Host Controller crashed immediately after with a
+`NullPointerException` in `java.lang.ref.Cleaner.register()` → `CleanerImpl.getCleanerImpl()`
+returning null, while `org.jboss.msc.service.ServiceContainer$Factory.create()` was setting up its
+shutdown hook. Same bug class as the `ThreadPoolExecutor` regression: a synthetic `Cleaner.create()`
+native (meant only as a fallback stub) was winning over real bytecode for this **static** factory
+method, returning a Cleaner with its real `impl` field left null, which real `register()` bytecode
+then NPE'd on. Fixed by extending the `drop_real_layout_synthetic` registry gate to
+`java/lang/ref/Cleaner`/`Cleaner$Cleanable`, same pattern already used for `ThreadPoolExecutor`.
+See `docs/internal/java-lang-ref-cleaner-static-native-half-initialized-object-FIXED.md`.
+
+**New blocker #2, found but NOT fixed**: with the Cleaner fix in place, boot progresses much
+further — extensions parse, Elytron initializes, `host=foo:add()` op runs — then Host Controller
+**segfaults** (confirmed via `strace -f -e trace=exit_group`: genuine `SIGSEGV`/`SEGV_MAPERR`,
+`si_addr=NULL`, not a Java exception or clean exit) and respawns forever until the boot times out.
+Confirmed independent of the JIT (`CRATONVM_DISABLE_JIT=1` reproduces identically). Live-gdb
+(temporarily relaxing `ptrace_scope`, restored afterward) pinned the crash to a specific,
+reproducible instruction sequence — a monomorphic inline-cache dispatch stub dereferencing a NULL
+receiver — but the exact Rust source line was not identified before this session's budget ran out.
+Filed as `docs/known-issues/wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver.md`,
+with the live-gdb recipe and disassembly included for whoever continues.
+
+**The four original front-line residuals (`AttributeChangeNotification`, `ContentCleanerService`,
+`FileInputStream(File)`, `WFLYHC0034`) still have not been re-observed** — this SIGSEGV is now the
+gating blocker, one step later in the boot sequence than the Cleaner bug, itself one step later
+than the original `ThreadPoolExecutor` regression. Recommended next step: fix the SIGSEGV per that
+doc's own recommended next steps (get the exact crash-site source line via `addr2line` against the
+captured instruction offset, since it's ASLR-base-independent and was confirmed constant across
+multiple captures), then re-run this doc's harness recipe again.
