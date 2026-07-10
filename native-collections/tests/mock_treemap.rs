@@ -290,6 +290,99 @@ fn tree_map_liquibase_tie_comparator_preserves_insert_order() {
 }
 
 #[test]
+fn comparator_backed_tree_map_clear_then_put_keeps_array_store_visible() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let tm = new_treemap_with_tie_comparator(&reg, &mut ctx);
+
+    let stale_key = alloc_named_object(&mut ctx, "test/LiquibaseStep", 1);
+    ctx.set_field(stale_key, 0, Value::Int(5));
+    let stale_value = boxed_int(&mut ctx, 50);
+    call(
+        &reg,
+        &mut ctx,
+        TM,
+        "put",
+        PUT,
+        &[
+            Value::Object(Some(tm)),
+            Value::Object(Some(stale_key)),
+            stale_value,
+        ],
+    )
+    .unwrap();
+
+    call(
+        &reg,
+        &mut ctx,
+        TM,
+        "clear",
+        "()V",
+        &[Value::Object(Some(tm))],
+    )
+    .unwrap();
+
+    let key = alloc_named_object(&mut ctx, "test/LiquibaseStep", 1);
+    ctx.set_field(key, 0, Value::Int(10));
+    let value = boxed_int(&mut ctx, 100);
+    call(
+        &reg,
+        &mut ctx,
+        TM,
+        "put",
+        PUT,
+        &[Value::Object(Some(tm)), Value::Object(Some(key)), value],
+    )
+    .unwrap();
+
+    let size = call(
+        &reg,
+        &mut ctx,
+        TM,
+        "size",
+        "()I",
+        &[Value::Object(Some(tm))],
+    )
+    .unwrap();
+    assert_eq!(size, Some(Value::Int(1)));
+
+    let first = call(
+        &reg,
+        &mut ctx,
+        TM,
+        "firstKey",
+        "()Ljava/lang/Object;",
+        &[Value::Object(Some(tm))],
+    )
+    .unwrap();
+    assert_eq!(first, Some(Value::Object(Some(key))));
+
+    let action = alloc_named_object(&mut ctx, "test/BiConsumer", 0);
+    ctx.clear_invoke_virtual_log();
+    call(
+        &reg,
+        &mut ctx,
+        TM,
+        "forEach",
+        "(Ljava/util/function/BiConsumer;)V",
+        &[Value::Object(Some(tm)), Value::Object(Some(action))],
+    )
+    .unwrap();
+    let visited = ctx
+        .invoke_virtual_log()
+        .into_iter()
+        .filter(|(_, method, desc, _)| {
+            method == "accept" && desc == "(Ljava/lang/Object;Ljava/lang/Object;)V"
+        })
+        .map(|(_, _, _, args)| match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            other => panic!("unexpected TreeMap.forEach key arg: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(visited, vec![key]);
+}
+
+#[test]
 fn tree_set_liquibase_tie_comparator_preserves_insert_order() {
     let reg = build_registry();
     let mut ctx = MockCtx::new();
