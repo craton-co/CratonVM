@@ -176,36 +176,43 @@ Merged that fix in and reran `TestFormAuthenticatorA/B/C` again — zero
 `FileDescriptor.closeAll` NPEs recurred (see below), confirming it's the same
 bug and it's already resolved. No new doc needed.
 
-**Post-merge verification and a new, unrelated finding:** merged
-`origin/dev` (25 commits, `f4ee4065..03fd1788`, spanning GC/JIT/native-builtins
-work from several concurrent sessions — none of it touching this doc's own
-territory) into the fix branch, rebuilt, and reran `TestFormAuthenticatorA/B/C`
-once more. Both the zero-byte symptom and the `FileDescriptor` NPE stayed
-gone (0 occurrences of either across all three classes, ~6 test methods
-each completing cleanly with no `ERROR`/`Exception` lines before the crash
-below) — but all three classes now **segfault** (SIGSEGV, exit 139,
-`timeout: the monitored command dumped core`) partway through the run
-(after 6/9, 6/6, and 6/7 methods respectively completed with no errors).
-This is a **new, unrelated regression**, almost certainly introduced by one
-of the 25 merged commits (`gc/src/zgc.rs`, `jit/src/x64.rs`,
-`jit/src/ir_lower.rs`, `native-builtins/src/lang_string.rs`,
-`vm/src/vm/vm_object.rs`, `vm/src/memory/gc.rs`,
-`vm/src/threading/monitor.rs` all changed substantially in that merge) —
-not root-caused this session (genuinely out of scope: unrelated to both
-the zero-byte and `FileDescriptor` investigations, and no core dump was
-retrievable — this host's `core_pattern` routes through `apport`, which
-didn't leave a plain core file behind). Notably, `docs/known-issues/hib-global-temptable-nondeterministic-sigsegv-20260710.md`
-(filed the same day, "post the 2026-07-09/10 merge wave") describes a
-similarly-shaped non-deterministic SIGSEGV cluster in a completely
-different suite (Hibernate) after repeated create/drop DDL cycles — worth
-a follow-up session checking whether these are the same underlying race,
-since `TestFormAuthenticatorA/B/C` also repeatedly starts/stops a full
-embedded Tomcat (create/destroy cycle) once per test method, a similar
-shape of repeated-lifecycle churn.
+**Post-merge verification, a new unrelated regression, and its fix (also
+someone else's):** merged `origin/dev` (25 commits, `f4ee4065..03fd1788`,
+spanning GC/JIT/native-builtins work from several concurrent sessions —
+none of it touching this doc's own territory) into the fix branch, rebuilt,
+and reran `TestFormAuthenticatorA/B/C` once more. Both the zero-byte
+symptom and the `FileDescriptor` NPE stayed gone (0 occurrences of either
+across all three classes, ~6 test methods each completing cleanly with no
+`ERROR`/`Exception` lines before the crash below) — but all three classes
+now **segfaulted** (SIGSEGV, exit 139, `timeout: the monitored command
+dumped core`) partway through the run (after 6/9, 6/6, and 6/7 methods
+respectively completed with no errors). Before root-causing this myself, a
+second `git fetch`/merge (standard pre-push practice on this repo) turned
+up 4 more commits, including `93b33576` ("Fix guarded-inline-getfield
+SIGSEGV regression masking ES IVF-KNN vector hang cluster") — filed by a
+*third* concurrent session investigating an unrelated ElasticSearch
+IVF-KNN vector-query hang, which had bisected a SIGSEGV (corrupted
+`getfield` result feeding an `AALOAD` bounds check) to JIT commit
+`07dfa5e0`'s default-on "guarded inline getfield" fast path, and fixed it
+by flipping that fast path back to opt-in
+(`CRATONVM_JIT_GUARDED_GETFIELD=1`). Merged that in, rebuilt again, and
+reran: **`TestFormAuthenticatorB`/`C` both now pass cleanly (`OK (6
+tests)`/`OK (7 tests)`, exit 0)**; `TestFormAuthenticatorA` first timed
+out (240s) on its last method with a "STW cross-thread JIT takeover ...
+waiting for cooperative mutators" stall, then **passed cleanly on an
+immediate retry (`OK (9 tests)`, exit 0)** — treated as host-load
+flakiness (this shared host's load average fluctuated 4–15 throughout the
+session) rather than a new bug, consistent with this repo's existing
+STW-quota-race findings elsewhere, and not chased further here.
 
 **Conclusion:** retiring this doc as a non-issue — the zero-byte symptom
-itself is confirmed not to reproduce on an idle host, with or without the
-unrelated fixes/regressions found along the way. No CratonVM code was
-changed as part of *this* investigation (the `FileDescriptor` fix was
-someone else's, already merged; the new segfault is unroot-caused and
-flagged separately, not fixed here).
+itself is confirmed not to reproduce on an idle host. As a bonus, by the
+end of this investigation (after merging in three unrelated fixes from
+three different concurrent sessions — `StreamDecoder` field-index,
+`FileDescriptor`/`native_fis_close` slot clobber, and guarded-inline-getfield
+SIGSEGV — none of which this investigation authored), `TestFormAuthenticatorA/B/C`
+all pass cleanly end-to-end on this host. No CratonVM code was changed as
+part of *this specific* investigation; the value added here was root-cause
+elimination (confirming this doc's own symptom doesn't reproduce) plus
+duplicate-fix detection (twice) that avoided filing two redundant known-issue
+docs for bugs already fixed elsewhere.
