@@ -993,12 +993,7 @@ fn sc_remote_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     if let Some((host, port)) = cf_remote(ctx, this) {
         if port > 0 {
-            let h = ctx.create_string(&host);
-            return ctx.new_object_initialized(
-                "java/net/InetSocketAddress",
-                "(Ljava/lang/String;I)V",
-                &[Value::Object(Some(h)), Value::Int(port)],
-            );
+            return new_resolved_inet_socket_address(ctx, &host, port);
         }
     }
     Ok(Some(Value::Object(None)))
@@ -1025,12 +1020,7 @@ fn sc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let Some(addr) = local else {
         return Ok(Some(Value::Object(None)));
     };
-    let h = ctx.create_string(&addr.ip().to_string());
-    ctx.new_object_initialized(
-        "java/net/InetSocketAddress",
-        "(Ljava/lang/String;I)V",
-        &[Value::Object(Some(h)), Value::Int(addr.port() as i32)],
-    )
+    new_resolved_inet_socket_address(ctx, &addr.ip().to_string(), addr.port() as i32)
 }
 
 // ---------------------------------------------------------------------------
