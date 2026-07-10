@@ -60770,14 +60770,20 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         "newThread",
         "(Ljava/lang/Runnable;)Ljava/lang/Thread;",
         |ctx, args| {
+            // BUG FIX (2026-07-10, ES executors-factory mainlock NPE, layer 2
+            // residual): this used to allocate a real-shaped Thread object via
+            // alloc_concurrent_synthetic and then poke 5 legacy synthetic
+            // slots — the exact same half-real pattern that made
+            // ThreadPoolExecutor's mainLock/ctl/workQueue null (see
+            // initialize_real_thread_pool_executor in phases_early.rs). A
+            // Thread built this way never runs the real constructor, so
+            // start()/start0() operate on an uninitialized `holder` and the
+            // worker never actually runs — real ThreadPoolExecutor.execute()
+            // silently never executes submitted tasks. Drive the real
+            // Thread(Runnable) constructor instead so start() works.
+            // See docs/known-issues/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe.md.
             let runnable = args.get(1).copied().unwrap_or(Value::Object(None));
-            let thread = alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5);
-            let name = ctx.create_string("pool-thread");
-            ctx.set_field(thread, 0, Value::Object(Some(name)));
-            ctx.set_field(thread, 1, Value::Int(5));
-            ctx.set_field(thread, 3, runnable);
-            ctx.set_field(thread, 4, Value::Int(0));
-            Ok(Some(Value::Object(Some(thread))))
+            ctx.new_object_initialized("java/lang/Thread", "(Ljava/lang/Runnable;)V", &[runnable])
         },
     );
     registry.set_category(__prev_cat);
