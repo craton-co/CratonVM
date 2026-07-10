@@ -6541,7 +6541,7 @@ fn ra_is_reset(ra: usize) -> bool {
 /// just publishes its current savebase address; the watcher keeps DR0 pinned to
 /// it (reset is called at a stable stack depth, so this is steady-state idle).
 #[cfg(windows)]
-mod savebase_watcher {
+pub(crate) mod savebase_watcher {
     use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 
     pub static ARM_ADDR: AtomicUsize = AtomicUsize::new(0);

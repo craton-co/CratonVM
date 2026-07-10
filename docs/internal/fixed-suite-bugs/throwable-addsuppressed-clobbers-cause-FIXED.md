@@ -1,8 +1,57 @@
 # ES FAIL family - vector codec exceptions with corrupted Throwable cause output
 
-Status: OPEN (narrowed — 2 of 3 rows now PASS; 1 residual root-caused, not yet fixed)
+> # ✅ FIXED 2026-07-10 — the `Caused by: java.lang.Object` corruption
+> **Root cause:** `native_throwable_add_suppressed`/`native_throwable_get_suppressed`
+> (`native-builtins/src/lang_misc.rs`) hardcoded **field index 2** as
+> "suppressed storage". Index 2 is `cause` in the real-JDK `Throwable` layout
+> used consistently everywhere else in this codebase (`backtrace`=0,
+> `detailMessage`=1, **`cause`=2**, `stackTrace`=3, `suppressedExceptions`=4).
+> Every real `Throwable.addSuppressed()` call therefore silently clobbered
+> the receiver's `cause` field with a freshly-allocated `Object[]` array
+> instead of touching `suppressedExceptions` — which is exactly what
+> `printStackTrace` then displayed as `Caused by: java.lang.Object`.
+>
+> **Found via** a new hardware data-write breakpoint (generalizing this
+> codebase's existing "spring-bug-10" `savebase_watcher` DR0/VEH
+> infrastructure — see `gc/src/heap.rs`/`vm/src/runtime/crash_handler.rs`/
+> `vm/src/vm/vm_exec.rs`) armed on the victim's `cause` slot right after
+> construction, plus a full-symbol `profsym` build. The captured backtrace
+> pinpointed the exact write to `native_throwable_add_suppressed` at
+> `lang_misc.rs:1277`, called via reflection (`Method.invoke`) from a
+> thread-cleanup path that suppresses a secondary close-time exception onto
+> the primary one — exactly what `BaseIndexFileFormatTestCase.testMultiClose`
+> exercises. This was a **static, 100%-deterministic bug**, not a GC,
+> threading, or stale-reference issue — every disproven theory earlier in
+> this doc (self-forwarding GC, concurrency, array-addressing misalignment)
+> was a real, correctly-executed diagnostic step that simply hadn't reached
+> the actual write site yet.
+>
+> **Fix:** `native_throwable_add_suppressed`/`native_throwable_get_suppressed`
+> now resolve `suppressedExceptions` **by name** (`ctx.get_field_by_name`/
+> `set_field_by_name`) instead of a hardcoded index, matching the pattern
+> `init_suppressed_sentinel` already used correctly for the same field. Also
+> hardened: only treats an existing value as the suppressed array if
+> `heap_kind_of(..) == Array` (the real-JDK `SUPPRESSED_SENTINEL` — a `List`,
+> not an array — no longer gets misread as a 0-length array).
+>
+> **Verified:** `ES93FlatBFloat16VectorFormatTests` no longer produces
+> `Caused by: java.lang.Object` (0 occurrences across 5 repeated runs, same
+> seed). `getSuppressed()`/`addSuppressed()`/`getCause()` regression-checked
+> directly (single + multiple suppressed exceptions, and — the key case —
+> `cause` correctly survives a later `addSuppressed()` call). This was the
+> corruption this whole doc chases; **not** the underlying vector-codec
+> correctness bugs, see below.
+>
+> **Residual (separate, still open):** with the corruption gone,
+> `ES93FlatBFloat16VectorFormatTests.testMultiClose` still fails —
+> now with a clean, honest `java.nio.BufferUnderflowException` (no message,
+> no bogus cause). This is a genuine, pre-existing Lucene-codec correctness
+> bug (why the buffer underflows at all during close/reopen), independent of
+> the exception-printing bug this doc was about, and untouched by today's
+> fix. Track it separately if it needs its own investigation — it's now
+> trivial to reproduce cleanly (no corrupted trace to work around).
 
-## Update 2026-07-10 (follow-up session)
+## Update 2026-07-10 (follow-up session — investigation log, historical)
 
 Reproducing this family first required fixing an unrelated, more severe
 regression: `RandomizedContext.current()` started returning `null` instead
@@ -238,6 +287,61 @@ All temporary diagnostic tooling from this investigation (`CRATONVM_DBG_CAUSE`,
 the dynamic watch mechanism, `[WATCHFIELD]`) is committed but **not merged
 into dev** — it's exploratory and should be reviewed before landing
 permanently. See branch `fix/es-vector-codec-exception-cause-object-20260710`.
+
+### The actual break: a hardware watchpoint (same-session continuation)
+
+Following the recommended next step above, this session generalized the
+existing "spring-bug-10" hardware-watchpoint infrastructure
+(`vm/src/jit/helpers.rs::savebase_watcher`, `vm/src/runtime/crash_handler.rs`'s
+VEH) into a reusable "report the writer of ANY value at this address"
+tool (`GENERIC_HEAP_WATCH_MODE` / `arm_generic_heap_watch`, wired through
+`NativeContext::dbg_set_watch_cell`). Armed on the victim's `cause` slot,
+it caught the write immediately:
+
+```text
+[HEAPWATCH] write @0x00000000222113F0 val=0x0000000000000004 RIP=0x00007FF684038AFB (exe+0x268AFB) jit=<none>
+```
+
+`val=4` is `Value::Object`'s discriminant — the write was a normal,
+legitimate `Value::Object(...)` store, mid-flight. Building with the
+workspace's existing `[profile.profsym]` (full debug symbols, same
+opt-level/LTO as release — already in `Cargo.toml` for exactly this
+purpose) and resolving the same RVA:
+
+```text
+0x268AFB   cratonvm_gc::gen_heap::GenerationalHeap::set_field+0x19B  [gc/src/gen_heap.rs:2016]
+```
+
+A **normal, legitimate heap write** — not a wild pointer, not an
+out-of-bounds array store. Adding `Backtrace::force_capture()` to the
+watchpoint's VEH branch (Windows VEH runs in ordinary thread context, so
+this is safe, unlike a Unix signal handler) and rebuilding with `profsym`
+finally produced a **fully clean, fully resolved** backtrace:
+
+```text
+14: cratonvm_native_builtins::lang_misc::native_throwable_add_suppressed
+        at native-builtins\src\lang_misc.rs:1277
+15: cratonvm_vm::vm::vm_exec::safe_native_call
+16: cratonvm_vm::runtime::interpreter::try_stackless_invoke
+...
+24: cratonvm_native_builtins::lang_class::native_method_invoke        (reflection)
+25: cratonvm_native_builtins::lang_reflect::native_method_invoke_boxed
+...
+40: cratonvm_vm::vm::vm_exec::impl$5::thread_start::closure$6         (thread cleanup)
+```
+
+`native_throwable_add_suppressed` (`lang_misc.rs:1242`, at the time)
+hardcoded field **index 2** as "suppressed storage" — but index 2 is
+`cause` in the real-JDK layout this codebase uses everywhere else. Every
+`addSuppressed()` call clobbered `cause` with a fresh `Object[]` array.
+`testMultiClose`'s close-time cleanup suppresses a secondary exception onto
+the primary one via reflection from a thread-cleanup path — landing exactly
+here. **Fixed**: see the banner at the top of this doc. The `CRATONVM_DBG_CELLCORRUPT`
+1-element-array/off-by-8 evidence above was real (that 1-element `Object[]`
+*is* the very array `addSuppressed` allocates at
+`ctx.new_ref_array(ClassId::new(0), 1)`) — it just hadn't yet been traced
+back to its allocation site, which the hardware watchpoint's backtrace
+finally supplied directly.
 
 ## Original entry (2026-07-10, before this update)
 

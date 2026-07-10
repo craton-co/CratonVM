@@ -2582,6 +2582,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn dbg_set_watch_cell(&mut self, addr: usize) {
         cratonvm_gc::heap::set_dynamic_watch(addr);
+        crate::runtime::crash_handler::arm_generic_heap_watch(addr);
     }
 
     fn vm_identity(&self) -> usize {
