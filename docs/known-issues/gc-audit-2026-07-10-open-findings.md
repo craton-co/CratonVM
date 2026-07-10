@@ -144,3 +144,65 @@ The A5 unregistered-JIT-frame detector port to Linux LANDED (third wave).
   `-XX:+UseStringDeduplication` can do anything (G1CORE-6).
 - Parallel young evacuator residual race (documented in-code) — keep
   `CRATONVM_G1_PARALLEL_EVAC` off (G1CORE-5).
+
+## Cross-confirmation from an independent real-world trigger (2026-07-10)
+
+Investigating the ES `DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests` /
+`IVFKnnFloatVectorQueryTests` hang cluster
+(`docs/known-issues/elasticsearch-suite/ES-HANG-20260709-...`) independently
+reproduced this same finding via a real Lucene `IndexWriter` workload — no
+synthetic MTChurn harness involved. Worktree
+`/data/data/wt-es-vectors-ivfknn-hang-20260710`.
+
+Repro (`testSlicesDense`, `--nojit` or `CRATONVM_JIT_GETFIELD_HELPER=1`,
+`--Xmx 2g`) is non-deterministic across runs, same seed:
+- Most runs: permanent spin (82-116% CPU, zero forward progress) with the
+  worker thread AND a `Lucene Merge Thread` both parked in
+  `Monitor::block_enter`/`enter` (`vm/src/threading/monitor.rs:457/500`) —
+  matching the "5 waiters, nobody woken" shape exactly, just with 2 waiters
+  instead of 5 (Lucene's own concurrency here is far lighter than MTChurn's
+  6-thread stress). Live gdb confirms both threads are genuinely parked
+  (`parking_lot::Condvar::wait`), and with only 6 threads total in the process
+  and 4 of them idle/legitimately-parked elsewhere, there is no live thread
+  positioned to ever call the matching `exit()`/notify — consistent with
+  the finding-1(b) orphaned-monitor hypothesis (a stale/wrong owner, or a
+  lost wakeup, rather than genuine live contention).
+- One run (153s, no permanent hang) instead **completed with 2 real
+  failures**, including a genuine Lucene-internal NPE surfaced through
+  `ConcurrentMergeScheduler.handleMergeException`:
+  `NullPointerException: Cannot invoke
+  "org.apache.lucene.index.ReadersAndUpdates.dropMergingUpdates()" because
+  "rld" is null` — `rld` comes out of `IndexWriter`'s `readerPool` map and
+  should never be null on this path. Immediately preceding this failure: a
+  sustained ~49s burst of 544+ (rate-limited) `gen_heap::get_field`
+  out-of-bounds WARNs, all `class_id=ClassId(0) num_slots=0
+  java/lang/Object` — the "zeroed live object" shape — escalating in volume
+  the longer the run's merge activity continues.
+
+This is independent, real-world corroboration of finding 1: the SAME
+underlying probabilistic GC/monitor race manifests as either a lost-wakeup
+deadlock (most runs) or live data corruption surfacing as a downstream
+Lucene NPE (this run) depending on exact timing — matching "intermittently
+loses increments... (~1/5 runs)" and "an exception thrown mid-churn is
+itself a corruption symptom" in the finding-1(b) writeup above, just via a
+completely different trigger workload than MTChurn. The OOB-field-read WARN
+burst right before the NPE is worth treating as a corruption *symptom*
+here, not the previously-assumed-benign "collection-layout probe" — at
+minimum the volume/timing correlation with a real NPE is suspicious enough
+to warrant using it as an additional signal alongside `CRATONVM_DBG_ATHROW`
+when chasing finding-1(b)'s precursor exception.
+
+The finding-1(b) registry-miss tripwire (this doc's WARN counter) did NOT
+fire during either manifestation of this repro — so if finding-1(b)'s
+specific "second orphaned Monitor via a registry-lookup miss" mechanism is
+involved here, it isn't the ONLY path to the same lost-wakeup symptom, or
+this repro's race window differs enough from MTChurn's to not hit that
+exact branch. Worth rechecking once finding-1(a)'s quota-race fix is
+actually stabilized (current `wip/gc-stw-quota-race-20260710` attempt is
+parked, not merged).
+
+No fix attempted here — deferred to whoever picks up finding 1, given the
+existing parked WIP attempt already found this subsystem is not safe to
+patch quickly. This ES workload is a reusable, real-world (non-synthetic)
+additional repro for validating any future fix attempt, in addition to
+MTChurn/BinaryTrees(16).
