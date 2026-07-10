@@ -327,16 +327,23 @@ alongside its existing raw-field writes, so both representations agree.
 | `TestHttp11Processor.testWithTEChunkedWithCL` | `SocketWrapperBase.lock` NPE (`rc=-1`) | New, different failure (Jasper/JSP fixture issue — see below) |
 
 Confirmed stable across 3 repeat runs (not flaky) for `testDelayedNBWrite`/
-`testNonBlockingReadIgnoreIsReady`. **Why did fixing an unrelated
-client-Socket bug also make the `SocketWrapperBase.lock` NPE stop firing for
-3/6 methods?** Not fully explained, and not claimed as a fix for that bug —
-the other doc's root-cause (a stale local across a GC safepoint/JIT
-tier-transition boundary) is inherently timing-sensitive, so it's plausible
-this change shifted allocation/JIT-compilation timing enough to move those
-3 methods' runs outside its trigger window, without the underlying race
-being closed. Do not treat this as evidence the lock bug is fixed — treat
-each of these 3 as "currently not observed to hit it" rather than
-"confirmed clear of it", and re-check if it resurfaces.
+`testNonBlockingReadIgnoreIsReady`.
+
+**Correction (this fix does NOT explain the `SocketWrapperBase.lock` NPE
+disappearing for 3/6 methods — an unrelated, independent fix does).** The
+`dev` tip this fix was built on top of already included `9cbbc82c` ("Fix
+Tomcat WebSocket close-delay blockers") *before* this fix was written
+(`git merge-base --is-ancestor 9cbbc82c HEAD` on this branch: yes). Per
+`tomcat-socketprocessor-run-stale-local-lock-open`'s own updated status,
+that commit is independently and much more convincingly implicated as the
+actual fix for the `SocketWrapperBase.lock` bug — confirmed by a *separate*
+session's from-scratch `TestRewriteValve` rerun (121/121 NPEs pre-`9cbbc82c`,
+0/121 post — nothing to do with sockets or this fix). So the client-Socket
+fix above and the lock bug's disappearance are two independent fixes that
+happened to land in the same merged tree, not one causing the other. Which
+of `9cbbc82c`'s three bundled changes actually fixed the lock bug is itself
+still unbisected — see that doc for details before assuming it's fully
+understood.
 
 The remaining `conf/logging.properties FileNotFoundException` /
 "A child container failed during stop" noise on every method (pass or

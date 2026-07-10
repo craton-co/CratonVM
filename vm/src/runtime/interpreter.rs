@@ -5682,9 +5682,11 @@ pub(crate) fn try_osr_with_backoff(
             // compile (idempotent), and back off so we re-probe later rather
             // than spin. A subsequent hot back-edge finds the published
             // artifact and falls through to the reuse-enter below.
-            ensure_bg_compiler_started(shared);
             let key = crate::jit::tiered::MethodKey::new(cn, mn, md);
-            let _ = shared.tiered_manager.request_osr(&key, entry_pc as u32);
+            if !crate::jit::tiered::is_osr_denied(&key) {
+                ensure_bg_compiler_started(shared);
+                let _ = shared.tiered_manager.request_osr(&key, entry_pc as u32);
+            }
             thread.frames[*frame_idx].record_osr_rejection(entry_pc);
             return OsrBackoffOutcome::Skip;
         }
@@ -20310,6 +20312,368 @@ pub(crate) fn is_jdk_wrapper_math_native_override(
     }
 }
 
+fn is_bc_sect_field_class(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "org/bouncycastle/math/ec/custom/sec/SecT113Field"
+            | "org/bouncycastle/math/ec/custom/sec/SecT131Field"
+            | "org/bouncycastle/math/ec/custom/sec/SecT163Field"
+            | "org/bouncycastle/math/ec/custom/sec/SecT193Field"
+            | "org/bouncycastle/math/ec/custom/sec/SecT233Field"
+            | "org/bouncycastle/math/ec/custom/sec/SecT239Field"
+            | "org/bouncycastle/math/ec/custom/sec/SecT283Field"
+            | "org/bouncycastle/math/ec/custom/sec/SecT409Field"
+            | "org/bouncycastle/math/ec/custom/sec/SecT571Field"
+    )
+}
+
+fn is_bc_sect_field_native_override(class_name: &str, method_name: &str, descriptor: &str) -> bool {
+    if !is_bc_sect_field_class(class_name) {
+        return false;
+    }
+    matches!(
+        (method_name, descriptor),
+        (
+            "add" | "addBothTo" | "addExt" | "multiply" | "multiplyAddToExt",
+            "([J[J[J)V"
+        ) | (
+            "addOne" | "halfTrace" | "invert" | "reduce" | "sqrt" | "square" | "squareAddToExt",
+            "([J[J)V"
+        ) | ("squareN", "([JI[J)V")
+            | ("trace", "([J)I")
+    ) || (class_name == "org/bouncycastle/math/ec/custom/sec/SecT571Field"
+        && matches!(
+            (method_name, descriptor),
+            ("precompMultiplicand", "([J)[J")
+                | ("multiplyPrecomp" | "multiplyPrecompAddToExt", "([J[J[J)V")
+        ))
+}
+
+fn is_bc_sect_point_class(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "org/bouncycastle/math/ec/custom/sec/SecT113R1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT113R2Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT131R1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT131R2Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT163K1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT163R1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT163R2Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT193R1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT193R2Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT233K1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT233R1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT239K1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT283K1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT283R1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT409K1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT409R1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT571K1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT571R1Point"
+    )
+}
+
+pub(crate) fn is_bc_crypto_math_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    if is_bc_sect_field_native_override(class_name, method_name, descriptor) {
+        return true;
+    }
+    if class_name == "org/bouncycastle/math/ec/ECPoint"
+        && method_name == "timesPow2"
+        && descriptor == "(I)Lorg/bouncycastle/math/ec/ECPoint;"
+    {
+        return true;
+    }
+    if is_bc_sect_point_class(class_name)
+        && method_name == "twice"
+        && descriptor == "()Lorg/bouncycastle/math/ec/ECPoint;"
+    {
+        return true;
+    }
+    match class_name {
+        "org/bouncycastle/math/ec/ECFieldElement$Fp" => matches!(
+            (method_name, descriptor),
+            (
+                "add" | "subtract" | "multiply" | "divide",
+                "(Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;"
+            ) | ("addOne" | "square" | "negate" | "invert", "()Lorg/bouncycastle/math/ec/ECFieldElement;")
+                | (
+                    "modAdd" | "modMult" | "modSubtract",
+                    "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;"
+                )
+                | (
+                    "modDouble" | "modHalf" | "modHalfAbs" | "modInverse" | "modReduce",
+                    "(Ljava/math/BigInteger;)Ljava/math/BigInteger;"
+                )
+                | (
+                    "multiplyPlusProduct" | "multiplyMinusProduct",
+                    "(Lorg/bouncycastle/math/ec/ECFieldElement;Lorg/bouncycastle/math/ec/ECFieldElement;Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;"
+                )
+                | (
+                    "squarePlusProduct" | "squareMinusProduct",
+                    "(Lorg/bouncycastle/math/ec/ECFieldElement;Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;"
+                )
+        ),
+        "org/bouncycastle/math/ec/ECFieldElement$F2m" => matches!(
+            (method_name, descriptor),
+            (
+                "add" | "subtract" | "multiply" | "divide",
+                "(Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;"
+            ) | ("addOne" | "square" | "negate" | "invert", "()Lorg/bouncycastle/math/ec/ECFieldElement;")
+                | (
+                    "multiplyPlusProduct" | "multiplyMinusProduct",
+                    "(Lorg/bouncycastle/math/ec/ECFieldElement;Lorg/bouncycastle/math/ec/ECFieldElement;Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;"
+                )
+                | (
+                    "squarePlusProduct" | "squareMinusProduct",
+                    "(Lorg/bouncycastle/math/ec/ECFieldElement;Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;"
+                )
+                | ("squarePow", "(I)Lorg/bouncycastle/math/ec/ECFieldElement;")
+        ),
+        "org/bouncycastle/math/ec/ECPoint$F2m" => matches!(
+            (method_name, descriptor),
+            (
+                "add" | "twicePlus",
+                "(Lorg/bouncycastle/math/ec/ECPoint;)Lorg/bouncycastle/math/ec/ECPoint;"
+            ) | ("twice", "()Lorg/bouncycastle/math/ec/ECPoint;")
+        ),
+        "org/bouncycastle/math/ec/ECPoint$Fp" => matches!(
+            (method_name, descriptor),
+            (
+                "add" | "twicePlus",
+                "(Lorg/bouncycastle/math/ec/ECPoint;)Lorg/bouncycastle/math/ec/ECPoint;"
+            ) | (
+                "twice" | "threeTimes" | "negate",
+                "()Lorg/bouncycastle/math/ec/ECPoint;"
+            ) | ("timesPow2", "(I)Lorg/bouncycastle/math/ec/ECPoint;")
+        ),
+        "org/bouncycastle/math/ec/ECAlgorithms" => matches!(
+            (method_name, descriptor),
+            (
+                "implShamirsTrickJsf",
+                "(Lorg/bouncycastle/math/ec/ECPoint;Ljava/math/BigInteger;Lorg/bouncycastle/math/ec/ECPoint;Ljava/math/BigInteger;)Lorg/bouncycastle/math/ec/ECPoint;"
+            )
+        ),
+        "org/bouncycastle/math/ec/LongArray" => matches!(
+            (method_name, descriptor),
+            ("modReduce" | "modSquare" | "modInverse", "(I[I)Lorg/bouncycastle/math/ec/LongArray;")
+                | ("reduce", "(I[I)V")
+                | (
+                    "modMultiply" | "multiply",
+                    "(Lorg/bouncycastle/math/ec/LongArray;I[I)Lorg/bouncycastle/math/ec/LongArray;"
+                )
+                | ("square", "(I[I)Lorg/bouncycastle/math/ec/LongArray;")
+                | ("modSquareN", "(II[I)Lorg/bouncycastle/math/ec/LongArray;")
+        ),
+        "org/bouncycastle/math/Primes" => matches!(
+            (method_name, descriptor),
+            ("implHasAnySmallFactors", "(Ljava/math/BigInteger;)Z")
+                | (
+                    "isMRProbablePrime",
+                    "(Ljava/math/BigInteger;Ljava/security/SecureRandom;I)Z"
+                )
+                | (
+                    "isMRProbablePrimeToBase",
+                    "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Z"
+                )
+        ),
+        "org/bouncycastle/math/ec/rfc7748/X25519Field" => {
+            method_name == "mul" && descriptor == "([I[I[I)V"
+        }
+        "org/bouncycastle/math/ec/rfc7748/X448Field" => matches!(
+            (method_name, descriptor),
+            ("mul", "([I[I[I)V")
+                | ("mul", "([II[I)V")
+                | ("sqr", "([I[I)V")
+                | ("sqr", "([II[I)V")
+        ),
+        "org/bouncycastle/util/BigIntegers" => matches!(
+            (method_name, descriptor),
+            ("hasAnySmallFactors", "(Ljava/math/BigInteger;)Z")
+                | (
+                    "modOddInverse" | "modOddInverseVar",
+                    "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;"
+                )
+        ),
+        "org/bouncycastle/crypto/prng/DigestRandomGenerator" => matches!(
+            (method_name, descriptor),
+            ("nextBytes", "([B)V") | ("nextBytes", "([BII)V")
+        ),
+        "org/bouncycastle/crypto/engines/GOST3412_2015Engine" => {
+            method_name == "processBlock" && descriptor == "([BI[BI)I"
+        }
+        "org/bouncycastle/crypto/engines/SM4Engine" => {
+            method_name == "processBlock" && descriptor == "([BI[BI)I"
+        }
+        "org/bouncycastle/crypto/engines/XTEAEngine" => {
+            method_name == "processBlock" && descriptor == "([BI[BI)I"
+        }
+        "org/bouncycastle/crypto/engines/Salsa20Engine" => {
+            (method_name == "salsaCore" && descriptor == "(I[I[I)V")
+                || (method_name == "processBytes" && descriptor == "([BII[BI)I")
+        }
+        "org/bouncycastle/crypto/engines/XSalsa20Engine"
+        | "org/bouncycastle/crypto/engines/ChaChaEngine"
+        | "org/bouncycastle/crypto/engines/ChaCha7539Engine"
+        | "org/bouncycastle/crypto/engines/XChaCha20Engine" => {
+            method_name == "processBytes" && descriptor == "([BII[BI)I"
+        }
+        "org/bouncycastle/crypto/engines/VMPCEngine"
+        | "org/bouncycastle/crypto/engines/VMPCKSA3Engine" => {
+            method_name == "processBytes" && descriptor == "([BII[BI)I"
+        }
+        "org/bouncycastle/crypto/engines/AESEngine" => matches!(
+            (method_name, descriptor),
+            ("encryptBlock" | "decryptBlock", "([BI[BI[[I)V")
+                | ("<init>", "()V")
+                | (
+                    "newInstance",
+                    "()Lorg/bouncycastle/crypto/MultiBlockCipher;"
+                )
+                | ("generateWorkingKey", "([BZ)[[I")
+                | (
+                    "init",
+                    "(ZLorg/bouncycastle/crypto/CipherParameters;)V"
+                )
+                | ("processBlock", "([BI[BI)I")
+        ),
+        "org/bouncycastle/crypto/engines/AESLightEngine"
+        | "org/bouncycastle/crypto/engines/AESFastEngine" => matches!(
+            (method_name, descriptor),
+            ("encryptBlock" | "decryptBlock", "([BI[BI[[I)V")
+                | ("<init>", "()V")
+                | ("generateWorkingKey", "([BZ)[[I")
+                | (
+                    "init",
+                    "(ZLorg/bouncycastle/crypto/CipherParameters;)V"
+                )
+                | ("processBlock", "([BI[BI)I")
+        ),
+        "org/bouncycastle/crypto/modes/SICBlockCipher" => matches!(
+            (method_name, descriptor),
+            ("reset", "()V")
+                | ("seekTo", "(J)J")
+                | (
+                    "init",
+                    "(ZLorg/bouncycastle/crypto/CipherParameters;)V"
+                )
+                | ("processBlock", "([BI[BI)I")
+                | ("processBytes", "([BII[BI)I")
+        ),
+        "org/bouncycastle/crypto/modes/CBCBlockCipher" => {
+            method_name == "processBlock" && descriptor == "([BI[BI)I"
+        }
+        "org/bouncycastle/util/Pack" => matches!(
+            (method_name, descriptor),
+            ("bigEndianToInt" | "littleEndianToInt", "([BI)I")
+                | ("bigEndianToInt" | "littleEndianToInt", "([BI[I)V")
+                | ("bigEndianToInt" | "littleEndianToInt", "([BI[III)V")
+                | ("intToBigEndian" | "intToLittleEndian", "(I[BI)V")
+                | ("intToBigEndian" | "intToLittleEndian", "([I[BI)V")
+                | ("intToBigEndian" | "intToLittleEndian", "([III[BI)V")
+        ),
+        "org/bouncycastle/util/Arrays" => method_name == "copyOf" && descriptor == "([BI)[B",
+        "org/bouncycastle/crypto/params/KeyParameter" => matches!(
+            (method_name, descriptor),
+            ("<init>", "([B)V") | ("<init>", "([BII)V")
+        ),
+        "org/bouncycastle/crypto/params/ParametersWithIV" => matches!(
+            (method_name, descriptor),
+            (
+                "<init>",
+                "(Lorg/bouncycastle/crypto/CipherParameters;[B)V"
+            ) | (
+                "<init>",
+                "(Lorg/bouncycastle/crypto/CipherParameters;[BII)V"
+            )
+        ),
+        "org/bouncycastle/crypto/digests/Blake2sDigest" => {
+            (method_name == "G" && descriptor == "(IIIIII)V")
+                || (method_name == "compress" && descriptor == "([BI)V")
+        }
+        "org/bouncycastle/crypto/digests/KeccakDigest" => matches!(
+            (method_name, descriptor),
+            ("KeccakPermutation" | "KeccakExtract", "()V") | ("KeccakAbsorb", "([BI)V")
+        ),
+        "org/bouncycastle/crypto/generators/SCrypt" => {
+            method_name == "generate" && descriptor == "([B[BIIII)[B"
+        }
+        "org/bouncycastle/crypto/generators/Argon2BytesGenerator" => matches!(
+            (method_name, descriptor),
+            ("generateBytes", "([B[BII)I")
+                | (
+                    "roundFunction",
+                    "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;IIIIIIIIIIIIIIII)V"
+                )
+        ),
+        "org/bouncycastle/crypto/generators/Argon2BytesGenerator$Block" => matches!(
+            (method_name, descriptor),
+            ("fromBytes" | "toBytes", "([B)V")
+                | (
+                    "copyBlock" | "xorWith",
+                    "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V"
+                )
+                | (
+                    "xor" | "xorWith",
+                    "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V"
+                )
+                | (
+                    "clear",
+                    "()Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;"
+                )
+        ),
+        "org/bouncycastle/crypto/generators/Argon2BytesGenerator$FillBlock" => matches!(
+            (method_name, descriptor),
+            ("applyBlake", "()V")
+                | (
+                    "fillBlock",
+                    "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V"
+                )
+                | (
+                    "fillBlock" | "fillBlockWithXor",
+                    "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V"
+                )
+        ),
+        "org/bouncycastle/crypto/generators/Argon2BytesGenerator$FixedBlockPool" => matches!(
+            (method_name, descriptor),
+            (
+                "allocate",
+                "()Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;"
+            ) | (
+                "deallocate",
+                "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V"
+            )
+        ),
+        "org/bouncycastle/crypto/generators/PKCS5S2ParametersGenerator" => matches!(
+            (method_name, descriptor),
+            (
+                "generateDerivedParameters" | "generateDerivedMacParameters",
+                "(I)Lorg/bouncycastle/crypto/CipherParameters;"
+            ) | (
+                "generateDerivedParameters",
+                "(II)Lorg/bouncycastle/crypto/CipherParameters;"
+            )
+        ),
+        "org/bouncycastle/crypto/generators/PKCS12ParametersGenerator" => matches!(
+            (method_name, descriptor),
+            (
+                "generateDerivedParameters" | "generateDerivedMacParameters",
+                "(I)Lorg/bouncycastle/crypto/CipherParameters;"
+            ) | (
+                "generateDerivedParameters",
+                "(II)Lorg/bouncycastle/crypto/CipherParameters;"
+            )
+        ),
+        "org/bouncycastle/crypto/generators/BCrypt" => {
+            method_name == "generate" && descriptor == "([B[BI)[B"
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn is_forkjoin_native_override(
     class_name: &str,
     method_name: &str,
@@ -20865,6 +21229,9 @@ fn force_native_over_real_jdk_bytecode(
     }
 
     if is_forkjoin_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_bc_crypto_math_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
 
@@ -21930,6 +22297,7 @@ fn redefine_immune_forced_native(
     redefine_immune_reflection_native(class_name, method_name)
         || redefine_immune_string_builder_native(class_name, method_name, method_descriptor)
         || redefine_immune_path_native(class_name, method_name, method_descriptor)
+        || is_bc_crypto_math_native_override(class_name, method_name, method_descriptor)
         || is_stamped_lock_native_override(class_name, method_name, method_descriptor)
 }
 
@@ -23995,6 +24363,10 @@ fn compile_osr_artifact(
     max_locals: usize,
     entry_pc: usize,
 ) -> Option<Arc<crate::jit::CompiledMethod>> {
+    let osr_key = crate::jit::tiered::MethodKey::new(&class_name, &method_name, &method_descriptor);
+    if crate::jit::tiered::is_osr_denied(&osr_key) {
+        return None;
+    }
     // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
     // OSR is a JIT entry point distinct from `try_jit_compile_callee` /
     // `try_jit_upgrade_with_gate`, so it needs its own gate so the user-facing
@@ -24123,6 +24495,15 @@ fn compile_osr_artifact(
             // JIT-return exception drains) remains available, so do NOT
             // bail-list here.
             if scan.has_athrow {
+                return None;
+            }
+            // BC GOST3412_2015Engine.init_gf256_mul_table showed that OSR
+            // entering a nested primitive-array allocation loop can resume with
+            // corrupt stack state for the next `newarray` length. Keep normal
+            // method-entry JIT enabled, but decline OSR until the x64 OSR stack
+            // mapper models primitive allocation loops safely.
+            if scan.has_newarray {
+                crate::jit::tiered::mark_osr_denied(osr_key.clone());
                 return None;
             }
 
@@ -27159,6 +27540,9 @@ fn background_compile_task(
         None => return fail(0), // VM dropped (teardown) — nothing to compile.
     };
     if crate::classloading::any_class_redefined() {
+        return fail(0);
+    }
+    if task.osr_bci.is_some() && crate::jit::tiered::is_osr_denied(&task.method_key) {
         return fail(0);
     }
     let optimized = crate::jit::tiered::tier_uses_optimized_backend(task.target_tier);
@@ -31981,6 +32365,607 @@ mod tests {
             "java/util/concurrent/locks/StampedLock$WriteLockView",
             "newCondition",
             "()Ljava/util/concurrent/locks/Condition;"
+        ));
+    }
+
+    #[test]
+    fn bc_crypto_math_force_native_covers_longarray_helpers() {
+        let long_array = "org/bouncycastle/math/ec/LongArray";
+        for (name, descriptor) in [
+            ("modReduce", "(I[I)Lorg/bouncycastle/math/ec/LongArray;"),
+            (
+                "modMultiply",
+                "(Lorg/bouncycastle/math/ec/LongArray;I[I)Lorg/bouncycastle/math/ec/LongArray;",
+            ),
+            ("modSquare", "(I[I)Lorg/bouncycastle/math/ec/LongArray;"),
+            ("modSquareN", "(II[I)Lorg/bouncycastle/math/ec/LongArray;"),
+            ("modInverse", "(I[I)Lorg/bouncycastle/math/ec/LongArray;"),
+            ("reduce", "(I[I)V"),
+            (
+                "multiply",
+                "(Lorg/bouncycastle/math/ec/LongArray;I[I)Lorg/bouncycastle/math/ec/LongArray;",
+            ),
+            ("square", "(I[I)Lorg/bouncycastle/math/ec/LongArray;"),
+        ] {
+            assert!(
+                is_bc_crypto_math_native_override(long_array, name, descriptor),
+                "{name}{descriptor} must route to the registered BC native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(long_array, name, descriptor),
+                "{name}{descriptor} must not fall through to interpreted BC bytecode"
+            );
+            assert!(
+                redefine_immune_forced_native(long_array, name, descriptor),
+                "{name}{descriptor} must stay native after unrelated redefinition"
+            );
+        }
+
+        let f2m = "org/bouncycastle/math/ec/ECFieldElement$F2m";
+        for (name, descriptor) in [
+            (
+                "add",
+                "(Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;",
+            ),
+            (
+                "subtract",
+                "(Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;",
+            ),
+            (
+                "multiply",
+                "(Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;",
+            ),
+            (
+                "divide",
+                "(Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;",
+            ),
+            (
+                "multiplyPlusProduct",
+                "(Lorg/bouncycastle/math/ec/ECFieldElement;Lorg/bouncycastle/math/ec/ECFieldElement;Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;",
+            ),
+            (
+                "squarePlusProduct",
+                "(Lorg/bouncycastle/math/ec/ECFieldElement;Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;",
+            ),
+            ("addOne", "()Lorg/bouncycastle/math/ec/ECFieldElement;"),
+            ("square", "()Lorg/bouncycastle/math/ec/ECFieldElement;"),
+            ("squarePow", "(I)Lorg/bouncycastle/math/ec/ECFieldElement;"),
+            ("invert", "()Lorg/bouncycastle/math/ec/ECFieldElement;"),
+        ] {
+            assert!(
+                is_bc_crypto_math_native_override(f2m, name, descriptor),
+                "{name}{descriptor} must route to the registered BC F2m native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(f2m, name, descriptor),
+                "{name}{descriptor} must not fall through to interpreted BC F2m bytecode"
+            );
+            assert!(
+                redefine_immune_forced_native(f2m, name, descriptor),
+                "{name}{descriptor} must stay native after unrelated redefinition"
+            );
+        }
+
+        let f2m_point = "org/bouncycastle/math/ec/ECPoint$F2m";
+        for (name, descriptor) in [
+            (
+                "add",
+                "(Lorg/bouncycastle/math/ec/ECPoint;)Lorg/bouncycastle/math/ec/ECPoint;",
+            ),
+            ("twice", "()Lorg/bouncycastle/math/ec/ECPoint;"),
+            (
+                "twicePlus",
+                "(Lorg/bouncycastle/math/ec/ECPoint;)Lorg/bouncycastle/math/ec/ECPoint;",
+            ),
+        ] {
+            assert!(
+                is_bc_crypto_math_native_override(f2m_point, name, descriptor),
+                "{name}{descriptor} must route to the registered BC F2m point native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(f2m_point, name, descriptor),
+                "{name}{descriptor} must not fall through to interpreted BC F2m point bytecode"
+            );
+            assert!(
+                redefine_immune_forced_native(f2m_point, name, descriptor),
+                "{name}{descriptor} must stay native after unrelated redefinition"
+            );
+        }
+
+        let ec_algorithms = "org/bouncycastle/math/ec/ECAlgorithms";
+        assert!(is_bc_crypto_math_native_override(
+            ec_algorithms,
+            "implShamirsTrickJsf",
+            "(Lorg/bouncycastle/math/ec/ECPoint;Ljava/math/BigInteger;Lorg/bouncycastle/math/ec/ECPoint;Ljava/math/BigInteger;)Lorg/bouncycastle/math/ec/ECPoint;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            ec_algorithms,
+            "implShamirsTrickJsf",
+            "(Lorg/bouncycastle/math/ec/ECPoint;Ljava/math/BigInteger;Lorg/bouncycastle/math/ec/ECPoint;Ljava/math/BigInteger;)Lorg/bouncycastle/math/ec/ECPoint;"
+        ));
+        assert!(redefine_immune_forced_native(
+            ec_algorithms,
+            "implShamirsTrickJsf",
+            "(Lorg/bouncycastle/math/ec/ECPoint;Ljava/math/BigInteger;Lorg/bouncycastle/math/ec/ECPoint;Ljava/math/BigInteger;)Lorg/bouncycastle/math/ec/ECPoint;"
+        ));
+
+        let x25519_field = "org/bouncycastle/math/ec/rfc7748/X25519Field";
+        assert!(is_bc_crypto_math_native_override(
+            x25519_field,
+            "mul",
+            "([I[I[I)V"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            x25519_field,
+            "mul",
+            "([I[I[I)V"
+        ));
+        assert!(redefine_immune_forced_native(
+            x25519_field,
+            "mul",
+            "([I[I[I)V"
+        ));
+
+        let x448_field = "org/bouncycastle/math/ec/rfc7748/X448Field";
+        for (name, descriptor) in [
+            ("mul", "([I[I[I)V"),
+            ("mul", "([II[I)V"),
+            ("sqr", "([I[I)V"),
+            ("sqr", "([II[I)V"),
+        ] {
+            assert!(is_bc_crypto_math_native_override(
+                x448_field,
+                name,
+                descriptor
+            ));
+            assert!(force_native_over_real_jdk_bytecode(
+                x448_field,
+                name,
+                descriptor
+            ));
+            assert!(redefine_immune_forced_native(
+                x448_field,
+                name,
+                descriptor
+            ));
+        }
+
+        let fp_point = "org/bouncycastle/math/ec/ECPoint$Fp";
+        for (name, descriptor) in [
+            (
+                "add",
+                "(Lorg/bouncycastle/math/ec/ECPoint;)Lorg/bouncycastle/math/ec/ECPoint;",
+            ),
+            ("twice", "()Lorg/bouncycastle/math/ec/ECPoint;"),
+            (
+                "twicePlus",
+                "(Lorg/bouncycastle/math/ec/ECPoint;)Lorg/bouncycastle/math/ec/ECPoint;",
+            ),
+            ("threeTimes", "()Lorg/bouncycastle/math/ec/ECPoint;"),
+            ("timesPow2", "(I)Lorg/bouncycastle/math/ec/ECPoint;"),
+            ("negate", "()Lorg/bouncycastle/math/ec/ECPoint;"),
+        ] {
+            assert!(
+                is_bc_crypto_math_native_override(fp_point, name, descriptor),
+                "{name}{descriptor} must route to the registered BC Fp point native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(fp_point, name, descriptor),
+                "{name}{descriptor} must not fall through to interpreted BC Fp point bytecode"
+            );
+            assert!(
+                redefine_immune_forced_native(fp_point, name, descriptor),
+                "{name}{descriptor} must stay native after unrelated redefinition"
+            );
+        }
+
+        let sect571 = "org/bouncycastle/math/ec/custom/sec/SecT571Field";
+        for (name, descriptor) in [
+            ("add", "([J[J[J)V"),
+            ("addBothTo", "([J[J[J)V"),
+            ("addExt", "([J[J[J)V"),
+            ("multiply", "([J[J[J)V"),
+            ("multiplyAddToExt", "([J[J[J)V"),
+            ("reduce", "([J[J)V"),
+            ("square", "([J[J)V"),
+            ("squareAddToExt", "([J[J)V"),
+            ("squareN", "([JI[J)V"),
+            ("invert", "([J[J)V"),
+            ("sqrt", "([J[J)V"),
+            ("halfTrace", "([J[J)V"),
+            ("trace", "([J)I"),
+            ("precompMultiplicand", "([J)[J"),
+            ("multiplyPrecomp", "([J[J[J)V"),
+            ("multiplyPrecompAddToExt", "([J[J[J)V"),
+        ] {
+            assert!(
+                is_bc_crypto_math_native_override(sect571, name, descriptor),
+                "{name}{descriptor} must route to the registered SecT native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(sect571, name, descriptor),
+                "{name}{descriptor} must not fall through to interpreted SecT bytecode"
+            );
+            assert!(
+                redefine_immune_forced_native(sect571, name, descriptor),
+                "{name}{descriptor} must stay native after unrelated redefinition"
+            );
+        }
+
+        assert!(is_bc_crypto_math_native_override(
+            "org/bouncycastle/math/ec/custom/sec/SecT233Field",
+            "multiply",
+            "([J[J[J)V"
+        ));
+        assert!(is_bc_crypto_math_native_override(
+            "org/bouncycastle/math/ec/ECPoint",
+            "timesPow2",
+            "(I)Lorg/bouncycastle/math/ec/ECPoint;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "org/bouncycastle/math/ec/ECPoint",
+            "timesPow2",
+            "(I)Lorg/bouncycastle/math/ec/ECPoint;"
+        ));
+        assert!(redefine_immune_forced_native(
+            "org/bouncycastle/math/ec/ECPoint",
+            "timesPow2",
+            "(I)Lorg/bouncycastle/math/ec/ECPoint;"
+        ));
+
+        let cbc = "org/bouncycastle/crypto/modes/CBCBlockCipher";
+        assert!(is_bc_crypto_math_native_override(
+            cbc,
+            "processBlock",
+            "([BI[BI)I"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            cbc,
+            "processBlock",
+            "([BI[BI)I"
+        ));
+        assert!(redefine_immune_forced_native(
+            cbc,
+            "processBlock",
+            "([BI[BI)I"
+        ));
+
+        let sic = "org/bouncycastle/crypto/modes/SICBlockCipher";
+        for (name, descriptor) in [
+            ("processBlock", "([BI[BI)I"),
+            ("processBytes", "([BII[BI)I"),
+        ] {
+            assert!(is_bc_crypto_math_native_override(sic, name, descriptor));
+            assert!(force_native_over_real_jdk_bytecode(sic, name, descriptor));
+            assert!(redefine_immune_forced_native(sic, name, descriptor));
+        }
+
+        let sm4 = "org/bouncycastle/crypto/engines/SM4Engine";
+        assert!(is_bc_crypto_math_native_override(
+            sm4,
+            "processBlock",
+            "([BI[BI)I"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            sm4,
+            "processBlock",
+            "([BI[BI)I"
+        ));
+        assert!(redefine_immune_forced_native(
+            sm4,
+            "processBlock",
+            "([BI[BI)I"
+        ));
+
+        let xtea = "org/bouncycastle/crypto/engines/XTEAEngine";
+        assert!(is_bc_crypto_math_native_override(
+            xtea,
+            "processBlock",
+            "([BI[BI)I"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            xtea,
+            "processBlock",
+            "([BI[BI)I"
+        ));
+        assert!(redefine_immune_forced_native(
+            xtea,
+            "processBlock",
+            "([BI[BI)I"
+        ));
+
+        let salsa = "org/bouncycastle/crypto/engines/Salsa20Engine";
+        assert!(is_bc_crypto_math_native_override(
+            salsa,
+            "salsaCore",
+            "(I[I[I)V"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            salsa,
+            "salsaCore",
+            "(I[I[I)V"
+        ));
+        assert!(redefine_immune_forced_native(
+            salsa,
+            "salsaCore",
+            "(I[I[I)V"
+        ));
+        for stream_engine in [
+            "org/bouncycastle/crypto/engines/Salsa20Engine",
+            "org/bouncycastle/crypto/engines/XSalsa20Engine",
+            "org/bouncycastle/crypto/engines/ChaChaEngine",
+            "org/bouncycastle/crypto/engines/ChaCha7539Engine",
+            "org/bouncycastle/crypto/engines/XChaCha20Engine",
+        ] {
+            assert!(is_bc_crypto_math_native_override(
+                stream_engine,
+                "processBytes",
+                "([BII[BI)I"
+            ));
+            assert!(force_native_over_real_jdk_bytecode(
+                stream_engine,
+                "processBytes",
+                "([BII[BI)I"
+            ));
+            assert!(redefine_immune_forced_native(
+                stream_engine,
+                "processBytes",
+                "([BII[BI)I"
+            ));
+        }
+
+        for vmpc_engine in [
+            "org/bouncycastle/crypto/engines/VMPCEngine",
+            "org/bouncycastle/crypto/engines/VMPCKSA3Engine",
+        ] {
+            assert!(is_bc_crypto_math_native_override(
+                vmpc_engine,
+                "processBytes",
+                "([BII[BI)I"
+            ));
+            assert!(force_native_over_real_jdk_bytecode(
+                vmpc_engine,
+                "processBytes",
+                "([BII[BI)I"
+            ));
+            assert!(redefine_immune_forced_native(
+                vmpc_engine,
+                "processBytes",
+                "([BII[BI)I"
+            ));
+        }
+
+        let pkcs12 = "org/bouncycastle/crypto/generators/PKCS12ParametersGenerator";
+        for (name, descriptor) in [
+            (
+                "generateDerivedParameters",
+                "(I)Lorg/bouncycastle/crypto/CipherParameters;",
+            ),
+            (
+                "generateDerivedParameters",
+                "(II)Lorg/bouncycastle/crypto/CipherParameters;",
+            ),
+            (
+                "generateDerivedMacParameters",
+                "(I)Lorg/bouncycastle/crypto/CipherParameters;",
+            ),
+        ] {
+            assert!(is_bc_crypto_math_native_override(pkcs12, name, descriptor));
+            assert!(force_native_over_real_jdk_bytecode(
+                pkcs12, name, descriptor
+            ));
+            assert!(redefine_immune_forced_native(pkcs12, name, descriptor));
+        }
+
+        for (class_name, name, descriptor) in [
+            (
+                "org/bouncycastle/crypto/digests/Blake2sDigest",
+                "compress",
+                "([BI)V",
+            ),
+            (
+                "org/bouncycastle/crypto/digests/Blake2sDigest",
+                "G",
+                "(IIIIII)V",
+            ),
+            (
+                "org/bouncycastle/crypto/digests/KeccakDigest",
+                "KeccakPermutation",
+                "()V",
+            ),
+            (
+                "org/bouncycastle/crypto/digests/KeccakDigest",
+                "KeccakAbsorb",
+                "([BI)V",
+            ),
+            (
+                "org/bouncycastle/crypto/digests/KeccakDigest",
+                "KeccakExtract",
+                "()V",
+            ),
+            (
+                "org/bouncycastle/crypto/generators/SCrypt",
+                "generate",
+                "([B[BIIII)[B",
+            ),
+            (
+                "org/bouncycastle/crypto/generators/Argon2BytesGenerator",
+                "generateBytes",
+                "([B[BII)I",
+            ),
+            (
+                "org/bouncycastle/crypto/generators/Argon2BytesGenerator",
+                "roundFunction",
+                "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;IIIIIIIIIIIIIIII)V",
+            ),
+        ] {
+            assert!(is_bc_crypto_math_native_override(
+                class_name, name, descriptor
+            ));
+            assert!(force_native_over_real_jdk_bytecode(
+                class_name, name, descriptor
+            ));
+            assert!(redefine_immune_forced_native(class_name, name, descriptor));
+        }
+
+        let argon2_block = "org/bouncycastle/crypto/generators/Argon2BytesGenerator$Block";
+        for (name, descriptor) in [
+            ("fromBytes", "([B)V"),
+            ("toBytes", "([B)V"),
+            (
+                "copyBlock",
+                "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V",
+            ),
+            (
+                "xor",
+                "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V",
+            ),
+            (
+                "xorWith",
+                "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V",
+            ),
+            (
+                "xorWith",
+                "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V",
+            ),
+            (
+                "clear",
+                "()Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;",
+            ),
+        ] {
+            assert!(is_bc_crypto_math_native_override(
+                argon2_block,
+                name,
+                descriptor
+            ));
+            assert!(force_native_over_real_jdk_bytecode(
+                argon2_block,
+                name,
+                descriptor
+            ));
+            assert!(redefine_immune_forced_native(
+                argon2_block,
+                name,
+                descriptor
+            ));
+        }
+
+        let argon2_fill_block = "org/bouncycastle/crypto/generators/Argon2BytesGenerator$FillBlock";
+        for (name, descriptor) in [
+            ("applyBlake", "()V"),
+            (
+                "fillBlock",
+                "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V",
+            ),
+            (
+                "fillBlock",
+                "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V",
+            ),
+            (
+                "fillBlockWithXor",
+                "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V",
+            ),
+        ] {
+            assert!(is_bc_crypto_math_native_override(
+                argon2_fill_block,
+                name,
+                descriptor
+            ));
+            assert!(force_native_over_real_jdk_bytecode(
+                argon2_fill_block,
+                name,
+                descriptor
+            ));
+            assert!(redefine_immune_forced_native(
+                argon2_fill_block,
+                name,
+                descriptor
+            ));
+        }
+
+        let argon2_fixed_pool =
+            "org/bouncycastle/crypto/generators/Argon2BytesGenerator$FixedBlockPool";
+        for (name, descriptor) in [
+            (
+                "allocate",
+                "()Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;",
+            ),
+            (
+                "deallocate",
+                "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V",
+            ),
+        ] {
+            assert!(is_bc_crypto_math_native_override(
+                argon2_fixed_pool,
+                name,
+                descriptor
+            ));
+            assert!(force_native_over_real_jdk_bytecode(
+                argon2_fixed_pool,
+                name,
+                descriptor
+            ));
+            assert!(redefine_immune_forced_native(
+                argon2_fixed_pool,
+                name,
+                descriptor
+            ));
+        }
+
+        let pack = "org/bouncycastle/util/Pack";
+        for (name, descriptor) in [
+            ("bigEndianToInt", "([BI)I"),
+            ("littleEndianToInt", "([BI)I"),
+            ("bigEndianToInt", "([BI[I)V"),
+            ("littleEndianToInt", "([BI[I)V"),
+            ("bigEndianToInt", "([BI[III)V"),
+            ("littleEndianToInt", "([BI[III)V"),
+            ("intToBigEndian", "(I[BI)V"),
+            ("intToLittleEndian", "(I[BI)V"),
+            ("intToBigEndian", "([I[BI)V"),
+            ("intToLittleEndian", "([I[BI)V"),
+            ("intToBigEndian", "([III[BI)V"),
+            ("intToLittleEndian", "([III[BI)V"),
+        ] {
+            assert!(is_bc_crypto_math_native_override(pack, name, descriptor));
+            assert!(force_native_over_real_jdk_bytecode(pack, name, descriptor));
+            assert!(redefine_immune_forced_native(pack, name, descriptor));
+        }
+
+        for point in [
+            "org/bouncycastle/math/ec/custom/sec/SecT283R1Point",
+            "org/bouncycastle/math/ec/custom/sec/SecT571K1Point",
+            "org/bouncycastle/math/ec/custom/sec/SecT163K1Point",
+        ] {
+            assert!(
+                is_bc_crypto_math_native_override(
+                    point,
+                    "twice",
+                    "()Lorg/bouncycastle/math/ec/ECPoint;"
+                ),
+                "{point}.twice must route to the registered SecT point native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(
+                    point,
+                    "twice",
+                    "()Lorg/bouncycastle/math/ec/ECPoint;"
+                ),
+                "{point}.twice must not fall through to interpreted SecT point bytecode"
+            );
+            assert!(
+                redefine_immune_forced_native(
+                    point,
+                    "twice",
+                    "()Lorg/bouncycastle/math/ec/ECPoint;"
+                ),
+                "{point}.twice must stay native after unrelated redefinition"
+            );
+        }
+        assert!(!is_bc_crypto_math_native_override(
+            "org/bouncycastle/math/ec/custom/sec/SecP224K1Field",
+            "multiply",
+            "([I[I[I)V"
         ));
     }
 
