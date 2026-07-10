@@ -1131,6 +1131,16 @@ fn initialize_class_shared(
                 if matches!(&*class_name_for_jfr, "jdk/internal/misc/UnsafeConstants") {
                     post_clinit_fixup(shared, class_id, &class_name_for_jfr);
                 }
+                // ES-FAIL-FAMILY-20260710: see the matching `post_clinit_fixup`
+                // arm for the full root-cause writeup. `Unsafe.<clinit>`
+                // itself (not just `UnsafeConstants.<clinit>`) needs a
+                // success-path backfill: its `ARRAY_*_BASE_OFFSET`/
+                // `ARRAY_*_INDEX_SCALE` statics are computed by calling
+                // natives that are not yet registered this early in boot,
+                // so they silently latch at 0 instead of throwing.
+                if matches!(&*class_name_for_jfr, "jdk/internal/misc/Unsafe") {
+                    post_clinit_fixup(shared, class_id, &class_name_for_jfr);
+                }
                 // (Removed) R15 WildFly Module.<clinit> post-success fixup.
                 // The earlier band-aid unconditionally overwrote
                 // `BOOT_MODULE_LOADER` (and conditionally backfilled
@@ -2152,6 +2162,64 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             n += set_static_by_name("UNALIGNED_ACCESS", Value::Int(1)) as i32;
             n += set_static_by_name("DATA_CACHE_LINE_FLUSH_SIZE", Value::Int(0)) as i32;
             tracing::warn!("Post-clinit fixup: UnsafeConstants populated ({n}/5)");
+        }
+        "jdk/internal/misc/Unsafe" => {
+            // ES-FAIL-FAMILY-20260710: `Unsafe.<clinit>` computes each
+            // `ARRAY_*_BASE_OFFSET`/`ARRAY_*_INDEX_SCALE` static by calling
+            // `theUnsafe.arrayBaseOffset(...)`/`arrayIndexScale(...)`
+            // (which call the private `arrayBaseOffset0`/`arrayIndexScale0`
+            // natives) during real-JDK bootstrap, before this VM's native
+            // registry has those methods wired up (they are registered in a
+            // later "Session 10" pass). The `<clinit>` itself does not throw
+            // -- the unregistered native calls silently return the zero
+            // value for their return type -- so every one of these 18
+            // `static final` fields is permanently latched at 0 for the
+            // rest of the process.
+            //
+            // Any code that follows the documented Unsafe protocol
+            // (`offset = ARRAY_<T>_BASE_OFFSET + index`) then hands
+            // `getIntUnaligned`/`getShortUnaligned`/etc. an offset that is
+            // short by 16, so those reads land on the wrong bytes. This is
+            // silent (no exception) and byte-for-byte deterministic, so the
+            // corruption is not visible until something decodes the
+            // misread value -- e.g. `java.util.zip.ZipUtils.get32/get16`
+            // (used by `ZipInputStream.getNextEntry()`'s LOC-header parser),
+            // which is how `Build$CurrentHolder.findCurrent()` was observed
+            // to see `JarInputStream.getManifest()` silently return null
+            // for the real `elasticsearch-<version>.jar`.
+            //
+            // Values match `native_unsafe_array_base_offset`/
+            // `array_index_scale_for_name` in native-builtins/src/lib.rs --
+            // CratonVM's own uniform "16-byte header, no compressed oops"
+            // convention, not a per-type HotSpot table.
+            let mut n = 0;
+            for name in [
+                "ARRAY_BOOLEAN_BASE_OFFSET",
+                "ARRAY_BYTE_BASE_OFFSET",
+                "ARRAY_SHORT_BASE_OFFSET",
+                "ARRAY_CHAR_BASE_OFFSET",
+                "ARRAY_INT_BASE_OFFSET",
+                "ARRAY_LONG_BASE_OFFSET",
+                "ARRAY_FLOAT_BASE_OFFSET",
+                "ARRAY_DOUBLE_BASE_OFFSET",
+                "ARRAY_OBJECT_BASE_OFFSET",
+            ] {
+                n += set_static_by_name(name, Value::Long(16)) as i32;
+            }
+            for (name, scale) in [
+                ("ARRAY_BOOLEAN_INDEX_SCALE", 1),
+                ("ARRAY_BYTE_INDEX_SCALE", 1),
+                ("ARRAY_SHORT_INDEX_SCALE", 2),
+                ("ARRAY_CHAR_INDEX_SCALE", 2),
+                ("ARRAY_INT_INDEX_SCALE", 4),
+                ("ARRAY_LONG_INDEX_SCALE", 8),
+                ("ARRAY_FLOAT_INDEX_SCALE", 4),
+                ("ARRAY_DOUBLE_INDEX_SCALE", 8),
+                ("ARRAY_OBJECT_INDEX_SCALE", 8),
+            ] {
+                n += set_static_by_name(name, Value::Int(scale)) as i32;
+            }
+            tracing::warn!("Post-clinit fixup: Unsafe ARRAY_*_BASE_OFFSET/INDEX_SCALE populated ({n}/18)");
         }
         "java/io/File" => {
             // See the success-path call site (`init_class`) for the full
