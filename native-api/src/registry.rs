@@ -2865,6 +2865,9 @@ pub struct NativeMethodRegistry {
     /// `StringReader` has the same drift on modern JDKs: the real class wraps a
     /// final `Reader r`, while the synthetic native constructor writes the old
     /// `(content,pos,length)` slots, leaving `r` null before `mark()` delegates.
+    /// `Pattern`/`Matcher` have the same drift: the legacy regex natives allocate
+    /// real-layout objects but write the old synthetic slots, leaving fields such
+    /// as `Matcher.locals` uninitialized.
     /// Same mechanism as the `CRATONVM_REAL_NET_SOCKETS` Socket drop above,
     /// but set by `vm_init`'s real-JDK arm (not env-gated). Off in synthetic mode
     /// (there the fake layout *is* the object layout). Surfaced via Spring
@@ -3166,6 +3169,20 @@ impl NativeMethodRegistry {
             && matches!(
                 method_name,
                 "newScheduledThreadPool" | "newSingleThreadScheduledExecutor"
+            )
+        {
+            return;
+        }
+        // Real-JDK mode: drop legacy regex natives. They were written for the
+        // old synthetic two-field Pattern / six-field Matcher layout; on real
+        // OpenJDK objects they corrupt slots and bypass constructors, so later
+        // Pattern/Matcher bytecode observes impossible state (for example a
+        // Matcher whose `locals` field is not an int[]). Let the JDK regex
+        // bytecode own both object construction and matching in real mode.
+        if self.drop_real_layout_synthetic
+            && matches!(
+                class_name,
+                "java/util/regex/Pattern" | "java/util/regex/Matcher"
             )
         {
             return;
@@ -3901,6 +3918,25 @@ mod tests {
                 "newScheduledThreadPool",
                 "(I)Ljava/util/concurrent/ScheduledExecutorService;",
             )
+            .is_none());
+
+        real_layout.register(
+            "java/util/regex/Pattern",
+            "matcher",
+            "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;",
+            dummy_native,
+        );
+        assert!(real_layout
+            .find(
+                "java/util/regex/Pattern",
+                "matcher",
+                "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;",
+            )
+            .is_none());
+
+        real_layout.register("java/util/regex/Matcher", "matches", "()Z", dummy_native);
+        assert!(real_layout
+            .find("java/util/regex/Matcher", "matches", "()Z")
             .is_none());
     }
 
