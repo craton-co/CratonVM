@@ -181,3 +181,11 @@ dump content follows it, on this build. Use CratonVM's own
 `--stack-dump-on-timeout=N` watchdog (dumps real interpreter frame chains +
 a thread summary) instead of relying on that marker for future repros of this
 cluster.
+
+**Verified NOT the same bug as `afa4a6fd`** (String compact-layout
+field-offset dual-dispatch, TaskInfoTests SIGSEGV, landed on `dev` while this
+investigation was in progress): merged `origin/dev` into this branch and
+re-tested with `CRATONVM_JIT_GUARDED_GETFIELD=1` (forcing the guard back on)
+— still SIGSEGVs. The two are separate, if superficially similar
+(compact/legacy-layout dispatch), bugs in different code paths (generic
+getfield inline arms vs. hand-rolled String-intrinsic field loads).
