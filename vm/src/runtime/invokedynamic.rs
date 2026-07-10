@@ -935,6 +935,32 @@ fn allocate_lambda_proxy(
     }
     captures.reverse();
 
+    // GC-safety: captures sits in a raw Rust Vec, invisible to the
+    // collector (native stale-local family). The fallback allocation path
+    // below can force a GC on young-gen exhaustion (maybe_gc_forced_pub),
+    // which may relocate any captured object reference. Pin every captured
+    // object into native_pin_roots (which the GC remaps) before
+    // attempting allocation, and refresh captures from the pins
+    // afterward so a relocated capture is never written stale into the new
+    // proxy's fields.
+    //
+    // Concrete failure without this: a bound interface-method-reference
+    // lambda (e.g. values::get over TDigestDoubleArray) captured under
+    // memory pressure got a stale pre-GC ObjectRef written into its proxy
+    // field. Every later dispatch through that proxy read the captured
+    // field, found the (now-vacated) old address, and resolved a garbage/
+    // zeroed class id there instead of the real receiver class.
+    let pin_base = thread.native_pin_roots.len();
+    let mut handles: Vec<Option<usize>> = Vec::with_capacity(captures.len());
+    for c in captures.iter() {
+        if let Value::Object(Some(o)) = c {
+            handles.push(Some(thread.native_pin_roots.len()));
+            thread.native_pin_roots.push(*o);
+        } else {
+            handles.push(None);
+        }
+    }
+
     // Allocate a proxy object on the heap with fields for captured values.
     // Use try_alloc + GC retry to avoid aborting on young-gen exhaustion.
     let proxy_ref = match shared.heap.try_alloc_object(proxy_class_id, num_captures) {
@@ -942,7 +968,7 @@ fn allocate_lambda_proxy(
         None => {
             thread.tlab.retire();
             super::interpreter::maybe_gc_forced_pub(shared, thread);
-            shared
+            match shared
                 .heap
                 .try_alloc_object(proxy_class_id, num_captures)
                 .ok_or_else(|| {
@@ -954,9 +980,24 @@ fn allocate_lambda_proxy(
                             ),
                         },
                     ))
-                })?
+                }) {
+                Ok(obj) => obj,
+                Err(e) => {
+                    thread.native_pin_roots.truncate(pin_base);
+                    return Err(e);
+                }
+            }
         }
     };
+    // Refresh any captured object references from their pins — the retry
+    // path above may have relocated them during GC.
+    for (j, h) in handles.iter().enumerate() {
+        if let Some(h) = *h {
+            captures[j] = Value::Object(Some(thread.native_pin_roots[h]));
+        }
+    }
+    thread.native_pin_roots.truncate(pin_base);
+
     for (i, val) in captures.iter().enumerate() {
         shared.heap.set_field(proxy_ref, i, *val);
     }

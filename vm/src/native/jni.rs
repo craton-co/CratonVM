@@ -489,6 +489,12 @@ pub fn detach_foreign_thread(shared: &SharedVm) -> bool {
         None => return false,
     };
     let tid = jt.thread_id;
+    // SATB (G1MARK-2): drain this thread's per-thread SATB buffer before the
+    // thread detaches — same rationale as the platform-thread exit path in
+    // vm_exec.rs: unflushed entries in the thread-local buffer are dropped
+    // with the TLS, losing the marker's only record of overwritten
+    // references. Cheap no-op when no marking cycle is active.
+    shared.heap.flush_thread_satb();
     // BUG-03 — stop publishing this thread's TLAB address before the box is
     // dropped, so the collector can never read a dangling pointer.
     shared.thread_registry.clear_tlab_addr(tid);
