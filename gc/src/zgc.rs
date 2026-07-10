@@ -1406,6 +1406,14 @@ pub struct ZgcRealHeap {
     allocated: AtomicUsize,
     /// Collection is triggered once `allocated` crosses this byte count.
     gc_threshold: usize,
+    /// Post-GC re-arm floor: `needs_gc` stays `false` until `allocated`
+    /// also crosses this. Set by each sweep to
+    /// `live + max(remaining_headroom / 4, 64 KiB)` so a live set that sits
+    /// above the static 75% threshold cannot latch `needs_gc` permanently
+    /// true — which made `maybe_gc` (polled after EVERY allocation
+    /// bytecode) run a full STW mark-sweep per allocation: a livelock-grade
+    /// GC storm with no OOME ever surfacing.
+    gc_rearm: AtomicUsize,
     /// Lifetime collection counter (observability).
     gc_count: AtomicUsize,
     /// Shared `java.lang.ref` reference processor.
@@ -1445,6 +1453,7 @@ impl ZgcRealHeap {
             next_hash_code: AtomicI32::new(1),
             allocated: AtomicUsize::new(0),
             gc_threshold: cap * ZGC_REAL_GC_THRESHOLD_PERCENT / 100,
+            gc_rearm: AtomicUsize::new(0),
             gc_count: AtomicUsize::new(0),
             ref_processor: Mutex::new(ReferenceProcessor::new()),
         }
@@ -1984,7 +1993,8 @@ impl GarbageCollector for ZgcRealHeap {
     }
 
     fn needs_gc(&self) -> bool {
-        self.allocated.load(Ordering::Relaxed) >= self.gc_threshold
+        let a = self.allocated.load(Ordering::Relaxed);
+        a >= self.gc_threshold && a >= self.gc_rearm.load(Ordering::Relaxed)
     }
 
     fn collect_garbage(
@@ -2078,11 +2088,56 @@ impl GarbageCollector for ZgcRealHeap {
                     bytes_freed += size;
                 }
             }
+
+            // Coalesce the free list into maximal spans — same rationale as
+            // gen_heap's post-sweep coalescer. The loop above returns ONE
+            // object-sized hole per dead object, and `Arena::alloc`'s
+            // small-tier scan is BUDGETED (16 entries): a workload whose
+            // dead objects mix sizes (e.g. runs of 72-byte boxes burying
+            // 296-byte byte[] holes) then misses reusable holes forever and
+            // burns bump space until the arena exhausts — CopyChurn at
+            // -Xmx256m OOM'd with most of the arena sitting unreachable on
+            // the free list. Merging adjacent (and defensively overlapping)
+            // holes rebuilds them into a few large spans that route to the
+            // unbounded large tier, restoring reuse.
+            let sorted = arena.free_blocks_sorted();
+            if sorted.len() > 1 {
+                arena.clear_free_list();
+                let mut merged: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
+                for (off, sz) in sorted {
+                    if let Some(last) = merged.last_mut() {
+                        let last_end = last.0 + last.1;
+                        if off <= last_end {
+                            // Adjacent or overlapping: extend to the farther
+                            // end so no span is ever double-served.
+                            let new_end = last_end.max(off + sz);
+                            last.1 = new_end - last.0;
+                            continue;
+                        }
+                    }
+                    merged.push((off, sz));
+                }
+                for (off, sz) in merged {
+                    arena.add_free_block(off, sz);
+                }
+            }
         }
 
         // Publish the new registry and live-byte total.
         *self.registry.lock() = survivors;
         self.allocated.store(bytes_copied, Ordering::Relaxed);
+        // Re-arm the trigger: require at least a quarter of the remaining
+        // headroom (min 64 KiB) of NEW allocation before the next
+        // threshold-triggered collection, so a live set parked above the
+        // static threshold cannot re-fire a full STW cycle on every
+        // allocation (see `gc_rearm`). Allocation-failure GCs are driven by
+        // the fallible alloc paths and ignore this gate.
+        let cap = self.heap_capacity();
+        let headroom = cap.saturating_sub(bytes_copied);
+        self.gc_rearm.store(
+            bytes_copied.saturating_add((headroom / 4).max(64 * 1024)),
+            Ordering::Relaxed,
+        );
         self.gc_count.fetch_add(1, Ordering::Relaxed);
 
         // Non-moving: no object changed address, so roots and external

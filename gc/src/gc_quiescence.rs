@@ -344,40 +344,109 @@ pub fn movable_jit_root_count() -> usize {
 // evacuated and its own slots fixed up in place (young→young references carry no
 // remembered set, so the pinned region must be scanned explicitly).
 //
-// Thread-local for the same reason as MOVABLE_JIT_ROOTS: the JIT entry chain and
-// the (self-triggered) collection run on the same thread. Cleared at the start
-// of each root-gathering pass. A missed publication only risks a stale slot (the
-// pre-fix behaviour); a stale EXTRA entry is prevented by the per-pass clear and
-// would at worst over-pin one region for one cycle.
+// CROSS-THREAD (2026-07-10, MTChurn lost-increment fix): this registry is
+// process-global, keyed by publishing thread. The original design was a plain
+// `thread_local!` set on the assumption that "the JIT entry chain and the
+// (self-triggered) collection run on the same thread" — but that only covers
+// the GC INITIATOR's own JIT frames. Every OTHER mutator that parks at the STW
+// barrier (or sits in a blocking native) with live JIT frames publishes its
+// conservative roots into its root SNAPSHOT (which keeps the objects alive)
+// while its thread-local pin set was invisible to the initiator's
+// `pinned_jit_roots_snapshot()` — so G1 evacuated the objects anyway and the
+// parked thread resumed its compiled code on dangling from-space addresses
+// (observed as massive lost `synchronized` increments + zero-header field
+// writes under multi-threaded churn).
+//
+// Model: each thread owns one entry (replace-on-publish, so stale pins drop as
+// soon as the thread republishes with fewer/no JIT frames — it deposits at
+// every safepoint arrival and blocking-region entry). The entry is removed by
+// a TLS drop guard when the thread exits. `pinned_jit_roots_snapshot()` is the
+// union across threads: by the time the initiator selects a CSet, every
+// counted mutator has parked (and therefore republished), so the union is
+// current. Over-pinning (an entry from a thread that left JIT after its last
+// deposit) is safe — it only keeps a region out of one CSet.
 
+static PINNED_JIT_ROOTS_BY_THREAD: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, std::collections::HashSet<usize>>>,
+> = std::sync::OnceLock::new();
+
+fn pinned_jit_map(
+) -> &'static std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, std::collections::HashSet<usize>>>
+{
+    PINNED_JIT_ROOTS_BY_THREAD.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// TLS guard: removes this thread's pin-registry entry when the thread exits,
+/// so a dead thread's regions do not stay pinned forever.
+struct PinnedJitRootsGuard(std::thread::ThreadId);
+impl Drop for PinnedJitRootsGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = pinned_jit_map().lock() {
+            map.remove(&self.0);
+        }
+    }
+}
 thread_local! {
-    static PINNED_JIT_ROOTS: std::cell::RefCell<std::collections::HashSet<usize>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
+    static PINNED_JIT_ROOTS_GUARD: std::cell::OnceCell<PinnedJitRootsGuard> =
+        const { std::cell::OnceCell::new() };
 }
-
-/// Clear the conservative-pinned-JIT-root set. Called by the VM's root gatherer
-/// at the start of every collection, before the JIT-frame scan republishes.
-pub fn clear_pinned_jit_roots() {
-    PINNED_JIT_ROOTS.with(|s| s.borrow_mut().clear());
-}
-
-/// Record `addr` (an object address discovered conservatively in a JIT frame,
-/// whose holder slot the collector cannot rewrite) as pin-required for G1.
-pub fn add_pinned_jit_root(addr: usize) {
-    PINNED_JIT_ROOTS.with(|s| {
-        s.borrow_mut().insert(addr);
+fn arm_pinned_guard() {
+    PINNED_JIT_ROOTS_GUARD.with(|g| {
+        let _ = g.get_or_init(|| PinnedJitRootsGuard(std::thread::current().id()));
     });
 }
 
-/// Snapshot the conservative-pinned-JIT-root addresses published this cycle.
-/// `G1Collector` maps these to regions it must exclude from the collection set.
-pub fn pinned_jit_roots_snapshot() -> Vec<usize> {
-    PINNED_JIT_ROOTS.with(|s| s.borrow().iter().copied().collect())
+/// Clear the CALLING thread's conservative-pinned-JIT-root entry. Called by
+/// the VM's root gatherer (initiator) at the start of every collection,
+/// before its own JIT-frame scan republishes. Other threads' entries are
+/// left intact — they are owned by those threads' deposits.
+pub fn clear_pinned_jit_roots() {
+    if let Ok(mut map) = pinned_jit_map().lock() {
+        map.remove(&std::thread::current().id());
+    }
 }
 
-/// Count of conservative-pinned JIT roots published this cycle (diagnostics).
+/// Record `addr` (an object address discovered conservatively in a JIT frame,
+/// whose holder slot the collector cannot rewrite) as pin-required for G1,
+/// owned by the calling thread.
+pub fn add_pinned_jit_root(addr: usize) {
+    arm_pinned_guard();
+    if let Ok(mut map) = pinned_jit_map().lock() {
+        map.entry(std::thread::current().id()).or_default().insert(addr);
+    }
+}
+
+/// Replace the CALLING thread's pin entry wholesale with `addrs` (removing it
+/// when empty). Used by the root-snapshot deposit paths so a thread's pins
+/// always reflect its CURRENT live JIT frames.
+pub fn publish_pinned_jit_roots(addrs: &[usize]) {
+    arm_pinned_guard();
+    if let Ok(mut map) = pinned_jit_map().lock() {
+        let tid = std::thread::current().id();
+        if addrs.is_empty() {
+            map.remove(&tid);
+        } else {
+            map.insert(tid, addrs.iter().copied().collect());
+        }
+    }
+}
+
+/// Snapshot the conservative-pinned-JIT-root addresses published by ALL
+/// threads. `G1Collector` maps these to regions it must exclude from the
+/// collection set.
+pub fn pinned_jit_roots_snapshot() -> Vec<usize> {
+    match pinned_jit_map().lock() {
+        Ok(map) => map.values().flat_map(|s| s.iter().copied()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Count of conservative-pinned JIT roots currently published (diagnostics).
 pub fn pinned_jit_root_count() -> usize {
-    PINNED_JIT_ROOTS.with(|s| s.borrow().len())
+    match pinned_jit_map().lock() {
+        Ok(map) => map.values().map(|s| s.len()).sum(),
+        Err(_) => 0,
+    }
 }
 
 // ---------------------------------------------------------------------------

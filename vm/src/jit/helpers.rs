@@ -1626,12 +1626,23 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     if crate::runtime::interpreter::gc_overhead_limit_exceeded(vm) {
         return jit_newarray_oom(vm, length as usize);
     }
-    // Retry after GC. On a second failure the heap is genuinely exhausted —
-    // surface a catchable `java/lang/OutOfMemoryError` exactly as the
-    // interpreter's `gc_alloc_array` does, instead of the old non-fallible
-    // `alloc_array` (which would abort the process on a real OOM).
-    let Some(obj_ref) = heap.try_alloc_array(ClassId::new(0), elem_type, length as usize) else {
-        return jit_newarray_oom(vm, length as usize);
+    // Retry after GC. On a second failure, try a G1 last-ditch full mark
+    // cycle (dead humongous spans need cleanup, not a young pause) and retry
+    // once more; then the heap is genuinely exhausted — surface a catchable
+    // `java/lang/OutOfMemoryError` exactly as the interpreter's
+    // `gc_alloc_array` does, instead of the old non-fallible `alloc_array`
+    // (which would abort the process on a real OOM).
+    let obj_ref = match heap.try_alloc_array(ClassId::new(0), elem_type, length as usize) {
+        Some(o) => o,
+        None => {
+            if !jit_g1_last_ditch_full_cycle(vm) {
+                return jit_newarray_oom(vm, length as usize);
+            }
+            match heap.try_alloc_array(ClassId::new(0), elem_type, length as usize) {
+                Some(o) => o,
+                None => return jit_newarray_oom(vm, length as usize),
+            }
+        }
     };
     jit_newarray_finish(obj_ref, atype, length)
 }
@@ -1662,6 +1673,28 @@ fn jit_newarray_oom(vm: &SharedVm, length: usize) -> i64 {
         vm,
         &format!("Java heap space (alloc_array length {})", length),
     )
+}
+
+/// G1 last-ditch full mark cycle on allocation failure — see the
+/// interpreter's `g1_force_full_cycle`: young pauses cannot reclaim dead
+/// Old/humongous spans, only a completed mark cycle's cleanup can. Returns
+/// `true` when the cycle was attempted (caller should retry the allocation
+/// once before surfacing OOM).
+#[cold]
+fn jit_g1_last_ditch_full_cycle(vm: &SharedVm) -> bool {
+    if !vm.heap.is_g1() {
+        return false;
+    }
+    // SAFETY: called only from the JIT allocation slow-path helpers, on a
+    // mutator thread that entered compiled code through the JIT entry
+    // trampoline — the same contract as the surrounding `jit_thread_mut`
+    // calls in those helpers.
+    if let Some((thread, _guard)) = unsafe { jit_thread_mut() } {
+        crate::runtime::interpreter::g1_force_full_cycle(vm, thread);
+        true
+    } else {
+        false
+    }
 }
 
 /// Shared OOM signal for the fallible JIT allocation helpers — `jit_newarray`
@@ -2004,11 +2037,30 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     // abort in alloc_young. The `new` codegen's emit_post_alloc_oom_check bails
     // on the 0/null sentinel and routes the OOME through the method's exception
     // table (matching the interpreter's gc_alloc_object).
-    let Some(obj_ref) = heap.try_alloc_object_full(class_id, num_fields as usize) else {
-        return jit_alloc_oom(
-            vm,
-            &format!("Java heap space (new_object class_id {class_id_raw} fields {num_fields})"),
-        );
+    let obj_ref = match heap.try_alloc_object_full(class_id, num_fields as usize) {
+        Some(o) => o,
+        None => {
+            // G1 last-ditch full cycle + one retry (see jit_newarray).
+            if !jit_g1_last_ditch_full_cycle(vm) {
+                return jit_alloc_oom(
+                    vm,
+                    &format!(
+                        "Java heap space (new_object class_id {class_id_raw} fields {num_fields})"
+                    ),
+                );
+            }
+            match heap.try_alloc_object_full(class_id, num_fields as usize) {
+                Some(o) => o,
+                None => {
+                    return jit_alloc_oom(
+                        vm,
+                        &format!(
+                            "Java heap space (new_object class_id {class_id_raw} fields {num_fields})"
+                        ),
+                    )
+                }
+            }
+        }
     };
     // Initialize primitive-typed fields to proper JVM default values.
     // Zero memory reads as Object(None) which is wrong for int/long/float/double fields.
@@ -2129,15 +2181,32 @@ pub unsafe extern "C" fn jit_anewarray_object(
     // abort in alloc_young. The `anewarray` codegen's emit_post_alloc_oom_check
     // bails on the 0/null sentinel and routes the OOME through the method's
     // exception table (matching the interpreter's gc_alloc_array).
-    let Some(arr) =
-        heap.try_alloc_array_full(class_id, ArrayElementType::Reference, length as usize)
-    else {
-        return jit_alloc_oom(
-            vm,
-            &format!(
-                "Java heap space (anewarray component {component_class_id_raw} length {length})"
-            ),
-        );
+    let arr = match heap.try_alloc_array_full(class_id, ArrayElementType::Reference, length as usize)
+    {
+        Some(a) => a,
+        None => {
+            // G1 last-ditch full cycle + one retry (see jit_newarray).
+            if !jit_g1_last_ditch_full_cycle(vm) {
+                return jit_alloc_oom(
+                    vm,
+                    &format!(
+                        "Java heap space (anewarray component {component_class_id_raw} length {length})"
+                    ),
+                );
+            }
+            match heap.try_alloc_array_full(class_id, ArrayElementType::Reference, length as usize)
+            {
+                Some(a) => a,
+                None => {
+                    return jit_alloc_oom(
+                        vm,
+                        &format!(
+                            "Java heap space (anewarray component {component_class_id_raw} length {length})"
+                        ),
+                    )
+                }
+            }
+        }
     };
     arr.as_ptr() as i64
 }

@@ -1958,13 +1958,22 @@ pub(crate) fn alloc_object_shared(
             },
         )));
     }
+    if let Some(obj) = shared.heap.try_alloc_object(class_id, num_fields) {
+        shared
+            .bytes_allocated_total
+            // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
+            .fetch_add(total_size as u64, std::sync::atomic::Ordering::Relaxed);
+        return Ok(obj);
+    }
+    // G1 last-ditch: see `gc_alloc_array` — dead Old/humongous spans need a
+    // completed mark cycle's cleanup; run one synchronously and retry once.
+    g1_force_full_cycle(shared, thread);
     shared
         .heap
         .try_alloc_object(class_id, num_fields)
         .map(|obj| {
             shared
                 .bytes_allocated_total
-                // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
                 .fetch_add(total_size as u64, std::sync::atomic::Ordering::Relaxed);
             obj
         })
@@ -2037,6 +2046,13 @@ fn gc_alloc_array(
             },
         )));
     }
+    if let Some(arr) = shared.heap.try_alloc_array(class_id, element_type, length) {
+        return Ok(arr);
+    }
+    // G1 last-ditch: the young pause above cannot reclaim dead Old/humongous
+    // spans — only a completed mark cycle's cleanup can. Run one
+    // synchronously and retry once before surfacing OOM.
+    g1_force_full_cycle(shared, thread);
     shared
         .heap
         .try_alloc_array(class_id, element_type, length)
@@ -2291,7 +2307,29 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     // roots and with the concurrent old-gen collector disabled). See
     // docs/real-raf-segv-root-cause.md.
     if !moving_young_precise_only {
+        let jit_scan_start = snapshot.len();
         crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut snapshot);
+        // G1 pin-in-place, cross-thread half: the snapshot keeps these
+        // conservatively-discovered objects ALIVE, but under G1 (a moving
+        // collector) their regions must also be EXCLUDED from the collection
+        // set — the JIT register/spill slots holding them cannot be
+        // rewritten when the object moves. The initiator only publishes its
+        // OWN JIT roots (roots.rs); every parked/blocked mutator must
+        // publish here, into the process-global per-thread pin registry
+        // consumed by `G1Collector::jit_pinned_region_set`. Replace
+        // semantics: a deposit with no live JIT frames clears this thread's
+        // stale pins.
+        if shared.heap.is_g1() {
+            let addrs: Vec<usize> = snapshot[jit_scan_start..]
+                .iter()
+                .map(|r| r.as_ptr() as usize)
+                .collect();
+            cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&addrs);
+        }
+    } else if shared.heap.is_g1() {
+        // Precise-relocation mode covers every JIT oop with rewritable
+        // shadow-stack slots — no conservative pins needed; drop stale ones.
+        cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&[]);
     }
 
     // §4 (multi-thread shadow scan, marking half). Also publish THIS thread's
@@ -3041,6 +3079,54 @@ fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread) {
     );
     if !done {
         tracing::debug!("[G1] Final remark lost the STW race — retrying at next GC");
+    }
+}
+
+/// Last-ditch G1 full marking cycle before declaring OutOfMemoryError.
+///
+/// Young/mixed pauses reclaim only collection-set regions; dead Old regions
+/// and dead humongous spans are reclaimed exclusively by a completed mark
+/// cycle's cleanup phase (`reclaim_dead_humongous_spans_locked`). When an
+/// allocation still fails after the forced young GC, the heap may simply be
+/// full of *unmarked dead* Old/humongous data — run one complete cycle
+/// synchronously (start → drain → final remark → cleanup) and let the caller
+/// retry the allocation once more before throwing OOM. Mirrors HotSpot's
+/// last-ditch full GC on allocation failure.
+///
+/// No-op on non-G1 backends. Bounded: gives up after ~2s if the background
+/// marker never quiesces or the STW races never resolve — the caller then
+/// proceeds to OOM; this can delay an inevitable OOM slightly but never
+/// hangs the allocation path.
+pub(crate) fn g1_force_full_cycle(shared: &SharedVm, thread: &mut JvmThread) {
+    if !shared.heap.is_g1() {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    // If a cycle is already mid-flight we simply help finish it — its
+    // cleanup reclaims the same dead spans a fresh cycle would.
+    let mut saw_active = shared.heap.g1_is_marking_active();
+    loop {
+        if shared.heap.g1_is_marking_active() {
+            saw_active = true;
+            if shared.heap.g1_concurrent_mark_finished() {
+                // Runs remark+cleanup under a brief STW; on a lost STW race
+                // the cycle stays open and the loop retries.
+                g1_final_remark_cleanup(shared, thread);
+            } else {
+                std::thread::yield_now();
+            }
+        } else if saw_active {
+            return; // cycle completed — cleanup has run
+        } else {
+            // Not started yet (or the initial-mark STW lost its race —
+            // g1_concurrent_mark_cycle returns without activating in that
+            // case). Start/retry it.
+            g1_concurrent_mark_cycle(shared, thread);
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::debug!("[G1] last-ditch full cycle timed out — proceeding to OOM");
+            return;
+        }
     }
 }
 
