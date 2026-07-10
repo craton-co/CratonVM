@@ -143,6 +143,74 @@ pub(crate) fn chacha_core(rounds: i32, input: &[i32; 16], x: &mut [i32; 16]) {
 /// `org.bouncycastle.pqc.crypto.sphincs.Permute.permute(int rounds, int[] x)` —
 /// the bare permutation (the SPHINCS hash), updating `x` in place with NO
 /// final input-add. Byte-identical to the bytecode.
+/// `org.bouncycastle.crypto.engines.Salsa20Engine.salsaCore(int rounds,
+/// int[] input, int[] x)` - the Salsa20 stream-cipher block function.
+/// Transcribed from BC's Java source; all additions are Java int wrapping adds.
+pub(crate) fn salsa_core(rounds: i32, input: &[i32; 16], x: &mut [i32; 16]) {
+    let mut x00 = input[0] as u32;
+    let mut x01 = input[1] as u32;
+    let mut x02 = input[2] as u32;
+    let mut x03 = input[3] as u32;
+    let mut x04 = input[4] as u32;
+    let mut x05 = input[5] as u32;
+    let mut x06 = input[6] as u32;
+    let mut x07 = input[7] as u32;
+    let mut x08 = input[8] as u32;
+    let mut x09 = input[9] as u32;
+    let mut x10 = input[10] as u32;
+    let mut x11 = input[11] as u32;
+    let mut x12 = input[12] as u32;
+    let mut x13 = input[13] as u32;
+    let mut x14 = input[14] as u32;
+    let mut x15 = input[15] as u32;
+
+    let mut i = rounds;
+    while i > 0 {
+        x04 ^= x00.wrapping_add(x12).rotate_left(7);
+        x08 ^= x04.wrapping_add(x00).rotate_left(9);
+        x12 ^= x08.wrapping_add(x04).rotate_left(13);
+        x00 ^= x12.wrapping_add(x08).rotate_left(18);
+        x09 ^= x05.wrapping_add(x01).rotate_left(7);
+        x13 ^= x09.wrapping_add(x05).rotate_left(9);
+        x01 ^= x13.wrapping_add(x09).rotate_left(13);
+        x05 ^= x01.wrapping_add(x13).rotate_left(18);
+        x14 ^= x10.wrapping_add(x06).rotate_left(7);
+        x02 ^= x14.wrapping_add(x10).rotate_left(9);
+        x06 ^= x02.wrapping_add(x14).rotate_left(13);
+        x10 ^= x06.wrapping_add(x02).rotate_left(18);
+        x03 ^= x15.wrapping_add(x11).rotate_left(7);
+        x07 ^= x03.wrapping_add(x15).rotate_left(9);
+        x11 ^= x07.wrapping_add(x03).rotate_left(13);
+        x15 ^= x11.wrapping_add(x07).rotate_left(18);
+
+        x01 ^= x00.wrapping_add(x03).rotate_left(7);
+        x02 ^= x01.wrapping_add(x00).rotate_left(9);
+        x03 ^= x02.wrapping_add(x01).rotate_left(13);
+        x00 ^= x03.wrapping_add(x02).rotate_left(18);
+        x06 ^= x05.wrapping_add(x04).rotate_left(7);
+        x07 ^= x06.wrapping_add(x05).rotate_left(9);
+        x04 ^= x07.wrapping_add(x06).rotate_left(13);
+        x05 ^= x04.wrapping_add(x07).rotate_left(18);
+        x11 ^= x10.wrapping_add(x09).rotate_left(7);
+        x08 ^= x11.wrapping_add(x10).rotate_left(9);
+        x09 ^= x08.wrapping_add(x11).rotate_left(13);
+        x10 ^= x09.wrapping_add(x08).rotate_left(18);
+        x12 ^= x15.wrapping_add(x14).rotate_left(7);
+        x13 ^= x12.wrapping_add(x15).rotate_left(9);
+        x14 ^= x13.wrapping_add(x12).rotate_left(13);
+        x15 ^= x14.wrapping_add(x13).rotate_left(18);
+
+        i -= 2;
+    }
+
+    let out = [
+        x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15,
+    ];
+    for k in 0..16 {
+        x[k] = out[k].wrapping_add(input[k] as u32) as i32;
+    }
+}
+
 pub(crate) fn permute(rounds: i32, x: &mut [i32; 16]) {
     let mut s = [0u32; 16];
     for k in 0..16 {
@@ -250,6 +318,38 @@ mod tests {
                 "chacha_core word {k} mismatch"
             );
         }
+    }
+
+    #[test]
+    fn salsa_core_matches_bc_set1_vector() {
+        let input: [u32; 16] = [
+            0x6170_7865,
+            0x0000_0080,
+            0,
+            0,
+            0,
+            0x3120_646e,
+            0,
+            0,
+            0,
+            0,
+            0x7962_2d36,
+            0x0000_0080,
+            0,
+            0,
+            0,
+            0x6b20_6574,
+        ];
+        let mut x = [0i32; 16];
+        salsa_core(20, &input.map(|w| w as i32), &mut x);
+        let mut out = [0u8; 64];
+        for k in 0..16 {
+            out[4 * k..4 * k + 4].copy_from_slice(&(x[k] as u32).to_le_bytes());
+        }
+        assert_eq!(
+            hex(&out),
+            "4dfa5e481da23ea09a31022050859936da52fcee218005164f267cb65f5cfd7f2b4f97e0ff16924a52df269515110a07f9e460bc65ef95da58f740b7d1dbb0aa"
+        );
     }
 
     /// `permute` runs the identical inner rounds but omits the input-add, so

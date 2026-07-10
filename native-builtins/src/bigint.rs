@@ -576,6 +576,38 @@ impl BigInt {
     /// Strong-probable-prime (Miller-Rabin) test with fixed small-prime bases —
     /// mirrors the decimal `bi_is_probable_prime_str` (trial division < 1000,
     /// then 13 fixed bases), but on words so the inner `modPow` is fast.
+    pub(crate) fn mod_inverse(&self, modulus: &BigInt) -> Option<BigInt> {
+        if modulus.signum() <= 0 {
+            return None;
+        }
+        let one = Self::small(1);
+        if modulus.cmp(&one) == Ordering::Equal {
+            return Some(BigInt::zero());
+        }
+
+        let mut t = BigInt::zero();
+        let mut new_t = one.clone();
+        let mut r = modulus.clone();
+        let mut new_r = self.modulo(modulus);
+
+        while !new_r.is_zero() {
+            let (q, rem) = r.divmod(&new_r);
+            let next_t = t.sub(&q.mul(&new_t));
+            t = new_t;
+            new_t = next_t;
+            r = new_r;
+            new_r = rem;
+        }
+
+        if r.cmp(&one) != Ordering::Equal {
+            return None;
+        }
+        if t.is_neg() {
+            t = t.add(modulus);
+        }
+        Some(t)
+    }
+
     pub(crate) fn is_probable_prime(&self) -> bool {
         if self.neg || self.is_zero() {
             return false;
@@ -776,8 +808,8 @@ mod tests {
     use super::*;
     use crate::{
         bi_add_str, bi_bitwise_and, bi_bitwise_or, bi_bitwise_xor, bi_compare, bi_div_str,
-        bi_is_probable_prime_str, bi_mod_pow_str, bi_mod_str, bi_mul_str, bi_shift_left_str,
-        bi_shift_right_str, bi_sub_str,
+        bi_is_probable_prime_str, bi_mod_inverse_str, bi_mod_pow_str, bi_mod_str, bi_mul_str,
+        bi_shift_left_str, bi_shift_right_str, bi_sub_str,
     };
 
     // Deterministic LCG so the spread is reproducible without a rand dep.
@@ -991,6 +1023,42 @@ mod tests {
                 bi_mod_pow_str(&ba, &e, &m),
                 "rand modpow({ba}^{e} mod {m})"
             );
+        }
+    }
+
+    #[test]
+    fn mod_inverse_matches_decimal() {
+        let cases = [
+            ("1", "2"),
+            ("2", "3"),
+            ("3", "11"),
+            ("42", "2017"),
+            ("-42", "2017"),
+            (
+                "123456789012345678901234567890",
+                "115792089237316195423570985008687907853269984665640564039457584007913129639747",
+            ),
+            (
+                "98765432109876543210987654321",
+                "6277101735386680763835789423207666416083908700390324961279",
+            ),
+        ];
+        for (a, m) in cases {
+            let got = b(a).mod_inverse(&b(m)).map(|v| v.to_decimal());
+            let want = bi_mod_inverse_str(a, m);
+            assert_eq!(got, want, "modInverse({a}, {m})");
+        }
+        assert_eq!(b("2").mod_inverse(&b("4")), None);
+        assert_eq!(b("9").mod_inverse(&b("1")).unwrap().to_decimal(), "0");
+
+        let mut state = 0x5151_6262_7373_8484u64;
+        let prime =
+            "115792089237316195423570985008687907853269984665640564039457584007913129639747";
+        for _ in 0..80 {
+            let a = rand_decimal(&mut state);
+            let got = b(&a).mod_inverse(&b(prime)).map(|v| v.to_decimal());
+            let want = bi_mod_inverse_str(&a, prime);
+            assert_eq!(got, want, "rand modInverse({a}, prime)");
         }
     }
 

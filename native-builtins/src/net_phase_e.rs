@@ -308,9 +308,23 @@ pub(crate) fn sock_set_for_create(
     port: i32,
     stream_id: i32,
 ) {
+    sock_set_for_create_with_local_port(ctx, this, port, 0, stream_id);
+}
+
+/// Same as [`sock_set_for_create`] but also records the real local (client)
+/// port, for callers that already resolved it from the live `TcpStream`
+/// (e.g. `phases_early.rs`'s `phase52_socket_connect`) instead of always
+/// defaulting to 0.
+pub(crate) fn sock_set_for_create_with_local_port(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    port: i32,
+    local_port: i32,
+    stream_id: i32,
+) {
     sock_set(ctx, this, |s| {
         s.port = port;
-        s.local_port = 0;
+        s.local_port = local_port;
         s.closed = 0;
         s.stream_id = stream_id;
     });
@@ -4259,14 +4273,10 @@ fn http_build_request(
         let _ = write!(&mut out, "Host: {host}:{port}\r\n");
     }
     let mut has_content_length = false;
-    let mut has_connection = false;
     let mut has_user_agent = false;
     for (k, v) in headers {
         if k.eq_ignore_ascii_case("content-length") {
             has_content_length = true;
-        }
-        if k.eq_ignore_ascii_case("connection") {
-            has_connection = true;
         }
         if k.eq_ignore_ascii_case("user-agent") {
             has_user_agent = true;
@@ -4275,9 +4285,6 @@ fn http_build_request(
     }
     if !has_user_agent {
         out.extend_from_slice(b"User-Agent: cratonvm-phaseE/1.0\r\n");
-    }
-    if !has_connection {
-        out.extend_from_slice(b"Connection: close\r\n");
     }
     if !has_content_length && (!body.is_empty() || matches!(method, "POST" | "PUT" | "PATCH")) {
         let _ = write!(&mut out, "Content-Length: {}\r\n", body.len());
