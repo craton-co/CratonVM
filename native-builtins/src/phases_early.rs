@@ -3391,12 +3391,41 @@ const TL_FIELD_VALUE: usize = 0;
 
 std::thread_local! {
     /// Per-OS-thread map: TL identity hash → value held by this thread.
-    static TL_MAP: std::cell::RefCell<rustc_hash::FxHashMap<i32, Value>> =
+    static TL_MAP: std::cell::RefCell<rustc_hash::FxHashMap<i32, ThreadLocalValue>> =
         std::cell::RefCell::new(rustc_hash::FxHashMap::default());
     /// One-shot flag: has this OS thread drained any inherited ITL entries
     /// queued for the Java Thread it is running? Reset path: not needed
     /// because OS threads are 1:1 with Java threads in CratonVM.
     static TL_INHERITED_DRAINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[derive(Clone, Copy)]
+enum ThreadLocalValue {
+    Root(usize),
+    Plain(Value),
+}
+
+fn thread_local_value_from_java(ctx: &mut dyn NativeContext, value: Value) -> ThreadLocalValue {
+    match value {
+        Value::Object(Some(obj)) => ThreadLocalValue::Root(ctx.add_global_root(obj)),
+        other => ThreadLocalValue::Plain(other),
+    }
+}
+
+fn thread_local_value_to_java(ctx: &mut dyn NativeContext, value: ThreadLocalValue) -> Value {
+    match value {
+        ThreadLocalValue::Root(handle) => ctx
+            .resolve_global_root(handle)
+            .map(|obj| Value::Object(Some(obj)))
+            .unwrap_or(Value::Object(None)),
+        ThreadLocalValue::Plain(value) => value,
+    }
+}
+
+fn drop_thread_local_value_root(ctx: &mut dyn NativeContext, value: ThreadLocalValue) {
+    if let ThreadLocalValue::Root(handle) = value {
+        let _ = ctx.remove_global_root(handle);
+    }
 }
 
 /// `withInitial` suppliers, keyed by the ThreadLocal's JLS identity hash.
@@ -3456,7 +3485,8 @@ fn drain_inherited_for_current_thread(ctx: &mut dyn NativeContext) {
         TL_MAP.with(|m| {
             let mut map = m.borrow_mut();
             for (k, v) in entries {
-                map.entry(k).or_insert(v);
+                map.entry(k)
+                    .or_insert_with(|| thread_local_value_from_java(ctx, v));
             }
         });
     }
@@ -3528,7 +3558,7 @@ fn native_tl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     drain_inherited_for_current_thread(ctx);
     let key = tl_key(ctx, this);
     if let Some(v) = TL_MAP.with(|m| m.borrow().get(&key).copied()) {
-        return Ok(Some(v));
+        return Ok(Some(thread_local_value_to_java(ctx, v)));
     }
     // Miss path: if a supplier was registered via `withInitial`, invoke it
     // on the current thread, cache the result, and return.
@@ -3544,10 +3574,12 @@ fn native_tl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         let initial = ctx
             .invoke_virtual(s, "get", "()Ljava/lang/Object;", &[])?
             .unwrap_or(Value::Object(None));
-        TL_MAP.with(|m| {
-            m.borrow_mut().insert(key, initial);
-        });
-        return Ok(Some(initial));
+        let stored = thread_local_value_from_java(ctx, initial);
+        let old = TL_MAP.with(|m| m.borrow_mut().insert(key, stored));
+        if let Some(old) = old {
+            drop_thread_local_value_root(ctx, old);
+        }
+        return Ok(Some(thread_local_value_to_java(ctx, stored)));
     }
     // JDK ThreadLocal.get() calls initialValue() on first access and caches
     // even a null result. Mockito's ThreadSafeMockingProgress uses an
@@ -3556,10 +3588,12 @@ fn native_tl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let initial = ctx
         .invoke_virtual(this, "initialValue", "()Ljava/lang/Object;", &[])?
         .unwrap_or(Value::Object(None));
-    TL_MAP.with(|m| {
-        m.borrow_mut().insert(key, initial);
-    });
-    Ok(Some(initial))
+    let stored = thread_local_value_from_java(ctx, initial);
+    let old = TL_MAP.with(|m| m.borrow_mut().insert(key, stored));
+    if let Some(old) = old {
+        drop_thread_local_value_root(ctx, old);
+    }
+    Ok(Some(thread_local_value_to_java(ctx, stored)))
 }
 
 fn native_tl_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3567,9 +3601,11 @@ fn native_tl_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     drain_inherited_for_current_thread(ctx);
     let val = args.get(1).copied().unwrap_or(Value::Object(None));
     let key = tl_key(ctx, this);
-    TL_MAP.with(|m| {
-        m.borrow_mut().insert(key, val);
-    });
+    let stored = thread_local_value_from_java(ctx, val);
+    let old = TL_MAP.with(|m| m.borrow_mut().insert(key, stored));
+    if let Some(old) = old {
+        drop_thread_local_value_root(ctx, old);
+    }
     Ok(None)
 }
 
@@ -3577,9 +3613,10 @@ fn native_tl_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let this = obj_arg(args, 0)?;
     drain_inherited_for_current_thread(ctx);
     let key = tl_key(ctx, this);
-    TL_MAP.with(|m| {
-        m.borrow_mut().remove(&key);
-    });
+    let old = TL_MAP.with(|m| m.borrow_mut().remove(&key));
+    if let Some(old) = old {
+        drop_thread_local_value_root(ctx, old);
+    }
     Ok(None)
 }
 
@@ -3627,7 +3664,13 @@ pub(crate) fn snapshot_inheritable_tl_entries() -> Option<rustc_hash::FxHashMap<
         let map = m.borrow();
         map.iter()
             .filter(|(k, _)| inheritable.contains(k))
-            .map(|(k, v)| (*k, *v))
+            .map(|(k, v)| {
+                let value = match *v {
+                    ThreadLocalValue::Root(_) => Value::Object(None),
+                    ThreadLocalValue::Plain(value) => value,
+                };
+                (*k, value)
+            })
             .collect()
     });
     if snap.is_empty() {

@@ -1393,6 +1393,24 @@ fn process_references_after_gc(
 
     let result = ref_proc.process_references(&is_marked, 64, 0);
 
+    let is_reference_object = |obj: ObjectRef| -> bool {
+        if shared.heap.num_fields(obj) < 2 {
+            return false;
+        }
+        let mut current = Some(shared.heap.class_id_of(obj));
+        let cm = shared.class_manager.read();
+        while let Some(cid) = current {
+            let Some(cls) = cm.class_store.get(cid) else {
+                return false;
+            };
+            if cls.name.as_ref() == "java/lang/ref/Reference" {
+                return true;
+            }
+            current = cls.superclass;
+        }
+        false
+    };
+
     // bc math-ec 0x4 ROOT-CAUSE FIX (2026-06-09, hexdump-proven): the
     // cleared/enqueue lists hold PRE-GC addresses; `pointer_map.get(..)
     // .unwrap_or(addr)` keeps the STALE address for a Reference that was
@@ -1610,10 +1628,18 @@ fn process_references_after_gc(
             };
             // SAFETY: both addresses are live post-collection object headers.
             let ro = unsafe { ObjectRef::from_raw(ref_obj_new as *mut u8) };
+            if !is_reference_object(ro) {
+                if straystack_enabled() {
+                    eprintln!(
+                        "[refproc] SKIP stale RESTORE ref @0x{ref_obj_new:x} (not Reference)"
+                    );
+                }
+                continue;
+            }
             let rt = unsafe { ObjectRef::from_raw(referent_new as *mut u8) };
             // Slot 0 = REF_FIELD_REFERENT. `set_field` fires the write barrier,
             // so a young referent restored into a promoted (old-gen) Reference
-            // re-marks the old→young card.
+            // re-marks the old-to-young card.
             shared.heap.set_field(ro, 0, Value::Object(Some(rt)));
         }
         // Drop entries whose Reference object was collected this cycle so the
@@ -2021,6 +2047,26 @@ fn gc_alloc_array(
     element_type: ArrayElementType,
     length: usize,
 ) -> Result<ObjectRef, MethodCallFailed> {
+    if std::env::var_os("CRATONVM_DBG_LARGE_ARRAY_ALLOC").is_some() && length > 100_000_000 {
+        eprintln!(
+            "[DBG_LARGE_ARRAY_ALLOC] class_id={} element_type={:?} length={} (0x{:x}) frames={}",
+            class_id.as_u32(),
+            element_type,
+            length,
+            length,
+            thread.frames.len()
+        );
+        for (i, frame) in thread.frames.iter().rev().take(64).enumerate() {
+            eprintln!(
+                "[DBG_LARGE_ARRAY_ALLOC frame {}] {}.{}{} pc={}",
+                i,
+                frame.class_name(),
+                frame.method_name(),
+                frame.method_descriptor(),
+                frame.pc
+            );
+        }
+    }
     if let Some(arr) = shared.heap.try_alloc_array(class_id, element_type, length) {
         return Ok(arr);
     }
@@ -12474,6 +12520,29 @@ fn execute_instruction(
             } else {
                 shared.heap.get_field(obj_ref, field.field_index)
             };
+            if std::env::var_os("CRATONVM_DBG_PEEKMAP").is_some() {
+                let field_name = resolve_field_name(shared, current_class_id, *index);
+                if matches!(field_name.as_deref(), Some("map")) {
+                    let cm = shared.class_manager.read();
+                    let recv_cid = shared.heap.class_id_of(obj_ref);
+                    let recv_name = cm
+                        .get_class(recv_cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    if recv_name.contains("PeekableTouchable") {
+                        eprintln!(
+                            "[peekmap] GET recv={} obj=0x{:x} slot={} value={:?} in {}.{} pc={}",
+                            recv_name,
+                            obj_ref.as_ptr() as usize,
+                            field.field_index,
+                            value,
+                            thread.frames[frame_idx].class_name(),
+                            thread.frames[frame_idx].method_name(),
+                            thread.frames[frame_idx].pc
+                        );
+                    }
+                }
+            }
             // K2 (T10.9.E) — J/D direct-CompactValue fast path.
             //
             // For long/double fields, build the CompactValue with the exact
@@ -12894,6 +12963,29 @@ fn execute_instruction(
             let old_value = shared.heap.get_field(obj_ref, field.field_index);
             if let Value::Object(Some(old_ref)) = old_value {
                 shared.heap.write_barrier_pre(std::ptr::null_mut(), old_ref);
+            }
+            if std::env::var_os("CRATONVM_DBG_PEEKMAP").is_some() {
+                let field_name = resolve_field_name(shared, current_class_id, *index);
+                if matches!(field_name.as_deref(), Some("map")) {
+                    let cm = shared.class_manager.read();
+                    let recv_cid = shared.heap.class_id_of(obj_ref);
+                    let recv_name = cm
+                        .get_class(recv_cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    if recv_name.contains("PeekableTouchable") {
+                        eprintln!(
+                            "[peekmap] PUT recv={} obj=0x{:x} slot={} value={:?} in {}.{} pc={}",
+                            recv_name,
+                            obj_ref.as_ptr() as usize,
+                            field.field_index,
+                            value,
+                            thread.frames[frame_idx].class_name(),
+                            thread.frames[frame_idx].method_name(),
+                            thread.frames[frame_idx].pc
+                        );
+                    }
+                }
             }
             if field.is_volatile {
                 shared
@@ -16662,6 +16754,7 @@ fn execute_invoke_kind(
             )? {
                 if let Some(value) = result {
                     let ret = crate::jit::return_type(&method_descriptor);
+                    let value = crate::vm::remap_pending_native_return(thread, value);
                     let value = coerce_value_for_return(value, ret);
                     // T18.K4 — tag-exact push for J/D lambda return values.
                     push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
@@ -17698,6 +17791,7 @@ fn execute_invoke_kind(
     if let Some(value) = result {
         let ret = crate::jit::return_type(&method_descriptor);
         if ret != b'V' {
+            let value = crate::vm::remap_pending_native_return(thread, value);
             let value = coerce_value_for_return(value, ret);
             // T18.K4 — tag-exact push for J/D fallback invoke return values.
             push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
@@ -19289,6 +19383,7 @@ fn invoke_cached_native_callback(
         // its `max_stack` — kafka-clients `Crc32CTest.testUpdate` panicked at
         // `value_stack.rs` "len 24 index 24". Only push for non-void returns.
         if ret != b'V' {
+            let value = crate::vm::remap_pending_native_return(thread, value);
             let value = coerce_value_for_return(value, ret);
             push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
             crate::vm::native_return_pushed_to_stack(shared, thread);
@@ -20386,6 +20481,231 @@ pub(crate) fn is_count_down_latch_native_override(
         )
 }
 
+pub(crate) fn is_enum_set_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    (class_name == "java/util/EnumSet"
+        && matches!(
+            (method_name, descriptor),
+            ("allOf", "(Ljava/lang/Class;)Ljava/util/EnumSet;")
+                | ("size", "()I")
+                | ("iterator", "()Ljava/util/Iterator;")
+        ))
+        || (matches!(
+            class_name,
+            "java/util/RegularEnumSet" | "java/util/JumboEnumSet"
+        ) && matches!(
+            (method_name, descriptor),
+            ("addAll", "()V") | ("size", "()I") | ("iterator", "()Ljava/util/Iterator;")
+        ))
+        || (class_name == "java/util/EnumSet$Itr"
+            && matches!(
+                (method_name, descriptor),
+                ("hasNext", "()Z") | ("next", "()Ljava/lang/Object;")
+            ))
+}
+
+pub(crate) fn is_unsafe_object_field_offset_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    matches!(class_name, "sun/misc/Unsafe" | "jdk/internal/misc/Unsafe")
+        && method_name == "objectFieldOffset"
+        && matches!(
+            descriptor,
+            "(Ljava/lang/Class;Ljava/lang/String;)J" | "(Ljava/lang/reflect/Field;)J"
+        )
+}
+
+pub(crate) fn is_sun_unsafe_ordered_write_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "sun/misc/Unsafe"
+        && matches!(
+            (method_name, descriptor),
+            ("putOrderedInt", "(Ljava/lang/Object;JI)V")
+                | ("putOrderedLong", "(Ljava/lang/Object;JJ)V")
+                | (
+                    "putOrderedObject",
+                    "(Ljava/lang/Object;JLjava/lang/Object;)V"
+                )
+        )
+}
+
+pub(crate) fn is_java_util_hash_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    matches!(
+        (class_name, method_name, descriptor),
+        ("java/util/Arrays", "hashCode", "([Ljava/lang/Object;)I")
+            | ("java/util/Objects", "hash", "([Ljava/lang/Object;)I")
+            | (
+                "org/infinispan/configuration/parsing/ParserRegistry$QName",
+                "hashCode",
+                "()I",
+            )
+    )
+}
+
+pub(crate) fn is_collectors_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/util/stream/Collectors"
+        && method_name == "joining"
+        && matches!(
+            descriptor,
+            "()Ljava/util/stream/Collector;"
+                | "(Ljava/lang/CharSequence;)Ljava/util/stream/Collector;"
+                | "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/util/stream/Collector;"
+        )
+}
+
+pub(crate) fn is_smallrye_process_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "io/smallrye/common/os/Process"
+        && matches!(
+            (method_name, descriptor),
+            ("<clinit>", "()V")
+                | ("getProcessName", "()Ljava/lang/String;")
+                | ("getProcessId", "()J")
+                | ("getCurrentProcess", "()Lio/smallrye/common/os/ProcessInfo;")
+        )
+}
+
+pub(crate) fn is_regex_matcher_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/util/regex/Matcher"
+        && matches!(
+            (method_name, descriptor),
+            ("find", "()Z")
+                | ("find", "(I)Z")
+                | ("matches", "()Z")
+                | ("lookingAt", "()Z")
+                | ("group", "()Ljava/lang/String;")
+                | ("group", "(I)Ljava/lang/String;")
+                | ("start", "()I")
+                | ("start", "(I)I")
+                | ("end", "()I")
+                | ("end", "(I)I")
+                | ("groupCount", "()I")
+                | ("replaceAll", "(Ljava/lang/String;)Ljava/lang/String;")
+                | ("replaceFirst", "(Ljava/lang/String;)Ljava/lang/String;")
+                | (
+                    "appendReplacement",
+                    "(Ljava/lang/StringBuffer;Ljava/lang/String;)Ljava/util/regex/Matcher;",
+                )
+                | (
+                    "appendReplacement",
+                    "(Ljava/lang/StringBuilder;Ljava/lang/String;)Ljava/util/regex/Matcher;",
+                )
+                | (
+                    "appendTail",
+                    "(Ljava/lang/StringBuffer;)Ljava/lang/StringBuffer;"
+                )
+                | (
+                    "appendTail",
+                    "(Ljava/lang/StringBuilder;)Ljava/lang/StringBuilder;"
+                )
+                | ("reset", "()Ljava/util/regex/Matcher;")
+                | (
+                    "reset",
+                    "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;"
+                )
+        )
+}
+
+pub(crate) fn is_liquibase_parser_factory_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "liquibase/parser/ChangeLogParserFactory"
+        && method_name == "getParser"
+        && descriptor
+            == "(Ljava/lang/String;Lliquibase/resource/ResourceAccessor;)Lliquibase/parser/ChangeLogParser;"
+}
+
+pub(crate) fn is_file_is_invalid_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/io/File" && method_name == "isInvalid" && descriptor == "()Z"
+}
+
+pub(crate) fn is_sax_parser_factory_set_validating_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    matches!(
+        class_name,
+        "javax/xml/parsers/SAXParserFactory"
+            | "com/sun/org/apache/xerces/internal/jaxp/SAXParserFactoryImpl"
+    ) && method_name == "setValidating"
+        && descriptor == "(Z)V"
+}
+
+pub(crate) fn is_liquibase_entity_resolver_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "liquibase/parser/core/xml/LiquibaseEntityResolver"
+        && method_name == "resolveEntity"
+        && matches!(
+            descriptor,
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Lorg/xml/sax/InputSource;"
+                | "(Ljava/lang/String;Ljava/lang/String;)Lorg/xml/sax/InputSource;"
+        )
+}
+
+pub(crate) fn is_liquibase_configuration_definition_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "liquibase/configuration/ConfigurationDefinition"
+        && method_name == "getCurrentValue"
+        && descriptor == "()Ljava/lang/Object;"
+}
+
+pub(crate) fn is_liquibase_expression_expander_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "liquibase/changelog/ExpressionExpander"
+        && method_name == "expandExpressions"
+        && descriptor
+            == "(Ljava/lang/String;Lliquibase/changelog/DatabaseChangeLog;)Ljava/lang/String;"
+}
+
+pub(crate) fn is_hibernate_query_engine_validate_named_queries_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "org/hibernate/query/internal/QueryEngineImpl"
+        && method_name == "validateNamedQueries"
+        && descriptor == "()V"
+}
+
 pub(crate) fn is_ffm_symbol_lookup_native_override(
     class_name: &str,
     method_name: &str,
@@ -20937,6 +21257,66 @@ fn force_native_over_real_jdk_bytecode(
                 | "implAddOpensToAllUnnamed"
         )
     {
+        return true;
+    }
+    // `EnumSet.allOf` is real bytecode in JDK 25 and constructs specialized
+    // Regular/JumboEnumSet instances through paths CratonVM does not fully
+    // materialize yet. Keycloak's X500SAMLProfileConstants static initializer
+    // iterates `EnumSet.allOf(...)`; force only that factory so size()/iterator()
+    // remain coherent with the real JDK EnumSet object returned by the native.
+    if is_enum_set_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_unsafe_object_field_offset_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_sun_unsafe_ordered_write_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_java_util_hash_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_collectors_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_smallrye_process_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_regex_matcher_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_liquibase_parser_factory_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_file_is_invalid_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_sax_parser_factory_set_validating_native_override(
+        class_name,
+        method_name,
+        method_descriptor,
+    ) {
+        return true;
+    }
+    if is_liquibase_entity_resolver_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_liquibase_configuration_definition_native_override(
+        class_name,
+        method_name,
+        method_descriptor,
+    ) {
+        return true;
+    }
+    if is_liquibase_expression_expander_native_override(class_name, method_name, method_descriptor)
+    {
+        return true;
+    }
+    if is_hibernate_query_engine_validate_named_queries_native_override(
+        class_name,
+        method_name,
+        method_descriptor,
+    ) {
         return true;
     }
     // `ServerSocket.getLocalSocketAddress()` is pure Java in the real JDK:
@@ -21603,6 +21983,16 @@ fn force_native_over_real_jdk_bytecode(
             // `MXBeanSupport.findMXBeanInterface` `it.remove()` reduction
             // loop to succeed.
             | ("java/util/Iterator", "remove", "()V")
+            // `Map.forEach(BiConsumer)` is also an interface default method.
+            // Force the registered bridge for the exact default-method surface
+            // so receiver-aware map natives win over bytecode that loops through
+            // partially modelled entrySet views. Keycloak RealmModelTest drives
+            // this through Hibernate/Infinispan map implementations.
+            | (
+                "java/util/Map",
+                "forEach",
+                "(Ljava/util/function/BiConsumer;)V",
+            )
             // `ConstantCallSite.getTarget`. On JDK 25 the body is no
             // longer a plain `getfield target` — it first reads
             // `private boolean isFrozen` and throws
@@ -21978,6 +22368,7 @@ fn intercept_force_registered_native(
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
         if let Some(value) = result.filter(|_| ret_type != b'V') {
+            let value = crate::vm::remap_pending_native_return(thread, value);
             push_invoke_return_value(
                 &mut thread.frames[frame_idx].stack,
                 coerce_value_for_return(value, ret_type),
@@ -22023,6 +22414,7 @@ fn intercept_jython_pyjavatype_findattr_ex(
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
         if let Some(value) = result.filter(|_| ret_type != b'V') {
+            let value = crate::vm::remap_pending_native_return(thread, value);
             push_invoke_return_value(
                 &mut thread.frames[frame_idx].stack,
                 coerce_value_for_return(value, ret_type),
@@ -22064,6 +22456,7 @@ fn intercept_jython_pymodule_findattr(
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
         if let Some(value) = result.filter(|_| ret_type != b'V') {
+            let value = crate::vm::remap_pending_native_return(thread, value);
             push_invoke_return_value(
                 &mut thread.frames[frame_idx].stack,
                 coerce_value_for_return(value, ret_type),
@@ -22139,6 +22532,7 @@ fn intercept_urlclassloader_subclass_find_class(
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
         if let Some(value) = result.filter(|_| ret_type != b'V') {
+            let value = crate::vm::remap_pending_native_return(thread, value);
             push_invoke_return_value(
                 &mut thread.frames[frame_idx].stack,
                 coerce_value_for_return(value, ret_type),
@@ -22289,6 +22683,7 @@ fn try_stackless_invoke(
         {
             let result = safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result.filter(|_| ret_type != b'V') {
+                let value = crate::vm::remap_pending_native_return(thread, value);
                 push_invoke_return_value(
                     &mut thread.frames[frame_idx].stack,
                     coerce_value_for_return(value, ret_type),
@@ -22312,6 +22707,7 @@ fn try_stackless_invoke(
         {
             let result = safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result.filter(|_| ret_type != b'V') {
+                let value = crate::vm::remap_pending_native_return(thread, value);
                 push_invoke_return_value(
                     &mut thread.frames[frame_idx].stack,
                     coerce_value_for_return(value, ret_type),
@@ -22446,6 +22842,7 @@ fn try_stackless_invoke(
                 );
             }
             if ret_type != b'V' {
+                let value = crate::vm::remap_pending_native_return(thread, value);
                 // T18.K4 — tag-exact push for J/D native-override return values.
                 // `coerce_value_for_return` may widen/narrow the type-erased
                 // native result; we then push via the category-2 aware path so
@@ -22528,6 +22925,7 @@ fn try_stackless_invoke(
         {
             let result = safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result.filter(|_| ret_type != b'V') {
+                let value = crate::vm::remap_pending_native_return(thread, value);
                 // T18.K4 — tag-exact push for J/D native-bytecode method return values.
                 push_invoke_return_value(
                     &mut thread.frames[frame_idx].stack,
@@ -22596,6 +22994,7 @@ fn try_stackless_invoke(
         {
             let result = safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result.filter(|_| ret_type != b'V') {
+                let value = crate::vm::remap_pending_native_return(thread, value);
                 // T18.K4 — tag-exact push for J/D native-override (on bytecode method) return values.
                 push_invoke_return_value(
                     &mut thread.frames[frame_idx].stack,
@@ -23089,6 +23488,7 @@ fn execute_invokestatic(
     if let Some(value) = result {
         let ret = crate::jit::return_type(&method_descriptor);
         if ret != b'V' {
+            let value = crate::vm::remap_pending_native_return(thread, value);
             let value = coerce_value_for_return(value, ret);
             // T18.K4 — tag-exact push for J/D fallback invokestatic return values.
             push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
@@ -23150,6 +23550,7 @@ fn invoke_cached_intrinsic(
     INTRINSIC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
     if let Some(value) = result.filter(|_| return_type != b'V') {
+        let value = crate::vm::remap_pending_native_return(thread, value);
         let value = coerce_value_for_return(value, return_type);
         push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
         crate::vm::native_return_pushed_to_stack(shared, thread);
@@ -31568,6 +31969,49 @@ mod tests {
             "java/util/concurrent/Semaphore",
             "await",
             "()V"
+        ));
+    }
+
+    #[test]
+    fn enum_set_force_native_covers_keycloak_allof_iteration_surface() {
+        for (class_name, name, descriptor) in [
+            (
+                "java/util/EnumSet",
+                "allOf",
+                "(Ljava/lang/Class;)Ljava/util/EnumSet;",
+            ),
+            ("java/util/EnumSet", "size", "()I"),
+            ("java/util/EnumSet", "iterator", "()Ljava/util/Iterator;"),
+            ("java/util/JumboEnumSet", "addAll", "()V"),
+            ("java/util/JumboEnumSet", "size", "()I"),
+            (
+                "java/util/JumboEnumSet",
+                "iterator",
+                "()Ljava/util/Iterator;",
+            ),
+            ("java/util/RegularEnumSet", "addAll", "()V"),
+            ("java/util/RegularEnumSet", "size", "()I"),
+            (
+                "java/util/RegularEnumSet",
+                "iterator",
+                "()Ljava/util/Iterator;",
+            ),
+            ("java/util/EnumSet$Itr", "hasNext", "()Z"),
+            ("java/util/EnumSet$Itr", "next", "()Ljava/lang/Object;"),
+        ] {
+            assert!(
+                is_enum_set_native_override(class_name, name, descriptor),
+                "{class_name}.{name}{descriptor} must route to the registered native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(class_name, name, descriptor),
+                "real-JDK bytecode dispatch must force {class_name}.{name}{descriptor}"
+            );
+        }
+        assert!(!is_enum_set_native_override(
+            "java/util/EnumSet",
+            "copyOf",
+            "(Ljava/util/Collection;)Ljava/util/EnumSet;"
         ));
     }
 

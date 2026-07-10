@@ -13,6 +13,18 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, Vm
 use cratonvm_types::ClassId;
 use cratonvm_types::{ObjectRef, Value};
 
+#[inline]
+pub(crate) fn unsafe_offset_is_heap_slot(
+    ctx: &dyn NativeContext,
+    obj: ObjectRef,
+    offset: usize,
+) -> bool {
+    // Craton heap field offsets are slot indexes. HotSpot/JCTools byte offsets
+    // may be numerically below padded mirror field counts, so cap heap-slot
+    // treatment to the small real-slot range.
+    offset < ctx.object_num_fields(obj) && offset < 64
+}
+
 /// Normalise property keys after `read_string` (trim stray control/NUL).
 #[inline]
 fn normalize_java_property_key(key: &str) -> String {

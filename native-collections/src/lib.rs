@@ -389,6 +389,7 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_arraylist_natives(registry);
     register_hashmap_natives(registry);
     register_hashset_natives(registry);
+    register_hibernate_persistent_map_natives(registry);
     // Guard against an invokeinterface/assignability edge where AssertJ's
     // SortedSet fast path can incorrectly dispatch `SortedSet.comparator()`
     // against a plain HashSet/LinkedHashSet receiver in real-JDK mode.
@@ -1354,23 +1355,53 @@ fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
 /// The 64M cap is a runaway guard; a well-behaved iterator terminates long
 /// before it.
 fn collection_elements_generic(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Value> {
-    let mut out = Vec::new();
-    let iter = match ctx.invoke_virtual(this, "iterator", "()Ljava/util/Iterator;", &[]) {
+    let pin_base = ctx.pin_native_root(this);
+    let this_cur = ctx.read_native_pin(pin_base, this);
+    let iter = match ctx.invoke_virtual(this_cur, "iterator", "()Ljava/util/Iterator;", &[]) {
         Ok(Some(Value::Object(Some(it)))) => it,
-        _ => return out,
+        _ => {
+            ctx.unpin_native_roots(pin_base);
+            return Vec::new();
+        }
     };
+    let iter_pin = ctx.pin_native_root(iter);
+    let mut out: Vec<(Value, Option<(usize, ObjectRef)>)> = Vec::new();
     const MAX_ELEMENTS: usize = 64 * 1024 * 1024;
     while out.len() < MAX_ELEMENTS {
-        match ctx.invoke_virtual(iter, "hasNext", "()Z", &[]) {
+        let iter_cur = ctx.read_native_pin(iter_pin, iter);
+        match ctx.invoke_virtual(iter_cur, "hasNext", "()Z", &[]) {
             Ok(Some(Value::Int(n))) if n != 0 => {}
             _ => break,
         }
-        match ctx.invoke_virtual(iter, "next", "()Ljava/lang/Object;", &[]) {
-            Ok(Some(v)) => out.push(v),
+        let iter_cur = ctx.read_native_pin(iter_pin, iter);
+        match ctx.invoke_virtual(iter_cur, "next", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(v)) => {
+                let pin = match v {
+                    Value::Object(Some(r)) => Some((ctx.pin_native_root(r), r)),
+                    _ => None,
+                };
+                out.push((v, pin));
+            }
             _ => break,
         }
     }
-    out
+    let refreshed = out
+        .iter()
+        .map(|(value, pin)| match pin {
+            Some((handle, fallback)) => {
+                Value::Object(Some(ctx.read_native_pin(*handle, *fallback)))
+            }
+            None => *value,
+        })
+        .collect();
+    for (_, pin) in &out {
+        if let Some((handle, _)) = pin {
+            ctx.unpin_native_roots(*handle);
+        }
+    }
+    ctx.unpin_native_roots(iter_pin);
+    ctx.unpin_native_roots(pin_base);
+    refreshed
 }
 
 #[inline]
@@ -4184,6 +4215,15 @@ fn map_collect_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, 
         }
     }
     entries
+}
+
+fn register_hibernate_persistent_map_natives(r: &mut NativeMethodRegistry) {
+    r.register(
+        "org/hibernate/collection/spi/PersistentMap",
+        "forEach",
+        "(Ljava/util/function/BiConsumer;)V",
+        native_hibernate_persistent_map_for_each,
+    );
 }
 
 fn register_hashmap_natives(r: &mut NativeMethodRegistry) {
@@ -9125,6 +9165,61 @@ fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     result
 }
 
+fn native_hibernate_persistent_map_for_each(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let action = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+
+    let this_pin = ctx.pin_native_root(this);
+    let action_pin = ctx.pin_native_root(action);
+    if !matches!(ctx.get_field_by_name(this, "map"), Value::Object(Some(_))) {
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let _ = ctx.invoke_virtual(this_cur, "size", "()I", &[]);
+    }
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let backing = match ctx.get_field_by_name(this_cur, "map") {
+        Value::Object(Some(m)) => m,
+        _ => {
+            ctx.unpin_native_roots(action_pin);
+            ctx.unpin_native_roots(this_pin);
+            return Ok(None);
+        }
+    };
+    let entries = collect_entries_any(ctx, backing);
+    let keys: Vec<Value> = entries.iter().map(|(k, _)| *k).collect();
+    let vals: Vec<Value> = entries.iter().map(|(_, v)| *v).collect();
+    let (key_pin_base, key_pins) = pin_value_slice(ctx, &keys);
+    let (val_pin_base, val_pins) = pin_value_slice(ctx, &vals);
+    let mut result = Ok(None);
+    for i in 0..entries.len() {
+        let action_cur = ctx.read_native_pin(action_pin, action);
+        let key = read_pinned_elem(ctx, key_pins[i], keys[i]);
+        let val = read_pinned_elem(ctx, val_pins[i], vals[i]);
+        if let Err(e) = ctx.invoke_virtual(
+            action_cur,
+            "accept",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+            &[key, val],
+        ) {
+            result = Err(e);
+            break;
+        }
+    }
+    ctx.unpin_native_roots(val_pin_base);
+    ctx.unpin_native_roots(key_pin_base);
+    ctx.unpin_native_roots(action_pin);
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
 fn native_map_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
@@ -13581,7 +13676,8 @@ const COLLECTOR_FIELD_TAG: usize = 0;
 const COLLECTOR_FIELD_ARG1: usize = 1;
 const COLLECTOR_FIELD_ARG2: usize = 2;
 const COLLECTOR_FIELD_ARG3: usize = 3;
-const COLLECTOR_NUM_FIELDS: usize = 4;
+const COLLECTOR_FIELD_ARG4: usize = 4;
+const COLLECTOR_NUM_FIELDS: usize = 5;
 
 const COLLECTOR_TAG_TO_LIST: i32 = 1;
 const COLLECTOR_TAG_TO_SET: i32 = 2;
@@ -13623,6 +13719,9 @@ const COLLECTOR_TAG_TO_COLLECTION: i32 = 14;
 /// `mapping` synthetic lets it compose with our tagged downstream collectors via
 /// the same recursive sub-stream protocol used by groupingBy(downstream).
 const COLLECTOR_TAG_MAPPING: i32 = 15;
+/// `Collectors.toMap(keyFn, valFn, mergeFn, supplier)`.
+/// ARG1=keyFn, ARG2=valFn, ARG3=mergeFn, ARG4=supplier.
+const COLLECTOR_TAG_TO_MAP_SUPPLIER: i32 = 16;
 
 fn register_collectors_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -13664,6 +13763,12 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
         "toMap",
         "(Ljava/util/function/Function;Ljava/util/function/Function;Ljava/util/function/BinaryOperator;)Ljava/util/stream/Collector;",
         native_collectors_to_map_merge,
+    );
+    r.register(
+        c,
+        "toMap",
+        "(Ljava/util/function/Function;Ljava/util/function/Function;Ljava/util/function/BinaryOperator;Ljava/util/function/Supplier;)Ljava/util/stream/Collector;",
+        native_collectors_to_map_supplier,
     );
     r.register(
         c,
@@ -13879,6 +13984,7 @@ fn is_known_collector_tag(tag: i32) -> bool {
             | COLLECTOR_TAG_COLLECTING_AND_THEN
             | COLLECTOR_TAG_TO_COLLECTION
             | COLLECTOR_TAG_MAPPING
+            | COLLECTOR_TAG_TO_MAP_SUPPLIER
     )
 }
 
@@ -13923,7 +14029,7 @@ fn native_collector_combiner(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     make_collector_fn(ctx, args, "java/util/function/BinaryOperator")
 }
 
-/// `supplier.get()` — fresh accumulation container for the source collector.
+/// `supplier.get()` - fresh accumulation container for the source collector.
 fn native_collfn_supplier_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -13932,8 +14038,20 @@ fn native_collfn_supplier_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let coll = ctx.get_field(this, 0);
     match collector_tag_of(ctx, coll) {
         Some(COLLECTOR_TAG_TO_SET) => make_set_of(ctx, &[]),
+        Some(COLLECTOR_TAG_TO_MAP) | Some(COLLECTOR_TAG_TO_MAP_MERGE) => make_map_of(ctx, &[]),
+        Some(COLLECTOR_TAG_TO_MAP_SUPPLIER) => {
+            if let Value::Object(Some(c)) = coll {
+                if let Value::Object(Some(user)) = ctx.get_field(c, COLLECTOR_FIELD_ARG4) {
+                    if let Ok(Some(Value::Object(Some(map)))) =
+                        ctx.invoke_virtual(user, "get", "()Ljava/lang/Object;", &[])
+                    {
+                        return Ok(Some(Value::Object(Some(map))));
+                    }
+                }
+            }
+            make_map_of(ctx, &[])
+        }
         Some(COLLECTOR_TAG_TO_COLLECTION) => {
-            // toCollection(supplier): invoke the user-provided supplier (ARG1).
             if let Value::Object(Some(c)) = coll {
                 if let Value::Object(Some(user)) = ctx.get_field(c, COLLECTOR_FIELD_ARG1) {
                     if let Ok(r @ Some(_)) =
@@ -13949,15 +14067,83 @@ fn native_collfn_supplier_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     }
 }
 
-/// `accumulator.accept(container, element)` — container.add(element).
+/// `accumulator.accept(container, element)` - append to collection or map collector.
 fn native_collfn_accumulator_accept(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
     let container = args.get(1).copied().unwrap_or(Value::Object(None));
     let item = args.get(2).copied().unwrap_or(Value::Object(None));
-    if let Value::Object(Some(c)) = container {
-        ctx.invoke_virtual(c, "add", "(Ljava/lang/Object;)Z", &[item])?;
+    let coll = ctx.get_field(this, 0);
+    match collector_tag_of(ctx, coll) {
+        Some(COLLECTOR_TAG_TO_MAP)
+        | Some(COLLECTOR_TAG_TO_MAP_MERGE)
+        | Some(COLLECTOR_TAG_TO_MAP_SUPPLIER) => {
+            let map = match container {
+                Value::Object(Some(m)) => m,
+                _ => return Ok(None),
+            };
+            let c = match coll {
+                Value::Object(Some(c)) => c,
+                _ => return Ok(None),
+            };
+            let key_fn = match ctx.get_field(c, COLLECTOR_FIELD_ARG1) {
+                Value::Object(Some(f)) => f,
+                _ => return Ok(None),
+            };
+            let val_fn = match ctx.get_field(c, COLLECTOR_FIELD_ARG2) {
+                Value::Object(Some(f)) => f,
+                _ => return Ok(None),
+            };
+            let key = ctx
+                .invoke_virtual(
+                    key_fn,
+                    "apply",
+                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[item],
+                )?
+                .unwrap_or(Value::Object(None));
+            let mut value = ctx
+                .invoke_virtual(
+                    val_fn,
+                    "apply",
+                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[item],
+                )?
+                .unwrap_or(Value::Object(None));
+            if !matches!(collector_tag_of(ctx, coll), Some(COLLECTOR_TAG_TO_MAP)) {
+                let old = ctx
+                    .invoke_virtual(map, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[key])?
+                    .unwrap_or(Value::Object(None));
+                if !matches!(old, Value::Object(None)) {
+                    if let Value::Object(Some(mf)) = ctx.get_field(c, COLLECTOR_FIELD_ARG3) {
+                        value = ctx
+                            .invoke_virtual(
+                                mf,
+                                "apply",
+                                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                                &[old, value],
+                            )?
+                            .unwrap_or(Value::Object(None));
+                    }
+                }
+            }
+            ctx.invoke_virtual(
+                map,
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[key, value],
+            )?;
+        }
+        _ => {
+            if let Value::Object(Some(c)) = container {
+                ctx.invoke_virtual(c, "add", "(Ljava/lang/Object;)Z", &[item])?;
+            }
+        }
     }
     Ok(None)
 }
@@ -14035,6 +14221,22 @@ fn native_collectors_to_map_merge(ctx: &mut dyn NativeContext, args: &[Value]) -
     ctx.set_field(c, COLLECTOR_FIELD_ARG1, key_fn);
     ctx.set_field(c, COLLECTOR_FIELD_ARG2, val_fn);
     ctx.set_field(c, COLLECTOR_FIELD_ARG3, merge_fn);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_to_map_supplier(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_TO_MAP_SUPPLIER);
+    let key_fn = args.first().copied().unwrap_or(Value::Object(None));
+    let val_fn = args.get(1).copied().unwrap_or(Value::Object(None));
+    let merge_fn = args.get(2).copied().unwrap_or(Value::Object(None));
+    let supplier = args.get(3).copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, key_fn);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, val_fn);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG3, merge_fn);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG4, supplier);
     Ok(Some(Value::Object(Some(c))))
 }
 
@@ -14190,6 +14392,7 @@ fn collect_via_collector_protocol(
         .class_name_of_id(ctx.class_id_of_object(collector))
         .as_deref()
         == Some("java/lang/Object")
+        && collector_tag_of(ctx, Value::Object(Some(collector))).is_none()
     {
         return make_list_of(ctx, elements);
     }
@@ -14485,6 +14688,87 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 }
             }
             make_map_of(ctx, &pairs)
+        }
+        COLLECTOR_TAG_TO_MAP_SUPPLIER => {
+            let key_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let val_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG2) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let merge_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG3) {
+                Value::Object(Some(r)) => Some(r),
+                _ => None,
+            };
+            let supplier = match ctx.get_field(collector, COLLECTOR_FIELD_ARG4) {
+                Value::Object(Some(r)) => Some(r),
+                _ => None,
+            };
+            let map_obj = match supplier {
+                Some(s) => match ctx.invoke_virtual(s, "get", "()Ljava/lang/Object;", &[])? {
+                    Some(Value::Object(Some(m))) => Some(m),
+                    _ => None,
+                },
+                None => None,
+            };
+            let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(elements.len());
+            for elem in &elements {
+                let k = ctx
+                    .invoke_virtual(
+                        key_fn,
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[*elem],
+                    )?
+                    .unwrap_or(Value::Object(None));
+                let v = ctx
+                    .invoke_virtual(
+                        val_fn,
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[*elem],
+                    )?
+                    .unwrap_or(Value::Object(None));
+                let mut idx = None;
+                for (i, (ek, _)) in pairs.iter().enumerate() {
+                    if values_equal(ctx, ek, &k) {
+                        idx = Some(i);
+                        break;
+                    }
+                }
+                if let Some(i) = idx {
+                    let existing = pairs[i].1;
+                    let merged = if let Some(mf) = merge_fn {
+                        ctx.invoke_virtual(
+                            mf,
+                            "apply",
+                            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                            &[existing, v],
+                        )?
+                        .unwrap_or(Value::Object(None))
+                    } else {
+                        v
+                    };
+                    pairs[i].1 = merged;
+                } else {
+                    pairs.push((k, v));
+                }
+            }
+            if let Some(m) = map_obj {
+                for (k, v) in &pairs {
+                    ctx.invoke_virtual(
+                        m,
+                        "put",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[*k, *v],
+                    )?;
+                }
+                Ok(Some(Value::Object(Some(m))))
+            } else {
+                make_map_of(ctx, &pairs)
+            }
         }
         COLLECTOR_TAG_COLLECTING_AND_THEN => {
             let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);

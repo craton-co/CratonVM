@@ -3106,6 +3106,16 @@ s22_test!(
 );
 s22_test!(test_s22_get_env, "testGetEnv", 1);
 s22_test!(test_s22_get_env_missing, "testGetEnvMissing", 1);
+s22_test!(
+    test_s22_plain_properties_get_ignores_system_properties,
+    "testPlainPropertiesGetIgnoresSystemProperties",
+    1
+);
+s22_test!(
+    test_s22_string_split_whitespace_comma_regex,
+    "testStringSplitWhitespaceCommaRegex",
+    1
+);
 
 // ===========================================================================
 // Session 23: Java Memory Model Compliance
@@ -4480,6 +4490,10 @@ s47_test!(test_s47_arraylist_basic, "testArrayListBasic");
 s47_test!(test_s47_arraylist_mutations, "testArrayListMutations");
 s47_test!(test_s47_arraylist_grow, "testArrayListGrow");
 s47_test!(test_s47_arraylist_iterator, "testArrayListIterator");
+s47_test!(
+    test_s47_arraylist_list_iterator_previous,
+    "testArrayListListIteratorPrevious"
+);
 s47_test!(test_s47_arraylist_insert, "testArrayListInsert");
 s47_test!(test_s47_arraylist_last_index_of, "testArrayListLastIndexOf");
 s47_test!(test_s47_arraylist_capacity, "testArrayListCapacity");
@@ -4511,6 +4525,15 @@ s47_test!(
     "testCollectionsSingletonList"
 );
 s47_test!(test_s47_collections_reverse, "testCollectionsReverse");
+s47_test!(test_s47_enumset_all_of_iterator, "testEnumSetAllOfIterator");
+s47_test!(
+    test_s47_large_enumset_all_of_iterator,
+    "testLargeEnumSetAllOfIterator"
+);
+s47_test!(
+    test_s47_collections_synchronized_collection_for_each,
+    "testCollectionsSynchronizedCollectionForEach"
+);
 
 // Optional
 s47_test!(test_s47_optional_basic, "testOptionalBasic");
@@ -4896,6 +4919,10 @@ s48_test!(test_s48_baos_toString, "baos_toString");
 // StringReader / StringWriter
 s48_test!(test_s48_sw_basic, "sw_basic");
 s48_test!(test_s48_sr_readChar, "sr_readChar");
+s48_test!(
+    test_s48_sr_readCharArrayMultiline,
+    "sr_readCharArrayMultiline"
+);
 
 // ByteBuffer
 s48_test!(test_s48_bb_allocateCapacity, "bb_allocateCapacity");
