@@ -76505,8 +76505,62 @@ fn native_asr_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 }
 
 // ===========================================================================
-// AtomicMarkableReference — 2-field (ref=0, mark=1 Int)
+// AtomicMarkableReference — JDK-faithful single `pair` field (slot 0) that
+// holds an `AtomicMarkableReference$Pair { reference@0, mark@1 }`.
+//
+// Same bug class as AtomicStampedReference above (see its comment): the real
+// class declares exactly ONE instance field (`private volatile Pair<V>
+// pair`) plus a static `PAIR` VarHandle, so the allocated object has
+// num_slots==1. The old intrinsic stored `mark` directly at slot 1, which is
+// out-of-bounds on a 1-slot object -> the GC guard silently dropped the
+// write and every subsequent `isMarked`/`compareAndSet`/`attemptMark` read a
+// stale mark forever. A caller spinning on `compareAndSet(ref, ref, false,
+// true)` waiting for the mark to flip to `true` never observes it and
+// busy-loops/never completes — this was the root cause of ES
+// `RestClientSingleHostIntegTests` (`testManyAsyncRequests`) timing out:
+// Apache httpasyncclient's reactor session-request tracking uses
+// `AtomicMarkableReference`. Also: `get(boolean[])` was never registered as
+// a native at all, so real bytecode ran unintercepted against slot 0
+// expecting a `Pair` — finding the bare corrupted reference stored there by
+// `native_amr_set`/`native_amr_init` instead and throwing
+// `ClassCastException`. Modelling the real Pair object (as
+// AtomicStampedReference already does) keeps the intrinsic and any real
+// bytecode perfectly consistent.
 // ===========================================================================
+
+const AMR_PAIR_CLASS: &str = "java/util/concurrent/atomic/AtomicMarkableReference$Pair";
+
+/// Allocate a real-layout `AtomicMarkableReference$Pair` holding
+/// `(reference, mark)`. Slot 0 = reference (Object), slot 1 = mark (boolean,
+/// stored as Int 0/1), matching the JDK field order so real AMR bytecode
+/// reading `pair.reference` / `pair.mark` stays consistent with the
+/// intrinsic.
+fn amr_alloc_pair(ctx: &mut dyn NativeContext, reference: Value, mark: bool) -> ObjectRef {
+    // `alloc_concurrent_synthetic` resolves the real Pair class (2 fields) when
+    // loadable and falls back to a 2-field synthetic class otherwise, so the
+    // header's declared field count always matches the 2 slots we write.
+    let pair = alloc_concurrent_synthetic(ctx, AMR_PAIR_CLASS, 2);
+    ctx.set_field(pair, 0, reference);
+    ctx.set_field(pair, 1, Value::Int(if mark { 1 } else { 0 }));
+    pair
+}
+
+/// Read `(reference, mark)` out of the `pair` stored in `this.field(0)`.
+/// Returns `(Value::Object(None), false)` if the pair slot is null or somehow
+/// not a 2-field object (defensive — should not happen after construction).
+fn amr_read_pair(ctx: &mut dyn NativeContext, this: ObjectRef) -> (Value, bool) {
+    match ctx.get_field(this, 0) {
+        Value::Object(Some(pair)) => {
+            let reference = ctx.get_field(pair, 0);
+            let mark = match ctx.get_field(pair, 1) {
+                Value::Int(v) => v != 0,
+                _ => false,
+            };
+            (reference, mark)
+        }
+        _ => (Value::Object(None), false),
+    }
+}
 
 fn register_atomic_markable_ref_natives(r: &mut NativeMethodRegistry) {
     // census-tag: AtomicMarkableReference atomic primitive → Bridge.
@@ -76521,6 +76575,15 @@ fn register_atomic_markable_ref_natives(r: &mut NativeMethodRegistry) {
         native_amr_get_ref,
     );
     r.register(c, "isMarked", "()Z", native_amr_is_marked);
+    // get(boolean[]) — reads mark into markHolder[0] and returns the
+    // reference. Must be registered explicitly (see comment above): without
+    // it, real bytecode ran unintercepted against a corrupted slot 0.
+    r.register(
+        c,
+        "get",
+        "([Z)Ljava/lang/Object;",
+        native_amr_get_with_holder,
+    );
     r.register(c, "set", "(Ljava/lang/Object;Z)V", native_amr_set);
     r.register(
         c,
@@ -76549,18 +76612,9 @@ fn native_amr_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => return Ok(None),
     };
     let r = args.get(1).copied().unwrap_or(Value::Object(None));
-    let mark = match args.get(2) {
-        Some(Value::Int(v)) => {
-            if *v != 0 {
-                1
-            } else {
-                0
-            }
-        }
-        _ => 0,
-    };
-    ctx.set_field(this, 0, r);
-    ctx.set_field(this, 1, Value::Int(mark));
+    let mark = matches!(args.get(2), Some(Value::Int(v)) if *v != 0);
+    let pair = amr_alloc_pair(ctx, r, mark);
+    ctx.set_field(this, 0, Value::Object(Some(pair)));
     Ok(None)
 }
 
@@ -76569,7 +76623,8 @@ fn native_amr_get_ref(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, 0)))
+    let (reference, _mark) = amr_read_pair(ctx, this);
+    Ok(Some(reference))
 }
 
 fn native_amr_is_marked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -76577,11 +76632,22 @@ fn native_amr_is_marked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let m = match ctx.get_field(this, 1) {
-        Value::Int(v) => v,
-        _ => 0,
+    let (_reference, mark) = amr_read_pair(ctx, this);
+    Ok(Some(Value::Int(if mark { 1 } else { 0 })))
+}
+
+/// `V get(boolean[] markHolder)` — store the current mark into
+/// `markHolder[0]` and return the current reference (matches JDK semantics).
+fn native_amr_get_with_holder(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(Value::Int(if m != 0 { 1 } else { 0 })))
+    let (reference, mark) = amr_read_pair(ctx, this);
+    if let Some(Value::Object(Some(holder))) = args.get(1) {
+        ctx.set_array_element(*holder, 0, Value::Int(if mark { 1 } else { 0 }));
+    }
+    Ok(Some(reference))
 }
 
 fn native_amr_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -76590,18 +76656,11 @@ fn native_amr_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => return Ok(None),
     };
     let r = args.get(1).copied().unwrap_or(Value::Object(None));
-    let mark = match args.get(2) {
-        Some(Value::Int(v)) => {
-            if *v != 0 {
-                1
-            } else {
-                0
-            }
-        }
-        _ => 0,
-    };
-    ctx.set_field(this, 0, r);
-    ctx.set_field(this, 1, Value::Int(mark));
+    let mark = matches!(args.get(2), Some(Value::Int(v)) if *v != 0);
+    // JDK `set` allocates a fresh Pair only when reference or mark differ; we
+    // always install a fresh Pair (semantically identical, slightly simpler).
+    let pair = amr_alloc_pair(ctx, r, mark);
+    ctx.set_field(this, 0, Value::Object(Some(pair)));
     Ok(None)
 }
 
@@ -76611,19 +76670,12 @@ fn native_amr_attempt_mark(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(Some(Value::Int(0))),
     };
     let expected_ref = args.get(1).copied().unwrap_or(Value::Object(None));
-    let new_mark = match args.get(2) {
-        Some(Value::Int(v)) => {
-            if *v != 0 {
-                1
-            } else {
-                0
-            }
-        }
-        _ => 0,
-    };
-    let current_ref = ctx.get_field(this, 0);
+    let new_mark = matches!(args.get(2), Some(Value::Int(v)) if *v != 0);
+    let (current_ref, _current_mark) = amr_read_pair(ctx, this);
     if values_ref_equal(current_ref, expected_ref) {
-        ctx.set_field(this, 1, Value::Int(new_mark));
+        // Swap in a new Pair carrying the (unchanged) reference + new mark.
+        let pair = amr_alloc_pair(ctx, current_ref, new_mark);
+        ctx.set_field(this, 0, Value::Object(Some(pair)));
         Ok(Some(Value::Int(1)))
     } else {
         Ok(Some(Value::Int(0)))
@@ -76637,22 +76689,16 @@ fn native_amr_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let expected_ref = args.get(1).copied().unwrap_or(Value::Object(None));
     let new_ref = args.get(2).copied().unwrap_or(Value::Object(None));
-    let expected_mark = match args.get(3) {
-        Some(Value::Int(v)) => *v != 0,
-        _ => false,
-    };
-    let new_mark = match args.get(4) {
-        Some(Value::Int(v)) => *v != 0,
-        _ => false,
-    };
-    let current_ref = ctx.get_field(this, 0);
-    let current_mark = match ctx.get_field(this, 1) {
-        Value::Int(v) => v != 0,
-        _ => false,
-    };
+    let expected_mark = matches!(args.get(3), Some(Value::Int(v)) if *v != 0);
+    let new_mark = matches!(args.get(4), Some(Value::Int(v)) if *v != 0);
+    let (current_ref, current_mark) = amr_read_pair(ctx, this);
     if values_ref_equal(current_ref, expected_ref) && current_mark == expected_mark {
-        ctx.set_field(this, 0, new_ref);
-        ctx.set_field(this, 1, Value::Int(if new_mark { 1 } else { 0 }));
+        // Install a new Pair only if reference or mark actually changes (the
+        // JDK fast-path: when both are identical it skips the casPair entirely).
+        if !values_ref_equal(current_ref, new_ref) || current_mark != new_mark {
+            let pair = amr_alloc_pair(ctx, new_ref, new_mark);
+            ctx.set_field(this, 0, Value::Object(Some(pair)));
+        }
         Ok(Some(Value::Int(1)))
     } else {
         Ok(Some(Value::Int(0)))
