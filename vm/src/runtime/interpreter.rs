@@ -22917,7 +22917,24 @@ fn synthetic_stub_should_yield_to_real_bytecode(
                 | "java/util/concurrent/LinkedBlockingDeque"
                 | "java/util/concurrent/atomic/AtomicBoolean"
                 | "java/util/EnumSet"
-                | "java/util/StringJoiner"
+                // NOT "java/util/StringJoiner" (2026-07-10): yielding this
+                // class's SyntheticStub natives to real bytecode here exposes
+                // a deterministic heap-reference-integrity defect (the
+                // `gen_heap::read_slot` "corrupt Value cell"/HIB-CV-32 guard
+                // fires reading StringJoiner's own `size`/`elts` fields back
+                // after a `putfield`, on the SECOND `add()` call onward) that
+                // does not reproduce for an equivalent user-defined class with
+                // the identical bytecode shape and field count/layout (ruled
+                // out via a standalone MicroProbe repro) — something specific
+                // to this being a natively-registered bootstrap class, not the
+                // bytecode pattern itself. See docs/known-issues/
+                // stringjoiner-synthetic-native-real-jdk-field-mismatch.md. Path 2
+                // (`invoke_or_native` in vm/src/vm/vm_exec.rs) still protects
+                // StringJoiner via its own, separate, long-standing allowlist
+                // — this only reverts the NEW path-1 (interpreter
+                // try_stackless_invoke) preference added here, back to the
+                // proven-safe pre-existing behavior (always dispatch to the
+                // SyntheticStub native uniformly for this class at this path).
                 | "java/io/FileInputStream"
                 | "java/lang/ref/Cleaner"
                 | "java/lang/ref/Cleaner$Cleanable"
