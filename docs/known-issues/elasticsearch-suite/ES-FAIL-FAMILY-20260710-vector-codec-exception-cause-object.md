@@ -143,13 +143,35 @@ real. A companion Java-level stack dump was added at the interpreter's
 the dynamic watch) — **it never fires**, so the corrupting write is not a
 plain interpreted `putfield`.
 
-The strongest lead so far comes from the codebase's own **pre-existing**
-`CRATONVM_DBG_CELLCORRUPT`/`CRATONVM_DBG_BADREF` diagnostics
-(`gc/src/gen_heap.rs::set_array_element`, already documented in-tree as
-catching "an array-element write through a STALE array reference … writing
-a raw 8-byte pointer into the middle of that object's 16-byte Value cells").
-Enabling them on the same repro fires right as the corrupted cause gets
-read:
+**This is very likely the SAME broader, still-partially-open GC-corruption
+investigation this codebase has been chasing for weeks, not a new,
+ES-specific bug** — `CRATONVM_DBG_CELLCORRUPT` itself was born in
+`docs/internal/gcstress-residual-corruption-faces-FIXED.md` (2026-07-03,
+under the `Fork6Hard`/`CRATONVM_DBG_GC_STRESS` multi-threaded lane; despite
+the filename, that doc's own body says "Kept OPEN here rather than retired
+because the underlying corruption is unfixed" for its "face 1: stale
+bootstrap-era raw pointer in Value cells — NARROWED, writer still
+unidentified"). A sibling investigation,
+`docs/internal/gaps/bc-math-ec-gc-0x4-handoff.md`, chased a related-shaped
+`Value::Object(Some(0x4))` corruption in BouncyCastle EC math and got a
+**different, already-fixed** root cause (`ReferenceProcessor` re-emission —
+NOT applicable here, our corrupted value is a real live pointer, not the
+literal integer `4`) but its hunt independently arrived at the exact same
+"header/field-cell aliasing" and "off-by-8-within-a-16-byte-cell" framing
+this doc's shift-test evidence (below) reproduces. Read both docs before
+continuing the hunt — in particular `bc-math-ec-gc-0x4-handoff.md` §6
+recommends a **hardware watchpoint** (VEH infra already exists in
+`vm/src/runtime/crash_handler.rs`) as "the definitive tool" for exactly this
+class of problem, since software watchpoints/backtraces (this doc's own
+`[CELLWATCH]`/`[WATCHFIELD]` attempts included) keep coming back
+inconclusive or unreliable on this codebase's JIT-adjacent stack shapes.
+
+Enabling the pre-existing `CRATONVM_DBG_CELLCORRUPT`/`CRATONVM_DBG_BADREF`
+diagnostics (`gc/src/gen_heap.rs::dump_corrupt_cell_holder`, called from
+`validate_copy_source_cells` — fires when a *GC copy source* object's Value
+cells fail to decode, i.e. this is a promotion/compaction-time validator,
+not an array-store-time one) on the same repro fires right as the corrupted
+cause gets read:
 
 ```text
 [CELLCORRUPT] holder=0xc6722398 (young_from=true old=false) class_id=0 class=java/lang/Object kind=0x01 num_slots=1 array_len=1 gc_flags=0x0 index=0 raw0=0x00000000c675dc80 raw1=0x0000000100000028
