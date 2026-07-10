@@ -565,6 +565,9 @@ pub fn update_all_roots(
     // TLS SSLContext KeyManager[] objects (client-cert resolver); scan
     // companion `t27_tls::gc_scan_tls_ctx_key_manager_roots` in `roots.rs`.
     cratonvm_native_builtins::t27_tls::gc_update_tls_ctx_key_manager_refs(pointer_map);
+    // Process-wide default SSLContext; scan companion
+    // `t27_tls::gc_scan_default_ssl_context_root` in `roots.rs`.
+    cratonvm_native_builtins::t27_tls::gc_update_default_ssl_context_ref(pointer_map);
 
     // ForkJoinTask done/result side-table; scan companion
     // `phases_early::gc_scan_forkjoin_roots` in `roots.rs`.

@@ -1061,9 +1061,13 @@ impl VmHeap {
                 }
             }
             VmHeap::Generational(h) => {
-                if let Some(q) = h.satb_queue_handle() {
+                // Clone-free: this runs on EVERY JIT helper entry, and the
+                // common case (no concurrent old-gen mark running) is a
+                // single Acquire load — don't pay an Arc refcount round
+                // trip just to check `is_active`.
+                if let Some(q) = h.satb_queue_ref() {
                     if q.is_active() {
-                        crate::satb::flush_thread_satb_buffer(&q);
+                        crate::satb::flush_thread_satb_buffer(q);
                     }
                 }
             }
