@@ -2605,6 +2605,40 @@ impl StringFieldLayout {
     /// `coder_field_index` is ignored (and the offset zeroed) when
     /// `has_coder` is `false`. `string_class_id` is the `java/lang/String`
     /// `ObjectHeader` class id used as the CharSequence receiver guard.
+    ///
+    /// # BUG-ES-TASKINFO-20260710 — compact-ref-field offsets were wrong
+    ///
+    /// Under `CRATONVM_COMPACT_REF_FIELDS` (default ON), a *reference*
+    /// instance field is stored as a bare 8-byte pointer instead of the
+    /// uniform 16-byte `Value` cell (see `cratonvm_types::field_layout`).
+    /// `String.value` (a `byte[]` ref, always field index 0) is exactly such
+    /// a field, so it only occupies 8 bytes of body space — but the old
+    /// `cell(idx) = HEADER_SIZE + idx * SLOT_SIZE` formula assumed every
+    /// field, including `value`, takes a full 16-byte `SLOT_SIZE`. That
+    /// overcounts `value`'s footprint by 8 bytes, so it computed every
+    /// following field's offset (`coder`, `hash`) 8 bytes too high.
+    ///
+    /// Concretely: the inlined `indexOf`/`charAt`/`length`/`hashCode`/
+    /// `equals`/`compareTo` intrinsics in `x64.rs` would read `value`'s own
+    /// trailing bytes as if they were `coder`'s cell, and — for `indexOf` —
+    /// dereference what should have been `coder`'s tag+payload32 word (a
+    /// small int, e.g. `1i64 << 32` for a UTF16-coded string) as if it were
+    /// an 8-byte pointer, producing a wild-pointer SIGSEGV. The bogus
+    /// pointer was fully deterministic (not a data race): it fell straight
+    /// out of the fixed mis-offset applied to every compact-ref-field
+    /// `java/lang/String` instance, reproducing byte-for-byte across runs.
+    ///
+    /// The fix consults the registered per-class `CompactLayout` (built at
+    /// class-define time; see `cratonvm_types::class_layout`) for the real
+    /// per-field byte offset whenever compact ref fields are enabled and a
+    /// layout is available for `string_class_id`, instead of assuming
+    /// uniform `SLOT_SIZE` spacing. A *reference* field has no tag/payload32
+    /// prefix — every call site in `x64.rs` reads the pointer via
+    /// `cell_offset + FIELD_CELL_PAYLOAD64_OFFSET`, so the resolved absolute
+    /// offset is biased by `-FIELD_CELL_PAYLOAD64_OFFSET` before being
+    /// stored, so that arithmetic still lands on the bare pointer. Falls
+    /// back to the legacy uniform formula when compact ref fields are off,
+    /// or (defensively) if no layout is registered yet for `string_class_id`.
     pub fn new(
         value_field_index: usize,
         coder_field_index: Option<usize>,
@@ -2612,6 +2646,19 @@ impl StringFieldLayout {
         string_class_id: u32,
     ) -> Self {
         let cell = |idx: usize| -> i32 {
+            if cratonvm_types::compact_ref_fields_enabled() {
+                if let Some((body_off, is_ref)) =
+                    cratonvm_types::compact_field_slot(string_class_id, idx)
+                {
+                    let abs = (cratonvm_types::HEADER_SIZE + body_off) as i32;
+                    return if is_ref {
+                        // Bare 8-byte pointer, no cell tag/payload32 prefix.
+                        abs - cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET as i32
+                    } else {
+                        abs
+                    };
+                }
+            }
             (cratonvm_types::HEADER_SIZE + idx * cratonvm_types::SLOT_SIZE) as i32
         };
         StringFieldLayout {

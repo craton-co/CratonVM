@@ -497,3 +497,100 @@ The four `AbortedUploadClient`/multipart tests (`testChunkedPUTNoLimit`,
 `testAbortedUploadUnlimitedSwallow`, `testAbortedUploadLimitedSwallow`,
 `testAbortedUploadUnlimitedNoSwallow`) now pass their real assertions
 cleanly.
+
+## 2026-07-10: `AbortedPOSTClient` empty-response bug root-caused — not a Tomcat/VM logic bug, an interpreter-speed gap
+
+Root-caused via layered live instrumentation of the real Tomcat classes
+(`SocketProcessorBase.run()`, `Http11Processor.service()`/`prepareRequest()`,
+`NioEndpoint`'s Poller timeout check, plus fine-grained client-side timing in
+the test itself — same classpath-override technique used throughout this
+doc). Chain of findings, each ruling out the previous hypothesis:
+
+1. **`doPost()` never runs.** Instrumented `AbortedPOSTServlet.doPost()` to
+   print on entry — it never fires for `testAbortedPOSTOKSwallow`.
+2. **`Http11Processor.service()` never runs either.** Instrumented its
+   `parseRequestLine()`/`parseHeaders()`/`badRequest()` call sites and the
+   adapter-dispatch checkpoint — none fire. Ruled out header-parsing/bad-request
+   theories (absolute-URI host mismatch, `maxPostSize`/`maxSwallowSize`
+   connector-property ordering — tried reordering `AbortedPOSTClient.init()`
+   to match `AbortedUploadClient`'s order, no effect).
+3. **`SocketProcessorBase.run()` itself fires with `event=ERROR`, not
+   `event=OPEN_READ`.** Every working connection (`AbortedUploadClient`,
+   `testChunkedPUTNoLimit`) shows `OPEN_READ`; this one shows `ERROR`. Traced
+   to `NioEndpoint.Poller`'s per-tick timeout scan
+   (`NioEndpoint.java` around the `readTimeout || writeTimeout` check):
+   the connector's read timeout is a hardcoded **3000ms**
+   (`configuredReadTimeout=3000`, same value on every connection — not a
+   config difference), and for this connection **zero bytes were ever read**
+   in that window (`deltaRead` climbs 1ms → 1002ms → 2004ms → 3005ms with
+   `lastRead` frozen the whole time), so the Poller gives up and dispatches
+   `SocketEvent.ERROR` — which `AbstractProtocol$ConnectionHandler.process()`
+   treats as "nothing to do, already handled" and returns `CLOSED` **without
+   ever constructing an `Http11Processor`**. No error is logged anywhere
+   because, from Tomcat's perspective, this is normal, expected connection-
+   timeout handling, not a fault.
+4. **The client hadn't sent a single byte in that window because it was
+   still building the request string.** Added `System.nanoTime()` timing
+   around every step of `AbortedPOSTClient.doRequest()`:
+   ```
+   DBG_TIMING init_ms=5975            (Tomcat startup — happens before connect(), irrelevant to the read-timeout clock)
+   DBG_TIMING connect_ms=0            (TCP handshake — instant, this is when the server's read-timeout clock starts)
+   DBG_TIMING content_build_ms=5108   (new String(body) — body is a 10,000,000-element char[])
+   DBG_TIMING processRequest_ms=36    (once it finally reaches the write, the actual I/O is fast)
+   ```
+   **`new String(char[])` on a 10-million-element array takes ~5.1–6.5
+   seconds** (measured across 3 separate runs) — i.e. *longer than the
+   connector's 3-second read timeout, entirely before the client attempts
+   to send anything*. That's the whole bug: the connection sits open with
+   nothing arriving, times out, and gets torn down while the client is
+   still busy in a **pure in-memory, non-network** operation.
+
+**Root cause, precisely:** `java.lang.String(char[])`'s constructor has
+**no CratonVM native override** — it runs as the real JDK's own bytecode
+(`String(char[], int, int, Void)` → `StringUTF16.compress`/`toBytes`, a
+per-character Latin-1-fits-in-a-byte check + copy loop; confirmed via
+`native-builtins/src/lang_string.rs`'s own comment: *"the real-JDK
+`StringUTF16` bytecode (e.g. the `String(char[])` constructor, which has no
+native override)..."*). Called only 3 times total in this whole test class
+(once per `AbortedPOSTClient` test) — nowhere near the JIT's default
+500-invocation warm-up threshold (`CRATONVM_JIT_THRESHOLD`,
+`vm/src/runtime/env_cache.rs:76`) — so this 10-million-iteration loop stays
+fully interpreted every time, at roughly 500–650ns/char. **Tried
+`CRATONVM_JIT_OSR=1`** (on-stack replacement, which could in principle
+compile a hot loop mid-invocation without needing 500 separate calls) —
+**did not help** (`content_build_ms` was 6464ms with OSR on vs. 5108ms
+without, if anything slightly worse), so this loop shape either doesn't
+qualify for CratonVM's current OSR triggering or the one-shot compile
+overhead isn't worth it for a single invocation either way.
+
+**This is not a Tomcat bug, not a socket/connector bug, and not the same
+family as blocker #3 above** — it's a pure interpreter-throughput gap for a
+specific, extremely common JDK bulk operation (turning a large `char[]`
+into a `String`) that happens to collide with this one test harness's
+hardcoded 3-second connector timeout. `AbortedUploadClient`'s tests build a
+comparably-sized string too (`StringBuilder.append(char[])` +
+`getBytes("UTF-8")` + `new String(byte[], "ASCII")`) but apparently take a
+different, faster path — not confirmed why, but plausibly `StringBuilder`'s
+bulk `append(char[])` and/or the byte[]-based `String` constructors *do*
+have native overrides in this codebase (several are visible in
+`native-builtins/src/deprecated_util.rs`/`lang_string.rs`), unlike the bare
+`String(char[])` constructor.
+
+**Not fixed this session.** The correct fix is a native intrinsic for
+`String(char[])`/`StringUTF16.compress` (bulk Latin-1-fits check + copy in
+Rust, bypassing the interpreted per-char loop) — but this is a
+**very high-blast-radius change** (every `char[]`-to-`String` conversion in
+every Java program run on CratonVM) that needs careful validation against
+CratonVM's existing little-endian compact-string byte layout
+(`vm/src/vm/vm_object.rs::create_java_string`) and the Latin-1/UTF-16 coder
+selection semantics — not something to rush. Left for a dedicated
+performance-focused session. Workaround for this specific test only: none
+attempted (modifying the stock Tomcat test suite isn't appropriate).
+
+**Practical takeaway:** treat this connector 3-second-read-timeout +
+large-char-array-to-String pattern as a known trap for any other
+CratonVM/Tomcat (or any embedded-server) test that builds a multi-megabyte
+string via `new String(char[])` right before sending it — the interpreter
+cost of that one conversion can alone exceed a short test-harness timeout,
+producing a confusing "silent empty response, no error logged" symptom that
+looks like a connector bug but isn't.
