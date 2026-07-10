@@ -19693,6 +19693,20 @@ impl Compiler {
                                         cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                                     );
                                 }
+                                b'L' | b'[' => {
+                                    // Defense-in-depth: contradictory metadata
+                                    // (`c_is_ref == false` for a reference
+                                    // descriptor). A non-ref-classified slot is
+                                    // written as a full 16-byte `Value` cell, so
+                                    // read the 8-byte pointer payload — never the
+                                    // 32-bit MOVSXD below, which sign-extends half
+                                    // a pointer into a bogus non-null receiver.
+                                    self.emit_mov_r64_mem_disp32(
+                                        RAX,
+                                        RAX,
+                                        cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                    );
+                                }
                                 b'F' => {
                                     self.emit_mov_r32_mem_disp32(
                                         RAX,
@@ -19725,6 +19739,17 @@ impl Compiler {
                         } else {
                             match type_tag {
                                 b'J' | b'D' => {
+                                    self.emit_mov_r64_mem_disp32(
+                                        RAX,
+                                        RAX,
+                                        legacy_cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                    );
+                                }
+                                b'L' | b'[' => {
+                                    // Defense-in-depth (see the compact branch):
+                                    // a reference descriptor always reads the
+                                    // legacy cell's 64-bit pointer payload, even
+                                    // when `c_is_ref` wrongly says non-ref.
                                     self.emit_mov_r64_mem_disp32(
                                         RAX,
                                         RAX,
