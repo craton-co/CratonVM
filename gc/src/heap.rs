@@ -1608,15 +1608,40 @@ pub fn cell_watch_addr() -> usize {
     })
 }
 
+/// ES-FAIL-FAMILY-20260710 hunt: a RUNTIME-settable companion to
+/// [`cell_watch_addr`] (which only reads a fixed address from the
+/// `CRATONVM_DBG_WATCH_CELL` env var at process start). Some hunts don't know
+/// the address to watch until the program has already run for a while (e.g.
+/// "watch the `cause` slot of the next `BufferUnderflowException` this
+/// constructs" — the address is only known once that object is allocated).
+/// `set_dynamic_watch` lets native code (via a `NativeContext` hook) arm the
+/// watch mid-run; [`cell_watch_check`] checks both addresses. `0` = disabled.
+static DYNAMIC_WATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// See [`DYNAMIC_WATCH`].
+#[inline]
+pub fn set_dynamic_watch(addr: usize) {
+    DYNAMIC_WATCH.store(addr, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// See [`DYNAMIC_WATCH`].
+#[inline]
+pub fn dynamic_watch_addr() -> usize {
+    DYNAMIC_WATCH.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// See [`cell_watch_addr`]. `extra` carries the value/context being written.
 #[inline]
 pub fn cell_watch_check(dst: usize, len: usize, site: &str, extra: &dyn std::fmt::Debug) {
-    let w = cell_watch_addr();
-    if w != 0 && dst <= w && w.wrapping_sub(dst) < len {
-        eprintln!(
-            "[CELLWATCH] {site}: write [{dst:#x} +{len}) covers watch {w:#x} value={extra:?}\n{}",
-            std::backtrace::Backtrace::force_capture(),
-        );
+    let env_w = cell_watch_addr();
+    let dyn_w = dynamic_watch_addr();
+    for w in [env_w, dyn_w] {
+        if w != 0 && dst <= w && w.wrapping_sub(dst) < len {
+            eprintln!(
+                "[CELLWATCH] {site}: write [{dst:#x} +{len}) covers watch {w:#x} value={extra:?}\n{}",
+                std::backtrace::Backtrace::force_capture(),
+            );
+        }
     }
 }
 

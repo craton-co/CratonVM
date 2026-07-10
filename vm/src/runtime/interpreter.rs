@@ -12833,6 +12833,44 @@ fn execute_instruction(
             // block still re-checks its own cached gate, so behaviour is
             // byte-for-byte identical to the original sequence. See
             // `env_cache::any_field_diag`.
+            // ES-FAIL-FAMILY-20260710 hunt: java-level-stack companion to
+            // `cratonvm_gc::heap::dynamic_watch_addr()` (armed by
+            // `NativeContext::dbg_set_watch_cell`, see
+            // `native_builtins::lang_misc::write_throwable_cause`). The
+            // watch's own `[CELLWATCH]` report captures a Rust backtrace,
+            // which is unreliable here (JIT frames lack Windows unwind
+            // info and the walk comes back garbled) — this prints the
+            // actual JAVA call stack instead, which is always available.
+            {
+                let watch = cratonvm_gc::heap::dynamic_watch_addr();
+                if watch != 0 {
+                    let addr = obj_ref.as_ptr() as usize
+                        + cratonvm_types::HEADER_SIZE
+                        + field.field_index * cratonvm_types::SLOT_SIZE;
+                    if addr == watch {
+                        eprintln!(
+                            "[WATCHFIELD] putfield HIT watch={watch:#x} obj=0x{:x} field_index={} value={:?} in {}.{}{} pc={}",
+                            obj_ref.as_ptr() as usize,
+                            field.field_index,
+                            value,
+                            thread.frames[frame_idx].class_name(),
+                            thread.frames[frame_idx].method_name(),
+                            thread.frames[frame_idx].method_descriptor(),
+                            thread.frames[frame_idx].pc,
+                        );
+                        eprintln!("[WATCHFIELD] Java stack (top first):");
+                        for f in thread.frames.iter().rev().take(30) {
+                            eprintln!(
+                                "[WATCHFIELD]   {}.{}{} pc={}",
+                                f.class_name(),
+                                f.method_name(),
+                                f.method_descriptor(),
+                                f.pc,
+                            );
+                        }
+                    }
+                }
+            }
             if crate::runtime::env_cache::any_field_diag() {
                 // Gated diagnostic (CRATONVM_DBG_FIELDADDR): trace put for specific
                 // fields — object address + resolved slot — to localize a write
