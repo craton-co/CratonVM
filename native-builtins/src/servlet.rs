@@ -2357,6 +2357,55 @@ fn s2_bb_limit(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
 fn s2_bb_cap(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
     ctx.get_field(buf, BB_CAP).as_int().unwrap_or(0)
 }
+
+/// Read a ByteBuffer's `mark`, preferring the real-JDK named field.
+///
+/// `Buffer`'s actual real-JDK field order is `mark(0), position(1),
+/// limit(2), capacity(3), address(4)` (see `t27_tls.rs`'s `bb_view` doc
+/// comment / the FIXED bug it documents for the same class of issue). The
+/// indexed `BB_MARK = 4` constant used throughout this file for the
+/// synthetic-mode layout (`array, pos, limit, cap, mark, order`) therefore
+/// lands on real field 4 — `address` (a `long`) — for real-JDK-mode
+/// `ByteBuffer` objects, NOT `mark` (real field 0). `position`/`limit`/
+/// `capacity` happen to align (real indices 1/2/3 match `BB_POS`/`BB_LIMIT`/
+/// `BB_CAP`), which is what let this go unnoticed: only `mark`/`reset` were
+/// silently broken (every `reset()` on a real ByteBuffer threw
+/// `InvalidMarkException`, even immediately after a matching `mark()` —
+/// found via Tomcat's `TestHttp2Limits`, whose HTTP/2 header-block-fragment
+/// buffering hits this mark/reset idiom on every request). Falls back to
+/// the indexed slot for genuinely synthetic (non-real-JDK) buffer objects
+/// that have no `mark` field to resolve by name.
+#[inline]
+fn s2_bb_get_mark(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
+    match ctx.get_field_by_name(buf, "mark") {
+        Value::Int(m) => m,
+        _ => ctx.get_field(buf, BB_MARK).as_int().unwrap_or(-1),
+    }
+}
+
+/// Write a ByteBuffer's `mark` to both the real-JDK named field and the
+/// synthetic indexed slot. See `s2_bb_get_mark` for why the named field is
+/// authoritative for real-JDK-mode objects.
+#[inline]
+fn s2_bb_set_mark(ctx: &mut dyn NativeContext, buf: ObjectRef, value: i32) {
+    // Only fall back to the indexed synthetic slot when there is truly no
+    // real `mark` field to resolve by name (a genuinely synthetic buffer
+    // class, e.g. when the real JDK class failed to load). For real-JDK
+    // ByteBuffer/DirectByteBuffer objects, index 4 aliases the real
+    // `address` field (`Buffer{mark,position,limit,capacity,address}`) —
+    // for `DirectByteBuffer` specifically, `address` is the actual native
+    // memory pointer backing the buffer, so writing our `mark` value there
+    // unconditionally corrupts it, crashing the very next `get`/`put` with
+    // a wild-pointer SIGSEGV (found via a `ByteBuffer.allocateDirect` +
+    // `mark()`/`put()` repro while fixing the heap-buffer InvalidMarkException
+    // bug above). `get_field_by_name` returns `Value::Object(None)` only when
+    // field resolution itself fails (see `vm_exec.rs::get_field_by_name`),
+    // which distinguishes "no such field" from "real int field valued 0".
+    match ctx.get_field_by_name(buf, "mark") {
+        Value::Object(None) => ctx.set_field(buf, BB_MARK, Value::Int(value)),
+        _ => ctx.set_field_by_name(buf, "mark", Value::Int(value)),
+    }
+}
 #[inline]
 fn s2_bb_order(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
     ctx.get_field(buf, BB_ORDER).as_int().unwrap_or(0)
@@ -3341,11 +3390,34 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             //    aliasing the native memory.
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, cap);
             let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 8);
+            // Real-JDK named `mark` field (mirrors `bb_write_hb`) — deliberately
+            // NOT also written via the indexed BB_MARK fallback below. Real
+            // `Buffer`'s field order is `mark(0), position(1), limit(2),
+            // capacity(3), address(4)`, so index 4 — this file's synthetic-mode
+            // BB_MARK slot — aliases `address` (the actual native memory
+            // pointer) for a real-JDK `DirectByteBuffer`, NOT `mark`.
+            // Without this by-name write, `mark` starts at its generic
+            // zero-init default (`Value::Object(None)`, indistinguishable from
+            // "field doesn't exist"), so `s2_bb_get_mark`'s by-name-first probe
+            // misreads that as "no such field" on the FIRST `mark()` call and
+            // falls back to the indexed slot, silently overwriting `address`
+            // with the mark value — the next `put`/`get` then computes a
+            // garbage target address and SIGSEGVs (found chasing the
+            // ByteBuffer.mark()/reset() InvalidMarkException fix above through
+            // to a `ByteBuffer.allocateDirect` + `mark()` + `put()` repro).
+            // Skipping the indexed write here means a *genuinely* synthetic
+            // (non-real-JDK) ByteBuffer class would leave `mark` unusable —
+            // accepted: this whole module is real-JDK-mode-only in practice.
+            ctx.set_field_by_name(buf, "position", Value::Int(0));
+            ctx.set_field_by_name(buf, "limit", Value::Int(cap as i32));
+            ctx.set_field_by_name(buf, "capacity", Value::Int(cap as i32));
+            ctx.set_field_by_name(buf, "mark", Value::Int(-1));
+            // Synthetic-mode indexed fallback (array/order/native-id/direct-flag
+            // only — NOT mark, see above).
             ctx.set_field(buf, BB_ARRAY, Value::Object(Some(arr)));
             ctx.set_field(buf, BB_POS, Value::Int(0));
             ctx.set_field(buf, BB_LIMIT, Value::Int(cap as i32));
             ctx.set_field(buf, BB_CAP, Value::Int(cap as i32));
-            ctx.set_field(buf, BB_MARK, Value::Int(-1));
             ctx.set_field(buf, BB_ORDER, Value::Int(0));
             ctx.set_field(buf, BB_NATIVE_ID, Value::Long(alloc_id));
             ctx.set_field(buf, BB_DIRECT_FLAG, Value::Int(1));
@@ -3786,7 +3858,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             let pos = s2_bb_pos(ctx, this);
             ctx.set_field(this, BB_LIMIT, Value::Int(pos));
             ctx.set_field(this, BB_POS, Value::Int(0));
-            ctx.set_field(this, BB_MARK, Value::Int(-1));
+            s2_bb_set_mark(ctx, this, -1);
             Ok(Some(Value::Object(Some(this))))
         });
         r.register(bb, "clear", ret, |ctx, args| {
@@ -3794,25 +3866,25 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             let cap = s2_bb_cap(ctx, this);
             ctx.set_field(this, BB_POS, Value::Int(0));
             ctx.set_field(this, BB_LIMIT, Value::Int(cap));
-            ctx.set_field(this, BB_MARK, Value::Int(-1));
+            s2_bb_set_mark(ctx, this, -1);
             Ok(Some(Value::Object(Some(this))))
         });
         r.register(bb, "rewind", ret, |ctx, args| {
             let this = obj_arg(args, 0)?;
             ctx.set_field(this, BB_POS, Value::Int(0));
-            ctx.set_field(this, BB_MARK, Value::Int(-1));
+            s2_bb_set_mark(ctx, this, -1);
             Ok(Some(Value::Object(Some(this))))
         });
         r.register(bb, "mark", ret, |ctx, args| {
             let this = obj_arg(args, 0)?;
             let pos = s2_bb_pos(ctx, this);
-            ctx.set_field(this, BB_MARK, Value::Int(pos));
+            s2_bb_set_mark(ctx, this, pos);
             Ok(Some(Value::Object(Some(this))))
         });
     }
     r.register(bb, "reset", "()Ljava/nio/Buffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let mark = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+        let mark = s2_bb_get_mark(ctx, this);
         if mark < 0 {
             return Err(RuntimeError::IllegalStateException {
                 message: "InvalidMarkException".into(),
@@ -3879,7 +3951,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         }
         ctx.set_field(this, BB_POS, Value::Int(n as i32));
         ctx.set_field(this, BB_LIMIT, Value::Int(cap));
-        ctx.set_field(this, BB_MARK, Value::Int(-1));
+        s2_bb_set_mark(ctx, this, -1);
         Ok(Some(Value::Object(Some(this))))
     });
 

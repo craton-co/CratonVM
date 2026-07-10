@@ -4,6 +4,33 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-10 TestEncodingDetector fully green: UTF-16/prolog-conflict residual retired
+
+- FIXED/RETIRED: [`encodingdetector-utf16-and-conflicting-prolog-residuals-FIXED.md`](../internal/fixed-suite-bugs/encodingdetector-utf16-and-conflicting-prolog-residuals-FIXED.md) — both residual clusters traced to the same root cause: synthetic `BufferedInputStream`/`InputStreamReader` overrides (added in `45cc4f4f`) unconditionally shadowed real JDK 25 bytecode for every instance, not just genuinely-synthetic-stub ones, because the interpreter's `invokevirtual` vtable fast path doesn't consult the `NativeKind::SyntheticStub` category the way `vm_exec.rs`'s `real_protected_stub` check does. `BufferedInputStream.reset()` was a silent no-op (broke `EncodingDetector`'s mark/reread-with-detected-encoding sequence); `InputStreamReader.read([CII)I` ignored the charset entirely (broke every UTF-16BE/LE decode). Removed both native overrides — real bytecode already implements them correctly. `org.apache.jasper.compiler.TestEncodingDetector`: `OK (22 tests)`, matching HotSpot exactly.
+
+## 2026-07-10 WildFly corrupt-Value doc: `Level.parse` FIXED, new `ThreadPoolExecutor.execute()` regression found (OPEN, blocking)
+
+Investigating `wildfly-domain-heap-corrupt-value-timeout.md`'s front-line
+residuals surfaced two unrelated, earlier-gating bugs before those residuals
+could be reached again:
+
+- FIXED: [`java-util-logging-level-parse-throws-for-all-names-FIXED.md`](../internal/fixed-suite-bugs/java-util-logging-level-parse-throws-for-all-names-FIXED.md) — `java.util.logging.Level.parse(String)` threw `IllegalArgumentException` for *every* name, including standard JDK constants (`Level.parse("WARNING")` itself failed), due to a JDK-25 `KnownLevel`/module-synthesis gap. Broke WildFly's own `host.xml`/`domain.xml` parsing of `<level name="WARN"/>`. Fixed with a targeted native override.
+- OPEN (new, blocking): [`threadpoolexecutor-execute-npe-on-ctl-regression.md`](threadpoolexecutor-execute-npe-on-ctl-regression.md) — `Executors.newSingleThreadExecutor()`/`newFixedThreadPool()`/`newCachedThreadPool()` return objects whose `.execute(Runnable)` now NPEs on `ThreadPoolExecutor`'s uninitialized `ctl` field — a **completely standalone-reproducible regression**, bisected (via fresh rebuilds) to `be605560..f28d6ae6` (2026-07-09) but the exact dispatch mechanism was NOT located despite three separate print-tracing attempts (all reverted). This now kills WildFly's process-controller "Read thread" before the Host Controller handshake completes, gating the original doc's own residuals from being re-observed live.
+
+## 2026-07-10 Tomcat NIO/HTTP2 bare-assertions doc RETIRED; ByteBuffer.mark()/reset() found broken for real-JDK objects (FIXED); 1 narrow residual split off
+
+Fixed the doc's own `\p{XDigit}` regex residual, and — while root-causing
+the other two — found and fixed an unrelated, much bigger bug:
+`ByteBuffer.mark()`/`reset()` were completely broken for real-JDK
+`ByteBuffer`/`DirectByteBuffer` objects (`InvalidMarkException` on every
+`reset()`, even right after a matching `mark()`; SIGSEGV on direct buffers
+after the first `mark()` call). This explained both the `TestHttp2Limits`
+regression and the previously-unexplained Jasper JSP failure in
+`TestHttp11Processor`.
+
+- FIXED/RETIRED: [`nonblockingapi-http11processor-http2limits-bare-assertions-FIXED.md`](../internal/fixed-suite-bugs/nonblockingapi-http11processor-http2limits-bare-assertions-FIXED.md) — 5/6 of the doc's originally-failing methods now pass (`testDelayedNBWrite`, `testPipelining`, `testWithTEChunkedWithCL`, `testHeaderLimits100x32`, `testPostWithTrailerHeadersSize0`); root cause and fix for both the regex gap and the `ByteBuffer` bug are in the doc's final section.
+- OPEN (new, split off): [`tomcat-08-07/nonblockingreadignoreisready-async-error-response-completion-gap.md`](tomcat-08-07/nonblockingreadignoreisready-async-error-response-completion-gap.md) — `TestNonBlockingAPI.testNonBlockingReadIgnoreIsReady`'s Java-level `onError`/`onComplete` callback sequence is confirmed byte-for-byte identical to HotSpot (via socket-capture + log diff), but CratonVM then writes zero bytes to the socket where HotSpot's container commits an implicit `200` response. Narrowed but not root-caused; low priority (narrow, deliberately-adversarial test scenario).
+
 ## 2026-07-10 ES storedscripts crash trio FIXED; Object.contains signal gone (masked); new Executors factory mainLock NPE found (OPEN, partially fixed)
 
 Re-verified the 3 `findNative`-crash-family docs for

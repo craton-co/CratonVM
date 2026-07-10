@@ -23514,8 +23514,28 @@ impl Compiler {
                             //      fits in ARG_REGS.
                             let needs_ctx_arg_count = n + 1; // vm_ptr + n receiver/params
                             let args_fit = n >= 1 && needs_ctx_arg_count <= ARG_REGS.len();
-                            let pic_inline = pic_ptr.is_some() && args_fit;
-                            let mic_inline = !pic_inline && mic_ptr.is_some() && args_fit;
+                            // Spring SpEL's flawed-pattern threshold test drives
+                            // catastrophic regex backtracking through the mutually
+                            // recursive BmpCharPropertyGreedy/GroupHead pair. The
+                            // raw inline IC direct-call path skips the dispatch
+                            // helper's frame bookkeeping for that recursion shape
+                            // and short-circuits the search after only ~2k
+                            // CharSequence accesses. Keep just this pair on the
+                            // helper path; the helper can still call compiled
+                            // callees, but preserves the backtracking state.
+                            let regex_backtracking_frame = self
+                                .method_label
+                                .starts_with("java/util/regex/Pattern$BmpCharPropertyGreedy.match")
+                                || self
+                                    .method_label
+                                    .starts_with("java/util/regex/Pattern$GroupHead.match");
+                            let inline_virtual_ic_allowed = !regex_backtracking_frame;
+                            let pic_inline =
+                                inline_virtual_ic_allowed && pic_ptr.is_some() && args_fit;
+                            let mic_inline = inline_virtual_ic_allowed
+                                && !pic_inline
+                                && mic_ptr.is_some()
+                                && args_fit;
                             // `.done` patches collected from each emitted
                             // fast-path. Multiple in PIC's case (one per
                             // slot), one in MIC's, none if neither inline
