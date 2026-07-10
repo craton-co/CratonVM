@@ -264,3 +264,152 @@ client-socket-layer expertise risked a blind, unverified patch. This doc
 should stay OPEN, split into (a) "blocked on `SocketWrapperBase.lock`" for
 4/6 methods — re-run once that lands — and (b) the new `TestHttp2Limits`
 client-socket issue, which needs its own from-scratch investigation.
+
+
+## 2026-07-10 (continued): client-Socket bug FIXED — 3/6 methods now pass,
+## remaining 3 each hit a different, newly-surfaced (previously masked) issue
+
+Root-caused and fixed the `TestHttp2Limits` client-socket bug identified
+above, then re-verified all 6 methods against the fix.
+
+### Fix: `SocketFactory.createSocket()` / `net_phase_e.rs` Socket side-table split-brain
+
+CratonVM has **two independent, mutually-unaware representations** of
+`java.net.Socket` connection state for real-JDK mode:
+- `native-builtins/src/net_phase_e.rs`'s `register_re1_socket` — the
+  "current" implementation, backing `Socket`'s own instance methods
+  (`connect()`, `getOutputStream()`, `getInputStream()`, `isConnected()`,
+  `close()`, …). It stores state in an identity-hash-keyed side table
+  (`SockSide` / `sock_get`/`sock_set`) specifically because synthetic field
+  slots collide with real JDK's actual private fields (see that file's own
+  `SockSide` doc comment).
+- `native-builtins/src/phases_early.rs`'s `register_phase52_server_socket_factory`
+  — backs `javax.net.SocketFactory`'s static `createSocket(...)` overloads.
+  Its `phase52_socket_connect` allocates a `Socket`, does a real
+  `TcpStream::connect`, and recorded the resulting stream id/ports **only**
+  in raw object field slots (`SOCK_STREAM_ID`, `SOCK_HOST`, etc.) — never
+  touching the side table above.
+
+So `SocketFactory.getDefault().createSocket(host, port)` genuinely connects
+(the TCP handshake happens for real), but every later call that goes
+through `net_phase_e.rs`'s side-table-backed accessors — `getOutputStream()`,
+`getInputStream()`, `isConnected()` — reads the table's untouched default
+(`stream_id: -1`), reporting "not connected" on a socket that plainly is.
+This is the exact same class of bug `sock_set_for_create` was already added
+to fix for the analogous `SSLSocketFactory.createSocket()` path (see that
+function's doc comment in `net_phase_e.rs`) — `SocketFactory` (plain,
+non-TLS) was simply never migrated to call it.
+
+**Fix** (branch `fix/http-proto-edge-bare-assertions`): extended
+`sock_set_for_create` with a `sock_set_for_create_with_local_port` variant
+(the original caller, `phases_late.rs`'s TLS path, keeps calling the
+0-local-port original unchanged) and made `phase52_socket_connect` call it
+alongside its existing raw-field writes, so both representations agree.
+
+**Verification:**
+- Minimal, Tomcat-free repro (`ServerSocket` accept loop +
+  `SocketFactory.getDefault().createSocket(host, port)` +
+  `getOutputStream()`/write/read/close): failed with `Socket.getOutputStream:
+  not connected` before the fix, passes clean after (`isConnected=true`,
+  write/read/close all succeed).
+- `cargo test --release -p cratonvm-native-builtins net_phase_e`: 35/35
+  pass, no regressions.
+- Real Tomcat fixture re-run of all 6 originally-failing methods (real JDK
+  25, JUnitCore, same classpath as always):
+
+| Method | Before this fix | After this fix |
+|---|---|---|
+| `TestHttp2Limits.testHeaderLimits100x32` | `Socket.getOutputStream: not connected` | **PASSES** (only pre-existing harmless `conf/logging.properties` teardown noise remains — see below) |
+| `TestNonBlockingAPI.testDelayedNBWrite` | `SocketWrapperBase.lock` NPE (`rc=-1`) | **PASSES** (teardown noise only) |
+| `TestHttp11Processor.testPipelining` | `SocketWrapperBase.lock` NPE (`rc=-1`) | **PASSES** (teardown noise only) |
+| `TestHttp2Limits.testPostWithTrailerHeadersSize0` | `Socket.getOutputStream: not connected` | New, different failure (regex bug — see below) |
+| `TestNonBlockingAPI.testNonBlockingReadIgnoreIsReady` | `SocketWrapperBase.lock` NPE (`rc=-1`) | New, different failure (async error-handling gap — see below) |
+| `TestHttp11Processor.testWithTEChunkedWithCL` | `SocketWrapperBase.lock` NPE (`rc=-1`) | New, different failure (Jasper/JSP fixture issue — see below) |
+
+Confirmed stable across 3 repeat runs (not flaky) for `testDelayedNBWrite`/
+`testNonBlockingReadIgnoreIsReady`. **Why did fixing an unrelated
+client-Socket bug also make the `SocketWrapperBase.lock` NPE stop firing for
+3/6 methods?** Not fully explained, and not claimed as a fix for that bug —
+the other doc's root-cause (a stale local across a GC safepoint/JIT
+tier-transition boundary) is inherently timing-sensitive, so it's plausible
+this change shifted allocation/JIT-compilation timing enough to move those
+3 methods' runs outside its trigger window, without the underlying race
+being closed. Do not treat this as evidence the lock bug is fixed — treat
+each of these 3 as "currently not observed to hit it" rather than
+"confirmed clear of it", and re-check if it resurfaces.
+
+The remaining `conf/logging.properties FileNotFoundException` /
+"A child container failed during stop" noise on every method (pass or
+fail) is a pre-existing fixture gap in this Linux Tomcat fixture (missing
+`output/build/conf/logging.properties`), unrelated to CratonVM correctness
+— not investigated further, not blocking.
+
+### 3 residual failures — each a different, previously-masked bug
+
+**`TestHttp2Limits.testPostWithTrailerHeadersSize0`** — a genuinely new
+regex-engine bug, isolated down to:
+```java
+"5".matches("\\p{XDigit}+")          // → false (WRONG)
+Pattern.matches("\\p{XDigit}+", "5") // → true  (correct, from the same process)
+```
+`String.matches(regex)` is real bytecode that's specified to do nothing but
+`return Pattern.matches(regex, this);` — yet it disagrees with calling
+`Pattern.matches` directly for `\p{XDigit}` (a POSIX character class), while
+plain classes like `\d` agree via both entry points. `java/util/regex/Pattern`
+and `Matcher` are on the `drop_real_layout_synthetic` list (real-JDK mode
+runs real `Pattern`/`Matcher` bytecode end-to-end, not the legacy Rust-regex
+translation layer `translate_java_regex()` — that layer is a red herring
+here, unlike the unrelated `\p{java*}` gap in
+`wildfly-regex-java-predefined-classes-unsupported.md`), so this is an
+interpreter-level bytecode-execution discrepancy, not a missing-translation
+gap. Test's exact failure:
+```
+Expected: match to regular expression pattern [...Connection \[\p{XDigit}++\]...]
+     but: was "0-Goaway-[3]-[11]-[Connection [0], Stream [3], Total header size too big]"
+```
+(the "0" connection ID trivially satisfies `\p{XDigit}++`, so the test's
+own values are fine — this is purely the matcher disagreeing with itself
+depending on entry point). **Not root-caused further or fixed** — flagged
+as a new, separate investigation.
+
+**`TestNonBlockingAPI.testNonBlockingReadIgnoreIsReady`** — no more
+`lock is null`; instead a real `IllegalStateException` from Tomcat's own
+non-blocking-read contract enforcement (expected — the test intentionally
+has its `ReadListener` ignore `isReady()` to verify Tomcat rejects the
+misbehaving read):
+```
+java.lang.IllegalStateException: In non-blocking mode you may not read from
+  the ServletInputStream until the previous read has completed and isReady()
+  returns true
+	at org.apache.catalina.connector.CoyoteInputStream.checkNonBlockingRead(...)
+```
+Real Tomcat/HotSpot presumably still completes the HTTP response (200 OK)
+after this async error via its `AsyncListener.onError`/error-page machinery;
+here the request ends without one (`rc=-1`). Looks like a gap in
+CratonVM's async-error → HTTP-response completion path for this specific
+misbehavior scenario, not a socket/GC/JIT issue. **Not investigated
+further.**
+
+**`TestHttp11Processor.testWithTEChunkedWithCL`** — no more `lock is null`;
+instead:
+```
+ERROR ... Servlet.service() for servlet [jsp] ... threw exception
+  [org.apache.jasper.JasperException: Unable to compile class for JSP]
+  with root cause (java/io/IOException: Stream closed)
+```
+This test needs the real Tomcat test webapp's `echo-params.jsp` compiled via
+Jasper. Given this Linux fixture already has known gaps (missing
+`webapp-virtual-webapp`/`webapp-virtual-library` — see
+`tomcat-linux-suite-fixture-location` memory), this looks more likely to be
+a **fixture gap** than a VM bug, but wasn't confirmed either way. **Not
+investigated further.**
+
+### Updated bottom line
+
+3/6 methods now pass outright (`testHeaderLimits100x32`, `testDelayedNBWrite`,
+`testPipelining`). The other 3 each hit a distinct, previously-masked issue
+that only became visible once the client-socket bug stopped hiding them —
+none of the 3 share a root cause with each other or with the still-open
+`SocketWrapperBase.lock` bug. This doc should stay OPEN, narrowed to these
+3 residual, independent investigations (regex `\p{XDigit}`, async
+read-error response completion, Jasper JSP fixture/compile issue).

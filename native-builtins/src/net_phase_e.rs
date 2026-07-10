@@ -308,9 +308,23 @@ pub(crate) fn sock_set_for_create(
     port: i32,
     stream_id: i32,
 ) {
+    sock_set_for_create_with_local_port(ctx, this, port, 0, stream_id);
+}
+
+/// Same as [`sock_set_for_create`] but also records the real local (client)
+/// port, for callers that already resolved it from the live `TcpStream`
+/// (e.g. `phases_early.rs`'s `phase52_socket_connect`) instead of always
+/// defaulting to 0.
+pub(crate) fn sock_set_for_create_with_local_port(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    port: i32,
+    local_port: i32,
+    stream_id: i32,
+) {
     sock_set(ctx, this, |s| {
         s.port = port;
-        s.local_port = 0;
+        s.local_port = local_port;
         s.closed = 0;
         s.stream_id = stream_id;
     });
