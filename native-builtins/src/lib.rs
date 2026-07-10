@@ -72339,7 +72339,7 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         .class_name_of_id(handler_cid)
         .unwrap_or_else(|| "java/lang/reflect/InvocationHandler".to_string());
 
-    // CRATONVM_REAL_ANNOTATIONS: when the proxy's InvocationHandler is the
+    // Real annotations: when the proxy's InvocationHandler is the
     // synthetic AnnotationProxy carrying the member data, the generated `$ProxyN`
     // method bodies reach here (the cached/dead-code dispatch path that a 2nd
     // call site falls into, bypassing `proxy_invoke_handler_shared`). Calling
@@ -72377,7 +72377,7 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                     Some(arr) if ctx.array_length(arr) > 0 => ctx.get_array_element(arr, 0),
                     _ => Value::Object(None),
                 };
-                // Under CRATONVM_REAL_ANNOTATIONS every annotation is a real
+                // In real-annotation mode every annotation is a real
                 // `$ProxyN`, so the `other` argument is typically ALSO a real
                 // proxy (not a bare AnnotationProxy) — unwrap it to its
                 // AnnotationProxy handler (slot 0) before comparing, mirroring
