@@ -86,3 +86,125 @@ Connector smoke run:
 The full `apps/tomcat-suite-runner` checkout is not present in this worktree,
 so `org.apache.catalina.core.TestSwallowAbortedUploads` itself still needs an
 isolated rerun before this note can be archived.
+
+## 2026-07-09 Linux re-verify: original symptom confirmed fixed; found 2 more
+## blockers (both now resolved) and 1 new, still-OPEN blocker
+
+Re-verified on the Azure Linux build host against the real Tomcat fixture
+(`/data/data/apps/tomcat`, real JDK 25, `org.junit.runner.JUnitCore
+org.apache.catalina.core.TestSwallowAbortedUploads`, all 10 test methods).
+
+**Original `WSAECONNABORTED` symptom: confirmed FIXED.** `sc_close`'s
+`lingering_channel_close` (described above) landed on `dev` via commit
+`27c3e9ac` ("fix(tomcat): unblock HttpServlet/DoHead family...",
+2026-06-29) — well before this re-verify. `native-io/src/socket_channel.rs`
+on current `dev` no longer calls `Shutdown::Both` unconditionally. This part
+of the bug is done; do not re-investigate the socket-close path.
+
+**New blocker #1 (found + fixed elsewhere): `ScheduledThreadPoolExecutor.getQueue()`
+NPE blocked the test from even starting.** Running the class end-to-end (not
+just the socket-close path) surfaced a *different* bug blocking every one of
+the 10 methods before any request was even sent:
+```
+org.apache.catalina.LifecycleException: Failed to start component [StandardEngine[Tomcat]]
+Caused by: java.lang.NullPointerException: Cannot invoke "java.util.concurrent.BlockingQueue.add(Object)" because
+  the return value of "java.util.concurrent.ThreadPoolExecutor.getQueue()" is null
+	at java.util.concurrent.ScheduledThreadPoolExecutor.delayedExecute(ScheduledThreadPoolExecutor.java:347)
+	at java.util.concurrent.ScheduledThreadPoolExecutor.scheduleWithFixedDelay(ScheduledThreadPoolExecutor.java:667)
+	at org.apache.tomcat.util.threads.ScheduledThreadPoolExecutor.scheduleWithFixedDelay(ScheduledThreadPoolExecutor.java:134)
+	at org.apache.catalina.core.ContainerBase.startInternal(ContainerBase.java:764)
+```
+Root cause: `StandardServer.reconfigureUtilityExecutor()` builds Tomcat's
+shared "Catalina-utility-" pool via direct
+`new java.util.concurrent.ScheduledThreadPoolExecutor(threads, threadFactory)`
+(the real JDK class — Tomcat's own `org.apache.tomcat.util.threads.ScheduledThreadPoolExecutor`
+is a thin wrapper delegating to it, not a subclass). CratonVM had **three**
+separate, redundant native `<init>` overrides for
+`java/util/concurrent/ScheduledThreadPoolExecutor` (`native-builtins/src/phases_early.rs::register_scheduled_executor_natives`,
+a real-JDK-mode inline duplicate in `vm/src/vm/vm_init.rs`, and a third,
+better one — `native-builtins/src/phases_late.rs::register_p63_scheduled_executor`
+— that is only reachable from the synthetic/fake-JDK bootstrap path and
+never gets registered in real-JDK mode at all). The two natives that *do*
+run in real-JDK mode only ever wrote two legacy synthetic slots
+(`corePoolSize`, `shutdown`) and never invoked the real `ThreadPoolExecutor`
+constructor chain, so the real, inherited `workQueue` field was left `null`
+— exactly the "synthetic native shadows real bytecode" pattern behind the
+`File.FS`/`ThreadGroup` bugs (see
+`docs/internal/fixed-suite-bugs/file-fs-native-clinit-never-set-FIXED.md` and
+`.../threadgroup-native-field-index-mismatch-FIXED.md`).
+
+This was found and fixed **concurrently by a different session** (working the
+`EnumSet.of()`/`allOf()` websocket-close bug, branch
+`codex/fix-tomcat-wsclose-enumset-20260709-223225`), which dropped the whole
+`ScheduledThreadPoolExecutor`/`Executors.newScheduledThreadPool`/`newSingleThreadScheduledExecutor`
+native surface in real-JDK mode (via `NativeMethodRegistry`'s existing
+`drop_real_layout_synthetic` mechanism — the same one already used for
+`java/util/StringJoiner` and, in their change, `java/util/EnumSet`) so the
+real JDK bytecode constructs and drives `ScheduledThreadPoolExecutor`
+end-to-end. That fix was **independently verified in this session**, both
+directly on their (uncommitted, at verification time) worktree and by
+re-applying their diff onto a fresh `origin/dev` tip in a disposable
+worktree:
+- Standalone repro (`STPEProbe.java`: `new ScheduledThreadPoolExecutor(1, tf)`,
+  `getQueue()`, `scheduleWithFixedDelay(...)`, `shutdown()`) — passes clean,
+  `queue=[]` (non-null) instead of `queue=null`.
+- Full `TestSwallowAbortedUploads` run: `getQueue()` NPE occurrences dropped
+  from present-in-every-method to **0/10** methods.
+
+**New blocker #2 (found, already fixed elsewhere by the time of this
+re-verify): `ByteBuffer.put(int, byte)` `AbstractMethodError`.** Past the
+`getQueue()` blocker, `NioEndpoint`'s socket read hit
+`AbstractMethodError: method java/nio/ByteBuffer.put(IB)Ljava/nio/ByteBuffer;
+has no Code attribute`. This turned out to be the same family as (and
+plausibly the identical live-dispatch-site fix for)
+`docs/internal/tomcat-08-07/bytebuffer-address-unset-aioobe.md`, fixed on
+`dev` via commit `1f1b5d28`/merge `1d7134d0` ("Fix ByteBuffer heap address
+initialization", 2026-07-09) — landed independently, unrelated to this
+investigation. Re-verified with a worktree built from a fresh `origin/dev`
+tip (which includes that fix) plus the `ScheduledThreadPoolExecutor` diff
+above: `AbstractMethodError` occurrences also dropped to **0/10** methods.
+
+**New blocker #3 — STILL OPEN, now the sole blocker.** With both of the
+above fixed (verified together in one combined build off a fresh `dev` tip),
+`TestSwallowAbortedUploads` still fails **100% (10/10 methods, `Tests run:
+10, Failures: 20`)** with a new symptom, now hit on every single method:
+```
+ERROR [org.apache.tomcat.util.net.NioEndpoint] Error running socket processor
+  (java/lang/NullPointerException: Cannot invoke "java.util.concurrent.locks.ReentrantLock.lock()" because "lock" is null)
+```
+Not yet root-caused. Notes for the next session:
+- `org.apache.tomcat.util.net.SocketWrapperBase` declares
+  `private final ReentrantLock lock = new ReentrantLock();`
+  (`SocketWrapperBase.java:66`) — the only `ReentrantLock lock` field found
+  in the reachable HTTP (non-websocket) request path via
+  `grep -rl 'ReentrantLock lock' java/`.
+- `javap -p -c` on the real compiled `SocketWrapperBase.class` confirms the
+  constructor bytecode looks correct in isolation: `new ReentrantLock()` +
+  `putfield lock` at bci 4–12, immediately after `invokespecial
+  Object.<init>` at bci 0. `getLock()` is a plain `getfield` + `areturn`.
+  No native `<init>` override is registered anywhere in the tree for
+  `SocketWrapperBase`, `NioSocketWrapper`, or `ReentrantLock` that would
+  explain a skipped/shadowed write (confirmed via
+  `grep -rn 'SocketWrapperBase\|NioSocketWrapper'` across
+  `native-builtins/src/*.rs` and `vm/src/vm/vm_init.rs` — the only hit is an
+  unrelated TLS comment).
+- Two untested hypotheses: (a) a GC/moving-object stale-field-write —
+  `SocketWrapperBase` is constructed on the Poller/Acceptor thread but the
+  failing `.lock()` call happens later, on a worker thread pulled from the
+  executor pool, which is exactly the cross-thread-visibility shape of
+  several already-fixed bugs in this codebase (see
+  `docs/internal/fixed-suite-bugs/*stale-local*`,
+  `*cat2-local-store-upper-half-leak*`); (b) a JIT miscompilation of the
+  field-initializer store in `SocketWrapperBase.<init>` (interpreter-vs-JIT
+  divergence). Neither has been tested — no repro has been isolated below
+  the full Tomcat fixture yet; that's the recommended next step (a minimal
+  `NioEndpoint`-driven socket accept/read probe, bypassing the rest of
+  Tomcat, to confirm/rule out cross-thread visibility vs. JIT).
+
+**Status stays OPEN.** Do not retire this doc until blocker #3 is fixed and
+the full class passes clean. Verification commands used throughout (adjust
+the binary path):
+```bash
+<EXE> --java-home /home/victor/jdk25 -Xmx2g -cp "$(cat /data/data/apps/tomcat/.suite/cp-linux-fixed.txt)" \
+  org.junit.runner.JUnitCore org.apache.catalina.core.TestSwallowAbortedUploads
+```

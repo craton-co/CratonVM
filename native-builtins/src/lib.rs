@@ -2097,6 +2097,7 @@ pub mod lang_system;
 pub mod phases_early;
 pub mod phases_late;
 pub mod stamped_lock;
+pub mod uncaught_handlers;
 #[cfg(feature = "synthetic-jdk")]
 pub mod util_time;
 // T19_K3_PROPS_SIDETABLE — robust java.util.Properties storage so
@@ -18410,6 +18411,25 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(I)Ljava/lang/String;",
         native_matcher_group_idx,
     );
+    registry.register(
+        "java/util/regex/Matcher",
+        "start",
+        "()I",
+        native_matcher_start,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "start",
+        "(I)I",
+        native_matcher_start_idx,
+    );
+    registry.register("java/util/regex/Matcher", "end", "()I", native_matcher_end);
+    registry.register(
+        "java/util/regex/Matcher",
+        "end",
+        "(I)I",
+        native_matcher_end_idx,
+    );
 
     // bug-26 (kafka SCRAM): `javax.crypto.Mac` (getInstance/init/update/doFinal)
     // was only registered inside `register_synthetic_overrides`, which real-JDK
@@ -19264,6 +19284,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             },
         );
         registry.register(
+            "java/io/InputStreamReader",
+            "close",
+            "()V",
+            native_noop_with_this,
+        );
+        registry.register(
             "java/util/jar/Attributes",
             "<init>",
             "()V",
@@ -19291,13 +19317,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             "java/util/jar/Attributes",
             "get",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
-            native_attrs_get_value,
+            native_attrs_get_object,
         );
         registry.register(
             "java/util/jar/Attributes",
             "put",
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            native_attrs_put_value,
+            native_attrs_put_object,
         );
         registry.register("java/util/jar/Attributes", "size", "()I", native_attrs_size);
         registry.register(
@@ -19317,6 +19343,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             "toString",
             "()Ljava/lang/String;",
             native_attrs_name_to_string,
+        );
+        registry.register(
+            "java/util/jar/Attributes$Name",
+            "equals",
+            "(Ljava/lang/Object;)Z",
+            native_attrs_name_equals,
+        );
+        registry.register(
+            "java/util/jar/Attributes$Name",
+            "hashCode",
+            "()I",
+            native_attrs_name_hash_code,
         );
         registry.register(
             "java/util/jar/Attributes$Name",
@@ -19405,22 +19443,45 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 let one = ctx.new_array(cratonvm_types::ArrayElementType::Char, 1);
                 let mut out = String::new();
                 let mut saw_any = false;
+                let key = ctx.identity_hash_code(this);
                 loop {
-                    let n = match ctx.invoke_virtual(
-                        reader,
-                        "read",
-                        "([CII)I",
-                        &[Value::Object(Some(one)), Value::Int(0), Value::Int(1)],
-                    )? {
-                        Some(Value::Int(n)) => n,
-                        _ => -1,
+                    let ch = if let Some(ch) = r3_br_pending_chars().lock().remove(&key) {
+                        ch
+                    } else {
+                        let n = match ctx.invoke_virtual(
+                            reader,
+                            "read",
+                            "([CII)I",
+                            &[Value::Object(Some(one)), Value::Int(0), Value::Int(1)],
+                        )? {
+                            Some(Value::Int(n)) => n,
+                            _ => -1,
+                        };
+                        if n <= 0 {
+                            break;
+                        }
+                        ctx.get_array_element(one, 0).as_int().unwrap_or(0)
                     };
-                    if n <= 0 {
+                    saw_any = true;
+                    if ch == b'\n' as i32 {
                         break;
                     }
-                    saw_any = true;
-                    let ch = ctx.get_array_element(one, 0).as_int().unwrap_or(0);
-                    if ch == b'\n' as i32 || ch == b'\r' as i32 {
+                    if ch == b'\r' as i32 {
+                        let n = match ctx.invoke_virtual(
+                            reader,
+                            "read",
+                            "([CII)I",
+                            &[Value::Object(Some(one)), Value::Int(0), Value::Int(1)],
+                        )? {
+                            Some(Value::Int(n)) => n,
+                            _ => -1,
+                        };
+                        if n > 0 {
+                            let next = ctx.get_array_element(one, 0).as_int().unwrap_or(0);
+                            if next != b'\n' as i32 {
+                                r3_br_pending_chars().lock().insert(key, next);
+                            }
+                        }
                         break;
                     }
                     if let Some(c) = char::from_u32(ch as u32) {
@@ -19810,8 +19871,10 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // late StackWalker phase; use the same implementation earlier.
     crate::phases_late::register_p59_stackwalker(registry);
     // Logging bootstrap can see synthetic LogRecord/EnumMap before the normal
-    // phase-50/54 registrations are installed.
-    crate::phases_early::register_enum_map_natives(registry);
+    // phase-50/54 registrations are installed. Only `<init>` is registered
+    // here — see `register_enum_map_init_native`'s doc comment for why the
+    // rest of `register_enum_map_natives` must stay synthetic-mode-only.
+    crate::phases_early::register_enum_map_init_native(registry);
     crate::phases_early::register_phase54_logging_extras(registry);
     // JBoss Modules can resolve ThreadLocal as a synthetic real-JDK stub during
     // early module bootstrap, but its withInitial body lives in phase 50.
@@ -23690,6 +23753,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Thread$UncaughtExceptionHandler;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    crate::uncaught_handlers::register_uncaught_handler_natives(registry);
     registry.register(
         "java/lang/Thread",
         "getThreadGroup",
@@ -24598,6 +24662,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()I",
         crate::lang_system::native_runtime_version_feature,
     );
+    registry.register(
+        "java/lang/Runtime$Version",
+        "build",
+        "()Ljava/util/Optional;",
+        crate::lang_system::native_runtime_version_build,
+    );
     // Runtime.exec overloads — spawn subprocesses via std::process::Command
     registry.register(
         "java/lang/Runtime",
@@ -25498,6 +25568,14 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             name,
             descriptor,
             native_scoped_memory_put_long,
+        );
+    }
+    for name in ["copyMemory", "copyMemoryInternal"] {
+        registry.register(
+            scoped_memory_access,
+            name,
+            "(Ljdk/internal/misc/ScopedMemoryAccess$Scope;Ljdk/internal/misc/ScopedMemoryAccess$Scope;Ljava/lang/Object;JLjava/lang/Object;JJ)V",
+            native_scoped_memory_copy_memory,
         );
     }
 
@@ -28319,6 +28397,43 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             |_ctx, _args| Ok(Some(cratonvm_types::Value::Object(None))),
         );
         registry.register(buf, "checkSession", "()V", |_ctx, _args| Ok(None));
+        registry.register(buf, "isReadOnly", "()Z", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            match ctx.get_field_by_name(this, "isReadOnly") {
+                Value::Int(v) => Ok(Some(Value::Int(if v != 0 { 1 } else { 0 }))),
+                _ => {
+                    let cname = ctx
+                        .class_name_of_id(ctx.class_id_of_object(this))
+                        .unwrap_or_default();
+                    Ok(Some(Value::Int(
+                        if cname.ends_with('R') || cname.contains("ReadOnly") {
+                            1
+                        } else {
+                            0
+                        },
+                    )))
+                }
+            }
+        });
+        registry.register(buf, "isDirect", "()Z", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let cname = ctx
+                .class_name_of_id(ctx.class_id_of_object(this))
+                .unwrap_or_default();
+            Ok(Some(Value::Int(
+                if cname.contains("Direct") || cname.contains("Mapped") {
+                    1
+                } else {
+                    0
+                },
+            )))
+        });
     }
 
     // S111r15 — Character.toLowerCase / toUpperCase native overrides for
@@ -28944,6 +29059,20 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `check_override` allow-list entry for `java/lang/ref/Cleaner`
     // in `vm/src/vm/vm_exec.rs`.
     crate::phases_late::register_p69_cleaner(registry);
+    // Elasticsearch/log4j date formatting opens `${java.home}/lib/tzdb.dat`
+    // during startup. Real `FileInputStream` calls `FileCleanable.register`,
+    // whose only purpose is GC-time fd cleanup, but that path bootstraps
+    // CleanerFactory/InnocuousThread and currently trips ThreadGroup layout
+    // differences before any file bytes are read. Close paths still go through
+    // the fd natives, so skipping the phantom-cleaner registration is safe for
+    // deterministic test execution and keeps simple file opens out of cleaner
+    // thread bootstrap.
+    registry.register(
+        "java/io/FileCleanable",
+        "register",
+        "(Ljava/io/FileDescriptor;)V",
+        |_ctx, _args| Ok(None),
+    );
 
     // UUID-OVERRIDE: java.util.UUID natives. Real JDK 25 `UUID.toString()`
     // bytecode uses `jdk/internal/util/ByteArrayLittleEndian.{setLong,setInt}`
@@ -38976,42 +39105,38 @@ fn native_unsafe_object_field_offset(
         // opaque index, not our heap slot), and the fallback chain above
         // only reads two well-known slots. The inheritance walk below
         // guarantees the returned offset is the real heap slot.
-        let effective_slot = if slot == 0 {
-            if let Some((class_id, field_name)) =
-                crate::lang_class::field_class_and_name(ctx, *field_obj)
-            {
+        let effective_slot = if let Some((class_id, field_name)) =
+            crate::lang_class::field_class_and_name(ctx, *field_obj)
+        {
+            let cname = ctx.class_name_of_id(class_id).unwrap_or_default();
+            let resolved = ctx.resolve_field_index(&cname, &field_name).or_else(|| {
                 let mut cid_opt = Some(class_id);
-                let mut resolved: Option<usize> = None;
                 while let Some(cid) = cid_opt {
                     let fields = ctx.declared_fields(cid);
                     if let Some(f) = fields.iter().find(|f| !f.is_static && f.name == field_name) {
-                        resolved = Some(f.slot_index);
-                        break;
+                        return Some(f.slot_index);
                     }
                     cid_opt = ctx.superclass_of(cid);
                 }
-                if let Some(s) = resolved {
-                    if s != 0 {
-                        static FIXED: std::sync::OnceLock<
-                            std::sync::Mutex<std::collections::HashSet<(String, String)>>,
-                        > = std::sync::OnceLock::new();
-                        let seen = FIXED.get_or_init(|| {
-                            std::sync::Mutex::new(std::collections::HashSet::new())
-                        });
-                        let cname = ctx.class_name_of_id(class_id).unwrap_or_default();
-                        let mut g = seen.lock().unwrap_or_else(|e| e.into_inner());
-                        if g.insert((cname.clone(), field_name.clone())) {
-                            tracing::info!(
-                                target: "cratonvm::unsafe",
-                                "objectFieldOffset(Field): class={cname:?} field={field_name:?} \
-                                 rj_slot=0 → resolved via declared_fields walk to slot={s}"
-                            );
-                        }
+                None
+            });
+            if let Some(s) = resolved {
+                if s != slot {
+                    static FIXED: std::sync::OnceLock<
+                        std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+                    > = std::sync::OnceLock::new();
+                    let seen = FIXED
+                        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+                    let mut g = seen.lock().unwrap_or_else(|e| e.into_inner());
+                    if g.insert((cname.clone(), field_name.clone())) {
+                        tracing::info!(
+                            target: "cratonvm::unsafe",
+                            "objectFieldOffset(Field): class={cname:?} field={field_name:?} \
+                             rj_slot={slot} → resolved by name to slot={s}"
+                        );
                     }
-                    s
-                } else {
-                    slot
                 }
+                s
             } else {
                 slot
             }
@@ -39762,6 +39887,21 @@ fn native_scoped_memory_get_long(ctx: &mut dyn NativeContext, args: &[Value]) ->
 fn native_scoped_memory_put_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let adapted = scoped_memory_access_unsafe_args(args);
     native_unsafe_put_long_mb(ctx, &adapted)
+}
+
+fn native_scoped_memory_copy_memory(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let adapted = vec![
+        args.first().copied().unwrap_or(Value::Object(None)),
+        args.get(3).copied().unwrap_or(Value::Object(None)),
+        args.get(4).copied().unwrap_or(Value::Long(0)),
+        args.get(5).copied().unwrap_or(Value::Object(None)),
+        args.get(6).copied().unwrap_or(Value::Long(0)),
+        args.get(7).copied().unwrap_or(Value::Long(0)),
+    ];
+    unsafe_natives::native_unsafe_copy_memory_consolidated(ctx, &adapted)
 }
 
 macro_rules! unsafe_multibyte_get {
@@ -41487,6 +41627,12 @@ fn native_unsafe_object_field_offset1(
             _ => None,
         });
     if let Some(class_id) = resolved_cid {
+        if let Some(cname) = ctx.class_name_of_id(class_id) {
+            if let Some(slot) = ctx.resolve_field_index(&cname, &field_name) {
+                return Ok(Some(Value::Long(slot as i64)));
+            }
+        }
+
         // T19.H1 — `declared_fields` only lists fields declared by
         // `class_id` itself, not inherited ones. HotSpot resolves
         // `Unsafe.objectFieldOffset(C.class, "name")` by walking the
@@ -43363,6 +43509,16 @@ mod java_replacement_tests {
         assert_eq!(ra("foo bar", "\\bbar\\b", "X"), "foo X");
         assert_eq!(ra("foobar", "\\bbar\\b", "X"), "foobar");
     }
+
+    #[test]
+    fn java_all_property_classes_compile() {
+        let all = compile_java_regex("\\p{all}", 0).unwrap();
+        assert!(all.is_match("x"));
+
+        let none = compile_java_regex("(\\P{all})+", 0).unwrap();
+        assert!(!none.is_match(""));
+        assert!(!none.is_match("x"));
+    }
 }
 
 /// Split a string on every match of a fancy-regex Regex. Mirrors the semantics
@@ -43590,7 +43746,9 @@ fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
     // capital-P negated forms), and no `\Q...\E` quoted-literal blocks,
     // there's nothing to rewrite.
     let has_quote_block = pattern.contains("\\Q");
+    let has_all_class = pattern.contains("\\p{all}") || pattern.contains("\\P{all}");
     if !has_quote_block
+        && !has_all_class
         && !(pattern.contains("\\p{In")
             || pattern.contains("\\P{In")
             || pattern.contains("\\p{Is")
@@ -43653,6 +43811,22 @@ fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
                 Some(e) => e + 2,
                 None => bytes.len(),
             };
+            continue;
+        }
+        // Java's `all` property denotes every character. Rust regexes do not
+        // have that alias, but they do accept explicit Unicode scalar ranges.
+        // The negated form becomes a class that compiles and can never match.
+        if i + 7 <= bytes.len()
+            && bytes[i] == b'\\'
+            && (bytes[i + 1] == b'p' || bytes[i + 1] == b'P')
+            && &pattern[i + 2..i + 7] == "{all}"
+        {
+            if bytes[i + 1] == b'P' {
+                out.push_str("[^\\x{0}-\\x{10FFFF}]");
+            } else {
+                out.push_str("[\\x{0}-\\x{10FFFF}]");
+            }
+            i += 7;
             continue;
         }
         // Look for `\p{In` or `\p{Is` (both cases of p) followed by a name and `}`.
@@ -43870,6 +44044,12 @@ fn register_regex_natives(_registry: &mut NativeMethodRegistry) {
     // bytecode. The previous Rust-regex-engine substitutes (which did not
     // match Java regex semantics) are removed so the real .class bytecode
     // runs instead.
+}
+
+fn r3_br_pending_chars() -> &'static parking_lot::Mutex<std::collections::HashMap<i32, i32>> {
+    static T: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<i32, i32>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
 fn native_pattern_compile(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -44277,6 +44457,47 @@ fn native_matcher_group_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(Some(Value::Object(None)))
 }
 
+fn matcher_group_boundary(
+    ctx: &mut dyn NativeContext,
+    mat: cratonvm_types::ObjectRef,
+    idx: usize,
+    want_end: bool,
+) -> MethodCallResult {
+    let input = matcher_read_input(ctx, mat);
+    let pat_obj = match matcher_get_pattern(ctx, mat) {
+        Some(p) => p,
+        None => return Ok(Some(Value::Int(-1))),
+    };
+    let re = read_pattern_regex(ctx, pat_obj)?;
+    let match_start = match ctx.get_field(mat, MAT_FIELD_MATCH_START) {
+        Value::Int(s) if s >= 0 => s as usize,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+                message: "No match found".to_string(),
+            }
+            .into());
+        }
+    };
+
+    if idx >= re.captures_len() {
+        return Err(
+            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                index: idx as i32,
+            }
+            .into(),
+        );
+    }
+
+    let Some(caps) = re.captures(&input[match_start..]) else {
+        return Ok(Some(Value::Int(-1)));
+    };
+    let Some(group) = caps.get(idx) else {
+        return Ok(Some(Value::Int(-1)));
+    };
+    let offset = if want_end { group.end } else { group.start };
+    Ok(Some(Value::Int((match_start + offset) as i32)))
+}
+
 fn native_matcher_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
@@ -44285,12 +44506,48 @@ fn native_matcher_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(Some(ctx.get_field(this, MAT_FIELD_MATCH_START)))
 }
 
+fn native_matcher_start_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let idx = match args.get(1) {
+        Some(Value::Int(i)) if *i >= 0 => *i as usize,
+        Some(Value::Int(i)) => {
+            return Err(
+                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: *i }
+                    .into(),
+            );
+        }
+        _ => 0,
+    };
+    matcher_group_boundary(ctx, this, idx, false)
+}
+
 fn native_matcher_end(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(-1))),
     };
     Ok(Some(ctx.get_field(this, MAT_FIELD_MATCH_END)))
+}
+
+fn native_matcher_end_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let idx = match args.get(1) {
+        Some(Value::Int(i)) if *i >= 0 => *i as usize,
+        Some(Value::Int(i)) => {
+            return Err(
+                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: *i }
+                    .into(),
+            );
+        }
+        _ => 0,
+    };
+    matcher_group_boundary(ctx, this, idx, true)
 }
 
 fn native_matcher_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -58746,13 +59003,27 @@ fn native_attrs_ensure_map(
     Ok(map)
 }
 
-fn native_attrs_key_object(ctx: &mut dyn NativeContext, key: ObjectRef) -> ObjectRef {
-    if ctx.read_string(key).is_some() {
-        return key;
+fn native_attrs_name_text(ctx: &dyn NativeContext, name_obj: ObjectRef) -> Option<String> {
+    match ctx.get_field(name_obj, 0) {
+        Value::Object(Some(name)) => ctx.read_string(name),
+        _ => None,
     }
-    match ctx.get_field(key, 0) {
-        Value::Object(Some(name)) if ctx.read_string(name).is_some() => name,
-        _ => key,
+}
+
+fn native_attrs_make_name(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes$Name", 1);
+    let obj_pin = ctx.pin_native_root(obj);
+    let s = ctx.create_string(name);
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.set_field(obj, 0, Value::Object(Some(s)));
+    ctx.unpin_native_roots(obj_pin);
+    obj
+}
+
+fn native_attrs_key_for_value(ctx: &mut dyn NativeContext, key: ObjectRef) -> ObjectRef {
+    match ctx.read_string(key) {
+        Some(name) => native_attrs_make_name(ctx, &name),
+        None => key,
     }
 }
 
@@ -58783,7 +59054,7 @@ fn native_attrs_put_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let map = native_attrs_ensure_map(ctx, this)?;
     let map_pin = ctx.pin_native_root(map);
     let key = ctx.read_native_pin(key_pin, key);
-    let map_key = native_attrs_key_object(ctx, key);
+    let map_key = native_attrs_key_for_value(ctx, key);
     let map_key_pin = ctx.pin_native_root(map_key);
     let value = ctx.read_native_pin(value_pin, value);
     let map = ctx.read_native_pin(map_pin, map);
@@ -58816,7 +59087,7 @@ fn native_attrs_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let map = native_attrs_ensure_map(ctx, this)?;
     let map_pin = ctx.pin_native_root(map);
     let key = ctx.read_native_pin(key_pin, key);
-    let map_key = native_attrs_key_object(ctx, key);
+    let map_key = native_attrs_key_for_value(ctx, key);
     let map_key_pin = ctx.pin_native_root(map_key);
     let map = ctx.read_native_pin(map_pin, map);
     let map_key = ctx.read_native_pin(map_key_pin, map_key);
@@ -58828,6 +59099,63 @@ fn native_attrs_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     ctx.unpin_native_roots(key_pin);
     ctx.unpin_native_roots(map_pin);
     ctx.unpin_native_roots(map_key_pin);
+    result
+}
+
+fn native_attrs_put_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = match args.get(1) {
+        Some(Value::Object(Some(key))) => *key,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let value = match args.get(2) {
+        Some(Value::Object(Some(value))) => *value,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = ctx.pin_native_root(key);
+    let value_pin = ctx.pin_native_root(value);
+    let this = ctx.read_native_pin(this_pin, this);
+    let map = native_attrs_ensure_map(ctx, this)?;
+    let map_pin = ctx.pin_native_root(map);
+    let key = ctx.read_native_pin(key_pin, key);
+    let value = ctx.read_native_pin(value_pin, value);
+    let map = ctx.read_native_pin(map_pin, map);
+    let result = cratonvm_native_collections::native_map_put_pub(
+        ctx,
+        &[
+            Value::Object(Some(map)),
+            Value::Object(Some(key)),
+            Value::Object(Some(value)),
+        ],
+    );
+    ctx.unpin_native_roots(this_pin);
+    ctx.unpin_native_roots(key_pin);
+    ctx.unpin_native_roots(value_pin);
+    ctx.unpin_native_roots(map_pin);
+    result
+}
+
+fn native_attrs_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = match args.get(1) {
+        Some(Value::Object(Some(key))) => *key,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = ctx.pin_native_root(key);
+    let this = ctx.read_native_pin(this_pin, this);
+    let map = native_attrs_ensure_map(ctx, this)?;
+    let map_pin = ctx.pin_native_root(map);
+    let key = ctx.read_native_pin(key_pin, key);
+    let map = ctx.read_native_pin(map_pin, map);
+    let result = cratonvm_native_collections::native_map_get_pub(
+        ctx,
+        &[Value::Object(Some(map)), Value::Object(Some(key))],
+    );
+    ctx.unpin_native_roots(this_pin);
+    ctx.unpin_native_roots(key_pin);
+    ctx.unpin_native_roots(map_pin);
     result
 }
 
@@ -58864,6 +59192,39 @@ fn native_attrs_name_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(ctx.get_field(this, 0)))
 }
 
+fn native_attrs_name_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let name = native_attrs_name_text(ctx, this).unwrap_or_default();
+    let mut h = 0i32;
+    for b in name.bytes() {
+        h = h
+            .wrapping_mul(31)
+            .wrapping_add(b.to_ascii_lowercase() as i32);
+    }
+    Ok(Some(Value::Int(h)))
+}
+
+fn native_attrs_name_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let other = match args.get(1) {
+        Some(Value::Object(Some(other))) => *other,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if this.as_ptr() == other.as_ptr() {
+        return Ok(Some(Value::Int(1)));
+    }
+    let lhs = native_attrs_name_text(ctx, this).unwrap_or_default();
+    let rhs = match native_attrs_name_text(ctx, other) {
+        Some(rhs) => rhs,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int(if lhs.eq_ignore_ascii_case(&rhs) {
+        1
+    } else {
+        0
+    })))
+}
+
 fn native_attrs_name_constant(ctx: &mut dyn NativeContext, name: &'static str) -> MethodCallResult {
     let obj = alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes$Name", 1);
     let obj_pin = ctx.pin_native_root(obj);
@@ -58875,6 +59236,14 @@ fn native_attrs_name_constant(ctx: &mut dyn NativeContext, name: &'static str) -
 }
 
 fn native_file_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    #[cfg(windows)]
+    let fs_class = "java/io/WinNTFileSystem";
+    #[cfg(not(windows))]
+    let fs_class = "java/io/UnixFileSystem";
+    if let Some(Value::Object(Some(fs))) = ctx.new_object_initialized(fs_class, "()V", &[])? {
+        ctx.set_static_field_by_name("java/io/File", "FS", Value::Object(Some(fs)));
+    }
+
     let separator = ctx.create_string(std::path::MAIN_SEPARATOR_STR);
     ctx.set_static_field_by_name("java/io/File", "separator", Value::Object(Some(separator)));
     ctx.set_static_field_by_name(
@@ -58926,7 +59295,11 @@ fn native_file_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
     #[cfg(windows)]
     {
         let fs_obj = alloc_concurrent_synthetic(ctx, "java/io/WinNTFileSystem", 4);
-        ctx.set_field_by_name(fs_obj, "slash", Value::Int(std::path::MAIN_SEPARATOR as i32));
+        ctx.set_field_by_name(
+            fs_obj,
+            "slash",
+            Value::Int(std::path::MAIN_SEPARATOR as i32),
+        );
         ctx.set_field_by_name(fs_obj, "semicolon", Value::Int(';' as i32));
         ctx.set_field_by_name(fs_obj, "altSlash", Value::Int('/' as i32));
         ctx.set_field_by_name(fs_obj, "userDir", Value::Object(Some(user_dir_str)));
@@ -58935,7 +59308,11 @@ fn native_file_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
     #[cfg(not(windows))]
     {
         let fs_obj = alloc_concurrent_synthetic(ctx, "java/io/UnixFileSystem", 3);
-        ctx.set_field_by_name(fs_obj, "slash", Value::Int(std::path::MAIN_SEPARATOR as i32));
+        ctx.set_field_by_name(
+            fs_obj,
+            "slash",
+            Value::Int(std::path::MAIN_SEPARATOR as i32),
+        );
         ctx.set_field_by_name(fs_obj, "colon", Value::Int(':' as i32));
         ctx.set_field_by_name(fs_obj, "userDir", Value::Object(Some(user_dir_str)));
         ctx.set_static_field_by_name("java/io/File", "FS", Value::Object(Some(fs_obj)));
@@ -58958,6 +59335,12 @@ fn alloc_heap_bytebuffer(ctx: &mut dyn NativeContext, capacity: usize) -> Object
     ctx.set_field_by_name(buf, "limit", Value::Int(cap));
     ctx.set_field_by_name(buf, "capacity", Value::Int(cap));
     ctx.set_field_by_name(buf, "mark", Value::Int(-1));
+    // Real HeapByteBuffer seeds Buffer.address to ARRAY_BYTE_BASE_OFFSET +
+    // offset. Bulk get/put bytecode routes through ScopedMemoryAccess and
+    // expects this base-offset-relative value when copying from/to hb.
+    // Keep this last so synthetic indexed compatibility writes cannot clobber
+    // the inherited real-JDK Buffer.address slot.
+    ctx.set_field_by_name(buf, "address", Value::Long(16));
     buf
 }
 
@@ -58966,9 +59349,19 @@ fn native_heap_bytebuffer_allocate(
     args: &[Value],
 ) -> MethodCallResult {
     let capacity = args.first().and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-    Ok(Some(Value::Object(Some(alloc_heap_bytebuffer(
-        ctx, capacity,
-    )))))
+    let bytes = ctx.new_array(cratonvm_types::ArrayElementType::Byte, capacity);
+    let bytes_pin = ctx.pin_native_root(bytes);
+    let bytes = ctx.read_native_pin(bytes_pin, bytes);
+    let result = native_byte_buffer_wrap_bytes_offset_len(
+        ctx,
+        &[
+            Value::Object(Some(bytes)),
+            Value::Int(0),
+            Value::Int(capacity.min(i32::MAX as usize) as i32),
+        ],
+    );
+    ctx.unpin_native_roots(bytes_pin);
+    result
 }
 
 fn alloc_coding_error_action(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
@@ -65498,6 +65891,7 @@ fn native_sync_collection_init(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => Value::Object(Some(this)),
     };
     ctx.set_field_by_name(this, "c", backing);
+    ctx.set_field(this, 0, backing);
     ctx.set_field_by_name(this, "mutex", mutex);
     Ok(None)
 }
@@ -65591,6 +65985,7 @@ fn native_sync_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => Value::Object(Some(this)),
     };
     ctx.set_field_by_name(this, "m", backing);
+    ctx.set_field(this, 0, backing);
     ctx.set_field_by_name(this, "mutex", mutex);
     Ok(None)
 }
@@ -70306,6 +70701,30 @@ mod nio_heap_byte_buffer_tests {
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_types::ArrayElementType;
+
+    #[test]
+    fn bytebuffer_allocate_initializes_real_address_for_bulk_copy() {
+        let mut ctx = MockNativeContext::new();
+        let result = native_heap_bytebuffer_allocate(&mut ctx, &[Value::Int(8)])
+            .expect("ByteBuffer.allocate native succeeds")
+            .expect("ByteBuffer.allocate returns object");
+        let buffer = match result {
+            Value::Object(Some(buffer)) => buffer,
+            other => panic!("expected ByteBuffer object, got {other:?}"),
+        };
+
+        assert_eq!(ctx.get_field_by_name(buffer, "position"), Value::Int(0));
+        assert_eq!(ctx.get_field_by_name(buffer, "limit"), Value::Int(8));
+        assert_eq!(ctx.get_field_by_name(buffer, "capacity"), Value::Int(8));
+        assert_eq!(ctx.get_field_by_name(buffer, "mark"), Value::Int(-1));
+        assert_eq!(ctx.get_field_by_name(buffer, "offset"), Value::Int(0));
+        assert_eq!(ctx.get_field_by_name(buffer, "address"), Value::Long(16));
+        let hb = match ctx.get_field_by_name(buffer, "hb") {
+            Value::Object(Some(hb)) => hb,
+            other => panic!("expected hb byte array, got {other:?}"),
+        };
+        assert_eq!(ctx.array_length(hb), 8);
+    }
 
     #[test]
     fn heap_byte_buffer_memorysegment_constructors_initialize_real_fields() {

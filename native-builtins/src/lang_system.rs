@@ -1173,6 +1173,12 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
         native_runtime_version_feature,
     );
     registry.register(
+        "java/lang/Runtime$Version",
+        "build",
+        "()Ljava/util/Optional;",
+        native_runtime_version_build,
+    );
+    registry.register(
         "java/lang/Runtime",
         "addShutdownHook",
         "(Ljava/lang/Thread;)V",
@@ -1329,6 +1335,19 @@ pub(crate) fn native_runtime_version_feature(
         })
         .unwrap_or(25);
     Ok(Some(Value::Int(v)))
+}
+
+/// `Runtime.Version.build()` - optional build number.
+///
+/// CratonVM's lightweight `Runtime.version()` object does not populate the real
+/// JDK `build` field, so the real accessor would return null. Returning
+/// `Optional.empty()` matches a valid version object and keeps callers from
+/// treating the VM metadata as malformed.
+pub(crate) fn native_runtime_version_build(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[])
 }
 
 pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

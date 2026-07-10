@@ -24,6 +24,7 @@ thread_local! {
     /// `Class.getGenericInterfaces`, …) sets this to the declaring class/method
     /// for the duration of its conversion via [`GenericDeclScope`].
     static GENERIC_DECL_SCOPE: Cell<Option<ObjectRef>> = const { Cell::new(None) };
+    static TYPE_PARAM_BUILD_SCOPE: Cell<Option<ObjectRef>> = const { Cell::new(None) };
 }
 
 /// RAII guard installing the current [`GENERIC_DECL_SCOPE`] and restoring the
@@ -44,6 +45,28 @@ impl Drop for GenericDeclScope {
     fn drop(&mut self) {
         GENERIC_DECL_SCOPE.with(|c| c.set(self.0));
     }
+}
+
+struct TypeParamBuildScope(Option<ObjectRef>);
+
+impl TypeParamBuildScope {
+    fn new(decl: Value) -> Self {
+        let r = match decl {
+            Value::Object(Some(o)) => Some(o),
+            _ => None,
+        };
+        TypeParamBuildScope(TYPE_PARAM_BUILD_SCOPE.with(|c| c.replace(r)))
+    }
+}
+
+impl Drop for TypeParamBuildScope {
+    fn drop(&mut self) {
+        TYPE_PARAM_BUILD_SCOPE.with(|c| c.set(self.0));
+    }
+}
+
+fn is_building_type_params_for(decl: ObjectRef) -> bool {
+    TYPE_PARAM_BUILD_SCOPE.with(|c| c.get() == Some(decl))
 }
 
 /// The current generic-declaration scope as a `Value` (null when unset).
@@ -69,6 +92,9 @@ fn resolve_declared_type_variable(
     decl: ObjectRef,
     name: &str,
 ) -> Option<Value> {
+    if is_building_type_params_for(decl) {
+        return None;
+    }
     let arr = match ctx.invoke_virtual(
         decl,
         "getTypeParameters",
@@ -394,6 +420,7 @@ pub fn type_param_to_java(
     // Bounds may reference type variables (e.g. `<T extends Comparable<T>>`);
     // their declaration is this same generic declaration.
     let _scope = GenericDeclScope::new(generic_decl);
+    let _build_scope = TypeParamBuildScope::new(generic_decl);
     let tv = alloc_concurrent_synthetic(ctx, "java/lang/reflect/TypeVariable", 3);
     let name_str = ctx.create_string(&tp.name);
     ctx.set_field(tv, 0, Value::Object(Some(name_str)));

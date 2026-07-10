@@ -21062,6 +21062,8 @@ fn force_native_over_real_jdk_bytecode(
                 | "putLongInternal"
                 | "putLongUnaligned"
                 | "putLongUnalignedInternal"
+                | "copyMemory"
+                | "copyMemoryInternal"
         )
     {
         return true;
@@ -21074,6 +21076,23 @@ fn force_native_over_real_jdk_bytecode(
         && matches!(
             method_name,
             "write" | "toByteArray" | "size" | "reset" | "toString"
+        )
+    {
+        return true;
+    }
+    // The lightweight resource-reader bridge stores the backing InputStream in
+    // the reader slot used by the native read shim. Real JDK close() expects a
+    // fully initialized sun.nio.cs.StreamDecoder in `sd` and can NPE while
+    // closing META-INF/services readers during Elasticsearch provider loading.
+    if class_name == "java/io/InputStreamReader"
+        && matches!((method_name, method_descriptor), ("close", "()V"))
+    {
+        return true;
+    }
+    if class_name == "java/lang/Runtime$Version"
+        && matches!(
+            (method_name, method_descriptor),
+            ("feature", "()I") | ("build", "()Ljava/util/Optional;")
         )
     {
         return true;
