@@ -25795,6 +25795,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 ctx.class_name_of_id(cid).as_deref(),
                 Some("java/lang/reflect/GenericArrayType")
                     | Some("java/lang/reflect/ParameterizedType")
+                    | Some("java/lang/reflect/TypeVariable")
                     | Some("java/lang/reflect/WildcardType")
             );
             if is_reflect {
