@@ -44061,16 +44061,13 @@ fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
     // or `\Q...\E` quoted-literal blocks,
     // there's nothing to rewrite.
     let has_quote_block = pattern.contains("\\Q");
-    let has_all_class = pattern.contains("\\p{all}") || pattern.contains("\\P{all}");
-    if !has_quote_block
-        && !has_all_class
-        && !(pattern.contains("\\p{In")
-            || pattern.contains("\\P{In")
-            || pattern.contains("\\p{Is")
-            || pattern.contains("\\P{Is")
-            || pattern.contains("\\p{java")
-            || pattern.contains("\\P{java"))
-    {
+    // Any `\p{...}`/`\P{...}` needs the loop below: it covers Unicode
+    // block/script prefixes (In/Is), `Character.is*` names (java*), the
+    // `all` alias, AND the POSIX character classes (Alpha, Digit, XDigit,
+    // ...) handled by `map_java_character_property`, which don't share a
+    // common prefix so can't be cheaply pre-filtered individually.
+    let has_property_class = pattern.contains("\\p{") || pattern.contains("\\P{");
+    if !has_quote_block && !has_property_class {
         return std::borrow::Cow::Borrowed(pattern);
     }
     let mut out = String::with_capacity(pattern.len());
@@ -44337,6 +44334,41 @@ fn map_java_character_property(name: &str) -> Option<&'static str> {
         "javaLetter" => Some(r"\p{L}"),
         "javaLetterOrDigit" => Some(r"\p{L}\p{Nd}"),
         "javaSpaceChar" => Some(r"\p{Z}"),
+        // POSIX character classes (java.util.regex.Pattern javadoc,
+        // "POSIX character classes (US-ASCII only)"). Rust's `regex` crate
+        // only recognizes Unicode property names in `\p{...}` (it has no
+        // notion of "XDigit"/"Alpha"/etc.), so without this table these
+        // patterns fail to compile in BOTH the `regex` and `fancy-regex`
+        // fallback, and `compile_java_regex` returns an Err. That Err was
+        // observed to silently corrupt `String.matches` (see
+        // `native_string_matches`'s literal-equality fallback on compile
+        // failure) — e.g. `"5".matches("\\p{XDigit}+")` returned `false`
+        // instead of `true`, while `Pattern.matches("\\p{XDigit}+", "5")`
+        // (real bytecode, unaffected by this translation layer) correctly
+        // returned `true`. Found via Tomcat's
+        // `TestHttp2Limits.testPostWithTrailerHeadersSize0`. These are
+        // always US-ASCII-only (matching Java's default; Java only
+        // redefines them in Unicode terms under the rarely-used
+        // `UNICODE_CHARACTER_CLASS` flag, which this translation layer
+        // does not special-case, same as the existing `\p{java*}` entries
+        // above).
+        "Lower" => Some("a-z"),
+        "Upper" => Some("A-Z"),
+        "ASCII" => Some(r"\x00-\x7F"),
+        "Alpha" => Some("a-zA-Z"),
+        "Digit" => Some("0-9"),
+        "Alnum" => Some("a-zA-Z0-9"),
+        // `!"#$%&'()*+,-./` (\x21-\x2F) + `:;<=>?@` (\x3A-\x40) +
+        // `[\]^_`` (\x5B-\x60) + `{|}~` (\x7B-\x7E) — printable
+        // ASCII minus letters and digits, as four contiguous byte ranges
+        // (sidesteps escaping `]`/`\`/`-` as literal bracket-class chars).
+        "Punct" => Some(r"\x21-\x2F\x3A-\x40\x5B-\x60\x7B-\x7E"),
+        "Graph" => Some(r"\x21-\x7E"),
+        "Print" => Some(r"\x20-\x7E"),
+        "Blank" => Some(" \t"),
+        "Cntrl" => Some(r"\x00-\x1F\x7F"),
+        "XDigit" => Some("0-9a-fA-F"),
+        "Space" => Some(r" \t\n\x0B\f\r"),
         _ => None,
     }
 }
