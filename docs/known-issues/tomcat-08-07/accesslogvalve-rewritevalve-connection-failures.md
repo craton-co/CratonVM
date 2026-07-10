@@ -1,9 +1,17 @@
 # TestAccessLogValve / TestRewriteValve — connection-level `-1` response failures
 
-**Status:** OPEN — re-verified in isolation, both are CONFIRMED GENUINE bugs
-(not contention). One root cause found along the way has been **FIXED**; two
-newly-discovered, deeper root causes remain **OPEN** with full diagnosis but
-no landed fix (see linked docs). **HotSpot:** PASS on both.
+**Status:** All three root causes found in this investigation now have fixes
+**landed on `dev`** (2026-07-09/10) — Layer 1 (`URL.openConnection()` CCE),
+Layer 2 (`ByteBuffer.address`, fixed by a separate session — see
+`docs/internal/tomcat-08-07/bytebuffer-address-unset-aioobe.md`), and Layer 3
+(`StringReader.read()`, fixed in this session — see
+`docs/internal/fixed-suite-bugs/stringreader-read-never-advances-infinite-loop-FIXED.md`).
+`TestRewriteValve` (Layer 3's reproducer) was re-run against the Layer 3 fix
+and now completes all 121 tests instead of hanging. **`TestAccessLogValve`
+(Layer 2's reproducer) has not been independently re-run against the Layer 2
+fix in this session** — recommend a follow-up full re-run of both classes
+together before moving this doc out of `known-issues/`. **HotSpot:** PASS on
+both.
 
 ## 2026-07-09 re-verification (Azure host, dev @ `7e382917`, `-Parallel 1`)
 
@@ -54,7 +62,7 @@ real http(s) URLs (via the pre-existing `url_custom_handler_connection`
 real-handler delegation), matching HotSpot's own `getClass().getName()`
 exactly.
 
-### Layer 2 (found, root-caused, NOT fixed): `TestAccessLogValve` — `ByteBuffer.address` never initialized → AIOOBE
+### Layer 2 (found, root-caused, FIXED by a separate session): `TestAccessLogValve` — `ByteBuffer.address` never initialized → AIOOBE
 
 With Layer 1 fixed, the ClassCastException is gone, but **every** connection
 in `TestAccessLogValve` still fails, now surfacing the **original** `-1`
@@ -75,16 +83,12 @@ array's real bounds check — throwing `ArrayIndexOutOfBoundsException` on the
 accepts and even receives bytes, but the buffer-fill/parse path throws before
 a response is ever written, so the client sees a dead connection (`-1`).
 
-**Not yet fixed**: two natural fix locations
-(`servlet.rs::bb_write_hb`, `native-io/src/lib.rs::alloc_byte_buffer`) were
-patched with the (correct, already-proven-elsewhere-in `charset.rs`) missing
-`address = 16` field write, but **neither is actually on the live dispatch
-path** for `ByteBuffer.allocate()` in a real-JDK-mode, default-feature CLI
-build — confirmed via an *unconditional* `eprintln!` inside each registered
-closure that never fired. See the linked doc for the "phantom native"
-investigation and hand-off notes.
+**FIXED** (2026-07-09, separate session): the live default-release allocator
+(`native-builtins/src/lib.rs::alloc_heap_bytebuffer` — neither of the two
+locations named above) was found and now seeds `address = 16`. See the
+linked doc for the "phantom native" investigation write-up, now resolved.
 
-### Layer 3 (found, root-caused, NOT fixed, unrelated to sockets): `TestRewriteValve` — `StringReader.read()` never advances → infinite loop
+### Layer 3 (found, root-caused, FIXED in this session): `TestRewriteValve` — `StringReader.read()` never advances → infinite loop
 
 `TestRewriteValve` does **not** reproduce the originally-reported `-1`/`400`
 symptom at all anymore. In isolation with a 300s timeout it now **hangs
@@ -93,39 +97,34 @@ completes. A `--stack-dump-on-timeout 30` capture caught the main thread
 spinning tens of millions of times inside
 `RewriteValve.parse(Ljava/io/BufferedReader;)V` → `StringReader.read()`.
 
-Root cause fully diagnosed — see
-[`stringreader-read-never-advances-infinite-loop.md`](stringreader-read-never-advances-infinite-loop.md).
-Short version: `StringReader.read()` unconditionally returns the buffer's
-**first** character forever; the position never advances, so any
-`BufferedReader`/`StringReader`-based text parsing loop (config parsing,
-`RewriteValve`'s rule-file parser here) spins forever. Same "phantom native"
-pattern as Layer 2 — the two candidate registered implementations
-(`phases_early.rs`, correctly-shaped 3-field synthetic version in
-`native-io/src/lib.rs`) are both provably not on the live dispatch path
-(confirmed via the same unconditional-`eprintln!` technique), and simple,
-targeted probes rule out the VM's general field/post-increment/synchronized
-mechanics as the culprit (they all work correctly in isolation) — the bug is
-specific to however `java.io.StringReader` actually gets resolved.
+**FIXED** (2026-07-09/10, this session): root-caused and fixed — see
+[`stringreader-read-never-advances-infinite-loop-FIXED.md`](../../internal/fixed-suite-bugs/stringreader-read-never-advances-infinite-loop-FIXED.md).
+Short version: the live native (`native-io`'s `register_string_rw_natives`,
+`NativeKind::SyntheticStub`) wins dispatch over real bytecode by default
+(the `CRATONVM_REAL` differential switch defaults to off), but stored
+position/length in flat object field slots that don't exist on real JDK
+25's `StringReader` (rewritten to a single `Reader` delegate) — the writes
+silently no-op'd, so `read()` always saw `pos == 0`. Fixed with a
+GC-stable side table instead of object fields. `TestRewriteValve` now
+completes all 121 tests within its timeout (previously: complete hang, zero
+progress).
 
 ## Recommendation for the next session
 
 1. **Layer 1 fix is landed and verified** — no further action needed there.
-2. Layers 2 and 3 share a **systemic, unresolved mystery**: a method that
-   `classloading/src/class_manager.rs` marks `NATIVE` via its synthetic
-   classfile-patching mechanism (`java/nio/ByteBuffer.allocate`,
-   `java/io/StringReader.read`) resolves to *something* at runtime, but not
-   to any of the plausibly-matching registrations found by exhaustive `grep`
-   across `native-builtins`/`native-io` (each confirmed dead via an
-   unconditional debug print that never fires). Before attempting another
-   fix at the Rust-native-registration layer, first find the actual runtime
-   dispatch site — likely requires instrumenting
-   `vm/src/runtime/interpreter.rs`'s native-dispatch path itself (around the
-   `shared.native_methods.find(...)` call sites, ~15 of them) or checking
-   for a second, independent `NativeMethodRegistry` instance / resolution
-   cache that isn't `shared.native_methods`.
-3. Once the live dispatch site is found, both fixes are simple one-line
-   field-initialization / index-arithmetic corrections — the hard part is
-   locating where to apply them, not the fix itself.
+2. **Layer 2 fix is landed** (separate session) — recommend an isolated
+   `TestAccessLogValve` re-run to confirm the `-1`/`400` symptom is actually
+   gone now (not independently re-verified in this session).
+3. **Layer 3 fix is landed and verified in this session** —
+   `TestRewriteValve` completes all 121 tests. The remaining failures in
+   that run (`NullPointerException: Cannot enter synchronized block because
+   "this.lock" is null` in the NIO socket/lock path, and the
+   `LifecycleException` cascades it triggers) are a distinct,
+   previously-undocumented issue, not investigated further here — worth a
+   new known-issue doc if it reproduces outside this suite.
+4. Once both Layer 2 and Layer 3 re-runs are independently confirmed clean
+   (or at least free of these three specific symptoms), this doc can move
+   to `docs/internal/` per the known-issues convention.
 
 ## Reproduction
 
