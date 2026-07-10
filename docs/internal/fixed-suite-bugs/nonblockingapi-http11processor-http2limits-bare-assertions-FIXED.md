@@ -420,3 +420,126 @@ none of the 3 share a root cause with each other or with the still-open
 `SocketWrapperBase.lock` bug. This doc should stay OPEN, narrowed to these
 3 residual, independent investigations (regex `\p{XDigit}`, async
 read-error response completion, Jasper JSP fixture/compile issue).
+
+
+## 2026-07-10 (final) RETIRED — regex fixed, ByteBuffer.mark()/reset() root-caused and fixed, 5/6 methods now pass
+
+Fixed the `\p{XDigit}` regex residual and, while root-causing the async
+listener/response path for the other two residuals, found and fixed an
+unrelated, much more impactful bug: `ByteBuffer.mark()`/`reset()` were
+completely broken for real-JDK `ByteBuffer`/`DirectByteBuffer` objects, and
+that bug — not anything specific to Jasper or HTTP/2 — explains the
+`testWithTEChunkedWithCL` residual too.
+
+### Fix 1: `\p{XDigit}` and the other POSIX character classes
+
+Root cause matches the prior session's diagnosis exactly:
+`native-builtins/src/lib.rs`'s `translate_java_regex`/`map_java_character_property`
+(the fast native regex translation layer backing `String.matches`) never
+translated Java's POSIX character classes (`\p{Alpha}`, `\p{Digit}`,
+`\p{XDigit}`, `\p{Punct}`, `\p{Graph}`, `\p{Print}`, `\p{Blank}`, `\p{Cntrl}`,
+`\p{ASCII}`, `\p{Lower}`, `\p{Upper}`, `\p{Alnum}`, `\p{Space}`) — only the
+Unicode-block (`\p{InXxx}`), script (`\p{IsXxx}`), and `Character.is*`-alias
+(`\p{java*}`) forms. Since the `regex` crate's `\p{...}` syntax only knows
+Unicode property names (no "XDigit"), compiling such a pattern always failed
+in both the `regex` crate and the `fancy-regex` fallback, and
+`native_string_matches`'s error path silently falls back to literal-string
+equality on any compile failure — hence `"5".matches("\p{XDigit}+")`
+returning `false` instead of `true` (and, by the same mechanism, every
+other POSIX class was equally broken via `String.matches`/`replaceAll`/
+`replaceFirst`, not just the one case this doc's repro happened to hit).
+
+Added all 13 POSIX classes to the translation table and widened the
+fast-path pre-filter (previously only bailed the rewrite loop in for
+`\p{In`/`\p{Is`/`\p{java`/`\p{all}` substrings specifically) to trigger on
+any `\p{`/`\P{` occurrence, since POSIX names don't share a common prefix
+with each other or with those. Verified against a 15-case repro comparing
+CratonVM to real HotSpot directly (`String.matches` for every POSIX class
+plus the original `Pattern.matches` cross-check) — all match.
+
+(`dev` had independently, unrelatedly refactored this same function in the
+interim to add several more `\p{java*}` aliases and rename
+`map_java_character_property` → `map_java_predefined_class`; merged cleanly
+by moving the POSIX table into its own `map_posix_character_class` + a
+dedicated loop branch rather than reusing the renamed function.)
+
+### Fix 2 (new, bigger): `ByteBuffer.mark()`/`reset()` — wrong real field, and a `DirectByteBuffer` SIGSEGV
+
+While chasing the async-listener path for the other two residuals, running
+the real `TestHttp2Limits` class surfaced a **new, previously-undocumented
+regression**, unrelated to anything this doc had described: `Servlet.service()`
+for the shared `SimpleServlet`/JSP-echo servlets threw
+`java.lang.IllegalStateException: InvalidMarkException` on essentially
+every request touching the HTTP/2 header-block-fragment buffer or Jasper's
+JSP-source reading — i.e. `testHeaderLimits100x32` (previously passing per
+this doc's own 2026-07-10 table) had regressed, and `testPostWithTrailerHeadersSize0`
+failed with a wrong status/body instead of the documented regex-matcher
+disagreement.
+
+Minimal repro (`ByteBuffer.allocate(16).position(3); mark(); reset();`)
+reproduced it directly: **every `reset()` on a real-JDK `ByteBuffer` threw
+`InvalidMarkException`, even called immediately after a matching `mark()`
+with no mutation in between.**
+
+Root cause: `native-builtins/src/servlet.rs`'s `register_s2_bytebuffer`
+(the native `java.nio.ByteBuffer` implementation) tracks buffer state via a
+synthetic indexed-slot convention (`BB_ARRAY=0, BB_POS=1, BB_LIMIT=2,
+BB_CAP=3, BB_MARK=4, BB_ORDER=5`) designed for a fully-synthetic (no real
+JDK class) layout. But in real-JDK mode these objects are allocated as the
+*real* `java.nio.ByteBuffer`/`DirectByteBuffer` class, whose actual real
+field order is `Buffer{mark(0), position(1), limit(2), capacity(3),
+address(4)}` (documented previously in
+`docs/internal/tomcat-suite-bugs/08-jsse-nio-sslengine-bytebuffer-FIXED.md`
+for the exact same class of bug in a different file). `position`/`limit`/
+`capacity` happen to align by coincidence (real indices 1/2/3 match
+`BB_POS`/`BB_LIMIT`/`BB_CAP`), which is exactly why only `mark`/`reset` were
+visibly broken: index 4 — this file's `BB_MARK` — lands on the real
+`address` field (a `long`), not `mark` (real index 0). `mark()` writing an
+`Int` there either got silently dropped by descriptor-aware `set_field`
+(type mismatch: `Int` into a `Long`-typed slot) or coerced away, so
+`reset()`'s read of the same wrong slot came back as the not-a-valid-int
+default, and `InvalidMarkException` fired unconditionally.
+
+Worse, for `DirectByteBuffer` specifically, `address` is the buffer's *real
+native memory pointer*. `ByteBuffer.allocateDirect()`'s own field-init code
+had exactly the same `BB_MARK`-indexed-slot bug, and — because it never
+also initializes the real `mark` field by name the way the heap-buffer path
+(`bb_write_hb`) does — the very first `mark()` call on a direct buffer
+*would* successfully corrupt `address` via the indexed fallback (verified
+with `gdb`: `address` read back as `3`, the buffer's position at time of
+`mark()`, instead of the real allocated pointer). The next `put()`/`get()`
+then computes a garbage target address and SIGSEGVs
+(`native_scoped_memory_put_byte` → `native_unsafe_put_byte_mb` →
+`copy_to_native_memory` → `memcpy` to an invalid address).
+
+**Fix:** added by-name-first `mark` accessors (`s2_bb_get_mark`/
+`s2_bb_set_mark`, mirroring the existing `hb`/`position`/`limit`/`capacity`
+by-name pattern already used for allocation) to `mark()`, `reset()`,
+`flip()`, `clear()`, `rewind()`, and `compact()`; and initialized the real
+`mark` field by name in `allocateDirect()` (removing its redundant indexed
+write, which would otherwise still clobber `address` on the very first
+`mark()` call even with the by-name accessors in place, since a
+never-yet-initialized real `mark` field reads back indistinguishably from
+"field doesn't exist").
+
+Verified with a 7-case direct/heap repro (basic mark/reset, flip+mark+get+reset,
+compact+mark+put+reset, reset-without-mark still throws, position+mark+position+reset,
+direct-buffer mark/reset, direct-buffer mark+put+put — the exact SIGSEGV
+sequence) — all match HotSpot, no crash.
+
+### Verification — all originally-listed methods re-run against real HotSpot and fixed CratonVM
+
+| Method | Doc's prior status | Status after both fixes |
+|---|---|---|
+| `TestNonBlockingAPI.testDelayedNBWrite` | PASSES | **PASSES** (regression-checked) |
+| `TestNonBlockingAPI.testNonBlockingReadIgnoreIsReady` | New failure (async-response gap) | **Still OPEN** — split off to [`nonblockingreadignoreisready-async-error-response-completion-gap.md`](../nonblockingreadignoreisready-async-error-response-completion-gap.md) |
+| `TestHttp11Processor.testPipelining` | PASSES | **PASSES** (regression-checked, alongside `testPipeliningBug64974`) |
+| `TestHttp11Processor.testWithTEChunkedWithCL` | New failure (Jasper "Stream closed") | **PASSES** — was the `ByteBuffer.mark()`/`reset()` bug (Jasper's JSP-source reading uses the same idiom), not a fixture gap as suspected |
+| `TestHttp2Limits.testHeaderLimits100x32` | PASSES | **PASSES** (regression-checked — had actually regressed to the `InvalidMarkException` bug in the interim; fixed) |
+| `TestHttp2Limits.testPostWithTrailerHeadersSize0` | New failure (regex `\p{XDigit}`) | **PASSES** |
+
+5/6 fixed. Doc retired; the one remaining residual has its own narrower,
+better-scoped doc (linked above) rather than blocking retirement of
+everything else.
+
+Branch `fix/tomcat0807-http-proto-edge-residuals-20260710`, merged to `dev`.
