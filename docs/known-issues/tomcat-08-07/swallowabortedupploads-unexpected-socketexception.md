@@ -208,3 +208,31 @@ the binary path):
 <EXE> --java-home /home/victor/jdk25 -Xmx2g -cp "$(cat /data/data/apps/tomcat/.suite/cp-linux-fixed.txt)" \
   org.junit.runner.JUnitCore org.apache.catalina.core.TestSwallowAbortedUploads
 ```
+
+## 2026-07-10 correction after WebSocket close-delay work
+
+The `lock is null` blocker above is no longer current. A focused probe during
+`TestWsRemoteEndpointImplServerDeadlock` showed the misleading `lock` message
+came from `java.util.concurrent.LinkedBlockingDeque.clear()` on Tomcat's
+WebSocket `WriteBuffer`, not from `SocketWrapperBase.lock` itself; direct
+`SocketWrapperBase` construction/read probes kept its `lock` field non-null.
+
+This branch drops the synthetic `LinkedBlockingDeque` fallback surface in
+real-JDK mode so the real JDK constructor initializes `lock`, `notEmpty`,
+`notFull`, and the linked-node fields. Re-running this class with the final
+WebSocket-close binary and a temporary logging basedir no longer shows the
+`NioEndpoint ... ReentrantLock.lock() because "lock" is null` processor error.
+The class now reaches request/response assertions:
+
+```text
+Tests run: 10, Failures: 6
+1) testAbortedPOSTOKSwallow
+2) testAbortedUploadLimitedNoSwallow
+3) testChunkedPUTLimit
+4) testAbortedPOST413Swallow
+5) testAbortedPOST413NoSwallow
+6) testAbortedPOSTOKNoSwallow
+```
+
+Status remains OPEN, but the next investigation should start from those six
+behavioral assertion failures, not from the old `lock is null` blocker.

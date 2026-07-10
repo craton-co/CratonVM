@@ -2840,7 +2840,8 @@ pub struct NativeMethodRegistry {
     drop_synthetic_stubs: bool,
     /// Real-JDK mode: drop synthetic natives whose hardcoded field-slot layout
     /// corrupts the *real* JDK object. Currently `java/util/StringJoiner`,
-    /// `java/util/EnumSet`, and `ScheduledThreadPoolExecutor`. `StringJoiner` is registered by
+    /// `java/io/StringReader`, `java/util/EnumSet`, `LinkedBlockingDeque`, and
+    /// `ScheduledThreadPoolExecutor`. `StringJoiner` is registered by
     /// `native-collections::register_string_joiner_natives` with a fake
     /// 5-field layout (delim/prefix/suffix/elements-ArrayList/emptyValue) but
     /// bundles into `register_collections_natives` — a function real-JDK mode
@@ -2856,7 +2857,14 @@ pub struct NativeMethodRegistry {
     /// `EnumSet.of(...)` and `allOf(...)` on app enums return an empty object
     /// with `iterator() == null`. Dropping the native surface lets the JDK
     /// factories allocate the concrete `RegularEnumSet`/`JumboEnumSet` classes,
-    /// which CratonVM's real collection paths already handle.
+    /// which CratonVM's real collection paths already handle. `LinkedBlockingDeque`
+    /// is registered as a SyntheticStub fallback by native-collections with the
+    /// four-slot fake blocking-queue layout; on a real JDK deque, that constructor
+    /// leaves real final fields such as `lock`/`notEmpty` null, and Tomcat's
+    /// `WriteBuffer.clear()` then fails in `LinkedBlockingDeque.clear()`.
+    /// `StringReader` has the same drift on modern JDKs: the real class wraps a
+    /// final `Reader r`, while the synthetic native constructor writes the old
+    /// `(content,pos,length)` slots, leaving `r` null before `mark()` delegates.
     /// Same mechanism as the `CRATONVM_REAL_NET_SOCKETS` Socket drop above,
     /// but set by `vm_init`'s real-JDK arm (not env-gated). Off in synthetic mode
     /// (there the fake layout *is* the object layout). Surfaced via Spring
@@ -3113,6 +3121,13 @@ impl NativeMethodRegistry {
         {
             return;
         }
+        // Real-JDK mode: drop synthetic `java/io/StringReader` natives. The
+        // fake surface uses the historical content/pos/length slot layout, but
+        // JDK 25 StringReader wraps a final `Reader r`; the fake constructor
+        // leaves that delegate null and real `mark()`/`read()` immediately NPE.
+        if self.drop_real_layout_synthetic && class_name == "java/io/StringReader" {
+            return;
+        }
         // Real-JDK mode: drop every `java/util/EnumSet` native, including the
         // SyntheticStub-tagged fallback surface. The real JDK factories are
         // self-contained once `Class.getEnumConstantsShared` works, and they
@@ -3123,6 +3138,16 @@ impl NativeMethodRegistry {
         // layout, producing `size() == 0` and `iterator() == null` for non-JDK
         // enums such as Log4j's StandardLevel and Jakarta DispatcherType.
         if self.drop_real_layout_synthetic && class_name == "java/util/EnumSet" {
+            return;
+        }
+        // Real-JDK mode: drop the synthetic LinkedBlockingDeque fallback surface.
+        // Its constructor writes the native-collections four-slot queue layout
+        // (array/head/size/capacity). A real JDK LinkedBlockingDeque needs its
+        // own constructor to initialize `lock`, `notEmpty`, `notFull`, and the
+        // linked-node fields before methods such as `clear()` run.
+        if self.drop_real_layout_synthetic
+            && class_name == "java/util/concurrent/LinkedBlockingDeque"
+        {
             return;
         }
         // Real-JDK mode: drop the synthetic ScheduledThreadPoolExecutor surface.
@@ -3828,6 +3853,27 @@ mod tests {
         assert!(real_layout
             .find("java/util/HashSet", "size", "()I")
             .is_some());
+
+        real_layout.set_category(NativeKind::SyntheticStub);
+        real_layout.register(
+            "java/io/StringReader",
+            "<init>",
+            "(Ljava/lang/String;)V",
+            dummy_native,
+        );
+        assert!(real_layout
+            .find("java/io/StringReader", "<init>", "(Ljava/lang/String;)V")
+            .is_none());
+
+        real_layout.register(
+            "java/util/concurrent/LinkedBlockingDeque",
+            "<init>",
+            "()V",
+            dummy_native,
+        );
+        assert!(real_layout
+            .find("java/util/concurrent/LinkedBlockingDeque", "<init>", "()V")
+            .is_none());
 
         real_layout.register(
             "java/util/concurrent/ScheduledThreadPoolExecutor",

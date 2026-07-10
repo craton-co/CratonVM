@@ -42581,14 +42581,7 @@ fn native_atomic_ref_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let this = unsafe_obj(args, 0).unwrap();
     let val = ctx.get_field_volatile(this, 0);
     let text = match val {
-        Value::Object(Some(obj)) => {
-            let class_id = ctx.class_id_of_object(obj);
-            let class_name = ctx
-                .class_name_of_id(class_id)
-                .unwrap_or_else(|| "?".to_string());
-            let hash = ctx.identity_hash_code(obj);
-            format!("{}@{:x}", class_name.replace('/', "."), hash)
-        }
+        Value::Object(Some(obj)) => crate::lang_string::invoke_to_string(ctx, obj)?,
         _ => "null".to_string(),
     };
     let s = ctx.create_string(&text);
@@ -73821,6 +73814,30 @@ mod concurrency_tests {
     }
 
     /// RD.2 — AtomicReference CAS uses reference identity, not .equals().
+    #[test]
+    fn atomic_reference_to_string_delegates_to_value() {
+        let reg = register_atomics();
+        let ar = "java/util/concurrent/atomic/AtomicReference";
+        let mut ctx = make_ctx();
+        let obj = alloc_concurrent_synthetic(&mut ctx, ar, 1);
+        let value = ctx.create_string("CLOSED");
+
+        let init = reg.find(ar, "<init>", "(Ljava/lang/Object;)V").unwrap();
+        init(
+            &mut ctx,
+            &[Value::Object(Some(obj)), Value::Object(Some(value))],
+        )
+        .unwrap();
+
+        let to_string = reg.find(ar, "toString", "()Ljava/lang/String;").unwrap();
+        let result = to_string(&mut ctx, &[Value::Object(Some(obj))]).unwrap();
+        let rendered = match result {
+            Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap(),
+            other => panic!("AtomicReference.toString returned {other:?}"),
+        };
+        assert_eq!(rendered, "CLOSED");
+    }
+
     #[test]
     fn rd2_atomic_reference_identity_cas() {
         let reg = register_atomics();
