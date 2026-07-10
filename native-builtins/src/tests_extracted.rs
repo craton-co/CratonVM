@@ -2414,6 +2414,34 @@ fn s2_bb_arr(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<ObjectRef> {
     }
 }
 
+/// Native-memory address of a DIRECT buffer (real-JDK `DirectByteBuffer`
+/// has no `hb` heap array; its storage lives at the `address` field). Same
+/// name-first/slot-4-fallback resolution as native-io's
+/// `directbuffer_address`. `None` for heap buffers and storage-less
+/// synthetics.
+fn s2_bb_direct_addr(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<i64> {
+    match ctx.get_field_by_name(buf, "address") {
+        Value::Long(v) if v != 0 => Some(v),
+        _ => match ctx.get_field(buf, 4) {
+            Value::Long(v) if v != 0 => Some(v),
+            _ => None,
+        },
+    }
+}
+
+/// Write a buffer's `position`. Buffers with a heap array keep this
+/// family's historic `BB_POS` slot write (self-consistent with `s2_bb_pos`
+/// on both real heap and synthetic buffers). DIRECT buffers are otherwise
+/// managed by the name-based native-io natives, whose layout the `BB_POS`
+/// slot is not guaranteed to match — write their `position` by name.
+fn s2_bb_set_pos(ctx: &mut dyn NativeContext, buf: ObjectRef, v: i32) {
+    if s2_bb_arr(ctx, buf).is_some() {
+        ctx.set_field(buf, BB_POS, Value::Int(v));
+    } else {
+        ctx.set_field_by_name(buf, "position", Value::Int(v));
+    }
+}
+
 fn s2_bb_get_byte(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i8 {
     if let Some(arr) = s2_bb_arr(ctx, buf) {
         ctx.get_array_element(arr, idx as usize).as_int().unwrap_or(0) as i8
@@ -2798,19 +2826,57 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let src  = obj_arg(args, 1)?;
         let src_pos = s2_bb_pos(ctx, src);
         let src_lim = s2_bb_limit(ctx, src);
-        let n = (src_lim - src_pos).max(0);
+        let n = (src_lim - src_pos).max(0) as usize;
         let pos = s2_bb_pos(ctx, this);
-        if pos + n > s2_bb_limit(ctx, this) {
+        if pos + n as i32 > s2_bb_limit(ctx, this) {
             return Err(RuntimeError::BufferOverflowException.into());
         }
-        let src_arr = match s2_bb_arr(ctx, src) { Some(a) => a, None => return Ok(Some(Value::Object(Some(this)))) };
-        let dst_arr = match s2_bb_arr(ctx, this) { Some(a) => a, None => return Ok(Some(Value::Object(Some(this)))) };
-        for i in 0..n as usize {
-            let b = ctx.get_array_element(src_arr, src_pos as usize + i);
-            ctx.set_array_element(dst_arr, pos as usize + i, b);
+        // Either side may be a DIRECT buffer (real-JDK `DirectByteBuffer`:
+        // no heap array, storage at `address`). The pre-fix code silently
+        // returned without copying OR advancing positions whenever a side
+        // had no heap array. `IOUtil.read` routes every buffered
+        // `FileChannel` read through a temporary direct buffer and then
+        // `dst.put(directSrc)`, so file reads "succeeded" (count returned)
+        // while delivering ZERO bytes with an unmoved destination position —
+        // Lucene's `BufferedIndexInput.refill()` then flipped an empty
+        // buffer and the first `readByte()` threw `BufferUnderflowException`
+        // (ES-FAIL-FAMILY-20260710-vector-codec-exception-cause-object).
+        let mut bytes = vec![0u8; n];
+        if let Some(src_arr) = s2_bb_arr(ctx, src) {
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = ctx
+                    .get_array_element(src_arr, src_pos as usize + i)
+                    .as_int()
+                    .unwrap_or(0) as u8;
+            }
+        } else if let Some(addr) = s2_bb_direct_addr(ctx, src) {
+            if !ctx.copy_from_native_memory(addr.saturating_add(src_pos as i64), &mut bytes) {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "ByteBuffer.put: direct source read failed".to_string(),
+                }
+                .into());
+            }
+        } else {
+            // Genuinely storage-less synthetic buffer — keep the historic
+            // silent no-op so half-built synthetic-mode buffers stay benign.
+            return Ok(Some(Value::Object(Some(this))));
         }
-        ctx.set_field(src, BB_POS, Value::Int(src_lim));
-        ctx.set_field(this, BB_POS, Value::Int(pos + n));
+        if let Some(dst_arr) = s2_bb_arr(ctx, this) {
+            for (i, b) in bytes.iter().enumerate() {
+                ctx.set_array_element(dst_arr, pos as usize + i, Value::Int(*b as i8 as i32));
+            }
+        } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
+            if !ctx.copy_to_native_memory(addr.saturating_add(pos as i64), &bytes) {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "ByteBuffer.put: direct destination write failed".to_string(),
+                }
+                .into());
+            }
+        } else {
+            return Ok(Some(Value::Object(Some(this))));
+        }
+        s2_bb_set_pos(ctx, src, src_lim);
+        s2_bb_set_pos(ctx, this, pos + n as i32);
         Ok(Some(Value::Object(Some(this))))
     });
 

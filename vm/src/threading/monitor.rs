@@ -1049,6 +1049,33 @@ impl MonitorTable {
                     // and its registry insert is closed by the registry
                     // mutex inside `inflate_locked`, so this branch only
                     // fires on a true invariant violation — see C8.
+                    //
+                    // GC-audit finding 1(b) tripwire (2026-07-10): this
+                    // branch is the prime suspect for the MTChurn
+                    // lost-wakeup pile-up. If a pause's monitor-registry
+                    // remap races a thread the STW quota hole let run
+                    // mid-collection, that thread can miss here and
+                    // RE-INFLATE a SECOND Monitor for the same Java object
+                    // — every waiter parked on the first is orphaned (the
+                    // gdb-captured 5-waiters-none-woken picture). Loud,
+                    // rate-limited, and counted so an MTChurn round can
+                    // confirm or kill the hypothesis cheaply.
+                    {
+                        static REINFLATE_MISSES: std::sync::atomic::AtomicUsize =
+                            std::sync::atomic::AtomicUsize::new(0);
+                        let n = REINFLATE_MISSES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n < 8 {
+                            tracing::warn!(
+                                obj = obj_ref.as_ptr() as usize,
+                                occurrence = n + 1,
+                                "monitor registry miss with INFLATED mark word — \
+                                 re-inflating a second Monitor for this object \
+                                 (audit finding 1(b) tripwire: waiters on the \
+                                 original monitor are now orphaned)"
+                            );
+                        }
+                    }
                     let m = self
                         .inflate_locked(obj_ref, header)
                         .expect("monitor inflation invariant: registry/mark-word desync");
@@ -1575,6 +1602,31 @@ impl Default for MonitorTable {
 impl cratonvm_gc::MonitorCleanup for MonitorTable {
     fn remap_after_gc(&self, pointer_map: &std::collections::HashMap<usize, usize>) {
         self.remap_after_gc(pointer_map);
+    }
+
+    /// Whole-heap dead-address prune (ZGC backend — see the trait doc).
+    /// `dead` is EXACT (every element's object was just swept), so removal
+    /// is unconditional: a thread still blocked on a dead object's monitor
+    /// holds its own `Arc<Monitor>` clone (dropping the registry entry
+    /// cannot free it under that thread), and no future locker can exist
+    /// for a dead object — while a NEW object reusing the address MUST get
+    /// a fresh monitor, not the dead object's.
+    fn prune_dead(&self, dead: &[usize]) {
+        if dead.is_empty() {
+            return;
+        }
+        {
+            let mut monitors = self.monitors.lock().expect("monitors registry poisoned");
+            for d in dead {
+                monitors.remove(d);
+            }
+        }
+        {
+            let mut cas = self.cas_locks.lock().expect("cas_locks registry poisoned");
+            for d in dead {
+                cas.remove(d);
+            }
+        }
     }
 }
 

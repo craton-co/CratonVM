@@ -539,6 +539,15 @@ pub trait NativeContext {
     /// Get the identity hash code of an ObjectRef.
     fn identity_hash_code(&self, obj: ObjectRef) -> i32;
 
+    /// ES-FAIL-FAMILY-20260710 hunt: arm the GC's dynamic software
+    /// write-watchpoint (see `cratonvm_gc::heap::set_dynamic_watch`) at a
+    /// raw heap address, so any subsequent write through an instrumented
+    /// heap write primitive that covers this address prints its call site.
+    /// `addr = 0` disarms. Default no-op so mock/test `NativeContext` impls
+    /// don't need to implement it; only the real VM's impl (which has a
+    /// live heap to watch) overrides it.
+    fn dbg_set_watch_cell(&mut self, _addr: usize) {}
+
     /// Stable identity for the owning VM/heap.
     ///
     /// Native side caches that store heap `ObjectRef`s must scope entries to
@@ -979,6 +988,36 @@ pub trait NativeContext {
     /// for mock/test contexts.
     fn create_string_uninterned(&mut self, text: &str) -> ObjectRef {
         self.create_string(text)
+    }
+
+    /// Populate an *already-allocated* `java/lang/String` object's backing
+    /// fields directly from raw UTF-16 code `units`, using the same
+    /// Latin1-fits-in-a-byte bulk scan + little-endian compact-string layout
+    /// as [`create_string`](Self::create_string). Unlike `create_string`,
+    /// this does NOT allocate the `String` object itself and does NOT touch
+    /// the intern pool — it exists for native `<init>` overrides
+    /// (`String(char[])`, `String(char[], int, int)`) that intercept
+    /// construction *after* `new` has already allocated `this`: a
+    /// constructor native must mutate `this` in place, not return a
+    /// different object identity.
+    ///
+    /// Preserves raw code units byte-for-byte (including unpaired
+    /// surrogates), unlike routing through a Rust `&str`, which cannot
+    /// represent those. Returns `false` only on backing-array allocation
+    /// failure (heap exhaustion) — the caller should surface a catchable
+    /// `OutOfMemoryError`.
+    ///
+    /// Default impl (mock/test contexts, which treat strings as opaque
+    /// objects): stores the units in a plain `char[]` at field 0 via the
+    /// generic array/field primitives. The VM override replaces this with
+    /// the exact compact-string layout used by every other String natively.
+    fn init_string_from_units(&mut self, this: ObjectRef, units: &[u16]) -> bool {
+        let arr = self.new_array(ArrayElementType::Char, units.len());
+        for (i, &u) in units.iter().enumerate() {
+            self.set_array_element(arr, i, Value::Int(u as i32));
+        }
+        self.set_field(this, 0, Value::Object(Some(arr)));
+        true
     }
 
     /// Read a Java String object back to a Rust String.
@@ -3226,6 +3265,36 @@ impl NativeMethodRegistry {
         if self.drop_real_layout_synthetic
             && class_name == "java/util/StringJoiner"
             && self.current_category != NativeKind::SyntheticStub
+        {
+            return;
+        }
+        // Real-JDK mode: drop the synthetic `java/lang/ref/Cleaner`/
+        // `Cleaner$Cleanable` natives (`create()`, `register(Object,Runnable)`,
+        // `Cleanable.clean()`). These were meant only as a fallback for when
+        // real class bytes are unavailable (see this block's own comment at
+        // the registration site, phases_late.rs::register_p68_cleaner: "real
+        // Cleaner bytecode still wins whenever the real class is loaded") --
+        // but `create()` is a STATIC factory method, and static dispatch has
+        // no per-instance real-vs-synthetic safety net the way concrete
+        // instance methods do, so the native unconditionally wins there and
+        // allocates a bare Cleaner with its real `impl` field left null.
+        // `register(Object,Runnable)` (an instance method) then correctly
+        // prefers real bytecode -- which calls `PhantomCleanable.<init>` ->
+        // `CleanerImpl.getCleanerImpl(this)` -> reads the null `impl` field
+        // and NPEs ("Cannot read field \"queue\" because the return value of
+        // ... getCleanerImpl(...) is null"), first seen booting a WildFly
+        // Host Controller (`ServiceContainer$Factory.create()` calls
+        // `Cleaner.create()` then `.register(...)`). Same half-real-object
+        // bug class as the ThreadPoolExecutor/Executors-factory NPEs above --
+        // drop the synthetic surface entirely so real bytecode constructs and
+        // wires up the Cleaner end-to-end (matches this file's own stated
+        // intent, just enforced from the registration side since dispatch
+        // does not enforce it uniformly for static factory methods).
+        if self.drop_real_layout_synthetic
+            && matches!(
+                class_name,
+                "java/lang/ref/Cleaner" | "java/lang/ref/Cleaner$Cleanable"
+            )
         {
             return;
         }

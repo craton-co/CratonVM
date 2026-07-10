@@ -1271,6 +1271,48 @@ pub struct G1Collector {
     /// time/correctness trade — no crash, just longer mark.
     mark_worklist_overflowed: AtomicBool,
 
+    /// G1MARK-8 — set when the marker popped a gray-set entry whose header
+    /// failed the plausibility gate (`plausible_mark_scan_target`): a wild
+    /// child pointer read from a corrupt/stale ref slot, or (vanishingly
+    /// unlikely) a torn header. Scanning such an "object" would amplify the
+    /// corruption — its garbage `num_slots`/`array_length` extent would be
+    /// walked and more garbage pushed as children. We skip the scan instead,
+    /// but that leaves the closure potentially incomplete, so `cleanup`
+    /// consults this flag and RETAINS everything for the cycle (no in-place
+    /// Old-region frees, no humongous reclaim) — the Generational marker's
+    /// "mark all old-gen for this cycle" fail-safe, region-flavored.
+    mark_saw_implausible: AtomicBool,
+
+    /// Finalizer-resurrection input for the CURRENT collection (see
+    /// [`Self::collect_garbage_with_finalizers`]): referent addresses of
+    /// registered, not-yet-enqueued finalizable objects. Consumed (taken)
+    /// by the serial young/mixed paths' Phase 3.5, which evacuates any of
+    /// them that died in the CSet so `finalize()` can still run against
+    /// valid memory. Empty on every plain `collect_garbage` call.
+    pending_finalizer_roots: Mutex<Vec<usize>>,
+    /// Output half of the finalizer-resurrection protocol: the POST-copy
+    /// addresses of objects Phase 3.5 resurrected this collection. Drained
+    /// by [`Self::collect_garbage_with_finalizers`].
+    resurrected_finalizers: Mutex<Vec<usize>>,
+
+    /// Region indices still holding UNRESOLVED self-forwarded objects after
+    /// the evacuation-failure retry loop gave up (wedged drain / pass cap).
+    /// Paired with [`Self::kept_unresolved_live`]: inside such a region,
+    /// ONLY the recorded self-forwarded addresses are live — everything
+    /// else below the cursor is dead garbage the failing pass never
+    /// scanned, whose ref slots were never rewritten. `is_addr_in_live_region`
+    /// must not report those dead bodies as live, or post-GC reference
+    /// processing "restores" a weak referent whose fields dangle into
+    /// regions freed the same pause (G1CORE-3). Cleared at the start of
+    /// every retry evaluation; normally both sets are empty.
+    kept_unresolved_regions: Mutex<std::collections::HashSet<usize>>,
+    /// The self-forwarded (live-in-place) addresses within
+    /// [`Self::kept_unresolved_regions`].
+    kept_unresolved_live: Mutex<std::collections::HashSet<usize>>,
+    /// Lock-free fast gate for the two sets above (they are empty except in
+    /// the rare wedged-drain window; `is_addr_in_live_region` is a hot path).
+    kept_unresolved_any: AtomicBool,
+
     /// SECURITY FIX (V7a): RSet write-barrier TLS-cache epoch.
     ///
     /// `post_write_barrier_rset`'s fast path caches a stable `*const
@@ -1403,6 +1445,12 @@ impl G1Collector {
             mixed_gc_remaining: AtomicU64::new(0),
             mark_worklist: Mutex::new(Vec::new()),
             mark_worklist_overflowed: AtomicBool::new(false),
+            mark_saw_implausible: AtomicBool::new(false),
+            pending_finalizer_roots: Mutex::new(Vec::new()),
+            resurrected_finalizers: Mutex::new(Vec::new()),
+            kept_unresolved_regions: Mutex::new(std::collections::HashSet::new()),
+            kept_unresolved_live: Mutex::new(std::collections::HashSet::new()),
+            kept_unresolved_any: AtomicBool::new(false),
             // SECURITY FIX (V7a): start the RSet TLS-cache epoch at 0.
             rset_cache_epoch: AtomicU64::new(0),
             region_lookup,
@@ -1691,6 +1739,12 @@ impl G1Collector {
             m.iter().filter(|(k, v)| k == v).map(|(&k, _)| k).collect()
         };
 
+        // Reset the unresolved-kept tracking for this pause; repopulated
+        // below iff the drain gives up with seeds remaining.
+        self.kept_unresolved_any.store(false, Ordering::Release);
+        self.kept_unresolved_regions.lock().clear();
+        self.kept_unresolved_live.lock().clear();
+
         let mut acc = first;
         let mut seeds = identities(&acc.pointer_map);
         if seeds.is_empty() {
@@ -1736,7 +1790,88 @@ impl G1Collector {
                 break; // genuinely wedged: the live set does not fit (true OOM)
             }
         }
+        if !seeds.is_empty() {
+            // The drain gave up (wedge / pass cap) with live self-forwarded
+            // objects still parked in kept regions. Two follow-ups keep the
+            // heap coherent until a later pause resolves them:
+            //
+            // (a) G1CORE-4: their ref slots were rewritten IN PLACE to
+            //     to-space addresses by the failing pass — GC-internal edges
+            //     no mutator barrier ever recorded. A kept OLD region is not
+            //     re-collected automatically (unlike kept Eden→Survivor), so
+            //     without remembered-set entries the next young pause never
+            //     scans it as a source and frees its live young referents.
+            //     Record each seed's outgoing cross-region edges now.
+            //
+            // (b) G1CORE-3: record the kept regions + their live addresses
+            //     so `is_addr_in_live_region` reports the regions' DEAD
+            //     bodies (never scanned, slots never rewritten) as dead —
+            //     otherwise post-GC reference processing restores weak
+            //     referents whose fields dangle into same-pause-freed
+            //     regions.
+            {
+                let mut regions = self.regions.lock();
+                for &seed in &seeds {
+                    self.record_outgoing_rset_edges(&mut regions, seed);
+                }
+            }
+            let mut kept_regions = self.kept_unresolved_regions.lock();
+            let mut kept_live = self.kept_unresolved_live.lock();
+            for &seed in &seeds {
+                if let Some(idx) = self.lookup_region_for_addr(seed) {
+                    kept_regions.insert(idx);
+                }
+                kept_live.insert(seed);
+            }
+            self.kept_unresolved_any.store(true, Ordering::Release);
+        }
         acc
+    }
+
+    /// Record remembered-set edges for every cross-region reference held by
+    /// the (live, in-place) object at `obj_addr` — the GC-internal
+    /// counterpart of `post_write_barrier_rset` for slots the collector
+    /// itself rewrote. See the unresolved-kept block in
+    /// [`Self::retry_after_evacuation_failure`].
+    fn record_outgoing_rset_edges(&self, regions: &mut [G1Region], obj_addr: usize) {
+        let Some(src_idx) = self.lookup_region_for_addr(obj_addr) else {
+            return;
+        };
+        let obj_ptr = obj_addr as *mut u8;
+        // Kept objects are ordinary (humongous regions never enter a CSet),
+        // so flat payload reads are in-bounds.
+        let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+        let mut record = |raw: usize| {
+            if raw == 0 {
+                return;
+            }
+            if let Some(dst_idx) = self.lookup_region_for_addr(raw) {
+                if dst_idx != src_idx && regions[dst_idx].region_type != RegionType::Free {
+                    regions[dst_idx].rset.add_reference(src_idx);
+                }
+            }
+        };
+        if header.kind == ObjectKind::Array {
+            if header.element_type == ArrayElementType::Reference {
+                for i in 0..header.array_length as usize {
+                    // SAFETY: i < array_length — inside the allocation.
+                    let raw =
+                        unsafe { std::ptr::read(obj_ptr.add(HEADER_SIZE + i * 8) as *const u64) };
+                    record(raw as usize);
+                }
+            }
+        } else {
+            for slot_idx in 0..header.num_slots as usize {
+                // SAFETY: slot_idx < num_slots — inside the allocation. STW:
+                // no concurrent mutator stores, plain reads are fine.
+                let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+                let value =
+                    unsafe { cratonvm_types::read_value_atomic(slot_ptr as *const Value) };
+                if let Value::Object(Some(r)) = value {
+                    record(r.as_ptr() as usize);
+                }
+            }
+        }
     }
 
     /// Minimal same-pause drain of evacuation-failed objects: evacuate exactly
@@ -1900,7 +2035,14 @@ impl G1Collector {
         // parallel evacuator would relocate a JIT-rooted object whose holder
         // slot cannot be rewritten). When parallel DOES run (no thread in JIT)
         // there are no conservative JIT roots to pin, so it stays correct.
-        if parallel_evac_enabled() && !crate::gc_quiescence::is_active() {
+        // Finalizer resurrection (Phase 3.5) is implemented only on the
+        // serial paths — force serial while resurrection candidates are
+        // pending (System.gc with registered finalizables; rare and already
+        // a full-STW slow path).
+        if parallel_evac_enabled()
+            && !crate::gc_quiescence::is_active()
+            && self.pending_finalizer_roots.lock().is_empty()
+        {
             return self.young_collection_parallel(roots, monitors);
         }
         let start = std::time::Instant::now();
@@ -2093,6 +2235,19 @@ impl G1Collector {
             );
         }
 
+        // Phase 3.5: finalizer resurrection (see
+        // `collect_garbage_with_finalizers`). Must run after the closure is
+        // complete (so "not forwarded" == dead) and before Phase 5 resets
+        // the CSet regions (after that, the bytes are gone).
+        self.resurrect_dead_finalizers(
+            &mut regions,
+            &cset_set,
+            &mut pointer_map,
+            &mut objects_copied,
+            &mut bytes_copied,
+            &mut work_list,
+        );
+
         // Phase 4: Update forwarding pointers in non-CSet regions
         self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
 
@@ -2226,10 +2381,19 @@ impl G1Collector {
         let cap_percent = self.config.old_cset_region_threshold_percent as usize;
         let max_old = ((total_regions * cap_percent) / 100).max(1);
 
+        // `live_bytes > 0` = "has liveness data from the last completed mark
+        // cycle" (HotSpot likewise only mixes regions with marking data). A
+        // region promoted into AFTER cleanup still carries the reset()
+        // defaults live_bytes=0 / gc_efficiency=0: it sorts FIRST (looks
+        // like 100% garbage) with an estimated evacuation cost of 0, so the
+        // pause budget never binds on it and the mixed pause copies fully-
+        // live regions wholesale — blowing max_gc_pause_ms and draining
+        // to-space toward evacuation failure. A genuinely 0-live STAMPED
+        // region cannot appear here: cleanup frees those in place.
         let mut candidates: Vec<(usize, f64)> = regions
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.region_type == RegionType::Old && !r.pinned)
+            .filter(|(_, r)| r.region_type == RegionType::Old && !r.pinned && r.live_bytes > 0)
             .map(|(i, r)| (i, r.gc_efficiency))
             .collect();
         candidates.sort_by(|a, b| {
@@ -2327,7 +2491,12 @@ impl G1Collector {
             .iter()
             .enumerate()
             .filter(|(i, r)| {
-                r.region_type == RegionType::Old && !r.pinned && !jit_pinned_regions.contains(i)
+                // live_bytes > 0 = has liveness data from the last completed
+                // mark cycle — see select_old_regions_for_mixed_gc.
+                r.region_type == RegionType::Old
+                    && !r.pinned
+                    && !jit_pinned_regions.contains(i)
+                    && r.live_bytes > 0
             })
             .map(|(i, r)| (i, r.gc_efficiency))
             .collect();
@@ -2467,6 +2636,16 @@ impl G1Collector {
                 &mut work_list,
             );
         }
+
+        // Phase 3.5: finalizer resurrection — see young_collection.
+        self.resurrect_dead_finalizers(
+            &mut regions,
+            &cset_set,
+            &mut pointer_map,
+            &mut objects_copied,
+            &mut bytes_copied,
+            &mut work_list,
+        );
 
         // Update references and free evacuated regions
         self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
@@ -2999,9 +3178,12 @@ impl G1Collector {
             .iter()
             .enumerate()
             .filter(|(i, r)| {
+                // live_bytes > 0 = has liveness data from the last completed
+                // mark cycle — see select_old_regions_for_mixed_gc.
                 r.region_type == RegionType::Old
                     && !r.pinned
                     && !jit_pinned_regions.contains(i)
+                    && r.live_bytes > 0
             })
             .map(|(i, r)| (i, r.gc_efficiency))
             .collect();
@@ -3149,6 +3331,117 @@ impl G1Collector {
     /// instead means the parallel evacuator can later derive it from the
     /// atomic CAS-forwarding install in the object header (`forwarding_ptr`)
     /// without changing the call sites.
+    /// Run a collection with finalizer-aware resurrection: any address in
+    /// `finalizer_addrs` (registered, not-yet-enqueued finalizable objects,
+    /// from `ReferenceProcessor::finalizer_referent_addresses`) that DIES in
+    /// this collection's CSet is evacuated anyway — with its transitive
+    /// closure — so `finalize()` can later run against valid memory, exactly
+    /// like the generational backend's Phase 2.5. Returns the collection
+    /// result plus the POST-copy addresses of the resurrected objects; the
+    /// caller must enqueue them for finalization AND mark their processor
+    /// entries enqueued (once-only finalization).
+    ///
+    /// Dead finalizables OUTSIDE the CSet (e.g. promoted to an Old region a
+    /// young pause does not collect) are left in place, still registered —
+    /// they are picked up by whichever later collection selects their
+    /// region.
+    pub fn collect_garbage_with_finalizers(
+        &self,
+        stw: &crate::collector::StopTheWorldToken,
+        roots: &mut [ObjectRef],
+        finalizer_addrs: &[usize],
+        monitors: &dyn MonitorCleanup,
+    ) -> (GcResult, Vec<usize>) {
+        *self.pending_finalizer_roots.lock() = finalizer_addrs.to_vec();
+        self.resurrected_finalizers.lock().clear();
+        let result =
+            <Self as crate::collector::GarbageCollector>::collect_garbage(self, stw, roots, monitors);
+        // Belt-and-braces: clear any candidates a path did not consume
+        // (e.g. an empty-CSet early return) so a later plain collection
+        // never sees stale candidates.
+        self.pending_finalizer_roots.lock().clear();
+        let mut dead = std::mem::take(&mut *self.resurrected_finalizers.lock());
+        // `retry_after_evacuation_failure` (run inside collect_garbage,
+        // after Phase 3.5) can relocate objects AGAIN via the kept-region
+        // drain and composes those forwards into the final pointer map —
+        // resolve each resurrected address through it so the caller never
+        // enqueues an intermediate (already-vacated) address.
+        for addr in dead.iter_mut() {
+            if let Some(&fixed) = result.pointer_map.get(&*addr) {
+                *addr = fixed;
+            }
+        }
+        (result, dead)
+    }
+
+    /// Phase 3.5 (serial young/mixed): evacuate dead-but-finalizable CSet
+    /// objects (and their transitive closure, via the same Phase-3 scan)
+    /// so `finalize()` can run against valid memory. See
+    /// [`Self::collect_garbage_with_finalizers`]. No-op when no candidates
+    /// are pending (every plain collection).
+    fn resurrect_dead_finalizers(
+        &self,
+        regions: &mut Vec<G1Region>,
+        cset_set: &std::collections::HashSet<usize>,
+        pointer_map: &mut HashMap<usize, usize>,
+        objects_copied: &mut usize,
+        bytes_copied: &mut usize,
+        work_list: &mut Vec<*mut u8>,
+    ) {
+        let candidates = std::mem::take(&mut *self.pending_finalizer_roots.lock());
+        if candidates.is_empty() {
+            return;
+        }
+        let mut resurrected = Vec::new();
+        let scan_resume = work_list.len();
+        for old_addr in candidates {
+            if pointer_map.contains_key(&old_addr) {
+                continue; // survived normally (or already self-forwarded)
+            }
+            let Some(ridx) = self.lookup_region_for_addr(old_addr) else {
+                continue; // not a current heap address
+            };
+            if !cset_set.contains(&ridx) {
+                continue; // not dying this pause — stays registered
+            }
+            // Dead in the CSet: evacuate it like a root and let the scan
+            // below pull its subtree out too.
+            if let Some((new_ptr, fresh)) = self.evacuate_object(
+                regions,
+                old_addr as *mut u8,
+                pointer_map,
+                objects_copied,
+                bytes_copied,
+                cset_set,
+            ) {
+                if fresh {
+                    work_list.push(new_ptr);
+                }
+                resurrected.push(new_ptr as usize);
+            }
+        }
+        // Re-run the Phase-3 closure over the resurrected subtree.
+        let mut scan_idx = scan_resume;
+        while scan_idx < work_list.len() {
+            let obj_ptr = work_list[scan_idx];
+            scan_idx += 1;
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            self.scan_and_evacuate_refs(
+                regions,
+                obj_ptr,
+                header,
+                cset_set,
+                pointer_map,
+                objects_copied,
+                bytes_copied,
+                work_list,
+            );
+        }
+        if !resurrected.is_empty() {
+            self.resurrected_finalizers.lock().extend(resurrected);
+        }
+    }
+
     fn evacuate_object(
         &self,
         regions: &mut Vec<G1Region>,
@@ -4354,6 +4647,24 @@ impl G1Collector {
         }
     }
 
+    /// Test/diagnostic: has `addr` been grayed or marked by the current
+    /// mark cycle? True if its region's bitmap has it marked OR it sits in
+    /// the mark worklist. Used by the g1_concurrent SATB delivery test,
+    /// whose raw queue-contents assertion under-approximates delivery now
+    /// that the marker drains the shards mid-cycle (G1MARK-6). Takes the
+    /// regions lock then (after dropping it) the worklist lock — never both.
+    pub(crate) fn dbg_is_grayed_or_marked(&self, addr: usize) -> bool {
+        {
+            let regions = self.regions.lock();
+            if let Some(idx) = self.region_for_ptr(&regions, addr as *mut u8) {
+                if regions[idx].mark_bitmap.is_marked(addr) {
+                    return true;
+                }
+            }
+        }
+        self.mark_worklist.lock().contains(&addr)
+    }
+
     /// Abort an in-flight marking cycle WITHOUT acting on the (incomplete)
     /// bitmap: discard the gray set, deactivate the SATB barrier, return the
     /// phase to `Idle`. No cleanup verdicts are computed — the next cycle
@@ -4364,6 +4675,7 @@ impl G1Collector {
         self.mark_worklist.lock().clear();
         self.mark_worklist_overflowed
             .store(false, Ordering::Relaxed);
+        self.mark_saw_implausible.store(false, Ordering::Relaxed);
         let _ = self.satb_queue.deactivate_and_drain();
         self.gc_state.set_phase(ConcurrentGcPhase::Idle);
     }
@@ -4399,6 +4711,8 @@ impl G1Collector {
         // a previous cycle's overflow doesn't trigger a needless rescan.
         self.mark_worklist_overflowed
             .store(false, Ordering::Relaxed);
+        // G1MARK-8: same per-cycle reset for the implausible-header flag.
+        self.mark_saw_implausible.store(false, Ordering::Relaxed);
         self.gc_state.set_phase(ConcurrentGcPhase::ConcurrentMark);
     }
 
@@ -4427,6 +4741,25 @@ impl G1Collector {
             return self.mark_worklist.lock().is_empty();
         }
 
+        // G1MARK-6: pull mutator SATB overwrites into the gray set NOW
+        // rather than letting them pile up in the shard queue until a young
+        // pause or the final remark drains them. A mutation-heavy but
+        // allocation-free phase (in-place updates of a preallocated working
+        // set) triggers no young pauses, so the shards — which have no size
+        // bound — grew without limit and the eventual remark pause was
+        // O(all entries). Draining from the marker keeps the queue bounded
+        // by the marker's cadence and shrinks the final remark. Entries
+        // logged after this drain are picked up on the next step; the
+        // gray-set/worklist protocol is the same one remark uses.
+        // (Must run BEFORE the worklist lock below — push_gray_or_mark
+        // takes that lock itself.)
+        {
+            let regions = self.regions.lock();
+            for addr in self.satb_queue.drain() {
+                self.push_gray_or_mark(&regions, addr);
+            }
+        }
+
         let regions = self.regions.lock();
         let mut worklist = self.mark_worklist.lock();
         let mut remaining = work_amount;
@@ -4446,6 +4779,26 @@ impl G1Collector {
                 Some(idx) => idx,
                 None => continue,
             };
+
+            // G1MARK-8: header-plausibility gate. Worklist entries are raw
+            // field bytes read by `scan_object_refs` — a corrupt or stale
+            // slot can name any in-region address. Region containment alone
+            // (above) still lets a wild pointer's garbage "header" drive the
+            // scan: its num_slots/array_length extent is walked and more
+            // garbage is pushed as children (corruption amplifier — the same
+            // class ZGC-4 closed with its registry check; G1 has no
+            // per-object registry, so the gate is geometric + header
+            // consistency instead). Skipping the scan can under-mark if the
+            // header was genuinely torn, so the flag makes `cleanup` retain
+            // everything this cycle.
+            if !plausible_mark_scan_target(&regions[region_idx], obj_addr) {
+                self.mark_saw_implausible.store(true, Ordering::Relaxed);
+                tracing::warn!(
+                    "g1 concurrent mark: skipping gray entry {obj_addr:#x} (region {region_idx}) \
+                     with implausible header — cleanup will retain all regions this cycle"
+                );
+                continue;
+            }
 
             // Round-2 fix (HIGH — GC #5): bitmaps now live per-region, so
             // route the mark through the owning region's bitmap (which is
@@ -4711,14 +5064,20 @@ impl G1Collector {
         };
 
         // Round-9 gc HIGH-5 — graceful overflow. The previous panic was
-        // reachable from any wide-graph workload (hostile or otherwise);
-        // we now drop the push and set the overflow flag. The marker
-        // (see `concurrent_mark_step` / `cleanup` and the rescan in
-        // `finish_marking`) consults the flag and re-walks all live
-        // regions conservatively before the sweep transition.
+        // reachable from any wide-graph workload (hostile or otherwise).
+        //
+        // G1MARK-7: at the cap, a SEED-class entry (root or SATB overwrite)
+        // must NOT be plain-dropped the way `scan_object_refs` drops child
+        // pushes: the overflow rescan only re-walks MARKED objects, and no
+        // marked object need reference a root or a SATB seed — a dropped
+        // unmarked seed was unrecoverable and cleanup freed it live. Mark it
+        // black without scanning instead (same recovery contract as the
+        // CSet-drain and `push_gray_or_mark` paths): the forced rescan scans
+        // every marked object's fields, closing the seed's subtree.
         let overflow_flag = &self.mark_worklist_overflowed;
-        let push_with_cap = |worklist: &mut Vec<usize>, addr: usize| {
+        let push_with_cap = |worklist: &mut Vec<usize>, idx: usize, addr: usize| {
             if worklist.len() >= MARK_WORKLIST_CAP {
+                regions[idx].mark_bitmap.try_mark(addr);
                 overflow_flag.store(true, Ordering::Relaxed);
                 return;
             }
@@ -4737,7 +5096,7 @@ impl G1Collector {
                 if regions[idx].mark_bitmap.is_marked(addr) {
                     continue; // already black
                 }
-                push_with_cap(&mut worklist, addr);
+                push_with_cap(&mut worklist, idx, addr);
             }
         }
 
@@ -4778,7 +5137,7 @@ impl G1Collector {
                 if regions[idx].mark_bitmap.is_marked(addr) {
                     continue;
                 }
-                push_with_cap(&mut worklist, addr);
+                push_with_cap(&mut worklist, idx, addr);
             }
         }
 
@@ -4798,6 +5157,18 @@ impl G1Collector {
         // `rset_cache_epoch`.
         self.rset_cache_epoch.fetch_add(1, Ordering::Release);
         let region_size = self.config.region_size;
+        // G1MARK-8 fail-safe: the marker skipped an implausible-header gray
+        // entry this cycle, so the closure may be incomplete — a 0-live
+        // verdict is not trustworthy. Retain everything (no in-place frees,
+        // no humongous reclaim); the next cycle re-derives liveness from
+        // scratch. Swap-and-clear: the flag is per-cycle.
+        let saw_implausible = self.mark_saw_implausible.swap(false, Ordering::Relaxed);
+        if saw_implausible {
+            tracing::warn!(
+                "g1 cleanup: implausible gray entry seen during marking — \
+                 retaining all regions this cycle (no in-place frees)"
+            );
+        }
         // TAMS guard (see `mark_start_snapshot`): bytes allocated after the
         // mark-start snapshot carry no mark information and MUST count as
         // live, or this pass frees Old regions filled by promotion during
@@ -4891,7 +5262,8 @@ impl G1Collector {
             // by SATB. The empty-snapshot gate keeps the bitmap-only verdict
             // advisory when cleanup is driven outside a real cycle (unit
             // tests) — no in-place free there.
-            if !mark_snapshot.is_empty()
+            if !saw_implausible
+                && !mark_snapshot.is_empty()
                 && region.live_bytes == 0
                 && region.region_type == RegionType::Old
                 && !region.pinned
@@ -4906,7 +5278,11 @@ impl G1Collector {
             }
         }
 
-        self.reclaim_dead_humongous_spans_locked(&mut regions);
+        // G1MARK-8: humongous reclaim trusts the same possibly-incomplete
+        // closure — skip it under the fail-safe.
+        if !saw_implausible {
+            self.reclaim_dead_humongous_spans_locked(&mut regions);
+        }
 
         // Refresh the IHOP occupancy statistic NOW: cleanup just freed Old
         // regions and dead humongous spans, and leaving the pre-cleanup sum
@@ -5112,6 +5488,19 @@ impl G1Collector {
     /// address on a hit and only returned a `bool`, so the caller had no
     /// way to actually perform the dedup. Returning the canonical address
     /// makes the function correct on its own terms.
+    ///
+    /// # DO NOT WIRE UP without a remap (G1CORE-6)
+    ///
+    /// The table stores RAW canonical object addresses and NO collection
+    /// path remaps or purges them: a canonical String registered in Eden is
+    /// evacuated or freed by the very next young pause, after which a HIT
+    /// returns a dangling from-space address the caller would install as a
+    /// live reference (UAF). There are currently no production callers
+    /// (`string_dedup_enabled` plumbs from `-XX:+UseStringDeduplication`
+    /// but nothing invokes this API). Before adding one: remap
+    /// `string_dedup_table` values through the pointer map (and drop
+    /// entries whose value died) in every collection's fix-up phase, or
+    /// register only non-moving (post-promotion Old) addresses.
     pub fn deduplicate_string(&self, hash: u64, addr: usize) -> Option<usize> {
         if !self.config.string_dedup_enabled {
             return None;
@@ -6017,7 +6406,24 @@ impl G1Collector {
                 // is below the region's allocation cursor.
                 _ => {
                     let base = r.data.as_ptr() as usize;
-                    addr >= base && addr < base + r.cursor
+                    if addr < base || addr >= base + r.cursor {
+                        return false;
+                    }
+                    // G1CORE-3: a kept region with UNRESOLVED evacuation
+                    // failures holds exactly the recorded self-forwarded
+                    // objects as live — the rest of its below-cursor bytes
+                    // are dead garbage the failing pass never scanned, whose
+                    // ref slots were never rewritten. Reporting those as
+                    // live lets reference processing "restore" a dead weak
+                    // referent whose fields dangle into regions freed the
+                    // same pause. Both sets are empty except in the rare
+                    // wedged-drain window (one lock + one lookup then).
+                    if self.kept_unresolved_any.load(Ordering::Acquire)
+                        && self.kept_unresolved_regions.lock().contains(&idx)
+                    {
+                        return self.kept_unresolved_live.lock().contains(&addr);
+                    }
+                    true
                 }
             },
         }
@@ -6697,6 +7103,48 @@ fn object_total_size(header: &ObjectHeader) -> usize {
 #[inline]
 fn is_humongous_filler(header: &ObjectHeader) -> bool {
     matches!(header.kind, ObjectKind::HumongousFiller)
+}
+
+/// G1MARK-8: can `obj_addr` be trusted as an object start for a mark scan?
+///
+/// Gray-set entries are raw field bytes — a corrupt or stale slot can name
+/// any address inside a live region, and `scan_object_refs` would then walk
+/// a garbage header's `num_slots`/`array_length` extent, pushing more
+/// garbage as children (corruption amplifier). Gate: object starts are
+/// 8-aligned (`is_heap_addr`'s own invariant), the header must sit inside
+/// the region's allocated prefix, its fields must be self-consistent
+/// (shared `concurrent_mark_object_size` validator), and — except for a
+/// humongous span, whose scan goes through the bounds-checked
+/// `humongous_copy` — the object's extent must not cross the cursor.
+///
+/// False positives (garbage that happens to look plausible) are bounded by
+/// the containment check; false negatives (a real object rejected, e.g. a
+/// torn header) under-mark, which is why the caller sets
+/// `mark_saw_implausible` and `cleanup` retains everything for the cycle.
+fn plausible_mark_scan_target(region: &G1Region, obj_addr: usize) -> bool {
+    if obj_addr & 0x7 != 0 {
+        return false;
+    }
+    let base = region.data.as_ptr() as usize;
+    let off = obj_addr.wrapping_sub(base);
+    // Header must be fully inside the allocated prefix. (Real objects
+    // satisfy start + size <= cursor, so start + HEADER_SIZE <= cursor.)
+    if off.checked_add(HEADER_SIZE).is_none_or(|end| end > region.cursor) {
+        return false;
+    }
+    // SAFETY: the header span was just confirmed inside this region's
+    // allocated prefix; the validator reads it field-by-field unaligned.
+    let Some(size) =
+        crate::concurrent_mark::concurrent_mark_object_size(obj_addr as *const ObjectHeader)
+    else {
+        return false;
+    };
+    if region.region_type != RegionType::HumongousStart
+        && off.checked_add(size).is_none_or(|end| end > region.cursor)
+    {
+        return false;
+    }
+    true
 }
 
 /// TLAB-retire GAP sentinel probe (see `Tlab::retire`, tlab.rs): a
@@ -7590,14 +8038,19 @@ mod tests {
     fn mixed_collection_selects_old_regions() {
         let gc = make_collector();
 
-        // Manually set up some old regions with gc_efficiency data
+        // Manually set up some old regions with gc_efficiency data.
+        // `live_bytes > 0` marks them as carrying marking data from a
+        // completed cycle — regions without it (post-cleanup promotions)
+        // are ineligible for the mixed CSet (G1CORE-7 gate).
         {
             let mut regions = gc.regions.lock();
             regions[0].region_type = RegionType::Old;
             regions[0].cursor = 100;
+            regions[0].live_bytes = 10;
             regions[0].gc_efficiency = 0.1; // 10% live = 90% garbage, best candidate
             regions[1].region_type = RegionType::Old;
             regions[1].cursor = 100;
+            regions[1].live_bytes = 90;
             regions[1].gc_efficiency = 0.9; // 90% live = 10% garbage, poor candidate
         }
 
@@ -8371,6 +8824,133 @@ mod tests {
             regions[x_region].region_type,
             RegionType::Free,
             "wholly-dead TAMS-clean Old region must be freed in place by cleanup"
+        );
+    }
+
+    /// G1MARK-7: a remark SEED (root / SATB overwrite) arriving at a full
+    /// worklist must be marked black in place, not dropped — the overflow
+    /// rescan only re-walks MARKED objects, so a dropped unmarked seed was
+    /// unrecoverable and cleanup freed it live.
+    #[test]
+    fn remark_seed_at_worklist_cap_is_marked_not_dropped() {
+        let cfg = G1CollectorConfig {
+            promotion_age: 1,
+            ..small_config()
+        };
+        let gc = G1Collector::new(cfg);
+
+        // Y: promoted to Old; after the cycle starts its ONLY liveness
+        // evidence is the remark root below.
+        let y = gc.alloc_object(ClassId::new(1), 0);
+        let mut roots = vec![y];
+        gc.young_collection(&mut roots, &NoopMonitors);
+        gc.young_collection(&mut roots, &NoopMonitors);
+        let y = roots[0];
+        let y_region = {
+            let regions = gc.regions.lock();
+            let idx = gc.region_for_ptr(&regions, y.as_ptr()).unwrap();
+            assert_eq!(regions[idx].region_type, RegionType::Old);
+            idx
+        };
+
+        // Filler object whose address saturates the worklist.
+        let x = gc.alloc_object(ClassId::new(2), 0);
+
+        gc.start_concurrent_mark();
+        gc.mark_worklist
+            .lock()
+            .extend(std::iter::repeat(x.as_ptr() as usize).take(MARK_WORKLIST_CAP));
+
+        // Pre-fix: y's push is dropped (worklist at cap) and nothing ever
+        // marks it — cleanup frees its region while it is a remark root.
+        gc.remark(&[y]);
+        assert!(
+            gc.mark_worklist_overflowed.load(Ordering::Relaxed),
+            "cap hit must set the overflow flag"
+        );
+        {
+            let regions = gc.regions.lock();
+            assert!(
+                regions[y_region].mark_bitmap.is_marked(y.as_ptr() as usize),
+                "seed at cap must be marked black in place"
+            );
+        }
+
+        while !gc.concurrent_mark_step(usize::MAX) {}
+        gc.cleanup();
+
+        let regions = gc.regions.lock();
+        assert_eq!(
+            regions[y_region].region_type,
+            RegionType::Old,
+            "root-live Old region must survive cleanup after a capped remark"
+        );
+        assert!(regions[y_region].live_bytes > 0);
+    }
+
+    /// G1MARK-8: a gray-set entry with an implausible header (wild child
+    /// pointer from a corrupt/stale slot) must be skipped without scanning,
+    /// and cleanup must RETAIN everything for that cycle (the closure may
+    /// be incomplete). The next, clean cycle reclaims as usual.
+    #[test]
+    fn implausible_gray_entry_skips_scan_and_retains_cycle() {
+        let cfg = G1CollectorConfig {
+            promotion_age: 1,
+            ..small_config()
+        };
+        let gc = G1Collector::new(cfg);
+
+        // X: promoted to Old, then dropped — wholly-dead at mark start.
+        let x = gc.alloc_object(ClassId::new(1), 0);
+        let mut roots = vec![x];
+        gc.young_collection(&mut roots, &NoopMonitors);
+        gc.young_collection(&mut roots, &NoopMonitors);
+        let x = roots[0];
+        let x_region = {
+            let regions = gc.regions.lock();
+            let idx = gc.region_for_ptr(&regions, x.as_ptr()).unwrap();
+            assert_eq!(regions[idx].region_type, RegionType::Old);
+            idx
+        };
+        roots.clear();
+
+        // Garbage "object": a byte[] whose payload we stamp with 0xFF —
+        // an interior pointer at the payload start reads kind_tag=0xFF,
+        // which no ObjectKind matches.
+        let arr = gc.alloc_array(ClassId::new(9), ArrayElementType::Byte, 64);
+        let garbage_addr = arr.as_ptr() as usize + HEADER_SIZE;
+        assert_eq!(garbage_addr & 0x7, 0);
+        unsafe { std::ptr::write_bytes(garbage_addr as *mut u8, 0xFF, 32) };
+
+        gc.start_concurrent_mark();
+        gc.mark_worklist.lock().push(garbage_addr);
+        gc.remark(&[]);
+        while !gc.concurrent_mark_step(usize::MAX) {}
+
+        gc.cleanup();
+        {
+            let regions = gc.regions.lock();
+            assert_eq!(
+                regions[x_region].region_type,
+                RegionType::Old,
+                "cleanup must retain all regions after an implausible gray entry"
+            );
+        }
+        assert!(
+            !gc.mark_saw_implausible.load(Ordering::Relaxed),
+            "fail-safe flag is per-cycle and must be cleared by cleanup"
+        );
+
+        // A clean follow-up cycle reclaims the wholly-dead region.
+        gc.start_concurrent_mark();
+        gc.remark(&[]);
+        while !gc.concurrent_mark_step(usize::MAX) {}
+        gc.cleanup();
+        let regions = gc.regions.lock();
+        assert_eq!(
+            regions[x_region].region_type,
+            RegionType::Free,
+            "next clean cycle must reclaim the wholly-dead Old region"
         );
     }
 

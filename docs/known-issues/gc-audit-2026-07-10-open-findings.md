@@ -3,125 +3,206 @@
 Audit of the G1 and ZGC backends at dev `57ad9415` (4 parallel deep-reads of
 `gc/` + the VM↔GC integration layer, plus a deterministic probe kit run on
 Linux against HotSpot jdk25 baselines: ChurnCheck / HumongousCheck /
-CopyChurn / MTChurn / RefCheck, `/data/data/gcprobes-0710` on the Azure host).
+CopyChurn / MTChurn / RefCheck / BinaryTrees, `/data/data/gcprobes-0710` on
+the Azure host).
 
-**FIXED on branch `fix/gc-audit-g1-zgc-20260710`** (not listed below): G1
-humongous-blind IHOP + no full-GC fallback (HumongousCheck OOM); TLAB
-gap-sentinel desync in all 9 g1.rs region walkers; conservative-JIT-root pin
-registry was thread-local (initiator-only) — now process-global per-thread;
-parallel CSet builders missing the JIT-pin filter; adaptive IHOP decay-to-0
-kill switch; stale IHOP occupancy after cleanup; ZGC free-list
-never-coalesced fragmentation (CopyChurn OOM); ZGC `needs_gc` latch (GC storm
-when live ≥ 75%); SATB pre-barrier missing on statics-side-table writes via
-reflection/Unsafe/VarHandle/MethodHandle; unflushed thread-local SATB buffers
-dropped at thread exit / JNI detach.
+**FIXED — first wave** (dev `8b8a0790`): G1 humongous-blind IHOP + no
+full-GC fallback; TLAB gap-sentinel desync in all 9 g1.rs region walkers;
+conservative-JIT-root pin registry was thread-local (initiator-only) — now
+process-global per-thread; parallel CSet builders missing the JIT-pin
+filter; adaptive IHOP decay-to-0 kill switch; stale IHOP occupancy after
+cleanup; ZGC free-list never-coalesced fragmentation; ZGC `needs_gc` latch;
+SATB pre-barrier missing on statics-side-table writes; unflushed
+thread-local SATB buffers dropped at thread exit / JNI detach.
+
+**FIXED — second wave** (branch `fix/gc-audit-g1-zgc-20260710`, commits
+`6af7bf8c`..): java.lang.ref protocol (weak refs now CLEAR on enqueue —
+queue linkage moved off the referent slot onto the real `next` field;
+finalize() runs exactly once via GC resurrection on G1 AND ZGC plus
+processor-entry flagging; backend-exact post-GC staleness guard replacing
+the G1/ZGC-inert young-only check — RefCheck is HotSpot-identical on all
+three backends). JNI local refs scanned on parked threads and REMAPPED
+after moving GC on all three per-thread paths; JNI pin set spliced into
+collect_roots for every backend + re-keyed after moves. ZGC: hash-set
+registry (O(1) conservative-root validation), mark-phase wild-child
+validation, in-place sweep prune (snapshot-race leak), monitor/cas-lock
+dead-address pruning channel. G1: mixed CSet only selects Old regions with
+marking data; the concurrent marker drains SATB shards each step (bounded
+queue, smaller remark); unresolved-kept-region coherence after a wedged
+evacuation-failure drain (rset edges recorded + precise liveness).
+Generational: concurrent old-gen sweep gained a remark-time TAMS snapshot
+(objects allocated remark→sweep are implicitly live).
+
+**FIXED — third wave** (branch `fix/gc-open-items-20260710`): G1MARK-7 —
+`remark()` plain-dropped ROOT/SATB seeds at the 1M gray-set cap (the
+overflow rescan only re-walks MARKED objects, so a dropped unmarked seed
+was freed live by cleanup); seeds are now marked black in place like the
+CSet-drain path. G1MARK-8 — gray-set entries popped by
+`concurrent_mark_step` now pass a header-plausibility gate (alignment +
+allocated-prefix containment + the Generational marker's shared field
+validator); a rejected entry sets a per-cycle fail-safe that makes
+`cleanup` retain everything (no in-place frees, no humongous reclaim)
+since the closure may be incomplete. INT-6 — both inline ref-putfield
+arms (legacy + compact) now prepend the guarded-getfield receiver check
+and require published region bounds: G1/ZGC publish none, so every
+receiver bails to the full-barrier helper there (the GC_FLAG_OLD_GEN
+"young" test is only meaningful under Generational). G1CORE-11 —
+`RegionHeap` is `#[deprecated]` and no longer re-exported. INT-3
+(diagnostics half) — the A5 unregistered-JIT-frame detector and the
+moving-young-coverage check are ported to Linux
+(`pthread_getattr_np`-based stack-high, memoized per thread).
 
 The items below are REAL and still OPEN. Severity ordered.
 
-## 1. G1/ZGC: finalizer protocol absent + stale-address guard inert (probe-confirmed)
-`VmHeap::collect_garbage_with_finalizers` ignores `finalizer_addrs` for G1
-and ZGC (vm_heap.rs ~883-894, returns `Vec::new()`), so dead finalizable
-objects are never resurrected → `finalize()` never runs (RefCheck:
-`finalized=0/32` on G1 and ZGC vs HotSpot 32/32). Worse,
-`process_references_after_gc`'s anti-stale guard `is_stale_young` is
-hardwired `false` for G1/ZGC (`VmHeap::is_in_young_addr`), so a dead
-finalizable/cleaner PRE-GC address can be enqueued and `run_finalizers`
-later invokes `finalize()` on recycled memory (UAF / wrong-object
-finalize). Fix shape: make the guard backend-generic
-(`!pointer_map.contains_key(addr) && !heap.is_addr_live(addr)`), then
-implement resurrection for G1 (root `finalizer_referent_addresses` during
-the pause, mirror gen_heap's contract).
+## 1. STW/monitor race family: GC and monitors vs excluded threads (probe-confirmed; partially root-caused)
+Reproducers: MTChurn (6 threads, `synchronized(locks[i&15]){counters[i&15]++}`,
+-Xmx256m) intermittently loses increments on G1+JIT (~1/5 runs) and — less
+often — on Generational under load; BinaryTrees(16) G1+JIT completes with a
+wrong run-varying total; rare SIGSEGV in `scan_and_evacuate_refs` on a
+forced-GC-from-exception path. `--nojit` and single-threaded runs are 100%
+exact.
 
-## 2. All backends: dead WeakReferences enqueued but referent never cleared (probe-confirmed)
-RefCheck: `deadCleared=1/256 enqueued=256` on Generational, G1 AND ZGC
-(HotSpot: 256/256). References are enqueued on the ReferenceQueue while
-`get()` still returns the (dead) referent — a spec violation (clear must
-happen before enqueue) pointing at the VM-level pre-GC-null/post-GC-restore
-protocol restoring referents that the processor decided to clear. Also
-`finalized=96/32` on Generational — finalize() runs ~3× per object
-(re-registration / requeue bug).
+TWO stacked defects identified:
 
-## 3. G1: MTChurn intermittent lost `synchronized` increments (probe-confirmed, ~1 in 4-6 runs)
-6 threads churn + `synchronized(locks[i&15]){counters[i&15]++;}` at
--Xmx256m loses 2-78% of increments intermittently. NOT the pin gap:
-CRATONVM_G1_DBG_PINS shows `jit_active=false pin_addrs=0` at every pause in
-BOTH passing and failing runs — compiled frames are running with an EMPTY
-JIT-entry chain (guard-less entry), so quiescence/pins/scans are all blind
-to them. The A5 unregistered-JIT-frame detector (conservative_roots.rs
-~1316) is `#[cfg(target_os = "windows")]` — inert on Linux — and even on
-Windows depends on `JIT_CODE_RANGES` which is only populated under
-default-off precise maps. Generational is immune only because its young
-sweep is always non-moving. Root-cause investigation ongoing (see repro:
-MTChurn.java; --nojit passes 100%).
+(a) **Barrier quota races** (root-caused, fix parked on
+`wip/gc-stw-quota-race-20260710`): the STW barrier counts arrivals from
+threads its request EXCLUDED as blocked (enter_blocked pre_stw /
+post-block drain / safepoint-while-flagged) — an excluded arrival fills a
+counted running mutator's quota slot and `wait_for_all()` releases while
+that mutator still mutates. Adjacent: blocked-region exit clears
+`in_blocked_region` with a plain store (excluded thread resumes bytecode
+mid-pause), and `thread_join` deposits its snapshot before retiring its
+TLAB. The parked fix's accounting (excluded-tid snapshot atomic with the
+counts + `arrive_and_wait_auto` + `leave_blocked_region_synced`) is sound
+in design and does NOT itself deadlock —
 
-## 4. G1/ZGC: STW hang risk when a JIT thread never polls (INT-3)
+(b) **but a residual monitor-vs-evacuation race survives it**: a
+gdb-captured incident shows ALL worker threads parked in
+`Monitor::block_enter` simultaneously (16 locks, 5 waiters — a lost-wakeup
+pile-up, not contention), main in `Object.wait`, and the last thread
+SEGV-ing in `scan_and_evacuate_refs` inside a `maybe_gc_forced` reached
+from `create_exception_object` (an exception thrown mid-churn is itself a
+corruption symptom). With the quota fix the corruption's manifestation
+shifts from lost increments to lost wakeups (silent hang). Hypothesis to
+validate next: monitor identity/lock-word state diverges when the locked
+object (or the contended-monitor table keying) is evacuated in the window
+between `enter_or_contend` and `block_enter` / between thin-lock CAS and
+inflation — i.e. the monitor table remap protocol is not atomic with
+respect to threads mid-acquisition that the pause treated as excluded.
+Next steps: CRATONVM_DBG_ATHROW to identify the precursor exception;
+instrument enter_or_contend/remap_after_gc with a generation check;
+consider keying inflated monitors by identity hash instead of address.
+Affects all moving collections; Generational is only shielded by its
+non-moving-under-JIT sweep.
+
+## 2. G1/ZGC: STW hang risk when a JIT thread never polls (INT-3)
 `stw_take_over_and_wait` falls back to a plain unbounded `wait_for_all()`
 for non-Generational backends (`supports_jit_tlab_skip()` is
 Generational-only). A compiled loop that neither allocates nor re-enters
 the interpreter never arrives → whole-VM livelock under G1/ZGC + JIT.
 Needs either xt-takeover extension to G1 (freeze + conservative scan +
-pin) or back-edge safepoint polls.
+pin) or back-edge safepoint polls. Scoping note (2026-07-10 third wave):
+the cross-thread JIT-pin registry and the CSet pin filter are already
+process-global on G1 (first wave), so the remaining blocker for the
+xt-takeover route is the frozen-peer TLAB protocol — a frozen peer never
+retires its TLAB (no gap sentinel), and every g1.rs region walker would
+walk its uninitialized tail. G1 needs the equivalent of the Generational
+"JIT TLAB skip regions" side channel, consumed by all region walkers,
+plus load validation on the Linux probe host before it can be trusted.
+The A5 unregistered-JIT-frame detector port to Linux LANDED (third wave).
 
-## 5. JNI local references: scanned initiator-only, NEVER remapped (INT-2/INT-5)
-`jni::update_local_refs_after_gc` has zero production callers (the comment
-in roots.rs claiming gc.rs calls it is false) → any JNI local held across a
-GC-triggering JNI call dangles after a moving (G1) collection. Parked
-threads' JNI locals are not even scanned (`update_root_snapshot` never
-calls `collect_local_ref_roots`) → reclaim of objects held only by a
-non-initiator's JNI local. Same-family: `gc/src/pinned.rs` keep-alive set
-is spliced only into the semispace `Heap` (INT-10).
-
-## 6. G1: evacuation-failure kept regions — two edge gaps (G1CORE-3/4)
-(a) `is_addr_in_live_region` treats every below-cursor address of a KEPT
-region as live → dead weak referents there are "restored" with fields
-still pointing into same-pause-freed regions (UAF via WeakReference.get()).
-(b) A kept OLD region after a wedged drain holds GC-rewritten Old→young
-edges recorded in NO remembered set → next young pause frees the live
-young referent. Both need evacuation-failure pressure (near-OOM) to hit.
-
-## 7. G1: mixed CSet selects liveness-unknown regions as "100% garbage" (G1CORE-7)
-Regions promoted after the last cleanup have `live_bytes=0` /
-`gc_efficiency=0` defaults → sorted FIRST with estimated cost 0, blowing
-the pause budget copying fully-live regions and inviting evacuation
-failure. HotSpot only mixes regions with marking data.
-
-## 8. G1: open marking cycle grows SATB shards unboundedly (G1MARK-6)
-Final remark is driven only from allocation-triggered GCs; a
-mutation-heavy/allocation-free phase keeps SATB active with nothing
-draining the shards (no size bound) → native memory bloat + O(entries)
-remark pause. Needs a completion nudge (marker-thread drain or time/volume
-trigger).
-
-## 9. ZGC assorted (ZGC-3/4/5/6, INT-9)
-- Monitor/cas-lock tables never pruned under ZGC (empty pointer_map
-  early-return) → unbounded leak + stale-monitor inheritance on recycled
-  addresses. Needs a dead-address channel through `MonitorCleanup`.
-- Mark phase traces unvalidated child pointers (no containment/sanity
-  check, unlike gen_heap/concurrent_mark) — corruption amplifier.
-- `is_object_address`/`is_heap_addr`/`is_addr_live` are O(live-objects)
-  linear registry scans under a mutex; no TLAB → GC pauses scale
-  pathologically and reads as hangs (BUG-01 family, quadratically worse).
-- Registry snapshot→publish window in `collect_garbage` can drop
-  concurrently-registered allocations (unregistered-thread allocators).
-- `ZgcRealHeap`'s internal ReferenceProcessor + all of
-  ZgcHeap/ZgcCollector/zgc_concurrent.rs are dead code (metadata-only
-  simulation, no VM consumer) — delete or wire up.
-
-## 10. Misc
+## 3. Misc
 - Class unloading machinery (`gc/src/class_unloading.rs`) has no driver;
   statics/mirrors/class-locks are immortal roots (INT-7).
 - G1 weak/soft refs with dead OLD-region referents are cleared only when
   the region is evacuated — concurrent-mark cleanup never feeds reference
-  processing (INT-8).
-- JIT inline putfield fast paths (default-off) elide the RSet post-barrier
-  under G1 (`GC_FLAG_OLD_GEN` never set by G1) — must bail to helper or set
-  the flag before ever enabling (INT-6).
-- `RegionHeap` (gc/src/region.rs) is exported but unused, with known-unsound
-  conservative slot rewriting — deprecate/hide (G1CORE-11).
-- G1 string-dedup table stores raw addresses, never remapped (feature is
-  default-off and API has no callers — latent landmine, G1CORE-6).
+  processing (INT-8). CORRECTED ANALYSIS (third wave): the originally
+  proposed fix — "run the ReferenceProcessor against the mark bitmap
+  after remark" — is INERT as stated, because the mark bitmap is TAINTED
+  for exactly the referents it would judge: (a) the concurrent marker's
+  `scan_object_refs` has no Reference-class awareness and traces straight
+  through the (restored) `referent` slot of every live Reference, and
+  (b) each mid-cycle young pause's `weakref_null_referents_pre_gc` writes
+  fire the SATB pre-barrier, recording every active referent as a
+  mark-cycle root. A real fix needs all four of: (1) marker referent-slot
+  hiding — a Reference-address skip set snapshotted at mark start and
+  remapped across every evacuation pause; (2) SATB suppression on the
+  protocol's null-pass writes (they are not semantic overwrites); (3) a
+  `Reference.get()`/`refersTo` keep-alive barrier while marking is active
+  (single hook family: `native_ref_get`/`native_soft_ref_get` — without
+  it a mutator can `get()` a referent, store it into a black object, and
+  remark clears the weak ref while a strong path exists → UAF, the exact
+  race HotSpot's G1ReferenceGet intrinsic barrier exists for); (4)
+  remark-time reference processing that resurrects `to_finalize` (mark +
+  re-drain) BEFORE `cleanup` frees wholly-dead regions. Related spec gap
+  in the same family: cleanup's in-place free reclaims dead FINALIZABLE
+  objects without resurrection — the post-GC staleness guard then
+  correctly skips them, so no UAF, but their `finalize()` silently never
+  runs.
+- G1 string-dedup table stores raw addresses, never remapped — API now
+  carries a DO-NOT-WIRE-UP doc warning; the remap is still needed before
+  `-XX:+UseStringDeduplication` can do anything (G1CORE-6).
 - Parallel young evacuator residual race (documented in-code) — keep
   `CRATONVM_G1_PARALLEL_EVAC` off (G1CORE-5).
-- Generational (not G1/ZGC, noted in passing): `ConcurrentMarker` sweep has
-  no TAMS — old-gen objects allocated between remark and sweep can be freed
-  live (G1MARK-3).
+
+## Cross-confirmation from an independent real-world trigger (2026-07-10)
+
+Investigating the ES `DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests` /
+`IVFKnnFloatVectorQueryTests` hang cluster
+(`docs/known-issues/elasticsearch-suite/ES-HANG-20260709-...`) independently
+reproduced this same finding via a real Lucene `IndexWriter` workload — no
+synthetic MTChurn harness involved. Worktree
+`/data/data/wt-es-vectors-ivfknn-hang-20260710`.
+
+Repro (`testSlicesDense`, `--nojit` or `CRATONVM_JIT_GETFIELD_HELPER=1`,
+`--Xmx 2g`) is non-deterministic across runs, same seed:
+- Most runs: permanent spin (82-116% CPU, zero forward progress) with the
+  worker thread AND a `Lucene Merge Thread` both parked in
+  `Monitor::block_enter`/`enter` (`vm/src/threading/monitor.rs:457/500`) —
+  matching the "5 waiters, nobody woken" shape exactly, just with 2 waiters
+  instead of 5 (Lucene's own concurrency here is far lighter than MTChurn's
+  6-thread stress). Live gdb confirms both threads are genuinely parked
+  (`parking_lot::Condvar::wait`), and with only 6 threads total in the process
+  and 4 of them idle/legitimately-parked elsewhere, there is no live thread
+  positioned to ever call the matching `exit()`/notify — consistent with
+  the finding-1(b) orphaned-monitor hypothesis (a stale/wrong owner, or a
+  lost wakeup, rather than genuine live contention).
+- One run (153s, no permanent hang) instead **completed with 2 real
+  failures**, including a genuine Lucene-internal NPE surfaced through
+  `ConcurrentMergeScheduler.handleMergeException`:
+  `NullPointerException: Cannot invoke
+  "org.apache.lucene.index.ReadersAndUpdates.dropMergingUpdates()" because
+  "rld" is null` — `rld` comes out of `IndexWriter`'s `readerPool` map and
+  should never be null on this path. Immediately preceding this failure: a
+  sustained ~49s burst of 544+ (rate-limited) `gen_heap::get_field`
+  out-of-bounds WARNs, all `class_id=ClassId(0) num_slots=0
+  java/lang/Object` — the "zeroed live object" shape — escalating in volume
+  the longer the run's merge activity continues.
+
+This is independent, real-world corroboration of finding 1: the SAME
+underlying probabilistic GC/monitor race manifests as either a lost-wakeup
+deadlock (most runs) or live data corruption surfacing as a downstream
+Lucene NPE (this run) depending on exact timing — matching "intermittently
+loses increments... (~1/5 runs)" and "an exception thrown mid-churn is
+itself a corruption symptom" in the finding-1(b) writeup above, just via a
+completely different trigger workload than MTChurn. The OOB-field-read WARN
+burst right before the NPE is worth treating as a corruption *symptom*
+here, not the previously-assumed-benign "collection-layout probe" — at
+minimum the volume/timing correlation with a real NPE is suspicious enough
+to warrant using it as an additional signal alongside `CRATONVM_DBG_ATHROW`
+when chasing finding-1(b)'s precursor exception.
+
+The finding-1(b) registry-miss tripwire (this doc's WARN counter) did NOT
+fire during either manifestation of this repro — so if finding-1(b)'s
+specific "second orphaned Monitor via a registry-lookup miss" mechanism is
+involved here, it isn't the ONLY path to the same lost-wakeup symptom, or
+this repro's race window differs enough from MTChurn's to not hit that
+exact branch. Worth rechecking once finding-1(a)'s quota-race fix is
+actually stabilized (current `wip/gc-stw-quota-race-20260710` attempt is
+parked, not merged).
+
+No fix attempted here — deferred to whoever picks up finding 1, given the
+existing parked WIP attempt already found this subsystem is not safe to
+patch quickly. This ES workload is a reusable, real-world (non-synthetic)
+additional repro for validating any future fix attempt, in addition to
+MTChurn/BinaryTrees(16).

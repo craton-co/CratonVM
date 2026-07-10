@@ -1129,6 +1129,18 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
         for new_addr in &dead_finalizers {
             shared.finalizer_thread.enqueue(*new_addr);
         }
+        // Once-only finalization: flag the processor entries for the objects
+        // just enqueued. `process_references_after_gc` above already ran
+        // `update_after_gc`, so entry referents hold post-GC addresses
+        // matching `dead_finalizers`. Without this, the resurrected object
+        // looks alive to every later cycle and the GC re-resurrects +
+        // re-enqueues it (finalize() observed running 3× per object).
+        if !dead_finalizers.is_empty() {
+            shared
+                .ref_processor
+                .lock()
+                .mark_finalizer_enqueued(&dead_finalizers);
+        }
     } else {
         let mut counted_os_tids: Vec<u32> = Vec::new();
         let should_initiate_gc = {
@@ -1175,6 +1187,13 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             crate::runtime::ec_watch::remap(&result.pointer_map);
             for new_addr in &dead_finalizers {
                 shared.finalizer_thread.enqueue(*new_addr);
+            }
+            // Once-only finalization — see the single-threaded arm above.
+            if !dead_finalizers.is_empty() {
+                shared
+                    .ref_processor
+                    .lock()
+                    .mark_finalizer_enqueued(&dead_finalizers);
             }
             // xt-hardening (2026-07-03): clear regions + resume BEFORE
             // complete_gc (see maybe_gc's epilogue for the race rationale).
@@ -1407,9 +1426,13 @@ fn process_references_after_gc(
     // in EITHER young semispace that is NOT a pointer-map key did not
     // survive — skip it entirely. Old-gen addresses don't move in a minor GC
     // (major relocations ARE merged into the map) and stay processed.
-    let is_stale_young = |addr: usize| -> bool {
-        !pointer_map.contains_key(&addr) && shared.heap.is_in_young_addr(addr)
-    };
+    // Backend-generic since 2026-07-10 (`pre_gc_addr_did_not_survive`): the
+    // original closure checked only the Generational young semispaces, so it
+    // was hardwired inert for G1/ZGC — dead finalize/cleaner/enqueue
+    // addresses flowed through unguarded and `run_finalizers` later
+    // dereferenced freed CSet memory (finalize-on-recycled-object UAF).
+    let is_stale_young =
+        |addr: usize| -> bool { shared.heap.pre_gc_addr_did_not_survive(addr, pointer_map) };
 
     // Null referent field (field 0) on cleared weak/soft references.
     // ROOT-CAUSE FIX (2026-06-10): once-only emission — the legacy
@@ -1505,12 +1528,25 @@ fn process_references_after_gc(
             }
             continue;
         }
-        // Push onto queue's linked list head (field 0 = head, field 1 = size)
+        // Push onto queue's linked list head (field 0 = head, field 1 = size).
+        //
+        // Queue linkage uses the Reference's `next` field (slot 2, matching
+        // the real-JDK `java.lang.ref.Reference` layout: referent, queue,
+        // next, discovered) — NOT the referent slot. The old protocol reused
+        // slot 0 (the referent) as the next pointer, so every
+        // enqueued-but-not-yet-polled WeakReference answered `get()` with
+        // the NEXT Reference in the queue instead of null (only the
+        // first-enqueued, whose next was null, read as cleared — the
+        // RefCheck `deadCleared=1/256 enqueued=256` signature). References
+        // with fewer than 3 fields (legacy synthetic shape) fall back to the
+        // old slot-0 linkage, which is at least consistent with the poll
+        // side's identical fallback.
         let old_head = shared.heap.get_field(q_obj, 0); // RQ_FIELD_HEAD
         shared
             .heap
             .set_field(q_obj, 0, Value::Object(Some(ref_obj))); // new head
-        shared.heap.set_field(ref_obj, 0, old_head); // REF_FIELD_REFERENT = next ptr
+        let next_slot = if shared.heap.num_fields(ref_obj) > 2 { 2 } else { 0 };
+        shared.heap.set_field(ref_obj, next_slot, old_head); // REF_FIELD_NEXT
         let size = match shared.heap.get_field(q_obj, 1) {
             // RQ_FIELD_SIZE
             Value::Int(v) => v,
@@ -2257,6 +2293,14 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     if let Some(r) = thread.native_pending_return {
         snapshot.push(r);
     }
+    // JNI local references (INT-5, safepoint half): a JNI native that
+    // obtained local refs and re-entered Java parks HERE — and a
+    // cross-thread collector marks this thread only from this snapshot, so
+    // an object reachable solely through this thread's `JNI_LOCAL_FRAMES`
+    // was reclaimed. Thread-local storage; this deposit always runs on the
+    // owning thread. The resume-side remap is `update_local_refs_after_gc`
+    // in `apply_pointer_map_to_thread`.
+    crate::native::jni::collect_local_ref_roots(&mut snapshot);
 
     // This thread's own `java.lang.Thread` mirror (and any pending async
     // exception). These live in `JvmThread` fields, not on any frame, so the
@@ -2578,6 +2622,13 @@ pub(crate) fn apply_pointer_map_to_thread(
     pointer_map: &std::collections::HashMap<usize, usize>,
     heap: &crate::memory::VmHeap,
 ) {
+    // JNI local references (INT-2, safepoint-resume half): rewrite THIS
+    // thread's `JNI_LOCAL_FRAMES` handles through the pointer map — a JNI
+    // native that re-entered Java and parked at the safepoint poll must not
+    // resume with dangling local jobjects after a moving collection. The
+    // storage is thread-local and this function always runs on the resuming
+    // thread, so this is the only place that can reach these handles.
+    crate::native::jni::update_local_refs_after_gc(pointer_map);
     // BUG-03 trace (gated): record that the safepoint-peer remap ran for main.
     if thread.thread_id.0 == 0 && std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
         let jto = thread
@@ -12833,6 +12884,44 @@ fn execute_instruction(
             // block still re-checks its own cached gate, so behaviour is
             // byte-for-byte identical to the original sequence. See
             // `env_cache::any_field_diag`.
+            // ES-FAIL-FAMILY-20260710 hunt: java-level-stack companion to
+            // `cratonvm_gc::heap::dynamic_watch_addr()` (armed by
+            // `NativeContext::dbg_set_watch_cell`, see
+            // `native_builtins::lang_misc::write_throwable_cause`). The
+            // watch's own `[CELLWATCH]` report captures a Rust backtrace,
+            // which is unreliable here (JIT frames lack Windows unwind
+            // info and the walk comes back garbled) — this prints the
+            // actual JAVA call stack instead, which is always available.
+            {
+                let watch = cratonvm_gc::heap::dynamic_watch_addr();
+                if watch != 0 {
+                    let addr = obj_ref.as_ptr() as usize
+                        + cratonvm_types::HEADER_SIZE
+                        + field.field_index * cratonvm_types::SLOT_SIZE;
+                    if addr == watch {
+                        eprintln!(
+                            "[WATCHFIELD] putfield HIT watch={watch:#x} obj=0x{:x} field_index={} value={:?} in {}.{}{} pc={}",
+                            obj_ref.as_ptr() as usize,
+                            field.field_index,
+                            value,
+                            thread.frames[frame_idx].class_name(),
+                            thread.frames[frame_idx].method_name(),
+                            thread.frames[frame_idx].method_descriptor(),
+                            thread.frames[frame_idx].pc,
+                        );
+                        eprintln!("[WATCHFIELD] Java stack (top first):");
+                        for f in thread.frames.iter().rev().take(30) {
+                            eprintln!(
+                                "[WATCHFIELD]   {}.{}{} pc={}",
+                                f.class_name(),
+                                f.method_name(),
+                                f.method_descriptor(),
+                                f.pc,
+                            );
+                        }
+                    }
+                }
+            }
             if crate::runtime::env_cache::any_field_diag() {
                 // Gated diagnostic (CRATONVM_DBG_FIELDADDR): trace put for specific
                 // fields — object address + resolved slot — to localize a write
@@ -26482,7 +26571,7 @@ fn try_jit_upgrade_with_gate(
             .get_class_name(cp_idx)
             .map(|s| s.to_string())
     };
-    let field_resolver = |cp_idx: u16| -> Option<(usize, u8, u32, bool)> {
+    let field_resolver = |cp_idx: u16| -> Option<(usize, u8, Option<(u32, bool)>)> {
         // Resolve the field using the standard resolution mechanism
         let field = resolve_field_ref(shared, class_id, cp_idx).ok()?;
         // Get the field descriptor from the constant pool
@@ -26497,15 +26586,23 @@ fn try_jit_upgrade_with_gate(
         };
         let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
         let type_tag = *descriptor.as_bytes().first()?;
-        Some({
-            let (c_off, c_ref) = cratonvm_types::compact_field_slot(
+        // `None` ⇒ no genuine compact slot for this field (class has no
+        // registered `CompactLayout`, or the index falls outside it).
+        // Fabricating a `(0, false)` placeholder here poisoned the JIT's
+        // compact-offset inline getfield/putfield with a garbage offset: for
+        // a reference field it emitted a 32-bit sign-extended load of half a
+        // `Value` cell, producing a bogus non-null receiver that SIGSEGVed in
+        // the invoke inline cache (WildFly Host Controller `host=foo:add()`,
+        // docs/known-issues/wildfly-domain-hostcontroller-sigsegv-*).
+        Some((
+            field.field_index,
+            type_tag,
+            cratonvm_types::compact_field_slot(
                 field.declaring_class_id.as_u32(),
                 field.field_index,
             )
-            .map(|(o, r)| (o as u32, r))
-            .unwrap_or((0, false));
-            (field.field_index, type_tag, c_off, c_ref)
-        })
+            .map(|(o, r)| (o as u32, r)),
+        ))
     };
     let static_field_resolver = |cp_idx: u16| -> Option<(u32, usize, u8, bool)> {
         let field = resolve_field_ref(shared, class_id, cp_idx).ok()?;
@@ -26807,7 +26904,7 @@ fn try_jit_upgrade_with_gate(
                     .get_class_name(cp_idx)
                     .map(|s| s.to_string())
             };
-            let c_field_resolver = |cp_idx: u16| -> Option<(usize, u8, u32, bool)> {
+            let c_field_resolver = |cp_idx: u16| -> Option<(usize, u8, Option<(u32, bool)>)> {
                 let field = resolve_field_ref(shared, callee_cid, cp_idx).ok()?;
                 let cm = shared.class_manager.read();
                 let class = cm.get_class(callee_cid)?;
@@ -26820,15 +26917,17 @@ fn try_jit_upgrade_with_gate(
                 };
                 let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
                 let type_tag = *descriptor.as_bytes().first()?;
-                Some({
-                    let (c_off, c_ref) = cratonvm_types::compact_field_slot(
+                // `None` ⇒ no genuine compact slot — do NOT fabricate
+                // `(0, false)` (see the sibling resolver's comment).
+                Some((
+                    field.field_index,
+                    type_tag,
+                    cratonvm_types::compact_field_slot(
                         field.declaring_class_id.as_u32(),
                         field.field_index,
                     )
-                    .map(|(o, r)| (o as u32, r))
-                    .unwrap_or((0, false));
-                    (field.field_index, type_tag, c_off, c_ref)
-                })
+                    .map(|(o, r)| (o as u32, r)),
+                ))
             };
             let c_static_field_resolver = |cp_idx: u16| -> Option<(u32, usize, u8, bool)> {
                 let field = resolve_field_ref(shared, callee_cid, cp_idx).ok()?;
@@ -27563,7 +27662,7 @@ fn try_jit_compile_callee_slow(
             .get_class_name(cp_idx)
             .map(|s| s.to_string())
     };
-    let field_resolver = |cp_idx: u16| -> Option<(usize, u8, u32, bool)> {
+    let field_resolver = |cp_idx: u16| -> Option<(usize, u8, Option<(u32, bool)>)> {
         let field = resolve_field_ref(shared, cid, cp_idx).ok()?;
         let cm = shared.class_manager.read();
         let class = cm.get_class(cid)?;
@@ -27576,15 +27675,23 @@ fn try_jit_compile_callee_slow(
         };
         let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
         let type_tag = *descriptor.as_bytes().first()?;
-        Some({
-            let (c_off, c_ref) = cratonvm_types::compact_field_slot(
+        // `None` ⇒ no genuine compact slot for this field (class has no
+        // registered `CompactLayout`, or the index falls outside it).
+        // Fabricating a `(0, false)` placeholder here poisoned the JIT's
+        // compact-offset inline getfield/putfield with a garbage offset: for
+        // a reference field it emitted a 32-bit sign-extended load of half a
+        // `Value` cell, producing a bogus non-null receiver that SIGSEGVed in
+        // the invoke inline cache (WildFly Host Controller `host=foo:add()`,
+        // docs/known-issues/wildfly-domain-hostcontroller-sigsegv-*).
+        Some((
+            field.field_index,
+            type_tag,
+            cratonvm_types::compact_field_slot(
                 field.declaring_class_id.as_u32(),
                 field.field_index,
             )
-            .map(|(o, r)| (o as u32, r))
-            .unwrap_or((0, false));
-            (field.field_index, type_tag, c_off, c_ref)
-        })
+            .map(|(o, r)| (o as u32, r)),
+        ))
     };
     let static_field_resolver = |cp_idx: u16| -> Option<(u32, usize, u8, bool)> {
         let field = resolve_field_ref(shared, cid, cp_idx).ok()?;

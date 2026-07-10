@@ -1624,11 +1624,25 @@ fn native_fis_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let _ = ctx.fd_table().close(fd);
     // Mark the descriptor closed so a double-close / post-close read is a
     // clean EOF rather than reusing a recycled fd id.
+    //
+    // In the real-JDK layout slot 0 *is* the `fd` `FileDescriptor` reference
+    // field (see the FIS-FIX note on `fis_set_fd` above) — unconditionally
+    // writing `Value::Int(-1)` there coerced that reference to `null` on the
+    // heap, so a later close (however dispatched: e.g. `StreamDecoder`'s
+    // native `close()` invoking `is.close()` via `invoke_virtual` before any
+    // bytecode call has cached this method's real-bytecode resolution) left
+    // `this.fd == null`, and any subsequent `close()` NPE'd in
+    // `FileDescriptor.closeAll` reading it (surfaced as Jasper's JDT
+    // compiler's `FileInputStream.close()` NPE — see docs/known-issues/
+    // tomcat-08-07/jspdocumentparser-saxparse-malformed-markup.md). Only
+    // mirror into slot 0 when there is no real `FileDescriptor` object,
+    // exactly mirroring `fis_set_fd`'s guard.
     if let Some(fd_obj) = fis_fd_object(ctx, this) {
         ctx.set_field_by_name(fd_obj, "fd", Value::Int(-1));
         ctx.set_field_by_name(fd_obj, "handle", Value::Long(-1));
+    } else {
+        ctx.set_field(this, 0, Value::Int(-1));
     }
-    ctx.set_field(this, 0, Value::Int(-1));
     Ok(None)
 }
 
