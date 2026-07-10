@@ -25,18 +25,39 @@
 //!       └──► C1 (after 3+ deopts → c2_bailout, stays C1)
 //! ```
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, RwLock};
 use rustc_hash::FxHashMap;
 
 /// Consecutive background-compile attempts allowed to fail (run but not
 /// publish a body) at a given tier before `should_compile` gives up on that
 /// method entirely. See `CompilerCore::complete_task` / `should_compile`.
 const MAX_TIER_FAIL_RETRIES: u32 = 3;
+
+fn osr_deny_list() -> &'static RwLock<HashSet<MethodKey>> {
+    static LIST: std::sync::OnceLock<RwLock<HashSet<MethodKey>>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| RwLock::new(HashSet::new()))
+}
+
+/// Returns true when OSR is permanently disabled for this method, without
+/// affecting normal invocation-counted JIT compilation.
+pub fn is_osr_denied(key: &MethodKey) -> bool {
+    osr_deny_list().read().contains(key)
+}
+
+/// Permanently disable OSR for this method in the current VM process.
+pub fn mark_osr_denied(key: MethodKey) {
+    osr_deny_list().write().insert(key);
+}
+
+/// Test helper: reset process-global OSR deny state.
+pub fn clear_osr_deny_list_for_test() {
+    osr_deny_list().write().clear();
+}
 
 // ───────────────────────────────────────────────────────────────────────────────
 // CompilationTier
@@ -719,6 +740,9 @@ impl TieredCompilationManager {
     /// Called on each back-edge (loop iteration) from the interpreter.
     /// May trigger OSR compilation.
     pub fn on_backedge(&self, key: &MethodKey, bci: u32) -> Option<CompilationTask> {
+        if is_osr_denied(key) {
+            return None;
+        }
         let mut methods = self.core.methods.lock();
         let state = methods
             .entry(key.clone())
@@ -776,6 +800,9 @@ impl TieredCompilationManager {
     /// artifact; the mutator enters it once published. (Threshold tuning of
     /// when a loop counts as "hot enough" is Step 6.)
     pub fn request_osr(&self, key: &MethodKey, bci: u32) -> Option<CompilationTask> {
+        if is_osr_denied(key) {
+            return None;
+        }
         let mut methods = self.core.methods.lock();
         let state = methods
             .entry(key.clone())
@@ -1340,6 +1367,7 @@ mod tests {
 
     #[test]
     fn step5_request_osr_enqueues_osr_task_immediately() {
+        clear_osr_deny_list_for_test();
         let mgr = TieredCompilationManager::with_default_policy();
         let key = test_key();
         // Unlike on_backedge, the first call enqueues immediately (no 10k count).
@@ -1362,10 +1390,30 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
+        clear_osr_deny_list_for_test();
+    }
+
+    #[test]
+    fn step5_request_osr_honors_osr_deny_list() {
+        clear_osr_deny_list_for_test();
+        let mgr = TieredCompilationManager::with_default_policy();
+        let key = test_key();
+        mark_osr_denied(key.clone());
+        assert!(
+            mgr.request_osr(&key, 42).is_none(),
+            "OSR-denied method must not enqueue an OSR task"
+        );
+        assert!(
+            mgr.on_backedge(&key, 42).is_none(),
+            "OSR-denied method must not enqueue through backedge accounting"
+        );
+        assert!(mgr.dequeue_compilation().is_none());
+        clear_osr_deny_list_for_test();
     }
 
     #[test]
     fn step5_request_osr_skips_when_already_c2_or_bailed() {
+        clear_osr_deny_list_for_test();
         // Already at C2 → nothing to OSR-compile. `compilation_complete` /
         // `on_c2_bailout` use `get_mut` (no-op on an unseen method), so the
         // method must first be registered via `on_method_invocation`.
@@ -1672,10 +1720,7 @@ mod tests {
         let key = test_key();
 
         // 1st invocation crosses c1_threshold=1 and enqueues C1.
-        assert_eq!(
-            mgr.on_method_invocation(&key),
-            Some(CompilationTier::C1)
-        );
+        assert_eq!(mgr.on_method_invocation(&key), Some(CompilationTier::C1));
         // Fail it MAX_TIER_FAIL_RETRIES - 1 times; each failure must still
         // leave the method eligible for another attempt (queued_for_compilation
         // reset, current_tier untouched).

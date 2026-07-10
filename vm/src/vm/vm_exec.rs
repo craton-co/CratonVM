@@ -863,7 +863,10 @@ pub fn safe_native_call(
             }
         }
         Err(MethodCallFailed::ExceptionThrown(exc)) => {
-            let exc_is_current = shared.heap.is_object_address(exc.as_ptr() as usize).is_some();
+            let exc_is_current = shared
+                .heap
+                .is_object_address(exc.as_ptr() as usize)
+                .is_some();
             if !exc_is_current {
                 if let Some(obj) = thread
                     .native_pin_roots
@@ -12757,6 +12760,11 @@ fn invoke_on_class_shared_inner(
                             class_name,
                             method_name,
                             descriptor,
+                        )
+                        || crate::runtime::interpreter::is_bc_crypto_math_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
                         );
                     if check_override
                         && shared
@@ -14062,8 +14070,7 @@ mod tests {
             ctx: &mut dyn cratonvm_native_api::NativeContext,
             _args: &[Value],
         ) -> MethodCallResult {
-            let stale =
-                unsafe { ObjectRef::from_raw(0xfeed_face_0000_1000usize as *mut u8) };
+            let stale = unsafe { ObjectRef::from_raw(0xfeed_face_0000_1000usize as *mut u8) };
             let live = ctx.alloc_object(ClassId::new(0), 0);
             ctx.pin_native_root(live);
             Err(MethodCallFailed::ExceptionThrown(stale))
@@ -14071,12 +14078,7 @@ mod tests {
 
         let shared = test_shared();
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let result = safe_native_call(
-            &shared,
-            &mut thread,
-            throwing_native,
-            &[],
-        );
+        let result = safe_native_call(&shared, &mut thread, throwing_native, &[]);
         let thrown = match result {
             Err(MethodCallFailed::ExceptionThrown(exc)) => exc,
             other => panic!("expected native Java exception, got {other:?}"),
