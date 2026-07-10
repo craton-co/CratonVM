@@ -4,6 +4,10 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-10 TestEncodingDetector fully green: UTF-16/prolog-conflict residual retired
+
+- FIXED/RETIRED: [`encodingdetector-utf16-and-conflicting-prolog-residuals-FIXED.md`](../internal/fixed-suite-bugs/encodingdetector-utf16-and-conflicting-prolog-residuals-FIXED.md) — both residual clusters traced to the same root cause: synthetic `BufferedInputStream`/`InputStreamReader` overrides (added in `45cc4f4f`) unconditionally shadowed real JDK 25 bytecode for every instance, not just genuinely-synthetic-stub ones, because the interpreter's `invokevirtual` vtable fast path doesn't consult the `NativeKind::SyntheticStub` category the way `vm_exec.rs`'s `real_protected_stub` check does. `BufferedInputStream.reset()` was a silent no-op (broke `EncodingDetector`'s mark/reread-with-detected-encoding sequence); `InputStreamReader.read([CII)I` ignored the charset entirely (broke every UTF-16BE/LE decode). Removed both native overrides — real bytecode already implements them correctly. `org.apache.jasper.compiler.TestEncodingDetector`: `OK (22 tests)`, matching HotSpot exactly.
+
 ## 2026-07-10 WildFly corrupt-Value doc: `Level.parse` FIXED, new `ThreadPoolExecutor.execute()` regression found (OPEN, blocking)
 
 Investigating `wildfly-domain-heap-corrupt-value-timeout.md`'s front-line
