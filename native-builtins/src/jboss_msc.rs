@@ -1474,6 +1474,78 @@ fn native_service_controller_get_state(
     }
 }
 
+/// `ServiceController.provides()` — real MSC 1.5.x interface method
+/// ("the complete set of names... under which the service is provided")
+/// with no default implementation; any caller through our synthetic
+/// mirror died with `AbstractMethodError:
+/// org/jboss/msc/service/ServiceController.provides()Ljava/util/Set;`.
+/// First surfaced booting a WildFly Host Controller: the
+/// `jboss.remoting.endpoint.management.management.operation.handler`
+/// service's own MSC start() path calls it, the resulting
+/// `AbstractMethodError` marks that service FAILED, and the failure
+/// cascades into `WFLYCTL0459: Triggering roll back due to missing
+/// management services` — which is why a *later*, unrelated
+/// `http-interface` `add` operation then fails with
+/// `IllegalStateException: Container is down` (the whole management
+/// transaction was already rolled back by this point).
+///
+/// Returns the full set of names this controller is addressable under:
+/// its primary name plus every alias registered via
+/// `ServiceBuilder.addAliases(...)` (`ContainerState.aliases` is
+/// alias -> primary, so this reverse-scans it — cheap, since `provides()`
+/// is called rarely relative to the hot install/dispatch paths).
+fn native_service_controller_provides(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let id = match ctx.get_field(this, SC_FIELD_ID) {
+        Value::Long(l) => l as u64,
+        _ => 0,
+    };
+    let names: Vec<Arc<ServiceName>> = {
+        let container = global_container();
+        let state = container.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match state.by_id.get(&id) {
+            Some(primary) => {
+                let mut out = vec![primary.clone()];
+                for (alias, target) in state.aliases.iter() {
+                    if target == primary {
+                        out.push(alias.clone());
+                    }
+                }
+                out
+            }
+            None => Vec::new(),
+        }
+    };
+    let set = match ctx.new_object_initialized("java/util/HashSet", "()V", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        // No real HashSet available (mock/unit-test contexts): degrade to an
+        // empty-but-valid Set rather than failing dispatch outright — matches
+        // `getState`'s own fallback philosophy above.
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let set_pin = ctx.pin_native_root(set);
+    let mut set_cur = set;
+    for name in names {
+        let name_obj = alloc_java_service_name(ctx, &name);
+        let name_pin = ctx.pin_native_root(name_obj);
+        set_cur = ctx.read_native_pin(set_pin, set_cur);
+        let name_obj = ctx.read_native_pin(name_pin, name_obj);
+        ctx.unpin_native_roots(name_pin);
+        let _ = ctx.invoke_virtual(
+            set_cur,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(name_obj))],
+        )?;
+    }
+    set_cur = ctx.read_native_pin(set_pin, set_cur);
+    ctx.unpin_native_roots(set_pin);
+    Ok(Some(Value::Object(Some(set_cur))))
+}
+
 /// `ServiceController.getStartException()` — `BootstrapImpl$1`'s FAILED branch
 /// calls this to build the bootstrap-failure report; as a code-less interface
 /// method it previously died with `AbstractMethodError` (swallowed by the
@@ -3414,6 +3486,12 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         "getState",
         "()Lorg/jboss/msc/service/ServiceController$State;",
         native_service_controller_get_state,
+    );
+    r.register(
+        ctrl,
+        "provides",
+        "()Ljava/util/Set;",
+        native_service_controller_provides,
     );
 
     // R63 WildFly: Lockable acquire/release shims (see native_lockable_lock_noop).
