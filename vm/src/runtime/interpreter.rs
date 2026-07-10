@@ -3288,6 +3288,23 @@ fn g1_remark_process_references(
     // reference processing itself keeps them alive.
     resurrect.extend(ref_proc.soft_survivor_referents());
 
+    // DBG (CRATONVM_DBG_REFPROC_REMARK): per-remark mechanism evidence —
+    // distinguishes clears that happened HERE (against the mark bitmap)
+    // from clears the evacuation-pause path produced, which black-box
+    // probes cannot tell apart.
+    if std::env::var_os("CRATONVM_DBG_REFPROC_REMARK").is_some() {
+        eprintln!(
+            "[refproc-remark] soft_cleared={} weak_cleared={} enqueued={} finalize={} \
+             cleaner_actions={} resurrect={}",
+            result.stats.soft_refs_cleared,
+            result.stats.weak_refs_cleared,
+            result.to_enqueue.len(),
+            result.to_finalize.len(),
+            result.cleaner_actions.len(),
+            resurrect.len(),
+        );
+    }
+
     resurrect
 }
 
