@@ -208,3 +208,97 @@ the binary path):
 <EXE> --java-home /home/victor/jdk25 -Xmx2g -cp "$(cat /data/data/apps/tomcat/.suite/cp-linux-fixed.txt)" \
   org.junit.runner.JUnitCore org.apache.catalina.core.TestSwallowAbortedUploads
 ```
+
+## 2026-07-10 blocker #3 root-caused: stale/lost local variable, not a field bug
+
+Re-verified independently on a fresh worktree off `dev` (`4723e059`, includes
+both blocker #1/#2 fixes above). Confirmed both prior findings still hold:
+original `WSAECONNABORTED` symptom stays fixed, and blocker #3's NPE still
+hits **10/10** methods, always as the single substantive failure per test
+(the other failure each test shows is unrelated: `output/build/conf/` —
+including `logging.properties` — doesn't exist in this fixture, so
+`WebappClassLoader.clearReferences()`'s JULI config reset throws
+`FileNotFoundException` on every test's teardown; that's a fixture gap, not
+a VM bug, and independent of blocker #3).
+
+**The two "untested hypotheses" from the note above are both wrong.** Four
+isolated repro attempts (plain construct-then-read, cross-thread handoff via
+a bare `Thread`, 200k-iteration JIT-warmup loop, and construction under heavy
+concurrent GC pressure from a background thread allocating 10 MB arrays)
+all failed to reproduce a null `lock` field for the exact
+`SocketWrapperBase`/`NioSocketWrapper` field shape in isolation — ruling out
+both "simple field-initializer never runs" and "naive cross-thread
+final-field visibility gap" as the mechanism, and ruling out both plain JIT
+warmup and GC pressure alone as sufficient triggers.
+
+**Direct instrumentation of the real `SocketWrapperBase`/`SocketProcessorBase`
+classes (recompiled and placed first on the classpath, same technique used
+above for the test class itself) found the actual mechanism.** Two
+experiments:
+1. Patched `SocketWrapperBase.getLock()` to print
+   `System.identityHashCode(this)` + the field value before returning. It
+   *always* printed a valid, unlocked `ReentrantLock` — including on the
+   exact call immediately preceding a crash reported one log line later.
+   I.e. `getLock()` itself, when it has a print statement added (making it a
+   bigger, non-trivial method), never returns null.
+2. Patched `SocketProcessorBase.run()` itself —
+   ```java
+   Lock lock = socketWrapper.getLock();
+   System.err.println("DBG_RUN ... lockLocal=" + lock + " thread=" + Thread.currentThread());
+   lock.lock();  // <-- still NPEs here, in the SAME run(), on the SAME local variable
+   ```
+   The print, reading the **same local variable** one bytecode-source-line
+   before `lock.lock()`, *always* showed a valid, non-null lock — yet
+   `lock.lock()` on the very next line still threw `NullPointerException:
+   lock is null`, 5/5 times (matching the number of real client connections
+   across the run; all thread names reported as `main`, i.e. this
+   connector/test config doesn't hand work off to a separate worker pool
+   thread — the earlier "cross-thread executor hand-off" theory in the note
+   above doesn't even apply here).
+
+That is: the **same local variable, read twice in immediate succession**,
+returns a valid reference the first time and `null` the second time, with a
+`System.err.println` (itself a method call, likely a safepoint-poll/GC
+opportunity or a JIT/interpreter-tier-transition point) as the only thing
+between the two reads. This is not a construction bug, not a cross-thread
+visibility bug, and not "the field is null" — it is a **stale/lost local
+variable reference across what is very likely a GC safepoint or JIT
+deopt/tier-transition boundary**, i.e. the same general bug family as the
+already-(partially-)fixed
+`docs/internal/fixed-suite-bugs/native-stale-local-family-and-persistent-singleton-roots.md`
+and `rootsnap-cache-stale-reassigned-local-ame` — striking a new, not
+previously covered code shape: "obtain a reference via a getter call, then
+immediately invoke a method on it" inside a `final` `Runnable.run()` that's
+almost certainly hot/JIT-compiled (`SocketProcessorBase.run()`, dispatched
+once per socket event). Per the project's own roadmap notes, precise
+GC/JIT root maps are **default-off** and known to have unsound gaps in
+roughly a dozen call-shapes; this looks like one more.
+
+**Tried and did NOT fix it:** `CRATONVM_STRICT_JIT_ROOTS=1` — same run
+instead **hung** (killed by a 90s timeout after only 6 of 10 methods logged
+the same NPE), so it's not a safe drop-in toggle for this case either
+(likely just a stricter/slower assertion mode, not an alternate sound
+implementation). No other precise-root-map env var was tried.
+
+**Not fixed in this session.** This needs the GC/JIT root-scanning
+subsystem itself (`vm/src/jit/conservative_roots.rs`, `gc/src/gen_heap.rs`)
+investigated by someone who owns that subsystem's roadmap, with proper
+regression coverage — not a blind patch from this investigation. Recommended
+next step for whoever picks this up: reproduce with `CRATONVM_DBG_PRECISE=1`
+/ `CRATONVM_DBG_VERIFY_OOP_MAPS=1` (both found via `grep` in
+`conservative_roots.rs`, neither tried yet) against the instrumented
+`SocketProcessorBase.run()` repro above — it's a clean, minimal, deterministic
+repro (5/5 hit rate) that doesn't require the full suite runner, just the
+Tomcat fixture + JUnitCore + this doc's classpath override technique.
+
+Once this is fixed, re-run `TestSwallowAbortedUploads` for a real (not
+NPE-masked) verdict on the swallow-uploads socket-close fix itself — in
+particular whether `testAbortedUploadLimitedNoSwallow` /
+`testAbortedPOST413NoSwallow` (which want a `SocketException` when Tomcat
+intentionally aborts without swallowing) still pass once requests actually
+reach `Http11Processor`, since `sc_close`'s lingering-drain can't currently
+distinguish "please help me finish draining" from "the app wants this
+aborted, don't drain" (both look identical at the raw-socket level — see the
+2026-07-09 candidate-fix section above and Tomcat's own
+`IdentityInputFilter.end()` / `checkSwallowInput()` — there is no separate
+`SO_LINGER`-style signal to key off).
