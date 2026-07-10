@@ -827,3 +827,118 @@ watchdog blocker is cleared, but the older HIB-CV-32 heap-corrupt/sustained-load
 question still has not been revalidated because WildFly domain boot now stops at later
 Host Controller configuration-loading/JMX/content-cleaner gaps before reaching a long
 managed-server workload.
+
+## 2026-07-10 update — one real blocker fixed (`Level.parse`), a second NEW regression
+## found and NOT fixed; the front-line residuals below could not be re-observed live
+
+Picked this doc up specifically to fix the four front-line residuals from the
+2026-07-09 update above (`AttributeChangeNotification` NoSuchMethodError,
+`ContentCleanerService` ClassCastException, `FileInputStream(File)`
+NoSuchMethodError, cascading `WFLYHC0034`). Working on branch
+`fix/wildfly-hib32-residuals-20260710` (Azure host, separate worktree from
+`/data/data/cratonvm`), against a **freshly-downloaded, pristine** WildFly
+32.0.1.Final distribution (`/data/data/probes/wildfly-hib32-20260710/dist/`) —
+the shared `/data/data/wildfly-dist` copy several prior sessions reused has
+accumulated `.bak`/regenerated config files from those sessions' own runs and
+is no longer a clean baseline; a fresh download from
+`github.com/wildfly/wildfly/releases` avoids that ambiguity for future
+sessions too.
+
+### Fixed: `java.util.logging.Level.parse(String)` threw for every name, including standard JDK constants
+
+Reproducing this doc's exact harness recipe against a pristine distribution
+(not the shared, already-mutated one) hits a **different, earlier** blocker
+than the four residuals above: Host Controller's own `host.xml`/`domain.xml`
+parsing fails immediately with
+
+```text
+ERROR [org.jboss.as.host.controller] WFLYCTL0085: Failed to parse configuration
+ParseError at [row,col]:[69,21]
+Message: "WFLYLOG0026: Log level WARN is invalid."
+```
+
+Standalone repro (no WildFly involved) confirmed this is a genuine, universal
+CratonVM bug, not a config or WildFly issue: `Level.parse("WARNING")` — a
+**standard** `java.util.logging.Level` constant, not even a JBoss LogManager
+extension — throws `IllegalArgumentException: Bad level "WARNING"` under
+real-JDK mode. Real JDK 25's `Level.parse` resolves names through
+`KnownLevel.findByName`, which throws an internal `NullPointerException`
+("Cannot invoke isNamed on null" on a `Module` reference — the same family of
+gap already tracked in `docs/internal/gaps/kc16-blocker-map.md`'s KC16
+investigation, `Class.getModule()` synthesis being incomplete) before it can
+match anything by name; `Level.parse`'s own catch-all then reports the
+generic `IllegalArgumentException` regardless of whether the name was a
+genuine standard constant or a JBoss extension (`WARN`/`ERROR`/`FATAL`/etc).
+
+Fixed with a native override for `Level.parse(String)`
+(`native-builtins/src/logmanager.rs::native_level_parse`, forced to win over
+real bytecode via `force_native_over_real_jdk_bytecode` in
+`vm/src/runtime/interpreter.rs`) that resolves both the 9 standard
+`java.util.logging.Level` constants and `org.jboss.logmanager.Level`'s 5
+extensions directly from their static fields — the same technique already
+used for the adjacent `LogContext.getLevelForName` workaround
+(`native_jboss_log_context_get_level_for_name`, same file). Verified
+standalone (`Level.parse("WARNING")`/`Level.parse("WARN")` both now resolve
+correctly) and confirmed the `WFLYLOG0026` parse failure no longer occurs
+against the pristine distribution.
+
+### NEW regression found (NOT fixed): `Executors.newSingleThreadExecutor()`/
+### `newFixedThreadPool()`/`newCachedThreadPool()` — `.execute()` NPEs on `ctl`
+
+With the logging fix in place, `domain.sh` boot reaches a **different,
+still-earlier** blocker than either the front-line residuals or the
+known BUG-03-family STW/JIT-takeover stall: the outer process-controller VM's
+own "Read thread" (`org.jboss.as.process.protocol.ConnectionImpl$2.run`,
+spawned via a plain `Executors`-backed pool to read the Host Controller
+child's initial greeting) dies with an uncaught
+`NullPointerException: Cannot invoke "AtomicInteger.get()" because "this.ctl"
+is null` (decoded via a new `CRATONVM_DBG_UNCAUGHT` `toString()` print added
+this session, `vm/src/vm/vm_exec.rs`) — a **completely standalone-reproducible
+regression**, unrelated to WildFly, bisected (via fresh from-scratch rebuilds,
+not cached binaries) to somewhere in `be605560..f28d6ae6`
+(2026-07-09). Full writeup, evidence, and the three reverted (ineffective)
+fix attempts:
+[`threadpoolexecutor-execute-npe-on-ctl-regression.md`](threadpoolexecutor-execute-npe-on-ctl-regression.md).
+
+This is now the **actual gating blocker** for re-observing this doc's own
+front-line residuals live: it kills the process-controller before Host
+Controller's greeting is processed, which is exactly what produces the
+"T19.H1 watchdog: main thread is in native (Rust) code" hang this doc's
+2026-07-09 update already described as a known, still-present shape
+(`process-controller/STW watchdog blocker cleared; later HC boot residuals
+remain` was evidently describing a *different* trigger of the same-shaped
+hang — this session's fresh pristine-distribution runs hit it deterministically,
+100% of attempts, whereas the shared/mutated distribution the 2026-07-09
+session used apparently avoided it, most likely by luck of timing/config
+state rather than by being fixed).
+
+### Status of the four front-line residuals from 2026-07-09
+
+**Not re-verified either way this session** — boot never got far enough,
+blocked by the two issues above. They remain the best-known next blocker
+once the `ThreadPoolExecutor` regression is fixed; nothing in this session's
+findings contradicts the 2026-07-09 analysis of them (the log lines quoted
+there are still the most recent direct evidence for all four).
+
+### Recommended next steps, in order
+
+1. Fix the `ThreadPoolExecutor.execute()` regression
+   (`threadpoolexecutor-execute-npe-on-ctl-regression.md`) — ideally with a
+   live debugger this time, since three separate print-tracing attempts in
+   this session failed to even locate which dispatch function handles the
+   call.
+2. Re-run this doc's harness recipe (a **pristine** WildFly 32.0.1.Final
+   distribution — do not reuse a previously-booted copy, see above) with
+   `CRATONVM_MSC_REAL_START=1`, and confirm `host.xml`/`domain.xml` parsing
+   and the process-controller/Host-Controller handshake both complete
+   cleanly.
+3. Only then will boot reach the point where the four front-line residuals
+   (`AttributeChangeNotification`, `ContentCleanerService`, `FileInputStream(File)`,
+   `WFLYHC0034`) can be re-observed and actually fixed — investigate each via
+   the same technique that worked this session (`CRATONVM_DBG_UNCAUGHT=1`
+   plus, where useful, `CRATONVM_DBG_MCL=1` for the two classloading-shaped
+   NoSuchMethodErrors — `javax/management/AttributeChangeNotification` and
+   `java/io/FileInputStream(File)` both looked, in the 2026-07-09 log, like
+   the JBoss-Modules `ModuleClassLoader` resolving them to synthetic stubs
+   rather than real JDK bytecode; not re-confirmed this session, still the
+   best lead for whoever picks this up next).
