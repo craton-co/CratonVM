@@ -1,47 +1,12 @@
 # Real `ThreadPoolExecutor.execute()` degraded to synchronous (or, before `306cd352`, silently dropped) — receiver-real check not fully effective
 
-Status: RESOLVED (2026-07-10) — root cause pinned down and fixed by the very next session to touch
-this area (branch `fix/wildfly-hib32-gate-20260710`); see the "Root-caused and fixed" update below.
-Moved to `docs/internal/`.
+Status: FIXED — 2026-07-10, by two independent, complementary fixes landed within the same
+session-day (`fix/tpe-execute-async-dispatch-20260710` and `fix/wildfly-hib32-gate-20260710`,
+reconciled here). Moved to `docs/internal/`.
+Severity: was High (broad blast radius — every real `ThreadPoolExecutor` in the VM, not just
+`Executors.*`-created ones)
 
-## 2026-07-10 update (root-caused and fixed)
-
-This doc's own analysis correctly suspected "a fourth, unpatched dispatch path" — confirmed: it's
-`try_stackless_invoke`'s own direct, unconditional native-registry lookup
-(`vm/src/runtime/interpreter.rs`), which is NOT one of the three receiver-aware exemptions
-`306cd352` patched (`intercept_force_registered_native`, `invoke_or_native`,
-`invoke_on_class_shared_inner`). A real `ThreadPoolExecutor.execute()` call reaching dispatch
-through that path still finds `native_es_execute` registered (correctly — the registration itself
-is receiver-agnostic) and calls it, landing on `306cd352`'s own defense-in-depth branch, which ran
-the task inline/synchronously specifically to break the shared async-pool's self-recursion — but
-fired for every real receiver reaching native this way, not just that one case.
-
-**Fix**: rather than patching a fifth dispatch point with the same kind of check, the registry-level
-drop for `java/util/concurrent/ThreadPoolExecutor` (`native-api/src/registry.rs`) was removed
-entirely, and the real-vs-synthetic decision moved fully into the native callbacks via a new
-`NativeContext::invoke_virtual_bytecode_only` (calls `interpreter::execute` directly, bypassing
-every native check — not just the primary one; `invoke_on_class_shared` was tried first and found
-to have its own unconditional native re-check for concrete declaring classes, which would have
-reintroduced this exact bug). `native_es_execute`'s old synchronous-inline defense-in-depth branch
-was removed as dead code once the earlier check unconditionally routes a real receiver to genuine
-bytecode instead. See
-`docs/internal/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md` for the full writeup.
-
-**Verified** with this doc's own exact repro (`ExecProbe3.java`, plain `new ThreadPoolExecutor(...)`,
-3 tasks): all 3 now run on distinct worker threads (`Thread[#1,...]`/`Thread[#2,...]`/`Thread[#3,...]`),
-confirmed not the calling thread — matches the "correct" behavior this doc's own bisection
-described for `4b08ffad` before either receiver-check fix landed.
-
-## Original report
-
-Found: 2026-07-10, while verifying
-`docs/known-issues/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe-FIXED.md`
-(the "layer 2" fix that makes `Executors.new*ThreadPool()` construct genuinely real
-`ThreadPoolExecutor` objects). Confirmed **unrelated** to that fix — reproduces identically for a
-plain, directly-constructed `new ThreadPoolExecutor(...)` that never touches `Executors.*` or this
-session's fix at all.
-
-## Symptom
+## Symptom (recap)
 
 ```java
 ExecutorService es = new ThreadPoolExecutor(4, 4, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>());
@@ -51,73 +16,108 @@ for (int i = 0; i < 3; i++) {
 }
 ```
 
-On dev `4b08ffad`: prints 3 distinct real worker threads (`Thread[#1,Thread,5,main]`,
-`Thread[#2,...]`, `Thread[#3,...]`) — correct, matches HotSpot semantics (`execute()` returns
-immediately, tasks run async on pool workers).
+- On dev `4b08ffad`: prints 3 distinct real worker threads (`Thread[#1,Thread,5,main]`,
+  `Thread[#2,...]`, `Thread[#3,...]`) — correct, matches HotSpot semantics (`execute()` returns
+  immediately, tasks run async on pool workers).
+- On dev `aa21e334` alone (no `306cd352`): **nothing prints at all** — the tasks are silently never
+  run, no exception, no hang, `execute()` returns normally.
+- On dev tip (`aa21e334` + `306cd352` + later): all 3 tasks print, but all on the **same**
+  calling thread instead of 3 distinct worker threads — `execute()` was running synchronously
+  instead of asynchronously.
 
-On dev `aa21e334` alone (no `306cd352`): **nothing prints at all** — the tasks are silently never
-run, no exception, no hang, `execute()` returns normally.
+## Root cause: (at least) five independent unconditional native-override checks, only one of which `306cd352` made receiver-aware
 
-On current dev tip (`aa21e334` + `306cd352` "fix: ThreadPoolExecutor.execute() NPE on ctl for
-synthetic Executors objects" + later commits, `8edd57be` at time of writing): all 3 tasks print, but
-all on the **same** thread (`Thread[#1099511627776,main,5,main]`) — i.e. `Thread.currentThread()`
-inside the task is the *calling* thread, not a pool worker. `execute()` is running the task
-synchronously/inline instead of asynchronously.
+`306cd352`'s own commit message describes three dispatch points it made receiver-aware
+(`intercept_force_registered_native` in `vm/src/runtime/interpreter.rs`, and
+`invoke_or_native`/`invoke_on_class_shared_inner` in `vm/src/vm/vm_exec.rs`). All three were
+implemented correctly, but at least two MORE independent, unconditional "a Rust native registered
+for this method always wins" checks existed and were not patched:
 
-## Analysis
+1. **`try_stackless_invoke`'s "step 1"** — `.or_else(|| shared.native_methods.find(class_name,
+   method_name, descriptor))`. Runs on literally the first call, before the interpreter even
+   knows real bytecode exists for the method.
+2. **`try_stackless_invoke`'s "step 6"** — a second, independent native lookup that runs
+   *after* real bytecode was already resolved at step 4/5. This one fires even when step 1
+   correctly fell through to bytecode.
+3. **`populate_virtual_invoke_cache`'s "Check native overrides FIRST"** block — populates the
+   monomorphic inline cache (`CachedInvokeTarget::VirtualNative`) keyed by `(call site, receiver
+   class_id)` alone. Since the cache has no per-instance awareness, caching `VirtualNative` here
+   for one real receiver would incorrectly apply to *every* future call at that site.
+4. **`populate_virtual_invoke_cache`'s direct call to `force_native_over_real_jdk_bytecode`** — a
+   pure `(class, method, descriptor)` allowlist (the same function `306cd352` added the
+   `ThreadPoolExecutor.execute` entry to) consulted here with zero receiver awareness, bypassing
+   every other receiver-aware guard.
+5. **`invoke_on_class_shared_inner`'s `override_cb` block** (a different code path than the one
+   `306cd352` patched in the same function) — an unconditional native re-check for any concrete
+   (non-interface) declaring class, independent of `should_force_registered_native_over_bytecode`.
 
-`306cd352` added a receiver-aware exemption (checking the real `workers` field is non-null) at
-three independent dispatch points — `native-api/src/registry.rs`'s registration-time drop,
-`vm/src/runtime/interpreter.rs`'s `intercept_force_registered_native` /
-`threadpool_executor_has_real_workers`, and `vm/src/vm/vm_exec.rs`'s `invoke_or_native` /
-`invoke_on_class_shared_inner` — specifically so a genuinely real `ThreadPoolExecutor` (its own
-`workers` field populated by a real `<init>`) keeps running its own real `execute()` bytecode
-instead of being forced through the registered `native_es_execute` native (which assumes
-CratonVM's synthetic 2-field layout). That commit's own message claims this was verified working
-for a directly-constructed `new ThreadPoolExecutor(...).execute()` ("still dispatches to real
-bytecode").
+Because `native_es_execute` had to stay registered on `ThreadPoolExecutor` (so the *synthetic*
+case could still be forced through it), all of these pre-existing, receiver-blind checks
+found it and routed dispatch straight into `native_es_execute`'s own defense-in-depth "run inline"
+fallback — for every real `ThreadPoolExecutor.execute()` call, not just the synthetic-stub or
+self-recursion cases that fallback was meant to catch.
 
-On the current dev tip tested here, that verification does not hold: `native_es_execute` is
-evidently still being reached for a receiver with a populated `workers` field, and its own
-defense-in-depth fallback (added in the same commit — "if ever reached for a real receiver anyway,
-run the task inline instead of recursing through `spawn_runnable_on_real_thread`") is what's
-producing the synchronous-execution symptom observed here. That fallback was intended purely to
-break a specific recursion (the shared `async_worker_pool` singleton calling `.execute()` on
-itself), not as a general substitute for real async dispatch — but it appears to be firing for
-every real `ThreadPoolExecutor.execute()` call, not just that one recursive case.
+## Two independent, complementary fixes
 
-Confirmed **not** JIT-specific: identical result with `--nojit`. Not root-caused further in this
-session (the three-dispatch-point interpreter/vm_exec logic in question is unfamiliar code from a
-different, very recently landed commit, not something written or well-understood as part of this
-session's own fix) — flagged for follow-up by whoever owns `306cd352`/`fix/tpe-npe-dispatch-20260710`,
-since they already have context on which of the three checks is failing (or whether there's a
-fourth, unpatched dispatch path).
+Two sessions landed fixes for this the same day, taking different but compatible approaches —
+both are on `dev`:
 
-## Severity
+1. **`fix/tpe-execute-async-dispatch-20260710`** (point-patches sites 1-4 above): added the same
+   `threadpool_executor_has_real_workers(shared, receiver)` receiver check (mirroring the one
+   already used correctly by `intercept_force_registered_native`) to `try_stackless_invoke`'s two
+   checks and both of `populate_virtual_invoke_cache`'s — the latter required threading the actual
+   receiver `Value` through the function (previously only had `receiver_class_id`, insufficient
+   for a per-instance check), added as a new `receiver_value: &Value` parameter.
+2. **`fix/wildfly-hib32-gate-20260710`** (structural fix, covers site 5 and any future site):
+   rather than continuing to enumerate and patch each unconditional-native-check call site
+   one-by-one, removed the registry-level drop for `ThreadPoolExecutor` entirely and added
+   `NativeContext::invoke_virtual_bytecode_only` (calls `interpreter::execute` directly, bypassing
+   every native check unconditionally) — `native_es_execute`/`native_es_submit_*`/the `shutdown`
+   closures check `executor_has_real_workers` themselves and redirect a genuinely-real receiver to
+   real bytecode via this escape hatch, regardless of which dispatch path reached them. This also
+   fixed `invoke_on_class_shared_inner`'s separate `override_cb` re-check (site 5, not covered by
+   fix 1) and extended the same real-vs-synthetic awareness to `submit()`/`shutdown()`.
 
-This silently degrades (or, on `aa21e334` alone without `306cd352`, silently drops entirely) the
-async-execution contract of `Executor.execute()`/`ExecutorService.execute()` for **every** real
-`ThreadPoolExecutor` in the VM — not just ones created via `Executors.*`. Any code that calls
-`.execute()` expecting a non-blocking, fire-and-forget dispatch (the documented contract) will
-instead block the calling thread for the task's duration. This did not visibly break the specific
-verification probe used to confirm the mainLock-NPE fix (results were still correct, just serial
-instead of concurrent), but is a correctness-relevant regression for any code with actual
-concurrency requirements (e.g. a caller submitting a long-running task and expecting to continue
-other work immediately).
+Both fixes are complementary, not conflicting: fix 1's point-patches make sites 1-4 exit to
+bytecode *before* ever reaching `native_es_execute`; fix 2's callback-level check is what actually
+handles any receiver that still reaches the native regardless (including site 5, and any future
+unaudited dispatch point) — and is what the now-dead-code synchronous-inline fallback in
+`native_es_execute` was replaced with.
 
-## Bisection
+## Verification
 
-- `4b08ffad` + this session's `Executors.*` real-init fix, **no** `306cd352`: correct (distinct
-  worker threads, confirmed via both `Executors.newFixedThreadPool(n)` and a plain
-  `new ThreadPoolExecutor(...)`).
-- `aa21e334` alone, no fix, no `306cd352`: tasks silently never execute.
-- Current dev tip (`aa21e334` + `306cd352` + later, with or without this session's `Executors.*`
-  fix — confirmed identical either way): tasks execute synchronously on the calling thread.
+- `ExecProbe3.java` (this doc's own repro, bare `new ThreadPoolExecutor(...).execute()` x3):
+  3 distinct worker thread IDs (`Thread[#1,...]`, `#2`, `#3`), confirmed in both debug and
+  `--release` builds, with and without `--nojit`.
+- `ExecProbe.java`/`ExecProbe2.java` (the pre-existing `Executors.newSingleThreadExecutor()` /
+  `newFixedThreadPool()` + `shutdown()`/`awaitTermination()` regression repros from `306cd352`/
+  the "layer 2" mainlock-NPE fix): still pass — `Executors.*` factories now correctly dispatch
+  asynchronously too (they build genuinely real objects since the "layer 2" fix, so they take
+  the same real-bytecode path this fix unblocks).
+- `cargo test -p cratonvm-vm --lib`: 2193 passed, 2 failed — the same two failures already
+  documented as pre-existing/unrelated in `306cd352`'s own commit message
+  (`real_jdk_mode_registers_fewer_natives`, a stale native-count threshold, and
+  `ensure_system_streams_creates_objects`).
+- `cargo test -p cratonvm-native-api --lib` (179/179) and `-p cratonvm-native-builtins --lib`
+  (2964/2965, the 1 pre-existing unrelated `ByteBuffer` failure) also pass.
+
+## Lesson for future "phantom native dispatch beats receiver-aware fix" investigations
+
+A receiver-aware exemption added at one native-vs-bytecode decision point does not automatically
+apply anywhere else `shared.native_methods.find(class, method, descriptor)` (or
+`force_native_over_real_jdk_bytecode`) is consulted directly — this codebase had at least five
+independent call sites that treat "a native is registered for this triple" as sufficient reason
+to skip bytecode, only one of which (`intercept_force_registered_native`) carried the
+receiver check before these fixes. When a fix "should" work per one dispatch point's logic but
+empirically doesn't, either (a) instrument every one of the class's `shared.native_methods.find`
+call sites directly and confirm which one still fires, or (b) consider whether the callback
+itself can be made receiver-aware and given an unconditional bytecode-only escape hatch
+(`NativeContext::invoke_virtual_bytecode_only`), which sidesteps needing to enumerate every
+dispatch site at all — see `docs/internal/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`.
 
 ## Reproduction
 
-Standalone (`/tmp/execprobe2/ExecProbe3.java` on the collection host — plain `new
-ThreadPoolExecutor(...)`, no `Executors.*` involved):
+Standalone (no WildFly/ES involved):
 
 ```java
 import java.util.concurrent.*;
@@ -135,11 +135,3 @@ public class ExecProbe3 {
     }
 }
 ```
-
-Collection context:
-- Host: `victor@20.83.144.174`
-- Worktree: `/data/data/cratonvm-worktrees/20260710-132130-es-executors-factory-real-init`
-- Bisection binaries under `/data/data/cratonvm-targets/es-executors-factory-real-init-20260710/release/`:
-  `cratonvm-fix-prespel-verify` (correct), `cratonvm-baseline-dev-aa21e334` (silently drops),
-  `cratonvm-es-executors-factory-real-init-20260710` (current dev tip + this session's fix,
-  synchronous)
