@@ -1,6 +1,6 @@
 # WildFly domain boot: Host Controller SIGSEGV in a cached-invoke dispatch stub, right after `host=foo:add()` — respawns forever, gates the four front-line residuals
 
-Status: OPEN — crash site conclusively identified (JIT inline PIC cascade inside a compiled ReentrantLock.lock() method, high confidence but not 100% proven); a specific, named root-cause candidate found (stale synthetic field-layout padding for ReentrantLock in classloading/src/class_manager.rs) but NOT YET CONFIRMED LIVE OR FIXED — see 2026-07-10 (new session) update at the bottom
+Status: FIXED 2026-07-10 — the previous update's root-cause candidate confirmed as step 1 of the chain; see the RESOLVED section at the bottom (doc moved to docs/internal/)
 Severity: High — this is now the gating blocker for `docs/known-issues/wildfly-domain-heap-corrupt-value-timeout.md`'s four front-line residuals (`AttributeChangeNotification`, `ContentCleanerService`, `FileInputStream(File)`, `WFLYHC0034`), which cannot be re-observed until this is fixed
 First confirmed: 2026-07-10, on Azure host `victor@20.83.144.174`, branch `fix/wildfly-residuals-20260710`
 
@@ -395,3 +395,98 @@ to `classloading/src/class_manager.rs`'s field-layout-padding logic without firs
 mechanism live (step 1-2 above) was judged too risky to attempt with this session's remaining
 budget, given that code is shared across many classes and a wrong change risks a regression
 elsewhere in exchange for an unconfirmed fix here.
+
+
+## RESOLVED (2026-07-10, third parallel session) — root cause found and fixed: fabricated `(0, false)` compact-field slots; every observation above now explained end-to-end
+
+Fixed on branch `fix/wildfly-hc-ic-null-receiver-20260710` (commits
+"fix(jit): never fabricate (0,false) compact-field slots" and
+"fix(native-builtins): BufferedReader.readLine held global pending-chars mutex across
+blocking read").
+
+### The full causal chain (merging both prior sessions' findings with this one's)
+
+1. `synthetic_stub_fields` carries a stale 3-field (`owner`/`holdCount`/`fair`)
+   `ReentrantLock` entry and the real-classfile load path pads the real 1-field class up to 3
+   (`class_manager.rs`, previous section's finding).
+2. `build_compact_layout` (`classloading/src/class.rs`) **refuses any padded class**
+   (`if padded { return None; }` — padded slots have no descriptor, so no trustworthy
+   oop-map) → `ReentrantLock` never gets a registered `CompactLayout` → its instances use the
+   legacy uniform 16-byte-cell layout. The previous section's "extra trailing padding slots
+   are inert on their own" puzzle resolves here: the padding never corrupts field 0 — it
+   *disables the compact layout*, and step 3 does the damage.
+3. The three vm-side JIT `cp_field_resolver` closures (`vm/src/runtime/interpreter.rs`)
+   resolved the compact slot with `compact_field_slot(...).unwrap_or((0, false))` —
+   **fabricating** a "compact slot at offset 0, non-ref" for exactly such classes, and
+   `jit/src/lib.rs` fed it into the single-pass emitter's `compact_field_off` map whenever
+   `CRATONVM_COMPACT_REF_FIELDS` (default ON) was set.
+4. The x64 compact-offset inline getfield arm trusted the entry: `c_is_ref == false` sent the
+   reference-typed `sync` field (type_tag `'L'`) into the int-category `_` match arm →
+   `MOVSXD` 32-bit sign-extended load in BOTH the compact and legacy branches, at
+   `HEADER_SIZE(40) + 0 + FIELD_CELL_PAYLOAD32_OFFSET(4) = 0x2c` (both branches collapse to
+   the same displacement for field 0 — visible verbatim in the wide gdb capture,
+   `/data/data/probes/wildfly-hc-sigsegv-20260710-215120/wide/wide-156265.log`).
+5. Bytes 4..8 of a legacy `Value::Object` cell are the **uninitialized padding dword between
+   the tag and the 64-bit pointer payload** — stale garbage. That is precisely the previous
+   section's captured "small, 8-byte-aligned, well-under-47-bit" receiver values
+   (`0x22841af8`, `0x226814b0`): non-null, pointer-plausible, and totally bogus — so neither
+   the PIC's null guard nor a `plausible_heap_pointer`-style guard could have caught it.
+6. The 3-way PIC cascade dereferences the bogus receiver for its class_id → `SEGV_MAPERR` →
+   Host Controller dies right after `Invoking the initial host=foo:add() op`
+   (`ReentrantLock.lock()` = `this.sync.lock()` — the previous section's identification is
+   confirmed) → process-controller respawns it forever.
+
+The same fabricated entries also steered the compact inline **putfield** arm (store of an
+8-byte pointer at fabricated offset 0 of a genuinely-compact receiver — silent heap
+corruption), and — by the same mechanism through the guarded-inline-getfield path — they are
+the root cause of the ES IVF-KNN corruption that `93b33576` ("Fix guarded-inline-getfield
+SIGSEGV regression...") mitigated the same day by flipping
+`guarded_inline_getfield_enabled()` to opt-in without having pinned the corrupting
+instruction: its "AALOAD bounds check dereferencing a small-int 0x40 receiver fed by a
+corrupted getfield result" is this exact MOVSXD emission.
+
+### The fix
+
+* `cp_field_resolver` now returns `Option<(usize, u8, Option<(u32, bool)>)>` — "no compact
+  slot" is representable, never fabricated. Pcs without a genuine slot take the guarded
+  uniform arm (per-object `GC_FLAG_COMPACT` keyed; layout-aware helper for compact receivers;
+  correct per-type widths for legacy cells).
+* Defense-in-depth in the x64 compact-offset getfield arm: type tags `'L'`/`'['` get an
+  explicit 64-bit payload load in both branches, so contradictory metadata can never again
+  emit a 32-bit pointer load.
+* Bonus fix discovered while verifying: the `BufferedReader.readLine` native held the global
+  pending-chars mutex across a blocking `invoke_virtual("read")` (edition-2021 `if let`
+  scrutinee temporary lives through the else branch). The process-controller's
+  "stderr for Host Controller" drain thread starved on that mutex behind a parked reader, so
+  the post-fix Host Controller *looked* silent (3 relayed lines instead of hundreds) and
+  would eventually block on a full stderr pipe. Introduced 2026-07-09 with the pending-chars
+  sidetable (`dcd9ef3a`); any parent JVM draining a child's stdout+stderr concurrently could
+  starve. Fixed by binding the lock result before the `if let`.
+
+### Verification (Azure host, pristine WildFly 32.0.1.Final, `CRATONVM_MSC_REAL_START=1`)
+
+* Pre-fix frozen binary (`/data/data/bin-cratonvm-hc-sigsegv-20260710-215120`, guarded
+  inline getfield still default-ON at its base): **8 crash/respawn cycles in 75 s**.
+* Fix at base `03fd1788` (guarded inline getfield still default-ON, i.e. the vulnerable
+  path active): **zero SIGSEGVs, zero respawns** — direct A/B on the emitter.
+* Final merged binary (`origin/dev` @ `ba23c02b` + both fixes,
+  `/data/data/bin-cratonvm-hc-ic-nullrecv-final-20260710`): `host=foo:add()` invoked once,
+  zero respawns, 224 Host Controller console lines relayed (vs 3 before the readLine fix),
+  boot proceeds through `WFLYSRV0049`/`ELY00001`/`WFLYHC0003` (http management service) into
+  management-model territory until the harness timeout.
+
+### Follow-ups spun out (NOT fixed here)
+
+* Boot now surfaces the next layer: `WFLYCTL0013 Operation("add") failed - address:
+  host=primary/core-service=management/management-interface=http-interface —
+  IllegalStateException: Container is down`, and a `StackOverflowError` from
+  `java.util.concurrent.ScheduledThreadPoolExecutor.shutdown` **recursing into itself**
+  (`at ScheduledThreadPoolExecutor.shutdown(ScheduledThreadPoolExecutor.java:842)` repeated
+  — smells like the invokespecial/virtual self-dispatch family of prior TPE fixes). These
+  belong to `wildfly-domain-heap-corrupt-value-timeout.md`'s residual hunt, which this crash
+  no longer gates.
+* `guarded_inline_getfield_enabled()` stays opt-in per `93b33576`'s prudence; with the root
+  cause fixed, re-flipping the default is a follow-up once the ES IVF-KNN cluster is
+  re-verified under `CRATONVM_JIT_GUARDED_GETFIELD=1`.
+* The env-var non-propagation into the Host Controller child (previous section) remains open
+  and unaddressed — `ProcessBuilder.environment()` is still ignored by the native `start`.
