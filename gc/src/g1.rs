@@ -599,10 +599,17 @@ impl<'a> SharedEvac<'a> {
             (r.cursor, r.data.addr() as *mut u8)
         };
 
+        let jit_skips = self.collector.jit_tlab_skip_spans();
         let mut newly: Vec<usize> = Vec::new();
         let mut offset = 0usize;
         while offset < cursor {
             let obj_ptr = base.add(offset);
+            // INT-3 — frozen-peer TLAB tail: uninitialized, no walkable
+            // filler; must be skipped before any byte is interpreted.
+            if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_ptr as usize) {
+                offset += skip;
+                continue;
+            }
             // TLAB-retire gap sentinel: skip its exact span.
             if let Some(gap) = gap_filler_len(obj_ptr) {
                 offset += gap;
@@ -1172,6 +1179,23 @@ pub struct G1Collector {
     /// All heap regions.
     regions: Mutex<Vec<G1Region>>,
 
+    /// INT-3 — published un-retired TLAB tails of threads the cross-thread
+    /// STW JIT takeover froze mid-JIT (plus any blocked/tearing-down thread
+    /// that missed its safepoint retire), as absolute `(cursor, end)`
+    /// address ranges.
+    ///
+    /// A frozen peer never reached `Tlab::retire`, so its reserved tail is
+    /// uninitialized memory *below* its Eden region's `cursor` carrying no
+    /// walkable int[]/gap filler. Every linear region walker must skip these
+    /// spans (see [`jit_tlab_skip_span_len`]), and
+    /// [`Self::jit_pinned_region_set`] excludes the containing regions from
+    /// the CSet — the owner resumes bump-allocating into `[cursor, end)`
+    /// after the pause, so the region must survive the collection in place.
+    /// Set under STW immediately before a collection and cleared immediately
+    /// after (empty on every normal cycle) — the G1 counterpart of
+    /// [`crate::gen_heap::GenerationalHeap::set_jit_tlab_skip_regions`].
+    jit_tlab_skip_regions: Mutex<Vec<(usize, usize)>>,
+
     /// Adaptive `needs_gc` Free-fraction threshold, in percent (baseline 25).
     /// Raised (up to 50) after any collection that recorded an evacuation
     /// failure — the free pool at trigger time is the young collection's
@@ -1426,6 +1450,7 @@ impl G1Collector {
             config: config.clone(),
             arena,
             regions: Mutex::new(regions),
+            jit_tlab_skip_regions: Mutex::new(Vec::new()),
             current_eden: AtomicUsize::new(usize::MAX), // no eden yet
             next_hash_code: AtomicI32::new(1),
             needs_gc_free_percent: AtomicUsize::new(25),
@@ -3718,9 +3743,16 @@ impl G1Collector {
             (r.cursor, r.data.as_mut_ptr())
         };
 
+        let jit_skips = self.jit_tlab_skip_spans();
         let mut offset = 0usize;
         while offset < cursor {
             let obj_ptr = unsafe { base.add(offset) };
+            // INT-3 — frozen-peer TLAB tail: uninitialized, no walkable
+            // filler; must be skipped before any byte is interpreted.
+            if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_ptr as usize) {
+                offset += skip;
+                continue;
+            }
             // TLAB-retire gap sentinel: skip its exact span (NOT a walkable
             // header — see `gap_filler_len`; `break`ing here would skip the
             // rest of a possibly-pinned source region's objects).
@@ -3853,6 +3885,7 @@ impl G1Collector {
         // (Edges are collected and applied after the walk to keep borrows simple;
         // `add_reference` dedups.)
         let mut new_rset_edges: Vec<(usize, usize)> = Vec::new();
+        let jit_skips = self.jit_tlab_skip_spans();
 
         for i in 0..regions.len() {
             if cset.contains(&i) || regions[i].region_type == RegionType::Free {
@@ -3865,6 +3898,12 @@ impl G1Collector {
 
             while offset < cursor {
                 let obj_ptr = unsafe { base.add(offset) };
+                // INT-3 — frozen-peer TLAB tail: uninitialized, no walkable
+                // filler; must be skipped before any byte is interpreted.
+                if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_ptr as usize) {
+                    offset += skip;
+                    continue;
+                }
                 // TLAB-retire gap sentinel: skip its exact span — breaking
                 // here would leave the rest of this region's references
                 // un-fixed-up after evacuation (stale pointers).
@@ -4009,6 +4048,7 @@ impl G1Collector {
             }
         };
 
+        let jit_skips = self.jit_tlab_skip_spans();
         for i in 0..regions.len() {
             if cset.contains(&i) || regions[i].region_type == RegionType::Free {
                 continue;
@@ -4020,6 +4060,11 @@ impl G1Collector {
 
             while offset < cursor {
                 let obj_ptr = unsafe { base.add(offset) };
+                // INT-3 — frozen-peer TLAB tail: skip before interpreting.
+                if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_ptr as usize) {
+                    offset += skip;
+                    continue;
+                }
                 // TLAB-retire gap sentinel: skip its exact span.
                 if let Some(gap) = gap_filler_len(obj_ptr) {
                     offset += gap;
@@ -4201,6 +4246,7 @@ impl G1Collector {
         }
         // Only NON-CSet regions (true survivors / old / new survivors). Kept CSet
         // regions are excluded — their dead objects are the stranded-copy noise.
+        let jit_skips = self.jit_tlab_skip_spans();
         for (ridx, region) in regions.iter().enumerate() {
             if region.region_type == RegionType::Free || cset_set.contains(&ridx) {
                 continue;
@@ -4210,6 +4256,11 @@ impl G1Collector {
             let mut offset = 0usize;
             while offset < cursor {
                 let obj_ptr = unsafe { base.add(offset) };
+                // INT-3 — frozen-peer TLAB tail: skip before interpreting.
+                if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_ptr as usize) {
+                    offset += skip;
+                    continue;
+                }
                 // TLAB-retire gap sentinel: skip its exact span.
                 if let Some(gap) = gap_filler_len(obj_ptr) {
                     offset += gap;
@@ -4298,6 +4349,7 @@ impl G1Collector {
         for r in roots {
             report(0, None, "root", r.as_ptr() as usize);
         }
+        let jit_skips = self.jit_tlab_skip_spans();
         for (ridx, region) in regions.iter().enumerate() {
             if region.region_type == RegionType::Free {
                 continue;
@@ -4307,6 +4359,11 @@ impl G1Collector {
             let mut off = 0usize;
             while off < cursor {
                 let obj_ptr = unsafe { base.add(off) };
+                // INT-3 — frozen-peer TLAB tail: skip before interpreting.
+                if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_ptr as usize) {
+                    off += skip;
+                    continue;
+                }
                 // TLAB-retire gap sentinel: skip its exact span.
                 if let Some(gap) = gap_filler_len(obj_ptr) {
                     off += gap;
@@ -4836,6 +4893,7 @@ impl G1Collector {
             // Reset the flag so we can detect re-overflow during recovery.
             self.mark_worklist_overflowed
                 .store(false, Ordering::Relaxed);
+            let jit_skips = self.jit_tlab_skip_spans();
             for region in regions.iter() {
                 if region.region_type == RegionType::Free {
                     continue;
@@ -4844,6 +4902,11 @@ impl G1Collector {
                 let mut offset = 0usize;
                 while offset < region.cursor {
                     let obj_addr = base + offset;
+                    // INT-3 — frozen-peer TLAB tail: skip before interpreting.
+                    if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_addr) {
+                        offset += skip;
+                        continue;
+                    }
                     // TLAB-retire gap sentinel: skip its exact span.
                     if let Some(gap) = gap_filler_len(obj_addr as *const u8) {
                         offset += gap;
@@ -5174,6 +5237,7 @@ impl G1Collector {
         // live, or this pass frees Old regions filled by promotion during
         // the cycle and zeroes live objects.
         let mark_snapshot: Vec<(u64, usize, RegionType)> = self.mark_start_snapshot.lock().clone();
+        let jit_skips = self.jit_tlab_skip_spans();
 
         for (region_idx, region) in regions.iter_mut().enumerate() {
             if region.region_type == RegionType::Free {
@@ -5189,6 +5253,11 @@ impl G1Collector {
 
             while offset < region.cursor {
                 let obj_addr = base + offset;
+                // INT-3 — frozen-peer TLAB tail: skip before interpreting.
+                if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_addr) {
+                    offset += skip;
+                    continue;
+                }
                 // TLAB-retire gap sentinel: skip its exact span.
                 if let Some(gap) = gap_filler_len(obj_addr as *const u8) {
                     offset += gap;
@@ -6129,14 +6198,61 @@ impl G1Collector {
     /// object must not move. Excluding its region from the CSet is G1's analog of
     /// the generational collector's non-moving-while-in-JIT sweep. Returns empty
     /// unless a thread is in JIT, so the no-JIT path pays nothing.
+    ///
+    /// INT-3 — ALSO includes every region holding a published un-retired
+    /// TLAB tail (see [`Self::set_jit_tlab_skip_regions`]): the tail's owner
+    /// resumes bump-allocating into `[cursor, end)` after the pause, so
+    /// evacuating + freeing that region would hand the same memory out
+    /// twice. Deliberately NOT gated on `gc_quiescence::is_active()` — a
+    /// blocked thread's un-retired tail can be published while no thread is
+    /// in JIT at all.
     fn jit_pinned_region_set(&self) -> std::collections::HashSet<usize> {
-        if !crate::gc_quiescence::is_active() {
-            return std::collections::HashSet::new();
+        let mut set: std::collections::HashSet<usize> = if crate::gc_quiescence::is_active() {
+            crate::gc_quiescence::pinned_jit_roots_snapshot()
+                .into_iter()
+                .filter_map(|addr| self.lookup_region_for_addr(addr))
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        for &(start, end) in self.jit_tlab_skip_regions.lock().iter() {
+            // A mutator TLAB is carved from a single Eden region
+            // (`refill_tlab`), so one lookup suffices; the `end - 1` probe is
+            // defense-in-depth should that invariant ever change.
+            if let Some(idx) = self.lookup_region_for_addr(start) {
+                set.insert(idx);
+            }
+            if end > start {
+                if let Some(idx) = self.lookup_region_for_addr(end - 1) {
+                    set.insert(idx);
+                }
+            }
         }
-        crate::gc_quiescence::pinned_jit_roots_snapshot()
-            .into_iter()
-            .filter_map(|addr| self.lookup_region_for_addr(addr))
-            .collect()
+        set
+    }
+
+    /// INT-3 — publish the reserved (un-retired) TLAB tails of frozen in-JIT
+    /// peers / blocked threads as absolute `(cursor, end)` address ranges so
+    /// this collection's region walkers skip them and their regions stay out
+    /// of the CSet (see [`Self::jit_tlab_skip_regions`]). Replaces any
+    /// previously-set list. Must be set under STW immediately before the
+    /// collection and cleared immediately after.
+    pub fn set_jit_tlab_skip_regions(&self, regions: &[(usize, usize)]) {
+        let mut g = self.jit_tlab_skip_regions.lock();
+        g.clear();
+        g.extend_from_slice(regions);
+    }
+
+    /// INT-3 — clear the published TLAB skip regions (see
+    /// [`Self::set_jit_tlab_skip_regions`]).
+    pub fn clear_jit_tlab_skip_regions(&self) {
+        self.jit_tlab_skip_regions.lock().clear();
+    }
+
+    /// INT-3 — snapshot of the published frozen-peer TLAB tails, taken once
+    /// per walk loop (not per object). Empty on every normal cycle.
+    fn jit_tlab_skip_spans(&self) -> Vec<(usize, usize)> {
+        self.jit_tlab_skip_regions.lock().clone()
     }
 
     /// Find which region contains the given address (by raw address).
@@ -6435,6 +6551,7 @@ impl G1Collector {
     pub fn walk_objects(&self) -> Vec<(*mut u8, usize)> {
         let mut result = Vec::new();
         let regions = self.regions.lock();
+        let jit_skips = self.jit_tlab_skip_spans();
         for r in regions.iter() {
             if r.region_type == RegionType::Free {
                 continue;
@@ -6444,6 +6561,11 @@ impl G1Collector {
             let mut offset = 0;
             while offset < used {
                 let ptr = (base + offset) as *mut u8;
+                // INT-3 — frozen-peer TLAB tail: skip before interpreting.
+                if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, base + offset) {
+                    offset += skip;
+                    continue;
+                }
                 // TLAB-retire gap sentinel: skip its exact span.
                 if let Some(gap) = gap_filler_len(ptr) {
                     offset += gap;
@@ -7163,6 +7285,25 @@ fn plausible_mark_scan_target(region: &G1Region, obj_addr: usize) -> bool {
 /// SAFETY contract: caller guarantees `ptr` points at >= 8 readable bytes
 /// inside a region (every walk loop checks `offset < cursor` first, and a
 /// gap is always a trailing 8..=32-byte span fully inside the region).
+/// INT-3 — if `addr` falls inside a published frozen-peer TLAB tail (see
+/// [`G1Collector::set_jit_tlab_skip_regions`]), return the distance to the
+/// span's end so the walker strides past it. The span is reserved,
+/// UNINITIALIZED memory below the region cursor: it carries no walkable
+/// filler (its owner was frozen mid-JIT before its safepoint retire), so it
+/// must be skipped BEFORE any header/sentinel byte is interpreted — random
+/// tail bytes could even alias `GAP_FILLER_CLASS_ID` and desync the walk. A
+/// linear walk lands exactly on a span's start (objects fill the TLAB
+/// contiguously up to `cursor`), but the check is range-based rather than
+/// exact-start as defense-in-depth. `spans` is empty on every cycle without
+/// frozen/blocked un-retired TLABs, making this a length check per object.
+#[inline]
+fn jit_tlab_skip_span_len(spans: &[(usize, usize)], addr: usize) -> Option<usize> {
+    spans
+        .iter()
+        .find(|&&(s, e)| addr >= s && addr < e)
+        .map(|&(_, e)| e - addr)
+}
+
 #[inline]
 fn gap_filler_len(ptr: *const u8) -> Option<usize> {
     let cid = unsafe { std::ptr::read(ptr as *const u32) };
@@ -8206,6 +8347,94 @@ mod tests {
         let gc = make_collector();
         gc.pin_region(9999); // should not panic
         assert!(!gc.is_pinned(9999));
+    }
+
+    // -- INT-3: frozen-peer TLAB skip regions --
+
+    /// INT-3 — a region holding a published un-retired TLAB tail must be
+    /// excluded from the CSet: its (frozen) owner resumes bump-allocating
+    /// into `[cursor, end)` after the pause, and objects it already
+    /// allocated there may be addressed by un-rewritable frozen-peer state.
+    /// Deliberately run WITHOUT `gc_quiescence` JIT activity: the exclusion
+    /// must hold even when no thread is in JIT (a blocked thread that missed
+    /// its retire publishes a tail too).
+    #[test]
+    fn jit_tlab_skip_region_excluded_from_cset() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        gc.set_field(obj, 0, Value::Int(41));
+
+        // Carve a mutator TLAB from the current Eden region — the region
+        // cursor now covers `len` bytes the "mutator" never initialized,
+        // exactly the state a frozen in-JIT peer leaves behind.
+        let (tlab_ptr, len) = gc.refill_tlab(4096).expect("TLAB refill");
+        let obj_region = {
+            let regions = gc.regions.lock();
+            gc.region_for_ptr(&regions, obj.as_ptr()).unwrap()
+        };
+        let tlab_region = gc.lookup_region_for_addr(tlab_ptr as usize).unwrap();
+        assert_eq!(
+            obj_region, tlab_region,
+            "test precondition: object and TLAB share the current Eden region"
+        );
+
+        gc.set_jit_tlab_skip_regions(&[(tlab_ptr as usize, tlab_ptr as usize + len)]);
+        let mut roots = vec![obj];
+        let result = gc.young_collection(&mut roots, &NoopMonitors);
+        assert_eq!(
+            result.stats.objects_copied, 0,
+            "region holding a frozen TLAB tail must be excluded from the CSet"
+        );
+        assert_eq!(
+            roots[0].as_ptr(),
+            obj.as_ptr(),
+            "object sharing the frozen peer's Eden region must not move"
+        );
+        assert_eq!(gc.get_field(obj, 0).as_int(), Some(41));
+
+        // After the (VM-driven) clear, the next collection evacuates normally.
+        gc.clear_jit_tlab_skip_regions();
+        let result = gc.young_collection(&mut roots, &NoopMonitors);
+        assert!(
+            result.stats.objects_copied > 0,
+            "clearing the skip list must restore normal evacuation"
+        );
+    }
+
+    /// INT-3 — every linear region walker must stride over a published
+    /// frozen TLAB tail instead of parsing its uninitialized bytes (zeroed
+    /// test-arena bytes parse as a run of phantom 0-slot objects; real
+    /// frozen-peer garbage can desync the stride entirely).
+    #[test]
+    fn walk_objects_skips_published_frozen_tlab_tail() {
+        let gc = make_collector();
+        let before = gc.alloc_object(ClassId::new(1), 2);
+        let (tlab_ptr, len) = gc.refill_tlab(4096).expect("TLAB refill");
+        let after = gc.alloc_object(ClassId::new(2), 3);
+        let span = (tlab_ptr as usize, tlab_ptr as usize + len);
+        assert_eq!(
+            gc.lookup_region_for_addr(before.as_ptr() as usize),
+            gc.lookup_region_for_addr(after.as_ptr() as usize),
+            "test precondition: allocations straddle the carved TLAB in one region"
+        );
+        assert!(
+            after.as_ptr() as usize >= span.1,
+            "test precondition: `after` lands beyond the carved TLAB"
+        );
+
+        gc.set_jit_tlab_skip_regions(&[span]);
+        let walked = gc.walk_objects();
+        let ptrs: Vec<usize> = walked.iter().map(|&(p, _)| p as usize).collect();
+        assert!(ptrs.contains(&(before.as_ptr() as usize)));
+        assert!(
+            ptrs.contains(&(after.as_ptr() as usize)),
+            "walker must stride over the frozen tail and reach objects behind it"
+        );
+        assert!(
+            ptrs.iter().all(|&p| p < span.0 || p >= span.1),
+            "no phantom object may be reported inside the frozen TLAB tail"
+        );
+        gc.clear_jit_tlab_skip_regions();
     }
 
     #[test]

@@ -97,19 +97,34 @@ non-moving-under-JIT sweep.
 
 ## 2. G1/ZGC: STW hang risk when a JIT thread never polls (INT-3)
 `stw_take_over_and_wait` falls back to a plain unbounded `wait_for_all()`
-for non-Generational backends (`supports_jit_tlab_skip()` is
+for non-Generational backends (`supports_jit_tlab_skip()` was
 Generational-only). A compiled loop that neither allocates nor re-enters
 the interpreter never arrives → whole-VM livelock under G1/ZGC + JIT.
-Needs either xt-takeover extension to G1 (freeze + conservative scan +
-pin) or back-edge safepoint polls. Scoping note (2026-07-10 third wave):
-the cross-thread JIT-pin registry and the CSet pin filter are already
-process-global on G1 (first wave), so the remaining blocker for the
-xt-takeover route is the frozen-peer TLAB protocol — a frozen peer never
-retires its TLAB (no gap sentinel), and every g1.rs region walker would
-walk its uninitialized tail. G1 needs the equivalent of the Generational
-"JIT TLAB skip regions" side channel, consumed by all region walkers,
-plus load validation on the Linux probe host before it can be trusted.
-The A5 unregistered-JIT-frame detector port to Linux LANDED (third wave).
+
+**G1 core fix IMPLEMENTED (2026-07-10, branch
+`claude/xenodochial-bun-89be77`) — pending Linux load validation
+(MTChurn/BinaryTrees G1+JIT, `/data/data/gcprobes-0710`); do not treat as
+fixed until that passes.** The xt-takeover now engages under G1:
+(a) frozen peers' un-retired TLAB tails are published to the G1 heap
+(`G1Collector::set_jit_tlab_skip_regions`) and every linear region walker
+(all 9 `gap_filler_len` sites) strides over them; (b) regions holding a
+published tail are excluded from the CSet via `jit_pinned_region_set`
+(un-gated on JIT activity — blocked-thread tails count too); (c) the VM
+pins everything a frozen peer can address — its conservative xt/helper
+roots AND its deposited snapshot roots (`pin_frozen_peer_roots_for_g1`,
+`root_snapshots_for_os_tids`) — because an excused peer never applies the
+cycle's pointer map to its frames, so under an evacuating collector those
+objects must not move (Generational gets this for free from its non-moving
+frozen-cycle sweep).
+
+Still OPEN within INT-3:
+- ZGC keeps the unbounded cooperative wait (no skip/pin protocol).
+- The G1 concurrent-mark STW points (`brief_stw_counted*` in initial mark
+  and final remark) still call plain `wait_for_all()` — a never-polling
+  JIT loop livelocks those pauses too; they need the takeover threaded
+  through (mark-only ⇒ no pin/skip required, just freeze + scan + excuse).
+- (The A5 unregistered-JIT-frame detector's Linux port is NOT part of
+  this item — it already landed in the third wave.)
 
 ## 3. Misc
 - Class unloading machinery (`gc/src/class_unloading.rs`) has no driver;
