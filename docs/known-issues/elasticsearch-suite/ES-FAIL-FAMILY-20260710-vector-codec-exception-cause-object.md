@@ -68,26 +68,154 @@ HIB-CV-32 diagnostic fires on a *different*, nearby slot in the same run,
 suggesting broader heap disturbance around the same GC cycle rather than an
 isolated one-field bug.)
 
-The pattern — a field written as a **self-reference** later reading back as
-an unrelated, live object — matches the self-forwarding class of GC bug
-already tracked in this codebase (see the G1 parallel-evac self-forward UAF:
-a self-referential pointer is not correctly relocated when the object itself
-moves during a GC cycle, so the stale self-pointer keeps pointing at the
-object's *old* address; once that address is reused by a later allocation —
-here, apparently a plain `new Object()` — reading the field returns whatever
-now lives there). `Throwable.cause = this` (set by
-`native_exc_init_noargs`/`capture_throwable_trace`'s sibling `backtrace =
-this`) is exactly this shape: a self-referential field on a moving-GC-managed
-object. This differs from the already-fixed `G1_PARALLEL_EVAC`-gated bug in
-that it reproduces under the **default** GC configuration (no
-`CRATONVM_G1_PARALLEL_EVAC` set) and under **both** `--nojit` and JIT-on —
-if it's the same class of forwarding bug, it lives in the default
-mover/relocator path, not the experimental parallel evacuator.
+**Self-forwarding-GC theory — tried, REFUTED.** The initial hypothesis (a
+self-referential pointer surviving a GC move stale, aliasing whatever gets
+reused at the object's old address once it relocates) was directly tested
+and disproven:
 
-Not yet fixed — pinning down exactly which relocator path drops the
-self-forward update, and confirming the "reused address" theory (e.g. a
-poisoning/canary build that fills freed regions with a recognizable pattern
-before reuse), is follow-up work. Keep this doc open for that residual.
+- A new Rust unit test, `self_referential_field_survives_promotion` in
+  `gc/src/gen_heap.rs` (kept in tree), allocates an object with a
+  self-referential field, forces it through `PROMOTION_AGE` young->old
+  promotions plus 5 more post-promotion GC cycles, and asserts the field
+  still points at the (relocated) object each time. **Passes cleanly** —
+  ordinary promotion correctly updates self-references.
+- Two concurrent Java repros (`ConcurrentSelfRefRepro`/`ConcurrentSelfRefRepro2`,
+  3 allocator/churner threads + a polling/throw-catch thread hammering a
+  small heap for 30s each, one holding plain `Exception` self-references,
+  the other actually throwing/catching real `BufferUnderflowException`
+  instances) found **no mismatch** across ~4.9M and ~3.6M checks.
+- Most decisively: enhancing `CRATONVM_DBG_CAUSE` to also log the raw heap
+  pointer (`ObjectRef::as_ptr()`), not just identity hash, on the REAL
+  failing `ES93FlatBFloat16VectorFormatTests.testMultiClose` repro shows
+  the victim `BufferUnderflowException`'s address is **IDENTICAL** at
+  write time and read time (e.g. `ptr=0x220f7720` both times) — **the
+  object never moves.** There is no relocation for a stale self-pointer to
+  survive.
+
+**What's actually happening: a live, valid `Object` reference gets written
+into the cause slot's memory, in place.** Since the object's address is
+constant, something performs a genuine (mistargeted) write to that exact
+byte range sometime after construction. To catch it red-handed, two new
+pieces of temporary diagnostic tooling were added (kept in tree, gated,
+following the codebase's existing `CRATONVM_DBG_*` pattern):
+
+- `cratonvm_gc::heap::{set_dynamic_watch, dynamic_watch_addr}` (`gc/src/heap.rs`)
+  — a runtime-settable companion to the existing `CRATONVM_DBG_WATCH_CELL`
+  env-var watchpoint, since the address to watch (the victim's cause slot)
+  isn't known until the object is allocated mid-run. `cell_watch_check` now
+  checks both.
+- `NativeContext::dbg_set_watch_cell` (`native-api/src/registry.rs`, default
+  no-op; overridden in `vm/src/vm/vm_exec.rs`) lets native code arm it.
+- `write_throwable_cause` arms the watch (`CRATONVM_DBG_WATCH_CAUSE_SELF=<class>`)
+  on the cause slot right after writing the self-sentinel for a matching
+  class.
+
+Running with `CRATONVM_DBG_CAUSE=1 CRATONVM_DBG_WATCH_CAUSE_SELF=java/nio/BufferUnderflowException`
+catches the write **immediately** (within 1-2 log lines of construction, not
+some arbitrary time later) at `gc::heap::write_slot`:
+
+```text
+CAUSE_DBG_WRITE this=java/nio/BufferUnderflowException hash=493794 ptr=0x221c56f0 cause=SELF
+CAUSE_DBG_ARM watch=0x221c5738 for java/nio/BufferUnderflowException hash=493794
+CAUSE_DBG_WRITE this=org/apache/lucene/index/CorruptIndexException hash=493823 ptr=0x221a8d58 cause=java/io/EOFException hash=493820
+[CELLWATCH] write_slot: write [0x221c5738 +16) covers watch 0x221c5738 value=Object(Some(ObjectRef { ptr: 0x221c6048 }))
+```
+
+Reproduced across 4 independent runs (2 different builds, JIT-on and
+`--nojit`): the corrupted cause value's address is **consistently exactly
+`0x958` (2392) bytes past the victim's own base address** — not random
+garbage, and not a stale/reused address (the offset is *positive* and
+*relative to the still-live victim*, ruling out "old address got reused").
+The corruption reliably happens right around construction of an
+`org.apache.lucene.index.CorruptIndexException` wrapping an `EOFException`
+(`native_exc_init_cause`, which calls `ctx.invoke_virtual(cause, "toString", …)`
+mid-construction — a virtual dispatch, and thus a re-entrant window).
+
+A Rust `Backtrace::force_capture()` at the `[CELLWATCH]` site is
+**unreliable here** — it comes back as ~17 repeats of
+`core::fmt::num::impl$35::fmt` plus a `jit_self_call_stack_guard` frame,
+identically shaped in both JIT-on and `--nojit` runs, indicating the
+Windows SEH unwinder loses the stack (likely once it crosses a JIT-compiled
+frame lacking `.pdata`/`.xdata` unwind info) rather than reporting anything
+real. A companion Java-level stack dump was added at the interpreter's
+`Instruction::Putfield` site (`vm/src/runtime/interpreter.rs`, prints
+`[WATCHFIELD]` + the full `thread.frames` when a putfield's target matches
+the dynamic watch) — **it never fires**, so the corrupting write is not a
+plain interpreted `putfield`.
+
+The strongest lead so far comes from the codebase's own **pre-existing**
+`CRATONVM_DBG_CELLCORRUPT`/`CRATONVM_DBG_BADREF` diagnostics
+(`gc/src/gen_heap.rs::set_array_element`, already documented in-tree as
+catching "an array-element write through a STALE array reference … writing
+a raw 8-byte pointer into the middle of that object's 16-byte Value cells").
+Enabling them on the same repro fires right as the corrupted cause gets
+read:
+
+```text
+[CELLCORRUPT] holder=0xc6722398 (young_from=true old=false) class_id=0 class=java/lang/Object kind=0x01 num_slots=1 array_len=1 gc_flags=0x0 index=0 raw0=0x00000000c675dc80 raw1=0x0000000100000028
+[CELLCORRUPT]   shift-test over 1 cells: valid@aligned=0 valid@+8=0 valid@-8=1
+[CELLCORRUPT]   target-header: class_id=3040 class=org/apache/lucene/index/CorruptIndexException kind=0x00 num_slots=12 array_len=0 gc_flags=0x0
+```
+
+`holder=0xc6722398` is exactly the address the corrupted `cause` field
+points to. It's a 1-element array (`kind=0x01`, `num_slots=1`,
+`array_len=1`) whose declared component type is `class_id=0`
+(`java/lang/Object`) — **which may or may not itself be legitimate**: a
+genuine `new Object[1]` (e.g. varargs boxing) is correctly `class_id=0`
+too, so this is not by itself proof of the separate, already-partially-fixed
+"`ClassId(0)` fallback anti-pattern" family (`686de27c1`,
+`cdbbc4152` — transient `ensure_class_initialized` failures minting a
+zero-field `ClassId(0)` stub instead of retrying via
+`ctx.ensure_synthetic_class`). What *is* conclusive: the **shift-test**
+— reading this array's single element at its nominal (aligned) offset
+produces garbage (fails the corrupt-cell check), but reading it **shifted
+back by exactly 8 bytes** decodes as a valid pointer to a live
+`org.apache.lucene.index.CorruptIndexException` (`num_slots=12`, matching
+Throwable's 5 inherited slots + Lucene's own extra fields). That's an
+**8-byte misalignment** in how this specific 1-element `Object[]`'s data
+region is addressed — consistent with (though not yet proven to be) a
+compact/legacy layout-size disagreement for arrays, in the same family as
+the already-documented compact-ref-fields legacy-instance bug (see
+`reference_compact_ref_fields_jit_inline_per_object_flag` — though that one
+is `CRATONVM_COMPACT_REF_FIELDS`-gated and default-OFF, so if this is
+related it's a different code path with the same *shape* of bug: an object
+addressed at the wrong element/field stride).
+
+**Not yet fixed.** What's confirmed:
+- NOT a GC-relocation/self-forwarding bug (object never moves).
+- NOT triggered by generic concurrency or by throwing/catching the specific
+  exception type concurrently (two dedicated repros, both clean).
+- NOT a plain interpreted `putfield` (the `[WATCHFIELD]` hook never fires).
+- IS a genuine out-of-place write of a valid `Object` reference, landing
+  consistently 2392 bytes past the victim, coinciding with
+  `CorruptIndexException(String, DataInput, Throwable)` construction.
+- The object the corrupted `cause` ends up pointing at is a 1-element
+  `Object[]` array with an apparent 8-byte element-addressing bug, whose
+  (correctly-offset) element points at that same `CorruptIndexException`.
+
+**Recommended next steps for a follow-up session:**
+1. Find what allocates a 1-element `Object[]` right around
+   `CorruptIndexException`/`EOFException` construction in this test's call
+   path (`CodecUtil.checkFooter` → `Lucene104PostingsReader.<init>` →
+   `AssertingPostingsFormat.fieldsProducer` → …) — likely varargs boxing for
+   a message-formatting call, or `Throwable.getStackTrace()`/suppressed-list
+   machinery. `CRATONVM_DBG_CELLCORRUPT=1` is the fastest way back into this
+   evidence.
+2. Extend the `[WATCHFIELD]`-style java-stack dump (already added at
+   `Instruction::Putfield`) to `aastore` (`0x53` in
+   `vm/src/runtime/interpreter.rs`, around the `set_array_element` call) and
+   to `gc::gen_heap::write_prim_element`/`set_field_as` call sites more
+   broadly, to catch the actual write's Java call site directly instead of
+   inferring it from timing.
+3. Investigate whether the array's own allocation size/stride computation
+   (wherever it's built — likely a `new_ref_array`/`alloc_array` call) is
+   off by one `Value` cell (16 bytes) vs. 8 bytes somewhere in its header or
+   component-size accounting, matching the shift-test's `-8` finding.
+
+All temporary diagnostic tooling from this investigation (`CRATONVM_DBG_CAUSE`,
+the dynamic watch mechanism, `[WATCHFIELD]`) is committed but **not merged
+into dev** — it's exploratory and should be reviewed before landing
+permanently. See branch `fix/es-vector-codec-exception-cause-object-20260710`.
 
 ## Original entry (2026-07-10, before this update)
 

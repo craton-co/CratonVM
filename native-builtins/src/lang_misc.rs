@@ -260,11 +260,44 @@ pub(crate) fn write_throwable_cause(ctx: &mut dyn NativeContext, this: ObjectRef
             other => format!("{other:?}"),
         };
         eprintln!(
-            "CAUSE_DBG_WRITE this={this_cls} hash={} cause={cause_desc}",
-            ctx.identity_hash_code(this)
+            "CAUSE_DBG_WRITE this={this_cls} hash={} ptr={:?} cause={cause_desc}",
+            ctx.identity_hash_code(this),
+            this.as_ptr()
         );
     }
     write_throwable_field_cached(ctx, &THROWABLE_CAUSE_INDEX, "cause", this, cause);
+
+    // ES-FAIL-FAMILY-20260710 hunt: arm a dynamic write-watchpoint (see
+    // `NativeContext::dbg_set_watch_cell`) on the cause slot right after
+    // writing the self-referential "uninitialized" sentinel into it, for
+    // the next constructed instance of a specific class (set via
+    // `CRATONVM_DBG_WATCH_CAUSE_SELF=<slash-separated class name>`) — to
+    // catch, with a full Rust backtrace, whatever later overwrites that
+    // exact memory slot with something else. Re-arms on every matching
+    // construction (last one wins), since we don't know in advance which
+    // instance will end up being the one that's actually printed/observed.
+    if let Value::Object(Some(c)) = cause {
+        if c == this {
+            if let Ok(watch_cls) = std::env::var("CRATONVM_DBG_WATCH_CAUSE_SELF") {
+                let this_cls = ctx
+                    .class_name_of_id(ctx.class_id_of_object(this))
+                    .unwrap_or_default();
+                if this_cls == watch_cls {
+                    let idx = THROWABLE_CAUSE_INDEX.load(Ordering::Relaxed);
+                    if idx != UNRESOLVED_FIELD_INDEX {
+                        let addr = this.as_ptr() as usize
+                            + cratonvm_types::HEADER_SIZE
+                            + idx * cratonvm_types::SLOT_SIZE;
+                        eprintln!(
+                            "CAUSE_DBG_ARM watch={addr:#x} for {this_cls} hash={}",
+                            ctx.identity_hash_code(this)
+                        );
+                        ctx.dbg_set_watch_cell(addr);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Capture the current call stack for a freshly-constructed throwable.
@@ -1011,9 +1044,11 @@ fn throwable_cause(ctx: &mut dyn NativeContext, t: ObjectRef) -> Option<ObjectRe
                 .class_name_of_id(ctx.class_id_of_object(c))
                 .unwrap_or_default();
             eprintln!(
-                "CAUSE_DBG_READ this={t_cls} hash={} cause={c_cls} cause_hash={}",
+                "CAUSE_DBG_READ this={t_cls} hash={} ptr={:?} cause={c_cls} cause_hash={} cause_ptr={:?}",
                 ctx.identity_hash_code(t),
-                ctx.identity_hash_code(c)
+                t.as_ptr(),
+                ctx.identity_hash_code(c),
+                c.as_ptr()
             );
         }
         return Some(c);
