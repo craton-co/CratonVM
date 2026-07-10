@@ -116,15 +116,43 @@ progress).
    `TestAccessLogValve` re-run to confirm the `-1`/`400` symptom is actually
    gone now (not independently re-verified in this session).
 3. **Layer 3 fix is landed and verified in this session** —
-   `TestRewriteValve` completes all 121 tests. The remaining failures in
-   that run (`NullPointerException: Cannot enter synchronized block because
-   "this.lock" is null` in the NIO socket/lock path, and the
-   `LifecycleException` cascades it triggers) are a distinct,
-   previously-undocumented issue, not investigated further here — worth a
-   new known-issue doc if it reproduces outside this suite.
+   `TestRewriteValve` completes all 121 tests.
 4. Once both Layer 2 and Layer 3 re-runs are independently confirmed clean
    (or at least free of these three specific symptoms), this doc can move
    to `docs/internal/` per the known-issues convention.
+
+## 2026-07-10: the `SocketWrapperBase.lock` NPE noted above is a known,
+## cross-cutting bug — now empirically resolved on current `dev`
+
+The `NullPointerException: ... "this.lock" is null` failure flagged as "a
+distinct, previously-undocumented issue" in an earlier version of this
+section is neither distinct nor previously undocumented — it's the exact
+`SocketWrapperBase`/`SocketProcessorBase` NPE root-caused across two prior
+sessions in
+`docs/known-issues/tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md`
+(root-caused as a stale/lost local variable, `TestSwallowAbortedUploads`;
+also hit `TestNonBlockingAPI`/`TestHttp11Processor` per
+`nonblockingapi-http11processor-http2limits-bare-assertions.md`).
+
+Re-ran `TestRewriteValve` against a fresh `origin/dev` tip (worktree
+`/data/data/wt-rewritevalve-lockcheck`) that includes commit `9cbbc82c`
+("Fix Tomcat WebSocket close-delay blockers", landed after this doc's Layer
+3 fix above): **zero** `lock is null` occurrences across all 121 tests
+(previously: every single connection). `Tests run: 121, Failures: 156`
+(down from 229 before `9cbbc82c`) — the 109 tests that previously died with
+a connection-level `-1` mostly now get a real HTTP response (a new,
+narrower `200`/`400`-vs-`302` behavioral mismatch, not investigated).
+Full comparison table and the open question of exactly which of
+`9cbbc82c`'s three bundled changes is responsible are in the swallow-upload
+doc's own "`TestRewriteValve` independently confirms" section — read that
+before doing further work here.
+
+**Practical upshot:** don't write a new known-issue doc for this NPE — it
+already has one, and it's evidently no longer reproducing (at least for
+these two test classes) on current `dev`. The remaining `TestRewriteValve`
+failures (200/400-vs-302, UTF-8 percent-encoding round-trip — see the
+swallow-upload doc's comparison table for exact counts) are the actual
+next-actionable item for this class, not the old NPE.
 
 ## Reproduction
 
