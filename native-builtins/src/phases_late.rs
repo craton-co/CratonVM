@@ -18339,6 +18339,19 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         "(Z)Ljava/nio/channels/SelectableChannel;",
         |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
     );
+    let socket_adaptor = "sun/nio/ch/SocketAdaptor";
+    r.register(
+        socket_adaptor,
+        "getInetAddress",
+        "()Ljava/net/InetAddress;",
+        |ctx, args| p72_socket_adaptor_address(ctx, args, false),
+    );
+    r.register(
+        socket_adaptor,
+        "getLocalAddress",
+        "()Ljava/net/InetAddress;",
+        |ctx, args| p72_socket_adaptor_address(ctx, args, true),
+    );
     r.set_category(__prev_cat);
 }
 
@@ -57071,6 +57084,60 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
 // java.net.ServerSocket extras + java.net.Socket extras (not already registered)
 // =============================================================================
 
+fn p72_socket_adaptor_address(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    local: bool,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let sc = match ctx.get_field_by_name(this, "sc") {
+        Value::Object(Some(sc)) => sc,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let method = if local {
+        "getLocalAddress"
+    } else {
+        "getRemoteAddress"
+    };
+    let socket_addr = match ctx.invoke_virtual(sc, method, "()Ljava/net/SocketAddress;", &[])? {
+        Some(Value::Object(Some(addr))) => addr,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    p72_inet_from_socket_address(ctx, socket_addr)
+}
+
+fn p72_inet_from_socket_address(
+    ctx: &mut dyn NativeContext,
+    socket_addr: ObjectRef,
+) -> MethodCallResult {
+    if let Ok(Some(Value::Object(Some(addr)))) =
+        ctx.invoke_virtual(socket_addr, "getAddress", "()Ljava/net/InetAddress;", &[])
+    {
+        return Ok(Some(Value::Object(Some(addr))));
+    }
+
+    let host = match ctx.invoke_virtual(socket_addr, "getHostString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let host = if host.is_empty() {
+        match ctx.invoke_virtual(socket_addr, "getHostName", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        }
+    } else {
+        host
+    };
+    if host.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+
+    let ip = host.trim_matches(&['[', ']'][..]);
+    Ok(Some(Value::Object(Some(
+        crate::net_phase_e::alloc_inet_address_external(ctx, ip, ip),
+    ))))
+}
+
 pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
     // NIO-SERVER-SOCKET (route 1): skip the synthetic java.net.Socket/ServerSocket
     // surface so real bytecode drives sun/nio/ch/Net. Third of three registrars
@@ -57528,6 +57595,19 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
         "getRemoteSocketAddress",
         "()Ljava/net/SocketAddress;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    let socket_adaptor_inet = "sun/nio/ch/SocketAdaptor";
+    r.register(
+        socket_adaptor_inet,
+        "getInetAddress",
+        "()Ljava/net/InetAddress;",
+        |ctx, args| p72_socket_adaptor_address(ctx, args, false),
+    );
+    r.register(
+        socket_adaptor_inet,
+        "getLocalAddress",
+        "()Ljava/net/InetAddress;",
+        |ctx, args| p72_socket_adaptor_address(ctx, args, true),
     );
     r.register(sock, "isInputShutdown", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))

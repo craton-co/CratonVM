@@ -796,7 +796,24 @@ fn jar_url_conn_ext(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
     ext
 }
 
+fn file_url_path(url: &str) -> Option<String> {
+    let raw = url.strip_prefix("file:")?;
+    let without_host = raw.strip_prefix("//").unwrap_or(raw);
+    let path = if cfg!(windows) {
+        without_host.trim_start_matches('/').to_string()
+    } else {
+        without_host.to_string()
+    };
+    Some(path)
+}
+
 fn synthetic_resource_url_content_len(ctx: &mut dyn NativeContext, url: &str) -> i64 {
+    if let Some(path) = file_url_path(url) {
+        return std::fs::metadata(path)
+            .map(|m| m.len() as i64)
+            .unwrap_or(-1);
+    }
+
     let resource = if let Some(rest) = url.strip_prefix("jrt:") {
         let path = rest.trim_start_matches('/');
         match path.split_once('/') {
@@ -815,6 +832,22 @@ fn synthetic_resource_url_content_len(ctx: &mut dyn NativeContext, url: &str) ->
     ctx.find_resource(resource)
         .map(|bytes| bytes.len() as i64)
         .unwrap_or(-1)
+}
+
+fn synthetic_resource_url_last_modified(url: &str) -> i64 {
+    let Some(path) = file_url_path(url) else {
+        return 0;
+    };
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    let Ok(modified) = meta.modified() else {
+        return 0;
+    };
+    match modified.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis().min(i64::MAX as u128) as i64,
+        Err(_) => 0,
+    }
 }
 
 /// `JarURLConnection.getJarEntry()` — build the `java/util/jar/JarEntry` for the
@@ -2849,6 +2882,50 @@ fn re1_connect_socket(
     Ok(None)
 }
 
+fn re1_socket_adaptor_inet(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    local: bool,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let sc = match ctx.get_field_by_name(this, "sc") {
+        Value::Object(Some(sc)) => sc,
+        _ => return Ok(None),
+    };
+    let method = if local {
+        "getLocalAddress"
+    } else {
+        "getRemoteAddress"
+    };
+    let socket_addr = match ctx.invoke_virtual(sc, method, "()Ljava/net/SocketAddress;", &[])? {
+        Some(Value::Object(Some(addr))) => addr,
+        _ => return Ok(None),
+    };
+
+    if let Ok(Some(Value::Object(Some(addr)))) =
+        ctx.invoke_virtual(socket_addr, "getAddress", "()Ljava/net/InetAddress;", &[])
+    {
+        return Ok(Some(addr));
+    }
+
+    let host = match ctx.invoke_virtual(socket_addr, "getHostString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let host = if host.is_empty() {
+        match ctx.invoke_virtual(socket_addr, "getHostName", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        }
+    } else {
+        host
+    };
+    if host.is_empty() {
+        return Ok(None);
+    }
+    let ip = host.trim_matches(&['[', ']'][..]);
+    Ok(Some(alloc_inet_address(ctx, ip, ip)))
+}
+
 fn register_re1_socket(r: &mut NativeMethodRegistry) {
     // NIO-SERVER-SOCKET (route 1): skip the synthetic java.net.Socket surface so
     // real bytecode drives sun/nio/ch/Net. See register_phase53_socket_stubs.
@@ -3127,6 +3204,9 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         "()Ljava/net/InetAddress;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            if let Some(addr) = re1_socket_adaptor_inet(ctx, this, false)? {
+                return Ok(Some(Value::Object(Some(addr))));
+            }
             let host = read_field_string_or(ctx, this, SOCK_HOST, "");
             if host.is_empty() {
                 return Ok(Some(Value::Object(None)));
@@ -3160,7 +3240,11 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         sock,
         "getLocalAddress",
         "()Ljava/net/InetAddress;",
-        |ctx, _args| {
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Some(addr) = re1_socket_adaptor_inet(ctx, this, true)? {
+                return Ok(Some(Value::Object(Some(addr))));
+            }
             let ia = alloc_inet_address(ctx, "localhost", "127.0.0.1");
             Ok(Some(Value::Object(Some(ia))))
         },
@@ -5595,6 +5679,18 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             let url = huc_url_string(ctx, this);
             Ok(Some(Value::Long(synthetic_resource_url_content_len(
                 ctx, &url,
+            ))))
+        },
+    );
+    r.register(
+        "java/net/URLConnection",
+        "getLastModified",
+        "()J",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let url = huc_url_string(ctx, this);
+            Ok(Some(Value::Long(synthetic_resource_url_last_modified(
+                &url,
             ))))
         },
     );
