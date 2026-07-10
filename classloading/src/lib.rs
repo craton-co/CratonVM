@@ -52,6 +52,7 @@ pub use class_manager::{
     jdk_superclass_lookup,
     jit_supersede_epoch,
     register_builtin_classloaders,
+    static_common_superclass_lookup,
     ClassFileLoadHook,
     ClassManager,
     DefineClassOptions,
