@@ -249,6 +249,23 @@ pub fn top_rbp_mirror_read() -> usize {
     top_rbp_get()
 }
 
+/// Save/restore hook for Rust-side compiled-entry calls
+/// (`try_call_compiled_entry` in `vm/src/jit/helpers.rs`): a compiled callee's
+/// prologue publishes ITS rbp into the mirror and nothing on the Rust dispatch
+/// path restores the JIT caller's value when the callee returns. A GC
+/// triggered from any later helper call would then start its precise remap
+/// walk at the DEAD callee frame (whose stack memory has been reused by
+/// subsequent Rust frames); a garbage "parent rbp"/"return address" pair that
+/// happens to resolve into registered JIT code gets its "oop slots" rewritten
+/// with relocated pointers — observed as heap addresses appearing inside
+/// double[] elements during Arrays.sort (ES SortingDigestTests, -Jit on).
+/// The dispatch helpers snapshot the mirror before the raw entry call and
+/// write it back afterwards. The JIT→JIT direct-call analogue is
+/// `emit_post_call_rbp_republish` in `jit/src/x64.rs`.
+pub fn top_rbp_mirror_write(v: usize) {
+    top_rbp_set(v);
+}
+
 #[inline]
 fn top_rbp_set(v: usize) {
     #[cfg(windows)]

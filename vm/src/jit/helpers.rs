@@ -774,6 +774,24 @@ unsafe fn try_call_compiled_entry(
     vm_ptr: i64,
     args_slice: &[i64],
 ) -> Option<i64> {
+    // The compiled callee's prologue publishes ITS rbp into the precise-maps
+    // innermost-RBP mirror; nothing on this Rust path republishes the JIT
+    // caller's rbp after the callee returns, so a later GC would walk the
+    // dead callee frame (see `top_rbp_mirror_write`). Snapshot + restore the
+    // mirror around the raw entry call.
+    let saved_top_rbp = crate::jit::conservative_roots::top_rbp_mirror_read();
+    let r = try_call_compiled_entry_inner(entry, needs_ctx, vm_ptr, args_slice);
+    crate::jit::conservative_roots::top_rbp_mirror_write(saved_top_rbp);
+    r
+}
+
+// SAFETY: same entry ABI contract as `try_call_compiled_entry`.
+unsafe fn try_call_compiled_entry_inner(
+    entry: usize,
+    needs_ctx: bool,
+    vm_ptr: i64,
+    args_slice: &[i64],
+) -> Option<i64> {
     let n = args_slice.len();
     if needs_ctx {
         Some(match n {

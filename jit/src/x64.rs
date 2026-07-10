@@ -21868,7 +21868,30 @@ impl Compiler {
                         // follow-up rather than threading a new descriptor param
                         // through every `x64::compile` caller.
                         self.emit_post_invoke_exception_check(b'I');
-                        self.push_from_rax();
+                        // VOID self-recursive fix (ES SortingDigestTests -Jit
+                        // on): this push was unconditional, so a `void`
+                        // self-recursive callee (DualPivotQuicksort.sort) left
+                        // a PHANTOM entry on the simulated operand stack after
+                        // every non-tail self-call. The extra entry shifts the
+                        // canonical spill-slot layout for everything downstream
+                        // of the next merge point, so later loads read
+                        // neighbouring slots (an array ref read as a double →
+                        // heap addresses stored into double[] elements,
+                        // deterministic mis-sorts and garbage AIOOBE indices —
+                        // no GC involved). The method's own return type IS
+                        // available via `method_key` ("Class.name:descriptor"),
+                        // so only push a return value when there is one. When
+                        // `method_key` is empty (unit-test compiles) keep the
+                        // historical push — those callers never compile void
+                        // self-recursive methods.
+                        let self_ret_ty = self
+                            .method_key
+                            .rfind(')')
+                            .and_then(|i| self.method_key.as_bytes().get(i + 1))
+                            .copied();
+                        if self_ret_ty != Some(b'V') {
+                            self.push_from_rax();
+                        }
                     }
                     pc += 3;
                 }
@@ -25588,11 +25611,23 @@ pub fn compile_with_param_slots(
     // register. This only touches the OSR metadata copy; the running code's
     // `reg_for_local` (which never asks for a high-half) is unaffected.
     let mut osr_local_assignments = compiler.local_assignments.clone();
+    // ES-tdigest OSR fix: the high-half nulling and the per-PC dead mask below
+    // must cover XMM-resident (float/double) locals exactly like GPR-resident
+    // ones. DualPivotQuicksort.sort coalesces several disjoint-live-range
+    // double locals (pivots, run temporaries) onto one XMM register; an OSR
+    // entry at a PC where one of them is dead loaded the dead local's garbage
+    // over the live owner's XMM value (the GPR-only mask said "safe"), so
+    // Arrays.sort(double[]) silently mis-sorted / threw garbage-index AIOOBE
+    // once the sort loop OSR-entered.
+    let mut osr_xmm_assignments = compiler.xmm_assignments.clone();
     {
         let high_halves = wide_local_high_halves(code, code_len);
         for &hh in &high_halves {
             if hh < osr_local_assignments.len() {
                 osr_local_assignments[hh] = None;
+            }
+            if hh < osr_xmm_assignments.len() {
+                osr_xmm_assignments[hh] = None;
             }
         }
     }
@@ -25614,15 +25649,38 @@ pub fn compile_with_param_slots(
         .enumerate()
         .filter(|(_, a)| a.is_some())
         .fold(0u64, |m, (i, _)| if i < 64 { m | (1u64 << i) } else { m });
+    // XMM-resident locals participate in the same graph-colouring coalescing
+    // as GPR-resident ones, so they need the same dead-at-entry protection
+    // (liveness tracks d/f locals at their base index via dload/dstore).
+    let xmm_resident: u64 = osr_xmm_assignments
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.is_some())
+        .fold(0u64, |m, (i, _)| if i < 64 { m | (1u64 << i) } else { m });
     let mut osr_dead_mask = vec![0u64; code_len + 1];
     for &(pc, live_in) in &compiler.osr_block_live_in {
         if pc < osr_dead_mask.len() {
-            osr_dead_mask[pc] = reg_resident & !live_in;
+            osr_dead_mask[pc] = (reg_resident | xmm_resident) & !live_in;
+        }
+    }
+    if std::env::var_os("CRATONVM_DBG_OSR_META").is_some() {
+        let masked: Vec<(usize, u64)> = compiler
+            .osr_block_live_in
+            .iter()
+            .filter_map(|&(pc, live_in)| {
+                let m = (reg_resident | xmm_resident) & !live_in;
+                if m != 0 { Some((pc, m)) } else { None }
+            })
+            .collect();
+        if !masked.is_empty() {
+            eprintln!(
+                "[osr-meta] gpr_resident={reg_resident:#x} xmm_resident={xmm_resident:#x} masked_entries={masked:x?}"
+            );
         }
     }
     cm.osr_dead_mask = Some(osr_dead_mask);
     cm.osr_local_assignments = Some(osr_local_assignments);
-    cm.osr_xmm_assignments = Some(compiler.xmm_assignments);
+    cm.osr_xmm_assignments = Some(osr_xmm_assignments);
     cm.osr_frame_size = compiler.frame_size;
     cm.osr_callee_saved_base = compiler.callee_saved_base;
     // HIB-CV-20 OSR caller-corruption fix: hand the trampoline the EXACT
