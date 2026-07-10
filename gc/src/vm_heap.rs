@@ -294,6 +294,18 @@ impl VmHeap {
         }
     }
 
+    /// Try to allocate directly in the old generation. This is only available
+    /// for the generational heap; other heap implementations return `None` so
+    /// callers can fall back to their normal allocation path.
+    pub fn try_alloc_object_old(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
+        match self {
+            VmHeap::Generational(h) => h.try_alloc_object_old(class_id, num_fields),
+            VmHeap::G1(_) => None,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => None,
+        }
+    }
+
     /// Fallible twin of [`alloc_object`](Self::alloc_object): same (no-GC)
     /// allocation path including the old-generation spill, but returns `None`
     /// on true heap exhaustion instead of aborting the VM. Lets the JIT

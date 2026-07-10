@@ -24,7 +24,7 @@ The previous terminal failures are gone:
 
 The class still fails later, but the remaining failure is a separate
 Hibernate/H2 authentication residual tracked in
-`docs/known-issues/keycloak-model-realmmodeltest-h2-auth-after-liquibase-nojit.md`.
+`docs/internal/fixed-suite-bugs/keycloak-model-realmmodeltest-h2-auth-after-liquibase-nojit-FIXED.md`.
 
 ## Evidence
 

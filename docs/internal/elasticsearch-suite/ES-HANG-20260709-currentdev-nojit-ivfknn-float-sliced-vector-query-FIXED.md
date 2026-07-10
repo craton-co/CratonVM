@@ -1,6 +1,6 @@
 # ES HANG - current-dev --nojit IVFKnnFloatSlicedVectorQueryTests
 
-Status: OPEN
+Status: FIXED
 
 Class:
 - `server org.elasticsearch.search.vectors.IVFKnnFloatSlicedVectorQueryTests`
@@ -22,6 +22,12 @@ Interpretation:
 - This is a vector-query residual behind the old FAIL row: HotSpot passes, CratonVM JIT crashes, and CratonVM --nojit hangs at the external 600s timeout.
 - Keep this separate from the existing `DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests` hang doc; the class name and current probe source differ.
 
-Next investigation:
-- Capture a current --nojit thread dump before timeout and compare with the vector score-zero/failure path.
-- Check whether the hang occurs during vector search iteration, randomizedtesting teardown, or native/vector-provider fallback initialization.
+Fix:
+- Added native FloatBuffer.order() handling for the NIO float-buffer view used by the scorer.
+- Added a bulk native for ES92Int7VectorsScorer.int7DotProductBulk, which reads each packed vector batch once and computes signed-byte dot products outside the no-JIT interpreter.
+
+Verification (2026-07-10, CratonVM --nojit, seed 783661625B8D4D10):
+- testSlicesDense: PASS, 155.008s.
+- testSlicesDenseWithFilter: PASS, 355.097s.
+- testSlicesSparse: PASS, 10.748s.
+- testSlicesSparseWithFilter: PASS, 47.203s.

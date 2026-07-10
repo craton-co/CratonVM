@@ -13,6 +13,18 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, Vm
 use cratonvm_types::ClassId;
 use cratonvm_types::{ObjectRef, Value};
 
+#[inline]
+pub(crate) fn unsafe_offset_is_heap_slot(
+    ctx: &dyn NativeContext,
+    obj: ObjectRef,
+    offset: usize,
+) -> bool {
+    // Craton heap field offsets are slot indexes. HotSpot/JCTools byte offsets
+    // may be numerically below padded mirror field counts, so cap heap-slot
+    // treatment to the small real-slot range.
+    offset < ctx.object_num_fields(obj) && offset < 64
+}
+
 /// Normalise property keys after `read_string` (trim stray control/NUL).
 #[inline]
 fn normalize_java_property_key(key: &str) -> String {
@@ -1085,6 +1097,12 @@ fn register_test_harness_natives(registry: &mut NativeMethodRegistry) {
         native_es_max_score_top_knn_collector_unsorted_top_k,
     );
     registry.register(
+        "org/elasticsearch/simdvec/ES92Int7VectorsScorer",
+        "int7DotProductBulk",
+        "([BI[F)V",
+        native_es92_int7_vectors_scorer_int7_dot_product_bulk,
+    );
+    registry.register(
         "java/util/Arrays",
         "sort",
         "([JII)V",
@@ -1694,6 +1712,53 @@ fn randomized_thread_group(ctx: &mut dyn NativeContext, thread: ObjectRef) -> Me
     ctx.invoke_virtual(thread, "getThreadGroup", "()Ljava/lang/ThreadGroup;", &[])
 }
 
+/// Best-effort thread name for the `IllegalStateException` messages below —
+/// mirrors `com.carrotsearch.randomizedtesting.Threads.threadName(Thread)`
+/// closely enough for a human-readable diagnostic; exact wording doesn't
+/// matter for correctness (only the exception *class* does, see below).
+fn randomized_thread_name(ctx: &mut dyn NativeContext, thread: ObjectRef) -> String {
+    match ctx.invoke_virtual(thread, "getName", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(name)))) => {
+            ctx.read_string(name).unwrap_or_else(|| "<unknown>".to_string())
+        }
+        _ => "<unknown>".to_string(),
+    }
+}
+
+/// `RandomizedContext.context(Thread)` never returns null in real-JDK
+/// bytecode — a missing context is always an `IllegalStateException` (see
+/// the decompiled `context(Thread)` bytecode this mirrors). Callers such as
+/// `AssertingCodec.<init>` (Lucene test framework) rely on that: they wrap
+/// `RandomizedContext.current().getTargetClass()` in
+/// `catch (IllegalStateException e) { targetClass = null; }` to tolerate
+/// running outside a randomized-test thread (e.g. from a static class
+/// initializer). Returning a plain `null` here instead of throwing skips
+/// that catch block — the very next `invokevirtual getTargetClass()` then
+/// NPEs on the null receiver, and the *wrong* exception type propagates
+/// uncaught out of the static initializer as `ExceptionInInitializerError`,
+/// crashing test classes that would otherwise gracefully no-op (e.g.
+/// `ES815BitFlatVectorFormatTests` and the other ES93 BFloat16 vector codec
+/// tests during `<clinit>`).
+fn randomized_no_context_error(
+    ctx: &mut dyn NativeContext,
+    thread: ObjectRef,
+    terminated: bool,
+) -> MethodCallFailed {
+    let thread_name = randomized_thread_name(ctx, thread);
+    let message = if terminated {
+        format!("No context for a terminated thread: {thread_name}")
+    } else {
+        format!(
+            "No context information for thread: {thread_name}. Is this thread running under a \
+             RandomizedRunner runner context? Add @RunWith(RandomizedRunner.class) to your test \
+             class. Make sure your code accesses random contexts within @BeforeClass and \
+             @AfterClass boundary (for example, static test class initializers are not \
+             permitted to access random contexts)."
+        )
+    };
+    RuntimeError::IllegalStateException { message }.into()
+}
+
 fn randomized_context_for_thread(
     ctx: &mut dyn NativeContext,
     thread: ObjectRef,
@@ -1701,7 +1766,7 @@ fn randomized_context_for_thread(
     let group_result = randomized_thread_group(ctx, thread)?;
     let group = match group_result {
         Some(Value::Object(Some(group))) => group,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(randomized_no_context_error(ctx, thread, true)),
     };
     let key = RandomizedContextCacheKey {
         vm: ctx.vm_identity(),
@@ -1714,7 +1779,7 @@ fn randomized_context_for_thread(
 
     let contexts = match randomized_context_static_contexts(ctx) {
         Some(contexts) => contexts,
-        None => return Ok(Some(Value::Object(None))),
+        None => return Err(randomized_no_context_error(ctx, thread, false)),
     };
     let mut current_group = group;
     loop {
@@ -1740,7 +1805,7 @@ fn randomized_context_for_thread(
         )?;
         current_group = match parent_result {
             Some(Value::Object(Some(parent))) => parent,
-            _ => return Ok(Some(Value::Object(None))),
+            _ => return Err(randomized_no_context_error(ctx, thread, false)),
         };
     }
 }
@@ -3012,6 +3077,60 @@ fn native_lucene_index_reader_context_id(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     Ok(Some(ctx.get_field_by_name(this, "identity")))
+}
+
+fn native_es92_int7_vectors_scorer_int7_dot_product_bulk(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let query = obj_arg(args, 1)?;
+    let count = args.get(2).and_then(Value::as_int).unwrap_or(0);
+    let scores = obj_arg(args, 3)?;
+    if count <= 0 {
+        return Ok(None);
+    }
+
+    let dimensions = ctx.get_field_by_name(this, "dimensions").as_int().unwrap_or(0);
+    if dimensions <= 0 || count as usize > ctx.array_length(scores) {
+        return Ok(None);
+    }
+    let input = lucene_field_obj(ctx, this, "in")?;
+    let byte_len = (count as usize)
+        .checked_mul(dimensions as usize)
+        .ok_or_else(|| lucene_aioobe(i32::MAX))?;
+    let packed = ctx.new_array(cratonvm_types::ArrayElementType::Byte, byte_len);
+    ctx.invoke_virtual(
+        input,
+        "readBytes",
+        "([BII)V",
+        &[
+            Value::Object(Some(packed)),
+            Value::Int(0),
+            Value::Int(byte_len as i32),
+        ],
+    )?;
+
+    let mut query_bytes = vec![0u8; dimensions as usize];
+    if ctx.read_byte_array_into(query, 0, &mut query_bytes) != query_bytes.len() {
+        return Ok(None);
+    }
+    let mut packed_bytes = vec![0u8; byte_len];
+    if ctx.read_byte_array_into(packed, 0, &mut packed_bytes) != byte_len {
+        return Ok(None);
+    }
+    for vector in 0..count as usize {
+        let start = vector * dimensions as usize;
+        let mut dot = 0i32;
+        for dimension in 0..dimensions as usize {
+            dot = dot.wrapping_add(
+                (packed_bytes[start + dimension] as i8 as i32)
+                    .wrapping_mul(query_bytes[dimension] as i8 as i32),
+            );
+        }
+        ctx.set_array_element(scores, vector, Value::Float(dot as f32));
+    }
+    Ok(None)
 }
 
 fn native_es_knn_score_doc_query_init(
@@ -18071,6 +18190,29 @@ fn native_byte_buffer_wrap_bytes(ctx: &mut dyn NativeContext, args: &[Value]) ->
     )
 }
 
+fn native_float_buffer_order(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let order_name = match args.first() {
+        Some(Value::Object(Some(this))) => {
+            let cname = ctx
+                .class_name_of_id(ctx.class_id_of_object(*this))
+                .unwrap_or_default();
+            if cname.ends_with("FloatBufferB") || cname.ends_with("FloatBufferRB") {
+                "BIG_ENDIAN"
+            } else if cname.ends_with("FloatBufferL") || cname.ends_with("FloatBufferRL") {
+                "LITTLE_ENDIAN"
+            } else {
+                "NATIVE_ORDER"
+            }
+        }
+        _ => "NATIVE_ORDER",
+    };
+    Ok(Some(Value::Object(Some(lucene_static_object(
+        ctx,
+        "java/nio/ByteOrder",
+        order_name,
+    )?))))
+}
+
 fn spring_map_get_key(
     ctx: &mut dyn NativeContext,
     map: ObjectRef,
@@ -22015,6 +22157,52 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // but test VMs use real-JDK mode and still need the print capture natives.
     register_test_harness_natives(registry);
 
+    // OutputStreamWriter(OutputStream, CharsetEncoder) -- real bytecode for
+    // this specific constructor overload produces a writer that emits ZERO
+    // bytes for every character written (confirmed by isolated probe: the
+    // (OutputStream, Charset) and (OutputStream, String) overloads work
+    // correctly, only the CharsetEncoder-accepting one is broken). This
+    // silently corrupted org.apache.catalina.util.URLEncoder.encode(String,
+    // Charset) -- which builds its OutputStreamWriter this exact way to
+    // percent-encode unsafe characters -- dropping every encoded character
+    // instead of emitting "%XX", observed as Tomcat manager's "war=" deploy
+    // parameter having every '/' silently stripped. Root cause not fully
+    // understood (a real-bytecode-only bug, no interpreter fix attempted
+    // here); work around by delegating to the proven-working (OutputStream,
+    // Charset) constructor on the same object, reading the Charset off the
+    // caller-supplied CharsetEncoder via its own real charset() accessor.
+    // This loses the caller's chosen malformed-input / unmappable-character
+    // error actions (REPORT vs REPLACE), which no caller in this codebase's
+    // test suites has been observed to depend on.
+    registry.register(
+        "java/io/OutputStreamWriter",
+        "<init>",
+        "(Ljava/io/OutputStream;Ljava/nio/charset/CharsetEncoder;)V",
+        |ctx, args| {
+            let this = args.first().copied().unwrap_or(Value::Object(None));
+            let stream = args.get(1).copied().unwrap_or(Value::Object(None));
+            let encoder = match args.get(2) {
+                Some(Value::Object(Some(e))) => Some(*e),
+                _ => None,
+            };
+            let charset = match encoder {
+                Some(e) => ctx
+                    .invoke_virtual(e, "charset", "()Ljava/nio/charset/Charset;", &[])
+                    .ok()
+                    .flatten()
+                    .unwrap_or(Value::Object(None)),
+                None => Value::Object(None),
+            };
+            ctx.invoke_special(
+                "java/io/OutputStreamWriter",
+                "<init>",
+                "(Ljava/io/OutputStream;Ljava/nio/charset/Charset;)V",
+                &[this, stream, charset],
+            )?;
+            Ok(None)
+        },
+    );
+
     // Real-JDK mode does not call the full synthetic/experimental
     // `register_builtins` surface, but JBoss Marshalling calls
     // `sun.reflect.ReflectionFactory` directly for serialization hooks.
@@ -25653,6 +25841,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 ctx.class_name_of_id(cid).as_deref(),
                 Some("java/lang/reflect/GenericArrayType")
                     | Some("java/lang/reflect/ParameterizedType")
+                    | Some("java/lang/reflect/TypeVariable")
                     | Some("java/lang/reflect/WildcardType")
             );
             if is_reflect {
@@ -32237,6 +32426,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // subclass that the JDK 25 NIO hierarchy uses for direct/heap
     // buffers. (Buffer itself covers any rare invokespecial-on-Buffer
     // sites that bypass the virtual cache.)
+    registry.register(
+        "java/nio/FloatBuffer",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+        native_float_buffer_order,
+    );
+
     for buf in [
         "java/nio/Buffer",
         "java/nio/ByteBuffer",
@@ -40631,7 +40827,7 @@ fn uuid_get_lsb(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef) -> 
 fn alloc_uuid(ctx: &mut dyn NativeContext, msb: i64, lsb: i64) -> cratonvm_types::ObjectRef {
     let class_id = match ctx.ensure_class_initialized("java/util/UUID") {
         Ok(id) => id,
-        Err(_) => cratonvm_types::ClassId::new(0),
+        Err(_) => ctx.ensure_synthetic_class("java/util/UUID", 2),
     };
     let obj = ctx.alloc_object(class_id, 2);
     uuid_set_msb(ctx, obj, msb);
@@ -48677,7 +48873,7 @@ fn native_pattern_split_impl(
 
     let string_class_id = match ctx.ensure_class_initialized("java/lang/String") {
         Ok(id) => id,
-        Err(_) => cratonvm_types::ClassId::new(0),
+        Err(_) => ctx.ensure_synthetic_class("java/lang/String", 8),
     };
     let arr = ctx.new_ref_array(string_class_id, parts.len());
     for (i, part) in parts.iter().enumerate() {
@@ -60620,14 +60816,20 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         "newThread",
         "(Ljava/lang/Runnable;)Ljava/lang/Thread;",
         |ctx, args| {
+            // BUG FIX (2026-07-10, ES executors-factory mainlock NPE, layer 2
+            // residual): this used to allocate a real-shaped Thread object via
+            // alloc_concurrent_synthetic and then poke 5 legacy synthetic
+            // slots — the exact same half-real pattern that made
+            // ThreadPoolExecutor's mainLock/ctl/workQueue null (see
+            // initialize_real_thread_pool_executor in phases_early.rs). A
+            // Thread built this way never runs the real constructor, so
+            // start()/start0() operate on an uninitialized `holder` and the
+            // worker never actually runs — real ThreadPoolExecutor.execute()
+            // silently never executes submitted tasks. Drive the real
+            // Thread(Runnable) constructor instead so start() works.
+            // See docs/known-issues/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe.md.
             let runnable = args.get(1).copied().unwrap_or(Value::Object(None));
-            let thread = alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5);
-            let name = ctx.create_string("pool-thread");
-            ctx.set_field(thread, 0, Value::Object(Some(name)));
-            ctx.set_field(thread, 1, Value::Int(5));
-            ctx.set_field(thread, 3, runnable);
-            ctx.set_field(thread, 4, Value::Int(0));
-            Ok(Some(Value::Object(Some(thread))))
+            ctx.new_object_initialized("java/lang/Thread", "(Ljava/lang/Runnable;)V", &[runnable])
         },
     );
     registry.set_category(__prev_cat);
@@ -60917,6 +61119,29 @@ fn native_es_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // apply the same fix here: hand the task to the shared bounded real
     // `ThreadPoolExecutor` so it runs on an actual worker thread and the
     // caller returns immediately, matching HotSpot's `execute()` semantics.
+    // Defense in depth: several independent interpreter dispatch points
+    // decide whether to force this native over real bytecode for
+    // `ThreadPoolExecutor.execute()`, each with its own receiver-real-check
+    // (see docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md).
+    // If this native is EVER reached for a genuinely real, bytecode-
+    // constructed `ThreadPoolExecutor` anyway (its real `workers` field is
+    // populated) -- e.g. this exact function's own shared async worker pool
+    // singleton (`async_worker_pool`, itself a real `ThreadPoolExecutor`)
+    // calling `.execute()` on itself via `spawn_runnable_on_real_thread`
+    // below -- do NOT hand off through `spawn_runnable_on_real_thread` again:
+    // that would call `pool.execute(...)`, which (if ALSO routed to this
+    // native) recurses forever and stack-overflows. Running the task inline
+    // here breaks that recursion; it only degrades a real pool's execute()
+    // to synchronous in the narrow case some dispatch path still lands here
+    // for a real receiver.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if executor_has_real_workers(ctx, *this) {
+            if let Some(Value::Object(Some(runnable))) = args.get(1) {
+                ctx.invoke_virtual(*runnable, "run", "()V", &[])?;
+            }
+            return Ok(None);
+        }
+    }
     if let Some(Value::Object(Some(runnable))) = args.get(1) {
         return spawn_runnable_on_real_thread(ctx, *runnable);
     }
