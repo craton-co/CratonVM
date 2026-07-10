@@ -2293,6 +2293,14 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     if let Some(r) = thread.native_pending_return {
         snapshot.push(r);
     }
+    // JNI local references (INT-5, safepoint half): a JNI native that
+    // obtained local refs and re-entered Java parks HERE — and a
+    // cross-thread collector marks this thread only from this snapshot, so
+    // an object reachable solely through this thread's `JNI_LOCAL_FRAMES`
+    // was reclaimed. Thread-local storage; this deposit always runs on the
+    // owning thread. The resume-side remap is `update_local_refs_after_gc`
+    // in `apply_pointer_map_to_thread`.
+    crate::native::jni::collect_local_ref_roots(&mut snapshot);
 
     // This thread's own `java.lang.Thread` mirror (and any pending async
     // exception). These live in `JvmThread` fields, not on any frame, so the
@@ -2614,6 +2622,13 @@ pub(crate) fn apply_pointer_map_to_thread(
     pointer_map: &std::collections::HashMap<usize, usize>,
     heap: &crate::memory::VmHeap,
 ) {
+    // JNI local references (INT-2, safepoint-resume half): rewrite THIS
+    // thread's `JNI_LOCAL_FRAMES` handles through the pointer map — a JNI
+    // native that re-entered Java and parked at the safepoint poll must not
+    // resume with dangling local jobjects after a moving collection. The
+    // storage is thread-local and this function always runs on the resuming
+    // thread, so this is the only place that can reach these handles.
+    crate::native::jni::update_local_refs_after_gc(pointer_map);
     // BUG-03 trace (gated): record that the safepoint-peer remap ran for main.
     if thread.thread_id.0 == 0 && std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
         let jto = thread
