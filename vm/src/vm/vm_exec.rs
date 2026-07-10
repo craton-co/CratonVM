@@ -139,7 +139,7 @@ fn thread_start_handoff_grace() -> std::time::Duration {
         let millis = std::env::var("CRATONVM_THREAD_START_GRACE_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(80);
+            .unwrap_or(0);
         std::time::Duration::from_millis(millis)
     })
 }
@@ -2598,6 +2598,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
+    fn dbg_set_watch_cell(&mut self, addr: usize) {
+        cratonvm_gc::heap::set_dynamic_watch(addr);
+        crate::runtime::crash_handler::arm_generic_heap_watch(addr);
+    }
+
     fn vm_identity(&self) -> usize {
         self.shared.vm_identity
     }
@@ -4879,14 +4884,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
         self.shared.thread_registry.set_join_handle(tid, handle);
         if !is_executor_worker {
-            // Give newly-started plain Java workers a short handoff window before
-            // the parent immediately closes an async context or enters a tight
-            // timed wait. Spring's @Async tests expose this under OSR: diagnostic
-            // ring recording or the watchdog thread adds enough pacing; without
-            // it, a Mockito-backed SimpleAsyncTaskExecutor worker can be starved
-            // long enough to hang class execution. Do not apply this to real
-            // ThreadPoolExecutor workers: CompletableFuture concurrency-limit
-            // tests depend on their first tasks entering within a 10 ms window.
+            // Preserve HotSpot-like parent scheduling by default: Thread.start()
+            // should not sleep the submitting thread. The env knob remains for
+            // diagnosing legacy starvation cases, but a non-zero default lets
+            // tiny async tasks complete before callers can close/cancel them.
+            // Do not apply this to real ThreadPoolExecutor workers: CompletableFuture
+            // concurrency-limit tests depend on their first tasks entering within
+            // a 10 ms window.
             let grace = thread_start_handoff_grace();
             if grace.is_zero() {
                 std::thread::yield_now();
@@ -12365,6 +12369,37 @@ fn invoke_on_class_shared_inner(
                                 | "getLocalAddress"
                                 | "socket"
                             ))
+                        // SocketAdaptor address accessors need the same channel
+                        // shims: the real JDK bytecode returns the unresolved
+                        // InetSocketAddress we synthesize for accepted peers,
+                        // so Socket.getInetAddress() becomes null and Tomcat's
+                        // request remoteAddr/remoteHost population fails.
+                        || (class_name == "sun/nio/ch/SocketAdaptor"
+                            && matches!(method_name, "getInetAddress" | "getLocalAddress"))
+                        || (class_name == "java/net/Socket"
+                            && matches!(method_name, "getInetAddress" | "getLocalAddress"))
+                        // Jasper's embedded ECJ can surface a CratonVM-only
+                        // false-positive "must implement
+                        // ServletConfig.getInitParameterNames()" problem for
+                        // generated JSP classes. Let the narrow native
+                        // DefaultProblem.isError override demote only that
+                        // problem so Jasper still treats real ECJ errors as
+                        // fatal.
+                        || (matches!(
+                            class_name,
+                            "org/eclipse/jdt/internal/compiler/problem/DefaultProblem"
+                                | "org/eclipse/jdt/core/compiler/CategorizedProblem"
+                                | "org/eclipse/jdt/core/compiler/IProblem"
+                        )
+                            && method_name == "isError"
+                            && descriptor == "()Z")
+                        || (class_name == "org/apache/tomcat/util/buf/MessageBytes"
+                            && method_name == "toString"
+                            && descriptor == "()Ljava/lang/String;")
+                        || (class_name == "org/apache/jasper/servlet/JspServlet"
+                            && method_name == "handleMissingResource"
+                            && descriptor
+                                == "(Ljakarta/servlet/http/HttpServletRequest;Ljakarta/servlet/http/HttpServletResponse;Ljava/lang/String;)V")
                         // SelectableChannel.register — JDK bytecode walks
                         // SelectorProvider state we don't initialize.
                         || (matches!(

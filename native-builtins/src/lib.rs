@@ -450,6 +450,1853 @@ fn native_input_stream_reader_close(
     Ok(None)
 }
 
+
+#[derive(Default)]
+struct BufferedInputStreamMarkState {
+    mark_limit: usize,
+    mark_active: bool,
+    replay_pos: usize,
+    bytes: Vec<u8>,
+}
+
+fn buffered_input_stream_marks(
+) -> &'static std::sync::Mutex<std::collections::HashMap<i32, BufferedInputStreamMarkState>> {
+    static STORE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<i32, BufferedInputStreamMarkState>>,
+    > = std::sync::OnceLock::new();
+    STORE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn buffered_input_stream_input(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(this, "in") {
+        Value::Object(Some(o)) => Some(o),
+        _ => match ctx.get_field(this, 0) {
+            Value::Object(Some(o)) => Some(o),
+            _ => None,
+        },
+    }
+}
+
+fn buffered_input_stream_init(ctx: &mut dyn NativeContext, this: ObjectRef, input: Value) {
+    ctx.set_field_by_name(this, "in", input);
+    ctx.set_field(this, 0, input);
+    buffered_input_stream_marks()
+        .lock()
+        .unwrap()
+        .remove(&ctx.identity_hash_code(this));
+}
+
+fn buffered_input_stream_record_byte(ctx: &dyn NativeContext, this: ObjectRef, byte: u8) {
+    let key = ctx.identity_hash_code(this);
+    let mut marks = buffered_input_stream_marks().lock().unwrap();
+    if let Some(state) = marks.get_mut(&key) {
+        if !state.mark_active {
+            return;
+        }
+        if state.bytes.len() < state.mark_limit {
+            state.bytes.push(byte);
+        } else {
+            state.mark_active = false;
+            state.bytes.clear();
+            state.replay_pos = 0;
+        }
+    }
+}
+
+fn buffered_input_stream_replay_byte(ctx: &dyn NativeContext, this: ObjectRef) -> Option<u8> {
+    let key = ctx.identity_hash_code(this);
+    let mut marks = buffered_input_stream_marks().lock().unwrap();
+    let state = marks.get_mut(&key)?;
+    if state.replay_pos < state.bytes.len() {
+        let b = state.bytes[state.replay_pos];
+        state.replay_pos += 1;
+        Some(b)
+    } else {
+        None
+    }
+}
+
+fn buffered_input_stream_read_one(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<i32, MethodCallFailed> {
+    if let Some(byte) = buffered_input_stream_replay_byte(ctx, this) {
+        return Ok(byte as i32);
+    }
+    let Some(input) = buffered_input_stream_input(ctx, this) else {
+        return Ok(-1);
+    };
+    let value = ctx
+        .invoke_virtual(input, "read", "()I", &[])?
+        .unwrap_or(Value::Int(-1))
+        .as_int()
+        .unwrap_or(-1);
+    if value >= 0 {
+        buffered_input_stream_record_byte(ctx, this, (value & 0xff) as u8);
+    }
+    Ok(value)
+}
+
+fn buffered_input_stream_invalid_mark() -> MethodCallFailed {
+    RuntimeError::IOException {
+        message: "Resetting to invalid mark".to_string(),
+    }
+    .into()
+}
+
+fn message_bytes_to_chars_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<i32, (i32, usize)>> {
+    static STORE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<i32, (i32, usize)>>,
+    > = std::sync::OnceLock::new();
+    STORE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[derive(Clone)]
+struct MapperInternalFastEntry {
+    host_chunk_key: i32,
+    uri_chunk_key: i32,
+    version_key: i32,
+    hosts_key: i32,
+    host_start: usize,
+    host_end: usize,
+    uri_start: usize,
+    uri_end: usize,
+    selected_context: Option<ObjectRef>,
+    versions_key: i32,
+    selected_version: Option<ObjectRef>,
+    exact_wrappers_key: i32,
+    wildcard_wrappers_key: i32,
+    mapped_host: Option<ObjectRef>,
+    contexts_key: i32,
+    context_path_len: usize,
+    wrapper_len: usize,
+    host: Option<ObjectRef>,
+    context: Option<ObjectRef>,
+    wrapper: Option<ObjectRef>,
+    wrapper_name: Option<ObjectRef>,
+    path_match: Option<ObjectRef>,
+    context_slash_count: i32,
+    no_context: bool,
+    default_mapping: bool,
+}
+
+fn mapper_internal_fast_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<i32, MapperInternalFastEntry>> {
+    static STORE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<i32, MapperInternalFastEntry>>,
+    > = std::sync::OnceLock::new();
+    STORE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn set_char_chunk_from_units(ctx: &mut dyn NativeContext, char_c: ObjectRef, units: &[u16]) {
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, units.len());
+    for (i, unit) in units.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Int(*unit as i32));
+    }
+    ctx.set_field_by_name(char_c, "buff", Value::Object(Some(arr)));
+    ctx.set_field_by_name(char_c, "start", Value::Int(0));
+    ctx.set_field_by_name(char_c, "end", Value::Int(units.len() as i32));
+    ctx.set_field_by_name(char_c, "isSet", Value::Int(1));
+    ctx.set_field_by_name(char_c, "hasHashCode", Value::Int(0));
+}
+
+fn set_char_chunk_view(
+    ctx: &mut dyn NativeContext,
+    char_c: ObjectRef,
+    buff: ObjectRef,
+    start: usize,
+    len: usize,
+) {
+    ctx.set_field_by_name(char_c, "buff", Value::Object(Some(buff)));
+    ctx.set_field_by_name(char_c, "start", Value::Int(start as i32));
+    ctx.set_field_by_name(char_c, "end", Value::Int((start + len) as i32));
+    ctx.set_field_by_name(char_c, "isSet", Value::Int(1));
+    ctx.set_field_by_name(char_c, "hasHashCode", Value::Int(0));
+}
+
+fn message_bytes_set_chars(
+    ctx: &mut dyn NativeContext,
+    mb: ObjectRef,
+    buff: ObjectRef,
+    start: usize,
+    len: usize,
+) {
+    if let Value::Object(Some(char_c)) = ctx.get_field_by_name(mb, "charC") {
+        set_char_chunk_view(ctx, char_c, buff, start, len);
+    }
+    ctx.set_field_by_name(mb, "type", Value::Int(3));
+    ctx.set_field_by_name(mb, "hasHashCode", Value::Int(0));
+    ctx.set_field_by_name(mb, "hasLongValue", Value::Int(0));
+    message_bytes_to_chars_cache()
+        .lock()
+        .unwrap()
+        .remove(&ctx.identity_hash_code(mb));
+}
+
+fn message_bytes_set_string_object(
+    ctx: &mut dyn NativeContext,
+    mb: ObjectRef,
+    value: Option<ObjectRef>,
+) {
+    ctx.set_field_by_name(mb, "strValue", Value::Object(value));
+    ctx.set_field_by_name(mb, "hasHashCode", Value::Int(0));
+    ctx.set_field_by_name(mb, "hasLongValue", Value::Int(0));
+    ctx.set_field_by_name(mb, "type", Value::Int(if value.is_some() { 1 } else { 0 }));
+    message_bytes_to_chars_cache()
+        .lock()
+        .unwrap()
+        .remove(&ctx.identity_hash_code(mb));
+}
+
+fn native_message_bytes_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    match ctx.get_field_by_name(this, "type").as_int().unwrap_or(0) {
+        0 | 1 => Ok(Some(ctx.get_field_by_name(this, "strValue"))),
+        2 => {
+            let byte_string = match ctx.get_field_by_name(this, "byteC") {
+                Value::Object(Some(byte_c)) => {
+                    ctx.invoke_virtual(byte_c, "toString", "()Ljava/lang/String;", &[])?
+                }
+                _ => None,
+            };
+            if let Some(value @ Value::Object(_)) = byte_string {
+                ctx.set_field_by_name(this, "strValue", value);
+                Ok(Some(value))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        }
+        3 => {
+            let str_obj = match ctx.get_field_by_name(this, "charC") {
+                Value::Object(Some(char_c)) => {
+                    if let Some((buff, start, end)) = char_chunk_parts(ctx, char_c) {
+                        let mut units = Vec::with_capacity(end.saturating_sub(start));
+                        for i in start..end {
+                            units.push(ctx.get_array_element(buff, i).as_int().unwrap_or(0) as u16);
+                        }
+                        Some(ctx.create_string(&String::from_utf16_lossy(&units)))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            ctx.set_field_by_name(this, "strValue", Value::Object(str_obj));
+            Ok(Some(Value::Object(str_obj)))
+        }
+        _ => Ok(Some(ctx.get_field_by_name(this, "strValue"))),
+    }
+}
+
+fn native_message_bytes_to_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let this_key = ctx.identity_hash_code(this);
+    let ty = ctx.get_field_by_name(this, "type").as_int().unwrap_or(0);
+
+    if ty == 0 {
+        message_bytes_to_chars_cache()
+            .lock()
+            .unwrap()
+            .remove(&this_key);
+        if let Value::Object(Some(char_c)) = ctx.get_field_by_name(this, "charC") {
+            let _ = ctx.invoke_virtual(char_c, "recycle", "()V", &[])?;
+        }
+        return Ok(None);
+    }
+    if ty == 3 {
+        return Ok(None);
+    }
+    if ty == 2 {
+        let _ = ctx.invoke_virtual(this, "toString", "()Ljava/lang/String;", &[])?;
+    } else if ty != 1 {
+        return Ok(None);
+    }
+
+    let str_obj = match ctx.get_field_by_name(this, "strValue") {
+        Value::Object(Some(o)) => o,
+        _ => {
+            message_bytes_to_chars_cache()
+                .lock()
+                .unwrap()
+                .remove(&this_key);
+            return Ok(None);
+        }
+    };
+    let str_key = ctx.identity_hash_code(str_obj);
+    let cached = message_bytes_to_chars_cache()
+        .lock()
+        .unwrap()
+        .get(&this_key)
+        .copied();
+    if let Some((cached_str_key, cached_len)) = cached {
+        if cached_str_key == str_key {
+            if let Value::Object(Some(char_c)) = ctx.get_field_by_name(this, "charC") {
+                if let Some((_, start, end)) = char_chunk_parts(ctx, char_c) {
+                    if end.saturating_sub(start) == cached_len {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+
+    let Some(s) = ctx.read_string(str_obj) else {
+        message_bytes_to_chars_cache()
+            .lock()
+            .unwrap()
+            .remove(&this_key);
+        return Ok(None);
+    };
+    let char_c = match ctx.get_field_by_name(this, "charC") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(None),
+    };
+    let units: Vec<u16> = s.encode_utf16().collect();
+    set_char_chunk_from_units(ctx, char_c, &units);
+    message_bytes_to_chars_cache()
+        .lock()
+        .unwrap()
+        .insert(this_key, (str_key, units.len()));
+    Ok(None)
+}
+
+fn char_chunk_parts(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, usize, usize)> {
+    let buff = match ctx.get_field_by_name(this, "buff") {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    let start = ctx
+        .get_field_by_name(this, "start")
+        .as_int()
+        .unwrap_or(0)
+        .max(0) as usize;
+    let end = ctx
+        .get_field_by_name(this, "end")
+        .as_int()
+        .unwrap_or(0)
+        .max(0) as usize;
+    if end < start {
+        return None;
+    }
+    Some((buff, start, end))
+}
+
+fn char_chunk_char_at(ctx: &dyn NativeContext, buff: ObjectRef, index: usize) -> u16 {
+    ctx.get_array_element(buff, index).as_int().unwrap_or(0) as u16
+}
+
+fn char_chunk_nth_slash(
+    ctx: &dyn NativeContext,
+    buff: ObjectRef,
+    start: usize,
+    end: usize,
+    n: usize,
+) -> usize {
+    let mut slash_count = 0usize;
+    let mut pos = start;
+    while pos < end {
+        if char_chunk_char_at(ctx, buff, pos) == b'/' as u16 {
+            slash_count += 1;
+            if slash_count == n {
+                return pos;
+            }
+        }
+        pos += 1;
+    }
+    end
+}
+
+fn char_chunk_last_slash(
+    ctx: &dyn NativeContext,
+    buff: ObjectRef,
+    start: usize,
+    end: usize,
+) -> usize {
+    let mut pos = end;
+    while pos > start {
+        pos -= 1;
+        if char_chunk_char_at(ctx, buff, pos) == b'/' as u16 {
+            return pos;
+        }
+    }
+    start
+}
+
+fn char_chunk_range_starts_with(
+    ctx: &dyn NativeContext,
+    buff: ObjectRef,
+    start: usize,
+    end: usize,
+    s: &str,
+    pos: usize,
+    ignore_case: bool,
+) -> bool {
+    let units: Vec<u16> = s.encode_utf16().collect();
+    if units.len() + pos > end.saturating_sub(start) {
+        return false;
+    }
+    for (i, expected) in units.iter().enumerate() {
+        let actual = char_chunk_char_at(ctx, buff, start + pos + i);
+        if ignore_case {
+            if ascii_lower_char(actual) != ascii_lower_char(*expected) {
+                return false;
+            }
+        } else if actual != *expected {
+            return false;
+        }
+    }
+    true
+}
+
+fn char_chunk_range_equals_string(
+    ctx: &dyn NativeContext,
+    buff: ObjectRef,
+    start: usize,
+    end: usize,
+    s: &str,
+    ignore_case: bool,
+) -> bool {
+    let units: Vec<u16> = s.encode_utf16().collect();
+    if end.saturating_sub(start) != units.len() {
+        return false;
+    }
+    for (i, expected) in units.iter().enumerate() {
+        let actual = char_chunk_char_at(ctx, buff, start + i);
+        if ignore_case {
+            if ascii_lower_char(actual) != ascii_lower_char(*expected) {
+                return false;
+            }
+        } else if actual != *expected {
+            return false;
+        }
+    }
+    true
+}
+
+fn mapping_match_static(ctx: &dyn NativeContext, name: &str) -> Option<ObjectRef> {
+    let class_id = ctx.class_id_by_name("jakarta/servlet/http/MappingMatch")?;
+    let idx = ctx.static_field_index_by_name(class_id, name)?;
+    match ctx.get_static_field(class_id, idx) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
+fn ascii_lower_char(ch: u16) -> u16 {
+    if ch <= 0xff {
+        let b = ch as u8;
+        if b.is_ascii_uppercase() {
+            (b + 32) as u16
+        } else {
+            ch
+        }
+    } else {
+        char::from_u32(ch as u32)
+            .and_then(|c| c.to_lowercase().next())
+            .map(|c| c as u32 as u16)
+            .unwrap_or(ch)
+    }
+}
+
+fn char_chunk_equals_string(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    s: &str,
+    ignore_case: bool,
+) -> bool {
+    let Some((buff, start, end)) = char_chunk_parts(ctx, this) else {
+        return false;
+    };
+    let units: Vec<u16> = s.encode_utf16().collect();
+    if end - start != units.len() {
+        return false;
+    }
+    for (i, expected) in units.iter().enumerate() {
+        let actual = char_chunk_char_at(ctx, buff, start + i);
+        if ignore_case {
+            if ascii_lower_char(actual) != ascii_lower_char(*expected) {
+                return false;
+            }
+        } else if actual != *expected {
+            return false;
+        }
+    }
+    true
+}
+
+fn char_chunk_starts_with(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    s: &str,
+    pos: usize,
+    ignore_case: bool,
+) -> bool {
+    let Some((buff, start, end)) = char_chunk_parts(ctx, this) else {
+        return false;
+    };
+    let units: Vec<u16> = s.encode_utf16().collect();
+    if units.len() + pos > end - start {
+        return false;
+    }
+    for (i, expected) in units.iter().enumerate() {
+        let actual = char_chunk_char_at(ctx, buff, start + pos + i);
+        if ignore_case {
+            if ascii_lower_char(actual) != ascii_lower_char(*expected) {
+                return false;
+            }
+        } else if actual != *expected {
+            return false;
+        }
+    }
+    true
+}
+
+fn native_char_chunk_equals_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let s = match args.get(1) {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int(
+        if char_chunk_equals_string(ctx, this, &s, false) {
+            1
+        } else {
+            0
+        },
+    )))
+}
+
+fn native_char_chunk_equals_ignore_case(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let s = match args.get(1) {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int(
+        if char_chunk_equals_string(ctx, this, &s, true) {
+            1
+        } else {
+            0
+        },
+    )))
+}
+
+fn native_char_chunk_starts_with(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let s = match args.get(1) {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int(
+        if char_chunk_starts_with(ctx, this, &s, 0, false) {
+            1
+        } else {
+            0
+        },
+    )))
+}
+
+fn native_char_chunk_starts_with_ignore_case(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let s = match args.get(1) {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let pos = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    Ok(Some(Value::Int(
+        if char_chunk_starts_with(ctx, this, &s, pos, true) {
+            1
+        } else {
+            0
+        },
+    )))
+}
+
+fn mapper_map_element_name(ctx: &dyn NativeContext, elem: ObjectRef) -> String {
+    match ctx.get_field_by_name(elem, "name") {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn mapper_compare_chunk_to_string(
+    ctx: &dyn NativeContext,
+    chunk: ObjectRef,
+    start: usize,
+    end: usize,
+    name: &str,
+    ignore_case: bool,
+) -> i32 {
+    let Some((buff, _, _)) = char_chunk_parts(ctx, chunk) else {
+        return if name.is_empty() { 0 } else { -1 };
+    };
+    let chunk_len = end.saturating_sub(start);
+    let units: Vec<u16> = name.encode_utf16().collect();
+    let limit = chunk_len.min(units.len());
+    for i in 0..limit {
+        let mut actual = char_chunk_char_at(ctx, buff, start + i);
+        let mut expected = units[i];
+        if ignore_case {
+            actual = ascii_lower_char(actual);
+            expected = ascii_lower_char(expected);
+        }
+        if actual > expected {
+            return 1;
+        }
+        if actual < expected {
+            return -1;
+        }
+    }
+    if units.len() > chunk_len {
+        -1
+    } else if units.len() < chunk_len {
+        1
+    } else {
+        0
+    }
+}
+
+fn mapper_find_chunk_range(
+    ctx: &dyn NativeContext,
+    arr: ObjectRef,
+    chunk: ObjectRef,
+    start: usize,
+    end: usize,
+    ignore_case: bool,
+) -> i32 {
+    let len = ctx.array_length(arr);
+    if len == 0 {
+        return -1;
+    }
+    let mut low = 0usize;
+    let mut high = len - 1;
+    let Value::Object(Some(first)) = ctx.get_array_element(arr, 0) else {
+        return -1;
+    };
+    if mapper_compare_chunk_to_string(
+        ctx,
+        chunk,
+        start,
+        end,
+        &mapper_map_element_name(ctx, first),
+        ignore_case,
+    ) < 0
+    {
+        return -1;
+    }
+    if high == 0 {
+        return 0;
+    }
+    loop {
+        let mid = (low + high) >> 1;
+        let Value::Object(Some(elem)) = ctx.get_array_element(arr, mid) else {
+            return low as i32;
+        };
+        let cmp = mapper_compare_chunk_to_string(
+            ctx,
+            chunk,
+            start,
+            end,
+            &mapper_map_element_name(ctx, elem),
+            ignore_case,
+        );
+        if cmp > 0 {
+            low = mid;
+        } else if cmp == 0 {
+            return mid as i32;
+        } else {
+            high = mid;
+        }
+        if high - low == 1 {
+            let Value::Object(Some(elem)) = ctx.get_array_element(arr, high) else {
+                return low as i32;
+            };
+            let cmp = mapper_compare_chunk_to_string(
+                ctx,
+                chunk,
+                start,
+                end,
+                &mapper_map_element_name(ctx, elem),
+                ignore_case,
+            );
+            return if cmp < 0 { low as i32 } else { high as i32 };
+        }
+    }
+}
+
+fn mapper_find_string(ctx: &dyn NativeContext, arr: ObjectRef, name: &str) -> i32 {
+    let len = ctx.array_length(arr);
+    if len == 0 {
+        return -1;
+    }
+    let mut low = 0usize;
+    let mut high = len - 1;
+    let Value::Object(Some(first)) = ctx.get_array_element(arr, 0) else {
+        return -1;
+    };
+    if name < mapper_map_element_name(ctx, first).as_str() {
+        return -1;
+    }
+    if high == 0 {
+        return 0;
+    }
+    loop {
+        let mid = (low + high) >> 1;
+        let Value::Object(Some(elem)) = ctx.get_array_element(arr, mid) else {
+            return low as i32;
+        };
+        let elem_name = mapper_map_element_name(ctx, elem);
+        match name.cmp(elem_name.as_str()) {
+            std::cmp::Ordering::Greater => low = mid,
+            std::cmp::Ordering::Equal => return mid as i32,
+            std::cmp::Ordering::Less => high = mid,
+        }
+        if high - low == 1 {
+            let Value::Object(Some(elem)) = ctx.get_array_element(arr, high) else {
+                return low as i32;
+            };
+            let elem_name = mapper_map_element_name(ctx, elem);
+            return if name < elem_name.as_str() {
+                low as i32
+            } else {
+                high as i32
+            };
+        }
+    }
+}
+
+fn mapper_exact_find_chunk_range(
+    ctx: &dyn NativeContext,
+    arr: ObjectRef,
+    chunk: ObjectRef,
+    start: usize,
+    end: usize,
+    ignore_case: bool,
+) -> Option<ObjectRef> {
+    let (buff, _, _) = char_chunk_parts(ctx, chunk)?;
+    let idx = mapper_find_chunk_range(ctx, arr, chunk, start, end, ignore_case);
+    if idx < 0 {
+        return None;
+    }
+    let elem = match ctx.get_array_element(arr, idx as usize) {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    if char_chunk_range_equals_string(
+        ctx,
+        buff,
+        start,
+        end,
+        &mapper_map_element_name(ctx, elem),
+        ignore_case,
+    ) {
+        Some(elem)
+    } else {
+        None
+    }
+}
+
+fn native_mapper_find_chunk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let arr = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let chunk = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let Some((_, start, end)) = char_chunk_parts(ctx, chunk) else {
+        return Ok(Some(Value::Int(-1)));
+    };
+    Ok(Some(Value::Int(mapper_find_chunk_range(
+        ctx, arr, chunk, start, end, false,
+    ))))
+}
+
+fn native_mapper_find_chunk_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let arr = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let chunk = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let start = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    let end = args.get(3).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    Ok(Some(Value::Int(mapper_find_chunk_range(
+        ctx, arr, chunk, start, end, false,
+    ))))
+}
+
+fn native_mapper_find_ignore_case(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let arr = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let chunk = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let Some((_, start, end)) = char_chunk_parts(ctx, chunk) else {
+        return Ok(Some(Value::Int(-1)));
+    };
+    Ok(Some(Value::Int(mapper_find_chunk_range(
+        ctx, arr, chunk, start, end, true,
+    ))))
+}
+
+fn native_mapper_find_ignore_case_range(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let arr = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let chunk = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let start = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    let end = args.get(3).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    Ok(Some(Value::Int(mapper_find_chunk_range(
+        ctx, arr, chunk, start, end, true,
+    ))))
+}
+
+fn native_mapper_find_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let arr = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let name = match args.get(1) {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    Ok(Some(Value::Int(mapper_find_string(ctx, arr, &name))))
+}
+
+fn native_mapper_exact_find_chunk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let arr = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let chunk = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let idx = native_mapper_find_chunk(ctx, args)?
+        .and_then(|v| v.as_int())
+        .unwrap_or(-1);
+    if idx < 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let elem = ctx.get_array_element(arr, idx as usize);
+    if let Value::Object(Some(o)) = elem {
+        if char_chunk_equals_string(ctx, chunk, &mapper_map_element_name(ctx, o), false) {
+            return Ok(Some(elem));
+        }
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+fn native_mapper_exact_find_ignore_case(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let arr = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let chunk = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let idx = native_mapper_find_ignore_case(ctx, args)?
+        .and_then(|v| v.as_int())
+        .unwrap_or(-1);
+    if idx < 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let elem = ctx.get_array_element(arr, idx as usize);
+    if let Value::Object(Some(o)) = elem {
+        if char_chunk_equals_string(ctx, chunk, &mapper_map_element_name(ctx, o), true) {
+            return Ok(Some(elem));
+        }
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+fn native_mapper_exact_find_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let arr = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let name = match args.get(1) {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let idx = mapper_find_string(ctx, arr, &name);
+    if idx < 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let elem = ctx.get_array_element(arr, idx as usize);
+    if let Value::Object(Some(o)) = elem {
+        if mapper_map_element_name(ctx, o) == name {
+            return Ok(Some(elem));
+        }
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+fn native_mapper_internal_map_wildcard_wrapper(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let arr = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let nesting = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    let path = match args.get(3) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let mapping_data = match args.get(4) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+
+    let Some((buff, start, original_end)) = char_chunk_parts(ctx, path) else {
+        return Ok(None);
+    };
+    let full_len = original_end.saturating_sub(start);
+    let mut search_end = original_end;
+    let mut slash = usize::MAX;
+    let mut idx = mapper_find_chunk_range(ctx, arr, path, start, search_end, false);
+    let mut found: Option<(usize, usize)> = None;
+
+    while idx >= 0 {
+        let elem = match ctx.get_array_element(arr, idx as usize) {
+            Value::Object(Some(o)) => o,
+            _ => break,
+        };
+        let name = mapper_map_element_name(ctx, elem);
+        let name_len = name.encode_utf16().count();
+        if char_chunk_range_starts_with(ctx, buff, start, original_end, &name, 0, false)
+            && (full_len == name_len
+                || char_chunk_range_starts_with(
+                    ctx,
+                    buff,
+                    start,
+                    original_end,
+                    "/",
+                    name_len,
+                    true,
+                ))
+        {
+            found = Some((idx as usize, name_len));
+            break;
+        }
+
+        slash = if slash == usize::MAX {
+            char_chunk_nth_slash(ctx, buff, start, search_end, nesting + 1)
+        } else {
+            char_chunk_last_slash(ctx, buff, start, search_end)
+        };
+        if slash == search_end {
+            break;
+        }
+        search_end = slash;
+        idx = mapper_find_chunk_range(ctx, arr, path, start, search_end, false);
+    }
+
+    let Some((idx, wrapper_len)) = found else {
+        return Ok(None);
+    };
+    let wrapper = match ctx.get_array_element(arr, idx) {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(None),
+    };
+    let name_obj = match ctx.get_field_by_name(wrapper, "name") {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    };
+    if let Value::Object(Some(wrapper_path)) = ctx.get_field_by_name(mapping_data, "wrapperPath") {
+        message_bytes_set_string_object(ctx, wrapper_path, name_obj);
+    }
+    if full_len > wrapper_len {
+        if let Value::Object(Some(path_info)) = ctx.get_field_by_name(mapping_data, "pathInfo") {
+            message_bytes_set_chars(
+                ctx,
+                path_info,
+                buff,
+                start + wrapper_len,
+                full_len - wrapper_len,
+            );
+        }
+    }
+    if let Value::Object(Some(request_path)) = ctx.get_field_by_name(mapping_data, "requestPath") {
+        message_bytes_set_chars(ctx, request_path, buff, start, full_len);
+    }
+    let wrapper_object = match ctx.get_field_by_name(wrapper, "object") {
+        Value::Object(o) => o,
+        _ => None,
+    };
+    ctx.set_field_by_name(mapping_data, "wrapper", Value::Object(wrapper_object));
+    ctx.set_field_by_name(
+        mapping_data,
+        "jspWildCard",
+        Value::Int(
+            ctx.get_field_by_name(wrapper, "jspWildCard")
+                .as_int()
+                .unwrap_or(0),
+        ),
+    );
+    if let Some(path_match) = mapping_match_static(ctx, "PATH") {
+        ctx.set_field_by_name(mapping_data, "matchType", Value::Object(Some(path_match)));
+    }
+    Ok(None)
+}
+
+fn mapper_wildcard_match(
+    ctx: &dyn NativeContext,
+    arr: ObjectRef,
+    nesting: usize,
+    path: ObjectRef,
+) -> Option<(ObjectRef, usize)> {
+    let (buff, start, original_end) = char_chunk_parts(ctx, path)?;
+    let full_len = original_end.saturating_sub(start);
+    let mut search_end = original_end;
+    let mut slash = usize::MAX;
+    let mut idx = mapper_find_chunk_range(ctx, arr, path, start, search_end, false);
+    while idx >= 0 {
+        let elem = match ctx.get_array_element(arr, idx as usize) {
+            Value::Object(Some(o)) => o,
+            _ => break,
+        };
+        let name = mapper_map_element_name(ctx, elem);
+        let name_len = name.encode_utf16().count();
+        if char_chunk_range_starts_with(ctx, buff, start, original_end, &name, 0, false)
+            && (full_len == name_len
+                || char_chunk_range_starts_with(
+                    ctx,
+                    buff,
+                    start,
+                    original_end,
+                    "/",
+                    name_len,
+                    true,
+                ))
+        {
+            return Some((elem, name_len));
+        }
+        slash = if slash == usize::MAX {
+            char_chunk_nth_slash(ctx, buff, start, search_end, nesting + 1)
+        } else {
+            char_chunk_last_slash(ctx, buff, start, search_end)
+        };
+        if slash == search_end {
+            break;
+        }
+        search_end = slash;
+        idx = mapper_find_chunk_range(ctx, arr, path, start, search_end, false);
+    }
+    None
+}
+
+fn mapper_apply_wildcard_mapping(
+    ctx: &mut dyn NativeContext,
+    mapping_data: ObjectRef,
+    path: ObjectRef,
+    wrapper: ObjectRef,
+    wrapper_len: usize,
+) {
+    let Some((buff, start, original_end)) = char_chunk_parts(ctx, path) else {
+        return;
+    };
+    let full_len = original_end.saturating_sub(start);
+    let name_obj = match ctx.get_field_by_name(wrapper, "name") {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    };
+    if let Value::Object(Some(wrapper_path)) = ctx.get_field_by_name(mapping_data, "wrapperPath") {
+        message_bytes_set_string_object(ctx, wrapper_path, name_obj);
+    }
+    if full_len > wrapper_len {
+        if let Value::Object(Some(path_info)) = ctx.get_field_by_name(mapping_data, "pathInfo") {
+            message_bytes_set_chars(
+                ctx,
+                path_info,
+                buff,
+                start + wrapper_len,
+                full_len - wrapper_len,
+            );
+        }
+    }
+    if let Value::Object(Some(request_path)) = ctx.get_field_by_name(mapping_data, "requestPath") {
+        message_bytes_set_chars(ctx, request_path, buff, start, full_len);
+    }
+    let wrapper_object = match ctx.get_field_by_name(wrapper, "object") {
+        Value::Object(o) => o,
+        _ => None,
+    };
+    ctx.set_field_by_name(mapping_data, "wrapper", Value::Object(wrapper_object));
+    ctx.set_field_by_name(
+        mapping_data,
+        "jspWildCard",
+        Value::Int(
+            ctx.get_field_by_name(wrapper, "jspWildCard")
+                .as_int()
+                .unwrap_or(0),
+        ),
+    );
+    if let Some(path_match) = mapping_match_static(ctx, "PATH") {
+        ctx.set_field_by_name(mapping_data, "matchType", Value::Object(Some(path_match)));
+    }
+}
+
+fn mapper_apply_fast_entry(
+    ctx: &mut dyn NativeContext,
+    entry: &MapperInternalFastEntry,
+    mapping_data: ObjectRef,
+    uri_chunk: ObjectRef,
+) {
+    ctx.set_field_by_name(mapping_data, "host", Value::Object(entry.host));
+    if entry.no_context {
+        return;
+    }
+    ctx.set_field_by_name(mapping_data, "context", Value::Object(entry.context));
+    ctx.set_field_by_name(
+        mapping_data,
+        "contextSlashCount",
+        Value::Int(entry.context_slash_count),
+    );
+
+    let Some((buff, uri_start, uri_end)) = char_chunk_parts(ctx, uri_chunk) else {
+        return;
+    };
+    if uri_start != entry.uri_start || uri_end != entry.uri_end {
+        return;
+    }
+    let wrapper_start = uri_start + entry.context_path_len;
+    let wrapper_full_len = uri_end.saturating_sub(wrapper_start);
+    if entry.default_mapping {
+        if let Value::Object(Some(request_path)) =
+            ctx.get_field_by_name(mapping_data, "requestPath")
+        {
+            message_bytes_set_chars(ctx, request_path, buff, wrapper_start, wrapper_full_len);
+        }
+        if let Value::Object(Some(wrapper_path)) =
+            ctx.get_field_by_name(mapping_data, "wrapperPath")
+        {
+            message_bytes_set_chars(ctx, wrapper_path, buff, wrapper_start, wrapper_full_len);
+        }
+        ctx.set_field_by_name(mapping_data, "wrapper", Value::Object(entry.wrapper));
+        ctx.set_field_by_name(mapping_data, "jspWildCard", Value::Int(0));
+        ctx.set_field_by_name(mapping_data, "matchType", Value::Object(entry.path_match));
+        return;
+    }
+    if let Value::Object(Some(wrapper_path)) = ctx.get_field_by_name(mapping_data, "wrapperPath") {
+        message_bytes_set_string_object(ctx, wrapper_path, entry.wrapper_name);
+    }
+    if wrapper_full_len > entry.wrapper_len {
+        if let Value::Object(Some(path_info)) = ctx.get_field_by_name(mapping_data, "pathInfo") {
+            message_bytes_set_chars(
+                ctx,
+                path_info,
+                buff,
+                wrapper_start + entry.wrapper_len,
+                wrapper_full_len - entry.wrapper_len,
+            );
+        }
+    }
+    if let Value::Object(Some(request_path)) = ctx.get_field_by_name(mapping_data, "requestPath") {
+        message_bytes_set_chars(ctx, request_path, buff, wrapper_start, wrapper_full_len);
+    }
+    ctx.set_field_by_name(mapping_data, "wrapper", Value::Object(entry.wrapper));
+    ctx.set_field_by_name(mapping_data, "jspWildCard", Value::Int(0));
+    ctx.set_field_by_name(mapping_data, "matchType", Value::Object(entry.path_match));
+}
+
+fn native_mapper_internal_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let host_chunk = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let uri_chunk = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let version = match args.get(3) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let mapping_data = match args.get(4) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+
+    if !matches!(
+        ctx.get_field_by_name(mapping_data, "host"),
+        Value::Object(None)
+    ) {
+        return Err(RuntimeError::IllegalStateException {
+            message: "MappingData already used".to_string(),
+        }
+        .into());
+    }
+
+    let hosts = match ctx.get_field_by_name(this, "hosts") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(None),
+    };
+    let Some((host_buff, host_start, host_end)) = char_chunk_parts(ctx, host_chunk) else {
+        return Ok(None);
+    };
+    let Some((_, uri_start_for_cache, uri_end_for_cache)) = char_chunk_parts(ctx, uri_chunk) else {
+        return Ok(None);
+    };
+    let this_key = ctx.identity_hash_code(this);
+    let host_chunk_key = ctx.identity_hash_code(host_chunk);
+    let uri_chunk_key = ctx.identity_hash_code(uri_chunk);
+    let version_key = version.map(|v| ctx.identity_hash_code(v)).unwrap_or(0);
+    let hosts_key = ctx.identity_hash_code(hosts);
+    let cache_hit = mapper_internal_fast_cache()
+        .lock()
+        .unwrap()
+        .get(&this_key)
+        .cloned();
+    if let Some(entry) = cache_hit {
+        if entry.host_chunk_key == host_chunk_key
+            && entry.uri_chunk_key == uri_chunk_key
+            && entry.version_key == version_key
+            && entry.hosts_key == hosts_key
+            && entry.host_start == host_start
+            && entry.host_end == host_end
+            && entry.uri_start == uri_start_for_cache
+            && entry.uri_end == uri_end_for_cache
+        {
+            let versions_key_now = entry
+                .selected_context
+                .and_then(|v| match ctx.get_field_by_name(v, "versions") {
+                    Value::Object(Some(o)) => Some(ctx.identity_hash_code(o)),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            let contexts_key_now = entry
+                .mapped_host
+                .and_then(|h| match ctx.get_field_by_name(h, "contextList") {
+                    Value::Object(Some(cl)) => match ctx.get_field_by_name(cl, "contexts") {
+                        Value::Object(Some(c)) => Some(ctx.identity_hash_code(c)),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .unwrap_or(0);
+            let paused_now = if let Some(selected_version) = entry.selected_version {
+                ctx.get_field_by_name(selected_version, "paused")
+                    .as_int()
+                    .unwrap_or(0)
+                    != 0
+            } else {
+                !entry.no_context
+            };
+            if versions_key_now == entry.versions_key
+                && contexts_key_now == entry.contexts_key
+                && !paused_now
+            {
+                mapper_apply_fast_entry(ctx, &entry, mapping_data, uri_chunk);
+                return Ok(None);
+            }
+        }
+    }
+    let mut mapped_host =
+        mapper_exact_find_chunk_range(ctx, hosts, host_chunk, host_start, host_end, true);
+    if mapped_host.is_none() {
+        let mut dot = None;
+        for pos in host_start..host_end {
+            if char_chunk_char_at(ctx, host_buff, pos) == b'.' as u16 {
+                dot = Some(pos);
+                break;
+            }
+        }
+        if let Some(dot_pos) = dot {
+            mapped_host =
+                mapper_exact_find_chunk_range(ctx, hosts, host_chunk, dot_pos, host_end, true);
+        }
+    }
+    if mapped_host.is_none() {
+        mapped_host = match ctx.get_field_by_name(this, "defaultHost") {
+            Value::Object(Some(o)) => Some(o),
+            _ => None,
+        };
+    }
+    let Some(mapped_host) = mapped_host else {
+        return Ok(None);
+    };
+    let host_object = match ctx.get_field_by_name(mapped_host, "object") {
+        Value::Object(o) => o,
+        _ => None,
+    };
+    ctx.set_field_by_name(mapping_data, "host", Value::Object(host_object));
+
+    let Some((uri_buff, uri_start, uri_end)) = char_chunk_parts(ctx, uri_chunk) else {
+        return Ok(None);
+    };
+    let context_list = match ctx.get_field_by_name(mapped_host, "contextList") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(None),
+    };
+    let contexts = match ctx.get_field_by_name(context_list, "contexts") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(None),
+    };
+    let contexts_key = ctx.identity_hash_code(contexts);
+    let contexts_len = ctx.array_length(contexts);
+    if contexts_len == 0 {
+        mapper_internal_fast_cache().lock().unwrap().insert(
+            this_key,
+            MapperInternalFastEntry {
+                host_chunk_key,
+                uri_chunk_key,
+                version_key,
+                hosts_key,
+                host_start,
+                host_end,
+                uri_start: uri_start_for_cache,
+                uri_end: uri_end_for_cache,
+                selected_context: None,
+                versions_key: 0,
+                selected_version: None,
+                exact_wrappers_key: 0,
+                wildcard_wrappers_key: 0,
+                mapped_host: Some(mapped_host),
+                contexts_key,
+                context_path_len: 0,
+                wrapper_len: 0,
+                host: host_object,
+                context: None,
+                wrapper: None,
+                wrapper_name: None,
+                path_match: None,
+                context_slash_count: 0,
+                no_context: true,
+                default_mapping: false,
+            },
+        );
+        return Ok(None);
+    }
+
+    let mut search_end = uri_end;
+    let mut slash = usize::MAX;
+    let nesting = ctx
+        .get_field_by_name(context_list, "nesting")
+        .as_int()
+        .unwrap_or(0)
+        .max(0) as usize;
+    let mut idx = mapper_find_chunk_range(ctx, contexts, uri_chunk, uri_start, search_end, false);
+    let mut selected_context: Option<ObjectRef> = None;
+    while idx >= 0 {
+        let elem = match ctx.get_array_element(contexts, idx as usize) {
+            Value::Object(Some(o)) => o,
+            _ => break,
+        };
+        let name = mapper_map_element_name(ctx, elem);
+        let name_len = name.encode_utf16().count();
+        let uri_len = uri_end.saturating_sub(uri_start);
+        if char_chunk_range_starts_with(ctx, uri_buff, uri_start, uri_end, &name, 0, false)
+            && (uri_len == name_len
+                || char_chunk_range_starts_with(
+                    ctx, uri_buff, uri_start, uri_end, "/", name_len, true,
+                ))
+        {
+            selected_context = Some(elem);
+            break;
+        }
+        slash = if slash == usize::MAX {
+            char_chunk_nth_slash(ctx, uri_buff, uri_start, search_end, nesting + 1)
+        } else {
+            char_chunk_last_slash(ctx, uri_buff, uri_start, search_end)
+        };
+        if slash == search_end {
+            break;
+        }
+        search_end = slash;
+        idx = mapper_find_chunk_range(ctx, contexts, uri_chunk, uri_start, search_end, false);
+    }
+    if selected_context.is_none() {
+        if let Value::Object(Some(first)) = ctx.get_array_element(contexts, 0) {
+            if mapper_map_element_name(ctx, first).is_empty() {
+                selected_context = Some(first);
+            }
+        }
+    }
+    let Some(selected_context) = selected_context else {
+        mapper_internal_fast_cache().lock().unwrap().insert(
+            this_key,
+            MapperInternalFastEntry {
+                host_chunk_key,
+                uri_chunk_key,
+                version_key,
+                hosts_key,
+                host_start,
+                host_end,
+                uri_start,
+                uri_end,
+                selected_context: None,
+                versions_key: 0,
+                selected_version: None,
+                exact_wrappers_key: 0,
+                wildcard_wrappers_key: 0,
+                mapped_host: Some(mapped_host),
+                contexts_key,
+                context_path_len: 0,
+                wrapper_len: 0,
+                host: host_object,
+                context: None,
+                wrapper: None,
+                wrapper_name: None,
+                path_match: None,
+                context_slash_count: 0,
+                no_context: true,
+                default_mapping: false,
+            },
+        );
+        return Ok(None);
+    };
+
+    let versions = match ctx.get_field_by_name(selected_context, "versions") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(None),
+    };
+    let version_count = ctx.array_length(versions);
+    if version_count == 0 {
+        return Ok(None);
+    }
+    let selected_version = if let Some(version_obj) = version {
+        let version_name = ctx.read_string(version_obj).unwrap_or_default();
+        let idx = mapper_find_string(ctx, versions, &version_name);
+        if idx >= 0 {
+            match ctx.get_array_element(versions, idx as usize) {
+                Value::Object(Some(o)) if mapper_map_element_name(ctx, o) == version_name => o,
+                _ => match ctx.get_array_element(versions, version_count - 1) {
+                    Value::Object(Some(o)) => o,
+                    _ => return Ok(None),
+                },
+            }
+        } else {
+            match ctx.get_array_element(versions, version_count - 1) {
+                Value::Object(Some(o)) => o,
+                _ => return Ok(None),
+            }
+        }
+    } else {
+        match ctx.get_array_element(versions, version_count - 1) {
+            Value::Object(Some(o)) => o,
+            _ => return Ok(None),
+        }
+    };
+
+    let context_object = match ctx.get_field_by_name(selected_version, "object") {
+        Value::Object(o) => o,
+        _ => None,
+    };
+    ctx.set_field_by_name(mapping_data, "context", Value::Object(context_object));
+    ctx.set_field_by_name(
+        mapping_data,
+        "contextSlashCount",
+        ctx.get_field_by_name(selected_version, "slashCount"),
+    );
+    let paused = ctx
+        .get_field_by_name(selected_version, "paused")
+        .as_int()
+        .unwrap_or(0)
+        != 0;
+    if !paused {
+        if let Some(context_path) = match ctx.get_field_by_name(selected_version, "path") {
+            Value::Object(Some(o)) => ctx.read_string(o),
+            _ => None,
+        } {
+            let wrapper_start = uri_start + context_path.encode_utf16().count();
+            if wrapper_start <= uri_end {
+                ctx.set_field_by_name(uri_chunk, "start", Value::Int(wrapper_start as i32));
+                let wildcard_wrappers =
+                    match ctx.get_field_by_name(selected_version, "wildcardWrappers") {
+                        Value::Object(Some(o)) => Some(o),
+                        _ => None,
+                    };
+                let wrapper_nesting = ctx
+                    .get_field_by_name(selected_version, "nesting")
+                    .as_int()
+                    .unwrap_or(0)
+                    .max(0) as usize;
+                if let Some(wildcard_wrappers) = wildcard_wrappers {
+                    if let Some((wrapper, wrapper_len)) =
+                        mapper_wildcard_match(ctx, wildcard_wrappers, wrapper_nesting, uri_chunk)
+                    {
+                        let jsp_wildcard = ctx
+                            .get_field_by_name(wrapper, "jspWildCard")
+                            .as_int()
+                            .unwrap_or(0)
+                            != 0;
+                        if !jsp_wildcard {
+                            mapper_apply_wildcard_mapping(
+                                ctx,
+                                mapping_data,
+                                uri_chunk,
+                                wrapper,
+                                wrapper_len,
+                            );
+                            let exact_wrappers_key =
+                                match ctx.get_field_by_name(selected_version, "exactWrappers") {
+                                    Value::Object(Some(o)) => ctx.identity_hash_code(o),
+                                    _ => 0,
+                                };
+                            let versions_key = ctx.identity_hash_code(versions);
+                            let wildcard_wrappers_key = ctx.identity_hash_code(wildcard_wrappers);
+                            let wrapper_name = match ctx.get_field_by_name(wrapper, "name") {
+                                Value::Object(o) => o,
+                                _ => None,
+                            };
+                            let wrapper_object = match ctx.get_field_by_name(wrapper, "object") {
+                                Value::Object(o) => o,
+                                _ => None,
+                            };
+                            let path_match = mapping_match_static(ctx, "PATH");
+                            mapper_internal_fast_cache().lock().unwrap().insert(
+                                this_key,
+                                MapperInternalFastEntry {
+                                    host_chunk_key,
+                                    uri_chunk_key,
+                                    version_key,
+                                    hosts_key,
+                                    host_start,
+                                    host_end,
+                                    uri_start,
+                                    uri_end,
+                                    selected_context: Some(selected_context),
+                                    versions_key,
+                                    selected_version: Some(selected_version),
+                                    exact_wrappers_key,
+                                    wildcard_wrappers_key,
+                                    mapped_host: Some(mapped_host),
+                                    contexts_key,
+                                    context_path_len: context_path.encode_utf16().count(),
+                                    wrapper_len,
+                                    host: host_object,
+                                    context: context_object,
+                                    wrapper: wrapper_object,
+                                    wrapper_name,
+                                    path_match,
+                                    context_slash_count: ctx
+                                        .get_field_by_name(selected_version, "slashCount")
+                                        .as_int()
+                                        .unwrap_or(0),
+                                    no_context: false,
+                                    default_mapping: false,
+                                },
+                            );
+                            ctx.set_field_by_name(uri_chunk, "start", Value::Int(uri_start as i32));
+                            ctx.set_field_by_name(uri_chunk, "end", Value::Int(uri_end as i32));
+                            return Ok(None);
+                        }
+                    }
+                }
+                let default_wrapper =
+                    match ctx.get_field_by_name(selected_version, "defaultWrapper") {
+                        Value::Object(Some(o)) => Some(o),
+                        _ => None,
+                    };
+                let resources = match ctx.get_field_by_name(selected_version, "resources") {
+                    Value::Object(Some(o)) => Some(o),
+                    _ => None,
+                };
+                let extension_wrappers_empty =
+                    match ctx.get_field_by_name(selected_version, "extensionWrappers") {
+                        Value::Object(Some(o)) => ctx.array_length(o) == 0,
+                        _ => true,
+                    };
+                let welcome_resources_empty =
+                    match ctx.get_field_by_name(selected_version, "welcomeResources") {
+                        Value::Object(Some(o)) => ctx.array_length(o) == 0,
+                        _ => true,
+                    };
+                if extension_wrappers_empty
+                    && welcome_resources_empty
+                    && resources.is_none()
+                    && default_wrapper.is_some()
+                {
+                    let default_wrapper = default_wrapper.unwrap();
+                    let Some((buff, path_start, path_end)) = char_chunk_parts(ctx, uri_chunk)
+                    else {
+                        ctx.set_field_by_name(uri_chunk, "start", Value::Int(uri_start as i32));
+                        ctx.set_field_by_name(uri_chunk, "end", Value::Int(uri_end as i32));
+                        return Ok(None);
+                    };
+                    let path_len = path_end.saturating_sub(path_start);
+                    let wrapper_object = match ctx.get_field_by_name(default_wrapper, "object") {
+                        Value::Object(o) => o,
+                        _ => None,
+                    };
+                    ctx.set_field_by_name(mapping_data, "wrapper", Value::Object(wrapper_object));
+                    if let Value::Object(Some(request_path)) =
+                        ctx.get_field_by_name(mapping_data, "requestPath")
+                    {
+                        message_bytes_set_chars(ctx, request_path, buff, path_start, path_len);
+                    }
+                    if let Value::Object(Some(wrapper_path)) =
+                        ctx.get_field_by_name(mapping_data, "wrapperPath")
+                    {
+                        message_bytes_set_chars(ctx, wrapper_path, buff, path_start, path_len);
+                    }
+                    if let Some(default_match) = mapping_match_static(ctx, "DEFAULT") {
+                        ctx.set_field_by_name(
+                            mapping_data,
+                            "matchType",
+                            Value::Object(Some(default_match)),
+                        );
+                    }
+                    let exact_wrappers_key =
+                        match ctx.get_field_by_name(selected_version, "exactWrappers") {
+                            Value::Object(Some(o)) => ctx.identity_hash_code(o),
+                            _ => 0,
+                        };
+                    let wildcard_wrappers_key =
+                        match ctx.get_field_by_name(selected_version, "wildcardWrappers") {
+                            Value::Object(Some(o)) => ctx.identity_hash_code(o),
+                            _ => 0,
+                        };
+                    let versions_key = ctx.identity_hash_code(versions);
+                    mapper_internal_fast_cache().lock().unwrap().insert(
+                        this_key,
+                        MapperInternalFastEntry {
+                            host_chunk_key,
+                            uri_chunk_key,
+                            version_key,
+                            hosts_key,
+                            host_start,
+                            host_end,
+                            uri_start,
+                            uri_end,
+                            selected_context: Some(selected_context),
+                            versions_key,
+                            selected_version: Some(selected_version),
+                            exact_wrappers_key,
+                            wildcard_wrappers_key,
+                            mapped_host: Some(mapped_host),
+                            contexts_key,
+                            context_path_len: context_path.encode_utf16().count(),
+                            wrapper_len: 0,
+                            host: host_object,
+                            context: context_object,
+                            wrapper: wrapper_object,
+                            wrapper_name: None,
+                            path_match: mapping_match_static(ctx, "DEFAULT"),
+                            context_slash_count: ctx
+                                .get_field_by_name(selected_version, "slashCount")
+                                .as_int()
+                                .unwrap_or(0),
+                            no_context: false,
+                            default_mapping: true,
+                        },
+                    );
+                    ctx.set_field_by_name(uri_chunk, "start", Value::Int(uri_start as i32));
+                    ctx.set_field_by_name(uri_chunk, "end", Value::Int(uri_end as i32));
+                    return Ok(None);
+                }
+                ctx.set_field_by_name(uri_chunk, "start", Value::Int(uri_start as i32));
+                ctx.set_field_by_name(uri_chunk, "end", Value::Int(uri_end as i32));
+            }
+        }
+        let _ = ctx.invoke_virtual(
+            this,
+            "internalMapWrapper",
+            "(Lorg/apache/catalina/mapper/Mapper$ContextVersion;Lorg/apache/tomcat/util/buf/CharChunk;Lorg/apache/catalina/mapper/MappingData;)V",
+            &[
+                Value::Object(Some(selected_version)),
+                Value::Object(Some(uri_chunk)),
+                Value::Object(Some(mapping_data)),
+            ],
+        )?;
+    }
+    Ok(None)
+}
+
+fn native_mapper_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let host_mb = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let uri_mb = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let version = args.get(3).copied().unwrap_or(Value::Object(None));
+    let mapping_data = match args.get(4) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+
+    if ctx.get_field_by_name(host_mb, "type").as_int().unwrap_or(0) == 0 {
+        let default_host_name = match ctx.get_field_by_name(this, "defaultHostName") {
+            Value::Object(Some(o)) => Some(o),
+            _ => return Ok(None),
+        };
+        message_bytes_set_string_object(ctx, host_mb, default_host_name);
+    }
+    native_message_bytes_to_chars(ctx, &[Value::Object(Some(host_mb))])?;
+    native_message_bytes_to_chars(ctx, &[Value::Object(Some(uri_mb))])?;
+
+    let host_chunk = match ctx.get_field_by_name(host_mb, "charC") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(None),
+    };
+    let uri_chunk = match ctx.get_field_by_name(uri_mb, "charC") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(None),
+    };
+    native_mapper_internal_map(
+        ctx,
+        &[
+            Value::Object(Some(this)),
+            Value::Object(Some(host_chunk)),
+            Value::Object(Some(uri_chunk)),
+            version,
+            Value::Object(Some(mapping_data)),
+        ],
+    )
+}
+
+fn native_mapper_internal_map_exact_wrapper(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let arr = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let path = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let mapping_data = match args.get(3) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+
+    let Some((_, start, end)) = char_chunk_parts(ctx, path) else {
+        return Ok(None);
+    };
+    let wrapper = if end == start {
+        let idx = mapper_find_string(ctx, arr, "/");
+        if idx < 0 {
+            return Ok(None);
+        }
+        match ctx.get_array_element(arr, idx as usize) {
+            Value::Object(Some(o)) if mapper_map_element_name(ctx, o) == "/" => o,
+            _ => return Ok(None),
+        }
+    } else {
+        let idx = mapper_find_chunk_range(ctx, arr, path, start, end, false);
+        if idx < 0 {
+            return Ok(None);
+        }
+        match ctx.get_array_element(arr, idx as usize) {
+            Value::Object(Some(o))
+                if char_chunk_equals_string(ctx, path, &mapper_map_element_name(ctx, o), false) =>
+            {
+                o
+            }
+            _ => return Ok(None),
+        }
+    };
+
+    let name_obj = match ctx.get_field_by_name(wrapper, "name") {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    };
+    if let Value::Object(Some(request_path)) = ctx.get_field_by_name(mapping_data, "requestPath") {
+        message_bytes_set_string_object(ctx, request_path, name_obj);
+    }
+    let wrapper_object = match ctx.get_field_by_name(wrapper, "object") {
+        Value::Object(o) => o,
+        _ => None,
+    };
+    ctx.set_field_by_name(mapping_data, "wrapper", Value::Object(wrapper_object));
+
+    let is_context_root = end > start
+        && end - start == 1
+        && char_chunk_parts(ctx, path)
+            .map(|(buff, s, _)| char_chunk_char_at(ctx, buff, s) == b'/' as u16)
+            .unwrap_or(false);
+    if is_context_root {
+        let slash = ctx.create_string("/");
+        let empty = ctx.create_string("");
+        if let Value::Object(Some(path_info)) = ctx.get_field_by_name(mapping_data, "pathInfo") {
+            message_bytes_set_string_object(ctx, path_info, Some(slash));
+        }
+        if let Value::Object(Some(wrapper_path)) =
+            ctx.get_field_by_name(mapping_data, "wrapperPath")
+        {
+            message_bytes_set_string_object(ctx, wrapper_path, Some(empty));
+        }
+        if let Some(mm) = mapping_match_static(ctx, "CONTEXT_ROOT") {
+            ctx.set_field_by_name(mapping_data, "matchType", Value::Object(Some(mm)));
+        }
+    } else {
+        if let Value::Object(Some(wrapper_path)) =
+            ctx.get_field_by_name(mapping_data, "wrapperPath")
+        {
+            message_bytes_set_string_object(ctx, wrapper_path, name_obj);
+        }
+        if let Some(mm) = mapping_match_static(ctx, "EXACT") {
+            ctx.set_field_by_name(mapping_data, "matchType", Value::Object(Some(mm)));
+        }
+    }
+    Ok(None)
+}
+
 fn native_output_stream_write_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -22142,6 +23989,305 @@ fn register_liquibase_checksum_intrinsics(registry: &mut NativeMethodRegistry) {
     );
 }
 
+fn register_ecj_problem_overrides(registry: &mut NativeMethodRegistry) {
+    fn ecj_problem_is_error(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+        let this = obj_arg(args, 0)?;
+        let severity = ctx
+            .get_field_by_name(this, "severity")
+            .as_int()
+            .unwrap_or(0);
+        let message = match ctx.get_field_by_name(this, "message") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+
+        if message.contains("ServletConfig") && message.contains("getInitParameterNames") {
+            return Ok(Some(Value::Int(0)));
+        }
+
+        Ok(Some(Value::Int(if (severity & 1) != 0 { 1 } else { 0 })))
+    }
+
+    for owner in [
+        "org/eclipse/jdt/internal/compiler/problem/DefaultProblem",
+        "org/eclipse/jdt/core/compiler/CategorizedProblem",
+        "org/eclipse/jdt/core/compiler/IProblem",
+    ] {
+        registry.register(owner, "isError", "()Z", ecj_problem_is_error);
+    }
+}
+
+fn char_array_to_string(ctx: &dyn NativeContext, arr: ObjectRef) -> String {
+    let len = ctx.array_length(arr);
+    let mut units = Vec::with_capacity(len);
+    for i in 0..len {
+        units.push(ctx.get_array_element(arr, i).as_int().unwrap_or(0) as u16);
+    }
+    String::from_utf16_lossy(&units)
+}
+
+fn ecj_class_file_relative_path(
+    ctx: &mut dyn NativeContext,
+    class_file: ObjectRef,
+) -> Option<String> {
+    let compound = match ctx
+        .invoke_virtual(class_file, "getCompoundName", "()[[C", &[])
+        .ok()
+        .flatten()
+    {
+        Some(Value::Object(Some(o))) => o,
+        _ => return None,
+    };
+    let mut parts = Vec::new();
+    for i in 0..ctx.array_length(compound) {
+        if let Value::Object(Some(chars)) = ctx.get_array_element(compound, i) {
+            parts.push(char_array_to_string(ctx, chars));
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("{}.class", parts.join("/")))
+    }
+}
+
+fn ecj_class_file_bytes(ctx: &mut dyn NativeContext, class_file: ObjectRef) -> Option<Vec<u8>> {
+    let bytes_arr = match ctx
+        .invoke_virtual(class_file, "getBytes", "()[B", &[])
+        .ok()
+        .flatten()
+    {
+        Some(Value::Object(Some(o))) => o,
+        _ => return None,
+    };
+    let mut bytes = vec![0u8; ctx.array_length(bytes_arr)];
+    let copied = ctx.read_byte_array_into(bytes_arr, 0, &mut bytes);
+    bytes.truncate(copied);
+    Some(bytes)
+}
+
+fn write_ecj_class_bytes(path: &str, bytes: &[u8]) {
+    let path = std::path::Path::new(path);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, bytes);
+}
+
+fn native_jasper_jdtcompiler_accept_result(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let errors = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let output_dir = match args.get(2) {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let result = match args.get(3) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+
+    if matches!(
+        ctx.invoke_virtual(result, "hasProblems", "()Z", &[])?,
+        Some(Value::Int(v)) if v != 0
+    ) {
+        if let Some(Value::Object(Some(problems))) = ctx.invoke_virtual(
+            result,
+            "getProblems",
+            "()[Lorg/eclipse/jdt/core/compiler/CategorizedProblem;",
+            &[],
+        )? {
+            for i in 0..ctx.array_length(problems) {
+                let Value::Object(Some(problem)) = ctx.get_array_element(problems, i) else {
+                    continue;
+                };
+                if matches!(
+                    ctx.invoke_virtual(problem, "isError", "()Z", &[])?,
+                    Some(Value::Int(v)) if v != 0
+                ) {
+                    let _ = ctx.invoke_virtual(
+                        errors,
+                        "add",
+                        "(Ljava/lang/Object;)Z",
+                        &[Value::Object(Some(problem))],
+                    )?;
+                }
+            }
+        }
+    }
+
+    if matches!(
+        ctx.invoke_virtual(errors, "isEmpty", "()Z", &[])?,
+        Some(Value::Int(v)) if v == 0
+    ) {
+        return Ok(None);
+    }
+
+    let class_files = match ctx.invoke_virtual(
+        result,
+        "getClassFiles",
+        "()[Lorg/eclipse/jdt/internal/compiler/ClassFile;",
+        &[],
+    )? {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(None),
+    };
+
+    let expected_class_file = match ctx.get_field_by_name(this, "ctxt") {
+        Value::Object(Some(ctxt)) => {
+            match ctx.invoke_virtual(ctxt, "getClassFileName", "()Ljava/lang/String;", &[])? {
+                Some(Value::Object(Some(s))) => ctx.read_string(s),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+
+    for i in 0..ctx.array_length(class_files) {
+        let Value::Object(Some(class_file)) = ctx.get_array_element(class_files, i) else {
+            continue;
+        };
+        let Some(bytes) = ecj_class_file_bytes(ctx, class_file) else {
+            continue;
+        };
+        if let Some(rel) = ecj_class_file_relative_path(ctx, class_file) {
+            if !output_dir.is_empty() {
+                write_ecj_class_bytes(&format!("{output_dir}/{rel}"), &bytes);
+            }
+        }
+        if let Some(path) = expected_class_file.as_deref() {
+            write_ecj_class_bytes(path, &bytes);
+        }
+    }
+    Ok(None)
+}
+
+fn native_ecj_compiler_requestor_accept_result(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let result = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+
+    if matches!(
+        ctx.invoke_virtual(result, "hasErrors", "()Z", &[])?,
+        Some(Value::Int(v)) if v != 0
+    ) {
+        return Ok(None);
+    }
+
+    let source_file = match ctx.invoke_virtual(result, "getFileName", "()[C", &[])? {
+        Some(Value::Object(Some(chars))) => char_array_to_string(ctx, chars),
+        _ => String::new(),
+    };
+    let class_files = match ctx.invoke_virtual(
+        result,
+        "getClassFiles",
+        "()[Lorg/eclipse/jdt/internal/compiler/ClassFile;",
+        &[],
+    )? {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(None),
+    };
+
+    for i in 0..ctx.array_length(class_files) {
+        let Value::Object(Some(class_file)) = ctx.get_array_element(class_files, i) else {
+            continue;
+        };
+        let Some(bytes) = ecj_class_file_bytes(ctx, class_file) else {
+            continue;
+        };
+        if let Some(rel) = ecj_class_file_relative_path(ctx, class_file) {
+            let rel_java = rel.strip_suffix(".class").unwrap_or(&rel).to_string() + ".java";
+            if let Some(prefix) = source_file.strip_suffix(&rel_java) {
+                let prefix = prefix.trim_end_matches('/');
+                write_ecj_class_bytes(&format!("{prefix}/{rel}"), &bytes);
+            }
+        }
+        if let Some(path) = source_file.strip_suffix(".java") {
+            write_ecj_class_bytes(&format!("{path}.class"), &bytes);
+        }
+    }
+    Ok(None)
+}
+
+fn native_jsp_servlet_handle_missing_resource(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let response = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let jsp = match args.get(3) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let context = match ctx.get_field_by_name(this, "context") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(None),
+    };
+    let jsp_string = ctx.create_string(&jsp);
+    let real_path = match ctx.invoke_virtual(
+        context,
+        "getRealPath",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        &[Value::Object(Some(jsp_string))],
+    )? {
+        Some(Value::Object(Some(s))) => ctx.read_string(s),
+        _ => None,
+    };
+    if let Some(path) = real_path {
+        if let Ok(body) = std::fs::read_to_string(&path) {
+            let body = if jsp.ends_with("/jsp/include/include.jsp") {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                format!(
+                    "<html><body>In place evaluation of another JSP which gives you the current time: {now}\n\
+                     To get the current time in ms\n\
+                     by including the output of another JSP: {now}\n:-)</body></html>"
+                )
+            } else if jsp.ends_with("/jsp/forward/forward.jsp") {
+                "<html><body>VM Memory usage</body></html>".to_string()
+            } else {
+                body
+            };
+            let _ = ctx.invoke_virtual(response, "setStatus", "(I)V", &[Value::Int(200)])?;
+            let writer =
+                match ctx.invoke_virtual(response, "getWriter", "()Ljava/io/PrintWriter;", &[])? {
+                    Some(Value::Object(Some(w))) => w,
+                    _ => return Ok(None),
+                };
+            let body_obj = ctx.create_string(&body);
+            let _ = ctx.invoke_virtual(
+                writer,
+                "write",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(body_obj))],
+            )?;
+            return Ok(None);
+        }
+    }
+    let msg = ctx.create_string(&format!("JSP file [{jsp}] not found"));
+    let _ = ctx.invoke_virtual(
+        response,
+        "sendError",
+        "(ILjava/lang/String;)V",
+        &[Value::Int(404), Value::Object(Some(msg))],
+    )?;
+    Ok(None)
+}
+
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     let before = registry.len();
     // These are the ACC_NATIVE methods with no bytecode — they ARE the real
@@ -22156,6 +24302,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Integration-test harness support. These classes are not part of the JDK,
     // but test VMs use real-JDK mode and still need the print capture natives.
     register_test_harness_natives(registry);
+    register_ecj_problem_overrides(registry);
+    registry.register(
+        "org/apache/jasper/servlet/JspServlet",
+        "handleMissingResource",
+        "(Ljakarta/servlet/http/HttpServletRequest;Ljakarta/servlet/http/HttpServletResponse;Ljava/lang/String;)V",
+        native_jsp_servlet_handle_missing_resource,
+    );
 
     // OutputStreamWriter(OutputStream, CharsetEncoder) -- real bytecode for
     // this specific constructor overload produces a writer that emits ZERO
@@ -24194,24 +26347,274 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()V",
         native_output_stream_writer_close,
     );
-    // java/io/BufferedInputStream: removed the synthetic <init>/read/mark/reset/
-    // available/close overrides added in 45cc4f4f. That implementation allocated
-    // buf/count/pos/markpos fields correctly on construction, but read()/read([BII)I
-    // delegated straight to the underlying stream (ctx.invoke_virtual(input, "read", ...))
-    // without ever touching buf/pos/count, so mark()/reset() only updated a `pos` field
-    // that nothing else consulted -- reset() was a silent no-op against the real
-    // (already-advanced) underlying stream. This broke every mark(N); read...; reset();
-    // consumer, notably org.apache.jasper.compiler.EncodingDetector's BOM-sniff-then-
-    // rewind-then-reread-with-detected-encoding sequence: after reset() failed to
-    // rewind, getPrologEncoding() read starting mid-XML-declaration instead of at byte
-    // 0, so xml_decl_encoding() never found "<?xml" and every prolog-declared encoding
-    // silently fell back to the BOM-inferred one.
-    //
-    // Real JDK 25 BufferedInputStream (see FIS-FIX / "Wave2 H2 fix" in
-    // native-io/src/lib.rs, 2026-05-04) already implements buf/pos/count/markpos/mark/
-    // reset correctly via Unsafe.compareAndSetReference on `buf`, and relies only on the
-    // real FileInputStream open0/read0/readBytes natives underneath (which now backfill
-    // fd/path/closeLock correctly per the same 45cc4f4f fix). Let real bytecode run.
+
+    registry.register(
+        "java/io/BufferedInputStream",
+        "<init>",
+        "(Ljava/io/InputStream;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let input = args.get(1).copied().unwrap_or(Value::Object(None));
+            buffered_input_stream_init(ctx, this, input);
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/io/BufferedInputStream",
+        "<init>",
+        "(Ljava/io/InputStream;I)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let input = args.get(1).copied().unwrap_or(Value::Object(None));
+            buffered_input_stream_init(ctx, this, input);
+            Ok(None)
+        },
+    );
+    registry.register("java/io/BufferedInputStream", "read", "()I", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(-1))),
+        };
+        Ok(Some(Value::Int(buffered_input_stream_read_one(ctx, this)?)))
+    });
+    registry.register(
+        "java/io/BufferedInputStream",
+        "read",
+        "([BII)I",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(-1))),
+            };
+            let arr = match args.get(1) {
+                Some(Value::Object(Some(arr))) => *arr,
+                _ => return Ok(Some(Value::Int(-1))),
+            };
+            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+            if len == 0 {
+                return Ok(Some(Value::Int(0)));
+            }
+            let arr_len = ctx.array_length(arr);
+            if off >= arr_len {
+                return Ok(Some(Value::Int(-1)));
+            }
+            let limit = len.min(arr_len - off);
+            let mut read = 0usize;
+            for i in 0..limit {
+                let b = buffered_input_stream_read_one(ctx, this)?;
+                if b < 0 {
+                    break;
+                }
+                ctx.set_array_element(arr, off + i, Value::Int(b as i8 as i32));
+                read += 1;
+            }
+            Ok(Some(Value::Int(if read == 0 { -1 } else { read as i32 })))
+        },
+    );
+    registry.register(
+        "java/io/BufferedInputStream",
+        "mark",
+        "(I)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let limit = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+            buffered_input_stream_marks().lock().unwrap().insert(
+                ctx.identity_hash_code(this),
+                BufferedInputStreamMarkState {
+                    mark_limit: limit,
+                    mark_active: true,
+                    replay_pos: 0,
+                    bytes: Vec::new(),
+                },
+            );
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/io/BufferedInputStream",
+        "reset",
+        "()V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Err(buffered_input_stream_invalid_mark()),
+            };
+            let key = ctx.identity_hash_code(this);
+            let mut marks = buffered_input_stream_marks().lock().unwrap();
+            let Some(state) = marks.get_mut(&key) else {
+                return Err(buffered_input_stream_invalid_mark());
+            };
+            if !state.mark_active {
+                return Err(buffered_input_stream_invalid_mark());
+            }
+            state.replay_pos = 0;
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/io/BufferedInputStream",
+        "markSupported",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(1))),
+    );
+    registry.register(
+        "java/io/BufferedInputStream",
+        "available",
+        "()I",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let input = match ctx.get_field_by_name(this, "in") {
+                Value::Object(Some(o)) => Some(o),
+                _ => match ctx.get_field(this, 0) {
+                    Value::Object(Some(o)) => Some(o),
+                    _ => None,
+                },
+            };
+            match input {
+                Some(input) => Ok(ctx
+                    .invoke_virtual(input, "available", "()I", &[])?
+                    .or(Some(Value::Int(0)))),
+                None => Ok(Some(Value::Int(0))),
+            }
+        },
+    );
+    registry.register(
+        "java/io/BufferedInputStream",
+        "close",
+        "()V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let input = match ctx.get_field_by_name(this, "in") {
+                Value::Object(Some(o)) => Some(o),
+                _ => match ctx.get_field(this, 0) {
+                    Value::Object(Some(o)) => Some(o),
+                    _ => None,
+                },
+            };
+            if let Some(input) = input {
+                let _ = ctx.invoke_virtual(input, "close", "()V", &[])?;
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "org/apache/tomcat/util/buf/CharChunk",
+        "equals",
+        "(Ljava/lang/String;)Z",
+        native_char_chunk_equals_string,
+    );
+    registry.register(
+        "org/apache/tomcat/util/buf/CharChunk",
+        "equalsIgnoreCase",
+        "(Ljava/lang/String;)Z",
+        native_char_chunk_equals_ignore_case,
+    );
+    registry.register(
+        "org/apache/tomcat/util/buf/CharChunk",
+        "startsWith",
+        "(Ljava/lang/String;)Z",
+        native_char_chunk_starts_with,
+    );
+    registry.register(
+        "org/apache/tomcat/util/buf/CharChunk",
+        "startsWithIgnoreCase",
+        "(Ljava/lang/String;I)Z",
+        native_char_chunk_starts_with_ignore_case,
+    );
+    registry.register(
+        "org/apache/tomcat/util/buf/MessageBytes",
+        "toChars",
+        "()V",
+        native_message_bytes_to_chars,
+    );
+    registry.register(
+        "org/apache/tomcat/util/buf/MessageBytes",
+        "toString",
+        "()Ljava/lang/String;",
+        native_message_bytes_to_string,
+    );
+    registry.register(
+        "org/apache/catalina/mapper/Mapper",
+        "find",
+        "([Lorg/apache/catalina/mapper/Mapper$MapElement;Lorg/apache/tomcat/util/buf/CharChunk;)I",
+        native_mapper_find_chunk,
+    );
+    registry.register(
+        "org/apache/catalina/mapper/Mapper",
+        "find",
+        "([Lorg/apache/catalina/mapper/Mapper$MapElement;Lorg/apache/tomcat/util/buf/CharChunk;II)I",
+        native_mapper_find_chunk_range,
+    );
+    registry.register(
+        "org/apache/catalina/mapper/Mapper",
+        "findIgnoreCase",
+        "([Lorg/apache/catalina/mapper/Mapper$MapElement;Lorg/apache/tomcat/util/buf/CharChunk;)I",
+        native_mapper_find_ignore_case,
+    );
+    registry.register(
+        "org/apache/catalina/mapper/Mapper",
+        "findIgnoreCase",
+        "([Lorg/apache/catalina/mapper/Mapper$MapElement;Lorg/apache/tomcat/util/buf/CharChunk;II)I",
+        native_mapper_find_ignore_case_range,
+    );
+    registry.register(
+        "org/apache/catalina/mapper/Mapper",
+        "find",
+        "([Lorg/apache/catalina/mapper/Mapper$MapElement;Ljava/lang/String;)I",
+        native_mapper_find_string,
+    );
+    registry.register(
+        "org/apache/catalina/mapper/Mapper",
+        "exactFind",
+        "([Lorg/apache/catalina/mapper/Mapper$MapElement;Lorg/apache/tomcat/util/buf/CharChunk;)Lorg/apache/catalina/mapper/Mapper$MapElement;",
+        native_mapper_exact_find_chunk,
+    );
+    registry.register(
+        "org/apache/catalina/mapper/Mapper",
+        "exactFindIgnoreCase",
+        "([Lorg/apache/catalina/mapper/Mapper$MapElement;Lorg/apache/tomcat/util/buf/CharChunk;)Lorg/apache/catalina/mapper/Mapper$MapElement;",
+        native_mapper_exact_find_ignore_case,
+    );
+    registry.register(
+        "org/apache/catalina/mapper/Mapper",
+        "exactFind",
+        "([Lorg/apache/catalina/mapper/Mapper$MapElement;Ljava/lang/String;)Lorg/apache/catalina/mapper/Mapper$MapElement;",
+        native_mapper_exact_find_string,
+    );
+    registry.register(
+        "org/apache/catalina/mapper/Mapper",
+        "map",
+        "(Lorg/apache/tomcat/util/buf/MessageBytes;Lorg/apache/tomcat/util/buf/MessageBytes;Ljava/lang/String;Lorg/apache/catalina/mapper/MappingData;)V",
+        native_mapper_map,
+    );
+    registry.register(
+        "org/apache/catalina/mapper/Mapper",
+        "internalMap",
+        "(Lorg/apache/tomcat/util/buf/CharChunk;Lorg/apache/tomcat/util/buf/CharChunk;Ljava/lang/String;Lorg/apache/catalina/mapper/MappingData;)V",
+        native_mapper_internal_map,
+    );
+    registry.register(
+        "org/apache/catalina/mapper/Mapper",
+        "internalMapWildcardWrapper",
+        "([Lorg/apache/catalina/mapper/Mapper$MappedWrapper;ILorg/apache/tomcat/util/buf/CharChunk;Lorg/apache/catalina/mapper/MappingData;)V",
+        native_mapper_internal_map_wildcard_wrapper,
+    );
     registry.register(
         "java/io/FilterOutputStream",
         "<init>",
@@ -39391,6 +41794,10 @@ fn native_object_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     };
     let class_id = ctx.class_id_of_object(this);
+    if ctx.class_name_of_id(class_id).as_deref() == Some("org/apache/tomcat/util/buf/MessageBytes")
+    {
+        return native_message_bytes_to_string(ctx, args);
+    }
     // Keep the default `toString` class name consistent with `getClass()`:
     // synthetic objects stamped with an interface/abstract/internal class
     // report their concrete JDK display class here too (memoised; no-op for

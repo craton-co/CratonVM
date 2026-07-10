@@ -2099,7 +2099,70 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         }
         None
     }
+    fn empty_annotation_array(
+        ctx: &mut dyn cratonvm_native_api::registry::NativeContext,
+    ) -> Value {
+        let cid = ctx
+            .class_id_by_name("java/lang/annotation/Annotation")
+            .or_else(|| ctx.ensure_class_initialized("java/lang/annotation/Annotation").ok())
+            .unwrap_or(cratonvm_types::ClassId::new(0));
+        Value::Object(Some(ctx.new_ref_array(cid, 0)))
+    }
+    fn empty_annotation_array_for_type(
+        ctx: &mut dyn cratonvm_native_api::registry::NativeContext,
+        args: &[Value],
+    ) -> Value {
+        let cid = match args.get(1) {
+            Some(Value::Object(Some(mirror))) => ctx
+                .class_id_from_mirror(*mirror)
+                .unwrap_or_else(|| cratonvm_types::ClassId::new(0)),
+            _ => cratonvm_types::ClassId::new(0),
+        };
+        Value::Object(Some(ctx.new_ref_array(cid, 0)))
+    }
+    fn register_type_variable_annotation_natives(
+        registry: &mut NativeMethodRegistry,
+        class_name: &'static str,
+    ) {
+        registry.register(
+            class_name,
+            "getAnnotation",
+            "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+            |_ctx, _args| Ok(Some(Value::Object(None))),
+        );
+        registry.register(
+            class_name,
+            "getDeclaredAnnotation",
+            "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+            |_ctx, _args| Ok(Some(Value::Object(None))),
+        );
+        registry.register(
+            class_name,
+            "getAnnotations",
+            "()[Ljava/lang/annotation/Annotation;",
+            |ctx, _args| Ok(Some(empty_annotation_array(ctx))),
+        );
+        registry.register(
+            class_name,
+            "getDeclaredAnnotations",
+            "()[Ljava/lang/annotation/Annotation;",
+            |ctx, _args| Ok(Some(empty_annotation_array(ctx))),
+        );
+        registry.register(
+            class_name,
+            "getAnnotationsByType",
+            "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;",
+            |ctx, args| Ok(Some(empty_annotation_array_for_type(ctx, args))),
+        );
+        registry.register(
+            class_name,
+            "getDeclaredAnnotationsByType",
+            "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;",
+            |ctx, args| Ok(Some(empty_annotation_array_for_type(ctx, args))),
+        );
+    }
     let tvi_real = "sun/reflect/generics/reflectiveObjects/TypeVariableImpl";
+    register_type_variable_annotation_natives(registry, tvi_real);
     registry.register(tvi_real, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field_by_name(this, "name")))
@@ -2168,6 +2231,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field_by_name(this, "genericComponentType")))
         },
     );
+    register_type_variable_annotation_natives(registry, "java/lang/reflect/TypeVariable");
     registry.register(
         "java/lang/reflect/TypeVariable",
         "getName",

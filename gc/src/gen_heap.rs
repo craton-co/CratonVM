@@ -10325,6 +10325,85 @@ mod tests {
         roots[0]
     }
 
+    /// ES-FAIL-FAMILY-20260710 hunt: a field that points back to its own
+    /// holder (`Throwable.cause = this`, `Throwable.backtrace = this` — the
+    /// JDK "uninitialized" self-reference sentinel) must be updated to the
+    /// relocated address when the holder itself moves during GC (promotion
+    /// young->old, and any further old-gen compaction), not left pointing at
+    /// the holder's stale pre-move address. A field write for a *self*
+    /// reference is easy to special-case incorrectly (e.g. "skip rewriting
+    /// this slot, the pointer is already correct" without accounting for the
+    /// holder itself having just moved) — if that happens, the field keeps
+    /// pointing at the old, now-free address, and once that address is
+    /// reused by a later allocation, reading the field returns whatever
+    /// unrelated object now lives there.
+    #[test]
+    fn self_referential_field_survives_promotion() {
+        let heap = GenerationalHeap::with_sizes(16 * 1024, 32 * 1024);
+        let monitors = NoOpMonitors;
+
+        let obj = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(obj, 0, Value::Object(Some(obj)));
+
+        let mut roots = vec![obj];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        assert!(
+            heap.is_in_old(roots[0].as_ptr()),
+            "S-SELFREF: object should be promoted to old gen"
+        );
+
+        let relocated = roots[0];
+        match heap.get_field(relocated, 0) {
+            Value::Object(Some(r)) => {
+                assert_eq!(
+                    r.as_ptr(),
+                    relocated.as_ptr(),
+                    "S-SELFREF: self-referential field should track the relocated \
+                     object after promotion (field points at {:?}, holder is now at {:?})",
+                    r.as_ptr(),
+                    relocated.as_ptr()
+                );
+            }
+            other => panic!(
+                "S-SELFREF: self-reference lost/corrupted after promotion, field={:?}",
+                other
+            ),
+        }
+
+        // Keep stressing the heap after promotion — allocate + collect a few
+        // more times (some of which may trigger old-gen compaction) and
+        // re-check the self-reference each time, in case the bug needs a
+        // SECOND relocation of an already-old object rather than the initial
+        // young->old promotion.
+        for cycle in 0..5 {
+            for _ in 0..200 {
+                let garbage = heap.alloc_object(ClassId::new(0), 4);
+                heap.set_field(garbage, 0, Value::Int(cycle));
+            }
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+            let relocated = roots[0];
+            match heap.get_field(relocated, 0) {
+                Value::Object(Some(r)) => {
+                    assert_eq!(
+                        r.as_ptr(),
+                        relocated.as_ptr(),
+                        "S-SELFREF: self-referential field diverged after post-promotion \
+                         GC cycle {cycle} (field points at {:?}, holder is now at {:?})",
+                        r.as_ptr(),
+                        relocated.as_ptr()
+                    );
+                }
+                other => panic!(
+                    "S-SELFREF: self-reference lost/corrupted at post-promotion cycle \
+                     {cycle}, field={:?}",
+                    other
+                ),
+            }
+        }
+    }
+
     #[test]
     fn s29_random_graph_gc_never_collects_reachable() {
         // Property-based: build random object graph, GC, verify all reachable objects survive
