@@ -12380,6 +12380,24 @@ fn jarfs_read_entry(jar: &str, entry: &str) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+fn jarfs_entry_size(jar: &str, entry: &str) -> std::io::Result<i64> {
+    let entry = entry.trim_start_matches('/');
+    let jar_bytes =
+        jar_bytes_cached(jar).ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    let cursor = std::io::Cursor::new(jar_bytes.as_slice());
+    let mut zip = zip::ZipArchive::new(cursor)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let entry_name = if zip.file_names().any(|name| name == entry) {
+        entry.to_string()
+    } else {
+        format!("/{entry}")
+    };
+    let f = zip
+        .by_name(&entry_name)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    Ok(f.size() as i64)
+}
+
 fn jarfs_rewrite_entry(jar: &str, entry: &str, data: Option<&[u8]>) -> std::io::Result<()> {
     use std::io::{Read, Write};
     let entry = entry.trim_start_matches('/').trim_end_matches('/');
@@ -12577,6 +12595,7 @@ fn jarfs_list_dir_classified(jar: &str, dir: &str) -> Vec<(String, bool)> {
 struct JrtImage {
     reader: cratonvm_reader::JImageReader,
     entries: Vec<String>,
+    entry_sizes: std::collections::HashMap<String, u64>,
 }
 
 fn jrt_image(java_home: &str) -> Option<std::sync::Arc<JrtImage>> {
@@ -12592,16 +12611,21 @@ fn jrt_image(java_home: &str) -> Option<std::sync::Arc<JrtImage>> {
     let built = cratonvm_reader::JImageReader::open(&modules_path)
         .ok()
         .map(|reader| {
-            let mut entries: Vec<String> = reader
-                .iter_entries()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(p, _, _)| p)
-                .filter(|p| p.starts_with('/'))
-                .collect();
+            let mut entries = Vec::new();
+            let mut entry_sizes = std::collections::HashMap::new();
+            for (p, _, size) in reader.iter_entries().unwrap_or_default() {
+                if p.starts_with('/') {
+                    entry_sizes.insert(p.clone(), size);
+                    entries.push(p);
+                }
+            }
             entries.sort_unstable();
             entries.dedup();
-            Arc::new(JrtImage { reader, entries })
+            Arc::new(JrtImage {
+                reader,
+                entries,
+                entry_sizes,
+            })
         });
     guard.insert(java_home.to_string(), built.clone());
     built
@@ -12623,7 +12647,9 @@ fn jrt_entry_to_image(entry: &str) -> Option<String> {
 }
 
 fn jrt_img_is_file(img: &JrtImage, path: &str) -> bool {
-    img.entries.binary_search(&path.to_string()).is_ok()
+    img.entries
+        .binary_search_by(|e| e.as_str().cmp(path))
+        .is_ok()
 }
 
 fn jrt_img_is_dir(img: &JrtImage, path: &str) -> bool {
@@ -12723,6 +12749,17 @@ fn jrtfs_list_dir_classified(java_home: &str, entry: &str) -> Vec<(String, bool)
         }
         None => Vec::new(),
     }
+}
+
+fn jrtfs_entry_size(java_home: &str, entry: &str) -> std::io::Result<i64> {
+    let img =
+        jrt_image(java_home).ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    let img_path = jrt_entry_to_image(entry)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    img.entry_sizes
+        .get(&img_path)
+        .map(|size| *size as i64)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
 }
 
 /// Read a jrt logical entry's bytes out of the jimage.
@@ -25786,12 +25823,7 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         ctx.set_field(bfa, 2, Value::Object(Some(ft)));
         let (is_dir, size) = match jarfs_classify(&jar, &entry) {
             JarFsKind::Dir => (1, 0i64),
-            JarFsKind::File => (
-                0,
-                jarfs_read_entry(&jar, &entry)
-                    .map(|b| b.len() as i64)
-                    .unwrap_or(0),
-            ),
+            JarFsKind::File => (0, jarfs_entry_size(&jar, &entry).unwrap_or(0)),
             JarFsKind::Absent => {
                 // Real readAttributes throws NoSuchFileException (an
                 // IOException) for missing files; FileTreeWalker catches it
@@ -25817,12 +25849,7 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         ctx.set_field(bfa, 2, Value::Object(Some(ft)));
         let (is_dir, size) = match jrtfs_classify(&java_home, &entry) {
             JarFsKind::Dir => (1, 0i64),
-            JarFsKind::File => (
-                0,
-                jrtfs_read(&java_home, &entry)
-                    .map(|b| b.len() as i64)
-                    .unwrap_or(0),
-            ),
+            JarFsKind::File => (0, jrtfs_entry_size(&java_home, &entry).unwrap_or(0)),
             JarFsKind::Absent => {
                 return Err(RuntimeError::IOException {
                     message: format!("NoSuchFileException: {entry} in jrt:/"),
@@ -26314,12 +26341,19 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
-    r.register(md, "isAutomatic", "()Z", |_ctx, _args| {
+    r.register(md, "isAutomatic", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Value::Int(v) = ctx.get_field_by_name(this, "automatic") {
+            return Ok(Some(Value::Int(if v != 0 { 1 } else { 0 })));
+        }
         Ok(Some(Value::Int(0)))
     });
     r.register(md, "isOpen", "()Z", |ctx, args| {
-        // Bit 0 of the flags field (index 1) marks "open" modules.
         let this = obj_arg(args, 0)?;
+        if let Value::Int(v) = ctx.get_field_by_name(this, "open") {
+            return Ok(Some(Value::Int(if v != 0 { 1 } else { 0 })));
+        }
+        // Bit 0 of the synthetic flags field (index 1) marks "open" modules.
         if ctx.object_num_fields(this) > 1 {
             let flags = ctx.get_field(this, 1).as_int().unwrap_or(0);
             return Ok(Some(Value::Int(flags & 1)));
