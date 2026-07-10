@@ -1,6 +1,6 @@
 # ES HANG - server org.elasticsearch.index.codec.tsdb.es95.ES95TSDBDocValuesFormatTests
 
-Status: OPEN
+Status: FIXED (retired 2026-07-10)
 
 Observed in:
 - Run: `es-nonpassed-rerun-20260708-191002`
@@ -42,3 +42,8 @@ Extracted stdout signals:
 Current classification:
 - The row carries the historical `System$1.findNative(ClassLoader,String)long` signal.
 - This final run used the binary built before later `dev` fixes; re-run on current `dev` before assigning ownership if the class matches a fixed family.
+## Retirement update (2026-07-10)
+
+Moved out of `docs/known-issues` because this per-class record only captured the historical `java/lang/System$1.findNative(ClassLoader,String)J` root. That root is now represented by the fixed family note under `docs/internal/elasticsearch-suite`, and the 2026-07-10 current-dev local partial rerun recorded 0 CRASH rows and no `System$1.findNative` recurrence before the user-requested stop.
+
+If this class fails again on current `dev`, file a fresh known-issue document for the current signature instead of reopening this stale per-class crash note.

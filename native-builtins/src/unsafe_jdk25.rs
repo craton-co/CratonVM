@@ -142,22 +142,24 @@ pub fn native_unsafe_copy_swap_memory(
     }
 
     // Fallback: legacy slot-by-slot swap for non-array (object-field) targets.
-    //
-    // `bytes` is interpreted as a slot count here, so it MUST be bounded by the
-    // real field count of BOTH the source (read) and destination (write)
-    // objects. Without this bound an attacker-controlled (offset, bytes) walks
-    // `get_field`/`set_field` past the last slot — an OOB heap read on `src`
-    // and, worse, an OOB heap WRITE on `dst` that scribbles over neighbouring
-    // objects. Clamp the iteration to whatever range fits in both objects.
-    let src_fields = ctx.object_num_fields(src);
-    let dst_fields = ctx.object_num_fields(dst);
-    let src_room = src_fields.saturating_sub(src_offset);
-    let dst_room = dst_fields.saturating_sub(dest_offset);
-    let count = bytes.min(src_room).min(dst_room);
-    for i in 0..count {
-        let val = ctx.get_field(src, src_offset + i);
+    // HotSpot byte offsets that are outside Craton's small heap-slot range must
+    // use the Unsafe synthetic side store; treating them as field indices can
+    // write through padded real-JDK mirror layouts and corrupt neighbouring heap
+    // Value cells.
+    for i in 0..bytes {
+        let src_slot = src_offset + i;
+        let dst_slot = dest_offset + i;
+        let val = if crate::unsafe_offset_is_heap_slot(ctx, src, src_slot) {
+            ctx.get_field(src, src_slot)
+        } else {
+            crate::synthetic_get(ctx, src, src_slot)
+        };
         let swapped = swap_value(val, elem_size);
-        ctx.set_field(dst, dest_offset + i, swapped);
+        if crate::unsafe_offset_is_heap_slot(ctx, dst, dst_slot) {
+            ctx.set_field(dst, dst_slot, swapped);
+        } else {
+            crate::synthetic_put(ctx, dst, dst_slot, swapped);
+        }
     }
 
     Ok(None)

@@ -1,11 +1,13 @@
 # FormAuthenticator A/B/C — bare `assertTrue` failures across cookie/session matrix
 
-**Status:** NARROWED TO 2 NEW, UNRELATED, SMALL RESIDUALS — the doc's
-originally-documented defect (JSP compilation blocking the whole FORM-auth
-cookie/session matrix) is FIXED. **Severity was** medium (broke a wide swath
-of Tomcat's FORM-auth cookie/session-ID handling test matrix); the two
-remaining single-method residuals are low. **HotSpot:** PASS (A 9/9, B 6/6,
-C 7/7 — `overnight0629c/hotspot-jit`).
+**Status:** NARROWED TO 1 RESIDUAL (down from 3 stacked bugs, all fixed) —
+the doc's originally-documented defect (JSP compilation blocking the whole
+FORM-auth cookie/session matrix) is FIXED, and the residual found while
+verifying that fix is now understood to be ONE bug (not two), partially
+fixed, with a concrete lead for the rest. **Severity was** medium (broke a
+wide swath of Tomcat's FORM-auth cookie/session-ID handling test matrix);
+the residual is low (intermittent, ~1 test in 3 reruns). **HotSpot:** PASS
+(A 9/9, B 6/6, C 7/7 — `overnight0629c/hotspot-jit`).
 
 ## Original summary (2026-07-07/08 discovery)
 
@@ -122,44 +124,71 @@ exactly) in 3 of 4 runs. Two OTHER, unrelated single-method failures
 appear intermittently across A/B/C (never more than one per class per
 run) — see below.
 
-## 2 new, small, unrelated residuals found while verifying the fix — NOT investigated further
+### 4. `NoSuchMethodError: java/lang/Object.read([CII)I` (PARTIALLY FIXED — commit `686de27c`, merged `99ed33ff`; residual OPEN, see below)
 
-Both surfaced only after (1)-(3) stopped masking them; both are single
-methods, different mechanisms. 4 full reruns distinguish their character:
+The "2 new residuals" reported after verifying fix (3) turned out to be
+**the same bug**: `testNoChangedSessidWithoutCookies`'s plain `assertTrue`
+failure (no exception logged) and the `NoSuchMethodError` seen in
+`TestFormAuthenticatorB`/`C` are the identical underlying failure, just
+caught at different points — confirmed by re-running with instrumentation:
+`testNoChangedSessidWithoutCookies` fails with the exact same
+`NoSuchMethodError: java/lang/Object.read([CII)I` at
+`SimpleHttpClient.readLine` in every instrumented rerun.
 
-- **`TestFormAuthenticatorA.testNoChangedSessidWithoutCookies`** — plain
-  `assertTrue` failure at `TestFormAuthenticatorA.java:302` (no exception,
-  no server-side error logged). **Reproduced consistently in EVERY rerun
-  (3/3) that included class A** — looks like a real, reproducible bug, not
-  host noise. Method exercises `SERVER_FREEZE_SESSID` + `CLIENT_NO_COOKIES`
-  (session ID must NOT change across the login flow while the client
-  relies on path-parameter session tracking). Not root-caused — worth its
-  own known-issues doc.
-- **`java.lang.NoSuchMethodError: java/lang/Object.read([CII)I`** at
-  `SimpleHttpClient.readLine` (client-side test-harness code, not server
-  Tomcat code) — looks like a `Reader.read(char[],int,int)` virtual dispatch
-  resolving onto `Object` instead of the real `Reader` subclass. **Confirmed
-  genuinely intermittent/non-deterministic across reruns**: hit
-  `TestFormAuthenticatorC.testPostWithContinueNoServerCookies` in one run,
-  then `TestFormAuthenticatorB.testPostNoContinuePostRedirectNoClientCookies`
-  in a later run (with C then clean) — different class, different method,
-  same signature. This rules out "one broken test method" and points at a
-  rare dispatch-resolution bug that can strike any `Reader.read`-driven
-  request/response cycle, similar in flavor (rare, non-deterministic,
-  wrong-method-resolved) to this investigation's own JASPER-JDT.3 finding
-  but in a completely different subsystem (method resolution, not JIT
-  array-bounds). Was initially suspected to be a host-load-135 artifact —
-  the moving target across otherwise-clean reruns keeps that possibility
-  open too (a stale/racy method-cache entry surfacing only under heavy
-  concurrent host load is plausible) — but a genuine rare correctness bug
-  hasn't been ruled out either. Not root-caused.
+**Root cause, part 1 (fixed):** `native-io/src/stream_decoder.rs`'s
+`alloc_stream_decoder` fell back to `ClassId::new(0)` — which per this
+codebase's own documented convention IS `java/lang/Object` (zero declared
+fields) — when `ctx.ensure_class_initialized("sun/nio/cs/StreamDecoder")`
+transiently failed. Any object allocated with that class id has no real
+methods, so `sd.read(...)` (reached via `BufferedReader.readLine()` →
+`InputStreamReader.read()` → `StreamDecoder.read()`) threw
+`NoSuchMethodError` against `Object`. Fixed by using the documented
+`ensure_synthetic_class` fallback instead (retries the real class first,
+only degrades to a properly-sized stub as a last resort); same fix applied
+to the write-side sibling `native-io/src/stream_encoder.rs`.
+**Verified improvement, not a complete fix:** `TestFormAuthenticatorA` went
+from failing `testNoChangedSessidWithoutCookies` in every run before this
+fix to a clean 9/9 PASS in 2 of 3 reruns after it (previously 0 of ~4) —
+but the `NoSuchMethodError` still recurs occasionally.
 
-Both are new territory, unrelated to JSP compilation, `RemoteCIDRValve`, or
-`InetSocketAddress`. Recommend: `testNoChangedSessidWithoutCookies` looks
-solid enough (3/3) to root-cause directly and deserves its own
-known-issues doc now; re-run the `NoSuchMethodError` a few more times on an
-idle host first to separate "rare real bug" from "load artifact" before
-writing it up.
+**Root cause, part 2 (OPEN, NOT fixed — needs dedicated bisection, not a
+blind patch):** instrumenting `SimpleHttpClient.readLine()` directly
+(temporary reflection-based introspection, since Tomcat's own JULI logging
+discards detail — see (3) above) on a repeat occurrence found
+`BufferedReader.in == null` on a **freshly-constructed reader that had
+never been used or closed** — `connect()` constructs it, and the *very
+next* operation on that same reader fails with `in` already null, no
+`disconnect()`/`close()` in between. A `private final` field reading back
+null immediately after being set in the constructor is the exact symptom
+shape already root-caused (and then *re*-root-caused after an initial
+misdiagnosis) in
+[`swallowabortedupploads-unexpected-socketexception.md`](swallowabortedupploads-unexpected-socketexception.md)'s
+2026-07-10 bisection section: **not a GC/JIT stale-local bug** (that theory
+was tested and explicitly retracted there) but a **synthetic native writing
+a fake/undersized field layout onto an object stamped with the real
+class's `ClassId`, corrupting a nearby real object's fields via heap
+adjacency** — the same family as that doc's `LinkedBlockingDeque` fix and
+the `StringJoiner`/`EnumSet`/`ScheduledThreadPoolExecutor` cases, and (found
+independently, same day, by another session) the
+`threadpoolexecutor-shutdown-npe-on-mainlock-synthetic-executor.md` case.
+
+`alloc_stream_decoder` itself is a concrete next suspect: `javap` on the
+real `sun.nio.cs.StreamDecoder` shows its declared field order is
+`(closed, haveLeftoverChar, leftoverChar, cs, decoder, bb, in, ch)` — `in`
+is the **7th** field, not the 1st — yet this file's own module doc comment
+and its `SD_INPUT = 0` constant assume slot 0 holds `in`. Whether this
+mismatch is real (and if so, whether CratonVM's field-slot numbering
+differs from `javap`'s declaration order in a way that makes it moot) was
+**not verified** — getting this wrong risks introducing worse corruption
+than doing nothing, so it was left as a documented lead rather than
+guessed at. **Do not blind-patch this** — follow the same per-native
+bisection methodology the swallow-uploads doc used (build variants with
+one change at a time, rerun, compare failure counts) to confirm the exact
+mechanism before touching `stream_decoder.rs`'s slot assignments.
+
+**Status:** doc stays OPEN for this residual. HotSpot-matching pass rate
+(9/9, 6/6, 7/7) is now achieved in the *majority* of reruns but not every
+one.
 
 ## Reproduction
 
@@ -188,9 +217,11 @@ cd C:\craton\CratonVM\apps\tomcat-suite-runner
 
 ## Recommendation
 
-Re-verify `testNoChangedSessidWithoutCookies` and
-`testPostWithContinueNoServerCookies` on an idle host (this session's host
-hit load average 135 before a clean repeat could finish); if both
-reproduce consistently, split each into its own `docs/known-issues/`
-doc — this doc has otherwise served its purpose and should retire to
-`docs/internal/` once that split happens.
+Root-cause item (4)'s remaining `NoSuchMethodError: java/lang/Object.read`
+residual using the swallow-uploads doc's bisection methodology (build
+variants isolating one synthetic-native change at a time against
+`sun.nio.cs.StreamDecoder`'s construction path, rerun, compare failure
+counts) rather than guessing at `stream_decoder.rs`'s field-slot
+assignments directly. Once that lands and a few clean full-suite reruns
+confirm 9/9, 6/6, 7/7 consistently, this doc has served its purpose and
+should retire to `docs/internal/`.

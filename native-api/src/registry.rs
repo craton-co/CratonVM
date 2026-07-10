@@ -3239,15 +3239,30 @@ impl NativeMethodRegistry {
         // (see `alloc_concurrent_synthetic` call sites in
         // `register_executor_natives`), so a class-name-keyed drop can't tell
         // the two apart — it silently starved the synthetic objects' own
-        // `execute()`/`submit()` overrides too, sending them straight to real
-        // JDK bytecode that dereferences an uninitialized `ctl`
-        // (`AtomicInteger`) field and NPEs
-        // (`threadpoolexecutor-execute-npe-on-ctl-regression.md`). The
-        // real-vs-synthetic distinction now happens per-*instance*, inside
+        // `execute()`/`submit()`/`shutdown()` overrides too, sending them
+        // straight to real JDK bytecode that dereferences an uninitialized
+        // `ctl`/`mainLock` field and NPEs
+        // (`docs/internal/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`,
+        // `docs/known-issues/threadpoolexecutor-shutdown-npe-on-mainlock-synthetic-executor.md`).
+        // A prior narrower fix (merged separately, same day) exempted only
+        // `execute(Runnable)` from this drop and pushed the real-vs-synthetic
+        // distinction into the interpreter's dispatch layer instead
+        // (`force_native_over_real_jdk_bytecode` / `intercept_force_registered_native`
+        // in vm/src/runtime/interpreter.rs, plus matching checks in
+        // vm/src/vm/vm_exec.rs) — those checks are still in place and harmless,
+        // but they don't cover every dispatch path (`try_stackless_invoke`'s own
+        // direct native lookup isn't one of the patched call sites), so a real
+        // receiver could still reach `native_es_execute` and — in that fix —
+        // degrade to synchronous inline execution. This drop is now removed
+        // entirely (not just for `execute`), and the real-vs-synthetic
+        // distinction happens per-*instance* inside
         // `native_es_execute`/`native_es_submit_*`/the `shutdown` closures
-        // (`executor_has_real_workers`), which forward to real bytecode via
-        // `NativeContext::invoke_virtual_bytecode_only` for a genuinely-real
-        // receiver instead of relying on this registration-time filter.
+        // (`executor_has_real_workers`), which forward a genuinely-real
+        // receiver to real bytecode via
+        // `NativeContext::invoke_virtual_bytecode_only` — regardless of which
+        // dispatch path reached the native, and preserving true async
+        // semantics for a real pool's `execute()` (not just synchronous
+        // fallback).
         let key = native_method_hash(class_name, method_name, descriptor);
         // With 128-bit composite keys, collisions on our keyspace are
         // vanishingly unlikely. We keep a cheap `debug_assert!` as

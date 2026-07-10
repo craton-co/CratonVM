@@ -1,6 +1,6 @@
 # Keycloak RealmModelTest no-JIT H2 auth failure after Liquibase completes
 
-Status: open
+Status: fixed/retired
 
 Date observed: 2026-07-09
 
@@ -20,6 +20,29 @@ due to: Error calling Driver.connect() [Wrong user name or password [28000-240]]
 
 This is no longer a Liquibase timeout. It is a later H2/Hibernate credential
 propagation residual in the same `RealmModelTest` class.
+
+## Fixed evidence
+
+Retired on 2026-07-10 after the focused Keycloak model class passed on the Azure host from the isolated worktree branch `codex/fix-keycloak-realmmodel-h2-auth-20260709-123713`.
+
+Validation binary:
+
+```text
+/data/data/cargo-targets/keycloak-realmmodel-h2-auth-20260709-123713-baseline/release/cratonvm-keycloak-realmmodel-h2-auth-20260709-123713-fixed
+```
+
+Runner result:
+
+```text
+run: verify-realmmodel-h2-auth-fixed-jdk25-20260709-123713-r109-final-candidate-700
+mode: all-nojit
+status: PASS
+seconds: 352.304
+tests: 3
+failed: 0
+```
+
+The final run no longer reproduced the tracked `Wrong user name or password [28000-240]` H2 bootstrap failure, the post-Liquibase timeout, the intermediate H2 `Command` cast failure, or the `java.util.Map.forEach` localization NPE. The relevant runtime fixes are the H2 `SessionLocal.prepareLocal` no-cache bridge plus the receiver-aware `Map.forEach` path for Hibernate `PersistentMap` backed by arbitrary map implementations.
 
 ## Evidence
 

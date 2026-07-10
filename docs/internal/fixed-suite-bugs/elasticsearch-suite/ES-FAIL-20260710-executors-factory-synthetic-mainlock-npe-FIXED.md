@@ -10,11 +10,15 @@ A separate, parallel investigation (originally chasing
 same root cause and this doc's own "Suggested fix direction" option 2: move
 the `drop_real_layout_synthetic` real-vs-synthetic distinction from
 registration time (a per-*class* gate that can't see per-*object* state) to
-dispatch time.
+dispatch time. A narrower, `execute()`-only fix for the same bug had already
+landed on `dev` independently by the time this was found (branch
+`fix/tpe-npe-dispatch-20260710`) — this generalizes it to cover
+`submit()`/`shutdown()` too and fixes a real-executor async-semantics gap
+that fix's own doc had flagged as unexplained.
 
 **Fix**, on branch `fix/wildfly-hib32-gate-20260710` (see
-`docs/internal/fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`
-for the full writeup):
+`docs/internal/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`
+for the full writeup, including both fixes' reconciliation):
 1. Removed the `class_name == "java/util/concurrent/ThreadPoolExecutor"`
    registration-time drop from `NativeMethodRegistry::register()` entirely.
 2. Added `NativeContext::invoke_virtual_bytecode_only` — a real

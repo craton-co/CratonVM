@@ -948,8 +948,12 @@ there are still the most recent direct evidence for all four).
 Picked this up specifically to clear step 1 of the 2026-07-10 recommended
 steps above. Root-caused and fixed on branch `fix/wildfly-hib32-gate-20260710`
 (Windows worktree; no Azure host access this session) — full writeup in
-`docs/internal/fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`.
-Short version: the earlier bisection to `f28d6ae6` was a red herring — the
+`docs/internal/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`
+(a narrower, `execute()`-only fix for the same bug landed on `dev`
+independently while this session was in progress, branch
+`fix/tpe-npe-dispatch-20260710`; this generalizes it to `submit()`/
+`shutdown()` too — see that doc's own "later same day" section for the
+reconciliation). Short version: the earlier bisection to `f28d6ae6` was a red herring — the
 actual cause is a `native-api/src/registry.rs` registration-time gate
 (`f157de8a`, 2026-06-17) that unconditionally dropped every native
 registered on class name `java/util/concurrent/ThreadPoolExecutor` in

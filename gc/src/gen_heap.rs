@@ -1331,7 +1331,7 @@ impl GenerationalHeap {
     /// spilling the single allocation into old gen lets a young-full native call
     /// succeed without GC instead of `std::process::abort()`-ing the whole VM.
     /// The `GC_FLAG_OLD_GEN` mark keeps minor GC from trying to forward it.
-    fn try_alloc_object_old(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
+    pub(crate) fn try_alloc_object_old(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
         let (total_size, array_len, compact_flag) = plan_object_alloc(class_id, num_fields)?;
         let mut header = ObjectHeader::new(
             class_id,
