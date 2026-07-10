@@ -41,18 +41,39 @@ protocol restoring referents that the processor decided to clear. Also
 `finalized=96/32` on Generational — finalize() runs ~3× per object
 (re-registration / requeue bug).
 
-## 3. G1: MTChurn intermittent lost `synchronized` increments (probe-confirmed, ~1 in 4-6 runs)
+## 3. STW barrier quota races: GC can run under a live mutator (probe-confirmed; root-caused; fix attempt parked)
 6 threads churn + `synchronized(locks[i&15]){counters[i&15]++;}` at
--Xmx256m loses 2-78% of increments intermittently. NOT the pin gap:
-CRATONVM_G1_DBG_PINS shows `jit_active=false pin_addrs=0` at every pause in
-BOTH passing and failing runs — compiled frames are running with an EMPTY
-JIT-entry chain (guard-less entry), so quiescence/pins/scans are all blind
-to them. The A5 unregistered-JIT-frame detector (conservative_roots.rs
-~1316) is `#[cfg(target_os = "windows")]` — inert on Linux — and even on
-Windows depends on `JIT_CODE_RANGES` which is only populated under
-default-off precise maps. Generational is immune only because its young
-sweep is always non-moving. Root-cause investigation ongoing (see repro:
-MTChurn.java; --nojit passes 100%).
+-Xmx256m loses 2-78% of increments intermittently (~1 in 4-6 runs);
+BinaryTrees(16) under G1+JIT completes with a WRONG run-varying total, and
+the same family occasionally SEGVs in `scan_and_evacuate_refs` under host
+load. `--nojit` and Generational/ZGC pass 100% (Generational is only
+shielded by its non-moving-under-JIT sweep).
+
+ROOT CAUSE (2026-07-10 deep-dive, instrumented with a watched-array
+registry that caught workers writing through a superseded `counters[]`
+copy while a pause was in flight): the stop-the-world barrier can satisfy
+its arrival quota with the WRONG threads. A thread whose
+`in_blocked_region` flag is up at request time is excluded from
+`expected` — but when such a thread arrives at the barrier anyway
+(`enter_blocked` pre_stw arm, `check_post_block_gc` drain, safepoint poll
+while still flagged) `arrive_and_wait` counts it toward `arrived`,
+filling a counted running mutator's quota slot; `wait_for_all()` then
+releases while that mutator still runs and the collector evacuates
+objects under live mutation. Two adjacent holes: blocked-region exit
+clears `in_blocked_region` with a plain store (a pause requested in the
+window between the drain loop and the clear excluded the thread, yet the
+thread resumes bytecode mid-collection), and `thread_join` deposits its
+root snapshot before retiring its TLAB.
+
+FIX ATTEMPT parked on branch `wip/gc-stw-quota-race-20260710`
+(excluded-tid snapshot atomic with the counts + `arrive_and_wait_auto` +
+`leave_blocked_region_synced` + join retire-order): the approach closes
+the accounting hole but AS IMPLEMENTED it intermittently HANGS the VM
+outright under load (suspected starvation/livelock in the synced
+blocked-region exit under continuous pause pressure) and still SEGVs on a
+forced-GC path — do not merge without a redo + liveness argument. The
+quota hole affects ALL moving collections, not just G1.
+Repro: MTChurn.java / BinaryTrees.java in /data/data/gcprobes-0710.
 
 ## 4. G1/ZGC: STW hang risk when a JIT thread never polls (INT-3)
 `stw_take_over_and_wait` falls back to a plain unbounded `wait_for_all()`
