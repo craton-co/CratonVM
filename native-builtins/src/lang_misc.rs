@@ -244,6 +244,26 @@ pub(crate) fn write_throwable_detail_message(
 /// the mirror clobbered the message field whenever both helpers ran
 /// (e.g. via `<init>(String, Throwable)`).
 pub(crate) fn write_throwable_cause(ctx: &mut dyn NativeContext, this: ObjectRef, cause: Value) {
+    if std::env::var_os("CRATONVM_DBG_CAUSE").is_some() {
+        let this_cls = ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .unwrap_or_default();
+        let cause_desc = match cause {
+            Value::Object(Some(c)) if c == this => "SELF".to_string(),
+            Value::Object(Some(c)) => {
+                let cn = ctx
+                    .class_name_of_id(ctx.class_id_of_object(c))
+                    .unwrap_or_default();
+                format!("{cn} hash={}", ctx.identity_hash_code(c))
+            }
+            Value::Object(None) => "NULL".to_string(),
+            other => format!("{other:?}"),
+        };
+        eprintln!(
+            "CAUSE_DBG_WRITE this={this_cls} hash={} cause={cause_desc}",
+            ctx.identity_hash_code(this)
+        );
+    }
     write_throwable_field_cached(ctx, &THROWABLE_CAUSE_INDEX, "cause", this, cause);
 }
 
@@ -982,6 +1002,19 @@ fn throwable_cause(ctx: &mut dyn NativeContext, t: ObjectRef) -> Option<ObjectRe
     if let Value::Object(Some(c)) = by_name {
         if c == t {
             return None;
+        }
+        if std::env::var_os("CRATONVM_DBG_CAUSE").is_some() {
+            let t_cls = ctx
+                .class_name_of_id(ctx.class_id_of_object(t))
+                .unwrap_or_default();
+            let c_cls = ctx
+                .class_name_of_id(ctx.class_id_of_object(c))
+                .unwrap_or_default();
+            eprintln!(
+                "CAUSE_DBG_READ this={t_cls} hash={} cause={c_cls} cause_hash={}",
+                ctx.identity_hash_code(t),
+                ctx.identity_hash_code(c)
+            );
         }
         return Some(c);
     }

@@ -1694,6 +1694,53 @@ fn randomized_thread_group(ctx: &mut dyn NativeContext, thread: ObjectRef) -> Me
     ctx.invoke_virtual(thread, "getThreadGroup", "()Ljava/lang/ThreadGroup;", &[])
 }
 
+/// Best-effort thread name for the `IllegalStateException` messages below —
+/// mirrors `com.carrotsearch.randomizedtesting.Threads.threadName(Thread)`
+/// closely enough for a human-readable diagnostic; exact wording doesn't
+/// matter for correctness (only the exception *class* does, see below).
+fn randomized_thread_name(ctx: &mut dyn NativeContext, thread: ObjectRef) -> String {
+    match ctx.invoke_virtual(thread, "getName", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(name)))) => {
+            ctx.read_string(name).unwrap_or_else(|| "<unknown>".to_string())
+        }
+        _ => "<unknown>".to_string(),
+    }
+}
+
+/// `RandomizedContext.context(Thread)` never returns null in real-JDK
+/// bytecode — a missing context is always an `IllegalStateException` (see
+/// the decompiled `context(Thread)` bytecode this mirrors). Callers such as
+/// `AssertingCodec.<init>` (Lucene test framework) rely on that: they wrap
+/// `RandomizedContext.current().getTargetClass()` in
+/// `catch (IllegalStateException e) { targetClass = null; }` to tolerate
+/// running outside a randomized-test thread (e.g. from a static class
+/// initializer). Returning a plain `null` here instead of throwing skips
+/// that catch block — the very next `invokevirtual getTargetClass()` then
+/// NPEs on the null receiver, and the *wrong* exception type propagates
+/// uncaught out of the static initializer as `ExceptionInInitializerError`,
+/// crashing test classes that would otherwise gracefully no-op (e.g.
+/// `ES815BitFlatVectorFormatTests` and the other ES93 BFloat16 vector codec
+/// tests during `<clinit>`).
+fn randomized_no_context_error(
+    ctx: &mut dyn NativeContext,
+    thread: ObjectRef,
+    terminated: bool,
+) -> MethodCallFailed {
+    let thread_name = randomized_thread_name(ctx, thread);
+    let message = if terminated {
+        format!("No context for a terminated thread: {thread_name}")
+    } else {
+        format!(
+            "No context information for thread: {thread_name}. Is this thread running under a \
+             RandomizedRunner runner context? Add @RunWith(RandomizedRunner.class) to your test \
+             class. Make sure your code accesses random contexts within @BeforeClass and \
+             @AfterClass boundary (for example, static test class initializers are not \
+             permitted to access random contexts)."
+        )
+    };
+    RuntimeError::IllegalStateException { message }.into()
+}
+
 fn randomized_context_for_thread(
     ctx: &mut dyn NativeContext,
     thread: ObjectRef,
@@ -1701,7 +1748,7 @@ fn randomized_context_for_thread(
     let group_result = randomized_thread_group(ctx, thread)?;
     let group = match group_result {
         Some(Value::Object(Some(group))) => group,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(randomized_no_context_error(ctx, thread, true)),
     };
     let key = RandomizedContextCacheKey {
         vm: ctx.vm_identity(),
@@ -1714,7 +1761,7 @@ fn randomized_context_for_thread(
 
     let contexts = match randomized_context_static_contexts(ctx) {
         Some(contexts) => contexts,
-        None => return Ok(Some(Value::Object(None))),
+        None => return Err(randomized_no_context_error(ctx, thread, false)),
     };
     let mut current_group = group;
     loop {
@@ -1740,7 +1787,7 @@ fn randomized_context_for_thread(
         )?;
         current_group = match parent_result {
             Some(Value::Object(Some(parent))) => parent,
-            _ => return Ok(Some(Value::Object(None))),
+            _ => return Err(randomized_no_context_error(ctx, thread, false)),
         };
     }
 }
