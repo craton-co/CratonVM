@@ -92,33 +92,55 @@ real JDK 25, worktree `wt-formauth-cookie-session-20260710`, branch
    this chain; the `(int)` overload has the same class of gap but wasn't
    proven relevant here).
 
-3. **Residual, NOT fixed — JSP compile now fails differently:**
-   `Servlet.service() for servlet [jsp] threw exception (java/io/IOException:
-   Stream closed)` / `JasperException: Unable to compile class for JSP`,
-   100% reproducible on the Linux fixture across all of A/B/C, both
-   `--nojit` and JIT-on (rules out a JIT-only bug). **This is very likely
-   the same issue already flagged, independently and the same day, in**
-   [`nonblockingapi-http11processor-http2limits-bare-assertions.md`](nonblockingapi-http11processor-http2limits-bare-assertions.md)'s
-   `TestHttp11Processor.testWithTEChunkedWithCL` residual — identical
-   `JasperException: Unable to compile class for JSP` / `IOException: Stream
-   closed` pair, for a *different* JSP (`echo-params.jsp`) on the *same*
-   Linux fixture. That doc's own conclusion: "looks more likely to be a
-   fixture gap... but wasn't confirmed either way." Seeing the identical
-   signature recur for a second, unrelated JSP/test class strengthens that
-   suspicion — plausible causes include a missing Jasper scratch-dir
-   resource in this transferred-from-Windows Linux fixture, or contention
-   with one of the dozens of other concurrent sessions sharing this host
-   (`uptime` load average 50+ during this investigation) racing on
-   `java.io.tmpdir`/JAR-handle state. **Not confirmed either way — needs
-   re-verification on a native Windows harness (this doc's original repro
-   platform) or an idle host before concluding VM-bug vs. fixture-gap.**
-   Whoever picks this up: check the sibling doc first (same signature, same
-   day) rather than re-diagnosing from scratch.
+3. **Residual, NOT fixed — JSP compile now fails differently, and the
+   exact failure is NOT STABLE across otherwise-identical reruns:**
+   - First post-fix rerun (binary built at dev `df1650e1` + this fix):
+     `Servlet.service() for servlet [jsp] threw exception (java/io/IOException:
+     Stream closed)` / `JasperException: Unable to compile class for JSP`,
+     100% reproducible across all of A/B/C in that binary, both `--nojit`
+     and JIT-on.
+   - Second rerun, SAME fix, rebuilt after merging a large batch of
+     concurrent `origin/dev` changes (including substantial `jit/src`
+     churn — `ir.rs`/`lib.rs`/`tiered.rs`/`x64.rs`) on top of the same base:
+     `Stream closed` is GONE, replaced by a *different* symptom —
+     `JasperException: Unable to compile class for JSP` with root cause
+     `ArrayIndexOutOfBoundsException: Index 1 out of bounds for length 1` —
+     again 100% reproducible across all of A/B/C on that binary.
+   - The failure changing shape between two builds that differ only in
+     which unrelated `origin/dev` commits got merged in (RemoteCIDRValve fix
+     itself unchanged and independently re-verified intact both times —
+     `grep -c 'property.*null\|RemoteCIDR'` returns 0 in both runs) is a
+     strong signal this is a genuine **non-deterministic VM/JIT correctness
+     bug**, not a static Linux-fixture gap as originally hypothesized (a
+     missing file/resource would fail the *same* way every time regardless
+     of which JIT code merged in). This exact "same JasperException wrapper,
+     different array-bounds symptom size/index across runs" shape matches
+     the ALREADY-DOCUMENTED, still-not-fully-closed residual in
+     [`jasper-jdt-parser-arrayindexoutofbounds.md`](../jasper-jdt-parser-arrayindexoutofbounds.md)
+     (that doc's own history: "length 50" → "length 100" → now here,
+     "length 1" — same family, the "conservative JIT policy" partial fix for
+     the Eclipse JDT parser package apparently doesn't cover every call-site
+     shape). **This is also very likely the same issue flagged independently
+     the same day in**
+     [`nonblockingapi-http11processor-http2limits-bare-assertions.md`](nonblockingapi-http11processor-http2limits-bare-assertions.md)'s
+     `TestHttp11Processor.testWithTEChunkedWithCL` residual (identical
+     `JasperException: Unable to compile class for JSP` / `Stream closed`
+     pair, different JSP — `echo-params.jsp`) — that doc guessed "fixture
+     gap," but the new evidence here (symptom changing with JIT-adjacent
+     code changes) argues for the JIT-correctness-family explanation
+     instead. **Not root-caused — whoever picks this up should start from
+     the JDT-parser doc's open residual, not re-diagnose from scratch, and
+     should NOT assume fixture-gap without checking for JIT nondeterminism
+     first** (rerun the identical binary 2-3x before concluding anything
+     about stability).
 
 **Bottom line:** the doc's originally-observed symptom (AIOOBE) is fixed
 upstream; a second, previously-masked bug (RemoteCIDRValve/InetSocketAddress)
-is fixed this session; a third, previously-masked-again bug/fixture-gap
-blocks full PASS and remains open, tracked jointly with the sibling doc
+is fixed this session; a third, previously-masked-again bug — most likely a
+non-deterministic JIT/Eclipse-JDT-parser correctness issue (symptom shape
+changed across otherwise-identical reruns; see `jasper-jdt-parser-
+arrayindexoutofbounds.md`), not a static fixture gap as first suspected —
+blocks full PASS and remains open, tracked jointly with both sibling docs
 above. **Stays in `known-issues/`** (not retired) — the tests still do not
 pass end-to-end.
 
@@ -148,9 +170,16 @@ cd C:\craton\CratonVM\apps\tomcat-suite-runner
 
 ## Recommendation
 
-Root-cause the residual `Stream closed` / `Unable to compile class for JSP`
-failure (item 3 above) jointly with the sibling
+Root-cause the residual `Unable to compile class for JSP` failure (item 3
+above) as a JIT/Eclipse-JDT-parser correctness bug first, not a fixture gap
+— the symptom's exact shape (`Stream closed` vs. an `ArrayIndexOutOfBounds`
+of varying size/index) changed between two builds differing only in
+unrelated merged `jit/src` commits, which fixture gaps don't do. Start from
+[`jasper-jdt-parser-arrayindexoutofbounds.md`](../jasper-jdt-parser-arrayindexoutofbounds.md)'s
+open residual (same family, same "size varies run to run" shape) and
+jointly with the sibling
 `nonblockingapi-http11processor-http2limits-bare-assertions.md` doc's
-`testWithTEChunkedWithCL` case — same signature, same day, different JSP.
-First determine fixture-gap vs. genuine VM bug (re-run on Windows or an idle
-Linux host), then re-verify all of A/B/C end-to-end before retiring this doc.
+`testWithTEChunkedWithCL` case — same `JasperException`/root-cause pair,
+same day, different JSP. Re-verify all of A/B/C end-to-end (multiple reruns
+of the SAME binary, to separate flakiness from a fixed rate) before
+retiring this doc.
