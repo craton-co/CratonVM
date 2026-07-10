@@ -44054,12 +44054,23 @@ pub(crate) fn compile_anchored_cached(full: &str) -> Option<JavaRegex> {
 ///   that escapes `StatusLogger$Config.<clinit>` and aborts WildFly boot.
 /// - `\p{IsScriptName}` / `\P{IsScriptName}` (Java Unicode-script prefix) →
 ///   `\p{ScriptName}` / `\P{ScriptName}` (same accepted-without-prefix shape).
-/// - `\p{javaWhitespace}` / `\p{javaDigit}` and their negated forms (Java
-///   `Character.is*` property names) ? equivalent Rust-regex character classes.
+/// - `\p{java*}` / `\P{java*}` (the predefined Java character-class aliases
+///   from `java.util.regex.Pattern`'s `CharPredicates.forProperty` table,
+///   e.g. `\p{javaWhitespace}`, `\p{javaDigit}`) → an explicit Rust-regex
+///   class body matching the corresponding `java.lang.Character.isXxx(int)`
+///   predicate (see `map_java_predefined_class`). These are direct method
+///   aliases, not Unicode property/category names, so neither `regex` nor
+///   `fancy-regex` understands them by name. `java.util.Scanner`'s static
+///   initializer depends on `\p{javaWhitespace}` and `\p{javaDigit}`
+///   (`WHITESPACE_PATTERN` / `NON_ASCII_DIGIT`), so leaving these
+///   untranslated makes `Scanner`'s `<clinit>` throw unconditionally.
+///   Residual: does not honor `Pattern.CASE_INSENSITIVE` widening
+///   `javaLowerCase`/`javaUpperCase`/`javaTitleCase` into a tri-case union
+///   (rare — needs both the flag and one of these three classes together).
 fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
-    // Fast path: if the pattern doesn't contain a Java-only property spelling
-    // or `\Q...\E` quoted-literal blocks,
-    // there's nothing to rewrite.
+    // Fast path: if the pattern doesn't contain `\p{In`, `\p{Is`, or `\p{java`
+    // (or the capital-P negated forms), and no `\Q...\E` quoted-literal
+    // blocks, there's nothing to rewrite.
     let has_quote_block = pattern.contains("\\Q");
     // Any `\p{...}`/`\P{...}` needs the loop below: it covers Unicode
     // block/script prefixes (In/Is), `Character.is*` names (java*), the
@@ -44127,32 +44138,6 @@ fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
             };
             continue;
         }
-        // Translate Java `Character.is*` property spellings used by the JDK
-        // regex engine (notably Scanner's `\p{javaWhitespace}` delimiter and
-        // `\p{javaDigit}` non-ASCII digit probe). Rust's regex parser does not
-        // recognize the `java*` namespace.
-        if i + 4 < bytes.len()
-            && bytes[i] == b'\\'
-            && (bytes[i + 1] == b'p' || bytes[i + 1] == b'P')
-            && bytes[i + 2] == b'{'
-        {
-            if let Some(close_off) = pattern[i + 3..].find('}') {
-                let name = &pattern[i + 3..i + 3 + close_off];
-                if let Some(class_body) = map_java_character_property(name) {
-                    if bytes[i + 1] == b'P' {
-                        out.push_str("[^");
-                        out.push_str(class_body);
-                        out.push(']');
-                    } else {
-                        out.push('[');
-                        out.push_str(class_body);
-                        out.push(']');
-                    }
-                    i = i + 3 + close_off + 1;
-                    continue;
-                }
-            }
-        }
         // Java's `all` property denotes every character. Rust regexes do not
         // have that alias, but they do accept explicit Unicode scalar ranges.
         // The negated form becomes a class that compiles and can never match.
@@ -44168,6 +44153,52 @@ fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
             }
             i += 7;
             continue;
+        }
+        // Look for `\p{Name}` / `\P{Name}` POSIX character classes (Lower,
+        // Upper, ASCII, Alpha, Digit, Alnum, Punct, Graph, Print, Blank,
+        // Cntrl, XDigit, Space -- java.util.regex.Pattern javadoc, "POSIX
+        // character classes (US-ASCII only)"). Rust's `regex` crate only
+        // recognizes Unicode property names in `\p{...}` (no notion of
+        // "XDigit"/"Alpha"/etc.), so without this these patterns fail to
+        // compile in BOTH the `regex` and `fancy-regex` fallback, and
+        // `compile_java_regex` returns an Err. That Err was observed to
+        // silently corrupt `String.matches` (see `native_string_matches`'s
+        // literal-equality fallback on compile failure) -- e.g.
+        // `"5".matches("\\p{XDigit}+")` returned `false` instead of `true`,
+        // while `Pattern.matches("\\p{XDigit}+", "5")` (real bytecode,
+        // unaffected by this translation layer) correctly returned `true`.
+        // Found via Tomcat's `TestHttp2Limits.testPostWithTrailerHeadersSize0`.
+        // Checked before the `In`/`Is`/`java*` branches below since POSIX
+        // names never collide with those prefixes; unrecognized names fall
+        // through unchanged to let those branches (or the literal copy at
+        // the bottom) handle them. See `map_posix_character_class` for the
+        // US-ASCII-only rationale (matches Java's default; the rarely-used
+        // `UNICODE_CHARACTER_CLASS` flag is not special-cased here, same as
+        // the `java*` branch below).
+        if i + 3 < bytes.len()
+            && bytes[i] == b'\\'
+            && (bytes[i + 1] == b'p' || bytes[i + 1] == b'P')
+            && bytes[i + 2] == b'{'
+        {
+            if let Some(close_off) = pattern[i + 3..].find('}') {
+                let name = &pattern[i + 3..i + 3 + close_off];
+                if let Some(class_body) = map_posix_character_class(name) {
+                    let negated = bytes[i + 1] == b'P';
+                    if negated {
+                        out.push_str("[^");
+                        out.push_str(class_body);
+                        out.push(']');
+                    } else {
+                        out.push('[');
+                        out.push_str(class_body);
+                        out.push(']');
+                    }
+                    i = i + 3 + close_off + 1;
+                    continue;
+                }
+                // Not a POSIX name: fall through to the In/Is/java* checks
+                // below (or literal copy if none match either).
+            }
         }
         // Look for `\p{In` or `\p{Is` (both cases of p) followed by a name and `}`.
         // All matched bytes are ASCII so byte indexing is safe.
@@ -44203,6 +44234,34 @@ fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
                 }
                 i = i + 5 + close_off + 1;
                 continue;
+            }
+        }
+        // Look for `\p{java...}` / `\P{java...}` — the predefined Java
+        // character-class aliases (see `map_java_predefined_class`).
+        if i + 3 < bytes.len()
+            && bytes[i] == b'\\'
+            && (bytes[i + 1] == b'p' || bytes[i + 1] == b'P')
+            && bytes[i + 2] == b'{'
+            && pattern[i + 3..].starts_with("java")
+        {
+            if let Some(close_off) = pattern[i + 3..].find('}') {
+                let name = &pattern[i + 3..i + 3 + close_off];
+                let negated = bytes[i + 1] == b'P';
+                if let Some(class_body) = map_java_predefined_class(name) {
+                    if negated {
+                        out.push_str("[^");
+                        out.push_str(class_body);
+                        out.push(']');
+                    } else {
+                        out.push('[');
+                        out.push_str(class_body);
+                        out.push(']');
+                    }
+                    i = i + 3 + close_off + 1;
+                    continue;
+                }
+                // Unknown `java*` name: fall through and copy the escape
+                // literally below, same as any other unrecognized pattern.
             }
         }
         // Copy one full UTF-8 character.
@@ -44311,47 +44370,11 @@ fn ascii_perl_classes(pattern: &str) -> String {
     out
 }
 
-/// Map a Java Unicode block name (used after the `In` prefix in `\p{InXxx}`)
-/// to a Rust regex character-class body covering the same code points. The
-/// Rust regex crate doesn't expose Unicode blocks natively, so we substitute
-/// equivalent code-point ranges for the common ones encountered in real-world
-/// JDK / library code. Returns `None` for unknown blocks so the caller can
-/// fall back to a less specific translation.
-fn map_java_character_property(name: &str) -> Option<&'static str> {
+/// Map a Java POSIX character-class name (`\p{Name}` with no `In`/`Is`/`java`
+/// prefix) to a Rust regex character-class body. See the loop branch above
+/// for why this table exists. Always US-ASCII-only, matching Java's default.
+fn map_posix_character_class(name: &str) -> Option<&'static str> {
     match name {
-        // Character.isWhitespace: ASCII whitespace controls, file/group/record/unit
-        // separators, SPACE_SEPARATOR excluding non-breaking spaces, plus LINE /
-        // PARAGRAPH_SEPARATOR.
-        "javaWhitespace" => Some(
-            r"\u{0009}-\u{000D}\u{001C}-\u{001F}\u{0020}\u{1680}\u{2000}-\u{200A}\u{2028}\u{2029}\u{205F}\u{3000}",
-        ),
-        "javaDigit" => Some(r"\p{Nd}"),
-        "javaISOControl" => Some(r"\u{0000}-\u{001F}\u{007F}-\u{009F}"),
-        "javaLowerCase" => Some(r"\p{Lowercase}"),
-        "javaUpperCase" => Some(r"\p{Uppercase}"),
-        "javaAlphabetic" => Some(r"\p{Alphabetic}"),
-        "javaIdeographic" => Some(r"\p{Ideographic}"),
-        "javaLetter" => Some(r"\p{L}"),
-        "javaLetterOrDigit" => Some(r"\p{L}\p{Nd}"),
-        "javaSpaceChar" => Some(r"\p{Z}"),
-        // POSIX character classes (java.util.regex.Pattern javadoc,
-        // "POSIX character classes (US-ASCII only)"). Rust's `regex` crate
-        // only recognizes Unicode property names in `\p{...}` (it has no
-        // notion of "XDigit"/"Alpha"/etc.), so without this table these
-        // patterns fail to compile in BOTH the `regex` and `fancy-regex`
-        // fallback, and `compile_java_regex` returns an Err. That Err was
-        // observed to silently corrupt `String.matches` (see
-        // `native_string_matches`'s literal-equality fallback on compile
-        // failure) — e.g. `"5".matches("\\p{XDigit}+")` returned `false`
-        // instead of `true`, while `Pattern.matches("\\p{XDigit}+", "5")`
-        // (real bytecode, unaffected by this translation layer) correctly
-        // returned `true`. Found via Tomcat's
-        // `TestHttp2Limits.testPostWithTrailerHeadersSize0`. These are
-        // always US-ASCII-only (matching Java's default; Java only
-        // redefines them in Unicode terms under the rarely-used
-        // `UNICODE_CHARACTER_CLASS` flag, which this translation layer
-        // does not special-case, same as the existing `\p{java*}` entries
-        // above).
         "Lower" => Some("a-z"),
         "Upper" => Some("A-Z"),
         "ASCII" => Some(r"\x00-\x7F"),
@@ -44359,8 +44382,8 @@ fn map_java_character_property(name: &str) -> Option<&'static str> {
         "Digit" => Some("0-9"),
         "Alnum" => Some("a-zA-Z0-9"),
         // `!"#$%&'()*+,-./` (\x21-\x2F) + `:;<=>?@` (\x3A-\x40) +
-        // `[\]^_`` (\x5B-\x60) + `{|}~` (\x7B-\x7E) — printable
-        // ASCII minus letters and digits, as four contiguous byte ranges
+        // `[\]^_`` (\x5B-\x60) + `{|}~` (\x7B-\x7E) -- printable ASCII
+        // minus letters and digits, as four contiguous byte ranges
         // (sidesteps escaping `]`/`\`/`-` as literal bracket-class chars).
         "Punct" => Some(r"\x21-\x2F\x3A-\x40\x5B-\x60\x7B-\x7E"),
         "Graph" => Some(r"\x21-\x7E"),
@@ -44373,6 +44396,12 @@ fn map_java_character_property(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Map a Java Unicode block name (used after the `In` prefix in `\p{InXxx}`)
+/// to a Rust regex character-class body covering the same code points. The
+/// Rust regex crate doesn't expose Unicode blocks natively, so we substitute
+/// equivalent code-point ranges for the common ones encountered in real-world
+/// JDK / library code. Returns `None` for unknown blocks so the caller can
+/// fall back to a less specific translation.
 fn map_java_unicode_block(name: &str, is_block: bool) -> Option<&'static str> {
     if !is_block {
         // Script names ("Is" prefix) — Rust regex supports `\p{Latin}` etc.
@@ -44398,6 +44427,237 @@ fn map_java_unicode_block(name: &str, is_block: bool) -> Option<&'static str> {
         "Katakana" => Some(r"\u{30A0}-\u{30FF}"),
         "Hangul_Syllables" | "HangulSyllables" => Some(r"\u{AC00}-\u{D7AF}"),
         _ => None,
+    }
+}
+
+/// Translate a `\p{java*}` / `\P{java*}` predefined Java character-class
+/// name (see `java.util.regex.Pattern`'s `CharPredicates.forProperty`) into
+/// a Rust-regex-crate-compatible class body — i.e. text valid to place
+/// inside a single pair of `[...]` brackets. Returns `None` for names
+/// outside this family (letting the caller fall back to copying the escape
+/// literally, same as any other unrecognized `\p{...}` form).
+///
+/// Each entry mirrors the exact semantics documented on the corresponding
+/// `java.lang.Character.isXxx(int)` method (verified against JDK 25
+/// source), not a convenient approximation. Notably:
+/// - `javaWhitespace` (`Character.isWhitespace`) is Unicode space
+///   separators (`Zs`/`Zl`/`Zp`) *excluding* the three non-breaking spaces
+///   (U+00A0, U+2007, U+202F), plus the ASCII control-whitespace range
+///   U+0009-U+000D and the separator controls U+001C-U+001F. Expressed as
+///   explicit codepoints/ranges rather than `\p{Z}` minus a subtraction, so
+///   it doesn't depend on character-class set-operator support.
+/// - `javaJavaIdentifierStart`/`javaJavaIdentifierPart` follow the older,
+///   simpler `Character.isJavaIdentifierStart`/`Part` rules (letter/digit +
+///   currency + connector punctuation, + combining/non-spacing marks for
+///   `Part`) — NOT the same as `javaUnicodeIdentifierStart`/`Part`, which
+///   follow the newer `ID_Start`/`ID_Continue`-based UAX31 profile.
+fn map_java_predefined_class(name: &str) -> Option<&'static str> {
+    match name {
+        "javaLowerCase" => Some(r"\p{Lowercase}"),
+        "javaUpperCase" => Some(r"\p{Uppercase}"),
+        "javaAlphabetic" => Some(r"\p{Alphabetic}"),
+        "javaIdeographic" => Some(r"\p{Ideographic}"),
+        "javaTitleCase" => Some(r"\p{Lt}"),
+        "javaDigit" => Some(r"\p{Nd}"),
+        // isDefined = NOT unassigned (Cn) — enumerate every other general
+        // category rather than relying on `--`/negation-inside-brackets.
+        "javaDefined" => Some(r"\p{L}\p{M}\p{N}\p{P}\p{S}\p{Z}\p{Cc}\p{Cf}\p{Co}\p{Cs}"),
+        "javaLetter" => Some(r"\p{L}"),
+        "javaLetterOrDigit" => Some(r"\p{L}\p{Nd}"),
+        // isJavaIdentifierStart: isLetter || LETTER_NUMBER || currency
+        // symbol || connector punctuation.
+        "javaJavaIdentifierStart" => Some(r"\p{L}\p{Nl}\p{Sc}\p{Pc}"),
+        // isJavaIdentifierPart: the above plus digit, combining/non-spacing
+        // marks, and isIdentifierIgnorable.
+        "javaJavaIdentifierPart" => {
+            Some(r"\p{L}\p{Nl}\p{Nd}\p{Mc}\p{Mn}\p{Sc}\p{Pc}\p{Cf}\x00-\x08\x0E-\x1B\x7F-\x9F")
+        }
+        // isUnicodeIdentifierStart: ID_Start plus VERTICAL TILDE (U+2E2F,
+        // kept for backward compatibility per the UAX31 profile in the
+        // javadoc).
+        "javaUnicodeIdentifierStart" => Some(r"\p{ID_Start}\u{2E2F}"),
+        // isUnicodeIdentifierPart: ID_Start + ID_Continue + U+2E2F +
+        // isIdentifierIgnorable.
+        "javaUnicodeIdentifierPart" => {
+            Some(r"\p{ID_Start}\p{ID_Continue}\u{2E2F}\p{Cf}\x00-\x08\x0E-\x1B\x7F-\x9F")
+        }
+        // isIdentifierIgnorable: non-whitespace ISO control ranges plus the
+        // FORMAT (Cf) general category.
+        "javaIdentifierIgnorable" => Some(r"\x00-\x08\x0E-\x1B\x7F-\x9F\p{Cf}"),
+        "javaSpaceChar" => Some(r"\p{Z}"),
+        // isWhitespace: see the function-level doc comment above.
+        "javaWhitespace" => Some(
+            r"\x09-\x0D\x1C-\x1F\x20\u{1680}\u{2000}-\u{2006}\u{2008}-\u{200A}\u{2028}\u{2029}\u{205F}\u{3000}",
+        ),
+        "javaISOControl" => Some(r"\x00-\x1F\x7F-\x9F"),
+        "javaMirrored" => Some(r"\p{Bidi_Mirrored}"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod java_predefined_class_tests {
+    use super::compile_java_regex;
+
+    fn m(pat: &str, s: &str) -> bool {
+        compile_java_regex(pat, 0)
+            .unwrap_or_else(|e| panic!("pattern {pat:?} failed to compile: {e:?}"))
+            .is_match(s)
+    }
+
+    const ALL_NAMES: &[&str] = &[
+        "javaLowerCase",
+        "javaUpperCase",
+        "javaAlphabetic",
+        "javaIdeographic",
+        "javaTitleCase",
+        "javaDigit",
+        "javaDefined",
+        "javaLetter",
+        "javaLetterOrDigit",
+        "javaJavaIdentifierStart",
+        "javaJavaIdentifierPart",
+        "javaUnicodeIdentifierStart",
+        "javaUnicodeIdentifierPart",
+        "javaIdentifierIgnorable",
+        "javaSpaceChar",
+        "javaWhitespace",
+        "javaISOControl",
+        "javaMirrored",
+    ];
+
+    #[test]
+    fn all_names_compile_positive_and_negated() {
+        for name in ALL_NAMES {
+            let pos = format!("\\p{{{name}}}");
+            compile_java_regex(&pos, 0)
+                .unwrap_or_else(|e| panic!("{pos:?} failed to compile: {e:?}"));
+            let neg = format!("\\P{{{name}}}");
+            compile_java_regex(&neg, 0)
+                .unwrap_or_else(|e| panic!("{neg:?} failed to compile: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn scanner_whitespace_pattern() {
+        // java.util.Scanner.WHITESPACE_PATTERN, Scanner.java:415.
+        assert!(m(r"\p{javaWhitespace}+", " \t\n"));
+        assert!(!m(r"^\p{javaWhitespace}+$", "abc"));
+    }
+
+    #[test]
+    fn scanner_non_ascii_digit_pattern() {
+        // java.util.Scanner.NON_ASCII_DIGIT, Scanner.java:422-423. Must match
+        // a non-ASCII decimal digit but NOT an ASCII one.
+        assert!(m(r"[\p{javaDigit}&&[^0-9]]", "\u{0660}")); // ARABIC-INDIC DIGIT ZERO
+        assert!(!m(r"[\p{javaDigit}&&[^0-9]]", "5"));
+    }
+
+    #[test]
+    fn java_whitespace_excludes_nbsp_but_includes_controls() {
+        assert!(m(r"\p{javaWhitespace}", " "));
+        assert!(m(r"\p{javaWhitespace}", "\t"));
+        assert!(m(r"\p{javaWhitespace}", "\u{001C}"));
+        assert!(m(r"\p{javaWhitespace}", "\u{2028}"));
+        assert!(!m(r"\p{javaWhitespace}", "\u{00A0}"));
+        assert!(!m(r"\p{javaWhitespace}", "\u{2007}"));
+        assert!(!m(r"\p{javaWhitespace}", "\u{202F}"));
+        assert!(!m(r"\p{javaWhitespace}", "a"));
+    }
+
+    #[test]
+    fn java_space_char_includes_nbsp_unlike_whitespace() {
+        // isSpaceChar has NO non-breaking-space exclusion, unlike isWhitespace.
+        assert!(m(r"\p{javaSpaceChar}", " "));
+        assert!(m(r"\p{javaSpaceChar}", "\u{00A0}"));
+        assert!(!m(r"\p{javaSpaceChar}", "a"));
+    }
+
+    #[test]
+    fn java_digit_and_case() {
+        assert!(m(r"\p{javaDigit}", "5"));
+        assert!(!m(r"\p{javaDigit}", "a"));
+        assert!(m(r"\p{javaUpperCase}", "A"));
+        assert!(!m(r"\p{javaUpperCase}", "a"));
+        assert!(m(r"\p{javaLowerCase}", "a"));
+        assert!(!m(r"\p{javaLowerCase}", "A"));
+    }
+
+    #[test]
+    fn java_letter_vs_alphabetic_letter_number() {
+        // U+2160 ROMAN NUMERAL ONE: general category Nl (Letter_Number).
+        // isLetter() excludes it; isAlphabetic() includes it.
+        assert!(!m(r"\p{javaLetter}", "\u{2160}"));
+        assert!(m(r"\p{javaAlphabetic}", "\u{2160}"));
+        assert!(m(r"\p{javaLetter}", "a"));
+    }
+
+    #[test]
+    fn java_ideographic_and_titlecase() {
+        assert!(m(r"\p{javaIdeographic}", "\u{4E2D}")); // 中
+        assert!(!m(r"\p{javaIdeographic}", "a"));
+        assert!(m(r"\p{javaTitleCase}", "\u{01C5}")); // Dz with caron (titlecase)
+        assert!(!m(r"\p{javaTitleCase}", "a"));
+    }
+
+    #[test]
+    fn java_letter_or_digit() {
+        assert!(m(r"\p{javaLetterOrDigit}", "a"));
+        assert!(m(r"\p{javaLetterOrDigit}", "5"));
+        assert!(!m(r"\p{javaLetterOrDigit}", " "));
+    }
+
+    #[test]
+    fn java_identifier_start_and_part() {
+        assert!(m(r"\p{javaJavaIdentifierStart}", "a"));
+        assert!(m(r"\p{javaJavaIdentifierStart}", "$"));
+        assert!(m(r"\p{javaJavaIdentifierStart}", "_"));
+        assert!(!m(r"\p{javaJavaIdentifierStart}", "5"));
+        assert!(m(r"\p{javaJavaIdentifierPart}", "5"));
+        assert!(m(r"\p{javaJavaIdentifierPart}", "$"));
+    }
+
+    #[test]
+    fn unicode_identifier_start_excludes_currency_unlike_java_identifier_start() {
+        // isUnicodeIdentifierStart is ID_Start-based and does NOT special-case
+        // currency symbols, unlike isJavaIdentifierStart.
+        assert!(m(r"\p{javaUnicodeIdentifierStart}", "a"));
+        assert!(!m(r"\p{javaUnicodeIdentifierStart}", "$"));
+        assert!(m(r"\p{javaUnicodeIdentifierPart}", "5"));
+        assert!(!m(r"\p{javaUnicodeIdentifierPart}", "$"));
+    }
+
+    #[test]
+    fn java_identifier_ignorable() {
+        assert!(m(r"\p{javaIdentifierIgnorable}", "\u{0000}"));
+        assert!(!m(r"\p{javaIdentifierIgnorable}", "a"));
+    }
+
+    #[test]
+    fn java_iso_control() {
+        assert!(m(r"\p{javaISOControl}", "\u{0007}"));
+        assert!(!m(r"\p{javaISOControl}", "a"));
+    }
+
+    #[test]
+    fn java_mirrored() {
+        assert!(m(r"\p{javaMirrored}", "(")); // LEFT PARENTHESIS is mirrored
+        assert!(!m(r"\p{javaMirrored}", "a"));
+    }
+
+    #[test]
+    fn java_defined_excludes_noncharacter() {
+        assert!(m(r"\p{javaDefined}", "a"));
+        // U+FFFE is a permanently-reserved noncharacter (gc=Cn) per the
+        // Unicode stability policy, so this holds across Unicode versions.
+        assert!(!m(r"\p{javaDefined}", "\u{FFFE}"));
+        assert!(m(r"\P{javaDefined}", "\u{FFFE}"));
+    }
+
+    #[test]
+    fn negated_form_wraps_correctly() {
+        assert!(m(r"\P{javaDigit}", "a"));
+        assert!(!m(r"\P{javaDigit}", "5"));
     }
 }
 

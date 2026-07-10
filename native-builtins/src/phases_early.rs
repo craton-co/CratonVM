@@ -8821,6 +8821,30 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
             Ok(Some(Value::Object(Some(sv))))
         },
     );
+// BUG FIX (2026-07-10, es-storedscripts-retire): these Executors factory
+    // registrations (newFixedThreadPool, newCachedThreadPool x2,
+    // newSingleThreadExecutor below) were copy-pasted from the
+    // newScheduledThreadPool/newSingleThreadScheduledExecutor blocks above
+    // and never had their allocated class corrected: each one synthesized an
+    // object tagged java/util/concurrent/ScheduledThreadPoolExecutor instead
+    // of plain java/util/concurrent/ThreadPoolExecutor. Real JDK
+    // newFixedThreadPool()/newCachedThreadPool()/newSingleThreadExecutor()
+    // never return an STPE. Because register_executors_scheduled_natives
+    // (native_stpe_*) is gated off in real-JDK mode (see
+    // docs/internal/tomcat-suite-bugs/11-stpe-mainlock-npe-teardown-regression.md),
+    // no native shadowed these mistagged objects' methods, so real inherited
+    // ScheduledThreadPoolExecutor/ThreadPoolExecutor bytecode ran against a
+    // 2-field synthetic object whose ctl/workQueue/mainLock/workers fields
+    // were never initialised -- NPE ("Cannot invoke ReentrantLock.lock()
+    // because mainLock is null") on shutdown(), or on ctl.get() via
+    // submit()/schedule() (STPE.submit delegates through schedule()).
+    // Tagging the object ThreadPoolExecutor (matching the sibling
+    // registration in native-builtins/src/lib.rs::native_new_fixed_pool)
+    // routes shutdown()/shutdownNow()/isShutdown() through the
+    // already-synthetic-aware natives registered on ThreadPoolExecutor in
+    // lib.rs (executor_has_real_workers() correctly identifies this as
+    // synthetic and takes the safe branch instead of touching mainLock).
+    // See docs/known-issues/elasticsearch-suite/ES-FAIL-20260710-executors-factory-mistagged-stpe-mainlock-npe.md.
     r.register(
         ex,
         "newFixedThreadPool",
@@ -8832,7 +8856,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
             };
             let sv = alloc_concurrent_synthetic(
                 ctx,
-                "java/util/concurrent/ScheduledThreadPoolExecutor",
+                "java/util/concurrent/ThreadPoolExecutor",
                 2,
             );
             ctx.set_field(sv, 0, Value::Int(ps));
@@ -8847,7 +8871,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         |ctx, _args| {
             let sv = alloc_concurrent_synthetic(
                 ctx,
-                "java/util/concurrent/ScheduledThreadPoolExecutor",
+                "java/util/concurrent/ThreadPoolExecutor",
                 2,
             );
             ctx.set_field(sv, 0, Value::Int(0));
@@ -8862,7 +8886,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         |ctx, _args| {
             let sv = alloc_concurrent_synthetic(
                 ctx,
-                "java/util/concurrent/ScheduledThreadPoolExecutor",
+                "java/util/concurrent/ThreadPoolExecutor",
                 2,
             );
             ctx.set_field(sv, 0, Value::Int(0));
@@ -8877,7 +8901,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         |ctx, _args| {
             let sv = alloc_concurrent_synthetic(
                 ctx,
-                "java/util/concurrent/ScheduledThreadPoolExecutor",
+                "java/util/concurrent/ThreadPoolExecutor",
                 2,
             );
             ctx.set_field(sv, 0, Value::Int(1));
@@ -10332,13 +10356,26 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         let this = obj_arg(args, 0)?;
         let host = obj_arg(args, 1)?;
         let port = args[2].as_int().unwrap_or(0);
-        p52_isa_set(
-            ctx,
-            this,
-            Value::Object(Some(host)),
-            Value::Object(None),
-            port,
-        );
+        // Real JDK resolves the hostname via `InetAddress.getByName(host)`
+        // here, falling back to an unresolved address only on
+        // UnknownHostException. Leaving `addr` unconditionally null made
+        // EVERY `new InetSocketAddress(String,int)` permanently unresolved
+        // (`getAddress()` always null, `isUnresolved()` always true), even
+        // for trivially-resolvable literals like "127.0.0.1" — this broke
+        // `sun.nio.ch.SocketAdaptor.getInetAddress()` (its private
+        // `remoteAddress()` builds one of these from the channel's peer IP
+        // string), which in turn NPE'd `RemoteCIDRValve.isAllowed` on any
+        // Tomcat context configured with that valve (e.g. the examples
+        // webapp's `META-INF/context.xml`).
+        let host_str = ctx.read_string(host).unwrap_or_default();
+        let addr = crate::net_phase_e::resolve_host_external(&host_str)
+            .map(|ip| {
+                Value::Object(Some(crate::net_phase_e::alloc_inet_address_external(
+                    ctx, &host_str, &ip,
+                )))
+            })
+            .unwrap_or(Value::Object(None));
+        p52_isa_set(ctx, this, Value::Object(Some(host)), addr, port);
         Ok(Some(Value::Object(None)))
     });
     r.register(isa, "<init>", "(Ljava/net/InetAddress;I)V", |ctx, args| {

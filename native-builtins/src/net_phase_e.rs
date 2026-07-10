@@ -483,6 +483,15 @@ pub(crate) fn alloc_inet_address_external(
     alloc_inet_address(ctx, host, ip)
 }
 
+/// `pub(crate)` re-export of [`resolve_host`] for sibling modules that need
+/// to resolve a hostname/literal to an IP string without duplicating the
+/// IPv4/IPv6-literal-then-DNS-fallback logic (used by `phases_early.rs`'s
+/// synthetic `InetSocketAddress(String,int)` constructor — see its call site
+/// for why an unconditionally-unresolved address is wrong there).
+pub(crate) fn resolve_host_external(host: &str) -> Option<String> {
+    resolve_host(host).ok().map(|ip| ip.to_string())
+}
+
 /// Read an InetAddress's `(hostName, ipAddress)` from the side table.
 /// Returns `None` for an InetAddress we never recorded.
 ///
