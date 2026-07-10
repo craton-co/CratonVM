@@ -1,0 +1,44 @@
+diff --git a/vm/src/vm/vm_exec.rs b/vm/src/vm/vm_exec.rs
+--- a/vm/src/vm/vm_exec.rs
++++ b/vm/src/vm/vm_exec.rs
+@@ -6127,7 +6127,33 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
+                 }
+             };
+             // Coerce return value from impl's descriptor back to SAM's view.
+-            let r = raw_result?;
++            let r = match raw_result {
++                Ok(result) => result,
++                Err(MethodCallFailed::InternalError(VmError::Linkage(
++                    LinkageError::NoSuchMethodError {
++                        class_name,
++                        method_name,
++                        method_descriptor,
++                    },
++                ))) => {
++                    if let Some(result) = object_serialization_hook_neutral_result(
++                        &method_name,
++                        &method_descriptor,
++                        &full_args,
++                    ) {
++                        if std::env::var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some() {
++                            eprintln!(
++                                "[rf-ser] neutral MethodHandle missing hook {}.{}{}",
++                                class_name, method_name, method_descriptor
++                            );
++                        }
++                        result
++                    } else {
++                        return Err(MethodCallFailed::InternalError(VmError::Linkage(
++                            LinkageError::NoSuchMethodError {
++                                class_name,
++                                method_name,
++                                method_descriptor,
++                            },
++                        )));
++                    }
++                }
++                Err(err) => return Err(err),
++            };
+             crate::runtime::interpreter::coerce_return(
+                 self.shared,
+                 self.thread,

@@ -1,0 +1,105 @@
+diff --git a/native-builtins/src/serialization.rs b/native-builtins/src/serialization.rs
+--- a/native-builtins/src/serialization.rs
++++ b/native-builtins/src/serialization.rs
+@@ -3491,6 +3491,10 @@ fn native_jdk_reflection_factory_get(
+     Ok(Some(Value::Object(Some(obj))))
+ }
+ 
++fn reflection_factory_debug_enabled() -> bool {
++    std::env::var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some()
++}
++
+ fn reflection_factory_class_arg(
+     ctx: &dyn NativeContext,
+     args: &[Value],
+@@ -3539,9 +3543,27 @@ fn reflection_factory_private_hook(
+     let Some((class_id, _)) = reflection_factory_class_arg(ctx, args) else {
+         return Ok(Some(Value::Object(None)));
+     };
+-    match find_private_method(ctx, class_id, name, descriptor) {
+-        Some(method) => reflection_factory_hook_handle(ctx, class_id, method),
+-        None => Ok(Some(Value::Object(None))),
++    let target_name = ctx.class_name_of_id(class_id).unwrap_or_default();
++    let method = find_private_method(ctx, class_id, name, descriptor);
++    if reflection_factory_debug_enabled() {
++        match &method {
++            Some(m) => eprintln!(
++                "[rf-ser] private {}{} target={} cid={} -> handle decl_cid={} decl={} meta_desc={}",
++                name,
++                descriptor,
++                target_name,
++                class_id.as_u32(),
++                m.declaring_class_id.as_u32(),
++                ctx.class_name_of_id(m.declaring_class_id).unwrap_or_default(),
++                m.descriptor
++            ),
++            None => eprintln!(
++                "[rf-ser] private {}{} target={} cid={} -> null",
++                name,
++                descriptor,
++                target_name,
++                class_id.as_u32()
++            ),
++        }
+     }
++    match method {
++        Some(method) => reflection_factory_hook_handle(ctx, class_id, method),
++        None => Ok(Some(Value::Object(None))),
++    }
+ }
+ 
+ fn reflection_factory_inheritable_hook(
+@@ -3554,9 +3576,27 @@ fn reflection_factory_inheritable_hook(
+     let Some((class_id, _)) = reflection_factory_class_arg(ctx, args) else {
+         return Ok(Some(Value::Object(None)));
+     };
+-    match find_inheritable_method(ctx, class_id, name, descriptor) {
+-        Some(method) => reflection_factory_hook_handle(ctx, class_id, method),
+-        None => Ok(Some(Value::Object(None))),
++    let target_name = ctx.class_name_of_id(class_id).unwrap_or_default();
++    let method = find_inheritable_method(ctx, class_id, name, descriptor);
++    if reflection_factory_debug_enabled() {
++        match &method {
++            Some(m) => eprintln!(
++                "[rf-ser] inheritable {}{} target={} cid={} -> handle decl_cid={} decl={} meta_desc={}",
++                name,
++                descriptor,
++                target_name,
++                class_id.as_u32(),
++                m.declaring_class_id.as_u32(),
++                ctx.class_name_of_id(m.declaring_class_id).unwrap_or_default(),
++                m.descriptor
++            ),
++            None => eprintln!(
++                "[rf-ser] inheritable {}{} target={} cid={} -> null",
++                name,
++                descriptor,
++                target_name,
++                class_id.as_u32()
++            ),
++        }
+     }
++    match method {
++        Some(method) => reflection_factory_hook_handle(ctx, class_id, method),
++        None => Ok(Some(Value::Object(None))),
++    }
+ }
+ 
+ fn native_reflection_factory_read_object(
+@@ -3653,6 +3693,16 @@ fn constructor_meta_from_constructor_object(
+         Value::Int(flags) => flags as u16,
+         _ => 0,
+     };
++    if reflection_factory_debug_enabled() {
++        eprintln!(
++            "[rf-ser] ctor-copy obj={:?} decl_cid={} decl={} desc={} flags=0x{:x}",
++            ctor_obj,
++            declaring_class_id.as_u32(),
++            ctx.class_name_of_id(declaring_class_id).unwrap_or_default(),
++            descriptor,
++            access_flags
++        );
++    }
+     Some(MethodMetadata {
+         name: "<init>".to_string(),
+         descriptor,
