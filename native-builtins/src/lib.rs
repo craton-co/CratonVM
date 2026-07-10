@@ -18480,6 +18480,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(I)I",
         native_matcher_end_idx,
     );
+    registry.register(
+        "java/util/regex/Matcher",
+        "replaceAll",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        native_matcher_replace_all,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "replaceFirst",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        native_matcher_replace_first,
+    );
 
     // bug-26 (kafka SCRAM): `javax.crypto.Mac` (getInstance/init/update/doFinal)
     // was only registered inside `register_synthetic_overrides`, which real-JDK
@@ -23885,6 +23897,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             _ => None,
         };
         ctx.set_field_by_name(this, "name", name);
+        let tid = next_java_thread_tid();
+        ctx.set_field_by_name(this, "tid", Value::Long(tid));
+        if let Some(tid_slot) = ctx.resolve_field_index("java/lang/Thread", "tid") {
+            ctx.set_field(this, tid_slot, Value::Long(tid));
+        }
         // JDK 17 keeps the Runnable directly on Thread.target and has no
         // Thread$FieldHolder. Seed the direct field before attempting the newer
         // holder layout so app-created threads still run on that JDK shape.
@@ -38429,6 +38446,15 @@ fn thread_next_tid_offset() -> usize {
     offset
 }
 
+fn next_java_thread_tid() -> i64 {
+    let offset = thread_next_tid_offset();
+    let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
+    let entry = map.entry(offset).or_insert(1);
+    let tid = (*entry).max(1);
+    *entry = tid.saturating_add(1);
+    tid
+}
+
 /// Lock the shard that owns `key` in a `usize`-keyed sharded map.
 #[inline]
 fn lock_unsafe_shard_usize<V>(
@@ -44607,7 +44633,7 @@ fn native_matcher_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         None => return Ok(Some(Value::Object(Some(ctx.create_string(&input))))),
     };
     let re = read_pattern_regex(ctx, pat_obj)?;
-    let result = re.replace_all(&input, replacement.as_str());
+    let result = re.replace_all_java(&input, replacement.as_str());
     Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
 }
 
@@ -44626,7 +44652,7 @@ fn native_matcher_replace_first(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         None => return Ok(Some(Value::Object(Some(ctx.create_string(&input))))),
     };
     let re = read_pattern_regex(ctx, pat_obj)?;
-    let result = re.replace_first(&input, replacement.as_str());
+    let result = re.replace_first_java(&input, replacement.as_str());
     Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
 }
 
