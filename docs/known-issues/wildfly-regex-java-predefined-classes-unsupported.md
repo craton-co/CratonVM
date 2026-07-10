@@ -79,6 +79,51 @@ WildFly at all; it is a fundamental, extremely widely-used JDK class. Any other 
 that compiles a `\p{java*}` pattern directly (rare, since most application code uses `\s`/`\d`/`\w` instead
 of the java-specific forms) would hit the same failure.
 
+### Confirmed scale — round-5 full-suite rerun, 2026-07-10
+
+Reran all 1531 non-passed/never-tested WildFly classes (2 shards, same binary) after writing this doc.
+**947 of 1531 classes (61.9%)** hit this exact bug directly (`NoClassDefFoundError: java/util/Scanner`,
+928 classified `FAIL` + 19 `TIMEOUT`) — making it by far the single dominant blocker of this round, ahead
+of every other cause combined.
+
+The blast radius is larger still: Maven Surefire's own forked-JVM bookkeeping thread
+(`org.apache.maven.surefire.booter.PpidChecker`, which runs on a `ScheduledThreadPoolExecutor` inside
+every forked test JVM to detect a dead parent process) also lazily triggers `Scanner.<clinit>` the first
+time it runs. Confirmed directly via a `.dumpstream` file from this run:
+
+```text
+WARN cratonvm_vm::vm::vm_util: <clinit> failed — wrapping in ExceptionInInitializerError class=java/util/Scanner
+  cause=java/lang/IllegalArgumentException PatternSyntaxException: Error compiling regex: Regex error: error parsing pattern 0
+  [CLINIT-TRACE 0] at java/util/concurrent/ThreadPoolExecutor$Worker.run (ThreadPoolExecutor.java:614)
+  ...
+  [CLINIT-TRACE 5] at org/apache/maven/surefire/booter/ForkedBooter$2.run (ForkedBooter.java:214)
+  [CLINIT-TRACE 6] at org/apache/maven/surefire/booter/PpidChecker.isProcessAlive (PpidChecker.java:123)
+```
+
+Across the run window, **1171 of 1236 (94.7%)** `.dumpstream` files written by forked test JVMs in
+`/data/data/cratonvm/apps/wildfly` contain this exact clinit failure — i.e. it fires in nearly every single
+forked JVM CratonVM launches under this harness, independent of which test class is under test. When it
+fires early enough in the fork's lifetime (which it usually does, since `PpidChecker`'s check runs on a
+short fixed schedule right after fork startup), the uncaught `ExceptionInInitializerError` in that
+background thread kills the fork before it ever prints `Running <class>` — Surefire's parent process (on
+real JDK 17, unaffected) then sees a fork that died mid-protocol and reports one of two downstream
+symptoms depending on exactly when the pipe was cut:
+
+- `org.apache.maven.surefire.booter.SurefireBooterForkException: The forked VM terminated without properly
+  saying goodbye. VM crash or System.exit called?` — classified `CRASH` by this harness. **20/20 CRASH
+  classes this round** showed zero evidence of ever reaching test execution (no `Running org.wildfly...`
+  line), consistent with all 20 being this same fork-startup crash rather than 20 distinct issues.
+- `org.apache.maven.surefire.booter.SurefireBooterForkException: There was an error in the forked process
+  / Test mechanism :: java.lang.Object cannot be cast to java.lang.Integer` — Maven's `ForkStarter` failing
+  to decode a value from the corrupted/truncated wire-protocol stream left by the fork dying mid-write.
+  **58 instances this round**, all likewise missing any `Running org.wildfly...` evidence.
+
+Net: of the 1531 classes rerun, roughly **1025 (947 + 20 + 58 ≈ 67%)** show direct or downstream evidence
+of this one bug. The remaining non-passing classes are dominated by an unrelated, pre-existing
+shared-host/shared-checkout race (`WFLYLNCHR0001`/`WFLYLNCHR0003`: `target/wildfly` provisioning directory
+missing or incomplete when a class runs — not a CratonVM bug, see harness notes), not additional CratonVM
+defects.
+
 ## Fix sketch (not implemented — root cause identified for whoever picks this up)
 
 Extend `translate_java_regex()` with a rewrite table for the `\p{java*}` family. Since the `regex` crate has
