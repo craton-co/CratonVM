@@ -10173,13 +10173,28 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         let this = obj_arg(args, 0)?;
         let host = obj_arg(args, 1)?;
         let port = args[2].as_int().unwrap_or(0);
-        p52_isa_set(
-            ctx,
-            this,
-            Value::Object(Some(host)),
-            Value::Object(None),
-            port,
-        );
+        // Real InetSocketAddress(String, int) attempts to resolve the
+        // hostname via InetAddress.getByName and only leaves the address
+        // unresolved (isUnresolved()==true, getAddress()==null) if that
+        // genuinely fails. This synthetic constructor used to always pass
+        // addr=None unconditionally, so EVERY string-based InetSocketAddress
+        // -- even a literal IP like 127.0.0.1 -- came out permanently
+        // unresolved. That silently broke any real-bytecode caller that
+        // extracts the InetAddress (e.g. SocketAdaptor.getInetAddress(),
+        // which Tomcat's RemoteCIDRValve needs via Request.getRemoteAddr())
+        // -- toString() still looked fine since it just prints the host
+        // string, masking the gap. Mirror the real semantics: try to
+        // resolve, fall back to unresolved only on failure.
+        let addr = match ctx.invoke(
+            "java/net/InetAddress",
+            "getByName",
+            "(Ljava/lang/String;)Ljava/net/InetAddress;",
+            &[Value::Object(Some(host))],
+        ) {
+            Ok(Some(v @ Value::Object(Some(_)))) => v,
+            _ => Value::Object(None),
+        };
+        p52_isa_set(ctx, this, Value::Object(Some(host)), addr, port);
         Ok(Some(Value::Object(None)))
     });
     r.register(isa, "<init>", "(Ljava/net/InetAddress;I)V", |ctx, args| {
