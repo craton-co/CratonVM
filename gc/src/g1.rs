@@ -1283,6 +1283,24 @@ pub struct G1Collector {
     /// by [`Self::collect_garbage_with_finalizers`].
     resurrected_finalizers: Mutex<Vec<usize>>,
 
+    /// Region indices still holding UNRESOLVED self-forwarded objects after
+    /// the evacuation-failure retry loop gave up (wedged drain / pass cap).
+    /// Paired with [`Self::kept_unresolved_live`]: inside such a region,
+    /// ONLY the recorded self-forwarded addresses are live — everything
+    /// else below the cursor is dead garbage the failing pass never
+    /// scanned, whose ref slots were never rewritten. `is_addr_in_live_region`
+    /// must not report those dead bodies as live, or post-GC reference
+    /// processing "restores" a weak referent whose fields dangle into
+    /// regions freed the same pause (G1CORE-3). Cleared at the start of
+    /// every retry evaluation; normally both sets are empty.
+    kept_unresolved_regions: Mutex<std::collections::HashSet<usize>>,
+    /// The self-forwarded (live-in-place) addresses within
+    /// [`Self::kept_unresolved_regions`].
+    kept_unresolved_live: Mutex<std::collections::HashSet<usize>>,
+    /// Lock-free fast gate for the two sets above (they are empty except in
+    /// the rare wedged-drain window; `is_addr_in_live_region` is a hot path).
+    kept_unresolved_any: AtomicBool,
+
     /// SECURITY FIX (V7a): RSet write-barrier TLS-cache epoch.
     ///
     /// `post_write_barrier_rset`'s fast path caches a stable `*const
@@ -1417,6 +1435,9 @@ impl G1Collector {
             mark_worklist_overflowed: AtomicBool::new(false),
             pending_finalizer_roots: Mutex::new(Vec::new()),
             resurrected_finalizers: Mutex::new(Vec::new()),
+            kept_unresolved_regions: Mutex::new(std::collections::HashSet::new()),
+            kept_unresolved_live: Mutex::new(std::collections::HashSet::new()),
+            kept_unresolved_any: AtomicBool::new(false),
             // SECURITY FIX (V7a): start the RSet TLS-cache epoch at 0.
             rset_cache_epoch: AtomicU64::new(0),
             region_lookup,
@@ -1705,6 +1726,12 @@ impl G1Collector {
             m.iter().filter(|(k, v)| k == v).map(|(&k, _)| k).collect()
         };
 
+        // Reset the unresolved-kept tracking for this pause; repopulated
+        // below iff the drain gives up with seeds remaining.
+        self.kept_unresolved_any.store(false, Ordering::Release);
+        self.kept_unresolved_regions.lock().clear();
+        self.kept_unresolved_live.lock().clear();
+
         let mut acc = first;
         let mut seeds = identities(&acc.pointer_map);
         if seeds.is_empty() {
@@ -1750,7 +1777,88 @@ impl G1Collector {
                 break; // genuinely wedged: the live set does not fit (true OOM)
             }
         }
+        if !seeds.is_empty() {
+            // The drain gave up (wedge / pass cap) with live self-forwarded
+            // objects still parked in kept regions. Two follow-ups keep the
+            // heap coherent until a later pause resolves them:
+            //
+            // (a) G1CORE-4: their ref slots were rewritten IN PLACE to
+            //     to-space addresses by the failing pass — GC-internal edges
+            //     no mutator barrier ever recorded. A kept OLD region is not
+            //     re-collected automatically (unlike kept Eden→Survivor), so
+            //     without remembered-set entries the next young pause never
+            //     scans it as a source and frees its live young referents.
+            //     Record each seed's outgoing cross-region edges now.
+            //
+            // (b) G1CORE-3: record the kept regions + their live addresses
+            //     so `is_addr_in_live_region` reports the regions' DEAD
+            //     bodies (never scanned, slots never rewritten) as dead —
+            //     otherwise post-GC reference processing restores weak
+            //     referents whose fields dangle into same-pause-freed
+            //     regions.
+            {
+                let mut regions = self.regions.lock();
+                for &seed in &seeds {
+                    self.record_outgoing_rset_edges(&mut regions, seed);
+                }
+            }
+            let mut kept_regions = self.kept_unresolved_regions.lock();
+            let mut kept_live = self.kept_unresolved_live.lock();
+            for &seed in &seeds {
+                if let Some(idx) = self.lookup_region_for_addr(seed) {
+                    kept_regions.insert(idx);
+                }
+                kept_live.insert(seed);
+            }
+            self.kept_unresolved_any.store(true, Ordering::Release);
+        }
         acc
+    }
+
+    /// Record remembered-set edges for every cross-region reference held by
+    /// the (live, in-place) object at `obj_addr` — the GC-internal
+    /// counterpart of `post_write_barrier_rset` for slots the collector
+    /// itself rewrote. See the unresolved-kept block in
+    /// [`Self::retry_after_evacuation_failure`].
+    fn record_outgoing_rset_edges(&self, regions: &mut [G1Region], obj_addr: usize) {
+        let Some(src_idx) = self.lookup_region_for_addr(obj_addr) else {
+            return;
+        };
+        let obj_ptr = obj_addr as *mut u8;
+        // Kept objects are ordinary (humongous regions never enter a CSet),
+        // so flat payload reads are in-bounds.
+        let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+        let mut record = |raw: usize| {
+            if raw == 0 {
+                return;
+            }
+            if let Some(dst_idx) = self.lookup_region_for_addr(raw) {
+                if dst_idx != src_idx && regions[dst_idx].region_type != RegionType::Free {
+                    regions[dst_idx].rset.add_reference(src_idx);
+                }
+            }
+        };
+        if header.kind == ObjectKind::Array {
+            if header.element_type == ArrayElementType::Reference {
+                for i in 0..header.array_length as usize {
+                    // SAFETY: i < array_length — inside the allocation.
+                    let raw =
+                        unsafe { std::ptr::read(obj_ptr.add(HEADER_SIZE + i * 8) as *const u64) };
+                    record(raw as usize);
+                }
+            }
+        } else {
+            for slot_idx in 0..header.num_slots as usize {
+                // SAFETY: slot_idx < num_slots — inside the allocation. STW:
+                // no concurrent mutator stores, plain reads are fine.
+                let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+                let value =
+                    unsafe { cratonvm_types::read_value_atomic(slot_ptr as *const Value) };
+                if let Value::Object(Some(r)) = value {
+                    record(r.as_ptr() as usize);
+                }
+            }
+        }
     }
 
     /// Minimal same-pause drain of evacuation-failed objects: evacuate exactly
@@ -2260,10 +2368,19 @@ impl G1Collector {
         let cap_percent = self.config.old_cset_region_threshold_percent as usize;
         let max_old = ((total_regions * cap_percent) / 100).max(1);
 
+        // `live_bytes > 0` = "has liveness data from the last completed mark
+        // cycle" (HotSpot likewise only mixes regions with marking data). A
+        // region promoted into AFTER cleanup still carries the reset()
+        // defaults live_bytes=0 / gc_efficiency=0: it sorts FIRST (looks
+        // like 100% garbage) with an estimated evacuation cost of 0, so the
+        // pause budget never binds on it and the mixed pause copies fully-
+        // live regions wholesale — blowing max_gc_pause_ms and draining
+        // to-space toward evacuation failure. A genuinely 0-live STAMPED
+        // region cannot appear here: cleanup frees those in place.
         let mut candidates: Vec<(usize, f64)> = regions
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.region_type == RegionType::Old && !r.pinned)
+            .filter(|(_, r)| r.region_type == RegionType::Old && !r.pinned && r.live_bytes > 0)
             .map(|(i, r)| (i, r.gc_efficiency))
             .collect();
         candidates.sort_by(|a, b| {
@@ -2361,7 +2478,12 @@ impl G1Collector {
             .iter()
             .enumerate()
             .filter(|(i, r)| {
-                r.region_type == RegionType::Old && !r.pinned && !jit_pinned_regions.contains(i)
+                // live_bytes > 0 = has liveness data from the last completed
+                // mark cycle — see select_old_regions_for_mixed_gc.
+                r.region_type == RegionType::Old
+                    && !r.pinned
+                    && !jit_pinned_regions.contains(i)
+                    && r.live_bytes > 0
             })
             .map(|(i, r)| (i, r.gc_efficiency))
             .collect();
@@ -3043,9 +3165,12 @@ impl G1Collector {
             .iter()
             .enumerate()
             .filter(|(i, r)| {
+                // live_bytes > 0 = has liveness data from the last completed
+                // mark cycle — see select_old_regions_for_mixed_gc.
                 r.region_type == RegionType::Old
                     && !r.pinned
                     && !jit_pinned_regions.contains(i)
+                    && r.live_bytes > 0
             })
             .map(|(i, r)| (i, r.gc_efficiency))
             .collect();
@@ -4580,6 +4705,25 @@ impl G1Collector {
     pub fn concurrent_mark_step(&self, work_amount: usize) -> bool {
         if work_amount == 0 {
             return self.mark_worklist.lock().is_empty();
+        }
+
+        // G1MARK-6: pull mutator SATB overwrites into the gray set NOW
+        // rather than letting them pile up in the shard queue until a young
+        // pause or the final remark drains them. A mutation-heavy but
+        // allocation-free phase (in-place updates of a preallocated working
+        // set) triggers no young pauses, so the shards — which have no size
+        // bound — grew without limit and the eventual remark pause was
+        // O(all entries). Draining from the marker keeps the queue bounded
+        // by the marker's cadence and shrinks the final remark. Entries
+        // logged after this drain are picked up on the next step; the
+        // gray-set/worklist protocol is the same one remark uses.
+        // (Must run BEFORE the worklist lock below — push_gray_or_mark
+        // takes that lock itself.)
+        {
+            let regions = self.regions.lock();
+            for addr in self.satb_queue.drain() {
+                self.push_gray_or_mark(&regions, addr);
+            }
         }
 
         let regions = self.regions.lock();
@@ -6172,7 +6316,24 @@ impl G1Collector {
                 // is below the region's allocation cursor.
                 _ => {
                     let base = r.data.as_ptr() as usize;
-                    addr >= base && addr < base + r.cursor
+                    if addr < base || addr >= base + r.cursor {
+                        return false;
+                    }
+                    // G1CORE-3: a kept region with UNRESOLVED evacuation
+                    // failures holds exactly the recorded self-forwarded
+                    // objects as live — the rest of its below-cursor bytes
+                    // are dead garbage the failing pass never scanned, whose
+                    // ref slots were never rewritten. Reporting those as
+                    // live lets reference processing "restore" a dead weak
+                    // referent whose fields dangle into regions freed the
+                    // same pause. Both sets are empty except in the rare
+                    // wedged-drain window (one lock + one lookup then).
+                    if self.kept_unresolved_any.load(Ordering::Acquire)
+                        && self.kept_unresolved_regions.lock().contains(&idx)
+                    {
+                        return self.kept_unresolved_live.lock().contains(&addr);
+                    }
+                    true
                 }
             },
         }
