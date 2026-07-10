@@ -10345,6 +10345,19 @@ fn phase52_socket_connect(
             let id = crate::servlet::s2_alloc_stream(stream);
             ctx.set_field(sock, SOCK_STREAM_ID, Value::Int(id));
             ctx.set_field(sock, SOCK_LOCAL_PORT, Value::Int(local_port));
+            // FIX (SocketFactory.createSocket "not connected" split-brain):
+            // `Socket.getOutputStream`/`getInputStream`/`isConnected` (registered
+            // in net_phase_e.rs) read connect state from an identity-keyed side
+            // table, not these raw fields (see net_phase_e.rs's SockSide doc
+            // comment) -- the same collision `sock_set_for_create` was added to
+            // fix for `SSLSocketFactory.createSocket`. This factory path never
+            // populated that side table, so a socket obtained via
+            // `SocketFactory.getDefault().createSocket(host, port)` connected
+            // for real but every later side-table-backed accessor saw the
+            // default stream_id=-1 ("not connected"). Populate it here too.
+            crate::net_phase_e::sock_set_for_create_with_local_port(
+                ctx, sock, port, local_port, id,
+            );
             Ok(Some(Value::Object(Some(sock))))
         }
         Err(e) => Err(RuntimeError::IOException {
