@@ -2125,6 +2125,14 @@ pub fn precise_jit_maps_enabled() -> bool {
 /// fresh-object-initialisation pattern (`n.left = newChild`) that dominates
 /// allocation-heavy code (object binarytrees). DEFAULT-OFF pending GC-stress
 /// validation; opt in with `CRATONVM_JIT_INLINE_PUTFIELD`.
+///
+/// INT-6 (GC audit 2026-07-10): the YOUNG test reads `GC_FLAG_OLD_GEN`, which
+/// only the GENERATIONAL backend maintains — under G1/ZGC every object read
+/// as "young" and the fast path elided G1's RSet post-barrier for Old→young
+/// stores. Both inline arms now prepend the guarded-getfield receiver check
+/// (null/alignment/published-region containment): G1/ZGC never publish
+/// region bounds, so every receiver bails to the full-barrier helper there,
+/// making the switch safe to enable on any backend.
 pub fn inline_putfield_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -20020,7 +20028,10 @@ impl Compiler {
                             if let Some(&(c_off, _)) = self
                                 .compact_field_off
                                 .get(&pc)
-                                .filter(|_| cratonvm_types::compact_ref_fields_enabled())
+                                .filter(|_| {
+                                    cratonvm_types::compact_ref_fields_enabled()
+                                        && self.helpers.region_bounds_addr != 0
+                                })
                             {
                                 if std::env::var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
                                     eprintln!("[compact-inline] putfield-ref pc={pc} off={c_off}");
@@ -20037,9 +20048,22 @@ impl Compiler {
                                 let cell_off = (HEADER_SIZE + c_off as usize) as i32; // Cast: disp32
                                 let mut bail: Vec<usize> = Vec::new();
                                 self.load_slot_to_reg(RAX, obj_slot);
-                                // null receiver → helper.
-                                self.emit_test_r64_r64(RAX);
-                                bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+                                // INT-6: null + alignment + published-region
+                                // containment (subsumes the old bare null check).
+                                // The YOUNG test below reads GC_FLAG_OLD_GEN,
+                                // which ONLY the Generational backend maintains —
+                                // under G1/ZGC every object reads as "young" and
+                                // the fast path would skip G1's RSet post-barrier
+                                // for an Old→young store (edge lost, referent
+                                // freed live at the next young pause). G1/ZGC
+                                // publish no region bounds (table all zeros), so
+                                // this guard routes EVERY receiver to the full-
+                                // barrier helper there; under Generational it
+                                // adds the same three containment compares the
+                                // guarded getfield already pays.
+                                bail.extend(self.emit_guarded_getfield_receiver_check(
+                                    self.helpers.region_bounds_addr,
+                                ));
                                                                             // LEGACY receiver (no GC_FLAG_COMPACT) → helper: the
                                                                             // compact 8-byte cell offset is only valid for a
                                                                             // genuinely-compact object. A class with a registered
@@ -20087,14 +20111,26 @@ impl Compiler {
                                 self.patch_rel32_to_here(done);
                             } else if inline_putfield_enabled()
                                 && !cratonvm_types::compact_ref_fields_enabled()
+                                && self.helpers.region_bounds_addr != 0
                             {
                                 let cell_off = (HEADER_SIZE + field_index * SLOT_SIZE) as i32; // Cast: x86-64 disp32
                                 let mut bail: Vec<usize> = Vec::new();
                                 // obj → RAX
                                 self.load_slot_to_reg(RAX, obj_slot);
-                                // null receiver → helper (matches the helper's no-op).
-                                self.emit_test_r64_r64(RAX);
-                                bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+                                // INT-6: null + alignment + published-region
+                                // containment (subsumes the old bare null check;
+                                // null still reaches the helper, matching its
+                                // no-op semantics). The YOUNG test below reads
+                                // GC_FLAG_OLD_GEN, which ONLY the Generational
+                                // backend maintains — under G1/ZGC every object
+                                // reads as "young" and this fast path would elide
+                                // G1's RSet post-barrier for an Old→young store.
+                                // G1/ZGC publish no region bounds (table all
+                                // zeros), so every receiver bails to the full-
+                                // barrier helper there.
+                                bail.extend(self.emit_guarded_getfield_receiver_check(
+                                    self.helpers.region_bounds_addr,
+                                ));
                                                                             // old-gen receiver → helper (card barrier). gc_flags is
                                                                             // the byte at header offset 21; GC_FLAG_OLD_GEN == bit 0.
                                 self.emit_mov_r32_mem_disp32(RCX, RAX, 21);
