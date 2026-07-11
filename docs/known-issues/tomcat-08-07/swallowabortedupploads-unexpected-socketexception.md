@@ -1151,3 +1151,91 @@ instead; (2) once a fresh core is caught, cross-reference its crash PC against
 `CRATONVM_DBG_JIT_NAMES=1`'s `lookup_jit_method_name` output (not attempted
 this pass) to identify the actual Java method/bytecode offset, which no prior
 session in this bug's history has done.
+
+## 2026-07-11: mechanism narrowed further — locals dataflow ruled OUT, two remaining candidates identified; no fix attempted
+
+Follow-up to the "Case B confirmed" section above, prompted by attempting to
+scope an actual fix. A resumed diagnostic session hit an API session limit
+mid-run (its live-repro attempts — ~50 more launches across a `hunt.sh`
+driver script — reproduced the same picture as the section above: no fresh
+crash, majority hung on the unrelated STW-takeover contention bug); its
+partial draft is folded into this section rather than lost. Direct source
+reading (`jit/src/x64.rs`) this session adds one concrete, load-bearing
+correction and narrows the remaining hypothesis space to two candidates:
+
+**`compute_local_oop_masks`'s AND-intersection at CFG merge points is NOT the
+gap** — its own doc comment carries a rigorous soundness argument grounded in
+JVM bytecode verification: "A live oop that is conditionally a primitive on
+another path merges to 'not definitely oop' and is omitted; such a slot is
+necessarily dead-as-oop at that PC (the verifier forbids reading a slot with
+conflicting types), so the omission is safe." The verifier's own type-merge
+rules already guarantee a local can't be soundly read as a reference at a
+program point where it's oop-typed on one incoming edge and not on another.
+An earlier hypothesis this session considered — switching that AND to an OR
+(over-approximate, "can only over-retain, never corrupt" under the current
+non-moving collector, mirroring the `=all` register-spill argument) — is
+**not the right fix**: it targets a dataflow that is already provably sound
+for locals. **Do not pursue this specific change without addressing why this
+soundness argument would be wrong first** — it would be adding complexity
+without closing the actual gap.
+
+**Where the actual gap lives**, per the SB-CRASH-04 doc comment on
+`emit_pre_safepoint_spill` ("an oop can also live in a callee-saved register
+as an operand-stack temporary that survives the call, **or via a value the
+per-slot oop tracker fails to tag**") and a read of the sibling mechanism,
+`flush_scratch_registers`'s default-on `flush_callee_saved_oops` step
+(`jit/src/x64.rs` ~line 14853-14944): that step only spills a `StackSlot::
+CalleeSaved` operand-stack entry to its frame home if `self.stack_oop_marks`
+— the parallel "per-slot oop tracker" the SB-CRASH-04 comment names — already
+marks that stack index as holding a reference. **If `stack_oop_marks` fails
+to tag a genuinely-reference-valued stack entry (a false negative in that
+tracker, not in the locals dataflow), the default-on flush silently skips
+it**, leaving it register-resident and unprotected. This is a specific,
+falsifiable hypothesis, not yet confirmed: it requires finding a concrete
+operand-stack-producing code path where a reference value can end up on the
+stack without `stack_oop_marks` being set for it (candidates worth checking:
+values produced by inlined/guarded fast paths — the crash disassembly's
+class-identity-check shape strongly resembles `guarded_inline_getfield`/an
+invoke inline-cache fast path, both relatively new/complex codegen — merges
+of stack shapes across conditional branches feeding an invoke's receiver
+slot, or a stack entry produced by a call whose return-oop-ness isn't
+propagated into `stack_oop_marks` correctly).
+
+**A second, structurally different candidate was also identified and is
+NOT yet ruled out**: the crash's faulting instruction reloads `rsi` from a
+stack-relative address (`rbp-0x38`) rather than reading a register directly —
+i.e. this specific crash's immediate cause is a *stale read from a frame
+slot*, not (necessarily) an *unspilled register*. Two sub-hypotheses this
+implies, not distinguished this session:
+  (a) the slot was never populated with the live receiver at all (consistent
+      with the `stack_oop_marks` false-negative theory above — the flush that
+      would have written it never ran), or
+  (b) the slot WAS correctly populated at some earlier point but its backing
+      frame offset got reused/overwritten by unrelated codegen before this
+      reload — a frame-slot-lifetime/aliasing bug, a different and
+      structurally unrelated class of defect from "GC found the root
+      invisible." `reserve_spill_slots`' offset-reuse bookkeeping (not read
+      this session) would be the place to check for (b).
+
+These two candidates need genuinely different fixes ((a): extend
+`stack_oop_marks` propagation at whatever codegen site drops the tag; (b):
+fix spill-slot lifetime tracking so a live oop's frame home is never handed
+out to a different value while still needed) — **implementing either without
+confirming which one applies risks a wrong, unverified change to
+correctness-critical GC/JIT code**, which given the failure mode (silent
+memory corruption, not just a crash) is worse than leaving the bug open and
+well-documented. No code change was attempted this session for this reason.
+
+**Recommended concrete next step for whoever picks this up**: rather than
+another blind crash-hunt on this chronically-busy shared host (three
+consecutive sessions have now hit majority-hang rates from concurrent
+sessions' CPU load — this appears to be the host's steady state, not a
+transient spike), either (1) request a quieter/dedicated window, or (2)
+instrument `stack_oop_marks` writes directly with a temporary debug build
+(log every stack push/pop with its oop-mark bit, keyed by method+bci) and
+compare against `compute_param_oop_mask`-style ground truth for the specific
+inline-cache/invoke codegen path, which would settle hypothesis (a) without
+needing to catch a live crash at all — a static/logged trace of one run
+through the `AbortedPOSTClient` code path, cross-referenced against the
+bytecode's actual receiver-liveness, may be enough to confirm or refute it
+directly.
