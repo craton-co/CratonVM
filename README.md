@@ -70,8 +70,8 @@ every configuration. `CRATONVM_JIT_OSR` back-edge OSR is default-on;
 `guarded_inline_getfield_enabled()` is the single largest lever in the first 4 rows —
 see [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for its find/fix history.
 
-**HashMap and String/Regex are known-slow outliers, not calibration noise — but both
-are now root-caused, and partially fixed.** Sized far below the other kernels because
+**HashMap and String/Regex were known-slow outliers, not calibration noise; both
+are now root-caused and fixed.** Sized far below the other kernels because
 at JDK-comparable scale they don't complete in reasonable time.
 
 String/Regex's O(n²)-shaped scaling (18.8x at 1K entries → 238.8x at 10K in the
@@ -103,11 +103,12 @@ check-order, a lock-free receiver-corruption fast path, and a lock-free field-la
 cache mirroring an already-proven pattern elsewhere in this codebase) — a 5-round,
 isolated (same rationale as Binary Trees above) re-measurement post-fix averages
 **~206x** (14,930 ms CratonVM / 72.6 ms JDK), down from the isolated methodology's
-prior ~357x. Deliberately NOT touched: conservative root scanning and the SATB GC
-flush, both correctness-critical with a real prior crash/heap-corruption history in
-this codebase. See
-[`docs/known-issues/hashmap-native-dispatch-overhead.md`](docs/known-issues/hashmap-native-dispatch-overhead.md)
-for the full investigation and remaining-work writeup.*
+prior ~357x. A follow-up then addressed the correctness-sensitive root-publication
+and dispatch residual. The pinned million-entry
+probe improved from 18,113 ms to a five-round mean of 1,719 ms (**10.54x**), with
+identical checksums. See the archived
+[`docs/internal/hashmap-native-dispatch-overhead.md`](docs/internal/hashmap-native-dispatch-overhead.md)
+for the implementation and validation record.*
 
 See [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full 26-round JIT optimization journey.
 

@@ -1407,7 +1407,11 @@ impl GenerationalHeap {
     /// spilling the single allocation into old gen lets a young-full native call
     /// succeed without GC instead of `std::process::abort()`-ing the whole VM.
     /// The `GC_FLAG_OLD_GEN` mark keeps minor GC from trying to forward it.
-    pub(crate) fn try_alloc_object_old(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
+    pub(crate) fn try_alloc_object_old(
+        &self,
+        class_id: ClassId,
+        num_fields: usize,
+    ) -> Option<ObjectRef> {
         let (total_size, array_len, compact_flag) = plan_object_alloc(class_id, num_fields)?;
         let mut header = ObjectHeader::new(
             class_id,
@@ -8367,34 +8371,45 @@ fn compact_field_slot(header: &ObjectHeader, index: usize) -> Option<(usize, boo
         return None;
     }
     let cid = header.class_id.as_u32();
-    // Per-thread single-entry cache, mirroring `compact_oop_scan` (heap.rs) —
-    // getfield/putfield on a run of same-class objects (e.g. repeated
-    // `Integer` unboxing, or a HashMap's internal per-entry field writes)
-    // otherwise re-takes the `CLASS_LAYOUTS` registry RwLock on every single
-    // field access. Validated against `layout_generation()` so a redefine
-    // (which bumps the generation) cannot serve a stale layout. See
-    // reference_hashmap_native_call_dispatch_overhead_20260711.
+    // A single-entry cache thrashes on the common alternating-class pattern
+    // (for example Integer.value plus HashMap.size). Keep a tiny round-robin
+    // working set and resolve the requested slot while the cache is borrowed,
+    // avoiding both registry locks and Arc clone/drop traffic on hits.
+    struct FieldSlotCache {
+        entries: [Option<(u32, u64, Arc<CompactLayout>)>; 8],
+        next: usize,
+    }
+    impl FieldSlotCache {
+        const fn new() -> Self {
+            Self {
+                entries: [None, None, None, None, None, None, None, None],
+                next: 0,
+            }
+        }
+    }
     thread_local! {
-        static FIELD_SLOT_CACHE: std::cell::RefCell<Option<(u32, u64, Arc<CompactLayout>)>> =
-            const { std::cell::RefCell::new(None) };
+        static FIELD_SLOT_CACHE: std::cell::RefCell<FieldSlotCache> =
+            const { std::cell::RefCell::new(FieldSlotCache::new()) };
     }
     let gen = cratonvm_types::layout_generation();
-    let layout = FIELD_SLOT_CACHE.with(|c| {
-        {
-            let cache = c.borrow();
-            if let Some((cached_cid, cached_gen, arc)) = &*cache {
+    FIELD_SLOT_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        for entry in &cache.entries {
+            if let Some((cached_cid, cached_gen, layout)) = entry {
                 if *cached_cid == cid && *cached_gen == gen {
-                    return Some(arc.clone());
+                    let offset = layout.field_offset(index)? as usize;
+                    return Some((offset, layout.field_is_ref(index)?));
                 }
             }
         }
-        let arc = class_layout(cid)?;
-        *c.borrow_mut() = Some((cid, gen, arc.clone()));
-        Some(arc)
-    })?;
-    let off = layout.field_offset(index)? as usize;
-    let is_ref = layout.field_is_ref(index)?;
-    Some((off, is_ref))
+        let layout = class_layout(cid)?;
+        let offset = layout.field_offset(index)? as usize;
+        let is_ref = layout.field_is_ref(index)?;
+        let replace = cache.next;
+        cache.entries[replace] = Some((cid, gen, layout));
+        cache.next = (replace + 1) % cache.entries.len();
+        Some((offset, is_ref))
+    })
 }
 
 /// Visit every reference slot of an object/array (read-only), invoking

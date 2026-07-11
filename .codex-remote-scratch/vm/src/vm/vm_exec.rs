@@ -4187,6 +4187,32 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .map(|c| c.num_total_fields)
             .unwrap_or(0);
         let slots = num_fields.max(real_fields);
+        // Native callbacks execute on the mutator's own `JvmThread`, so small
+        // objects can use the same lock-free TLAB path as interpreted/JIT
+        // `new`. Historically this method went straight to `GenHeap`, taking
+        // the shared young-arena lock until young filled and then the old-gen
+        // lock for every allocation. Autobox-heavy code (notably
+        // HashMap<Integer, Integer>) therefore serialized millions of tiny
+        // wrapper allocations through global locks despite an available TLAB.
+        //
+        // This path deliberately does not initiate GC from inside the native
+        // callback: `tlab_alloc_object` only bumps/refills young space and
+        // returns `None` when it cannot. The existing `heap.alloc_object`
+        // fallback retains the previous spill/OOM behavior and native rooting
+        // contract.
+        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+        let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+        if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
+            if let Some(obj) = crate::runtime::interpreter::tlab_alloc_object(
+                self.thread,
+                self.shared,
+                class_id,
+                slots,
+                requested_size,
+            ) {
+                return obj;
+            }
+        }
         self.shared.heap.alloc_object(class_id, slots)
     }
 
@@ -11949,10 +11975,7 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/util/logging/Handler"
                             && matches!(
                                 (method_name, descriptor),
-                                ("<init>", "()V")
-                                    | ("getLevel", "()Ljava/util/logging/Level;")
-                                    | ("isLoggable", "(Ljava/util/logging/LogRecord;)Z")
-                                    | ("getFormatter", "()Ljava/util/logging/Formatter;")
+                                ("getFormatter", "()Ljava/util/logging/Formatter;")
                                     | ("setFormatter", "(Ljava/util/logging/Formatter;)V")
                             ))
                         || (class_name == "org/jboss/threads/JBossThread"
@@ -13099,13 +13122,22 @@ fn invoke_on_class_shared_inner(
                                 method_name,
                                 "log" | "info" | "warning" | "severe"
                                     | "fine" | "finer" | "finest"
-                                    // Synthetic LogManager-backed loggers
-                                    // store handlers in their native slot 2.
-                                    // Letting real Logger.addHandler bytecode
-                                    // run loses that state, so JULI
-                                    // AsyncFileHandler never sees a record.
-                                    | "addHandler" | "removeHandler" | "getHandlers"
+                                    // JULI's `DirectJDKLog` (Tomcat) routes
+                                    // every log call through `Logger.logp`,
+                                    // not `warning`/`log`. Without `logp`
+                                    // here the bytecode runs against our
+                                    // synthetic Logger (no Handler chain) and
+                                    // the message is silently dropped — that
+                                    // was the "Tomcat Bootstrap rc=0, no
+                                    // output" symptom. Force the native
+                                    // (registered in logmanager.rs) to win.
                                     | "logp"
+                                    // Synthetic Logger mirrors do not carry the
+                                    // JDK ConfigurationData handler list. Route
+                                    // explicit handler installation through the
+                                    // JUL bridge so in-process captures observe
+                                    // the same records as the console sink.
+                                    | "addHandler" | "removeHandler"
                                     // `isLoggable` gates JULI's emit path;
                                     // the real bytecode returns false for our
                                     // parent-less synthetic Logger, so every
@@ -13113,16 +13145,8 @@ fn invoke_on_class_shared_inner(
                                     | "isLoggable"
                             ))
                         || (class_name == "java/util/logging/LogRecord"
-                            && matches!(method_name, "<init>" | "getLevel" | "getMessage"))
-                        || (class_name == "java/util/concurrent/ThreadPoolExecutor"
-                            && matches!(
-                                method_name,
-                                "execute" | "shutdown" | "isShutdown" | "isTerminated" | "awaitTermination"
-                            ))
-                        || (class_name == "org/apache/juli/AsyncFileHandler$LoggerExecutorService"
-                            && matches!(method_name, "shutdown" | "isShutdown" | "awaitTermination"))
-                        || (class_name == "org/apache/juli/FileHandler"
-                            && method_name == "clean")
+                            && method_name == "getMessage"
+                            && descriptor == "()Ljava/lang/String;")
                         || (class_name == "org/jboss/logmanager/Logger"
                             && matches!(
                                 method_name,
