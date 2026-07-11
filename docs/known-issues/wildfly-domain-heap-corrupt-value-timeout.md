@@ -1107,3 +1107,105 @@ into management-model territory. The four front-line residuals
 (`IllegalStateException: Container is down`) and a `StackOverflowError` from
 `ScheduledThreadPoolExecutor.shutdown` recursing into itself (dispatch-bug shaped, sibling of
 the prior TPE fixes). Those are the new front line for this doc's hunt.
+
+
+## 2026-07-10/11 update (fourth session) — two MSC bugs fixed; both "third session" residuals cleared; new front line is the pre-existing, separately-tracked BUG-03 STW/JIT-takeover stall
+
+Picked up where the third session left off: `WFLYCTL0013 Container is down`
+(`IllegalStateException` on the `http-interface` `add` op) and a
+`StackOverflowError` from `ScheduledThreadPoolExecutor.shutdown` self-recursion.
+Root-caused via `CRATONVM_DBG_MSC=1` trace diffing (extracted `-> start id=N` /
+`<- start id=N OK` lines, diffed started-vs-completed ids to confirm the missing
+services never even *started*, not started-and-failed, then cross-referenced
+`[msc] install` lines for the relevant service names). Found two independent,
+real bugs in the from-scratch MSC (`native-builtins/src/jboss_msc.rs`), both
+fixed and pushed to `dev`:
+
+1. **`ServiceController.provides()` had zero native backing.** It's a real MSC
+   1.5.x interface method with no default implementation; any caller through
+   the synthetic mirror died with `AbstractMethodError:
+   org/jboss/msc/service/ServiceController.provides()Ljava/util/Set;`. The
+   `jboss.remoting.endpoint.management.management.operation.handler` service's
+   own start() path calls it — the resulting `AbstractMethodError` marked that
+   service FAILED, cascading into `WFLYCTL0459: Triggering roll back due to
+   missing management services`, which is why the *later*, unrelated
+   `http-interface` `add` then saw `IllegalStateException: Container is down`
+   (the management transaction was already rolled back). Fixed by implementing
+   `native_service_controller_provides()`: returns the controller's primary
+   `ServiceName` plus every alias reverse-scanned from `ContainerState.aliases`.
+   Commit `bd5626a9`.
+
+2. **OnDemand/Lazy dependencies of Active services were never demanded.**
+   `take_ready_start()`'s `can_start()` check requires every dependency to be
+   `Up`, but an `OnDemand`/`Lazy` service only becomes start-eligible once
+   `demanded == true`. The only production call site for `demand()` was
+   `ServiceController.setMode(Mode.ACTIVE)` — so an OnDemand service reachable
+   *only* via a dependency edge (never given an explicit `setMode(ACTIVE)` by
+   any Java code) never got demanded: a permanent deadlock. Concretely,
+   `org.wildfly.management.http.extensible` (OnDemand) is only reachable via
+   its Active dependent `...extensible.shutdown`'s dependency edge, so it never
+   started, and the whole http-management service chain never came up. Real
+   MSC treats an Active/Passive (or demanded Lazy/OnDemand) service's mere
+   dependency edge to an OnDemand/Lazy service as an implicit demand — added a
+   cheap pre-pass at the top of `take_ready_start()` that propagates demand
+   along dependency edges before computing start-eligibility (converges within
+   a few polling calls even for multi-level OnDemand chains). Commit
+   `f3d69e2b`.
+
+Both merged into `dev` at `13011cff`, verified against `origin/dev` with a
+`git log -S<symbol>` shadowing check (clean — neither `jboss_msc.rs` nor these
+symbols were touched by any concurrent commit since the branch point) and
+`cargo check -p cratonvm-native-builtins` + `cargo test -p
+cratonvm-native-builtins --lib` (2960 passed, same 5 pre-existing unrelated
+failures as the `origin/dev` baseline, plus one **confirmed-flaky**
+parallel-test-isolation failure —
+`lang_system::checkexec_security_tests::denying_sm_blocks_processbuilder_start_stub`
+races on the process-wide `SECURITY_MANAGER` `Mutex` static against other
+`checkexec_security_tests` running concurrently in sibling threads; passes
+deterministically under `--test-threads=1`; pre-existing test-infra gap,
+unrelated to this session's changes, not fixed here).
+
+**Live verification (Azure host, pristine WildFly 32.0.1.Final,
+`CRATONVM_MSC_REAL_START=1`, binary built from `dev` @ these two commits):**
+`WFLYCTL0459`, `Container is down`, the `AbstractMethodError`, **and** the
+`StackOverflowError` from `ScheduledThreadPoolExecutor.shutdown` are **all
+gone (0 hits)** — the boot log grew from a ~105-line stall to 595+ lines,
+reaching `Invoking domain.xml ops` and activating multiple subsystem
+extensions (JAX-RS, Transactions, Weld, JSF(Mojarra), Datasources,
+ResourceAdapters) before stalling. A 30 s re-check confirmed the log genuinely
+stops growing there, not just slow progress.
+
+**New front line: the boot now stalls at the pre-existing, separately-tracked
+BUG-03 STW/JIT-takeover family** (`STW cross-thread JIT takeover is still
+waiting for cooperative mutators rounds=64 pending=7 taken=0`, from
+`vm/src/runtime/interpreter.rs`). Per this investigation's standing scope
+guardrail, BUG-03 itself is **not** chased here — but I did check whether it
+can be routed *around* (not fixed) via `CRATONVM_DISABLE_JIT=1`, since the
+stall is explicitly JIT-related: it cannot. With JIT disabled the boot fails
+**much earlier** and differently — `org/jboss/modules/Main.<clinit>` throws
+`ExceptionInInitializerError` wrapping an `UnsatisfiedLinkError` for `Missing
+native method in real-JDK mode method=java/io/InputStreamReader.<init>
+(Ljava/io/InputStream;Ljava/nio/charset/Charset;)V`, before JBoss Modules even
+finishes bootstrapping. This looks like a real, separate, interpreter-only
+native-registration gap (the 2-arg `InputStreamReader(InputStream, Charset)`
+constructor apparently isn't registered/reachable in real-JDK mode when the
+JIT never compiles the caller) — **not investigated further, not fixed, not
+filed as its own doc** (out of scope for this session); noted here only to
+save a future session from re-trying the same "disable JIT to route around
+BUG-03" idea and hitting the same dead end.
+
+**The four original front-line residuals (`AttributeChangeNotification`,
+`ContentCleanerService`, `FileInputStream(File)`, `WFLYHC0034`) and the
+`HIB-CV-32` sustained-load / `CRATONVM_DIAG_HIB32=1` corrupt-Value-cell check
+still have not been reached** — boot has now moved several phases past where
+they were originally observed (bootstrap → extensions → Elytron →
+`host=foo:add()` → Cleaner → SIGSEGV → `provides()`/demand-propagation →
+domain.xml subsystem activation), each phase revealing the next blocker
+in sequence. It remains unknown whether those four residuals are still
+reachable in their original form or have been superseded, because boot has
+not yet gotten past BUG-03 to find out. This doc stays OPEN, now gated by
+BUG-03 (tracked in its own existing doc/section, not duplicated here).
+
+No lingering `domain.sh`/Host Controller/Process Controller processes were
+left running on the probe host after this session (verified via `ps aux`
+post-run).
