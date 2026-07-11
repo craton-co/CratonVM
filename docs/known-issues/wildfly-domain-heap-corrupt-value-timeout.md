@@ -1,6 +1,6 @@
 # WildFly domain startup timeout with repeated corrupt `Value` cell guard
 
-Status: OPEN — gated by WFLYHC0053 (`Could not get the server inventory in 30 seconds`). HIB-CV-32 has now stayed silent across every 2026-07-07 through 2026-07-11 run (multiple sessions, tens of thousands of log lines each) including this doc's own seventh-session byte-level socket capture — very strong evidence that guard is genuinely closed. The seventh session (2026-07-11) root-caused WFLYHC0053 to the exact byte level: Host Controller's read of the Process Controller's process-inventory response socket gets exactly 1 of 53 written bytes, then the connection is treated as closed, even though the Process Controller's own socket end never closes and is still blocked waiting for more input — mechanism identified, underlying cause (race vs. genuine OS-level EOF) NOT YET FOUND. See the 2026-07-11 seventh-session update at the bottom for the full repro recipe and next steps. Do not move to internal until WFLYHC0053 is resolved and a domain boot reaches sustained managed-server load with HIB-CV-32 confirmed silent throughout.
+Status: OPEN — gated by WFLYHC0053 (`Could not get the server inventory in 30 seconds`). HIB-CV-32 has now stayed silent across every 2026-07-07 through 2026-07-11 run (multiple sessions, tens of thousands of log lines each) — very strong evidence that guard is genuinely closed. The seventh session's byte-level capture (`bytes=[152]`) was initially misread as a corrupted opcode; the eighth session (2026-07-11) corrected this via decompilation of the real WildFly protocol classes — 152/153 are the wire protocol's own legitimate CHUNK_START/CHUNK_END marker bytes, not corruption — and precisely narrowed the actual failure to the Host Controller read-task's Pipe-construction/`readExecutor.execute()` submission step (between reading a valid 152 chunk-start byte and the next expected read), landing one real, independently-verified fix along the way (a `BufferedOutputStream` flush-ordering TOCTOU race, `native-io/src/lib.rs`) that is NOT itself the root cause. See the 2026-07-11 eighth-session update at the bottom for the exact mechanism and next steps (most promising: live gdb on the read-task thread to see whether `readExecutor.execute()` throws). Do not move to internal until WFLYHC0053 is resolved and a domain boot reaches sustained managed-server load with HIB-CV-32 confirmed silent throughout.
 Severity: High
 First confirmed: 2026-07-05 on Azure worktree `codex/wildfly-nonpassed-probes-20260705-035722`
 
@@ -1642,3 +1642,158 @@ byte-level reproduction recipe for whoever continues.
    `native-io/src/process.rs` per that file's own comment, confirmed dead this session) is safe,
    low-risk cleanup debt worth deleting in its own small PR — not related to WFLYHC0053, flagged
    here only so it isn't mistaken for the live implementation by a future reader again.
+
+
+## 2026-07-11 update (eighth session, same day) — corrected the seventh session's "corrupted opcode" misdiagnosis; landed one real, independently-justified fix (not the root cause); precisely narrowed the actual failure window; still not fixed
+
+Continued directly from the seventh session's byte-level capture (`bytes=[152]`). The
+coordinator asked to (1) isolate genuine short-read/EOF vs. a registry-identity race via a
+`gdb` breakpoint or scoped `CRATONVM_DBG_SOCK_BYTES`, (2) fix the root cause if found, (3)
+only chase the GC-timing correlation if the direct trace came up empty, (4) re-check the
+four original residuals and retire the doc once genuinely clean.
+
+### Byte 152 is NOT corruption — it is the real WildFly wire protocol's own `CHUNK_START` marker
+
+This is the single most important correction from this session. The seventh session's
+byte-level capture (`bytes=[152]`, i.e. `0x98`/signed `-104`) was read as "PC's
+`ProcessController.sendInventory()` writes opcode byte 20 (`bipush 20; invokevirtual
+OutputStream.write(I)V`, confirmed via `javap`), but Host Controller receives 152 instead
+— an apparent write-side corruption." **This was a misdiagnosis.** Two more rounds of
+targeted, per-process (not merged-log), sequence-numbered, thread-ID-tagged file logging
+(added temporarily to `native-builtins/src/net_phase_e.rs`'s `re1_socket_read_stream`/
+`re1_socket_write_stream`, reverted before finishing — see below) definitively ruled out
+both a log-transport artifact (the very first capture attempt turned out to be corrupted
+by two separate OS *processes* — Process Controller and Host Controller — both writing to
+the same shared `/tmp` trace path; fixed by suffixing the trace file with
+`std::process::id()`) and a registry-identity swap (the `Arc<TcpStream>` pointer for
+`sid=1`/`sid=2` stayed byte-for-byte identical across every read/write in the failing
+window — no stream-identity race).
+
+With reliable, per-process, byte-value-capturing traces in hand, decompiling
+`org.jboss.as.process.protocol.ConnectionImpl$MessageOutputStream.write(byte[],int,int)`
+(via `javap -p -c` on the real `wildfly-process-controller-24.0.1.Final.jar`) showed the
+real WildFly wire protocol prefixes **every** chunk with a header byte `hdr[0] = -104`
+(`bipush -104` in the bytecode) — `-104` signed = **152** unsigned. Decompiling the
+matching read side, `ConnectionImpl$2.run()` (the connection's dedicated read-loop
+`Runnable`), confirmed the receiver's own `lookupswitch` on the first byte of every
+message: `152` → "more data follows, read a 4-byte length next"; `153` → "end of message
+data"; anything else → `invalidCommandByte` `IOException`. **152 is the correct, expected,
+first byte of every single chunk this protocol ever sends — not a corrupted opcode.** My
+own prior write-up incorrectly treated the raw-socket byte stream as if it were already
+opcode-dispatch-ready payload; it is not — `ConnectionImpl$2.run()`'s chunk-length/pipe
+plumbing sits between the raw socket and the `MessageHandler.handleMessage()` opcode
+dispatch I'd originally decompiled, and I had conflated the two layers.
+
+### The real failure window, precisely narrowed via the same decompilation
+
+`ConnectionImpl$2.run()`'s bytecode (full disassembly captured, not reproduced here) shows
+that after reading a valid `152` and *before* the next socket read (`StreamUtils.readInt`,
+which does four separate single-byte `InputStream.read()` calls, byte-for-byte mirroring
+the writer's four `ishr`/`i2b`/`bastore` shifts), the very first `152` chunk of a message
+additionally: (a) constructs a bounded, ring-buffer-backed `org.jboss.as.process.protocol.Pipe`
+(a WildFly-authored class — plain `Object`-monitor `wait()`/`notify()`, not JDK
+`PipedInputStream`/`PipedOutputStream`, so no native-stub involvement expected there), and
+(b) submits a task to the connection's `readExecutor` (the same `EnhancedQueueExecutor`
+built in `ProcessControllerConnectionService.start()`, `core=1 max=4 queue=256`, already a
+class this whole investigation chain has hit multiple independent bugs in) to drain the
+pipe and dispatch to `MessageHandler.handleMessage()` on a separate thread.
+
+**The reliable, per-process, sequence-numbered trace shows the read task's socket-read
+sequence stops dead after the single `152` byte — no further `PRE-READ` for `readInt`'s
+four bytes ever appears, in any of 5 fresh full-boot captures.** Per the exception table
+covering this whole loop body, ANY exception between reading `152` and reaching
+`readInt()` — which per the bytecode is only the Pipe-construction + `readExecutor.execute()`
+submission — is caught by a catch-all handler that does **not** log anything (only the
+narrower, sibling `IOException` handler calls a logging method), safely closes the pipe,
+and calls `ConnectionImpl.closed()` (→ the `ClosedCallback` → `ServerInventoryImpl.
+connectionFinished()` → the "process controller connection closed." line this doc has
+tracked since its first report) before re-throwing. This exactly matches every observed
+symptom: no error/exception text anywhere in the logs before the closure (grepped for
+"panic"/"Exception"/"terminated with error" across all captures, zero hits in this exact
+window), and the connection-closed line firing near-instantly rather than after any
+visible delay.
+
+**This narrows the actual bug to one of: `new Pipe(8192)`'s constructor, `pipe.getIn()`/
+`getOut()`, or (most suspected, given this exact executor's prior bug history in this
+investigation) `readExecutor.execute(task)` throwing or otherwise misbehaving under
+CratonVM in a way real HotSpot would not.** Not pinned to one of these three specifically
+before this session's time ran out — see recommended next steps.
+
+### One real fix landed (verified, but NOT the root cause — do not close this doc on its account)
+
+While reading `native_bos_flush_locked` (`native-io/src/lib.rs`, backs
+`java.io.BufferedOutputStream.flush()`, which is what `BufferedOutputStream.close()` calls
+before closing its wrapped `MessageOutputStream` — this IS on the write path for every
+message this protocol sends) to check the seventh session's now-refuted "152 vs 20"
+hypothesis, found a **real, independent bug**: the native flush reset the buffer's
+`count` field to `0` *before* invoking the wrapped stream's `write(byte[], int, int)`,
+rather than *after* as real `BufferedOutputStream.flushBuffer()` does. This is a genuine
+correctness deviation — it signals the buffer "empty and reusable" while the flush's
+`write` call (which is passed the SAME backing array as a live argument) is still in
+flight, opening a real TOCTOU window for any write that reaches the same
+`BufferedOutputStream` instance during that window to corrupt the array before its bytes
+are consumed. Fixed by moving the `ctx.set_field(this, count_slot, Value::Int(0))` call to
+after the `invoke_virtual` (matching JDK `flushBuffer()` exactly); the comment in the code
+explains why this doesn't reintroduce the stale-native-local-oop hazard the original
+(now-corrected) ordering was guarding against (`buf`/`inner` are passed as invoke
+arguments regardless of reset timing, so they're rooted for the call's duration either
+way; nothing is read back from them afterward in either version).
+
+**Verified:** `cargo test -p cratonvm-native-io --lib` — clean (no regressions). Two full
+WildFly domain-boot runs with the fix applied reached the identical `WFLYHC0053` failure
+point with no observable behavior change otherwise (confirms no regression, and confirms —
+as expected once the "152 vs 20" premise was refuted — that this fix alone does not
+resolve `WFLYHC0053`). Committed on its own merits as a real, defensible correctness fix,
+explicitly **not** claimed to close this doc.
+
+### Diagnostics used this session (reverted, not merged)
+
+Temporary, env-var-gated (`CRATONVM_DBG_SOCK_ID`, `CRATONVM_DBG_SOCK_ID_FILE`) per-process
+file-logging instrumentation was added to `re1_socket_read_stream`/`re1_socket_write_stream`/
+the three `Socket.close()` registrations (`net_phase_e.rs`, `servlet.rs`) to get the
+byte-value and Arc-identity evidence above. **Reverted via `git checkout --` before this
+session's commit** — it served its investigative purpose but isn't a fix and would just be
+clutter; the exact instrumentation (stream-id-gated `<= 5`, sequence-numbered,
+per-OS-process-suffixed file logger) is fully described above if a future session wants to
+recreate it quickly rather than from scratch.
+
+### Status and recommended next steps, in priority order
+
+`WFLYHC0053` is **still open** — this session corrected a wrong turn, landed one real
+independent fix, and precisely narrowed the failure window, but did not find the exact
+line. This doc stays in `docs/known-issues/`.
+
+1. **Most promising, not yet attempted:** live `gdb`-attach Host Controller's read-task
+   thread right as it processes the first `152` byte of the `start-servers` response (the
+   exact reproduction recipe — unique bind address/port to avoid this shared host's port
+   collisions with concurrent sessions, `JBOSS_JAVA_SIZING=-Xms64m -Xmx1536m
+   -XX:MaxMetaspaceSize=256m`, `CRATONVM_MSC_REAL_START=1` — reliably reaches this point at
+   ~17,450-17,510 log lines into a fresh boot) and single-step/backtrace to see whether
+   `readExecutor.execute()` throws, what it throws, and why. A conditional breakpoint on
+   `native_ThreadPoolExecutor`/`EnhancedQueueExecutor` dispatch functions (search
+   `native-builtins/src/` for the exact registration names) triggered only after boot
+   reaches ~17,000 log lines would avoid wading through the huge volume of unrelated
+   executor activity earlier in boot.
+2. If `readExecutor.execute()` is confirmed to throw (or silently reject) here
+   specifically, compare against this exact executor's already-documented bug history in
+   this investigation chain (the original `ThreadPoolExecutor.execute()` NPE regression,
+   the dispatch-degrades-to-synchronous bug, the `f157de8a` registry-gate bug — all fixed,
+   but this is evidently either a fourth distinct issue or a residual of one of those not
+   caught by their own verification).
+3. If the executor submission is clean, check `org.jboss.as.process.protocol.Pipe`'s
+   constructor/`getIn()`/`getOut()` next — it's plain WildFly-authored bytecode using
+   `Object` monitor `wait()`/`notify()`, so a bug here would point at CratonVM's
+   object-monitor primitives specifically in this narrow scenario, not at any native I/O
+   registration.
+4. Only pursue the `gen_heap::mark_young` conservative-root-rejection correlation flagged
+   in the seventh-session update if steps 1-3 come up empty — hold the project's standing
+   `gc_barrier` verification bar (repeated load testing, no merge on any flake, read
+   `wip/gc-stw-quota-race-20260710` first) if it comes to that.
+5. Once `WFLYHC0053` is actually fixed: re-check the four original front-line residuals
+   (`AttributeChangeNotification`, `ContentCleanerService`, `FileInputStream(File)`,
+   `WFLYHC0034` — still not re-observed in any run across the sixth, seventh, or eighth
+   sessions) and get one clean sustained-load run confirming `HIB-CV-32` silence (it has
+   stayed silent across every run in sessions six through eight, tens of thousands of log
+   lines each — strong standing evidence, just needs one clean end-to-end confirmation
+   once boot can get past `WFLYHC0053` to a genuinely running state) before retiring this
+   doc.
