@@ -1213,6 +1213,16 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             safepoint_check(shared, thread);
         }
     }
+    // INT-8: a forced GC advances the G1 concurrent-cycle machinery exactly
+    // like an allocation-triggered young GC (`maybe_gc`'s epilogue calls
+    // this at 819/903). Without it, a `System.gc()`-driven application —
+    // whose forced young collections keep Eden below the allocation-GC
+    // threshold — could NEVER start or complete a marking cycle: no cleanup
+    // ever reclaimed dead Old regions and no remark-time reference
+    // processing ever ran. HotSpot's default `System.gc()` under G1 is a
+    // full collection that processes every generation's references; this
+    // IHOP/completion check is the closest cycle-machinery equivalent.
+    maybe_concurrent_gc(shared, thread);
     // Run pending finalizers
     run_finalizers(shared, thread);
     // Run pending Cleaner actions (NEW-17). These were submitted to
