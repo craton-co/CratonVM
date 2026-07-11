@@ -4,6 +4,33 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-11 WildFly Surefire-fork boot-crash follow-up: 2 more GC-staleness sites FIXED (6/10 → 9/10 sample); residual narrowed to a concurrent extension-loading race + the known STW JIT-takeover stall
+
+Follow-up to the entry directly below. Investigating the residual's two reported symptoms
+(`ProcessorInfo.readCPUMask()` `NoSuchMethodError`, `ParallelBootOperationStepHandler` NPE) found the
+identical unpinned-`ObjectRef`-across-`ensure_class_initialized`+`alloc_object` pattern in two more
+functions, both backing *every* `InputStreamReader`/`OutputStreamWriter` construction VM-wide:
+
+- FIXED: `native-io/src/stream_decoder.rs::alloc_stream_decoder` and
+  `native-io/src/stream_encoder.rs::alloc_stream_encoder` held their `InputStream`/`OutputStream`
+  parameter across the same two GC-risking calls (`ensure_class_initialized("sun/nio/cs/StreamDecoder"
+  /StreamEncoder")`, `alloc_object`) before storing it into the new `StreamDecoder`/`StreamEncoder`'s
+  field — same "Family 1" pattern as the sibling `lang_class.rs` fix. Verified: re-running the identical
+  10-class sample against a binary with all three fixes raised the "clears the original crash" rate from
+  6/10 to **9/10**.
+- OPEN, better characterized (updated): [`wildfly-parallel-boot-stale-objectref-residual.md`](wildfly-parallel-boot-stale-objectref-residual.md) —
+  the one remaining class in the sample does **not** deterministically hit the original crash: 3 runs
+  against the identical fixed binary gave 3 *different* outcomes, including a *new* signature
+  (`WFLYCTL0153: No META-INF/services/org.jboss.as.controller.Extension found`) for a *different*
+  specific extension each time. This points at a genuinely concurrent race in WildFly's own
+  `DeferredExtensionContext`/`FutureTask`-based extension loading, not another single fixed
+  unprotected-`ObjectRef` site. Separately reconfirmed (via a live-attach attempt, though it missed the
+  exact stall window) that the STW cross-thread JIT-takeover stall documented in
+  `wildfly-gc-barrier-boot-hang-and-harness-fixes.md` (main-thread instance fixed; the
+  EnhancedQueueExecutor-worker-parked-in-futex instance explicitly left OPEN as high-regression-risk
+  deep GC-barrier work) still reproduces on current dev — several "boots further, still fails" classes
+  show the identical `rounds=64 ... taken=0` signature.
+
 ## 2026-07-11 WildFly Surefire-fork boot-crash (96% of suite failures) FIXED — reflection-object GC-staleness; residual stale-`ObjectRef` sites found elsewhere in boot
 
 Root-caused and fixed the dominant blocker for the WildFly suite under CratonVM: the managed server

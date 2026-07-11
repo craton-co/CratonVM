@@ -141,29 +141,34 @@ of that cluster. A full suite re-run is needed for an exact post-fix count; that
 separate out the pre-existing, now-more-visible bugs this fix "uncovers" further into boot (see
 Residual).
 
-## Residual (split off, not fixed here)
+## Residual (split off, not fixed here) — UPDATE 2026-07-11: 2 more sites found+fixed, 6/10 → 9/10
 
 Fixing the ServiceLoader/reflection-construction GC-staleness bug did **not** fully close this
-cluster. For classes that now boot further, two *different*, previously-invisible bugs were newly
-observed (same general "stale `ObjectRef` under GC pressure" bug class, different unprotected call
-sites — not covered by this fix):
+cluster on its own (6/10 in the sample below). A same-day follow-up session found the **identical**
+unpinned-`ObjectRef`-across-`ensure_class_initialized`+`alloc_object` pattern in two more functions:
+`native-io/src/stream_decoder.rs::alloc_stream_decoder` and
+`native-io/src/stream_encoder.rs::alloc_stream_encoder` (both hold their `InputStream`/`OutputStream`
+parameter across the same two GC-risking calls before storing it into the new
+`StreamDecoder`/`StreamEncoder`'s field) — these back **every** `InputStreamReader`/
+`OutputStreamWriter` construction VM-wide, so under WildFly's classloading-heavy boot they were at
+least as impactful as the original three sites. Fixed the same way. Re-running the identical 10-class
+sample against a binary with all three fixes raised the "clears the original crash" rate from **6/10 to
+9/10** — see `docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md` for the full
+before/after breakdown.
 
-1. `NoSuchMethodError: java/lang/Object.read([CII)I` at `org.wildfly.common.cpu.ProcessorInfo.readCPUMask()`
-   — a virtual-dispatch receiver resolving to `java.lang.Object`'s vtable instead of the real `Reader`
-   subtype, immediately preceding a cascade of CratonVM's own defensive diagnostics:
-   `gen_heap::get_field: out-of-bounds field read dropped ... class_id=ClassId(0) class_name=java/lang/Object`
-   and `Stale pointer detected in invokevirtual receiver (ptr=..., all-zero header) — falling back to
-   CP class org/jboss/as/controller/AbstractOperationContext` — i.e. the exact same "stale ref resolves
-   to a reused all-zero slot" symptom described above, but at a different, not-yet-identified call site.
-2. A follow-on `NullPointerException: Cannot invoke "org.jboss.dmr.ModelValue.has(String)" because
-   "this.value" is null` inside `org.jboss.as.controller.ParallelBootOperationStepHandler$ParallelBootTask.run`
-   (an `EnhancedQueueExecutor` worker thread) — WildFly's *parallel* boot-step execution, i.e. a
-   multi-threaded context, which is a plausible place for a similarly-unprotected native allocation to
-   race with a concurrent GC.
-
-These are tracked separately in
+The one remaining class in the sample does **not** deterministically hit the original crash — repeated
+runs against the identical fixed binary produced 3 *different* outcomes (the original NPE, a
+later-stage failure, and a *new* signature: `WFLYCTL0153: No META-INF/services/
+org.jboss.as.controller.Extension found` for a *different* specific extension each time). This points
+at a genuinely concurrent race in WildFly's `DeferredExtensionContext`/`FutureTask`-based extension
+loading, not another single fixed unprotected-`ObjectRef` site — plus a separately-confirmed, already-
+tracked STW cross-thread JIT-takeover stall (`docs/internal/fixed-suite-bugs/
+wildfly-gc-barrier-boot-hang-and-harness-fixes.md`'s explicitly-flagged, not-yet-fixed
+EnhancedQueueExecutor-parked-in-futex residual). Both are tracked in
 `docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md` for whoever picks up the next
-session.
+session — the first is a promising, well-scoped next investigation; the second is deep GC-barrier work
+already assessed as high regression risk by a prior session and should not be attempted without a fresh
+live-gdb capture at the exact stall.
 
 ## Evidence
 
@@ -171,8 +176,10 @@ session.
 Azure host 20.83.144.174, worktree /data/data/wt-wf-surefire-boot-src-20260711 (fix),
   /data/data/wt-wf-surefire-boot-20260711 (repro harness copy)
 Frozen binaries: frozen-cratonvm-wf-surefire-boot-20260711-v1.bin (pre-fix, confirms repro),
-  frozen-cratonvm-wf-surefire-boot-20260711-v2.bin (post-fix, confirms improvement)
+  frozen-cratonvm-wf-surefire-boot-20260711-v2.bin (lang_class.rs fix only, 6/10 sample),
+  frozen-cratonvm-wf-surefire-boot-20260711-v3.bin (+ stream_decoder.rs/stream_encoder.rs fixes, 9/10 sample)
 /data/data/cratonvm/apps/wildfly/testsuite/integration/basic/target/surefire-reports/
   org.jboss.as.test.integration.beanvalidation.BeanValidationTestCase-output.txt (before/after captured
   separately during the investigation)
+/data/data/wt-wf-surefire-boot-20260711/sample_results_v3.txt (10-class before/after verdict log)
 ```
