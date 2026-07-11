@@ -2153,7 +2153,7 @@ pub fn inline_getfield_enabled() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_INLINE_GETFIELD").is_some())
 }
 
-/// Opt-IN guarded inline `getfield` (perf/throughput-20260710).
+/// Default-ON guarded inline `getfield` (perf/throughput-20260710).
 ///
 /// The 2026-07-09 hardening (`Fix JIT getfield receiver validation`,
 /// 85baa4219) routed EVERY default-path JIT `getfield` through the checked
@@ -2175,37 +2175,39 @@ pub fn inline_getfield_enabled() -> bool {
 /// not publish bounds (G1/ZGC → table all zeros) — branches to the checked
 /// helper, preserving its NPE / `i64::MIN`-sentinel semantics exactly.
 ///
-/// DEFAULT FLIPPED BACK OFF 2026-07-10 (found investigating the ES
-/// DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests /
-/// IVFKnnFloatVectorQueryTests hang cluster,
-/// docs/known-issues/elasticsearch-suite/): with this path default-on,
-/// `testSlicesDense` under JIT SIGSEGVs almost immediately (dmesg: `segfault
-/// at 4c`, gdb: an AALOAD bounds-check dereferencing a receiver of `0x40` —
-/// a small int value used as an array pointer, i.e. a getfield result feeding
-/// a later array access got corrupted). Confirmed by bisection: (a)
-/// `CRATONVM_JIT_GETFIELD_HELPER=1` (this path OFF) makes the SIGSEGV
-/// disappear and the run reverts to the ORIGINAL pre-existing interpreter
-/// hang the known-issue docs already describe — so this guard is a genuine
-/// NEW regression, not a pre-existing bug surfacing; (b)
-/// `CRATONVM_OSR_NEWARRAY=0` (the sibling perf/throughput-20260710 change)
-/// does NOT avoid the crash, ruling out OSR-newarray as the cause. The exact
-/// corrupting instruction was not pinned down (the region-bounds containment
-/// check and the per-object GC_FLAG_COMPACT routing both read correctly on
-/// static review) — reproduces reliably via the repro command in the
-/// known-issue doc, needs dedicated bisection time. Until root-caused,
-/// default to the safe checked-helper path; opt in with
-/// `CRATONVM_JIT_GUARDED_GETFIELD=1` for A/B measurement.
+/// FLIPPED BACK OFF then RE-ENABLED, same day (2026-07-10): investigating the
+/// ES DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests /
+/// IVFKnnFloatVectorQueryTests hang cluster
+/// (docs/known-issues/elasticsearch-suite/) found `testSlicesDense` under JIT
+/// SIGSEGVing almost immediately with this path default-on (dmesg: `segfault
+/// at 4c`, gdb: an AALOAD bounds-check dereferencing a receiver of `0x40` — a
+/// small int value used as an array pointer, i.e. a getfield RESULT feeding a
+/// later array access got corrupted) — the flag was flipped to opt-in
+/// (`CRATONVM_JIT_GUARDED_GETFIELD=1`) pending root-cause. That root cause
+/// was found and fixed the SAME DAY, in a different investigation
+/// (the WildFly Host Controller invoke-inline-cache SIGSEGV): the vm-side JIT
+/// field resolvers fabricated a `(0, false)` "compact slot" for any field
+/// with NO genuine registered `CompactLayout` entry, and the compact-offset
+/// inline getfield arm trusted it — a REFERENCE field with the fabricated
+/// `is_ref=false` fell into the int-category match arm and got a 32-bit
+/// `MOVSXD` load of half a `Value` cell, producing exactly this "small-int
+/// garbage used as a pointer" shape. See
+/// docs/internal/wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver-FIXED.md
+/// for the full chain. Re-verified clean with
+/// `CRATONVM_JIT_GUARDED_GETFIELD=1` against the exact IVF-KNN repro (no
+/// SIGSEGV, no dmesg segfault entry — only the separate, still-OPEN,
+/// already-tracked Lucene IndexWriter/STW-monitor-race hang this doc's own
+/// "underlying interpreter hang" section describes) — re-enabled default-ON.
+/// `CRATONVM_JIT_GETFIELD_HELPER=1` restores the helper-only path if a new
+/// corruption is ever suspected here again.
 pub fn guarded_inline_getfield_enabled() -> bool {
     // NOT OnceLock-cached (unlike the other flags in this file): this is a
     // JIT COMPILE-TIME gate, read once per getfield call SITE during
     // compilation, never on the runtime hot path — so re-reading the env
     // var every call has no measurable cost. Caching it would make the
-    // opt-in racy against whichever test/thread first triggers ANY getfield
-    // compilation in the process (fixed 2026-07-10: the guarded-inline unit
-    // test below flaked because an unrelated parallel test's compile() call
-    // won the OnceLock race before this test's env::set_var took effect).
+    // off-switch racy against whichever test/thread first triggers ANY
+    // getfield compilation in the process.
     std::env::var_os("CRATONVM_JIT_GETFIELD_HELPER").is_none()
-        && std::env::var_os("CRATONVM_JIT_GUARDED_GETFIELD").is_some()
 }
 
 /// Default-ON inline self-recursion stack check (perf/throughput-20260710).
@@ -22407,7 +22409,30 @@ impl Compiler {
                         // follow-up rather than threading a new descriptor param
                         // through every `x64::compile` caller.
                         self.emit_post_invoke_exception_check(b'I');
-                        self.push_from_rax();
+                        // VOID self-recursive fix (ES SortingDigestTests -Jit
+                        // on): this push was unconditional, so a `void`
+                        // self-recursive callee (DualPivotQuicksort.sort) left
+                        // a PHANTOM entry on the simulated operand stack after
+                        // every non-tail self-call. The extra entry shifts the
+                        // canonical spill-slot layout for everything downstream
+                        // of the next merge point, so later loads read
+                        // neighbouring slots (an array ref read as a double →
+                        // heap addresses stored into double[] elements,
+                        // deterministic mis-sorts and garbage AIOOBE indices —
+                        // no GC involved). The method's own return type IS
+                        // available via `method_key` ("Class.name:descriptor"),
+                        // so only push a return value when there is one. When
+                        // `method_key` is empty (unit-test compiles) keep the
+                        // historical push — those callers never compile void
+                        // self-recursive methods.
+                        let self_ret_ty = self
+                            .method_key
+                            .rfind(')')
+                            .and_then(|i| self.method_key.as_bytes().get(i + 1))
+                            .copied();
+                        if self_ret_ty != Some(b'V') {
+                            self.push_from_rax();
+                        }
                     }
                     pc += 3;
                 }
@@ -26143,11 +26168,23 @@ pub fn compile_with_param_slots(
     // register. This only touches the OSR metadata copy; the running code's
     // `reg_for_local` (which never asks for a high-half) is unaffected.
     let mut osr_local_assignments = compiler.local_assignments.clone();
+    // ES-tdigest OSR fix: the high-half nulling and the per-PC dead mask below
+    // must cover XMM-resident (float/double) locals exactly like GPR-resident
+    // ones. DualPivotQuicksort.sort coalesces several disjoint-live-range
+    // double locals (pivots, run temporaries) onto one XMM register; an OSR
+    // entry at a PC where one of them is dead loaded the dead local's garbage
+    // over the live owner's XMM value (the GPR-only mask said "safe"), so
+    // Arrays.sort(double[]) silently mis-sorted / threw garbage-index AIOOBE
+    // once the sort loop OSR-entered.
+    let mut osr_xmm_assignments = compiler.xmm_assignments.clone();
     {
         let high_halves = wide_local_high_halves(code, code_len);
         for &hh in &high_halves {
             if hh < osr_local_assignments.len() {
                 osr_local_assignments[hh] = None;
+            }
+            if hh < osr_xmm_assignments.len() {
+                osr_xmm_assignments[hh] = None;
             }
         }
     }
@@ -26169,15 +26206,38 @@ pub fn compile_with_param_slots(
         .enumerate()
         .filter(|(_, a)| a.is_some())
         .fold(0u64, |m, (i, _)| if i < 64 { m | (1u64 << i) } else { m });
+    // XMM-resident locals participate in the same graph-colouring coalescing
+    // as GPR-resident ones, so they need the same dead-at-entry protection
+    // (liveness tracks d/f locals at their base index via dload/dstore).
+    let xmm_resident: u64 = osr_xmm_assignments
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.is_some())
+        .fold(0u64, |m, (i, _)| if i < 64 { m | (1u64 << i) } else { m });
     let mut osr_dead_mask = vec![0u64; code_len + 1];
     for &(pc, live_in) in &compiler.osr_block_live_in {
         if pc < osr_dead_mask.len() {
-            osr_dead_mask[pc] = reg_resident & !live_in;
+            osr_dead_mask[pc] = (reg_resident | xmm_resident) & !live_in;
+        }
+    }
+    if std::env::var_os("CRATONVM_DBG_OSR_META").is_some() {
+        let masked: Vec<(usize, u64)> = compiler
+            .osr_block_live_in
+            .iter()
+            .filter_map(|&(pc, live_in)| {
+                let m = (reg_resident | xmm_resident) & !live_in;
+                if m != 0 { Some((pc, m)) } else { None }
+            })
+            .collect();
+        if !masked.is_empty() {
+            eprintln!(
+                "[osr-meta] gpr_resident={reg_resident:#x} xmm_resident={xmm_resident:#x} masked_entries={masked:x?}"
+            );
         }
     }
     cm.osr_dead_mask = Some(osr_dead_mask);
     cm.osr_local_assignments = Some(osr_local_assignments);
-    cm.osr_xmm_assignments = Some(compiler.xmm_assignments);
+    cm.osr_xmm_assignments = Some(osr_xmm_assignments);
     cm.osr_frame_size = compiler.frame_size;
     cm.osr_callee_saved_base = compiler.callee_saved_base;
     // HIB-CV-20 OSR caller-corruption fix: hand the trampoline the EXACT
@@ -29950,15 +30010,11 @@ mod tests {
     ///     load could produce).
     #[test]
     fn test_getfield_guarded_inline_fast_and_fallback() {
-        // Opt in explicitly: guarded_inline_getfield_enabled() defaults OFF
-        // since 2026-07-10 (see its doc comment) after it was found to
-        // SIGSEGV on a real Elasticsearch IVF-KNN vector workload. Not
-        // OnceLock-cached (compile-time gate only), so this plain env var
-        // set is race-free against other tests in this binary.
-        // SAFETY: test-only, single-purpose env var.
-        unsafe {
-            std::env::set_var("CRATONVM_JIT_GUARDED_GETFIELD", "1");
-        }
+        // guarded_inline_getfield_enabled() is default-ON (see its doc
+        // comment) -- no env var needed to exercise this path. If a test run
+        // sets CRATONVM_JIT_GETFIELD_HELPER=1 to force the helper-only path
+        // globally, this test's own assertions about the inline guard would
+        // no longer hold; nothing here does that.
         use std::sync::atomic::{AtomicUsize, Ordering};
         static TEST_BOUNDS: [AtomicUsize; 6] = [
             AtomicUsize::new(0),
