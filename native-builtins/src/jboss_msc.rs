@@ -617,6 +617,24 @@ impl ServiceContainer {
         self.pool_cv.notify_all();
     }
 
+    /// `ServiceContainer.isShutdown()` -- true once `shutdown()` has been
+    /// called at least once. Real MSC interface method with no default
+    /// implementation; unregistered, any caller died with
+    /// `AbstractMethodError: org/jboss/msc/service/ServiceContainer.isShutdown()Z
+    /// has no Code attribute`. First surfaced in `AbstractControllerService`'s
+    /// boot-completion path (`DomainModelControllerService.boot()` ->
+    /// `BootstrapListener.generateBootStatistics()`), aborting Host Controller
+    /// boot with `WFLYCTL0002: Error booting the container` right after
+    /// `start-servers` already failed on its own unrelated
+    /// `WFLYHC0053: Could not get the server inventory in 30 seconds` timeout
+    /// -- so this AbstractMethodError was masking the real failure reason in
+    /// the boot log by throwing during the FINALLY-style error-reporting path
+    /// itself.
+    pub fn is_shutdown(&self) -> bool {
+        let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        state.shutdown
+    }
+
     /// Count services in a given state — used by tests and health
     /// checks.
     pub fn count_in(&self, s: ServiceState) -> usize {
@@ -1819,6 +1837,19 @@ fn native_service_container_shutdown(
 ) -> MethodCallResult {
     global_container().shutdown();
     Ok(None)
+}
+
+/// `ServiceContainer.isShutdown()Z` -- see `ServiceContainer::is_shutdown`
+/// doc comment for the AbstractMethodError this fixes.
+fn native_service_container_is_shutdown(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(if global_container().is_shutdown() {
+        1
+    } else {
+        0
+    })))
 }
 
 /// R63 (WildFly): `org/jboss/msc/service/Lockable.acquireWrite()/acquireRead()`
@@ -3442,6 +3473,7 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         native_service_container_add_service,
     );
     r.register(cont, "shutdown", "()V", native_service_container_shutdown);
+    r.register(cont, "isShutdown", "()Z", native_service_container_is_shutdown);
     for stability_class in [
         cont,
         "org/jboss/msc/service/ServiceContainerImpl",
