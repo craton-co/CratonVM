@@ -200,14 +200,29 @@ fn spring_xml_set_factory_attribute(
     name: &str,
     value: Value,
 ) -> MethodCallResult {
+    // `create_string` may run a moving collection.  This helper is called
+    // with both a long-lived DocumentBuilderFactory and (for schema mode) a
+    // shared grammar-pool object, so neither raw reference may be used after
+    // that allocation without first rooting and refreshing it.
+    let factory_pin = ctx.pin_native_root(factory);
+    let value_pin = match value {
+        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+        _ => None,
+    };
     let name = ctx.create_string(name);
-    ctx.invoke_virtual(
+    let factory = ctx.read_native_pin(factory_pin, factory);
+    let value = match value_pin {
+        Some((pin, obj)) => Value::Object(Some(ctx.read_native_pin(pin, obj))),
+        None => value,
+    };
+    let result = ctx.invoke_virtual(
         factory,
         "setAttribute",
         "(Ljava/lang/String;Ljava/lang/Object;)V",
         &[Value::Object(Some(name)), value],
-    )?;
-    Ok(None)
+    );
+    ctx.unpin_native_roots(factory_pin);
+    result.map(|_| None)
 }
 
 fn native_spring_default_document_loader_create_document_builder_factory(
@@ -226,30 +241,48 @@ fn native_spring_default_document_loader_create_document_builder_factory(
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    spring_xml_set_factory_bool(ctx, factory, "setNamespaceAware", namespace_aware)?;
-    if validation_mode != 0 {
-        spring_xml_set_factory_bool(ctx, factory, "setValidating", true)?;
-        if validation_mode == 3 {
-            spring_xml_set_factory_bool(ctx, factory, "setNamespaceAware", true)?;
-            let schema = ctx.create_string("http://www.w3.org/2001/XMLSchema");
-            spring_xml_set_factory_attribute(
-                ctx,
-                factory,
-                "http://java.sun.com/xml/jaxp/properties/schemaLanguage",
-                Value::Object(Some(schema)),
-            )?;
-            if let Some(pool) = spring_xml_shared_grammar_pool(ctx) {
+    // Every setter below dispatches into Java and can collect.  Keep the
+    // factory rooted across the whole configuration sequence and refresh it
+    // before every forwarded use (including the final return value).
+    let factory_pin = ctx.pin_native_root(factory);
+    let result = (|| -> MethodCallResult {
+        let factory = ctx.read_native_pin(factory_pin, factory);
+        spring_xml_set_factory_bool(
+            ctx,
+            factory,
+            "setNamespaceAware",
+            namespace_aware,
+        )?;
+        if validation_mode != 0 {
+            let factory = ctx.read_native_pin(factory_pin, factory);
+            spring_xml_set_factory_bool(ctx, factory, "setValidating", true)?;
+            if validation_mode == 3 {
+                let factory = ctx.read_native_pin(factory_pin, factory);
+                spring_xml_set_factory_bool(ctx, factory, "setNamespaceAware", true)?;
+                let schema = ctx.create_string("http://www.w3.org/2001/XMLSchema");
+                let factory = ctx.read_native_pin(factory_pin, factory);
                 spring_xml_set_factory_attribute(
                     ctx,
                     factory,
-                    "http://apache.org/xml/properties/internal/grammar-pool",
-                    Value::Object(Some(pool)),
+                    "http://java.sun.com/xml/jaxp/properties/schemaLanguage",
+                    Value::Object(Some(schema)),
                 )?;
+                if let Some(pool) = spring_xml_shared_grammar_pool(ctx) {
+                    let factory = ctx.read_native_pin(factory_pin, factory);
+                    spring_xml_set_factory_attribute(
+                        ctx,
+                        factory,
+                        "http://apache.org/xml/properties/internal/grammar-pool",
+                        Value::Object(Some(pool)),
+                    )?;
+                }
             }
         }
-    }
 
-    Ok(Some(Value::Object(Some(factory))))
+        Ok(Some(Value::Object(Some(ctx.read_native_pin(factory_pin, factory)))))
+    })();
+    ctx.unpin_native_roots(factory_pin);
+    result
 }
 
 fn osw_wrapped_output(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
