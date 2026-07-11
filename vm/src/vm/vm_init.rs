@@ -5888,11 +5888,16 @@ mod tests {
         // `Map`/`ListIterator`/`Serializable` and the 8
         // `cratonvm/internal/Unmodifiable*` synthetic stamps, see
         // `d3474b3e`/`c2d68883`) plus `AssertionError` and `Iterator` and
-        // their transitively-loaded superinterfaces. This count legitimately
-        // grew from 5 as that bootstrap work landed; if it changes again,
-        // verify the new value against `SharedVm::new`'s class-loading calls
-        // rather than assuming a regression.
-        assert_eq!(shared.class_manager.read().loaded_count(), 25);
+        // their transitively-loaded superinterfaces. Grew again from 25 to 29
+        // with `4edaa9ba7`'s 4 new bootstrap loads: `java/util/Map$Entry`
+        // plus the `cratonvm/internal/UnmodifiableEntrySet` +
+        // `UnmodifiableMapEntry` + `UnmodifiableEntryItr` synthetic stamps
+        // (registered in `vm_init.rs` to fix `Collections.unmodifiableMap()
+        // .entrySet()`'s `setValue()` not throwing). This count legitimately
+        // grew from 5 as bootstrap work landed; if it changes again, verify
+        // the new value against `SharedVm::new`'s class-loading calls rather
+        // than assuming a regression.
+        assert_eq!(shared.class_manager.read().loaded_count(), 29);
         assert!(shared.statics.read().is_empty());
         assert!(shared.string_pool.read().is_empty());
         assert!(shared.class_mirrors.read().is_empty());
@@ -6059,8 +6064,9 @@ mod tests {
         let vm = Vm::new(VmConfig::default());
         // self_arc should be set, and get_arc should work
         let arc = vm.shared.get_arc();
-        // Same bootstrap class set as `shared_vm_default_config`.
-        assert_eq!(arc.class_manager.read().loaded_count(), 25);
+        // Same bootstrap class set as `shared_vm_default_config` — see that
+        // test's comment for what's currently in it and why the count moves.
+        assert_eq!(arc.class_manager.read().loaded_count(), 29);
     }
 
     #[test]
