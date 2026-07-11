@@ -58777,7 +58777,8 @@ fn native_b64_without_padding(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    b64_alloc_encoder(ctx, b64_variant(ctx, this), true)
+    let variant = b64_variant(ctx, this);
+    b64_alloc_encoder(ctx, variant, true)
 }
 
 fn native_b64_decode_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
