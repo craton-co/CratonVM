@@ -113,7 +113,12 @@ CratonVM. Given the narrow, deliberately-adversarial nature of the
 triggering scenario (misbehaving `ReadListener` + container auto-recovery),
 this is lower priority than a bug hit by normal application code.
 
-## 2026-07-10: original "implicit 200 commit" theory REFUTED; real root cause is a ~2s Acceptor/Poller-thread latency, tracked separately
+## 2026-07-10: original "implicit 200 commit" and Acceptor/Poller theories REFUTED; real root cause is deferred `HttpURLConnection` streaming
+
+**Correction (2026-07-11):** The Acceptor enters native `accept()` promptly;
+the client bridge buffers fixed-length streaming writes and sends them only at
+response retrieval. The active issue is
+[`../httpurlconnection-fixed-length-streaming-deferred.md`](../httpurlconnection-fixed-length-streaming-deferred.md).
 
 Reproduced with a `Request.method(Class, String)` + `JUnitCore`
 single-method runner (respects `@Test(expected=...)` correctly, unlike
@@ -156,10 +161,10 @@ client observes rc=200" claim above — that claim does not hold up):
   now live in their own doc since this is a general VM-core
   threading/scheduling concern, not specific to this test or even to
   Tomcat:
-  [`nio-poller-acceptor-thread-scheduling-latency.md`](../nio-poller-acceptor-thread-scheduling-latency.md).
+  [`httpurlconnection-fixed-length-streaming-deferred.md`](../httpurlconnection-fixed-length-streaming-deferred.md).
 
 **This doc stays OPEN** — `testNonBlockingReadIgnoreIsReady` is not fixed.
-Fixing it requires fixing the Acceptor/Poller latency issue in the doc
+Fixing it requires implementing live fixed-length HTTP streaming in the doc
 linked above; once that lands, re-verify this test (and re-check
 `testNonBlockingRead`/other `DataWriter`-paced tests in the same class for
 behavior changes, since they share the same underlying connector timing).
