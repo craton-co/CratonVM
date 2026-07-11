@@ -4,7 +4,13 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
-## 2026-07-10 `testNonBlockingReadIgnoreIsReady`'s old theory REFUTED; real cause is a general ~2s NioEndpoint Acceptor/Poller-thread latency, split into its own doc
+## 2026-07-10 `testNonBlockingReadIgnoreIsReady`: Acceptor/Poller theory refuted; real cause is deferred `HttpURLConnection` streaming
+
+**Correction (2026-07-11):** The Acceptor/Poller finding below was disproved
+by a minimal fixed-length-streaming `HttpURLConnection` reproducer. The
+legacy bridge buffers its body locally and only opens/sends the request at
+response retrieval; direct `Socket` clients are accepted promptly. The active
+record is [`httpurlconnection-fixed-length-streaming-deferred.md`](httpurlconnection-fixed-length-streaming-deferred.md).
 
 Re-investigated
 [`tomcat-08-07/nonblockingreadignoreisready-async-error-response-completion-gap.md`](tomcat-08-07/nonblockingreadignoreisready-async-error-response-completion-gap.md).
@@ -21,21 +27,18 @@ after a same-JVM warm-up test) and not the earlier-hypothesized
 `native-io` socket-close/drain-timeout issue (tested directly, zero
 effect — the peer had already sent EOF long before close() ran).
 
-- OPEN (new): [`nio-poller-acceptor-thread-scheduling-latency.md`](nio-poller-acceptor-thread-scheduling-latency.md)
-  — the actual mechanism: the NioEndpoint `Acceptor` thread appears to make
-  no progress for ~2 seconds (two full `Poller` `selectorTimeout=1000` ms
-  cycles) while the `Poller` thread is independently parked in blocking
-  `select()`/`WSAPoll` calls, then both make rapid progress together.
-  Isolated Rust unit tests confirm the low-level `wakeup()`/`select()`/
-  registration primitives are each individually fast and correct — the
-  bug (if it is one mechanism at all) is in how CratonVM schedules/runs
-  the two threads concurrently, not in the selector's own logic. Not
-  Tomcat-specific: likely affects any app with one thread parked in a
-  long blocking native call while another needs to make independent
-  progress. Needs VM-core threading/scheduling ownership to pick up with
-  proper `Thread.start()`/blocking-region instrumentation.
-- Updated: the original doc now documents the refutation and cross-links
-  here; it stays OPEN (not fixed) pending the above.
+- SUPERSEDED/RETIRED: [`nio-poller-acceptor-thread-scheduling-latency-SUPERSEDED.md`](../internal/tomcat-08-07/nio-poller-acceptor-thread-scheduling-latency-SUPERSEDED.md)
+  — the originally-claimed mechanism (NioEndpoint `Acceptor` thread appears to
+  make no progress for ~2 seconds while `Poller` is independently parked in
+  blocking `select()`/`WSAPoll`, then both make rapid progress together) does
+  **not** hold up: isolated Rust unit tests confirmed the low-level
+  `wakeup()`/`select()`/registration primitives are each individually fast and
+  correct, the Acceptor entered native `accept()` immediately, and a direct
+  `Socket` client was accepted promptly under the same NIO/Poller shape. The
+  apparent stall was entirely client-side (see the correction above). Moved to
+  `docs/internal/` — its primary claim is refuted and the real, still-open
+  issue is tracked separately by `httpurlconnection-fixed-length-streaming-deferred.md`
+  (linked above), which is currently owned by another concurrent session.
 
 ## 2026-07-10 ES suite-wide `Build$CurrentHolder` manifest-null FIXED (VM-core `Unsafe` bootstrap bug); new pre-existing Jackson residual filed
 

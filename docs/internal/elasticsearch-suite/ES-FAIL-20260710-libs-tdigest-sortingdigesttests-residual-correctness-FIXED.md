@@ -226,3 +226,53 @@ pre-existing performance issue (not a correctness bug, and not caused by
 either fix above — confirmed via live `gdb` sampling showing real forward
 progress, not a livelock). See
 [`testmonotonicity-quantile-cdf-dispatch-performance.md`](../../known-issues/elasticsearch-suite/testmonotonicity-quantile-cdf-dispatch-performance.md).
+
+## Update 2026-07-10 (later, concurrent session): true root cause of the `-Jit on` cluster
+
+The OSR-deny for `DualPivotQuicksort.sort` (dev `05f6930e`, above) fixes the
+symptom but is a MASK: it works because denying OSR for `sort` also prevents
+the OSR pipeline's eager-callee compiles, so the actually-poisoned artifact
+is never created. The underlying defect — found independently and
+concurrently on `fix/es-tdigest-jiton-20260710` — is in the **C2/IR backend
+lowerer** (`jit/src/ir_lower.rs`): `node_slot` is zero-initialised and
+`slot_of()` returned that `0` default for an SSA node the scheduler never
+placed in an emitted block. The emitted use then reads `[rbp - 0]` — the
+saved caller RBP — as a data value. Concretely, IR-compiling
+`java/util/DualPivotQuicksort.insertionSort([DII)V` (IR-eligible call-free
+FP compute) left the pc17 `ArrayLoad(Double)` feeding a GVN-collapsed loop
+phi unallocated, so `a[i+1] = ai` stored the frame pointer into the array
+being sorted (stack addresses as ~6e-310 subnormals, then smeared by the
+insertion shift). Every large `Arrays.sort(double[])` under `-Jit on` was
+silently mis-sorted whenever that artifact was reachable; all six failure
+shapes in this doc were downstream of sorting on corrupted data.
+
+Pinned by: `CRATONVM_DBG_PRECISE` showing ZERO GC activity before the
+corruption (eliminating every GC/staleness theory), a standalone
+`Arrays.sort(double[10000])` repro, per-callee `CRATONVM_JIT_BISECT_SKIP`
+bisection, `CRATONVM_JIT_IR_FP=0` isolating the IR backend, a hardware
+watchpoint (gdb, ASLR off) catching `movsd [rax+rcx*8+0x28], xmm0` writing
+`rbp+0x2E0` into `a[0]`, and an env-gated `slot_of` probe naming the
+unallocated node (`CRATONVM_DBG_IRSLOT=1`).
+
+Fix (same branch): any `slot_of()` readback of an unallocated slot latches
+`unallocated_slot_use` and the lowering bails to the single-pass backend —
+closing the whole class of "scheduler gap ⇒ silent frame-pointer read"
+miscompiles rather than this one victim. Three companion JIT soundness gaps
+found during the hunt are fixed in the same commit: the OSR dead-local mask
+ignored XMM-resident (double) locals (garbage seeded into coalesced pivot
+registers on OSR entry at `sort`'s bci 575/599 — this doc's original
+"OSR-reuse at two entry PCs" observation); the raw self-recursive CALL path
+pushed a phantom RAX return value for void methods; and the precise-maps
+innermost-RBP mirror was never restored when a compiled callee returned into
+a Rust dispatch helper. With the IR-lowerer bail in place the OSR deny for
+`DualPivotQuicksort.sort` is no longer load-bearing for correctness (kept as
+a harmless perf-policy choice).
+
+Also for the record: the `testMonotonicity` `-Jit on`
+`NoSuchMethodError: java/lang/Object.get(I)D` that briefly surfaced between
+the IR fix and this merge was the stale-lambda-capture-field family — a
+gated diagnostic (`CRATONVM_DBG_LAMBDA=1`, landed in `try_lambda_dispatch`)
+showed the dead pointer baked into the proxy's capture field with no
+forwarding pointer and a fresh field re-read returning the same dead
+address. It stopped reproducing after merging dev `395f7246` (concurrent
+GC-audit work; exact commit not bisected).

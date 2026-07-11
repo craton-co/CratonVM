@@ -637,6 +637,25 @@ impl VmHeap {
         dispatch!(self, set_field(obj, index, value))
     }
 
+    /// INT-8: field store with the G1 SATB pre-barrier SUPPRESSED. Reserved
+    /// for the weak-reference PROTOCOL writes (the pre-collection referent
+    /// null pass and the remark-time referent clears): those are not
+    /// semantic overwrites, and SATB-logging them recorded every active
+    /// referent as a mark root — the taint that made bitmap-based reference
+    /// processing inert (see `G1Collector::set_field_no_satb`). On the
+    /// Generational and ZGC backends this is a plain `set_field`: their
+    /// reference protocols never depended on hiding these writes (Gen uses
+    /// the watched-referents channel; ZGC processes references against its
+    /// own non-moving mark), so no behavior change there.
+    pub fn set_field_suppress_satb(&self, obj: ObjectRef, index: usize, value: Value) {
+        #[cfg(debug_assertions)]
+        clear_pending_pre_barrier();
+        match self {
+            VmHeap::G1(h) => h.collector.set_field_no_satb(obj, index, value),
+            other => dispatch!(other, set_field(obj, index, value)),
+        }
+    }
+
     pub fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
         dispatch!(self, get_field_volatile(obj, index))
     }
@@ -1290,6 +1309,18 @@ impl VmHeap {
         }
     }
 
+    /// INT-8: publish the referent-slot skip set for the cycle that
+    /// [`Self::g1_start_concurrent_mark`] just opened — the Weak/Soft/Phantom
+    /// `Reference` OBJECT addresses from the VM's reference registry,
+    /// snapshotted inside the same initial-mark STW. Must run BEFORE
+    /// [`Self::g1_mark_roots`] seeds the gray set (the skip set gates how
+    /// Reference objects are scanned). No-op on other backends.
+    pub fn g1_set_reference_skip_set(&self, addrs: &[usize]) {
+        if let VmHeap::G1(state) = self {
+            state.collector.set_reference_skip_set(addrs);
+        }
+    }
+
     /// Mark roots into G1's mark bitmap.
     pub fn g1_mark_roots(&self, roots: &[cratonvm_types::ObjectRef]) {
         if let VmHeap::G1(g1) = self {
@@ -1355,14 +1386,30 @@ impl VmHeap {
     /// 3. drains the gray set to a fixed point (including the overflow
     ///    rescans — `concurrent_mark_step` returns `false` until both the
     ///    worklist is empty and no overflow recovery is pending);
-    /// 4. `cleanup()` — per-region liveness, in-place free of wholly-dead
+    /// 4. INT-8 — when `process_refs` is supplied, invokes it with the
+    ///    post-remark liveness predicate (`G1Collector::is_live_after_mark`:
+    ///    bitmap + TAMS snapshot; conservative LIVE without positive
+    ///    evidence). The callback runs the VM's reference processing
+    ///    (clears, queue links, finalizer/cleaner submissions) and returns
+    ///    the addresses that must be RESURRECTED — dead finalizables about
+    ///    to run `finalize()`, pending cleaner chains, policy-retained soft
+    ///    referents. Those are marked gray and the closure re-drained, so
+    ///    step 5 cannot free them. This window — bitmap complete, nothing
+    ///    freed yet — is the only point in the cycle where weak/soft refs
+    ///    to dead OLD-region referents can be cleared (evacuation pauses
+    ///    only ever see CSet deaths);
+    /// 5. `cleanup()` — per-region liveness, in-place free of wholly-dead
     ///    Old regions, humongous reclaim, SATB deactivation — while the
     ///    world is still stopped.
     ///
     /// Returns `false` (and does nothing) when no cycle is active, so a
     /// second initiator that lost the STW race cannot re-run remark against
     /// an already-completed cycle.
-    pub fn g1_final_remark_and_cleanup(&self, roots: &[cratonvm_types::ObjectRef]) -> bool {
+    pub fn g1_final_remark_and_cleanup(
+        &self,
+        roots: &[cratonvm_types::ObjectRef],
+        process_refs: Option<&mut dyn FnMut(&dyn Fn(usize) -> bool) -> Vec<usize>>,
+    ) -> bool {
         if let VmHeap::G1(state) = self {
             let Some(ctrl) = state.concurrent_mark.lock().take() else {
                 // Defensive: a marking-active phase with no controller is an
@@ -1390,6 +1437,15 @@ impl VmHeap {
                 steps,
                 outcome.is_ok(),
             );
+            // INT-8 (step 4): reference processing against the completed
+            // bitmap, then resurrection of everything the processor handed
+            // out, BEFORE cleanup can free it.
+            if let Some(cb) = process_refs {
+                let collector = &state.collector;
+                let is_live = |addr: usize| collector.is_live_after_mark(addr);
+                let resurrect = cb(&is_live);
+                collector.resurrect_after_remark(&resurrect);
+            }
             state
                 .collector
                 .gc_state
