@@ -136,8 +136,26 @@ cycle's pointer map to its frames, so under an evacuating collector those
 objects must not move (Generational gets this for free from its non-moving
 frozen-cycle sweep).
 
-**Residuals CLOSED (2026-07-10, second pass — pending probe-host
-validation of this pass):**
+**Residuals CLOSED + probe-host-VALIDATED (2026-07-10/11 second pass,
+binary `gcprobes-0710/cratonvm-int3resid`).** Validation: `SpinPollMark`
+probe (spinners hold a live Node in JIT state and run allocation-free
+compiled spins for the whole choreography; main retains 58MB, ages it
+into Old with 24 forced GCs — tenuring ~15, plain churn never promotes —
+then churns young so IHOP=25 starts the cycle) is HotSpot-exact on
+G1/ZGC/Gen, with gdb breakpoint confirmation (SIGUSR2 passthrough — gdb
+otherwise intercepts the takeover's rendezvous signal) of THREE full
+concurrent-mark cycles per run: `g1_start_concurrent_mark` ×3 +
+`g1_final_remark_and_cleanup` ×3, all inside never-polling spin windows.
+ZGC: SpinPoll 3/3 + MTChurn 5/5 + Churn/Copy/RefCheck HotSpot-identical.
+G1 regression: MTChurn 10/10 + SpinPoll 3/3 + all gates exact. Gen:
+MTChurn 5/5 + both spin probes exact (256m; 80–128m Gen runs OOM on the
+retained set — binary-parity, pre-existing sizing). NOTE for future
+probes: `tracing::debug!` is compiled out of release
+(`release_max_level_info`) and `-verbose:gc` is parsed but unconsumed —
+use gdb breakpoints on un-inlined cross-crate (LTO-off) gc-crate symbols
+for cycle confirmation. A pre-existing `POST-GC STALE LOCAL` tripwire
+(main's frame local under OOM-pressure G1) fires identically pre/post —
+separate finding, not this item.
 - ZGC: `supports_jit_tlab_skip()` now returns true for every backend. ZGC
   is trivially safe for the takeover — `ZgcRealHeap` is a non-moving STW
   mark-sweep whose sweep walks the allocation-base REGISTRY (never linear
