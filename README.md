@@ -121,26 +121,37 @@ matches HotSpot bit-for-bit.
 | Benchmark (N = 2²⁴)                              | HotSpot C2 | TornadoVM GPU  | **CratonVM GPU** | vs HotSpot | vs TornadoVM |
 |---------------------------------------------------|------------|----------------|-------------------|------------|--------------|
 | Integer div-chain (48 unvectorizable divs/elem)    | 1,910 ms   | 28 ms          | **9 ms**          | **212x**   | **3.1x**     |
+| Double div-chain (64 divs/elem, IEEE-exact)¹        | 1,508 ms   | 129 ms         | **91 ms**         | **16.6x**  | **1.4x**     |
 | 96 multiply-adds/elem (AVX2-vectorized on CPU)     | 8 ms       | 17 ms          | **11 ms**         | 0.7x       | 1.5x         |
-| Dot-product reduction (`int·int` → `long`)         | 7 ms       | unimplemented¹ | **18 ms**         | 0.4x       | n/a¹         |
+| Dot-product reduction (`int·int` → `long`)         | 7 ms       | unimplemented²  | **18 ms**         | 0.4x       | n/a²          |
 
-¹ TornadoVM 4.0.1's PTX backend throws `TornadoInternalError: unimplemented`
+¹ `FDIV_CHECKSUM` is **bit-exact** between CratonVM-GPU and HotSpot at
+every size tested (`div.rn.f64` PTX is IEEE-754 round-to-nearest, same as
+x86 `vdivpd`); TornadoVM's checksum diverges slightly from HotSpot's —
+its PTX backend doesn't guarantee bit-exact division.
+
+² TornadoVM 4.0.1's PTX backend throws `TornadoInternalError: unimplemented`
 on the equivalent `@Reduce`-over-`LongArray` kernel; CratonVM's transparent
 reduction dispatch handles a shape TornadoVM's own reduction skeleton
 currently can't.
 
-*The div-chain row is the honest "GPU wins big" case: 48 data-dependent
-integer divisions per element that no CPU SIMD unit can vectorize, so the
-GPU wins on raw parallelism. The other two rows are the honest counter-cases
-kept in for the same reason the CPU table above shows CratonVM losing to
-JDK — HotSpot's AVX2 auto-vectorizer (96-MAD) and a PCIe-round-trip-bound
-single-scalar-output kernel (dot-product) are both genuinely hard for any
-GPU dispatch to beat at this size; the GPU still ties or wins overall
-against TornadoVM's own PTX backend on both. Checksums verified identical
-between CratonVM-GPU and HotSpot on every row. Full results — more input
-sizes, `ldc`-constant kernels, cold-start numbers up to N = 2²⁸, sources,
-and methodology — are in "GPU offload benchmarks" further down this file
-and in [docs/gpu/README.md](docs/gpu/README.md).*
+*The two div-chain rows are the "GPU wins big" cases: neither integer nor
+double division has a competitive CPU-vectorized form the way multiply/add
+does, so the GPU wins on raw parallelism at every size tested (confirmed
+2²⁰ through 2²⁶ for the double kernel — see sources below; the ratio holds
+steady, it isn't a one-off at this particular N). The other two rows are
+the honest counter-cases kept in for the same reason the CPU table above
+shows CratonVM losing to JDK, and neither has a scale-up fix: 96-MAD's
+AVX2 auto-vectorizer stays competitive with the GPU at every N large enough
+to escape millisecond-timer noise (an earlier "GPU wins at 2²²" reading was
+that noise, not a real result — see sources), and dot-product's ratio holds
+flat from 2²² through 2²⁶ because a single atomic-accumulator cell doesn't
+get relatively cheaper with more elements; a real fix needs a proper
+tree/shared-memory reduction, tracked as an open item. Checksums verified
+identical between CratonVM-GPU and HotSpot on every row. Full results —
+more input sizes, `ldc`-constant kernels, cold-start numbers up to N = 2²⁸,
+sources, and methodology — are in "GPU offload benchmarks" further down
+this file and in [docs/gpu/README.md](docs/gpu/README.md).*
 
 ## Quick Start
 
@@ -401,6 +412,27 @@ no CPU JIT can vectorize this shape; the GPU wins on raw parallelism:
 | 2²⁴ | 2,232 ms | 1,910 ms | **9 ms** | 28 ms | **212×** |
 | 2²⁶ | 9,162 ms | 6,735 ms | **33 ms** | 86 ms | **204×** |
 
+**Double-precision division chain** — 64 sequential `x = x / b[i] + c` steps
+per element (`GpuFloatDivChain`). The floating-point counterpart of the
+integer chain above: `vdivpd` has real but low throughput even under AVX2
+(a shared, weakly-pipelined execution unit, unlike multiply/add/FMA), so the
+GPU wins here too, and its `div.rn.f64` is IEEE-754 exact — `FDIV_CHECKSUM`
+matches HotSpot bit-for-bit at every size, unlike TornadoVM's PTX backend
+(checksum diverges slightly there, e.g. `2.3711976971862224E8` vs
+`2.3833420668027386E8` at 2²⁶ — approximate device math):
+
+| N | CratonVM CPU | HotSpot C2 | **CratonVM GPU** | TornadoVM GPU | GPU vs HotSpot |
+|---|---|---|---|---|---|
+| 2²⁰ | 435 ms | 89 ms | **7 ms** | 11 ms | **12.7×** |
+| 2²² | 1,856 ms | 400 ms | **23 ms** | 38 ms | **17.4×** |
+| 2²⁴ | 6,299 ms | 1,508 ms | **91 ms** | 129 ms | **16.6×** |
+| 2²⁶ | not measured* | 5,578 ms | **365 ms** | 482 ms | **15.3×** |
+
+\* the own-CPU run at 2²⁶ (64M elements × 64 divisions × 3 reps) was still
+running after several minutes on this shared/loaded box and was not worth
+blocking on — the 2²⁰-2²⁴ rows already establish the CratonVM-CPU trend,
+and the comparison that matters (GPU vs. HotSpot/TornadoVM) is complete.
+
 **96 multiply-adds per element** (`GpuWarm.heavy`) — a shape HotSpot C2 *can*
 auto-vectorize with AVX2, making it the honest hard case: the GPU still beats
 or ties the vectorized CPU and outruns TornadoVM ~2× on the same kernel:
@@ -411,8 +443,19 @@ or ties the vectorized CPU and outruns TornadoVM ~2× on the same kernel:
 | 2²⁴ | 1,955 ms | 8 ms | **11 ms** | 17 ms | 178× |
 | 2²⁶ | 7,689 ms | 25 ms | **27 ms** | 51 ms | 285× |
 
+*Does the 96-MAD ratio ever flip in CratonVM-GPU's favor at a smaller N?
+Checked directly: at N ≤ 2²² both HotSpot and CratonVM-GPU round to 0-1 ms,
+which is `System.nanoTime()`/millisecond-timer noise, not a reproducible
+signal (an earlier "2× GPU win at 2²²" reading, visible in the table above,
+was exactly this noise — re-measured and it doesn't hold up). At N ≥ 2²⁴ the
+ratio settles to ~0.7-0.9× and stays there; scaling further doesn't change
+it because both sides scale ~linearly once past the noise floor. The
+double-precision division chain above is the honest floating-point
+alternative that *does* show a clear, reproducible win at every size.*
+
 Sources: [bench-gpu/results/divchain-comparison-20260711.md](bench-gpu/results/divchain-comparison-20260711.md),
 [warm-comparison-20260711.md](bench-gpu/results/warm-comparison-20260711.md),
+[float-divchain-20260711.md](bench-gpu/results/float-divchain-20260711.md),
 and the cold-start 4-way in [gpu-comparison-20260711.md](bench-gpu/results/gpu-comparison-20260711.md)
 (includes N = 2²⁸ / 269M elements: 579 ms on GPU vs 30.8 s CratonVM CPU).
 Benchmark sources live in `bench-gpu/` (+ `bench-tornado/` for the TornadoVM twins). Numbers were taken on a
@@ -447,6 +490,14 @@ transparent-offload surface for a shape that TornadoVM 4.0.1's PTX backend
 currently can't handle at all: the equivalent `@Reduce`-over-`LongArray` kernel
 (`bench-tornado/TornadoDotBench.java`) throws
 `TornadoInternalError: unimplemented`.
+
+Does scaling N help? No: the ratio holds roughly flat (~3× slower on GPU)
+from N=2²² through N=2²⁶ (12 ms → 41 ms GPU vs 4 ms → 19 ms HotSpot at
+2²⁴/2²⁶). The kernel is memory-bandwidth-bound on both sides, and every GPU
+thread races an atomic add on the *same* accumulator cell — that
+contention doesn't improve with more elements. A real win here needs a
+proper tree/shared-memory reduction instead of a single atomic cell
+(tracked as an open item, not yet built).
 
 **`ldc` constants** (`bench-gpu/GpuLdcBench.java`, a 96-step multiply-add chain
 using constants outside `sipush` range so javac emits `ldc` instead of
