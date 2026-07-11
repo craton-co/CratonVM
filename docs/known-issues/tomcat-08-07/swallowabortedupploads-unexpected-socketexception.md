@@ -1347,3 +1347,52 @@ already built and validated as safe, with no regressions across an
 extensive test matrix — a legitimate, low-risk, high-value default-path
 improvement to the general register-invisibility problem regardless of
 whether it happens to be the exact mechanism behind this one crash.
+
+
+## 2026-07-10: `accesslogvalve-rewritevalve-connection-failures.md` retired — its sixth-cause SIGSEGV catalogued here; stale Hibernate cross-reference in that doc corrected
+
+`docs/known-issues/tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md`
+has been retired and moved to
+`docs/internal/tomcat-08-07/accesslogvalve-rewritevalve-connection-failures-RESOLVED.md`.
+All five of its own locally-owned root causes (Layer 1 `URL.openConnection()`
+CCE, Layer 2 `ByteBuffer.address`, Layer 3 `StringReader.read()`, the
+cross-cutting `SocketWrapperBase.lock` NPE, and the fifth-cause JIT
+`ConcurrentLinkedQueue` allocate-then-CAS miscompile) are FIXED on `dev`. Its
+sixth cause was never a new/distinct bug — it's another confirmed occurrence
+of this doc's "register-invisible JIT root" family, catalogued here rather
+than left to sit in a now-closed doc:
+
+- **Class/method:** `org.apache.catalina.valves.TestAccessLogValve`,
+  crashed around test #8 (`test[7: Name[pct-A], Type[json]]`), on an
+  `http-nio` worker thread, inside JIT-compiled code (`rip` in an anonymous
+  executable region with no symbol table).
+- **Register dump:** `rax=0x5 rdi=0x200106b6010 rsi=0x1894ed00
+  r10=0x200417c27c0 r12=0x20042260010 r13=0x1 r14=0x200106b6010
+  r15=0x20042260000` — `rdi`/`r10`/`r12`/`r14`/`r15` all share the
+  `0x2000xxxxxxxx`-tagged-pointer shape every other live register in this
+  family's crashes shares; `rsi` alone breaks it (`0x1894ed00`, a bare
+  truncated value) — the same byte-for-byte signature as the DoHead doc and
+  this doc's own `AbortedPOSTClient` occurrences above.
+- Consistent with the family's known fingerprint: `CRATONVM_JIT_VIRTUAL_TIERUP=0`
+  avoided the crash there too (got 5x further before hitting the unrelated
+  STW cross-thread JIT takeover stall instead). Deliberately not patched, same
+  reasoning as this doc's own residual: the real fix is precise JIT oop maps
+  / shadow stack.
+
+**Correction to the retired doc's own text:** that doc's sixth-cause section
+also cited `docs/known-issues/hib-global-temptable-nondeterministic-sigsegv-20260710.md`
+(Hibernate global-temp-table DDL) as a corroborating occurrence of this same
+family. That citation is stale and should not be repeated: the Hibernate
+SIGSEGV cluster was subsequently root-caused as a **different, unrelated**
+bug (the guarded-inline-getfield JIT regression, already fixed by `93b33576`)
+and moved to
+`docs/internal/fixed-suite-bugs/hib-global-temptable-nondeterministic-sigsegv-20260710-RESOLVED.md`,
+which explicitly refutes the global-temp-table/GC-root-pinning hypothesis for
+that cluster. Don't count it among this family's confirmed occurrences.
+
+**Updated confirmed-occurrence list for the register-invisible-JIT-root
+family** (tomcat-08-07 investigation): DoHead
+(`docs/internal/fixed-suite-bugs/dohead-jit-heap-corruption-register-invisibility-FIXED.md`),
+`TestSwallowAbortedUploads`/`AbortedPOSTClient` (this doc, above), and
+`TestAccessLogValve` (this section). The Hibernate global-temp-table cluster
+is explicitly **not** part of this list per the correction above.

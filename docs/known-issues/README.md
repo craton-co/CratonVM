@@ -4,6 +4,11 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-10 AccessLogValve/RewriteValve doc RETIRED (5/6 causes fixed; 6th is the already-tracked register-invisible-JIT-root family, not a new bug)
+
+- RETIRED: [`tomcat-08-07/accesslogvalve-rewritevalve-connection-failures-RESOLVED.md`](../internal/tomcat-08-07/accesslogvalve-rewritevalve-connection-failures-RESOLVED.md) (moved from `known-issues/tomcat-08-07/`) — five of six root causes found across this investigation (`URL.openConnection()` CCE, `ByteBuffer.address`, `StringReader.read()`, the cross-cutting `SocketWrapperBase.lock` NPE, and a JIT `ConcurrentLinkedQueue` allocate-then-CAS miscompile) are FIXED and landed on `dev`. The sixth — a SIGSEGV around `TestAccessLogValve` test #8 — is a confirmed, byte-for-byte register-signature match with the already-tracked, currently-OPEN "register-invisible JIT root" bug family (real fix needs precise JIT oop maps / shadow stack, deep infrastructure work, deliberately not attempted). Catalogued as another occurrence in [`tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md`](tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md), the live tracking doc for this family — don't reopen the retired doc for a repeat of this signature, add it there instead.
+- **Correction while retiring:** the retired doc's sixth-cause section had cited `hib-global-temptable-nondeterministic-sigsegv-20260710.md` as a corroborating occurrence of this family. That's stale — see the entry above (2026-07-10 Hibernate remote rerun SIGSEGV cluster RESOLVED): that cluster was a different, unrelated, already-fixed bug. Corrected in both the retired doc and the swallow-uploads tracking doc.
+
 ## 2026-07-10 `testNonBlockingReadIgnoreIsReady`: Acceptor/Poller theory refuted; real cause is deferred `HttpURLConnection` streaming
 
 **Correction (2026-07-11):** The Acceptor/Poller finding below was disproved
