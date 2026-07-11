@@ -63281,7 +63281,20 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         // can't just re-call `execute`/`shutdown` via `invoke_virtual` (would
         // recurse back into this same native).
         if executor_has_real_workers(ctx, this) {
-            ctx.invoke_virtual_bytecode_only(this, "shutdown", "()V", &[])?;
+            // NOT invoke_virtual_bytecode_only: this native is ALSO reached
+            // via ScheduledThreadPoolExecutor.shutdown()'s super.shutdown()
+            // (invokespecial always checks the native registry first -- see
+            // populate_invoke_cache), and that dynamic-receiver-class helper
+            // would just re-find STPE's own overriding shutdown() again --
+            // infinite recursion. invoke_special_bytecode_only resolves
+            // statically on the NAMED class instead of the receiver's
+            // dynamic class, so it lands on ThreadPoolExecutor's own body.
+            ctx.invoke_special_bytecode_only(
+                "java/util/concurrent/ThreadPoolExecutor",
+                "shutdown",
+                "()V",
+                &[Value::Object(Some(this))],
+            )?;
         } else {
             ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
         }
@@ -63329,7 +63342,20 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         // can't just re-call `execute`/`shutdown` via `invoke_virtual` (would
         // recurse back into this same native).
         if executor_has_real_workers(ctx, this) {
-            ctx.invoke_virtual_bytecode_only(this, "shutdown", "()V", &[])?;
+            // NOT invoke_virtual_bytecode_only: this native is ALSO reached
+            // via ScheduledThreadPoolExecutor.shutdown()'s super.shutdown()
+            // (invokespecial always checks the native registry first -- see
+            // populate_invoke_cache), and that dynamic-receiver-class helper
+            // would just re-find STPE's own overriding shutdown() again --
+            // infinite recursion. invoke_special_bytecode_only resolves
+            // statically on the NAMED class instead of the receiver's
+            // dynamic class, so it lands on ThreadPoolExecutor's own body.
+            ctx.invoke_special_bytecode_only(
+                "java/util/concurrent/ThreadPoolExecutor",
+                "shutdown",
+                "()V",
+                &[Value::Object(Some(this))],
+            )?;
         } else {
             ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
         }
