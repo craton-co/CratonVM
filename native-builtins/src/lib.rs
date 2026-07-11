@@ -7204,6 +7204,13 @@ fn native_lucene_byte_buffers_data_input_slice(
     Ok(Some(Value::Object(Some(new_obj))))
 }
 
+fn native_jackson_stream_read_constraints_max_name_length(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    Ok(args.first().copied())
+}
+
 fn register_spring_codec_intrinsics(registry: &mut NativeMethodRegistry) {
     registry.register(
         "org/springframework/core/codec/CharSequenceEncoder",
@@ -24368,6 +24375,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // the ObjectStreamClass rules before Java-side MethodHandle fallback runs.
     #[cfg(feature = "experimental-serialization")]
     serialization::register_reflection_factory_serialization(registry);
+
+    registry.register(
+        "com/fasterxml/jackson/core/StreamReadConstraints$Builder",
+        "maxNameLength",
+        "(I)Lcom/fasterxml/jackson/core/StreamReadConstraints$Builder;",
+        native_jackson_stream_read_constraints_max_name_length,
+    );
 
     registry.with_category(cratonvm_native_api::NativeKind::Intrinsic, |registry| {
         register_spring_codec_intrinsics(registry);

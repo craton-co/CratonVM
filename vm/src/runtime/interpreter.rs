@@ -24404,7 +24404,13 @@ fn execute_invokestatic(
     // preservation as self-calls; resolving by flat name can pick the app copy.
     let static_dispatch_class_id = self_class_id.or_else(|| {
         if crate::runtime::env_cache::loader_aware_resolution() {
-            lookup_loader_initiated(shared, current_class_id, &method_class_name)
+            // Preserve the initiating loader even when the global classpath
+            // already has a same-named class. This is required for nested
+            // implementation jars whose owner is only visible to the caller
+            // loader.
+            lookup_loader_initiated(shared, current_class_id, &method_class_name).or_else(|| {
+                drive_defining_loader_load(shared, thread, current_class_id, &method_class_name)
+            })
         } else {
             None
         }

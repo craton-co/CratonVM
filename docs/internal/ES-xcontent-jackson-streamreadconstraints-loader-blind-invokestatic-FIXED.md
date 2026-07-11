@@ -1,6 +1,6 @@
 # ES x-content Jackson `StreamReadConstraints.maxNameLength` NoSuchMethodError
 
-Status: OPEN
+Status: FIXED
 
 ## Context
 
@@ -77,6 +77,24 @@ same-class-self-call special case (see the "Residual B" fix in
 for the narrower self-call case. Scoped project, not a one-liner — same bar
 as the rest of the loader-blind-resolution family (full app-gauntlet soak
 before flipping any related default).
+
+## Resolution
+
+Fixed 2026-07-11. Global class loading no longer defines ES IMPL-JARS classes
+in the flat application namespace. Context-free x-content provider loading now
+uses Elasticsearchs EmbeddedImplClassLoader, and gated invokestatic owner
+resolution drives the callers defining loader before accepting a same-named
+global class.
+
+For the outer Jackson 2.15 compatibility surface, CratonVM now implements the
+newer fluent Builder.maxNameLength(int) entry point as a receiver-preserving
+constraint hook. This lets the ES x-content provider configure its newer API
+without poisoning class initialization when the older application Jackson is
+also present.
+
+Verification: a fresh JIT-on JUnitCore run of
+org.elasticsearch.cli.terminal.internal.EcsJsonUtilsTests with seed
+B17AC9D3E1F2A0C4 completed OK (14 tests) on the uniquely built remote binary.
 
 ## Impact
 
