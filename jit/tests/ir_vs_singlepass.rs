@@ -1113,7 +1113,7 @@ fn compile_opt_fields(
     optimize: bool,
 ) -> Option<CompiledMethod> {
     let field_resolver_with_compact =
-        |cp_idx| field_resolver(cp_idx).map(|(field_index, tag)| (field_index, tag, 0, false));
+        |cp_idx| field_resolver(cp_idx).map(|(field_index, tag)| (field_index, tag, None));
     try_compile(
         cm,
         None,
