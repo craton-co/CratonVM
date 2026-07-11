@@ -1,6 +1,6 @@
 # WildFly domain startup timeout with repeated corrupt `Value` cell guard
 
-Status: OPEN — but the HIB-CV-32 corrupt-Value guard did NOT fire in ANY 2026-07-07 run (the sixth session finally ran the real Arquillian test end-to-end under CratonVM nested processes; see the 2026-07-07 sixth-session update at the bottom). Three merged fixes on this path (class_manager/vtable_manager AB-BA 48b3c2d2, XNIO AbstractMethodError 952f0093, jit_instanceof UAF) plus the 11 MSC real-start boot fixes (4b2508cf) appear to have cleared or now out-gate whatever produced the guard; two NEW blockers (sibling doc) currently stop the boot before the sustained-load phase that originally provoked it. Do not move to internal until a domain boot again runs a long sustained workload with the guard confirmed silent under CRATONVM_DIAG_HIB32=1.
+Status: OPEN — gated by WFLYHC0053 (`Could not get the server inventory in 30 seconds`). HIB-CV-32 has now stayed silent across every 2026-07-07 through 2026-07-11 run (multiple sessions, tens of thousands of log lines each) including this doc's own seventh-session byte-level socket capture — very strong evidence that guard is genuinely closed. The seventh session (2026-07-11) root-caused WFLYHC0053 to the exact byte level: Host Controller's read of the Process Controller's process-inventory response socket gets exactly 1 of 53 written bytes, then the connection is treated as closed, even though the Process Controller's own socket end never closes and is still blocked waiting for more input — mechanism identified, underlying cause (race vs. genuine OS-level EOF) NOT YET FOUND. See the 2026-07-11 seventh-session update at the bottom for the full repro recipe and next steps. Do not move to internal until WFLYHC0053 is resolved and a domain boot reaches sustained managed-server load with HIB-CV-32 confirmed silent throughout.
 Severity: High
 First confirmed: 2026-07-05 on Azure worktree `codex/wildfly-nonpassed-probes-20260705-035722`
 
@@ -1458,3 +1458,187 @@ re-confirmed** — they did not appear verbatim in this run's 63K lines
 (none of the four signature strings matched), but boot also never reached a
 fully-up, steady state to be confident they're truly gone rather than just
 not-yet-reached. Re-check once `WFLYHC0053` is resolved.
+
+
+## 2026-07-11 update (seventh session) — `WFLYHC0053` root-caused to a specific 1-byte socket read; not fixed; two independent findings, one ruled out as gating, one flagged as the strongest remaining lead
+
+Picked this up as the designated next target per the sixth session's own hand-off. Confirmed the
+sixth session's `CRATONVM_JAVA_HOME` fix and MSC fixes (`bd5626a9`, `f3d69e2b`, `40d05aac`) are all
+already on `dev` — no re-work needed there. Built a fresh isolated-worktree binary from
+`origin/dev` and reproduced the doc's harness recipe repeatedly (6 full boot attempts) on a
+**custom bind address/port** (`-b=127.0.0.5x -bmanagement=127.0.0.5x -Djboss.management.http.port=x9990
+-Djboss.management.native.port=x9999`) — the shared host had a genuinely unrelated concurrent
+session's real-HotSpot WildFly testsuite (`ModelPersistenceTestCase`) bound to the stock
+`127.0.0.1:9990`, which produced a **false-positive** `WFLYSRV0083 Address already in use` in the
+first two attempts before this was diagnosed as port contention, not a CratonVM bug. **Anyone
+re-running this doc's harness on this shared host should use non-default bind
+addresses/ports** — this cost real time to diagnose and would silently corrupt results otherwise.
+
+### Finding A (ruled out as the WFLYHC0053 gate, but a real, separate bug): a Java thread permanently blocks reading the Host Controller process's own real stdin (`System.in`, native fd 0)
+
+Live `gdb -p <hc-pid> -batch -ex 'thread apply all bt'` on a boot that had gone quiet for 80+ s
+caught the "main-vm" thread mid-interpreter-call-stack (`execute_frame` → `execute_instruction` →
+`try_stackless_invoke` → `safe_native_call` → `native_fis_read`, `vm/src/vm/vm_exec.rs` /
+`native-io/src/lib.rs`), blocked in a real `libc::read(fd=0, ...)` — i.e. genuinely parked reading
+the VM process's own OS-level stdin, not a synthetic/pipe fd. Added a temporary, flag-gated
+diagnostic (`CRATONVM_DBG_STDIN_READ=1`, since reverted — not committed, see below) directly in
+`native_fis_read` (`native-io/src/lib.rs`) confirming: `this_class=java/io/FileInputStream fd=0`,
+and the read **never returns** for the rest of the boot (no matching `result=` line in three full
+runs that otherwise completed and reached `WFLYSRV0025`/`WFLYHC0053`).
+
+Traced the likely Java-level origin via `javap` on `wildfly-process-controller-24.0.1.Final.jar`:
+`ManagedProcess.start()` (the class that spawns Host Controller via `ProcessBuilder`) writes a
+`pcAuthKey` to `Process.getOutputStream()` (base64-encoded) then immediately `close()`s that
+stream (bytecode offsets 445-469) — i.e. Host Controller's own real stdin (fd 0, connected to
+that pipe) is expected to receive the auth key once, then see EOF. CratonVM's
+`ProcessBuilder.start()` (the live implementation is `native-io/src/process.rs`'s
+`native_process_builder_start` → `spawn_and_wrap_with_redirects`; a second,
+`child.wait_with_output()`-based implementation also exists at
+`native-builtins/src/phases_late.rs::register_phase57_process`'s `"start"` registration but is
+dead code, overridden by the native-io one per that file's own doc comment — worth deleting in a
+follow-up to stop it misleading future readers) defaults `ProcessBuilder`'s stdin to
+`Stdio::piped()` correctly, and `native_pipe_output_close`
+(`native-io/src/process.rs`) correctly calls `fd_table().close(fd)`, which removes the
+`ChildStdinPipe` entry and lets `Drop` close the OS pipe — this part looks correct on inspection.
+
+**Why this is ruled out as WFLYHC0053's gate:** in three separate full runs, boot continued for
+tens of thousands of further log lines and reliably reached both `WFLYSRV0025 ... started` and the
+`WFLYHC0053` failure while this one thread stayed permanently parked on fd 0 — proving CratonVM
+threads run genuinely independently here (this is not the sole "main-vm" interpreter thread
+blocking everything, despite the thread's OS name). So whatever Java thread this is, it is not on
+the critical boot path. **Not further identified which WildFly thread/code this is** (candidates:
+a genuine second stdin read past the auth key that real WildFly expects to block until a later
+lifecycle event — plausible, matches `SendStdInTask`-style command delivery seen in
+`ManagedServer`'s inner classes — vs. an actual bug where EOF didn't propagate and some thread is
+stuck that shouldn't be). Recorded here so a future investigation of thread/resource leaks doesn't
+have to re-discover this; not itself worth chasing further under this doc's WFLYHC0053 mandate.
+The temporary diagnostic was reverted before finishing this session (not merged) — `git checkout --
+native-io/src/lib.rs` — since it never became a real fix; re-add
+`if fd == 0 { eprintln!(...) }` guards in `native_fis_read` if picking this up again.
+
+### Finding B (the actual WFLYHC0053 mechanism, root-caused to the byte level, NOT fixed): Host Controller's read of the Process Controller's inventory response gets exactly 1 byte, then the connection is treated as closed, despite the Process Controller having already written the full response and never closing its own end
+
+With `CRATONVM_DBG_SOCK=1` (light) and a clean unique-port run, captured the **exact** socket
+byte-level exchange at the moment `WFLYHC0053` fires (this reproduces **100% reliably**, every
+run, always within ~1 second of `"Executing two-phase"` being logged for the
+`start-servers(enabled-auto-start=true)` operation — this is NOT the 30-second internal timeout
+being slow; the actual connection-loss event happens almost immediately, and the code then waits
+out the full 30 s on a latch that will now never be counted down):
+
+```text
+[Host Controller] TRACE [org.jboss.as.host.controller] Executing two-phase
+[dbg-sock] write: sid=1 sent=5 bytes      <- HC sends the request header (sid=1 is HC's socket)
+[Host Controller] TRACE ... Sending data chunk of size %d
+[dbg-sock] read: sid=2 got=1  (x5, byte-by-byte)   <- PC receives it (sid=2 is PC's accepted socket)
+[dbg-sock] write: sid=1 sent=1 bytes      <- HC sends end-of-message marker
+TRACE ... Received end data marker
+TRACE ... Sending data chunk of size %d
+[dbg-sock] write: sid=2 sent=5 bytes      <- PC writes its response header
+[dbg-sock] write: sid=2 sent=47 bytes     <- PC writes its response payload (47 bytes)
+TRACE ... Sending end of message
+[dbg-sock] write: sid=2 sent=1 bytes      <- PC writes its end-of-message marker
+[Host Controller] [dbg-sock] write: sid=1 sent=1 bytes
+[dbg-sock] read: sid=2 want=1 (blocking on recv...)   <- PC's own reader goes back to waiting; PC's socket is NOT closed
+[Host Controller] [dbg-sock] read: sid=1 got=1        <- HC reads exactly ONE byte of PC's 53-byte response
+[Host Controller] DEBUG [org.jboss.as.host.controller] process controller connection closed.
+```
+
+Traced `ServerInventoryImpl.connectionFinished()` (`javap` on
+`wildfly-host-controller-24.0.1.Final.jar`) as the exact source of the "process controller
+connection closed." DEBUG line — it is a `ProcessMessageHandler` connection-lifecycle callback
+(sets `connectionFinished=true`, notifies a `shutdownCondition` monitor) that does **not** count
+down `processInventoryLatch` (only the real `handleProcessInventory(Map)` success callback does
+that, confirmed via `javap` on `ProcessControllerConnectionService$2`) — so once this fires,
+`determineRunningProcesses()`'s `processInventoryLatch.await(30, SECONDS)` is guaranteed to time
+out and `WFLYHC0053` is guaranteed to fire, exactly matching the observed symptom.
+
+**The key anomaly, not yet resolved:** PC's socket (`sid=2`) never closes — its own log shows it
+returning to `read: sid=2 want=1 (blocking on recv...)` immediately after finishing its 3 writes,
+i.e. PC still considers the connection fully alive and is waiting for HC's *next* request. Yet HC's
+socket (`sid=1`) reads exactly 1 of the 53 bytes PC wrote, then whatever consumes that 1 byte
+(almost certainly a `read()` for byte 2 of PC's 5-byte response header) sees something that
+Java-level code interprets as connection-closed — either a genuine `n==0` from the underlying
+`std::net::TcpStream::read()` (which `re1_socket_read_stream`, `native-builtins/src/net_phase_e.rs`,
+correctly maps to Java `-1`/EOF) or an exception the higher-level WildFly protocol code treats
+equivalently. Since PC's own socket end is provably still open and un-shutdown at the OS level
+moments later, a genuine `-1`/EOF on HC's read implies either (a) HC is reading from the wrong
+stream/a stale registry entry for `sid=1` (an identity/lifecycle bug in `s2_registry`, not
+inspected further this session), or (b) something briefly, spuriously shuts down or drops HC's
+read half specifically. **`re1_socket_read_stream`/`re1_socket_write_stream`/`close()`/
+`shutdownInput()`/`shutdownOutput()` (`native-builtins/src/net_phase_e.rs`) were all read this
+session and look individually correct** (proper blocking `read()`/`write_all()`+`flush()`, correct
+`n==0`→`-1` EOF mapping, `close()`'s `fd<3` stdin-protection guard is correctly scoped since
+`ChildStdinPipe`/socket fds always come from a monotonic counter starting at 3 — checked, not a
+collision) — so if this is a bug in this layer at all, it is a **race/identity** bug, not a
+straightforward logic error visible from a single-threaded reading of the code.
+
+**Suspicious but unconfirmed temporal correlation:** immediately before every capture of this
+exact failure, the log shows a tight burst (5 occurrences, not unbounded — not itself a hang) of
+`cratonvm_gc::gen_heap` `mark_young: rejecting object ... with implausible extent 0` /
+`GC: inconsistent header ... inline-alloc forgot to set kind=Array` / `[A2] BREADCRUMB ... never
+header-written here, or freed+reused past the ring` warnings, all against the identical address
+and an implausible `class_id=1278978112` (~1.27 billion — far outside any real class-id range,
+consistent with the conservative scanner correctly rejecting a stale, non-pointer stack slot per
+its own documented by-design behavior, i.e. this is very likely benign noise and NOT proof of a
+real GC bug). **This was not chased further** — the doc's own guardrail is explicit that
+`gc_barrier`/STW territory needs a very high verification bar before any code change, and this
+session did not attempt to establish causation (vs. coincidence: any burst of allocation activity
+around a hot request-handling path will produce some of this conservative-rejection noise by
+design). Recorded as the strongest remaining lead, not a diagnosis: if a future session wants to
+pursue it, the concrete next step is a live `gdb` capture with a breakpoint on the second/third
+`read()` call on `sid=1` (or `CRATONVM_DBG_SOCK_BYTES=1`, which shows actual byte content — not
+used this session because the combined overhead of full-boot `DBG_SOCK_BYTES` plus this doc's
+normal ~17-140K-line boot volume made runs too slow/heavy to reliably reach the critical point
+within a reasonable window; a wrapper that only enables it once the log shows `"Invoking domain.xml
+ops"` would fix this, but needs either a live-attach env-var-injection trick or restructuring the
+harness to start two-phase) correlated exactly with `s2_registry`'s lock state and any GC pause
+timing (`CRATONVM_DBG_STW_CENSUS=1`) at the moment of the second read.
+
+**Also confirmed this session, not new:** `HIB-CV-32` (`gen_heap::read_slot: corrupt Value cell`)
+did not fire in any of the 6 runs (tens of thousands of lines each) — consistent with the sixth
+session's finding; the guard remains silent. The heap-sizing note from the sixth session
+(`JBOSS_JAVA_SIZING=-Xms64m -Xmx1536m -XX:MaxMetaspaceSize=256m` avoids the default `-Xmx512m`
+`OutOfMemoryError`) was re-confirmed necessary — a run without it hit the same OOM at a
+comparable point in boot.
+
+**The four original front-line residuals (`AttributeChangeNotification`, `ContentCleanerService`,
+`FileInputStream(File)`, `WFLYHC0034`) again did not appear verbatim** in any of this session's
+runs (grepped for all four signature strings across all 6 logs, zero hits) — boot reliably reaches
+much further than where they were originally observed, reinforcing prior sessions' suspicion that
+they were superseded, but still not something this session can positively confirm fixed rather
+than just not-yet-reached in a materially different way (boot never reaches a fully-up, steady
+managed-server state — it reaches `WFLYSRV0025` with `Started 0 of 0 services` and stops there).
+
+**No fix landed this session.** Per this doc's own standing instruction not to force a close or a
+fix that doesn't hold up: the byte-level mechanism (Finding B) is now precisely characterized, but
+the actual root cause (why HC's read sees the connection as closed when PC's write clearly
+succeeded and PC's own socket stayed open) was not isolated to a single line of code, and this
+session's remaining time budget did not allow safely following the GC-timing lead into
+`gc_barrier`/`s2_registry` territory with the verification rigor this project's guardrails require
+for that area. This doc stays OPEN, still blocked on `WFLYHC0053`, now with a much narrower,
+byte-level reproduction recipe for whoever continues.
+
+**Recommended next steps, in order:**
+1. Reproduce Finding B's exact byte-level capture again (recipe: `CRATONVM_MSC_REAL_START=1
+   CRATONVM_DBG_SOCK=1`, unique bind address/port to avoid this shared host's port collisions,
+   `JBOSS_JAVA_SIZING=-Xms64m -Xmx1536m -XX:MaxMetaspaceSize=256m`, watch for `"Executing
+   two-phase"` then the very next `[dbg-sock] read: sid=1` lines) and this time have a `gdb`
+   breakpoint or `CRATONVM_DBG_SOCK_BYTES=1` (narrowly scoped, e.g. only after `"Invoking
+   domain.xml ops"` appears) ready to fire exactly at the second read on `sid=1`, to see whether
+   it returns `n=0` (genuine OS-level EOF — then the question moves to "why did the OS report
+   EOF/RST on a socket the peer never closed", a kernel/registry-identity question) or throws/
+   errors a different way.
+2. If it is a genuine `n=0`, audit `s2_registry`'s `Arc<TcpStream>` lifecycle end-to-end
+   (`net_phase_e.rs`) for anything that could `shutdown()`/drop the *specific* `sid=1` entry
+   concurrently with this read — a second thread on HC's side (there are many: MSC workers, XNIO
+   I/O threads, the domain-channel handler) touching the same registry entry via a stale/reused
+   `stream_id` is the most likely mechanical candidate given the multi-threaded, high-object-churn
+   context this always reproduces in.
+3. Only pursue the GC-timing correlation (mark_young rejection burst) if step 2 comes up empty —
+   and if so, treat it exactly per this doc's own standing guardrail (live-load verification,
+   park-don't-merge on any flake, read `wip/gc-stw-quota-race-20260710` first).
+4. Independently, `native-builtins/src/phases_late.rs::register_phase57_process`'s dead
+   `wait_with_output()`-based `ProcessBuilder.start()` registration (overridden by
+   `native-io/src/process.rs` per that file's own comment, confirmed dead this session) is safe,
+   low-risk cleanup debt worth deleting in its own small PR — not related to WFLYHC0053, flagged
+   here only so it isn't mistaken for the live implementation by a future reader again.
