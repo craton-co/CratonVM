@@ -1,6 +1,6 @@
 # ES HANG - server org.elasticsearch.lucene.queries.IntegerRandomBinaryDocValuesRangeQueryTests
 
-Status: OPEN
+Status: FIXED
 
 Observed in:
 - Run: `es-nonpassed-rerun-20260708-191002`
@@ -21,18 +21,26 @@ Collection context:
 - Binary base dev SHA: `3d61003bbfdf9c6b045d29afefd45519dc558881`
 - Docs generated after isolated worktree fast-forwarded to dev SHA: `8736a20b6e269bae3ec89d44e22117e2d4eba9a0`
 
-Re-run one class:
-```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File apps/elasticsearch-suite-runner/run-elasticsearch-suite.ps1 -Category others -Jit on -Vm craton -ElasticsearchRoot "/data/data/cratonvm-worktrees/20260708-191002-es-nonpassed-rerun/apps/elasticsearch" -WorkDir "/data/data/cratonvm-worktrees/20260708-191002-es-nonpassed-rerun/apps/elasticsearch-suite-runner/.suite-es-nonpassed-20260708-191002" -Exe /data/data/cratonvm-targets/es-nonpassed-20260708-191002/release/cratonvm-es-nonpassed-20260708-191002 -JdkHome /usr/lib/jvm/java-21-openjdk-amd64 -TimeoutSec 600 -RunName repro-b775287812 -ModeName repro-b775287812 -Start 625 -Count 1
-```
-
 Evidence files:
 - stdout: `/data/data/cratonvm-worktrees/20260708-191002-es-nonpassed-rerun/apps/elasticsearch-suite-runner/.suite-es-nonpassed-20260708-191002/results/es-nonpassed-rerun-20260708-191002/jit-shard3/logs/server.org.elasticsearch.lucene.queries.IntegerRandomBinaryDocVa.242b76baab09.out.log`
 - stderr: `/data/data/cratonvm-worktrees/20260708-191002-es-nonpassed-rerun/apps/elasticsearch-suite-runner/.suite-es-nonpassed-20260708-191002/results/es-nonpassed-rerun-20260708-191002/jit-shard3/logs/server.org.elasticsearch.lucene.queries.IntegerRandomBinaryDocVa.242b76baab09.err.log`
-- result TSV: `/data/data/cratonvm-worktrees/20260708-191002-es-nonpassed-rerun/apps/elasticsearch-suite-runner/.suite-es-nonpassed-20260708-191002/results/es-nonpassed-rerun-20260708-191002/jit-shard3/results.tsv`
 
 Extracted stderr signals:
 - `==== jstack at approximately timeout time ====`
-Current classification:
-- 600 second class watchdog timeout in the completed four-shard collection run.
-- Treat as an open hang until reproduced or disproved on current `dev`.
+- `NOTE: reproduce with: gradlew test --tests IntegerRandomBinaryDocValuesRangeQueryTests.testAllEqual -Dtests.seed=B17AC9D3E1F2A0C4 ...`
+- `WARN [RandomizedRunner] Will linger awaiting termination of 3 leaked thread(s).`
+
+## 2026-07-10 investigation and fix
+
+Same root cause and fix as
+[LongRandomBinaryDocValuesRangeQueryTests](long-random-binary-doc-values-range-query-tests-FIXED.md)
+(see that doc for the full investigation) — the shared mechanism is
+`LRUQueryCache`'s internal `java.util.concurrent.locks.ReentrantReadWriteLock`
+and its `writeLock()`, a plain `ReentrantLock`-shaped object whose `unlock()`
+getfield-of-`sync` got miscompiled by the compact-field getfield bug (fixed
+upstream as commit `7f96c26c` + `be710234`).
+
+**Verified 2026-07-10 on a clean checkout of dev tip `e768916a`** (no local
+changes): `IntegerRandomBinaryDocValuesRangeQueryTests` passes cleanly under
+default JIT settings — `OK (6 tests)`, ~20-30s, 0 failures. The original 600s
+hang does not reproduce.

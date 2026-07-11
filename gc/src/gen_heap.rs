@@ -2573,6 +2573,17 @@ impl GenerationalHeap {
         self.satb_queue.clone()
     }
 
+    /// Borrow the SATB queue without cloning the `Arc`. The JIT helper
+    /// entry path (`VmHeap::flush_thread_satb`) checks `is_active()` on
+    /// EVERY slow-path allocation; the refcount round trip of
+    /// [`Self::satb_queue_handle`] is measurable there and buys nothing —
+    /// the queue, once installed by `enable_concurrent_gc`, lives as long
+    /// as the heap.
+    #[inline]
+    pub fn satb_queue_ref(&self) -> Option<&SatbQueue> {
+        self.satb_queue.as_deref()
+    }
+
     /// Get the old generation's base pointer and capacity (for creating a ConcurrentMarker).
     pub fn old_gen_info(&self) -> (usize, usize) {
         let og = self.old_gen.lock();
@@ -7280,6 +7291,25 @@ impl GenerationalHeap {
 
         pointer_map.insert(old_ptr as usize, new_ptr as usize);
         *objects_copied += 1;
+        if desc_trace_enabled() {
+            if let Some((cname, _)) = crate::gc::resolve_class_info(header.class_id.as_u32()) {
+                if cname == "org/junit/runner/Description"
+                    || cname == "java/util/concurrent/ConcurrentLinkedQueue"
+                {
+                    eprintln!(
+                        "[desctrace-fwd] {} ihash={} old=0x{:x} new=0x{:x} promoted={} age={} jit_active={} moving_young={}",
+                        cname,
+                        header.identity_hash_code,
+                        old_ptr as usize,
+                        new_ptr as usize,
+                        landed_in_old_gen,
+                        header.gc_age,
+                        crate::gc_quiescence::is_active(),
+                        crate::gc_quiescence::moving_young_enabled(),
+                    );
+                }
+            }
+        }
         // CRIT-P2 fix: enqueue promoted objects so the alternating Cheney
         // loop can scan them in O(1) per object instead of re-filtering
         // `pointer_map.values()` per iteration. Young to-space copies are
@@ -7940,6 +7970,17 @@ fn gcw_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_GCWRITE").is_some())
+}
+
+/// Cached CRATONVM_DBG_DESCTRACE gate (temp investigation aid, ALV5th GC
+/// bug): trace every forward_object relocation of a
+/// org/junit/runner/Description or java/util/concurrent/ConcurrentLinkedQueue
+/// instance (old addr -> new addr, identity hash, promoted-or-not, age).
+#[inline]
+fn desc_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some())
 }
 
 /// Cached `CRATONVM_DBG_FWDGUARD` gate (bc math-ec 0x4): log forward_object
@@ -10323,6 +10364,85 @@ mod tests {
             "object should be promoted to old gen"
         );
         roots[0]
+    }
+
+    /// ES-FAIL-FAMILY-20260710 hunt: a field that points back to its own
+    /// holder (`Throwable.cause = this`, `Throwable.backtrace = this` — the
+    /// JDK "uninitialized" self-reference sentinel) must be updated to the
+    /// relocated address when the holder itself moves during GC (promotion
+    /// young->old, and any further old-gen compaction), not left pointing at
+    /// the holder's stale pre-move address. A field write for a *self*
+    /// reference is easy to special-case incorrectly (e.g. "skip rewriting
+    /// this slot, the pointer is already correct" without accounting for the
+    /// holder itself having just moved) — if that happens, the field keeps
+    /// pointing at the old, now-free address, and once that address is
+    /// reused by a later allocation, reading the field returns whatever
+    /// unrelated object now lives there.
+    #[test]
+    fn self_referential_field_survives_promotion() {
+        let heap = GenerationalHeap::with_sizes(16 * 1024, 32 * 1024);
+        let monitors = NoOpMonitors;
+
+        let obj = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(obj, 0, Value::Object(Some(obj)));
+
+        let mut roots = vec![obj];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        assert!(
+            heap.is_in_old(roots[0].as_ptr()),
+            "S-SELFREF: object should be promoted to old gen"
+        );
+
+        let relocated = roots[0];
+        match heap.get_field(relocated, 0) {
+            Value::Object(Some(r)) => {
+                assert_eq!(
+                    r.as_ptr(),
+                    relocated.as_ptr(),
+                    "S-SELFREF: self-referential field should track the relocated \
+                     object after promotion (field points at {:?}, holder is now at {:?})",
+                    r.as_ptr(),
+                    relocated.as_ptr()
+                );
+            }
+            other => panic!(
+                "S-SELFREF: self-reference lost/corrupted after promotion, field={:?}",
+                other
+            ),
+        }
+
+        // Keep stressing the heap after promotion — allocate + collect a few
+        // more times (some of which may trigger old-gen compaction) and
+        // re-check the self-reference each time, in case the bug needs a
+        // SECOND relocation of an already-old object rather than the initial
+        // young->old promotion.
+        for cycle in 0..5 {
+            for _ in 0..200 {
+                let garbage = heap.alloc_object(ClassId::new(0), 4);
+                heap.set_field(garbage, 0, Value::Int(cycle));
+            }
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+            let relocated = roots[0];
+            match heap.get_field(relocated, 0) {
+                Value::Object(Some(r)) => {
+                    assert_eq!(
+                        r.as_ptr(),
+                        relocated.as_ptr(),
+                        "S-SELFREF: self-referential field diverged after post-promotion \
+                         GC cycle {cycle} (field points at {:?}, holder is now at {:?})",
+                        r.as_ptr(),
+                        relocated.as_ptr()
+                    );
+                }
+                other => panic!(
+                    "S-SELFREF: self-reference lost/corrupted at post-promotion cycle \
+                     {cycle}, field={:?}",
+                    other
+                ),
+            }
+        }
     }
 
     #[test]

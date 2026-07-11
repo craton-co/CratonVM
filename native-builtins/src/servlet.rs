@@ -2271,6 +2271,17 @@ const BB_LIMIT: usize = 2;
 const BB_CAP: usize = 3;
 const BB_MARK: usize = 4;
 const BB_ORDER: usize = 5; // 0=BIG_ENDIAN, 1=LITTLE_ENDIAN
+// Real `Buffer.segment` field index (`final java.lang.foreign.MemorySegment
+// segment`) — the only Object-typed slot among a real-JDK-shaped typed
+// NIO buffer view's 6 physical fields (mark/position/limit/capacity/
+// address/segment). Used to stash the backing array reference for
+// IntBuffer/LongBuffer/ShortBuffer/FloatBuffer/DoubleBuffer views, whose
+// abstract class declares no `hb` field to write by name — see
+// `s2_bb_arr`'s fallback and `s2_bb_synthetic_layout`'s class-name guard
+// (both fixed together 2026-07-11; writing here without that guard gets
+// silently clobbered by `s2_bb_set_order`, which used to also treat slot 5
+// as an int order flag for these same 6-field objects).
+const BB_SEGMENT_SLOT: usize = 5;
                            // NEW-17: extra fields for direct buffers. Bytes 6..7 are only populated
                            // by `allocateDirect`; non-direct buffers leave them at default (0).
 const BB_NATIVE_ID: usize = 6; // Long  — alloc_id from NativeMemoryTable, 0 if heap
@@ -2336,6 +2347,18 @@ pub(crate) fn bb_write_hb(ctx: &mut dyn NativeContext, buf: ObjectRef, arr: Obje
     ctx.set_field_by_name(buf, "limit", Value::Int(cap));
     ctx.set_field_by_name(buf, "capacity", Value::Int(cap));
     ctx.set_field_by_name(buf, "mark", Value::Int(-1));
+    // Mirror the JDK field initializer: fresh buffers default to
+    // BIG_ENDIAN. In real-JDK mode `alloc_concurrent_synthetic` resolves
+    // the REAL (abstract) `java.nio.ByteBuffer` class and allocates its
+    // full field layout, so without this seed the named `bigEndian` slot
+    // reads back Int(0) — which `s2_bb_order` would decode as
+    // LITTLE_ENDIAN by default.
+    ctx.set_field_by_name(buf, "bigEndian", Value::Int(1));
+    ctx.set_field_by_name(
+        buf,
+        "nativeByteOrder",
+        Value::Int(if cfg!(target_endian = "big") { 1 } else { 0 }),
+    );
     // Synthetic-mode indexed fallback.
     ctx.set_field(buf, BB_ARRAY, Value::Object(Some(arr)));
     ctx.set_field(buf, BB_POS, Value::Int(0));
@@ -2406,9 +2429,120 @@ fn s2_bb_set_mark(ctx: &mut dyn NativeContext, buf: ObjectRef, value: i32) {
         _ => ctx.set_field_by_name(buf, "mark", Value::Int(value)),
     }
 }
+/// True for the 6-slot pure-synthetic ByteBuffer layout that the indexed
+/// `BB_*` accessors address. In REAL-JDK mode this is false for every s2
+/// `ByteBuffer`: `alloc_concurrent_synthetic(_, "java/nio/ByteBuffer", 6)`
+/// resolves the real (abstract) class and allocates its FULL field layout
+/// (11 slots — `Buffer{mark,position,limit,capacity,address,segment}` +
+/// `ByteBuffer{hb,offset,isReadOnly,bigEndian,nativeByteOrder}`), where
+/// slot 5 aliases `segment`, not the synthetic order slot.
+///
+/// BUG (found 2026-07-11): field COUNT alone is not a reliable
+/// discriminator for the typed NIO buffers (Int/Long/Short/Float/
+/// DoubleBuffer) — the abstract class itself declares no fields beyond
+/// `Buffer`'s own 6 (`mark,position,limit,capacity,address,segment`), so a
+/// real-JDK-shaped `java/nio/FloatBuffer` object ALSO has exactly 6 fields,
+/// same as the pure-synthetic layout this function was written to detect.
+/// Without the class-name check below, `s2_bb_order`/`s2_bb_set_order`
+/// treated every typed-buffer view as pure-synthetic and read/wrote slot 5
+/// as an int order flag — silently clobbering the array reference
+/// `s2_typed_buffer_view_fns!`/`s2_view_buf_fn!` stash there (see
+/// `s2_bb_arr`'s `BB_SEGMENT_SLOT` fallback), so every value read through a
+/// typed-buffer view came back zero regardless of what was written.
+#[inline]
+fn s2_bb_synthetic_layout(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
+    if ctx.object_num_fields(buf) != 6 {
+        return false;
+    }
+    let cid = ctx.class_id_of_object(buf);
+    !matches!(
+        ctx.class_name_of_id(cid).as_deref(),
+        Some(
+            "java/nio/IntBuffer"
+                | "java/nio/LongBuffer"
+                | "java/nio/ShortBuffer"
+                | "java/nio/FloatBuffer"
+                | "java/nio/DoubleBuffer"
+        )
+    )
+}
+
 #[inline]
 fn s2_bb_order(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
-    ctx.get_field(buf, BB_ORDER).as_int().unwrap_or(0)
+    // Real-layout ByteBuffers keep their byte order in the named
+    // `bigEndian` boolean (seeded to the JDK BIG_ENDIAN default by
+    // `bb_write_hb`, mirrored by the `order(ByteOrder)` native below). The
+    // indexed `BB_ORDER` slot (5) only exists on the pure-synthetic
+    // layout — on a real-layout buffer that index aliases `segment`, so
+    // the old slot read never yielded the order Int and every buffer
+    // decoded as BIG_ENDIAN no matter what `order(LITTLE_ENDIAN)` was
+    // called: Lucene's `BufferedIndexInput` (LE-ordered buffer from
+    // `ByteBuffer.allocate(...).order(LITTLE_ENDIAN)`) then byteswapped
+    // every buffered `getShort`/`getInt`/`getLong` — surfacing as
+    // `CorruptIndexException: truncated file: length=79 but
+    // expectedLength==5692549928996306944` (79 byte-reversed) in
+    // `Lucene104PostingsReader` under the ES vector-codec tests.
+    if s2_bb_synthetic_layout(ctx, buf) {
+        return ctx.get_field(buf, BB_ORDER).as_int().unwrap_or(0);
+    }
+    match ctx.get_field_by_name(buf, "bigEndian") {
+        Value::Int(v) => {
+            if v != 0 {
+                0
+            } else {
+                1
+            }
+        }
+        // Unresolvable / non-Int on this non-synthetic buffer object: for a
+        // typed-buffer view (IntBuffer/LongBuffer/ShortBuffer/FloatBuffer/
+        // DoubleBuffer — no `bigEndian` field to resolve, unlike ByteBuffer)
+        // the order flag is instead stashed by `s2_bb_set_order` below in
+        // the real `mark: int` slot (index 0 — genuinely free for these
+        // views once the array moved to `BB_SEGMENT_SLOT`; `Int`-into-`int`
+        // is not subject to the descriptor-coercion trap that broke slot 0
+        // as Object storage). Any other non-Int value there (a stray -1
+        // default, or a genuine "no order set yet") falls back to the JDK
+        // default BIG_ENDIAN.
+        _ => match ctx.get_field(buf, BB_ARRAY) {
+            Value::Int(1) => 1,
+            _ => 0,
+        },
+    }
+}
+
+/// Write a buffer's byte order — the mutation counterpart of
+/// `s2_bb_order`, with the same layout discrimination. Used by the
+/// `order(ByteOrder)` native and by slice/view creation when propagating
+/// the source buffer's order.
+fn s2_bb_set_order(ctx: &mut dyn NativeContext, buf: ObjectRef, ord: i32) {
+    if s2_bb_synthetic_layout(ctx, buf) {
+        ctx.set_field(buf, BB_ORDER, Value::Int(ord));
+        return;
+    }
+    // Real ByteBuffer (has a genuine `bigEndian` field): write it by name,
+    // as before. Typed-buffer view (IntBuffer/LongBuffer/ShortBuffer/
+    // FloatBuffer/DoubleBuffer — no `bigEndian` field to resolve): the
+    // by-name write is a no-op, so stash the flag in the real `mark: int`
+    // slot instead (index 0 — genuinely free for these views once the
+    // array moved to `BB_SEGMENT_SLOT`). Gated on whether `bigEndian`
+    // actually resolves so this NEVER touches slot 0 — real `mark` — on a
+    // genuine ByteBuffer, which already round-trips correctly by name.
+    let has_big_endian_field = !matches!(
+        ctx.get_field_by_name(buf, "bigEndian"),
+        Value::Object(None)
+    );
+    if has_big_endian_field {
+        ctx.set_field_by_name(buf, "bigEndian", Value::Int(if ord == 1 { 0 } else { 1 }));
+        // nativeByteOrder = (bigEndian == platform-is-big-endian); every
+        // CratonVM target is little-endian, so it is "order == LITTLE_ENDIAN".
+        ctx.set_field_by_name(
+            buf,
+            "nativeByteOrder",
+            Value::Int(if ord == 1 { 1 } else { 0 }),
+        );
+    } else {
+        ctx.set_field(buf, BB_ARRAY, Value::Int(ord));
+    }
 }
 #[inline]
 fn s2_bb_arr(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<ObjectRef> {
@@ -2418,9 +2552,55 @@ fn s2_bb_arr(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<ObjectRef> {
     if let Value::Object(Some(a)) = ctx.get_field_by_name(buf, "hb") {
         return Some(a);
     }
-    match ctx.get_field(buf, BB_ARRAY) {
+    if let Value::Object(Some(a)) = ctx.get_field(buf, BB_ARRAY) {
+        return Some(a);
+    }
+    // BUG (found 2026-07-11): typed-buffer-view objects (IntBuffer/
+    // LongBuffer/ShortBuffer/FloatBuffer/DoubleBuffer, e.g. from
+    // `ByteBuffer.asFloatBuffer()`) have NO `hb` field at all (only
+    // HeapFloatBuffer etc. declare it, not the abstract class our synthetic
+    // views are stamped with) — same descriptor-coercion trap as `hb`
+    // applies to the indexed slot 0 above (real slot 0 = `mark: int`), so
+    // `s2_typed_buffer_view_fns!`/`s2_view_buf_fn!` (servlet.rs) instead
+    // stash the array reference in slot 5 — the real `Buffer.segment` field
+    // (`final java.lang.foreign.MemorySegment segment`), the ONLY
+    // Object-typed field Buffer itself declares, so `ctx.set_field` doesn't
+    // coerce an Object write there. Silently returning 0 for every read
+    // when this fallback was missing surfaced as "expected:<X> but
+    // was:<0.0>" across nearly the entire ES vector-codec test family —
+    // every value read through a typed-buffer view came back zero
+    // regardless of what was actually written.
+    match ctx.get_field(buf, BB_SEGMENT_SLOT) {
         Value::Object(Some(a)) => Some(a),
         _ => None,
+    }
+}
+
+/// Native-memory address of a DIRECT buffer (real-JDK `DirectByteBuffer`
+/// has no `hb` heap array; its storage lives at the `address` field). Same
+/// name-first/slot-4-fallback resolution as native-io's
+/// `directbuffer_address`. `None` for heap buffers and storage-less
+/// synthetics.
+fn s2_bb_direct_addr(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<i64> {
+    match ctx.get_field_by_name(buf, "address") {
+        Value::Long(v) if v != 0 => Some(v),
+        _ => match ctx.get_field(buf, 4) {
+            Value::Long(v) if v != 0 => Some(v),
+            _ => None,
+        },
+    }
+}
+
+/// Write a buffer's `position`. Buffers with a heap array keep this
+/// family's historic `BB_POS` slot write (self-consistent with `s2_bb_pos`
+/// on both real heap and synthetic buffers). DIRECT buffers are otherwise
+/// managed by name-based natives whose layout the `BB_POS` slot is not
+/// guaranteed to match — write their `position` by name.
+fn s2_bb_set_pos(ctx: &mut dyn NativeContext, buf: ObjectRef, v: i32) {
+    if s2_bb_arr(ctx, buf).is_some() {
+        ctx.set_field(buf, BB_POS, Value::Int(v));
+    } else {
+        ctx.set_field_by_name(buf, "position", Value::Int(v));
     }
 }
 
@@ -3273,12 +3453,41 @@ macro_rules! s2_view_buf_fn {
             let lim = s2_bb_limit(ctx, this);
             let rem = (lim - pos) / $elem_sz;
             let vb = alloc_concurrent_synthetic(ctx, $cls, 6);
-            ctx.set_field(vb, BB_ARRAY, ctx.get_field(this, BB_ARRAY));
+            // BUG (found 2026-07-11): `ctx.get_field(this, BB_ARRAY)` reads
+            // the SOURCE ByteBuffer's raw indexed slot 0 — but in real-JDK
+            // mode `this` is allocated with the real Buffer+ByteBuffer field
+            // layout (see `bb_write_hb`'s doc comment), where slot 0 is the
+            // real `mark` field (an Int, almost always -1), NOT the backing
+            // array. The actual array lives in the by-name `hb` field.
+            // Reading the wrong slot silently propagated `Value::Int(-1)`
+            // into the view's BB_ARRAY slot; every subsequent read on the
+            // view then found no `Object` there, fell through `s2_bb_arr`'s
+            // "no array" branch, and returned a benign 0 — every ES vector
+            // read via `ByteBuffer.asFloatBuffer()`/`asIntBuffer()`/etc.
+            // (i.e. essentially all quantized/HNSW/DiskBBQ vector value
+            // reads) silently came back as an all-zero vector, surfacing as
+            // "expected:<X> but was:<0.0>" across nearly the whole ES
+            // vector-codec test family. `s2_bb_arr` resolves the by-name
+            // `hb` field first (falling back to the indexed slot only for
+            // genuinely storage-less synthetics), matching what
+            // `s2_bb_as_char_buffer` already does correctly below.
+            //
+            // (The typed-buffer-view `slice`/`slice(II)`/`duplicate` natives
+            // added alongside this fix's sibling commit do NOT have this bug
+            // despite looking similar: their receiver is always an
+            // abstract-stamped typed-buffer view, which — unlike ByteBuffer —
+            // declares no `hb` field of its own, so `s2_bb_arr`'s by-name
+            // lookup already falls straight through to the same indexed
+            // slot 0 that a raw `ctx.get_field` reads.)
+            ctx.set_field(vb, BB_SEGMENT_SLOT, Value::Object(s2_bb_arr(ctx, this)));
             ctx.set_field(vb, BB_POS, Value::Int(0));
             ctx.set_field(vb, BB_LIMIT, Value::Int(rem));
             ctx.set_field(vb, BB_CAP, Value::Int(rem));
             ctx.set_field(vb, BB_MARK, Value::Int(-(pos + 1)));
-            ctx.set_field(vb, BB_ORDER, ctx.get_field(this, BB_ORDER));
+            // Propagate the source buffer's order via the layout-aware
+            // accessors (the source may be real-layout: order in `bigEndian`).
+            let ord = s2_bb_order(ctx, this);
+            s2_bb_set_order(ctx, vb, ord);
             Ok(Some(Value::Object(Some(vb))))
         }
     };
@@ -3619,25 +3828,58 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             let src = obj_arg(args, 1)?;
             let src_pos = s2_bb_pos(ctx, src);
             let src_lim = s2_bb_limit(ctx, src);
-            let n = (src_lim - src_pos).max(0);
+            let n = (src_lim - src_pos).max(0) as usize;
             let pos = s2_bb_pos(ctx, this);
-            if pos + n > s2_bb_limit(ctx, this) {
+            if pos + n as i32 > s2_bb_limit(ctx, this) {
                 return Err(RuntimeError::BufferOverflowException.into());
             }
-            let src_arr = match s2_bb_arr(ctx, src) {
-                Some(a) => a,
-                None => return Ok(Some(Value::Object(Some(this)))),
-            };
-            let dst_arr = match s2_bb_arr(ctx, this) {
-                Some(a) => a,
-                None => return Ok(Some(Value::Object(Some(this)))),
-            };
-            for i in 0..n as usize {
-                let b = ctx.get_array_element(src_arr, src_pos as usize + i);
-                ctx.set_array_element(dst_arr, pos as usize + i, b);
+            // Either side may be a DIRECT buffer (real-JDK `DirectByteBuffer`:
+            // `hb == null`, storage at `address`). The pre-fix code silently
+            // returned without copying OR advancing positions whenever a side
+            // had no heap array. `IOUtil.read` routes every buffered
+            // `FileChannel` read through a temporary direct buffer and then
+            // `dst.put(directSrc)`, so file reads "succeeded" (count
+            // returned) while delivering ZERO bytes with an unmoved
+            // destination position — Lucene's `BufferedIndexInput.refill()`
+            // then flipped an empty buffer and the first `readByte()` threw
+            // `BufferUnderflowException` (doc:
+            // ES-FAIL-FAMILY-20260710-vector-codec-exception-cause-object).
+            let mut bytes = vec![0u8; n];
+            if let Some(src_arr) = s2_bb_arr(ctx, src) {
+                for (i, b) in bytes.iter_mut().enumerate() {
+                    *b = ctx
+                        .get_array_element(src_arr, src_pos as usize + i)
+                        .as_int()
+                        .unwrap_or(0) as u8;
+                }
+            } else if let Some(addr) = s2_bb_direct_addr(ctx, src) {
+                if !ctx.copy_from_native_memory(addr.saturating_add(src_pos as i64), &mut bytes) {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "ByteBuffer.put: direct source read failed".to_string(),
+                    }
+                    .into());
+                }
+            } else {
+                // Genuinely storage-less synthetic buffer — keep the historic
+                // silent no-op so half-built synthetic buffers stay benign.
+                return Ok(Some(Value::Object(Some(this))));
             }
-            ctx.set_field(src, BB_POS, Value::Int(src_lim));
-            ctx.set_field(this, BB_POS, Value::Int(pos + n));
+            if let Some(dst_arr) = s2_bb_arr(ctx, this) {
+                for (i, b) in bytes.iter().enumerate() {
+                    ctx.set_array_element(dst_arr, pos as usize + i, Value::Int(*b as i8 as i32));
+                }
+            } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
+                if !ctx.copy_to_native_memory(addr.saturating_add(pos as i64), &bytes) {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "ByteBuffer.put: direct destination write failed".to_string(),
+                    }
+                    .into());
+                }
+            } else {
+                return Ok(Some(Value::Object(Some(this))));
+            }
+            s2_bb_set_pos(ctx, src, src_lim);
+            s2_bb_set_pos(ctx, this, pos + n as i32);
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -3980,6 +4222,19 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(bb, "order", "()Ljava/nio/ByteOrder;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let ord = s2_bb_order(ctx, this);
+        // Prefer the REAL ByteOrder statics: JDK and library bytecode
+        // compares the result with `==` against `ByteOrder.LITTLE_ENDIAN`
+        // (e.g. Lucene's `assert buffer.order() == LITTLE_ENDIAN`), and a
+        // synthetic stand-in also corrupts its `name` field in real-JDK
+        // mode (slot 0 is the name String there, not an order int).
+        if let Some(cid) = ctx.class_id_by_name("java/nio/ByteOrder") {
+            let field = if ord == 1 { "LITTLE_ENDIAN" } else { "BIG_ENDIAN" };
+            if let Some(idx) = ctx.static_field_index_by_name(cid, field) {
+                if let Value::Object(Some(o)) = ctx.get_static_field(cid, idx) {
+                    return Ok(Some(Value::Object(Some(o))));
+                }
+            }
+        }
         let bo = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
         ctx.set_field(bo, 0, Value::Int(ord));
         Ok(Some(Value::Object(Some(bo))))
@@ -3990,12 +4245,25 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/ByteOrder;)Ljava/nio/ByteBuffer;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // The argument is usually one of the REAL `ByteOrder` statics,
+            // whose field 0 is the `name` String — the old
+            // `get_field(bo, 0).as_int()` decode silently yielded 0
+            // (BIG_ENDIAN) for every real constant, so
+            // `order(LITTLE_ENDIAN)` was a no-op in real-JDK mode. Decode
+            // both representations.
             let ord = match args.get(1) {
-                Some(Value::Object(Some(bo))) => ctx.get_field(*bo, 0).as_int().unwrap_or(0),
+                Some(Value::Object(Some(bo))) => match ctx.get_field(*bo, 0) {
+                    Value::Int(v) => v,
+                    Value::Object(Some(name)) => match ctx.read_string(name).as_deref() {
+                        Some("LITTLE_ENDIAN") => 1,
+                        _ => 0,
+                    },
+                    _ => 0,
+                },
                 Some(Value::Int(v)) => *v,
                 _ => 0,
             };
-            ctx.set_field(this, BB_ORDER, Value::Int(ord));
+            s2_bb_set_order(ctx, this, ord);
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -4016,7 +4284,10 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
         bb_write_hb(ctx, buf, new_arr, rem as i32);
         ctx.set_field_by_name(buf, "isReadOnly", Value::Int(0));
-        ctx.set_field(buf, BB_ORDER, ctx.get_field(this, BB_ORDER));
+        // Propagate the source buffer's order via the layout-aware
+        // accessors (the source may be real-layout: order in `bigEndian`).
+        let ord = s2_bb_order(ctx, this);
+        s2_bb_set_order(ctx, buf, ord);
         Ok(Some(Value::Object(Some(buf))))
     });
     r.register(bb, "duplicate", "()Ljava/nio/ByteBuffer;", |ctx, args| {
@@ -4238,11 +4509,406 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(this))))
         });
         r.register(cls, "array", "()[I", |ctx, args| {
-            Ok(Some(ctx.get_field(obj_arg(args, 0)?, BB_ARRAY)))
+            Ok(Some(Value::Object(s2_bb_arr(ctx, obj_arg(args, 0)?))))
         });
         r.register(cls, "isDirect", "()Z", |_, _| Ok(Some(Value::Int(0))));
         r.register(cls, "isReadOnly", "()Z", |_, _| Ok(Some(Value::Int(0))));
     }
+
+    // `order`/`slice`/`slice(int,int)`/`duplicate`/`asReadOnlyBuffer` are
+    // `public abstract` on every typed NIO buffer subclass in real JDK 25
+    // (unlike ByteBuffer, where they're concrete bytecode) — `get`/`put`
+    // (relative + absolute) and `compact` are abstract too, but only
+    // IntBuffer has working overrides below (legacy). Every view-buffer
+    // instance handed out by `s2_view_buf_fn!` above (`ByteBuffer.asXxxBuffer()`)
+    // is stamped with the LITERAL abstract class name, so an `invokevirtual`
+    // for any of these against that receiver resolves to a Code-less abstract
+    // declaration and throws AbstractMethodError unless registered directly
+    // here. See
+    // docs/known-issues/elasticsearch-suite/ES-FAIL-FAMILY-20260710-floatbuffer-abstract-receiver-nocode.md
+    // (found via `FloatBuffer.order()`/`put(int,float)` on a raw vector slice
+    // view — `ES814HnswScalarQuantizedVectorsFormatTests.testRescoreUsesRawVectorSlice`
+    // — and `IntBuffer.order()` in `PreconditionerTests`).
+    //
+    // `bs` below is the byte-offset (within the shared backing byte[]) where
+    // this view's element 0 starts — encoded by `s2_view_buf_fn!`/`slice`/
+    // `slice(II)` as `-(bs+1)` in the indexed `BB_MARK` slot (mirroring the
+    // existing IntBuffer get/put below, which reads it the same way).
+    macro_rules! s2_typed_buffer_view_fns {
+        (
+            $get:ident, $get_abs:ident, $put:ident, $put_abs:ident,
+            $order:ident, $slice:ident, $slice2:ident, $dup:ident, $ro:ident, $compact:ident,
+            $get_bulk:ident, $put_bulk:ident,
+            $cls:literal, $width:expr, $read:ident, $write:ident,
+            $to_value:expr, $from_value:expr
+        ) => {
+            fn $get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                let this = obj_arg(args, 0)?;
+                let pos = s2_bb_pos(ctx, this);
+                if pos >= s2_bb_limit(ctx, this) {
+                    return Err(RuntimeError::BufferUnderflowException.into());
+                }
+                let bs = {
+                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+                    if m < 0 { -(m + 1) } else { 0 }
+                };
+                let off = pos
+                    .checked_mul($width)
+                    .and_then(|b| bs.checked_add(b))
+                    .unwrap_or(-1);
+                let raw = $read(ctx, this, off);
+                ctx.set_field(this, BB_POS, Value::Int(pos + 1));
+                Ok(Some(($to_value)(raw)))
+            }
+            fn $get_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                let this = obj_arg(args, 0)?;
+                let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+                let bs = {
+                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+                    if m < 0 { -(m + 1) } else { 0 }
+                };
+                let off = idx
+                    .checked_mul($width)
+                    .and_then(|b| bs.checked_add(b))
+                    .unwrap_or(-1);
+                let raw = $read(ctx, this, off);
+                Ok(Some(($to_value)(raw)))
+            }
+            fn $put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                let this = obj_arg(args, 0)?;
+                let v = args.get(1).cloned().unwrap_or(Value::Int(0));
+                let pos = s2_bb_pos(ctx, this);
+                if pos >= s2_bb_limit(ctx, this) {
+                    return Err(RuntimeError::BufferOverflowException.into());
+                }
+                let bs = {
+                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+                    if m < 0 { -(m + 1) } else { 0 }
+                };
+                let off = pos
+                    .checked_mul($width)
+                    .and_then(|b| bs.checked_add(b))
+                    .unwrap_or(-1);
+                $write(ctx, this, off, ($from_value)(&v));
+                ctx.set_field(this, BB_POS, Value::Int(pos + 1));
+                Ok(Some(Value::Object(Some(this))))
+            }
+            fn $put_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                let this = obj_arg(args, 0)?;
+                let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+                let v = args.get(2).cloned().unwrap_or(Value::Int(0));
+                let bs = {
+                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+                    if m < 0 { -(m + 1) } else { 0 }
+                };
+                let off = idx
+                    .checked_mul($width)
+                    .and_then(|b| bs.checked_add(b))
+                    .unwrap_or(-1);
+                $write(ctx, this, off, ($from_value)(&v));
+                Ok(Some(Value::Object(Some(this))))
+            }
+            fn $order(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                let this = obj_arg(args, 0)?;
+                let obj = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
+                ctx.set_field(obj, 0, Value::Int(s2_bb_order(ctx, this)));
+                Ok(Some(Value::Object(Some(obj))))
+            }
+            fn $slice(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                let this = obj_arg(args, 0)?;
+                let pos = s2_bb_pos(ctx, this);
+                let lim = s2_bb_limit(ctx, this);
+                let remaining = (lim - pos).max(0);
+                let bs = {
+                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+                    if m < 0 { -(m + 1) } else { 0 }
+                };
+                let new_bs = pos
+                    .checked_mul($width)
+                    .and_then(|b| bs.checked_add(b))
+                    .unwrap_or(bs);
+                let vb = alloc_concurrent_synthetic(ctx, $cls, 6);
+                ctx.set_field(vb, BB_SEGMENT_SLOT, Value::Object(s2_bb_arr(ctx, this)));
+                ctx.set_field(vb, BB_POS, Value::Int(0));
+                ctx.set_field(vb, BB_LIMIT, Value::Int(remaining));
+                ctx.set_field(vb, BB_CAP, Value::Int(remaining));
+                ctx.set_field(vb, BB_MARK, Value::Int(-(new_bs + 1)));
+                let ord = s2_bb_order(ctx, this);
+                s2_bb_set_order(ctx, vb, ord);
+                Ok(Some(Value::Object(Some(vb))))
+            }
+            fn $slice2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                let this = obj_arg(args, 0)?;
+                let index = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+                let length = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+                let cap = s2_bb_cap(ctx, this);
+                if index < 0 || length < 0 || index.checked_add(length).map_or(true, |e| e > cap) {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: "IndexOutOfBoundsException".to_string(),
+                    }
+                    .into());
+                }
+                let bs = {
+                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+                    if m < 0 { -(m + 1) } else { 0 }
+                };
+                let new_bs = index
+                    .checked_mul($width)
+                    .and_then(|b| bs.checked_add(b))
+                    .unwrap_or(bs);
+                let vb = alloc_concurrent_synthetic(ctx, $cls, 6);
+                ctx.set_field(vb, BB_SEGMENT_SLOT, Value::Object(s2_bb_arr(ctx, this)));
+                ctx.set_field(vb, BB_POS, Value::Int(0));
+                ctx.set_field(vb, BB_LIMIT, Value::Int(length));
+                ctx.set_field(vb, BB_CAP, Value::Int(length));
+                ctx.set_field(vb, BB_MARK, Value::Int(-(new_bs + 1)));
+                let ord = s2_bb_order(ctx, this);
+                s2_bb_set_order(ctx, vb, ord);
+                Ok(Some(Value::Object(Some(vb))))
+            }
+            fn $dup(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                let this = obj_arg(args, 0)?;
+                let pos = s2_bb_pos(ctx, this);
+                let lim = s2_bb_limit(ctx, this);
+                let cap = s2_bb_cap(ctx, this);
+                let bs_field = ctx.get_field(this, BB_MARK);
+                let vb = alloc_concurrent_synthetic(ctx, $cls, 6);
+                ctx.set_field(vb, BB_SEGMENT_SLOT, Value::Object(s2_bb_arr(ctx, this)));
+                ctx.set_field(vb, BB_POS, Value::Int(pos));
+                ctx.set_field(vb, BB_LIMIT, Value::Int(lim));
+                ctx.set_field(vb, BB_CAP, Value::Int(cap));
+                ctx.set_field(vb, BB_MARK, bs_field);
+                let ord = s2_bb_order(ctx, this);
+                s2_bb_set_order(ctx, vb, ord);
+                Ok(Some(Value::Object(Some(vb))))
+            }
+            fn $ro(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                $dup(ctx, args)
+            }
+            fn $compact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                let this = obj_arg(args, 0)?;
+                let pos = s2_bb_pos(ctx, this);
+                let lim = s2_bb_limit(ctx, this);
+                let cap = s2_bb_cap(ctx, this);
+                let bs = {
+                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+                    if m < 0 { -(m + 1) } else { 0 }
+                };
+                let remaining = (lim - pos).max(0);
+                for i in 0..remaining {
+                    let src_off = (pos + i)
+                        .checked_mul($width)
+                        .and_then(|b| bs.checked_add(b))
+                        .unwrap_or(-1);
+                    let dst_off = i
+                        .checked_mul($width)
+                        .and_then(|b| bs.checked_add(b))
+                        .unwrap_or(-1);
+                    let raw = $read(ctx, this, src_off);
+                    $write(ctx, this, dst_off, raw);
+                }
+                ctx.set_field(this, BB_POS, Value::Int(remaining));
+                ctx.set_field(this, BB_LIMIT, Value::Int(cap));
+                Ok(Some(Value::Object(Some(this))))
+            }
+            // Bulk `get`/`put(T[], off, len)` are CONCRETE (not abstract) on
+            // every typed buffer — real JDK 25's implementation
+            // (`FloatBuffer.getArray`/`putArray` etc.) reads/writes via
+            // `this.address` + `ScopedMemoryAccess` directly for anything
+            // beyond a trivial length, COMPLETELY bypassing virtual dispatch
+            // to the single-element accessors above. Our synthetic
+            // abstract-stamped view never sets a real `address`, so that
+            // fast path silently read/wrote zero bytes — even after the
+            // single-element get/put fix above, any bulk vector read (the
+            // overwhelmingly common case: `buffer.get(vec, 0, dims)`) still
+            // came back all-zero. Registering natives here is not enough by
+            // itself either: these methods HAVE real Code, so the registered
+            // native is inert unless force-listed in
+            // `force_native_over_real_jdk_bytecode` (vm/src/runtime/interpreter.rs)
+            // — added there alongside this fix.
+            fn $get_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                let this = obj_arg(args, 0)?;
+                let dst = obj_arg(args, 1)?;
+                let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+                let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+                let pos = s2_bb_pos(ctx, this);
+                if off < 0
+                    || len < 0
+                    || off.checked_add(len).map_or(true, |e| e > ctx.array_length(dst) as i32)
+                {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: "IndexOutOfBoundsException".to_string(),
+                    }
+                    .into());
+                }
+                if pos.checked_add(len).map_or(true, |e| e > s2_bb_limit(ctx, this)) {
+                    return Err(RuntimeError::BufferUnderflowException.into());
+                }
+                let bs = {
+                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+                    if m < 0 { -(m + 1) } else { 0 }
+                };
+                for i in 0..len {
+                    let src_off = (pos + i)
+                        .checked_mul($width)
+                        .and_then(|b| bs.checked_add(b))
+                        .unwrap_or(-1);
+                    let raw = $read(ctx, this, src_off);
+                    ctx.set_array_element(dst, (off + i) as usize, ($to_value)(raw));
+                }
+                ctx.set_field(this, BB_POS, Value::Int(pos + len));
+                Ok(Some(Value::Object(Some(this))))
+            }
+            fn $put_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                let this = obj_arg(args, 0)?;
+                let src = obj_arg(args, 1)?;
+                let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+                let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+                let pos = s2_bb_pos(ctx, this);
+                if off < 0
+                    || len < 0
+                    || off.checked_add(len).map_or(true, |e| e > ctx.array_length(src) as i32)
+                {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: "IndexOutOfBoundsException".to_string(),
+                    }
+                    .into());
+                }
+                if pos.checked_add(len).map_or(true, |e| e > s2_bb_limit(ctx, this)) {
+                    return Err(RuntimeError::BufferOverflowException.into());
+                }
+                let bs = {
+                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+                    if m < 0 { -(m + 1) } else { 0 }
+                };
+                for i in 0..len {
+                    let v = ctx.get_array_element(src, (off + i) as usize);
+                    let dst_off = (pos + i)
+                        .checked_mul($width)
+                        .and_then(|b| bs.checked_add(b))
+                        .unwrap_or(-1);
+                    $write(ctx, this, dst_off, ($from_value)(&v));
+                }
+                ctx.set_field(this, BB_POS, Value::Int(pos + len));
+                Ok(Some(Value::Object(Some(this))))
+            }
+        };
+    }
+
+    s2_typed_buffer_view_fns!(
+        s2_ib_get, s2_ib_get_abs, s2_ib_put, s2_ib_put_abs,
+        s2_ib_order, s2_ib_slice, s2_ib_slice2, s2_ib_dup, s2_ib_ro, s2_ib_compact,
+        s2_ib_get_bulk, s2_ib_put_bulk,
+        "java/nio/IntBuffer", 4, s2_bb_read4, s2_bb_write4,
+        |v: i32| Value::Int(v), |v: &Value| v.as_int().unwrap_or(0)
+    );
+    s2_typed_buffer_view_fns!(
+        s2_lb_get, s2_lb_get_abs, s2_lb_put, s2_lb_put_abs,
+        s2_lb_order, s2_lb_slice, s2_lb_slice2, s2_lb_dup, s2_lb_ro, s2_lb_compact,
+        s2_lb_get_bulk, s2_lb_put_bulk,
+        "java/nio/LongBuffer", 8, s2_bb_read8, s2_bb_write8,
+        |v: i64| Value::Long(v),
+        |v: &Value| match v {
+            Value::Long(l) => *l,
+            other => other.as_int().unwrap_or(0) as i64,
+        }
+    );
+    s2_typed_buffer_view_fns!(
+        s2_sb_get, s2_sb_get_abs, s2_sb_put, s2_sb_put_abs,
+        s2_sb_order, s2_sb_slice, s2_sb_slice2, s2_sb_dup, s2_sb_ro, s2_sb_compact,
+        s2_sb_get_bulk, s2_sb_put_bulk,
+        "java/nio/ShortBuffer", 2, s2_bb_read2, s2_bb_write2,
+        |v: i16| Value::Int(v as i32), |v: &Value| v.as_int().unwrap_or(0) as i16
+    );
+    s2_typed_buffer_view_fns!(
+        s2_fb_get, s2_fb_get_abs, s2_fb_put, s2_fb_put_abs,
+        s2_fb_order, s2_fb_slice, s2_fb_slice2, s2_fb_dup, s2_fb_ro, s2_fb_compact,
+        s2_fb_get_bulk, s2_fb_put_bulk,
+        "java/nio/FloatBuffer", 4, s2_bb_read4, s2_bb_write4,
+        |v: i32| Value::Float(f32::from_bits(v as u32)),
+        |v: &Value| match v {
+            Value::Float(f) => f.to_bits() as i32,
+            other => other.as_int().unwrap_or(0),
+        }
+    );
+    s2_typed_buffer_view_fns!(
+        s2_db_get, s2_db_get_abs, s2_db_put, s2_db_put_abs,
+        s2_db_order, s2_db_slice, s2_db_slice2, s2_db_dup, s2_db_ro, s2_db_compact,
+        s2_db_get_bulk, s2_db_put_bulk,
+        "java/nio/DoubleBuffer", 8, s2_bb_read8, s2_bb_write8,
+        |v: i64| Value::Double(f64::from_bits(v as u64)),
+        |v: &Value| match v {
+            Value::Double(d) => d.to_bits() as i64,
+            other => other.as_int().unwrap_or(0) as i64,
+        }
+    );
+
+    // IntBuffer keeps its own long-standing get/put above (untouched); only
+    // register the previously-missing abstract methods for it.
+    r.register(ib, "order", "()Ljava/nio/ByteOrder;", s2_ib_order);
+    r.register(ib, "slice", "()Ljava/nio/IntBuffer;", s2_ib_slice);
+    r.register(ib, "slice", "(II)Ljava/nio/IntBuffer;", s2_ib_slice2);
+    r.register(ib, "duplicate", "()Ljava/nio/IntBuffer;", s2_ib_dup);
+    r.register(ib, "asReadOnlyBuffer", "()Ljava/nio/IntBuffer;", s2_ib_ro);
+    r.register(ib, "compact", "()Ljava/nio/IntBuffer;", s2_ib_compact);
+    r.register(ib, "get", "([III)Ljava/nio/IntBuffer;", s2_ib_get_bulk);
+    r.register(ib, "put", "([III)Ljava/nio/IntBuffer;", s2_ib_put_bulk);
+
+    let lb = "java/nio/LongBuffer";
+    r.register(lb, "get", "()J", s2_lb_get);
+    r.register(lb, "get", "(I)J", s2_lb_get_abs);
+    r.register(lb, "put", "(J)Ljava/nio/LongBuffer;", s2_lb_put);
+    r.register(lb, "put", "(IJ)Ljava/nio/LongBuffer;", s2_lb_put_abs);
+    r.register(lb, "order", "()Ljava/nio/ByteOrder;", s2_lb_order);
+    r.register(lb, "slice", "()Ljava/nio/LongBuffer;", s2_lb_slice);
+    r.register(lb, "slice", "(II)Ljava/nio/LongBuffer;", s2_lb_slice2);
+    r.register(lb, "duplicate", "()Ljava/nio/LongBuffer;", s2_lb_dup);
+    r.register(lb, "asReadOnlyBuffer", "()Ljava/nio/LongBuffer;", s2_lb_ro);
+    r.register(lb, "compact", "()Ljava/nio/LongBuffer;", s2_lb_compact);
+    r.register(lb, "get", "([JII)Ljava/nio/LongBuffer;", s2_lb_get_bulk);
+    r.register(lb, "put", "([JII)Ljava/nio/LongBuffer;", s2_lb_put_bulk);
+
+    let sb = "java/nio/ShortBuffer";
+    r.register(sb, "get", "()S", s2_sb_get);
+    r.register(sb, "get", "(I)S", s2_sb_get_abs);
+    r.register(sb, "put", "(S)Ljava/nio/ShortBuffer;", s2_sb_put);
+    r.register(sb, "put", "(IS)Ljava/nio/ShortBuffer;", s2_sb_put_abs);
+    r.register(sb, "order", "()Ljava/nio/ByteOrder;", s2_sb_order);
+    r.register(sb, "slice", "()Ljava/nio/ShortBuffer;", s2_sb_slice);
+    r.register(sb, "slice", "(II)Ljava/nio/ShortBuffer;", s2_sb_slice2);
+    r.register(sb, "duplicate", "()Ljava/nio/ShortBuffer;", s2_sb_dup);
+    r.register(sb, "asReadOnlyBuffer", "()Ljava/nio/ShortBuffer;", s2_sb_ro);
+    r.register(sb, "compact", "()Ljava/nio/ShortBuffer;", s2_sb_compact);
+    r.register(sb, "get", "([SII)Ljava/nio/ShortBuffer;", s2_sb_get_bulk);
+    r.register(sb, "put", "([SII)Ljava/nio/ShortBuffer;", s2_sb_put_bulk);
+
+    let fb = "java/nio/FloatBuffer";
+    r.register(fb, "get", "()F", s2_fb_get);
+    r.register(fb, "get", "(I)F", s2_fb_get_abs);
+    r.register(fb, "put", "(F)Ljava/nio/FloatBuffer;", s2_fb_put);
+    r.register(fb, "put", "(IF)Ljava/nio/FloatBuffer;", s2_fb_put_abs);
+    r.register(fb, "order", "()Ljava/nio/ByteOrder;", s2_fb_order);
+    r.register(fb, "slice", "()Ljava/nio/FloatBuffer;", s2_fb_slice);
+    r.register(fb, "slice", "(II)Ljava/nio/FloatBuffer;", s2_fb_slice2);
+    r.register(fb, "duplicate", "()Ljava/nio/FloatBuffer;", s2_fb_dup);
+    r.register(fb, "asReadOnlyBuffer", "()Ljava/nio/FloatBuffer;", s2_fb_ro);
+    r.register(fb, "compact", "()Ljava/nio/FloatBuffer;", s2_fb_compact);
+    r.register(fb, "get", "([FII)Ljava/nio/FloatBuffer;", s2_fb_get_bulk);
+    r.register(fb, "put", "([FII)Ljava/nio/FloatBuffer;", s2_fb_put_bulk);
+
+    let db = "java/nio/DoubleBuffer";
+    r.register(db, "get", "()D", s2_db_get);
+    r.register(db, "get", "(I)D", s2_db_get_abs);
+    r.register(db, "put", "(D)Ljava/nio/DoubleBuffer;", s2_db_put);
+    r.register(db, "put", "(ID)Ljava/nio/DoubleBuffer;", s2_db_put_abs);
+    r.register(db, "order", "()Ljava/nio/ByteOrder;", s2_db_order);
+    r.register(db, "slice", "()Ljava/nio/DoubleBuffer;", s2_db_slice);
+    r.register(db, "slice", "(II)Ljava/nio/DoubleBuffer;", s2_db_slice2);
+    r.register(db, "duplicate", "()Ljava/nio/DoubleBuffer;", s2_db_dup);
+    r.register(db, "asReadOnlyBuffer", "()Ljava/nio/DoubleBuffer;", s2_db_ro);
+    r.register(db, "compact", "()Ljava/nio/DoubleBuffer;", s2_db_compact);
+    r.register(db, "get", "([DII)Ljava/nio/DoubleBuffer;", s2_db_get_bulk);
+    r.register(db, "put", "([DII)Ljava/nio/DoubleBuffer;", s2_db_put_bulk);
 
     // equals / hashCode / compareTo / toString
     r.register(bb, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {

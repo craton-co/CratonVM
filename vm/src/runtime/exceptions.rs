@@ -1072,6 +1072,32 @@ pub fn throw_runtime_error(
     // when the CLI uncaught-exception renderer later prints zero frames.
     // The env-var read is a single cached atomic load, so the no-debug
     // path is free; it is intentionally NOT gated behind `tracing::enabled!`.
+    // ALV5th GC investigation (temp probe, CRATONVM_DBG_NPE_NONE): dump a
+    // full Rust backtrace + Java stack the instant a message-less NPE is
+    // thrown from Rust (as opposed to constructed by Java bytecode via
+    // `new NullPointerException()`), so the exact Rust throw site is known
+    // instead of inferred from bytecode-level probes.
+    if std::env::var_os("CRATONVM_DBG_NPE_NONE").is_some() {
+        if let RuntimeError::NullPointerException { message: None } = &error {
+            eprintln!(
+                "[npe-none] message-less NPE thrown — Java stack ({} frames, deepest first):",
+                thread.frames.len()
+            );
+            for (i, f) in thread.frames.iter().enumerate().rev().take(20) {
+                eprintln!(
+                    "  [{i}] {}.{}{} pc={}",
+                    f.class_name(),
+                    f.method_name(),
+                    f.method_descriptor(),
+                    f.pc
+                );
+            }
+            eprintln!(
+                "[npe-none] Rust backtrace:\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+    }
     if std::env::var_os("CRATONVM_DBG_AIOOBE").is_some() {
         if let RuntimeError::ArrayIndexOutOfBoundsException { index } = &error {
             eprintln!(
@@ -1093,6 +1119,35 @@ pub fn throw_runtime_error(
                     f.pc
                 );
             }
+        }
+    }
+    // CRATONVM_DBG_BUFUNDER: companion to the AIOOBE dump above for
+    // `BufferUnderflowException` raised Rust-side (native ByteBuffer /
+    // buffer-view helpers). These never pass through the `Athrow` opcode, so
+    // `CRATONVM_DBG_ATHROW` only ever shows the later Java-level rethrow
+    // (e.g. Lucene's `IOUtils.rethrowAlways`) — this dump names the true
+    // origin frame instead.
+    if std::env::var_os("CRATONVM_DBG_BUFUNDER").is_some()
+        && matches!(&error, RuntimeError::BufferUnderflowException)
+    {
+        eprintln!(
+            "[BUFUNDER-THROW] — full live Java thread stack ({} frames, deepest first):",
+            thread.frames.len()
+        );
+        for (i, f) in thread.frames.iter().enumerate().rev().take(25) {
+            let cn = shared
+                .class_manager
+                .read()
+                .get_class(f.class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_default();
+            eprintln!(
+                "[BUFUNDER-STK {i}] {}.{}{} pc={}",
+                cn,
+                f.method_name(),
+                f.method_descriptor(),
+                f.pc
+            );
         }
     }
     if crate::runtime::env_cache::charset_dbg() {

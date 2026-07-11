@@ -1,6 +1,6 @@
 # WildFly domain startup timeout with repeated corrupt `Value` cell guard
 
-Status: OPEN — but the HIB-CV-32 corrupt-Value guard did NOT fire in ANY 2026-07-07 run (the sixth session finally ran the real Arquillian test end-to-end under CratonVM nested processes; see the 2026-07-07 sixth-session update at the bottom). Three merged fixes on this path (class_manager/vtable_manager AB-BA 48b3c2d2, XNIO AbstractMethodError 952f0093, jit_instanceof UAF) plus the 11 MSC real-start boot fixes (4b2508cf) appear to have cleared or now out-gate whatever produced the guard; two NEW blockers (sibling doc) currently stop the boot before the sustained-load phase that originally provoked it. Do not move to internal until a domain boot again runs a long sustained workload with the guard confirmed silent under CRATONVM_DIAG_HIB32=1.
+Status: OPEN — gated by WFLYHC0053 (`Could not get the server inventory in 30 seconds`). HIB-CV-32 has now stayed silent across every 2026-07-07 through 2026-07-11 run (multiple sessions, tens of thousands of log lines each) — very strong evidence that guard is genuinely closed. The seventh session's byte-level capture (`bytes=[152]`) was initially misread as a corrupted opcode; the eighth session corrected this — 152/153 are the wire protocol's own legitimate CHUNK_START/CHUNK_END marker bytes — and landed one real, independently-verified fix (`BufferedOutputStream` flush-ordering TOCTOU race, `native-io/src/lib.rs`, commit `1f774cdb`) that is NOT the root cause. The ninth session (2026-07-11) live-debugged further: refuted a generic-`Executor`-interface-dispatch hypothesis (0 hits across a 34K-line run) and the GC-timing correlation flagged earlier (0/5 correlation across fresh captures); confirmed via live `gdb`/`strace` that the connection's reader thread is genuinely, cleanly blocked in a normal `recv()` moments before each closure, and that the failure point is non-deterministic (fires at different points across repeated runs, ruling out a fixed-content logic bug — points to a genuine host-timing-dependent race). Deeper `gdb` narrowing was blocked by the release build optimizing out the relevant local variable; see the ninth-session update at the bottom for the exact tooling workaround needed and recommended next steps. Do not move to internal until WFLYHC0053 is resolved and a domain boot reaches sustained managed-server load with HIB-CV-32 confirmed silent throughout.
 Severity: High
 First confirmed: 2026-07-05 on Azure worktree `codex/wildfly-nonpassed-probes-20260705-035722`
 
@@ -1034,3 +1034,905 @@ update recommended, and for `ContentCleanerService` specifically, trace
 which capability's `Supplier` resolves to the wrong type first (add tracing
 in `jboss_msc.rs`'s capability-injection path rather than guessing further
 from bytecode alone).
+
+
+## 2026-07-10 update (Azure host session, later same day) — one real blocker found+fixed (Cleaner), a second found but not yet fixed (Host Controller SIGSEGV); the four residuals still not reached
+
+Continued directly from the "gate is fixed" update above, now with Azure host access
+(`victor@20.83.144.174`, branch `fix/wildfly-residuals-20260710`, worktree per the standing
+isolated-worktree workflow). Re-ran this doc's own harness recipe (pristine WildFly 32.0.1.Final,
+`bin/domain.sh`, `CRATONVM_MSC_REAL_START=1`).
+
+**Confirmed the gate fix works**: process-controller/Host-Controller handshake now completes
+cleanly (no more `ThreadPoolExecutor` NPE killing the process-controller's read thread).
+
+**New blocker #1, found and FIXED**: Host Controller crashed immediately after with a
+`NullPointerException` in `java.lang.ref.Cleaner.register()` → `CleanerImpl.getCleanerImpl()`
+returning null, while `org.jboss.msc.service.ServiceContainer$Factory.create()` was setting up its
+shutdown hook. Same bug class as the `ThreadPoolExecutor` regression: a synthetic `Cleaner.create()`
+native (meant only as a fallback stub) was winning over real bytecode for this **static** factory
+method, returning a Cleaner with its real `impl` field left null, which real `register()` bytecode
+then NPE'd on. Fixed by extending the `drop_real_layout_synthetic` registry gate to
+`java/lang/ref/Cleaner`/`Cleaner$Cleanable`, same pattern already used for `ThreadPoolExecutor`.
+See `docs/internal/java-lang-ref-cleaner-static-native-half-initialized-object-FIXED.md`.
+
+**New blocker #2, found but NOT fixed**: with the Cleaner fix in place, boot progresses much
+further — extensions parse, Elytron initializes, `host=foo:add()` op runs — then Host Controller
+**segfaults** (confirmed via `strace -f -e trace=exit_group`: genuine `SIGSEGV`/`SEGV_MAPERR`,
+`si_addr=NULL`, not a Java exception or clean exit) and respawns forever until the boot times out.
+Confirmed independent of the JIT (`CRATONVM_DISABLE_JIT=1` reproduces identically). Live-gdb
+(temporarily relaxing `ptrace_scope`, restored afterward) pinned the crash to a specific,
+reproducible instruction sequence — a monomorphic inline-cache dispatch stub dereferencing a NULL
+receiver — but the exact Rust source line was not identified before this session's budget ran out.
+Filed as `docs/known-issues/wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver.md`,
+with the live-gdb recipe and disassembly included for whoever continues.
+
+**The four original front-line residuals (`AttributeChangeNotification`, `ContentCleanerService`,
+`FileInputStream(File)`, `WFLYHC0034`) still have not been re-observed** — this SIGSEGV is now the
+gating blocker, one step later in the boot sequence than the Cleaner bug, itself one step later
+than the original `ThreadPoolExecutor` regression. Recommended next step: fix the SIGSEGV per that
+doc's own recommended next steps (get the exact crash-site source line via `addr2line` against the
+captured instruction offset, since it's ASLR-base-independent and was confirmed constant across
+multiple captures), then re-run this doc's harness recipe again.
+
+## 2026-07-10 update (later same day) — SIGSEGV investigation continued, still not fixed; no new information for this doc
+
+Picked up the gating SIGSEGV doc (`wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver.md`)
+per its own recommended next step. Made substantial progress there (crash site conclusively
+identified as a JIT-compiled `ReentrantLock.lock()`, a specific named root-cause candidate found
+in classloading field-layout padding, and a separate confirmed finding that env vars do not reach
+the Host Controller child process) but did **not** land a fix — see that doc's own 2026-07-10
+"new session" entry for full detail. The four front-line residuals this doc tracks
+(`AttributeChangeNotification`, `ContentCleanerService`, `FileInputStream(File)`, `WFLYHC0034`)
+remain unreachable and unobserved; nothing changed for this doc specifically. This doc stays OPEN,
+still gated by the sibling SIGSEGV doc.
+
+
+## 2026-07-10 update (third session, same day) — the gating Host Controller SIGSEGV is FIXED; residual hunt is unblocked
+
+The Host Controller SIGSEGV that gated this doc's four front-line residuals is fixed — root
+cause: fabricated `(0, false)` compact-field slots poisoning the JIT's inline getfield
+(reference field read as a 32-bit sign-extended slice of a `Value` cell → bogus non-null
+receiver into the invoke inline cache; crashing method `ReentrantLock.lock()`). Full write-up:
+`docs/internal/wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver-FIXED.md`
+(also fixes a `BufferedReader.readLine` global-mutex-across-blocking-read starvation that made
+the post-fix Host Controller look silent).
+
+With both fixes the domain boot invokes `host=foo:add()` once, never respawns, and proceeds
+into management-model territory. The four front-line residuals
+(`AttributeChangeNotification`, `ContentCleanerService`, `FileInputStream(File)`,
+`WFLYHC0034`) did **not** re-appear verbatim in a 150 s bounded run; what surfaces instead:
+`WFLYCTL0013 Operation("add") failed` on
+`host=primary/core-service=management/management-interface=http-interface`
+(`IllegalStateException: Container is down`) and a `StackOverflowError` from
+`ScheduledThreadPoolExecutor.shutdown` recursing into itself (dispatch-bug shaped, sibling of
+the prior TPE fixes). Those are the new front line for this doc's hunt.
+
+
+## 2026-07-10/11 update (fourth session) — two MSC bugs fixed; both "third session" residuals cleared; new front line is the pre-existing, separately-tracked BUG-03 STW/JIT-takeover stall
+
+Picked up where the third session left off: `WFLYCTL0013 Container is down`
+(`IllegalStateException` on the `http-interface` `add` op) and a
+`StackOverflowError` from `ScheduledThreadPoolExecutor.shutdown` self-recursion.
+Root-caused via `CRATONVM_DBG_MSC=1` trace diffing (extracted `-> start id=N` /
+`<- start id=N OK` lines, diffed started-vs-completed ids to confirm the missing
+services never even *started*, not started-and-failed, then cross-referenced
+`[msc] install` lines for the relevant service names). Found two independent,
+real bugs in the from-scratch MSC (`native-builtins/src/jboss_msc.rs`), both
+fixed and pushed to `dev`:
+
+1. **`ServiceController.provides()` had zero native backing.** It's a real MSC
+   1.5.x interface method with no default implementation; any caller through
+   the synthetic mirror died with `AbstractMethodError:
+   org/jboss/msc/service/ServiceController.provides()Ljava/util/Set;`. The
+   `jboss.remoting.endpoint.management.management.operation.handler` service's
+   own start() path calls it — the resulting `AbstractMethodError` marked that
+   service FAILED, cascading into `WFLYCTL0459: Triggering roll back due to
+   missing management services`, which is why the *later*, unrelated
+   `http-interface` `add` then saw `IllegalStateException: Container is down`
+   (the management transaction was already rolled back). Fixed by implementing
+   `native_service_controller_provides()`: returns the controller's primary
+   `ServiceName` plus every alias reverse-scanned from `ContainerState.aliases`.
+   Commit `bd5626a9`.
+
+2. **OnDemand/Lazy dependencies of Active services were never demanded.**
+   `take_ready_start()`'s `can_start()` check requires every dependency to be
+   `Up`, but an `OnDemand`/`Lazy` service only becomes start-eligible once
+   `demanded == true`. The only production call site for `demand()` was
+   `ServiceController.setMode(Mode.ACTIVE)` — so an OnDemand service reachable
+   *only* via a dependency edge (never given an explicit `setMode(ACTIVE)` by
+   any Java code) never got demanded: a permanent deadlock. Concretely,
+   `org.wildfly.management.http.extensible` (OnDemand) is only reachable via
+   its Active dependent `...extensible.shutdown`'s dependency edge, so it never
+   started, and the whole http-management service chain never came up. Real
+   MSC treats an Active/Passive (or demanded Lazy/OnDemand) service's mere
+   dependency edge to an OnDemand/Lazy service as an implicit demand — added a
+   cheap pre-pass at the top of `take_ready_start()` that propagates demand
+   along dependency edges before computing start-eligibility (converges within
+   a few polling calls even for multi-level OnDemand chains). Commit
+   `f3d69e2b`.
+
+Both merged into `dev` at `13011cff`, verified against `origin/dev` with a
+`git log -S<symbol>` shadowing check (clean — neither `jboss_msc.rs` nor these
+symbols were touched by any concurrent commit since the branch point) and
+`cargo check -p cratonvm-native-builtins` + `cargo test -p
+cratonvm-native-builtins --lib` (2960 passed, same 5 pre-existing unrelated
+failures as the `origin/dev` baseline, plus one **confirmed-flaky**
+parallel-test-isolation failure —
+`lang_system::checkexec_security_tests::denying_sm_blocks_processbuilder_start_stub`
+races on the process-wide `SECURITY_MANAGER` `Mutex` static against other
+`checkexec_security_tests` running concurrently in sibling threads; passes
+deterministically under `--test-threads=1`; pre-existing test-infra gap,
+unrelated to this session's changes, not fixed here).
+
+**Live verification (Azure host, pristine WildFly 32.0.1.Final,
+`CRATONVM_MSC_REAL_START=1`, binary built from `dev` @ these two commits):**
+`WFLYCTL0459`, `Container is down`, the `AbstractMethodError`, **and** the
+`StackOverflowError` from `ScheduledThreadPoolExecutor.shutdown` are **all
+gone (0 hits)** — the boot log grew from a ~105-line stall to 595+ lines,
+reaching `Invoking domain.xml ops` and activating multiple subsystem
+extensions (JAX-RS, Transactions, Weld, JSF(Mojarra), Datasources,
+ResourceAdapters) before stalling. A 30 s re-check confirmed the log genuinely
+stops growing there, not just slow progress.
+
+**New front line: the boot now stalls at the pre-existing, separately-tracked
+BUG-03 STW/JIT-takeover family** (`STW cross-thread JIT takeover is still
+waiting for cooperative mutators rounds=64 pending=7 taken=0`, from
+`vm/src/runtime/interpreter.rs`). Per this investigation's standing scope
+guardrail, BUG-03 itself is **not** chased here — but I did check whether it
+can be routed *around* (not fixed) via `CRATONVM_DISABLE_JIT=1`, since the
+stall is explicitly JIT-related: it cannot. With JIT disabled the boot fails
+**much earlier** and differently — `org/jboss/modules/Main.<clinit>` throws
+`ExceptionInInitializerError` wrapping an `UnsatisfiedLinkError` for `Missing
+native method in real-JDK mode method=java/io/InputStreamReader.<init>
+(Ljava/io/InputStream;Ljava/nio/charset/Charset;)V`, before JBoss Modules even
+finishes bootstrapping. This looks like a real, separate, interpreter-only
+native-registration gap (the 2-arg `InputStreamReader(InputStream, Charset)`
+constructor apparently isn't registered/reachable in real-JDK mode when the
+JIT never compiles the caller) — **not investigated further, not fixed, not
+filed as its own doc** (out of scope for this session); noted here only to
+save a future session from re-trying the same "disable JIT to route around
+BUG-03" idea and hitting the same dead end.
+
+**The four original front-line residuals (`AttributeChangeNotification`,
+`ContentCleanerService`, `FileInputStream(File)`, `WFLYHC0034`) and the
+`HIB-CV-32` sustained-load / `CRATONVM_DIAG_HIB32=1` corrupt-Value-cell check
+still have not been reached** — boot has now moved several phases past where
+they were originally observed (bootstrap → extensions → Elytron →
+`host=foo:add()` → Cleaner → SIGSEGV → `provides()`/demand-propagation →
+domain.xml subsystem activation), each phase revealing the next blocker
+in sequence. It remains unknown whether those four residuals are still
+reachable in their original form or have been superseded, because boot has
+not yet gotten past BUG-03 to find out. This doc stays OPEN, now gated by
+BUG-03 (tracked in its own existing doc/section, not duplicated here).
+
+No lingering `domain.sh`/Host Controller/Process Controller processes were
+left running on the probe host after this session (verified via `ps aux`
+post-run).
+
+
+## 2026-07-11 update (fifth session) — BUG-03 groundwork laid (Generational-GC path confirmed, `park()` verified correct), but a NEW earlier blocker now prevents reaching it at all
+
+Coordinator approved expanding scope into BUG-03 itself (the `STW
+cross-thread JIT takeover is still waiting for cooperative mutators` stall
+that now gates this doc, per the fourth-session entry above), with an
+explicit, strict caution bar: check for concurrent GC-barrier work first,
+don't touch `gc_barrier` wait/count logic without a liveness proof, verify
+under repeated load, park-don't-merge on any hang/flake.
+
+**Concurrent-work check (done first, as required):** read
+`docs/known-issues/gc-audit-2026-07-10-open-findings.md` and the parked
+`wip/gc-stw-quota-race-20260710` branch. Finding: the GC audit's own finding
+2 ("G1/ZGC: STW hang risk when a JIT thread never polls") is BUG-03's
+symptom family, and its G1 half is already landed + load-validated
+(`e78a8bd3`, "INT-3 — extend cross-thread STW JIT takeover to G1"). BUT:
+
+- **WildFly's `domain.sh` sets no `-XX:+UseG1GC`**, and CratonVM's default
+  backend is Generational (`gc/src/vm_heap.rs:65-70`, doc comment:
+  "Generational semi-space + old-gen mark-sweep (**default**)"). So the
+  G1-specific INT-3 landing is very likely NOT the mechanism in play for
+  this doc's repro at all — this boot exercises the Generational path,
+  which the audit doc separately claims "gets this for free from its
+  non-moving frozen-cycle sweep" (i.e. was never supposed to need INT-3's
+  G1-specific work in the first place).
+- Confirmed by reading the code (not just the doc) that the exact log
+  message this doc quotes ("STW cross-thread JIT takeover is still waiting
+  for cooperative mutators") is unique to `stw_take_over_and_wait`
+  (`vm/src/runtime/interpreter.rs:475`, called from exactly 3 sites: 889,
+  1031, 1223 — all young-gen-pause family), which is DIFFERENT from the
+  `brief_stw_counted`/`brief_stw_counted_with_live_blocked` functions the
+  audit doc flags as still using plain `wait_for_all()` for G1's
+  initial-mark/final-remark. So BUG-03 is not simply "the concurrent-mark
+  wiring the audit doc already knows is missing" either — it's hitting the
+  mechanism that's supposed to already work.
+- Read `NativeContextImpl::park()` (`vm/src/vm/vm_exec.rs:5878`) end to end:
+  it DOES correctly call `self.shared.gc_barrier.enter_blocked()` before
+  actually parking (the coordinator's option (a) — "make a JIT-thread's
+  park-in-native register as gc_barrier-blocked" — already exists and looks
+  correct for the generic `Unsafe.park`/`LockSupport.park` path). Also
+  confirmed `jit/src/x64.rs` has zero special-casing for native calls made
+  from JIT-compiled code (grep for `park`/`enter_blocked` in `jit/src/`
+  finds only unrelated register-allocation "parking" terminology and
+  `parking_lot` cache internals) — meaning a native call from JIT-compiled
+  bytecode goes through the exact same Rust dispatch as from the
+  interpreter, so `ctx.park()` should behave identically regardless of
+  caller. **This means option (a) as literally described may already be
+  implemented and correct** — the 7 threads BUG-03's log shows stuck
+  (`pending=7`, `taken=0` after 64+ rounds) are apparently NOT simply
+  "parked without registering blocked", since that path looks sound. What
+  they're actually doing (spinning in JIT code the takeover's
+  `any_thread_in_jit()` fails to catch, vs. blocked in some OTHER native —
+  e.g. socket accept/read — that never calls `enter_blocked` at all) could
+  not be determined this session; see below.
+
+**Live verification blocked by a NEW finding.** The plan was to boot with
+`CRATONVM_DBG_STW_CENSUS=1` and `CRATONVM_DBG_XT_JIT_ROOT_SCAN=1` to capture
+`ThreadRegistry::debug_thread_census()` at the exact moment of the stall —
+this prints each alive thread's `blocked`/`ready`/`state`/top-frame, which
+would have definitively answered "what are the 7 pending threads actually
+doing". Instead, boot now fails to get anywhere near that point: **20/20
+attempts in a controlled batch died within under a second, at
+`org/jboss/modules/Main.<clinit>`**, with a `Missing native method in
+real-JDK mode` for `InputStreamReader.<init>(InputStream, Charset)` —
+completely unrelated to GC/STW, gating even the most basic JBoss Modules
+bootstrap. Full detail, reproduction data, and what was ruled out:
+[`wildfly-jboss-modules-inputstreamreader-clinit-race.md`](wildfly-jboss-modules-inputstreamreader-clinit-race.md)
+(new doc). This is now the actual front-line gate for this whole
+investigation — ahead of BUG-03, ahead of the four original residuals,
+ahead of HIB-CV-32.
+
+**No fix attempted for either issue this session.** Per the coordinator's
+explicit bar ("if you observe ANY intermittent hang, SEGV, or flakiness
+under load — do not merge, park it... a well-documented, safely-parked
+partial attempt is a good outcome, an unsafe merge is not") and given BUG-03
+itself could not even be empirically re-observed (only reasoned about via
+static code reading), no `gc_barrier`/STW/JIT-park code was touched this
+session. The new InputStreamReader blocker is a different subsystem
+entirely (real-bytecode class/method resolution, not GC-barrier) and was
+investigated only far enough to characterize and rule out easy hypotheses
+(see its own doc) — actually root-causing it needs live tracing this
+session did not have time for after the characterization work.
+
+**Next steps for whoever continues, in order:**
+1. Root-cause and fix `wildfly-jboss-modules-inputstreamreader-clinit-race.md`
+   first — nothing else in this doc chain is reachable until boot gets
+   past `org/jboss/modules/Main.<clinit>` again.
+2. Once boot reaches WildFly-specific code again, immediately capture
+   `CRATONVM_DBG_STW_CENSUS=1`/`CRATONVM_DBG_XT_JIT_ROOT_SCAN=1` output at
+   the BUG-03 stall (`stw_take_over_and_wait`, `vm/src/runtime/interpreter.rs:475`)
+   to see the pending threads' actual state — this is the missing piece
+   that turns the option (a)/(b) choice from a guess into an evidence-based
+   decision. Given `park()` already looks correct (see above), lean toward
+   investigating whether the pending threads are doing blocking native I/O
+   (socket accept/read for the management interface) that never calls
+   `enter_blocked`, rather than assuming they're spinning JIT loops the
+   takeover fails to catch — but confirm either way before writing code.
+3. Whatever the fix, it must clear the verification bar the coordinator set
+   for touching this subsystem: `cargo test` clean for the owning crate,
+   repeated runs under real load (not once), and the existing GC-audit
+   probe kit (`/data/data/gcprobes-0710/`) if reachable — park, don't merge,
+   on any flake.
+
+
+## 2026-07-11 update (sixth session, same day) — the InputStreamReader "blocker" was a test-harness bug, not a CratonVM defect; genuine sustained load reached for the first time; one more MSC AbstractMethodError fixed
+
+The coordinator proposed a specific hypothesis for the InputStreamReader
+finding above: re-register `<init>` as a `NativeKind::SyntheticStub`-tagged
+native (the same technique used for the ThreadPoolExecutor/Cleaner fixes),
+reasoning that `invokespecial` goes through a different, category-respecting
+dispatch path than the `invokevirtual` vtable fast path the original removal
+commit's comment was about.
+
+**Verifying that hypothesis surfaced two corrections, then the real root
+cause:**
+
+1. `invokespecial` and `invokevirtual` are NOT as cleanly separated as the
+   hypothesis assumed — both route through the same
+   `execute_invoke_kind` -> `try_stackless_invoke` path in
+   `vm/src/runtime/interpreter.rs`, which has its own
+   `synthetic_stub_should_yield_to_real_bytecode` allowlist gate, separate
+   from (and in addition to) `vm_exec.rs`'s `invoke_or_native` gate the
+   coordinator cited. Neither allowlist contained `InputStreamReader`.
+2. `RealSelector::prefers_real()` (`vm/src/runtime/env_cache.rs`) — the
+   general, non-allowlist escape hatch — defaults to `false` for every class
+   unless `CRATONVM_REAL` is explicitly set (it's a differential-testing
+   switch, off by default; matches the existing memory note "CRATONVM_REAL:
+   SyntheticStub wins by default"). So implementing the coordinator's fix
+   literally (re-register `<init>` as SyntheticStub without also adding
+   `InputStreamReader` to both allowlists) would have made the OLD,
+   already-fixed UTF-16 decode bug (`aaf64a5d`'s whole reason for existing)
+   come back for every real-JDK `InputStreamReader`, not fixed the WildFly
+   issue in a targeted way.
+3. Before committing to any of that, added temporary
+   `CRATONVM_DBG_ISRTRACE` instrumentation to
+   `classloading/src/class_manager.rs::load_class` (built, tested, then
+   `git checkout --` reverted — never shipped) to empirically answer the
+   coordinator's own point 2 ("does this actually resolve as a synthetic
+   stub at this point"). It does — but the reason is not a race or a
+   dispatch-path bug at all: `ClassManager::has_real_boot_classes()`
+   returns **`false`** at the point `org.jboss.modules.Main.<clinit>`
+   loads `java/io/InputStreamReader`, because this investigation's test
+   harness sets `JAVA_HOME` to a shim directory (just a `bin/java` symlink,
+   satisfying `domain.sh`'s launcher convention) that CratonVM's own
+   `resolve_java_home()` (`vm/src/config.rs`) ALSO consults for real JDK
+   discovery — finding nothing there. `CRATONVM_JAVA_HOME` is the
+   documented escape hatch for exactly this ("used when JAVA_HOME points at
+   a cratonvm shim tree... but boot modules must come from a real JDK") and
+   had never been set by any probe script in this entire investigation.
+
+**Fix: `CRATONVM_JAVA_HOME=/home/victor/jdk25`, no code change.** Verified
+**10/10** in a controlled batch (same rigor as the original 0/20 finding).
+`docs/known-issues/wildfly-jboss-modules-inputstreamreader-clinit-race.md`
+is retracted (its reproduction data and `has_real_boot_classes()` mechanism
+trace stay for the record, but the "CratonVM race/bug" framing was wrong).
+
+**This unblocked far more than expected.** With real bytecode correctly
+available, a from-scratch boot run (`CRATONVM_DBG_STW_CENSUS=1`,
+`CRATONVM_DBG_XT_JIT_ROOT_SCAN=1`, default `-Xmx512m`) produced **63,367
+log lines** — two orders of magnitude past any previous run in this
+investigation — before finally dying with a genuine
+`OutOfMemoryError: young gen exhausted` (128 MiB from-space full). Findings
+from that run and a `-Xmx1536m` follow-up:
+
+- **BUG-03's specific stall pattern did NOT reproduce as a permanent
+  livelock.** The "STW cross-thread JIT takeover is still waiting..."
+  warning fired exactly ONCE (`pending=1`, far smaller than the earlier
+  `pending=7`) and then resolved — boot continued for 62,000+ more lines
+  afterward. It's plausible (not proven) that the earlier "permanent"
+  characterization of BUG-03 was itself partly an artifact of the same
+  missing-`CRATONVM_JAVA_HOME` gap: with real bytecode unavailable, more
+  classes fall back to synthetic-stub implementations, which may not poll
+  GC safepoints the way real bytecode does, making some thread
+  genuinely un-excusable rather than just transiently busy. BUG-03 is
+  **not re-closed** by this alone — a single successful resolution isn't
+  proof against the underlying livelock risk the GC audit doc describes —
+  but the WildFly repro specifically no longer demonstrates it as a hard
+  blocker. Worth a dedicated repeat-under-load check in a future session
+  before fully retiring it here.
+- **HIB-CV-32's corrupt-Value-cell detector fired ZERO times** across the
+  entire 63K-line run. The detector (`gc/src/gen_heap.rs::read_slot`) is
+  unconditional — `CRATONVM_DIAG_HIB32` only lifts the print cap past the
+  first 32 hits, so a true zero-hit run needs no special flag. This is a
+  genuine, strong signal toward this doc's original closure bar, though
+  boot still doesn't reach a *quiescent running* state (see below), so it
+  isn't the full sustained-load picture yet.
+- **The `OutOfMemoryError` is a heap-sizing artifact, not a leak**: bumping
+  `JBOSS_JAVA_SIZING` from the WildFly-default `-Xmx512m` to `-Xmx1536m`
+  eliminates it entirely (no OOM in the follow-up run) — confirms this
+  specific default is just too small for a Host Controller's full domain
+  boot on CratonVM, not a memory-correctness bug.
+- **New finding, fixed same session**: with the OOM out of the way, boot
+  reaches `start-servers`, which now fails with
+  `WFLYHC0053: Could not get the server inventory in 30 seconds`, followed
+  by a masking `AbstractMethodError: method
+  org/jboss/msc/service/ServiceContainer.isShutdown()Z has no Code
+  attribute` during the boot-failure reporting path itself (so the
+  AbstractMethodError was hiding the real WFLYHC0053 timeout in the log).
+  Same family and same fix pattern as this doc's earlier `provides()` fix:
+  `ServiceContainer.isShutdown()` is a real MSC interface method with no
+  default implementation and zero native backing. Implemented
+  `ServiceContainer::is_shutdown()` (reads the existing `state.shutdown`
+  bool the `shutdown()` method already sets) +
+  `native_service_container_is_shutdown`, registered as `"isShutdown", "()Z"`
+  right after the existing `"shutdown", "()V"` registration in
+  `native-builtins/src/jboss_msc.rs`. `cargo test -p cratonvm-native-builtins
+  --lib`: 2961 passed, the same 5 pre-existing failures, zero new failures
+  (this run did not hit the flaky `denying_sm_blocks_processbuilder_start_stub`
+  parallel-test race noted in the fourth-session entry). Commit `40d05aac`.
+
+**With the AbstractMethodError gone, the real error underneath was no
+longer masked — and Host Controller itself now completes its own boot.**
+Re-running with the fix, boot proceeds through the `WFLYHC0053` failure
+(the `start-servers` operation for the actual managed servers still fails
+and rolls back) but then Host Controller finishes its OWN startup and logs:
+
+```
+INFO [org.jboss.as] WFLYSRV0025: WildFly Full 32.0.1.Final (WildFly Core
+Unknown) (Host Controller) started in 143128ms - Started 0 of 0 services
+(0 services are lazy, passive or on-demand) - Host Controller
+configuration files in use: domain.xml, host.xml
+```
+
+This is the furthest this entire investigation has ever gotten — Host
+Controller reports itself fully started, something no prior session
+reached. "Started 0 of 0 services" confirms the managed *application*
+servers never came up (consistent with the `WFLYHC0053` failure above),
+but the Host Controller process itself is healthy and stable at this point,
+not crashed, not livelocked, not OOM'd.
+
+**`WFLYHC0053: Could not get the server inventory in 30 seconds` is now
+the front line** — not yet investigated. This is a genuinely new, different
+failure from anything previously tracked in this doc (not the four
+original residuals, not `Container is down`, not BUG-03). `start-servers`
+timing out waiting for server inventory suggests either a slow/stuck
+Process Controller <-> Host Controller handshake or a managed server
+process that never reports in — worth checking with `CRATONVM_DBG_MSC=1`
+and a live process list the same way the demand-propagation deadlock was
+diagnosed, plus checking whether the managed server's own child process
+ever actually spawns (`ps aux` during the 30s window).
+
+**The four original front-line residuals
+(`AttributeChangeNotification`, `ContentCleanerService`,
+`FileInputStream(File)`, `WFLYHC0034`) still have not been individually
+re-confirmed** — they did not appear verbatim in this run's 63K lines
+(none of the four signature strings matched), but boot also never reached a
+fully-up, steady state to be confident they're truly gone rather than just
+not-yet-reached. Re-check once `WFLYHC0053` is resolved.
+
+
+## 2026-07-11 update (seventh session) — `WFLYHC0053` root-caused to a specific 1-byte socket read; not fixed; two independent findings, one ruled out as gating, one flagged as the strongest remaining lead
+
+Picked this up as the designated next target per the sixth session's own hand-off. Confirmed the
+sixth session's `CRATONVM_JAVA_HOME` fix and MSC fixes (`bd5626a9`, `f3d69e2b`, `40d05aac`) are all
+already on `dev` — no re-work needed there. Built a fresh isolated-worktree binary from
+`origin/dev` and reproduced the doc's harness recipe repeatedly (6 full boot attempts) on a
+**custom bind address/port** (`-b=127.0.0.5x -bmanagement=127.0.0.5x -Djboss.management.http.port=x9990
+-Djboss.management.native.port=x9999`) — the shared host had a genuinely unrelated concurrent
+session's real-HotSpot WildFly testsuite (`ModelPersistenceTestCase`) bound to the stock
+`127.0.0.1:9990`, which produced a **false-positive** `WFLYSRV0083 Address already in use` in the
+first two attempts before this was diagnosed as port contention, not a CratonVM bug. **Anyone
+re-running this doc's harness on this shared host should use non-default bind
+addresses/ports** — this cost real time to diagnose and would silently corrupt results otherwise.
+
+### Finding A (ruled out as the WFLYHC0053 gate, but a real, separate bug): a Java thread permanently blocks reading the Host Controller process's own real stdin (`System.in`, native fd 0)
+
+Live `gdb -p <hc-pid> -batch -ex 'thread apply all bt'` on a boot that had gone quiet for 80+ s
+caught the "main-vm" thread mid-interpreter-call-stack (`execute_frame` → `execute_instruction` →
+`try_stackless_invoke` → `safe_native_call` → `native_fis_read`, `vm/src/vm/vm_exec.rs` /
+`native-io/src/lib.rs`), blocked in a real `libc::read(fd=0, ...)` — i.e. genuinely parked reading
+the VM process's own OS-level stdin, not a synthetic/pipe fd. Added a temporary, flag-gated
+diagnostic (`CRATONVM_DBG_STDIN_READ=1`, since reverted — not committed, see below) directly in
+`native_fis_read` (`native-io/src/lib.rs`) confirming: `this_class=java/io/FileInputStream fd=0`,
+and the read **never returns** for the rest of the boot (no matching `result=` line in three full
+runs that otherwise completed and reached `WFLYSRV0025`/`WFLYHC0053`).
+
+Traced the likely Java-level origin via `javap` on `wildfly-process-controller-24.0.1.Final.jar`:
+`ManagedProcess.start()` (the class that spawns Host Controller via `ProcessBuilder`) writes a
+`pcAuthKey` to `Process.getOutputStream()` (base64-encoded) then immediately `close()`s that
+stream (bytecode offsets 445-469) — i.e. Host Controller's own real stdin (fd 0, connected to
+that pipe) is expected to receive the auth key once, then see EOF. CratonVM's
+`ProcessBuilder.start()` (the live implementation is `native-io/src/process.rs`'s
+`native_process_builder_start` → `spawn_and_wrap_with_redirects`; a second,
+`child.wait_with_output()`-based implementation also exists at
+`native-builtins/src/phases_late.rs::register_phase57_process`'s `"start"` registration but is
+dead code, overridden by the native-io one per that file's own doc comment — worth deleting in a
+follow-up to stop it misleading future readers) defaults `ProcessBuilder`'s stdin to
+`Stdio::piped()` correctly, and `native_pipe_output_close`
+(`native-io/src/process.rs`) correctly calls `fd_table().close(fd)`, which removes the
+`ChildStdinPipe` entry and lets `Drop` close the OS pipe — this part looks correct on inspection.
+
+**Why this is ruled out as WFLYHC0053's gate:** in three separate full runs, boot continued for
+tens of thousands of further log lines and reliably reached both `WFLYSRV0025 ... started` and the
+`WFLYHC0053` failure while this one thread stayed permanently parked on fd 0 — proving CratonVM
+threads run genuinely independently here (this is not the sole "main-vm" interpreter thread
+blocking everything, despite the thread's OS name). So whatever Java thread this is, it is not on
+the critical boot path. **Not further identified which WildFly thread/code this is** (candidates:
+a genuine second stdin read past the auth key that real WildFly expects to block until a later
+lifecycle event — plausible, matches `SendStdInTask`-style command delivery seen in
+`ManagedServer`'s inner classes — vs. an actual bug where EOF didn't propagate and some thread is
+stuck that shouldn't be). Recorded here so a future investigation of thread/resource leaks doesn't
+have to re-discover this; not itself worth chasing further under this doc's WFLYHC0053 mandate.
+The temporary diagnostic was reverted before finishing this session (not merged) — `git checkout --
+native-io/src/lib.rs` — since it never became a real fix; re-add
+`if fd == 0 { eprintln!(...) }` guards in `native_fis_read` if picking this up again.
+
+### Finding B (the actual WFLYHC0053 mechanism, root-caused to the byte level, NOT fixed): Host Controller's read of the Process Controller's inventory response gets exactly 1 byte, then the connection is treated as closed, despite the Process Controller having already written the full response and never closing its own end
+
+With `CRATONVM_DBG_SOCK=1` (light) and a clean unique-port run, captured the **exact** socket
+byte-level exchange at the moment `WFLYHC0053` fires (this reproduces **100% reliably**, every
+run, always within ~1 second of `"Executing two-phase"` being logged for the
+`start-servers(enabled-auto-start=true)` operation — this is NOT the 30-second internal timeout
+being slow; the actual connection-loss event happens almost immediately, and the code then waits
+out the full 30 s on a latch that will now never be counted down):
+
+```text
+[Host Controller] TRACE [org.jboss.as.host.controller] Executing two-phase
+[dbg-sock] write: sid=1 sent=5 bytes      <- HC sends the request header (sid=1 is HC's socket)
+[Host Controller] TRACE ... Sending data chunk of size %d
+[dbg-sock] read: sid=2 got=1  (x5, byte-by-byte)   <- PC receives it (sid=2 is PC's accepted socket)
+[dbg-sock] write: sid=1 sent=1 bytes      <- HC sends end-of-message marker
+TRACE ... Received end data marker
+TRACE ... Sending data chunk of size %d
+[dbg-sock] write: sid=2 sent=5 bytes      <- PC writes its response header
+[dbg-sock] write: sid=2 sent=47 bytes     <- PC writes its response payload (47 bytes)
+TRACE ... Sending end of message
+[dbg-sock] write: sid=2 sent=1 bytes      <- PC writes its end-of-message marker
+[Host Controller] [dbg-sock] write: sid=1 sent=1 bytes
+[dbg-sock] read: sid=2 want=1 (blocking on recv...)   <- PC's own reader goes back to waiting; PC's socket is NOT closed
+[Host Controller] [dbg-sock] read: sid=1 got=1        <- HC reads exactly ONE byte of PC's 53-byte response
+[Host Controller] DEBUG [org.jboss.as.host.controller] process controller connection closed.
+```
+
+Traced `ServerInventoryImpl.connectionFinished()` (`javap` on
+`wildfly-host-controller-24.0.1.Final.jar`) as the exact source of the "process controller
+connection closed." DEBUG line — it is a `ProcessMessageHandler` connection-lifecycle callback
+(sets `connectionFinished=true`, notifies a `shutdownCondition` monitor) that does **not** count
+down `processInventoryLatch` (only the real `handleProcessInventory(Map)` success callback does
+that, confirmed via `javap` on `ProcessControllerConnectionService$2`) — so once this fires,
+`determineRunningProcesses()`'s `processInventoryLatch.await(30, SECONDS)` is guaranteed to time
+out and `WFLYHC0053` is guaranteed to fire, exactly matching the observed symptom.
+
+**The key anomaly, not yet resolved:** PC's socket (`sid=2`) never closes — its own log shows it
+returning to `read: sid=2 want=1 (blocking on recv...)` immediately after finishing its 3 writes,
+i.e. PC still considers the connection fully alive and is waiting for HC's *next* request. Yet HC's
+socket (`sid=1`) reads exactly 1 of the 53 bytes PC wrote, then whatever consumes that 1 byte
+(almost certainly a `read()` for byte 2 of PC's 5-byte response header) sees something that
+Java-level code interprets as connection-closed — either a genuine `n==0` from the underlying
+`std::net::TcpStream::read()` (which `re1_socket_read_stream`, `native-builtins/src/net_phase_e.rs`,
+correctly maps to Java `-1`/EOF) or an exception the higher-level WildFly protocol code treats
+equivalently. Since PC's own socket end is provably still open and un-shutdown at the OS level
+moments later, a genuine `-1`/EOF on HC's read implies either (a) HC is reading from the wrong
+stream/a stale registry entry for `sid=1` (an identity/lifecycle bug in `s2_registry`, not
+inspected further this session), or (b) something briefly, spuriously shuts down or drops HC's
+read half specifically. **`re1_socket_read_stream`/`re1_socket_write_stream`/`close()`/
+`shutdownInput()`/`shutdownOutput()` (`native-builtins/src/net_phase_e.rs`) were all read this
+session and look individually correct** (proper blocking `read()`/`write_all()`+`flush()`, correct
+`n==0`→`-1` EOF mapping, `close()`'s `fd<3` stdin-protection guard is correctly scoped since
+`ChildStdinPipe`/socket fds always come from a monotonic counter starting at 3 — checked, not a
+collision) — so if this is a bug in this layer at all, it is a **race/identity** bug, not a
+straightforward logic error visible from a single-threaded reading of the code.
+
+**Suspicious but unconfirmed temporal correlation:** immediately before every capture of this
+exact failure, the log shows a tight burst (5 occurrences, not unbounded — not itself a hang) of
+`cratonvm_gc::gen_heap` `mark_young: rejecting object ... with implausible extent 0` /
+`GC: inconsistent header ... inline-alloc forgot to set kind=Array` / `[A2] BREADCRUMB ... never
+header-written here, or freed+reused past the ring` warnings, all against the identical address
+and an implausible `class_id=1278978112` (~1.27 billion — far outside any real class-id range,
+consistent with the conservative scanner correctly rejecting a stale, non-pointer stack slot per
+its own documented by-design behavior, i.e. this is very likely benign noise and NOT proof of a
+real GC bug). **This was not chased further** — the doc's own guardrail is explicit that
+`gc_barrier`/STW territory needs a very high verification bar before any code change, and this
+session did not attempt to establish causation (vs. coincidence: any burst of allocation activity
+around a hot request-handling path will produce some of this conservative-rejection noise by
+design). Recorded as the strongest remaining lead, not a diagnosis: if a future session wants to
+pursue it, the concrete next step is a live `gdb` capture with a breakpoint on the second/third
+`read()` call on `sid=1` (or `CRATONVM_DBG_SOCK_BYTES=1`, which shows actual byte content — not
+used this session because the combined overhead of full-boot `DBG_SOCK_BYTES` plus this doc's
+normal ~17-140K-line boot volume made runs too slow/heavy to reliably reach the critical point
+within a reasonable window; a wrapper that only enables it once the log shows `"Invoking domain.xml
+ops"` would fix this, but needs either a live-attach env-var-injection trick or restructuring the
+harness to start two-phase) correlated exactly with `s2_registry`'s lock state and any GC pause
+timing (`CRATONVM_DBG_STW_CENSUS=1`) at the moment of the second read.
+
+**Also confirmed this session, not new:** `HIB-CV-32` (`gen_heap::read_slot: corrupt Value cell`)
+did not fire in any of the 6 runs (tens of thousands of lines each) — consistent with the sixth
+session's finding; the guard remains silent. The heap-sizing note from the sixth session
+(`JBOSS_JAVA_SIZING=-Xms64m -Xmx1536m -XX:MaxMetaspaceSize=256m` avoids the default `-Xmx512m`
+`OutOfMemoryError`) was re-confirmed necessary — a run without it hit the same OOM at a
+comparable point in boot.
+
+**The four original front-line residuals (`AttributeChangeNotification`, `ContentCleanerService`,
+`FileInputStream(File)`, `WFLYHC0034`) again did not appear verbatim** in any of this session's
+runs (grepped for all four signature strings across all 6 logs, zero hits) — boot reliably reaches
+much further than where they were originally observed, reinforcing prior sessions' suspicion that
+they were superseded, but still not something this session can positively confirm fixed rather
+than just not-yet-reached in a materially different way (boot never reaches a fully-up, steady
+managed-server state — it reaches `WFLYSRV0025` with `Started 0 of 0 services` and stops there).
+
+**No fix landed this session.** Per this doc's own standing instruction not to force a close or a
+fix that doesn't hold up: the byte-level mechanism (Finding B) is now precisely characterized, but
+the actual root cause (why HC's read sees the connection as closed when PC's write clearly
+succeeded and PC's own socket stayed open) was not isolated to a single line of code, and this
+session's remaining time budget did not allow safely following the GC-timing lead into
+`gc_barrier`/`s2_registry` territory with the verification rigor this project's guardrails require
+for that area. This doc stays OPEN, still blocked on `WFLYHC0053`, now with a much narrower,
+byte-level reproduction recipe for whoever continues.
+
+**Recommended next steps, in order:**
+1. Reproduce Finding B's exact byte-level capture again (recipe: `CRATONVM_MSC_REAL_START=1
+   CRATONVM_DBG_SOCK=1`, unique bind address/port to avoid this shared host's port collisions,
+   `JBOSS_JAVA_SIZING=-Xms64m -Xmx1536m -XX:MaxMetaspaceSize=256m`, watch for `"Executing
+   two-phase"` then the very next `[dbg-sock] read: sid=1` lines) and this time have a `gdb`
+   breakpoint or `CRATONVM_DBG_SOCK_BYTES=1` (narrowly scoped, e.g. only after `"Invoking
+   domain.xml ops"` appears) ready to fire exactly at the second read on `sid=1`, to see whether
+   it returns `n=0` (genuine OS-level EOF — then the question moves to "why did the OS report
+   EOF/RST on a socket the peer never closed", a kernel/registry-identity question) or throws/
+   errors a different way.
+2. If it is a genuine `n=0`, audit `s2_registry`'s `Arc<TcpStream>` lifecycle end-to-end
+   (`net_phase_e.rs`) for anything that could `shutdown()`/drop the *specific* `sid=1` entry
+   concurrently with this read — a second thread on HC's side (there are many: MSC workers, XNIO
+   I/O threads, the domain-channel handler) touching the same registry entry via a stale/reused
+   `stream_id` is the most likely mechanical candidate given the multi-threaded, high-object-churn
+   context this always reproduces in.
+3. Only pursue the GC-timing correlation (mark_young rejection burst) if step 2 comes up empty —
+   and if so, treat it exactly per this doc's own standing guardrail (live-load verification,
+   park-don't-merge on any flake, read `wip/gc-stw-quota-race-20260710` first).
+4. Independently, `native-builtins/src/phases_late.rs::register_phase57_process`'s dead
+   `wait_with_output()`-based `ProcessBuilder.start()` registration (overridden by
+   `native-io/src/process.rs` per that file's own comment, confirmed dead this session) is safe,
+   low-risk cleanup debt worth deleting in its own small PR — not related to WFLYHC0053, flagged
+   here only so it isn't mistaken for the live implementation by a future reader again.
+
+
+## 2026-07-11 update (eighth session, same day) — corrected the seventh session's "corrupted opcode" misdiagnosis; landed one real, independently-justified fix (not the root cause); precisely narrowed the actual failure window; still not fixed
+
+Continued directly from the seventh session's byte-level capture (`bytes=[152]`). The
+coordinator asked to (1) isolate genuine short-read/EOF vs. a registry-identity race via a
+`gdb` breakpoint or scoped `CRATONVM_DBG_SOCK_BYTES`, (2) fix the root cause if found, (3)
+only chase the GC-timing correlation if the direct trace came up empty, (4) re-check the
+four original residuals and retire the doc once genuinely clean.
+
+### Byte 152 is NOT corruption — it is the real WildFly wire protocol's own `CHUNK_START` marker
+
+This is the single most important correction from this session. The seventh session's
+byte-level capture (`bytes=[152]`, i.e. `0x98`/signed `-104`) was read as "PC's
+`ProcessController.sendInventory()` writes opcode byte 20 (`bipush 20; invokevirtual
+OutputStream.write(I)V`, confirmed via `javap`), but Host Controller receives 152 instead
+— an apparent write-side corruption." **This was a misdiagnosis.** Two more rounds of
+targeted, per-process (not merged-log), sequence-numbered, thread-ID-tagged file logging
+(added temporarily to `native-builtins/src/net_phase_e.rs`'s `re1_socket_read_stream`/
+`re1_socket_write_stream`, reverted before finishing — see below) definitively ruled out
+both a log-transport artifact (the very first capture attempt turned out to be corrupted
+by two separate OS *processes* — Process Controller and Host Controller — both writing to
+the same shared `/tmp` trace path; fixed by suffixing the trace file with
+`std::process::id()`) and a registry-identity swap (the `Arc<TcpStream>` pointer for
+`sid=1`/`sid=2` stayed byte-for-byte identical across every read/write in the failing
+window — no stream-identity race).
+
+With reliable, per-process, byte-value-capturing traces in hand, decompiling
+`org.jboss.as.process.protocol.ConnectionImpl$MessageOutputStream.write(byte[],int,int)`
+(via `javap -p -c` on the real `wildfly-process-controller-24.0.1.Final.jar`) showed the
+real WildFly wire protocol prefixes **every** chunk with a header byte `hdr[0] = -104`
+(`bipush -104` in the bytecode) — `-104` signed = **152** unsigned. Decompiling the
+matching read side, `ConnectionImpl$2.run()` (the connection's dedicated read-loop
+`Runnable`), confirmed the receiver's own `lookupswitch` on the first byte of every
+message: `152` → "more data follows, read a 4-byte length next"; `153` → "end of message
+data"; anything else → `invalidCommandByte` `IOException`. **152 is the correct, expected,
+first byte of every single chunk this protocol ever sends — not a corrupted opcode.** My
+own prior write-up incorrectly treated the raw-socket byte stream as if it were already
+opcode-dispatch-ready payload; it is not — `ConnectionImpl$2.run()`'s chunk-length/pipe
+plumbing sits between the raw socket and the `MessageHandler.handleMessage()` opcode
+dispatch I'd originally decompiled, and I had conflated the two layers.
+
+### The real failure window, precisely narrowed via the same decompilation
+
+`ConnectionImpl$2.run()`'s bytecode (full disassembly captured, not reproduced here) shows
+that after reading a valid `152` and *before* the next socket read (`StreamUtils.readInt`,
+which does four separate single-byte `InputStream.read()` calls, byte-for-byte mirroring
+the writer's four `ishr`/`i2b`/`bastore` shifts), the very first `152` chunk of a message
+additionally: (a) constructs a bounded, ring-buffer-backed `org.jboss.as.process.protocol.Pipe`
+(a WildFly-authored class — plain `Object`-monitor `wait()`/`notify()`, not JDK
+`PipedInputStream`/`PipedOutputStream`, so no native-stub involvement expected there), and
+(b) submits a task to the connection's `readExecutor` (the same `EnhancedQueueExecutor`
+built in `ProcessControllerConnectionService.start()`, `core=1 max=4 queue=256`, already a
+class this whole investigation chain has hit multiple independent bugs in) to drain the
+pipe and dispatch to `MessageHandler.handleMessage()` on a separate thread.
+
+**The reliable, per-process, sequence-numbered trace shows the read task's socket-read
+sequence stops dead after the single `152` byte — no further `PRE-READ` for `readInt`'s
+four bytes ever appears, in any of 5 fresh full-boot captures.** Per the exception table
+covering this whole loop body, ANY exception between reading `152` and reaching
+`readInt()` — which per the bytecode is only the Pipe-construction + `readExecutor.execute()`
+submission — is caught by a catch-all handler that does **not** log anything (only the
+narrower, sibling `IOException` handler calls a logging method), safely closes the pipe,
+and calls `ConnectionImpl.closed()` (→ the `ClosedCallback` → `ServerInventoryImpl.
+connectionFinished()` → the "process controller connection closed." line this doc has
+tracked since its first report) before re-throwing. This exactly matches every observed
+symptom: no error/exception text anywhere in the logs before the closure (grepped for
+"panic"/"Exception"/"terminated with error" across all captures, zero hits in this exact
+window), and the connection-closed line firing near-instantly rather than after any
+visible delay.
+
+**This narrows the actual bug to one of: `new Pipe(8192)`'s constructor, `pipe.getIn()`/
+`getOut()`, or (most suspected, given this exact executor's prior bug history in this
+investigation) `readExecutor.execute(task)` throwing or otherwise misbehaving under
+CratonVM in a way real HotSpot would not.** Not pinned to one of these three specifically
+before this session's time ran out — see recommended next steps.
+
+### One real fix landed (verified, but NOT the root cause — do not close this doc on its account)
+
+While reading `native_bos_flush_locked` (`native-io/src/lib.rs`, backs
+`java.io.BufferedOutputStream.flush()`, which is what `BufferedOutputStream.close()` calls
+before closing its wrapped `MessageOutputStream` — this IS on the write path for every
+message this protocol sends) to check the seventh session's now-refuted "152 vs 20"
+hypothesis, found a **real, independent bug**: the native flush reset the buffer's
+`count` field to `0` *before* invoking the wrapped stream's `write(byte[], int, int)`,
+rather than *after* as real `BufferedOutputStream.flushBuffer()` does. This is a genuine
+correctness deviation — it signals the buffer "empty and reusable" while the flush's
+`write` call (which is passed the SAME backing array as a live argument) is still in
+flight, opening a real TOCTOU window for any write that reaches the same
+`BufferedOutputStream` instance during that window to corrupt the array before its bytes
+are consumed. Fixed by moving the `ctx.set_field(this, count_slot, Value::Int(0))` call to
+after the `invoke_virtual` (matching JDK `flushBuffer()` exactly); the comment in the code
+explains why this doesn't reintroduce the stale-native-local-oop hazard the original
+(now-corrected) ordering was guarding against (`buf`/`inner` are passed as invoke
+arguments regardless of reset timing, so they're rooted for the call's duration either
+way; nothing is read back from them afterward in either version).
+
+**Verified:** `cargo test -p cratonvm-native-io --lib` — clean (no regressions). Two full
+WildFly domain-boot runs with the fix applied reached the identical `WFLYHC0053` failure
+point with no observable behavior change otherwise (confirms no regression, and confirms —
+as expected once the "152 vs 20" premise was refuted — that this fix alone does not
+resolve `WFLYHC0053`). Committed on its own merits as a real, defensible correctness fix,
+explicitly **not** claimed to close this doc.
+
+### Diagnostics used this session (reverted, not merged)
+
+Temporary, env-var-gated (`CRATONVM_DBG_SOCK_ID`, `CRATONVM_DBG_SOCK_ID_FILE`) per-process
+file-logging instrumentation was added to `re1_socket_read_stream`/`re1_socket_write_stream`/
+the three `Socket.close()` registrations (`net_phase_e.rs`, `servlet.rs`) to get the
+byte-value and Arc-identity evidence above. **Reverted via `git checkout --` before this
+session's commit** — it served its investigative purpose but isn't a fix and would just be
+clutter; the exact instrumentation (stream-id-gated `<= 5`, sequence-numbered,
+per-OS-process-suffixed file logger) is fully described above if a future session wants to
+recreate it quickly rather than from scratch.
+
+### Status and recommended next steps, in priority order
+
+`WFLYHC0053` is **still open** — this session corrected a wrong turn, landed one real
+independent fix, and precisely narrowed the failure window, but did not find the exact
+line. This doc stays in `docs/known-issues/`.
+
+1. **Most promising, not yet attempted:** live `gdb`-attach Host Controller's read-task
+   thread right as it processes the first `152` byte of the `start-servers` response (the
+   exact reproduction recipe — unique bind address/port to avoid this shared host's port
+   collisions with concurrent sessions, `JBOSS_JAVA_SIZING=-Xms64m -Xmx1536m
+   -XX:MaxMetaspaceSize=256m`, `CRATONVM_MSC_REAL_START=1` — reliably reaches this point at
+   ~17,450-17,510 log lines into a fresh boot) and single-step/backtrace to see whether
+   `readExecutor.execute()` throws, what it throws, and why. A conditional breakpoint on
+   `native_ThreadPoolExecutor`/`EnhancedQueueExecutor` dispatch functions (search
+   `native-builtins/src/` for the exact registration names) triggered only after boot
+   reaches ~17,000 log lines would avoid wading through the huge volume of unrelated
+   executor activity earlier in boot.
+2. If `readExecutor.execute()` is confirmed to throw (or silently reject) here
+   specifically, compare against this exact executor's already-documented bug history in
+   this investigation chain (the original `ThreadPoolExecutor.execute()` NPE regression,
+   the dispatch-degrades-to-synchronous bug, the `f157de8a` registry-gate bug — all fixed,
+   but this is evidently either a fourth distinct issue or a residual of one of those not
+   caught by their own verification).
+3. If the executor submission is clean, check `org.jboss.as.process.protocol.Pipe`'s
+   constructor/`getIn()`/`getOut()` next — it's plain WildFly-authored bytecode using
+   `Object` monitor `wait()`/`notify()`, so a bug here would point at CratonVM's
+   object-monitor primitives specifically in this narrow scenario, not at any native I/O
+   registration.
+4. Only pursue the `gen_heap::mark_young` conservative-root-rejection correlation flagged
+   in the seventh-session update if steps 1-3 come up empty — hold the project's standing
+   `gc_barrier` verification bar (repeated load testing, no merge on any flake, read
+   `wip/gc-stw-quota-race-20260710` first) if it comes to that.
+5. Once `WFLYHC0053` is actually fixed: re-check the four original front-line residuals
+   (`AttributeChangeNotification`, `ContentCleanerService`, `FileInputStream(File)`,
+   `WFLYHC0034` — still not re-observed in any run across the sixth, seventh, or eighth
+   sessions) and get one clean sustained-load run confirming `HIB-CV-32` silence (it has
+   stayed silent across every run in sessions six through eight, tens of thousands of log
+   lines each — strong standing evidence, just needs one clean end-to-end confirmation
+   once boot can get past `WFLYHC0053` to a genuinely running state) before retiring this
+   doc.
+
+
+## 2026-07-11 update (ninth session, same day) — the generic-`Executor`-interface hypothesis is refuted; the GC-timing correlation is refuted; live evidence confirms this is a genuine, host-timing-dependent race, not a deterministic logic bug; root cause still not found; hit real tooling limits this session
+
+Continued directly from the eighth session's precisely-narrowed failure window (between
+Host Controller's read task successfully reading a valid `152` chunk-start byte and the
+next expected socket read). The coordinator asked to (1) live-`gdb` the read-task thread
+at the `readExecutor.execute()` submission step and check `EnhancedQueueExecutor` for
+another instance of the "native always wins over real bytecode" bug class, (2) fix
+whatever is found, (3) only chase the GC-timing correlation if the direct trace comes up
+empty, (4) re-check residuals and retire the doc if genuinely clean.
+
+### Hypothesis: a generic, unconditional `java/util/concurrent/Executor.execute()` native was intercepting real executors — investigated, then refuted
+
+Found a real, concerning-looking candidate first: `native-builtins/src/phases_late.rs`
+registers `"execute", "(Ljava/lang/Runnable;)V"` on the literal **interface** name
+`java/util/concurrent/Executor` (not a concrete class), intended only for
+`CompletableFuture.delayedExecutor()`'s synthetic 1-field return object (it reads field
+index 0 as a delay-in-millis `Long`, defaulting to "run immediately" if that read doesn't
+match). If this registration's dispatch reached real `EnhancedQueueExecutor` instances
+(which implement `Executor` transitively) via interface-based fallback resolution, it
+would run submitted tasks **synchronously, inline, on the calling thread** — a correctness
+bug for any real async executor, and a plausible self-deadlock mechanism for exactly this
+investigation's read-task/Pipe-consumer relationship (the read task calling
+`readExecutor.execute(pipeConsumerTask)` synchronously would block itself inside the very
+task that's waiting for bytes only the read task's own subsequent loop iterations can
+supply).
+
+Added a temporary flag-gated diagnostic (`CRATONVM_DBG_EXEC_INTERFACE`, reverted before
+finishing — not committed) directly in this native. **Result: zero hits across a full
+34,000+-line boot run that included two `start-servers` cycles and a `WFLYHC0053`-shaped
+connection closure.** This registration is never reached by `EnhancedQueueExecutor.
+execute()` — confirming `org/jboss/threads/EnhancedQueueExecutor` genuinely dispatches
+`execute()` through its own class-exact registration path (or real bytecode, per
+`wildfly_core.rs`'s own comment: EnhancedQueueExecutor defaults to real jboss-threads
+bytecode unless `CRATONVM_SYNTHETIC_EQE=1`, which this investigation's harness never sets).
+**This specific hypothesis is refuted.** The registration itself is still a latent
+correctness landmine for *some* other real-`Executor`-implementing class that doesn't have
+its own exact-class registration — worth flagging for a future cleanup pass (scope it to
+only apply to the actual synthetic delayed-executor object, e.g. by checking the object's
+real class name equals a synthetic marker rather than matching on the bare interface name)
+— but it is conclusively not this doc's bug.
+
+### Live `gdb` capture: the read task is genuinely, cleanly blocked in a normal `recv()` moments before closure — not stuck in a Pipe/executor deadlock at the moment observed
+
+Captured a full `thread apply all bt` on Host Controller right as a boot stalled at the
+exact log-line position `WFLYHC0053`'s trigger always occurs at. Found the connection's
+dedicated reader thread (`"Read thread for..."`, spawned via `native_jboss_thread_run`)
+sitting in a completely ordinary blocking chain: `re1_socket_read_stream` →
+`std::net::TcpStream::read` → `recv_with_flags` → `libc::recv` — i.e. genuinely,
+correctly waiting for the Process Controller to send more bytes, not wedged inside Pipe
+construction or `readExecutor.execute()` as the eighth session's static bytecode analysis
+suggested might be the failure point. A second capture taken immediately after
+`"process controller connection closed."` printed (moments later) showed that same thread
+had already disappeared (42 live threads vs. 43 in the first snapshot, and no thread named
+`"Read thread for..."` remained) — i.e. whatever happens, happens fast, between one
+`recv()` return and the thread completing/being recycled, too fast to catch with
+periodic `gdb` snapshots.
+
+### `strace` capture: no raw socket EOF/error observed — but with an important tooling caveat
+
+Attached `strace -e trace=network,close` to Host Controller through a full boot to a
+`WFLYHC0053` closure. **Zero `recvfrom`/`read`/`write` calls returned an EOF (`= 0`) or an
+error (`ECONNRESET`/`EPIPE`/etc.) anywhere in the entire trace** — arguing against a raw
+TCP-level connection reset as the trigger. **Caveat, important for whoever continues:**
+`strace -e trace=network` only captured 5 `recvfrom` and 3 `sendto` calls in the entire
+run, even though this investigation's own earlier byte-level traces (eighth session) show
+dozens of reads/writes on this exact connection — meaning the vast majority of this
+connection's I/O goes through the plain `read`/`write` syscalls Rust's `TcpStream`
+actually uses for an already-connected socket, which `trace=network` does **not** include.
+A follow-up attempt with `-e trace=network,read,write,close` was so much slower (every
+`read()` call process-wide, including all bytecode/classloading I/O, gets traced) that it
+never reached the failure point in a reasonable window and was abandoned. **A future
+attempt should filter to a specific fd** (e.g. via `-e trace=read,write` combined with
+`-P /proc/<pid>/fd/<N>` if the strace version on this host supports path-based filtering,
+or attach only in a narrow window right before the expected failure point using the log
+line count as a timing signal, as this session did for the `gdb` captures).
+
+### Confirmed: the failure is genuinely non-deterministic, not tied to a specific message
+
+Across 5 fresh full-boot runs this session, `"process controller connection closed."`
+fired at five different points: line ~17,470-17,477 three times (matching prior sessions'
+usual position, on the *second* `start-servers(enabled-auto-start=true)` call), but also
+once on the *first*, simpler `start-servers(enabled-auto-start=false)` call at line
+~34,915, and once at line ~18,206. **This rules out a bug tied to specific message
+content or a fixed sequence position** — it is a genuine race, most likely dependent on
+host scheduling jitter (this shared host consistently ran at load average ~11/16 cores
+with 20+ concurrent user sessions throughout this investigation).
+
+### The GC-timing correlation flagged in the seventh/eighth session is refuted
+
+Per the coordinator's own instruction to only chase this if the direct trace came up
+empty: checked all 5 of this session's captured closures for `gen_heap::mark_young:
+rejecting` conservative-root-rejection warnings in the 200 lines immediately preceding
+each closure. **Zero warnings found near any of the 5 closures.** The single prior
+occurrence (seventh session, one run) that motivated this lead was very likely
+coincidental noise from unrelated allocation activity elsewhere in that specific boot, not
+a causal factor. **This lead is closed — no further reason to suspect `gen_heap`/GC-timing
+involvement, and per the standing guardrail, `gc_barrier` territory was correctly not
+touched this session.**
+
+### Attempted deeper live narrowing — blocked by a genuine release-build tooling limitation
+
+Attempted a `gdb` Python script attaching a breakpoint at `net_phase_e.rs:2727` (the line
+computing `n` from the blocking read's result inside `re1_socket_read_stream`), intending
+to filter to only our target connection's low `stream_id` values and log the exact
+`read_result` (success-with-byte-count vs. `io::Error`) for every relevant read leading up
+to the closure. **The `stream_id` local variable is optimized out of the release binary's
+debug info at that exact program point in every one of ~1,000 breakpoint hits captured**
+(`No symbol "stream_id" in current context"` from `gdb`, consistently) — a real limitation
+of debugging a `[optimized + debuginfo]` release build, not a dead end in the underlying
+question. Ran out of session time to retry with the function's `this` parameter (a real
+argument, generally more debug-info-stable than a derived local under optimization) or a
+`-C opt-level=1`/debug build of just this one function.
+
+### Recommended next steps for whoever continues, in priority order
+
+1. Retry the `gdb` live-narrowing approach using the function parameter `this` (not the
+   derived local `stream_id`) at `net_phase_e.rs`'s `re1_socket_read_stream`, computing
+   `stream_id` at break time via the object's own side-table lookup if needed (or simply
+   log every hit's `this` pointer plus `read_result`, and post-filter using the known
+   pointer values from a `CRATONVM_DBG_SOCK`-style parallel run to identify which `this`
+   corresponds to the target connection) — this should avoid the optimized-out-local
+   problem entirely.
+2. Given the confirmed non-determinism, budget for **several** repeated attempts per
+   debugging session (this session needed 5 full ~3-minute boots just to observe the
+   closure point shift around) — a single capture is not representative.
+3. If live capture continues to be too fragile/slow to catch reliably, consider a
+   purpose-built synthetic repro outside WildFly entirely: two real OS processes, a
+   from-scratch `Connection`-like class mirroring `ConnectionImpl`'s exact chunk-framing +
+   `Pipe` + `readExecutor.execute()` dispatch shape, hammered under load — matching this
+   whole investigation's own repeated pattern of "narrow WildFly-specific repros down to a
+   minimal, iteration-friendly synthetic one" (see e.g. the fourth session's
+   `FieldSpawn.java` for the AB-BA lock-order bug earlier in this doc).
+4. The `strace` fd-filtering caveat above (network-only misses the real `read`/`write`
+   syscalls) should save the next session from repeating this session's two failed
+   attempts (too narrow, then too broad).
+
+### Status: WFLYHC0053 remains OPEN — no fix found this session beyond the already-landed, independently-justified `BufferedOutputStream` flush-ordering fix (commit `1f774cdb`, does not resolve this bug). Two real hypotheses (generic-Executor-interface dispatch, GC-timing correlation) were tested and refuted, narrowing the search space for whoever continues. The four original front-line residuals were not re-checked this session (boot never reaches a stable enough state — the closures happen too early/unpredictably relative to where those residuals were originally observed). This doc stays in `docs/known-issues/`, not retired — it is not genuinely clean.

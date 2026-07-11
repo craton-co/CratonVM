@@ -819,7 +819,24 @@ fn jar_url_conn_ext(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
     ext
 }
 
+fn file_url_path(url: &str) -> Option<String> {
+    let raw = url.strip_prefix("file:")?;
+    let without_host = raw.strip_prefix("//").unwrap_or(raw);
+    let path = if cfg!(windows) {
+        without_host.trim_start_matches('/').to_string()
+    } else {
+        without_host.to_string()
+    };
+    Some(path)
+}
+
 fn synthetic_resource_url_content_len(ctx: &mut dyn NativeContext, url: &str) -> i64 {
+    if let Some(path) = file_url_path(url) {
+        return std::fs::metadata(path)
+            .map(|m| m.len() as i64)
+            .unwrap_or(-1);
+    }
+
     let resource = if let Some(rest) = url.strip_prefix("jrt:") {
         let path = rest.trim_start_matches('/');
         match path.split_once('/') {
@@ -838,6 +855,22 @@ fn synthetic_resource_url_content_len(ctx: &mut dyn NativeContext, url: &str) ->
     ctx.find_resource(resource)
         .map(|bytes| bytes.len() as i64)
         .unwrap_or(-1)
+}
+
+fn synthetic_resource_url_last_modified(url: &str) -> i64 {
+    let Some(path) = file_url_path(url) else {
+        return 0;
+    };
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    let Ok(modified) = meta.modified() else {
+        return 0;
+    };
+    match modified.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis().min(i64::MAX as u128) as i64,
+        Err(_) => 0,
+    }
 }
 
 /// `JarURLConnection.getJarEntry()` — build the `java/util/jar/JarEntry` for the
@@ -2872,6 +2905,50 @@ fn re1_connect_socket(
     Ok(None)
 }
 
+fn re1_socket_adaptor_inet(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    local: bool,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let sc = match ctx.get_field_by_name(this, "sc") {
+        Value::Object(Some(sc)) => sc,
+        _ => return Ok(None),
+    };
+    let method = if local {
+        "getLocalAddress"
+    } else {
+        "getRemoteAddress"
+    };
+    let socket_addr = match ctx.invoke_virtual(sc, method, "()Ljava/net/SocketAddress;", &[])? {
+        Some(Value::Object(Some(addr))) => addr,
+        _ => return Ok(None),
+    };
+
+    if let Ok(Some(Value::Object(Some(addr)))) =
+        ctx.invoke_virtual(socket_addr, "getAddress", "()Ljava/net/InetAddress;", &[])
+    {
+        return Ok(Some(addr));
+    }
+
+    let host = match ctx.invoke_virtual(socket_addr, "getHostString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let host = if host.is_empty() {
+        match ctx.invoke_virtual(socket_addr, "getHostName", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        }
+    } else {
+        host
+    };
+    if host.is_empty() {
+        return Ok(None);
+    }
+    let ip = host.trim_matches(&['[', ']'][..]);
+    Ok(Some(alloc_inet_address(ctx, ip, ip)))
+}
+
 fn register_re1_socket(r: &mut NativeMethodRegistry) {
     // NIO-SERVER-SOCKET (route 1): skip the synthetic java.net.Socket surface so
     // real bytecode drives sun/nio/ch/Net. See register_phase53_socket_stubs.
@@ -3150,6 +3227,9 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         "()Ljava/net/InetAddress;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            if let Some(addr) = re1_socket_adaptor_inet(ctx, this, false)? {
+                return Ok(Some(Value::Object(Some(addr))));
+            }
             let host = read_field_string_or(ctx, this, SOCK_HOST, "");
             if host.is_empty() {
                 return Ok(Some(Value::Object(None)));
@@ -3183,7 +3263,11 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         sock,
         "getLocalAddress",
         "()Ljava/net/InetAddress;",
-        |ctx, _args| {
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Some(addr) = re1_socket_adaptor_inet(ctx, this, true)? {
+                return Ok(Some(Value::Object(Some(addr))));
+            }
             let ia = alloc_inet_address(ctx, "localhost", "127.0.0.1");
             Ok(Some(Value::Object(Some(ia))))
         },
@@ -5614,6 +5698,18 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             ))))
         },
     );
+    r.register(
+        "java/net/URLConnection",
+        "getLastModified",
+        "()J",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let url = huc_url_string(ctx, this);
+            Ok(Some(Value::Long(synthetic_resource_url_last_modified(
+                &url,
+            ))))
+        },
+    );
     // URLConnection.getInputStream — defer to URL.openStream by reading
     // the URL stored in HUC_URL during openConnection above.
     r.register(
@@ -7986,11 +8082,54 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getDefault",
         "()Ljavax/net/ssl/SSLContext;",
         |ctx, _args| {
+            // FIX (es-restclientbuilder-ssl-default-context-20260710): if
+            // `SSLContext.setDefault(ctx)` installed a context (see the new
+            // `setDefault` registration below), return that SAME object --
+            // not a fresh, unconfigured one -- so callers that rely on the
+            // JDK's documented getDefault()/setDefault() contract (e.g.
+            // RestClientBuilder.build() -> SSLContext.getDefault() at
+            // RestClientBuilder.java:330) see the trust/key managers that
+            // were attached to it at `init()` time. This is the LIVE
+            // getDefault()/init() registration in real-JDK mode: it is
+            // registered here, in `register_re6_ssl_context` (called from
+            // `register_essential_natives`, unconditionally), AFTER
+            // `phases_late::register_p68_ssl`'s own getDefault/init (called a
+            // few lines earlier in the same function) -- so this
+            // implementation wins via last-registered-wins. The THIRD and
+            // FOURTH registrations of the same (class, method, descriptor)
+            // triple, in `tls.rs::register_ssl_context` and a second call to
+            // `phases_late::register_p68_ssl`, both live inside
+            // `register_synthetic_overrides`, which is
+            // `#[cfg(feature = "synthetic-jdk")]`-gated to a no-op shim in
+            // the default real-JDK build -- so they never run here and are
+            // not live competitors for last-write-wins.
+            if let Some(ctx_obj) = crate::t27_tls::get_runtime_default_ssl_context() {
+                return Ok(Some(Value::Object(Some(ctx_obj))));
+            }
             let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2);
             let name = ctx.create_string("TLS");
             ctx.set_field(obj, 0, Value::Object(Some(name)));
             ctx.set_field(obj, 1, Value::Int(1));
             Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+    // `SSLContext.setDefault(SSLContext)` -- previously missing entirely
+    // (confirmed by grep across phases_late.rs/net_phase_e.rs/tls.rs), which
+    // made `getDefault()` above always return a fresh, unconfigured context
+    // even after a caller called `setDefault` with a fully `.init()`'d one.
+    // Static method: args[0] is the SSLContext parameter, no receiver.
+    r.register(
+        ctx_cls,
+        "setDefault",
+        "(Ljavax/net/ssl/SSLContext;)V",
+        |_ctx, args| {
+            match args.first().copied() {
+                Some(Value::Object(Some(ctx_obj))) => {
+                    crate::t27_tls::set_runtime_default_ssl_context(ctx_obj);
+                    Ok(None)
+                }
+                _ => Err(npe("context")),
+            }
         },
     );
     r.register(

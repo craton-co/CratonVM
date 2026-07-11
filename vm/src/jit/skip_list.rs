@@ -673,6 +673,33 @@ fn should_skip_jit_internal(
             return Some(SkipReason::JavaUtilCollection);
         }
 
+        // ALV5th (2026-07-10) -- ConcurrentLinkedQueue is the same
+        // allocate-then-CAS hazard as the AQS family above: offer() does
+        // `Node<E> newNode = new Node<E>(e);` then CASes it onto the tail
+        // (tryCasSuccessor -> NEXT VarHandle compareAndSet) or appends it via
+        // Node.appendRelaxed. Repro: org.junit.runner.Description.fChildren
+        // is a ConcurrentLinkedQueue (JUnit 4.13+); a Parameterized test with
+        // enough cases (~40+) crosses the instance-method JIT tier-up
+        // threshold (CRATONVM_JIT_VIRTUAL_TIERUP, default on) mid-suite,
+        // JIT-compiles offer()/tryCasSuccessor(), and a subsequent call
+        // raises a message-less NullPointerException from JIT-compiled code
+        // (a spurious null-checked store, not a GC/root-scanning issue --
+        // gc_quiescence::is_active() was confirmed false at every relocation
+        // preceding the crash, ruling out a mid-JIT-call GC race). Verified
+        // CRATONVM_JIT_VIRTUAL_TIERUP=0 alone fixes it and
+        // CRATONVM_BG_COMPILE=0 alone does not, isolating the defect to this
+        // tier-up's JIT codegen for the allocate-then-CAS idiom, matching the
+        // AQS family exactly. See
+        // docs/known-issues/tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md.
+        // Deliberately unconditional (not gated by
+        // callee_saved_gpr_local_homes_enabled()), same rationale as the AQS
+        // family immediately above.
+        if is_known_miscompile_clq_family(class_name, method_name)
+            && !package_allowed(class_name, allow_packages)
+        {
+            return Some(SkipReason::JavaUtilCollection);
+        }
+
         // KC26-PIC.1 (2026-07-05) — Keycloak PicocliTest post-CompactValue
         // residual timeout. The class no longer hits the old raw CompactValue
         // SIGSEGV, but default JIT spends the watchdog window cycling through
@@ -2560,6 +2587,28 @@ fn is_known_miscompile_aqs_family(class_name: &str, method_name: &str) -> bool {
                 "java/util/concurrent/locks/ReentrantReadWriteLock$Sync$ThreadLocalHoldCounter",
                 "initialValue"
             )
+    )
+}
+
+/// ALV5th (2026-07-10) -- ConcurrentLinkedQueue's allocate-then-CAS hot
+/// methods. Sibling of `is_known_miscompile_aqs_family`: same JIT
+/// miscompile archetype (allocate a node, then CAS/relaxed-append it into
+/// a lock-free linked structure), different j.u.c. class. See the call
+/// site's doc comment for the concrete repro (JUnit Description.fChildren).
+fn is_known_miscompile_clq_family(class_name: &str, method_name: &str) -> bool {
+    matches!(
+        (class_name, method_name),
+        ("java/util/concurrent/ConcurrentLinkedQueue", "add")
+            | ("java/util/concurrent/ConcurrentLinkedQueue", "offer")
+            | ("java/util/concurrent/ConcurrentLinkedQueue", "tryCasSuccessor")
+            | ("java/util/concurrent/ConcurrentLinkedQueue", "updateHead")
+            | ("java/util/concurrent/ConcurrentLinkedQueue", "succ")
+            | ("java/util/concurrent/ConcurrentLinkedQueue", "poll")
+            | ("java/util/concurrent/ConcurrentLinkedQueue", "skipDeadNodes")
+            | ("java/util/concurrent/ConcurrentLinkedQueue", "<init>")
+            | ("java/util/concurrent/ConcurrentLinkedQueue$Node", "<init>")
+            | ("java/util/concurrent/ConcurrentLinkedQueue$Node", "appendRelaxed")
+            | ("java/util/concurrent/ConcurrentLinkedQueue$Node", "casItem")
     )
 }
 

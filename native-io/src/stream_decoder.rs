@@ -9,12 +9,33 @@
 //! implement the public method surface natively over the underlying
 //! `InputStream`.
 //!
-//! State model (GC-safe — see the comment on the slot constants below):
-//! * slot 0 of the SD object holds the underlying `java.io.InputStream`
-//!   (a real reference field the collector scans/relocates);
-//! * slot 4 holds a stable `int` id (a primitive the collector ignores)
-//!   keying a Rust side-table that owns the charset name and the
-//!   incomplete-byte carry.
+//! ## Field access is by NAME, never by hardcoded index
+//!
+//! The SD object is allocated with the REAL `sun.nio.cs.StreamDecoder` class id
+//! (so `InputStreamReader` bytecode dispatches `sd.read(...)` to our natives),
+//! so it carries the real class's full (inherited + own) field layout. An
+//! earlier version of this file addressed the underlying `InputStream` and its
+//! side-table key via hardcoded absolute slot indices (`SD_INPUT = 0`,
+//! `SD_ID = 4`), on the mistaken assumption that slot 0 is `StreamDecoder`'s
+//! own `in` field. `javap` on the real class shows its declared field order is
+//! `(closed, haveLeftoverChar, leftoverChar, cs, decoder, bb, in, ch)` — `in`
+//! is the 7th field, not the 1st (and that's before even accounting for any
+//! fields the object's absolute slot numbering inherits from `java.io.Reader`)
+//! — so slot 0 is really `closed` (a primitive `boolean`) and slot 4 is really
+//! `decoder` (a `CharsetDecoder` reference). Writing the `InputStream`
+//! reference into slot 0 and an `int` id into slot 4 silently corrupted those
+//! two real fields: a reference written where the real class's reference map
+//! says a primitive lives is NOT relocated by a moving collector (the
+//! `BufferedReader.in` reads-null-right-after-construction symptom — see
+//! `docs/known-issues/tomcat-08-07/form-authenticator-cookie-session-bare-assertion.md`),
+//! and conversely an `int` written where the map says a reference lives risks
+//! the collector treating that bit pattern as a pointer. Fixed the same way
+//! `stream_encoder.rs` fixed the analogous `StreamEncoder` corruption:
+//! resolve the one real field this shim legitimately owns (`in`) **by name**
+//! (`get_field_by_name`/`set_field_by_name`, which walk the real class's field
+//! metadata instead of trusting a hand-counted index), and keep the side-table
+//! key off any object field entirely — `ctx.identity_hash_code` instead of a
+//! scratch primitive slot.
 //!
 //! Each `read` decodes the complete prefix of (carry + freshly-read bytes)
 //! straight into the caller's `char[]` and carries the trailing incomplete
@@ -22,33 +43,17 @@
 //! to the next call, so multi-byte boundaries are preserved. No decoded
 //! read-ahead `char[]` is buffered in an object field (such a field is not
 //! in the real StreamDecoder reference map, so the collector would free it
-//! mid-stream — the cause of the prior readLine hang).
+//! mid-stream — the cause of the prior readLine hang). The mutable per-decoder
+//! state (charset name + the incomplete-byte carry) lives in a Rust side-table
+//! keyed by the object's stable identity hash; the underlying `InputStream` is
+//! re-read from the real `in` field on every call (never cached in Rust, so GC
+//! motion is transparent).
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use cratonvm_native_api::charset as engine;
-
-// GC-safe state model.
-//
-// The SD object is allocated with the REAL `sun.nio.cs.StreamDecoder` class id
-// (so `InputStreamReader` bytecode dispatches `sd.read(...)` to our natives) but
-// only `SD_NUM_FIELDS` slots. The collector scans that object using the *real*
-// class's reference map, which does NOT mark our scratch slots as references —
-// so an object reference (a decoded `char[]` / carry `byte[]`) stored in one of
-// them is NOT rooted and gets collected mid-stream (the readLine hang). Only:
-//   * slot 0 — the underlying `InputStream` — is a real reference field (`in`)
-//     that the collector scans and relocates, so it is safe to keep there; and
-//   * a primitive (`int`) stored in a scratch slot persists (the collector
-//     ignores it).
-// Therefore the mutable per-decoder state (charset name + the incomplete-byte
-// carry) lives in a Rust side-table keyed by a stable `int` id stored in a
-// primitive slot. The `InputStream` is re-read from slot 0 on every call (never
-// cached in Rust, so GC motion is transparent).
-const SD_INPUT: usize = 0; // real `in` field — GC-scanned reference, persists
-const SD_ID: usize = 4; // scratch primitive slot — holds the side-table key
-const SD_NUM_FIELDS: usize = 7;
 
 struct SdState {
     name: String,
@@ -78,8 +83,6 @@ fn sd_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, SdStat
     T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-static SD_NEXT_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
-
 fn obj_arg(args: &[Value], i: usize) -> Option<ObjectRef> {
     match args.get(i) {
         Some(Value::Object(Some(o))) => Some(*o),
@@ -91,8 +94,11 @@ fn int_arg(args: &[Value], i: usize) -> i32 {
     args.get(i).and_then(|v| v.as_int()).unwrap_or(0)
 }
 
-fn sd_id(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    ctx.get_field(this, SD_ID).as_int().unwrap_or(0)
+/// Stable per-object side-table key. Unlike a monotonic counter stashed in a
+/// scratch field slot (the previous, corrupting approach — see module doc),
+/// this touches no real field at all.
+fn sd_key(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    ctx.identity_hash_code(this)
 }
 
 /// Allocate and return a synthetic StreamDecoder wrapping `is`.
@@ -116,18 +122,20 @@ pub(crate) fn alloc_stream_decoder(
         // fresh decoder at the wrong moment (observed in
         // TestFormAuthenticatorA/B/C's SimpleHttpClient.readLine). Use the
         // documented `ensure_synthetic_class` fallback instead -- it always
-        // returns a class that actually declares `SD_NUM_FIELDS` fields, so
+        // returns a class that actually declares the requested fields, so
         // the object stays usable even on the rare initialization race.
-        Err(_) => ctx.ensure_synthetic_class("sun/nio/cs/StreamDecoder", SD_NUM_FIELDS),
+        Err(_) => ctx.ensure_synthetic_class("sun/nio/cs/StreamDecoder", 9),
     };
-    let obj = ctx.alloc_object(cid, SD_NUM_FIELDS);
-    let id = SD_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // slot 0 (`in`) is a real GC-scanned reference; slot 4 is a scratch
-    // primitive holding the side-table key. Everything else stays zero-init.
-    ctx.set_field(obj, SD_INPUT, Value::Object(Some(is)));
-    ctx.set_field(obj, SD_ID, Value::Int(id));
+    // `alloc_object` clamps the slot count up to the resolved real class's
+    // total declared instance-field count, so `0` here is fine — the object
+    // ends up with every real `Reader`/`StreamDecoder` field, not a
+    // hand-picked scratch few (see module doc for why hardcoding a smaller
+    // count and indexing into it corrupted real fields).
+    let obj = ctx.alloc_object(cid, 0);
+    ctx.set_field_by_name(obj, "in", Value::Object(Some(is)));
+    let key = sd_key(ctx, obj);
     sd_table().lock().unwrap().insert(
-        id,
+        key,
         SdState {
             name: charset_name.to_string(),
             carry: Vec::new(),
@@ -360,12 +368,12 @@ fn native_sd_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(o) => o,
         None => return Ok(None),
     };
-    if let Value::Object(Some(is)) = ctx.get_field(this, SD_INPUT) {
+    if let Value::Object(Some(is)) = ctx.get_field_by_name(this, "in") {
         let _ = ctx.invoke_virtual(is, "close", "()V", &[]);
     }
-    ctx.set_field(this, SD_INPUT, Value::Object(None));
-    let id = sd_id(ctx, this);
-    sd_table().lock().unwrap().remove(&id);
+    ctx.set_field_by_name(this, "in", Value::Object(None));
+    let key = sd_key(ctx, this);
+    sd_table().lock().unwrap().remove(&key);
     Ok(None)
 }
 
@@ -375,17 +383,17 @@ fn native_sd_ready(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(o) => o,
         None => return Ok(Some(Value::Int(0))),
     };
-    let id = sd_id(ctx, this);
+    let key = sd_key(ctx, this);
     let has_carry = sd_table()
         .lock()
         .unwrap()
-        .get(&id)
+        .get(&key)
         .map(|s| !s.carry.is_empty())
         .unwrap_or(false);
     if has_carry {
         return Ok(Some(Value::Int(1)));
     }
-    if let Value::Object(Some(is)) = ctx.get_field(this, SD_INPUT) {
+    if let Value::Object(Some(is)) = ctx.get_field_by_name(this, "in") {
         let r = ctx.invoke_virtual(is, "available", "()I", &[])?;
         if let Some(Value::Int(v)) = r {
             return Ok(Some(Value::Int(if v > 0 { 1 } else { 0 })));
@@ -416,10 +424,10 @@ fn decode_into(
     if len == 0 {
         return Ok(0);
     }
-    let id = sd_id(ctx, this);
+    let key = sd_key(ctx, this);
     let (name, mut bytes, prop) = {
         let t = sd_table().lock().unwrap();
-        match t.get(&id) {
+        match t.get(&key) {
             Some(s) => (s.name.clone(), s.carry.clone(), s.prop),
             None => ("UTF-8".to_string(), Vec::new(), None),
         }
@@ -433,7 +441,7 @@ fn decode_into(
     }
     let mut eof = false;
     if want > 0 {
-        if let Value::Object(Some(is)) = ctx.get_field(this, SD_INPUT) {
+        if let Value::Object(Some(is)) = ctx.get_field_by_name(this, "in") {
             let tmp = ctx.new_array(ArrayElementType::Byte, want);
             let r = ctx.invoke_virtual(
                 is,
@@ -498,7 +506,7 @@ fn decode_into(
     // fallback state) for the next call.
     {
         let mut t = sd_table().lock().unwrap();
-        let entry = t.entry(id).or_insert_with(|| SdState {
+        let entry = t.entry(key).or_insert_with(|| SdState {
             name: name.clone(),
             carry: Vec::new(),
             prop: None,
@@ -664,7 +672,7 @@ pub fn register_stream_decoder_natives(registry: &mut NativeMethodRegistry) {
             Some(o) => o,
             None => return Ok(Some(Value::Int(0))),
         };
-        let open = matches!(ctx.get_field(this, SD_INPUT), Value::Object(Some(_)));
+        let open = matches!(ctx.get_field_by_name(this, "in"), Value::Object(Some(_)));
         Ok(Some(Value::Int(if open { 1 } else { 0 })))
     });
     registry.register(sd, "getEncoding", "()Ljava/lang/String;", |ctx, args| {
@@ -672,11 +680,11 @@ pub fn register_stream_decoder_natives(registry: &mut NativeMethodRegistry) {
             Some(o) => o,
             None => return Ok(Some(Value::Object(None))),
         };
-        let id = sd_id(ctx, this);
+        let key = sd_key(ctx, this);
         let name = sd_table()
             .lock()
             .unwrap()
-            .get(&id)
+            .get(&key)
             .map(|s| s.name.clone())
             .unwrap_or_else(|| "UTF-8".to_string());
         let s = ctx.create_string(&name);

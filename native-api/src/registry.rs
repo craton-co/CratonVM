@@ -8,7 +8,7 @@
 
 // AUDIT 2026-05-16: std::collections::HashMap is unused — the registry
 // migrated to rustc_hash::FxHashMap (T10.9.B). Import removed.
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// NIO-SERVER-SOCKET (route 1): cached check of the `CRATONVM_REAL_NET_SOCKETS`
 /// env var. When set, the native registry drops all synthetic
@@ -539,6 +539,15 @@ pub trait NativeContext {
     /// Get the identity hash code of an ObjectRef.
     fn identity_hash_code(&self, obj: ObjectRef) -> i32;
 
+    /// ES-FAIL-FAMILY-20260710 hunt: arm the GC's dynamic software
+    /// write-watchpoint (see `cratonvm_gc::heap::set_dynamic_watch`) at a
+    /// raw heap address, so any subsequent write through an instrumented
+    /// heap write primitive that covers this address prints its call site.
+    /// `addr = 0` disarms. Default no-op so mock/test `NativeContext` impls
+    /// don't need to implement it; only the real VM's impl (which has a
+    /// live heap to watch) overrides it.
+    fn dbg_set_watch_cell(&mut self, _addr: usize) {}
+
     /// Stable identity for the owning VM/heap.
     ///
     /// Native side caches that store heap `ObjectRef`s must scope entries to
@@ -979,6 +988,36 @@ pub trait NativeContext {
     /// for mock/test contexts.
     fn create_string_uninterned(&mut self, text: &str) -> ObjectRef {
         self.create_string(text)
+    }
+
+    /// Populate an *already-allocated* `java/lang/String` object's backing
+    /// fields directly from raw UTF-16 code `units`, using the same
+    /// Latin1-fits-in-a-byte bulk scan + little-endian compact-string layout
+    /// as [`create_string`](Self::create_string). Unlike `create_string`,
+    /// this does NOT allocate the `String` object itself and does NOT touch
+    /// the intern pool — it exists for native `<init>` overrides
+    /// (`String(char[])`, `String(char[], int, int)`) that intercept
+    /// construction *after* `new` has already allocated `this`: a
+    /// constructor native must mutate `this` in place, not return a
+    /// different object identity.
+    ///
+    /// Preserves raw code units byte-for-byte (including unpaired
+    /// surrogates), unlike routing through a Rust `&str`, which cannot
+    /// represent those. Returns `false` only on backing-array allocation
+    /// failure (heap exhaustion) — the caller should surface a catchable
+    /// `OutOfMemoryError`.
+    ///
+    /// Default impl (mock/test contexts, which treat strings as opaque
+    /// objects): stores the units in a plain `char[]` at field 0 via the
+    /// generic array/field primitives. The VM override replaces this with
+    /// the exact compact-string layout used by every other String natively.
+    fn init_string_from_units(&mut self, this: ObjectRef, units: &[u16]) -> bool {
+        let arr = self.new_array(ArrayElementType::Char, units.len());
+        for (i, &u) in units.iter().enumerate() {
+            self.set_array_element(arr, i, Value::Int(u as i32));
+        }
+        self.set_field(this, 0, Value::Object(Some(arr)));
+        true
     }
 
     /// Read a Java String object back to a Rust String.
@@ -2141,6 +2180,38 @@ pub trait NativeContext {
         self.invoke(class_name, method_name, descriptor, args)
     }
 
+    /// Like [`Self::invoke_special`] but for a native that IS ITSELF the
+    /// native registered for `(class_name, method_name, descriptor)` and
+    /// must run that class's own real bytecode body directly.
+    ///
+    /// [`Self::invoke_special`] re-finds ANY registered native FIRST (see its
+    /// own contract) -- calling it from inside that same native re-enters it
+    /// (unbounded Rust-stack recursion). This variant skips that check
+    /// entirely and resolves straight to `class_name`'s own bytecode, still
+    /// with true invokespecial semantics: static binding on `class_name`'s
+    /// hierarchy, never virtual dispatch to a receiver's overriding
+    /// subclass. That distinction is the whole point -- the bug this exists
+    /// to fix was a native registered on `ThreadPoolExecutor.shutdown()`,
+    /// reached via `ScheduledThreadPoolExecutor.shutdown()`'s
+    /// `super.shutdown()`, which used `invoke_virtual_bytecode_only` (dynamic
+    /// receiver class) and so re-dispatched straight back into the STPE
+    /// override that called it -- `StackOverflowError` from infinite
+    /// self-recursion.
+    ///
+    /// `args[0]` MUST be the receiver, same contract as [`Self::invoke_special`].
+    ///
+    /// Default implementation falls back to [`Self::invoke_special`] -- safe
+    /// for any context with no such native-reentrancy hazard (mocks, tests).
+    fn invoke_special_bytecode_only(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        self.invoke_special(class_name, method_name, descriptor, args)
+    }
+
     // -- Scoped Values (JEP 446, Java 25) --
 
     /// Look up a scoped value binding by key_id on the current thread's stack.
@@ -2514,6 +2585,22 @@ pub trait NativeContext {
     /// no-op keeps mock/test contexts compiling.
     fn touch_soft_reference(&mut self, _reference_obj: ObjectRef) {}
 
+    /// INT-8: GC keep-alive for a referent a `Reference.get()` just handed to
+    /// the mutator — the HotSpot `G1ReferenceGet` intrinsic barrier
+    /// equivalent. While a G1 concurrent mark cycle is active, the marker
+    /// deliberately does NOT trace through referent slots (referent-slot
+    /// hiding); a mutator that reads a referent and stores it into an
+    /// already-scanned (black) object would create the only strong path via
+    /// an edge the snapshot cannot see, and the remark-time reference
+    /// processor could then clear the weak ref and free the referent while
+    /// strongly reachable (use-after-free). The VM overrides this with the
+    /// heap's SATB pre-barrier (`VmHeap::write_barrier_pre`), which logs the
+    /// value as a mark root when marking is active and is a no-op otherwise.
+    /// `refersTo` intentionally does NOT call this — its JDK contract is to
+    /// test the referent WITHOUT keeping it alive. The default no-op keeps
+    /// mock/test contexts compiling.
+    fn gc_reference_keep_alive(&mut self, _referent: ObjectRef) {}
+
     /// Record a JFR thread sleep event. Called by Thread.sleep implementations.
     /// Default is no-op; the VM overrides this with the real JFR recorder.
     fn record_thread_sleep(&mut self, _sleep_nanos: i64, _actual_duration_nanos: u64) {}
@@ -2785,6 +2872,55 @@ pub struct StackTraceEntry {
 /// - `Ok(None)` — method returned void
 /// - `Err(MethodCallFailed)` — method threw an exception or had an internal error
 pub type NativeCallback = fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult;
+
+/// Event emitted by the native `ByteArrayOutputStream` implementation before
+/// it falls back to growing its in-heap byte buffer.
+///
+/// Most streams are ordinary buffers, so observers return `Ok(false)` and the
+/// I/O crate performs its normal operation.  A small number of bridge APIs
+/// expose a ByteArrayOutputStream-shaped Java object while the bytes must go to
+/// a native sink immediately (legacy fixed-length HttpURLConnection is one).
+/// Keeping that opt-in at the API boundary avoids making native-io depend on a
+/// higher-level protocol crate.
+pub enum BaosEvent {
+    WriteByte(u8),
+    /// A Java byte-array slice.  The observer must read it through `ctx` only
+    /// after deciding it owns this stream, keeping the ordinary BAOS hot path
+    /// allocation-free.
+    WriteArray {
+        array: ObjectRef,
+        offset: usize,
+        len: usize,
+    },
+    Flush,
+    Close,
+}
+
+/// Return `Ok(true)` when the event was consumed and the ordinary BAOS path
+/// must be skipped; `Ok(false)` leaves the receiver's normal buffering intact.
+pub type BaosEventHook =
+    fn(&mut dyn NativeContext, ObjectRef, BaosEvent) -> Result<bool, MethodCallFailed>;
+
+static BAOS_EVENT_HOOK: OnceLock<BaosEventHook> = OnceLock::new();
+
+/// Install the process-wide optional BAOS bridge hook.  Registration happens
+/// during native bootstrap; repeated registrations are harmless because the
+/// first (and only) bridge implementation wins.
+pub fn install_baos_event_hook(hook: BaosEventHook) {
+    let _ = BAOS_EVENT_HOOK.set(hook);
+}
+
+/// Offer a BAOS event to the optional bridge hook.
+pub fn dispatch_baos_event(
+    ctx: &mut dyn NativeContext,
+    stream: ObjectRef,
+    event: BaosEvent,
+) -> Result<bool, MethodCallFailed> {
+    match BAOS_EVENT_HOOK.get() {
+        Some(hook) => hook(ctx, stream, event),
+        None => Ok(false),
+    }
+}
 
 /// Classification of a registered native method.
 ///
@@ -3226,6 +3362,36 @@ impl NativeMethodRegistry {
         if self.drop_real_layout_synthetic
             && class_name == "java/util/StringJoiner"
             && self.current_category != NativeKind::SyntheticStub
+        {
+            return;
+        }
+        // Real-JDK mode: drop the synthetic `java/lang/ref/Cleaner`/
+        // `Cleaner$Cleanable` natives (`create()`, `register(Object,Runnable)`,
+        // `Cleanable.clean()`). These were meant only as a fallback for when
+        // real class bytes are unavailable (see this block's own comment at
+        // the registration site, phases_late.rs::register_p68_cleaner: "real
+        // Cleaner bytecode still wins whenever the real class is loaded") --
+        // but `create()` is a STATIC factory method, and static dispatch has
+        // no per-instance real-vs-synthetic safety net the way concrete
+        // instance methods do, so the native unconditionally wins there and
+        // allocates a bare Cleaner with its real `impl` field left null.
+        // `register(Object,Runnable)` (an instance method) then correctly
+        // prefers real bytecode -- which calls `PhantomCleanable.<init>` ->
+        // `CleanerImpl.getCleanerImpl(this)` -> reads the null `impl` field
+        // and NPEs ("Cannot read field \"queue\" because the return value of
+        // ... getCleanerImpl(...) is null"), first seen booting a WildFly
+        // Host Controller (`ServiceContainer$Factory.create()` calls
+        // `Cleaner.create()` then `.register(...)`). Same half-real-object
+        // bug class as the ThreadPoolExecutor/Executors-factory NPEs above --
+        // drop the synthetic surface entirely so real bytecode constructs and
+        // wires up the Cleaner end-to-end (matches this file's own stated
+        // intent, just enforced from the registration side since dispatch
+        // does not enforce it uniformly for static factory methods).
+        if self.drop_real_layout_synthetic
+            && matches!(
+                class_name,
+                "java/lang/ref/Cleaner" | "java/lang/ref/Cleaner$Cleanable"
+            )
         {
             return;
         }

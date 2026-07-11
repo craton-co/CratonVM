@@ -795,6 +795,13 @@ pub struct SharedVm {
     pub field_descriptor_cache:
         parking_lot::RwLock<crate::runtime::fx_collections::FxHashMap<(ClassId, usize), u8>>,
 
+    /// Per-class allocation-init cache for the JIT slow-path allocators
+    /// (`jit_new_object` + the guarded TLAB-refill arm): primitive-field
+    /// default-init recipe + `has_finalizer`, computed once per class and
+    /// then read lock-free — replaces two `class_manager.read()` round trips
+    /// per slow-path allocation. See `crate::jit::alloc_class_cache`.
+    pub jit_alloc_class_cache: crate::jit::alloc_class_cache::JitAllocClassCache,
+
     /// WP0.2 — per-class cache of `ObjectStreamClass` descriptor
     /// mirrors. Populated by the first call to
     /// `ObjectStreamClass.lookup(cls)` for any given class; every
@@ -2616,6 +2623,8 @@ impl SharedVm {
             field_descriptor_cache: parking_lot::RwLock::new(
                 crate::runtime::fx_collections::FxHashMap::default(),
             ),
+            // JIT slow-path allocation: per-class init recipe cache.
+            jit_alloc_class_cache: crate::jit::alloc_class_cache::JitAllocClassCache::new(),
             // WP0.2 — ObjectStreamClass.lookup(cls) cache.
             osc_cache: crate::runtime::serialization::OscCache::new(),
             // WP1.3 — bootstrap init-level state machine. Starts at 0
@@ -2721,6 +2730,18 @@ impl SharedVm {
         // `if let Some(vm) = ...upgrade()` falls through to a no-op until
         // the weak handle is wired.
         cratonvm_classloading::install_resolution_invalidate_hook(resolution_invalidate_adapter);
+
+        // Found while investigating the guarded-inline-getfield SIGSEGV
+        // cluster (that SIGSEGV's actual cause was a separate, already-fixed
+        // bug — see `jit_invalidate_adapter`'s doc comment): `install_jit_invalidate_hook`
+        // itself dates back further (it already backs `redefine_class`'s Step
+        // 8 `fire_jit_invalidate_hook` call) but had no installer anywhere in
+        // the VM, so that call was always a silent no-op. Wire it up so BOTH
+        // `redefine_class` and the synthetic-stub-upgrade path
+        // (`upgrade_synthetic_class` / `recompute_subclass_layouts`, which —
+        // unlike JEP 109 redefine — really can change field layout) actually
+        // evict stale JIT-compiled code.
+        cratonvm_classloading::install_jit_invalidate_hook(jit_invalidate_adapter);
 
         // Catch-up pass: replay every class already in the ClassManager's
         // `vtable_descriptors` through the adapter, so classes loaded
@@ -2832,6 +2853,62 @@ fn resolution_invalidate_adapter(class_id: u32) {
     // `ResolutionCache::invalidate_class` (drops by key-class OR
     // resolved-declaring-class match).
     shared.link_resolver.invalidate_class(cid);
+}
+
+/// The `JitInvalidateHook` adapter handed to
+/// `cratonvm_classloading::install_jit_invalidate_hook`.
+///
+/// Fired whenever a class's field layout may have changed in a way that
+/// already-compiled JIT code cannot safely observe: JVMTI `redefine_class`
+/// (Step 8), and — critically — `upgrade_synthetic_class` /
+/// `recompute_subclass_layouts`, which (unlike JEP 109 redefine) really can
+/// change instance field count/order/offsets when a synthetic JDK stub is
+/// later replaced by its real `.class` bytecode. A method JIT-compiled
+/// against the stub's layout bakes the stub's field offsets
+/// (`compact_field_off`, or the legacy `field_index * SLOT_SIZE` cell
+/// offset) directly into its machine code as immediates; nothing else in
+/// the VM invalidated that code when the layout later grew/reordered, so it
+/// kept reading/writing the WRONG byte offset of any object allocated under
+/// the new layout — a stale-offset getfield could silently return whatever
+/// raw bytes sat at the old offset (e.g. a small int) where a reference was
+/// expected, corrupting anything computed from it. Found while
+/// investigating the guarded-inline-getfield SIGSEGV cluster
+/// (docs/known-issues/elasticsearch-suite/ES-HANG-20260709-*), but that
+/// specific SIGSEGV's confirmed root cause is a different, already-fixed
+/// bug: the vm-side JIT field resolvers used to fabricate a `(0, false)`
+/// compact slot for any field with no genuine registered `CompactLayout`
+/// entry, and the compact-offset inline getfield arm trusted it — see
+/// `be7102344`'s commit message ("perf(jit): re-enable guarded-inline-
+/// getfield default-ON, root cause fixed") and the WildFly Host Controller
+/// fix it cites. This invalidation gap is real and independent of that bug
+/// — nothing else in the VM ever evicted JIT code after a layout-changing
+/// synthetic-stub upgrade, regardless of the fabricated-slot bug's fix.
+///
+/// A full cache flush is used rather than a class-scoped eviction —
+/// mirroring `redefine_class`'s own existing conservative pattern in
+/// `vm_exec.rs` (`jit_cache.write().clear_all()`) — because any OTHER
+/// class's compiled method may hold a getfield/putfield referencing the
+/// changed class's fields, and there is no reverse index of "which
+/// compiled methods read which class's fields" to evict precisely. A full
+/// flush is rare (each synthetic class upgrades at most once) and safe:
+/// `clear_all` retires evicted methods rather than freeing their code
+/// immediately, so any still-active frame stays valid.
+fn jit_invalidate_adapter(class_id: u32) {
+    let weak = match RESOLUTION_INVALIDATE_VM.get() {
+        Some(w) => w,
+        None => return, // hook fired before VM init wired the handle
+    };
+    let shared = match weak.upgrade() {
+        Some(s) => s,
+        None => return, // VM has been dropped; nothing to invalidate
+    };
+    let evicted = shared.jit_cache.write().clear_all();
+    if evicted > 0 {
+        tracing::debug!(
+            "JIT: fully invalidated {evicted} method(s) due to a class layout \
+             change (class_id={class_id})"
+        );
+    }
 }
 
 /// The `ClassInfoHook` adapter handed to `cratonvm_gc::install_class_info_hook`.
