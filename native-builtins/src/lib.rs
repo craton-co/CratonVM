@@ -70238,19 +70238,6 @@ fn native_classloader_load_class(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(None))),
     };
-    if name == "p.C" || name == "com.example.HelloWorld" {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let this_class = ctx
-            .class_name_of_id(ctx.class_id_of_object(this))
-            .unwrap_or_default();
-        eprintln!(
-            "[load-simple-trace] name={name} this={this_class}#{}",
-            ctx.identity_hash_code(this)
-        );
-    }
     // Try to get Class mirror
     if let Ok(cid) = ctx.ensure_class_initialized(&name.replace('.', "/")) {
         Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))))

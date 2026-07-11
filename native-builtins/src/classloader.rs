@@ -1210,7 +1210,7 @@ fn loader_can_see_defining(
 /// must not report a child loader's class as already globally available; that
 /// reverse leak lets sibling BeanShell interpreters reuse the first generated
 /// `MyMessenger` instead of defining their own.
-fn cid_visible_mirror(
+pub(crate) fn cid_visible_mirror(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     cid: cratonvm_types::ClassId,
@@ -1229,31 +1229,6 @@ fn resolve_global_if_visible(
     internal: &str,
 ) -> Option<ObjectRef> {
     let cid = ctx.ensure_class_initialized(internal).ok()?;
-    if internal == "p/C" || internal == "com/example/HelloWorld" {
-        let this_class = ctx
-            .class_name_of_id(ctx.class_id_of_object(this))
-            .unwrap_or_default();
-        let this_id = ctx.identity_hash_code(this);
-        match defining_loader_for(cid.as_u32()) {
-            Some(def) => {
-                let def_class = ctx
-                    .class_name_of_id(ctx.class_id_of_object(def))
-                    .unwrap_or_default();
-                let def_id = ctx.identity_hash_code(def);
-                let visible = loader_can_see_defining(ctx, this, def);
-                eprintln!(
-                    "[loader-vis-trace] internal={internal} cid={} this={this_class}#{this_id} def={def_class}#{def_id} visible={visible}",
-                    cid.as_u32()
-                );
-            }
-            None => {
-                eprintln!(
-                    "[loader-vis-trace] internal={internal} cid={} this={this_class}#{this_id} def=<none>",
-                    cid.as_u32()
-                );
-            }
-        }
-    }
     cid_visible_mirror(ctx, this, cid)
 }
 
@@ -1271,15 +1246,9 @@ fn cl_load_class_base_delegation(
 ) -> MethodCallResult {
     let dotted = ctx.read_string(name_obj).unwrap_or_default();
     let internal = dotted.replace('.', "/");
-    if internal == "p/C" || internal == "com/example/HelloWorld" {
-        let this_class = ctx
-            .class_name_of_id(ctx.class_id_of_object(this))
-            .unwrap_or_default();
-        eprintln!(
-            "[load-base-trace] internal={internal} this={this_class}#{}",
-            ctx.identity_hash_code(this)
-        );
-    }
+
+    // HIB-CV-24 / SBR-14 -- honor a supplied child/isolated `ClassLoader`.
+    //
     // CratonVM stands in for `ClassLoader.loadClass` with this native (it keeps no
     // JDK bytecode for it). The steps below resolve a class through CratonVM's
     // flat global store (`ensure_class_initialized`) BEFORE reaching the
@@ -1317,9 +1286,6 @@ fn cl_load_class_base_delegation(
         };
         if let Some(lid) = loader_id {
             if let Some(cid) = ctx.class_id_by_name_and_loader(&internal, lid) {
-                if internal == "p/C" || internal == "com/example/HelloWorld" {
-                    eprintln!("[load-base-trace] own-namespace-hit internal={internal} lid={lid} cid={}", cid.as_u32());
-                }
                 if let Some(mirror) = cid_visible_mirror(ctx, this, cid) {
                     return Ok(Some(Value::Object(Some(mirror))));
                 }
@@ -1345,9 +1311,6 @@ fn cl_load_class_base_delegation(
         // .isCacheSafe via `isLoadable`.
         if let Some(pid) = parent_lid {
             if let Some(cid) = ctx.class_id_by_name_and_loader(&internal, pid) {
-                if internal == "p/C" || internal == "com/example/HelloWorld" {
-                    eprintln!("[load-base-trace] parent-namespace-hit internal={internal} pid={pid} cid={}", cid.as_u32());
-                }
                 if let Some(mirror) = cid_visible_mirror(ctx, this, cid) {
                     return Ok(Some(Value::Object(Some(mirror))));
                 }

@@ -782,6 +782,33 @@ fn cl_real_load_class(
     cl_real_load_class_base(ctx, this, class_name_obj)
 }
 
+/// `ctx.load_class` resolves through CratonVM's flat global class store with no
+/// awareness of the requesting loader. Wrap it with the same JVMS §5.3
+/// defining-loader visibility check the synthetic-JDK path applies
+/// (`cid_visible_mirror`) so a user-defined loader cannot resolve a SIBLING
+/// loader's dynamically-defined class here -- two unrelated sibling loaders
+/// each defining their own same-named class from different bytecode must get
+/// distinct `Class` objects, not the first loader's (real-JDK-mode analogue of
+/// the synthetic path's `resolve_global_if_visible`).
+fn load_class_visible_to(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    internal: &str,
+) -> Option<Value> {
+    let mirror_val = match ctx.load_class(internal) {
+        Ok(Some(v)) => v,
+        _ => return None,
+    };
+    match mirror_val {
+        Value::Object(Some(mirror_obj)) => match ctx.class_id_from_mirror(mirror_obj) {
+            Some(cid) => crate::classloader::cid_visible_mirror(ctx, this, cid)
+                .map(|m| Value::Object(Some(m))),
+            None => Some(mirror_val),
+        },
+        other => Some(other),
+    }
+}
+
 /// Base `ClassLoader.loadClass` parent-first delegation for real-JDK mode
 /// (CratonVM keeps no JDK bytecode for `ClassLoader.loadClass`).
 ///
@@ -891,7 +918,7 @@ fn cl_real_load_class_base(
 
     // 1. Standard VM class loading (skipped when deferring to a custom findClass).
     if !defer_to_find_class {
-        if let Ok(Some(mirror)) = ctx.load_class(&internal) {
+        if let Some(mirror) = load_class_visible_to(ctx, this, &internal) {
             return Ok(Some(mirror));
         }
         if let Some(mirror) =
@@ -926,7 +953,7 @@ fn cl_real_load_class_base(
     //     the only source of application classes, so a findClass-overriding loader
     //     whose override legitimately misses still resolves here.
     if defer_to_find_class {
-        if let Ok(Some(mirror)) = ctx.load_class(&internal) {
+        if let Some(mirror) = load_class_visible_to(ctx, this, &internal) {
             return Ok(Some(mirror));
         }
     }
