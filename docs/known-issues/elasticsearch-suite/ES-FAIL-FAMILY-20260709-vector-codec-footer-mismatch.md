@@ -1,6 +1,35 @@
 # ES failure family - vector codec footer/checksum corruption
 
-Status: FIXED (2026-07-10)
+Status: REOPENED (2026-07-11)
+
+## Reopened on current dev
+
+The original float-array `Unsafe.copyMemory` fix remains present in
+`native-builtins/src/lib.rs`, but the same observable vector-file corruption
+still occurs on current `dev`. This note is therefore open again; the current
+evidence does not prove that the original float-array fix is wrong, only that
+it did not cover every path that can produce a zero or truncated footer.
+
+Current-dev focused probe:
+
+- CratonVM source and binary: `d274d898c43a4ca07ac877ba85543d153d2ea83c`
+  (`cratonvm-es-focused-currentdev-20260711-172542`).
+- Class: `org.elasticsearch.index.codec.vectors.ES813FlatVectorFormatTests`
+  (`others` index 1339 in the compiled fixture).
+- HotSpot: PASS, 53 tests, 0 failures.
+- CratonVM JIT on: FAIL, 14 tests, 3 failures, including
+  `CorruptIndexException: codec footer mismatch (file truncated?): actual footer=0`.
+- CratonVM JIT off: the same FAIL with the same footer mismatch.
+
+The failed test is `testMultiClose`. Both CratonVM modes also report the
+randomized-testing suite deadline as exceeded despite the runner recording a
+short class duration. This is an additional symptom, not evidence that the
+footer mismatch is merely a timeout artifact.
+
+Next step: use a minimal `FloatBuffer.put(float[])` plus Lucene
+`Directory` write/read probe to compare the on-disk bytes, the bytes read
+through CratonVM NIO, and the footer presented to Lucene. Keep this separate
+from the broader vector performance timeout family.
 
 Fix summary:
 - Root cause was CratonVM's raw `Unsafe.copyMemory` primitive-array byte reader treating `float[]` elements as `Value::Int`; real Java float arrays store `Value::Float`, so `FloatBuffer.put(float[])` copied all-zero bytes into byte-backed vector files.
