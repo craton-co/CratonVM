@@ -1169,6 +1169,28 @@ pub trait NativeContext {
     /// Get the ClassId for a loaded class by name. Returns None if not loaded.
     fn class_id_by_name(&self, name: &str) -> Option<ClassId>;
 
+    /// Resolve `name` to a `ClassId`, preferring whichever loaded class is
+    /// registered under the SAME classloader as `near`'s own declaring
+    /// context, falling back to the normal global (bootstrap-first) search
+    /// used by [`Self::class_id_by_name`].
+    ///
+    /// A plain by-name lookup can silently resolve to an unrelated
+    /// same-named class loaded under a DIFFERENT classloader when the JVM
+    /// spec's (loader, name) identity legitimately produces two distinct
+    /// classes with the same name -- e.g. Hibernate ORM's bytecode
+    /// enhancement reloads an `@EmbeddedId` class under its own private
+    /// ByteBuddy classloader. Resolving a field/parameter's declared type
+    /// via plain name search can then find the FIRST-loaded (often stale)
+    /// variant instead of the one the caller's own class actually sees,
+    /// causing a real, correctly-typed value to be rejected as an
+    /// assignability mismatch. Use this instead of `class_id_by_name`
+    /// whenever `name` is a symbolic reference that must match the specific
+    /// class variant visible to a known class (`near`) -- e.g. a
+    /// `Field`/`Method`/`Constructor`'s own declaring class.
+    fn class_id_by_name_near(&self, name: &str, _near: ClassId) -> Option<ClassId> {
+        self.class_id_by_name(name)
+    }
+
     /// For a synthetic lambda-proxy `ClassId` (created by `register_lambda_proxy`,
     /// class id `>= 0x8000_0000`, not in the class store), return the internal
     /// name of its functional (SAM) interface. Returns `None` for any non-lambda

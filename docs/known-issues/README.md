@@ -25,10 +25,22 @@ Investigated the confirmed-but-unexplained pattern already flagged in
   staleness check `safe_native_call` already used elsewhere. Verified across
   all 4 repro classes: zero crashes post-fix (previously 100%), one class
   (`OneToOneJoinColumnsEmbeddedIdTest`) now runs to full completion.
-- OPEN (new, unmasked by the fix): [`onetoone-embeddedid-propertyaccessexception.md`](onetoone-embeddedid-propertyaccessexception.md)
-  — `OneToOneJoinColumnsEmbeddedIdTest` now completes (previously crashed)
-  but shows a genuine `org.hibernate.PropertyAccessException` on 3/6 tests,
-  setting an embedded-id key field.
+- FIXED/RETIRED (same day, follow-up): [`onetoone-embeddedid-propertyaccessexception-FIXED.md`](../internal/fixed-suite-bugs/onetoone-embeddedid-propertyaccessexception-FIXED.md)
+  — the `org.hibernate.PropertyAccessException` this fix unmasked in
+  `OneToOneJoinColumnsEmbeddedIdTest` (3/6 tests) is fixed too:
+  `Field.set`/`Method.invoke`/`Constructor.newInstance`'s reflective
+  argument-coercion check resolved the expected reference type via a
+  global, loader-chain-first name search, which can resolve to the WRONG
+  same-named class when a class is legitimately loaded under two different
+  classloaders (confirmed: Hibernate's bytecode enhancement reloads
+  `@EmbeddedId` classes under a private ByteBuddy-style loader, distinct
+  from the original `Application`-loader `ClassId`) — rejecting a
+  perfectly-typed value as a mismatch. Fixed with a new
+  `class_id_by_name_near` resolution that prefers the SAME loader as the
+  declaring `Field`/`Method`/`Constructor`. `OneToOneJoinColumnsEmbeddedIdTest`:
+  `ok=3 failed=3` → `ok=6 failed=0`. Verified no regressions via a
+  115-class sample of `passed.txt` cross-checked against the pre-fix
+  baseline for every non-PASS result.
 - OPEN (new, unmasked by the fix, host-load-limited): [`functests-astparser-defaultcatalog-post-fix-slow-untriaged.md`](functests-astparser-defaultcatalog-post-fix-slow-untriaged.md)
   — `FunctionTests`/`ASTParserLoadingTest`/`DefaultCatalogAndSchemaTest` no
   longer crash and now run far more of the real suite, but didn't reach a

@@ -4061,6 +4061,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         self.shared.class_manager.read().find_class_by_name(name)
     }
 
+    fn class_id_by_name_near(&self, name: &str, near: ClassId) -> Option<ClassId> {
+        let cm = self.shared.class_manager.read();
+        if let Some(loader) = cm.get_loader_id(near) {
+            if let Some(id) = cm.find_class_by_name_in_loader(name, loader) {
+                return Some(id);
+            }
+        }
+        cm.find_class_by_name(name)
+    }
+
     fn is_record_class(&self, class_id: ClassId) -> bool {
         self.shared
             .class_manager
