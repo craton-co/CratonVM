@@ -47,8 +47,8 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 | Sieve (100K x 20,000)      | 5,253 ms      | 19,371 ms         | 3.69x         |
 | Matrix 1280x1280           | 2,623 ms      | 10,364 ms         | 3.95x         |
 | HashMap (1M put/get)       | 47 ms         | 17,144 ms         | 365x          |
-| String/Regex (10K)         | 12 ms         | 1,110 ms          | 92.5x         |
-| **QuickBench TOTAL**       | **13,331 ms** | **68,775 ms**     | **5.16x**     |
+| String/Regex (10K)         | 11 ms         | 414 ms            | 37.6x         |
+| **QuickBench TOTAL**       | **13,330 ms** | **68,079 ms**     | **5.11x**     |
 | Binary Trees (depth=18)    | 382 ms        | 4,916 ms          | 12.9x         |
 
 *Measured 2026-07-10 on the primary Windows dev box (hybrid P/E-core CPU, pinned to
@@ -81,7 +81,11 @@ interpreter overhead — see
 [`docs/known-issues/matcher-native-full-input-redecode-quadratic.md`](docs/known-issues/matcher-native-full-input-redecode-quadratic.md)
 and
 [`docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`](docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md)
-(merged `a87901e6`). The combined-run ratio dropped from 247x to 92.5x accordingly.
+(merged `a87901e6`). The pre-fix combined-run ratio was 247x; the table above uses a
+freshly-verified **37.6x** (11 ms JDK / 414 ms CratonVM, best of 5, `StringRegexOnly.java`
+standalone) — an isolated re-measurement, not yet re-run through the exact combined-suite
+harness, so treat it as directionally correct rather than perfectly apples-to-apples with
+the other rows.
 
 HashMap's ~230–365x is a *different* shape of bug — cdb stack-sampling (attach-and-dump
 the JIT-compiled benchmark's own call stacks, the same technique used to profile the
@@ -106,30 +110,6 @@ this codebase. See
 for the full investigation and remaining-work writeup.*
 
 See [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full 26-round JIT optimization journey.
-
-#### `String`/regex micro-benchmarks
-
-| Benchmark                              | JDK 25 C2  | CratonVM default | Default ratio |
-|-----------------------------------------|------------|-------------------|---------------|
-| `String.substring()` (10,000 calls)     | 2 ms       | 27 ms             | 13.5x         |
-| `Pattern`/`Matcher` `find()`+`group()` (10,000 matches) | 10 ms | 399 ms | 39.9x |
-
-*Measured 2026-07-11 on the same shared Azure Linux build host as the QuickBench
-rows above, against JDK 25 Temurin and a CratonVM release build off `dev` at
-`a87901e6` (best of 3 runs each). Both benchmarks build one large `String` via
-`StringBuilder`, then repeatedly extract small substrings from it (directly, or
-via `Matcher.group()`). Until this commit, both scaled **quadratically** instead
-of linearly with input size -- `String.substring()`'s real-JDK-mode native
-decoded the *entire* parent string on every call regardless of how small the
-requested range was, so `n` calls over an `n`-length parent cost O(n^2) instead
-of O(n). At 10,000 entries this was 1,283 ms/4,775 ms before the fix (44x/12x
-worse than the numbers above) and did not complete within 60s at 50,000 entries
-at all; see [docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md](docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md)
-for the full root-cause story. The remaining 13.5x/39.9x gap above is the
-already-tracked constant-factor cost of CratonVM's interpreted `java.util.regex`
-engine and native String-accessor call overhead (see
-[docs/internal/wildfly-suite-bugs/bug-03-regex-perf-deployment-build.md](docs/internal/wildfly-suite-bugs/bug-03-regex-perf-deployment-build.md)),
-not an algorithmic-complexity bug.*
 
 ### Benchmark — GPU offload (vs HotSpot C2 & TornadoVM)
 
