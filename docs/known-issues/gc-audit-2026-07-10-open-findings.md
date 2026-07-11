@@ -155,7 +155,16 @@ probes: `tracing::debug!` is compiled out of release
 use gdb breakpoints on un-inlined cross-crate (LTO-off) gc-crate symbols
 for cycle confirmation. A pre-existing `POST-GC STALE LOCAL` tripwire
 (main's frame local under OOM-pressure G1) fires identically pre/post —
-separate finding, not this item.
+ROOT-CAUSED (2026-07-11) as a benign detector artifact: under the G1
+evacuation-failure retry, a drain pass allocates to-space from regions the
+first pass freed, so a first-pass FROM-address (map key) is legitimately
+handed out again as a drain DESTINATION (map value) for a different
+object; a slot correctly rewritten to that recycled address still matches
+a key and tripped the detector (`CRATONVM_DBG_BUG03` shows the rewrite
+happening in the same pause; every firing follows a `[g1][RETRY]` drain).
+`verify_no_stale_refs` now recognises recycled destinations (benign,
+reported only under `CRATONVM_GC_VERIFY_STALE=1`); the frame remap itself
+was always correct.
 - ZGC: `supports_jit_tlab_skip()` now returns true for every backend. ZGC
   is trivially safe for the takeover — `ZgcRealHeap` is a non-moving STW
   mark-sweep whose sweep walks the allocation-base REGISTRY (never linear

@@ -2597,6 +2597,24 @@ fn safepoint_reg_spill_all() -> bool {
     })
 }
 
+/// SB-CRASH-04 default-path gap — opt-OUT for folding `precise_maps` into the
+/// full-GPR safepoint register spill (see the call site in `Compiler::new`).
+/// `precise_maps` has been default-on since 2026-07-07, but its own
+/// `emit_pre_safepoint_spill` branch only ever wrote the safepoint-id slot for
+/// oop-map lookup — several call sites' own comments (the MIC/PIC inline-
+/// dispatch cascade in particular: "the caller's register-only oops must be
+/// spilled BEFORE the cascade to be visible to the conservative scan")
+/// document spilling registers as their purpose, but that spill only ran when
+/// the SEPARATE `CRATONVM_JIT_SAFEPOINT_REG_SPILL` env var was ALSO set —
+/// off by default, so the documented protection never actually happened on
+/// the default path. `CRATONVM_NO_PRECISE_REG_SPILL=1` restores that
+/// pre-fix, env-var-only gating for bisection.
+fn precise_reg_spill_disabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_NO_PRECISE_REG_SPILL").is_some())
+}
+
 /// The full set of allocatable GPRs spilled at safepoints under the `=all` gate
 /// (every integer register except RSP/RBP, which are the stack/frame pointers
 /// and never hold a Java reference). Order is fixed so the reserved frame-slot
@@ -7862,8 +7880,22 @@ impl Compiler {
         // GPRs into reserved frame slots at every GC-capable safepoint so the
         // conservative root scan can see register-only oops. The slot count =
         // `alloc_used_regs.len()`, reserved in `total` below.
-        let safepoint_reg_spill = safepoint_reg_spill_enabled();
-        let safepoint_reg_spill_all = safepoint_reg_spill_all();
+        //
+        // FIX (SB-CRASH-04 default-path gap, see `precise_reg_spill_disabled`
+        // above for the full rationale): fold `precise_maps` — default-on —
+        // into the SAME decision so the already-built, already-safe (`=all`:
+        // "can only over-retain, never corrupt" under the non-moving young
+        // sweep this VM runs whenever JIT frames are live) full-GPR spill
+        // actually runs by default, matching what several call sites'
+        // comments already claim happens. The FULL GPR file (not just the
+        // callee-saved subset) is required: a receiver/args staged into
+        // ARG_REGS immediately before a GC-capable call (invoke dispatch,
+        // the MIC/PIC cascade, allocation helpers, checkcast/instanceof) sit
+        // in caller-saved/argument registers, which the callee-saved-only
+        // spill never covers.
+        let precise_implies_reg_spill = precise_maps && !precise_reg_spill_disabled();
+        let safepoint_reg_spill = safepoint_reg_spill_enabled() || precise_implies_reg_spill;
+        let safepoint_reg_spill_all = safepoint_reg_spill_all() || precise_implies_reg_spill;
         let safepoint_reg_spill_nostore = safepoint_reg_spill_nostore();
         // Register-only operand-stack-oop soundness (DEFAULT ON): flush
         // `CalleeSaved` operand-stack reference entries in `flush_scratch_
