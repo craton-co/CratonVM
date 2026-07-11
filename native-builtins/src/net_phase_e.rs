@@ -2774,7 +2774,39 @@ fn re1_socket_write_stream(
         Ok(())
     })();
     ctx.end_blocking_region();
-    write_result.map_err(|e| ioex(format!("Socket write failed: {e}")))?;
+    if let Err(e) = write_result {
+        // Real java.net.Socket write path: a peer-reset/broken-pipe write
+        // failure must surface as a real, catchable java.net.SocketException
+        // (matching real JDK's SocketOutputStream.socketWrite0) -- callers
+        // such as TestSwallowAbortedUploads doTestChunkedPUT() specifically catch
+        // SocketException, and a bare java.io.IOException falls
+        // through uncaught. Mirrors the SocketException classification
+        // native-io/src/socket_channel.rs::map_err already does for the NIO
+        // SocketChannel write path.
+        let is_reset = matches!(
+            e.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+        );
+        if is_reset {
+            let jmsg = ctx.create_string(&format!("Connection reset: {e}"));
+            return match ctx.new_object_initialized(
+                "java/net/SocketException",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(jmsg))],
+            ) {
+                Ok(Some(Value::Object(Some(exc)))) => {
+                    let exc_pin = ctx.pin_native_root(exc);
+                    let exc = ctx.read_native_pin(exc_pin, exc);
+                    Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc))
+                }
+                _ => Err(ioex(format!("Socket write failed: {e}"))),
+            };
+        }
+        return Err(ioex(format!("Socket write failed: {e}")));
+    }
     if std::env::var_os("CRATONVM_DBG_SOCK").is_some() {
         eprintln!(
             "[dbg-sock] write: sid={stream_id} sent={} bytes",
