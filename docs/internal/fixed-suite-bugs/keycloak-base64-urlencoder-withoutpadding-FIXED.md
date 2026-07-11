@@ -1,4 +1,20 @@
-# `java.util.Base64.Encoder.withoutPadding()` does not strip the padding character — core JDK API bug, likely explains the SD-JWT digest-verification failures too
+# FIXED: Base64 URL encoder real-JDK state layout
+
+Status: resolved 2026-07-11.
+
+## Resolution
+
+The native Base64 encoder treated a real JDK `Base64$Encoder` as a one-field synthetic object. Its state belongs
+in the real layout's `linemax`, `isURL`, and `doPadding` slots, so the old implementation lost both the URL-safe
+alphabet and the no-padding setting. The corrected implementation preserves those settings when constructing and
+deriving encoders.
+
+Fresh Azure verification passed the native handler regression test and a Java SHA-256/base64url probe, producing
+the expected 43-character URL-safe digest with no trailing `=`.
+
+## Historical report
+
+### `java.util.Base64.Encoder.withoutPadding()` does not strip the padding character
 
 Status: open — high-confidence, foundational CratonVM bug in a core, extremely widely-used JDK API (not Keycloak-specific)
 

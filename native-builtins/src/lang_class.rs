@@ -3236,6 +3236,7 @@ pub(crate) fn coerce_arg_strict(
     value: Value,
     expected_desc: &str,
     context: &str,
+    near: Option<cratonvm_types::ClassId>,
 ) -> Result<Value, MethodCallFailed> {
     // WP2.1-field вЂ” operand-stack tag-erasure recovery for J/D.
     //
@@ -3342,7 +3343,24 @@ pub(crate) fn coerce_arg_strict(
                 if expected_desc.starts_with('L') && expected_desc.ends_with(';') {
                     let internal = &expected_desc[1..expected_desc.len() - 1];
                     if internal != "java/lang/Object" {
-                        if let Some(expected_cid) = ctx.class_id_by_name(internal) {
+                        // Resolve the formal type in the SAME classloader as
+                        // the declaring Field/Method/Constructor (`near`)
+                        // when known, not a plain global name search. A
+                        // class can legitimately be loaded twice under
+                        // different loaders with the JVM-spec (loader, name)
+                        // identity model -- e.g. Hibernate ORM's bytecode
+                        // enhancement reloads an `@EmbeddedId` class under
+                        // its own private loader. A global by-name lookup
+                        // can then resolve `expected_cid` to the FIRST-ever
+                        // loaded (often stale) variant while the actual
+                        // value being assigned is a perfectly valid instance
+                        // of the variant the declaring class really sees --
+                        // rejecting a correctly-typed value as a "mismatch".
+                        let resolved = match near {
+                            Some(n) => ctx.class_id_by_name_near(internal, n),
+                            None => ctx.class_id_by_name(internal),
+                        };
+                        if let Some(expected_cid) = resolved {
                             if !ctx.is_interface_class(expected_cid) {
                                 let arg_cid = ctx.class_id_of_object(obj);
                                 if !ctx.is_subclass(arg_cid, expected_cid) {
@@ -4256,7 +4274,7 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // Strictly coerce the value if the field expects a primitive (including
     // widening); this raises IllegalArgumentException if the wrapper type
     // cannot be narrowed/widened to the target primitive per JLS В§5.1.2.
-    let coerced = coerce_arg_strict(ctx, new_value, &descriptor, "Field.set")?;
+    let coerced = coerce_arg_strict(ctx, new_value, &descriptor, "Field.set", Some(class_id))?;
 
     // WP2.1-field вЂ” volatile-aware write fences (no-op for non-volatile).
     volatile_store_fence_pre(modifiers);
@@ -4581,7 +4599,7 @@ fn field_set_raw(
     // Narrow or widen the incoming primitive into whatever the field
     // actually holds. This catches `Field.setInt(...)` on a reference field
     // and the like, producing IllegalArgumentException as per javadoc.
-    let coerced = coerce_arg_strict(ctx, new_value, &descriptor, "Field typed setter")?;
+    let coerced = coerce_arg_strict(ctx, new_value, &descriptor, "Field typed setter", Some(class_id))?;
 
     // WP2.1-field вЂ” volatile-aware write fences (no-op for non-volatile).
     volatile_store_fence_pre(modifiers);
@@ -6014,7 +6032,7 @@ pub(crate) fn native_method_invoke(
         // type mismatch (per java.lang.reflect.Method.invoke javadoc).
         for (i, pdesc) in param_descs.iter().enumerate() {
             let arg_val = raw_args[i];
-            match coerce_arg_strict(ctx, arg_val, pdesc, "Method.invoke argument") {
+            match coerce_arg_strict(ctx, arg_val, pdesc, "Method.invoke argument", ctx.class_id_from_mirror(declaring_mirror)) {
                 Ok(coerced) => invoke_args.push(coerced),
                 Err(e) => {
                     // JDK-faithful cause: HotSpot's reflective unboxing calls
@@ -8056,7 +8074,7 @@ pub(crate) fn native_constructor_new_instance(
         } else {
             Value::Object(None)
         };
-        let coerced = coerce_arg_strict(ctx, arg_val, pdesc, "Constructor.newInstance argument")?;
+        let coerced = coerce_arg_strict(ctx, arg_val, pdesc, "Constructor.newInstance argument", declaring_cid)?;
         init_args.push(coerced);
     }
 
@@ -16152,13 +16170,13 @@ mod tests {
     #[test]
     fn coerce_arg_strict_primitive_value_stays() {
         let mut ctx = mock_ctx();
-        let v = coerce_arg_strict(&ctx, Value::Int(7), "I", "test").unwrap();
+        let v = coerce_arg_strict(&ctx, Value::Int(7), "I", "test", None).unwrap();
         assert_eq!(v, Value::Int(7));
         // int в†’ long widening is allowed implicitly.
-        let v = coerce_arg_strict(&ctx, Value::Int(7), "J", "test").unwrap();
+        let v = coerce_arg_strict(&ctx, Value::Int(7), "J", "test", None).unwrap();
         assert_eq!(v, Value::Long(7));
         // long в†’ int is narrowing and must fail.
-        let r = coerce_arg_strict(&ctx, Value::Long(7), "I", "test");
+        let r = coerce_arg_strict(&ctx, Value::Long(7), "I", "test", None);
         assert!(r.is_err(), "narrowing long в†’ int should be rejected");
         drop(ctx);
     }
@@ -16166,7 +16184,7 @@ mod tests {
     #[test]
     fn coerce_arg_strict_null_to_primitive_errors() {
         let ctx = mock_ctx();
-        let r = coerce_arg_strict(&ctx, Value::Object(None), "I", "test");
+        let r = coerce_arg_strict(&ctx, Value::Object(None), "I", "test", None);
         assert!(r.is_err(), "null cannot be coerced to primitive");
     }
 
@@ -16174,11 +16192,11 @@ mod tests {
     fn coerce_arg_strict_reference_passes_through() {
         let mut ctx = mock_ctx();
         let obj = ctx.alloc_object(ClassId::new(0), 0);
-        let v = coerce_arg_strict(&ctx, Value::Object(Some(obj)), "Ljava/lang/Object;", "test")
+        let v = coerce_arg_strict(&ctx, Value::Object(Some(obj)), "Ljava/lang/Object;", "test", None)
             .unwrap();
         assert_eq!(v, Value::Object(Some(obj)));
         // null is legal for a reference type.
-        let v = coerce_arg_strict(&ctx, Value::Object(None), "Ljava/lang/String;", "test").unwrap();
+        let v = coerce_arg_strict(&ctx, Value::Object(None), "Ljava/lang/String;", "test", None).unwrap();
         assert_eq!(v, Value::Object(None));
     }
 
@@ -16186,7 +16204,7 @@ mod tests {
     fn coerce_arg_strict_primitive_to_reference_errors() {
         let ctx = mock_ctx();
         // Passing an int where a reference is expected is an error.
-        let r = coerce_arg_strict(&ctx, Value::Int(1), "Ljava/lang/String;", "test");
+        let r = coerce_arg_strict(&ctx, Value::Int(1), "Ljava/lang/String;", "test", None);
         assert!(r.is_err());
     }
 

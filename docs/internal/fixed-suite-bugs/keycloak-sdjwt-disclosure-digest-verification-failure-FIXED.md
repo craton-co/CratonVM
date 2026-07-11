@@ -1,4 +1,25 @@
-# SD-JWT: "At least one disclosure is not protected by digest" fails legitimate (positive) verification test cases
+# FIXED: SD-JWT disclosure-digest verification failures
+
+Status: resolved 2026-07-11.
+
+## Resolution
+
+`Base64.getUrlEncoder().withoutPadding()` stored its configuration in synthetic field slot zero. In real-JDK mode,
+that slot is the encoder's `newline` field, so the native encoder lost both the URL-safe alphabet and its
+no-padding setting. The encoder now uses the JDK layout (`linemax`, `isURL`, and `doPadding`) and preserves it
+when `withoutPadding()` returns a derived encoder.
+
+Verified on the Azure host with a fresh uniquely named release binary:
+
+- native handler regression test: PASS;
+- direct SD-JWT-shaped SHA-256 disclosure digest probe: HotSpot and CratonVM both produced
+  `B4rHgFoNMPPP0YoisIj52221sNSvj9S4PKUR_XsQSmw` (43 characters, URL-safe, no `=`).
+
+An attempted Maven rerun of the Keycloak classes stops before test discovery on the separate Jansi native-method
+gap (`org.fusesource.jansi.internal.CLibrary.init()`), which is unrelated to SD-JWT. The direct probe executes the
+same `SHA-256` plus `Base64.getUrlEncoder().withoutPadding().encodeToString(...)` path responsible for this issue.
+
+## Historical report
 
 Status: open — **root cause confirmed**: same underlying bug as
 `base64-urlencoder-withoutpadding-not-stripping-padding.md` in this same folder. High impact within SD-JWT/OID4VC
