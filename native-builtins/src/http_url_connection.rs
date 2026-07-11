@@ -1016,6 +1016,7 @@ fn build_request_head(
         let _ = write!(&mut out, "Host: {}:{}\r\n", parsed.host, parsed.port);
     }
     let mut has_user_agent = false;
+    let mut has_connection = false;
     let mut has_content_length = false;
     let mut has_content_type = false;
     let mut has_authorization = false;
@@ -1023,6 +1024,9 @@ fn build_request_head(
         let lk = k.to_ascii_lowercase();
         if lk == "user-agent" {
             has_user_agent = true;
+        }
+        if lk == "connection" {
+            has_connection = true;
         }
         if lk == "content-length" {
             has_content_length = true;
@@ -1049,6 +1053,13 @@ fn build_request_head(
     }
     if !has_user_agent {
         out.extend_from_slice(b"User-Agent: Java/CratonVM\r\n");
+    }
+    // The legacy JDK HttpURLConnection client keeps HTTP/1.1 connections
+    // alive by default and sends the explicit compatibility header. Tomcat
+    // exposes that choice in its response header set, including when it drops
+    // an invalid response header before committing the response.
+    if !has_connection {
+        out.extend_from_slice(b"Connection: keep-alive\r\n");
     }
     let is_output_method = has_output || matches!(method, "POST" | "PUT" | "PATCH");
     if !has_content_length && is_output_method {
@@ -1157,9 +1168,13 @@ fn read_response<S: Read>(
     let mut chunked = false;
     for h in resp.headers.iter() {
         let name = h.name.to_string();
-        let value = std::str::from_utf8(h.value)
-            .map_err(|e| format!("non-utf8 header value for {name}: {e}"))?
-            .to_string();
+        // HTTP header fields are byte-oriented. `HttpURLConnection` exposes
+        // those bytes as ISO-8859-1 code points rather than interpreting them
+        // as UTF-8. In particular, Tomcat may emit a UTF-8 cookie value; its
+        // client test retrieves the raw header bytes with ISO-8859-1 and then
+        // decodes them as UTF-8. Requiring UTF-8 here both violates that
+        // contract and either rejects or corrupts valid obs-text bytes.
+        let value: String = h.value.iter().map(|&byte| char::from(byte)).collect();
         let lname = name.to_ascii_lowercase();
         if lname == "content-length" {
             content_length = value.trim().parse::<usize>().ok();
@@ -2882,6 +2897,7 @@ mod http_url_connection_tests {
         assert!(s.starts_with("GET /foo HTTP/1.1\r\n"));
         assert!(s.contains("Host: example.com\r\n"));
         assert!(s.contains("User-Agent: Java/CratonVM\r\n"));
+        assert!(s.contains("Connection: keep-alive\r\n"));
     }
 
     #[test]
@@ -3010,6 +3026,22 @@ mod http_url_connection_tests {
         let (status, _h, body) = read_response(&mut data, false).unwrap();
         assert_eq!(status, 200);
         assert_eq!(body, b"HELLO");
+    }
+
+    #[test]
+    fn test_read_response_preserves_non_utf8_header_bytes_as_latin1() {
+        // Tomcat's RFC6265 cookie test emits U+0120 as UTF-8 (C4 A0) then
+        // uses String.getBytes(ISO_8859_1) to recover the wire bytes from the
+        // response header. The HTTP client must therefore retain C4 A0 as
+        // Latin-1 code points, not decode or replace them as UTF-8.
+        let mut data: &[u8] =
+            b"HTTP/1.1 200 OK\r\nSet-Cookie: Test=\xC4\xA0\r\nContent-Length: 0\r\n\r\n";
+        let (status, headers, body) = read_response(&mut data, false).unwrap();
+        assert_eq!(status, 200);
+        assert!(body.is_empty());
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == "Set-Cookie" && value == "Test=\u{00c4}\u{00a0}"));
     }
 
     #[test]

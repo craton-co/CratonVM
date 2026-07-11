@@ -18,11 +18,14 @@ Each row in the table below is one of the five solutions. Columns
 follow the 15 comparison dimensions the brief asks for. Where public
 sources are inconsistent or silent, the cell says **"unclear from
 public docs"** rather than guessing. Performance numbers cite the
-canonical kernel they were measured on; CratonVM's row uses the
-verified **5.18× best / 6× mean** speedup over CPU on vector-add at
-n = 2²⁰ (1,048,576 elements), measured with the JIT disabled to dodge
-an unrelated int[]-loop regression — both numbers are noted as such
-to keep this fair.
+canonical kernel they were measured on. CratonVM's row was refreshed
+on 2026-07-11 with real RTX 2060 measurements (warm, full
+H2D + kernel + D2H per call, checksum-verified against HotSpot):
+**~210× over HotSpot C2 and ~3× over TornadoVM PTX** on the
+data-dependent integer-division kernel, **178–472× over CratonVM's
+own CPU JIT** on the 96-MAD kernel. See `bench-gpu/results/` and the
+repo README for the full tables; the old "5.18× with JIT disabled"
+figure below is superseded.
 
 ---
 
@@ -77,20 +80,17 @@ and rejects most other shapes. Babylon comes with the gravity of OpenJDK
 governance and a long-horizon AST-based code model that opens the door
 to non-GPU targets (SQL, autodiff). IBM's `com.ibm.gpu.Maths.sortArray`
 is one method call away — no analyzer, no annotations, no kernel author.
-And CratonVM has no real-GPU benchmark numbers landed yet beyond a
-single user-reported 5.18× on vector-add; TornadoVM has a decade of
-published research.
+CratonVM's published research footprint is one repo;
+TornadoVM has a decade of published research.
 
-**Caveat on the 5.18× number.** Measured on vector-add `n = 2²⁰` (1,048,576
-elements). The CratonVM JIT currently has a known regression that
-miscompiles certain int[]-iterating static methods called more than
-once from `main` (see commit `1d8348d`), so the measurement was taken
-with the JIT disabled. Once the JIT bug is fixed and end-to-end
-measurements on larger inputs (`n = 2²⁴`) are landed per
-[`first-results.md`](./first-results.md), this row should be updated
-with proper min/mean/max nanoseconds across CPU, transparent GPU, and
-explicit `GpuExecutor.submit` paths. Until then, treat the speedup as
-indicative, not load-bearing.
+**Update (2026-07-11) on CratonVM's numbers.** The old "5.18× with the JIT
+disabled" caveat is obsolete: transparent `--gpu` offload was measured on an
+RTX 2060 with the JIT on, warm, full per-call H2D + kernel + D2H, checksums
+matching HotSpot bit-for-bit at every size. Headlines: div-chain kernel
+(48 data-dependent integer divisions/element, unvectorizable on x86) —
+CratonVM-GPU 9 ms vs HotSpot C2 1,910 ms vs TornadoVM 28 ms at n = 2²⁴;
+96-MAD kernel — CratonVM-GPU 27 ms vs TornadoVM 51 ms at n = 2²⁶. Full
+tables in `bench-gpu/results/` and the repo README.
 
 ---
 

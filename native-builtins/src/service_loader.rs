@@ -18,13 +18,23 @@ use cratonvm_types::Value;
 /// `ServiceLoader.load(Class)` — use the thread context class loader.
 fn native_sl_load_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let service = match args.first() {
-        Some(Value::Object(Some(o))) => Value::Object(Some(*o)),
+        Some(Value::Object(Some(o))) => *o,
         _ => {
             return Err(MethodCallFailed::InternalError(VmError::Internal {
                 message: "ServiceLoader.load(null)".to_string(),
             }));
         }
     };
+    // GC-safety: the two `ctx.invoke` calls below (`Thread.currentThread()`,
+    // `getContextClassLoader()`) can each trigger a moving GC; `service` (the
+    // `Class` mirror for the requested service type) is reused afterward in
+    // `build_service_loader`, unpinned otherwise. Same "Family 1"
+    // stale-ObjectRef pattern as `native_module_load_service`/
+    // `native_module_load_service_from_caller_module_loader` in
+    // jboss_module_loader.rs (see
+    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md) --
+    // this is the equally-hot `ServiceLoader.load(Class)` static-factory path.
+    let service_pin = ctx.pin_native_root(service);
     // Fetch the thread context class loader via Thread.currentThread().getContextClassLoader().
     let tcl = ctx
         .invoke(
@@ -48,7 +58,9 @@ fn native_sl_load_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             .unwrap_or(Value::Object(None)),
         _ => Value::Object(None),
     };
-    build_service_loader(ctx, service, loader)
+    let service = ctx.read_native_pin(service_pin, service);
+    ctx.unpin_native_roots(service_pin);
+    build_service_loader(ctx, Value::Object(Some(service)), loader)
 }
 
 /// `ServiceLoader.load(Class, ClassLoader)` — pass through caller's loader.
@@ -262,6 +274,32 @@ pub(crate) fn impl_jars_load_class(
         let Some(listing_bytes) = first_bytes.or_else(|| ctx.find_resource(&listing_path)) else {
             continue;
         };
+        if module_name == "x-content" {
+            let app_loader = crate::classloader::get_or_create_app_loader(ctx);
+            // GC-safety: `create_string` below can trigger a moving GC;
+            // `app_loader` (the shared application-classloader singleton) is
+            // reused as an `invoke` argument afterward, unpinned otherwise.
+            let app_loader_pin = ctx.pin_native_root(app_loader);
+            let module_name_obj = ctx.create_string(&module_name);
+            let app_loader = ctx.read_native_pin(app_loader_pin, app_loader);
+            ctx.unpin_native_roots(app_loader_pin);
+            if let Ok(Some(Value::Object(Some(loader)))) = ctx.invoke(
+                "org/elasticsearch/core/internal/provider/EmbeddedImplClassLoader",
+                "getInstance",
+                "(Ljava/lang/ClassLoader;Ljava/lang/String;)Lorg/elasticsearch/core/internal/provider/EmbeddedImplClassLoader;",
+                &[Value::Object(Some(app_loader)), Value::Object(Some(module_name_obj))],
+            ) {
+                let name_obj = ctx.create_string(&dotted);
+                if let Ok(Some(Value::Object(Some(mirror)))) = ctx.invoke_virtual(
+                    loader,
+                    "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[Value::Object(Some(name_obj))],
+                ) {
+                    return Some(mirror);
+                }
+            }
+        }
         let listing_text = String::from_utf8_lossy(&listing_bytes).into_owned();
         for jar_name in listing_text
             .lines()
@@ -1119,6 +1157,19 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 continue;
             }
         };
+        // GC-safety: `ctor` is held across two intervening allocating calls
+        // (`setAccessible` invoke, `new_ref_array` for `empty_args`) before
+        // its second use in `newInstance` below. Per the `pin_native_root`
+        // contract, a moving GC in that window leaves `ctor` stale — reading
+        // its `clazz` field then resolves to whatever now occupies the
+        // reused slot, throwing "Constructor.newInstance: no declaring
+        // class" for what looks like an entirely unrelated, arbitrary
+        // provider each time (this was the residual behind the WildFly
+        // DeferredExtensionContext "No META-INF/services/... found for
+        // <extension>" flakiness even after `create_constructor_object`
+        // itself was fixed — the Constructor object created there was fine;
+        // it went stale HERE, one call site later).
+        let ctor_pin = ctx.pin_native_root(ctor);
         // setAccessible(true)
         let _ = ctx.invoke(
             "java/lang/reflect/AccessibleObject",
@@ -1131,6 +1182,8 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 .unwrap_or(cratonvm_types::ClassId::new(0)),
             0,
         );
+        let ctor = ctx.read_native_pin(ctor_pin, ctor);
+        ctx.unpin_native_roots(ctor_pin);
         let inst_result = ctx.invoke(
             "java/lang/reflect/Constructor",
             "newInstance",
@@ -1450,11 +1503,17 @@ fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     )?;
     let stream = match arr_val {
         Some(Value::Object(Some(arr))) => {
+            // GC-safety: `ensure_class_initialized`/`alloc_object` below can
+            // trigger a moving GC; `arr` is stored into the new stream
+            // afterward, unpinned otherwise.
+            let arr_pin = ctx.pin_native_root(arr);
             let cid = ctx
                 .ensure_class_initialized("java/util/stream/Stream")
                 .unwrap_or(cratonvm_types::ClassId::new(0));
             let nfields = ctx.class_num_total_fields(cid).max(1);
             let s = ctx.alloc_object(cid, nfields);
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            ctx.unpin_native_roots(arr_pin);
             ctx.set_field(s, 0, Value::Object(Some(arr)));
             Some(Value::Object(Some(s)))
         }
@@ -1480,13 +1539,18 @@ fn drain_instances_to_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(o))) => o,
         _ => return alloc_synthetic_stream(ctx, &[]),
     };
+    // GC-safety: each `invoke_virtual` call below can trigger a moving GC;
+    // `iter_obj` is reused on every loop iteration, unpinned otherwise.
+    let iter_pin = ctx.pin_native_root(iter_obj);
     let mut collected: Vec<Value> = Vec::new();
     const SAFETY_CAP: usize = 1_000_000;
     loop {
+        let iter_obj = ctx.read_native_pin(iter_pin, iter_obj);
         let has_next = ctx.invoke_virtual(iter_obj, "hasNext", "()Z", &[]);
         if !matches!(has_next, Ok(Some(Value::Int(1)))) {
             break;
         }
+        let iter_obj = ctx.read_native_pin(iter_pin, iter_obj);
         let next = ctx.invoke_virtual(iter_obj, "next", "()Ljava/lang/Object;", &[]);
         match next {
             Ok(Some(v)) => collected.push(v),
@@ -1496,6 +1560,7 @@ fn drain_instances_to_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             break;
         }
     }
+    ctx.unpin_native_roots(iter_pin);
     alloc_synthetic_stream(ctx, &collected)
 }
 
@@ -1507,6 +1572,9 @@ fn native_sl_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             return empty_optional(ctx);
         }
     };
+    // GC-safety: `invoke`'s `hasNext` call below can trigger a moving GC;
+    // `iter_obj` is reused in the following `next` call, unpinned otherwise.
+    let iter_pin = ctx.pin_native_root(iter_obj);
     let has_next = ctx.invoke(
         "java/util/Iterator",
         "hasNext",
@@ -1514,8 +1582,11 @@ fn native_sl_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         &[Value::Object(Some(iter_obj))],
     )?;
     if matches!(has_next, Some(Value::Int(0)) | None) {
+        ctx.unpin_native_roots(iter_pin);
         return empty_optional(ctx);
     }
+    let iter_obj = ctx.read_native_pin(iter_pin, iter_obj);
+    ctx.unpin_native_roots(iter_pin);
     let first = ctx.invoke(
         "java/util/Iterator",
         "next",
@@ -1648,6 +1719,11 @@ fn native_stream_support_stream_from_spliterator(
         }
     };
     let spl_class = ctx.class_name_of_id(ctx.class_id_of_object(spliterator));
+    // GC-safety: `ensure_class_initialized`/`alloc_object` below (in both
+    // branches) can trigger a moving GC; `spliterator` is reused afterward
+    // (either stashed in the lazy slot, or re-read from field 0), unpinned
+    // otherwise.
+    let spliterator_pin = ctx.pin_native_root(spliterator);
     if spl_class.as_deref() != Some("java/util/Spliterator") {
         // Real Spliterator implementation. DEFER draining: stash the spliterator
         // in the synthetic stream's lazy slot (field 2) so the terminal op can
@@ -1666,6 +1742,8 @@ fn native_stream_support_stream_from_spliterator(
         // elements (0) and close-handlers (1).
         let nfields = ctx.class_num_total_fields(cid).max(3);
         let stream = ctx.alloc_object(cid, nfields);
+        let spliterator = ctx.read_native_pin(spliterator_pin, spliterator);
+        ctx.unpin_native_roots(spliterator_pin);
         ctx.set_field(stream, 0, Value::Object(None));
         ctx.set_field(stream, 2, Value::Object(Some(spliterator)));
         return Ok(Some(Value::Object(Some(stream))));
@@ -1674,6 +1752,8 @@ fn native_stream_support_stream_from_spliterator(
     // (2-field variants carry (array, cursor); 3-field ones (array, pos,
     // fence)). A missing/non-array field 0 means an empty synthetic
     // spliterator.
+    let spliterator = ctx.read_native_pin(spliterator_pin, spliterator);
+    ctx.unpin_native_roots(spliterator_pin);
     let field0 = ctx.get_field(spliterator, 0);
     let arr = match field0 {
         Value::Object(Some(a)) if ctx.heap_kind_of(a) == cratonvm_types::ObjectKind::Array => a,
@@ -1690,16 +1770,26 @@ fn native_stream_support_stream_from_spliterator(
     // Snapshot the slice [pos, fence) into a fresh array so the resulting
     // Stream's lifetime is independent of the spliterator's cursor.
     let n = fence.saturating_sub(pos);
+    // GC-safety: `new_array` below can trigger a moving GC; `arr` (the
+    // source backing array) is read from afterward in the copy loop.
+    let arr_pin = ctx.pin_native_root(arr);
     let snapshot = ctx.new_array(cratonvm_types::ArrayElementType::Reference, n);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
     for i in 0..n {
         let v = ctx.get_array_element(arr, pos + i);
         ctx.set_array_element(snapshot, i, v);
     }
+    // GC-safety: `ensure_class_initialized`/`alloc_object` below can trigger
+    // a moving GC; `snapshot` is stored into the new stream afterward.
+    let snapshot_pin = ctx.pin_native_root(snapshot);
     let cid = ctx
         .ensure_class_initialized("java/util/stream/Stream")
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let nfields = ctx.class_num_total_fields(cid).max(1);
     let stream = ctx.alloc_object(cid, nfields);
+    let snapshot = ctx.read_native_pin(snapshot_pin, snapshot);
+    ctx.unpin_native_roots(snapshot_pin);
     ctx.set_field(stream, 0, Value::Object(Some(snapshot)));
     Ok(Some(Value::Object(Some(stream))))
 }
@@ -1709,11 +1799,16 @@ fn alloc_synthetic_stream(ctx: &mut dyn NativeContext, elems: &[Value]) -> Metho
     for (i, v) in elems.iter().enumerate() {
         ctx.set_array_element(arr, i, *v);
     }
+    // GC-safety: `ensure_class_initialized`/`alloc_object` below can trigger
+    // a moving GC; `arr` is stored into the new stream afterward.
+    let arr_pin = ctx.pin_native_root(arr);
     let cid = ctx
         .ensure_class_initialized("java/util/stream/Stream")
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let nfields = ctx.class_num_total_fields(cid).max(1);
     let stream = ctx.alloc_object(cid, nfields);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     Ok(Some(Value::Object(Some(stream))))
 }
@@ -1726,11 +1821,11 @@ fn alloc_synthetic_stream(ctx: &mut dyn NativeContext, elems: &[Value]) -> Metho
 const STREAM_COLLECTOR_CLASS: &str = "cratonvm/internal/StreamCollector";
 
 fn native_stream_collector_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mut elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let mut len = match ctx.get_field(this, 1) {
         Value::Int(v) => v as usize,
         _ => 0,
@@ -1741,8 +1836,24 @@ fn native_stream_collector_accept(ctx: &mut dyn NativeContext, args: &[Value]) -
     };
     let cap = ctx.array_length(storage);
     let storage = if len >= cap {
+        // GC-safety: growing the backing array below (`new_array`) can
+        // trigger a moving GC; `this`, `storage` (the OLD array we're about
+        // to copy FROM), and `elem` (the value being appended, often itself
+        // an ObjectRef) are all reused afterward, unpinned otherwise.
+        let this_pin = ctx.pin_native_root(this);
+        let storage_pin = ctx.pin_native_root(storage);
+        let elem_pin = match elem {
+            Value::Object(Some(e)) => Some(ctx.pin_native_root(e)),
+            _ => None,
+        };
         let new_cap = (cap * 2).max(16);
         let bigger = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+        this = ctx.read_native_pin(this_pin, this);
+        let storage = ctx.read_native_pin(storage_pin, storage);
+        if let (Some(pin), Value::Object(Some(e))) = (elem_pin, elem) {
+            elem = Value::Object(Some(ctx.read_native_pin(pin, e)));
+        }
+        ctx.unpin_native_roots(this_pin);
         for i in 0..len {
             let v = ctx.get_array_element(storage, i);
             ctx.set_array_element(bigger, i, v);

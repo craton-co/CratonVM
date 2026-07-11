@@ -2768,14 +2768,6 @@ impl ClassManager {
             return Ok((bytes, ClassLoaderId::Application));
         }
 
-        // ES IMPL-JARS fallback: inner-jar classes stored as directory-prefixed
-        // ZIP entries (IMPL-JARS/<module>/<jar>/<path>.class) in outer module
-        // JARs; the interpreter's class resolution bypasses the ClassLoader
-        // native, so this must live here.
-        if let Some(bytes) = find_in_impl_jars(self.application.class_path(), name) {
-            return Ok((bytes, ClassLoaderId::Application));
-        }
-
         Err(VmError::ClassFile(ClassFileError::ClassNotFound {
             class_name: name.to_string(),
         }))

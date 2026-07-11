@@ -42666,16 +42666,40 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // `make_provider` writes by field NAME (`set_field_by_name`)
             // specifically to survive that, and its registered `getInfo()`
             // native reads the same "info" field back by name — see
-            // `jca/provider_chain.rs`'s module doc for the full story. Using
-            // the same "SunJSSE" entry already seeded in the provider chain
-            // keeps this consistent with `Security.getProvider("SunJSSE")`.
-            let (version, coverage) = crate::jca::provider_chain::find("SunJSSE")
-                .unwrap_or((25.0, "coverage: KeyManagerFactory{SunX509,NewSunX509,PKIX}"));
+            // `jca/provider_chain.rs`'s module doc for the full story.
+            //
+            // FIX (keymanagerfactoryfips-bare-assertion): this used to
+            // hardcode "SunJSSE" unconditionally, so ANY caller who
+            // registered their own `KeyManagerFactory.<algo>` service on a
+            // custom `Provider` (via `Security.addProvider` +
+            // `Provider.put`/`putService`) got the wrong provider back —
+            // `getProvider()` always pointed at the built-in SunJSSE
+            // placeholder instead of the caller's own `Provider` instance.
+            // Tomcat's `TestKeyManagerWrappingFips.testBug64614_01` hits
+            // this directly: it registers a dummy `KeyManagerFactory`
+            // service on a provider whose `getInfo()` contains "FIPS", and
+            // `SSLUtilBase.getKeyManagers()` branches on
+            // `kmf.getProvider().getInfo().contains("FIPS")` — which always
+            // read the SunJSSE placeholder's info (no "FIPS") instead.
+            // `find_service_provider` searches the real provider chain
+            // (which already includes providers added via
+            // `Security.addProvider`) for who registered this algorithm,
+            // falling back to "SunJSSE" — the previous hardcoded default —
+            // when nobody has, so the existing SunX509/NewSunX509/PKIX
+            // callers are unaffected.
+            let algorithm = args.get(0).copied().unwrap_or(Value::Object(None));
+            let algo_str = match algorithm {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let provider_name =
+                crate::jca::provider_chain::find_service_provider("KeyManagerFactory", &algo_str)
+                    .unwrap_or_else(|| "SunJSSE".to_string());
             let provider =
-                crate::jca::provider_chain::make_provider(ctx, "SunJSSE", version, coverage);
+                crate::jca::provider_chain::resolve_or_make_provider(ctx, &provider_name);
             ctx.set_field(obj, 0, Value::Object(Some(provider)));
             ctx.set_field(obj, 1, Value::Object(None)); // factorySpi — unused by this stub
-            ctx.set_field(obj, 2, args.get(0).copied().unwrap_or(Value::Object(None))); // algorithm
+            ctx.set_field(obj, 2, algorithm); // algorithm
             Ok(Some(Value::Object(Some(obj))))
         },
     );

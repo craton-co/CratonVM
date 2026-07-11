@@ -11785,22 +11785,41 @@ fn native_bos_flush_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             Value::Object(Some(o)) => o,
             _ => return Ok(None),
         };
-        // Reset count BEFORE the write so we hold no native-local oop across the
-        // invoke: a single bulk `out.write(buf, 0, count)` (matches the real
-        // BufferedOutputStream.flushBuffer) instead of a per-byte `write(int)`
-        // loop. The loop held `buf`/`inner`/`this` across N invoke_virtual calls;
-        // a GC firing mid-loop (now that blocking I/O no longer deadlocks STW)
-        // would strand those un-rooted native locals → a relocated `inner`
-        // dispatches `write` against garbage (seen as `Object.write(I)V`). `buf`
-        // and `inner` are passed AS ARGS to the single invoke (rooted for its
-        // duration); nothing is read back afterward.
-        ctx.set_field(this, count_slot, Value::Int(0));
+        // CORRECTNESS FIX (2026-07-11, WildFly WFLYHC0053 investigation): this
+        // used to reset `count` to 0 BEFORE the `out.write(buf, 0, count)`
+        // invoke below, reasoning that it avoided holding a native-local oop
+        // across the call. That reordering is a real behavioral deviation
+        // from the JDK (`BufferedOutputStream.flushBuffer()` resets
+        // `count = 0` AFTER `out.write(...)` returns, never before) and
+        // opens a correctness window: as soon as `count` reads back as 0,
+        // this object's buffer is signaled "empty and available", so any
+        // write(int)/write(byte[]) that reaches this same BufferedOutputStream
+        // while the invoke below is still in flight would start overwriting
+        // `buf[0..]` — the SAME array object still passed as a live argument
+        // to the in-flight `write` call — before its bytes are consumed by
+        // the write inside that call. `buf` and `inner` are passed AS ARGS
+        // to the invoke (rooted for its duration regardless of when `count`
+        // is reset), so moving the reset after the call does not reintroduce
+        // the stale-native-local hazard the original comment was guarding
+        // against — nothing is read back from `this`/`buf`/`inner` after the
+        // invoke either way. This is a real, independently-justified fix
+        // (verified via 2 full WildFly domain-boot runs: no regression, same
+        // subsequent behavior otherwise) — NOTE it was found while
+        // investigating `docs/known-issues/wildfly-domain-heap-corrupt-value-timeout.md`'s
+        // WFLYHC0053 blocker, but is NOT that bug's root cause: the observed
+        // byte value (152) that looked like corruption on first read is
+        // actually the real WildFly wire protocol's own `CHUNK_START` marker
+        // byte (`ConnectionImpl$MessageOutputStream`/`ConnectionImpl$2`'s
+        // `lookupswitch` on 152/153), not a corrupted opcode — see that
+        // doc's own write-up for the corrected mechanism and what's still
+        // open.
         ctx.invoke_virtual(
             inner,
             "write",
             "([BII)V",
             &[Value::Object(Some(buf)), Value::Int(0), Value::Int(count)],
         )?;
+        ctx.set_field(this, count_slot, Value::Int(0));
     }
     Ok(None)
 }

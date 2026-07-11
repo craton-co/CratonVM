@@ -391,10 +391,20 @@ pub fn output_array_index(param_kinds: &[ParamKind]) -> Option<usize> {
 /// must skip the CPU dispatch. `FallThrough` means the GPU path
 /// declined — the operand stack and locals are exactly as the hook
 /// received them and the CPU path must run.
+///
+/// `FallThroughKeepHooked` is `FallThrough` plus a contract with the
+/// interpreter: the call site must NOT be promoted into the invoke
+/// cache. A cached target dispatches straight to the CPU body and
+/// never re-enters this hook, which would permanently end offload for
+/// a site whose *current* arguments merely failed a per-call gate
+/// (`--gpu-min-work`: the next call may pass a bigger array). The
+/// same rule is why a `Handled` site is never cached either — see the
+/// hook in `execute_invokestatic`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchOutcome {
     Handled,
     FallThrough,
+    FallThroughKeepHooked,
 }
 
 /// Interpreter hook entry point for transparent GPU offload.
@@ -494,7 +504,10 @@ pub fn try_dispatch(
             //    run on the CPU.
             let runtime_work = largest_primitive_array_len(shared, args);
             if (runtime_work as u32) < shared.config.gpu_min_work {
-                return Ok(DispatchOutcome::FallThrough);
+                // Per-call gate, not a property of the method: the next
+                // call at this site may pass a larger array, so the site
+                // must stay on the slow path where this hook can see it.
+                return Ok(DispatchOutcome::FallThroughKeepHooked);
             }
             // Marshal args → device, launch the kernel, synchronize, and
             // write kernel-written arrays back into the Java heap. This
@@ -916,12 +929,9 @@ pub(crate) fn maybe_warmup_gpu(
 // `gpu-offload` and is fully decoupled from the existing
 // `try_dispatch` / `OffloadCache::lookup_or_compile` paths.
 //
-// `cuda_bridge` does not (yet) expose a `Stream` type — the real
-// path is gated behind PHASE3-CUDA-TODO comments. We define a local
-// placeholder `cuda_bridge::Stream` equivalent here so the
-// surrounding signatures land in their final shape and can be wired
-// up by the Phase 3 Java glue. When the bridge gains a real
-// `Stream`, replace the local type alias with the import.
+// `cuda_bridge` exposes the real `Stream` type (re-exported just
+// below); the PHASE3-CUDA-TODO placeholder era this comment used to
+// describe is over — the import IS the real per-context CUDA stream.
 
 /// The CUDA stream type used by `StreamSubmission`. Re-exported
 /// from `cuda-bridge` so callers can use a single `Stream` path
@@ -1952,8 +1962,25 @@ pub fn finalize_submission(
 
         // 3. Drain writebacks. First failure marks the submission
         //    Failed and stops further writebacks.
+        //
+        //    The `FailureFlag` entries must drain FIRST even though they
+        //    are pushed last: if the kernel tripped a bounds check, the
+        //    array writebacks below would otherwise copy partial device
+        //    state into the Java heap *before* the flag is read — the
+        //    deopt would then re-run the method on a heap the failed
+        //    kernel already dirtied, breaking the documented "the
+        //    interpreter observes no partial GPU state" guarantee
+        //    (docs/book/src/gpu/overview.md §Exceptions).
         let mut first_err: Option<String> = None;
-        for wb in &writebacks {
+        for wb in writebacks
+            .iter()
+            .filter(|wb| matches!(wb, MarshalWriteback::FailureFlag { .. }))
+            .chain(
+                writebacks
+                    .iter()
+                    .filter(|wb| !matches!(wb, MarshalWriteback::FailureFlag { .. })),
+            )
+        {
             if let Err(msg) = wb.writeback(shared, &local_token) {
                 first_err = Some(msg);
                 break;

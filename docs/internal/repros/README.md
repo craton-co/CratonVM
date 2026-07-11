@@ -25,6 +25,7 @@ $CV --java-home "$JDK" -cp <dir> <Repro>  # CratonVM (reproduces the gap)
 | `bug06-fam5-…` | `bug06-fam5-reflection-null/Refl5.java` | ✅ **CLOSED 2026-07-02** — probe ==HotSpot in nojit+jit on dev `ffb247e5`; the suite-level `getDeclaredMethod on null` ×28 is extinct (0 instances in the clean 2026-06-30/07-01 re-runs + fresh 196-class sweep). Doc: `docs/internal/fixed-suite-bugs/bug06-fam5-reflection-getdeclaredmethod-null.md`. |
 | `springrepos-…` (latent deep recursion) | `springrepos-deep-recursion/GroovyNestProbe.java` | deeply-nested Groovy closures; clean `dev` runs slow-not-crash — the native-stack overflow only with the unmerged cold-path JIT experiment. |
 | `jit-regalloc-callee-saved-clobber-family` | `jit-regalloc-dup_x1/Dupx.java` | the bare `tab[index++]` `dup_x1` idiom — **does NOT** reproduce alone (matches HotSpot); kept as the negative control showing the family bug is method-shape-specific. |
+| `wildfly-domain-hc0053-server-inventory-timeout` (blocking finding, not the doc's own root cause) | `wildfly-hc0053-aqs-stw-hang/AqsContentionProbe.java` | N (>=8) threads hammering one shared `ReentrantLock` + concurrent `System.gc()` pressure → hangs (`STW cross-thread JIT takeover ... taken=0`, whole-VM freeze) on `--release` dev tip; N<=7 clean. Zero WildFly/jboss-threads involved — isolates the STW/AQS-contention bug that blocked live `WFLYHC0053` verification, likely same root cause as `wip/gc-stw-quota-race-20260710`. HotSpot: clean at any N. |
 
 ## GC-root-race / Family-A probe (needs `GC_STRESS` or load)
 

@@ -269,21 +269,39 @@ Every test fixture is a real Java source compiled by `javac` via [`jit-cuda/buil
 - 1 multi-threaded allocation stress program (`GcStress` — for Part F)
 - 1 driver (`Benchmark`) for the eventual CPU vs GPU comparison
 
-## Known follow-ups (all flagged in source with "GPU-required follow-up")
+## Known follow-ups
 
-### The single critical follow-up: launch glue inside `try_dispatch`
+> **Status update (2026-07-11).** The launch glue formerly listed here as "the
+> single critical follow-up" is DONE and validated on real hardware (RTX 2060,
+> sm_75): the `Hit` arm of `try_dispatch` marshals, launches through
+> `dispatch_method_from_native` → `dispatch_async` → cudarc, synchronizes, and
+> writes back — with checksums matching HotSpot on every kernel tested. Two
+> same-day fixes: offloaded call sites are no longer promoted into the invoke
+> cache (promotion silently ended offload after the first call at a site), and
+> the failure-flag writeback drains before array writebacks (no partial GPU
+> state reaches the heap on a bounds deopt). Real benchmark numbers live in
+> `bench-gpu/results/` and the repo README. Remaining open items are tracked in
+> [`docs/known-issues/gpu-offload-followups-20260711.md`](../known-issues/gpu-offload-followups-20260711.md).
 
-[`vm/src/runtime/offload.rs`](../../vm/src/runtime/offload.rs) — the `LookupOutcome::Hit` arm currently logs `tracing::debug!` and returns `DispatchOutcome::FallThrough`. The signature, call-site contract, and `OffloadCache` lookup path are all final. Only the *body* of the `Hit` arm grows in the next iteration. The reason it's deferred: validating `cuLaunchKernel` + the deopt-on-failure dance requires actual NVIDIA hardware, and landing the surrounding cfg-gated wiring first lets us add the dispatch code in a single tightly-scoped change.
+### Open items (summary — see the known-issues doc for detail)
 
-Steps to finish on a GPU box: see the "How a method actually offloads" walk above, steps 6.a through 6.f.
-
-### Lower priority
-
-- **`jit-cuda` opcode coverage:** `lcmp`/`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg` return `Unsupported` (rare in element-wise loops). `dup2_x1` / `dup2_x2` also `Unsupported`. `frem` / `drem` emit text that won't `ptxas`-clean (no native rem on f32/f64) — the analyzer admits them but the kernel will fail validation; a software-correct sequence would close this.
-- **Reductions:** `EligibleDotProduct` lowers, but every CUDA thread races on `ret_ptr`. Result is only correct if every thread happens to compute the same value. A proper reduction kernel is needed for genuine sum-reductions.
-- **Analyzer fixture gaps:** `Reason::Monitor` and `Reason::JsrRet` are unreachable through `javac` output (synchronized always emits an exception table, hitting `HasExceptionHandlers` first; `jsr`/`ret` were dropped from `javac` decades ago). These are documented gaps with no synthetic-stub workaround.
-- **`Benchmark.java` real numbers:** awaiting a GPU box. The `docs/gpu/first-results.md` table is empty until then.
-- **GC stress integration test:** `GcStress.java` exists; a Rust integration test under `vm/tests/` that actually runs it while another thread holds a `SafepointToken` belongs to the next iteration.
+- **Reduction dispatch:** the analyzer proves reductions and the lowering emits
+  an atomic-add epilogue, but `try_dispatch` only launches void-return kernels;
+  scalar-return kernels fall through to the CPU.
+- **JIT-compiled callers** bypass the interpreter hook (structural; not yet hit
+  in practice).
+- **`dispatch_async`** is synchronous under the hood (event recorded, but
+  finalize synchronizes; no callback-driven completion).
+- **`jit-cuda` opcode coverage:** `lcmp`/`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg`,
+  `dup2_x1`/`dup2_x2`, `frem`/`drem`, and `ldc*` (constants beyond sipush
+  range) still reject or are unsupported in lowering.
+- **Analyzer fixture gaps:** `Reason::Monitor` and `Reason::JsrRet` are
+  unreachable through `javac` output (synchronized always emits an exception
+  table, hitting `HasExceptionHandlers` first; `jsr`/`ret` were dropped from
+  `javac` decades ago). Documented gaps with no synthetic-stub workaround.
+- **GC stress integration test:** `GcStress.java` exists; a Rust integration
+  test under `vm/tests/` that runs it while another thread holds a
+  `SafepointToken` belongs to a next iteration.
 
 ## File index (just the GPU-touching files)
 

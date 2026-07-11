@@ -8805,7 +8805,35 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 return Err(MethodCallFailed::InternalError(e));
             }
             Err(MethodCallFailed::ExceptionThrown(exc)) => {
-                let exc = thread.native_pending_return.take().unwrap_or(exc);
+                // `native_pending_return` roots a native call's returned
+                // object across the Rust<->Java boundary until it is pushed
+                // onto the caller's operand stack (see `safe_native_call` /
+                // `native_return_pushed_to_stack`). It is UNRELATED to the
+                // exception being unwound here in the common case — it can
+                // still hold a leftover value if the native call that set it
+                // never reached the "push to stack" step (e.g. its return
+                // value was discarded, or a later, independent exception
+                // fired before the pending value was consumed). Previously
+                // this code unconditionally preferred `native_pending_return`
+                // whenever it was `Some`, which meant a stale leftover object
+                // (observed: a `CommonToken` left over from ANTLR HQL
+                // parsing) silently replaced the REAL exception being
+                // propagated, misattributing the uncaught exception's class
+                // in fatal-error reporting.
+                //
+                // Only fall back to `native_pending_return` when `exc` itself
+                // has gone stale (relocated/reclaimed by a moving GC that ran
+                // during the failing native call, so `exc`'s address is no
+                // longer a valid live object) — mirroring the staleness check
+                // `safe_native_call` already performs in `vm_exec.rs`. The
+                // slot is always drained via `.take()` so a leftover value
+                // can never survive to poison a later, unrelated exception.
+                let pending_return = thread.native_pending_return.take();
+                let exc = if shared.heap.is_object_address(exc.as_ptr() as usize).is_some() {
+                    exc
+                } else {
+                    pending_return.unwrap_or(exc)
+                };
                 // Try to find handler, unwinding through stackless frames
                 // GC-root gap: see the pin in the `pending_java_exception` arm
                 // earlier in this function — same
@@ -21911,6 +21939,42 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    // Bulk `get(T[],int,int)`/`put(T[],int,int)` on every typed NIO buffer
+    // (Int/Long/Short/Float/DoubleBuffer) are CONCRETE (not abstract) real
+    // JDK 25 bytecode — `FloatBuffer.getArray`/`putArray` etc. read/write
+    // via `this.address` + `ScopedMemoryAccess` directly for any length
+    // beyond a trivial few elements, bypassing virtual dispatch to the
+    // single-element accessors entirely. Our synthetic abstract-stamped
+    // typed-buffer views (`native-builtins/src/servlet.rs`'s
+    // `s2_typed_buffer_view_fns!`, produced by e.g.
+    // `ByteBuffer.asFloatBuffer()`) never set a real `address` field, so
+    // that fast path silently read/wrote zero bytes for every bulk vector
+    // transfer — the dominant access pattern for ES/Lucene vector codecs
+    // (`buffer.get(vec, 0, dims)`), surfacing as
+    // "expected:<X> but was:<0.0>" across nearly the whole ES vector-codec
+    // test family. Registering the natives (in servlet.rs) is not enough by
+    // itself since real bytecode already exists for these signatures; force
+    // it to win here, mirroring the ByteBuffer block above.
+    if matches!(
+        class_name,
+        "java/nio/IntBuffer" | "java/nio/LongBuffer" | "java/nio/ShortBuffer"
+            | "java/nio/FloatBuffer" | "java/nio/DoubleBuffer"
+    ) && matches!(
+        (method_name, method_descriptor),
+        ("get", "([III)Ljava/nio/IntBuffer;")
+            | ("put", "([III)Ljava/nio/IntBuffer;")
+            | ("get", "([JII)Ljava/nio/LongBuffer;")
+            | ("put", "([JII)Ljava/nio/LongBuffer;")
+            | ("get", "([SII)Ljava/nio/ShortBuffer;")
+            | ("put", "([SII)Ljava/nio/ShortBuffer;")
+            | ("get", "([FII)Ljava/nio/FloatBuffer;")
+            | ("put", "([FII)Ljava/nio/FloatBuffer;")
+            | ("get", "([DII)Ljava/nio/DoubleBuffer;")
+            | ("put", "([DII)Ljava/nio/DoubleBuffer;")
+    ) {
+        return true;
+    }
+
     if class_name == "java/util/concurrent/LinkedBlockingDeque"
         && method_name == "clear"
         && method_descriptor == "()V"
@@ -22603,6 +22667,29 @@ fn force_native_over_real_jdk_bytecode(
                     "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;"
                 )
         )
+    {
+        return true;
+    }
+    // `String.substring(int,int)` — gate mismatch fix. `check_override`
+    // (vm_exec.rs, the invoke-slow-path native selector) already lists
+    // `java/lang/String.substring` as forced-native ("RKC16N.6 RECON":
+    // real-JDK String bytecode resolution issues during JDK class clinits),
+    // but that allowlist is CONSULTED ONLY on a vtable cache miss. The
+    // per-call-site cached vtable fast path (this function's own caller)
+    // resolves and caches its native-vs-bytecode decision independently, and
+    // `substring` was never added HERE — so once a call site's vtable entry
+    // warms, every subsequent `substring` call ran the real bytecode
+    // regardless of `check_override`'s intent. `native_string_substring`
+    // (native-builtins/src/lang_string.rs) already has a "read only the
+    // requested range" fast path specifically written to avoid decoding the
+    // WHOLE parent string per call — a real fix that this gate gap left
+    // completely unreachable. Confirmed via runtime instrumentation: a tight
+    // `text.substring(pos, pos+5)` loop over a large parent `String` cost
+    // O(n^2) instead of O(subLen) with this entry absent (see
+    // `docs/known-issues/substring-large-parent-quadratic-allocation.md`).
+    if class_name == "java/lang/String"
+        && method_name == "substring"
+        && method_descriptor == "(II)Ljava/lang/String;"
     {
         return true;
     }
@@ -24340,7 +24427,13 @@ fn execute_invokestatic(
     // preservation as self-calls; resolving by flat name can pick the app copy.
     let static_dispatch_class_id = self_class_id.or_else(|| {
         if crate::runtime::env_cache::loader_aware_resolution() {
-            lookup_loader_initiated(shared, current_class_id, &method_class_name)
+            // Preserve the initiating loader even when the global classpath
+            // already has a same-named class. This is required for nested
+            // implementation jars whose owner is only visible to the caller
+            // loader.
+            lookup_loader_initiated(shared, current_class_id, &method_class_name).or_else(|| {
+                drive_defining_loader_load(shared, thread, current_class_id, &method_class_name)
+            })
         } else {
             None
         }
@@ -24425,10 +24518,19 @@ fn execute_invokestatic(
     // GPU offload hook (Part E). Behind `gpu-offload`: with the
     // feature off, the entire block is removed by the preprocessor
     // and `execute_invokestatic` falls through to the existing CPU
-    // path unchanged. On Hit we consult the OffloadCache; the actual
-    // marshal-and-launch glue is deliberately scoped to a separate
-    // follow-up because it needs real GPU hardware to validate — see
-    // `crate::runtime::offload::try_dispatch` for the contract.
+    // path unchanged. On Hit the OffloadCache marshals, launches, and
+    // writes back via `crate::runtime::offload::try_dispatch`.
+    //
+    // Invoke-cache interaction (found 2026-07-11): the interpreter
+    // consults `thread.invoke_cache` BEFORE this slow path, so a site
+    // promoted into the cache dispatches straight to the CPU body and
+    // never re-enters this hook. An offloaded (or gated-but-eligible)
+    // site must therefore never be promoted, or the SECOND call at
+    // the site silently stops offloading — exactly the shape of a
+    // warm benchmark loop. The slow-path re-entry cost is noise next
+    // to any kernel that clears `--gpu-min-work`.
+    #[cfg_attr(not(feature = "gpu-offload"), allow(unused_mut))]
+    let mut suppress_invoke_cache = false;
     #[cfg(feature = "gpu-offload")]
     {
         if shared.config.gpu_offload_enabled
@@ -24447,8 +24549,16 @@ fn execute_invokestatic(
                 &args,
             )? {
                 crate::runtime::offload::DispatchOutcome::Handled => {
-                    populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+                    // Deliberately NOT populating the invoke cache —
+                    // see the block comment above.
                     return Ok(CachedCallResult::Handled);
+                }
+                crate::runtime::offload::DispatchOutcome::FallThroughKeepHooked => {
+                    // Eligible kernel, but a per-call gate (e.g.
+                    // --gpu-min-work) declined this particular call.
+                    // Run the CPU path but keep the site un-promoted
+                    // so a future call can still offload.
+                    suppress_invoke_cache = true;
                 }
                 crate::runtime::offload::DispatchOutcome::FallThrough => {
                     // Method is ineligible / blacklisted / launch
@@ -24473,11 +24583,15 @@ fn execute_invokestatic(
         static_dispatch_class_id,
     )? {
         CachedCallResult::FramePushed => {
-            populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+            if !suppress_invoke_cache {
+                populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+            }
             return Ok(CachedCallResult::FramePushed);
         }
         CachedCallResult::Handled => {
-            populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+            if !suppress_invoke_cache {
+                populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+            }
             return Ok(CachedCallResult::Handled);
         }
         CachedCallResult::CacheMiss => {}
@@ -24525,7 +24639,9 @@ fn execute_invokestatic(
     }
 
     // Populate invoke cache for future fast-path hits
-    populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+    if !suppress_invoke_cache {
+        populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+    }
 
     Ok(CachedCallResult::Handled)
 }
