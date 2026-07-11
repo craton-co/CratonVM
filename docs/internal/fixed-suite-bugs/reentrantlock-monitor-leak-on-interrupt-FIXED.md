@@ -144,7 +144,7 @@ breaking the WebSocket upgrade handshake itself
 [0]`) before the server ever reaches the actual close-handshake logic
 under test. This is tracked separately, in detail, with two untested
 hypotheses, in
-`docs/known-issues/tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md`
+`docs/internal/tomcat-08-07/swallowabortedupploads-unexpected-socketexception-RESOLVED.md`
 ("New blocker #3") — not this fix's scope; see that doc for the next
 steps on it. See
 `docs/known-issues/tomcat-08-07/wsremoteendpoint-close-delay-near-deadlock.md`
