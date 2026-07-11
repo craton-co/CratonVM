@@ -5695,40 +5695,70 @@ fn build_serialized_lambda(
         None => Value::Object(None),
     };
 
+    // GC-safety: `box_value` (per capture-arg iteration below) and every
+    // `create_string`/`alloc_object` further down can trigger a moving GC;
+    // `proxy`, `captured`, the ObjectRef inside `capturing_mirror`, and `sl`
+    // are all reused repeatedly across these hazards, unpinned otherwise.
+    // Same "Family 1" stale-ObjectRef pattern as `create_method_object`/
+    // `create_constructor_object`/`create_field_object` (see
+    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md).
+    let proxy_pin = ctx.pin_native_root(proxy);
+    let capturing_mirror_pin = match capturing_mirror {
+        Value::Object(Some(m)) => Some(ctx.pin_native_root(m)),
+        _ => None,
+    };
     // capturedArgs: one (boxed) value per proxy capture field, in order.
     let capture_chars: Vec<char> = meta.capture_types.chars().collect();
     let captured = ctx.new_ref_array(ClassId::new(0), capture_chars.len());
+    let captured_pin = ctx.pin_native_root(captured);
     for (i, tc) in capture_chars.iter().enumerate() {
+        let proxy = ctx.read_native_pin(proxy_pin, proxy);
         let raw = ctx.get_field(proxy, i);
         let boxed = box_value(ctx, raw, &tc.to_string());
+        let captured = ctx.read_native_pin(captured_pin, captured);
         ctx.set_array_element(captured, i, boxed);
     }
 
     let total = ctx.class_num_total_fields(sl_cid).max(10);
     let sl = ctx.alloc_object(sl_cid, total);
+    let sl_pin = ctx.pin_native_root(sl);
+    let capturing_mirror = match (capturing_mirror_pin, capturing_mirror) {
+        (Some(pin), Value::Object(Some(m))) => Value::Object(Some(ctx.read_native_pin(pin, m))),
+        _ => capturing_mirror,
+    };
+    let sl = ctx.read_native_pin(sl_pin, sl);
     ctx.set_field_by_name(sl, "capturingClass", capturing_mirror);
     let fic = ctx.create_string(&meta.functional_interface);
+    let sl = ctx.read_native_pin(sl_pin, sl);
     ctx.set_field_by_name(sl, "functionalInterfaceClass", Value::Object(Some(fic)));
     let fimn = ctx.create_string(&meta.sam_method_name);
+    let sl = ctx.read_native_pin(sl_pin, sl);
     ctx.set_field_by_name(
         sl,
         "functionalInterfaceMethodName",
         Value::Object(Some(fimn)),
     );
     let fims = ctx.create_string(&meta.sam_descriptor);
+    let sl = ctx.read_native_pin(sl_pin, sl);
     ctx.set_field_by_name(
         sl,
         "functionalInterfaceMethodSignature",
         Value::Object(Some(fims)),
     );
     let ic = ctx.create_string(&meta.impl_class);
+    let sl = ctx.read_native_pin(sl_pin, sl);
     ctx.set_field_by_name(sl, "implClass", Value::Object(Some(ic)));
     let imn = ctx.create_string(&meta.impl_member);
+    let sl = ctx.read_native_pin(sl_pin, sl);
     ctx.set_field_by_name(sl, "implMethodName", Value::Object(Some(imn)));
     let ims = ctx.create_string(&meta.impl_descriptor);
+    let sl = ctx.read_native_pin(sl_pin, sl);
     ctx.set_field_by_name(sl, "implMethodSignature", Value::Object(Some(ims)));
     ctx.set_field_by_name(sl, "implMethodKind", Value::Int(meta.impl_ref_kind as i32));
     let imt = ctx.create_string(&meta.instantiated_descriptor);
+    let sl = ctx.read_native_pin(sl_pin, sl);
+    let captured = ctx.read_native_pin(captured_pin, captured);
+    ctx.unpin_native_roots(proxy_pin);
     ctx.set_field_by_name(sl, "instantiatedMethodType", Value::Object(Some(imt)));
     ctx.set_field_by_name(sl, "capturedArgs", Value::Object(Some(captured)));
     Ok(Some(Value::Object(Some(sl))))
@@ -7835,6 +7865,13 @@ pub(crate) fn native_constructor_new_instance(
                         // though every field value round-tripped correctly.
                         let num_fields = ctx.class_num_total_fields(inst_cid);
                         let obj = ctx.alloc_object(inst_cid, num_fields);
+                        // GC-safety: `invoke_special` below runs the ancestor's
+                        // real `<init>` bytecode, which can trigger a moving GC;
+                        // `obj` is returned afterward, unpinned otherwise --
+                        // exactly the "Constructor.newInstance"-family
+                        // stale-ObjectRef pattern documented in
+                        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+                        let obj_pin = ctx.pin_native_root(obj);
                         {
                             // Run the ancestor's no-arg `<init>` (`clazz`);
                             // `java.lang.Object.<init>` is a no-op.
@@ -7852,6 +7889,8 @@ pub(crate) fn native_constructor_new_instance(
                                     }
                                 }
                             }
+                            let obj = ctx.read_native_pin(obj_pin, obj);
+                            ctx.unpin_native_roots(obj_pin);
                             return Ok(Some(Value::Object(Some(obj))));
                         }
                     }

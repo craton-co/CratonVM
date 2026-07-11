@@ -130,13 +130,24 @@ static PLATFORM_CL: Mutex<Option<ObjectRef>> = Mutex::new(None);
 /// `defineClass`). Build the same non-null `defaultDomain` shape here
 /// so the real JDK `defineClass` bytecode path runs cleanly.
 fn init_classloader_common_fields(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    // GC-safety: every `alloc_concurrent_synthetic`/`new_object`/`invoke` call
+    // below can trigger a moving GC; `this` (and, briefly, `cs`) are each
+    // reused repeatedly across multiple such hazards, unpinned otherwise.
+    // Same "Family 1" stale-ObjectRef pattern as the WildFly boot-crash
+    // fixes (see docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md)
+    // -- pin both now and re-read the forwarded reference right before use.
+    let this_pin = ctx.pin_native_root(this);
     // defaultDomain → ProtectionDomain(CodeSource(null URL, null certs),
     // null perms, this loader, null principals). Build CodeSource first.
     let cs = alloc_concurrent_synthetic(ctx, "java/security/CodeSource", 2);
+    let cs_pin = ctx.pin_native_root(cs);
     ctx.set_field_by_name(cs, "location", Value::Object(None));
     ctx.set_field_by_name(cs, "certs", Value::Object(None));
 
     let pd = alloc_concurrent_synthetic(ctx, "java/security/ProtectionDomain", 4);
+    let cs = ctx.read_native_pin(cs_pin, cs);
+    ctx.unpin_native_roots(cs_pin);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(pd, "codesource", Value::Object(Some(cs)));
     ctx.set_field_by_name(pd, "permissions", Value::Object(None));
     ctx.set_field_by_name(pd, "classloader", Value::Object(Some(this)));
@@ -148,23 +159,28 @@ fn init_classloader_common_fields(ctx: &mut dyn NativeContext, this: ObjectRef) 
     // (`addClass`) does `synchronized (classes) { classes.add(c); }`; a
     // null here would NPE on monitorenter.
     let classes = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 4);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, "classes", Value::Object(Some(classes)));
 
     // `packages` — ConcurrentHashMap; `ClassLoader.packages()` does
     // `getfield packages → values()` and would NPE on null.
     let packages = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, "packages", Value::Object(Some(packages)));
 
     // `package2certs` — ConcurrentHashMap consulted by `checkCerts`.
     let pkg2certs = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, "package2certs", Value::Object(Some(pkg2certs)));
 
     // `parallelLockMap` — used by `getClassLoadingLock`.
     let lock_map = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, "parallelLockMap", Value::Object(Some(lock_map)));
 
     // `assertionLock` — `setDefaultAssertionStatus` synchronizes on it.
     let lock = alloc_concurrent_synthetic(ctx, "java/lang/Object", 0);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, "assertionLock", Value::Object(Some(lock)));
 
     // `pdcache` — `SecureClassLoader`'s `Map<CodeSource, ProtectionDomain>`,
@@ -183,6 +199,7 @@ fn init_classloader_common_fields(ctx: &mut dyn NativeContext, this: ObjectRef) 
     // native `<init>()V` (a bare `alloc_concurrent_synthetic` leaves the segments
     // array null, so `computeIfAbsent` would silently no-op) and only when null
     // so a real ctor that already ran is not clobbered.
+    let this = ctx.read_native_pin(this_pin, this);
     if !matches!(
         ctx.get_field_by_name(this, "pdcache"),
         Value::Object(Some(_))
@@ -190,15 +207,20 @@ fn init_classloader_common_fields(ctx: &mut dyn NativeContext, this: ObjectRef) 
         if let Ok(Some(Value::Object(Some(chm)))) =
             ctx.new_object("java/util/concurrent/ConcurrentHashMap")
         {
+            let chm_pin = ctx.pin_native_root(chm);
             let _ = ctx.invoke(
                 "java/util/concurrent/ConcurrentHashMap",
                 "<init>",
                 "()V",
                 &[Value::Object(Some(chm))],
             );
+            let chm = ctx.read_native_pin(chm_pin, chm);
+            ctx.unpin_native_roots(chm_pin);
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field_by_name(this, "pdcache", Value::Object(Some(chm)));
         }
     }
+    ctx.unpin_native_roots(this_pin);
 }
 
 /// Populate the `URLClassLoader`-specific instance fields that the real
@@ -850,9 +872,12 @@ fn cl_real_load_class_base(
         {
             return Ok(Some(Value::Object(Some(mirror))));
         }
-        let exc = alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
-        let msg = ctx.create_string(&class_name);
-        ctx.set_field(exc, 0, Value::Object(Some(msg)));
+        let exc = crate::jboss_module_loader::alloc_single_message_exception(
+            ctx,
+            "java/lang/ClassNotFoundException",
+            1,
+            &class_name,
+        );
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
             exc,
         ));
@@ -959,9 +984,12 @@ fn cl_real_load_class_base(
     }
 
     // 3. Genuinely not found and no user override — throw CNFE per spec.
-    let exc = alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
-    let msg = ctx.create_string(&class_name);
-    ctx.set_field(exc, 0, Value::Object(Some(msg)));
+    let exc = crate::jboss_module_loader::alloc_single_message_exception(
+        ctx,
+        "java/lang/ClassNotFoundException",
+        1,
+        &class_name,
+    );
     Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
         exc,
     ))
@@ -1009,9 +1037,12 @@ pub fn ucl_real_find_class(
     if let Ok(Some(mirror)) = ctx.load_class(&internal) {
         return Ok(Some(mirror));
     }
-    let exc = alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
-    let msg = ctx.create_string(&class_name);
-    ctx.set_field(exc, 0, Value::Object(Some(msg)));
+    let exc = crate::jboss_module_loader::alloc_single_message_exception(
+        ctx,
+        "java/lang/ClassNotFoundException",
+        1,
+        &class_name,
+    );
     Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
         exc,
     ))
