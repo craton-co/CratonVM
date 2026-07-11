@@ -459,6 +459,8 @@ pub fn ensure_class_initialized_shared(
                         let _result = cvar.wait_for(&mut guard, std::time::Duration::from_secs(30));
                     }
                     drop(guard);
+                    // `check_post_block_gc` clears the registry flag under
+                    // the barrier admission lock before this thread resumes.
                     drop(blk);
                     ctx.check_post_block_gc();
                     // Loop back to re-check state (might be Initialized or Error)

@@ -511,7 +511,12 @@ fn stw_take_over_and_wait(
     let mut warned = false;
     loop {
         let tids_before = taken.tids.len();
-        let newly = if crate::jit::conservative_roots::any_thread_in_jit() {
+        // The global JIT-depth counter is a fast first-pass hint. Once a
+        // cooperative wait has actually timed out, perform a RIP-based scan
+        // even when the hint is false: a missed entry/exit bookkeeping
+        // transition must not become a permanent STW wait. The scan itself
+        // parks only peers whose RIP is inside a registered JIT range.
+        let newly = if rounds != 0 || crate::jit::conservative_roots::any_thread_in_jit() {
             xt::take_over_pass(&mut taken, &|a| shared.heap.is_object_address(a), xt_roots)
         } else {
             0
