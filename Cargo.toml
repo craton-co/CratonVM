@@ -347,6 +347,37 @@ inherits = "release"
 debug = 2
 strip = "none"
 
+# Debug-build utility profile (added 2026-07-11 while investigating
+# docs/known-issues/wildfly-domain-heap-corrupt-value-timeout.md /
+# WFLYHC0053, kept as a general-purpose tool since it's opt-in and zero
+# risk to the default release build): full debuginfo AND no LTO/low
+# opt-level so local variables survive for live gdb conditional
+# breakpoints, which the default release profile's
+# `debug = "line-tables-only"` and fat LTO both defeat even when they
+# don't change program behavior. Only affects builds explicitly run with
+# `--profile hc0053dbg`. Interpreter/JIT crates build at opt-level 1
+# (still much faster than a plain debug build); native-builtins and
+# native-io build at opt-level 0 specifically, since that's where this
+# investigation's socket/protocol code lives and needed locals preserved.
+# Runtime is meaningfully slower than release but boots WildFly in a
+# reasonable time for investigating boot-time (not throughput-sensitive)
+# bugs -- do not use for perf work, see `profsym` for that instead.
+[profile.hc0053dbg]
+inherits = "release"
+debug = 2
+strip = "none"
+lto = false
+codegen-units = 16
+opt-level = 1
+incremental = false
+
+[profile.hc0053dbg.package.cratonvm-native-builtins]
+opt-level = 0
+
+[profile.hc0053dbg.package.cratonvm-native-io]
+opt-level = 0
+
+
 # Benches must use the same codegen as release so criterion numbers are
 # representative of what users will actually run.
 [profile.bench]
