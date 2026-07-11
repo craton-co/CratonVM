@@ -64,10 +64,13 @@ directory, one million puts plus one million gets:
 | First-pass HotSpot | 49 / 56 / 46 / 44 / 44 ms | 47.8 ms |
 | Within-10x candidate | 343 / 338 / 339 / 344 / 345 ms | 341.8 ms |
 | Same-minute HotSpot | 48 / 50 / 49 / 49 / 52 ms | 49.6 ms |
+| Merged-dev CratonVM | 660 / 412 / 400 / 367 / 374 / 370 / 371 / 368 / 364 ms | 409.6 ms |
+| Merged-dev HotSpot | 55 / 54 / 50 / 51 / 51 / 50 / 49 / 49 / 51 ms | 51.1 ms |
 
-The final candidate is **6.89x HotSpot** by the five-round means and approximately
-53x faster than the original 18,113 ms pinned CratonVM baseline. Final rebased-dev
-numbers are recorded in the landing commit message/build handoff.
+The pre-rebase candidate is **6.89x HotSpot** by the five-round means. The final
+merged-dev nine-round means are **8.01x HotSpot**, including the first CratonVM
+outlier (660 ms); rounds 2-9 stabilize at 364-412 ms. The merged implementation is
+approximately 44x faster than the original 18,113 ms pinned CratonVM baseline.
 
 Correctness evidence includes `HashMapSemanticsProbe` normally and with
 `CRATONVM_DBG_GC_STRESS=1048576`, plus the `cratonvm-native-collections` unit and
