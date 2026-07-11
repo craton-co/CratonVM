@@ -21911,6 +21911,42 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    // Bulk `get(T[],int,int)`/`put(T[],int,int)` on every typed NIO buffer
+    // (Int/Long/Short/Float/DoubleBuffer) are CONCRETE (not abstract) real
+    // JDK 25 bytecode — `FloatBuffer.getArray`/`putArray` etc. read/write
+    // via `this.address` + `ScopedMemoryAccess` directly for any length
+    // beyond a trivial few elements, bypassing virtual dispatch to the
+    // single-element accessors entirely. Our synthetic abstract-stamped
+    // typed-buffer views (`native-builtins/src/servlet.rs`'s
+    // `s2_typed_buffer_view_fns!`, produced by e.g.
+    // `ByteBuffer.asFloatBuffer()`) never set a real `address` field, so
+    // that fast path silently read/wrote zero bytes for every bulk vector
+    // transfer — the dominant access pattern for ES/Lucene vector codecs
+    // (`buffer.get(vec, 0, dims)`), surfacing as
+    // "expected:<X> but was:<0.0>" across nearly the whole ES vector-codec
+    // test family. Registering the natives (in servlet.rs) is not enough by
+    // itself since real bytecode already exists for these signatures; force
+    // it to win here, mirroring the ByteBuffer block above.
+    if matches!(
+        class_name,
+        "java/nio/IntBuffer" | "java/nio/LongBuffer" | "java/nio/ShortBuffer"
+            | "java/nio/FloatBuffer" | "java/nio/DoubleBuffer"
+    ) && matches!(
+        (method_name, method_descriptor),
+        ("get", "([III)Ljava/nio/IntBuffer;")
+            | ("put", "([III)Ljava/nio/IntBuffer;")
+            | ("get", "([JII)Ljava/nio/LongBuffer;")
+            | ("put", "([JII)Ljava/nio/LongBuffer;")
+            | ("get", "([SII)Ljava/nio/ShortBuffer;")
+            | ("put", "([SII)Ljava/nio/ShortBuffer;")
+            | ("get", "([FII)Ljava/nio/FloatBuffer;")
+            | ("put", "([FII)Ljava/nio/FloatBuffer;")
+            | ("get", "([DII)Ljava/nio/DoubleBuffer;")
+            | ("put", "([DII)Ljava/nio/DoubleBuffer;")
+    ) {
+        return true;
+    }
+
     if class_name == "java/util/concurrent/LinkedBlockingDeque"
         && method_name == "clear"
         && method_descriptor == "()V"
