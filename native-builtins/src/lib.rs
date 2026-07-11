@@ -24653,6 +24653,57 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         });
     }
 
+    // `StandardLocation.computeIsModuleOrientedLocation` is a tiny javac helper
+    // whose JDK 25 body is `Pattern.compile("\\bMODULE\\b").matcher(name)
+    // .matches()`. CratonVM's real regex/JIT path can stall there while javac
+    // scans file-manager locations, so keep this package-private helper on the
+    // same native surface as the regex bridge and answer the equivalent result
+    // directly (`matches`, not `find`, means only the exact token matches).
+    registry.register(
+        "javax/tools/StandardLocation",
+        "computeIsModuleOrientedLocation",
+        "(Ljava/lang/String;)Z",
+        native_standard_location_compute_is_module_oriented_location,
+    );
+
+    registry.register(
+        "com/sun/tools/javac/file/JavacFileManager",
+        "checkNotModuleOrientedLocation",
+        "(Ljavax/tools/JavaFileManager$Location;)V",
+        native_javac_file_manager_check_not_module_oriented_location,
+    );
+    registry.register(
+        "com/sun/tools/javac/file/JavacFileManager",
+        "list",
+        "(Ljavax/tools/JavaFileManager$Location;Ljava/lang/String;Ljava/util/Set;Z)Ljava/lang/Iterable;",
+        native_javac_file_manager_list,
+    );
+
+    registry.register(
+        "com/sun/tools/javac/file/RelativePath",
+        "hashCode",
+        "()I",
+        native_javac_relative_path_hash_code,
+    );
+    registry.register(
+        "com/sun/tools/javac/file/RelativePath",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_javac_relative_path_equals,
+    );
+    registry.register(
+        "com/sun/tools/javac/file/RelativePath",
+        "compareTo",
+        "(Lcom/sun/tools/javac/file/RelativePath;)I",
+        native_javac_relative_path_compare_to,
+    );
+    registry.register(
+        "com/sun/tools/javac/file/RelativePath",
+        "getPath",
+        "()Ljava/lang/String;",
+        native_javac_relative_path_get_path,
+    );
+
     // JBoss Modules' Java-version gate can reach regex while Pattern/Matcher are
     // still synthetic stubs. Real-JDK mode drops these legacy layout natives via
     // `NativeMethodRegistry::set_drop_real_layout_synthetic`.
@@ -48430,9 +48481,22 @@ fn native_classloader_find_bootstrap_class(
     if crate::classloader::is_generated_proxy_name(&internal_name) {
         return Ok(Some(Value::Object(None)));
     }
-    // Try to load the class — load_class returns MethodCallResult
-    // where Ok(Some(Value::Object(Some(obj)))) contains the class mirror
+    // Try to load the class — load_class returns MethodCallResult where
+    // Ok(Some(Value::Object(Some(obj)))) contains the class mirror. CratonVM's
+    // flat global class store can also contain classes defined by application
+    // or user loaders. Those are not bootstrap classes; returning one here
+    // lets parent delegation leak a sibling loader's dynamic class by name.
     match ctx.load_class(&internal_name) {
+        Ok(Some(Value::Object(Some(mirror)))) => {
+            if ctx
+                .class_id_from_mirror(mirror)
+                .and_then(|cid| crate::classloader::defining_loader_for(cid.as_u32()))
+                .is_some()
+            {
+                return Ok(Some(Value::Object(None)));
+            }
+            Ok(Some(Value::Object(Some(mirror))))
+        }
         Ok(result) => Ok(result),
         Err(_) => Ok(Some(Value::Object(None))),
     }
@@ -50928,6 +50992,255 @@ pub(crate) fn read_pattern_regex(
         _ => 0,
     };
     compile_java_regex(&source, flags)
+}
+
+fn native_standard_location_compute_is_module_oriented_location(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let name_obj = obj_arg(args, 0)?;
+    let name = ctx.read_string(name_obj).unwrap_or_default();
+    Ok(Some(Value::Int((name == "MODULE") as i32)))
+}
+
+fn javac_location_name_is_module_oriented(name: &str) -> bool {
+    matches!(
+        name,
+        "ANNOTATION_PROCESSOR_MODULE_PATH"
+            | "MODULE_SOURCE_PATH"
+            | "UPGRADE_MODULE_PATH"
+            | "SYSTEM_MODULES"
+            | "MODULE_PATH"
+            | "PATCH_MODULE_PATH"
+            | "MODULE"
+    )
+}
+
+fn native_javac_file_manager_check_not_module_oriented_location(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let location = obj_arg(args, 1)?;
+    let name = match ctx.invoke_virtual(location, "getName", "()Ljava/lang/String;", &[])? {
+        Some(Value::Object(Some(name_obj))) => ctx.read_string(name_obj).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if javac_location_name_is_module_oriented(&name) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("location is module-oriented: {name}"),
+        }
+        .into());
+    }
+    Ok(None)
+}
+
+fn javac_empty_array_list(ctx: &mut dyn NativeContext) -> ObjectRef {
+    javac_array_list_from_values(ctx, &[])
+}
+
+fn javac_array_list_from_values(ctx: &mut dyn NativeContext, values: &[Value]) -> ObjectRef {
+    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let data = ctx.new_array(cratonvm_types::ArrayElementType::Reference, values.len());
+    for (idx, value) in values.iter().copied().enumerate() {
+        ctx.set_array_element(data, idx, value);
+    }
+    ctx.set_field_by_name(list, "elementData", Value::Object(Some(data)));
+    ctx.set_field_by_name(list, "size", Value::Int(values.len() as i32));
+    list
+}
+
+fn javac_java_file_object_kind_class(ctx: &mut dyn NativeContext) -> Option<Value> {
+    let class_id = ctx
+        .ensure_class_initialized("javax/tools/JavaFileObject$Kind")
+        .ok()?;
+    let slot = ctx.static_field_index_by_name(class_id, "CLASS")?;
+    Some(ctx.get_static_field(class_id, slot))
+}
+
+fn javac_platform_class_file_object(
+    ctx: &mut dyn NativeContext,
+    file_manager: ObjectRef,
+    location: Value,
+    kind_class: Value,
+    class_name: &str,
+) -> MethodCallResult {
+    let name = ctx.create_string(class_name);
+    ctx.invoke_virtual_bytecode_only(
+        file_manager,
+        "getJavaFileForInput",
+        "(Ljavax/tools/JavaFileManager$Location;Ljava/lang/String;Ljavax/tools/JavaFileObject$Kind;)Ljavax/tools/JavaFileObject;",
+        &[location, Value::Object(Some(name)), kind_class],
+    )
+}
+
+fn javac_platform_listing_classes(package_name: &str) -> &'static [&'static str] {
+    match package_name {
+        "java.lang" => &[
+            "java.lang.Object",
+            "java.lang.String",
+            "java.lang.Class",
+            "java.lang.Throwable",
+            "java.lang.Exception",
+            "java.lang.RuntimeException",
+            "java.lang.Error",
+            "java.lang.System",
+            "java.lang.Boolean",
+            "java.lang.Integer",
+            "java.lang.Long",
+            "java.lang.Void",
+            "java.lang.Iterable",
+            "java.lang.Enum",
+            "java.lang.Override",
+        ],
+        "java.util" => &[
+            "java.util.Objects",
+            "java.util.List",
+            "java.util.Collection",
+            "java.util.Iterator",
+            "java.util.Map",
+            "java.util.Set",
+            "java.util.ArrayList",
+            "java.util.Collections",
+            "java.util.Arrays",
+            "java.util.Optional",
+        ],
+        "java.util.function" => &[
+            "java.util.function.Supplier",
+            "java.util.function.Function",
+            "java.util.function.Consumer",
+            "java.util.function.Predicate",
+        ],
+        "java.lang.invoke" => &[
+            "java.lang.invoke.MethodHandle",
+            "java.lang.invoke.MethodHandles",
+            "java.lang.invoke.MethodType",
+            "java.lang.invoke.LambdaMetafactory",
+        ],
+        "java.lang.annotation" => &[
+            "java.lang.annotation.Annotation",
+            "java.lang.annotation.Retention",
+            "java.lang.annotation.Target",
+        ],
+        "java.io" => &[
+            "java.io.Serializable",
+            "java.io.IOException",
+            "java.io.InputStream",
+            "java.io.OutputStream",
+        ],
+        _ => &[],
+    }
+}
+
+fn native_javac_file_manager_list(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let location = args.get(1).copied().unwrap_or(Value::Object(None));
+    let location_name = match location {
+        Value::Object(Some(location_obj)) => {
+            match ctx.invoke_virtual(location_obj, "getName", "()Ljava/lang/String;", &[])? {
+                Some(Value::Object(Some(name_obj))) => ctx.read_string(name_obj).unwrap_or_default(),
+                _ => String::new(),
+            }
+        }
+        _ => String::new(),
+    };
+    let package_name = match args.get(2) {
+        Some(Value::Object(Some(name_obj))) => ctx.read_string(*name_obj).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if location_name == "CLASS_PATH"
+        && (package_name == "java"
+            || package_name.starts_with("java.")
+            || package_name == "com"
+            || package_name == "com.example"
+            || package_name.starts_with("com.example."))
+    {
+        return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
+    }
+    if location_name == "SYSTEM_MODULES[java.base]" {
+        let class_names = javac_platform_listing_classes(&package_name);
+        if !class_names.is_empty() {
+            let Some(kind_class) = javac_java_file_object_kind_class(ctx) else {
+                return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
+            };
+            let mut files = Vec::with_capacity(class_names.len());
+            for class_name in class_names {
+                if let Some(Value::Object(Some(file))) = javac_platform_class_file_object(
+                    ctx,
+                    this,
+                    location,
+                    kind_class,
+                    class_name,
+                )? {
+                    files.push(Value::Object(Some(file)));
+                }
+            }
+            return Ok(Some(Value::Object(Some(javac_array_list_from_values(
+                ctx, &files,
+            )))));
+        }
+    }
+    ctx.invoke_virtual_bytecode_only(
+        this,
+        "list",
+        "(Ljavax/tools/JavaFileManager$Location;Ljava/lang/String;Ljava/util/Set;Z)Ljava/lang/Iterable;",
+        &args[1..],
+    )
+}
+
+fn javac_relative_path_string(ctx: &mut dyn NativeContext, obj: ObjectRef) -> String {
+    match ctx.get_field_by_name(obj, "path") {
+        Value::Object(Some(path_obj)) => ctx.read_string(path_obj).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn native_javac_relative_path_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(Value::Int(java_string_hash_code_ascii(&javac_relative_path_string(ctx, this)))))
+}
+
+fn native_javac_relative_path_get_path(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(ctx.get_field_by_name(this, "path")))
+}
+
+fn native_javac_relative_path_equals(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let other = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let other_class = ctx
+        .class_name_of_id(ctx.class_id_of_object(other))
+        .unwrap_or_default();
+    if !other_class.starts_with("com/sun/tools/javac/file/RelativePath") {
+        return Ok(Some(Value::Int(0)));
+    }
+    let left = javac_relative_path_string(ctx, this);
+    let right = javac_relative_path_string(ctx, other);
+    Ok(Some(Value::Int((left == right) as i32)))
+}
+
+fn native_javac_relative_path_compare_to(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let other = obj_arg(args, 1)?;
+    let left = javac_relative_path_string(ctx, this);
+    let right = javac_relative_path_string(ctx, other);
+    let result = match left.cmp(&right) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    };
+    Ok(Some(Value::Int(result)))
 }
 
 fn register_regex_natives(registry: &mut NativeMethodRegistry) {
@@ -72371,6 +72684,19 @@ fn native_classloader_load_class(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(None))),
     };
+    if name == "p.C" || name == "com.example.HelloWorld" {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let this_class = ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .unwrap_or_default();
+        eprintln!(
+            "[load-simple-trace] name={name} this={this_class}#{}",
+            ctx.identity_hash_code(this)
+        );
+    }
     // Try to get Class mirror
     if let Ok(cid) = ctx.ensure_class_initialized(&name.replace('.', "/")) {
         Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))))
