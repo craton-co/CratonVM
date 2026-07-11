@@ -40,16 +40,36 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 
 ### Benchmark (vs HotSpot JDK 25 C2)
 
-| Benchmark                  | JDK 25 C2    | CratonVM default | Default ratio |
-|----------------------------|--------------|------------------|---------------|
-| Arithmetic (1.8B ops)      | 1,906 ms     | 3,919 ms         | 2.06x         |
-| Fibonacci(41) x5           | 1,793 ms     | 8,845 ms         | 4.93x         |
-| Sieve (100K x 16,700)      | 1,972 ms     | 11,267 ms        | 5.71x         |
-| Matrix 1230x1230           | 1,927 ms     | 5,427 ms         | 2.82x         |
-| **QuickBench TOTAL**       | **7,700 ms** | **29,458 ms**    | **3.83x**     |
-| Binary Trees (depth=18)    | 347 ms       | 8,214 ms         | 23.7x         |
+| Benchmark                  | JDK 25 C2     | CratonVM default | Default ratio |
+|----------------------------|---------------|-------------------|---------------|
+| Arithmetic (2B ops)        | 2,384 ms      | 10,845 ms         | 4.55x         |
+| Fibonacci(44)               | 3,229 ms      | 7,785 ms          | 2.41x         |
+| Sieve (100K x 20,000)      | 5,417 ms      | 19,714 ms         | 3.64x         |
+| Matrix 1280x1280           | 2,234 ms      | 14,928 ms         | 6.68x         |
+| **QuickBench TOTAL**       | **13,664 ms** | **53,272 ms**     | **3.90x**     |
+| Binary Trees (depth=18)    | 400 ms        | 12,003 ms         | 30.0x         |
 
-*QuickBench rows measured 2026-07-09 on a shared Azure Linux build host (same host as the Binary Trees row) against JDK 25.0.3 Temurin C2 and a CratonVM release build off `dev` at `bfc26c2d` (best of 3 HotSpot runs, best of 5 CratonVM runs). This is a rescaled variant of QuickBench (not the historical `bench/QuickBench.java` from commit `2cea208`) with each sub-test's workload sized so HotSpot lands around 2 seconds per test — the original 300M-iteration/fib(42)/500-rep/500x500 sizes were dominated by JVM startup and JIT-warmup noise (2-4x run-to-run swings on this shared host) rather than steady-state throughput. Scale-up: Arithmetic 300M → 1.8B iterations, Fibonacci fib(42) single call → fib(41) ×5 reps (recursion-depth steps are too coarse-grained for fine control, so it's repeated like the Sieve loop instead), Sieve 500 → 16,700 reps, Matrix 500x500 → 1230x1230. Sieve and Matrix ratios are both meaningfully worse at this steady-state size (5.0x→5.71x, 2.3x→2.82x) than the old short-run numbers, which were flattering CratonVM by diluting its slower steady-state throughput with a larger fixed-cost fraction. Binary Trees is unchanged from the 2026-07-08 snapshot (still the historical `bench/binarytrees.java` from `2cea208`, `--Xmx 4g`, best of 7 runs, one CratonVM-default run of 50,516 ms excluded as a contention outlier) and uses a different methodology than the rescaled QuickBench rows above it — only ratios, not absolute times, are meaningful across rows/snapshots. `CRATONVM_JIT_OSR` back-edge OSR is default-on (flipped 2026-07-04); `CRATONVM_JIT_THRESHOLD=1` on top showed no distinct benefit in either snapshot.*
+*Measured 2026-07-10 on the primary Windows dev box (hybrid P/E-core CPU, pinned to
+the 16 P-core logical processors via `ProcessorAffinity` — single-threaded benchmarks
+otherwise get scheduled onto slower E-cores, which skews results) against JDK 25 C2
+and a CratonVM release build off `dev` at `13011cffd` **plus** a same-day fix restoring
+the guarded-inline-getfield JIT fast path to its intended default-on state (see below).
+All rows measured in a single combined run (`bench/QuickBenchLong2.java`, a further
+rescale of the QuickBench suite: Arithmetic 1.8B → 2B, Fibonacci fib(41)×5 → fib(44)
+single call, Sieve 16,700 → 20,000 reps, Matrix 1230×1230 → 1280×1280); Binary Trees is
+the same kernel run as the suite's 5th test, not a separate process, so its ratio here
+(30.0x) is not directly comparable to a fresh-process `bintrees18` run (which measured
+~13x on this same build — see the JIT optimization doc) — running it back-to-back after
+four other allocation-heavy kernels leaves more GC/heap pressure resident. Checksums
+verified identical between CratonVM and JDK on every kernel. `CRATONVM_JIT_OSR`
+back-edge OSR is default-on; `guarded_inline_getfield_enabled()` (default-on again as of
+this fix) is the single largest lever in this table — a same-day intermediate commit
+had flipped it back to an opt-in checked-helper path after finding a real SIGSEGV on an
+Elasticsearch vector-query workload, which cost ~35-40% throughput on getfield-heavy
+kernels; it was restored to default-on as a deliberate trade-off (the crash is a narrow,
+specific repro, not a general hazard) while the root cause is investigated separately —
+see [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full history and the
+known workaround (`CRATONVM_JIT_GETFIELD_HELPER=1`) if you hit that crash signature.*
 
 See [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full 26-round JIT optimization journey.
 
