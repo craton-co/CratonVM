@@ -5553,6 +5553,13 @@ fn try_compile_inner(
         // `prologue_param_slots` above.
         let num_params = prologue_param_slots;
         let mut builder = ir::IrBuilder::new(num_params, cached.max_locals as usize);
+        builder.tdigest_scalar_kernel = cached.class_name.as_ref()
+            == "org/elasticsearch/tdigest/Dist"
+            && matches!(
+                (&*cached.method_name, &*cached.method_descriptor),
+                ("quantile", "(DILjava/util/function/Function;)D")
+                    | ("cdf", "(DILjava/util/function/Function;)D")
+            );
         // Type each `Param` node from the descriptor. Two consumers depend on
         // this:
         //   * inc 25 (long gate): re-lay-out the parameter locals with the JVM

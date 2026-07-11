@@ -162,6 +162,8 @@ pub struct JitRuntimeHelpers {
     pub throw_arithmetic: usize,
     pub invoke_dispatch: usize,
     pub invoke_virtual_mic: usize,
+    /// Scalar lambda adapter for TDigest numeric kernels.
+    pub lambda_int_to_double: usize,
     pub write_barrier: usize,
     /// Round-7 fix (CRIT, UAF in JIT): SATB pre-write barrier.
     ///
@@ -478,6 +480,7 @@ helper_fields! {
     (throw_arithmetic,               FieldKind::RequiredPtr),
     (invoke_dispatch,                FieldKind::RequiredPtr),
     (invoke_virtual_mic,             FieldKind::RequiredPtr),
+    (lambda_int_to_double,           FieldKind::RequiredPtr),
     (write_barrier,                  FieldKind::RequiredPtr),
     (satb_pre_write_barrier,         FieldKind::RequiredPtr),
     (uncommon_trap,                  FieldKind::RequiredPtr),
@@ -526,7 +529,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 49,
+    JitRuntimeHelpers::NUM_FIELDS == 50,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -576,7 +579,7 @@ impl JitRuntimeHelpers {
     /// silently returned `true` on a null `tlab_post_init` because the
     /// hand-maintained bulk array did not include it. The validator now
     /// iterates the macro-generated `all_fields()` list — all 46 fields,
-    /// 39 of which are required pointers — so no field can be silently
+    /// 40 of which are required pointers — so no field can be silently
     /// uncovered.)
     pub fn validate(&self) -> Result<(), Vec<&'static str>> {
         let nulls = self.null_pointers();
@@ -663,6 +666,7 @@ mod tests {
             throw_arithmetic: 0x1128,
             invoke_dispatch: 0x10D0,
             invoke_virtual_mic: 0x10D8,
+            lambda_int_to_double: 0x10DC,
             write_barrier: 0x10E0,
             satb_pre_write_barrier: 0x1110,
             uncommon_trap: 0x10E8,
@@ -840,6 +844,7 @@ mod tests {
             h.throw_aioobe,
             h.invoke_dispatch,
             h.invoke_virtual_mic,
+            h.lambda_int_to_double,
             h.write_barrier,
             h.satb_pre_write_barrier,
         ];
@@ -848,7 +853,7 @@ mod tests {
         for p in &ptrs {
             assert!(set.insert(p), "Duplicate pointer value: {:#x}", p);
         }
-        assert_eq!(set.len(), 30);
+        assert_eq!(set.len(), 31);
     }
 
     #[test]
@@ -883,6 +888,7 @@ mod tests {
             throw_arithmetic: 0,
             invoke_dispatch: 0,
             invoke_virtual_mic: 0,
+            lambda_int_to_double: 0,
             write_barrier: 0,
             satb_pre_write_barrier: 0,
             uncommon_trap: 0,
@@ -1078,8 +1084,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 49.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 49);
+        // And the macro-driven count is the canonical 50.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 50);
     }
 
     #[test]
@@ -1224,101 +1230,106 @@ mod tests {
             ),
             (
                 29,
+                "lambda_int_to_double",
+                std::mem::offset_of!(JitRuntimeHelpers, lambda_int_to_double),
+            ),
+            (
+                30,
                 "write_barrier",
                 std::mem::offset_of!(JitRuntimeHelpers, write_barrier),
             ),
             (
-                30,
+                31,
                 "satb_pre_write_barrier",
                 std::mem::offset_of!(JitRuntimeHelpers, satb_pre_write_barrier),
             ),
             (
-                31,
+                32,
                 "uncommon_trap",
                 std::mem::offset_of!(JitRuntimeHelpers, uncommon_trap),
             ),
             (
-                32,
+                33,
                 "math_fma_double",
                 std::mem::offset_of!(JitRuntimeHelpers, math_fma_double),
             ),
             (
-                33,
+                34,
                 "math_fma_float",
                 std::mem::offset_of!(JitRuntimeHelpers, math_fma_float),
             ),
             (
-                34,
+                35,
                 "tlab_cursor_offset_in_thread",
                 std::mem::offset_of!(JitRuntimeHelpers, tlab_cursor_offset_in_thread),
             ),
             (
-                35,
+                36,
                 "tlab_end_offset_in_thread",
                 std::mem::offset_of!(JitRuntimeHelpers, tlab_end_offset_in_thread),
             ),
             (
-                36,
+                37,
                 "class_id_offset_in_obj",
                 std::mem::offset_of!(JitRuntimeHelpers, class_id_offset_in_obj),
             ),
             (
-                37,
+                38,
                 "get_current_thread",
                 std::mem::offset_of!(JitRuntimeHelpers, get_current_thread),
             ),
             (
-                38,
+                39,
                 "tlab_post_init",
                 std::mem::offset_of!(JitRuntimeHelpers, tlab_post_init),
             ),
             (
-                39,
+                40,
                 "frame_record",
                 std::mem::offset_of!(JitRuntimeHelpers, frame_record),
             ),
             (
-                40,
+                41,
                 "shadow_stack_offset_in_thread",
                 std::mem::offset_of!(JitRuntimeHelpers, shadow_stack_offset_in_thread),
             ),
             (
-                41,
+                42,
                 "throw_exception",
                 std::mem::offset_of!(JitRuntimeHelpers, throw_exception),
             ),
             (
-                42,
+                43,
                 "jit_npe_with_action",
                 std::mem::offset_of!(JitRuntimeHelpers, jit_npe_with_action),
             ),
             (
-                43,
+                44,
                 "dispatch_threw",
                 std::mem::offset_of!(JitRuntimeHelpers, dispatch_threw),
             ),
             (
-                44,
+                45,
                 "jit_frem",
                 std::mem::offset_of!(JitRuntimeHelpers, jit_frem),
             ),
             (
-                45,
+                46,
                 "jit_drem",
                 std::mem::offset_of!(JitRuntimeHelpers, jit_drem),
             ),
             (
-                46,
+                47,
                 "self_call_stack_guard",
                 std::mem::offset_of!(JitRuntimeHelpers, self_call_stack_guard),
             ),
             (
-                47,
+                48,
                 "region_bounds_addr",
                 std::mem::offset_of!(JitRuntimeHelpers, region_bounds_addr),
             ),
             (
-                48,
+                49,
                 "native_stack_floor_fn",
                 std::mem::offset_of!(JitRuntimeHelpers, native_stack_floor_fn),
             ),
@@ -1358,7 +1369,7 @@ mod tests {
 
     #[test]
     fn jit_runtime_helpers_all_fields_classified() {
-        // The macro must classify every field. 39 RequiredPtr + 5
+        // The macro must classify every field. 40 RequiredPtr + 5
         // Offset + 5 OptionalPtr = 49. A new field whose classification
         // is omitted will fail to compile (the macro requires both
         // arms); this test pins the *counts* so a reclassification
@@ -1375,7 +1386,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::OptionalPtr)
             .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
-        assert_eq!(req, 39, "required-pointer count drifted");
+        assert_eq!(req, 40, "required-pointer count drifted");
         assert_eq!(opt, 5, "optional-pointer count drifted");
         assert_eq!(off, 5, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
@@ -1419,7 +1430,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::RequiredPtr)
             .map(|e| e.name)
             .collect();
-        assert_eq!(names.len(), 39);
+        assert_eq!(names.len(), 40);
         for name in names {
             let mut h = make_helpers();
             // Zero the field by name via a match — the macro doesn't
@@ -1452,7 +1463,7 @@ mod tests {
     #[test]
     fn jit_runtime_helpers_all_required_null_reports_every_name() {
         // Zero EVERY required pointer at once: `null_pointers()` must
-        // return the complete set of 39 required-field names (and
+        // return the complete set of 40 required-field names (and
         // `validate()` must reject). This complements the per-field
         // sweep above — it proves the validator does not stop at the
         // first miss and that the offset/optional fields (left non-zero
@@ -1465,7 +1476,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::RequiredPtr)
             .map(|e| e.name)
             .collect();
-        assert_eq!(required.len(), 39, "expected 39 required pointers");
+        assert_eq!(required.len(), 40, "expected 40 required pointers");
         // throw_exception is the round-10 addition — pin it explicitly so
         // a regression that drops it from the required set is caught here
         // and not just by the count.
@@ -1557,6 +1568,7 @@ mod tests {
             "throw_arithmetic" => h.throw_arithmetic = 0,
             "invoke_dispatch" => h.invoke_dispatch = 0,
             "invoke_virtual_mic" => h.invoke_virtual_mic = 0,
+            "lambda_int_to_double" => h.lambda_int_to_double = 0,
             "write_barrier" => h.write_barrier = 0,
             "satb_pre_write_barrier" => h.satb_pre_write_barrier = 0,
             "uncommon_trap" => h.uncommon_trap = 0,

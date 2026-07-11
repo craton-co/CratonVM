@@ -17,6 +17,7 @@
 //! are compiled through this pipeline; others fall back to the
 //! single-pass `x64::compile`.
 
+use crate::JitInvokeInfo;
 use std::collections::{HashMap, HashSet};
 
 // ── Node identity ────────────────────────────────────────────────────
@@ -251,6 +252,8 @@ pub enum Op {
     Call {
         info_ptr: usize,
     },
+    /// Scalar TDigest lambda adapter. Inputs: [ctrl, mem, lambda, index].
+    LambdaIntToDouble,
 
     // ── Speculation guard (real-frame-deopt) ─────────────────────────
     /// Speculative guard. Inputs: `[ctrl, cond]`. If `cond` is zero at
@@ -522,6 +525,7 @@ pub struct IrBuilder {
     /// live across the call — found by the conservative GC scan of the spilled
     /// frame, sound because GC is non-moving while a JIT frame is active).
     invoke_info: HashMap<usize, (usize, usize, u8)>,
+    pub tdigest_scalar_kernel: bool,
     /// inc 26/35: resolved `ldc2_w` (0x14) constant values (`pc → (bits, is_double)`).
     /// Set by [`Self::set_ldc2w_info`]; an `ldc2_w` pc not present bails to
     /// single-pass. `is_double` selects the lowering: a `long` constant becomes
@@ -568,6 +572,7 @@ impl IrBuilder {
             new_info: HashMap::new(),
             trivial_init_pcs: HashSet::new(),
             invoke_info: HashMap::new(),
+            tdigest_scalar_kernel: false,
             ldc2w_info: HashMap::new(),
         }
     }
@@ -1947,6 +1952,31 @@ impl IrBuilder {
                 // Both are 3-byte instructions. A pc not in `invoke_info` (gate
                 // off, or a non-emittable invoke present) bails to single-pass.
                 0xb6 | 0xb8 => {
+                    // Scalarize the fixed erased adapter in Dist's private
+                    // numeric kernels before it creates Integer/Double boxes.
+                    if op == 0xb8
+                        && self.tdigest_scalar_kernel
+                        && pc + 14 <= code.len()
+                        && code[pc + 3] == 0xb9
+                        && code[pc + 8] == 0xc0
+                        && code[pc + 11] == 0xb6
+                    {
+                        if self.stack.len() >= 2 {
+                            let index = self.pop();
+                            let lambda = self.pop();
+                            let inputs = vec![self.ctrl, self.mem, lambda, index];
+                            let call = self.graph.add(
+                                Op::LambdaIntToDouble,
+                                IrType::Double,
+                                inputs,
+                                Some(pc),
+                            );
+                            self.mem = call;
+                            self.push(call);
+                            pc += 14;
+                            continue;
+                        }
+                    }
                     let (info_ptr, num_args, ret_type) = match self.invoke_info.get(&pc) {
                         Some(&t) => t,
                         None => return None,

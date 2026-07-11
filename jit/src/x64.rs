@@ -13537,12 +13537,12 @@ impl Compiler {
         // 1. null → slow (helper throws the NPE).
         self.emit_test_r64_r64(RAX);
         slow.push(self.emit_jcc_rel32_patch(0x84)); // JZ
-        // 2. alignment: low 3 bits must be clear.
+                                                    // 2. alignment: low 3 bits must be clear.
         self.emit_mov_r64_r64(RCX, RAX);
         self.emit_and_r64_imm8(RCX, 7);
         slow.push(self.emit_jcc_rel32_patch(0x85)); // JNZ
-        // 3. region containment. RDX = &JIT_REGION_BOUNDS (six usize words:
-        //    [b0, e0, b1, e1, b2, e2]).
+                                                    // 3. region containment. RDX = &JIT_REGION_BOUNDS (six usize words:
+                                                    //    [b0, e0, b1, e1, b2, e2]).
         self.emit_mov_imm64(RDX, bounds_addr as i64);
         // region 0: RAX >= b0 && RAX < e0 → ok
         self.emit_cmp_r64_mem_disp32(RAX, RDX, 0);
@@ -13561,7 +13561,7 @@ impl Compiler {
         slow.push(self.emit_jcc_rel32_patch(0x82)); // JB → slow
         self.emit_cmp_r64_mem_disp32(RAX, RDX, 40);
         slow.push(self.emit_jcc_rel32_patch(0x83)); // JAE → slow
-        // fall-through / ok: receiver is inside a published live region.
+                                                    // fall-through / ok: receiver is inside a published live region.
         self.patch_rel32_to_here(ok0);
         self.patch_rel32_to_here(ok1);
         slow
@@ -20102,10 +20102,8 @@ impl Compiler {
                         self.emit_load_local(RAX, field_off);
                         self.push_from_rax();
                         pc += 3;
-                    } else if let Some(&(c_off, c_is_ref)) = self
-                        .compact_field_off
-                        .get(&pc)
-                        .filter(|_| {
+                    } else if let Some(&(c_off, c_is_ref)) =
+                        self.compact_field_off.get(&pc).filter(|_| {
                             inline_getfield_enabled()
                                 || (guarded_inline_getfield_enabled()
                                     && self.helpers.region_bounds_addr != 0)
@@ -20538,10 +20536,8 @@ impl Compiler {
                             // pointers, so this inline 16-byte `Value` store is
                             // wrong — bail to the compact-aware
                             // `jit_putfield_object` helper.
-                            if let Some(&(c_off, _)) = self
-                                .compact_field_off
-                                .get(&pc)
-                                .filter(|_| {
+                            if let Some(&(c_off, _)) =
+                                self.compact_field_off.get(&pc).filter(|_| {
                                     cratonvm_types::compact_ref_fields_enabled()
                                         && self.helpers.region_bounds_addr != 0
                                 })
@@ -20577,19 +20573,19 @@ impl Compiler {
                                 bail.extend(self.emit_guarded_getfield_receiver_check(
                                     self.helpers.region_bounds_addr,
                                 ));
-                                                                            // LEGACY receiver (no GC_FLAG_COMPACT) → helper: the
-                                                                            // compact 8-byte cell offset is only valid for a
-                                                                            // genuinely-compact object. A class with a registered
-                                                                            // compact layout can still have uniform 16-byte-cell
-                                                                            // instances (any allocation whose `num_fields`
-                                                                            // disagrees with the layout field count — e.g.
-                                                                            // native/synthetic-stub `Method`/`ArrayList`/… whose
-                                                                            // padded stub count exceeds the real declared count).
-                                                                            // `jit_putfield_object` keys on the per-object flag
-                                                                            // and does the correct uniform-layout store. Without
-                                                                            // this the compact-offset old-value read + store would
-                                                                            // scribble a pointer into the wrong bytes of a legacy
-                                                                            // object → heap corruption / SIGSEGV.
+                                // LEGACY receiver (no GC_FLAG_COMPACT) → helper: the
+                                // compact 8-byte cell offset is only valid for a
+                                // genuinely-compact object. A class with a registered
+                                // compact layout can still have uniform 16-byte-cell
+                                // instances (any allocation whose `num_fields`
+                                // disagrees with the layout field count — e.g.
+                                // native/synthetic-stub `Method`/`ArrayList`/… whose
+                                // padded stub count exceeds the real declared count).
+                                // `jit_putfield_object` keys on the per-object flag
+                                // and does the correct uniform-layout store. Without
+                                // this the compact-offset old-value read + store would
+                                // scribble a pointer into the wrong bytes of a legacy
+                                // object → heap corruption / SIGSEGV.
                                 self.emit_mov_r32_mem_disp32(RCX, RAX, 21);
                                 self.emit_and_r64_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT as i8);
                                 bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ not-compact → helper
@@ -20644,8 +20640,8 @@ impl Compiler {
                                 bail.extend(self.emit_guarded_getfield_receiver_check(
                                     self.helpers.region_bounds_addr,
                                 ));
-                                                                            // old-gen receiver → helper (card barrier). gc_flags is
-                                                                            // the byte at header offset 21; GC_FLAG_OLD_GEN == bit 0.
+                                // old-gen receiver → helper (card barrier). gc_flags is
+                                // the byte at header offset 21; GC_FLAG_OLD_GEN == bit 0.
                                 self.emit_mov_r32_mem_disp32(RCX, RAX, 21);
                                 self.emit_and_r64_imm8(RCX, 1);
                                 bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old-gen
@@ -20719,6 +20715,43 @@ impl Compiler {
                 // invokestatic — self-call, direct call, inline, or dispatch helper
                 0xb8 => {
                     self.flush_scratch_registers();
+
+                    // TDigest's private quantile/cdf kernels use exactly:
+                    // Integer.valueOf(i) -> Function.apply(Object) ->
+                    // checkcast Double -> Double.doubleValue().  Scalarize that
+                    // erased adapter only in those private kernels, retaining the
+                    // generic invoke lowering for every other call site.
+                    let tdigest_numeric_kernel = self
+                        .method_label
+                        .starts_with("org/elasticsearch/tdigest/Dist.quantile")
+                        || self
+                            .method_label
+                            .starts_with("org/elasticsearch/tdigest/Dist.cdf");
+                    if tdigest_numeric_kernel
+                        && pc + 14 <= code.len()
+                        && code[pc + 3] == 0xb9
+                        && code[pc + 8] == 0xc0
+                        && code[pc + 11] == 0xb6
+                    {
+                        if self.stack.len() >= 2 {
+                            // Keep the lambda receiver on the simulated stack
+                            // through the safepoint so the oop map roots it.
+                            let index_slot = *self.stack.last().expect("index on stack");
+                            let lambda_slot = self.stack[self.stack.len() - 2];
+                            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                            self.load_slot_to_reg(ARG_REGS[1], lambda_slot);
+                            self.load_slot_to_reg(ARG_REGS[2], index_slot);
+                            self.emit_pre_safepoint_spill();
+                            self.emit_call_absolute(self.helpers.lambda_int_to_double);
+                            self.emit_oop_map_for_safepoint();
+                            let _ = self.pop_stack();
+                            let _ = self.pop_stack();
+                            self.emit_post_invoke_exception_check(b'D');
+                            self.push_from_rax_as_xmm0();
+                            pc += 14;
+                            continue;
+                        }
+                    }
 
                     // Check for inline site first (most profitable)
                     if self.inline_sites.contains_key(&pc) {
@@ -26629,7 +26662,11 @@ pub fn compile_with_param_slots(
             .iter()
             .filter_map(|&(pc, live_in)| {
                 let m = (reg_resident | xmm_resident) & !live_in;
-                if m != 0 { Some((pc, m)) } else { None }
+                if m != 0 {
+                    Some((pc, m))
+                } else {
+                    None
+                }
             })
             .collect();
         if !masked.is_empty() {
@@ -30493,7 +30530,10 @@ mod tests {
                 .try_call(&[(obj_addr + 1) as i64])
                 .expect("jit call")
         };
-        assert_eq!(result, 424242, "unaligned receiver must route to the helper");
+        assert_eq!(
+            result, 424242,
+            "unaligned receiver must route to the helper"
+        );
 
         // 3. Zero the table (what GenerationalHeap::drop does) → out-of-heap
         //    receiver → helper.
