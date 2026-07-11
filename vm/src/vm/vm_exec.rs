@@ -730,25 +730,20 @@ fn safe_native_call_impl(
     // popped from the operand stack into this Rust slice and are otherwise
     // invisible to `collect_roots` / frame scanning during a safepoint GC.
     let pin_base = thread.native_pin_roots.len();
-    let mut inline_root_indices = [None; 4];
-    let mut overflow_root_indices =
-        (args.len() > inline_root_indices.len()).then(|| Vec::with_capacity(args.len()));
-    for (index, a) in args.iter().enumerate() {
+    // Retain a root index for every argument. The former four-element inline
+    // buffer could be selected before a re-entrant native path exposed a
+    // longer argument slice, leading to a bounds panic while remapping roots
+    // at the next safepoint.
+    let mut arg_root_indices = Vec::with_capacity(args.len());
+    for a in args {
         let before = thread.native_pin_roots.len();
         match (prevalidated_objects, a) {
             (true, Value::Object(Some(object))) => thread.native_pin_roots.push(*object),
             _ => pin_value_for_native_call(shared, &mut thread.native_pin_roots, a),
         }
         let root_index = (thread.native_pin_roots.len() > before).then_some(before);
-        if let Some(indices) = overflow_root_indices.as_mut() {
-            indices.push(root_index);
-        } else {
-            inline_root_indices[index] = root_index;
-        }
+        arg_root_indices.push(root_index);
     }
-    let arg_root_indices: &[Option<usize>] = overflow_root_indices
-        .as_deref()
-        .unwrap_or(&inline_root_indices[..args.len()]);
     let native_pin_base = thread.native_pin_roots.len();
 
     let mut remapped_args = None;
