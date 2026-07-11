@@ -4,6 +4,25 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-11 Spring suite genuine-bug list reconfirmed (125 → 96 open, 29 fixed)
+
+Scoped rerun of exactly the 125-class list from the doc below on dev
+`9948295e` (not a full 516-class HotSpot cross-reference). 29/125 now pass —
+`core.test.tools.CompiledTests` was fixed by commit `2ed5f407`
+(loader-defining-visibility fix in the real-JDK `loadClass` fast path); the
+other 28 most likely benefited from the same fix (shared
+`MockitoException`/`CompilationException`/CGLIB-proxy-`ABEND` symptoms), not
+individually root-caused. 10 of the previously-documented 31 "newly broken /
+HIB-CV-32" classes are among the 29 fixed. Four new failure clusters
+characterized within the remaining 96 (not yet root-caused): an 11-class AOT
+bean-registration TIMEOUT cluster (all hard-hang at the 120s ceiling), an
+8-class Groovy scripting cluster (high per-method failure ratios), a broad
+WebFlux reactive FAIL/EMPTY cluster, and 6 ABEND crashes with `found=0`
+(crash before test discovery, distinct from the mid-run HIB-CV-32 crash
+shape). See
+[`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](CRATONVM-SPRING-GENUINE-BUGLIST-125.md)
+for full detail.
+
 ## 2026-07-11 `HashMap` put/get ~230-365x slower than JDK-25 root-caused, partially fixed — fixed per-native-call dispatch overhead, not allocation/GC
 
 Initial hypothesis (Integer autoboxing/allocation pressure) was wrong. cdb
