@@ -2175,37 +2175,38 @@ pub fn inline_getfield_enabled() -> bool {
 /// not publish bounds (G1/ZGC → table all zeros) — branches to the checked
 /// helper, preserving its NPE / `i64::MIN`-sentinel semantics exactly.
 ///
-/// KNOWN OPEN RISK (found 2026-07-10 investigating the ES
-/// DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests /
-/// IVFKnnFloatVectorQueryTests hang cluster,
-/// docs/known-issues/elasticsearch-suite/): with this path on,
-/// `testSlicesDense` under JIT SIGSEGVs almost immediately (dmesg: `segfault
-/// at 4c`, gdb: an AALOAD bounds-check dereferencing a receiver of `0x40` —
-/// a small int value used as an array pointer, i.e. a getfield result feeding
-/// a later array access got corrupted). Bisection confirmed this guard is a
-/// genuine NEW regression (`CRATONVM_JIT_GETFIELD_HELPER=1` makes it
-/// disappear), not a pre-existing bug surfacing, and ruled out the sibling
-/// OSR-newarray change as the cause. The exact corrupting instruction was
-/// NOT pinned down (the region-bounds containment check and the per-object
-/// `GC_FLAG_COMPACT` routing both read correctly on static review) — repros
-/// reliably via the command in the known-issue doc.
-///
-/// A same-day commit (`93b335765`) flipped this default OFF pending root-cause
-/// (costing ~35-40% throughput on getfield-heavy workloads like bintrees-18 —
-/// re-measured 2026-07-10). Flipped back to DEFAULT-ON: the throughput win is
-/// large and the crash is a narrow, specific repro (Lucene vector query path),
-/// not a general correctness hazard blocking most workloads — the trade-off
-/// favors keeping the fast path on while the root cause is investigated
-/// separately (see the tracked follow-up task). If you hit a SIGSEGV matching
-/// this signature (AALOAD/array-bounds fault on a small-int-looking pointer,
-/// shortly after a getfield), set `CRATONVM_JIT_GETFIELD_HELPER=1` as an
-/// immediate workaround and cross-reference the known-issue docs above.
+/// FLIPPED BACK OFF then RE-ENABLED, same day (2026-07-10): investigating the
+/// ES DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests /
+/// IVFKnnFloatVectorQueryTests hang cluster
+/// (docs/known-issues/elasticsearch-suite/) found `testSlicesDense` under JIT
+/// SIGSEGVing almost immediately with this path default-on (dmesg: `segfault
+/// at 4c`, gdb: an AALOAD bounds-check dereferencing a receiver of `0x40` — a
+/// small int value used as an array pointer, i.e. a getfield RESULT feeding a
+/// later array access got corrupted) — the flag was flipped to opt-in
+/// (`CRATONVM_JIT_GUARDED_GETFIELD=1`) pending root-cause. That root cause
+/// was found and fixed the SAME DAY, in a different investigation
+/// (the WildFly Host Controller invoke-inline-cache SIGSEGV): the vm-side JIT
+/// field resolvers fabricated a `(0, false)` "compact slot" for any field
+/// with NO genuine registered `CompactLayout` entry, and the compact-offset
+/// inline getfield arm trusted it — a REFERENCE field with the fabricated
+/// `is_ref=false` fell into the int-category match arm and got a 32-bit
+/// `MOVSXD` load of half a `Value` cell, producing exactly this "small-int
+/// garbage used as a pointer" shape. See
+/// docs/internal/wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver-FIXED.md
+/// for the full chain. Re-verified clean with
+/// `CRATONVM_JIT_GUARDED_GETFIELD=1` against the exact IVF-KNN repro (no
+/// SIGSEGV, no dmesg segfault entry — only the separate, still-OPEN,
+/// already-tracked Lucene IndexWriter/STW-monitor-race hang this doc's own
+/// "underlying interpreter hang" section describes) — re-enabled default-ON.
+/// `CRATONVM_JIT_GETFIELD_HELPER=1` restores the helper-only path if a new
+/// corruption is ever suspected here again.
 pub fn guarded_inline_getfield_enabled() -> bool {
-    // NOT OnceLock-cached: this is a JIT COMPILE-TIME gate, read once per
-    // getfield call SITE during compilation, never on the runtime hot path —
-    // so re-reading the env var every call has no measurable cost, and
-    // avoids the opt-out being racy against whichever test/thread first
-    // triggers ANY getfield compilation in the process.
+    // NOT OnceLock-cached (unlike the other flags in this file): this is a
+    // JIT COMPILE-TIME gate, read once per getfield call SITE during
+    // compilation, never on the runtime hot path — so re-reading the env
+    // var every call has no measurable cost. Caching it would make the
+    // off-switch racy against whichever test/thread first triggers ANY
+    // getfield compilation in the process.
     std::env::var_os("CRATONVM_JIT_GETFIELD_HELPER").is_none()
 }
 
@@ -29977,6 +29978,11 @@ mod tests {
     ///     load could produce).
     #[test]
     fn test_getfield_guarded_inline_fast_and_fallback() {
+        // guarded_inline_getfield_enabled() is default-ON (see its doc
+        // comment) -- no env var needed to exercise this path. If a test run
+        // sets CRATONVM_JIT_GETFIELD_HELPER=1 to force the helper-only path
+        // globally, this test's own assertions about the inline guard would
+        // no longer hold; nothing here does that.
         use std::sync::atomic::{AtomicUsize, Ordering};
         static TEST_BOUNDS: [AtomicUsize; 6] = [
             AtomicUsize::new(0),

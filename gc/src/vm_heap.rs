@@ -449,18 +449,24 @@ impl VmHeap {
     ///   peer root — the VM pins those via
     ///   [`crate::gc_quiescence::add_pinned_jit_root`]) are excluded from the
     ///   CSet, so nothing a frozen peer can address moves.
+    /// - ZGC (INT-3 residual): trivially safe — `ZgcRealHeap` is a
+    ///   non-moving STW mark-sweep whose sweep walks the allocation-base
+    ///   REGISTRY (never linear memory), and [`Self::refill_tlab`] never
+    ///   hands ZGC mutators a TLAB, so un-retired tails cannot exist. A
+    ///   frozen peer's conservative roots are ordinary (pinned-by-design)
+    ///   mark roots.
     ///
     /// The collector only engages the forcible in-JIT-peer take-over when
-    /// this is `true`; ZGC still takes the cooperative-wait path (and so
-    /// keeps INT-3's livelock exposure there).
+    /// this is `true` — now on every backend.
     pub fn supports_jit_tlab_skip(&self) -> bool {
-        matches!(self, VmHeap::Generational(_) | VmHeap::G1(_))
+        true
     }
 
     /// BUG-03 / INT-3 — publish the reserved TLAB tails of forcibly-stopped
     /// in-JIT peers so the collection skips them (non-moving-sweep skip list
     /// on Generational; region-walker skip + CSet exclusion on G1). No-op on
-    /// backends without the protocol (see [`Self::supports_jit_tlab_skip`]).
+    /// ZGC, whose mutators never hold TLABs (the published list is always
+    /// empty there — see [`Self::supports_jit_tlab_skip`]).
     pub fn set_jit_tlab_skip_regions(&self, regions: &[(usize, usize)]) {
         match self {
             VmHeap::Generational(h) => h.set_jit_tlab_skip_regions(regions),

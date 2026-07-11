@@ -42,6 +42,10 @@ static TEST_REGION_BOUNDS: [std::sync::atomic::AtomicUsize; 6] = [
 ];
 
 fn dummy_helpers() -> JitRuntimeHelpers {
+    // guarded_inline_getfield_enabled() is default-ON (jit/src/x64.rs) --
+    // this whole file's contract ("no runtime helper reachable" via the
+    // wide-open TEST_REGION_BOUNDS above) relies on the guarded-inline path
+    // being taken, which now happens without an explicit opt-in.
     unsafe extern "C" fn stub() {
         panic!("ir_vs_singlepass invoked an unwired runtime helper");
     }
@@ -1112,6 +1116,9 @@ fn compile_opt_fields(
     field_resolver: &dyn Fn(u16) -> Option<(usize, u8)>,
     optimize: bool,
 ) -> Option<CompiledMethod> {
+    // No registered CompactLayout for this test's synthetic buffers -- None
+    // (not a fabricated (0, false)) is the correct "no compact slot" value;
+    // see cp_field_resolver's Option<(u32, bool)> contract in jit/src/lib.rs.
     let field_resolver_with_compact =
         |cp_idx| field_resolver(cp_idx).map(|(field_index, tag)| (field_index, tag, None));
     try_compile(
