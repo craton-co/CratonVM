@@ -24523,6 +24523,82 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             native_string_replace_charseq,
         );
     }
+    // `CRATONVM_NATIVE_MATCHER_FIND`: real-JDK-layout `Matcher.find()`/
+    // `find(int)`/`start`/`end`/`group` fast path — see the "java.util.regex.
+    // Matcher — real-JDK-layout `find()`/`find(int)` fast path" module banner
+    // further down this file (`native_matcher_find_realjdk`) for the full
+    // design. Unlike `CRATONVM_NATIVE_STRING_REGEX` above, this accelerates
+    // the explicit `Pattern.compile(...).matcher(...)` + `while (m.find())`
+    // idiom, not just the `String` convenience methods. DEFAULT-ON (opt-out
+    // `=0`/`false`) after a 141-case parity battery confirmed byte-identical
+    // results to HotSpot; read directly (native-builtins cannot depend on
+    // vm::env_cache) with the SAME semantics as
+    // `env_cache::native_matcher_find`.
+    let native_matcher_find_enabled = match std::env::var("CRATONVM_NATIVE_MATCHER_FIND") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    };
+    if native_matcher_find_enabled {
+        // `NativeKind::Intrinsic`: required so `NativeMethodRegistry::register`'s
+        // `keep_real_matcher_find_fastpath` exception (registry.rs) applies —
+        // otherwise the unconditional real-JDK-mode Pattern/Matcher drop
+        // (aimed at the legacy synthetic-layout bridge) would silently
+        // swallow this registration too, since that drop keys on class name
+        // alone. MUST be `Intrinsic`, not `Bridge`: the legacy synthetic
+        // `Matcher.find`/`find(int)` this drop targets is itself registered
+        // under `Bridge` in the real-JDK build (inherited from an ambient
+        // `set_category(Bridge)` far above its own registration site) — using
+        // `Bridge` here too would make the registry.rs exception match BOTH
+        // registrations, silently un-dropping the legacy synthetic-layout
+        // bridge alongside this one and corrupting every real `Matcher`
+        // object via its raw slot-index field writes. See the long comment
+        // on `keep_real_matcher_find_fastpath` in registry.rs for the full
+        // story (this was a real regression caught during validation, not a
+        // hypothetical).
+        registry.with_category(cratonvm_native_api::NativeKind::Intrinsic, |registry| {
+            registry.register(
+                "java/util/regex/Matcher",
+                "find",
+                "()Z",
+                native_matcher_find_realjdk,
+            );
+            registry.register(
+                "java/util/regex/Matcher",
+                "find",
+                "(I)Z",
+                native_matcher_find_at_realjdk,
+            );
+            // `start`/`end`/`group` read-only accessors over the state
+            // `find`/`find(int)` already populate correctly — see the "---
+            // `start()`/`end()`/..." banner above their implementations.
+            registry.register("java/util/regex/Matcher", "start", "()I", native_matcher_start_realjdk);
+            registry.register("java/util/regex/Matcher", "end", "()I", native_matcher_end_realjdk);
+            registry.register(
+                "java/util/regex/Matcher",
+                "start",
+                "(I)I",
+                native_matcher_start_idx_realjdk,
+            );
+            registry.register(
+                "java/util/regex/Matcher",
+                "end",
+                "(I)I",
+                native_matcher_end_idx_realjdk,
+            );
+            registry.register(
+                "java/util/regex/Matcher",
+                "group",
+                "()Ljava/lang/String;",
+                native_matcher_group_realjdk,
+            );
+            registry.register(
+                "java/util/regex/Matcher",
+                "group",
+                "(I)Ljava/lang/String;",
+                native_matcher_group_idx_realjdk,
+            );
+        });
+    }
     registry.with_category(cratonvm_native_api::NativeKind::SyntheticStub, |registry| {
         registry.register(
             "java/nio/ByteBuffer",
@@ -49745,6 +49821,57 @@ impl JavaRegex {
         }
     }
 
+    /// Like [`Self::captures`], but starts the search at byte offset `start`
+    /// within `text` while keeping `text`'s own bounds as the anchor context
+    /// for `^`/`$`/`\A`/`\z` (i.e. NOT the same as `captures(&text[start..])`,
+    /// which would incorrectly let `^` match at `start`). This is exactly the
+    /// semantics `java.util.regex.Matcher.find()` needs: search resumes after
+    /// the previous match, but anchors still refer to the matcher's region
+    /// bounds, not to the resume point. See the `regex`/`fancy-regex` crate
+    /// docs for `captures_at`/`captures_from_pos` for the same contract.
+    pub fn captures_at(&self, text: &str, start: usize) -> Option<JavaCaptures> {
+        match self {
+            JavaRegex::Std(r) => {
+                let caps = r.captures_at(text, start)?;
+                let groups: Vec<Option<JavaMatch>> = (0..caps.len())
+                    .map(|i| {
+                        caps.get(i).map(|m| JavaMatch {
+                            start: m.start(),
+                            end: m.end(),
+                            text: m.as_str().to_string(),
+                        })
+                    })
+                    .collect();
+                let mut named = std::collections::HashMap::new();
+                for (idx, name) in r.capture_names().enumerate() {
+                    if let Some(n) = name {
+                        named.insert(n.to_string(), idx);
+                    }
+                }
+                Some(JavaCaptures { groups, named })
+            }
+            JavaRegex::Fancy(r) => {
+                let caps = r.captures_from_pos(text, start).ok().flatten()?;
+                let groups: Vec<Option<JavaMatch>> = (0..caps.len())
+                    .map(|i| {
+                        caps.get(i).map(|m| JavaMatch {
+                            start: m.start(),
+                            end: m.end(),
+                            text: m.as_str().to_string(),
+                        })
+                    })
+                    .collect();
+                let mut named = std::collections::HashMap::new();
+                for (idx, name) in r.capture_names().enumerate() {
+                    if let Some(n) = name {
+                        named.insert(n.to_string(), idx);
+                    }
+                }
+                Some(JavaCaptures { groups, named })
+            }
+        }
+    }
+
     pub fn captures(&self, text: &str) -> Option<JavaCaptures> {
         match self {
             JavaRegex::Std(r) => {
@@ -52534,6 +52661,859 @@ fn native_matcher_has_match(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         .as_int()
         .unwrap_or(-1);
     Ok(Some(Value::Int(if match_start >= 0 { 1 } else { 0 })))
+}
+
+// ===========================================================================
+// java.util.regex.Matcher — real-JDK-layout `find()`/`find(int)` fast path
+// ===========================================================================
+//
+// Everything above this banner (`native_matcher_find` etc.) is the LEGACY
+// synthetic-layout bridge, unconditionally dropped in real-JDK mode by
+// `NativeMethodRegistry::register` (see `drop_real_layout_synthetic` in
+// `native-api/src/registry.rs`) — see
+// `docs/known-issues/matcher-native-full-input-redecode-quadratic.md`. It is
+// dead code for every program this VM actually runs by default.
+//
+// This section is different: it operates on the REAL OpenJDK
+// `java.util.regex.Matcher`/`Pattern` object layout (fields resolved BY NAME
+// via `get_field_by_name`/`resolve_field_index`, never by hardcoded slot
+// index — the exact same real-vs-synthetic-layout corruption the doc above
+// warns about is avoided by construction). It intercepts only
+// `Matcher.find()Z` / `Matcher.find(I)Z`, the two methods the interpreted
+// `java.util.regex` engine spends the vast majority of its time in for the
+// extremely common `while (m.find()) { ...; m.group(N); }` idiom (see
+// `docs/internal/wildfly-suite-bugs/bug-03-regex-perf-deployment-build.md`
+// for the interpreter-throughput root cause this works around). Every other
+// `Matcher` method — `group`/`start`/`end`/`region`/`appendReplacement`/
+// `matches`/`lookingAt`/`reset`/... — is left as real JDK bytecode, reading
+// the SAME `groups`/`first`/`last`/`modCount`/... fields this fast path
+// writes, so a program can freely mix accelerated `find()` calls with
+// unaccelerated calls to any other `Matcher` method and see fully consistent
+// state either way (the same "own the object model, not just an isolated
+// method" contract SBR-02's `String.replaceAll` native established for
+// literal String methods, extended here to a stateful object's method
+// surface).
+//
+// Any usage this fast path cannot faithfully reproduce (a non-`String`
+// `CharSequence` input — `charAt`-loop decoding it would reintroduce the
+// exact per-call boundary-crossing cost this exists to eliminate;
+// `transparentBounds(true)`; `anchoringBounds(false)`; a group-count
+// mismatch between the compiled Rust regex and the real `Pattern`'s own
+// `capturingGroupCount`) makes the native decline via
+// `ctx.invoke_virtual_bytecode_only`, which re-enters the SAME (class,
+// method, descriptor) triple but skips the native-override check — i.e. it
+// runs the real `Matcher.find()`/`find(int)` bytecode body directly, with
+// zero risk of infinite native-to-native recursion and zero correctness
+// risk (real Java semantics, just without the speedup for that one call).
+//
+// Known, accepted residual: `hitEnd()`/`requireEnd()` after a call serviced
+// by this fast path are best-effort approximations, not bit-identical to
+// HotSpot's backtracking-engine bookkeeping (see `matcher_realjdk_set_hit_end`
+// below) — the same category of documented, opt-out-guarded residual SBR-02
+// already accepted for Rust-regex-vs-`java.util.regex` engine differences
+// (possessive quantifiers, `\p{...}` property names, Unicode case folding).
+// `hitEnd`/`requireEnd` are consulted almost exclusively by `java.util.Scanner`
+// deciding whether to pull more data from an underlying `Readable` before
+// giving up — for the single-shot, already-fully-buffered `CharSequence`
+// inputs this fast path requires, an imprecise `hitEnd` cannot change the
+// match RESULT a caller observes, only (in the Scanner case) whether it
+// makes one extra, ultimately-irrelevant read attempt against a stream that
+// has no more data anyway.
+
+/// Real `java.util.regex.Matcher` field names (by name, not slot index —
+/// see the module banner above for why that distinction matters here).
+mod matcher_realjdk_fields {
+    pub const PARENT_PATTERN: &str = "parentPattern";
+    pub const TEXT: &str = "text";
+    pub const FROM: &str = "from";
+    pub const TO: &str = "to";
+    pub const FIRST: &str = "first";
+    pub const LAST: &str = "last";
+    pub const OLD_LAST: &str = "oldLast";
+    pub const GROUPS: &str = "groups";
+    pub const HIT_END: &str = "hitEnd";
+    pub const REQUIRE_END: &str = "requireEnd";
+    pub const TRANSPARENT_BOUNDS: &str = "transparentBounds";
+    pub const ANCHORING_BOUNDS: &str = "anchoringBounds";
+    pub const MOD_COUNT: &str = "modCount";
+}
+mod pattern_realjdk_fields {
+    pub const PATTERN: &str = "pattern";
+    pub const FLAGS: &str = "flags";
+    pub const CAPTURING_GROUP_COUNT: &str = "capturingGroupCount";
+}
+
+/// Resolved slot indices for every `Matcher`/`Pattern` field this fast path
+/// touches, resolved BY NAME exactly once (via `resolve_field_index`, the
+/// same name-based resolution `get_field_by_name` does internally) and
+/// cached forever after.
+///
+/// Why this exists: `get_field_by_name`/`set_field_by_name` each take a
+/// `class_manager` `RwLock::read()` and walk the class hierarchy searching
+/// for the field by name — on EVERY call, not just the first. A single
+/// `find()` call touches ~13 Matcher fields, so a naive by-name
+/// implementation pays that lock-plus-hierarchy-walk cost 13 times per
+/// match; measured, this was the dominant cost of the whole fast path
+/// (worse than the regex search itself). `get_field(obj, index)` by
+/// contrast resolves through a per-class-id CACHED descriptor lookup with
+/// no lock — see `vm/src/vm/vm_exec.rs`'s `get_field`/`get_field_by_name`
+/// implementations. Since `java.util.regex.Matcher`/`Pattern` are bootstrap
+/// classes (exactly one loaded definition VM-wide, field layout fixed for
+/// the process lifetime), resolving each field's slot index once via
+/// `resolve_field_index` and reusing it is both safe (still layout-agnostic
+/// — never a hardcoded slot number, just a cached RESULT of the same
+/// by-name resolution) and avoids paying the resolution cost on every call.
+#[derive(Clone, Copy)]
+struct MatcherFieldIndices {
+    parent_pattern: usize,
+    text: usize,
+    from: usize,
+    to: usize,
+    first: usize,
+    last: usize,
+    old_last: usize,
+    groups: usize,
+    hit_end: usize,
+    require_end: usize,
+    transparent_bounds: usize,
+    anchoring_bounds: usize,
+    mod_count: usize,
+}
+
+fn matcher_realjdk_field_indices(ctx: &mut dyn NativeContext) -> Option<MatcherFieldIndices> {
+    static CACHE: OnceLock<Option<MatcherFieldIndices>> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        use matcher_realjdk_fields as f;
+        const CLASS: &str = "java/util/regex/Matcher";
+        Some(MatcherFieldIndices {
+            parent_pattern: ctx.resolve_field_index(CLASS, f::PARENT_PATTERN)?,
+            text: ctx.resolve_field_index(CLASS, f::TEXT)?,
+            from: ctx.resolve_field_index(CLASS, f::FROM)?,
+            to: ctx.resolve_field_index(CLASS, f::TO)?,
+            first: ctx.resolve_field_index(CLASS, f::FIRST)?,
+            last: ctx.resolve_field_index(CLASS, f::LAST)?,
+            old_last: ctx.resolve_field_index(CLASS, f::OLD_LAST)?,
+            groups: ctx.resolve_field_index(CLASS, f::GROUPS)?,
+            hit_end: ctx.resolve_field_index(CLASS, f::HIT_END)?,
+            require_end: ctx.resolve_field_index(CLASS, f::REQUIRE_END)?,
+            transparent_bounds: ctx.resolve_field_index(CLASS, f::TRANSPARENT_BOUNDS)?,
+            anchoring_bounds: ctx.resolve_field_index(CLASS, f::ANCHORING_BOUNDS)?,
+            mod_count: ctx.resolve_field_index(CLASS, f::MOD_COUNT)?,
+        })
+    })
+}
+
+#[derive(Clone, Copy)]
+struct PatternFieldIndices {
+    pattern: usize,
+    flags: usize,
+}
+
+fn pattern_realjdk_field_indices(ctx: &mut dyn NativeContext) -> Option<PatternFieldIndices> {
+    static CACHE: OnceLock<Option<PatternFieldIndices>> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        use pattern_realjdk_fields as f;
+        const CLASS: &str = "java/util/regex/Pattern";
+        Some(PatternFieldIndices {
+            pattern: ctx.resolve_field_index(CLASS, f::PATTERN)?,
+            flags: ctx.resolve_field_index(CLASS, f::FLAGS)?,
+        })
+    })
+}
+
+/// One matcher's decoded input text plus the UTF-8-byte <-> UTF-16-code-unit
+/// offset tables needed to bridge Java's UTF-16 `Matcher` indices to the
+/// Rust `regex`/`fancy-regex` crates' UTF-8 byte offsets (and back). Built
+/// once per distinct `text` object and cached — this is what avoids the
+/// exact O(n)-redecode-per-call bug the legacy bridge had (see the module
+/// banner and `matcher-native-full-input-redecode-quadratic.md`), plus (new
+/// here) avoids paying the O(n) offset-table build more than once per input.
+/// Everything this fast path needs to run a search, resolved once per
+/// distinct `(matcher identity, text identity, pattern identity)` triple and
+/// cached — a SINGLE mutex lock covers text decode/offset-tables AND the
+/// compiled regex together, instead of two separate cache lookups (one for
+/// text, one via `compile_java_regex`'s own lock) on every `find()` call.
+/// Measured: consolidating these (plus resolving the `text` object's class
+/// only on a cache MISS, not every call — see `matcher_realjdk_cached`)
+/// meaningfully reduced per-call overhead versus two independent caches.
+struct MatcherRealCache {
+    /// `identity_hash_code` of the `text` field's current value, so a
+    /// `reset(CharSequence)` swap invalidates this entry (same GC-move-safe
+    /// keying rationale as the legacy `matcher_read_input_cached`).
+    text_identity: i32,
+    /// `identity_hash_code` of the `parentPattern` field's current value, so
+    /// `usePattern(Pattern)` swapping the compiled pattern invalidates this
+    /// entry too.
+    pattern_identity: i32,
+    utf8: std::sync::Arc<str>,
+    /// `byte_to_utf16[byte_offset] == utf16 code-unit offset at that byte`.
+    /// Length `utf8.len() + 1` (entries at non-char-boundary byte offsets
+    /// are unused filler — the `regex`/`fancy-regex` crates only ever report
+    /// match offsets on char boundaries).
+    byte_to_utf16: std::sync::Arc<[u32]>,
+    /// `utf16_to_byte[utf16_offset] == byte offset of that code unit`.
+    /// Length `utf16_len + 1`; the second unit of a surrogate pair maps to
+    /// the SAME byte offset as the first (both denote one Unicode scalar in
+    /// the UTF-8 side) — Java match boundaries essentially never split a
+    /// surrogate pair, matching the `regex` crate's own codepoint-atomic
+    /// match boundaries.
+    utf16_to_byte: std::sync::Arc<[u32]>,
+    /// Cloning a `JavaRegex` is cheap (the underlying `regex`/`fancy-regex`
+    /// engines are internally reference-counted), so storing the compiled
+    /// regex here and cloning it out on a cache hit avoids re-entering
+    /// `compile_java_regex`'s own separate mutex-guarded cache on every call.
+    re: JavaRegex,
+}
+
+fn matcher_realjdk_cache() -> &'static Mutex<std::collections::HashMap<i32, MatcherRealCache>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<i32, MatcherRealCache>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Build both offset tables in one O(n) pass over `s`.
+fn matcher_realjdk_build_offset_tables(s: &str) -> (Vec<u32>, Vec<u32>) {
+    let mut byte_to_utf16 = vec![0u32; s.len() + 1];
+    let mut utf16_to_byte = Vec::with_capacity(s.len() + 1);
+    let mut utf16_pos: u32 = 0;
+    for (byte_idx, ch) in s.char_indices() {
+        byte_to_utf16[byte_idx] = utf16_pos;
+        let units = ch.len_utf16();
+        for _ in 0..units {
+            utf16_to_byte.push(byte_idx as u32);
+        }
+        utf16_pos += units as u32;
+    }
+    byte_to_utf16[s.len()] = utf16_pos;
+    utf16_to_byte.push(s.len() as u32);
+    (byte_to_utf16, utf16_to_byte)
+}
+
+/// Fetch (rebuilding + caching if needed) the decoded text, offset tables,
+/// and compiled regex for `matcher`'s current `text`/`parentPattern`
+/// fields. Returns `None` if `text` is null or not a `java/lang/String`
+/// (caller falls back to real bytecode for any other `CharSequence` — see
+/// module banner), or if `parentPattern`/its `pattern`/`flags` fields can't
+/// be read.
+///
+/// The `text`-is-a-`String` class check only runs on a cache MISS — once a
+/// given `text` identity has been confirmed a `String`, later calls skip
+/// straight to the identity-hash comparison, which is what a class-manager
+/// `RwLock` read on every single call would otherwise force.
+fn matcher_realjdk_cached(
+    ctx: &mut dyn NativeContext,
+    matcher: ObjectRef,
+    idx: MatcherFieldIndices,
+    pattern_idx: PatternFieldIndices,
+) -> Option<(
+    std::sync::Arc<str>,
+    std::sync::Arc<[u32]>,
+    std::sync::Arc<[u32]>,
+    JavaRegex,
+)> {
+    let text_obj = match ctx.get_field(matcher, idx.text) {
+        Value::Object(Some(r)) => r,
+        _ => return None,
+    };
+    let pattern_obj = match ctx.get_field(matcher, idx.parent_pattern) {
+        Value::Object(Some(p)) => p,
+        _ => return None,
+    };
+    let text_identity = ctx.identity_hash_code(text_obj);
+    let pattern_identity = ctx.identity_hash_code(pattern_obj);
+    let matcher_identity = ctx.identity_hash_code(matcher);
+
+    if let Ok(guard) = matcher_realjdk_cache().lock() {
+        if let Some(entry) = guard.get(&matcher_identity) {
+            if entry.text_identity == text_identity && entry.pattern_identity == pattern_identity
+            {
+                return Some((
+                    entry.utf8.clone(),
+                    entry.byte_to_utf16.clone(),
+                    entry.utf16_to_byte.clone(),
+                    entry.re.clone(),
+                ));
+            }
+        }
+    }
+
+    // Cache miss: this is the only path that pays a class-manager lookup
+    // (confirming `text` is a real `String`, not some other `CharSequence`)
+    // and a fresh regex compile (itself cached by `compile_java_regex`, so
+    // even a cross-matcher-instance repeat of the same pattern text is
+    // cheap — just not as cheap as this cache's own zero-lock-contention
+    // clone-out on a hit).
+    let text_class = ctx.class_name_of_id(ctx.class_id_of_object(text_obj));
+    if text_class.as_deref() != Some("java/lang/String") {
+        return None;
+    }
+    let decoded = ctx.read_string(text_obj)?;
+    let pattern_str_obj = match ctx.get_field(pattern_obj, pattern_idx.pattern) {
+        Value::Object(Some(r)) => r,
+        _ => return None,
+    };
+    let pattern_text = ctx.read_string(pattern_str_obj)?;
+    let flags = ctx
+        .get_field(pattern_obj, pattern_idx.flags)
+        .as_int()
+        .unwrap_or(0);
+    let re = compile_java_regex(&pattern_text, flags).ok()?;
+
+    let (byte_to_utf16, utf16_to_byte) = matcher_realjdk_build_offset_tables(&decoded);
+    let utf8: std::sync::Arc<str> = std::sync::Arc::from(decoded.into_boxed_str());
+    let byte_to_utf16: std::sync::Arc<[u32]> = std::sync::Arc::from(byte_to_utf16.into_boxed_slice());
+    let utf16_to_byte: std::sync::Arc<[u32]> = std::sync::Arc::from(utf16_to_byte.into_boxed_slice());
+
+    if let Ok(mut guard) = matcher_realjdk_cache().lock() {
+        guard.insert(
+            matcher_identity,
+            MatcherRealCache {
+                text_identity,
+                pattern_identity,
+                utf8: utf8.clone(),
+                byte_to_utf16: byte_to_utf16.clone(),
+                utf16_to_byte: utf16_to_byte.clone(),
+                re: re.clone(),
+            },
+        );
+    }
+    Some((utf8, byte_to_utf16, utf16_to_byte, re))
+}
+
+/// Decline this fast path for the current call: re-enter the SAME (class,
+/// method, descriptor) triple with the native-override check skipped, so it
+/// runs the real JDK `Matcher` bytecode body. See module banner.
+fn matcher_realjdk_bail(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    method_name: &str,
+    descriptor: &str,
+    extra_args: &[Value],
+) -> MethodCallResult {
+    ctx.invoke_virtual_bytecode_only(this, method_name, descriptor, extra_args)
+}
+
+/// Shared core of `find()`/`find(int)`: given the search should resume at
+/// `next_search_utf16` (already clamped/advanced per the caller's own
+/// method-specific rule), run the search, write every field real
+/// `Matcher.search(int)` bytecode would write, and return whether it
+/// matched.
+///
+/// `groups_obj` MUST already be sized `capturingGroupCount * 2` by the real
+/// `Matcher` constructor (true for any real-JDK-allocated Matcher — real
+/// bytecode always runs the constructor since this native only ever
+/// intercepts `find`/`find(int)`, never `<init>`).
+#[allow(clippy::too_many_arguments)]
+fn matcher_realjdk_search(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    idx: MatcherFieldIndices,
+    re: &JavaRegex,
+    utf8: &str,
+    byte_to_utf16: &[u32],
+    utf16_to_byte: &[u32],
+    groups_obj: ObjectRef,
+    region_from_utf16: i32,
+    region_to_utf16: i32,
+    next_search_utf16: i32,
+) -> MethodCallResult {
+    let region_from_byte = utf16_to_byte[region_from_utf16.max(0) as usize] as usize;
+    let region_to_byte = utf16_to_byte[region_to_utf16.max(0) as usize] as usize;
+    let search_from_byte =
+        utf16_to_byte[next_search_utf16.max(0) as usize] as usize - region_from_byte;
+    let region_slice = &utf8[region_from_byte..region_to_byte];
+
+    ctx.set_field(this, idx.first, Value::Int(next_search_utf16));
+    // `oldLast = oldLast < 0 ? from : oldLast` — mirrors real `search(int)`.
+    let old_last = ctx.get_field(this, idx.old_last).as_int().unwrap_or(-1);
+    if old_last < 0 {
+        ctx.set_field(this, idx.old_last, Value::Int(next_search_utf16));
+    }
+
+    // Group-count safety net (checked by both callers via
+    // `matcher_realjdk_group_count_ok` BEFORE any field is mutated — doing
+    // it here instead would mean bailing to real bytecode after already
+    // having overwritten `first`/`oldLast` above, corrupting the state the
+    // bytecode fallback itself depends on). Trust the caller: by the time
+    // we're here, `re.captures_len() == groups_obj.length / 2` is already
+    // established, so every `caps.len()` below is guaranteed to match.
+    let caps = re.captures_at(region_slice, search_from_byte);
+    let matched = match caps {
+        Some(caps) => {
+            let mut whole_start = -1i32;
+            let mut whole_end = -1i32;
+            for i in 0..caps.len() {
+                let (s, e) = match caps.get(i) {
+                    Some(g) => {
+                        let abs_start_byte = region_from_byte + g.start;
+                        let abs_end_byte = region_from_byte + g.end;
+                        (
+                            byte_to_utf16[abs_start_byte] as i32,
+                            byte_to_utf16[abs_end_byte] as i32,
+                        )
+                    }
+                    None => (-1, -1),
+                };
+                if i == 0 {
+                    whole_start = s;
+                    whole_end = e;
+                }
+                ctx.set_array_element(groups_obj, 2 * i, Value::Int(s));
+                ctx.set_array_element(groups_obj, 2 * i + 1, Value::Int(e));
+            }
+            // `this.first`/`this.last` are the WHOLE MATCH's actual bounds
+            // (== groups[0]/groups[1]), NOT the position the search resumed
+            // from — real `Pattern$Start.match`'s own scan loop overwrites
+            // `matcher.first` as it tries each candidate position, so by the
+            // time of a successful match `first` reflects where the match
+            // itself begins, which for an unanchored pattern is commonly
+            // LATER than the resume position search started scanning at
+            // (e.g. `(a+)(b)` found starting at index 2 while the scan began
+            // at index 0). The provisional `FIRST = next_search_utf16` write
+            // above this match block exists only so a FAILED search still
+            // leaves a sensible in-progress value for any code that reads
+            // `first` mid-traversal in real JDK — overwritten here on
+            // success, matching what the real `Start` node does.
+            ctx.set_field(this, idx.first, Value::Int(whole_start));
+            ctx.set_field(this, idx.last, Value::Int(whole_end));
+            // `hitEnd` approximation (see module banner): real HotSpot's
+            // value depends on which internal `Pattern$Node` subclass the
+            // compiler chose for this exact pattern (e.g. a greedy
+            // quantifier's expansion reaching the region boundary vs. a
+            // literal/Boyer-Moore node concluding definitively) — verified
+            // against a 141-case parity battery that a plain "match end ==
+            // region end" boundary check is neither uniformly right nor
+            // uniformly wrong (JDK itself returns both `true` and `false`
+            // for different patterns whose match happens to end exactly at
+            // the region boundary), so no cheap boundary-only heuristic can
+            // close this without reimplementing HotSpot's backtracking
+            // engine. Kept as the closest-available signal; core `find()`/
+            // `group()`/`start()`/`end()` results are unaffected and fully
+            // parity-verified.
+            ctx.set_field(
+                this,
+                idx.hit_end,
+                Value::Int(if whole_end == region_to_utf16 { 1 } else { 0 }),
+            );
+            ctx.set_field(this, idx.require_end, Value::Int(0));
+            true
+        }
+        None => {
+            for i in 0..(ctx.array_length(groups_obj) / 2) {
+                ctx.set_array_element(groups_obj, 2 * i, Value::Int(-1));
+                ctx.set_array_element(groups_obj, 2 * i + 1, Value::Int(-1));
+            }
+            ctx.set_field(this, idx.first, Value::Int(-1));
+            // Best-effort: a failed search plausibly means the engine
+            // examined input through the region end. See module banner.
+            ctx.set_field(this, idx.hit_end, Value::Int(1));
+            false
+        }
+    };
+    let last = ctx.get_field(this, idx.last).as_int().unwrap_or(0);
+    ctx.set_field(this, idx.old_last, Value::Int(last));
+    let mod_count = ctx.get_field(this, idx.mod_count).as_int().unwrap_or(0);
+    ctx.set_field(this, idx.mod_count, Value::Int(mod_count.wrapping_add(1)));
+
+    Ok(Some(Value::Int(if matched { 1 } else { 0 })))
+}
+
+/// Real-JDK-layout `Matcher.find()Z`. See module banner for the full
+/// contract; mirrors real bytecode's own two-step algorithm exactly
+/// (`find()` computes the resume position from `first`/`last`/`from`/`to`,
+/// then what would be a `search(int)` call) so a zero-width match's
+/// next-position advance-by-one-UTF16-unit quirk — including its
+/// mid-surrogate-pair edge case — matches HotSpot bit-for-bit, rather than
+/// reimplementing a "nicer" char-boundary-safe advance.
+fn native_matcher_find_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        // No valid receiver at all — cannot even attempt a bytecode
+        // fallback (no object to dispatch on). Should be unreachable for a
+        // real instance-method call; mirror the legacy bridge's convention
+        // for this impossible case.
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let idx = match matcher_realjdk_field_indices(ctx) {
+        Some(idx) => idx,
+        None => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
+    };
+
+    if ctx.get_field(this, idx.transparent_bounds).as_int().unwrap_or(0) != 0
+        || ctx.get_field(this, idx.anchoring_bounds).as_int().unwrap_or(1) == 0
+    {
+        return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]);
+    }
+
+    let pattern_idx = match pattern_realjdk_field_indices(ctx) {
+        Some(p) => p,
+        None => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
+    };
+    let (utf8, byte_to_utf16, utf16_to_byte, re) =
+        match matcher_realjdk_cached(ctx, this, idx, pattern_idx) {
+            Some(t) => t,
+            None => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
+        };
+    let groups_obj = match ctx.get_field(this, idx.groups) {
+        Value::Object(Some(g)) => g,
+        _ => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
+    };
+    // Group-count safety net, checked BEFORE any field mutation below (see
+    // the comment in `matcher_realjdk_search` for why bailing after
+    // mutating `first`/`oldLast` would corrupt the fallback's own state).
+    if re.captures_len() != ctx.array_length(groups_obj) / 2 {
+        return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]);
+    }
+
+    let from = ctx.get_field(this, idx.from).as_int().unwrap_or(0);
+    let to = ctx
+        .get_field(this, idx.to)
+        .as_int()
+        .unwrap_or(byte_to_utf16[utf8.len()] as i32);
+    let first = ctx.get_field(this, idx.first).as_int().unwrap_or(-1);
+    let last = ctx.get_field(this, idx.last).as_int().unwrap_or(0);
+
+    let mut next_search = last;
+    if next_search == first {
+        next_search += 1;
+    }
+    if next_search < from {
+        next_search = from;
+    }
+    if next_search > to {
+        // Real `find()`'s own early-return branch: clear `groups[]` only,
+        // leave `first`/`last`/`modCount`/`hitEnd` untouched — replicated
+        // exactly (not a bug we're "fixing").
+        for i in 0..(ctx.array_length(groups_obj) / 2) {
+            ctx.set_array_element(groups_obj, 2 * i, Value::Int(-1));
+            ctx.set_array_element(groups_obj, 2 * i + 1, Value::Int(-1));
+        }
+        return Ok(Some(Value::Int(0)));
+    }
+
+    matcher_realjdk_search(
+        ctx,
+        this,
+        idx,
+        &re,
+        &utf8,
+        &byte_to_utf16,
+        &utf16_to_byte,
+        groups_obj,
+        from,
+        to,
+        next_search,
+    )
+}
+
+/// Real-JDK-layout `Matcher.find(I)Z`. Real bytecode's `find(int start)`
+/// calls `reset()` first (discards region/first/last/append-position, resets
+/// `from=0, to=length`) and THEN searches from `start` — the reset field
+/// writes below replicate that inline before running the shared search core.
+fn native_matcher_find_at_realjdk(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        // No valid receiver at all — see the analogous branch in
+        // `native_matcher_find_realjdk`.
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let start = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let idx = match matcher_realjdk_field_indices(ctx) {
+        Some(idx) => idx,
+        None => return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]),
+    };
+
+    if ctx.get_field(this, idx.transparent_bounds).as_int().unwrap_or(0) != 0
+        || ctx.get_field(this, idx.anchoring_bounds).as_int().unwrap_or(1) == 0
+    {
+        return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]);
+    }
+
+    let pattern_idx = match pattern_realjdk_field_indices(ctx) {
+        Some(p) => p,
+        None => return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]),
+    };
+    let (utf8, byte_to_utf16, utf16_to_byte, re) =
+        match matcher_realjdk_cached(ctx, this, idx, pattern_idx) {
+            Some(t) => t,
+            None => return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]),
+        };
+    let text_len_utf16 = byte_to_utf16[utf8.len()] as i32;
+
+    // Out-of-range `start`: let the real bytecode throw the exact
+    // `IndexOutOfBoundsException` Java specifies (no matching RuntimeError
+    // variant exists for this generic exception here, and this is a rare,
+    // non-hot-loop-shaped call), rather than fabricating one.
+    if start < 0 || start > text_len_utf16 {
+        return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]);
+    }
+
+    let groups_obj = match ctx.get_field(this, idx.groups) {
+        Value::Object(Some(g)) => g,
+        _ => return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]),
+    };
+    // Group-count safety net — checked before any field mutation below; see
+    // the comment in `matcher_realjdk_search`.
+    if re.captures_len() != ctx.array_length(groups_obj) / 2 {
+        return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]);
+    }
+
+    // Real bytecode `reset()`: first=-1, last=0, oldLast=-1, groups/locals
+    // cleared, lastAppendPosition=0, from=0, to=length, modCount++. We only
+    // need the subset later code reads: first/last/oldLast/from/to (groups[]
+    // gets fully overwritten by the search below regardless of outcome).
+    ctx.set_field(this, idx.first, Value::Int(-1));
+    ctx.set_field(this, idx.last, Value::Int(0));
+    ctx.set_field(this, idx.old_last, Value::Int(-1));
+    ctx.set_field(this, idx.from, Value::Int(0));
+    ctx.set_field(this, idx.to, Value::Int(text_len_utf16));
+    let mod_count = ctx.get_field(this, idx.mod_count).as_int().unwrap_or(0);
+    ctx.set_field(this, idx.mod_count, Value::Int(mod_count.wrapping_add(1)));
+
+    matcher_realjdk_search(
+        ctx,
+        this,
+        idx,
+        &re,
+        &utf8,
+        &byte_to_utf16,
+        &utf16_to_byte,
+        groups_obj,
+        0,
+        text_len_utf16,
+        start,
+    )
+}
+
+// --- `start()`/`end()`/`start(int)`/`end(int)`/`group()`/`group(int)` ---
+//
+// A typical `while (m.find()) { ...; m.group(N); }` loop calls one or more
+// of these on every iteration — real bytecode dispatch for them, left
+// unaccelerated, was measured as a substantial share of the remaining
+// per-iteration cost even after `find()` itself became fast. All six read
+// ONLY the `first`/`last`/`groups[]` state `find()`/`find(int)` already
+// populate correctly (see above) — no regex re-run, no text re-decode.
+// `group()`/`group(int)` delegate the actual character extraction to the
+// receiver `text` object's own (already-fast, see
+// `docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`)
+// `String.substring(int,int)` via `invoke_virtual` rather than re-deriving a
+// UTF-8 slice from this fast path's own cached tables — avoids a redundant
+// cache lookup and reuses the exact substring Java itself would produce.
+
+/// `checkGroup(group)`: real JDK throws the GENERIC `java.lang.IndexOutOfBoundsException`
+/// (not a subclass CratonVM has a dedicated `RuntimeError` variant for) on an
+/// invalid index — the caller bails to real bytecode for that rare case so
+/// it throws the exact right exception, rather than fabricating one here.
+/// Returns `true` when `group` is in bounds (`0..=groupCount()`, where
+/// `groupCount() == groups_obj.length/2 - 1`).
+fn matcher_realjdk_group_in_bounds(ctx: &mut dyn NativeContext, groups_obj: ObjectRef, group: i32) -> bool {
+    let group_count = (ctx.array_length(groups_obj) / 2) as i32 - 1;
+    group >= 0 && group <= group_count
+}
+
+fn native_matcher_start_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let idx = match matcher_realjdk_field_indices(ctx) {
+        Some(idx) => idx,
+        None => return matcher_realjdk_bail(ctx, this, "start", "()I", &[]),
+    };
+    let first = ctx.get_field(this, idx.first).as_int().unwrap_or(-1);
+    if first < 0 {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "No match found".to_string(),
+        }
+        .into());
+    }
+    Ok(Some(Value::Int(first)))
+}
+
+fn native_matcher_end_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let idx = match matcher_realjdk_field_indices(ctx) {
+        Some(idx) => idx,
+        None => return matcher_realjdk_bail(ctx, this, "end", "()I", &[]),
+    };
+    // `end()`'s real bytecode checks `hasMatch()` (== `first >= 0`), same as
+    // `start()` — `last` alone isn't a valid "no match" sentinel (it can be
+    // 0 on a fresh Matcher that never matched).
+    let first = ctx.get_field(this, idx.first).as_int().unwrap_or(-1);
+    if first < 0 {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "No match found".to_string(),
+        }
+        .into());
+    }
+    let last = ctx.get_field(this, idx.last).as_int().unwrap_or(-1);
+    Ok(Some(Value::Int(last)))
+}
+
+fn native_matcher_start_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let group = match args.get(1) {
+        Some(Value::Int(g)) => *g,
+        _ => return matcher_realjdk_bail(ctx, this, "start", "(I)I", &[Value::Int(0)]),
+    };
+    let idx = match matcher_realjdk_field_indices(ctx) {
+        Some(idx) => idx,
+        None => return matcher_realjdk_bail(ctx, this, "start", "(I)I", &[Value::Int(group)]),
+    };
+    let first = ctx.get_field(this, idx.first).as_int().unwrap_or(-1);
+    if first < 0 {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "No match found".to_string(),
+        }
+        .into());
+    }
+    let groups_obj = match ctx.get_field(this, idx.groups) {
+        Value::Object(Some(g)) => g,
+        _ => return matcher_realjdk_bail(ctx, this, "start", "(I)I", &[Value::Int(group)]),
+    };
+    if !matcher_realjdk_group_in_bounds(ctx, groups_obj, group) {
+        return matcher_realjdk_bail(ctx, this, "start", "(I)I", &[Value::Int(group)]);
+    }
+    Ok(Some(ctx.get_array_element(groups_obj, 2 * group as usize)))
+}
+
+fn native_matcher_end_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let group = match args.get(1) {
+        Some(Value::Int(g)) => *g,
+        _ => return matcher_realjdk_bail(ctx, this, "end", "(I)I", &[Value::Int(0)]),
+    };
+    let idx = match matcher_realjdk_field_indices(ctx) {
+        Some(idx) => idx,
+        None => return matcher_realjdk_bail(ctx, this, "end", "(I)I", &[Value::Int(group)]),
+    };
+    let first = ctx.get_field(this, idx.first).as_int().unwrap_or(-1);
+    if first < 0 {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "No match found".to_string(),
+        }
+        .into());
+    }
+    let groups_obj = match ctx.get_field(this, idx.groups) {
+        Value::Object(Some(g)) => g,
+        _ => return matcher_realjdk_bail(ctx, this, "end", "(I)I", &[Value::Int(group)]),
+    };
+    if !matcher_realjdk_group_in_bounds(ctx, groups_obj, group) {
+        return matcher_realjdk_bail(ctx, this, "end", "(I)I", &[Value::Int(group)]);
+    }
+    Ok(Some(ctx.get_array_element(groups_obj, 2 * group as usize + 1)))
+}
+
+fn native_matcher_group_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // Real bytecode `group()` is itself just `return group(0);`, so
+    // delegating here — including any bail-to-bytecode this triggers using
+    // the `group(I)` descriptor — produces byte-identical behavior to
+    // calling real `group()` directly.
+    native_matcher_group_idx_realjdk(ctx, &[Value::Object(Some(this)), Value::Int(0)])
+}
+
+fn native_matcher_group_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let group = match args.get(1) {
+        Some(Value::Int(g)) => *g,
+        _ => return matcher_realjdk_bail(ctx, this, "group", "(I)Ljava/lang/String;", &[Value::Int(0)]),
+    };
+    let idx = match matcher_realjdk_field_indices(ctx) {
+        Some(idx) => idx,
+        None => {
+            return matcher_realjdk_bail(
+                ctx,
+                this,
+                "group",
+                "(I)Ljava/lang/String;",
+                &[Value::Int(group)],
+            )
+        }
+    };
+    let first = ctx.get_field(this, idx.first).as_int().unwrap_or(-1);
+    if first < 0 {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "No match found".to_string(),
+        }
+        .into());
+    }
+    let groups_obj = match ctx.get_field(this, idx.groups) {
+        Value::Object(Some(g)) => g,
+        _ => {
+            return matcher_realjdk_bail(
+                ctx,
+                this,
+                "group",
+                "(I)Ljava/lang/String;",
+                &[Value::Int(group)],
+            )
+        }
+    };
+    if !matcher_realjdk_group_in_bounds(ctx, groups_obj, group) {
+        return matcher_realjdk_bail(
+            ctx,
+            this,
+            "group",
+            "(I)Ljava/lang/String;",
+            &[Value::Int(group)],
+        );
+    }
+    let start = ctx
+        .get_array_element(groups_obj, 2 * group as usize)
+        .as_int()
+        .unwrap_or(-1);
+    let end = ctx
+        .get_array_element(groups_obj, 2 * group as usize + 1)
+        .as_int()
+        .unwrap_or(-1);
+    if start == -1 || end == -1 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let text_obj = match ctx.get_field(this, idx.text) {
+        Value::Object(Some(t)) => t,
+        // Non-`String` `CharSequence` text: this fast path never runs
+        // `find()`/`find(int)` for that case (bails immediately — see
+        // `matcher_realjdk_cached`), so `groups[]` would still be all `-1`
+        // and this branch is unreachable in practice; kept as a defensive
+        // bail rather than an assumption.
+        _ => {
+            return matcher_realjdk_bail(
+                ctx,
+                this,
+                "group",
+                "(I)Ljava/lang/String;",
+                &[Value::Int(group)],
+            )
+        }
+    };
+    ctx.invoke_virtual(
+        text_obj,
+        "substring",
+        "(II)Ljava/lang/String;",
+        &[Value::Int(start), Value::Int(end)],
+    )
 }
 
 // ===========================================================================

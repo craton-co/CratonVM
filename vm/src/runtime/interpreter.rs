@@ -22705,6 +22705,35 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // `CRATONVM_NATIVE_MATCHER_FIND`: real-JDK-layout `Matcher.find()`/
+    // `find(int)`/`start`/`end`/`group` fast path (`native_matcher_find_realjdk`
+    // et al. in native-builtins/src/lib.rs). Extends the SBR-02 fast-regex
+    // idea above from the `String` convenience methods to the explicit
+    // `Pattern.compile(...).matcher(...)` + `while (m.find()) { m.group(N); }`
+    // idiom, which SBR-02 does nothing for (that idiom never calls
+    // `String.replaceAll`/etc.) and still runs the interpreted engine.
+    // `start`/`end`/`group` are included because they're on the same hot
+    // loop and only read state `find`/`find(int)` already populate — leaving
+    // them interpreted would still leave most of the per-iteration cost on
+    // the table. Opt-in (default OFF; see `env_cache::native_matcher_find`)
+    // pending the same parity validation SBR-02 went through before its flag
+    // flipped default-ON.
+    if class_name == "java/util/regex/Matcher"
+        && crate::runtime::env_cache::native_matcher_find()
+        && matches!(
+            (method_name, method_descriptor),
+            ("find", "()Z")
+                | ("find", "(I)Z")
+                | ("start", "()I")
+                | ("start", "(I)I")
+                | ("end", "()I")
+                | ("end", "(I)I")
+                | ("group", "()Ljava/lang/String;")
+                | ("group", "(I)Ljava/lang/String;")
+        )
+    {
+        return true;
+    }
     // `String.substring(int,int)` — gate mismatch fix. `check_override`
     // (vm_exec.rs, the invoke-slow-path native selector) already lists
     // `java/lang/String.substring` as forced-native ("RKC16N.6 RECON":

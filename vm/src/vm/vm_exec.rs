@@ -12809,6 +12809,33 @@ fn invoke_on_class_shared_inner(
                                 | "contains"
                                 | "split"
                             ))
+                        // `CRATONVM_NATIVE_MATCHER_FIND`: real-JDK-layout
+                        // `Matcher.find()`/`find(int)`/`start`/`end`/`group`
+                        // fast path — companion entry to the one in
+                        // `force_native_over_real_jdk_bytecode` (interpreter.rs),
+                        // kept in sync with it the same way the `String` block
+                        // just above mirrors that gate for `substring` et al.
+                        // Concrete (non-`ACC_NATIVE`) JDK bytecode methods, so
+                        // without an entry here the COLD (first, per call
+                        // site, before the vtable cache warms) dispatch would
+                        // run interpreted bytecode instead of the registered
+                        // `NativeKind::Intrinsic` native — correct either way,
+                        // just slower for that one call. See
+                        // `native_matcher_find_realjdk`'s module banner in
+                        // native-builtins/src/lib.rs.
+                        || (class_name == "java/util/regex/Matcher"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("find", "()Z")
+                                    | ("find", "(I)Z")
+                                    | ("start", "()I")
+                                    | ("start", "(I)I")
+                                    | ("end", "()I")
+                                    | ("end", "(I)I")
+                                    | ("group", "()Ljava/lang/String;")
+                                    | ("group", "(I)Ljava/lang/String;")
+                            )
+                            && crate::runtime::env_cache::native_matcher_find())
                         // Wave 3 Task C: NIO Selector — the real-JDK
                         // SelectorImpl bytecode walks `keys` / `selectedKeys`
                         // HashMaps that we don't populate (we don't run

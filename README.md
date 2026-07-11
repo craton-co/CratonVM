@@ -47,7 +47,7 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 | Sieve (100K x 20,000)      | 5,253 ms      | 19,371 ms         | 3.69x         |
 | Matrix 1280x1280           | 2,623 ms      | 10,364 ms         | 3.95x         |
 | HashMap (1M put/get)       | 47 ms         | 17,144 ms         | 365x          |
-| String/Regex (10K)         | 11 ms         | 414 ms            | 37.6x         |
+| String/Regex (10K)         | 8 ms          | 153 ms            | 19.1x         |
 | **QuickBench TOTAL**       | **13,330 ms** | **68,079 ms**     | **5.11x**     |
 | Binary Trees (depth=18)    | 382 ms        | 4,916 ms          | 12.9x         |
 
@@ -75,17 +75,45 @@ are now root-caused and fixed.** Sized far below the other kernels because
 at JDK-comparable scale they don't complete in reasonable time.
 
 String/Regex's O(n²)-shaped scaling (18.8x at 1K entries → 238.8x at 10K in the
-original profiling) is fixed upstream: `Matcher`'s native find()/group() path and a
+original profiling) was fixed upstream first: `Matcher`'s native find()/group() path and a
 substring-from-large-parent allocation path were both quadratic-allocation bugs, not
 interpreter overhead — see
 [`docs/known-issues/matcher-native-full-input-redecode-quadratic.md`](docs/known-issues/matcher-native-full-input-redecode-quadratic.md)
 and
 [`docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`](docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md)
-(merged `a87901e6`). The pre-fix combined-run ratio was 247x; the table above uses a
-freshly-verified **37.6x** (11 ms JDK / 414 ms CratonVM, best of 5, `StringRegexOnly.java`
-standalone) — an isolated re-measurement, not yet re-run through the exact combined-suite
-harness, so treat it as directionally correct rather than perfectly apples-to-apples with
-the other rows.
+(merged `a87901e6`). That landed the algorithmic (O(n²)→O(n)) fix and left a
+**37.6x** constant-factor gap (11 ms JDK / 414 ms CratonVM) — the interpreted
+`java.util.regex` engine itself, one JIT-tier-up/intrinsic layer short of HotSpot's
+compiled state machine.
+
+That remaining constant-factor gap is now also closed, most of the way:
+`CRATONVM_NATIVE_MATCHER_FIND` (**default-ON** since 2026-07-11) routes the explicit
+`Pattern.compile(...).matcher(...)` + `while (m.find()) { ...; m.group(N); }` idiom —
+the shape `bench/StringRegexOnly.java` exercises, and the common shape in real
+parsers/tokenizers — to a Rust-native fast path operating directly on the real OpenJDK
+`Matcher`/`Pattern` object layout (fields resolved by name, never a hardcoded slot
+index, so it can't corrupt a real object the way the pre-2026-07-11 legacy synthetic
+bridge would have). Covers `find()`, `find(int)`, `start()`, `start(int)`, `end()`,
+`end(int)`, `group()`, `group(int)` — the same hot loop's `start`/`end`/`group` calls
+dominated the *remaining* per-iteration cost once `find()` alone was fast, so all
+eight are accelerated together. See
+[`docs/internal/fixed-suite-bugs/matcher-find-realjdk-fastpath-FIXED.md`](docs/internal/fixed-suite-bugs/matcher-find-realjdk-fastpath-FIXED.md)
+for the full design (UTF-16↔UTF-8 offset bridging, bail-to-real-bytecode escape hatch,
+and the one documented residual: `hitEnd()`/`requireEnd()`, used almost exclusively by
+`java.util.Scanner`'s stream-refill logic, are a best-effort approximation rather than
+bit-identical to HotSpot's backtracking-engine bookkeeping — verified against a 141-case
+parity battery to have zero effect on `find`/`group`/`start`/`end` correctness).
+`CRATONVM_NATIVE_MATCHER_FIND=0` reverts to real JDK bytecode as the safety net.
+
+The table above uses a freshly-verified **19.1x** (8 ms JDK / 153 ms CratonVM, best of
+5, `bench/StringRegexOnly.java` standalone, `CRATONVM_NATIVE_MATCHER_FIND` at its new
+default) — down from 37.6x, though not yet at the 5-7x range the other constant-factor
+rows sit in. The residual is believed to be the same fixed per-native-call VM dispatch
+tax the HashMap section below documents (each `find`/`group`/`start`/`end` call is a
+separate native dispatch, each paying that tax) rather than anything specific to
+regex — closing it further would need the broader native-call-overhead fix HashMap is
+still waiting on, not another regex-specific change. Like the String/Regex row above
+it, an isolated re-measurement not yet re-run through the exact combined-suite harness.
 
 HashMap's ~230–365x is a *different* shape of bug — cdb stack-sampling (attach-and-dump
 the JIT-compiled benchmark's own call stacks, the same technique used to profile the
