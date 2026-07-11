@@ -79,3 +79,20 @@ Same conclusion as
 finding 1 for the full writeup. This is a VM-core GC/monitor race
 (actively investigated separately, WIP fix parked as unsafe), not an
 ES/Lucene-specific bug. Status stays OPEN.
+
+
+---
+
+## 2026-07-10 follow-up: guarded-inline-getfield SIGSEGV root-caused and FIXED; flag re-enabled default-ON
+
+Same root cause and fix as
+[the DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests doc](ES-HANG-20260709-server-org-elasticsearch-search-vectors-diversifyingchildrenivfknnfloatslicedvectorquerytests-3ff8aa1c4b.md)
+— see that doc for the full write-up (fabricated `(0, false)` compact-field slots in the JIT
+field resolver, fixed via
+`docs/internal/wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver-FIXED.md`).
+`guarded_inline_getfield_enabled()` (`jit/src/x64.rs`) is re-enabled default-ON
+(`fix/ivfknn-guarded-getfield-reverify-20260710`); re-verified via the sibling class's exact
+repro (both classes share the same Lucene IndexWriter flush/merge code path) — no SIGSEGV, only
+the already-tracked STW/monitor-race hang below. This class's own 3 separate test failures
+(`testScoreEuclidean`, `testScoreCosine`, `testSkewedIndex`, noted in the prior update) were not
+re-investigated here — still open, out of scope for this flag re-verification.

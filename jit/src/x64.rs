@@ -2153,7 +2153,7 @@ pub fn inline_getfield_enabled() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_INLINE_GETFIELD").is_some())
 }
 
-/// Opt-IN guarded inline `getfield` (perf/throughput-20260710).
+/// Default-ON guarded inline `getfield` (perf/throughput-20260710).
 ///
 /// The 2026-07-09 hardening (`Fix JIT getfield receiver validation`,
 /// 85baa4219) routed EVERY default-path JIT `getfield` through the checked
@@ -2175,37 +2175,39 @@ pub fn inline_getfield_enabled() -> bool {
 /// not publish bounds (G1/ZGC → table all zeros) — branches to the checked
 /// helper, preserving its NPE / `i64::MIN`-sentinel semantics exactly.
 ///
-/// DEFAULT FLIPPED BACK OFF 2026-07-10 (found investigating the ES
-/// DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests /
-/// IVFKnnFloatVectorQueryTests hang cluster,
-/// docs/known-issues/elasticsearch-suite/): with this path default-on,
-/// `testSlicesDense` under JIT SIGSEGVs almost immediately (dmesg: `segfault
-/// at 4c`, gdb: an AALOAD bounds-check dereferencing a receiver of `0x40` —
-/// a small int value used as an array pointer, i.e. a getfield result feeding
-/// a later array access got corrupted). Confirmed by bisection: (a)
-/// `CRATONVM_JIT_GETFIELD_HELPER=1` (this path OFF) makes the SIGSEGV
-/// disappear and the run reverts to the ORIGINAL pre-existing interpreter
-/// hang the known-issue docs already describe — so this guard is a genuine
-/// NEW regression, not a pre-existing bug surfacing; (b)
-/// `CRATONVM_OSR_NEWARRAY=0` (the sibling perf/throughput-20260710 change)
-/// does NOT avoid the crash, ruling out OSR-newarray as the cause. The exact
-/// corrupting instruction was not pinned down (the region-bounds containment
-/// check and the per-object GC_FLAG_COMPACT routing both read correctly on
-/// static review) — reproduces reliably via the repro command in the
-/// known-issue doc, needs dedicated bisection time. Until root-caused,
-/// default to the safe checked-helper path; opt in with
-/// `CRATONVM_JIT_GUARDED_GETFIELD=1` for A/B measurement.
+/// FLIPPED BACK OFF then RE-ENABLED, same day (2026-07-10): investigating the
+/// ES DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests /
+/// IVFKnnFloatVectorQueryTests hang cluster
+/// (docs/known-issues/elasticsearch-suite/) found `testSlicesDense` under JIT
+/// SIGSEGVing almost immediately with this path default-on (dmesg: `segfault
+/// at 4c`, gdb: an AALOAD bounds-check dereferencing a receiver of `0x40` — a
+/// small int value used as an array pointer, i.e. a getfield RESULT feeding a
+/// later array access got corrupted) — the flag was flipped to opt-in
+/// (`CRATONVM_JIT_GUARDED_GETFIELD=1`) pending root-cause. That root cause
+/// was found and fixed the SAME DAY, in a different investigation
+/// (the WildFly Host Controller invoke-inline-cache SIGSEGV): the vm-side JIT
+/// field resolvers fabricated a `(0, false)` "compact slot" for any field
+/// with NO genuine registered `CompactLayout` entry, and the compact-offset
+/// inline getfield arm trusted it — a REFERENCE field with the fabricated
+/// `is_ref=false` fell into the int-category match arm and got a 32-bit
+/// `MOVSXD` load of half a `Value` cell, producing exactly this "small-int
+/// garbage used as a pointer" shape. See
+/// docs/internal/wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver-FIXED.md
+/// for the full chain. Re-verified clean with
+/// `CRATONVM_JIT_GUARDED_GETFIELD=1` against the exact IVF-KNN repro (no
+/// SIGSEGV, no dmesg segfault entry — only the separate, still-OPEN,
+/// already-tracked Lucene IndexWriter/STW-monitor-race hang this doc's own
+/// "underlying interpreter hang" section describes) — re-enabled default-ON.
+/// `CRATONVM_JIT_GETFIELD_HELPER=1` restores the helper-only path if a new
+/// corruption is ever suspected here again.
 pub fn guarded_inline_getfield_enabled() -> bool {
     // NOT OnceLock-cached (unlike the other flags in this file): this is a
     // JIT COMPILE-TIME gate, read once per getfield call SITE during
     // compilation, never on the runtime hot path — so re-reading the env
     // var every call has no measurable cost. Caching it would make the
-    // opt-in racy against whichever test/thread first triggers ANY getfield
-    // compilation in the process (fixed 2026-07-10: the guarded-inline unit
-    // test below flaked because an unrelated parallel test's compile() call
-    // won the OnceLock race before this test's env::set_var took effect).
+    // off-switch racy against whichever test/thread first triggers ANY
+    // getfield compilation in the process.
     std::env::var_os("CRATONVM_JIT_GETFIELD_HELPER").is_none()
-        && std::env::var_os("CRATONVM_JIT_GUARDED_GETFIELD").is_some()
 }
 
 /// Default-ON inline self-recursion stack check (perf/throughput-20260710).
@@ -29976,15 +29978,11 @@ mod tests {
     ///     load could produce).
     #[test]
     fn test_getfield_guarded_inline_fast_and_fallback() {
-        // Opt in explicitly: guarded_inline_getfield_enabled() defaults OFF
-        // since 2026-07-10 (see its doc comment) after it was found to
-        // SIGSEGV on a real Elasticsearch IVF-KNN vector workload. Not
-        // OnceLock-cached (compile-time gate only), so this plain env var
-        // set is race-free against other tests in this binary.
-        // SAFETY: test-only, single-purpose env var.
-        unsafe {
-            std::env::set_var("CRATONVM_JIT_GUARDED_GETFIELD", "1");
-        }
+        // guarded_inline_getfield_enabled() is default-ON (see its doc
+        // comment) -- no env var needed to exercise this path. If a test run
+        // sets CRATONVM_JIT_GETFIELD_HELPER=1 to force the helper-only path
+        // globally, this test's own assertions about the inline guard would
+        // no longer hold; nothing here does that.
         use std::sync::atomic::{AtomicUsize, Ordering};
         static TEST_BOUNDS: [AtomicUsize; 6] = [
             AtomicUsize::new(0),
