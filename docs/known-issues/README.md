@@ -4,6 +4,47 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-11 Spring suite genuine-bug list reconfirmed (125 → 96 open, 29 fixed)
+
+Scoped rerun of exactly the 125-class list from the doc below on dev
+`9948295e` (not a full 516-class HotSpot cross-reference). 29/125 now pass —
+`core.test.tools.CompiledTests` was fixed by commit `2ed5f407`
+(loader-defining-visibility fix in the real-JDK `loadClass` fast path); the
+other 28 most likely benefited from the same fix (shared
+`MockitoException`/`CompilationException`/CGLIB-proxy-`ABEND` symptoms), not
+individually root-caused. 10 of the previously-documented 31 "newly broken /
+HIB-CV-32" classes are among the 29 fixed. Four new failure clusters
+characterized within the remaining 96 (not yet root-caused): an 11-class AOT
+bean-registration TIMEOUT cluster (all hard-hang at the 120s ceiling), an
+8-class Groovy scripting cluster (high per-method failure ratios), a broad
+WebFlux reactive FAIL/EMPTY cluster, and 6 ABEND crashes with `found=0`
+(crash before test discovery, distinct from the mid-run HIB-CV-32 crash
+shape). See
+[`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](CRATONVM-SPRING-GENUINE-BUGLIST-125.md)
+for full detail.
+
+## 2026-07-11 `HashMap` put/get ~230-365x slower than JDK-25 root-caused, partially fixed — fixed per-native-call dispatch overhead, not allocation/GC
+
+Initial hypothesis (Integer autoboxing/allocation pressure) was wrong. cdb
+stack-sampling (same technique used for this repo's `bintrees` GC/allocation-ceiling
+profile) found the ratio is flat across sizes (not O(n²), unlike the sibling
+String/Regex bug below) and NOT allocation-bound: only ~9% of sampled stacks were in
+allocation/boxing paths vs ~90% for an allocation-bound workload. The real cost is
+fixed per-native-call overhead in the JIT-to-native dispatch path — `HashMap.put/get`
+and `Integer.hashCode()/valueOf()` are native Rust functions, and every call pays for
+conservative JIT-frame root scanning (~29% of samples, the largest bucket),
+RwLock-guarded class/field-layout lookups, and generic dispatch-machinery overhead.
+Three targeted, behavior-preserving fixes shipped for the safely-addressable slice
+(key hash/equals check-order in `native-collections/src/lib.rs`, a lock-free
+receiver-corruption fast path in `vm/src/vm/vm_exec.rs`, a lock-free field-layout
+cache in `gc/src/gen_heap.rs` mirroring an already-proven pattern elsewhere in this
+codebase) — isolated 5-round re-measurement averages ~206x post-fix, down from ~357x.
+Root scanning and the SATB GC flush (the largest remaining buckets) are deliberately
+NOT touched — both are correctness-critical with a real prior crash/heap-corruption
+history in this codebase. See
+[`hashmap-native-dispatch-overhead.md`](hashmap-native-dispatch-overhead.md) for the
+full investigation, profile evidence, and remaining-work writeup.
+
 ## 2026-07-11 TestParameterMap `replaceAll()` lock-bypass FIXED/RETIRED — real bug was an unwrapped `Map.Entry` escaping `Collections.unmodifiableMap(...).entrySet()`, not field visibility
 
 The doc's own hypothesis (a plain-`boolean` `ParameterMap.locked` field-visibility
@@ -52,14 +93,47 @@ than repeating the pin dance inline.
   this session's code, confirmed by reproducing the identical failure against the last verified-good
   binary from a prior session. See the residual doc's "Follow-up session 3" section for the full story
   and what whoever next has a working harness should re-run.
-- Also scoped (not implemented, lower priority): a debug-build assertion that would catch every future
-  instance of this bug class deterministically instead of relying on sweeps —
-  [`../internal/wildfly-stale-objectref-debug-assertion-scoping.md`](../internal/wildfly-stale-objectref-debug-assertion-scoping.md).
+- Also **implemented** (same session, after initial scoping): a debug-build assertion,
+  `CRATONVM_DBG_STALE_OBJREF=1`, that catches this whole bug class deterministically at runtime for the
+  `Generational` (default) GC backend — a stale native local read within one GC cycle of evacuation now
+  hard-panics instead of silently corrupting. Reuses the GC's own existing forwarding-pointer header field
+  (no new tombstone format needed) behind a one-cycle quarantine delay on reclaiming evacuated memory; see
+  [`../internal/wildfly-stale-objectref-debug-assertion-scoping.md`](../internal/wildfly-stale-objectref-debug-assertion-scoping.md)
+  for the mechanism and its explicit scope boundaries (G1/ZGC not covered).
 - Remaining untriaged: `lang_class.rs`'s other 114 candidates, `lang_invoke.rs`, `servlet.rs`,
   `jboss_msc.rs`, the `wildfly_*.rs` files, `spring_startup_bootstrap.rs`, and three giant
   "Phase N native registration" files (`lib.rs`/`phases_late.rs`/`phases_early.rs`, ~1550 combined
   candidates) — a spot-check of `lib.rs` alone found another real bug
   (`spring_xml_set_factory_bool`'s caller), not yet fixed.
+
+## 2026-07-11 JIT BCE: missing AIOOBE + silent OOB heap write on multi-array loops (OPEN, Severity: HIGH)
+
+Found while validating the GPU offload deopt path (the bug itself is in the CPU JIT, not the
+GPU stack). Bounds-check elimination on a counted loop indexing multiple arrays by the same
+induction variable (e.g. `for (i=0;i<a.length;i++) out[i]=a[i]+b[i];` with `out.length <
+a.length`) elides the bounds check on the shorter array using the longer array's length as the
+loop bound — with the JIT/OSR on, the method returns normally with no
+`ArrayIndexOutOfBoundsException` and silently writes past the end of `out` into whatever object
+follows it on the heap. HotSpot JDK 25 and CratonVM `--nojit` both throw the required AIOOBE.
+See [`jit-bce-multi-array-oob-store-20260711.md`](jit-bce-multi-array-oob-store-20260711.md) for
+the minimal repro (`test_classes/gpu/BoundsDeopt2.java`) and the suspected BCE mechanism.
+
+## 2026-07-11 GPU offload: first real-hardware validation passed; 7 follow-ups filed (OPEN, none blocking)
+
+First systematic validation of the GPU offload stack on real hardware (RTX 2060) passed
+end-to-end — checksums matching HotSpot bit-for-bit on every kernel tested, including a
+div-chain kernel at ~210x HotSpot C2 / ~3x TornadoVM PTX (see
+[`bench-gpu/results/`](../../bench-gpu/results/) and [ROADMAP.md](../../ROADMAP.md#gpu-offload)).
+Two bugs found during that validation were fixed in-tree the same day (invoke-cache promotion
+killing repeat offloads; a failure-flag not drained after array writebacks). Seven follow-up
+gaps remain open and are being worked on in parallel (check the doc for current status before
+assuming any is still open): reduction-kernel dispatch never launches (void-return gate),
+JIT-compiled/OSR'd callers can bypass the offload hook, `dispatch_async` is synchronous under
+the hood, small arrays over-launch GPU threads (fixed 2^20-thread minimum), the
+occupancy-tuned block-size API is dead code, several analyzer/lowering coverage gaps (`ldc`,
+`frem`/`drem`, non-canonical loops), and there is no hardware CI. See
+[`gpu-offload-followups-20260711.md`](gpu-offload-followups-20260711.md) for all seven with
+pointers into `vm/src/runtime/offload.rs`.
 
 ## 2026-07-11 Regex `find()`+`group()` quadratic slowdown FIXED — two wrong turns (dead-code Matcher bridge, dead-code substring native) before finding the real bug in the live one
 
@@ -199,10 +273,22 @@ Investigated the confirmed-but-unexplained pattern already flagged in
   staleness check `safe_native_call` already used elsewhere. Verified across
   all 4 repro classes: zero crashes post-fix (previously 100%), one class
   (`OneToOneJoinColumnsEmbeddedIdTest`) now runs to full completion.
-- OPEN (new, unmasked by the fix): [`onetoone-embeddedid-propertyaccessexception.md`](onetoone-embeddedid-propertyaccessexception.md)
-  — `OneToOneJoinColumnsEmbeddedIdTest` now completes (previously crashed)
-  but shows a genuine `org.hibernate.PropertyAccessException` on 3/6 tests,
-  setting an embedded-id key field.
+- FIXED/RETIRED (same day, follow-up): [`onetoone-embeddedid-propertyaccessexception-FIXED.md`](../internal/fixed-suite-bugs/onetoone-embeddedid-propertyaccessexception-FIXED.md)
+  — the `org.hibernate.PropertyAccessException` this fix unmasked in
+  `OneToOneJoinColumnsEmbeddedIdTest` (3/6 tests) is fixed too:
+  `Field.set`/`Method.invoke`/`Constructor.newInstance`'s reflective
+  argument-coercion check resolved the expected reference type via a
+  global, loader-chain-first name search, which can resolve to the WRONG
+  same-named class when a class is legitimately loaded under two different
+  classloaders (confirmed: Hibernate's bytecode enhancement reloads
+  `@EmbeddedId` classes under a private ByteBuddy-style loader, distinct
+  from the original `Application`-loader `ClassId`) — rejecting a
+  perfectly-typed value as a mismatch. Fixed with a new
+  `class_id_by_name_near` resolution that prefers the SAME loader as the
+  declaring `Field`/`Method`/`Constructor`. `OneToOneJoinColumnsEmbeddedIdTest`:
+  `ok=3 failed=3` → `ok=6 failed=0`. Verified no regressions via a
+  115-class sample of `passed.txt` cross-checked against the pre-fix
+  baseline for every non-PASS result.
 - OPEN (new, unmasked by the fix, host-load-limited): [`functests-astparser-defaultcatalog-post-fix-slow-untriaged.md`](functests-astparser-defaultcatalog-post-fix-slow-untriaged.md)
   — `FunctionTests`/`ASTParserLoadingTest`/`DefaultCatalogAndSchemaTest` no
   longer crash and now run far more of the real suite, but didn't reach a
@@ -217,7 +303,7 @@ Investigated the confirmed-but-unexplained pattern already flagged in
 ## 2026-07-10/11 ES `RandomBinaryDocValuesRangeQueryTests` hang cluster: 4/4 FIXED (compact-field getfield bug fixed upstream; InetAddress CONTAINS false negative fixed 2026-07-11)
 
 - FIXED/RETIRED: [`long-random-binary-doc-values-range-query-tests-FIXED.md`](../internal/elasticsearch-suite/long-random-binary-doc-values-range-query-tests-FIXED.md), [`integer-random-binary-doc-values-range-query-tests-FIXED.md`](../internal/elasticsearch-suite/integer-random-binary-doc-values-range-query-tests-FIXED.md), [`double-random-binary-doc-values-range-query-tests-FIXED.md`](../internal/elasticsearch-suite/double-random-binary-doc-values-range-query-tests-FIXED.md) — all three classes' original 600s suite-timeout HANG (collected 2026-07-08, `LRUQueryCache`'s internal `ReentrantReadWriteLock`/`ReentrantLock` write-lock contention) had turned into a 100% deterministic JIT SIGSEGV on a binary built strictly after that collection: `ReentrantLock.unlock()`'s single getfield (`this.sync`) was compiled as a 32-bit sign-extending `movsxd` load instead of a 64-bit `mov`, corrupting the loaded receiver before dispatching `sync.release(1)`. Root cause: `compact_field_slot(...).unwrap_or((0, false))` in three `field_resolver` closures (`vm/src/runtime/interpreter.rs`) silently fabricated "offset 0, not a reference" whenever a field's declaring class had no registered compact layout, and `jit/src/lib.rs`'s scan step trusted that fabrication unconditionally, steering the getfield/putfield inline codegen to treat a genuine reference field as a primitive. Independently root-caused and fixed by a concurrent session via a third, unrelated symptom (WildFly Host Controller invoke-IC SIGSEGV) — see this file's own `7f96c26c`/`be710234`/`93b33576` entries. Verified 2026-07-10 on a clean checkout of dev tip `e768916a` (no local changes needed): all three classes pass cleanly (`OK (6 tests)`) under fully default JIT settings.
-- FIXED/RETIRED: [`elasticsearch-suite/ES-HANG-20260709-server-org-elasticsearch-lucene-queries-inetaddressrandombinarydocvaluesrangequerytests-51a9c7ea93-FIXED.md`](../internal/elasticsearch-suite/ES-HANG-20260709-server-org-elasticsearch-lucene-queries-inetaddressrandombinarydocvaluesrangequerytests-51a9c7ea93-FIXED.md) — the same SIGSEGV/hang mechanism was gone here too, but the class ran to completion and hit a **different, genuine correctness bug**: a `CONTAINS`-query false negative for a query range spanning an IPv4 min and IPv6 max against a stored box, whose max always printed with a trailing `/0.0.0.0`. Root-caused 2026-07-11 to two stacked defects in `native-builtins/src/net_phase_e.rs`'s `InetAddress` mirror machinery: (1) its process-global side table was never registered as a GC root (same bug class as `BUG-U`'s stale Locale), so a moving GC relocating a live mirror left it keyed on a vacated slot; (2) the fallback reader never checked the real `Inet6Address` holder6 field, so any miss (or any address built via the un-overridden two-arg `getByAddress(String,byte[])`) reported `"0.0.0.0"` instead of the real value. Fixed by adding `gc_scan_inet_addr_roots`/`gc_update_inet_addr_refs` (mirroring the existing Locale root-scan pattern) and fixing the holder6 fallback. Verified: 6/7 pre-fix runs reproduced the exact signature, 0/9 post-fix runs did. Two unrelated, rare, pre-existing failures surfaced during verification (a `java/util/Set` GC-staleness NPE, a `ClassCastException`) — flagged separately, not blocking this retirement.
+- FIXED/RETIRED: [`elasticsearch-suite/ES-HANG-20260709-server-org-elasticsearch-lucene-queries-inetaddressrandombinarydocvaluesrangequerytests-51a9c7ea93-FIXED.md`](../internal/elasticsearch-suite/ES-HANG-20260709-server-org-elasticsearch-lucene-queries-inetaddressrandombinarydocvaluesrangequerytests-51a9c7ea93-FIXED.md) — the same SIGSEGV/hang mechanism was gone here too, but the class ran to completion and hit a **different, genuine correctness bug**: a `CONTAINS`-query false negative for a query range spanning an IPv4 min and IPv6 max against a stored box, whose max always printed with a trailing `/0.0.0.0`. Root-caused 2026-07-11 to two stacked defects in `native-builtins/src/net_phase_e.rs`'s `InetAddress` mirror machinery: (1) its process-global side table was never registered as a GC root (same bug class as `BUG-U`'s stale Locale), so a moving GC relocating a live mirror left it keyed on a vacated slot; (2) the fallback reader never checked the real `Inet6Address` holder6 field, so any miss (or any address built via the un-overridden two-arg `getByAddress(String,byte[])`) reported `"0.0.0.0"` instead of the real value. Fixed by adding `gc_scan_inet_addr_roots`/`gc_update_inet_addr_refs` (mirroring the existing Locale root-scan pattern) and fixing the holder6 fallback. Verified: 6/7 pre-fix runs reproduced the exact signature, 0/9 post-fix runs did. Two unrelated, rare, pre-existing failures surfaced during verification (a `java/util/Set` GC-staleness NPE; a `ClassCastException` since confirmed as a third real-world corroboration of the already-tracked monitor-vs-evacuation race, see `docs/internal/gc-audit-2026-07-10-open-findings.md` finding 1(b)) — neither blocks this retirement.
 
 ## 2026-07-10 AccessLogValve/RewriteValve doc RETIRED (5/6 causes fixed; 6th is the already-tracked register-invisible-JIT-root family, not a new bug)
 

@@ -449,26 +449,36 @@ fn load_provider_class(
     loader: Option<cratonvm_types::ObjectRef>,
 ) -> Option<cratonvm_types::ObjectRef> {
     if let Some(loader_r) = loader {
+        // Both create_string calls can collect, so pin the module or custom
+        // loader for the entire findClass/loadClass/fallback sequence.
+        let loader_pin = ctx.pin_native_root(loader_r);
         let find_name = ctx.create_string(fqn);
+        let loader_r = ctx.read_native_pin(loader_pin, loader_r);
         if let Ok(Some(Value::Object(Some(c)))) = ctx.invoke_virtual(
             loader_r,
             "findClass",
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &[Value::Object(Some(find_name))],
         ) {
+            ctx.unpin_native_roots(loader_pin);
             return Some(c);
         }
         let name2 = ctx.create_string(fqn);
+        let loader_r = ctx.read_native_pin(loader_pin, loader_r);
         if let Ok(Some(Value::Object(Some(c)))) = ctx.invoke_virtual(
             loader_r,
             "loadClass",
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &[Value::Object(Some(name2))],
         ) {
+            ctx.unpin_native_roots(loader_pin);
             return Some(c);
         }
-        if let Some(c) = load_provider_class_from_loader_jars(ctx, loader_r, &fqn.replace('.', "/"))
-        {
+        let loader_r = ctx.read_native_pin(loader_pin, loader_r);
+        let from_loader_jars =
+            load_provider_class_from_loader_jars(ctx, loader_r, &fqn.replace('.', "/"));
+        ctx.unpin_native_roots(loader_pin);
+        if let Some(c) = from_loader_jars {
             return Some(c);
         }
     }
@@ -518,32 +528,49 @@ fn discover_providers(
     ctx: &mut dyn NativeContext,
     sl: cratonvm_types::ObjectRef,
 ) -> Result<Vec<String>, MethodCallFailed> {
+    // This function repeatedly re-enters Java while inspecting the loader.
+    // Keep both the ServiceLoader and its service Class rooted across the
+    // initial getName call; either one can move during that dispatch.
+    let sl_pin = ctx.pin_native_root(sl);
+    let sl = ctx.read_native_pin(sl_pin, sl);
     let service_class = match ctx.get_field_by_name(sl, "service") {
         Value::Object(Some(c)) => c,
         _ => match ctx.get_field(sl, 0) {
             Value::Object(Some(c)) => c,
             _ => {
+                ctx.unpin_native_roots(sl_pin);
                 return Err(MethodCallFailed::InternalError(VmError::Internal {
                     message: "ServiceLoader: service class is null".to_string(),
                 }));
             }
         },
     };
-    let service_name_val = ctx.invoke(
+    let service_pin = ctx.pin_native_root(service_class);
+    let service_name_val = match ctx.invoke(
         "java/lang/Class",
         "getName",
         "()Ljava/lang/String;",
         &[Value::Object(Some(service_class))],
-    )?;
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            ctx.unpin_native_roots(service_pin);
+            ctx.unpin_native_roots(sl_pin);
+            return Err(err);
+        }
+    };
+    ctx.unpin_native_roots(service_pin);
     let service_name = match service_name_val {
         Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
     if service_name.is_empty() {
+        ctx.unpin_native_roots(sl_pin);
         return Err(MethodCallFailed::InternalError(VmError::Internal {
             message: "ServiceLoader: service.getName() returned null".to_string(),
         }));
     }
+    let sl = ctx.read_native_pin(sl_pin, sl);
     let resource = format!("META-INF/services/{}", service_name);
 
     let mut providers: Vec<String> = Vec::new();
@@ -554,7 +581,6 @@ fn discover_providers(
     // so reproduce that source here and remember the module loader for provider
     // class instantiation below.
     if let Value::Object(Some(layer)) = ctx.get_field_by_name(sl, "layer") {
-        let sl_pin = ctx.pin_native_root(sl);
         let layer_pin = ctx.pin_native_root(layer);
         let layer = ctx.read_native_pin(layer_pin, layer);
         let _ = ctx.invoke(
@@ -630,7 +656,6 @@ fn discover_providers(
             ctx.unpin_native_roots(catalog_pin);
         }
         ctx.unpin_native_roots(layer_pin);
-        ctx.unpin_native_roots(sl_pin);
     }
 
     // When the ServiceLoader was created with a user-defined ClassLoader
@@ -677,6 +702,8 @@ fn discover_providers(
 
     if loader_is_jboss_module {
         if let Some(loader_r) = loader_ref_opt {
+            let loader_pin = ctx.pin_native_root(loader_r);
+            let loader_r = ctx.read_native_pin(loader_pin, loader_r);
             if let Some(module_name) = crate::jboss_module_loader::module_name_of_mcl(ctx, loader_r)
             {
                 providers.extend(crate::jboss_module_loader::module_service_provider_names(
@@ -697,13 +724,16 @@ fn discover_providers(
             } else if diag_sl {
                 eprintln!("[SL-LOADER-DBG] JBoss ModuleClassLoader has no module backref");
             }
+            ctx.unpin_native_roots(loader_pin);
         }
     }
 
     if let Some(loader_r) = loader_ref_opt {
         // Primary path: call loader.findResources(resource) → Enumeration<URL>,
         // then extract the entry path from each URL and read bytes directly.
+        let loader_pin = ctx.pin_native_root(loader_r);
         let res_name_val = Value::Object(Some(ctx.create_string(&resource)));
+        let loader_r = ctx.read_native_pin(loader_pin, loader_r);
         let enum_res = ctx.invoke_virtual(
             loader_r,
             "findResources",
@@ -828,6 +858,7 @@ fn discover_providers(
         // JarMeta to construct the embedded resource path.  This bypasses the
         // URL/ClassLoader/invokedynamic chain entirely.
         if !found_via_enum {
+            let loader_r = ctx.read_native_pin(loader_pin, loader_r);
             if let Value::Object(Some(jm_list_r)) = ctx.get_field_by_name(loader_r, "jarMetas") {
                 let size = match ctx.invoke(
                     "java/util/List",
@@ -937,6 +968,7 @@ fn discover_providers(
                 }
             }
         }
+        ctx.unpin_native_roots(loader_pin);
     }
 
     // Flat classpath scan: providers listed directly at
@@ -989,6 +1021,7 @@ fn discover_providers(
             providers
         );
     }
+    ctx.unpin_native_roots(sl_pin);
     Ok(providers)
 }
 
@@ -1134,11 +1167,14 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             }
         };
         // newInstance via Class.getDeclaredConstructor() + Constructor.newInstance().
+        let class_pin = ctx.pin_native_root(class);
         let empty_types = ctx.new_ref_array(
             ctx.class_id_by_name("java/lang/Class")
                 .unwrap_or(cratonvm_types::ClassId::new(0)),
             0,
         );
+        let class = ctx.read_native_pin(class_pin, class);
+        ctx.unpin_native_roots(class_pin);
         let ctor = ctx
             .invoke(
                 "java/lang/Class",

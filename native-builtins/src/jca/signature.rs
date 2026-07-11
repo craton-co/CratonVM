@@ -175,6 +175,8 @@ const SIG_MLDSA: i32 = 15;
 const SIG_MLDSA_44: i32 = 16;
 const SIG_MLDSA_65: i32 = 17;
 const SIG_MLDSA_87: i32 = 18;
+const SIG_ED448: i32 = 19;
+const SIG_EDDSA: i32 = 20;
 
 fn algo_idx(name: &str) -> i32 {
     let upper = name.to_ascii_uppercase();
@@ -195,7 +197,9 @@ fn algo_idx(name: &str) -> i32 {
         "SHA256WITHECDSA" | "SHA-256WITHECDSA" => SIG_SHA256_ECDSA,
         "SHA384WITHECDSA" | "SHA-384WITHECDSA" => SIG_SHA384_ECDSA,
         "SHA512WITHECDSA" | "SHA-512WITHECDSA" => SIG_SHA512_ECDSA,
-        "ED25519" | "EDDSA" => SIG_ED25519,
+        "ED25519" => SIG_ED25519,
+        "ED448" => SIG_ED448,
+        "EDDSA" => SIG_EDDSA,
         "SHA256WITHDSA" => SIG_SHA256_DSA,
         // Post-quantum ML-DSA (FIPS 204). The umbrella "ML-DSA" name carries no
         // parameter set; the concrete SPI suffix is resolved from the init key's
@@ -236,6 +240,8 @@ fn algo_name(idx: i32) -> &'static str {
         SIG_SHA256_ECDSA => "SHA256withECDSA",
         SIG_SHA512_ECDSA => "SHA512withECDSA",
         SIG_ED25519 => "Ed25519",
+        SIG_ED448 => "Ed448",
+        SIG_EDDSA => "EdDSA",
         SIG_SHA256_DSA => "SHA256withDSA",
         SIG_PSS_SHA256 => "SHA256withRSAandMGF1",
         SIG_PSS_SHA384 => "SHA384withRSAandMGF1",
@@ -394,6 +400,15 @@ fn clear_data(ctx: &mut dyn NativeContext, this: ObjectRef) {
 fn sign_dispatch(alg: i32, key_id: u64, data: &[u8]) -> Option<Vec<u8>> {
     match alg {
         SIG_SHA256_RSA => crypto_impl::rsa_sign(key_id, data),
+        SIG_PSS_SHA256 => {
+            crypto_impl::rsa_sign_pss_by_id(key_id, crypto_impl::PssHash::Sha256, data)
+        }
+        SIG_PSS_SHA384 => {
+            crypto_impl::rsa_sign_pss_by_id(key_id, crypto_impl::PssHash::Sha384, data)
+        }
+        SIG_PSS_SHA512 => {
+            crypto_impl::rsa_sign_pss_by_id(key_id, crypto_impl::PssHash::Sha512, data)
+        }
         SIG_SHA256_ECDSA => crypto_impl::ecdsa_sign_sha256(key_id, data),
         SIG_SHA384_ECDSA => crypto_impl::ecdsa_sign(key_id, data),
         SIG_ED25519 => crypto_impl::ed25519_sign(key_id, data),
@@ -445,12 +460,26 @@ fn ecdsa_real_spi_class(alg: i32) -> Option<&'static str> {
     }
 }
 
+/// Real SunEC EdDSA SPI for the requested curve. The generic `EdDSA` SPI
+/// selects its curve from the supplied key during initialization.
+fn eddsa_real_spi_class(alg: i32) -> Option<&'static str> {
+    if !crate::route_ec_to_real() {
+        return None;
+    }
+    match alg {
+        SIG_ED25519 => Some("sun/security/ec/ed/EdDSASignature$Ed25519"),
+        SIG_ED448 => Some("sun/security/ec/ed/EdDSASignature$Ed448"),
+        SIG_EDDSA => Some("sun/security/ec/ed/EdDSASignature"),
+        _ => None,
+    }
+}
+
 /// Drive the real SunEC `ECDSASignature$*` SPI: `new` → `engineInitSign/Verify(key)`
 /// → `engineUpdate(buffer)` → `engineSign()`/`engineVerify(sig)`. `verify_sig`
 /// `None` → sign (returns the DER `byte[]`); `Some(sig)` → verify (returns
 /// `Int(0/1)`). The real key is read from `SIG_OFF_KEYOBJ`; the payload from the
 /// identity-hash-keyed side table via `take_data`.
-fn drive_real_ecdsa(
+fn drive_real_signature_spi(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     spi_class: &'static str,
@@ -831,7 +860,10 @@ fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let alg = require_sig_algo(ctx, this)?;
     // EC: drive the real SunEC ECDSASignature SPI (real key, real DER output).
     if let Some(spi_class) = ecdsa_real_spi_class(alg) {
-        return drive_real_ecdsa(ctx, this, spi_class, None);
+        return drive_real_signature_spi(ctx, this, spi_class, None);
+    }
+    if let Some(spi_class) = eddsa_real_spi_class(alg) {
+        return drive_real_signature_spi(ctx, this, spi_class, None);
     }
     // ML-DSA: drive the real SUN ML_DSA_Impls$SIG* SPI (real lattice signature).
     if is_mldsa(alg) {
@@ -900,7 +932,14 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             Some(Value::Object(Some(arr))) => read_byte_array_full(ctx, *arr),
             _ => Vec::new(),
         };
-        return drive_real_ecdsa(ctx, this, spi_class, Some(provided));
+        return drive_real_signature_spi(ctx, this, spi_class, Some(provided));
+    }
+    if let Some(spi_class) = eddsa_real_spi_class(alg) {
+        let provided = match args.get(1) {
+            Some(Value::Object(Some(arr))) => read_byte_array_full(ctx, *arr),
+            _ => Vec::new(),
+        };
+        return drive_real_signature_spi(ctx, this, spi_class, Some(provided));
     }
     // ML-DSA: drive the real SUN ML_DSA_Impls$SIG* SPI (real lattice verify).
     if is_mldsa(alg) {
@@ -1181,6 +1220,8 @@ mod tests {
         assert_eq!(algo_idx("SHA256withECDSA"), SIG_SHA256_ECDSA);
         assert_eq!(algo_idx("SHA384withECDSA"), SIG_SHA384_ECDSA);
         assert_eq!(algo_idx("Ed25519"), SIG_ED25519);
+        assert_eq!(algo_idx("Ed448"), SIG_ED448);
+        assert_eq!(algo_idx("EdDSA"), SIG_EDDSA);
         assert_eq!(algo_idx("nope"), -1);
     }
 
@@ -1190,6 +1231,8 @@ mod tests {
         assert_eq!(algo_name(SIG_SHA256_ECDSA), "SHA256withECDSA");
         assert_eq!(algo_name(SIG_SHA384_ECDSA), "SHA384withECDSA");
         assert_eq!(algo_name(SIG_ED25519), "Ed25519");
+        assert_eq!(algo_name(SIG_ED448), "Ed448");
+        assert_eq!(algo_name(SIG_EDDSA), "EdDSA");
     }
 
     // ---- ML-DSA post-quantum Signature routing ----

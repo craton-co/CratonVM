@@ -17054,6 +17054,24 @@ impl Compiler {
             // (which use pc_to_native[header]) skip the hoisted computation.
             // On initial loop entry (fall-through from preheader), the hoisted
             // code executes and caches the invariant value in a spill slot.
+            //
+            // SOUNDNESS: the preheader executes UNCONDITIONALLY — even when
+            // the loop is zero-trip, and even when the in-body access the
+            // sequence was hoisted from is behind a conditional the program
+            // would skip (`for(..){ if (m != null) use(m[j][i]); }` with
+            // m == null). The original program may therefore never perform
+            // this load at all, so it must not fault and must not throw
+            // here. Each hoisted load is preceded by a null + unsigned
+            // bounds guard routed to the reason-2 deopt stub: on failure the
+            // interpreter re-runs the loop with real per-access semantics
+            // (throwing NPE/AIOOBE only if the access is actually reached).
+            // Repeated guard failures at this header cross the per-bci
+            // de-spec threshold and the recompile drops the hoist entirely
+            // (see the `despec_contains` filter on `hoist_info` in
+            // `compile_with_param_slots`). Before these guards the hoist was
+            // a raw MOV — a null/OOB row index crashed the VM or fed a
+            // garbage row pointer to the loop body (test_classes/
+            // LicmHoistRepro.java).
             {
                 // Collect hoist data to avoid borrow conflicts with self
                 let loop_hoists: Vec<(usize, usize, i32)> = self
@@ -17063,6 +17081,7 @@ impl Compiler {
                     .filter(|(_, h)| h.loop_header == pc)
                     .map(|(idx, h)| (h.array_local, h.index_local, self.hoist_offsets[idx]))
                     .collect();
+                let had_hoists = !loop_hoists.is_empty();
 
                 for (array_local, index_local, hoist_offset) in loop_hoists {
                     // Load array reference into RAX
@@ -17077,10 +17096,31 @@ impl Compiler {
                     } else {
                         self.emit_load_local(RCX, self.local_offset(index_local));
                     }
+                    // Null guard: TEST RAX, RAX (48 85 C0); JZ deopt (0F 84).
+                    self.buf.emit(&[0x48, 0x85, 0xC0]);
+                    self.buf.emit(&[0x0F, 0x84]);
+                    let null_patch = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    self.deopt_stubs.push((null_patch, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
+                    // Bounds guard: MOV R10D, [RAX + ARRAY_LENGTH_OFFSET];
+                    // CMP ECX, R10D; JAE deopt — unsigned, so a negative
+                    // index is caught as huge (same as emit_bounds_check).
+                    self.buf
+                        .emit(&[0x44, 0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // Cast: x86-64 register encoding
+                    self.buf.emit(&[0x41, 0x3B, 0xCA]);
+                    self.buf.emit(&[0x0F, 0x83]);
+                    let bounds_patch = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    self.deopt_stubs.push((bounds_patch, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
                     // Inline aaload: MOV RAX, [RAX + RCX*8 + HEADER_SIZE]
                     self.emit_ref_aload_regs();
                     // Store hoisted value in dedicated spill slot
                     self.emit_store_local(hoist_offset, RAX);
+                }
+                // Deopt snapshot for the hoist guards at this header (skip if
+                // the speculative-BCE guard block above already recorded one).
+                if had_hoists && !self.deopt_box_ptr_by_bci.contains_key(&pc) {
+                    self.emit_deopt_snapshot_at_guard(pc);
                 }
             }
 
@@ -25806,6 +25846,26 @@ pub fn compile_with_param_slots(
     } else {
         find_loop_hoists(code, code_len, &loops)
     };
+    // Per-bci de-spec (same registry the speculative-BCE guards use): the
+    // hoisted aaload's null+bounds preheader guard deopts at the loop-header
+    // bci; once a header crosses the de-spec threshold, drop its hoists so
+    // the recompile emits the in-loop aaload with its normal checks instead
+    // of re-making the failed speculation. Must run BEFORE `Compiler::new`
+    // pairs `hoist_offsets` with `hoist_info` by index.
+    let hoist_info: Vec<LoopHoist> = hoist_info
+        .into_iter()
+        .filter(|h| {
+            let despec = crate::deopt::despec_contains(method_key, h.loop_header as u32);
+            if despec && std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+                eprintln!(
+                    "[cratonvm-deopt] de-spec: dropping aaload LICM hoist at loop_header \
+                     bci={} for {} (recompile with in-loop checked access)",
+                    h.loop_header, method_key
+                );
+            }
+            !despec
+        })
+        .collect();
 
     // LICM: find loop-invariant integer-arithmetic runs to hoist into the
     // loop pre-header. These are pure, non-faulting ALU expressions on
@@ -31308,6 +31368,52 @@ mod tests {
         assert!(modified & (1 << 2) != 0); // local 2 modified by istore_2
         assert!(modified & (1 << 0) == 0); // local 0 NOT modified
         assert!(modified & (1 << 3) == 0); // local 3 NOT modified
+    }
+
+    #[test]
+    fn test_find_loop_hoists_conditional_body_still_detected() {
+        // The detector deliberately hoists a sequence that sits BEHIND a
+        // conditional inside the body (`for(..){ if (m != null) m[j]... }`) —
+        // and the loop may also be zero-trip at runtime. That is only sound
+        // because the EMISSION now guards the hoisted load with null+bounds
+        // checks routed to the reason-2 deopt stub (see the preheader "LICM:
+        // Emit hoisted aaload" block and test_classes/LicmHoistRepro.java);
+        // before those guards this shape crashed the VM on m == null. This
+        // test pins the detector contract so an emission-side reader knows
+        // conditional/zero-trip shapes DO reach the guarded preheader.
+        //
+        // Locals: 0=m (Object[]), 1=j, 2=n, 3=i.
+        //   0: iconst_0 ; 1: istore_3                    (i = 0)
+        //   2: iload_3 ; 3: iload_2 ; 4: if_icmpge → 21  (header)
+        //   7: aload_0 ; 8: ifnull → 15                  (skip if m == null)
+        //  11: aload_0 ; 12: iload_1 ; 13: aaload ; 14: pop
+        //  15: iinc 3, 1 ; 18: goto → 2 ; 21: return
+        let code: Vec<u8> = vec![
+            0x03, // 0: iconst_0
+            0x3e, // 1: istore_3
+            0x1d, // 2: iload_3 (header)
+            0x1c, // 3: iload_2
+            0xa2, 0x00, 0x11, // 4: if_icmpge +17 → 21
+            0x2a, // 7: aload_0
+            0xc6, 0x00, 0x07, // 8: ifnull +7 → 15
+            0x2a, // 11: aload_0
+            0x1b, // 12: iload_1
+            0x32, // 13: aaload
+            0x57, // 14: pop
+            0x84, 0x03, 0x01, // 15: iinc 3, 1
+            0xa7, 0xff, 0xf0, // 18: goto -16 → 2
+            0xb1, // 21: return
+        ];
+        let code_len = code.len();
+        let loops = detect_loops(&code, code_len);
+        assert_eq!(loops[0], (2, 18), "loop should be (2, 18), got {loops:?}");
+
+        let hoists = find_loop_hoists(&code, code_len, &loops);
+        assert_eq!(hoists.len(), 1, "conditional-body aaload is hoisted");
+        assert_eq!(hoists[0].loop_header, 2);
+        assert_eq!(hoists[0].seq_start, 11);
+        assert_eq!(hoists[0].array_local, 0);
+        assert_eq!(hoists[0].index_local, 1);
     }
 
     #[test]

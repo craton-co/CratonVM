@@ -14,8 +14,13 @@
 //! The emitted kernel is a SIMT element-wise body:
 //!
 //!  * Compute `tid = ctaid.x * ntid.x + tid.x`.
+//!  * If the loop has a non-zero (always non-negative — see
+//!    [`loop_recog`](self::loop_recog)'s module doc comment) constant
+//!    start value `K`, fold it in once: `tid = tid + K` (see
+//!    [`emit::Emitter::apply_loop_start_offset`]).
 //!  * Compare `tid >= bound`; if so, `ret`.
-//!  * Emit the loop body once with `iload iv` rewritten to `tid` and
+//!  * Emit the loop body once with `iload iv` rewritten to `tid`
+//!    (already `tid + K` when the loop has a non-zero start) and
 //!    `iinc iv` skipped.
 //!  * Emit each `*aload`/`*astore` with a bounds check that jumps to
 //!    a shared failure label on out-of-bounds, writing `1` to
@@ -26,6 +31,7 @@ use crate::emitter::{
     LoweringError, PtxKernel, PtxModule, PtxParam, PtxParamKind, RegDecl, RegKind,
 };
 use crate::signature::KernelSignature;
+use cratonvm_reader::constant_pool::ConstantPool;
 use cratonvm_reader::method::ClassFileMethod;
 
 mod emit;
@@ -41,9 +47,52 @@ use loop_recog::{detect_loop, LoopShape};
 /// established by [`build_param_list`]: array params are `(ptr, len)`
 /// pairs, scalar params are single typed registers, and the trailing
 /// `failure_flag` is a device-pointer used for deopt signalling.
+///
+/// No constant pool is available here, so a body containing
+/// `ldc`/`ldc_w`/`ldc2_w` (AUDIT C31 follow-up, 2026-07-11) fails to
+/// lower with [`LoweringError::UnsupportedNode`] — see
+/// [`lower_method_with_pool`] for the variant that can actually emit
+/// PTX for a numeric-literal `ldc`. In practice this is harmless: the
+/// CP-free `analyzer::analyze`/`analyze_with_annotations` already
+/// reject any such method before it ever reaches lowering (see
+/// `Reason::LoadConstant`), so this entry point only ever sees `ldc`
+/// here if a caller manually built a `KernelSignature` for a method it
+/// didn't get from the analyzer.
 pub fn lower_method(
     class_name: &str,
     method: &ClassFileMethod,
+    sig: &KernelSignature,
+    sm_major: u32,
+    sm_minor: u32,
+) -> Result<PtxModule, LoweringError> {
+    lower_method_with_pool_impl(class_name, method, None, sig, sm_major, sm_minor)
+}
+
+/// [`lower_method`], but resolving `ldc`/`ldc_w`/`ldc2_w` against `cp`
+/// (AUDIT C31 follow-up, 2026-07-11) instead of failing to lower them.
+/// `cp` should be the same constant pool the method's class was parsed
+/// with — i.e. the one passed to
+/// `analyzer::analyze_with_pool`/`analyze_with_annotations_and_pool` to
+/// admit the method in the first place.
+pub fn lower_method_with_pool(
+    class_name: &str,
+    method: &ClassFileMethod,
+    cp: &ConstantPool,
+    sig: &KernelSignature,
+    sm_major: u32,
+    sm_minor: u32,
+) -> Result<PtxModule, LoweringError> {
+    lower_method_with_pool_impl(class_name, method, Some(cp), sig, sm_major, sm_minor)
+}
+
+/// Shared implementation behind [`lower_method`] and
+/// [`lower_method_with_pool`]. `cp` is `None` for the CP-free entry
+/// point, which keeps its pre-AUDIT-C31 behaviour: an `ldc`/`ldc_w`/
+/// `ldc2_w` in the body fails to lower rather than being resolved.
+fn lower_method_with_pool_impl(
+    class_name: &str,
+    method: &ClassFileMethod,
+    cp: Option<&ConstantPool>,
     sig: &KernelSignature,
     sm_major: u32,
     sm_minor: u32,
@@ -55,9 +104,15 @@ pub fn lower_method(
         .code()
         .ok_or_else(|| LoweringError::UnsupportedNode("method has no Code attribute".into()))?;
     let bytes = &code.code;
-    let shape = detect_loop(bytes)?;
+    // `cp` also lets the loop recognizer resolve an `ldc`/`ldc_w`-
+    // sourced loop start value (a start constant too large for
+    // `iconst`/`bipush`/`sipush`) back to its `Integer` value — see
+    // `loop_recog::resolve_start_value`. `None` (the CP-free entry
+    // point) is always safe: such a start simply can't be proven
+    // constant and the loop is rejected instead of mis-lowered.
+    let shape = detect_loop(bytes, cp)?;
 
-    let mut emitter = Emitter::new(bytes, sig);
+    let mut emitter = Emitter::new(bytes, sig, cp);
     emitter.bind_param_locals()?;
 
     match shape {
@@ -76,6 +131,13 @@ pub fn lower_method(
             // Pre-loop: emit straight-line.
             emitter.iv_slot = Some(li.iv_slot);
             emitter.emit_tid();
+            // Fold the loop's constant start value `K` into the
+            // induction register (`tid` becomes `tid + K`; a no-op
+            // when `K == 0`) — see `Emitter::apply_loop_start_offset`'s
+            // doc comment for the full correctness analysis (grid
+            // over-launch and the output array's untouched `0..K`
+            // prefix).
+            emitter.apply_loop_start_offset(li.iv_start);
             let bound = locate_bound(bytes, &li, sig)?;
             emitter.walk(0, li.header_pc, Some(&li))?;
             // Drop the operand stack — javac emits `iload iv; iload bound`
@@ -388,7 +450,7 @@ mod tests {
             is_reduction: false,
             allow_div_by_zero,
         };
-        let mut emitter = Emitter::new(&bytes, &sig);
+        let mut emitter = Emitter::new(&bytes, &sig, None);
         emitter.bind_param_locals().expect("bind params");
         emitter.walk(0, bytes.len(), None).expect("lower irem body");
         emitter.finalize_epilogue();
@@ -417,6 +479,320 @@ mod tests {
         );
     }
 
+    // ─── AUDIT 2026-07-11: frem/drem lowering (white-box) ────────────
+    //
+    // Mirrors `lower_i32_remainder_body` above: a hand-built 4-byte
+    // straight-line body (`*load_0; *load_1; *rem; *return`) run
+    // straight through `Emitter` without going through the analyzer at
+    // all, so these tests pin the exact PTX sequence
+    // `lowering::emit::Emitter::frem_f32`/`drem_f64` emit, independent
+    // of admission policy.
+
+    fn lower_f32_remainder_body(allow_div_by_zero: bool) -> String {
+        let bytes = [0x22, 0x23, 0x72, 0xAE]; // fload_0; fload_1; frem; freturn
+        let sig = KernelSignature {
+            param_kinds: vec![ParamKind::F32, ParamKind::F32],
+            return_kind: ParamKind::F32,
+            estimated_work: 1,
+            needs_d2h_sync: false,
+            this_field_cps: vec![],
+            writes_param_mask: 0,
+            is_reduction: false,
+            allow_div_by_zero,
+        };
+        let mut emitter = Emitter::new(&bytes, &sig, None);
+        emitter.bind_param_locals().expect("bind params");
+        emitter.walk(0, bytes.len(), None).expect("lower frem body");
+        emitter.finalize_epilogue();
+        emitter.into_body()
+    }
+
+    fn lower_f64_remainder_body(allow_div_by_zero: bool) -> String {
+        // `double` is a category-2 (2-slot) JVM local: param 0 occupies
+        // slots 0-1, so param 1 starts at slot 2 — `dload_2`, not
+        // `dload_1` (which `bind_param_locals` never binds for this
+        // signature). Mirrors real javac output for
+        // `dremScalar(double a, double b)`.
+        let bytes = [0x26, 0x28, 0x73, 0xAF]; // dload_0; dload_2; drem; dreturn
+        let sig = KernelSignature {
+            param_kinds: vec![ParamKind::F64, ParamKind::F64],
+            return_kind: ParamKind::F64,
+            estimated_work: 1,
+            needs_d2h_sync: false,
+            this_field_cps: vec![],
+            writes_param_mask: 0,
+            is_reduction: false,
+            allow_div_by_zero,
+        };
+        let mut emitter = Emitter::new(&bytes, &sig, None);
+        emitter.bind_param_locals().expect("bind params");
+        emitter.walk(0, bytes.len(), None).expect("lower drem body");
+        emitter.finalize_epilogue();
+        emitter.into_body()
+    }
+
+    #[test]
+    fn frem_lowers_to_div_trunc_fma_sequence() {
+        let text = lower_f32_remainder_body(true);
+        // The div + truncate + fma identity from `frem_f32`'s doc
+        // comment: `r = a - trunc(a/b)*b`, one rounding total.
+        assert!(text.contains("div.rn.f32"), "missing quotient div\n{text}");
+        assert!(
+            text.contains("cvt.rzi.f32.f32"),
+            "missing truncate-toward-zero\n{text}"
+        );
+        assert!(text.contains("neg.f32"), "missing quotient negation\n{text}");
+        assert!(
+            text.contains("fma.rn.f32"),
+            "missing single-rounding fma\n{text}"
+        );
+        // The infinite-divisor correctness patch (JLS §15.17.3: `a %
+        // ±Infinity == a` for finite `a`).
+        assert!(text.contains("abs.f32"), "missing |divisor|\n{text}");
+        assert!(
+            text.contains("setp.eq.f32"),
+            "missing is-infinite predicate\n{text}"
+        );
+        assert!(
+            text.contains("selp.f32"),
+            "missing dividend/naive-remainder select\n{text}"
+        );
+        // PTX genuinely has no `rem.f32` mnemonic — pin that against a
+        // regression back to the old (ptxas-rejected) naive lowering
+        // this replaced.
+        assert!(
+            !text.contains("rem.f32"),
+            "PTX has no rem.f32 mnemonic; this must never be emitted\n{text}"
+        );
+    }
+
+    #[test]
+    fn drem_lowers_to_div_trunc_fma_sequence() {
+        let text = lower_f64_remainder_body(true);
+        assert!(text.contains("div.rn.f64"), "missing quotient div\n{text}");
+        assert!(
+            text.contains("cvt.rzi.f64.f64"),
+            "missing truncate-toward-zero\n{text}"
+        );
+        assert!(text.contains("neg.f64"), "missing quotient negation\n{text}");
+        assert!(
+            text.contains("fma.rn.f64"),
+            "missing single-rounding fma\n{text}"
+        );
+        assert!(text.contains("abs.f64"), "missing |divisor|\n{text}");
+        assert!(
+            text.contains("setp.eq.f64"),
+            "missing is-infinite predicate\n{text}"
+        );
+        assert!(
+            text.contains("selp.f64"),
+            "missing dividend/naive-remainder select\n{text}"
+        );
+        assert!(
+            !text.contains("rem.f64"),
+            "PTX has no rem.f64 mnemonic; this must never be emitted\n{text}"
+        );
+    }
+
+    #[test]
+    fn frem_never_emits_a_zero_divisor_deopt_guard() {
+        // Java floats never trap on a zero divisor — IEEE 754 division
+        // of a float by zero produces ±Infinity or NaN, never an
+        // exception — so unlike `div_or_rem_i32`/`div_or_rem_i64`,
+        // `frem_f32`/`drem_f64` must not branch to the shared
+        // `L_bounds_fail` deopt label at all (there is nothing to
+        // guard against and no failure-flag write is ever needed for
+        // this opcode).
+        let f32_text = lower_f32_remainder_body(true);
+        assert!(
+            !f32_text.contains("L_bounds_fail"),
+            "frem must not emit an integer-style zero-divisor guard\n{f32_text}"
+        );
+        let f64_text = lower_f64_remainder_body(true);
+        assert!(
+            !f64_text.contains("L_bounds_fail"),
+            "drem must not emit an integer-style zero-divisor guard\n{f64_text}"
+        );
+    }
+
+    #[test]
+    fn frem_lowering_is_unaffected_by_allow_div_by_zero_flag() {
+        // Unlike `irem`/`lrem` (see
+        // `allow_div_by_zero_skips_integer_remainder_zero_guard`),
+        // `frem` never emits a zero-divisor guard in the first place.
+        // `KernelSignature::allow_div_by_zero` is purely an
+        // ANALYZER-side admission gate for frem/drem (see
+        // `analyzer::classify`'s `0x72 | 0x73` arm) — once a method
+        // reaches this emitter at all, its frem/drem lowering is
+        // identical regardless of the flag's value.
+        assert_eq!(
+            lower_f32_remainder_body(true),
+            lower_f32_remainder_body(false)
+        );
+        assert_eq!(
+            lower_f64_remainder_body(true),
+            lower_f64_remainder_body(false)
+        );
+    }
+
+    // ─── AUDIT 2026-07-11: lcmp/fcmp*/dcmp* lowering (white-box) ─────
+    //
+    // Mirrors `lower_i32_remainder_body`/`lower_f32_remainder_body`
+    // above: a hand-built straight-line body run directly through
+    // `Emitter`, bypassing the analyzer and the `.class` fixture
+    // pipeline entirely. This is the accepted pattern for pinning an
+    // exact PTX sequence in isolation (see the file-level comment on
+    // those helpers and `test_support.rs`'s "no synthetic bytecode"
+    // rule, which is scoped to the `.class`-fixture loader, not to
+    // hand-built opcode arrays driving `Emitter` directly the way
+    // `analyzer.rs`'s `track_reduction_ops` tests already do).
+    //
+    // These shapes ARE realistic per-instruction JVM bytecode (each
+    // sequence is exactly what `lload_0; lload_2; lcmp; ireturn` etc.
+    // means per JVMS), but — per the reality-check analysis on
+    // `analyzer::Reason::Compare` and the `0x94` arm in `emit_op` —
+    // javac never emits this exact CONSUMPTION shape (a bare `*cmp*`
+    // immediately followed by `*return`, with no intervening `if*`):
+    // every real relational/equality use of `long`/`float`/`double`
+    // compiles the pushed value straight into a branch. So there is no
+    // `.class` fixture that could exercise `lcmp`/`cmp_f32`/`cmp_f64`
+    // through the real reader/analyzer/emitter path today; these tests
+    // pin the building block directly. `compare_branch_fusion_*` further
+    // down (in the real-class section) pins the actual end-to-end
+    // behaviour change for a realistic method: analyzer-`Eligible`,
+    // lowering-`Rejected` at the following `if*`.
+
+    fn lower_cmp_body(bytes: [u8; 4], param_kind: ParamKind) -> String {
+        let sig = KernelSignature {
+            param_kinds: vec![param_kind, param_kind],
+            return_kind: ParamKind::I32,
+            estimated_work: 1,
+            needs_d2h_sync: false,
+            this_field_cps: vec![],
+            writes_param_mask: 0,
+            is_reduction: false,
+            allow_div_by_zero: false,
+        };
+        let mut emitter = Emitter::new(&bytes, &sig, None);
+        emitter.bind_param_locals().expect("bind params");
+        emitter.walk(0, bytes.len(), None).expect("lower cmp body");
+        emitter.finalize_epilogue();
+        emitter.into_body()
+    }
+
+    #[test]
+    fn lcmp_lowers_to_setp_selp_chain() {
+        // lload_0; lload_2; lcmp; ireturn (long params: slot 0-1, 2-3).
+        let text = lower_cmp_body([0x1E, 0x20, 0x94, 0xAC], ParamKind::I64);
+        // Registers are fully deterministic here: `bind_param_locals`
+        // for two I64 params only touches the S64 pool, so `lcmp`'s
+        // Pred/S32 registers start fresh at %p0/%r0.
+        assert!(
+            text.contains("setp.gt.s64 %p0, %rl0, %rl1;"),
+            "missing gt predicate\n{text}"
+        );
+        assert!(
+            text.contains("setp.lt.s64 %p1, %rl0, %rl1;"),
+            "missing lt predicate\n{text}"
+        );
+        assert!(
+            text.contains("selp.s32 %r0, -1, 0, %p1;"),
+            "missing lt-or-eq select\n{text}"
+        );
+        assert!(
+            text.contains("selp.s32 %r1, 1, %r0, %p0;"),
+            "missing final gt-overrides-the-rest select\n{text}"
+        );
+        // Integers have no unordered case — no NaN predicate, exactly
+        // two selects (unlike the three the float/double variants need).
+        assert!(
+            !text.contains("setp.nan"),
+            "lcmp must not emit a NaN check — longs have a total order\n{text}"
+        );
+        assert_eq!(
+            text.matches("selp.s32").count(),
+            2,
+            "lcmp must emit exactly two selects\n{text}"
+        );
+    }
+
+    #[test]
+    fn fcmpl_lowers_with_nan_minus_one_override() {
+        // fload_0; fload_1; fcmpl; ireturn (float params: slot 0, 1).
+        let text = lower_cmp_body([0x22, 0x23, 0x95, 0xAC], ParamKind::F32);
+        assert!(
+            text.contains("setp.gt.f32 %p0, %f0, %f1;"),
+            "missing gt predicate\n{text}"
+        );
+        assert!(
+            text.contains("setp.lt.f32 %p1, %f0, %f1;"),
+            "missing lt predicate\n{text}"
+        );
+        assert!(
+            text.contains("setp.nan.f32 %p2, %f0, %f1;"),
+            "missing NaN predicate\n{text}"
+        );
+        assert!(
+            text.contains("selp.s32 %r0, -1, 0, %p1;"),
+            "missing lt-or-eq select\n{text}"
+        );
+        assert!(
+            text.contains("selp.s32 %r1, 1, %r0, %p0;"),
+            "missing ordered-result select\n{text}"
+        );
+        // The NaN override: fcmpl's default is -1.
+        assert!(
+            text.contains("selp.s32 %r2, -1, %r1, %p2;"),
+            "expected the fcmpl NaN-override select (default -1)\n{text}"
+        );
+        assert_eq!(
+            text.matches("selp.s32").count(),
+            3,
+            "fcmpl must emit exactly three selects (ordered chain + NaN override)\n{text}"
+        );
+    }
+
+    #[test]
+    fn fcmpg_lowers_with_nan_plus_one_override() {
+        // fload_0; fload_1; fcmpg; ireturn.
+        let text = lower_cmp_body([0x22, 0x23, 0x96, 0xAC], ParamKind::F32);
+        assert!(text.contains("setp.gt.f32 %p0, %f0, %f1;"));
+        assert!(text.contains("setp.lt.f32 %p1, %f0, %f1;"));
+        assert!(text.contains("setp.nan.f32 %p2, %f0, %f1;"));
+        assert!(text.contains("selp.s32 %r0, -1, 0, %p1;"));
+        assert!(text.contains("selp.s32 %r1, 1, %r0, %p0;"));
+        // The NaN override: fcmpg's default is +1 — the only difference
+        // from `fcmpl`'s PTX sequence.
+        assert!(
+            text.contains("selp.s32 %r2, 1, %r1, %p2;"),
+            "expected the fcmpg NaN-override select (default +1)\n{text}"
+        );
+        // Must NOT contain fcmpl's -1 override line.
+        assert!(
+            !text.contains("selp.s32 %r2, -1, %r1, %p2;"),
+            "fcmpg must not reuse fcmpl's -1 NaN default\n{text}"
+        );
+    }
+
+    #[test]
+    fn dcmpl_and_dcmpg_mirror_the_f32_sequence_in_f64() {
+        // dload_0; dload_2; dcmp*; ireturn (double params: slot 0-1, 2-3).
+        let l_text = lower_cmp_body([0x26, 0x28, 0x97, 0xAC], ParamKind::F64);
+        assert!(l_text.contains("setp.gt.f64 %p0, %fd0, %fd1;"));
+        assert!(l_text.contains("setp.lt.f64 %p1, %fd0, %fd1;"));
+        assert!(l_text.contains("setp.nan.f64 %p2, %fd0, %fd1;"));
+        assert!(l_text.contains("selp.s32 %r2, -1, %r1, %p2;"));
+
+        let g_text = lower_cmp_body([0x26, 0x28, 0x98, 0xAC], ParamKind::F64);
+        assert!(g_text.contains("setp.gt.f64 %p0, %fd0, %fd1;"));
+        assert!(g_text.contains("selp.s32 %r2, 1, %r1, %p2;"));
+        // PTX genuinely has no three-way integer/float compare mnemonic
+        // — pin that this never regresses into emitting a bogus `cmp.*`
+        // instruction ptxas would reject.
+        assert!(!l_text.contains("cmp.f64"));
+        assert!(!g_text.contains("cmp.f64"));
+    }
+
     // ─────────────── real-class lowering tests ──────────────────────
     use crate::analyzer::{analyze, OffloadVerdict};
     use crate::test_support::load_method;
@@ -428,6 +804,52 @@ mod tests {
             v => panic!("fixture {class}.{method_name} not eligible: {v:?}"),
         };
         lower_method(class, &method, &sig, 7, 5)
+            .unwrap_or_else(|e| panic!("lowering failed for {class}.{method_name}: {e}"))
+    }
+
+    /// [`lower_fixture`], but through the pool-aware
+    /// `analyze_with_pool` / `lower_method_with_pool` entry points
+    /// (AUDIT C31 follow-up, 2026-07-11) — needed for any fixture whose
+    /// body contains `ldc`/`ldc_w`/`ldc2_w`, which the CP-free path
+    /// still refuses. Uses `crate::analyzer::load_method_with_pool`
+    /// (declared `pub(crate)` specifically so this module doesn't need
+    /// its own copy of the fixture-loading boilerplate).
+    fn lower_fixture_with_pool(class: &str, method_name: &str, descriptor: &str) -> PtxModule {
+        let (method, cp) = crate::analyzer::load_method_with_pool(class, method_name, descriptor);
+        let sig = match crate::analyzer::analyze_with_pool(&method, &cp) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("fixture {class}.{method_name} not eligible: {v:?}"),
+        };
+        lower_method_with_pool(class, &method, &cp, &sig, 7, 5)
+            .unwrap_or_else(|e| panic!("lowering failed for {class}.{method_name}: {e}"))
+    }
+
+    /// [`lower_fixture_with_pool`], but additionally threading an
+    /// [`crate::annotations::AdmissionHint`] through
+    /// `analyzer::analyze_with_annotations_and_pool` — needed for
+    /// `EligibleFrem`, whose `frem` opcode the analyzer only admits
+    /// under `AdmissionHint::AllowDivByZero` (AUDIT 2026-07-11, see
+    /// `analyzer::classify`'s `0x72 | 0x73` arm).
+    fn lower_fixture_with_pool_and_hint(
+        class: &str,
+        method_name: &str,
+        descriptor: &str,
+        hint: crate::annotations::AdmissionHint,
+    ) -> PtxModule {
+        let (method, cp) = crate::analyzer::load_method_with_pool(class, method_name, descriptor);
+        let annotations = crate::annotations::MethodAnnotations {
+            gpu_kernel: Some(crate::annotations::GpuKernelAttrs {
+                admit: hint,
+                ..crate::annotations::GpuKernelAttrs::default()
+            }),
+            gpu_exclude: None,
+        };
+        let sig =
+            match crate::analyzer::analyze_with_annotations_and_pool(&method, &annotations, &cp) {
+                OffloadVerdict::Eligible(s) => s,
+                v => panic!("fixture {class}.{method_name} not eligible under {hint:?}: {v:?}"),
+            };
+        lower_method_with_pool(class, &method, &cp, &sig, 7, 5)
             .unwrap_or_else(|e| panic!("lowering failed for {class}.{method_name}: {e}"))
     }
 
@@ -508,7 +930,7 @@ mod tests {
     /// thread accumulates one iteration's partial term; a plain
     /// `st.global.s64 [ret_ptr], value` would race-overwrite the single
     /// output slot with every thread's per-element product → silently
-    /// wrong sums. The lowering must emit `atom.global.add.u64` against
+    /// wrong sums. The lowering must emit `red.global.add.u64` against
     /// `ret_ptr` so the partial contributions accumulate atomically.
     /// (PTX integer atomics use the unsigned-width suffix — the bit
     /// pattern is identical to the signed s64 we'd otherwise store, and
@@ -526,8 +948,8 @@ mod tests {
         let text = m.render();
         // The fix: atomic add into the shared accumulator slot.
         assert!(
-            text.contains("atom.global.add.u64"),
-            "reduction lowering must emit `atom.global.add.u64` against ret_ptr — \
+            text.contains("red.global.add.u64"),
+            "reduction lowering must emit `red.global.add.u64` against ret_ptr — \
              plain `st.global.s64` races between threads.\nPTX:\n{text}"
         );
         // And the racing plain store must NOT appear on the return path.
@@ -586,6 +1008,104 @@ mod tests {
         );
     }
 
+    /// Shared ptxas round-trip driver — see `ptxas_round_trip_vector_add`
+    /// for the rationale. Every lowering shape that can reach a real
+    /// device MUST have a round-trip test here: the 2026-07-11 hardware
+    /// validation found the reduction epilogue producing
+    /// `CUDA_ERROR_INVALID_PTX` at module load (silent CPU fallback via
+    /// blacklist) precisely because only vector_add was ever assembled.
+    fn ptxas_round_trip(text: &str, stem: &str) {
+        let tmpdir = std::env::temp_dir();
+        let stem = format!("cratonvm_jit_cuda_{stem}_{}", std::process::id());
+        let src_path = tmpdir.join(format!("{stem}.ptx"));
+        let out_path = tmpdir.join(format!("{stem}.cubin"));
+        std::fs::write(&src_path, text).expect("write ptx");
+        let ptxas = std::env::var("PTXAS").unwrap_or_else(|_| "ptxas".to_string());
+        let out = std::process::Command::new(&ptxas)
+            .arg("-arch=sm_75")
+            .arg("-o")
+            .arg(&out_path)
+            .arg(&src_path)
+            .output()
+            .expect("invoke ptxas");
+        assert!(
+            out.status.success(),
+            "ptxas rejected the PTX:\nstdout: {}\nstderr: {}\nPTX:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+            text,
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-it"),
+        ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
+    )]
+    fn ptxas_round_trip_dot_reduction() {
+        let m = lower_fixture("EligibleDotProduct", "dot", "([I[I)J");
+        ptxas_round_trip(&m.render(), "dot_reduction");
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-it"),
+        ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
+    )]
+    fn ptxas_round_trip_ldc_constants() {
+        for (class, method, desc) in [
+            ("EligibleLdcInt", "scale", "([I[I)V"),
+            ("EligibleLdcLong", "mix", "([J[J)V"),
+            ("EligibleLdcFloat", "fma", "([F[F)V"),
+            ("EligibleLdcDouble", "fma", "([D[D)V"),
+        ] {
+            let m = lower_fixture_with_pool(class, method, desc);
+            ptxas_round_trip(&m.render(), &format!("ldc_{class}"));
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-it"),
+        ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
+    )]
+    fn ptxas_round_trip_offset_loops() {
+        let m = lower_fixture_with_pool("EligibleOffsetLoop", "offsetLoop", "([I[I)V");
+        ptxas_round_trip(&m.render(), "offset_loop");
+        let m = lower_fixture_with_pool("EligibleOffsetLoop", "offsetLoopLargeStart", "([I[I)V");
+        ptxas_round_trip(&m.render(), "offset_loop_large_start");
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-it"),
+        ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
+    )]
+    fn ptxas_round_trip_frem() {
+        let m = lower_fixture_with_pool_and_hint(
+            "EligibleFrem",
+            "frem",
+            "([F[F)V",
+            crate::annotations::AdmissionHint::AllowDivByZero,
+        );
+        ptxas_round_trip(&m.render(), "frem");
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-it"),
+        ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
+    )]
+    fn ptxas_round_trip_math_intrinsics() {
+        let m = lower_fixture_with_pool_and_hint(
+            "EligibleMathKernel",
+            "sqrtAbsFma",
+            "([F[F[FFFF)V",
+            crate::annotations::AdmissionHint::AllowIntrinsicCalls,
+        );
+        ptxas_round_trip(&m.render(), "math_intrinsics");
+    }
+
     #[test]
     fn vector_add_kernel_has_correct_param_list_in_ptx() {
         let m = lower_fixture("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
@@ -628,15 +1148,22 @@ mod tests {
         // `iconst_0; ireturn`.
         let method = load_method("EligibleStraightLine", "constReturn", "()I");
         let code = method.code().expect("constReturn has a Code attribute");
-        let shape = super::loop_recog::detect_loop(&code.code).unwrap();
+        let shape = super::loop_recog::detect_loop(&code.code, None).unwrap();
         assert!(matches!(shape, super::loop_recog::LoopShape::StraightLine));
     }
 
-    // AUDIT 2026-05-16/2026-07-02: `frem`/`drem` previously emitted a
-    // non-existent `rem.f32`/`rem.f64` PTX mnemonic, then drifted into an
-    // analyzer-eligible/lowering-rejected split. The analyzer now rejects
-    // these methods before lowering. The emitter keeps its defensive
-    // UnsupportedNode arms, but normal admission must never reach them.
+    // AUDIT 2026-05-16/2026-07-02/2026-07-11: `frem`/`drem` previously
+    // emitted a non-existent `rem.f32`/`rem.f64` PTX mnemonic, then
+    // drifted into an analyzer-eligible/lowering-rejected split, then
+    // (2026-07-11) gained a real — but precision-bounded — lowering
+    // via `frem_f32`/`drem_f64`. `analyze()` (`Strict`, the default
+    // exercised by `frem_is_rejected_by_analyzer` below) still rejects
+    // unconditionally: a silently-wrong remainder for an
+    // out-of-precision-range quotient must never be the default
+    // outcome. The gated, opt-in admission path is covered separately
+    // by the `*_admitted_under_allow_div_by_zero_hint` tests in
+    // `analyzer.rs` and the `frem`/`drem` white-box + `EligibleFrem`
+    // lowering tests further up/down this file.
 
     #[test]
     fn frem_is_rejected_by_analyzer() {
@@ -660,6 +1187,17 @@ mod tests {
     // the conservative rejection: every non-canonical shape must fail
     // `lower_method` (→ CPU fallback), and the canonical baseline must
     // still lower.
+    //
+    // AUDIT 2026-07-11 (constant-start offset follow-up): `i = 5` is no
+    // longer in that rejected list — a non-negative compile-time-
+    // constant start is now folded into the induction register (`tid +
+    // K`) instead of being rejected. `NonCanonicalLoops.start5Loop` is
+    // therefore no longer exercised here as a rejection case; see
+    // `positive_start_loop_is_accepted_and_folds_the_offset` below
+    // (`lowering.rs`, not `NonCanonicalLoops.java`, changed — the
+    // fixture's Java source is untouched) and the new
+    // `EligibleOffsetLoop`/`NegativeStartLoop` fixtures for the
+    // accept/still-reject coverage.
 
     /// Helper: a `NonCanonicalLoops` method is analyzer-eligible but
     /// must be rejected by `lower_method`. Returns the error message.
@@ -709,13 +1247,38 @@ mod tests {
     }
 
     #[test]
-    fn nonzero_start_loop_is_rejected_by_lowering() {
-        // `for (i = 5; i < n; i++)` — `iconst_5; istore iv`. Every
-        // access would be offset by 5.
-        let msg = expect_loop_lowering_rejected("start5Loop", "([I)V");
+    fn positive_start_loop_is_accepted_and_folds_the_offset() {
+        // `for (i = 5; i < n; i++)` — `iconst_5; istore iv`. `K = 5` is
+        // a non-negative compile-time constant, so this now LOWERS
+        // (previously rejected — see the AUDIT 2026-07-11 comment
+        // above). The offset must be folded into the induction
+        // register once (`add.s32 ..., <tid>, 5;`) right after the tid
+        // computation, and the loop guard must compare that folded
+        // register (not the raw tid) against the bound.
+        let method = load_method("NonCanonicalLoops", "start5Loop", "([I)V");
+        let sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("expected NonCanonicalLoops.start5Loop to be analyzer-eligible, got {v:?}"),
+        };
+        let m = lower_method("NonCanonicalLoops", &method, &sig, 7, 5)
+            .expect("a non-negative constant start must now lower");
+        let text = m.render();
+        assert!(text.contains(".visible .entry NonCanonicalLoops__start5Loop_"));
+        // The tid+K fold: an `add.s32` with immediate 5 feeding a fresh
+        // register, right after `emit_tid`'s `mov.b32` reinterpret and
+        // before anything else touches the induction register.
         assert!(
-            msg.contains("non-zero loop start value"),
-            "expected start-value rejection, got: {msg}",
+            text.contains("mov.b32 %r0, %ru3;\n    add.s32 %r1, %r0, 5;"),
+            "expected the tid+K fold immediately after tid computation:\n{text}"
+        );
+        // The loop guard must use the folded register (%r1), not the
+        // raw tid (%r0).
+        assert!(
+            text.lines().any(|l| {
+                let l = l.trim_start();
+                l.starts_with("setp.ge.s32") && l.contains("%r1,")
+            }),
+            "expected the loop guard to compare the folded tid+K register:\n{text}"
         );
     }
 
@@ -737,18 +1300,139 @@ mod tests {
     #[test]
     fn canonical_loop_recognizer_records_unit_stride() {
         // White-box: the recognizer accepts the canonical loop and
-        // records exit op `if_icmpge` (0xA2) and stride +1.
+        // records exit op `if_icmpge` (0xA2), stride +1, and start 0.
         let method = load_method("NonCanonicalLoops", "canonical", "([I[I[I)V");
         let code = method.code().expect("canonical has a Code attribute");
-        let shape =
-            super::loop_recog::detect_loop(&code.code).expect("canonical loop must be recognized");
+        let shape = super::loop_recog::detect_loop(&code.code, None)
+            .expect("canonical loop must be recognized");
         match shape {
             super::loop_recog::LoopShape::Counted(li) => {
                 assert_eq!(li.exit_op, 0xA2, "canonical exit op must be if_icmpge");
                 assert_eq!(li.iv_stride, 1, "canonical stride must be +1");
+                assert_eq!(li.iv_start, 0, "canonical start must be 0");
             }
             other => panic!("expected Counted loop, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn positive_start_loop_recognizer_records_start_value() {
+        // White-box twin of `canonical_loop_recognizer_records_unit_stride`
+        // for the `K = 5` case: the recognizer now accepts this shape
+        // (previously rejected) and records `iv_start == 5`.
+        let method = load_method("NonCanonicalLoops", "start5Loop", "([I)V");
+        let code = method.code().expect("start5Loop has a Code attribute");
+        let shape = super::loop_recog::detect_loop(&code.code, None)
+            .expect("a non-negative constant start must now be recognized");
+        match shape {
+            super::loop_recog::LoopShape::Counted(li) => {
+                assert_eq!(li.exit_op, 0xA2);
+                assert_eq!(li.iv_stride, 1);
+                assert_eq!(li.iv_start, 5, "start5Loop's start value must be recorded as 5");
+            }
+            other => panic!("expected Counted loop, got {other:?}"),
+        }
+    }
+
+    // ─── AUDIT 2026-07-11 (constant-start offset): EligibleOffsetLoop ─
+    //
+    // `EligibleOffsetLoop.java` is the dedicated end-to-end fixture for
+    // `for (i = K; i < n; i++)` with `K > 0`: `offsetLoop` exercises the
+    // small-constant (`iconst_4`) path, `offsetLoopLargeStart`
+    // exercises the ldc-sourced (`K` outside `sipush` range) path.
+    // `NegativeStartLoop.java` pins that `K < 0` is still rejected.
+
+    #[test]
+    fn offset_loop_lowers_with_folded_start_value() {
+        // `for (i = 4; i < n; i++) out[i] = a[i] * 3 + 7;` — no ldc
+        // involved (4, 3, and 7 are all small enough for
+        // iconst/bipush), so the CP-free `lower_fixture` entry point
+        // is enough.
+        let m = lower_fixture("EligibleOffsetLoop", "offsetLoop", "([I[I)V");
+        let text = m.render();
+        assert!(text.contains(".visible .entry EligibleOffsetLoop__offsetLoop_"));
+        // The tid+K fold: an `add.s32` with immediate 4 feeding a fresh
+        // register, right after `emit_tid`'s `mov.b32` reinterpret —
+        // deterministic because both params are arrays (`bind_param_locals`
+        // only touches the U64 pool before `emit_tid` runs), so the tid
+        // register is always %r0 and the folded register is always %r1.
+        assert!(
+            text.contains("mov.b32 %r0, %ru3;\n    add.s32 %r1, %r0, 4;"),
+            "expected the tid+K fold immediately after tid computation:\n{text}"
+        );
+        // The loop guard must compare the folded register, not raw tid.
+        assert!(
+            text.lines().any(|l| {
+                let l = l.trim_start();
+                l.starts_with("setp.ge.s32") && l.contains("%r1,")
+            }),
+            "expected the loop guard to compare the folded tid+K register:\n{text}"
+        );
+        // The body still lowers normally (mul + add, one load per
+        // array, one store).
+        assert!(text.contains("mul.lo.s32"));
+        assert!(text.contains("add.s32"));
+        assert!(text.matches("ld.global.s32").count() >= 1);
+        assert!(text.contains("st.global.s32"));
+    }
+
+    #[test]
+    fn offset_loop_recognizer_records_start_value() {
+        // White-box: `iv_start == 4` for the small-constant case.
+        let method = load_method("EligibleOffsetLoop", "offsetLoop", "([I[I)V");
+        let code = method.code().expect("offsetLoop has a Code attribute");
+        let shape = super::loop_recog::detect_loop(&code.code, None)
+            .expect("K=4 must be recognized as a valid non-negative start");
+        match shape {
+            super::loop_recog::LoopShape::Counted(li) => {
+                assert_eq!(li.exit_op, 0xA2);
+                assert_eq!(li.iv_stride, 1);
+                assert_eq!(li.iv_start, 4);
+            }
+            other => panic!("expected Counted loop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn large_start_via_ldc_lowers_correctly() {
+        // `for (i = 40000; i < n; i++) out[i] = a[i];` — 40000 is
+        // outside sipush's +/-32767 range, so javac spills it to the
+        // constant pool and emits `ldc`. Needs the pool-aware entry
+        // point (mirrors every other `ldc`-involving fixture test in
+        // this file).
+        let m = lower_fixture_with_pool("EligibleOffsetLoop", "offsetLoopLargeStart", "([I[I)V");
+        let text = m.render();
+        assert!(text.contains(".visible .entry EligibleOffsetLoop__offsetLoopLargeStart_"));
+        // Same deterministic tid+K fold as the small-constant case,
+        // just with the ldc-resolved value 40000 instead of a literal
+        // 4 — proves `resolve_start_value` actually reads the
+        // constant-pool `Integer` entry rather than merely refusing to
+        // reject the loop.
+        assert!(
+            text.contains("mov.b32 %r0, %ru3;\n    add.s32 %r1, %r0, 40000;"),
+            "expected the tid+K fold with the ldc-resolved start value:\n{text}"
+        );
+    }
+
+    #[test]
+    fn negative_start_loop_is_rejected_by_lowering() {
+        // `for (i = -2; i < n; i++) a[i] = 0;` — `bipush -2; istore
+        // iv`. Negative starts remain rejected (see
+        // `loop_recog.rs`'s module doc comment for why: they would
+        // need more kernel threads than the host's bound-sized launch
+        // provides).
+        let method = load_method("NegativeStartLoop", "negativeStart", "([I)V");
+        let sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("expected NegativeStartLoop.negativeStart to be analyzer-eligible, got {v:?}"),
+        };
+        let err = lower_method("NegativeStartLoop", &method, &sig, 7, 5)
+            .expect_err("a negative constant start must still be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("negative loop start value"),
+            "expected negative-start rejection, got: {msg}",
+        );
     }
 
     #[test]
@@ -758,6 +1442,463 @@ mod tests {
             analyze(&method),
             OffloadVerdict::Rejected(crate::analyzer::Reason::FloatRemainder),
             "drem must be rejected before lowering"
+        );
+    }
+
+    // ─── AUDIT C31 follow-up (2026-07-11): ldc/ldc_w/ldc2_w lowering ──
+    //
+    // Mirrors the analyzer-side tests in `analyzer.rs`'s
+    // `ldc_*_is_eligible_with_pool` group, one level further down the
+    // pipeline: not just "is this admitted?" but "does it lower to the
+    // exact PTX immediate the constant-pool entry holds?". Float/double
+    // literals are asserted via the same exact-bit hex-literal encoding
+    // `emit_op` already uses for `fconst_0..2`/`dconst_0..1`
+    // (`0f<8 hex digits>` / `0d<16 hex digits>`) rather than a decimal
+    // comparison, so the test can't pass on a value that merely *prints*
+    // close to the literal but differs in its low bits.
+
+    #[test]
+    fn ldc_int_literal_lowers_to_immediate_moves() {
+        let m = lower_fixture_with_pool("EligibleLdcInt", "scale", "([I[I)V");
+        let text = m.render();
+        assert!(text.contains(".visible .entry EligibleLdcInt__scale_"));
+        // Both out-of-sipush-range constants (1_000_003 and 77_777)
+        // must appear as plain `mov.s32` immediates.
+        assert!(
+            text.contains(", 1000003;"),
+            "expected the 1_000_003 ldc immediate in:\n{text}"
+        );
+        assert!(
+            text.contains(", 77777;"),
+            "expected the 77_777 ldc immediate in:\n{text}"
+        );
+        assert!(text.contains("mul.lo.s32"));
+        assert!(text.contains("add.s32"));
+    }
+
+    #[test]
+    fn ldc2_w_long_literal_lowers_to_immediate_move() {
+        let m = lower_fixture_with_pool("EligibleLdcLong", "mix", "([J[J)V");
+        let text = m.render();
+        assert!(text.contains(".visible .entry EligibleLdcLong__mix_"));
+        assert!(
+            text.contains(", 6364136223846793005;"),
+            "expected the long-literal ldc2_w immediate in:\n{text}"
+        );
+        assert!(text.contains("mul.lo.s64"));
+    }
+
+    #[test]
+    fn ldc_float_literal_lowers_to_hex_bit_immediate() {
+        let m = lower_fixture_with_pool("EligibleLdcFloat", "fma", "([F[F)V");
+        let text = m.render();
+        assert!(text.contains(".visible .entry EligibleLdcFloat__fma_"));
+        let lit1 = format!("0f{:08X}", 3.14159265f32.to_bits());
+        let lit2 = format!("0f{:08X}", 1.5f32.to_bits());
+        assert!(
+            text.contains(&lit1),
+            "expected exact-bit float immediate {lit1} in:\n{text}"
+        );
+        assert!(
+            text.contains(&lit2),
+            "expected exact-bit float immediate {lit2} in:\n{text}"
+        );
+        assert!(text.contains("mul.f32"));
+        assert!(text.contains("add.f32"));
+    }
+
+    #[test]
+    fn ldc2_w_double_literal_lowers_to_hex_bit_immediate() {
+        let m = lower_fixture_with_pool("EligibleLdcDouble", "fma", "([D[D)V");
+        let text = m.render();
+        assert!(text.contains(".visible .entry EligibleLdcDouble__fma_"));
+        let lit = format!("0d{:016X}", 2.718281828459045f64.to_bits());
+        assert!(
+            text.contains(&lit),
+            "expected exact-bit double immediate {lit} in:\n{text}"
+        );
+        assert!(text.contains("mul.f64"));
+    }
+
+    /// The CP-free `lower_method` entry point must not silently accept
+    /// `ldc` — it has no constant pool to resolve the target against.
+    /// Build the `KernelSignature` through the pool-aware analyzer (this
+    /// fixture is only eligible with a pool — see
+    /// `analyzer::ldc_int_literal_still_rejected_without_pool`) and
+    /// confirm the *old* lowering entry point refuses to emit PTX for
+    /// it rather than, say, silently dropping the constant or panicking.
+    #[test]
+    fn lower_method_without_pool_rejects_ldc() {
+        let (method, cp) =
+            crate::analyzer::load_method_with_pool("EligibleLdcInt", "scale", "([I[I)V");
+        let sig = match crate::analyzer::analyze_with_pool(&method, &cp) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("expected Eligible, got {v:?}"),
+        };
+        let err = lower_method("EligibleLdcInt", &method, &sig, 7, 5)
+            .expect_err("lower_method with no constant pool must not lower ldc");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("constant pool"),
+            "expected a constant-pool-related error, got: {msg}"
+        );
+    }
+
+    /// A `String` CP entry must never lower even if it somehow reached
+    /// the emitter (defence in depth — the analyzer is the primary
+    /// guard, see `analyzer::ldc_string_is_rejected_even_with_pool`).
+    #[test]
+    fn ldc_string_never_lowers_even_with_pool() {
+        let (method, cp) = crate::analyzer::load_method_with_pool("RejectLdcString", "noop", "()V");
+        // The analyzer must refuse this fixture outright.
+        assert_eq!(
+            crate::analyzer::analyze_with_pool(&method, &cp),
+            OffloadVerdict::Rejected(crate::analyzer::Reason::LoadConstant)
+        );
+    }
+
+    // ─── AUDIT 2026-07-11: EligibleFrem end-to-end lowering ──────────
+    //
+    // `EligibleFrem.frem([F[F)V` (`out[i] = in[i] % 3.7f` inside the
+    // canonical loop) needs both loosenings the fixture's doc comment
+    // describes: the pool-aware `ldc` resolution for the `3.7f`
+    // literal (AUDIT C31 follow-up — `3.7f` has no `fconst` short
+    // form) and `AdmissionHint::AllowDivByZero` for the `frem` opcode
+    // itself. This is the only fixture in the suite that exercises
+    // both loosenings stacked in the same method body.
+
+    #[test]
+    fn eligible_frem_lowers_end_to_end_with_pool_and_hint() {
+        let m = lower_fixture_with_pool_and_hint(
+            "EligibleFrem",
+            "frem",
+            "([F[F)V",
+            crate::annotations::AdmissionHint::AllowDivByZero,
+        );
+        let text = m.render();
+        assert!(text.contains(".visible .entry EligibleFrem__frem_"));
+        // The `3.7f` ldc literal lowers to the same exact-bit f32
+        // hex-literal encoding as `fconst_0..2` and every other ldc
+        // float fixture (see `ldc_float_literal_lowers_to_hex_bit_immediate`).
+        let lit = format!("0f{:08X}", 3.7f32.to_bits());
+        assert!(
+            text.contains(&lit),
+            "expected the 3.7f ldc immediate {lit} in:\n{text}"
+        );
+        // The frem div+truncate+fma sequence from `frem_f32`.
+        assert!(text.contains("div.rn.f32"));
+        assert!(text.contains("cvt.rzi.f32.f32"));
+        assert!(text.contains("fma.rn.f32"));
+        // The infinite-divisor correctness patch: the canonical
+        // +Infinity bit pattern must appear as the `abs(divisor) ==
+        // Infinity` comparison target (see `frem_f32`'s doc comment).
+        assert!(
+            text.contains("0f7F800000"),
+            "expected the +Infinity bit-pattern comparison from the \
+             infinite-divisor patch in:\n{text}"
+        );
+        assert!(text.contains("selp.f32"));
+    }
+
+    // ─── AUDIT 2026-07-11: lcmp/fcmp*/dcmp* real-world reality check ──
+    //
+    // `CompareBranchFusion.java` is real javac output for the idiomatic
+    // 3-way `long`/`float`/`double` compare-and-branch pattern (`if (a <
+    // b) return -1; if (a > b) return 1; return 0;`). Before this audit
+    // every method here rejected at ANALYZE time with
+    // `Reason::Compare`, as soon as the scanner reached the first
+    // `lcmp`/`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg`. `classify`'s `0x94..=0x98`
+    // arm now admits these opcodes unconditionally (they have a real,
+    // bit-exact PTX lowering — see `lowering::emit::Emitter::lcmp`/
+    // `cmp_f32`/`cmp_f64`), so each method is now analyzer-`Eligible`.
+    //
+    // That does NOT make the method offloadable: the very next opcode
+    // after every `*cmp*` in this fixture is a single-operand `if<cond>`
+    // that consumes the pushed value for a branch, and general `if*`
+    // outside the canonical-loop guard position still unconditionally
+    // rejects in `emit_op` (`lowering/emit.rs`'s `0x99..=0xA4` arm,
+    // unchanged by this audit). So `lower_method` must still fail — just
+    // with a precise "if-branch … outside canonical-loop guard position"
+    // message instead of never reaching lowering at all. This pins
+    // exactly that before/after transition, matching the analysis in
+    // `analyzer::Reason::Compare`'s doc comment and the reality-check
+    // note on the `0x94` dispatch arm in `emit_op`.
+
+    fn expect_compare_fusion_eligible_but_not_lowerable(method_name: &str, descriptor: &str) {
+        let method = load_method("CompareBranchFusion", method_name, descriptor);
+        let sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!(
+                "expected CompareBranchFusion.{method_name} to be analyzer-Eligible \
+                 now that lcmp/fcmp*/dcmp* are admitted, got {v:?}"
+            ),
+        };
+        let err = lower_method("CompareBranchFusion", &method, &sig, 7, 5).expect_err(
+            "a *cmp*-then-if fusion must still fail to lower — general if-branches \
+             outside the canonical-loop guard are unchanged by this audit",
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("if-branch") && msg.contains("outside canonical-loop guard"),
+            "expected the general if-branch rejection (unchanged), got: {msg}"
+        );
+    }
+
+    #[test]
+    fn compare_branch_fusion_long_is_eligible_then_rejected_at_lowering() {
+        // Exercises `lcmp` (0x94).
+        expect_compare_fusion_eligible_but_not_lowerable("compareLongs", "(JJ)I");
+    }
+
+    #[test]
+    fn compare_branch_fusion_float_is_eligible_then_rejected_at_lowering() {
+        // Exercises both `fcmpg` (for `<`) and `fcmpl` (for `>`) — javac
+        // picks whichever variant makes a NaN operand evaluate the
+        // source-level relational operator to `false` (JLS §15.20.1).
+        expect_compare_fusion_eligible_but_not_lowerable("compareFloats", "(FF)I");
+    }
+
+    #[test]
+    fn compare_branch_fusion_double_is_eligible_then_rejected_at_lowering() {
+        // Exercises both `dcmpg` and `dcmpl`, the `double` twins.
+        expect_compare_fusion_eligible_but_not_lowerable("compareDoubles", "(DD)I");
+    }
+
+    // ─── AUDIT 2026-07-11: invokestatic intrinsic-table lowering ─────
+    //
+    // `EligibleMathKernel.java` mirrors `EligibleFrem.java`'s pattern
+    // exactly: no package, no `craton.gpu.*` import, eligibility gated
+    // behind `AdmissionHint::AllowIntrinsicCalls` supplied by the Rust
+    // test code via `lower_fixture_with_pool_and_hint` rather than a
+    // real `@GpuKernel` annotation. See that fixture's file doc comment
+    // for why (keeps these tests independent of the `craton-gpu`
+    // annotation classpath being built in the sandbox).
+
+    #[test]
+    fn sqrt_abs_fma_lowers_to_exact_ptx() {
+        let m = lower_fixture_with_pool_and_hint(
+            "EligibleMathKernel",
+            "sqrtAbsFma",
+            "([F[F[FFFF)V",
+            crate::annotations::AdmissionHint::AllowIntrinsicCalls,
+        );
+        let text = m.render();
+        assert!(text.contains(".visible .entry EligibleMathKernel__sqrtAbsFma_"));
+        // Math.sqrt(double) → the correctly-rounded PTX sqrt.
+        assert!(
+            text.contains("sqrt.rn.f64"),
+            "missing correctly-rounded sqrt\n{text}"
+        );
+        // (double) a[i] widen and (float) narrow of the sqrt result.
+        assert!(
+            text.contains("cvt.f64.f32"),
+            "missing (double) widen of a[i]\n{text}"
+        );
+        assert!(
+            text.contains("cvt.rn.f32.f64"),
+            "missing (float) narrow of the sqrt result\n{text}"
+        );
+        // Math.abs(float) → plain sign-bit-clear.
+        assert!(text.contains("abs.f32"), "missing float abs\n{text}");
+        // Math.fma(float,float,float) → single-rounding fma.
+        assert!(text.contains("fma.rn.f32"), "missing float fma\n{text}");
+        assert!(text.contains("mul.f32"));
+        assert!(text.contains("add.f32"));
+        assert!(text.contains("st.global.f32"));
+    }
+
+    #[test]
+    fn abs_int_lowers_to_branchless_wraparound_sequence() {
+        let m = lower_fixture_with_pool_and_hint(
+            "EligibleMathKernel",
+            "absInt",
+            "([I[I)V",
+            crate::annotations::AdmissionHint::AllowIntrinsicCalls,
+        );
+        let text = m.render();
+        assert!(
+            text.contains("shr.s32"),
+            "missing arithmetic-shift mask\n{text}"
+        );
+        assert!(text.contains("xor.b32"), "missing xor step\n{text}");
+        assert!(text.contains("sub.s32"), "missing sub step\n{text}");
+        // Deliberately must NOT rely on PTX's unverified abs.s32
+        // mnemonic at the Integer.MIN_VALUE boundary — see
+        // `lowering::emit::Emitter::abs_i32`'s doc comment.
+        assert!(
+            !text.contains("abs.s32"),
+            "must use the explicit wraparound-safe sequence, not abs.s32\n{text}"
+        );
+    }
+
+    #[test]
+    fn abs_long_lowers_to_branchless_wraparound_sequence() {
+        let m = lower_fixture_with_pool_and_hint(
+            "EligibleMathKernel",
+            "absLong",
+            "([J[J)V",
+            crate::annotations::AdmissionHint::AllowIntrinsicCalls,
+        );
+        let text = m.render();
+        assert!(text.contains("shr.s64"));
+        assert!(text.contains("xor.b64"));
+        assert!(text.contains("sub.s64"));
+        assert!(
+            !text.contains("abs.s64"),
+            "must use the explicit wraparound-safe sequence, not abs.s64\n{text}"
+        );
+    }
+
+    #[test]
+    fn fma_double_lowers_to_single_rounding_fma() {
+        let m = lower_fixture_with_pool_and_hint(
+            "EligibleMathKernel",
+            "fmaDouble",
+            "([D[DDDD)V",
+            crate::annotations::AdmissionHint::AllowIntrinsicCalls,
+        );
+        let text = m.render();
+        assert!(text.contains("fma.rn.f64"), "missing double fma\n{text}");
+        assert!(text.contains("abs.f64"), "missing double abs\n{text}");
+    }
+
+    #[test]
+    fn min_max_int_lowers_to_setp_selp() {
+        let m = lower_fixture_with_pool_and_hint(
+            "EligibleMathKernel",
+            "minMaxInt",
+            "([I[I[I)V",
+            crate::annotations::AdmissionHint::AllowIntrinsicCalls,
+        );
+        let text = m.render();
+        assert!(text.contains("setp.lt.s32"), "missing min predicate\n{text}");
+        assert!(text.contains("setp.gt.s32"), "missing max predicate\n{text}");
+        assert!(
+            text.matches("selp.s32").count() >= 2,
+            "expected at least one selp.s32 per min/max\n{text}"
+        );
+    }
+
+    #[test]
+    fn min_max_long_lowers_to_setp_selp() {
+        let m = lower_fixture_with_pool_and_hint(
+            "EligibleMathKernel",
+            "minMaxLong",
+            "([J[J[J)V",
+            crate::annotations::AdmissionHint::AllowIntrinsicCalls,
+        );
+        let text = m.render();
+        assert!(text.contains("setp.lt.s64"));
+        assert!(text.contains("setp.gt.s64"));
+        assert!(text.matches("selp.s64").count() >= 2);
+    }
+
+    #[test]
+    fn min_max_float_lowers_with_nan_and_signed_zero_handling() {
+        let m = lower_fixture_with_pool_and_hint(
+            "EligibleMathKernel",
+            "minMaxFloat",
+            "([F[F[F)V",
+            crate::annotations::AdmissionHint::AllowIntrinsicCalls,
+        );
+        let text = m.render();
+        assert!(
+            text.contains("setp.nan.f32"),
+            "missing NaN predicate\n{text}"
+        );
+        assert!(
+            text.contains("or.b32"),
+            "missing min's OR-of-raw-bits signed-zero handling\n{text}"
+        );
+        assert!(
+            text.contains("and.b32"),
+            "missing max's AND-of-raw-bits signed-zero handling\n{text}"
+        );
+        assert!(text.contains("setp.le.f32"), "missing min ordered compare\n{text}");
+        assert!(text.contains("setp.ge.f32"), "missing max ordered compare\n{text}");
+        // PTX's own min.f32/max.f32 do not implement Java's NaN/signed-zero
+        // rules — pin that this lowering never regresses to using them.
+        assert!(!text.contains("min.f32"));
+        assert!(!text.contains("max.f32"));
+    }
+
+    #[test]
+    fn min_max_double_lowers_with_nan_and_signed_zero_handling() {
+        let m = lower_fixture_with_pool_and_hint(
+            "EligibleMathKernel",
+            "minMaxDouble",
+            "([D[D[D)V",
+            crate::annotations::AdmissionHint::AllowIntrinsicCalls,
+        );
+        let text = m.render();
+        assert!(text.contains("setp.nan.f64"));
+        assert!(text.contains("or.b64"));
+        assert!(text.contains("and.b64"));
+        assert!(!text.contains("min.f64"));
+        assert!(!text.contains("max.f64"));
+    }
+
+    /// `Math.pow` is not in the curated intrinsic table (see
+    /// `analyzer::resolve_math_intrinsic`'s doc comment), so
+    /// `powRejected` never becomes analyzer-`Eligible` even under
+    /// `AllowIntrinsicCalls` — see
+    /// `analyzer::admit_intrinsic_calls_still_rejects_math_pow`. This
+    /// test instead bypasses the analyzer, building a `KernelSignature`
+    /// by hand exactly as if a future analyzer bug let the method
+    /// through, to pin the EMITTER's own defence-in-depth rejection —
+    /// mirrors `resolve_cp_entry`'s "should have been rejected
+    /// upstream" arms for `ldc`/`ldc2_w`.
+    #[test]
+    fn invokestatic_of_non_table_method_is_rejected_defensively_at_lowering() {
+        let (method, cp) =
+            crate::analyzer::load_method_with_pool("EligibleMathKernel", "powRejected", "([D[D)V");
+        let sig = KernelSignature {
+            param_kinds: vec![ParamKind::F64Array, ParamKind::F64Array],
+            return_kind: ParamKind::Void,
+            estimated_work: 1 << 20,
+            needs_d2h_sync: false,
+            this_field_cps: vec![],
+            writes_param_mask: 0,
+            is_reduction: false,
+            allow_div_by_zero: false,
+        };
+        let err = lower_method_with_pool("EligibleMathKernel", &method, &cp, &sig, 7, 5)
+            .expect_err("Math.pow must not lower even if it somehow reached the emitter");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not a recognised GPU intrinsic"),
+            "expected the defensive intrinsic-table rejection, got: {msg}"
+        );
+    }
+
+    /// The CP-free `lower_method` entry point must not silently accept
+    /// `invokestatic` — it has no constant pool to resolve the callee
+    /// against. Mirrors `lower_method_without_pool_rejects_ldc`.
+    #[test]
+    fn lower_method_without_pool_rejects_invokestatic() {
+        let (method, cp) = crate::analyzer::load_method_with_pool(
+            "EligibleMathKernel",
+            "sqrtAbsFma",
+            "([F[F[FFFF)V",
+        );
+        let annotations = crate::annotations::MethodAnnotations {
+            gpu_kernel: Some(crate::annotations::GpuKernelAttrs {
+                admit: crate::annotations::AdmissionHint::AllowIntrinsicCalls,
+                ..crate::annotations::GpuKernelAttrs::default()
+            }),
+            gpu_exclude: None,
+        };
+        let sig =
+            match crate::analyzer::analyze_with_annotations_and_pool(&method, &annotations, &cp) {
+                OffloadVerdict::Eligible(s) => s,
+                v => panic!("expected Eligible, got {v:?}"),
+            };
+        let err = lower_method("EligibleMathKernel", &method, &sig, 7, 5)
+            .expect_err("lower_method with no constant pool must not lower invokestatic");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("constant pool"),
+            "expected a constant-pool-related error, got: {msg}"
         );
     }
 }

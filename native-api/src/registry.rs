@@ -267,6 +267,39 @@ pub trait NativeThreadBlocker: Send + Sync {
     fn leave_blocked(&self);
 }
 
+/// Transport-only mirror of `vm::runtime::offload::SerializedResult`'s
+/// scalar variants, returned by [`NativeContext::gpu_future_take_result`].
+///
+/// `native-api` cannot depend on `vm` (the dependency runs the other
+/// way — `vm`'s `NativeContextImpl` implements this crate's
+/// `NativeContext` trait), so a completed GPU submission's
+/// `SerializedResult` can't cross the trait boundary as-is. This enum is
+/// the narrow subset `gpu_future_take_result` needs to hand back: the
+/// four scalar-reduction shapes a `)I`/`)J`/`)F`/`)D`-returning kernel
+/// produces, plus `Void` for a kernel with no return value (or one that
+/// wrote its result into a caller-owned array instead — see the trait
+/// method's doc comment). Primitive-array *future results* are
+/// deliberately not represented here: today `finalize_submission` never
+/// stamps a `SerializedResult::PrimitiveArray*` into a completed
+/// submission (array outputs are delivered via writeback into the
+/// caller's own array), so there is nothing for this enum to carry for
+/// that case.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GpuFutureResult {
+    /// The kernel had a void return, or wrote its result into a
+    /// caller-owned output array via writeback — nothing new to hand
+    /// back through the future's result slot.
+    Void,
+    /// Scalar-return accumulator readback (`)I` descriptor).
+    ScalarI32(i32),
+    /// Scalar-return accumulator readback (`)J` descriptor).
+    ScalarI64(i64),
+    /// Scalar-return accumulator readback (`)F` descriptor).
+    ScalarF32(f32),
+    /// Scalar-return accumulator readback (`)D` descriptor).
+    ScalarF64(f64),
+}
+
 /// Trait providing VM capabilities needed by native method implementations.
 ///
 /// The `Vm` struct implements this trait. Using a trait here avoids circular
@@ -299,6 +332,72 @@ pub trait NativeContext {
         None
     }
 
+    /// GpuStream affinity — mint a new Java-visible CUDA stream on the
+    /// per-VM default-ordinal `OffloadCache`.
+    ///
+    /// Called by `Native.newStream` (wraps the returned handle in a
+    /// `GpuStreamImpl`) and, lazily, by every `submit`/`launch`/
+    /// `submitMethod`/`submitWithArg(s)` handler the first time a given
+    /// `GpuExecutor` handle is used — see
+    /// `native-builtins/src/craton_gpu.rs::resolve_or_create_default_stream`.
+    /// That laziness is what gives an executor a real *default* stream:
+    /// every dispatch through the same executor handle reuses the one
+    /// stream minted on its first submit, instead of each call getting
+    /// its own private one-shot stream (the gap
+    /// `docs/gpu/async-api.md` describes under "GpuStream affinity is
+    /// not wired up").
+    ///
+    /// Returns `None` when there is no device (no driver / `--gpu` off
+    /// / `gpu-offload` compiled off on the VM side) — the default impl
+    /// here, matching every other no-driver fallback in this trait.
+    /// The VM's `NativeContextImpl` overrides under
+    /// `#[cfg(feature = "gpu-offload")]` to call
+    /// `runtime::offload::OffloadCache::stream_create`.
+    fn gpu_stream_create(&mut self) -> Option<u64> {
+        None
+    }
+
+    /// Release a stream minted by [`gpu_stream_create`](Self::gpu_stream_create).
+    /// Safe to call on an unknown or already-released `handle`
+    /// (no-op) — same idempotent-release convention as
+    /// [`gpu_release_array_cache`](Self::gpu_release_array_cache).
+    ///
+    /// Default impl is a no-op (no GPU offload). The VM override calls
+    /// `runtime::offload::OffloadCache::stream_release`.
+    fn gpu_stream_release(&mut self, _handle: u64) {}
+
+    /// Stream-affine sibling of [`gpu_dispatch_method`](Self::gpu_dispatch_method):
+    /// identical contract, plus `stream_handle`.
+    ///
+    /// * `Some(h)` — pin this dispatch onto the CUDA stream previously
+    ///   minted by [`gpu_stream_create`](Self::gpu_stream_create) under
+    ///   handle `h`. Two dispatches pinned to the SAME `h` serialize in
+    ///   submission order (the ordering guarantee a CUDA stream gives
+    ///   for free). An `h` that was never minted, or was already
+    ///   released via [`gpu_stream_release`](Self::gpu_stream_release),
+    ///   is a hard failure (a `Failed` submission), not a silent
+    ///   fresh-stream fallback.
+    /// * `None` — identical to calling
+    ///   [`gpu_dispatch_method`](Self::gpu_dispatch_method) directly: a
+    ///   fresh, private, one-shot stream for this dispatch alone.
+    ///
+    /// Default impl delegates to `gpu_dispatch_method` and ignores
+    /// `stream_handle` — correct for every mock/test context (no GPU
+    /// offload at all) and for a VM build with `gpu-offload` off. The
+    /// VM's `NativeContextImpl` overrides under
+    /// `#[cfg(feature = "gpu-offload")]` to call
+    /// `runtime::offload::dispatch_method_from_native_on_stream`.
+    fn gpu_dispatch_method_on_stream(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        java_args: &[Value],
+        _stream_handle: Option<u64>,
+    ) -> Option<u64> {
+        self.gpu_dispatch_method(class_name, method_name, descriptor, java_args)
+    }
+
     /// Phase 6 #4 — query the real GPU submission registry for the
     /// future at `handle`. Returns:
     ///   * `Some(0)` — Running
@@ -309,6 +408,35 @@ pub trait NativeContext {
     ///                 future state in native-builtins).
     /// Default impl returns None (no GPU offload).
     fn gpu_future_status(&self, _handle: u64) -> Option<i32> {
+        None
+    }
+
+    /// 2026-07-11 — take the real GPU submission's completed result for
+    /// `handle`, without blocking. This is the read half `gpu_future_status`
+    /// was missing: `gpu_future_status` (now backed by
+    /// `runtime::offload::poll_submission_status`) tells a caller *that*
+    /// a submission finished; this method hands back *what it produced*.
+    ///
+    /// Returns:
+    ///   * `Some(GpuFutureResult::Scalar*)` — the submission is complete
+    ///     and its kernel returned a scalar (`)I`/`)J`/`)F`/`)D`).
+    ///   * `Some(GpuFutureResult::Void)` — the submission is complete and
+    ///     either the kernel had a void return, or it wrote its result
+    ///     into a caller-owned primitive array rather than the future's
+    ///     result slot (array results are delivered via writeback into
+    ///     the caller's own arrays, not through the future — see
+    ///     [`GpuFutureResult`]'s doc comment).
+    ///   * `None` — the handle is not in the real registry, the
+    ///     submission is still `Running`, or it failed. This method
+    ///     never blocks and never finalizes-and-waits on the caller's
+    ///     behalf beyond what an already-observed completion allows: a
+    ///     caller that hasn't first seen `gpu_future_status`/
+    ///     `futureIsDone` report completion should treat `None` here as
+    ///     "not ready yet" and fall back to the blocking
+    ///     `gpu_future_synchronize` path, not as a permanent failure.
+    ///
+    /// Default impl returns `None` (no GPU offload).
+    fn gpu_future_take_result(&self, _handle: u64) -> Option<GpuFutureResult> {
         None
     }
 
@@ -481,6 +609,12 @@ pub trait NativeContext {
     /// `java.lang.Object`, slot). After the call, read the forwarded reference
     /// back with [`read_native_pin`] before using it. Unpin the whole batch with
     /// [`unpin_native_roots`] passing the index returned by the *first* pin.
+    ///
+    /// Forgot to pin somewhere? Run with `CRATONVM_DBG_STALE_OBJREF=1` (the
+    /// `Generational` GC backend only) to turn a stale read into an immediate,
+    /// deterministic panic instead of silent corruption — see
+    /// `gc/src/stale_objref_debug.rs` and
+    /// docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
     ///
     /// Default impl is a no-op (handle 0) for test mocks with no moving GC.
     fn pin_native_root(&mut self, _obj: ObjectRef) -> usize {
@@ -1168,6 +1302,28 @@ pub trait NativeContext {
 
     /// Get the ClassId for a loaded class by name. Returns None if not loaded.
     fn class_id_by_name(&self, name: &str) -> Option<ClassId>;
+
+    /// Resolve `name` to a `ClassId`, preferring whichever loaded class is
+    /// registered under the SAME classloader as `near`'s own declaring
+    /// context, falling back to the normal global (bootstrap-first) search
+    /// used by [`Self::class_id_by_name`].
+    ///
+    /// A plain by-name lookup can silently resolve to an unrelated
+    /// same-named class loaded under a DIFFERENT classloader when the JVM
+    /// spec's (loader, name) identity legitimately produces two distinct
+    /// classes with the same name -- e.g. Hibernate ORM's bytecode
+    /// enhancement reloads an `@EmbeddedId` class under its own private
+    /// ByteBuddy classloader. Resolving a field/parameter's declared type
+    /// via plain name search can then find the FIRST-loaded (often stale)
+    /// variant instead of the one the caller's own class actually sees,
+    /// causing a real, correctly-typed value to be rejected as an
+    /// assignability mismatch. Use this instead of `class_id_by_name`
+    /// whenever `name` is a symbolic reference that must match the specific
+    /// class variant visible to a known class (`near`) -- e.g. a
+    /// `Field`/`Method`/`Constructor`'s own declaring class.
+    fn class_id_by_name_near(&self, name: &str, _near: ClassId) -> Option<ClassId> {
+        self.class_id_by_name(name)
+    }
 
     /// For a synthetic lambda-proxy `ClassId` (created by `register_lambda_proxy`,
     /// class id `>= 0x8000_0000`, not in the class store), return the internal

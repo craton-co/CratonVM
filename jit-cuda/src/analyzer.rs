@@ -22,6 +22,7 @@
 use crate::annotations::{AdmissionHint, MethodAnnotations};
 use crate::signature::KernelSignature;
 use cratonvm_reader::attribute::CodeAttribute;
+use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 use cratonvm_reader::field_type::FieldType;
 use cratonvm_reader::method::ClassFileMethod;
 use cratonvm_reader::method_descriptor::MethodDescriptor;
@@ -83,6 +84,157 @@ impl ParamKind {
     }
 }
 
+// ---------------------------------------------------------------------
+// Curated GPU intrinsic table (AUDIT 2026-07-11, intrinsic-table
+// follow-up to the `AllowIntrinsicCalls` PHASE1-GUESS gap documented in
+// `docs/gpu/annotations.md`).
+//
+// This is the single source of truth for "which `java/lang/Math` (or
+// `java/lang/StrictMath`) static methods can this crate lower to PTX
+// bit-exactly". Both `classify_invokestatic` (below, the analyzer side)
+// and `lowering::emit::Emitter::invokestatic` (the emitter side)
+// resolve through [`resolve_math_intrinsic`] so the two layers can
+// never drift apart on which callees are admitted.
+// ---------------------------------------------------------------------
+
+/// A curated, Java-exact GPU intrinsic — the closed set of
+/// `java/lang/Math`/`java/lang/StrictMath` static methods this crate
+/// will lower to PTX. See [`resolve_math_intrinsic`] for the
+/// class/name/descriptor table and the exactness rationale, and
+/// `lowering::emit::Emitter::invokestatic` for the PTX each variant
+/// lowers to.
+///
+/// Deliberately EXCLUDED from this table (calls to these still reject
+/// with `Reason::Invoke` even under `AdmissionHint::AllowIntrinsicCalls`):
+///
+/// - `sin`/`cos`/`tan`/`exp`/`log`/`log10`/`pow`/`cbrt`/… — every
+///   `Math` method whose javadoc allows up to a couple ULPs of
+///   platform-dependent slack relative to `StrictMath` (the "the
+///   size of the error incurred is 1 or 2 ulps" family). PTX's
+///   `.approx` transcendental instructions (`sin.approx.f32`, etc.)
+///   are lower precision still and have no `f64` form at all on most
+///   architectures; there is no PTX instruction that is provably
+///   within Java's error bound for these, so none of them are in this
+///   table. (The original Phase 1 spec's five-method list —
+///   `sqrt`/`sin`/`cos`/`exp`/`log` — is superseded by this table:
+///   `sin`/`cos`/`exp`/`log` are cut for exactly this reason, `sqrt`
+///   is kept because it alone in that list is specified as *exactly*
+///   rounded, not approximate.)
+/// - `toIntExact`/`addExact`/`multiplyExact`/… — these can throw
+///   `ArithmeticException`; a GPU kernel body has no lowering for a
+///   Java exception.
+/// - `round`/`ceil`/`floor`/`rint`/`copySign`/`signum`/`hypot`/… — not
+///   yet audited for a bit-exact PTX mapping; left out of this first
+///   curated cut rather than guessed at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MathIntrinsic {
+    /// `Math.sqrt(double)` / `StrictMath.sqrt(double)` → `sqrt.rn.f64`.
+    SqrtF64,
+    /// `Math.abs(int)` / `StrictMath.abs(int)` → the explicit
+    /// wraparound-safe `shr`/`xor`/`sub` sequence (see
+    /// `Emitter::abs_i32`'s doc comment for why this crate does not
+    /// rely on PTX's `abs.s32` at the `Integer.MIN_VALUE` boundary).
+    AbsI32,
+    /// `Math.abs(long)` / `StrictMath.abs(long)` — 64-bit twin of
+    /// [`AbsI32`](MathIntrinsic::AbsI32).
+    AbsI64,
+    /// `Math.abs(float)` / `StrictMath.abs(float)` → `abs.f32` (pure
+    /// sign-bit clear — no rounding, no overflow edge case).
+    AbsF32,
+    /// `Math.abs(double)` / `StrictMath.abs(double)` → `abs.f64`.
+    AbsF64,
+    /// `Math.min(int,int)` / `StrictMath.min(int,int)` → `setp.lt.s32`
+    /// + `selp.s32`.
+    MinI32,
+    /// `Math.max(int,int)` / `StrictMath.max(int,int)` → `setp.gt.s32`
+    /// + `selp.s32`.
+    MaxI32,
+    /// `Math.min(long,long)` / `StrictMath.min(long,long)`.
+    MinI64,
+    /// `Math.max(long,long)` / `StrictMath.max(long,long)`.
+    MaxI64,
+    /// `Math.min(float,float)` / `StrictMath.min(float,float)` — the
+    /// NaN-and-signed-zero-correct `setp.nan` + bitwise-OR-of-raw-bits
+    /// + `selp` chain (see `Emitter::minmax_f32`'s doc comment).
+    MinF32,
+    /// `Math.max(float,float)` / `StrictMath.max(float,float)` — twin
+    /// of [`MinF32`](MathIntrinsic::MinF32) with the ordered comparison
+    /// and the zero-case bitwise op both flipped (`ge`/AND instead of
+    /// `le`/OR).
+    MaxF32,
+    /// `Math.min(double,double)` / `StrictMath.min(double,double)`.
+    MinF64,
+    /// `Math.max(double,double)` / `StrictMath.max(double,double)`.
+    MaxF64,
+    /// `Math.fma(float,float,float)` / `StrictMath.fma(float,float,float)`
+    /// → `fma.rn.f32` (single-rounding fused multiply-add — exactly
+    /// what both classes are specified to compute).
+    FmaF32,
+    /// `Math.fma(double,double,double)` / `StrictMath.fma(double,double,double)`
+    /// → `fma.rn.f64`.
+    FmaF64,
+}
+
+/// Resolve a static-method callsite — `class_name` in internal form
+/// (e.g. `"java/lang/Math"`), `method_name`, and the raw JVM
+/// `descriptor` string (e.g. `"(D)D"`) — to a curated [`MathIntrinsic`],
+/// or `None` if this crate has no lowering for it.
+///
+/// ## Why `java/lang/Math` and `java/lang/StrictMath` are both matched
+///
+/// `sqrt`/`abs`/`min`/`max`/`fma` are exactly the subset of `Math`'s
+/// methods whose javadoc requires `Math` and `StrictMath` to compute
+/// IDENTICAL results bit-for-bit — unlike `sin`/`cos`/`exp`/`log`/`pow`
+/// (excluded from this table entirely; see [`MathIntrinsic`]'s doc
+/// comment), where `Math` is explicitly allowed to trade accuracy for
+/// speed relative to `StrictMath`:
+///
+/// - `sqrt(double)`: specified as the correctly-rounded IEEE 754 square
+///   root — no "1 ulp" slack clause applies to it the way it does to
+///   the transcendentals, so both classes must agree exactly.
+/// - `abs`: pure sign-bit manipulation (float/double) or
+///   two's-complement negate-if-negative (int/long) — no rounding
+///   decision either class could differ on.
+/// - `min`/`max`: pure comparison plus NaN/signed-zero selection — no
+///   rounding.
+/// - `fma`: both classes are specified as "the exact product ... is
+///   then rounded once", i.e. a true fused multiply-add — identical
+///   contract since `StrictMath.fma` was added (Java 9).
+///
+/// A wrong/unrecognised `class_name` (anything other than those two),
+/// `method_name`, or `descriptor` — including a same-named overload
+/// this table doesn't cover, e.g. `Math.min(double,int)` (not a real
+/// overload, but the point stands for any descriptor mismatch) —
+/// returns `None`. The match is exact on all three fields; there is no
+/// fuzzy/partial matching.
+pub(crate) fn resolve_math_intrinsic(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> Option<MathIntrinsic> {
+    if class_name != "java/lang/Math" && class_name != "java/lang/StrictMath" {
+        return None;
+    }
+    Some(match (method_name, descriptor) {
+        ("sqrt", "(D)D") => MathIntrinsic::SqrtF64,
+        ("abs", "(I)I") => MathIntrinsic::AbsI32,
+        ("abs", "(J)J") => MathIntrinsic::AbsI64,
+        ("abs", "(F)F") => MathIntrinsic::AbsF32,
+        ("abs", "(D)D") => MathIntrinsic::AbsF64,
+        ("min", "(II)I") => MathIntrinsic::MinI32,
+        ("max", "(II)I") => MathIntrinsic::MaxI32,
+        ("min", "(JJ)J") => MathIntrinsic::MinI64,
+        ("max", "(JJ)J") => MathIntrinsic::MaxI64,
+        ("min", "(FF)F") => MathIntrinsic::MinF32,
+        ("max", "(FF)F") => MathIntrinsic::MaxF32,
+        ("min", "(DD)D") => MathIntrinsic::MinF64,
+        ("max", "(DD)D") => MathIntrinsic::MaxF64,
+        ("fma", "(FFF)F") => MathIntrinsic::FmaF32,
+        ("fma", "(DDD)D") => MathIntrinsic::FmaF64,
+        _ => return None,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reason {
     NonStatic,
@@ -93,6 +245,26 @@ pub enum Reason {
     UnsupportedParamType,
     UnsupportedReturnType,
     Allocation,
+    /// `invokestatic` (0xB8) — and every other invoke family opcode
+    /// (`invokevirtual`/`invokespecial`/`invokeinterface`/`invokedynamic`,
+    /// 0xB6/0xB7/0xB9/0xBA), which never have a GPU lowering at all.
+    ///
+    /// AUDIT 2026-07-11 (intrinsic table follow-up): `invokestatic`
+    /// under `AdmissionHint::AllowIntrinsicCalls` used to be admitted
+    /// unconditionally (PHASE1-GUESS — see the removed comment this
+    /// replaces) because the analyzer had no way to resolve the
+    /// constant-pool callee. `classify_invokestatic` now does the
+    /// resolution: with a constant pool available (the
+    /// `analyze_with_pool`/`analyze_with_annotations_and_pool` /
+    /// `_and_pool` entry points) and the hint set, a callsite that
+    /// resolves to one of the [`MathIntrinsic`] table entries via
+    /// [`resolve_math_intrinsic`] is admitted; every other
+    /// `invokestatic` — including a real `java/lang/Math` method NOT
+    /// in the table (`sin`/`cos`/`exp`/`log`/`pow`/…), any call to a
+    /// different class, and any `invokestatic` seen through the
+    /// CP-free `analyze`/`analyze_with_annotations` entry points
+    /// (which have no pool to resolve against) — still rejects with
+    /// this same reason, exactly as `Strict` mode always has.
     Invoke,
     FieldAccess,
     Throw,
@@ -144,16 +316,86 @@ pub enum Reason {
     /// the per-method blacklist with would-be-eligible methods.
     /// Reject upstream until the analyzer learns to resolve the CP
     /// entry or the emitter grows a numeric-only `ldc` arm.
+    ///
+    /// AUDIT 2026-07-11: this was, in practice, the single most common
+    /// eligibility killer — ANY `int` literal outside sipush range
+    /// (`|c| > 32767`) or ANY `long`/`float`/`double` literal forced a
+    /// blanket reject even in an otherwise-perfect element-wise kernel,
+    /// because javac has no `iconst`/`bipush`/`sipush`-style immediate
+    /// form for those cases and must fall back to `ldc`/`ldc2_w`. The
+    /// analyzer now resolves the CP entry when it has one (see
+    /// [`analyze_with_pool`] / [`analyze_with_annotations_and_pool`])
+    /// and admits `ldc`/`ldc_w` of an `Integer`/`Float` entry and
+    /// `ldc2_w` of a `Long`/`Double` entry — the emitter has a matching
+    /// `mov.s32`/`mov.f32`/`mov.s64`/`mov.f64` immediate lowering (see
+    /// `lowering/emit.rs`'s `ldc`/`ldc2_w`). `String`/`Class`/
+    /// `MethodType`/`MethodHandle`/`Dynamic` entries — and every
+    /// `ldc`/`ldc2_w` when no constant pool is available at all (the
+    /// plain [`analyze`] / [`analyze_with_annotations`] entry points) —
+    /// still reject with this same reason; there is no GPU-representable
+    /// immediate form for a reference-typed constant.
     LoadConstant,
     /// Direct annotation API users can pass `MethodAnnotations` with
     /// `gpu_exclude` set; that opt-out takes precedence over any
     /// `gpu_kernel` hint.
     GpuExcluded,
-    /// `frem` / `drem` require IEEE remainder lowering; the PTX emitter
-    /// rejects them defensively, so reject them at admission too.
+    /// `frem` (0x72) / `drem` (0x73) reject in `Strict` mode (the
+    /// default). PTX has no `rem.f32`/`rem.f64` mnemonic; the emitter
+    /// lowers them via a div + truncate + fma sequence
+    /// (`lowering::emit::Emitter::frem_f32`/`drem_f64` — see the long
+    /// AUDIT comment there for the full JLS §15.17.3 derivation) that
+    /// is bit-exact only while the quotient magnitude
+    /// `|dividend / divisor|` stays within the exactly-representable-
+    /// integer range of the type (`< 2^24` for `float`, `< 2^53` for
+    /// `double`). Outside that range a single rounded division can
+    /// recover the wrong truncated quotient, and the lowering then
+    /// returns a value that is wrong by a whole multiple of the
+    /// divisor — not a rounding-level error, a flatly incorrect
+    /// answer. Because the GPU deopt/failure-flag machinery only
+    /// catches bounds/div-zero traps (never wrong VALUES), a
+    /// silently-wrong `frem`/`drem` must never be the default.
+    ///
+    /// `classify`'s `0x72 | 0x73` arm therefore only admits these two
+    /// opcodes under `AdmissionHint::AllowDivByZero` — reusing that
+    /// hint (rather than minting a dedicated one, which would require
+    /// editing `annotations.rs`) because it is already the "accept
+    /// looser numeric edge-case semantics for a division-family
+    /// opcode" opt-in, and `frem`/`drem` are literally the floating
+    /// counterparts of `irem`/`lrem`. See `classify` for the full
+    /// reuse rationale.
     FloatRemainder,
-    /// `lcmp` / `fcmp*` / `dcmp*` push `-1/0/1` and have no lowering in
-    /// the element-wise subset.
+    /// `lcmp` (0x94) / `fcmpl`/`fcmpg` (0x95/0x96) / `dcmpl`/`dcmpg`
+    /// (0x97/0x98) push `-1`/`0`/`1`.
+    ///
+    /// AUDIT 2026-07-11: these opcodes now have a real, unconditionally
+    /// bit-exact PTX lowering (`lowering::emit::Emitter::lcmp`/
+    /// `cmp_f32`/`cmp_f64` — a `setp` + `selp` chain, with an explicit
+    /// `setp.nan` override for the `fcmpl`/`fcmpg`/`dcmpl`/`dcmpg`
+    /// NaN-handling rule). Unlike `frem`/`drem`, a compare has no
+    /// precision boundary, so `classify`'s `0x94..=0x98` arm admits them
+    /// under `Strict` too — this reason is therefore no longer returned
+    /// by `classify` and is kept only for API/history stability (a
+    /// caller pattern-matching on `Reason` still compiles, and the
+    /// variant documents what used to reject here).
+    ///
+    /// REALITY CHECK: admitting the opcode does NOT make a realistic
+    /// javac-emitted method newly offloadable end-to-end. Every real
+    /// use of `lcmp`/`fcmp*`/`dcmp*` javac emits is IMMEDIATELY followed
+    /// by a single-operand `if<cond>` that consumes the pushed value for
+    /// a branch decision (`a < b`, `a > b`, a hand-written 3-way
+    /// `compareTo`, …) — javac has no source construct that stores the
+    /// raw comparison result without doing so. That following `if*`
+    /// still rejects unconditionally in `lowering/emit.rs` ("if-branch
+    /// opcode … outside canonical-loop guard position"), so the net
+    /// effect of this change is that such a method becomes analyzer-
+    /// `Eligible` and then lowering-`Rejected` with a precise message,
+    /// instead of analyzer-`Rejected(Compare)` — more precise
+    /// diagnostics, no new false eligibility. See
+    /// `test_classes/gpu/CompareBranchFusion.java` and the
+    /// `compare_branch_fusion_*` tests in `lowering.rs` for the pinned
+    /// before/after transition, and the value-producing lowering is
+    /// still a correct building block for a future cmp-then-branch
+    /// fusion.
     Compare,
 }
 
@@ -168,8 +410,22 @@ pub enum OffloadVerdict {
 /// Equivalent to [`analyze_with_annotations`] with
 /// [`MethodAnnotations::default()`] — i.e. strict, behaves exactly as
 /// the analyzer did before the annotation feature landed.
+///
+/// This entry point has no constant pool, so `ldc`/`ldc_w`/`ldc2_w`
+/// always reject with `Reason::LoadConstant` regardless of what they
+/// target — see [`analyze_with_pool`] for the CP-aware variant that
+/// admits numeric-literal `ldc`.
 pub fn analyze(method: &ClassFileMethod) -> OffloadVerdict {
     analyze_with_annotations(method, &MethodAnnotations::default())
+}
+
+/// [`analyze`], but resolving `ldc`/`ldc_w`/`ldc2_w` against `cp` (AUDIT
+/// C31) so a numeric-literal load (`Integer`/`Float` via `ldc`/`ldc_w`,
+/// `Long`/`Double` via `ldc2_w`) is admitted instead of rejected
+/// outright. Equivalent to [`analyze_with_annotations_and_pool`] with
+/// [`MethodAnnotations::default()`].
+pub fn analyze_with_pool(method: &ClassFileMethod, cp: &ConstantPool) -> OffloadVerdict {
+    analyze_with_annotations_and_pool(method, &MethodAnnotations::default(), cp)
 }
 
 /// Inspect a class-file method with user-supplied annotations that can
@@ -187,12 +443,55 @@ pub fn analyze(method: &ClassFileMethod) -> OffloadVerdict {
 ///   component whose size comes from a method parameter is accepted.
 /// - `AdmissionHint::AllowDivByZero`   — recorded in the
 ///   [`KernelSignature`] so lowering skips integer zero-divisor guards.
+///   AUDIT 2026-07-11: also reused (see `classify`'s `0x72 | 0x73` arm
+///   and [`Reason::FloatRemainder`]) to admit `frem`/`drem`, whose
+///   div+truncate+fma lowering is only bit-exact for quotients within
+///   the type's exactly-representable-integer range — an explicit
+///   opt-in, same spirit as skipping the integer zero-divisor guard.
 /// - `AdmissionHint::AllowIntrinsicCalls` — `invokestatic` is accepted
-///   on the assumption that the lowering layer will handle the
-///   intrinsics listed in §2.4 (`Math.sqrt`/`sin`/`cos`/`exp`/`log`).
+///   only when the constant-pool callee resolves (via
+///   [`resolve_math_intrinsic`]) to one of the curated
+///   [`MathIntrinsic`] table entries (`Math`/`StrictMath`
+///   `sqrt`/`abs`/`min`/`max`/`fma`); every other `invokestatic` still
+///   rejects with `Reason::Invoke`. This supersedes the original
+///   Phase 1 spec's five-method list
+///   (`sqrt`/`sin`/`cos`/`exp`/`log`) — see [`MathIntrinsic`]'s doc
+///   comment for why the transcendentals were cut. Resolution needs a
+///   constant pool, so this loosening only has an effect through
+///   [`analyze_with_pool`]/[`analyze_with_annotations_and_pool`]; the
+///   CP-free entry points below always reject `invokestatic`
+///   regardless of the hint.
+///
+/// No constant pool is available here either, so `ldc`/`ldc_w`/`ldc2_w`
+/// still reject unconditionally — see
+/// [`analyze_with_annotations_and_pool`].
 pub fn analyze_with_annotations(
     method: &ClassFileMethod,
     annotations: &MethodAnnotations,
+) -> OffloadVerdict {
+    analyze_with_annotations_and_pool_impl(method, annotations, None)
+}
+
+/// [`analyze_with_annotations`], but resolving `ldc`/`ldc_w`/`ldc2_w`
+/// against `cp` (AUDIT C31) — see [`analyze_with_pool`] for the
+/// no-annotations shorthand.
+pub fn analyze_with_annotations_and_pool(
+    method: &ClassFileMethod,
+    annotations: &MethodAnnotations,
+    cp: &ConstantPool,
+) -> OffloadVerdict {
+    analyze_with_annotations_and_pool_impl(method, annotations, Some(cp))
+}
+
+/// Shared implementation behind all four `analyze*` entry points above.
+/// `cp` is `None` for the CP-free entry points (`analyze` /
+/// `analyze_with_annotations`), which keeps their pre-AUDIT-C31
+/// behaviour byte-for-byte: `ldc`/`ldc_w`/`ldc2_w` reject unconditionally
+/// because there is no constant pool to resolve them against.
+fn analyze_with_annotations_and_pool_impl(
+    method: &ClassFileMethod,
+    annotations: &MethodAnnotations,
+    cp: Option<&ConstantPool>,
 ) -> OffloadVerdict {
     if annotations.gpu_exclude.is_some() {
         return OffloadVerdict::Rejected(Reason::GpuExcluded);
@@ -259,7 +558,7 @@ pub fn analyze_with_annotations(
     // the body matches the dot-product/sum reduction shape — no second
     // walk needed.
     let (this_field_cps, estimated_work, has_backward, is_dot_reduction) =
-        match scan_bytecode(code, hint, is_static) {
+        match scan_bytecode(code, hint, is_static, cp) {
             Ok(t) => t,
             Err(reason) => return OffloadVerdict::Rejected(reason),
         };
@@ -356,10 +655,17 @@ pub fn analyze_with_annotations(
 /// from arrays (an `*aload`) and accumulates with an arithmetic `*add`.
 /// `analyze` uses it to exempt that shape from the conservative
 /// `ReductionNotImplemented` / `CountedLoopScalarReturn` guards.
+///
+/// `cp` is the class's constant pool, when the caller has one (AUDIT
+/// C31). It is only consulted to resolve `ldc` (0x12) / `ldc_w` (0x13) /
+/// `ldc2_w` (0x14) — see [`classify_ldc`] — so a numeric-literal load
+/// can be admitted instead of unconditionally rejected. `None` keeps
+/// the pre-AUDIT-C31 behaviour: every `ldc`/`ldc_w`/`ldc2_w` rejects.
 fn scan_bytecode(
     code: &CodeAttribute,
     hint: AdmissionHint,
     is_static: bool,
+    cp: Option<&ConstantPool>,
 ) -> Result<(Vec<u16>, usize, bool, bool), Reason> {
     let bytes = &code.code;
     let mut pc = 0usize;
@@ -499,7 +805,21 @@ fn scan_bytecode(
             return Err(Reason::NonStaticReceiverMisuse);
         }
 
-        match classify(op, hint, prev_op) {
+        // AUDIT 2026-07-11 (C31 follow-up): `ldc`/`ldc_w`/`ldc2_w` need
+        // the constant pool to classify precisely, which `classify`
+        // does not have access to. Intercept them here — before the
+        // generic classifier, which still conservatively rejects all
+        // three opcodes whenever it IS consulted (`cp = None`, or a
+        // caller that invokes `classify` directly) — and resolve
+        // against `cp` when the caller supplied one.
+        let op_class = if op == 0x12 || op == 0x13 || op == 0x14 {
+            classify_ldc(bytes, pc, op, cp)
+        } else if op == 0xB8 {
+            classify_invokestatic(bytes, pc, hint, cp)
+        } else {
+            classify(op, hint, prev_op)
+        };
+        match op_class {
             OpClass::Ok => {}
             OpClass::Reject(r) => return Err(r),
         }
@@ -672,22 +992,58 @@ fn classify(op: u8, hint: AdmissionHint, prev_op: Option<u8>) -> OpClass {
         // such method was analyzed-eligible and then lowering-rejected,
         // wasting work. Reject upstream with the precise reason; see
         // `Reason::LoadConstant`.
-        0x12 | 0x13 | 0x14 => OpClass::Reject(Reason::LoadConstant),
-        0x72 | 0x73 => OpClass::Reject(Reason::FloatRemainder),
-        0x94..=0x98 => OpClass::Reject(Reason::Compare),
-        0xB2..=0xB5 => OpClass::Reject(Reason::FieldAccess),
-        // Invokes: the AllowIntrinsicCalls hint loosens `invokestatic`
-        // (0xB8) so that the lowering layer can recognise the small set
-        // of intrinsics enumerated in §2.4 (Math.sqrt/sin/cos/exp/log).
         //
-        // PHASE1-GUESS: a precise check would resolve the 2-byte CP
-        // index following 0xB8 and confirm the target is one of the
-        // five `java/lang/Math` doubles. The analyzer does not carry a
-        // reference to the constant pool today, so we conservatively
-        // accept any `invokestatic` under the hint and leave the
-        // intrinsic-vs-arbitrary-call distinction to the lowering
-        // layer, which will refuse to emit PTX for an unknown callee.
-        0xB8 if matches!(hint, AdmissionHint::AllowIntrinsicCalls) => OpClass::Ok,
+        // AUDIT 2026-07-11 (C31 follow-up): this arm is the CP-free
+        // fallback. `scan_bytecode`'s walk loop intercepts these three
+        // opcodes *before* calling `classify` and routes them to
+        // `classify_ldc` instead, which can admit a numeric-literal
+        // `ldc`/`ldc2_w` when it has a constant pool to resolve against.
+        // This arm stays exactly as it was so `classify` remains correct
+        // (conservative) if ever called directly, e.g. from a test.
+        0x12 | 0x13 | 0x14 => OpClass::Reject(Reason::LoadConstant),
+        // AUDIT 2026-07-11: `frem`/`drem` now have a real PTX lowering
+        // (see `lowering::emit::Emitter::frem_f32`/`drem_f64`), but
+        // that lowering is only bit-exact for quotients within the
+        // exactly-representable-integer range of the type — see
+        // `Reason::FloatRemainder` for the full precision analysis.
+        // `AllowDivByZero` is reused as the opt-in gate rather than a
+        // dedicated hint (see the doc comment on that variant above
+        // for why); `Strict` (the default, `prev_op`-independent like
+        // every other band here) still rejects unconditionally so a
+        // silently-wrong remainder is never the default outcome.
+        0x72 | 0x73 if matches!(hint, AdmissionHint::AllowDivByZero) => OpClass::Ok,
+        0x72 | 0x73 => OpClass::Reject(Reason::FloatRemainder),
+        // AUDIT 2026-07-11: `lcmp`/`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg` used to
+        // reject unconditionally with `Reason::Compare` — see that
+        // variant's doc comment for the full history. They now have a
+        // real PTX lowering (`lowering/emit.rs`'s `lcmp`/`cmp_f32`/
+        // `cmp_f64`) that is bit-exact for every input (no precision
+        // boundary like `frem`/`drem`), so `Strict` admits them
+        // unconditionally too — no hint needed. This is a deliberately
+        // explicit arm rather than relying on the `0x54..=0xA4` catch-all
+        // band below (which already covers this range) so the intent is
+        // documented at the opcode, not implied by a wide band.
+        //
+        // Admitting the opcode does not, by itself, make any currently-
+        // rejected real-world method newly offloadable: every real
+        // javac-emitted use pairs the pushed value with an immediately
+        // following `if<cond>` branch, and general if-branches outside
+        // the canonical-loop guard still reject in `lowering/emit.rs`.
+        // See `Reason::Compare`'s doc comment for the full reality-check
+        // analysis and the fixture that pins the resulting analyzer-
+        // Eligible / lowering-Rejected transition.
+        0x94..=0x98 => OpClass::Ok,
+        0xB2..=0xB5 => OpClass::Reject(Reason::FieldAccess),
+        // Invokes: `invokestatic` (0xB8) needs the constant pool to
+        // classify precisely (same reason `ldc`/`ldc_w`/`ldc2_w` get
+        // pulled out above `classify` into `classify_ldc`) — see
+        // `classify_invokestatic`, which `scan_bytecode`'s walk loop
+        // intercepts 0xB8 to before it ever reaches this function. This
+        // arm is therefore the CP-free / non-`AllowIntrinsicCalls`
+        // fallback, kept so `classify` stays conservative (rejects) if
+        // ever called directly, e.g. from a test — mirrors the
+        // `0x12 | 0x13 | 0x14 => OpClass::Reject(Reason::LoadConstant)`
+        // arm's rationale exactly.
         0xB6..=0xBA => OpClass::Reject(Reason::Invoke),
         // Allocation: `new` (0xBB), `anewarray` (0xBD), and
         // `multianewarray` (0xC5) always reject — `AllowAllocation`
@@ -716,6 +1072,106 @@ fn classify(op: u8, hint: AdmissionHint, prev_op: Option<u8>) -> OpClass {
         | 0xC4
         | 0xC6..=0xC8 => OpClass::Ok,
         other => OpClass::Reject(Reason::UnknownOpcode(other)),
+    }
+}
+
+/// Classify `ldc` (0x12) / `ldc_w` (0x13) / `ldc2_w` (0x14) against the
+/// constant pool (AUDIT C31 follow-up, 2026-07-11).
+///
+/// `ldc`/`ldc_w` reference a single-slot CP entry; the only kinds a GPU
+/// immediate can represent are `Integer` and `Float`. `ldc2_w`
+/// references a two-slot CP entry (`Long` or `Double`) — per JVMS
+/// §6.5, `ldc`/`ldc_w` never target a `Long`/`Double` entry and
+/// `ldc2_w` never targets an `Integer`/`Float` one, but the check below
+/// enforces that pairing explicitly rather than trusting a
+/// (potentially malformed) class file. Every other CP entry kind —
+/// `String`, `ClassReference`, `MethodType`, `MethodHandle`,
+/// `Dynamic`, … — has no GPU-representable immediate form and rejects
+/// with the same [`Reason::LoadConstant`] as before this audit.
+///
+/// `cp = None` (the CP-free `analyze` / `analyze_with_annotations`
+/// entry points) and a truncated/out-of-range operand both fall back to
+/// the original unconditional reject — safe-by-default in the same
+/// spirit as every other conservative check in this module.
+fn classify_ldc(bytes: &[u8], pc: usize, op: u8, cp: Option<&ConstantPool>) -> OpClass {
+    let Some(cp) = cp else {
+        return OpClass::Reject(Reason::LoadConstant);
+    };
+    let index = match op {
+        0x12 => match bytes.get(pc + 1) {
+            Some(&b) => b as u16,
+            None => return OpClass::Reject(Reason::LoadConstant),
+        },
+        0x13 | 0x14 => match (bytes.get(pc + 1), bytes.get(pc + 2)) {
+            (Some(&hi), Some(&lo)) => u16::from_be_bytes([hi, lo]),
+            _ => return OpClass::Reject(Reason::LoadConstant),
+        },
+        _ => {
+            debug_assert!(false, "classify_ldc called with non-ldc opcode 0x{op:02x}");
+            return OpClass::Reject(Reason::LoadConstant);
+        }
+    };
+    let admits = match cp.get(index) {
+        Some(ConstantPoolEntry::Integer(_)) | Some(ConstantPoolEntry::Float(_)) => op != 0x14,
+        Some(ConstantPoolEntry::Long(_)) | Some(ConstantPoolEntry::Double(_)) => op == 0x14,
+        _ => false,
+    };
+    if admits {
+        OpClass::Ok
+    } else {
+        OpClass::Reject(Reason::LoadConstant)
+    }
+}
+
+/// Classify `invokestatic` (0xB8) against the admission hint and,
+/// when the hint is set, the constant pool (AUDIT 2026-07-11, closing
+/// the PHASE1-GUESS gap documented in `docs/gpu/annotations.md`).
+///
+/// Without `AdmissionHint::AllowIntrinsicCalls` this is identical to
+/// `classify`'s catch-all `0xB6..=0xBA` arm: reject with
+/// `Reason::Invoke`. With the hint, a constant pool is required to
+/// resolve the 2-byte CP index that follows the opcode to a
+/// `MethodReference` — no pool (the CP-free `analyze`/
+/// `analyze_with_annotations` entry points) means there is nothing to
+/// resolve against, so it still rejects; this is the precise behaviour
+/// fix over the old code, which admitted blindly regardless of pool
+/// availability. When a pool IS available, the callee is resolved via
+/// [`resolve_math_intrinsic`]; only a curated-table hit is admitted —
+/// everything else (a `java/lang/Math` method not in the table, a call
+/// to any other class, a malformed/out-of-range CP index) rejects with
+/// `Reason::Invoke`, same as `Strict` mode always has.
+fn classify_invokestatic(
+    bytes: &[u8],
+    pc: usize,
+    hint: AdmissionHint,
+    cp: Option<&ConstantPool>,
+) -> OpClass {
+    if !matches!(hint, AdmissionHint::AllowIntrinsicCalls) {
+        return OpClass::Reject(Reason::Invoke);
+    }
+    let Some(cp) = cp else {
+        return OpClass::Reject(Reason::Invoke);
+    };
+    let index = match (bytes.get(pc + 1), bytes.get(pc + 2)) {
+        (Some(&hi), Some(&lo)) => u16::from_be_bytes([hi, lo]),
+        _ => return OpClass::Reject(Reason::Invoke),
+    };
+    let Some(ConstantPoolEntry::MethodReference {
+        class_index,
+        name_and_type_index,
+    }) = cp.get(index)
+    else {
+        return OpClass::Reject(Reason::Invoke);
+    };
+    let Some(class_name) = cp.get_class_name(*class_index) else {
+        return OpClass::Reject(Reason::Invoke);
+    };
+    let Some((method_name, descriptor)) = cp.get_name_and_type(*name_and_type_index) else {
+        return OpClass::Reject(Reason::Invoke);
+    };
+    match resolve_math_intrinsic(class_name, method_name, descriptor) {
+        Some(_) => OpClass::Ok,
+        None => OpClass::Reject(Reason::Invoke),
     }
 }
 
@@ -846,6 +1302,55 @@ fn instruction_size(bytes: &[u8], pc: usize) -> Result<usize, Reason> {
     Ok(size)
 }
 
+/// Load a fixture `.class` file and return both the requested method
+/// AND the class's constant pool (AUDIT C31 follow-up, 2026-07-11).
+///
+/// [`crate::test_support::load_method`] only returns the
+/// `ClassFileMethod` — the `ClassFile` (and its constant pool) is
+/// dropped once the borrow used to force-decode the `Code` attribute
+/// ends. The pool-aware `analyze_with_pool` / `lower_method_with_pool`
+/// tests need the constant pool to stay alive alongside the method, so
+/// this mirrors `load_method`'s loading/force-decode logic but returns
+/// the `ConstantPool` too. `pub(crate)` (not `pub(super)`) so
+/// `lowering.rs`'s test module can reuse it instead of duplicating the
+/// loader a third time.
+#[cfg(test)]
+pub(crate) fn load_method_with_pool(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> (ClassFileMethod, ConstantPool) {
+    let fixture_dir = env!("JIT_CUDA_FIXTURE_DIR");
+    let path = std::path::Path::new(fixture_dir).join(format!("{class_name}.class"));
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
+    let mut class = cratonvm_reader::class_reader::read_class(&bytes)
+        .unwrap_or_else(|e| panic!("failed to parse fixture {}: {e:?}", path.display()));
+    // See `test_support::load_method` for why only `Code` is
+    // force-decoded (and why that has to happen before the constant
+    // pool is moved out of `class` below).
+    let cp = &class.constant_pool;
+    for method in class.methods.iter_mut() {
+        for attr in method.attributes.iter_mut() {
+            if attr.name() == "Code" {
+                let _ = attr.decode(cp);
+            }
+        }
+    }
+    let method = class
+        .methods
+        .into_iter()
+        .find(|m| &*m.name == method_name && &*m.descriptor == descriptor)
+        .unwrap_or_else(|| {
+            panic!(
+                "method {method_name}{descriptor} not found in {} \
+                 (did the Java source change without recompiling?)",
+                path.display()
+            )
+        });
+    (method, class.constant_pool)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,13 +1371,6 @@ mod tests {
                 ..GpuKernelAttrs::default()
             }),
             gpu_exclude: None,
-        }
-    }
-
-    fn assert_classify_rejects(op: u8, expected: Reason) {
-        match classify(op, AdmissionHint::Strict, None) {
-            OpClass::Reject(actual) => assert_eq!(actual, expected),
-            OpClass::Ok => panic!("opcode 0x{op:02x} was unexpectedly accepted"),
         }
     }
 
@@ -973,10 +1471,116 @@ mod tests {
         );
     }
 
+    // ─── AUDIT 2026-07-11: frem/drem gated admission ────────────────
+    //
+    // `frem`/`drem` now have a real (if precision-bounded) PTX
+    // lowering — see `lowering::emit::Emitter::frem_f32`/`drem_f64`.
+    // `Strict` (the default, exercised above) must keep rejecting them
+    // unconditionally; `AdmissionHint::AllowDivByZero` is the opt-in
+    // that admits them (see `classify`'s `0x72 | 0x73` arm and
+    // `Reason::FloatRemainder` for why that hint was reused instead of
+    // a dedicated one).
+
     #[test]
-    fn reject_compare_opcodes_before_lowering() {
+    fn frem_admitted_under_allow_div_by_zero_hint() {
+        let method = load_method("FloatRemainder", "fremScalar", "(FF)F");
+        let loose = annotate(AdmissionHint::AllowDivByZero);
+        match analyze_with_annotations(&method, &loose) {
+            OffloadVerdict::Eligible(sig) => {
+                assert_eq!(sig.param_kinds, vec![ParamKind::F32, ParamKind::F32]);
+                assert_eq!(sig.return_kind, ParamKind::F32);
+                assert!(
+                    sig.allow_div_by_zero,
+                    "AllowDivByZero must reach lowering through KernelSignature \
+                     even when it is admitting frem, not an integer div/rem"
+                );
+            }
+            v => panic!("expected Eligible under AllowDivByZero, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn drem_admitted_under_allow_div_by_zero_hint() {
+        let method = load_method("FloatRemainder", "dremScalar", "(DD)D");
+        let loose = annotate(AdmissionHint::AllowDivByZero);
+        match analyze_with_annotations(&method, &loose) {
+            OffloadVerdict::Eligible(sig) => {
+                assert_eq!(sig.param_kinds, vec![ParamKind::F64, ParamKind::F64]);
+                assert_eq!(sig.return_kind, ParamKind::F64);
+            }
+            v => panic!("expected Eligible under AllowDivByZero, got {v:?}"),
+        }
+    }
+
+    /// Other `AdmissionHint` loosenings must NOT accidentally admit
+    /// `frem`/`drem` — only `AllowDivByZero` does. Pins the `matches!`
+    /// guard in `classify` against a future accidental broadening
+    /// (e.g. someone generalising the guard to "any non-Strict hint").
+    #[test]
+    fn frem_still_rejected_under_unrelated_hints() {
+        let method = load_method("FloatRemainder", "fremScalar", "(FF)F");
+        for hint in [
+            AdmissionHint::AllowAllocation,
+            AdmissionHint::AllowIntrinsicCalls,
+        ] {
+            assert_eq!(
+                analyze_with_annotations(&method, &annotate(hint)),
+                OffloadVerdict::Rejected(Reason::FloatRemainder),
+                "hint {hint:?} must not admit frem — only AllowDivByZero does"
+            );
+        }
+    }
+
+    /// `EligibleFrem.frem([F[F)V` (`out[i] = in[i] % 3.7f` in the
+    /// canonical loop) needs BOTH loosenings at once: the pool-aware
+    /// `ldc` resolution (for the `3.7f` literal, which has no `fconst`
+    /// short form) and `AllowDivByZero` (for the `frem` opcode). Under
+    /// `Strict` — even with a constant pool available — it must still
+    /// reject on the `frem`, proving the fixture is "only Eligible
+    /// under the gating" as intended, not incidentally eligible via
+    /// the `ldc` loosening alone.
+    #[test]
+    fn eligible_frem_fixture_rejected_under_strict_even_with_pool() {
+        let (method, cp) = load_method_with_pool("EligibleFrem", "frem", "([F[F)V");
+        assert_eq!(
+            analyze_with_pool(&method, &cp),
+            OffloadVerdict::Rejected(Reason::FloatRemainder)
+        );
+    }
+
+    #[test]
+    fn eligible_frem_fixture_is_eligible_with_pool_and_allow_div_by_zero() {
+        let (method, cp) = load_method_with_pool("EligibleFrem", "frem", "([F[F)V");
+        let loose = annotate(AdmissionHint::AllowDivByZero);
+        match analyze_with_annotations_and_pool(&method, &loose, &cp) {
+            OffloadVerdict::Eligible(sig) => {
+                assert_eq!(
+                    sig.param_kinds,
+                    vec![ParamKind::F32Array, ParamKind::F32Array]
+                );
+                assert_eq!(sig.return_kind, ParamKind::Void);
+                assert!(sig.allow_div_by_zero);
+            }
+            v => panic!("expected Eligible under AllowDivByZero + pool, got {v:?}"),
+        }
+    }
+
+    // AUDIT 2026-07-11: `lcmp`/`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg` moved from
+    // an unconditional `Reject(Reason::Compare)` to unconditional `Ok` —
+    // see `classify`'s `0x94..=0x98` arm and `Reason::Compare`'s doc
+    // comment for the full rationale (a real, precision-free PTX
+    // lowering now exists; the opcodes are no longer rejected at
+    // analyze time, only a following non-canonical `if*` branch still
+    // rejects, one layer later, in `lowering/emit.rs`).
+    #[test]
+    fn compare_opcodes_are_admitted_by_analyzer() {
         for op in 0x94..=0x98 {
-            assert_classify_rejects(op, Reason::Compare);
+            match classify(op, AdmissionHint::Strict, None) {
+                OpClass::Ok => {}
+                OpClass::Reject(r) => {
+                    panic!("opcode 0x{op:02x} unexpectedly rejected with {r:?}")
+                }
+            }
         }
     }
 
@@ -1113,38 +1717,155 @@ mod tests {
         }
     }
 
-    /// `AllowIntrinsicCalls` must stop the analyzer from emitting
-    /// `Reason::Invoke` for `invokestatic`. We can't construct a
-    /// fixture containing the exact `Math.sqrt(D)D` callsite in this
-    /// agent's scope, so we fall back to the existing `RejectInvoke`
-    /// fixture and assert the *change in behaviour* — strict mode
-    /// rejects with `Invoke`, loose mode does not.
-    ///
-    /// PHASE1-GUESS: when a `RejectMathSqrt`-style fixture lands (a
-    /// scalar-in / scalar-out method whose only ineligibility is
-    /// `invokestatic java/lang/Math.sqrt(D)D`), this test should
-    /// upgrade its loose-mode assertion to `OffloadVerdict::Eligible`.
+    // ─── AUDIT 2026-07-11: intrinsic-table follow-up ─────────────────
+    //
+    // The tests below replace the old `admit_intrinsic_loosens_math_sqrt`
+    // PHASE1-GUESS placeholder (it asserted only "the verdict changed",
+    // using the unrelated `RejectInvoke` fixture, because no real
+    // `Math.sqrt` fixture and no CP-aware invoke resolution existed
+    // yet). `EligibleMathKernel.java` now gives us real
+    // `Math.sqrt`/`abs`/`fma`/`pow` callsites, and
+    // `classify_invokestatic`/`resolve_math_intrinsic` actually resolve
+    // the constant-pool callee instead of admitting every
+    // `invokestatic` blindly.
+
+    /// `sqrtAbsFma` calls `Math.sqrt`/`Math.abs`/`Math.fma` — all three
+    /// are in the curated table (see `resolve_math_intrinsic`) — so
+    /// under the pool-aware entry point with `AllowIntrinsicCalls` it
+    /// must be admitted `Eligible`; under `Strict`, even with the same
+    /// pool available, it must still reject with `Reason::Invoke`.
     #[test]
-    fn admit_intrinsic_loosens_math_sqrt() {
-        let method = load_method("RejectInvoke", "outer", "([I)I");
+    fn admit_intrinsic_calls_admits_real_math_kernel() {
+        let (method, cp) =
+            load_method_with_pool("EligibleMathKernel", "sqrtAbsFma", "([F[F[FFFF)V");
 
         let strict = annotate(AdmissionHint::Strict);
-        let strict_verdict = analyze_with_annotations(&method, &strict);
+        assert_eq!(
+            analyze_with_annotations_and_pool(&method, &strict, &cp),
+            OffloadVerdict::Rejected(Reason::Invoke),
+            "Strict must still reject Math.sqrt/abs/fma calls"
+        );
 
         let loose = annotate(AdmissionHint::AllowIntrinsicCalls);
-        let loose_verdict = analyze_with_annotations(&method, &loose);
+        match analyze_with_annotations_and_pool(&method, &loose, &cp) {
+            OffloadVerdict::Eligible(sig) => {
+                assert_eq!(
+                    sig.param_kinds,
+                    vec![
+                        ParamKind::F32Array,
+                        ParamKind::F32Array,
+                        ParamKind::F32Array,
+                        ParamKind::F32,
+                        ParamKind::F32,
+                        ParamKind::F32,
+                    ]
+                );
+                assert_eq!(sig.return_kind, ParamKind::Void);
+            }
+            v => panic!("expected Eligible under AllowIntrinsicCalls + pool, got {v:?}"),
+        }
+    }
 
-        // The loosening must change the answer: if strict rejected
-        // specifically for `Invoke`, the loose verdict must not be
-        // `Rejected(Invoke)`. (Downstream rejections such as
-        // ReductionNotImplemented may still fire — that's fine; this
-        // test is scoped to the Invoke loosening only.)
-        if let OffloadVerdict::Rejected(Reason::Invoke) = strict_verdict {
-            assert!(
-                !matches!(loose_verdict, OffloadVerdict::Rejected(Reason::Invoke)),
-                "AllowIntrinsicCalls must not emit Reason::Invoke; got {loose_verdict:?}"
+    /// The CP-free entry point (`analyze_with_annotations`, no constant
+    /// pool) can never resolve an `invokestatic` target, so even under
+    /// `AllowIntrinsicCalls` it must keep rejecting with
+    /// `Reason::Invoke`. This is the precise behavioural fix over the
+    /// old PHASE1-GUESS code, which admitted ANY `invokestatic` here
+    /// regardless of whether a pool was available to prove it safe.
+    /// Pins that the CP-free path never regresses back to blind
+    /// admission.
+    #[test]
+    fn admit_intrinsic_calls_without_pool_still_rejects_invoke() {
+        let method = load_method("EligibleMathKernel", "sqrtAbsFma", "([F[F[FFFF)V");
+        let loose = annotate(AdmissionHint::AllowIntrinsicCalls);
+        assert_eq!(
+            analyze_with_annotations(&method, &loose),
+            OffloadVerdict::Rejected(Reason::Invoke),
+            "AllowIntrinsicCalls with no constant pool must not blindly admit invokestatic"
+        );
+    }
+
+    /// `Math.pow` is deliberately NOT in the curated intrinsic table
+    /// (PTX's `.approx` transcendentals don't meet Java's
+    /// relative-error contract — see `MathIntrinsic`'s doc comment).
+    /// Even under `AllowIntrinsicCalls` WITH a constant pool available,
+    /// a callsite that resolves to `Math.pow` must still reject with
+    /// `Reason::Invoke` — proving the hint now discriminates by callee
+    /// instead of admitting every `invokestatic`.
+    #[test]
+    fn admit_intrinsic_calls_still_rejects_math_pow() {
+        let (method, cp) = load_method_with_pool("EligibleMathKernel", "powRejected", "([D[D)V");
+        let loose = annotate(AdmissionHint::AllowIntrinsicCalls);
+        assert_eq!(
+            analyze_with_annotations_and_pool(&method, &loose, &cp),
+            OffloadVerdict::Rejected(Reason::Invoke),
+            "Math.pow must not be admitted — it is not in the curated intrinsic table"
+        );
+    }
+
+    /// White-box coverage of [`resolve_math_intrinsic`] itself — every
+    /// table entry, both `java/lang/Math` and `java/lang/StrictMath`.
+    #[test]
+    fn resolve_math_intrinsic_covers_the_curated_table() {
+        use MathIntrinsic::*;
+        let cases: &[(&str, &str, &str, MathIntrinsic)] = &[
+            ("java/lang/Math", "sqrt", "(D)D", SqrtF64),
+            ("java/lang/StrictMath", "sqrt", "(D)D", SqrtF64),
+            ("java/lang/Math", "abs", "(I)I", AbsI32),
+            ("java/lang/StrictMath", "abs", "(I)I", AbsI32),
+            ("java/lang/Math", "abs", "(J)J", AbsI64),
+            ("java/lang/Math", "abs", "(F)F", AbsF32),
+            ("java/lang/StrictMath", "abs", "(F)F", AbsF32),
+            ("java/lang/Math", "abs", "(D)D", AbsF64),
+            ("java/lang/Math", "min", "(II)I", MinI32),
+            ("java/lang/Math", "max", "(II)I", MaxI32),
+            ("java/lang/Math", "min", "(JJ)J", MinI64),
+            ("java/lang/Math", "max", "(JJ)J", MaxI64),
+            ("java/lang/Math", "min", "(FF)F", MinF32),
+            ("java/lang/Math", "max", "(FF)F", MaxF32),
+            ("java/lang/Math", "min", "(DD)D", MinF64),
+            ("java/lang/Math", "max", "(DD)D", MaxF64),
+            ("java/lang/Math", "fma", "(FFF)F", FmaF32),
+            ("java/lang/StrictMath", "fma", "(FFF)F", FmaF32),
+            ("java/lang/Math", "fma", "(DDD)D", FmaF64),
+            ("java/lang/StrictMath", "fma", "(DDD)D", FmaF64),
+        ];
+        for (class_name, name, desc, expected) in cases {
+            assert_eq!(
+                resolve_math_intrinsic(class_name, name, desc),
+                Some(*expected),
+                "expected {class_name}.{name}{desc} to resolve to {expected:?}"
             );
         }
+    }
+
+    /// The deliberately-excluded transcendentals/unknown classes/
+    /// mismatched descriptors must all resolve to `None`.
+    #[test]
+    fn resolve_math_intrinsic_excludes_transcendentals_and_unknown_classes() {
+        for name in ["sin", "cos", "tan", "exp", "log", "log10", "pow", "cbrt"] {
+            assert_eq!(
+                resolve_math_intrinsic("java/lang/Math", name, "(D)D"),
+                None,
+                "{name}(D)D must not be in the curated intrinsic table"
+            );
+        }
+        assert_eq!(
+            resolve_math_intrinsic("java/lang/Math", "pow", "(DD)D"),
+            None,
+            "pow must not be in the curated intrinsic table under any descriptor"
+        );
+        // Wrong class entirely.
+        assert_eq!(
+            resolve_math_intrinsic("com/example/Math", "sqrt", "(D)D"),
+            None
+        );
+        // Right class/name, mismatched descriptor — must not fuzzy-match.
+        assert_eq!(resolve_math_intrinsic("java/lang/Math", "sqrt", "(F)F"), None);
+        assert_eq!(
+            resolve_math_intrinsic("java/lang/Math", "min", "(DI)D"),
+            None
+        );
     }
 
     #[test]
@@ -1204,6 +1925,114 @@ mod tests {
         assert!(
             matches!(baseline, OffloadVerdict::Eligible(_)),
             "control: vectorAdd must be Eligible without annotations"
+        );
+    }
+
+    // ─── AUDIT C31 follow-up (2026-07-11): ldc/ldc_w/ldc2_w numeric
+    // ─── literal admission ──────────────────────────────────────────
+    //
+    // Before this fix, ANY int literal outside sipush range
+    // (`|c| > 32767`) or ANY long/float/double literal made an
+    // otherwise-perfect element-wise kernel ineligible — the single
+    // most common real-world eligibility killer. `analyze_with_pool` /
+    // `analyze_with_annotations_and_pool` now resolve the CP entry and
+    // admit `ldc`/`ldc_w` of `Integer`/`Float`, and `ldc2_w` of
+    // `Long`/`Double`. The CP-free `analyze` / `analyze_with_annotations`
+    // entry points are unchanged: they still reject every ldc form,
+    // since they have no constant pool to resolve against.
+
+    #[test]
+    fn ldc_int_literal_is_eligible_with_pool() {
+        let (method, cp) = load_method_with_pool("EligibleLdcInt", "scale", "([I[I)V");
+        match analyze_with_pool(&method, &cp) {
+            OffloadVerdict::Eligible(sig) => {
+                assert_eq!(
+                    sig.param_kinds,
+                    vec![ParamKind::I32Array, ParamKind::I32Array]
+                );
+                assert_eq!(sig.return_kind, ParamKind::Void);
+            }
+            v => panic!("expected Eligible, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn ldc_int_literal_still_rejected_without_pool() {
+        // Same fixture, but through the CP-free entry point: it cannot
+        // resolve the `ldc` target, so it must keep rejecting exactly
+        // like it did before this audit.
+        let method = load_method("EligibleLdcInt", "scale", "([I[I)V");
+        assert_eq!(
+            analyze(&method),
+            OffloadVerdict::Rejected(Reason::LoadConstant)
+        );
+    }
+
+    #[test]
+    fn ldc2_w_long_literal_is_eligible_with_pool() {
+        let (method, cp) = load_method_with_pool("EligibleLdcLong", "mix", "([J[J)V");
+        match analyze_with_pool(&method, &cp) {
+            OffloadVerdict::Eligible(sig) => {
+                assert_eq!(
+                    sig.param_kinds,
+                    vec![ParamKind::I64Array, ParamKind::I64Array]
+                );
+                assert_eq!(sig.return_kind, ParamKind::Void);
+            }
+            v => panic!("expected Eligible, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn ldc_float_literal_is_eligible_with_pool() {
+        let (method, cp) = load_method_with_pool("EligibleLdcFloat", "fma", "([F[F)V");
+        match analyze_with_pool(&method, &cp) {
+            OffloadVerdict::Eligible(sig) => {
+                assert_eq!(
+                    sig.param_kinds,
+                    vec![ParamKind::F32Array, ParamKind::F32Array]
+                );
+                assert_eq!(sig.return_kind, ParamKind::Void);
+            }
+            v => panic!("expected Eligible, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn ldc2_w_double_literal_is_eligible_with_pool() {
+        let (method, cp) = load_method_with_pool("EligibleLdcDouble", "fma", "([D[D)V");
+        match analyze_with_pool(&method, &cp) {
+            OffloadVerdict::Eligible(sig) => {
+                assert_eq!(
+                    sig.param_kinds,
+                    vec![ParamKind::F64Array, ParamKind::F64Array]
+                );
+                assert_eq!(sig.return_kind, ParamKind::Void);
+            }
+            v => panic!("expected Eligible, got {v:?}"),
+        }
+    }
+
+    /// A `String` constant-pool entry must never be admitted — not even
+    /// once the pool is available — because a `java.lang.String` has no
+    /// GPU-representable immediate form. `RejectLdcString.noop()`'s body
+    /// is exactly `ldc #<String>; astore_0; return`, so the `ldc` is the
+    /// very first instruction the scan sees: whichever reason fires, it
+    /// is unambiguously the ldc classification and not, say, the
+    /// `astore` of a reference-typed local.
+    #[test]
+    fn ldc_string_is_rejected_even_with_pool() {
+        let (method, cp) = load_method_with_pool("RejectLdcString", "noop", "()V");
+        assert_eq!(
+            analyze_with_pool(&method, &cp),
+            OffloadVerdict::Rejected(Reason::LoadConstant),
+            "a String CP entry must stay rejected even when the pool is available"
+        );
+        // And the CP-free path rejects it too, for the same reason
+        // (just less precisely — it can't tell WHAT the entry is).
+        assert_eq!(
+            analyze(&method),
+            OffloadVerdict::Rejected(Reason::LoadConstant)
         );
     }
 

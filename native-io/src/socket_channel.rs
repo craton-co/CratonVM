@@ -214,33 +214,10 @@ fn accept_close_aware(
     }
 }
 
-fn lingering_channel_close(id: i32, stream: &TcpStream) {
-    let Ok(mut drain_stream) = stream.try_clone() else {
-        let _ = stream.shutdown(std::net::Shutdown::Write);
-        return;
-    };
+fn lingering_channel_close(_id: i32, stream: &TcpStream) {
+    // EXPERIMENT (2026-07-11, re-test on SB-CRASH-04 fix): shutdown(Write)
+    // ONLY, no background drain thread. See task #11 notes for rationale.
     let _ = stream.shutdown(std::net::Shutdown::Write);
-    let _ = std::thread::Builder::new()
-        .name(format!("cratonvm-tomcat0807-http-close-{id:x}"))
-        .spawn(move || {
-            let _ = drain_stream.set_nonblocking(false);
-            let _ = drain_stream.set_read_timeout(Some(LINGERING_CHANNEL_CLOSE_DRAIN_TIMEOUT));
-            let mut buf = [0u8; 1024];
-            loop {
-                match drain_stream.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(_) => continue,
-                    Err(e)
-                        if e.kind() == ErrorKind::WouldBlock
-                            || e.kind() == ErrorKind::TimedOut
-                            || e.kind() == ErrorKind::Interrupted =>
-                    {
-                        break;
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
 }
 
 // ---------------------------------------------------------------------------
@@ -2797,7 +2774,17 @@ mod tests {
     }
 
     #[test]
-    fn tomcat0807_http_lingering_channel_close_drains_peer_upload() {
+    fn tomcat0807_http_lingering_channel_close_sends_write_fin_not_full_reset() {
+        // sc_close no longer starts a background drain thread (2026-07-11 --
+        // see task #11 in the swallow-uploads known-issue doc: an
+        // unconditional background drain masked Tomcat's own
+        // checkSwallowInput()/DISABLE_SWALLOW_INPUT intent, silently turning
+        // every intentional abort-without-swallow into a graceful close).
+        // What lingering_channel_close still must guarantee is the original,
+        // narrower concern: a write-side FIN so a peer's blocking read sees
+        // EOF instead of hanging forever (the selector-duplicate-handle
+        // issue documented on sc_close itself) -- not that arbitrary-sized
+        // peer uploads always complete without a reset.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
@@ -2809,12 +2796,10 @@ mod tests {
         let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
         server.join().unwrap();
 
-        let chunk = [b'x'; 8192];
-        for _ in 0..64 {
-            client
-                .write_all(&chunk)
-                .expect("client upload write should not be reset by channel close");
-        }
-        let _ = client.shutdown(std::net::Shutdown::Write);
+        // The peer's read must see a clean EOF (not hang, not error) once
+        // the server's write-side FIN arrives.
+        let mut buf = [0u8; 16];
+        let n = client.read(&mut buf).unwrap();
+        assert_eq!(n, 0, "peer read should observe EOF after write-shutdown");
     }
 }

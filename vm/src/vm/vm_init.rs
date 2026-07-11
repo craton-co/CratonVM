@@ -1468,6 +1468,11 @@ impl SharedVm {
                 );
                 native_methods.set_category(__prev_bridge);
                 register_io_natives(&mut native_methods);
+                // The phase bundles are synthetic-only, but SmallRye calls
+                // ProcessHandle.current().info() in real-JDK mode as well.
+                cratonvm_native_builtins::phases_late::register_p60_process_handle(
+                    &mut native_methods,
+                );
                 // Mixed real-JDK mode still routes many collection call sites
                 // through synthetic wrappers; register collection natives so
                 // ArrayList/Iterator/Map operations don't fail linkage.
@@ -1858,6 +1863,9 @@ impl SharedVm {
             );
             native_methods.set_category(__prev_bridge);
             register_io_natives(&mut native_methods);
+            // Keep the default CLI's real-JDK registration in sync with the
+            // synthetic-feature build above.
+            cratonvm_native_builtins::phases_late::register_p60_process_handle(&mut native_methods);
             register_collections_natives(&mut native_methods);
             // Re-register the side-table-backed `java.util.Random` /
             // `SecureRandom` natives AFTER `register_collections_natives`:
@@ -4862,10 +4870,12 @@ impl Vm {
             ctx.deposit_root_snapshot();
         }
         if self.shared.gc_barrier.mark_blocked_region_enter() {
+            // GCAUDIT-0711-FIX (finding 1a): auto - the deposit above
+            // already raised in_blocked_region.
             let _ = self
                 .shared
                 .gc_barrier
-                .arrive_and_wait(self.main_thread.thread_id);
+                .arrive_and_wait_auto(self.main_thread.thread_id);
         }
     }
 
@@ -5888,11 +5898,16 @@ mod tests {
         // `Map`/`ListIterator`/`Serializable` and the 8
         // `cratonvm/internal/Unmodifiable*` synthetic stamps, see
         // `d3474b3e`/`c2d68883`) plus `AssertionError` and `Iterator` and
-        // their transitively-loaded superinterfaces. This count legitimately
-        // grew from 5 as that bootstrap work landed; if it changes again,
-        // verify the new value against `SharedVm::new`'s class-loading calls
-        // rather than assuming a regression.
-        assert_eq!(shared.class_manager.read().loaded_count(), 25);
+        // their transitively-loaded superinterfaces. Grew again from 25 to 29
+        // with `4edaa9ba7`'s 4 new bootstrap loads: `java/util/Map$Entry`
+        // plus the `cratonvm/internal/UnmodifiableEntrySet` +
+        // `UnmodifiableMapEntry` + `UnmodifiableEntryItr` synthetic stamps
+        // (registered in `vm_init.rs` to fix `Collections.unmodifiableMap()
+        // .entrySet()`'s `setValue()` not throwing). This count legitimately
+        // grew from 5 as bootstrap work landed; if it changes again, verify
+        // the new value against `SharedVm::new`'s class-loading calls rather
+        // than assuming a regression.
+        assert_eq!(shared.class_manager.read().loaded_count(), 29);
         assert!(shared.statics.read().is_empty());
         assert!(shared.string_pool.read().is_empty());
         assert!(shared.class_mirrors.read().is_empty());
@@ -6059,8 +6074,9 @@ mod tests {
         let vm = Vm::new(VmConfig::default());
         // self_arc should be set, and get_arc should work
         let arc = vm.shared.get_arc();
-        // Same bootstrap class set as `shared_vm_default_config`.
-        assert_eq!(arc.class_manager.read().loaded_count(), 25);
+        // Same bootstrap class set as `shared_vm_default_config` — see that
+        // test's comment for what's currently in it and why the count moves.
+        assert_eq!(arc.class_manager.read().loaded_count(), 29);
     }
 
     #[test]

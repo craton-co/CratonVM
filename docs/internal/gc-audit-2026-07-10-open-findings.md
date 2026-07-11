@@ -296,3 +296,60 @@ existing parked WIP attempt already found this subsystem is not safe to
 patch quickly. This ES workload is a reusable, real-world (non-synthetic)
 additional repro for validating any future fix attempt, in addition to
 MTChurn/BinaryTrees(16).
+
+
+## Second cross-confirmation from an independent real-world trigger (2026-07-11)
+
+While investigating a `ClassCastException` spotted once during verification of
+the (separate, since-fixed) `InetAddress` GC-root bug in
+[`ES-HANG-20260709-...-inetaddressrandombinarydocvaluesrangequerytests-51a9c7ea93-FIXED.md`](elasticsearch-suite/ES-HANG-20260709-server-org-elasticsearch-lucene-queries-inetaddressrandombinarydocvaluesrangequerytests-51a9c7ea93-FIXED.md),
+reproduced this same finding a THIRD independent way, via yet another real
+Lucene/ES workload — `org.elasticsearch.lucene.queries.InetAddressRandomBinaryDocValuesRangeQueryTests`
+(`testRandomMedium`, seed `B17AC9D3E1F2A0C4`, `--Xmx 2g`, clean dev tip
+`48c2d92d`). Worktree `/data/data/wt-inetaddress-cce-20260711` on the Azure
+host, no code changes (docs-only).
+
+20 runs (2 parallel streams of 10), all against the identical seed:
+- **17/20 clean.**
+- **3/20 (15%)** hit an identical pair of symptoms, always on
+  `testRandomMedium`, never on the other 5 test methods in the class:
+  ```
+  WARN cratonvm_vm::vm::vm_exec: implicit monitorexit on synchronized-method exit failed thread_id=ThreadId(2) error=InternalError(Runtime(IllegalMonitorStateException { message: "thread Thread-2 does not own the monitor for object at 0x..." }))
+  ...
+  java.lang.ClassCastException: java.util.ArrayList cannot be cast to java.lang.String
+  ```
+  (the `ClassCastException` carries **zero stack-trace frames** — printed
+  directly under the JUnit `1) testRandomMedium(...)` header with no
+  intervening `at ...` lines at all).
+- **1/20** hit the separate, already-known `java/util/Set` GC-staleness NPE
+  (side-table-unpinned-locals class of bug, tracked independently — not
+  this finding).
+- The `IllegalMonitorStateException`/"does not own the monitor" warning
+  appears in **exactly** the 3 runs that hit the `ClassCastException`, and
+  in **none** of the other 17 — a tight, 100%-correlated pairing across this
+  sample.
+
+This matches finding 1(b)'s core hypothesis precisely: a stale/wrong
+monitor owner (not genuine contention — nothing in this single-writer,
+mostly-single-thread-visible test workload should ever contend a lock hard
+enough to matter) immediately preceding a corrupted downstream exception
+(here: a `ClassCastException` with an impossible empty stack trace, rather
+than the IVFKnn corroboration's `NullPointerException` through
+`ConcurrentMergeScheduler` or the original writeup's SEGV reached from
+`create_exception_object` — the same "an exception thrown mid-churn is
+itself a corruption symptom" pattern, a third distinct downstream shape).
+`Thread-2` here is almost certainly `IndexWriter`'s background merge
+machinery or a `RandomizedRunner` policing thread (not confirmed via gdb in
+this pass — this repro is CPU-cheap enough, ~30-40s/run, single JUnit class,
+no WildFly/no custom harness, that a future gdb session attaching mid-run
+across a handful of repeats should be able to pin the identity quickly).
+
+Not investigated further here (per the same deferral rationale as the
+IVFKnn corroboration above — this is `gc_barrier`/monitor/evacuation
+territory the parked WIP fix attempt already found unsafe to patch
+quickly). Filed as a third reusable, real-world, non-synthetic repro for
+whoever picks up finding 1(b): `org.junit.runner.JUnitCore
+org.elasticsearch.lucene.queries.InetAddressRandomBinaryDocValuesRangeQueryTests`
+against the `server` module test classpath, `-Dtests.seed=B17AC9D3E1F2A0C4`,
+`--Xmx 2g` — cheaper to iterate than MTChurn/BinaryTrees/WildFly/IVFKnn
+(single small test class, ~30-40s/run, ~15% hit rate observed over 20 runs).

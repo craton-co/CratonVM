@@ -255,15 +255,17 @@ investment than more targeted symptom-chasing:
   description of its algorithm, or improve it further — e.g. it doesn't yet know about
   `ctx.initialize_class`/`ctx.new_object`/`ctx.define_class_full` as additional GC-triggering hazards,
   found by inspection but not added to the tool this session).
-- A debug-build assertion that _validates_ every `ObjectRef` read from a native local against a "known
-  allocation epoch" counter, panicking loudly the moment a stale read is detected (rather than silently
-  resolving to a reused all-zero slot) would convert every future instance of this bug class from
-  "silent, non-deterministic corruption 1-20% of the time" into "always caught in CI/tests". Scoped
-  (not implemented) in follow-up session 3 — see
+- ~~A debug-build assertion that validates every `ObjectRef` read...~~ — **IMPLEMENTED** later in
+  follow-up session 3, for the `Generational` (default) backend: `CRATONVM_DBG_STALE_OBJREF=1` now turns
+  a stale native-local read into a hard, deterministic panic instead of silent corruption, for one full
+  GC cycle after the object is evacuated. See
   [[wildfly-stale-objectref-debug-assertion-scoping]] (`docs/internal/wildfly-stale-objectref-debug-assertion-scoping.md`)
-  for the design sketch (GC-side quarantine + tombstone marker on evacuated from-space regions, checked
-  at the `NativeContext` method boundary) and why it wasn't attempted this session (requires GC/heap
-  cooperation, a larger and riskier change than the sweep itself).
+  for the mechanism (turned out to reuse the GC's own existing forwarding-pointer header field rather than
+  needing a new tombstone format — just a one-cycle quarantine delay on reclaiming evacuated memory) and
+  its explicit scope boundaries (G1/ZGC not covered; a couple of narrower gaps around the JIT's
+  guarded-inline fast path and `load_and_forward`'s own self-healing call sites). Verified via a new
+  `gc/tests/stale_objref_debug_assertion.rs` integration test plus the full `cratonvm-gc` crate suite
+  (823 tests) passing unchanged with the flag off.
 
 ## Also confirmed still present: STW cross-thread JIT-takeover stall (pre-existing, already tracked, NOT attempted)
 
@@ -350,3 +352,45 @@ Follow-up session 3 (static-analysis sweep, 2026-07-11):
     a real fix needs the actual build module's Galleon provisioning re-run, not attempted (out of scope,
     high risk on a busy shared host)
 ```
+
+
+## Follow-up session 4 (2026-07-11): live harness restored; ServiceLoader + MSC callback stale-reference fixes
+
+The Azure harness was made usable without changing tracked source: its missing
+`apps/wildfly/build/target/wildfly-32.0.1.Final` provisioning output is an
+ignored build artifact, so it now symlinks to the already-present
+`testsuite/integration/basic/target/wildfly` distribution (including
+`modules/`). This permitted real server-side retries again.
+
+A crucial harness correction: setting `CRATONVM_BIN` changes the Surefire
+**client** JVM only. Arquillian starts the WildFly server from
+`-Dcontainer.java.home=<home>/bin/java`. Initial comparison attempts therefore
+left the server on an older binary and are evidence only of the residual's
+continued reproducibility. Subsequent runs used unique, SHA-256-verified
+Java-home shims per frozen binary, so both the client and server executed the
+intended build.
+
+Two more high-confidence Family-1 sites were fixed:
+
+- `native-builtins/src/service_loader.rs`: `discover_providers` now roots the
+  `ServiceLoader`, service `Class`, and module/custom loader across Java
+  dispatches; `load_provider_class` roots the loader across `create_string` +
+  `findClass`/`loadClass`; `native_sl_iterator` roots the provider `Class`
+  across its allocating empty-parameter-array creation before
+  `getDeclaredConstructor`.
+- `native-builtins/src/jboss_msc.rs`: the service object retained in the
+  Rust-side `service_roots` map is refreshed after controller-mirror
+  allocation, and `drive_starts` roots/re-reads both the service receiver and
+  `StartContext` after dependency injection immediately before
+  `Service.start`. This is directly on the `AbstractControllerService.start`
+  path whose later boot step reports `this.controller is null`.
+
+`cargo check -p cratonvm-native-builtins` passed after both changes, as did
+release builds of the before/after and final probes. The corrected
+server-side samples still reproduce the **independent** controller-null and
+STW-takeover residuals (final MSC-root build: 3/4 controller-null, 1/4 STW),
+so this issue remains open. The samples did not produce `WFLYCTL0153` after
+these fixes, but the controlled current-dev sample also missed it in six
+retries; that is encouraging but not enough to mark the extension residual
+closed. The STW live-attach poll caught the warning but missed the process by
+a narrow race again; no GC-barrier change was attempted.

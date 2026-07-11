@@ -90,18 +90,44 @@ can't move an array a kernel is reading).
 Array-bounds violations are handled: the kernel flags the failure and returns,
 and the host deopts back to the interpreter, which observes no partial GPU state
 (input arrays aren't written by the failed path, and outputs are separate
-buffers materialized only after a successful kernel). Integer division-by-zero
-handling is planned. Any other Java exception means the method isn't
-offload-eligible, and the analyzer rejects it up front.
+buffers materialized only after a successful kernel).
+
+Integer division-by-zero and `INT_MIN`/`LONG_MIN` ÷ `-1` overflow are handled
+the same way, not merely planned. PTX's `div.s32`/`rem.s32` (and the 64-bit
+forms) are undefined on a zero divisor and on the `MIN_VALUE / -1` overflow
+case, where Java requires an `ArithmeticException` or a defined wraparound
+respectively. The lowering stage emits predicate guards ahead of every
+`idiv`/`irem`/`ldiv`/`lrem`: a zero-divisor check and, for division only, a
+`MIN_VALUE`-and-`-1` check, each branching to the same deopt exit as an
+out-of-bounds access. That exit sets the failure flag and returns; the VM then
+re-runs the whole method on the CPU, where normal Java semantics (throwing
+`ArithmeticException`, etc.) apply. A method can opt out of just the
+zero-divisor guard with `@GpuKernel(admit = AdmissionHint.ALLOW_DIV_BY_ZERO)`
+(`craton.gpu.GpuKernel`'s `admit` element) — the overflow guard on division
+still stays in. Any other Java exception (`NullPointerException`,
+`ClassCastException`, and so on) means the method isn't offload-eligible in
+the first place, and the analyzer rejects it up front rather than trying to
+handle it on the device.
 
 ## Status & follow-ups
 
-The GPU path is structured so the CPU build is completely unaffected, and the
-analyzer/lowering/marshalling/cache machinery is in place and tested on machines
-without a GPU. The final kernel-launch glue and a number of lower-priority items
-(broader opcode coverage in the lowering stage, true reduction kernels, and
-on-GPU benchmark numbers) require validation on real NVIDIA hardware and are
-tracked as follow-ups.
+The full launch path — interpreter hook → offload analyzer/cache →
+bytecode→PTX lowering → CUDA bridge → `cuLaunchKernel` — is implemented and
+has been validated end-to-end on real NVIDIA hardware (RTX 2060, sm_75),
+with kernel output checksums matching HotSpot bit-for-bit across every kernel
+measured. See [GPU offload benchmarks](benchmarks.md) for the numbers.
+
+That validation pass found and fixed two bugs: offload-eligible call sites
+were being promoted into the interpreter's invoke cache, which silently ended
+offload after a call site's first invocation, and the kernel's bounds-failure
+flag was read before outputs were written back, which could miss a late
+failure. Both are fixed in current `dev`.
+
+Remaining follow-ups — reduction kernels (non-`void` return) not yet wired
+into the dispatch path, JIT-compiled callers bypassing the offload hook,
+broader opcode coverage in the lowering stage, and a few smaller items — are
+tracked in
+[`docs/known-issues/gpu-offload-followups-20260711.md`](https://github.com/craton-co/cratonvm/blob/dev/docs/known-issues/gpu-offload-followups-20260711.md).
 
 ## FAQ
 

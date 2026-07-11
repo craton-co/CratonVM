@@ -39,6 +39,25 @@
 //! [`LookupOutcome::Skip`]. The interpreter's hook treats `Skip`
 //! identically to "no `--gpu` flag at all" — the call runs on the CPU
 //! unchanged.
+//!
+//! # Reduction (scalar-return) kernels
+//!
+//! [`try_dispatch`] transparently offloads a proven reduction
+//! (`KernelSignature::is_reduction` — a counted loop with a
+//! loop-carried accumulator and a scalar return) in addition to void
+//! kernels, but ONLY for `)I`/`)J` descriptors: the compiled PTX
+//! accumulates via `atom.global.add`, which is bit-exact for int/long
+//! (two's-complement wraparound doesn't depend on summation order) but
+//! NOT for `)F`/`)D` (GPU float atomic-add reorders the per-thread
+//! sum, unlike Java's sequential left-to-right fp accumulation) —
+//! those keep falling through to the CPU. The accumulator buffer
+//! (`ret_ptr`, the kernel param `build_param_list` appends after the
+//! declared params and before `failure_flag`) is allocated
+//! zero-initialized by [`dispatch_method_from_native`]; the value is
+//! downloaded by [`finalize_submission`] into
+//! [`SerializedResult::ScalarI32`]/[`SerializedResult::ScalarI64`] and
+//! surfaced to the interpreter as
+//! [`DispatchOutcome::HandledWithValue`].
 
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -52,7 +71,6 @@ use cratonvm_reader::method::ClassFileMethod;
 use cuda_bridge::{DeviceContext, DeviceModule};
 use jit_cuda::annotations::read_method_annotations;
 use jit_cuda::emitter::PtxModule;
-use jit_cuda::lowering::lower_method;
 use jit_cuda::signature::KernelSignature;
 use jit_cuda::{analyzer, OffloadVerdict, ParamKind};
 
@@ -125,6 +143,23 @@ pub struct OffloadCache {
     /// proper; we only keep `print_gpu_decisions` here for the
     /// analyzer-verdict log line.
     print_decisions: bool,
+    /// GpuStream affinity registry — Java-visible stream handle
+    /// (minted by [`stream_create`](OffloadCache::stream_create),
+    /// wrapped by `Native.newStream` or an executor's lazily-created
+    /// default stream — see
+    /// `native-builtins/src/craton_gpu.rs::resolve_or_create_default_stream`)
+    /// -> the real `cuda_bridge::Stream` it names.
+    /// [`dispatch_method_from_native_on_stream`] resolves a
+    /// caller-supplied handle here instead of always minting a fresh
+    /// private stream — see that function's stream-resolution step
+    /// for the ordering contract this buys.
+    streams: RwLock<FxHashMap<u64, Arc<Stream>>>,
+    /// Monotonic counter for `streams`' keys. Independent per
+    /// `OffloadCache` (i.e. per device ordinal) and from
+    /// `NEXT_SUBMISSION_HANDLE` (submissions and streams are
+    /// different Java-visible handle spaces reached through different
+    /// `Native.*` entry points, so nothing ever confuses the two).
+    next_stream_handle: std::sync::atomic::AtomicU64,
 }
 
 impl OffloadCache {
@@ -157,6 +192,8 @@ impl OffloadCache {
             kernels: RwLock::new(FxHashMap::default()),
             blacklist: RwLock::new(FxHashSet::default()),
             print_decisions: config.print_gpu_decisions,
+            streams: RwLock::new(FxHashMap::default()),
+            next_stream_handle: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -241,7 +278,14 @@ impl OffloadCache {
         // methods make progress in parallel. Annotations are passed
         // through so the analyzer can use hints (e.g. `@GpuKernel`
         // attrs) when deciding eligibility.
-        let verdict = analyzer::analyze_with_annotations(method, &method_annotations);
+        // Pool-aware analysis so `ldc`/`ldc_w`/`ldc2_w` of primitive
+        // constants (Integer/Float/Long/Double CP entries) are admitted;
+        // without the pool the analyzer must reject every ldc.
+        let verdict = analyzer::analyze_with_annotations_and_pool(
+            method,
+            &method_annotations,
+            constant_pool,
+        );
         if self.print_decisions {
             tracing::info!(
                 "gpu offload: {}.{}{} -> {:?}",
@@ -262,7 +306,14 @@ impl OffloadCache {
         // Lower to PTX. We target sm_70 by default; the eventual
         // production wiring should consult `cuda_bridge::probe` and
         // pass the device's actual compute capability.
-        let ptx_module: PtxModule = match lower_method(class_name, method, &sig, 7, 0) {
+        let ptx_module: PtxModule = match jit_cuda::lowering::lower_method_with_pool(
+            class_name,
+            method,
+            constant_pool,
+            &sig,
+            7,
+            0,
+        ) {
             Ok(m) => m,
             Err(e) => {
                 tracing::info!(
@@ -386,11 +437,22 @@ pub fn output_array_index(param_kinds: &[ParamKind]) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-/// Outcome of `try_dispatch`. `Handled` means the GPU path completed
-/// the call (operand stack already has the result if any); the caller
-/// must skip the CPU dispatch. `FallThrough` means the GPU path
-/// declined — the operand stack and locals are exactly as the hook
-/// received them and the CPU path must run.
+/// Outcome of `try_dispatch`. `Handled` / `HandledWithValue` mean the
+/// GPU path completed the call; the caller must skip the CPU dispatch.
+/// `FallThrough` means the GPU path declined — the operand stack and
+/// locals are exactly as the hook received them and the CPU path must
+/// run.
+///
+/// `HandledWithValue` (Part E) carries a kernel's scalar return value
+/// (an integer reduction accumulator today — see the Hit arm below)
+/// for the interpreter hook to push onto the caller's operand stack.
+/// `try_dispatch` itself cannot do that push: `push_invoke_return_value`
+/// / `coerce_value_for_return` live in `interpreter.rs`, on the far
+/// side of this module's public boundary, and the exact push sequence
+/// (tag-exact long handling, `native_return_pushed_to_stack` follow-up)
+/// only needs to exist once — the fallback invokestatic path already
+/// has it a few dozen lines below the hook, so `HandledWithValue`
+/// mirrors that instead of duplicating it here.
 ///
 /// `FallThroughKeepHooked` is `FallThrough` plus a contract with the
 /// interpreter: the call site must NOT be promoted into the invoke
@@ -398,11 +460,12 @@ pub fn output_array_index(param_kinds: &[ParamKind]) -> Option<usize> {
 /// never re-enters this hook, which would permanently end offload for
 /// a site whose *current* arguments merely failed a per-call gate
 /// (`--gpu-min-work`: the next call may pass a bigger array). The
-/// same rule is why a `Handled` site is never cached either — see the
-/// hook in `execute_invokestatic`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// same rule is why a `Handled`/`HandledWithValue` site is never
+/// cached either — see the hook in `execute_invokestatic`.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DispatchOutcome {
     Handled,
+    HandledWithValue(cratonvm_types::Value),
     FallThrough,
     FallThroughKeepHooked,
 }
@@ -411,27 +474,37 @@ pub enum DispatchOutcome {
 ///
 /// Looks the invokestatic target up in the `OffloadCache` (which
 /// analyzes, lowers, and loads the PTX module on first reach). On a
-/// cache `Hit` for an eligible **void** kernel whose largest array
-/// argument clears `--gpu-min-work`, it marshals the arguments to the
-/// device, launches the kernel, synchronizes, and writes the
-/// kernel-written arrays back into the Java heap — returning
-/// `Handled` so the interpreter skips the CPU body. Every other path
-/// (non-void return, work below threshold, marshal/launch failure,
-/// ineligible/blacklisted method) returns `FallThrough`, leaving the
-/// operand stack and locals untouched so the CPU body runs normally.
+/// cache `Hit` for an eligible kernel whose largest array argument
+/// clears `--gpu-min-work`, it marshals the arguments to the device,
+/// launches the kernel, and synchronizes:
 ///
-/// Non-void kernels (reductions) currently fall through: a `Handled`
-/// outcome would require pushing the kernel's scalar result onto the
-/// operand stack as the call's return value, which the array-writeback
-/// path does not do. Wiring scalar-return-on-stack is the next step.
+/// - A **void** kernel writes the kernel-written arrays back into the
+///   Java heap and returns `Handled` — the interpreter skips the CPU
+///   body with the operand stack already in its post-call shape (args
+///   popped, nothing pushed).
+/// - An **integer reduction** kernel (`)I`/`)J` return,
+///   `KernelSignature::is_reduction` proven by the analyzer) downloads
+///   the atomically-accumulated scalar and returns `HandledWithValue`
+///   — the interpreter hook pushes it as the call's return value.
+///   Float/double reductions are NOT offered here: GPU float
+///   atomic-add reorders the per-thread summation, which is not
+///   bit-identical to Java's sequential left-to-right fp accumulation,
+///   while int/long atomic add is exact (two's-complement wraparound
+///   doesn't care about summation order) — those keep falling through
+///   to the CPU.
+///
+/// Every other path (non-void non-reduction return, work below
+/// threshold, marshal/launch failure, ineligible/blacklisted method)
+/// returns `FallThrough`, leaving the operand stack and locals
+/// untouched so the CPU body runs normally.
 ///
 /// On a no-GPU machine `cache.has_device()` is false and the
 /// early-return in `execute_invokestatic` short-circuits before this
 /// function is reached.
 pub fn try_dispatch(
     shared: &crate::vm::SharedVm,
-    _thread: &mut crate::threading::JvmThread,
-    _frame_idx: usize,
+    thread: &mut crate::threading::JvmThread,
+    frame_idx: usize,
     class_name: &str,
     method_name: &str,
     method_descriptor: &str,
@@ -479,21 +552,30 @@ pub fn try_dispatch(
     drop(cm);
 
     match outcome {
-        LookupOutcome::Hit(_kernel) => {
+        LookupOutcome::Hit(kernel) => {
             // Transparent synchronous offload. Two gates first:
             //
-            // 1. VOID return only. A `Handled` outcome tells the
-            //    interpreter the invokestatic is complete with the
-            //    operand stack already in its post-call shape. For a
-            //    void map (`out[i] = f(a[i])`) that's correct — the
-            //    args were popped and nothing is pushed; the result
-            //    reaches Java via the D→H writeback into the `out`
-            //    array. A NON-void kernel (a reduction) would need its
-            //    scalar result pushed as the return value, which the
-            //    writeback path does not do — so those fall through to
-            //    the CPU. (The analyzer still classifies them; only the
-            //    launch is skipped.)
-            if !method_descriptor.ends_with(")V") {
+            // 1. VOID return, or a proven INTEGER reduction. A `Handled`
+            //    outcome tells the interpreter the invokestatic is
+            //    complete with the operand stack already in its
+            //    post-call shape — correct for a void map
+            //    (`out[i] = f(a[i])`): args popped, nothing pushed, the
+            //    result reaches Java via the D→H writeback into `out`.
+            //    A `HandledWithValue` outcome additionally carries the
+            //    scalar the interpreter hook must push. Only `)I`/`)J`
+            //    reductions qualify: GPU float atomic-add reorders the
+            //    per-thread summation and is not bit-identical to
+            //    Java's sequential fp accumulation, so `)F`/`)D`
+            //    reductions (and any other non-void, non-reduction
+            //    shape, e.g. an array return) still fall through to the
+            //    CPU. (The analyzer/cache still classify and compile
+            //    them; only the transparent launch is skipped here.)
+            let is_void = method_descriptor.ends_with(")V");
+            let is_int_reduction =
+                kernel.signature.is_reduction && method_descriptor.ends_with(")I");
+            let is_long_reduction =
+                kernel.signature.is_reduction && method_descriptor.ends_with(")J");
+            if !is_void && !is_int_reduction && !is_long_reduction {
                 return Ok(DispatchOutcome::FallThrough);
             }
             // 2. Real per-element work must clear `--gpu-min-work`. The
@@ -501,7 +583,11 @@ pub fn try_dispatch(
             //    for every counted loop, so it cannot gate small inputs;
             //    use the largest array argument's actual length. Below
             //    the threshold the host↔device round-trip dominates, so
-            //    run on the CPU.
+            //    run on the CPU. Applies identically to reductions —
+            //    their array-sized inputs vary per call exactly like a
+            //    void kernel's — so a small-input reduction call also
+            //    gets `FallThroughKeepHooked` rather than a permanent
+            //    de-offload.
             let runtime_work = largest_primitive_array_len(shared, args);
             if (runtime_work as u32) < shared.config.gpu_min_work {
                 // Per-call gate, not a property of the method: the next
@@ -510,8 +596,9 @@ pub fn try_dispatch(
                 return Ok(DispatchOutcome::FallThroughKeepHooked);
             }
             // Marshal args → device, launch the kernel, synchronize, and
-            // write kernel-written arrays back into the Java heap. This
-            // reuses the explicit-path machinery (`dispatch_method_from_native`
+            // write kernel-written arrays back into the Java heap (void)
+            // or download the accumulator (reduction). This reuses the
+            // explicit-path machinery (`dispatch_method_from_native`
             // registers a submission; we finalize it synchronously here).
             // Any failure leaves the operand stack + locals untouched, so
             // falling through to the CPU body is always safe.
@@ -522,20 +609,60 @@ pub fn try_dispatch(
                 method_descriptor,
                 args,
             );
-            let result = match lookup_submission(handle) {
-                Some(sub) => finalize_submission(shared, &sub),
+            // Keep our own submission handle alive across
+            // `release_submission` below (which only drops the
+            // registry's reference) so a reduction can still read the
+            // completed `SerializedResult` off `submission.status`
+            // after the registry entry is gone.
+            let submission = lookup_submission(handle);
+            let result = match &submission {
+                Some(sub) => finalize_submission(shared, sub),
                 None => Err("offload submission was not registered".to_string()),
             };
             release_submission(handle);
             match result {
                 Ok(()) => {
                     tracing::debug!(
-                        "gpu offload: {}.{}{} ran on device (n={})",
+                        "gpu offload: {}.{}{} ran on device (n={}, thread={:?}, frame={})",
                         class_name,
                         method_name,
                         method_descriptor,
                         runtime_work,
+                        thread.name,
+                        frame_idx,
                     );
+                    if is_int_reduction || is_long_reduction {
+                        let scalar = submission.as_ref().and_then(|sub| {
+                            let status = sub.status.lock();
+                            match &*status {
+                                SubmissionStatus::Completed {
+                                    result: SerializedResult::ScalarI32(v),
+                                } => Some(cratonvm_types::Value::Int(*v)),
+                                SubmissionStatus::Completed {
+                                    result: SerializedResult::ScalarI64(v),
+                                } => Some(cratonvm_types::Value::Long(*v)),
+                                _ => None,
+                            }
+                        });
+                        return Ok(match scalar {
+                            Some(value) => DispatchOutcome::HandledWithValue(value),
+                            None => {
+                                // Kernel finished but the submission
+                                // carries no scalar result — a Part E
+                                // wiring bug, not a device error. Fall
+                                // through rather than push a bogus
+                                // value onto the operand stack.
+                                tracing::debug!(
+                                    "gpu offload: {}.{}{} completed without a scalar \
+                                     accumulator result; falling back to CPU",
+                                    class_name,
+                                    method_name,
+                                    method_descriptor,
+                                );
+                                DispatchOutcome::FallThrough
+                            }
+                        });
+                    }
                     Ok(DispatchOutcome::Handled)
                 }
                 Err(msg) => {
@@ -829,6 +956,178 @@ mod tests {
         // accessor like kernels_for_class() would be needed once
         // a real device makes this exercisable.
     }
+
+    // ── Known-issues followups #3: poll_submission_status ────────────
+    //
+    // These exercise `poll_submission_status` against hand-built
+    // `StreamSubmission`s (bypassing `dispatch_async`/`submitMethod`)
+    // so they run on this no-GPU dev box without a real `Stream` or
+    // `Event` — the same reason the rest of this file's tests stop at
+    // the "no device" boundary. A real-device poll (Running ->
+    // Event::query -> inline finalize -> Completed, and the
+    // host-callback fast path) needs a live CUDA context to construct
+    // a `Stream`/`Event` at all and is exercised on GPU hardware, not
+    // here.
+
+    #[test]
+    fn poll_unknown_handle_returns_none() {
+        let shared = crate::vm::SharedVm::new(VmConfig::default());
+        // `NEXT_SUBMISSION_HANDLE` starts at 1 and only increases, so
+        // 0 is never issued to a real submission — always "unknown".
+        assert!(poll_submission_status(&shared, 0).is_none());
+    }
+
+    #[test]
+    fn poll_dispatch_time_failed_submission_returns_failed() {
+        let shared = crate::vm::SharedVm::new(VmConfig::default());
+        // Mirrors exactly what `record_failed_submission` builds for a
+        // pre-launch failure (no device, unknown kernel, marshal
+        // error, ...): `stream`/`event` both `None`, status already
+        // terminal at `Failed`.
+        let handle = NEXT_SUBMISSION_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sub = std::sync::Arc::new(StreamSubmission {
+            handle,
+            stream: None,
+            event: None,
+            status: parking_lot::Mutex::new(SubmissionStatus::Failed {
+                message: "test: dispatch-time failure".to_string(),
+            }),
+            finalize: parking_lot::Mutex::new(None),
+            device_done: std::sync::atomic::AtomicBool::new(false),
+        });
+        register_submission(sub);
+
+        assert_eq!(
+            poll_submission_status(&shared, handle),
+            Some(PollOutcome::Failed),
+        );
+
+        release_submission(handle);
+        assert!(lookup_submission(handle).is_none());
+    }
+
+    #[test]
+    fn poll_running_with_no_recorded_event_reports_running() {
+        // Defensive branch: `Running` with `event: None` shouldn't
+        // happen on any real `dispatch_async` path (every success
+        // route records an event before returning `Running`), but
+        // `poll_submission_status` must not panic or misreport if it
+        // ever does — it can't claim more than "still running" with
+        // nothing to query.
+        let shared = crate::vm::SharedVm::new(VmConfig::default());
+        let handle = NEXT_SUBMISSION_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sub = std::sync::Arc::new(StreamSubmission {
+            handle,
+            stream: None,
+            event: None,
+            status: parking_lot::Mutex::new(SubmissionStatus::Running),
+            finalize: parking_lot::Mutex::new(None),
+            device_done: std::sync::atomic::AtomicBool::new(false),
+        });
+        register_submission(sub);
+
+        assert_eq!(
+            poll_submission_status(&shared, handle),
+            Some(PollOutcome::Running),
+        );
+
+        release_submission(handle);
+    }
+
+    // ── GpuStream affinity — stream registry ─────────────────────────
+    //
+    // Exercise `OffloadCache::stream_create` / `stream_release` /
+    // `resolve_stream` directly. On this no-GPU dev box `ctx` is
+    // always `None` (see `offload_cache_skips_when_no_device` above),
+    // so `stream_create` always returns `None` — the same "no device"
+    // contract every other GPU-dependent path in this file already
+    // has. A live create/resolve/release round trip needs a real CUDA
+    // context and is exercised on GPU hardware, not here.
+
+    #[test]
+    fn stream_create_without_device_returns_none() {
+        let mut config = VmConfig::default();
+        config.gpu_offload_enabled = true;
+        let cache = OffloadCache::new(&config);
+        assert!(!cache.has_device());
+        assert_eq!(cache.stream_create(), None);
+    }
+
+    #[test]
+    fn resolve_unknown_stream_handle_returns_none() {
+        let config = VmConfig::default();
+        let cache = OffloadCache::new(&config);
+        // Never created anything — every handle, including the
+        // sentinel-ish 0 and 1 (the first value `stream_create` would
+        // hand out on a real device), must resolve to `None`.
+        assert!(cache.resolve_stream(0).is_none());
+        assert!(cache.resolve_stream(1).is_none());
+    }
+
+    #[test]
+    fn release_unknown_stream_handle_is_a_safe_no_op() {
+        let config = VmConfig::default();
+        let cache = OffloadCache::new(&config);
+        // Must not panic on a handle that was never created, and must
+        // be idempotent (mirrors `release_submission`'s contract).
+        cache.stream_release(42);
+        cache.stream_release(42);
+        assert!(cache.resolve_stream(42).is_none());
+    }
+
+    #[test]
+    fn dispatch_method_from_native_is_the_none_stream_wrapper() {
+        // `dispatch_method_from_native` must still exist with its old
+        // 5-arg signature (existing callers: `try_dispatch`,
+        // `vm/tests/gpu_offload_features.rs`) and behave exactly like
+        // `dispatch_method_from_native_on_stream(..., None)`. This box
+        // has no classpath configured, so the dispatch fails at
+        // class-load — the exact failure branch doesn't matter here,
+        // only that both entry points hand back a valid (nonzero),
+        // resolvable, terminally-`Failed` submission handle.
+        let shared = crate::vm::SharedVm::new(VmConfig::default());
+        let h1 = dispatch_method_from_native(&shared, "NoSuchClass", "m", "()V", &[]);
+        let h2 = dispatch_method_from_native_on_stream(
+            &shared,
+            "NoSuchClass",
+            "m",
+            "()V",
+            &[],
+            None,
+        );
+        assert!(h1 > 0 && h2 > 0 && h1 != h2);
+        for h in [h1, h2] {
+            let sub = lookup_submission(h).expect("handle must resolve to a submission");
+            assert!(matches!(&*sub.status.lock(), SubmissionStatus::Failed { .. }));
+            release_submission(h);
+        }
+    }
+
+    #[test]
+    fn dispatch_method_from_native_on_stream_unknown_handle_still_fails_cleanly() {
+        // A bogus `stream_handle` must never panic. On this no-GPU box
+        // the no-device check (step 4) trips before stream resolution
+        // (step 5) is ever reached, so this can't directly observe the
+        // "unknown or released stream handle" message — that specific
+        // branch needs a real device (`cache.has_device()` true) to
+        // reach, same limitation as `offload_cache_rejects_ineligible_method`
+        // above. What's verified here is the plumbing: passing
+        // `Some(_)` all the way through doesn't change the "always get
+        // a valid, terminally-Failed handle back" contract.
+        let shared = crate::vm::SharedVm::new(VmConfig::default());
+        let handle = dispatch_method_from_native_on_stream(
+            &shared,
+            "NoSuchClass",
+            "m",
+            "()V",
+            &[],
+            Some(999_999),
+        );
+        assert!(handle > 0);
+        let sub = lookup_submission(handle).expect("handle must resolve to a submission");
+        assert!(matches!(&*sub.status.lock(), SubmissionStatus::Failed { .. }));
+        release_submission(handle);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -940,15 +1239,38 @@ pub(crate) fn maybe_warmup_gpu(
 pub use cuda_bridge::Stream;
 
 /// Result of a kernel dispatch, serialised in a form the Java layer
-/// can unmarshal without touching device memory directly. Today only
-/// the four primitive-array shapes plus `Void` are needed; the
-/// analyzer rejects every other return shape long before we get
-/// here.
+/// can unmarshal without touching device memory directly. `Void`, the
+/// four primitive-array shapes, and (Part E) the four scalar-return
+/// shapes are what `dispatch_method_from_native` /
+/// `finalize_submission` populate today; surfacing a *new* primitive
+/// array as the future's result (rather than writing to a caller-owned
+/// `out` param) is still unwired — see `dispatch_async`'s doc comment.
 #[cfg(feature = "gpu-offload")]
 pub enum SerializedResult {
     /// The kernel had a void return — nothing to copy back beyond
     /// the host-side output array, which the caller already owns.
     Void,
+    /// Scalar-return accumulator readback (`)I` descriptor). Set by
+    /// `finalize_submission` from `MarshalWriteback::ScalarI32`'s
+    /// download. The common case is a proven integer reduction
+    /// (`KernelSignature::is_reduction`), but any scalar-`int`-return
+    /// kernel gets this variant — the atomic-add-vs-plain-store choice
+    /// is baked into the compiled PTX, not visible here.
+    ScalarI32(i32),
+    /// Scalar-return accumulator readback (`)J` descriptor). See
+    /// `ScalarI32`.
+    ScalarI64(i64),
+    /// Scalar-return accumulator readback (`)F` descriptor). GPU float
+    /// atomic-add reorders the per-thread summation and is therefore
+    /// not bit-identical to Java's sequential fp accumulation — the
+    /// transparent `try_dispatch` hook never requests this variant
+    /// (its Hit arm gates reductions to `)I`/`)J` only), but the
+    /// explicit `submitMethod` API surface can still dispatch a float
+    /// scalar-return kernel deliberately.
+    ScalarF32(f32),
+    /// Scalar-return accumulator readback (`)D` descriptor). Same
+    /// float-nondeterminism caveat as `ScalarF32`.
+    ScalarF64(f64),
     /// Raw little-endian `i32` bytes copied back from device memory.
     PrimitiveArrayI32 { bytes: Vec<u8> },
     /// Raw little-endian `i64` bytes copied back from device memory.
@@ -1017,6 +1339,22 @@ pub struct StreamSubmission {
     /// on the event, so the second submit can queue while the
     /// first kernel is still running on the device.
     pub finalize: parking_lot::Mutex<Option<FinalizeState>>,
+    /// Known-issues followups #3 — best-effort completion flag set by
+    /// a `Stream::add_host_callback` closure registered right after
+    /// the completion event in `OffloadCache::dispatch_async`. When
+    /// the driver flips this to `true`, [`poll_submission_status`]
+    /// can skip the `Event::query` round trip entirely.
+    ///
+    /// Always `false` for submissions that never reach the launch
+    /// site (pre-launch failures via `record_failed_submission`) —
+    /// harmless, since those are already terminal and
+    /// `poll_submission_status` never consults this field for a
+    /// non-`Running` status.
+    ///
+    /// The callback closure touches nothing but this atomic (see the
+    /// registration site for why: `cuLaunchHostFunc` callbacks must
+    /// never call back into the CUDA driver).
+    pub device_done: std::sync::atomic::AtomicBool,
 }
 
 /// Phase 7 #1 — payload of work that must run on the first
@@ -1071,6 +1409,77 @@ impl OffloadCache {
         self.kernels.read().get(&(class_id, method_index)).cloned()
     }
 
+    /// GpuStream affinity — mint a new Java-visible CUDA stream bound
+    /// to this cache's device context.
+    ///
+    /// Returns `None` when the cache has no device (`ctx` is `None` —
+    /// no `--gpu`/no driver) or the underlying `Stream::new` call
+    /// fails; callers treat that identically to every other
+    /// no-driver fallback in this file (`Native.newStream`'s override
+    /// hands back a purely local synthetic handle instead — see
+    /// `native-builtins/src/craton_gpu.rs::builtin_new_stream`).
+    ///
+    /// The returned handle is the SAME value later passed to
+    /// [`dispatch_method_from_native_on_stream`]'s `stream_handle`
+    /// parameter (resolved via [`resolve_stream`](Self::resolve_stream))
+    /// to pin a dispatch onto this exact stream.
+    ///
+    /// # Ordering contract
+    ///
+    /// Two submissions dispatched onto the SAME registered stream
+    /// serialize in submission order — that is what a CUDA stream
+    /// gives for free (kernels/copies enqueued on one stream execute
+    /// in enqueue order; the host never has to arrange this itself).
+    /// This composes with, and does not replace, the existing
+    /// per-buffer `last_write` event choreography the device-residency
+    /// cache (`device_cache`/`marshal_array_arg`) already does: that
+    /// mechanism serializes *data hazards* on a shared buffer across
+    /// ANY two streams (it makes a later kernel's read/write wait on
+    /// an earlier kernel's completion event regardless of which
+    /// stream either ran on); stream affinity additionally serializes
+    /// *launch order* for everything queued on one specific stream,
+    /// which is a strictly stronger, purely additive guarantee for
+    /// same-stream submissions.
+    pub fn stream_create(&self) -> Option<u64> {
+        let ctx = self.ctx.as_ref()?;
+        let stream = match Stream::new(ctx) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                tracing::info!("gpu stream: Stream::new failed: {e}");
+                return None;
+            }
+        };
+        let handle = self
+            .next_stream_handle
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.streams.write().insert(handle, stream);
+        Some(handle)
+    }
+
+    /// Drop this cache's reference to a previously-created stream.
+    /// Safe to call on an unknown or already-released handle
+    /// (no-op) — same idempotent-release convention as
+    /// [`release_submission`].
+    ///
+    /// This does not necessarily destroy the underlying CUDA stream
+    /// immediately: any [`StreamSubmission`] already dispatched onto
+    /// it via `resolve_stream` holds its own `Arc<Stream>` clone
+    /// (`StreamSubmission::stream`), so the stream stays alive until
+    /// every submission that used it is also finalized and dropped.
+    /// A dispatch against this handle *after* release fails with
+    /// "unknown or released stream handle" rather than silently
+    /// reusing a stream Java already asked us to forget.
+    pub fn stream_release(&self, handle: u64) {
+        self.streams.write().remove(&handle);
+    }
+
+    /// Resolve a Java-visible stream handle back to its `Arc<Stream>`.
+    /// Returns `None` for a handle this cache never minted (wrong
+    /// device / typo'd handle) or one that was already released.
+    pub fn resolve_stream(&self, handle: u64) -> Option<Arc<Stream>> {
+        self.streams.read().get(&handle).cloned()
+    }
+
     /// Asynchronous kernel dispatch on `stream`.
     ///
     /// Returns a [`StreamSubmission`] whose [`handle`](StreamSubmission::handle)
@@ -1083,51 +1492,80 @@ impl OffloadCache {
     /// - **Unknown kernel**: there is no compiled kernel for
     ///   `(class_id, method_index)`. Returns `Failed`.
     /// - **Launch dispatched**: the kernel is enqueued on `stream` via
-    ///   `DeviceModule::launch_on_stream`, then `stream.synchronize()`
-    ///   blocks the calling thread until the work completes. On success
-    ///   the status becomes `Completed { result: SerializedResult::Void }`.
-    ///   On any cudarc error the status becomes `Failed` with the error
-    ///   text.
+    ///   `DeviceModule::launch_on_stream`, a completion `Event` is
+    ///   recorded right after the launch, and the submission is
+    ///   returned immediately with status `Running` — `dispatch_async`
+    ///   itself never blocks on the device. On success the status
+    ///   eventually becomes `Completed { result }` once something
+    ///   finalizes the submission (see below). On any cudarc launch
+    ///   error the status becomes `Failed` with the error text right
+    ///   away.
     ///
-    /// # Why synchronous-under-the-hood?
+    /// # Why synchronous-under-the-hood? (get() still blocks; isDone() no longer has to)
     ///
-    /// The function is *named* `dispatch_async` and from the Java side
-    /// it is async (the `GpuFuture::get` call drives this method via a
-    /// worker thread, not the user's). Under the hood, however, we
-    /// call `stream.synchronize()` before returning. The real
-    /// stream-event-and-poll variant — where the host registers a
-    /// callback for the kernel completion and the future stays
-    /// `Running` until that callback fires — is a Phase 5 follow-up.
-    /// The current shape is enough to exercise the full
-    /// Java→Rust→cudarc→Rust→Java round-trip on a GPU box.
+    /// `dispatch_async` used to call `stream.synchronize()` before
+    /// returning — genuinely synchronous under an async-sounding name.
+    /// Phase 7 #1 replaced that: the function now only launches +
+    /// records an event and returns `Running` right away, deferring
+    /// the wait-and-drain-writebacks work to [`finalize_submission`].
+    /// `finalize_submission` is what actually blocks — it calls
+    /// `event.synchronize()` — and it only runs on the *first* call
+    /// made through it, whether that's the Java side's blocking
+    /// `GpuFuture::get()` (via `futureGetResult` / `futureSynchronize`)
+    /// or, as of known-issues followups item 3, a non-blocking poll.
     ///
-    /// # Limitation: only `Void` return
+    /// That poll is [`poll_submission_status`]: it asks the driver
+    /// "has the event fired?" via `Event::query` (optionally answered
+    /// even cheaper by a `Stream::add_host_callback` flag set at
+    /// dispatch time — see the callback registered right after the
+    /// event in this function) instead of waiting for it. If the
+    /// event has already fired, it runs the same finalize path inline
+    /// — bounded work, no device wait — and reports the resulting
+    /// terminal status; otherwise it reports `Running` and returns
+    /// immediately. This is what backs `Native.futureIsDone`: the
+    /// Java side can now ask "is it done yet?" without blocking a
+    /// thread on `event.synchronize()`, while `get()` / `futureGetResult`
+    /// keep their original blocking contract unchanged.
     ///
-    /// Today we only surface `SerializedResult::Void`. Primitive-array
-    /// return (the common shape: `kernel(int[] a, int[] b, int[] out)`)
-    /// is signalled by the caller writing to an output buffer the host
-    /// already owns — the host-side `int[]` of the `out` parameter is
-    /// what the Java code reads. Surfacing a *new* primitive array as
+    /// # Limitation: `Void` and scalar returns only
+    ///
+    /// `SerializedResult::Void` covers the common shape
+    /// (`kernel(int[] a, int[] b, int[] out)`) — the result is signalled
+    /// by the caller writing to an output buffer the host already
+    /// owns, no return value to surface. `SerializedResult::ScalarI32
+    /// / ScalarI64 / ScalarF32 / ScalarF64` (Part E) cover scalar-return
+    /// kernels (`)I` / `)J` / `)F` / `)D`, most commonly a proven
+    /// reduction): `dispatch_method_from_native` allocates and marshals
+    /// the accumulator buffer the kernel writes into, and
+    /// `finalize_submission` downloads it into the matching
+    /// `SerializedResult` variant. Surfacing a *new primitive array* as
     /// the future's result (e.g. for a method that returns `int[]`
-    /// rather than writing to `out`) needs the dispatch site to
+    /// rather than writing to `out`) still needs the dispatch site to
     /// allocate the output buffer, copy it back after the kernel, and
     /// stamp it into `SerializedResult::PrimitiveArray*`. That belongs
     /// to a later round.
     /// Asynchronously launch a compiled kernel on `stream`.
     ///
     /// `runtime_work` is the per-element launch count derived from the
-    /// actual array length the caller marshalled. The analyzer's
-    /// `KernelSignature::estimated_work` is a *compile-time* placeholder
-    /// (`1 << 20` for any counted-loop method); using it directly
-    /// truncates the launch grid for any n > 2^20, leaving the tail of
-    /// the output array unwritten. Pass `0` to fall back to the
-    /// analyzer's `estimated_work` — only safe for scalar-only kernels
-    /// (no array params) which don't have a per-element loop in the
-    /// first place. We use `u32` rather than `Option<u32>` because the
-    /// MSVC x64 ABI's handling of `Option<u32>` was observed to corrupt
-    /// stack passed CUDA kernel arguments on Windows when this function
-    /// is called via the GPU dispatch chain — passing the raw `u32` /
-    /// sentinel-0 encoding is the workaround.
+    /// actual array length the caller marshalled. Pass `0` for
+    /// scalar-only kernels (no array params, no per-element loop) — the
+    /// launch grid then falls back to the analyzer's
+    /// `KernelSignature::estimated_work`. We use `u32` rather than
+    /// `Option<u32>` because the MSVC x64 ABI's handling of
+    /// `Option<u32>` was observed to corrupt stack passed CUDA kernel
+    /// arguments on Windows when this function is called via the GPU
+    /// dispatch chain — passing the raw `u32` / sentinel-0 encoding is
+    /// the workaround.
+    ///
+    /// AUDIT (Part E launch-config fix): previously this took
+    /// `max(runtime_work, estimated_work)`, which meant the analyzer's
+    /// fixed `1 << 20` placeholder silently floored every launch to at
+    /// least a million threads — wasteful for any real array smaller
+    /// than that (the common case) and not actually needed: a genuine
+    /// `runtime_work` of `n` always wants exactly `n` threads, never
+    /// `max(n, 2^20)`. `runtime_work > 0` now wins outright; `estimated_work`
+    /// is consulted only for the `0`-sentinel scalar-only case, where
+    /// there is no array length to derive a grid from.
     pub fn dispatch_async(
         &self,
         stream: std::sync::Arc<Stream>,
@@ -1148,6 +1586,7 @@ impl OffloadCache {
                     event,
                     status: parking_lot::Mutex::new(status),
                     finalize: parking_lot::Mutex::new(None),
+                    device_done: std::sync::atomic::AtomicBool::new(false),
                 })
             };
         let make = |status: SubmissionStatus| make_with_event(status, None);
@@ -1182,20 +1621,25 @@ impl OffloadCache {
         };
 
         // The caller-supplied `runtime_work` is the actual array
-        // length the kernel will iterate over. The signature's
-        // `estimated_work` is a fixed `1 << 20` for any counted-loop
-        // method (see `jit_cuda::analyzer::estimate_work`) — using
-        // it directly leaves the tail unwritten for n > 2^20 because
-        // the launch grid undercounts threads. We take the max of
-        // the two so n ≤ 2^20 keeps the original launch shape and
-        // n > 2^20 grows to cover every output index.
-        let estimated = kernel.signature.estimated_work.max(1) as u32;
-        let work = if runtime_work > estimated {
+        // length the kernel will iterate over — always exact when
+        // present, so it wins outright (no more flooring against the
+        // analyzer's fixed `1 << 20` counted-loop placeholder; see the
+        // doc comment above). Only the `0` sentinel (scalar-only
+        // kernel, no array params to size a grid from) falls back to
+        // `estimated_work`.
+        let work = if runtime_work > 0 {
             runtime_work
         } else {
-            estimated
+            kernel.signature.estimated_work.max(1) as u32
         };
-        let cfg = cuda_bridge::LaunchConfig::elementwise(work);
+        // Occupancy-tuned block size (queries the driver for this
+        // kernel's `cuOccupancyMaxPotentialBlockSize`) instead of the
+        // fixed `DEFAULT_ELEMENTWISE_BLOCK` — falls back to the same
+        // 256 default when the query is unavailable (stub mode, or the
+        // driver call fails).
+        let cfg = kernel
+            .module
+            .elementwise_for_kernel(ctx, &kernel.kernel_name, work);
 
         // 4. Launch on the user-supplied stream. The launch itself is
         //    non-blocking; `stream.synchronize()` below is what makes
@@ -1231,12 +1675,47 @@ impl OffloadCache {
             });
         }
 
-        // 6. Return a Running submission. The status flips to
+        // 6. Build the Running submission. The status flips to
         //    Completed inside `finalize_submission` after the event
         //    fires and the writebacks complete. Callers attach the
         //    writebacks + token via `attach_finalize_state` before
         //    registering the submission.
-        make_with_event(SubmissionStatus::Running, Some(event))
+        let submission = make_with_event(SubmissionStatus::Running, Some(event));
+
+        // 7. Known-issues followups #3 — best-effort non-blocking
+        //    completion fast path. Register a host callback right
+        //    after the event so `poll_submission_status` can answer
+        //    `isDone()` without a driver round trip once the
+        //    callback fires. This is purely an optimization: if
+        //    registration fails for any reason, `poll_submission_status`
+        //    falls back to `Event::query`, which is always correct on
+        //    its own.
+        //
+        //    The closure clones the submission's `Arc` and touches
+        //    nothing else — `cuLaunchHostFunc` callbacks run on a
+        //    driver-owned thread and must never re-enter the CUDA
+        //    driver (no `Stream`/`Event`/`DeviceBuffer` calls), and a
+        //    plain `AtomicBool::store` is the only thing that's safe
+        //    to do there. Keeping the submission alive via the clone
+        //    until the callback fires is a side effect, not a goal,
+        //    but it is a benign one: it means the submission (and any
+        //    device buffers referenced by its pending `FinalizeState`)
+        //    can't be freed out from under a kernel that's still
+        //    in-flight on the device, even if every other reference
+        //    (registry + caller) is dropped first.
+        let cb_submission = submission.clone();
+        if let Err(e) = stream.add_host_callback(Box::new(move || {
+            cb_submission
+                .device_done
+                .store(true, std::sync::atomic::Ordering::Release);
+        })) {
+            tracing::debug!(
+                "gpu offload: add_host_callback registration failed ({e}); \
+                 poll_submission_status will fall back to Event::query for handle={handle}",
+            );
+        }
+
+        submission
     }
 }
 
@@ -1325,18 +1804,19 @@ fn record_failed_submission(stream: Option<std::sync::Arc<Stream>>, message: Str
         event: None,
         status: parking_lot::Mutex::new(SubmissionStatus::Failed { message }),
         finalize: parking_lot::Mutex::new(None),
+        device_done: std::sync::atomic::AtomicBool::new(false),
     });
     register_submission(sub);
     handle
 }
 
-/// Dispatch `class_name`.`method_name`(`descriptor`) on the GPU with
-/// `java_args`. Returns the submission handle the Java layer wraps
-/// in `GpuFutureImpl`. On any failure (method not eligible, missing
-/// device, marshal error, launch error) the returned handle still
-/// resolves — it points to a `StreamSubmission` whose status is
-/// `Failed { message }` so the Java side surfaces it as
-/// `GpuException` via `futureGetErrorMessage`.
+/// Convenience wrapper around
+/// [`dispatch_method_from_native_on_stream`] with `stream_handle =
+/// None` — a fresh, private, one-shot stream for this dispatch
+/// alone. Kept byte-for-byte source-compatible (same name, same
+/// 5-arg signature) so callers that don't care about stream affinity
+/// — the transparent `try_dispatch` interpreter hook, existing
+/// integration tests — need no changes.
 #[cfg(feature = "gpu-offload")]
 pub fn dispatch_method_from_native(
     shared: &crate::vm::SharedVm,
@@ -1344,6 +1824,53 @@ pub fn dispatch_method_from_native(
     method_name: &str,
     descriptor: &str,
     java_args: &[cratonvm_types::Value],
+) -> u64 {
+    dispatch_method_from_native_on_stream(
+        shared,
+        class_name,
+        method_name,
+        descriptor,
+        java_args,
+        None,
+    )
+}
+
+/// Dispatch `class_name`.`method_name`(`descriptor`) on the GPU with
+/// `java_args`, optionally pinned to a previously-registered CUDA
+/// stream. Returns the submission handle the Java layer wraps in
+/// `GpuFutureImpl`. On any failure (method not eligible, missing
+/// device, marshal error, launch error, unknown/released
+/// `stream_handle`) the returned handle still resolves — it points
+/// to a `StreamSubmission` whose status is `Failed { message }` so
+/// the Java side surfaces it as `GpuException` via
+/// `futureGetErrorMessage`.
+///
+/// `stream_handle`:
+///   * `Some(h)` — `h` must be a live handle from a prior
+///     [`OffloadCache::stream_create`] call (an executor's lazily
+///     created default stream, or an explicit `GpuStream` — see
+///     `native-builtins/src/craton_gpu.rs`). Resolved via
+///     [`OffloadCache::resolve_stream`] and dispatched onto that
+///     exact stream; an unknown or already-released handle is a hard
+///     `Failed` submission, never a silent fresh-stream fallback —
+///     see [`OffloadCache::stream_create`]'s doc comment for the
+///     ordering guarantee this buys.
+///   * `None` — unchanged pre-existing behavior: a fresh, private,
+///     one-shot `cuda_bridge::Stream` is created for this dispatch
+///     alone. This is what [`dispatch_method_from_native`] (this
+///     function's 5-arg convenience wrapper) always passes, and what
+///     the transparent `try_dispatch` interpreter hook uses — an
+///     `invokestatic` call site never had a Java-visible stream
+///     handle to give it in the first place, so its behavior is
+///     intentionally unaffected by this parameter's addition.
+#[cfg(feature = "gpu-offload")]
+pub fn dispatch_method_from_native_on_stream(
+    shared: &crate::vm::SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    java_args: &[cratonvm_types::Value],
+    stream_handle: Option<u64>,
 ) -> u64 {
     use cratonvm_types::{ArrayElementType, Value};
     use cuda_bridge::{KernelArgs, Stream as CudaStream};
@@ -1366,12 +1893,18 @@ pub fn dispatch_method_from_native(
     // decide whether to record a post-launch D→H writeback for that
     // arg or skip it (the read-only-input optimisation that closes
     // the residual gap to TornadoVM's `FIRST_EXECUTION`).
-    let (class_id, method_index, is_static, this_field_names, writes_param_mask): (
+    //
+    // Part E — also extract `return_kind` so the marshaller below
+    // knows whether the compiled PTX declares a trailing `ret_ptr`
+    // param (any non-void, non-array return) that needs a matching
+    // accumulator buffer pushed ahead of `failure_flag`.
+    let (class_id, method_index, is_static, this_field_names, writes_param_mask, return_kind): (
         crate::classloading::ClassId,
         u16,
         bool,
         Vec<String>,
         u64,
+        ParamKind,
     ) = {
         // Phase 9 #1 fix — load the class on demand. The class name
         // arrives as a string from `Native.submitMethod`; the user has
@@ -1482,6 +2015,7 @@ pub fn dispatch_method_from_native(
                     is_static_local,
                     names,
                     compiled.signature.writes_param_mask,
+                    compiled.signature.return_kind,
                 )
             }
             LookupOutcome::Skip => {
@@ -1517,15 +2051,52 @@ pub fn dispatch_method_from_native(
         }
     };
 
-    // 5. Create a real stream for this dispatch.
-    let stream = match CudaStream::new(ctx) {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            return record_failed_submission(
-                None,
-                format!("submitMethod: Stream::new failed: {e}"),
-            );
-        }
+    // 5. Resolve the stream to dispatch on.
+    //
+    //    `Some(h)` pins this dispatch onto a previously
+    //    `OffloadCache::stream_create`-minted stream (today: an
+    //    executor's lazily-created default stream, or an explicit
+    //    `GpuStream` from `Native.newStream` — see
+    //    `native-builtins/src/craton_gpu.rs`). We resolve it through
+    //    the cache rather than trusting a raw handle the caller might
+    //    supply, so a released handle (`stream_release` already ran)
+    //    fails loud instead of silently dispatching onto a stream
+    //    Java asked us to forget.
+    //
+    //    `None` keeps the original behavior: a fresh, private,
+    //    one-shot stream per dispatch — still the fallback for
+    //    handle-less callers, including the transparent interpreter
+    //    (`try_dispatch`) path via `dispatch_method_from_native`.
+    //
+    //    Two dispatches resolved onto the SAME registered stream run
+    //    in the order they were launched on it — a stock CUDA-stream
+    //    property, not something this function implements itself —
+    //    and it composes with (does not replace) the existing
+    //    per-buffer last-write-event choreography the device-residency
+    //    cache already does across streams; see `stream_create`'s doc
+    //    comment for the full contract.
+    let stream: Arc<Stream> = match stream_handle {
+        Some(h) => match cache.resolve_stream(h) {
+            Some(s) => s,
+            None => {
+                return record_failed_submission(
+                    None,
+                    format!(
+                        "submitMethod: unknown or released stream handle {h} \
+                         ({class_name}.{method_name}{descriptor})",
+                    ),
+                );
+            }
+        },
+        None => match CudaStream::new(ctx) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                return record_failed_submission(
+                    None,
+                    format!("submitMethod: Stream::new failed: {e}"),
+                );
+            }
+        },
     };
 
     // 6. Enter the GC-critical section. The guard lives in the
@@ -1805,7 +2376,72 @@ pub fn dispatch_method_from_native(
         }
     }
 
-    // 7c. Append the kernel's trailing `failure_flag` parameter.
+    // 7c. Part E — if the compiled kernel declares a scalar return,
+    //     `build_param_list` (`jit-cuda/src/lowering.rs`) emits a
+    //     trailing `ret_ptr: u64*` param ahead of `failure_flag` (see
+    //     7d below) for any `ParamKind::I32/I64/F32/F64` return kind —
+    //     regardless of whether the analyzer proved a reduction.
+    //     Whether the kernel body treats it as an atomic accumulator
+    //     (`atom.global.add`, proven reduction — see
+    //     `KernelSignature::is_reduction`) or a plain racing overwrite
+    //     (straight-line scalar return, every thread computes the same
+    //     value) is baked into the compiled PTX by
+    //     `jit_cuda::lowering::emit::scalar_return`; the host only
+    //     needs to allocate+push the slot, so this arm is unconditional
+    //     on `return_kind` and doesn't need to re-derive `is_reduction`
+    //     here.
+    //
+    //     MUST be zero-initialized: for the reduction case the atomic
+    //     add accumulates onto whatever is already in the cell, and
+    //     `0` is the identity element that matches Java's implicit
+    //     accumulator initializer (`int`/`long`/`float`/`double sum =
+    //     0`) — `KernelSignature::is_reduction`'s doc comment states
+    //     this contract explicitly ("The host marshaller MUST pre-zero
+    //     `*ret_ptr` before launch"). For the straight-line case the
+    //     zero is simply clobbered by the plain store, so pre-zeroing
+    //     is harmless there too. Without a device pointer in this slot
+    //     at all, `cuLaunchKernel` would fail exactly as the
+    //     `failure_flag` omission described below does — one fewer arg
+    //     than the compiled kernel declares.
+    macro_rules! push_scalar_return_buf {
+        ($ty:ty, $variant:ident, $tag:literal) => {{
+            let buf = match cuda_bridge::DeviceBuffer::<$ty>::zeros(ctx, 1) {
+                Ok(b) => std::sync::Arc::new(b),
+                Err(e) => {
+                    drop(token);
+                    return record_failed_submission(
+                        Some(stream.clone()),
+                        format!(
+                            "submitMethod: failed to allocate scalar-return ({}) buffer: {e}",
+                            $tag,
+                        ),
+                    );
+                }
+            };
+            kernel_args = kernel_args.push_device_ptr(buf.as_ref());
+            writebacks.push(MarshalWriteback::$variant { buf });
+        }};
+    }
+    match return_kind {
+        ParamKind::I32 => push_scalar_return_buf!(i32, ScalarI32, "i32"),
+        ParamKind::I64 => push_scalar_return_buf!(i64, ScalarI64, "i64"),
+        ParamKind::F32 => push_scalar_return_buf!(f32, ScalarF32, "f32"),
+        ParamKind::F64 => push_scalar_return_buf!(f64, ScalarF64, "f64"),
+        ParamKind::Void
+        | ParamKind::I32Array
+        | ParamKind::I64Array
+        | ParamKind::F32Array
+        | ParamKind::F64Array
+        | ParamKind::I16Array
+        | ParamKind::I8Array => {
+            // Void: no ret_ptr param at all. Array returns: not yet
+            // wired (see `SerializedResult`'s doc comment) — the
+            // analyzer/lowering pairing for those shapes is a later
+            // round's problem, unchanged by Part E.
+        }
+    }
+
+    // 7d. Append the kernel's trailing `failure_flag` parameter.
     //     `build_param_list` in `jit-cuda/src/lowering.rs` always emits
     //     a final `u64*` named `failure_flag`. The PTX bounds-check
     //     fail block (`emit::Emitter::emit_done_and_bounds_fail`)
@@ -1843,13 +2479,14 @@ pub fn dispatch_method_from_native(
     });
 
     // 8. Phase 7 #1 — dispatch on the stream. The launch grid's
-    //    element count comes from `max_array_len`: the analyzer's
-    //    `estimated_work` is a fixed compile-time placeholder
-    //    (1 << 20 for any counted loop) which silently truncates
-    //    the launch for n > 2^20. Pass 0 (no arrays seen) or a
-    //    truncated 2^31-1 (array bigger than u32::MAX is impossible
-    //    in JVM but defensive) when needed; `dispatch_async` takes
-    //    the max of `runtime_work` and `estimated_work`.
+    //    element count comes from `max_array_len` (0 for a scalar-only
+    //    kernel with no array args, or a truncated 2^31-1 — an array
+    //    bigger than u32::MAX is impossible in the JVM but defensive
+    //    regardless); `dispatch_async` uses this `runtime_work` value
+    //    outright when nonzero and only falls back to the analyzer's
+    //    `estimated_work` placeholder for the `0` (scalar-only)
+    //    sentinel — see the launch-config fix in `dispatch_async`'s
+    //    doc comment.
     //
     // Phase 10 #2 — flush the per-dispatch H2D byte total into the
     // process-wide trace counter; emit a per-submit log line when
@@ -1971,7 +2608,16 @@ pub fn finalize_submission(
         //    kernel already dirtied, breaking the documented "the
         //    interpreter observes no partial GPU state" guarantee
         //    (docs/book/src/gpu/overview.md §Exceptions).
+        // Part E — a scalar-return kernel's `ScalarI32`/`ScalarI64`/
+        // `ScalarF32`/`ScalarF64` writeback is the only kind that
+        // produces a value; every other writeback below returns
+        // `Ok(None)`. A submission has at most one `ret_ptr`
+        // (`build_param_list` emits it once, right before
+        // `failure_flag`), so at most one iteration of this loop ever
+        // sets `scalar_result` — a plain "last write wins" is
+        // sufficient and avoids an extra `is_some()` guard.
         let mut first_err: Option<String> = None;
+        let mut scalar_result: Option<SerializedResult> = None;
         for wb in writebacks
             .iter()
             .filter(|wb| matches!(wb, MarshalWriteback::FailureFlag { .. }))
@@ -1981,9 +2627,13 @@ pub fn finalize_submission(
                     .filter(|wb| !matches!(wb, MarshalWriteback::FailureFlag { .. })),
             )
         {
-            if let Err(msg) = wb.writeback(shared, &local_token) {
-                first_err = Some(msg);
-                break;
+            match wb.writeback(shared, &local_token) {
+                Ok(Some(result)) => scalar_result = Some(result),
+                Ok(None) => {}
+                Err(msg) => {
+                    first_err = Some(msg);
+                    break;
+                }
             }
         }
         // 4. Drop guard (release real GC gate) BEFORE we touch the
@@ -1998,7 +2648,7 @@ pub fn finalize_submission(
         match (&*status, first_err) {
             (SubmissionStatus::Running, None) => {
                 *status = SubmissionStatus::Completed {
-                    result: SerializedResult::Void,
+                    result: scalar_result.unwrap_or(SerializedResult::Void),
                 };
                 Ok(())
             }
@@ -2029,6 +2679,129 @@ pub fn finalize_submission(
             }
             SubmissionStatus::Completed { .. } => Ok(()),
             SubmissionStatus::Failed { message } => Err(message.clone()),
+        }
+    }
+}
+
+/// Known-issues followups item 3 — the non-blocking half of
+/// [`finalize_submission`]'s job.
+///
+/// Coarse terminal-vs-in-flight signal for a submission, without ever
+/// calling `event.synchronize()`. This is what `Native.futureIsDone`
+/// answers from: previously the only way to learn a submission's
+/// status was `finalize_submission`, which blocks the calling thread
+/// on the device until the kernel completes.
+#[cfg(feature = "gpu-offload")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollOutcome {
+    /// Dispatch accepted, kernel not observed complete yet. The
+    /// caller should poll again later (or fall back to the blocking
+    /// `get()` path via `finalize_submission` if it wants to wait).
+    Running,
+    /// The submission finished successfully. Callers still go through
+    /// the usual `finalize_submission` / status-read path to pull the
+    /// `SerializedResult` payload out — `PollOutcome` itself carries
+    /// no data, only the coarse signal.
+    Completed,
+    /// The submission failed, either at dispatch time or during
+    /// finalization (including a completion-query error surfaced by
+    /// this very poll). The error text is on `StreamSubmission::status`.
+    Failed,
+}
+
+/// Non-blocking poll of a submission's completion state.
+///
+/// Returns `None` for an unknown or already-`release_submission`d
+/// handle — same "unknown handle" convention as [`lookup_submission`].
+///
+/// For a `Running` submission this never calls `event.synchronize()`.
+/// It first checks `StreamSubmission::device_done` — set by the
+/// best-effort host callback `dispatch_async` registers right after
+/// the completion event — and only falls back to `Event::query` (also
+/// non-blocking; it's the "has the event fired?" driver call, not the
+/// "wait for it to fire" one) when that flag hasn't been observed set
+/// yet. Either way, once the device side reports done, finalization
+/// (writeback draining, GC-critical-guard release, status transition)
+/// runs inline on the calling thread via [`finalize_submission`] — the
+/// same work `get()` would have triggered, just invoked from a poll
+/// instead of a blocking wait. That inline call does no device
+/// waiting of its own (the event has already fired), so it's bounded
+/// work, not a hidden block.
+///
+/// An `Event::query` error is treated the same way
+/// `finalize_submission`'s own `event.synchronize()` failure is: the
+/// submission is stamped `Failed` with the error text, and any
+/// pending `FinalizeState` (writebacks, the GC-critical guard) is
+/// dropped immediately rather than left to leak GC-critical count
+/// forever with no future finalize call able to reach it.
+#[cfg(feature = "gpu-offload")]
+pub fn poll_submission_status(
+    shared: &crate::vm::SharedVm,
+    handle: u64,
+) -> Option<PollOutcome> {
+    let submission = lookup_submission(handle)?;
+
+    // Already terminal — no need to touch the event or the driver.
+    {
+        let status = submission.status.lock();
+        match &*status {
+            SubmissionStatus::Completed { .. } => return Some(PollOutcome::Completed),
+            SubmissionStatus::Failed { .. } => return Some(PollOutcome::Failed),
+            SubmissionStatus::Running => {}
+        }
+    }
+
+    // Fast path: the host callback registered at dispatch time may
+    // have already flipped this without a driver round trip. Fall
+    // back to `Event::query` when it hasn't (callback registration is
+    // best-effort and can fail; the callback may also simply not have
+    // run yet even though it will).
+    let device_done = submission
+        .device_done
+        .load(std::sync::atomic::Ordering::Acquire);
+    let query_result: cuda_bridge::Result<bool> = if device_done {
+        Ok(true)
+    } else {
+        match submission.event.as_ref() {
+            Some(event) => event.query(),
+            // `Running` with no recorded event shouldn't happen — every
+            // success path through `dispatch_async` records one before
+            // returning a `Running` submission — but stay defensive
+            // rather than panicking: no event to poll means we can't
+            // claim more than "still running".
+            None => Ok(false),
+        }
+    };
+
+    match query_result {
+        Ok(true) => {
+            // Device-side work observed complete. Run the same
+            // finalize path `get()` / `futureSynchronize` would have
+            // run, inline on this (polling) thread.
+            match finalize_submission(shared, &submission) {
+                Ok(()) => Some(PollOutcome::Completed),
+                Err(_) => Some(PollOutcome::Failed),
+            }
+        }
+        Ok(false) => Some(PollOutcome::Running),
+        Err(e) => {
+            // Mirror `finalize_submission`'s `event.synchronize()`
+            // error handling: drop the pending `FinalizeState` (which
+            // releases the GC-critical guard and any device buffers)
+            // and stamp the submission `Failed`, instead of leaving it
+            // stuck `Running` with a `FinalizeState` nothing will ever
+            // drain.
+            let pending = submission.finalize.lock().take();
+            {
+                let mut status = submission.status.lock();
+                if matches!(&*status, SubmissionStatus::Running) {
+                    *status = SubmissionStatus::Failed {
+                        message: format!("event.query: {e}"),
+                    };
+                }
+            }
+            drop(pending);
+            Some(PollOutcome::Failed)
         }
     }
 }
@@ -2542,34 +3315,75 @@ pub enum MarshalWriteback {
     FailureFlag {
         buf: std::sync::Arc<cuda_bridge::DeviceBuffer<u64>>,
     },
+    /// Part E — owns the 1-element device buffer a scalar-return
+    /// kernel's `ret_ptr` param points at (see
+    /// `jit_cuda::lowering::build_param_list`). For a proven reduction
+    /// (`KernelSignature::is_reduction`) the kernel epilogue is
+    /// `atom.global.add.u32 [ret_ptr], value` — the buffer MUST be
+    /// zero-initialized before launch so the atomic add lands on the
+    /// correct identity element (`0`, matching Java's implicit
+    /// accumulator initializer; see `KernelSignature::is_reduction`'s
+    /// doc comment). `dispatch_method_from_native` allocates this via
+    /// `DeviceBuffer::<i32>::zeros`. The writeback downloads the
+    /// accumulated value and surfaces it as `SerializedResult::ScalarI32`.
+    ScalarI32 {
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i32>>,
+    },
+    /// `)J`-descriptor counterpart of `ScalarI32` — `atom.global.add.u64`.
+    ScalarI64 {
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i64>>,
+    },
+    /// `)F`-descriptor counterpart of `ScalarI32` — `atom.global.add.f32`.
+    /// Only reachable via the explicit `submitMethod` API; `try_dispatch`
+    /// never requests a float reduction (see `SerializedResult::ScalarF32`).
+    ScalarF32 {
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<f32>>,
+    },
+    /// `)D`-descriptor counterpart of `ScalarI32` — `atom.global.add.f64`.
+    ScalarF64 {
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<f64>>,
+    },
 }
 
 #[cfg(feature = "gpu-offload")]
 impl MarshalWriteback {
+    /// Drain this writeback. Returns `Ok(Some(result))` when the
+    /// writeback produced a value the submission's terminal
+    /// `SerializedResult` must carry (Part E — the `Scalar*` variants);
+    /// every other writeback returns `Ok(None)` on success (their
+    /// output already landed in the JVM heap / resident store / cache
+    /// dirty-bit, not in `SerializedResult`). `finalize_submission`
+    /// keeps the *last* `Some` seen across the drain — today at most
+    /// one writeback per submission ever returns `Some` (a kernel has
+    /// at most one `ret_ptr`), so "last" is really "the only one".
     fn writeback(
         &self,
         shared: &crate::vm::SharedVm,
         token: &cratonvm_gc::safepoint::SafepointToken<'_>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<SerializedResult>, String> {
         use crate::runtime::gpu_marshal;
         match self {
             // Download the kernel-written buffer straight into the JVM heap
             // arena (no staging Vec + write-back) when the array is contiguous.
             Self::I32 { obj, buf, .. } => {
                 gpu_marshal::download_obj_i32(buf.as_ref(), *obj, &shared.heap, token)
-                    .map_err(|e| format!("download i32: {e}"))
+                    .map_err(|e| format!("download i32: {e}"))?;
+                Ok(None)
             }
             Self::I64 { obj, buf, .. } => {
                 gpu_marshal::download_obj_i64(buf.as_ref(), *obj, &shared.heap, token)
-                    .map_err(|e| format!("download i64: {e}"))
+                    .map_err(|e| format!("download i64: {e}"))?;
+                Ok(None)
             }
             Self::F32 { obj, buf, .. } => {
                 gpu_marshal::download_obj_f32(buf.as_ref(), *obj, &shared.heap, token)
-                    .map_err(|e| format!("download f32: {e}"))
+                    .map_err(|e| format!("download f32: {e}"))?;
+                Ok(None)
             }
             Self::F64 { obj, buf, .. } => {
                 gpu_marshal::download_obj_f64(buf.as_ref(), *obj, &shared.heap, token)
-                    .map_err(|e| format!("download f64: {e}"))
+                    .map_err(|e| format!("download f64: {e}"))?;
+                Ok(None)
             }
             // Phase 9 #1 — Resident-arg writebacks no longer
             // download to host bytes eagerly. They mark the cache
@@ -2590,19 +3404,19 @@ impl MarshalWriteback {
             // parallel Arc that lives until `releaseArray`.
             Self::ResidentI32 { handle, .. } => {
                 device_cache::mark_dirty(*handle);
-                Ok(())
+                Ok(None)
             }
             Self::ResidentI64 { handle, .. } => {
                 device_cache::mark_dirty(*handle);
-                Ok(())
+                Ok(None)
             }
             Self::ResidentF32 { handle, .. } => {
                 device_cache::mark_dirty(*handle);
-                Ok(())
+                Ok(None)
             }
             Self::ResidentF64 { handle, .. } => {
                 device_cache::mark_dirty(*handle);
-                Ok(())
+                Ok(None)
             }
             // Phase 9 #1 follow-up — read the failure flag back.
             // If non-zero, the kernel hit a bounds check; report as
@@ -2618,7 +3432,37 @@ impl MarshalWriteback {
                         cell[0]
                     ));
                 }
-                Ok(())
+                Ok(None)
+            }
+            // Part E — scalar-return accumulator readback. The device
+            // buffer was pre-zeroed by `dispatch_method_from_native`
+            // before launch (see the `ScalarI32` field doc); download
+            // the single cell and hand it back as the matching
+            // `SerializedResult` so `finalize_submission` can stamp it
+            // onto the submission's terminal status instead of `Void`.
+            Self::ScalarI32 { buf } => {
+                let mut cell = [0i32; 1];
+                gpu_marshal::download_into(buf, &mut cell)
+                    .map_err(|e| format!("download scalar i32 accumulator: {e}"))?;
+                Ok(Some(SerializedResult::ScalarI32(cell[0])))
+            }
+            Self::ScalarI64 { buf } => {
+                let mut cell = [0i64; 1];
+                gpu_marshal::download_into(buf, &mut cell)
+                    .map_err(|e| format!("download scalar i64 accumulator: {e}"))?;
+                Ok(Some(SerializedResult::ScalarI64(cell[0])))
+            }
+            Self::ScalarF32 { buf } => {
+                let mut cell = [0f32; 1];
+                gpu_marshal::download_into(buf, &mut cell)
+                    .map_err(|e| format!("download scalar f32 accumulator: {e}"))?;
+                Ok(Some(SerializedResult::ScalarF32(cell[0])))
+            }
+            Self::ScalarF64 { buf } => {
+                let mut cell = [0f64; 1];
+                gpu_marshal::download_into(buf, &mut cell)
+                    .map_err(|e| format!("download scalar f64 accumulator: {e}"))?;
+                Ok(Some(SerializedResult::ScalarF64(cell[0])))
             }
         }
     }
@@ -2626,8 +3470,8 @@ impl MarshalWriteback {
     /// Element-count of the array this writeback owns. Used by
     /// `dispatch_method_from_native` to compute the launch grid:
     /// the kernel needs `>= max(array_len)` threads to cover every
-    /// output index. Returns `None` for the `FailureFlag` variant
-    /// (no array body — just a 1-cell signal).
+    /// output index. Returns `None` for the `FailureFlag` and
+    /// `Scalar*` variants (no array body — just a 1-cell signal).
     pub fn array_len(&self) -> Option<usize> {
         match self {
             Self::I32 { len, .. }
@@ -2638,7 +3482,11 @@ impl MarshalWriteback {
             | Self::ResidentI64 { len, .. }
             | Self::ResidentF32 { len, .. }
             | Self::ResidentF64 { len, .. } => Some(*len),
-            Self::FailureFlag { .. } => None,
+            Self::FailureFlag { .. }
+            | Self::ScalarI32 { .. }
+            | Self::ScalarI64 { .. }
+            | Self::ScalarF32 { .. }
+            | Self::ScalarF64 { .. } => None,
         }
     }
 }

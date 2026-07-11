@@ -2233,22 +2233,6 @@ fn jmx_class_id_or_object(ctx: &mut dyn NativeContext, class_name: &str) -> Clas
         .unwrap_or(ClassId::new(0))
 }
 
-fn registered_thread_name(ctx: &dyn NativeContext, thread_id: i64) -> Option<String> {
-    ctx.enumerate_threads(256).into_iter().find_map(|thread_obj| {
-        let id = match ctx.get_field_by_name(thread_obj, "tid") {
-            Value::Long(id) => id,
-            Value::Int(id) => id as i64,
-            _ => return None,
-        };
-        if id != thread_id {
-            return None;
-        }
-        match ctx.get_field_by_name(thread_obj, "name") {
-            Value::Object(Some(name)) => ctx.read_string(name),
-            _ => None,
-        }
-    })
-}
 
 fn alloc_basic_thread_info(
     ctx: &mut dyn NativeContext,
@@ -2349,6 +2333,26 @@ fn alloc_named_thread_info(
 
     ctx.unpin_native_roots(name_pin);
     info
+}
+
+/// Return the real Java name for a live registered thread with the requested
+/// Java `Thread.tid`. JMX APIs must never silently substitute the main thread
+/// when the requested id is unknown.
+fn registered_thread_name(ctx: &dyn NativeContext, thread_id: i64) -> Option<String> {
+    ctx.enumerate_threads(256).into_iter().find_map(|thread_obj| {
+        let id = match ctx.get_field_by_name(thread_obj, "tid") {
+            Value::Long(id) => id,
+            Value::Int(id) => id as i64,
+            _ => return None,
+        };
+        if id != thread_id {
+            return None;
+        }
+        match ctx.get_field_by_name(thread_obj, "name") {
+            Value::Object(Some(name)) => ctx.read_string(name),
+            _ => None,
+        }
+    })
 }
 
 fn alloc_thread_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
