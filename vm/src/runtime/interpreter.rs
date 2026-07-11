@@ -21983,6 +21983,50 @@ fn force_native_over_real_jdk_bytecode(
     if is_awt_imageio_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
+    // javac calls this helper while scanning standard file-manager locations.
+    // The JDK 25 body is a one-token regex (`\\bMODULE\\b`). Letting that real
+    // regex bytecode run under CratonVM can stall in Pattern$Bound/CharPredicates
+    // during Spring's in-memory compilation tests; the registered native answers
+    // the bytecode-equivalent boolean directly.
+    if class_name == "javax/tools/StandardLocation"
+        && method_name == "computeIsModuleOrientedLocation"
+        && method_descriptor == "(Ljava/lang/String;)Z"
+    {
+        return true;
+    }
+
+    // Same javac location hot path as above: once `inferBinaryName` delegates to
+    // `JavacFileManager`, this guard can be reached for every scanned classfile.
+    // The native preserves the module-oriented rejection while avoiding repeated
+    // interpreted interface/default-method dispatch in the compiler loop.
+    if class_name == "com/sun/tools/javac/file/JavacFileManager"
+        && matches!(
+            (method_name, method_descriptor),
+            ("checkNotModuleOrientedLocation", "(Ljavax/tools/JavaFileManager$Location;)V")
+                | (
+                    "list",
+                    "(Ljavax/tools/JavaFileManager$Location;Ljava/lang/String;Ljava/util/Set;Z)Ljava/lang/Iterable;"
+                )
+        )
+    {
+        return true;
+    }
+
+    if class_name == "com/sun/tools/javac/file/RelativePath"
+        && matches!(
+            (method_name, method_descriptor),
+            ("hashCode", "()I")
+                | ("equals", "(Ljava/lang/Object;)Z")
+                | (
+                    "compareTo",
+                    "(Lcom/sun/tools/javac/file/RelativePath;)I"
+                )
+                | ("getPath", "()Ljava/lang/String;")
+        )
+    {
+        return true;
+    }
+
     // SBR-02 / bug-03: fast native regex. The real-JDK `String.replaceAll` /
     // `replaceFirst` / `matches` bodies run `Pattern.compile(...).matcher(...)`
     // in the interpreter (java.util.regex), which is 30–600× slower than
@@ -22207,6 +22251,16 @@ fn force_native_over_real_jdk_bytecode(
     matches!(
         (class_name, method_name, method_descriptor),
         ("java/lang/ClassLoader", "setDefaultAssertionStatus", "(Z)V")
+            | (
+                "java/lang/ClassLoader",
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+            )
+            | (
+                "java/lang/ClassLoader",
+                "loadClass",
+                "(Ljava/lang/String;Z)Ljava/lang/Class;",
+            )
             // `EndElementEvent.getNamespaces()` — the JDK Xerces StAX event impl
             // hard-codes an empty `ReadOnlyIterator` return (it computes
             // `fNamespaces.iterator()` then pops it). Our synthetic cursor reports
@@ -32612,6 +32666,65 @@ mod tests {
                 "{name}{descriptor} must use native Manifest bridge"
             );
         }
+    }
+
+    #[test]
+    fn standard_location_force_native_covers_javac_regex_shortcut() {
+        assert!(force_native_over_real_jdk_bytecode(
+            "javax/tools/StandardLocation",
+            "computeIsModuleOrientedLocation",
+            "(Ljava/lang/String;)Z"
+        ));
+        assert!(!force_native_over_real_jdk_bytecode(
+            "javax/tools/StandardLocation",
+            "locationFor",
+            "(Ljava/lang/String;)Ljavax/tools/JavaFileManager$Location;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "com/sun/tools/javac/file/JavacFileManager",
+            "checkNotModuleOrientedLocation",
+            "(Ljavax/tools/JavaFileManager$Location;)V"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "com/sun/tools/javac/file/JavacFileManager",
+            "list",
+            "(Ljavax/tools/JavaFileManager$Location;Ljava/lang/String;Ljava/util/Set;Z)Ljava/lang/Iterable;"
+        ));
+        assert!(!force_native_over_real_jdk_bytecode(
+            "com/sun/tools/javac/file/JavacFileManager",
+            "inferBinaryName",
+            "(Ljavax/tools/JavaFileManager$Location;Ljavax/tools/JavaFileObject;)Ljava/lang/String;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "com/sun/tools/javac/file/RelativePath",
+            "hashCode",
+            "()I"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "com/sun/tools/javac/file/RelativePath",
+            "equals",
+            "(Ljava/lang/Object;)Z"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "com/sun/tools/javac/file/RelativePath",
+            "compareTo",
+            "(Lcom/sun/tools/javac/file/RelativePath;)I"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "com/sun/tools/javac/file/RelativePath",
+            "getPath",
+            "()Ljava/lang/String;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/lang/ClassLoader",
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/lang/ClassLoader",
+            "loadClass",
+            "(Ljava/lang/String;Z)Ljava/lang/Class;"
+        ));
     }
 
     #[test]
