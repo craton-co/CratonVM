@@ -1076,6 +1076,7 @@ mod tests {
             );
         }
         barrier.complete_gc(HashMap::new());
+    }
 
     /// Finding 1(c) — `leave_blocked_region_flagged` must not clear the
     /// caller's `in_blocked_region` flag while a pause that excluded the
