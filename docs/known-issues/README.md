@@ -4,6 +4,44 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-11 WildFly stale-ObjectRef sweep: systematic static-analysis pass finds+fixes ~37 more sites across 6 files; harness verification blocked by unrelated environment gap
+
+Follow-up session 3 on [`wildfly-parallel-boot-stale-objectref-residual.md`](wildfly-parallel-boot-stale-objectref-residual.md),
+acting on that doc's own recommendation after 2 sessions of one-off manual chasing found only 6-7 sites.
+Built a line-oriented static-analysis scanner (masks comments/strings, tracks `ObjectRef`-like locals,
+two-pass wrapper-hazard discovery for helper functions that internally call a GC-triggering `ctx.*`
+method without being one themselves, interval-based "GC event between bind and use" detection) over
+`native-builtins/src`, `native-io/src`, `classloading/src`. First pass found 1968 candidates; adding
+wrapper-hazard detection found 3247. Manually triaged the ~2200 in files judged hot for WildFly
+boot/reflection/classloading, fixing **~37 confirmed real instances** across
+`jboss_module_loader.rs` (~15, including the singleton `build_local_module_loader` and
+`native_loader_load_module`'s own `this`/`module` locals — directly on the WildFly bootstrap-module
+path), `service_loader.rs` (8, including the `ServiceLoader.load(Class)` entry point itself),
+`classloader.rs` (6), `classloader_real.rs` (4), `lang_reflect.rs` (2), `lang_class.rs` (2, including
+another `Constructor.newInstance`-family site in the serialization-constructor branch, and the
+never-before-fixed `build_serialized_lambda`). All fixed with the same established
+`pin_native_root`/`read_native_pin`/`unpin_native_roots` idiom. Consolidated 9 identical
+exception-construction call sites into one new shared helper (`alloc_single_message_exception`) rather
+than repeating the pin dance inline.
+
+- Verified: clean `cargo check`, full `cargo test -p cratonvm-native-builtins --lib` (2961/2965; the 4
+  failures confirmed via `git stash` to be pre-existing/unrelated), and byte-for-byte non-regression
+  against the last known-good frozen binary on the one live repro attempted.
+- **Not** verified: a live clean WildFly boot improvement — the shared Azure host's provisioned test
+  distribution is missing its `modules/` directory entirely (`apps/wildfly/build/target/`, the Maven
+  module that provisions it, doesn't exist on this checkout), a pre-existing environment gap unrelated to
+  this session's code, confirmed by reproducing the identical failure against the last verified-good
+  binary from a prior session. See the residual doc's "Follow-up session 3" section for the full story
+  and what whoever next has a working harness should re-run.
+- Also scoped (not implemented, lower priority): a debug-build assertion that would catch every future
+  instance of this bug class deterministically instead of relying on sweeps —
+  [`../internal/wildfly-stale-objectref-debug-assertion-scoping.md`](../internal/wildfly-stale-objectref-debug-assertion-scoping.md).
+- Remaining untriaged: `lang_class.rs`'s other 114 candidates, `lang_invoke.rs`, `servlet.rs`,
+  `jboss_msc.rs`, the `wildfly_*.rs` files, `spring_startup_bootstrap.rs`, and three giant
+  "Phase N native registration" files (`lib.rs`/`phases_late.rs`/`phases_early.rs`, ~1550 combined
+  candidates) — a spot-check of `lib.rs` alone found another real bug
+  (`spring_xml_set_factory_bool`'s caller), not yet fixed.
+
 ## 2026-07-11 Regex `find()`+`group()` quadratic slowdown FIXED — two wrong turns (dead-code Matcher bridge, dead-code substring native) before finding the real bug in the live one
 
 A user-reported benchmark (`StringBuilder` append loop + `Pattern.compile().matcher()`

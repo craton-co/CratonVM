@@ -480,8 +480,18 @@ fn build_parameter_array(
         ctx.class_num_total_fields(parameter_class_id),
     );
 
+    // GC-safety: `arr` and `declaring_executable` are held across the whole
+    // loop below, which repeatedly allocates/classloads once per parameter
+    // (`alloc_object`, `create_string`, `descriptor_to_class_mirror` --
+    // all GC-triggering). Pin both for the loop's duration; each iteration's
+    // own `p`/`name` locals additionally need pinning across that same
+    // iteration's hazards before their use further down.
+    let arr_pin = ctx.pin_native_root(arr);
+    let declaring_executable_pin = ctx.pin_native_root(declaring_executable);
+
     for (i, pdesc) in param_descs.iter().enumerate() {
         let p = ctx.alloc_object(parameter_class_id, alloc_fields);
+        let p_pin = ctx.pin_native_root(p);
 
         let (name_str, modifiers) = match parameter_meta.get(i) {
             Some((n, flags)) if !n.is_empty() => (n.clone(), *flags as i32),
@@ -489,7 +499,13 @@ fn build_parameter_array(
             None => (format!("arg{i}"), 0),
         };
         let name = ctx.create_string(&name_str);
+        let name_pin = ctx.pin_native_root(name);
         let type_mirror = descriptor_to_class_mirror(ctx, pdesc);
+
+        let p = ctx.read_native_pin(p_pin, p);
+        let name = ctx.read_native_pin(name_pin, name);
+        ctx.unpin_native_roots(p_pin);
+        let declaring_executable = ctx.read_native_pin(declaring_executable_pin, declaring_executable);
 
         // Real-JDK Parameter layout (name, modifiers, executable, index) —
         // write by field name so the REAL Parameter bytecode works:
@@ -517,8 +533,11 @@ fn build_parameter_array(
             ctx.set_field(p, 3, Value::Object(Some(declaring_executable)));
         }
 
+        let arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(p)));
     }
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
     arr
 }
 
@@ -850,11 +869,28 @@ pub(crate) fn native_method_get_generic_exception_types(
                     Value::Object(Some(this))
                 };
                 let arr = ctx.new_ref_array(ClassId::new(0), method_sig.throws.len());
+                // GC-safety: `type_sig_to_java` per iteration can trigger
+                // classloading (GC); `arr` and the ObjectRef inside `decl`
+                // are both reused across iterations, unpinned otherwise.
+                let arr_pin = ctx.pin_native_root(arr);
+                let decl_pin = match decl {
+                    Value::Object(Some(d)) => Some(ctx.pin_native_root(d)),
+                    _ => None,
+                };
                 for (i, t) in method_sig.throws.iter().enumerate() {
+                    let decl = match (decl_pin, decl) {
+                        (Some(pin), Value::Object(Some(d))) => {
+                            Value::Object(Some(ctx.read_native_pin(pin, d)))
+                        }
+                        _ => decl,
+                    };
                     let _gscope = crate::generics::GenericDeclScope::new(decl);
                     let v = crate::generics::type_sig_to_java(ctx, t);
+                    let arr = ctx.read_native_pin(arr_pin, arr);
                     ctx.set_array_element(arr, i, v);
                 }
+                let arr = ctx.read_native_pin(arr_pin, arr);
+                ctx.unpin_native_roots(arr_pin);
                 return Ok(Some(Value::Object(Some(arr))));
             }
         }
