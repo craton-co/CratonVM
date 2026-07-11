@@ -392,6 +392,10 @@ fn rh8_old_region_selection_prefers_high_garbage() {
         for (i, region) in regions.iter_mut().take(10).enumerate() {
             region.region_type = cratonvm_gc::RegionType::Old;
             region.gc_efficiency = (i as f64) * 0.1;
+            // live_bytes > 0 marks the region as carrying marking data —
+            // regions without it are ineligible for the mixed CSet
+            // (G1CORE-7 gate: post-cleanup promotions have unknown liveness).
+            region.live_bytes = (i + 1) * 100;
         }
     });
 
@@ -415,6 +419,8 @@ fn rh8_pinned_regions_are_never_evacuated() {
         for (i, region) in regions.iter_mut().take(5).enumerate() {
             region.region_type = cratonvm_gc::RegionType::Old;
             region.gc_efficiency = (i as f64) * 0.1;
+            // Marking data required for mixed-CSet eligibility (G1CORE-7).
+            region.live_bytes = (i + 1) * 100;
             // Pin the lowest-efficiency (would-be-first) region.
             region.pinned = i == 0;
         }
@@ -439,6 +445,8 @@ fn rh8_selection_is_deterministic_under_ties() {
         for region in regions.iter_mut().take(10) {
             region.region_type = cratonvm_gc::RegionType::Old;
             region.gc_efficiency = 0.5; // all tied
+            // Marking data required for mixed-CSet eligibility (G1CORE-7).
+            region.live_bytes = 100;
         }
     });
     let first = g1.select_old_regions_for_mixed_gc();

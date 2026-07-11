@@ -439,28 +439,44 @@ impl VmHeap {
     }
 
     /// BUG-03 — whether this heap backend supports the cross-thread STW JIT
-    /// TLAB skip-region protocol (i.e. its young collection is the
-    /// generational non-moving sweep that consumes
-    /// [`GenerationalHeap::set_jit_tlab_skip_regions`]). The collector only
-    /// engages the forcible in-JIT-peer take-over when this is `true`, so the
-    /// G1 path keeps its existing (cooperative-wait) behaviour.
+    /// TLAB skip-region protocol, i.e. it can collect safely while a frozen
+    /// in-JIT peer holds an un-retired TLAB:
+    ///
+    /// - Generational: the young collection degrades to the non-moving sweep
+    ///   that consumes [`GenerationalHeap::set_jit_tlab_skip_regions`].
+    /// - G1 (INT-3): the published tails are skipped by every region walker
+    ///   and their regions (plus every region holding a conservative frozen-
+    ///   peer root — the VM pins those via
+    ///   [`crate::gc_quiescence::add_pinned_jit_root`]) are excluded from the
+    ///   CSet, so nothing a frozen peer can address moves.
+    ///
+    /// The collector only engages the forcible in-JIT-peer take-over when
+    /// this is `true`; ZGC still takes the cooperative-wait path (and so
+    /// keeps INT-3's livelock exposure there).
     pub fn supports_jit_tlab_skip(&self) -> bool {
-        matches!(self, VmHeap::Generational(_))
+        matches!(self, VmHeap::Generational(_) | VmHeap::G1(_))
     }
 
-    /// BUG-03 — publish/clear the reserved TLAB tails of forcibly-stopped
-    /// in-JIT peers so the next non-moving young sweep skips them. No-op on
+    /// BUG-03 / INT-3 — publish the reserved TLAB tails of forcibly-stopped
+    /// in-JIT peers so the collection skips them (non-moving-sweep skip list
+    /// on Generational; region-walker skip + CSet exclusion on G1). No-op on
     /// backends without the protocol (see [`Self::supports_jit_tlab_skip`]).
     pub fn set_jit_tlab_skip_regions(&self, regions: &[(usize, usize)]) {
-        if let VmHeap::Generational(h) = self {
-            h.set_jit_tlab_skip_regions(regions);
+        match self {
+            VmHeap::Generational(h) => h.set_jit_tlab_skip_regions(regions),
+            VmHeap::G1(h) => h.set_jit_tlab_skip_regions(regions),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => {}
         }
     }
 
-    /// BUG-03 — clear any published JIT TLAB skip regions.
+    /// BUG-03 / INT-3 — clear any published JIT TLAB skip regions.
     pub fn clear_jit_tlab_skip_regions(&self) {
-        if let VmHeap::Generational(h) = self {
-            h.clear_jit_tlab_skip_regions();
+        match self {
+            VmHeap::Generational(h) => h.clear_jit_tlab_skip_regions(),
+            VmHeap::G1(h) => h.clear_jit_tlab_skip_regions(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => {}
         }
     }
 
@@ -876,8 +892,12 @@ impl VmHeap {
         }
     }
 
-    /// GC with finalizer-aware resurrection (semispace only; G1 falls back
-    /// to normal collect since `is_addr_live` handles non-collected regions).
+    /// GC with finalizer-aware resurrection: dead-but-finalizable objects
+    /// are kept alive by the collection (evacuated under G1, marked under
+    /// ZGC, forwarded under the semispace young collector) and their
+    /// POST-collection addresses returned so the caller can enqueue them
+    /// for `finalize()` — and mark their `ReferenceProcessor` entries
+    /// enqueued so each object is finalized at most once.
     ///
     /// The `stw` parameter is type-level proof that the caller is in a
     /// stop-the-world phase — see [`crate::collector::StopTheWorldToken`].
@@ -893,15 +913,11 @@ impl VmHeap {
                 h.collect_garbage_with_finalizers(stw, roots, finalizer_addrs, monitors)
             }
             VmHeap::G1(h) => {
-                // G1's is_addr_live handles this correctly — dead finalizable
-                // objects in non-collected regions are still accessible.
-                let result = h.collect_garbage(stw, roots, monitors);
-                (result, Vec::new())
+                h.collect_garbage_with_finalizers(stw, roots, finalizer_addrs, monitors)
             }
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(h) => {
-                let result = h.collect_garbage(stw, roots, monitors);
-                (result, Vec::new())
+                h.collect_garbage_with_finalizers(stw, roots, finalizer_addrs, monitors)
             }
         }
     }
@@ -1061,9 +1077,13 @@ impl VmHeap {
                 }
             }
             VmHeap::Generational(h) => {
-                if let Some(q) = h.satb_queue_handle() {
+                // Clone-free: this runs on EVERY JIT helper entry, and the
+                // common case (no concurrent old-gen mark running) is a
+                // single Acquire load — don't pay an Arc refcount round
+                // trip just to check `is_active`.
+                if let Some(q) = h.satb_queue_ref() {
                     if q.is_active() {
-                        crate::satb::flush_thread_satb_buffer(&q);
+                        crate::satb::flush_thread_satb_buffer(q);
                     }
                 }
             }
@@ -1510,6 +1530,44 @@ impl VmHeap {
             VmHeap::G1(_) => false,
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(_) => false,
+        }
+    }
+
+    /// Backend-generic post-GC staleness verdict for a PRE-collection
+    /// address: `true` iff the object at `addr` did NOT survive the
+    /// collection whose `pointer_map` is supplied — i.e. writing through
+    /// `addr` (or `pointer_map`-relocating it) would touch freed/reused
+    /// memory. Used by the post-GC reference-processing writers
+    /// (clear/enqueue/finalize/cleaner) as their anti-corruption guard.
+    ///
+    /// Per backend:
+    /// - Generational: a young-space address absent from the pointer map did
+    ///   not survive (a live young object is always in the map after a
+    ///   moving young GC, and non-moving sweeps emit identity entries for
+    ///   watched survivors). Old-gen addresses are conservatively treated
+    ///   as surviving (they do not move in a minor GC; major relocations
+    ///   are merged into the map).
+    /// - G1: every live CSet object is in the pointer map (identity entries
+    ///   for self-forwarded ones) and every live non-CSet address sits in a
+    ///   live region — so "absent from the map AND not in a live region" is
+    ///   exact. This closes the G1/ZGC hole where the old young-only guard
+    ///   was hardwired inert and stale finalize/cleaner addresses flowed to
+    ///   `run_finalizers` (UAF on recycled CSet memory).
+    /// - ZGC: non-moving — dead means gone from the registry
+    ///   (`is_addr_live` false).
+    pub fn pre_gc_addr_did_not_survive(
+        &self,
+        addr: usize,
+        pointer_map: &std::collections::HashMap<usize, usize>,
+    ) -> bool {
+        if pointer_map.contains_key(&addr) {
+            return false;
+        }
+        match self {
+            VmHeap::Generational(h) => h.is_in_young_either(addr as *const u8),
+            VmHeap::G1(_) => !self.is_addr_live(addr),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => !self.is_addr_live(addr),
         }
     }
 

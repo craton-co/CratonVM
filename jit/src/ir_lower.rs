@@ -1330,15 +1330,15 @@ impl<'a> Lowerer<'a> {
                     self.emit_mov_reg_imm64(CALL_ARG_REGS[2], field_index as i64 as u64);
                     self.emit_mov_reg_imm64(RAX, self.getfield as u64);
                     self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
-                    // The checked `jit_getfield` helper returns the `i64::MIN`
-                    // deopt/NPE sentinel (with the pending-NPE flag set) on a bad
-                    // receiver instead of a legitimate field value. `Op::Load`
-                    // only ever represents an int-category field (see the doc
-                    // comment above), where `i64::MIN` can never be a genuine
-                    // result, so a plain compare-and-bail is unambiguous — mirrors
-                    // the non-J/D branch of `Op::Call`'s post-dispatch check
-                    // below. Without this, a bad receiver silently corrupts
-                    // execution instead of throwing (crash → hang conversion).
+                                                  // The checked `jit_getfield` helper returns the `i64::MIN`
+                                                  // deopt/NPE sentinel (with the pending-NPE flag set) on a bad
+                                                  // receiver instead of a legitimate field value. `Op::Load`
+                                                  // only ever represents an int-category field (see the doc
+                                                  // comment above), where `i64::MIN` can never be a genuine
+                                                  // result, so a plain compare-and-bail is unambiguous — mirrors
+                                                  // the non-J/D branch of `Op::Call`'s post-dispatch check
+                                                  // below. Without this, a bad receiver silently corrupts
+                                                  // execution instead of throwing (crash → hang conversion).
                     self.emit_mov_reg_imm64(R10, i64::MIN as u64);
                     self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
                     self.buf.emit(&[0x0F, 0x84]); // JE rel32 → shared bail stub

@@ -210,6 +210,34 @@ fn try_alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> 
         .heap
         .try_alloc_object_full(string_class_id, field_count)?;
 
+    if populate_java_string_fields(shared, str_obj, units) {
+        Some(str_obj)
+    } else {
+        None
+    }
+}
+
+/// Populate an *already-allocated* `java/lang/String` object's `value`
+/// (plus `coder`/`hash`/`hashIsZero` under compact strings) fields directly
+/// from raw UTF-16 code `units`, using the identical Latin1-fits-in-a-byte
+/// bulk scan + little-endian compact-string layout as
+/// [`try_alloc_java_string_object_from_units`] (the sole source of truth for
+/// that layout — see the comment there and `StringUTF16.isBigEndian()` in
+/// `native-builtins/src/lang_string.rs` for the byte-order rationale).
+///
+/// Unlike `create_string`/`create_java_string_from_units`, this does **not**
+/// allocate the `String` object itself and does **not** touch the intern
+/// pool. It exists for native `<init>` overrides (`String(char[])`,
+/// `String(char[], int, int)`) that intercept construction *after* the `new`
+/// bytecode has already allocated `this` — a constructor native's contract is
+/// to mutate `this`'s fields in place, not to return a different object.
+///
+/// Returns `false` only if the backing array allocation fails (heap
+/// exhaustion); the caller should surface a catchable `OutOfMemoryError`
+/// rather than aborting the process, since a huge user-supplied `char[]` is a
+/// normal, recoverable-in-Java condition — unlike the VM's own internal
+/// string-creation call sites that use the aborting `alloc_*` wrappers.
+pub fn populate_java_string_fields(shared: &SharedVm, str_obj: ObjectRef, units: &[u16]) -> bool {
     let compact = shared
         .compact_strings
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -222,11 +250,14 @@ fn try_alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> 
         // Field 3: boolean hashIsZero (false)
         if units.iter().all(|&u| u <= 0xFF) {
             // LATIN1: one byte per char
-            let byte_array = shared.heap.try_alloc_array_full(
+            let byte_array = match shared.heap.try_alloc_array_full(
                 ClassId::new(0),
                 ArrayElementType::Byte,
                 units.len(),
-            )?;
+            ) {
+                Some(a) => a,
+                None => return false,
+            };
             for (i, &u) in units.iter().enumerate() {
                 let _ = shared
                     .heap
@@ -248,11 +279,14 @@ fn try_alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> 
             // byte-swaps every non-LATIN-1 char and corrupts e.g.
             // `CharacterData00`'s packed lookup tables.
             let byte_len = units.len() * 2;
-            let byte_array = shared.heap.try_alloc_array_full(
+            let byte_array = match shared.heap.try_alloc_array_full(
                 ClassId::new(0),
                 ArrayElementType::Byte,
                 byte_len,
-            )?;
+            ) {
+                Some(a) => a,
+                None => return false,
+            };
             for (i, &unit) in units.iter().enumerate() {
                 // Little-endian: low byte at even index, high byte at odd index.
                 let lo = (unit & 0xFF) as u8;
@@ -276,11 +310,14 @@ fn try_alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> 
         // ---- Legacy / synthetic layout ----
         // Field 0: char[] value (UTF-16)
         // Field 1: int hash
-        let char_array = shared.heap.try_alloc_array_full(
+        let char_array = match shared.heap.try_alloc_array_full(
             ClassId::new(0),
             ArrayElementType::Char,
             units.len(),
-        )?;
+        ) {
+            Some(a) => a,
+            None => return false,
+        };
         for (i, &ch) in units.iter().enumerate() {
             let _ = shared
                 .heap
@@ -293,7 +330,7 @@ fn try_alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> 
         shared.heap.set_field(str_obj, 1, Value::Int(0));
     }
 
-    Some(str_obj)
+    true
 }
 
 /// Bulk-read a compact `byte[]` array payload into a `Vec<u8>`.

@@ -1921,23 +1921,12 @@ pub unsafe extern "C" fn jit_post_tlab_init(
     // Reconstruct the typed handle and finish init.
     let obj_ref = cratonvm_types::ObjectRef::from_raw(raw_ptr);
 
-    // Primitive-typed default values walk the class hierarchy under the
-    // class_manager RwLock. Kept here (rather than inlined) because the
-    // JIT cannot synthesise per-field descriptor reads without
-    // pre-resolving the full layout at compile time.
-    jit_init_primitive_fields(vm, obj_ref, class_id);
-
-    // JLS §12.6 finalizer registration. Cold path — most classes do not
-    // override finalize().
-    let has_fin = vm
-        .class_manager
-        .read()
-        .class_store
-        .get(class_id)
-        .map_or(false, |c| c.has_finalizer);
-    if has_fin {
-        vm.register_finalizable(obj_ref.as_ptr() as usize);
-    }
+    // Primitive-typed default values + JLS §12.6 finalizer registration.
+    // Kept here (rather than inlined) because the JIT cannot synthesise
+    // per-field descriptor reads without pre-resolving the full layout at
+    // compile time; the per-class recipe cache makes the steady state
+    // lock-free (see `jit_post_alloc_init`).
+    jit_post_alloc_init(vm, obj_ref, class_id);
 
     if dbg_jit_alloc_filter() == Some(class_id_raw as u32) {
         eprintln!(
@@ -2029,16 +2018,7 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
                 num_fields as usize,
                 total_size,
             ) {
-                jit_init_primitive_fields(vm, obj_ref, class_id);
-                let has_fin = vm
-                    .class_manager
-                    .read()
-                    .class_store
-                    .get(class_id)
-                    .map_or(false, |c| c.has_finalizer);
-                if has_fin {
-                    vm.register_finalizable(obj_ref.as_ptr() as usize);
-                }
+                jit_post_alloc_init(vm, obj_ref, class_id);
                 if dbg_jit_alloc_filter() == Some(class_id_raw as u32) {
                     eprintln!(
                         "[JIT_ALLOC] new_object(tlab) class_id={} obj=0x{:x}",
@@ -2080,19 +2060,10 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
             }
         }
     };
-    // Initialize primitive-typed fields to proper JVM default values.
-    // Zero memory reads as Object(None) which is wrong for int/long/float/double fields.
-    jit_init_primitive_fields(vm, obj_ref, class_id);
-    // Register with GC finalizer support if the class overrides finalize() (JLS §12.6).
-    let has_fin = vm
-        .class_manager
-        .read()
-        .class_store
-        .get(class_id)
-        .map_or(false, |c| c.has_finalizer);
-    if has_fin {
-        vm.register_finalizable(obj_ref.as_ptr() as usize);
-    }
+    // Initialize primitive-typed fields to proper JVM default values (zero
+    // memory reads as Object(None) which is wrong for int/long/float/double
+    // fields) + JLS §12.6 finalizer registration.
+    jit_post_alloc_init(vm, obj_ref, class_id);
     if dbg_jit_alloc_filter() == Some(class_id_raw as u32) {
         eprintln!(
             "[JIT_ALLOC] new_object class_id={} obj=0x{:x}",
@@ -2101,6 +2072,103 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
         );
     }
     obj_ref.as_ptr() as i64
+}
+
+/// Post-allocation init shared by the three JIT slow-path allocation arms:
+/// primitive-field default values + JLS §12.6 finalizer registration.
+///
+/// Fast path: a lock-free per-class recipe from `SharedVm::jit_alloc_class_cache`
+/// — no `class_manager.read()`, no hierarchy walk. First allocation of a class
+/// computes the recipe under the read lock and publishes it; the legacy
+/// two-lookup path remains as the fallback (cache opt-out via
+/// `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE`, dense-range overflow, or a class not
+/// yet in the store).
+fn jit_post_alloc_init(vm: &SharedVm, obj: ObjectRef, class_id: ClassId) {
+    use crate::jit::alloc_class_cache::{alloc_class_cache_enabled, ClassAllocInfo, PrimKind};
+
+    let cached = if alloc_class_cache_enabled() {
+        match vm.jit_alloc_class_cache.get(class_id.as_u32()) {
+            Some(info) => Some(info),
+            None => {
+                // First slow-path allocation of this class: build the recipe
+                // with the SAME walk as `jit_init_primitive_fields` so cached
+                // and uncached behavior are bit-identical. Publish only a
+                // complete recipe — bail to the legacy path if any class in
+                // the hierarchy is missing from the store.
+                let recipe = {
+                    let cm = vm.class_manager.read();
+                    let store = &cm.class_store;
+                    store.get(class_id).and_then(|root| {
+                        let has_finalizer = root.has_finalizer;
+                        let mut prim_inits: Vec<(u32, PrimKind)> = Vec::new();
+                        let mut cid = Some(class_id);
+                        while let Some(current_id) = cid {
+                            let Some(class) = store.get(current_id) else {
+                                return None;
+                            };
+                            let mut inst_idx = class.first_field_index;
+                            for f in &class.fields {
+                                if f.is_static() {
+                                    continue;
+                                }
+                                let desc_first =
+                                    f.descriptor.as_bytes().first().copied().unwrap_or(b'L');
+                                let kind = match desc_first {
+                                    b'I' | b'B' | b'C' | b'S' | b'Z' => Some(PrimKind::Int),
+                                    b'J' => Some(PrimKind::Long),
+                                    b'F' => Some(PrimKind::Float),
+                                    b'D' => Some(PrimKind::Double),
+                                    _ => None,
+                                };
+                                if let Some(kind) = kind {
+                                    // Truncation-checked: field indices are bounded
+                                    // by num_total_fields, far below u32::MAX.
+                                    prim_inits.push((inst_idx as u32, kind));
+                                }
+                                inst_idx += 1;
+                            }
+                            cid = class.superclass;
+                        }
+                        Some(ClassAllocInfo {
+                            has_finalizer,
+                            prim_inits: prim_inits.into_boxed_slice(),
+                        })
+                    })
+                };
+                recipe.and_then(|r| vm.jit_alloc_class_cache.insert(class_id.as_u32(), r))
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(info) = cached {
+        for &(inst_idx, kind) in info.prim_inits.iter() {
+            let val = match kind {
+                PrimKind::Int => Value::Int(0),
+                PrimKind::Long => Value::Long(0),
+                PrimKind::Float => Value::Float(0.0),
+                PrimKind::Double => Value::Double(0.0),
+            };
+            vm.heap.set_field(obj, inst_idx as usize, val);
+        }
+        if info.has_finalizer {
+            vm.register_finalizable(obj.as_ptr() as usize);
+        }
+        return;
+    }
+
+    // Legacy fallback: per-allocation class-manager lookups.
+    jit_init_primitive_fields(vm, obj, class_id);
+    let has_fin = vm
+        .class_manager
+        .read()
+        .class_store
+        .get(class_id)
+        .map_or(false, |c| c.has_finalizer);
+    if has_fin {
+        vm.register_finalizable(obj.as_ptr() as usize);
+    }
 }
 
 /// Initialize primitive-typed fields of a newly allocated object (JIT version).

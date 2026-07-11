@@ -478,9 +478,14 @@ fn stw_take_over_and_wait(
     counted_os_tids: &[u32],
 ) -> crate::jit::xt_root_scan::TakenOver {
     use crate::jit::xt_root_scan as xt;
-    // The forcible take-over is only sound on a heap whose young collection is
-    // the generational non-moving sweep that consumes the JIT TLAB skip
-    // regions (so a frozen peer's un-retired TLAB tail is not walked/reclaimed).
+    // The forcible take-over is only sound on a heap that can collect while a
+    // frozen peer holds an un-retired TLAB and un-rewritable roots:
+    // Generational degrades to the non-moving sweep that consumes the JIT
+    // TLAB skip regions; G1 (INT-3) skips the published tails in every region
+    // walker and pins everything a frozen peer can address out of the CSet
+    // (see `pin_frozen_peer_roots_for_g1`). ZGC has neither protocol yet and
+    // keeps the legacy unbounded cooperative wait — a compiled loop that
+    // never allocates nor re-enters the interpreter can still livelock it.
     if !xt::enabled() || !shared.heap.supports_jit_tlab_skip() {
         shared.gc_barrier.wait_for_all();
         return xt::TakenOver::default();
@@ -614,6 +619,51 @@ fn stw_take_over_and_wait(
         cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete();
     }
     taken
+}
+
+/// INT-3 (G1) — pin-in-place everything a forcibly-frozen peer can address.
+///
+/// A frozen peer is excused from the STW barrier, so it never applies this
+/// collection's pointer map to its own state; under an EVACUATING collector
+/// every object it references directly must therefore stay put. Two sources:
+///
+/// 1. `xt_roots` — the conservative register/stack scan of each frozen peer
+///    (plus the helper-window scans of blocked threads, whose Rust-stack
+///    locals are equally un-rewritable).
+/// 2. The frozen peers' deposited root snapshots — the collector's only view
+///    of their interpreter frames. The snapshot entries are merged into the
+///    collection roots (which keeps the objects ALIVE and rewrites the
+///    merged copies), but the peer's actual frame slots are never remapped:
+///    it skips the safepoint-resume `apply_pointer_map_to_thread`. Pinning
+///    the referenced regions keeps those slots valid; the objects' own
+///    fields are still fixed up in place by the phase-4 walk.
+///
+/// `add_pinned_jit_root` keys the pins to the INITIATOR's registry entry, so
+/// they last exactly one cycle (the initiator's next deposit or
+/// `collect_roots` replaces/clears them) and over-pinning only keeps a
+/// region out of one CSet. MUST run after `collect_roots` (which clears the
+/// initiator's entry) and before `collect_garbage`.
+///
+/// No-op on non-G1 backends: Generational frozen-peer cycles run the fully
+/// non-moving sweep (`mark_moving_young_coverage_incomplete`), so nothing
+/// moves and no pin is needed.
+fn pin_frozen_peer_roots_for_g1(
+    shared: &SharedVm,
+    xt_roots: &[ObjectRef],
+    taken: &crate::jit::xt_root_scan::TakenOver,
+) {
+    if !shared.heap.is_g1() {
+        return;
+    }
+    for r in xt_roots {
+        cratonvm_gc::gc_quiescence::add_pinned_jit_root(r.as_ptr() as usize);
+    }
+    for r in shared
+        .thread_registry
+        .root_snapshots_for_os_tids(&taken.tids)
+    {
+        cratonvm_gc::gc_quiescence::add_pinned_jit_root(r.as_ptr() as usize);
+    }
 }
 
 fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
@@ -842,6 +892,9 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 let mut roots = collect_roots(shared, thread);
                 let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
                 roots.extend(snapshot_roots);
+                // INT-3 (G1) — everything a frozen peer can address must not
+                // move; must follow collect_roots (which clears the pins).
+                pin_frozen_peer_roots_for_g1(shared, &xt_roots, &taken);
                 // BUG-03 — conservative roots from forcibly-stopped in-JIT peers.
                 roots.extend(xt_roots);
 
@@ -870,8 +923,10 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
 
                 // BUG-03 — drop the TLAB skip regions and resume the
                 // forcibly-stopped in-JIT peers now that the heap is
-                // consistent again (non-moving sweep → their pointers are
-                // unchanged). xt-hardening (2026-07-03): BOTH must happen
+                // consistent again (non-moving sweep on Generational /
+                // pinned-in-place regions + walker-skipped TLAB tails on G1
+                // (INT-3) → their pointers are unchanged). xt-hardening
+                // (2026-07-03): BOTH must happen
                 // BEFORE `complete_gc` reopens the world — a released mutator
                 // could otherwise win the NEXT STW, re-freeze the
                 // still-suspended peers and publish fresh skip regions that
@@ -977,6 +1032,9 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             let mut roots = collect_roots(shared, thread);
             let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
             roots.extend(snapshot_roots);
+            // INT-3 (G1) — everything a frozen peer can address must not
+            // move; must follow collect_roots (which clears the pins).
+            pin_frozen_peer_roots_for_g1(shared, &xt_roots, &taken);
             roots.extend(xt_roots); // BUG-03 cross-thread JIT conservative roots
                                     // STW invariant: `wait_for_all()` returned — every mutator
                                     // has parked at its safepoint poll (or, BUG-03, been forcibly
@@ -1129,6 +1187,18 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
         for new_addr in &dead_finalizers {
             shared.finalizer_thread.enqueue(*new_addr);
         }
+        // Once-only finalization: flag the processor entries for the objects
+        // just enqueued. `process_references_after_gc` above already ran
+        // `update_after_gc`, so entry referents hold post-GC addresses
+        // matching `dead_finalizers`. Without this, the resurrected object
+        // looks alive to every later cycle and the GC re-resurrects +
+        // re-enqueues it (finalize() observed running 3× per object).
+        if !dead_finalizers.is_empty() {
+            shared
+                .ref_processor
+                .lock()
+                .mark_finalizer_enqueued(&dead_finalizers);
+        }
     } else {
         let mut counted_os_tids: Vec<u32> = Vec::new();
         let should_initiate_gc = {
@@ -1154,6 +1224,9 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             let mut roots = collect_roots(shared, thread);
             let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
             roots.extend(snapshot_roots);
+            // INT-3 (G1) — everything a frozen peer can address must not
+            // move; must follow collect_roots (which clears the pins).
+            pin_frozen_peer_roots_for_g1(shared, &xt_roots, &taken);
             roots.extend(xt_roots); // BUG-03 cross-thread JIT conservative roots
                                     // STW invariant: `wait_for_all()` returned — every mutator
                                     // has parked at its safepoint poll (or, BUG-03, been forcibly
@@ -1175,6 +1248,13 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             crate::runtime::ec_watch::remap(&result.pointer_map);
             for new_addr in &dead_finalizers {
                 shared.finalizer_thread.enqueue(*new_addr);
+            }
+            // Once-only finalization — see the single-threaded arm above.
+            if !dead_finalizers.is_empty() {
+                shared
+                    .ref_processor
+                    .lock()
+                    .mark_finalizer_enqueued(&dead_finalizers);
             }
             // xt-hardening (2026-07-03): clear regions + resume BEFORE
             // complete_gc (see maybe_gc's epilogue for the race rationale).
@@ -1407,9 +1487,13 @@ fn process_references_after_gc(
     // in EITHER young semispace that is NOT a pointer-map key did not
     // survive — skip it entirely. Old-gen addresses don't move in a minor GC
     // (major relocations ARE merged into the map) and stay processed.
-    let is_stale_young = |addr: usize| -> bool {
-        !pointer_map.contains_key(&addr) && shared.heap.is_in_young_addr(addr)
-    };
+    // Backend-generic since 2026-07-10 (`pre_gc_addr_did_not_survive`): the
+    // original closure checked only the Generational young semispaces, so it
+    // was hardwired inert for G1/ZGC — dead finalize/cleaner/enqueue
+    // addresses flowed through unguarded and `run_finalizers` later
+    // dereferenced freed CSet memory (finalize-on-recycled-object UAF).
+    let is_stale_young =
+        |addr: usize| -> bool { shared.heap.pre_gc_addr_did_not_survive(addr, pointer_map) };
 
     // Null referent field (field 0) on cleared weak/soft references.
     // ROOT-CAUSE FIX (2026-06-10): once-only emission — the legacy
@@ -1505,12 +1589,25 @@ fn process_references_after_gc(
             }
             continue;
         }
-        // Push onto queue's linked list head (field 0 = head, field 1 = size)
+        // Push onto queue's linked list head (field 0 = head, field 1 = size).
+        //
+        // Queue linkage uses the Reference's `next` field (slot 2, matching
+        // the real-JDK `java.lang.ref.Reference` layout: referent, queue,
+        // next, discovered) — NOT the referent slot. The old protocol reused
+        // slot 0 (the referent) as the next pointer, so every
+        // enqueued-but-not-yet-polled WeakReference answered `get()` with
+        // the NEXT Reference in the queue instead of null (only the
+        // first-enqueued, whose next was null, read as cleared — the
+        // RefCheck `deadCleared=1/256 enqueued=256` signature). References
+        // with fewer than 3 fields (legacy synthetic shape) fall back to the
+        // old slot-0 linkage, which is at least consistent with the poll
+        // side's identical fallback.
         let old_head = shared.heap.get_field(q_obj, 0); // RQ_FIELD_HEAD
         shared
             .heap
             .set_field(q_obj, 0, Value::Object(Some(ref_obj))); // new head
-        shared.heap.set_field(ref_obj, 0, old_head); // REF_FIELD_REFERENT = next ptr
+        let next_slot = if shared.heap.num_fields(ref_obj) > 2 { 2 } else { 0 };
+        shared.heap.set_field(ref_obj, next_slot, old_head); // REF_FIELD_NEXT
         let size = match shared.heap.get_field(q_obj, 1) {
             // RQ_FIELD_SIZE
             Value::Int(v) => v,
@@ -2257,6 +2354,14 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     if let Some(r) = thread.native_pending_return {
         snapshot.push(r);
     }
+    // JNI local references (INT-5, safepoint half): a JNI native that
+    // obtained local refs and re-entered Java parks HERE — and a
+    // cross-thread collector marks this thread only from this snapshot, so
+    // an object reachable solely through this thread's `JNI_LOCAL_FRAMES`
+    // was reclaimed. Thread-local storage; this deposit always runs on the
+    // owning thread. The resume-side remap is `update_local_refs_after_gc`
+    // in `apply_pointer_map_to_thread`.
+    crate::native::jni::collect_local_ref_roots(&mut snapshot);
 
     // This thread's own `java.lang.Thread` mirror (and any pending async
     // exception). These live in `JvmThread` fields, not on any frame, so the
@@ -2578,6 +2683,13 @@ pub(crate) fn apply_pointer_map_to_thread(
     pointer_map: &std::collections::HashMap<usize, usize>,
     heap: &crate::memory::VmHeap,
 ) {
+    // JNI local references (INT-2, safepoint-resume half): rewrite THIS
+    // thread's `JNI_LOCAL_FRAMES` handles through the pointer map — a JNI
+    // native that re-entered Java and parked at the safepoint poll must not
+    // resume with dangling local jobjects after a moving collection. The
+    // storage is thread-local and this function always runs on the resuming
+    // thread, so this is the only place that can reach these handles.
+    crate::native::jni::update_local_refs_after_gc(pointer_map);
     // BUG-03 trace (gated): record that the safepoint-peer remap ran for main.
     if thread.thread_id.0 == 0 && std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
         let jto = thread
@@ -26556,7 +26668,7 @@ fn try_jit_upgrade_with_gate(
             .get_class_name(cp_idx)
             .map(|s| s.to_string())
     };
-    let field_resolver = |cp_idx: u16| -> Option<(usize, u8, u32, bool)> {
+    let field_resolver = |cp_idx: u16| -> Option<(usize, u8, Option<(u32, bool)>)> {
         // Resolve the field using the standard resolution mechanism
         let field = resolve_field_ref(shared, class_id, cp_idx).ok()?;
         // Get the field descriptor from the constant pool
@@ -26571,15 +26683,23 @@ fn try_jit_upgrade_with_gate(
         };
         let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
         let type_tag = *descriptor.as_bytes().first()?;
-        Some({
-            let (c_off, c_ref) = cratonvm_types::compact_field_slot(
+        // `None` ⇒ no genuine compact slot for this field (class has no
+        // registered `CompactLayout`, or the index falls outside it).
+        // Fabricating a `(0, false)` placeholder here poisoned the JIT's
+        // compact-offset inline getfield/putfield with a garbage offset: for
+        // a reference field it emitted a 32-bit sign-extended load of half a
+        // `Value` cell, producing a bogus non-null receiver that SIGSEGVed in
+        // the invoke inline cache (WildFly Host Controller `host=foo:add()`,
+        // docs/known-issues/wildfly-domain-hostcontroller-sigsegv-*).
+        Some((
+            field.field_index,
+            type_tag,
+            cratonvm_types::compact_field_slot(
                 field.declaring_class_id.as_u32(),
                 field.field_index,
             )
-            .map(|(o, r)| (o as u32, r))
-            .unwrap_or((0, false));
-            (field.field_index, type_tag, c_off, c_ref)
-        })
+            .map(|(o, r)| (o as u32, r)),
+        ))
     };
     let static_field_resolver = |cp_idx: u16| -> Option<(u32, usize, u8, bool)> {
         let field = resolve_field_ref(shared, class_id, cp_idx).ok()?;
@@ -26881,7 +27001,7 @@ fn try_jit_upgrade_with_gate(
                     .get_class_name(cp_idx)
                     .map(|s| s.to_string())
             };
-            let c_field_resolver = |cp_idx: u16| -> Option<(usize, u8, u32, bool)> {
+            let c_field_resolver = |cp_idx: u16| -> Option<(usize, u8, Option<(u32, bool)>)> {
                 let field = resolve_field_ref(shared, callee_cid, cp_idx).ok()?;
                 let cm = shared.class_manager.read();
                 let class = cm.get_class(callee_cid)?;
@@ -26894,15 +27014,17 @@ fn try_jit_upgrade_with_gate(
                 };
                 let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
                 let type_tag = *descriptor.as_bytes().first()?;
-                Some({
-                    let (c_off, c_ref) = cratonvm_types::compact_field_slot(
+                // `None` ⇒ no genuine compact slot — do NOT fabricate
+                // `(0, false)` (see the sibling resolver's comment).
+                Some((
+                    field.field_index,
+                    type_tag,
+                    cratonvm_types::compact_field_slot(
                         field.declaring_class_id.as_u32(),
                         field.field_index,
                     )
-                    .map(|(o, r)| (o as u32, r))
-                    .unwrap_or((0, false));
-                    (field.field_index, type_tag, c_off, c_ref)
-                })
+                    .map(|(o, r)| (o as u32, r)),
+                ))
             };
             let c_static_field_resolver = |cp_idx: u16| -> Option<(u32, usize, u8, bool)> {
                 let field = resolve_field_ref(shared, callee_cid, cp_idx).ok()?;
@@ -27637,7 +27759,7 @@ fn try_jit_compile_callee_slow(
             .get_class_name(cp_idx)
             .map(|s| s.to_string())
     };
-    let field_resolver = |cp_idx: u16| -> Option<(usize, u8, u32, bool)> {
+    let field_resolver = |cp_idx: u16| -> Option<(usize, u8, Option<(u32, bool)>)> {
         let field = resolve_field_ref(shared, cid, cp_idx).ok()?;
         let cm = shared.class_manager.read();
         let class = cm.get_class(cid)?;
@@ -27650,15 +27772,23 @@ fn try_jit_compile_callee_slow(
         };
         let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
         let type_tag = *descriptor.as_bytes().first()?;
-        Some({
-            let (c_off, c_ref) = cratonvm_types::compact_field_slot(
+        // `None` ⇒ no genuine compact slot for this field (class has no
+        // registered `CompactLayout`, or the index falls outside it).
+        // Fabricating a `(0, false)` placeholder here poisoned the JIT's
+        // compact-offset inline getfield/putfield with a garbage offset: for
+        // a reference field it emitted a 32-bit sign-extended load of half a
+        // `Value` cell, producing a bogus non-null receiver that SIGSEGVed in
+        // the invoke inline cache (WildFly Host Controller `host=foo:add()`,
+        // docs/known-issues/wildfly-domain-hostcontroller-sigsegv-*).
+        Some((
+            field.field_index,
+            type_tag,
+            cratonvm_types::compact_field_slot(
                 field.declaring_class_id.as_u32(),
                 field.field_index,
             )
-            .map(|(o, r)| (o as u32, r))
-            .unwrap_or((0, false));
-            (field.field_index, type_tag, c_off, c_ref)
-        })
+            .map(|(o, r)| (o as u32, r)),
+        ))
     };
     let static_field_resolver = |cp_idx: u16| -> Option<(u32, usize, u8, bool)> {
         let field = resolve_field_ref(shared, cid, cp_idx).ok()?;

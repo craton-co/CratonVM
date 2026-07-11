@@ -390,6 +390,15 @@ pub struct ConcurrentMarker {
     /// `satb_barrier` fast-path gates on `is_marking_active()` of the
     /// instance attached via `enable_concurrent_gc`.
     pub state: Arc<ConcurrentGcState>,
+    /// TAMS equivalent (G1MARK-3): the old-gen object starts as of the
+    /// REMARK pause — the last point the bitmap is authoritative. The sweep
+    /// (which runs OUTSIDE any STW) may only free objects present in this
+    /// snapshot: an old-gen allocation landing between remark and the sweep
+    /// (a young GC on another thread promoting survivors, or a direct
+    /// large-object allocation) is unmarked yet fully live, and the
+    /// unfiltered sweep freed it. Empty ⇒ remark never ran this cycle ⇒
+    /// the sweep frees nothing (abort-safe conservative default).
+    sweep_eligible: Mutex<HashSet<usize>>,
 }
 
 impl ConcurrentMarker {
@@ -420,6 +429,7 @@ impl ConcurrentMarker {
             queue: MarkQueue::new(),
             satb_queue,
             state,
+            sweep_eligible: Mutex::new(HashSet::new()),
         }
     }
 
@@ -432,6 +442,9 @@ impl ConcurrentMarker {
     pub fn abort_cycle(&self) {
         let _ = self.satb_queue.deactivate_and_drain();
         self.queue.clear();
+        // No sweep will run for this cycle; make sure a later cycle's sweep
+        // can never consume this cycle's stale eligibility snapshot.
+        self.sweep_eligible.lock().clear();
         self.state.set_phase(ConcurrentGcPhase::Idle);
     }
 
@@ -501,6 +514,9 @@ impl ConcurrentMarker {
         self.state.set_phase(ConcurrentGcPhase::Remark);
         let mut discovered = 0;
         let object_starts = old_gen_object_starts(old_gen);
+        // TAMS (G1MARK-3): everything the sweep is allowed to free must
+        // have existed AT REMARK — record the snapshot for concurrent_sweep.
+        *self.sweep_eligible.lock() = object_starts.clone();
 
         // Process SATB entries: these are old reference values that were
         // overwritten during concurrent marking. We must mark them to
@@ -679,8 +695,24 @@ impl ConcurrentMarker {
         let objects = old_gen.walk_objects();
         let mut freed = Vec::new();
 
+        // TAMS (G1MARK-3): the bitmap was finalized at the remark STW, but
+        // this sweep runs OUTSIDE any STW — an old-gen allocation landing
+        // between the remark and this walk (a young GC on another thread
+        // promoting survivors, or a direct large-object allocation) is
+        // unmarked yet fully live. Only objects that existed AT REMARK
+        // (the sweep_eligible snapshot) may be freed; later allocations are
+        // implicitly live for this cycle. An empty snapshot (remark never
+        // ran) frees nothing.
+        let eligible = std::mem::take(&mut *self.sweep_eligible.lock());
+        if eligible.is_empty() {
+            self.bitmap.clear();
+            self.state.set_phase(ConcurrentGcPhase::Idle);
+            return 0;
+        }
+
         for (obj_ptr, total_size) in objects {
-            if !self.bitmap.is_marked(obj_ptr as usize) {
+            if !self.bitmap.is_marked(obj_ptr as usize) && eligible.contains(&(obj_ptr as usize))
+            {
                 freed.push((obj_ptr, total_size));
             }
         }
@@ -884,7 +916,11 @@ impl ConcurrentMarker {
     }
 }
 
-fn concurrent_mark_object_size(header: *const ObjectHeader) -> Option<usize> {
+/// Torn/garbage-header gate shared by the Generational marker's `scan_object`
+/// and (G1MARK-8) G1's `concurrent_mark_step`: reads the header field-by-field
+/// with unaligned loads and cross-validates kind tag, element tag, gc-flag
+/// universe and size arithmetic. `None` means "do not trust this header".
+pub(crate) fn concurrent_mark_object_size(header: *const ObjectHeader) -> Option<usize> {
     let snapshot = ConcurrentMarkHeaderSnapshot::read(header);
     match snapshot.kind_tag {
         tag if tag == ObjectKind::Array as u8 => {

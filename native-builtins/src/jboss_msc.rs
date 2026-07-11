@@ -719,6 +719,58 @@ impl ServiceContainer {
     /// `start()` invocation; this method takes and releases `inner` itself.
     fn take_ready_start(&self) -> Option<u64> {
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // Demand-propagation pre-pass (BUG FIX 2026-07-10): real MSC treats
+        // "an Active/Passive/demanded-Lazy service depends on X" as an
+        // implicit demand on X whenever X is OnDemand/Lazy — the mere
+        // existence of a want-to-start dependent is what makes an OnDemand
+        // dependency start-eligible at all (JBoss MSC's own
+        // `ServiceControllerImpl` links a demand up the dependency edge as
+        // part of normal service linking, independent of any Java-code
+        // `setMode(ACTIVE)` call). Before this fix, `demand()` only ever
+        // fired reactively from the one production call site backing
+        // `ServiceController.setMode(Mode.ACTIVE)` — an OnDemand service
+        // reachable ONLY via a dependency edge (never given an explicit
+        // `setMode(ACTIVE)` call by any Java code) never got
+        // `demanded = true`, so `can_start` on its dependent(s) could NEVER
+        // return true: a permanent deadlock. First observed booting a
+        // WildFly Host Controller: `org.wildfly.management.http.extensible`
+        // (OnDemand) is only reachable via its ACTIVE dependent
+        // `org.wildfly.management.http.extensible.shutdown`'s dependency
+        // edge, so it never started, the http-management service chain
+        // never came up, `WFLYCTL0459: Triggering roll back due to missing
+        // management services` fired, and a later `http-interface` `add`
+        // then saw `IllegalStateException: Container is down`.
+        //
+        // Runs on every call (this method is polled repeatedly by the drive
+        // loop until quiescent) but is cheap: the `!d.demanded` check makes
+        // already-demanded services a no-op, and a multi-level OnDemand
+        // chain (A active -> B on-demand -> C on-demand) converges within a
+        // few calls — demanding B here makes B itself a demand-propagation
+        // source (`c.demanded && matches!(c.mode, OnDemand | Lazy)`, mirrored
+        // from the eligibility check below) on a subsequent call, which then
+        // demands C. Two passes (collect target names, then mutate) because
+        // the collection pass borrows `state.services` while iterating it.
+        let mut to_demand: Vec<Arc<ServiceName>> = Vec::new();
+        for c in state.services.values() {
+            let propagates_demand = matches!(c.mode, Mode::Active | Mode::Passive)
+                || (c.demanded && matches!(c.mode, Mode::OnDemand | Mode::Lazy));
+            if !propagates_demand {
+                continue;
+            }
+            for dep in &c.dependencies {
+                let resolved = state.resolve(dep).clone();
+                if let Some(d) = state.services.get(&resolved) {
+                    if matches!(d.mode, Mode::OnDemand | Mode::Lazy) && !d.demanded {
+                        to_demand.push(resolved);
+                    }
+                }
+            }
+        }
+        for name in to_demand {
+            if let Some(d) = state.services.get_mut(&name) {
+                d.demanded = true;
+            }
+        }
         let mut chosen: Option<(Arc<ServiceName>, u64)> = None;
         for (name, c) in state.services.iter() {
             // Auto-start modes are always eligible; OnDemand/Lazy become
@@ -1420,6 +1472,78 @@ fn native_service_controller_get_state(
         // ordinal-Int answer rather than failing dispatch outright.
         _ => Ok(Some(Value::Int(state.ordinal()))),
     }
+}
+
+/// `ServiceController.provides()` — real MSC 1.5.x interface method
+/// ("the complete set of names... under which the service is provided")
+/// with no default implementation; any caller through our synthetic
+/// mirror died with `AbstractMethodError:
+/// org/jboss/msc/service/ServiceController.provides()Ljava/util/Set;`.
+/// First surfaced booting a WildFly Host Controller: the
+/// `jboss.remoting.endpoint.management.management.operation.handler`
+/// service's own MSC start() path calls it, the resulting
+/// `AbstractMethodError` marks that service FAILED, and the failure
+/// cascades into `WFLYCTL0459: Triggering roll back due to missing
+/// management services` — which is why a *later*, unrelated
+/// `http-interface` `add` operation then fails with
+/// `IllegalStateException: Container is down` (the whole management
+/// transaction was already rolled back by this point).
+///
+/// Returns the full set of names this controller is addressable under:
+/// its primary name plus every alias registered via
+/// `ServiceBuilder.addAliases(...)` (`ContainerState.aliases` is
+/// alias -> primary, so this reverse-scans it — cheap, since `provides()`
+/// is called rarely relative to the hot install/dispatch paths).
+fn native_service_controller_provides(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let id = match ctx.get_field(this, SC_FIELD_ID) {
+        Value::Long(l) => l as u64,
+        _ => 0,
+    };
+    let names: Vec<Arc<ServiceName>> = {
+        let container = global_container();
+        let state = container.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match state.by_id.get(&id) {
+            Some(primary) => {
+                let mut out = vec![primary.clone()];
+                for (alias, target) in state.aliases.iter() {
+                    if target == primary {
+                        out.push(alias.clone());
+                    }
+                }
+                out
+            }
+            None => Vec::new(),
+        }
+    };
+    let set = match ctx.new_object_initialized("java/util/HashSet", "()V", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        // No real HashSet available (mock/unit-test contexts): degrade to an
+        // empty-but-valid Set rather than failing dispatch outright — matches
+        // `getState`'s own fallback philosophy above.
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let set_pin = ctx.pin_native_root(set);
+    let mut set_cur = set;
+    for name in names {
+        let name_obj = alloc_java_service_name(ctx, &name);
+        let name_pin = ctx.pin_native_root(name_obj);
+        set_cur = ctx.read_native_pin(set_pin, set_cur);
+        let name_obj = ctx.read_native_pin(name_pin, name_obj);
+        ctx.unpin_native_roots(name_pin);
+        let _ = ctx.invoke_virtual(
+            set_cur,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(name_obj))],
+        )?;
+    }
+    set_cur = ctx.read_native_pin(set_pin, set_cur);
+    ctx.unpin_native_roots(set_pin);
+    Ok(Some(Value::Object(Some(set_cur))))
 }
 
 /// `ServiceController.getStartException()` — `BootstrapImpl$1`'s FAILED branch
@@ -3362,6 +3486,12 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         "getState",
         "()Lorg/jboss/msc/service/ServiceController$State;",
         native_service_controller_get_state,
+    );
+    r.register(
+        ctrl,
+        "provides",
+        "()Ljava/util/Set;",
+        native_service_controller_provides,
     );
 
     // R63 WildFly: Lockable acquire/release shims (see native_lockable_lock_noop).

@@ -42,6 +42,17 @@ static TEST_REGION_BOUNDS: [std::sync::atomic::AtomicUsize; 6] = [
 ];
 
 fn dummy_helpers() -> JitRuntimeHelpers {
+    // guarded_inline_getfield_enabled() defaults OFF since 2026-07-10 (a
+    // real getfield-guard SIGSEGV found via the ES IVF-KNN vector suite —
+    // see its doc comment in jit/src/x64.rs). This whole file's contract
+    // ("no runtime helper reachable" via the wide-open TEST_REGION_BOUNDS
+    // above) requires the guarded-inline path to actually be taken, so opt
+    // in explicitly here. Not OnceLock-cached in the source (compile-time
+    // gate only), so this plain env var set is race-free against the other
+    // tests in this same integration-test binary.
+    unsafe {
+        std::env::set_var("CRATONVM_JIT_GUARDED_GETFIELD", "1");
+    }
     unsafe extern "C" fn stub() {
         panic!("ir_vs_singlepass invoked an unwired runtime helper");
     }

@@ -795,6 +795,13 @@ pub struct SharedVm {
     pub field_descriptor_cache:
         parking_lot::RwLock<crate::runtime::fx_collections::FxHashMap<(ClassId, usize), u8>>,
 
+    /// Per-class allocation-init cache for the JIT slow-path allocators
+    /// (`jit_new_object` + the guarded TLAB-refill arm): primitive-field
+    /// default-init recipe + `has_finalizer`, computed once per class and
+    /// then read lock-free — replaces two `class_manager.read()` round trips
+    /// per slow-path allocation. See `crate::jit::alloc_class_cache`.
+    pub jit_alloc_class_cache: crate::jit::alloc_class_cache::JitAllocClassCache,
+
     /// WP0.2 — per-class cache of `ObjectStreamClass` descriptor
     /// mirrors. Populated by the first call to
     /// `ObjectStreamClass.lookup(cls)` for any given class; every
@@ -2616,6 +2623,8 @@ impl SharedVm {
             field_descriptor_cache: parking_lot::RwLock::new(
                 crate::runtime::fx_collections::FxHashMap::default(),
             ),
+            // JIT slow-path allocation: per-class init recipe cache.
+            jit_alloc_class_cache: crate::jit::alloc_class_cache::JitAllocClassCache::new(),
             // WP0.2 — ObjectStreamClass.lookup(cls) cache.
             osc_cache: crate::runtime::serialization::OscCache::new(),
             // WP1.3 — bootstrap init-level state machine. Starts at 0

@@ -432,12 +432,34 @@ pub fn current_stack_pointer() -> usize {
     &probe as *const u8 as usize
 }
 
-/// DBG helper: the current thread's stack HIGH limit (one past the highest
-/// usable stack address) via the Win32 `GetCurrentThreadStackLimits`. Used
-/// only by the `CRATONVM_DBG_FULLSTACK_SCAN` diagnostic to bound a full-stack
-/// conservative scan.
-#[cfg(target_os = "windows")]
+/// The current thread's stack HIGH limit (one past the highest usable stack
+/// address). Bounds the A5 unregistered-JIT-frame scan and the
+/// `CRATONVM_DBG_FULLSTACK_SCAN` diagnostic.
+///
+/// Windows: Win32 `GetCurrentThreadStackLimits`. Linux (A5 port, GC audit
+/// 2026-07-10 INT-3 follow-up): `pthread_getattr_np` + `pthread_attr_getstack`
+/// — `stack_addr` is the LOWEST address, so high = addr + size. glibc answers
+/// for the initial thread too (it derives the main stack extent from
+/// /proc/self/maps + RLIMIT_STACK), but that derivation is not free, so the
+/// result is memoized per thread — a thread's stack top never changes.
+/// Returns 0 on failure; callers treat 0 as "unknown" and skip the scan
+/// (safe degradation, matching the pre-port non-Windows behaviour).
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn current_thread_stack_high() -> usize {
+    thread_local! {
+        static CACHED_HIGH: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    }
+    let cached = CACHED_HIGH.with(std::cell::Cell::get);
+    if cached != usize::MAX {
+        return cached;
+    }
+    let high = current_thread_stack_high_uncached();
+    CACHED_HIGH.with(|c| c.set(high));
+    high
+}
+
+#[cfg(target_os = "windows")]
+fn current_thread_stack_high_uncached() -> usize {
     #[link(name = "kernel32")]
     extern "system" {
         fn GetCurrentThreadStackLimits(low_limit: *mut usize, high_limit: *mut usize);
@@ -448,6 +470,27 @@ fn current_thread_stack_high() -> usize {
     // only writes the thread's stack bounds; no other effect.
     unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
     high
+}
+
+#[cfg(target_os = "linux")]
+fn current_thread_stack_high_uncached() -> usize {
+    // SAFETY: standard glibc stack-introspection sequence. `attr` is
+    // initialized by pthread_getattr_np before any read, and destroyed on
+    // every successful-init path. The out-pointers are valid locals.
+    unsafe {
+        let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+        if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
+            return 0;
+        }
+        let mut lo: *mut libc::c_void = std::ptr::null_mut();
+        let mut size: libc::size_t = 0;
+        let ok = libc::pthread_attr_getstack(&attr, &mut lo, &mut size) == 0;
+        libc::pthread_attr_destroy(&mut attr);
+        if !ok || lo.is_null() || size == 0 {
+            return 0;
+        }
+        (lo as usize).saturating_add(size)
+    }
 }
 
 /// Record that JIT execution is about to begin on the current thread.
@@ -840,7 +883,7 @@ fn dbg_no_prune() -> bool {
 
 /// Cached `CRATONVM_DBG_FULLSTACK_SCAN` gate (Windows-only diagnostic), same
 /// per-native-call hot-path rationale as [`dbg_no_prune`].
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn dbg_fullstack_scan() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_FULLSTACK_SCAN").is_some())
@@ -852,7 +895,7 @@ fn dbg_fullstack_scan() -> bool {
 /// is on the stack even if it pushed no `JitEntryGuard`. Early-exits on the
 /// first hit. Bounded like [`scan_one_frame`] so a stale `hi` cannot run into
 /// unmapped pages.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn native_stack_has_jit_frame(lo: usize, hi: usize) -> bool {
     // PERF (TC0622 startup): snapshot the JIT code ranges ONCE (single table
     // lock) into a reusable thread-local buffer, then binary-search each stack
@@ -922,7 +965,7 @@ fn native_stack_has_jit_frame(lo: usize, hi: usize) -> bool {
 }
 
 /// Cached `CRATONVM_JIT_RANGE_SCAN_LEGACY` gate — see `native_stack_has_jit_frame`.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn jit_range_scan_legacy() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CRATONVM_JIT_RANGE_SCAN_LEGACY").is_some())
@@ -1058,7 +1101,7 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
         }
     });
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     if cratonvm_jit::jit_code_range_count() > 0 {
         let cover_hi = JIT_ENTRY_CHAIN
             .with(|c| c.borrow().iter().map(|e| e.entry_sp).max())
@@ -1288,7 +1331,7 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     // stops the sweep zeroing it), the missed root WAS on the stack but
     // outside the JIT chain's bounds (a range bug); if corruption persists,
     // the missed root is not on the stack at all. Validated by is_object_address.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     if dbg_fullstack_scan() {
         let high = current_thread_stack_high();
         if high > scanner_sp {
@@ -1328,9 +1371,10 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     // (over-retention, safe — no collector-choice / throughput change); when it
     // is empty this also flips the collector off the moving path. Cheap-gated:
     // only when ≥1 method is compiled, only on the GC root-scan path, and the
-    // scan is bounded + early-exits. Windows-only for now (reuses
-    // `current_thread_stack_high`); the non-Windows port is a tracked follow-up.
-    #[cfg(target_os = "windows")]
+    // scan is bounded + early-exits. Windows + Linux (the Linux port landed
+    // with the 2026-07-10 GC audit INT-3 follow-up, once precise maps /
+    // JIT_CODE_RANGES defaulted on everywhere).
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     {
         let code_ranges = cratonvm_jit::jit_code_range_count();
         if code_ranges > 0 {

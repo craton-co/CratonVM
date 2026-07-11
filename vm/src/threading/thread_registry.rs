@@ -298,6 +298,37 @@ impl ThreadRegistry {
         out
     }
 
+    /// INT-3 — the deposited root-snapshot contents of every alive thread
+    /// whose OS tid is in `os_tids`.
+    ///
+    /// Used by the G1 cross-thread STW JIT takeover: a forcibly-frozen peer
+    /// is excused from the barrier, so it never applies the collection's
+    /// pointer map to its own frames — its deposit snapshot is the only view
+    /// of what those frames reference. Keeping the snapshot alive (it is
+    /// already merged into the collection roots) is not enough under an
+    /// evacuating collector: the objects must also NOT MOVE, so the caller
+    /// pins each returned address's region out of the CSet (see
+    /// `cratonvm_gc::gc_quiescence::add_pinned_jit_root`). Not needed on the
+    /// Generational backend, whose frozen-peer cycles run the fully
+    /// non-moving sweep.
+    pub fn root_snapshots_for_os_tids(&self, os_tids: &[u32]) -> Vec<ObjectRef> {
+        if os_tids.is_empty() {
+            return Vec::new();
+        }
+        let threads = self.threads.lock();
+        let mut out = Vec::new();
+        for entry in threads.values() {
+            if !entry.alive.load(Ordering::Acquire) {
+                continue;
+            }
+            let tid = entry.os_tid.load(Ordering::Acquire);
+            if tid != 0 && os_tids.contains(&tid) {
+                out.extend(entry.root_snapshot.lock().iter().copied());
+            }
+        }
+        out
+    }
+
     /// T19.K1 — Update the daemon flag for an already-registered thread.
     ///
     /// `Thread.setDaemon(boolean)` may be called between construction
@@ -1547,6 +1578,42 @@ mod tests {
         assert!(
             registry.collect_reserved_tlab_tails().is_empty(),
             "dead threads must not publish stale TLAB pointers"
+        );
+    }
+
+    /// INT-3 — the G1 takeover path pins the deposited snapshot roots of
+    /// FROZEN peers only, selected by OS tid; other threads' snapshots (and
+    /// dead threads) must not leak into the pin set.
+    #[test]
+    fn root_snapshots_for_os_tids_returns_only_matching_alive_threads() {
+        let registry = ThreadRegistry::new();
+        let tid = ThreadId(1);
+        registry.register(tid, "worker", None);
+        registry.set_os_tid_current(tid);
+
+        let mut backing = [0u64; 2];
+        let root = dummy_aligned_objref(&mut backing);
+        registry.set_root_snapshot(tid, Arc::new(Mutex::new(vec![root])));
+
+        let (_, _, tids) = registry.alive_count_blocked_and_os_tids();
+        assert!(!tids.is_empty(), "os tid must be published");
+        let roots = registry.root_snapshots_for_os_tids(&tids);
+        assert_eq!(roots.len(), 1, "matching alive thread's snapshot returned");
+        assert_eq!(roots[0].as_ptr(), root.as_ptr());
+
+        assert!(
+            registry.root_snapshots_for_os_tids(&[u32::MAX]).is_empty(),
+            "non-matching tid must contribute nothing"
+        );
+        assert!(
+            registry.root_snapshots_for_os_tids(&[]).is_empty(),
+            "empty tid set short-circuits"
+        );
+
+        registry.mark_dead(tid);
+        assert!(
+            registry.root_snapshots_for_os_tids(&tids).is_empty(),
+            "dead thread's snapshot must not be pinned"
         );
     }
 
