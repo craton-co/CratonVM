@@ -3663,18 +3663,54 @@ fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
 /// The 4-byte `wide; aload` form is not recognised — its prevalence in
 /// real classes is essentially zero, and bailing out is always safe
 /// (we simply emit the regular runtime check).
+///
+/// SOUNDNESS FIX (2026-07-10, ES RestClient JIT-only spurious-NPE family):
+/// the previous implementation guessed the preceding instruction by reading
+/// raw bytes at `code[pc - 1]` / `code[pc - 2]` and matching them against
+/// opcode values — exactly the class of bug `array_receiver_local` above
+/// already documents and fixes ("SOUNDNESS FIX (array_receiver_local)").
+/// That backward guess is unsound: for a multi-byte instruction (e.g.
+/// `getfield`/`putfield`'s big-endian u16 constant-pool index), a trailing
+/// OPERAND byte can numerically collide with the aload_0..3 opcode range
+/// (0x2A..=0x2D) or the `aload <u8>` prefix (0x19). Confirmed instance:
+/// `getfield #42` encodes as bytes `[0xB4, 0x00, 0x2A]` — the low byte of
+/// index 42 is 0x2A, which is ALSO the `aload_0` opcode. For a method whose
+/// `params`-style lazy-init field happened to land at constant-pool index
+/// 42 (`org.apache.http.client.methods.HttpRequestWrapper.getParams()`,
+/// hit by the real-world repro), `ifnonnull` immediately after that
+/// `getfield` misread the getfield's trailing index byte as `aload_0`
+/// (`this`, always non-null) and wrongly proved the null check dead —
+/// eliding it into an unconditional jump. Since `this` is unrelated to the
+/// getfield's *result*, this unsoundly skipped the method's entire
+/// lazy-initialization branch, permanently returning the (still-null)
+/// field. We now validate against a forward-walked instruction-start map
+/// (`instruction_start_map`, the same one `array_receiver_local` uses) and
+/// only accept a decode whose candidate instruction is a genuine boundary
+/// — never a coincidental operand byte. On any misalignment we return
+/// `None`, so the caller conservatively keeps the runtime `TEST`+`Jcc`.
 fn preceding_aload_nonnull_local(code: &[u8], pc: usize) -> Option<usize> {
     if pc == 0 {
         return None;
     }
-    // aload_0..aload_3 — 1-byte opcode at pc-1.
-    let prev1 = code[pc - 1];
-    if (0x2A..=0x2D).contains(&prev1) {
-        // Widening: u8 -> usize (opcode-relative local index, value fits)
-        return Some((prev1 - 0x2A) as usize);
+    let code_len = code.len();
+    if pc > code_len {
+        return None;
     }
-    // aload <u8> — 2 bytes at pc-2.
-    if pc >= 2 && code[pc - 2] == 0x19 {
+    let starts = instruction_start_map(code, code_len);
+    // aload_0..aload_3 — 1-byte opcode; only trust it if the map confirms
+    // `pc - 1` is a real instruction start (aload_0..3 are always exactly
+    // 1 byte long, so a genuine start there necessarily ends at `pc`).
+    if starts[pc - 1] {
+        let prev1 = code[pc - 1];
+        if (0x2A..=0x2D).contains(&prev1) {
+            // Widening: u8 -> usize (opcode-relative local index, value fits)
+            return Some((prev1 - 0x2A) as usize);
+        }
+    }
+    // aload <u8> — 2-byte instruction; only trust it if the map confirms
+    // `pc - 2` is a real instruction start (aload <u8> is always exactly 2
+    // bytes, so a genuine start there necessarily ends at `pc`).
+    if pc >= 2 && starts[pc - 2] && code[pc - 2] == 0x19 {
         // Widening: u8 -> wider int (bytecode operand byte, value fits)
         return Some(code[pc - 1] as usize);
     }
@@ -3890,6 +3926,74 @@ mod array_receiver_local_tests {
         let code = [0x2Au8, 0x11, 0x01, 0x02, 0x32];
         let starts = instruction_start_map(&code, code.len());
         assert_eq!(starts, vec![true, true, false, false, true]);
+    }
+}
+
+#[cfg(test)]
+mod preceding_aload_nonnull_local_tests {
+    use super::preceding_aload_nonnull_local;
+
+    // Regression coverage for the ES RestClient JIT-only spurious-NPE fix
+    // (2026-07-10): `preceding_aload_nonnull_local` used to guess the
+    // instruction preceding `pc` by reading a raw byte at `pc - 1` / `pc - 2`,
+    // the exact unsoundness `array_receiver_local_tests` above already
+    // covers for the sibling array-null-check helper.
+
+    #[test]
+    fn rejects_getfield_operand_collision() {
+        // aload_0; getfield #42; ifnonnull ...
+        // `getfield #42` encodes as [0xB4, 0x00, 0x2A] — the low byte of
+        // the constant-pool index (0x2A) numerically equals the `aload_0`
+        // opcode. A backward byte read at `pc - 1` (pc = the ifnonnull's
+        // own PC, 4) would misidentify the getfield's trailing operand
+        // byte as a genuine `aload_0` and wrongly borrow `this`'s
+        // provable non-nullity for the getfield's *result*. Real-world
+        // hit: org.apache.http.client.methods.HttpRequestWrapper.getParams(),
+        // whose lazily-initialized `params` field sat at constant-pool
+        // index 42 — the miscompiled `ifnonnull` always took the
+        // "already non-null" branch and the lazy-init store never ran.
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0xb4, 0x00, 0x2a, // 1: getfield #42
+            0xc7, 0x00, 0x00, // 4: ifnonnull (target irrelevant here)
+        ];
+        assert_eq!(preceding_aload_nonnull_local(&code, 4), None);
+    }
+
+    #[test]
+    fn accepts_genuine_aload_0() {
+        // aload_0; ifnonnull ... — the legitimate pattern this helper
+        // exists to recognise must still resolve to local 0.
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0xc7, 0x00, 0x00, // 1: ifnonnull
+        ];
+        assert_eq!(preceding_aload_nonnull_local(&code, 1), Some(0));
+    }
+
+    #[test]
+    fn accepts_genuine_aload_u8() {
+        // aload 5; ifnonnull ... — the two-byte wide-index form.
+        let code: Vec<u8> = vec![
+            0x19, 0x05, // 0: aload 5
+            0xc7, 0x00, 0x00, // 2: ifnonnull
+        ];
+        assert_eq!(preceding_aload_nonnull_local(&code, 2), Some(5));
+    }
+
+    #[test]
+    fn rejects_putfield_operand_collision() {
+        // aload_0; aload_1; putfield #298 (0x012A — high byte 0x01, low
+        // byte 0x2A); ifnonnull. Same collision, but on `putfield`'s
+        // trailing operand byte instead of `getfield`'s, and at a larger
+        // constant-pool index to show the bug is not specific to #42.
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0x2b, // 1: aload_1
+            0xb5, 0x01, 0x2a, // 2: putfield #298
+            0xc7, 0x00, 0x00, // 5: ifnonnull
+        ];
+        assert_eq!(preceding_aload_nonnull_local(&code, 5), None);
     }
 }
 

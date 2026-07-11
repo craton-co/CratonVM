@@ -1209,3 +1209,106 @@ BUG-03 (tracked in its own existing doc/section, not duplicated here).
 No lingering `domain.sh`/Host Controller/Process Controller processes were
 left running on the probe host after this session (verified via `ps aux`
 post-run).
+
+
+## 2026-07-11 update (fifth session) — BUG-03 groundwork laid (Generational-GC path confirmed, `park()` verified correct), but a NEW earlier blocker now prevents reaching it at all
+
+Coordinator approved expanding scope into BUG-03 itself (the `STW
+cross-thread JIT takeover is still waiting for cooperative mutators` stall
+that now gates this doc, per the fourth-session entry above), with an
+explicit, strict caution bar: check for concurrent GC-barrier work first,
+don't touch `gc_barrier` wait/count logic without a liveness proof, verify
+under repeated load, park-don't-merge on any hang/flake.
+
+**Concurrent-work check (done first, as required):** read
+`docs/known-issues/gc-audit-2026-07-10-open-findings.md` and the parked
+`wip/gc-stw-quota-race-20260710` branch. Finding: the GC audit's own finding
+2 ("G1/ZGC: STW hang risk when a JIT thread never polls") is BUG-03's
+symptom family, and its G1 half is already landed + load-validated
+(`e78a8bd3`, "INT-3 — extend cross-thread STW JIT takeover to G1"). BUT:
+
+- **WildFly's `domain.sh` sets no `-XX:+UseG1GC`**, and CratonVM's default
+  backend is Generational (`gc/src/vm_heap.rs:65-70`, doc comment:
+  "Generational semi-space + old-gen mark-sweep (**default**)"). So the
+  G1-specific INT-3 landing is very likely NOT the mechanism in play for
+  this doc's repro at all — this boot exercises the Generational path,
+  which the audit doc separately claims "gets this for free from its
+  non-moving frozen-cycle sweep" (i.e. was never supposed to need INT-3's
+  G1-specific work in the first place).
+- Confirmed by reading the code (not just the doc) that the exact log
+  message this doc quotes ("STW cross-thread JIT takeover is still waiting
+  for cooperative mutators") is unique to `stw_take_over_and_wait`
+  (`vm/src/runtime/interpreter.rs:475`, called from exactly 3 sites: 889,
+  1031, 1223 — all young-gen-pause family), which is DIFFERENT from the
+  `brief_stw_counted`/`brief_stw_counted_with_live_blocked` functions the
+  audit doc flags as still using plain `wait_for_all()` for G1's
+  initial-mark/final-remark. So BUG-03 is not simply "the concurrent-mark
+  wiring the audit doc already knows is missing" either — it's hitting the
+  mechanism that's supposed to already work.
+- Read `NativeContextImpl::park()` (`vm/src/vm/vm_exec.rs:5878`) end to end:
+  it DOES correctly call `self.shared.gc_barrier.enter_blocked()` before
+  actually parking (the coordinator's option (a) — "make a JIT-thread's
+  park-in-native register as gc_barrier-blocked" — already exists and looks
+  correct for the generic `Unsafe.park`/`LockSupport.park` path). Also
+  confirmed `jit/src/x64.rs` has zero special-casing for native calls made
+  from JIT-compiled code (grep for `park`/`enter_blocked` in `jit/src/`
+  finds only unrelated register-allocation "parking" terminology and
+  `parking_lot` cache internals) — meaning a native call from JIT-compiled
+  bytecode goes through the exact same Rust dispatch as from the
+  interpreter, so `ctx.park()` should behave identically regardless of
+  caller. **This means option (a) as literally described may already be
+  implemented and correct** — the 7 threads BUG-03's log shows stuck
+  (`pending=7`, `taken=0` after 64+ rounds) are apparently NOT simply
+  "parked without registering blocked", since that path looks sound. What
+  they're actually doing (spinning in JIT code the takeover's
+  `any_thread_in_jit()` fails to catch, vs. blocked in some OTHER native —
+  e.g. socket accept/read — that never calls `enter_blocked` at all) could
+  not be determined this session; see below.
+
+**Live verification blocked by a NEW finding.** The plan was to boot with
+`CRATONVM_DBG_STW_CENSUS=1` and `CRATONVM_DBG_XT_JIT_ROOT_SCAN=1` to capture
+`ThreadRegistry::debug_thread_census()` at the exact moment of the stall —
+this prints each alive thread's `blocked`/`ready`/`state`/top-frame, which
+would have definitively answered "what are the 7 pending threads actually
+doing". Instead, boot now fails to get anywhere near that point: **20/20
+attempts in a controlled batch died within under a second, at
+`org/jboss/modules/Main.<clinit>`**, with a `Missing native method in
+real-JDK mode` for `InputStreamReader.<init>(InputStream, Charset)` —
+completely unrelated to GC/STW, gating even the most basic JBoss Modules
+bootstrap. Full detail, reproduction data, and what was ruled out:
+[`wildfly-jboss-modules-inputstreamreader-clinit-race.md`](wildfly-jboss-modules-inputstreamreader-clinit-race.md)
+(new doc). This is now the actual front-line gate for this whole
+investigation — ahead of BUG-03, ahead of the four original residuals,
+ahead of HIB-CV-32.
+
+**No fix attempted for either issue this session.** Per the coordinator's
+explicit bar ("if you observe ANY intermittent hang, SEGV, or flakiness
+under load — do not merge, park it... a well-documented, safely-parked
+partial attempt is a good outcome, an unsafe merge is not") and given BUG-03
+itself could not even be empirically re-observed (only reasoned about via
+static code reading), no `gc_barrier`/STW/JIT-park code was touched this
+session. The new InputStreamReader blocker is a different subsystem
+entirely (real-bytecode class/method resolution, not GC-barrier) and was
+investigated only far enough to characterize and rule out easy hypotheses
+(see its own doc) — actually root-causing it needs live tracing this
+session did not have time for after the characterization work.
+
+**Next steps for whoever continues, in order:**
+1. Root-cause and fix `wildfly-jboss-modules-inputstreamreader-clinit-race.md`
+   first — nothing else in this doc chain is reachable until boot gets
+   past `org/jboss/modules/Main.<clinit>` again.
+2. Once boot reaches WildFly-specific code again, immediately capture
+   `CRATONVM_DBG_STW_CENSUS=1`/`CRATONVM_DBG_XT_JIT_ROOT_SCAN=1` output at
+   the BUG-03 stall (`stw_take_over_and_wait`, `vm/src/runtime/interpreter.rs:475`)
+   to see the pending threads' actual state — this is the missing piece
+   that turns the option (a)/(b) choice from a guess into an evidence-based
+   decision. Given `park()` already looks correct (see above), lean toward
+   investigating whether the pending threads are doing blocking native I/O
+   (socket accept/read for the management interface) that never calls
+   `enter_blocked`, rather than assuming they're spinning JIT loops the
+   takeover fails to catch — but confirm either way before writing code.
+3. Whatever the fix, it must clear the verification bar the coordinator set
+   for touching this subsystem: `cargo test` clean for the owning crate,
+   repeated runs under real load (not once), and the existing GC-audit
+   probe kit (`/data/data/gcprobes-0710/`) if reachable — park, don't merge,
+   on any flake.

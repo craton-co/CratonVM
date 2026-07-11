@@ -7732,6 +7732,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .touch_soft_reference(ref_addr, now_ms);
     }
 
+    /// INT-8: `Reference.get()` keep-alive — route the just-read referent
+    /// through the heap's SATB pre-barrier so an active G1 mark cycle logs
+    /// it as a root (the marker cannot see it through the hidden referent
+    /// slot). No-op when no cycle is active; on Generational/ZGC the
+    /// pre-barrier's own marking-active gate keeps it equally cheap.
+    fn gc_reference_keep_alive(&mut self, referent: ObjectRef) {
+        self.shared
+            .heap
+            .write_barrier_pre(std::ptr::null_mut(), referent);
+    }
+
     fn record_thread_sleep(&mut self, sleep_nanos: i64, actual_duration_nanos: u64) {
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

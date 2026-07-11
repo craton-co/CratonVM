@@ -219,7 +219,16 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
         if shared.heap.num_fields(ref_obj) >= 1 {
             // Slot 0 = REF_FIELD_REFERENT (matches the real JDK Reference layout
             // and the synthetic constant in native-builtins).
-            shared.heap.set_field(ref_obj, 0, Value::Object(None));
+            //
+            // INT-8: PROTOCOL write — SATB pre-barrier suppressed. This null
+            // is restored (for survivors) before mutators resume, so the
+            // snapshot graph is unchanged; letting it fire logged EVERY
+            // active referent as a G1 mark root at EVERY mid-cycle young
+            // pause, which kept weakly-reachable Old objects bitmap-marked
+            // and made remark-time reference processing inert.
+            shared
+                .heap
+                .set_field_suppress_satb(ref_obj, 0, Value::Object(None));
         }
     }
 }
@@ -1265,6 +1274,16 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             safepoint_check(shared, thread);
         }
     }
+    // INT-8: a forced GC advances the G1 concurrent-cycle machinery exactly
+    // like an allocation-triggered young GC (`maybe_gc`'s epilogue calls
+    // this at 819/903). Without it, a `System.gc()`-driven application —
+    // whose forced young collections keep Eden below the allocation-GC
+    // threshold — could NEVER start or complete a marking cycle: no cleanup
+    // ever reclaimed dead Old regions and no remark-time reference
+    // processing ever ran. HotSpot's default `System.gc()` under G1 is a
+    // full collection that processes every generation's references; this
+    // IHOP/completion check is the closest cycle-machinery equivalent.
+    maybe_concurrent_gc(shared, thread);
     // Run pending finalizers
     run_finalizers(shared, thread);
     // Run pending Cleaner actions (NEW-17). These were submitted to
@@ -3111,6 +3130,16 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
             // marker starts consuming it.
             shared.heap.flush_thread_satb();
             shared.heap.g1_start_concurrent_mark();
+            // INT-8: publish the referent-slot skip set for this cycle —
+            // the Weak/Soft/Phantom Reference OBJECT addresses currently
+            // registered. Inside this STW the snapshot is consistent (no
+            // mutator can construct, move, or free a Reference), and it
+            // must land before the roots below seed the gray set so no
+            // Reference is ever scanned without the skip in force. G1
+            // carries the set across every mid-cycle evacuation pause
+            // internally (remap survivors, prune CSet casualties).
+            let ref_objs = shared.ref_processor.lock().reference_object_addresses();
+            shared.heap.g1_set_reference_skip_set(&ref_objs);
             // Mark roots into the G1 mark bitmap
             let roots = collect_roots(shared, thread);
             let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
@@ -3181,7 +3210,18 @@ fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread) {
                 .into_iter()
                 .chain(snapshot_roots.into_iter())
                 .collect();
-            let completed = shared.heap.g1_final_remark_and_cleanup(&all_roots);
+            // INT-8: run VM reference processing against the completed mark
+            // bitmap between the remark drain and cleanup — the only point
+            // in the cycle where a weak/soft ref to a dead OLD-region
+            // referent can be observed dead (evacuation pauses only ever
+            // see CSet deaths). The callback returns the addresses the
+            // heap must resurrect before cleanup's in-place frees.
+            let mut process = |is_live: &dyn Fn(usize) -> bool| -> Vec<usize> {
+                g1_remark_process_references(shared, is_live)
+            };
+            let completed = shared
+                .heap
+                .g1_final_remark_and_cleanup(&all_roots, Some(&mut process));
             tracing::debug!(
                 "[G1] Final remark: {} roots, cycle_completed={}",
                 all_roots.len(),
@@ -3192,6 +3232,151 @@ fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread) {
     if !done {
         tracing::debug!("[G1] Final remark lost the STW race — retrying at next GC");
     }
+}
+
+/// INT-8 — remark-time reference processing (G1 only). Runs INSIDE the
+/// final-remark STW, after the gray set drained to a fixed point and BEFORE
+/// `cleanup()` frees anything, with `is_marked` = the collector's
+/// bitmap+TAMS verdict. This is the HotSpot-shaped point where weak/soft
+/// references to dead OLD-region referents finally clear: with referent-slot
+/// hiding, the bitmap holds an untainted verdict for every referent, and the
+/// young-pause processing path (whose `is_marked` treats every non-CSet
+/// region as live) can never see these deaths.
+///
+/// Mirrors `process_references_after_gc`'s consumer protocol with two
+/// deliberate differences:
+/// - no pointer map (nothing moved in this pause) — the staleness guard is
+///   dead-BY-MARK instead: a Reference/queue that is itself unmarked is
+///   skipped (writing through it would be resurrection-by-side-effect right
+///   before its region is freed);
+/// - referent clears use the SATB-suppressed store: the clear is the
+///   processor's decided verdict, and SATB-logging the old referent would
+///   feed it straight back into the resurrection drain that follows.
+///
+/// Returns every address that must stay live through this cycle's cleanup:
+/// dead finalizables about to run `finalize()` (this closes the
+/// finalize-never-runs gap for in-place-freed regions), submitted cleaner
+/// actions, pending cleaner chains, and policy-retained soft referents.
+fn g1_remark_process_references(
+    shared: &SharedVm,
+    is_marked: &dyn Fn(usize) -> bool,
+) -> Vec<usize> {
+    // Same subsystem-level exclusion switch as the post-GC path.
+    if no_refproc() {
+        return Vec::new();
+    }
+    let mut ref_proc = shared.ref_processor.lock();
+    let result = ref_proc.process_references(is_marked, 64, 0);
+
+    // Null the referent slot of newly-cleared references (once-only per
+    // entry, same contract as the post-GC path).
+    let cleared = ref_proc.take_newly_cleared();
+    for ref_addr in cleared {
+        if !is_marked(ref_addr) {
+            // The Reference itself is dead this cycle — no mutator can ever
+            // observe its slot again and cleanup may free it momentarily.
+            continue;
+        }
+        // SAFETY: `ref_addr` is a registry address kept current by the
+        // per-pause `update_after_gc`; nothing has been freed since.
+        let obj_ref = unsafe { ObjectRef::from_raw(ref_addr as *mut u8) };
+        if shared.heap.num_fields(obj_ref) < 2 {
+            continue; // belt-and-suspenders, mirrors the post-GC path
+        }
+        // SATB-suppressed: the clear is a decided verdict, not a semantic
+        // overwrite — logging the old referent would resurrect it in the
+        // re-drain below and retain the memory a full extra cycle.
+        shared
+            .heap
+            .set_field_suppress_satb(obj_ref, 0, Value::Object(None));
+    }
+
+    // Queue links for cleared/phantom references. Skip the whole enqueue
+    // when the Reference or its queue is dead-by-mark: linking a dead
+    // Reference into a live queue would resurrect it into a region cleanup
+    // is about to free (dangling queue head), and a dead queue has no
+    // consumer to poll it.
+    for (ref_addr, queue_addr) in &result.to_enqueue {
+        if !is_marked(*ref_addr) || !is_marked(*queue_addr) {
+            continue;
+        }
+        // SAFETY: registry addresses, current as above; both marked live.
+        let ref_obj = unsafe { ObjectRef::from_raw(*ref_addr as *mut u8) };
+        let q_obj = unsafe { ObjectRef::from_raw(*queue_addr as *mut u8) };
+        if shared.heap.num_fields(q_obj) < 2 || shared.heap.num_fields(ref_obj) < 2 {
+            continue;
+        }
+        // Same linked-list protocol as the post-GC path: head/size on the
+        // queue, linkage through the Reference's `next` slot (slot 2 on the
+        // real-JDK layout; legacy 2-field shape falls back to slot 0).
+        let old_head = shared.heap.get_field(q_obj, 0);
+        shared.heap.set_field(q_obj, 0, Value::Object(Some(ref_obj)));
+        let next_slot = if shared.heap.num_fields(ref_obj) > 2 { 2 } else { 0 };
+        shared.heap.set_field(ref_obj, next_slot, old_head);
+        let size = match shared.heap.get_field(q_obj, 1) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        shared.heap.set_field(q_obj, 1, Value::Int(size + 1));
+        shared.heap.set_field(ref_obj, 1, Value::Int(1)); // enqueued sentinel
+    }
+
+    // Everything handed out below must survive this cycle's cleanup — the
+    // caller marks these and re-drains the closure before any region is
+    // freed.
+    let mut resurrect: Vec<usize> = Vec::new();
+
+    // Dead finalizables: submit for finalize() AND resurrect. This is the
+    // half of INT-8 that closes the finalize-never-runs gap: previously a
+    // finalizable object in a wholly-dead Old region was freed in place by
+    // cleanup and the post-GC staleness guard then (correctly) dropped its
+    // stale submission — finalize() silently never ran.
+    for obj_addr in &result.to_finalize {
+        shared.finalizer_thread.enqueue(*obj_addr);
+        resurrect.push(*obj_addr);
+    }
+    while let Some(obj_addr) = ref_proc.dequeue_for_finalization() {
+        shared.finalizer_thread.enqueue(obj_addr);
+        resurrect.push(obj_addr);
+    }
+
+    // Cleaner actions fired by this round: submit + resurrect (the action
+    // object is dereferenced later by run_cleaner_actions).
+    for action_addr in &result.cleaner_actions {
+        shared.cleaner_thread.submit_action(*action_addr);
+        resurrect.push(*action_addr);
+    }
+
+    // Pending (not-yet-fired) cleaner chains: the registry will hand these
+    // out on a later cycle, so cleanup must not free them — the HotSpot
+    // equivalent is the Cleaner's internal strong list. Self-referent
+    // (finalizer-style) registrations are excluded inside the accessor.
+    resurrect.extend(ref_proc.cleaner_pending_object_addresses());
+
+    // Policy-retained soft referents: the marker never traced them
+    // (referent-slot hiding), so a softly-only-reachable referent is
+    // unmarked even though the LRU policy kept it — exactly like HotSpot,
+    // reference processing itself keeps them alive.
+    resurrect.extend(ref_proc.soft_survivor_referents());
+
+    // DBG (CRATONVM_DBG_REFPROC_REMARK): per-remark mechanism evidence —
+    // distinguishes clears that happened HERE (against the mark bitmap)
+    // from clears the evacuation-pause path produced, which black-box
+    // probes cannot tell apart.
+    if std::env::var_os("CRATONVM_DBG_REFPROC_REMARK").is_some() {
+        eprintln!(
+            "[refproc-remark] soft_cleared={} weak_cleared={} enqueued={} finalize={} \
+             cleaner_actions={} resurrect={}",
+            result.stats.soft_refs_cleared,
+            result.stats.weak_refs_cleared,
+            result.to_enqueue.len(),
+            result.to_finalize.len(),
+            result.cleaner_actions.len(),
+            resurrect.len(),
+        );
+    }
+
+    resurrect
 }
 
 /// Last-ditch G1 full marking cycle before declaring OutOfMemoryError.
