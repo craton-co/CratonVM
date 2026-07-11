@@ -4,6 +4,39 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-10 `testNonBlockingReadIgnoreIsReady`'s old theory REFUTED; real cause is a general ~2s NioEndpoint Acceptor/Poller-thread latency, split into its own doc
+
+Re-investigated
+[`tomcat-08-07/nonblockingreadignoreisready-async-error-response-completion-gap.md`](tomcat-08-07/nonblockingreadignoreisready-async-error-response-completion-gap.md).
+Its "container commits an implicit 200 response that never flushes" theory
+does not hold up: verified directly against real HotSpot that the test
+actually passes via a genuine client-side `IOException` thrown mid-upload,
+not `rc=200`. Root-caused via a correlated Rust+Java timeline instead: the
+client finishes its entire ~2s, `Thread.sleep`-paced write loop and closes
+its socket *before* CratonVM's Tomcat connector ever performs its first
+read — so the timing race HotSpot depends on (server reacting to a
+misbehaving `ReadListener` before the client's next write) never happens.
+Confirmed this is not a JIT-warm-up artifact (reproduces identically even
+after a same-JVM warm-up test) and not the earlier-hypothesized
+`native-io` socket-close/drain-timeout issue (tested directly, zero
+effect — the peer had already sent EOF long before close() ran).
+
+- OPEN (new): [`nio-poller-acceptor-thread-scheduling-latency.md`](nio-poller-acceptor-thread-scheduling-latency.md)
+  — the actual mechanism: the NioEndpoint `Acceptor` thread appears to make
+  no progress for ~2 seconds (two full `Poller` `selectorTimeout=1000` ms
+  cycles) while the `Poller` thread is independently parked in blocking
+  `select()`/`WSAPoll` calls, then both make rapid progress together.
+  Isolated Rust unit tests confirm the low-level `wakeup()`/`select()`/
+  registration primitives are each individually fast and correct — the
+  bug (if it is one mechanism at all) is in how CratonVM schedules/runs
+  the two threads concurrently, not in the selector's own logic. Not
+  Tomcat-specific: likely affects any app with one thread parked in a
+  long blocking native call while another needs to make independent
+  progress. Needs VM-core threading/scheduling ownership to pick up with
+  proper `Thread.start()`/blocking-region instrumentation.
+- Updated: the original doc now documents the refutation and cross-links
+  here; it stays OPEN (not fixed) pending the above.
+
 ## 2026-07-10 ES suite-wide `Build$CurrentHolder` manifest-null FIXED (VM-core `Unsafe` bootstrap bug); new pre-existing Jackson residual filed
 
 - FIXED/RETIRED: [`ES-FAIL-FAMILY-20260710-build-currentholder-manifest-null-FIXED.md`](../internal/fixed-suite-bugs/ES-FAIL-FAMILY-20260710-build-currentholder-manifest-null-FIXED.md) — every affected class (265 rows in the original partial run) crashed at bootstrap with `ExceptionInInitializerError`/`NullPointerException` from `Build$CurrentHolder.findCurrent()`, `manifest` being null. Root cause was NOT ES-specific: `jdk/internal/misc/Unsafe.<clinit>` computes its 9 `ARRAY_*_BASE_OFFSET`/9 `ARRAY_*_INDEX_SCALE` static constants by calling natives (`arrayBaseOffset0`/`arrayIndexScale0`) that aren't registered yet this early in real-JDK-mode bootstrap — the calls silently return 0 instead of throwing, so `ARRAY_BYTE_BASE_OFFSET` stays permanently latched at 0. `java.util.zip.ZipUtils.get32/get16` (used by `ZipInputStream.getNextEntry()`'s LOC-header parser, in turn used by `JarInputStream.getManifest()`) then reads 16 bytes short of where the header actually starts, the signature check silently fails, and `getManifest()` returns null with zero exceptions anywhere in the chain — reproduces for any jar, not just ES's. Fixed with a `jdk/internal/misc/Unsafe` post-clinit success-path backfill (`vm/src/vm/vm_util.rs`), mirroring the existing `UnsafeConstants` fixup for the identical bug shape.
