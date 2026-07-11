@@ -1,7 +1,7 @@
 # Garbage Collection in CratonVM — architecture and current state
 
 *Last updated 2026-07-11, after the four-wave G1/ZGC correctness audit
-(see [known-issues/gc-audit-2026-07-10-open-findings.md](known-issues/gc-audit-2026-07-10-open-findings.md)
+(see [known-issues/gc-audit-2026-07-10-open-findings.md](internal/gc-audit-2026-07-10-open-findings.md)
 for the finding-by-finding record).*
 
 CratonVM ships three garbage-collector backends behind one dispatcher
@@ -95,7 +95,7 @@ Generational, G1 and ZGC at `-Xmx256m`; the gc crate's unit+integration
 suites are green.
 
 **Known open issues** (details, evidence and reproducers in
-[known-issues/gc-audit-2026-07-10-open-findings.md](known-issues/gc-audit-2026-07-10-open-findings.md)):
+[known-issues/gc-audit-2026-07-10-open-findings.md](internal/gc-audit-2026-07-10-open-findings.md)):
 
 1. **STW barrier quota race (finding 1)** — the barrier can count an
    excluded (blocked) thread's arrival toward its quota and release the
