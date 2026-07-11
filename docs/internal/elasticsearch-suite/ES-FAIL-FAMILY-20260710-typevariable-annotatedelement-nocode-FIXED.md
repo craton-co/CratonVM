@@ -87,3 +87,7 @@ The neighboring `RestClientSingleHostIntegTests` still has separate Basic-auth
 assertion failures; it was not part of this three-row TypeVariable family.
 
 Evidence: `/data/data/es-typevariable-annotatedelement-20260711-141500-suite/results/esprobe-typevariable-annotatedelement-20260711-141500-r2/jit-typevariable-annotatedelement-r2/results.tsv`.
+
+Post-merge revalidation: after merging current `origin/dev`, run
+`esprobe-typevariable-annotatedelement-20260711-141500-r3-mergeddev` again
+passed all three target unit classes with JIT on (1.432s, 1.801s, and 2.439s).
