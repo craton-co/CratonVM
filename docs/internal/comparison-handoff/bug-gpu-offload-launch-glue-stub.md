@@ -1,5 +1,11 @@
 # CratonVM GPU offload — device launch glue is a stub (H2D=0, silent CPU fallback)
 
+> **RESOLVED (validated 2026-07-11).** The launch glue was completed after this
+> handoff was written: `try_dispatch` now marshals, launches on the RTX 2060,
+> and writes back, with checksums matching HotSpot. This doc describes the
+> pre-June-2026 state only. Open residuals live in
+> `docs/known-issues/gpu-offload-followups-20260711.md`.
+
 ## Symptom
 `bash test-infra/run-gpu-offload.sh` (gpu-driver binary, RTX 2060, sm_75):
 

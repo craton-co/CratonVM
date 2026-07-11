@@ -24489,10 +24489,19 @@ fn execute_invokestatic(
     // GPU offload hook (Part E). Behind `gpu-offload`: with the
     // feature off, the entire block is removed by the preprocessor
     // and `execute_invokestatic` falls through to the existing CPU
-    // path unchanged. On Hit we consult the OffloadCache; the actual
-    // marshal-and-launch glue is deliberately scoped to a separate
-    // follow-up because it needs real GPU hardware to validate — see
-    // `crate::runtime::offload::try_dispatch` for the contract.
+    // path unchanged. On Hit the OffloadCache marshals, launches, and
+    // writes back via `crate::runtime::offload::try_dispatch`.
+    //
+    // Invoke-cache interaction (found 2026-07-11): the interpreter
+    // consults `thread.invoke_cache` BEFORE this slow path, so a site
+    // promoted into the cache dispatches straight to the CPU body and
+    // never re-enters this hook. An offloaded (or gated-but-eligible)
+    // site must therefore never be promoted, or the SECOND call at
+    // the site silently stops offloading — exactly the shape of a
+    // warm benchmark loop. The slow-path re-entry cost is noise next
+    // to any kernel that clears `--gpu-min-work`.
+    #[cfg_attr(not(feature = "gpu-offload"), allow(unused_mut))]
+    let mut suppress_invoke_cache = false;
     #[cfg(feature = "gpu-offload")]
     {
         if shared.config.gpu_offload_enabled
@@ -24511,8 +24520,16 @@ fn execute_invokestatic(
                 &args,
             )? {
                 crate::runtime::offload::DispatchOutcome::Handled => {
-                    populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+                    // Deliberately NOT populating the invoke cache —
+                    // see the block comment above.
                     return Ok(CachedCallResult::Handled);
+                }
+                crate::runtime::offload::DispatchOutcome::FallThroughKeepHooked => {
+                    // Eligible kernel, but a per-call gate (e.g.
+                    // --gpu-min-work) declined this particular call.
+                    // Run the CPU path but keep the site un-promoted
+                    // so a future call can still offload.
+                    suppress_invoke_cache = true;
                 }
                 crate::runtime::offload::DispatchOutcome::FallThrough => {
                     // Method is ineligible / blacklisted / launch
@@ -24537,11 +24554,15 @@ fn execute_invokestatic(
         static_dispatch_class_id,
     )? {
         CachedCallResult::FramePushed => {
-            populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+            if !suppress_invoke_cache {
+                populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+            }
             return Ok(CachedCallResult::FramePushed);
         }
         CachedCallResult::Handled => {
-            populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+            if !suppress_invoke_cache {
+                populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+            }
             return Ok(CachedCallResult::Handled);
         }
         CachedCallResult::CacheMiss => {}
@@ -24589,7 +24610,9 @@ fn execute_invokestatic(
     }
 
     // Populate invoke cache for future fast-path hits
-    populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+    if !suppress_invoke_cache {
+        populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+    }
 
     Ok(CachedCallResult::Handled)
 }

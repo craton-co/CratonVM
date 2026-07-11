@@ -319,6 +319,44 @@ See [docs/PLATFORMS.md](docs/PLATFORMS.md) for the per-feature Linux / Windows /
 See [ROADMAP.md](ROADMAP.md) for future plans and the performance roadmap.
 See [docs/gpu/README.md](docs/gpu/README.md) for the full GPU-offload reference: build modes, CLI flags, architecture, file index, FAQ. The feature is opt-in via Cargo features — the default `cargo build` produces a CPU-only JVM with no GPU code linked.
 
+## GPU offload benchmarks (RTX 2060, vs TornadoVM)
+
+CratonVM can transparently offload eligible static methods over primitive
+arrays to an NVIDIA GPU (`cargo build --features gpu-driver`, then run with
+`--gpu` — no annotations, no API, no code changes). Measured 2026-07-11 on a
+GeForce RTX 2060 (sm_75) against [TornadoVM](https://github.com/beehive-lab/TornadoVM)
+4.0.1 (PTX backend, `@Parallel` + TaskGraph API) and HotSpot JDK 25 (C2).
+All timings are warm, include the full per-call H2D + kernel + D2H round-trip,
+and every row's checksum matches HotSpot bit-for-bit.
+
+**Integer division chain** — 48 data-dependent `x = x / b[i] + c` steps per
+element. x86 has no SIMD integer divide and the divisor is not a constant, so
+no CPU JIT can vectorize this shape; the GPU wins on raw parallelism:
+
+| N | CratonVM CPU | HotSpot C2 | **CratonVM GPU** | TornadoVM GPU | GPU vs best CPU |
+|---|---|---|---|---|---|
+| 2²² | 569 ms | 470 ms | **2 ms** | 7 ms | **235×** |
+| 2²⁴ | 2,232 ms | 1,910 ms | **9 ms** | 28 ms | **212×** |
+| 2²⁶ | 9,162 ms | 6,735 ms | **33 ms** | 86 ms | **204×** |
+
+**96 multiply-adds per element** (`GpuWarm.heavy`) — a shape HotSpot C2 *can*
+auto-vectorize with AVX2, making it the honest hard case: the GPU still beats
+or ties the vectorized CPU and outruns TornadoVM ~2× on the same kernel:
+
+| N | CratonVM CPU | HotSpot C2 | **CratonVM GPU** | TornadoVM GPU | GPU vs CratonVM CPU |
+|---|---|---|---|---|---|
+| 2²² | 472 ms | 2 ms | **1 ms** | 5 ms | 472× |
+| 2²⁴ | 1,955 ms | 8 ms | **11 ms** | 17 ms | 178× |
+| 2²⁶ | 7,689 ms | 25 ms | **27 ms** | 51 ms | 285× |
+
+Sources: [bench-gpu/results/divchain-comparison-20260711.md](bench-gpu/results/divchain-comparison-20260711.md),
+[warm-comparison-20260711.md](bench-gpu/results/warm-comparison-20260711.md),
+and the cold-start 4-way in [gpu-comparison-20260711.md](bench-gpu/results/gpu-comparison-20260711.md)
+(includes N = 2²⁸ / 269M elements: 579 ms on GPU vs 30.8 s CratonVM CPU).
+Benchmark sources live in `bench-gpu/` (+ `bench-tornado/` for the TornadoVM twins). Numbers were taken on a
+machine with background load; treat CPU baselines as ±25%. Open GPU work is
+tracked in [docs/known-issues/gpu-offload-followups-20260711.md](docs/known-issues/gpu-offload-followups-20260711.md).
+
 ## Contributing
 
 **Design constraint:** prefer real `.class` files from the JDK and application classpath over synthetic stub classes for application-visible types; see [docs/internal/app-jvm-bugs/jvm-no-synthetic-stubs.md](docs/internal/app-jvm-bugs/jvm-no-synthetic-stubs.md).
