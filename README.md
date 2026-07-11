@@ -107,6 +107,30 @@ for the full investigation and remaining-work writeup.*
 
 See [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full 26-round JIT optimization journey.
 
+#### `String`/regex micro-benchmarks
+
+| Benchmark                              | JDK 25 C2  | CratonVM default | Default ratio |
+|-----------------------------------------|------------|-------------------|---------------|
+| `String.substring()` (10,000 calls)     | 2 ms       | 27 ms             | 13.5x         |
+| `Pattern`/`Matcher` `find()`+`group()` (10,000 matches) | 10 ms | 399 ms | 39.9x |
+
+*Measured 2026-07-11 on the same shared Azure Linux build host as the QuickBench
+rows above, against JDK 25 Temurin and a CratonVM release build off `dev` at
+`a87901e6` (best of 3 runs each). Both benchmarks build one large `String` via
+`StringBuilder`, then repeatedly extract small substrings from it (directly, or
+via `Matcher.group()`). Until this commit, both scaled **quadratically** instead
+of linearly with input size -- `String.substring()`'s real-JDK-mode native
+decoded the *entire* parent string on every call regardless of how small the
+requested range was, so `n` calls over an `n`-length parent cost O(n^2) instead
+of O(n). At 10,000 entries this was 1,283 ms/4,775 ms before the fix (44x/12x
+worse than the numbers above) and did not complete within 60s at 50,000 entries
+at all; see [docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md](docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md)
+for the full root-cause story. The remaining 13.5x/39.9x gap above is the
+already-tracked constant-factor cost of CratonVM's interpreted `java.util.regex`
+engine and native String-accessor call overhead (see
+[docs/internal/wildfly-suite-bugs/bug-03-regex-perf-deployment-build.md](docs/internal/wildfly-suite-bugs/bug-03-regex-perf-deployment-build.md)),
+not an algorithmic-complexity bug.*
+
 ### Benchmark — GPU offload (vs HotSpot C2 & TornadoVM)
 
 CratonVM can transparently offload eligible static methods over primitive
