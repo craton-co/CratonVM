@@ -1072,6 +1072,32 @@ pub fn throw_runtime_error(
     // when the CLI uncaught-exception renderer later prints zero frames.
     // The env-var read is a single cached atomic load, so the no-debug
     // path is free; it is intentionally NOT gated behind `tracing::enabled!`.
+    // ALV5th GC investigation (temp probe, CRATONVM_DBG_NPE_NONE): dump a
+    // full Rust backtrace + Java stack the instant a message-less NPE is
+    // thrown from Rust (as opposed to constructed by Java bytecode via
+    // `new NullPointerException()`), so the exact Rust throw site is known
+    // instead of inferred from bytecode-level probes.
+    if std::env::var_os("CRATONVM_DBG_NPE_NONE").is_some() {
+        if let RuntimeError::NullPointerException { message: None } = &error {
+            eprintln!(
+                "[npe-none] message-less NPE thrown — Java stack ({} frames, deepest first):",
+                thread.frames.len()
+            );
+            for (i, f) in thread.frames.iter().enumerate().rev().take(20) {
+                eprintln!(
+                    "  [{i}] {}.{}{} pc={}",
+                    f.class_name(),
+                    f.method_name(),
+                    f.method_descriptor(),
+                    f.pc
+                );
+            }
+            eprintln!(
+                "[npe-none] Rust backtrace:\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+    }
     if std::env::var_os("CRATONVM_DBG_AIOOBE").is_some() {
         if let RuntimeError::ArrayIndexOutOfBoundsException { index } = &error {
             eprintln!(
