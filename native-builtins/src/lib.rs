@@ -10154,30 +10154,57 @@ fn antlr_double_key_map_put_value(
 ) -> MethodCallResult {
     let data = antlr_double_key_map_data_or_create(ctx, map)?;
     let inner_value = antlr_map_get(ctx, data, key1)?;
-    let (inner, previous) = match inner_value {
+    let previous = match inner_value {
         Some(Value::Object(Some(inner))) => {
-            let previous = antlr_map_get(ctx, inner, key2)?;
-            (inner, previous.unwrap_or(Value::Object(None)))
+            antlr_map_put(ctx, inner, key2, value)?.unwrap_or(Value::Object(None))
         }
         _ => {
-            let data_pin = ctx.pin_native_root(data);
-            if let Value::Object(Some(key)) = key1 {
-                ctx.pin_native_root(key);
-            }
-            if let Value::Object(Some(key)) = key2 {
-                ctx.pin_native_root(key);
-            }
-            if let Value::Object(Some(value)) = value {
-                ctx.pin_native_root(value);
-            }
-            let inner = antlr_new_linked_hash_map(ctx)?;
-            let data = ctx.read_native_pin(data_pin, data);
-            ctx.unpin_native_roots(data_pin);
-            antlr_map_put(ctx, data, key1, Value::Object(Some(inner)))?;
-            (inner, Value::Object(None))
+            // Creating the inner map can allocate and move all four objects. Keep
+            // them rooted as one scoped group, then release that group after the
+            // new map is linked from `data`. Previously the three argument pins
+            // were discarded without an unpin, permanently retaining every ANTLR
+            // merge-cache entry and its prediction-context graph.
+            let pins = ctx.pin_native_root(data);
+            let key1_pin = match key1 {
+                Value::Object(Some(key)) => Some((ctx.pin_native_root(key), key)),
+                _ => None,
+            };
+            let key2_pin = match key2 {
+                Value::Object(Some(key)) => Some((ctx.pin_native_root(key), key)),
+                _ => None,
+            };
+            let value_pin = match value {
+                Value::Object(Some(value)) => Some((ctx.pin_native_root(value), value)),
+                _ => None,
+            };
+            let created = (|| {
+                let inner = antlr_new_linked_hash_map(ctx)?;
+                let data = ctx.read_native_pin(pins, data);
+                let key1 = match key1_pin {
+                    Some((pin, fallback)) => {
+                        Value::Object(Some(ctx.read_native_pin(pin, fallback)))
+                    }
+                    None => key1,
+                };
+                let key2 = match key2_pin {
+                    Some((pin, fallback)) => {
+                        Value::Object(Some(ctx.read_native_pin(pin, fallback)))
+                    }
+                    None => key2,
+                };
+                let value = match value_pin {
+                    Some((pin, fallback)) => {
+                        Value::Object(Some(ctx.read_native_pin(pin, fallback)))
+                    }
+                    None => value,
+                };
+                antlr_map_put(ctx, data, key1, Value::Object(Some(inner)))?;
+                antlr_map_put(ctx, inner, key2, value)
+            })();
+            ctx.unpin_native_roots(pins);
+            created?.unwrap_or(Value::Object(None))
         }
     };
-    antlr_map_put(ctx, inner, key2, value)?;
     Ok(Some(previous))
 }
 
@@ -17847,6 +17874,33 @@ mod antlr_prediction_context_tests {
             }
         }
         count as i32
+    }
+
+    #[test]
+    fn antlr_double_key_map_insert_releases_temporary_native_pins() {
+        let mut ctx = mock_ctx();
+        let map = ctx.fresh_object_ref();
+        let data = alloc_concurrent_synthetic(&mut ctx, "java/util/HashMap", 3);
+        cratonvm_native_collections::native_map_init(&mut ctx, &[Value::Object(Some(data))])
+            .unwrap();
+        ctx.set_field(map, 0, Value::Object(Some(data)));
+        let key1 = ctx.fresh_object_ref();
+        let key2 = ctx.fresh_object_ref();
+        let value = ctx.fresh_object_ref();
+
+        assert_eq!(ctx.native_pin_count_for_test(), 0);
+        assert_eq!(
+            antlr_double_key_map_put_value(
+                &mut ctx,
+                map,
+                Value::Object(Some(key1)),
+                Value::Object(Some(key2)),
+                Value::Object(Some(value)),
+            )
+            .unwrap(),
+            Some(Value::Object(None))
+        );
+        assert_eq!(ctx.native_pin_count_for_test(), 0);
     }
 
     #[test]
