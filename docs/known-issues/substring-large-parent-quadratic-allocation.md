@@ -57,15 +57,45 @@ bytecode ultimately doing the same kind of "extract from parent" operation
 
 ## Dispatch verified: this is REAL JDK bytecode, and its call chain is provably NOT the source
 
-`String.substring(int,int)` is not force-dispatched to CratonVM's native
-(`native_string_substring`, `native-builtins/src/lang_string.rs`) in real-JDK mode —
-it's absent from both `force_native_over_real_jdk_bytecode`
-(`vm/src/runtime/interpreter.rs`) and the `check_override` slow-path allowlist
-(`vm/src/vm/vm_exec.rs`), and `java/lang/String` is not in the
-`drop_real_layout_synthetic` class list. So real JDK 25's own
-`substring`→`checkBoundsBeginEnd`→`isLatin1`→`StringLatin1.newString`/
-`StringUTF16.newString`→`Arrays.copyOfRange`→`System.arraycopy` bytecode chain
-runs. Traced each hop's dispatch:
+`String.substring(int,int)` real-JDK bytecode runs instead of CratonVM's native
+(`native_string_substring`, `native-builtins/src/lang_string.rs`), confirmed via
+runtime instrumentation (an unconditional `eprintln!` placed at the top of
+`native_string_substring`, `native_system_arraycopy`, and the
+`Arrays.copyOfRange([BII)[B` native handler — **none** fired across a 20-call
+`SubstringOnly` run). `java/lang/String` is not in the `drop_real_layout_synthetic`
+class list (unlike `Pattern`/`Matcher`), so that specific mechanism isn't why.
+
+**Dispatch-gate mismatch found, attempted fix, INCONCLUSIVE.** `vm/src/vm/vm_exec.rs`
+has a `check_override` allowlist (`invoke_on_class_shared_inner`'s slow path) that
+explicitly lists `java/lang/String.substring` as forced-native (comment: "RKC16N.6
+RECON... real-JDK String bytecode resolution is failing for these basic methods
+during JDK class clinits... route to our layout-neutral natives"). But
+`force_native_over_real_jdk_bytecode` (`vm/src/runtime/interpreter.rs`) — a
+*separate* allowlist consulted by the cached-vtable *fast path*
+(`interpreter.rs`, around the `CachedCallResult::CacheMiss` check) — does **not**
+include `substring` in its `java/lang/String` block (only `replaceAll`/
+`replaceFirst`/`matches`/the `CharSequence` `replace` overload are there). Since
+the fast path is what serves essentially every repeat call once a call site's
+vtable entry is warm, this looked like exactly the kind of gate-mismatch bug that
+would silently defeat `check_override`'s stated intent forever after the first
+call. **Added `("java/lang/String", "substring", "(II)Ljava/lang/String;")` to
+`force_native_over_real_jdk_bytecode` and rebuilt — but reinstrumenting
+`native_string_substring` afterward showed it was STILL never called, and
+`SubstringOnly`'s timings were unchanged (14/332/1315 ms at 1K/5K/10K, statistically
+identical to before the change).** So either this two-gate model is incomplete
+(there's a third, higher-priority cache/dispatch layer neither gate reaches — e.g.
+a call-site-level inline cache populated before either gate is consulted, or a
+JIT-level intrinsic/inlining path), or the edit didn't land where actual dispatch
+resolution happens. **This needs a properly-resourced dispatch-tracing session
+(ideally with an actual debugger attached to the interpreter's dispatch resolution
+code, not eprintln!-based trial and error) to pin down** — this session made three
+successive attempts (Matcher's `drop_real_layout_synthetic`, the substring
+`force_native_over_real_jdk_bytecode` gap) and only the first was confirmed to
+matter; the second, despite passing the same kind of static-analysis scrutiny,
+empirically changed nothing.
+
+Traced each hop's dispatch/bound-by anyway, since the call-chain analysis stands
+regardless of which gate is authoritative:
 
 | call | dispatch | bound by |
 |---|---|---|
@@ -137,6 +167,19 @@ regardless of whether a collection is triggered.
 
 ## Suggested next steps (not attempted this session)
 
+0. **Find the actual dispatch mechanism for `String.substring` first** — this
+   session's `force_native_over_real_jdk_bytecode` gate-mismatch fix (see above)
+   passed the same static-analysis scrutiny that correctly found the Matcher
+   `drop_real_layout_synthetic` issue, but empirically changed nothing. Something
+   in CratonVM's dispatch (a call-site inline cache, a JIT-level path, or a third
+   mechanism this session didn't find) is deciding "run real bytecode" for
+   `substring` upstream of both allowlists this session checked. Until that's
+   found, any native-side fix (to `native_string_substring` or otherwise) is
+   guaranteed unreachable, same as the Matcher fix turned out to be. Use an
+   actual debugger/instrumented build with a breakpoint or trace on the
+   dispatch-resolution function(s), not trial-and-error `eprintln!` edits (three
+   rebuild-and-test cycles in this session each took ~5-8 minutes and still
+   didn't localize it).
 1. Re-run `SubstringOnly` specifically (not just the original combined regex
    benchmark) under a much larger `-Xmx`/young-gen to fully confirm or refute the
    nursery-size angle in isolation — the earlier `-Xmx 4g` test was on the wrong
