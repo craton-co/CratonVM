@@ -112,6 +112,16 @@ struct Lowerer<'a> {
     buf: ExecutableBuffer,
     /// Maps NodeId → frame offset where its result is stored.
     node_slot: Vec<i32>,
+    /// Soundness latch (ES SortingDigestTests -Jit on): set when `slot_of`
+    /// is asked for a node that never went through `alloc_slot`. `node_slot`
+    /// is zero-initialised and `first_spill > 0`, so a 0 readback means the
+    /// scheduler never placed the node in an emitted block (observed: the
+    /// pc17 ArrayLoad(Double) feeding a GVN-collapsed loop phi in
+    /// DualPivotQuicksort.insertionSort) — emitting `[rbp - 0]` would read
+    /// the saved caller RBP as a data value (heap addresses stored into
+    /// double[] elements, silent mis-sorts). The lowering entry point checks
+    /// this latch and bails to the single-pass backend instead.
+    unallocated_slot_use: std::cell::Cell<bool>,
     /// Next available frame spill offset.
     next_spill: i32,
     /// Maps block index → native code offset (for branch patching).
@@ -254,6 +264,7 @@ impl<'a> Lowerer<'a> {
             schedule,
             buf,
             node_slot: vec![0; graph.nodes.len()],
+            unallocated_slot_use: std::cell::Cell::new(false),
             next_spill: first_spill,
             block_offsets: vec![0; schedule.blocks.len()],
             branch_patches: Vec::new(),
@@ -310,8 +321,22 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Get the frame offset for a node's result (must have been allocated).
+    /// A `0` readback means the node was never `alloc_slot`'d — see
+    /// `unallocated_slot_use`; the latch makes the whole lowering bail
+    /// rather than emit a `[rbp - 0]` access to the saved caller RBP.
     fn slot_of(&self, id: NodeId) -> i32 {
-        self.node_slot[id as usize]
+        let s = self.node_slot[id as usize];
+        if s == 0 {
+            self.unallocated_slot_use.set(true);
+            if std::env::var_os("CRATONVM_DBG_IRSLOT").is_some() {
+                let n = &self.graph.nodes[id as usize];
+                eprintln!(
+                    "[irslot] UNALLOCATED node={} op={:?} ty={:?} inputs={:?} pc={:?}",
+                    id, n.op, n.ty, n.inputs, n.bytecode_pc
+                );
+            }
+        }
+        s
     }
 
     // ── Phi resolution (BUG FIX [jit-irlower #2]) ────────────────────────
@@ -2463,6 +2488,15 @@ pub(crate) fn lower_inner(
     // Emit blocks in order
     for block_idx in 0..schedule.blocks.len() {
         lowerer.lower_block(block_idx);
+    }
+
+    // Soundness bail (ES SortingDigestTests -Jit on): some emitted use asked
+    // for the frame slot of a node that was never allocated one (scheduler
+    // gap — the node sits in no emitted block). The emitted code would read
+    // `[rbp - 0]`, i.e. the saved caller RBP, as a data value. Discard the
+    // artifact and let the caller fall back to the single-pass backend.
+    if lowerer.unallocated_slot_use.get() {
+        return None;
     }
 
     // real-frame-deopt (step 3): emit the shared deopt stub after the method

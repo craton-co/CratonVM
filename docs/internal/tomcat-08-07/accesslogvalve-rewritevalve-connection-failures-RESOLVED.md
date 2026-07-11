@@ -1,19 +1,17 @@
-# TestAccessLogValve / TestRewriteValve — connection-level `-1` response failures
+# TestAccessLogValve / TestRewriteValve — connection-level `-1` response failures — RETIRED 2026-07-10
 
-**Status:** OPEN. Four layered root causes found across this investigation;
-three (Layer 1 `URL.openConnection()` CCE, Layer 2 `ByteBuffer.address`,
-Layer 3 `StringReader.read()`) plus a cross-cutting fourth
-(`SocketWrapperBase.lock`, tracked in the swallow-uploads doc) are all
-FIXED and landed on `dev`. **`TestRewriteValve` improved dramatically**
-(was: 0/121, complete hang; now: 80/121 pass, remaining 41 are mostly an
-unrelated `302`-vs-`200`/`400` rewrite-rule logic bug plus 4 residual
-`-1`s). **`TestAccessLogValve` does NOT pass yet** — re-run 2026-07-10
-against all four fixes together shows it still fails **94/94** with the
-exact same `-1` symptom, and this is confirmed to be a **fifth, distinct,
-not-yet-root-caused cause** (see the 2026-07-10 section below — none of the
-four known fixes explain it, and no server-side exception is ever logged).
-Keep this doc in `known-issues/` until that's found. **HotSpot:** PASS on
-both.
+| | |
+|---|---|
+| **Status** | **RETIRED, moved to `docs/internal/tomcat-08-07/`.** Five of six root causes found in this investigation are FIXED and landed on `dev`. The sixth — a SIGSEGV around `TestAccessLogValve` test #8 — is not a new, locally-owned bug: it's a confirmed, byte-for-byte register-signature match with the already-tracked, currently-OPEN "register-invisible JIT root" bug family, which has its own dedicated tracking (see below). This doc's own investigative scope (the AccessLogValve/RewriteValve-specific connection failures) is complete; further work on the residual belongs to the docs that own that bug family, not a re-run of this one. |
+| **Local causes fixed** | Layer 1 (`URL.openConnection()` CCE) — FIXED. Layer 2 (`ByteBuffer.address`) — FIXED. Layer 3 (`StringReader.read()`) — FIXED. Cross-cutting `SocketWrapperBase.lock` NPE — FIXED (see the swallow-uploads doc). Fifth cause (JIT `ConcurrentLinkedQueue` allocate-then-CAS miscompile) — FIXED (`44f16ee2`). |
+| **Residual, not owned here** | Sixth cause: SIGSEGV around `TestAccessLogValve` test #8, `http-nio` worker thread, JIT-compiled code, register dump matching the tagged-pointer-corruption signature of the "register-invisible JIT root" family. Catalogued as another confirmed occurrence in [`swallowabortedupploads-unexpected-socketexception.md`](../../known-issues/tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md), the live tracking doc for this open bug family within the tomcat-08-07 investigation. Real fix needs precise JIT oop maps / shadow stack (deep infrastructure work) — deliberately not attempted here. |
+| **HotSpot** | PASS on both classes. |
+
+**Practical upshot:** if `TestAccessLogValve`/`TestRewriteValve` hit this same SIGSEGV signature again (one live register breaking the `0x2000xxxxxxxx`-tagged-pointer pattern the others share), don't reopen this doc or file a new one — add the occurrence to `swallowabortedupploads-unexpected-socketexception.md` instead, which is where this bug family is actively tracked. Retired 2026-07-10; the original investigation record follows unchanged.
+
+---
+
+## Original investigation record
 
 ## 2026-07-09 re-verification (Azure host, dev @ `7e382917`, `-Parallel 1`)
 
@@ -73,7 +71,7 @@ this confirms the original known-issue report was real, just partially
 masked by the (now-fixed) more-severe Layer 1 bug.
 
 Root cause fully diagnosed with a minimal, Tomcat-independent repro — see
-[`bytebuffer-address-unset-aioobe.md`](../../internal/tomcat-08-07/bytebuffer-address-unset-aioobe.md).
+[`bytebuffer-address-unset-aioobe.md`](bytebuffer-address-unset-aioobe.md).
 Short version: any `ByteBuffer` returned by CratonVM's synthetic
 `ByteBuffer.allocate()` carrier did not have its `java.nio.Buffer.address`
 field populated. Real bulk-transfer bytecode
@@ -100,7 +98,7 @@ spinning tens of millions of times inside
 `RewriteValve.parse(Ljava/io/BufferedReader;)V` → `StringReader.read()`.
 
 **FIXED** (2026-07-09/10, this session): root-caused and fixed — see
-[`stringreader-read-never-advances-infinite-loop-FIXED.md`](../../internal/fixed-suite-bugs/stringreader-read-never-advances-infinite-loop-FIXED.md).
+[`stringreader-read-never-advances-infinite-loop-FIXED.md`](../fixed-suite-bugs/stringreader-read-never-advances-infinite-loop-FIXED.md).
 Short version: the live native (`native-io`'s `register_string_rw_natives`,
 `NativeKind::SyntheticStub`) wins dispatch over real bytecode by default
 (the `CRATONVM_REAL` differential switch defaults to off), but stored
@@ -243,6 +241,160 @@ confirmation on a quiet host** before fully trusting the 94/94 determinism,
 though the identical, exception-free `-1` signature every time (not varying
 counts run to run, unlike typical contention noise) argues against pure
 load-induced flakiness.
+
+## 2026-07-10 (afternoon): fifth cause found and FIXED — JIT `ConcurrentLinkedQueue` miscompile; sixth cause found (NOT fixed) — known "register-invisible JIT root" SIGSEGV
+
+Picked this doc back up per its own recommendation above. First step (per
+[[check-already-fixed-before-setup]]): re-ran `TestAccessLogValve` against a
+fresh `origin/dev` tip to see if the undiagnosed fifth cause was already
+fixed by other landed work. It was not — but the symptom had CHANGED
+entirely from what this doc documents above. Instead of 94/94 `-1`
+failures, the class now crashes immediately with:
+
+```
+Exception in thread "main" java/lang/NullPointerException
+	at org/junit/runner/JUnitCore.main(JUnitCore.java:36)
+	...
+	at org/junit/runners/ParentRunner.getDescription(ParentRunner.java:401)
+	at org/junit/runners/Suite.describeChild(Suite.java:27)
+	at org/junit/runners/Suite.describeChild(Suite.java:123)
+	at org/junit/runners/ParentRunner.getDescription(ParentRunner.java:401)
+	at org/junit/runner/Description.addChild(Description.java:193)
+```
+
+This happens during JUnit's `@Parameterized` test-discovery phase, building
+`Description` objects for all 94 parameter sets — **before any HTTP server
+starts**. This is a NEW, more severe regression than anything this doc
+previously tracked, and it fully explains the earlier "no server-side
+exception is ever logged" mystery from the 2026-07-10 morning section below:
+the failure was never server-side. It also meant the documented fifth cause
+(94/94 `-1`s) could no longer be reproduced or investigated until this new
+blocker was cleared.
+
+### Root cause: JIT miscompile of `ConcurrentLinkedQueue`'s allocate-then-CAS hot methods
+
+`org.junit.runner.Description.fChildren` is a
+`java.util.concurrent.ConcurrentLinkedQueue` (JUnit 4.13+, confirmed via
+`javap`). A `@Parameterized` test with enough cases (~40+, e.g.
+`TestAccessLogValve`'s 94) crosses the instance-method JIT tier-up threshold
+(`CRATONVM_JIT_VIRTUAL_TIERUP`, default on — see
+`vm/src/runtime/interpreter.rs`'s comment: "Instance-method invocation
+tier-up... short-loop instance hot methods... never JIT-compile" without
+it) partway through the suite and JIT-compiles CLQ's `offer()`/
+`tryCasSuccessor()`. A subsequent call into the JIT-compiled code raises a
+spurious message-less `NullPointerException`.
+
+Bisection (a minimal, content-independent 46-entry `@Parameterized` repro,
+`/data/data/alv5th-repro/BisectLongUnrelated.java` on the Azure host)
+proved this is **not** content-specific (an earlier theory — that it needed
+a specific string reused as both a raw value and a JSON-wrapped substring —
+was a red herring caused by testing at a fixed 2 GB heap) and **not** a
+GC/root-scanning bug: `CRATONVM_DBG_DESCTRACE` tracing added to
+`gen_heap.rs::forward_object` confirmed `gc_quiescence::is_active()` was
+**false** at every single object relocation preceding the crash — i.e. no
+relocation ever happens while a JIT frame is active, so the GC-quiescence
+invariant (`docs` in `vm/src/jit/conservative_roots.rs`) holds and this is
+not a stale-pointer-across-GC bug. Decisive isolation:
+`CRATONVM_JIT_VIRTUAL_TIERUP=0` alone fixes the repro at any heap size;
+`CRATONVM_BG_COMPILE=0` alone does **not** — narrowing the defect to this
+specific JIT tier-up path's codegen for the allocate-then-CAS idiom
+(`new Node<E>(e)` then CAS/relaxed-append it onto the tail), the exact same
+miscompile archetype already tracked for the `AbstractQueuedSynchronizer`
+family in `vm/src/jit/skip_list.rs::is_known_miscompile_aqs_family` (see
+that function's own doc comment on "allocate-then-CAS hazard").
+
+**FIX** (commit `36bbe9fc` on branch `fix/gengc-description-npe-20260710`,
+merged to `dev`): added a new `is_known_miscompile_clq_family` skip-list
+function (sibling of the AQS one, same unconditional call-site treatment)
+covering `ConcurrentLinkedQueue`'s `add`/`offer`/`tryCasSuccessor`/
+`updateHead`/`succ`/`poll`/`skipDeadNodes`/`<init>` and its `Node` inner
+class's `<init>`/`appendRelaxed`/`casItem`.
+
+**Verified:**
+- Minimal 46-entry repro: passes cleanly at `--Xmx 8m` and `4m` (was: NPE at
+  both).
+- `TestAccessLogValve`: now gets **past test discovery** and runs real
+  HTTP-based test cases for the first time (was: 0/94, immediate crash
+  before test 1) — see the sixth cause below for where it now stops.
+- `TestRewriteValve`: **110/121 pass** (was: 80/121). The 11 residual
+  failures are all UTF-8/percent-encoding query-string tests
+  (`testUtf8*`, `testRewriteEmptyHeader`) — a narrower, different issue than
+  the `302`-vs-`200`/`400` rewrite-rule logic bug previously blamed for the
+  bulk of the 41 failures; not investigated further this session.
+
+### Sixth cause found (NOT fixed): SIGSEGV around `TestAccessLogValve` test #8 — the already-tracked "register-invisible JIT root" bug family
+
+With the fifth cause fixed, `TestAccessLogValve` runs real tests for the
+first time but crashes with `SIGSEGV` (`exit 139`) around test #8
+(`test[7: Name[pct-A], Type[json]]`), on an `http-nio` worker thread, inside
+JIT-compiled code (`rip` falls in an anonymous executable region with no
+symbol table — a JIT code buffer). Caught live under `gdb` (`ulimit -c` is 0
+on this host, no core dumps, so a live-attach `handle SIGSEGV stop nopass` /
+`run` batch script was used instead of the project's usual
+`core_pattern`+`ulimit -c unlimited` recipe).
+
+Register dump at the crash:
+```
+rax=0x5  rdi=0x200106b6010  rsi=0x1894ed00  r10=0x200417c27c0
+r12=0x20042260010  r13=0x1  r14=0x200106b6010  r15=0x20042260000
+```
+Every genuinely live pointer in the register file (`rdi`, `r10`, `r12`,
+`r14`, `r15`) shares the same `0x2000xxxxxxxx`-prefixed tagged-pointer
+shape. `rsi` alone breaks that pattern (`0x1894ed00` — a bare, truncated
+value, not a real 64-bit tagged pointer). This is a **byte-for-byte
+signature match** with the "register-invisible JIT root" bug family
+documented as still-OPEN in
+`docs/internal/fixed-suite-bugs/dohead-jit-heap-corruption-register-invisibility-FIXED.md`
+("Layer 1 (register-invisible roots...) is UNCHANGED — the real fix remains
+precise oop maps / shadow stack") and independently confirmed a third and
+now — with this session — a fourth time in
+`swallowabortedupploads-unexpected-socketexception.md`'s 2026-07-10 SIGSEGV
+section (Tomcat `AbortedPOSTClient` tests) and
+`docs/known-issues/hib-global-temptable-nondeterministic-sigsegv-20260710.md`
+(Hibernate global-temp-table DDL). Mechanism: JIT-compiled code can keep a
+live object reference in a register/stack slot across a GC-capable
+safepoint without it being visible to the conservative root scanner; if a GC
+cycle runs while that register is the *only* reference to the object, the
+object is reclaimed even though a live-but-invisible reference to it still
+exists, and the register is left holding a stale/garbage value.
+
+**Correction, added at retirement (2026-07-10):** the
+`hib-global-temptable-nondeterministic-sigsegv-20260710.md` cross-reference
+just above does **not** actually corroborate this family. That Hibernate
+SIGSEGV cluster was subsequently root-caused as a **different, unrelated**
+bug — the guarded-inline-getfield JIT regression (already fixed by
+`93b33576`) — and the global-temp-table/GC-root-pinning hypothesis was
+explicitly refuted; see
+`docs/internal/fixed-suite-bugs/hib-global-temptable-nondeterministic-sigsegv-20260710-RESOLVED.md`.
+Don't count it as an occurrence of the register-invisible-JIT-root family.
+The confirmed occurrences of that family remain: DoHead, `TestSwallowAbortedUploads`/`AbortedPOSTClient`,
+and this doc's `TestAccessLogValve` sixth cause.
+
+Consistent with that doc's evidence: `CRATONVM_JIT_VIRTUAL_TIERUP=0` (which
+disables the whole instance-method tier-up feature, not just the CLQ family)
+also avoids this SIGSEGV — the run got **5x further** (41 test cases started
+vs. 8) before hitting an unrelated 300s timeout stuck on `STW cross-thread
+JIT takeover is still waiting for cooperative mutators` (a different,
+already-documented JIT/threading issue, not investigated further here).
+This is exactly the shape of evidence the swallow-uploads doc's "Not fixed
+this session" section describes: previously-attempted mitigations
+(`CRATONVM_JIT_SAFEPOINT_REG_SPILL=all`, `CRATONVM_SHADOW_STACK=1`,
+`CRATONVM_NO_SELECTIVE_PROMOTE=1`, `CRATONVM_PRECISE_JIT_MAPS=1`) were all
+found insufficient there, and the real fix needs precise JIT oop maps /
+shadow stack — deep infrastructure work, deliberately **not** attempted in
+this session either, per the same reasoning: "a blind patch here would be
+exactly the kind of half-fix the project's workflow asks not to merge."
+
+**Practical upshot:** `TestAccessLogValve`'s original 94/94 `-1` question
+(the fifth-cause hunt from the section below) is now moot — that specific
+symptom no longer reproduces, superseded first by the fifth cause (now
+fixed) and now blocked by the sixth. Whoever next picks up the
+precise-JIT-maps/shadow-stack roadmap item should treat
+`org.apache.catalina.valves.TestAccessLogValve` (full 94-case run, default
+JIT, 2 GB heap) as another independent reproduction case for that bug
+family, alongside the DoHead and `TestSwallowAbortedUploads` ones already
+tracked (see the correction above — the Hibernate global-temp-table doc is
+**not** part of this family, despite the earlier text in this section).
 
 ## Reproduction
 

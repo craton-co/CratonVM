@@ -40,16 +40,43 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 
 ### Benchmark (vs HotSpot JDK 25 C2)
 
-| Benchmark                  | JDK 25 C2    | CratonVM default | Default ratio |
-|----------------------------|--------------|------------------|---------------|
-| Arithmetic (1.8B ops)      | 1,906 ms     | 3,919 ms         | 2.06x         |
-| Fibonacci(41) x5           | 1,793 ms     | 8,845 ms         | 4.93x         |
-| Sieve (100K x 16,700)      | 1,972 ms     | 11,267 ms        | 5.71x         |
-| Matrix 1230x1230           | 1,927 ms     | 5,427 ms         | 2.82x         |
-| **QuickBench TOTAL**       | **7,700 ms** | **29,458 ms**    | **3.83x**     |
-| Binary Trees (depth=18)    | 347 ms       | 8,214 ms         | 23.7x         |
+| Benchmark                  | JDK 25 C2     | CratonVM default | Default ratio |
+|----------------------------|---------------|-------------------|---------------|
+| Arithmetic (2B ops)        | 2,622 ms      | 11,465 ms         | 4.37x         |
+| Fibonacci(44)              | 2,774 ms      | 9,321 ms          | 3.36x         |
+| Sieve (100K x 20,000)      | 5,253 ms      | 19,371 ms         | 3.69x         |
+| Matrix 1280x1280           | 2,623 ms      | 10,364 ms         | 3.95x         |
+| HashMap (1M put/get)       | 49 ms         | 17,510 ms         | 357x          |
+| String/Regex (10K)         | 10 ms         | 2,470 ms          | 247x          |
+| **QuickBench TOTAL**       | **13,331 ms** | **70,501 ms**     | **5.29x**     |
+| Binary Trees (depth=18)    | 382 ms        | 4,916 ms          | 12.9x         |
 
-*QuickBench rows measured 2026-07-09 on a shared Azure Linux build host (same host as the Binary Trees row) against JDK 25.0.3 Temurin C2 and a CratonVM release build off `dev` at `bfc26c2d` (best of 3 HotSpot runs, best of 5 CratonVM runs). This is a rescaled variant of QuickBench (not the historical `bench/QuickBench.java` from commit `2cea208`) with each sub-test's workload sized so HotSpot lands around 2 seconds per test — the original 300M-iteration/fib(42)/500-rep/500x500 sizes were dominated by JVM startup and JIT-warmup noise (2-4x run-to-run swings on this shared host) rather than steady-state throughput. Scale-up: Arithmetic 300M → 1.8B iterations, Fibonacci fib(42) single call → fib(41) ×5 reps (recursion-depth steps are too coarse-grained for fine control, so it's repeated like the Sieve loop instead), Sieve 500 → 16,700 reps, Matrix 500x500 → 1230x1230. Sieve and Matrix ratios are both meaningfully worse at this steady-state size (5.0x→5.71x, 2.3x→2.82x) than the old short-run numbers, which were flattering CratonVM by diluting its slower steady-state throughput with a larger fixed-cost fraction. Binary Trees is unchanged from the 2026-07-08 snapshot (still the historical `bench/binarytrees.java` from `2cea208`, `--Xmx 4g`, best of 7 runs, one CratonVM-default run of 50,516 ms excluded as a contention outlier) and uses a different methodology than the rescaled QuickBench rows above it — only ratios, not absolute times, are meaningful across rows/snapshots. `CRATONVM_JIT_OSR` back-edge OSR is default-on (flipped 2026-07-04); `CRATONVM_JIT_THRESHOLD=1` on top showed no distinct benefit in either snapshot.*
+*Measured 2026-07-10 on the primary Windows dev box (hybrid P/E-core CPU, pinned to
+the 16 P-core logical processors via `ProcessorAffinity` — single-threaded benchmarks
+otherwise get scheduled onto slower E-cores, which skews results) against JDK 25 C2
+and a CratonVM release build off `dev` with the guarded-inline-getfield JIT fast path
+at its default-on state (see below) plus HashMap and String/Regex kernels added to
+close a gap — the original 5 kernels were all math/arrays, with nothing exercising
+hash-map or string/regex workloads. The 6 QuickBench-proper kernels are measured in a
+single combined run (`bench/QuickBenchLong3.java`); Binary Trees is a separate,
+freshly-launched process (5-round average, checksums identical every round) — mixing
+it into the combined run inflates its ratio via accumulated GC/heap pressure from the
+preceding kernels, so it's kept isolated for a representative number, matching how
+`bench/BenchSuite` always measures it elsewhere in this repo. Checksums verified
+identical between CratonVM and JDK on every kernel in every configuration.
+`CRATONVM_JIT_OSR` back-edge OSR is default-on; `guarded_inline_getfield_enabled()` is
+the single largest lever in the first 4 rows — see
+[docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for its find/fix history.
+
+**HashMap and String/Regex are known-slow outliers, not calibration noise.** Sized far
+below the other kernels because at JDK-comparable scale they don't complete in
+reasonable time: HashMap held a stable ~230x ratio across sizes tested (228.6x at
+250K entries, 233.8x at 1M — a large constant-factor overhead, likely Integer
+autoboxing + allocation/GC pressure, not an algorithmic bug). String/Regex's ratio
+instead GREW with size (18.8x at 1K entries → 94.4x at 5K → 238.8x at 10K; did not
+finish in 60s at 50K), consistent with an O(n²) bug rather than interpreter overhead —
+suspects are StringBuilder growth strategy and `Matcher.find()` cursor advancement
+between successive calls. Tracked as a follow-up investigation, not yet root-caused.*
 
 See [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full 26-round JIT optimization journey.
 

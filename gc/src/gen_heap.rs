@@ -2573,6 +2573,17 @@ impl GenerationalHeap {
         self.satb_queue.clone()
     }
 
+    /// Borrow the SATB queue without cloning the `Arc`. The JIT helper
+    /// entry path (`VmHeap::flush_thread_satb`) checks `is_active()` on
+    /// EVERY slow-path allocation; the refcount round trip of
+    /// [`Self::satb_queue_handle`] is measurable there and buys nothing —
+    /// the queue, once installed by `enable_concurrent_gc`, lives as long
+    /// as the heap.
+    #[inline]
+    pub fn satb_queue_ref(&self) -> Option<&SatbQueue> {
+        self.satb_queue.as_deref()
+    }
+
     /// Get the old generation's base pointer and capacity (for creating a ConcurrentMarker).
     pub fn old_gen_info(&self) -> (usize, usize) {
         let og = self.old_gen.lock();
@@ -7280,6 +7291,25 @@ impl GenerationalHeap {
 
         pointer_map.insert(old_ptr as usize, new_ptr as usize);
         *objects_copied += 1;
+        if desc_trace_enabled() {
+            if let Some((cname, _)) = crate::gc::resolve_class_info(header.class_id.as_u32()) {
+                if cname == "org/junit/runner/Description"
+                    || cname == "java/util/concurrent/ConcurrentLinkedQueue"
+                {
+                    eprintln!(
+                        "[desctrace-fwd] {} ihash={} old=0x{:x} new=0x{:x} promoted={} age={} jit_active={} moving_young={}",
+                        cname,
+                        header.identity_hash_code,
+                        old_ptr as usize,
+                        new_ptr as usize,
+                        landed_in_old_gen,
+                        header.gc_age,
+                        crate::gc_quiescence::is_active(),
+                        crate::gc_quiescence::moving_young_enabled(),
+                    );
+                }
+            }
+        }
         // CRIT-P2 fix: enqueue promoted objects so the alternating Cheney
         // loop can scan them in O(1) per object instead of re-filtering
         // `pointer_map.values()` per iteration. Young to-space copies are
@@ -7940,6 +7970,17 @@ fn gcw_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_GCWRITE").is_some())
+}
+
+/// Cached CRATONVM_DBG_DESCTRACE gate (temp investigation aid, ALV5th GC
+/// bug): trace every forward_object relocation of a
+/// org/junit/runner/Description or java/util/concurrent/ConcurrentLinkedQueue
+/// instance (old addr -> new addr, identity hash, promoted-or-not, age).
+#[inline]
+fn desc_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some())
 }
 
 /// Cached `CRATONVM_DBG_FWDGUARD` gate (bc math-ec 0x4): log forward_object

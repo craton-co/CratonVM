@@ -1,7 +1,10 @@
-# TestNonBlockingAPI.testNonBlockingReadIgnoreIsReady — container-driven async-completion writes zero bytes to the socket
+# TestNonBlockingAPI.testNonBlockingReadIgnoreIsReady — client never observes the connection failure HotSpot produces
 
-**Status:** OPEN. **Severity:** low (narrow, deliberately-adversarial test
-scenario). **HotSpot:** PASS.
+**Status:** OPEN. **Severity:** low-to-medium (this specific test is a
+narrow, deliberately-adversarial scenario, but the root cause — see the
+2026-07-10 correction below — is a general connector-timing issue tracked
+in its own doc, not specific to this test). **HotSpot:** PASS (via a
+genuine client-side `IOException`, not `rc=200` — see correction below).
 
 ## Summary
 
@@ -109,3 +112,67 @@ find exactly which call never happens (or happens but writes nothing) on
 CratonVM. Given the narrow, deliberately-adversarial nature of the
 triggering scenario (misbehaving `ReadListener` + container auto-recovery),
 this is lower priority than a bug hit by normal application code.
+
+## 2026-07-10: original "implicit 200 commit" and Acceptor/Poller theories REFUTED; real root cause is deferred `HttpURLConnection` streaming
+
+**Correction (2026-07-11):** The Acceptor enters native `accept()` promptly;
+the client bridge buffers fixed-length streaming writes and sends them only at
+response retrieval. The active issue is
+[`httpurlconnection-fixed-length-streaming-deferred-FIXED.md`](httpurlconnection-fixed-length-streaming-deferred-FIXED.md).
+
+Reproduced with a `Request.method(Class, String)` + `JUnitCore`
+single-method runner (respects `@Test(expected=...)` correctly, unlike
+whatever ad hoc harness produced this doc's original "HotSpot: PASS ...
+client observes rc=200" claim above — that claim does not hold up):
+
+- **Real HotSpot (JDK 25), verified directly:** the test **passes** because
+  `postUrl()`'s own mid-stream `os.write()` call throws a genuine
+  `java.net.SocketException`/`IOException` partway through the client's
+  5-chunk, 500ms-paced upload — satisfying `@Test(expected =
+  IOException.class)`. HotSpot does **not** return `rc=200`; there is no
+  "implicit 200 commit" to explain. (`ErrorState.CLOSE_NOW.isIoAllowed() ==
+  false` already makes clear the container is *not* supposed to write a
+  response here — the doc's original premise was self-contradictory with
+  the very code it was investigating.)
+- **CratonVM, root-caused via a correlated Rust+Java timeline:** the client
+  finishes writing its *entire* request body and closes its socket (~2
+  seconds of genuine `Thread.sleep`-paced writes) before CratonVM's Tomcat
+  connector ever performs its first read of the connection. By the time the
+  server looks at it, there is nothing left to fail on — no partial-read
+  race for the misbehaving `ReadListener` to lose, no mid-write client
+  failure, just a fully-buffered, already-closed stream that gets read,
+  processed (correctly — the whole `onError`/`onComplete`/`CLOSE_NOW`
+  sequence still matches HotSpot byte-for-byte once it finally runs), and
+  closed with zero response bytes (matching `ErrorState.CLOSE_NOW`'s
+  `isIoAllowed() == false`, which is *correct* behavior, not a bug). The
+  client then sees a clean EOF-with-no-response (`rc=-1`) instead of an
+  `IOException`, because the failure window HotSpot depends on (server
+  reacting *before* the client's next write) never occurs on CratonVM.
+
+  This is **not** a socket-close-semantics bug (an earlier hypothesis this
+  session — that `native-io`'s `sc_close`/`lingering_channel_close`
+  "drains too gently" — was tested and found to have **zero effect**: the
+  drain-timeout constant was never even reached, because the peer had
+  *already* sent EOF long before close() ran). The actual mechanism: **the
+  NioEndpoint Acceptor thread takes roughly two full `selectorTimeout`
+  cycles (~2s, `NioEndpoint`'s default `selectorTimeout=1000`) before
+  making progress, while a separate Poller thread is independently parked
+  in blocking `select()` calls** — full details, evidence, and repro steps
+  now live in their own doc since this is a general VM-core
+  threading/scheduling concern, not specific to this test or even to
+  Tomcat:
+  [`httpurlconnection-fixed-length-streaming-deferred-FIXED.md`](httpurlconnection-fixed-length-streaming-deferred-FIXED.md).
+
+**This doc stays OPEN** — `testNonBlockingReadIgnoreIsReady` is not fixed.
+Fixing it requires implementing live fixed-length HTTP streaming in the doc
+linked above; once that lands, re-verify this test (and re-check
+`testNonBlockingRead`/other `DataWriter`-paced tests in the same class for
+behavior changes, since they share the same underlying connector timing).
+Do not re-investigate the "implicit response commit" angle — it's refuted
+above.
+# Resolved 2026-07-11
+
+`TestNonBlockingAPI.testNonBlockingReadIgnoreIsReady` now passes after the
+fixed-length HTTP streaming repair. The historical investigation below is
+archived with its root-cause record at
+[`httpurlconnection-fixed-length-streaming-deferred-FIXED.md`](httpurlconnection-fixed-length-streaming-deferred-FIXED.md).

@@ -2659,7 +2659,39 @@ impl StringFieldLayout {
                     };
                 }
             }
+            // FALLBACK (compact ref fields globally off, or no CompactLayout
+            // registered yet for string_class_id -- e.g. a class that never
+            // reached ClassStore::add, as every test in
+            // intrinsic_string_access.rs/intrinsic_string_search.rs
+            // deliberately forges via a fake `string_class_id`).
+            //
+            // Every x64.rs call site reconstructs the true address by adding
+            // ITS OWN payload offset to this function's return value
+            // (`FIELD_CELL_PAYLOAD64_OFFSET` for `value`, `_32_OFFSET` for
+            // `coder`/`hash`), and emit_load_string_value_ptr /
+            // emit_load_string_i32_field's own "legacy" branch adds a
+            // FURTHER `+FIELD_CELL_PAYLOAD64_OFFSET` (8) on top of that. So
+            // this fallback must return `legacy_cell_start -
+            // FIELD_CELL_PAYLOAD64_OFFSET` for EVERY field, ref or
+            // primitive alike -- not the bare legacy cell-start unbiased --
+            // so the caller's add + the emitter's own +8 net out to the true
+            // legacy payload address. (The registered branch above only
+            // needs the bias for `is_ref` because its `abs` already IS a
+            // bare-pointer/payload address for non-ref fields; the fallback
+            // formula below is a plain cell-start for every field, so it
+            // always needs the bias.)
+            //
+            // BUG-STRINGINTRINSIC-20260711: this used to return the bare,
+            // unbiased `HEADER_SIZE + idx*SLOT_SIZE`, which put every
+            // fallback field's reconstructed address 8 bytes past its real
+            // payload. For `value` (a byte[] ref) that misread the NEXT
+            // field's (`coder`'s) cell as the array pointer -- combining
+            // `Value::Int`'s zero tag with `coder`'s own int payload into a
+            // bogus 64-bit value (e.g. `0x1_00000000` for coder=1),
+            // non-null and plausible-looking, later dereferenced for the
+            // array-length bounds check. SIGSEGV.
             (cratonvm_types::HEADER_SIZE + idx * cratonvm_types::SLOT_SIZE) as i32
+                - cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET as i32
         };
         StringFieldLayout {
             value_field_index,
@@ -4978,7 +5010,7 @@ fn clear_jit_recursive_cycle_methods_for_test() {
 pub fn try_compile(
     cached: &CachedBytecodeMethod,
     cp_class_name_resolver: Option<&dyn Fn(u16) -> Option<String>>,
-    cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8, u32, bool)>>,
+    cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8, Option<(u32, bool)>)>>,
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
@@ -5275,7 +5307,7 @@ thread_local! {
 fn try_compile_inner(
     cached: &CachedBytecodeMethod,
     cp_class_name_resolver: Option<&dyn Fn(u16) -> Option<String>>,
-    cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8, u32, bool)>>,
+    cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8, Option<(u32, bool)>)>>,
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
@@ -5568,7 +5600,7 @@ fn try_compile_inner(
             if let Some(resolver) = cp_field_resolver {
                 let mut fm = std::collections::HashMap::with_capacity(scan.field_ops.len());
                 for &(pc, cp_idx) in &scan.field_ops {
-                    if let Some((field_index, type_tag, _c_off, _c_ref)) = resolver(cp_idx) {
+                    if let Some((field_index, type_tag, _compact_slot)) = resolver(cp_idx) {
                         // The IR builder only needs (field_index, type_tag); it
                         // bails getfield/putfield to single-pass under compact.
                         fm.insert(pc, (field_index, type_tag));
@@ -5989,10 +6021,20 @@ fn try_compile_inner(
     if !scan.field_ops.is_empty() {
         let resolver = cp_field_resolver?;
         for &(pc, cp_idx) in &scan.field_ops {
-            let (field_index, type_tag, c_off, c_ref) = resolver(cp_idx)?;
+            let (field_index, type_tag, compact_slot) = resolver(cp_idx)?;
             field_info.push((pc, field_index, type_tag));
+            // Only a genuinely-resolved compact slot may enter the inline
+            // emitter's compact-offset map. `None` (no registered layout, or
+            // index outside it) previously arrived as a fabricated
+            // `(0, false)` tuple and steered the compact-offset inline
+            // getfield/putfield arms at a garbage offset — the WildFly Host
+            // Controller SIGSEGV. Such pcs now take the guarded uniform arm,
+            // which keys on the per-object GC_FLAG_COMPACT bit and routes
+            // compact receivers to the layout-aware helper.
             if compact_fields {
-                compact_field_info.push((pc, c_off, c_ref));
+                if let Some((c_off, c_ref)) = compact_slot {
+                    compact_field_info.push((pc, c_off, c_ref));
+                }
             }
             if code[pc] == 0xb5 && (type_tag == b'L' || type_tag == b'[') {
                 needs_heap = true;
@@ -7746,11 +7788,11 @@ mod tests {
         // and this test does not execute the generated code).
         let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
         // Resolve cp index 2 → field index 0, int (`I`).
-        // (field_index, type_tag, compact_offset, compact_ref) — see the note at
-        // the other field_resolver test closure; compact-ref widened this to 4.
-        let field_resolver = |cp: u16| -> Option<(usize, u8, u32, bool)> {
+        // (field_index, type_tag, compact_slot) — `None` = the field has no
+        // registered compact slot (a plain non-compact int field).
+        let field_resolver = |cp: u16| -> Option<(usize, u8, Option<(u32, bool)>)> {
             if cp == 2 {
-                Some((0, b'I', 0, false))
+                Some((0, b'I', None))
             } else {
                 None
             }
@@ -8206,14 +8248,11 @@ mod tests {
                 None
             }
         };
-        // (field_index, type_tag, compact_offset, compact_ref) — the compact-ref
-        // field-layout merge widened `cp_field_resolver` to 4 fields; a plain
-        // non-compact int field resolves with `(_, _, 0, false)`. (Incidental
-        // fix: this test was left on the old 2-tuple by that merge, which broke
-        // the whole `cratonvm-jit` test binary.)
-        let field_resolver = |cp: u16| -> Option<(usize, u8, u32, bool)> {
+        // (field_index, type_tag, compact_slot) — a plain non-compact int
+        // field resolves with `(_, _, None)`: no registered compact slot.
+        let field_resolver = |cp: u16| -> Option<(usize, u8, Option<(u32, bool)>)> {
             if cp == 3 {
-                Some((0, b'I', 0, false))
+                Some((0, b'I', None))
             } else {
                 None
             }

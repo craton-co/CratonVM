@@ -29,14 +29,16 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{
+    install_baos_event_hook, BaosEvent, NativeContext, NativeMethodRegistry,
+};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
@@ -161,6 +163,19 @@ struct RealReq {
     connect_timeout_ms: Option<i32>,
     read_timeout_ms: Option<i32>,
     follow_redirects: bool,
+    streaming: StreamingMode,
+}
+
+/// Only fixed-length streaming has a wire-level implementation today.  It is
+/// deliberately recorded separately from a user-supplied Content-Length: the
+/// JDK's streaming setter changes *when* bytes are sent, not just which header
+/// appears on the request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum StreamingMode {
+    #[default]
+    Buffered,
+    Fixed(u64),
+    Chunked(i32),
 }
 
 impl Default for RealReq {
@@ -172,6 +187,7 @@ impl Default for RealReq {
             connect_timeout_ms: None,
             read_timeout_ms: None,
             follow_redirects: true,
+            streaming: StreamingMode::Buffered,
         }
     }
 }
@@ -196,6 +212,29 @@ fn real_reqs() -> &'static Mutex<HashMap<i32, RealReq>> {
 /// (ASYNC_POOL pattern) and re-read at perform time.
 fn real_body_streams() -> &'static Mutex<HashMap<i32, ObjectRef>> {
     static R: OnceLock<Mutex<HashMap<i32, ObjectRef>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// An active HTTP/1.1 fixed-length request.  The Java-facing output stream is
+/// still a ByteArrayOutputStream-shaped object, but native-io offers its
+/// writes to the hook below before it buffers them.  This lets the real
+/// HttpURLConnection carrier preserve the JDK's immediate-upload semantics
+/// without teaching the I/O crate about HTTP.
+struct LiveFixedStream {
+    tcp: TcpStream,
+    expected: u64,
+    written: u64,
+    closed: bool,
+}
+
+fn live_fixed_streams() -> &'static Mutex<HashMap<i32, LiveFixedStream>> {
+    static R: OnceLock<Mutex<HashMap<i32, LiveFixedStream>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Maps the identity of the returned BAOS to its owning real connection.
+fn live_fixed_owners() -> &'static Mutex<HashMap<i32, i32>> {
+    static R: OnceLock<Mutex<HashMap<i32, i32>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -258,6 +297,212 @@ fn real_body_bytes(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<u8> {
     Vec::new()
 }
 
+/// Native-io calls this before it mutates an ordinary BAOS.  Returning `true`
+/// consumes the event, so only BAOS instances registered by
+/// `start_live_fixed_stream` bypass heap buffering.
+fn huc_live_baos_event(
+    ctx: &mut dyn NativeContext,
+    baos: ObjectRef,
+    event: BaosEvent,
+) -> Result<bool, MethodCallFailed> {
+    let baos_key = ctx.identity_hash_code(baos);
+    let Some(conn_key) = live_fixed_owners()
+        .lock()
+        .ok()
+        .and_then(|owners| owners.get(&baos_key).copied())
+    else {
+        return Ok(false);
+    };
+
+    let bytes = match event {
+        BaosEvent::WriteByte(b) => Some(vec![b]),
+        BaosEvent::WriteArray { array, offset, len } => {
+            let mut out = vec![0u8; len];
+            ctx.read_byte_array_into(array, offset, &mut out);
+            Some(out)
+        }
+        BaosEvent::Flush | BaosEvent::Close => None,
+    };
+    let mut streams = live_fixed_streams()
+        .lock()
+        .map_err(|_| ioex("HttpURLConnection fixed-length stream registry poisoned"))?;
+    let stream = streams
+        .get_mut(&conn_key)
+        .ok_or_else(|| ioex("HttpURLConnection fixed-length stream is no longer available"))?;
+
+    if let Some(bytes) = bytes {
+        if stream.closed {
+            return Err(ioex("HttpURLConnection fixed-length stream is closed"));
+        }
+        let next = stream
+            .written
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| ioex("HttpURLConnection fixed-length stream overflow"))?;
+        if next > stream.expected {
+            return Err(ioex(format!(
+                "HttpURLConnection fixed-length stream wrote {next} bytes; expected {}",
+                stream.expected
+            )));
+        }
+        ctx.begin_blocking_region();
+        let write_result = stream
+            .tcp
+            .write_all(&bytes)
+            .and_then(|_| stream.tcp.flush());
+        ctx.end_blocking_region();
+        write_result.map_err(|e| ioex(format!("HttpURLConnection streaming write failed: {e}")))?;
+        stream.written = next;
+        return Ok(true);
+    }
+
+    match event {
+        BaosEvent::Flush => {
+            ctx.begin_blocking_region();
+            let result = stream.tcp.flush();
+            ctx.end_blocking_region();
+            result.map_err(|e| ioex(format!("HttpURLConnection streaming flush failed: {e}")))?;
+        }
+        BaosEvent::Close => {
+            if !stream.closed {
+                if stream.written != stream.expected {
+                    return Err(ioex(format!(
+                        "HttpURLConnection fixed-length stream closed after {} bytes; expected {}",
+                        stream.written, stream.expected
+                    )));
+                }
+                ctx.begin_blocking_region();
+                let result = stream.tcp.shutdown(Shutdown::Write);
+                ctx.end_blocking_region();
+                result
+                    .map_err(|e| ioex(format!("HttpURLConnection streaming close failed: {e}")))?;
+                stream.closed = true;
+            }
+        }
+        BaosEvent::WriteByte(_) | BaosEvent::WriteArray { .. } => unreachable!(),
+    }
+    Ok(true)
+}
+
+fn take_live_fixed_stream(conn_key: i32) -> Result<Option<LiveFixedStream>, MethodCallFailed> {
+    let stream = live_fixed_streams()
+        .lock()
+        .map_err(|_| ioex("HttpURLConnection fixed-length stream registry poisoned"))?
+        .remove(&conn_key);
+    if stream.is_some() {
+        if let Ok(mut owners) = live_fixed_owners().lock() {
+            owners.retain(|_, owner| *owner != conn_key);
+        }
+    }
+    Ok(stream)
+}
+
+fn forget_live_fixed_stream(conn_key: i32) {
+    if let Ok(mut streams) = live_fixed_streams().lock() {
+        streams.remove(&conn_key);
+    }
+    if let Ok(mut owners) = live_fixed_owners().lock() {
+        owners.retain(|_, owner| *owner != conn_key);
+    }
+}
+
+/// Open a plain HTTP connection and write the request head now.  HTTPS keeps
+/// the established buffered path because its rustls stream may re-enter Java
+/// for key-manager callbacks; moving that stateful handshake into a write hook
+/// would require a separate TLS stream owner.  The Tomcat regression and the
+/// JDK fixed-length contract exercised here are plain HTTP.
+fn start_live_fixed_stream(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    baos: ObjectRef,
+    expected: u64,
+) -> Result<bool, MethodCallFailed> {
+    let Some(url_str) = huc_real_object_url(ctx, this) else {
+        return Ok(false);
+    };
+    let parsed = parse_url(&url_str).map_err(ioex)?;
+    if parsed.scheme != "http" {
+        return Ok(false);
+    }
+    let conn_key = ctx.identity_hash_code(this);
+    if live_fixed_streams()
+        .lock()
+        .ok()
+        .is_some_and(|streams| streams.contains_key(&conn_key))
+    {
+        return Ok(true);
+    }
+    let req = real_reqs()
+        .lock()
+        .ok()
+        .and_then(|reqs| reqs.get(&conn_key).cloned())
+        .unwrap_or_default();
+    let method = if req.method.is_empty() {
+        "POST"
+    } else {
+        req.method.as_str()
+    };
+    let connect_timeout = match req.connect_timeout_ms {
+        Some(v) if v > 0 => Duration::from_millis(v as u64),
+        _ => Duration::from_secs(30),
+    };
+    let read_timeout = match req.read_timeout_ms {
+        Some(v) if v > 0 => Duration::from_millis(v as u64),
+        _ => Duration::from_secs(60),
+    };
+    // The streaming setter owns Content-Length.  Do not let an earlier manual
+    // header make the protocol head disagree with the exact byte count that
+    // the write hook enforces.
+    let mut headers: Vec<(String, String)> = req
+        .headers
+        .into_iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("content-length"))
+        .collect();
+    headers.push(("Content-Length".to_string(), expected.to_string()));
+    let head = build_request_head(method, &parsed, &headers, expected, true);
+
+    let addr = format!("{}:{}", parsed.host, parsed.port);
+    let mut addrs: Vec<std::net::SocketAddr> =
+        std::net::ToSocketAddrs::to_socket_addrs(&addr.as_str())
+            .map_err(|e| ioex(format!("HttpURLConnection resolve {addr}: {e}")))?
+            .collect();
+    addrs.sort_by_key(|sa| u8::from(sa.is_ipv6()));
+    ctx.begin_blocking_region();
+    let tcp = addrs
+        .into_iter()
+        .find_map(|sa| TcpStream::connect_timeout(&sa, connect_timeout).ok());
+    ctx.end_blocking_region();
+    let mut tcp = tcp.ok_or_else(|| ioex(format!("HttpURLConnection connect failed: {addr}")))?;
+    let _ = tcp.set_read_timeout(Some(read_timeout));
+    let _ = tcp.set_write_timeout(Some(read_timeout));
+    let _ = tcp.set_nodelay(true);
+    ctx.begin_blocking_region();
+    let write_result = tcp.write_all(&head).and_then(|_| tcp.flush());
+    ctx.end_blocking_region();
+    write_result.map_err(|e| {
+        ioex(format!(
+            "HttpURLConnection streaming header write failed: {e}"
+        ))
+    })?;
+
+    live_fixed_streams()
+        .lock()
+        .map_err(|_| ioex("HttpURLConnection fixed-length stream registry poisoned"))?
+        .insert(
+            conn_key,
+            LiveFixedStream {
+                tcp,
+                expected,
+                written: 0,
+                closed: false,
+            },
+        );
+    live_fixed_owners()
+        .lock()
+        .map_err(|_| ioex("HttpURLConnection fixed-length owner registry poisoned"))?
+        .insert(ctx.identity_hash_code(baos), conn_key);
+    Ok(true)
+}
+
 /// Perform (idempotently) the request for a real-JDK http(s) connection and
 /// cache `(status, headers, body)` by object identity. Returns the HTTP status
 /// (-1 on parse/IO failure). The request honors the method, headers, and body
@@ -285,6 +530,63 @@ fn huc_real_perform(
             return Err(socket_timeout_ex("Read timed out"));
         }
         return Ok(st);
+    }
+    // Fixed-length streaming has already sent the request head and each body
+    // write on this same TCP connection.  Read its response instead of calling
+    // `perform` (which would open a second connection and replay an empty
+    // buffered BAOS).  Redirect replay is intentionally not attempted here:
+    // the JDK likewise cannot transparently replay a streamed request body.
+    if let Some(mut live) = take_live_fixed_stream(key)? {
+        if live.written != live.expected {
+            return Err(ioex(format!(
+                "HttpURLConnection fixed-length stream has {} bytes; expected {} before reading the response",
+                live.written, live.expected
+            )));
+        }
+        let method = real_reqs()
+            .lock()
+            .ok()
+            .and_then(|reqs| reqs.get(&key).map(|req| req.method.clone()))
+            .unwrap_or_default();
+        ctx.begin_blocking_region();
+        let response = read_response(&mut live.tcp, method.eq_ignore_ascii_case("HEAD"));
+        ctx.end_blocking_region();
+        return match response {
+            Ok((status, headers, body)) => {
+                if let Ok(mut results) = real_results().lock() {
+                    results.insert(
+                        key,
+                        RealResult {
+                            status,
+                            headers,
+                            body,
+                        },
+                    );
+                }
+                Ok(status)
+            }
+            Err(ref e) if e == READ_TIMEOUT_SENTINEL => {
+                if let Ok(mut results) = real_results().lock() {
+                    results.insert(
+                        key,
+                        RealResult {
+                            status: HUC_TIMEOUT_STATUS,
+                            headers: Vec::new(),
+                            body: Vec::new(),
+                        },
+                    );
+                }
+                Err(socket_timeout_ex("Read timed out"))
+            }
+            // A fixed-length streaming request has already committed its head
+            // and body to this connection.  If the peer aborts before a
+            // response can be parsed, surface that transport failure as the
+            // IOException HotSpot exposes to `postUrl`, rather than treating it
+            // like a malformed buffered response and returning -1.
+            Err(e) => Err(ioex(format!(
+                "HttpURLConnection streaming response failed: {e}"
+            ))),
+        };
     }
     let req = real_reqs()
         .lock()
@@ -437,6 +739,7 @@ fn real_forget(ctx: &dyn NativeContext, this: ObjectRef) {
     if let Ok(mut t) = real_body_streams().lock() {
         t.remove(&key);
     }
+    forget_live_fixed_stream(key);
 }
 
 // ---------------------------------------------------------------------------
@@ -682,7 +985,29 @@ fn build_request(
     headers: &[(String, String)],
     body: &[u8],
 ) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::with_capacity(256 + body.len());
+    let mut out = build_request_head(method, parsed, headers, body.len() as u64, !body.is_empty());
+    out.extend_from_slice(body);
+    out
+}
+
+fn ise<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
+    RuntimeError::IllegalStateException {
+        message: message.into(),
+    }
+    .into()
+}
+
+/// Build an HTTP/1.1 request head without materialising the body.  The live
+/// fixed-length path uses this to put headers on the wire before Java writes
+/// its first body byte.
+fn build_request_head(
+    method: &str,
+    parsed: &Url1,
+    headers: &[(String, String)],
+    body_len: u64,
+    has_output: bool,
+) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(256);
     let _ = write!(&mut out, "{method} {} HTTP/1.1\r\n", parsed.path);
     let default_port: u16 = if parsed.scheme == "https" { 443 } else { 80 };
     if parsed.port == default_port {
@@ -725,9 +1050,9 @@ fn build_request(
     if !has_user_agent {
         out.extend_from_slice(b"User-Agent: Java/CratonVM\r\n");
     }
-    let is_output_method = !body.is_empty() || matches!(method, "POST" | "PUT" | "PATCH");
+    let is_output_method = has_output || matches!(method, "POST" | "PUT" | "PATCH");
     if !has_content_length && is_output_method {
-        let _ = write!(&mut out, "Content-Length: {}\r\n", body.len());
+        let _ = write!(&mut out, "Content-Length: {body_len}\r\n");
     }
     // Real-JDK `HttpURLConnection` defaults the request Content-Type to
     // `application/x-www-form-urlencoded` when the application opened an
@@ -740,7 +1065,6 @@ fn build_request(
         out.extend_from_slice(b"Content-Type: application/x-www-form-urlencoded\r\n");
     }
     out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(body);
     out
 }
 
@@ -1679,6 +2003,14 @@ fn huc_get_output_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         if let Ok(mut t) = real_body_streams().lock() {
             t.insert(key, baos);
         }
+        let streaming = real_reqs()
+            .lock()
+            .ok()
+            .and_then(|reqs| reqs.get(&key).map(|req| req.streaming))
+            .unwrap_or_default();
+        if let StreamingMode::Fixed(expected) = streaming {
+            start_live_fixed_stream(ctx, this, baos, expected)?;
+        }
         return Ok(Some(Value::Object(Some(baos))));
     }
     if !matches!(ctx.get_field(this, HUC_DO_OUTPUT), Value::Int(1)) {
@@ -2155,6 +2487,65 @@ fn huc_set_read_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(None)
 }
 
+fn huc_set_fixed_length_streaming_mode(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let length = match args.get(1) {
+        Some(Value::Int(v)) => *v as i64,
+        Some(Value::Long(v)) => *v,
+        _ => return Err(iae("setFixedLengthStreamingMode: invalid length")),
+    };
+    if length < 0 {
+        return Err(iae("setFixedLengthStreamingMode: negative length"));
+    }
+    if !is_real_carrier(ctx, this) {
+        // Synthetic carriers retain their historical buffered implementation.
+        return Ok(None);
+    }
+    let key = ctx.identity_hash_code(this);
+    if live_fixed_streams()
+        .lock()
+        .ok()
+        .is_some_and(|streams| streams.contains_key(&key))
+    {
+        return Err(ise("setFixedLengthStreamingMode: already connected"));
+    }
+    with_real_req(ctx, this, |req| match req.streaming {
+        StreamingMode::Chunked(_) => Err(ise("Chunked encoding streaming mode set")),
+        _ => {
+            req.streaming = StreamingMode::Fixed(length as u64);
+            Ok(())
+        }
+    })?;
+    Ok(None)
+}
+
+fn huc_set_chunked_streaming_mode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let chunk_length = args.get(1).and_then(Value::as_int).unwrap_or(0);
+    if !is_real_carrier(ctx, this) {
+        return Ok(None);
+    }
+    let key = ctx.identity_hash_code(this);
+    if live_fixed_streams()
+        .lock()
+        .ok()
+        .is_some_and(|streams| streams.contains_key(&key))
+    {
+        return Err(ise("setChunkedStreamingMode: already connected"));
+    }
+    with_real_req(ctx, this, |req| match req.streaming {
+        StreamingMode::Fixed(_) => Err(ise("Fixed length streaming mode set")),
+        _ => {
+            req.streaming = StreamingMode::Chunked(chunk_length);
+            Ok(())
+        }
+    })?;
+    Ok(None)
+}
+
 fn huc_set_instance_follow_redirects(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2306,15 +2697,24 @@ fn register_one(r: &mut NativeMethodRegistry, cls: &str) {
     // `IllegalStateException("Chunked encoding streaming mode set")`. Spring's
     // `SimpleClientHttpRequest.executeInternal` calls this once `getDoOutput()` is
     // true — so it only surfaced after the doOutput fix let the body path run.
-    r.register(cls, "setFixedLengthStreamingMode", "(I)V", |_ctx, _args| {
-        Ok(None)
-    });
-    r.register(cls, "setFixedLengthStreamingMode", "(J)V", |_ctx, _args| {
-        Ok(None)
-    });
-    r.register(cls, "setChunkedStreamingMode", "(I)V", |_ctx, _args| {
-        Ok(None)
-    });
+    r.register(
+        cls,
+        "setFixedLengthStreamingMode",
+        "(I)V",
+        huc_set_fixed_length_streaming_mode,
+    );
+    r.register(
+        cls,
+        "setFixedLengthStreamingMode",
+        "(J)V",
+        huc_set_fixed_length_streaming_mode,
+    );
+    r.register(
+        cls,
+        "setChunkedStreamingMode",
+        "(I)V",
+        huc_set_chunked_streaming_mode,
+    );
     r.register(
         cls,
         "setInstanceFollowRedirects",
@@ -2332,6 +2732,7 @@ fn register_one(r: &mut NativeMethodRegistry, cls: &str) {
 }
 
 pub fn register_http_url_connection_real(r: &mut NativeMethodRegistry) {
+    install_baos_event_hook(huc_live_baos_event);
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // The legacy `sun.net.www.protocol.http.HttpURLConnection` is the bulk of

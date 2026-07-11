@@ -272,7 +272,17 @@ fn native_ref_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, REF_FIELD_REFERENT)))
+    let referent = ctx.get_field(this, REF_FIELD_REFERENT);
+    // INT-8: G1ReferenceGet-equivalent keep-alive. The G1 marker hides
+    // referent slots during a concurrent cycle, so a referent handed to the
+    // mutator here could otherwise be stored behind an already-scanned
+    // object as its only strong path and then be cleared+freed at remark
+    // while strongly reachable. Logging it via the SATB pre-barrier keeps
+    // it live for the remainder of the cycle; no-op outside a cycle.
+    if let Value::Object(Some(r)) = referent {
+        ctx.gc_reference_keep_alive(r);
+    }
+    Ok(Some(referent))
 }
 
 /// Round-5 fix (HIGH — broken SoftRef LRU): `SoftReference.get()` must
@@ -298,8 +308,10 @@ fn native_soft_ref_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // Only refresh the LRU when the referent is still live — touching
     // a cleared soft ref would needlessly churn the index for an
     // entry that's about to be removed.
-    if matches!(referent, Value::Object(Some(_))) {
+    if let Value::Object(Some(r)) = referent {
         ctx.touch_soft_reference(this);
+        // INT-8 keep-alive — see `native_ref_get`.
+        ctx.gc_reference_keep_alive(r);
     }
     Ok(Some(referent))
 }

@@ -1074,3 +1074,387 @@ than the original `ThreadPoolExecutor` regression. Recommended next step: fix th
 doc's own recommended next steps (get the exact crash-site source line via `addr2line` against the
 captured instruction offset, since it's ASLR-base-independent and was confirmed constant across
 multiple captures), then re-run this doc's harness recipe again.
+
+## 2026-07-10 update (later same day) — SIGSEGV investigation continued, still not fixed; no new information for this doc
+
+Picked up the gating SIGSEGV doc (`wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver.md`)
+per its own recommended next step. Made substantial progress there (crash site conclusively
+identified as a JIT-compiled `ReentrantLock.lock()`, a specific named root-cause candidate found
+in classloading field-layout padding, and a separate confirmed finding that env vars do not reach
+the Host Controller child process) but did **not** land a fix — see that doc's own 2026-07-10
+"new session" entry for full detail. The four front-line residuals this doc tracks
+(`AttributeChangeNotification`, `ContentCleanerService`, `FileInputStream(File)`, `WFLYHC0034`)
+remain unreachable and unobserved; nothing changed for this doc specifically. This doc stays OPEN,
+still gated by the sibling SIGSEGV doc.
+
+
+## 2026-07-10 update (third session, same day) — the gating Host Controller SIGSEGV is FIXED; residual hunt is unblocked
+
+The Host Controller SIGSEGV that gated this doc's four front-line residuals is fixed — root
+cause: fabricated `(0, false)` compact-field slots poisoning the JIT's inline getfield
+(reference field read as a 32-bit sign-extended slice of a `Value` cell → bogus non-null
+receiver into the invoke inline cache; crashing method `ReentrantLock.lock()`). Full write-up:
+`docs/internal/wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver-FIXED.md`
+(also fixes a `BufferedReader.readLine` global-mutex-across-blocking-read starvation that made
+the post-fix Host Controller look silent).
+
+With both fixes the domain boot invokes `host=foo:add()` once, never respawns, and proceeds
+into management-model territory. The four front-line residuals
+(`AttributeChangeNotification`, `ContentCleanerService`, `FileInputStream(File)`,
+`WFLYHC0034`) did **not** re-appear verbatim in a 150 s bounded run; what surfaces instead:
+`WFLYCTL0013 Operation("add") failed` on
+`host=primary/core-service=management/management-interface=http-interface`
+(`IllegalStateException: Container is down`) and a `StackOverflowError` from
+`ScheduledThreadPoolExecutor.shutdown` recursing into itself (dispatch-bug shaped, sibling of
+the prior TPE fixes). Those are the new front line for this doc's hunt.
+
+
+## 2026-07-10/11 update (fourth session) — two MSC bugs fixed; both "third session" residuals cleared; new front line is the pre-existing, separately-tracked BUG-03 STW/JIT-takeover stall
+
+Picked up where the third session left off: `WFLYCTL0013 Container is down`
+(`IllegalStateException` on the `http-interface` `add` op) and a
+`StackOverflowError` from `ScheduledThreadPoolExecutor.shutdown` self-recursion.
+Root-caused via `CRATONVM_DBG_MSC=1` trace diffing (extracted `-> start id=N` /
+`<- start id=N OK` lines, diffed started-vs-completed ids to confirm the missing
+services never even *started*, not started-and-failed, then cross-referenced
+`[msc] install` lines for the relevant service names). Found two independent,
+real bugs in the from-scratch MSC (`native-builtins/src/jboss_msc.rs`), both
+fixed and pushed to `dev`:
+
+1. **`ServiceController.provides()` had zero native backing.** It's a real MSC
+   1.5.x interface method with no default implementation; any caller through
+   the synthetic mirror died with `AbstractMethodError:
+   org/jboss/msc/service/ServiceController.provides()Ljava/util/Set;`. The
+   `jboss.remoting.endpoint.management.management.operation.handler` service's
+   own start() path calls it — the resulting `AbstractMethodError` marked that
+   service FAILED, cascading into `WFLYCTL0459: Triggering roll back due to
+   missing management services`, which is why the *later*, unrelated
+   `http-interface` `add` then saw `IllegalStateException: Container is down`
+   (the management transaction was already rolled back). Fixed by implementing
+   `native_service_controller_provides()`: returns the controller's primary
+   `ServiceName` plus every alias reverse-scanned from `ContainerState.aliases`.
+   Commit `bd5626a9`.
+
+2. **OnDemand/Lazy dependencies of Active services were never demanded.**
+   `take_ready_start()`'s `can_start()` check requires every dependency to be
+   `Up`, but an `OnDemand`/`Lazy` service only becomes start-eligible once
+   `demanded == true`. The only production call site for `demand()` was
+   `ServiceController.setMode(Mode.ACTIVE)` — so an OnDemand service reachable
+   *only* via a dependency edge (never given an explicit `setMode(ACTIVE)` by
+   any Java code) never got demanded: a permanent deadlock. Concretely,
+   `org.wildfly.management.http.extensible` (OnDemand) is only reachable via
+   its Active dependent `...extensible.shutdown`'s dependency edge, so it never
+   started, and the whole http-management service chain never came up. Real
+   MSC treats an Active/Passive (or demanded Lazy/OnDemand) service's mere
+   dependency edge to an OnDemand/Lazy service as an implicit demand — added a
+   cheap pre-pass at the top of `take_ready_start()` that propagates demand
+   along dependency edges before computing start-eligibility (converges within
+   a few polling calls even for multi-level OnDemand chains). Commit
+   `f3d69e2b`.
+
+Both merged into `dev` at `13011cff`, verified against `origin/dev` with a
+`git log -S<symbol>` shadowing check (clean — neither `jboss_msc.rs` nor these
+symbols were touched by any concurrent commit since the branch point) and
+`cargo check -p cratonvm-native-builtins` + `cargo test -p
+cratonvm-native-builtins --lib` (2960 passed, same 5 pre-existing unrelated
+failures as the `origin/dev` baseline, plus one **confirmed-flaky**
+parallel-test-isolation failure —
+`lang_system::checkexec_security_tests::denying_sm_blocks_processbuilder_start_stub`
+races on the process-wide `SECURITY_MANAGER` `Mutex` static against other
+`checkexec_security_tests` running concurrently in sibling threads; passes
+deterministically under `--test-threads=1`; pre-existing test-infra gap,
+unrelated to this session's changes, not fixed here).
+
+**Live verification (Azure host, pristine WildFly 32.0.1.Final,
+`CRATONVM_MSC_REAL_START=1`, binary built from `dev` @ these two commits):**
+`WFLYCTL0459`, `Container is down`, the `AbstractMethodError`, **and** the
+`StackOverflowError` from `ScheduledThreadPoolExecutor.shutdown` are **all
+gone (0 hits)** — the boot log grew from a ~105-line stall to 595+ lines,
+reaching `Invoking domain.xml ops` and activating multiple subsystem
+extensions (JAX-RS, Transactions, Weld, JSF(Mojarra), Datasources,
+ResourceAdapters) before stalling. A 30 s re-check confirmed the log genuinely
+stops growing there, not just slow progress.
+
+**New front line: the boot now stalls at the pre-existing, separately-tracked
+BUG-03 STW/JIT-takeover family** (`STW cross-thread JIT takeover is still
+waiting for cooperative mutators rounds=64 pending=7 taken=0`, from
+`vm/src/runtime/interpreter.rs`). Per this investigation's standing scope
+guardrail, BUG-03 itself is **not** chased here — but I did check whether it
+can be routed *around* (not fixed) via `CRATONVM_DISABLE_JIT=1`, since the
+stall is explicitly JIT-related: it cannot. With JIT disabled the boot fails
+**much earlier** and differently — `org/jboss/modules/Main.<clinit>` throws
+`ExceptionInInitializerError` wrapping an `UnsatisfiedLinkError` for `Missing
+native method in real-JDK mode method=java/io/InputStreamReader.<init>
+(Ljava/io/InputStream;Ljava/nio/charset/Charset;)V`, before JBoss Modules even
+finishes bootstrapping. This looks like a real, separate, interpreter-only
+native-registration gap (the 2-arg `InputStreamReader(InputStream, Charset)`
+constructor apparently isn't registered/reachable in real-JDK mode when the
+JIT never compiles the caller) — **not investigated further, not fixed, not
+filed as its own doc** (out of scope for this session); noted here only to
+save a future session from re-trying the same "disable JIT to route around
+BUG-03" idea and hitting the same dead end.
+
+**The four original front-line residuals (`AttributeChangeNotification`,
+`ContentCleanerService`, `FileInputStream(File)`, `WFLYHC0034`) and the
+`HIB-CV-32` sustained-load / `CRATONVM_DIAG_HIB32=1` corrupt-Value-cell check
+still have not been reached** — boot has now moved several phases past where
+they were originally observed (bootstrap → extensions → Elytron →
+`host=foo:add()` → Cleaner → SIGSEGV → `provides()`/demand-propagation →
+domain.xml subsystem activation), each phase revealing the next blocker
+in sequence. It remains unknown whether those four residuals are still
+reachable in their original form or have been superseded, because boot has
+not yet gotten past BUG-03 to find out. This doc stays OPEN, now gated by
+BUG-03 (tracked in its own existing doc/section, not duplicated here).
+
+No lingering `domain.sh`/Host Controller/Process Controller processes were
+left running on the probe host after this session (verified via `ps aux`
+post-run).
+
+
+## 2026-07-11 update (fifth session) — BUG-03 groundwork laid (Generational-GC path confirmed, `park()` verified correct), but a NEW earlier blocker now prevents reaching it at all
+
+Coordinator approved expanding scope into BUG-03 itself (the `STW
+cross-thread JIT takeover is still waiting for cooperative mutators` stall
+that now gates this doc, per the fourth-session entry above), with an
+explicit, strict caution bar: check for concurrent GC-barrier work first,
+don't touch `gc_barrier` wait/count logic without a liveness proof, verify
+under repeated load, park-don't-merge on any hang/flake.
+
+**Concurrent-work check (done first, as required):** read
+`docs/known-issues/gc-audit-2026-07-10-open-findings.md` and the parked
+`wip/gc-stw-quota-race-20260710` branch. Finding: the GC audit's own finding
+2 ("G1/ZGC: STW hang risk when a JIT thread never polls") is BUG-03's
+symptom family, and its G1 half is already landed + load-validated
+(`e78a8bd3`, "INT-3 — extend cross-thread STW JIT takeover to G1"). BUT:
+
+- **WildFly's `domain.sh` sets no `-XX:+UseG1GC`**, and CratonVM's default
+  backend is Generational (`gc/src/vm_heap.rs:65-70`, doc comment:
+  "Generational semi-space + old-gen mark-sweep (**default**)"). So the
+  G1-specific INT-3 landing is very likely NOT the mechanism in play for
+  this doc's repro at all — this boot exercises the Generational path,
+  which the audit doc separately claims "gets this for free from its
+  non-moving frozen-cycle sweep" (i.e. was never supposed to need INT-3's
+  G1-specific work in the first place).
+- Confirmed by reading the code (not just the doc) that the exact log
+  message this doc quotes ("STW cross-thread JIT takeover is still waiting
+  for cooperative mutators") is unique to `stw_take_over_and_wait`
+  (`vm/src/runtime/interpreter.rs:475`, called from exactly 3 sites: 889,
+  1031, 1223 — all young-gen-pause family), which is DIFFERENT from the
+  `brief_stw_counted`/`brief_stw_counted_with_live_blocked` functions the
+  audit doc flags as still using plain `wait_for_all()` for G1's
+  initial-mark/final-remark. So BUG-03 is not simply "the concurrent-mark
+  wiring the audit doc already knows is missing" either — it's hitting the
+  mechanism that's supposed to already work.
+- Read `NativeContextImpl::park()` (`vm/src/vm/vm_exec.rs:5878`) end to end:
+  it DOES correctly call `self.shared.gc_barrier.enter_blocked()` before
+  actually parking (the coordinator's option (a) — "make a JIT-thread's
+  park-in-native register as gc_barrier-blocked" — already exists and looks
+  correct for the generic `Unsafe.park`/`LockSupport.park` path). Also
+  confirmed `jit/src/x64.rs` has zero special-casing for native calls made
+  from JIT-compiled code (grep for `park`/`enter_blocked` in `jit/src/`
+  finds only unrelated register-allocation "parking" terminology and
+  `parking_lot` cache internals) — meaning a native call from JIT-compiled
+  bytecode goes through the exact same Rust dispatch as from the
+  interpreter, so `ctx.park()` should behave identically regardless of
+  caller. **This means option (a) as literally described may already be
+  implemented and correct** — the 7 threads BUG-03's log shows stuck
+  (`pending=7`, `taken=0` after 64+ rounds) are apparently NOT simply
+  "parked without registering blocked", since that path looks sound. What
+  they're actually doing (spinning in JIT code the takeover's
+  `any_thread_in_jit()` fails to catch, vs. blocked in some OTHER native —
+  e.g. socket accept/read — that never calls `enter_blocked` at all) could
+  not be determined this session; see below.
+
+**Live verification blocked by a NEW finding.** The plan was to boot with
+`CRATONVM_DBG_STW_CENSUS=1` and `CRATONVM_DBG_XT_JIT_ROOT_SCAN=1` to capture
+`ThreadRegistry::debug_thread_census()` at the exact moment of the stall —
+this prints each alive thread's `blocked`/`ready`/`state`/top-frame, which
+would have definitively answered "what are the 7 pending threads actually
+doing". Instead, boot now fails to get anywhere near that point: **20/20
+attempts in a controlled batch died within under a second, at
+`org/jboss/modules/Main.<clinit>`**, with a `Missing native method in
+real-JDK mode` for `InputStreamReader.<init>(InputStream, Charset)` —
+completely unrelated to GC/STW, gating even the most basic JBoss Modules
+bootstrap. Full detail, reproduction data, and what was ruled out:
+[`wildfly-jboss-modules-inputstreamreader-clinit-race.md`](wildfly-jboss-modules-inputstreamreader-clinit-race.md)
+(new doc). This is now the actual front-line gate for this whole
+investigation — ahead of BUG-03, ahead of the four original residuals,
+ahead of HIB-CV-32.
+
+**No fix attempted for either issue this session.** Per the coordinator's
+explicit bar ("if you observe ANY intermittent hang, SEGV, or flakiness
+under load — do not merge, park it... a well-documented, safely-parked
+partial attempt is a good outcome, an unsafe merge is not") and given BUG-03
+itself could not even be empirically re-observed (only reasoned about via
+static code reading), no `gc_barrier`/STW/JIT-park code was touched this
+session. The new InputStreamReader blocker is a different subsystem
+entirely (real-bytecode class/method resolution, not GC-barrier) and was
+investigated only far enough to characterize and rule out easy hypotheses
+(see its own doc) — actually root-causing it needs live tracing this
+session did not have time for after the characterization work.
+
+**Next steps for whoever continues, in order:**
+1. Root-cause and fix `wildfly-jboss-modules-inputstreamreader-clinit-race.md`
+   first — nothing else in this doc chain is reachable until boot gets
+   past `org/jboss/modules/Main.<clinit>` again.
+2. Once boot reaches WildFly-specific code again, immediately capture
+   `CRATONVM_DBG_STW_CENSUS=1`/`CRATONVM_DBG_XT_JIT_ROOT_SCAN=1` output at
+   the BUG-03 stall (`stw_take_over_and_wait`, `vm/src/runtime/interpreter.rs:475`)
+   to see the pending threads' actual state — this is the missing piece
+   that turns the option (a)/(b) choice from a guess into an evidence-based
+   decision. Given `park()` already looks correct (see above), lean toward
+   investigating whether the pending threads are doing blocking native I/O
+   (socket accept/read for the management interface) that never calls
+   `enter_blocked`, rather than assuming they're spinning JIT loops the
+   takeover fails to catch — but confirm either way before writing code.
+3. Whatever the fix, it must clear the verification bar the coordinator set
+   for touching this subsystem: `cargo test` clean for the owning crate,
+   repeated runs under real load (not once), and the existing GC-audit
+   probe kit (`/data/data/gcprobes-0710/`) if reachable — park, don't merge,
+   on any flake.
+
+
+## 2026-07-11 update (sixth session, same day) — the InputStreamReader "blocker" was a test-harness bug, not a CratonVM defect; genuine sustained load reached for the first time; one more MSC AbstractMethodError fixed
+
+The coordinator proposed a specific hypothesis for the InputStreamReader
+finding above: re-register `<init>` as a `NativeKind::SyntheticStub`-tagged
+native (the same technique used for the ThreadPoolExecutor/Cleaner fixes),
+reasoning that `invokespecial` goes through a different, category-respecting
+dispatch path than the `invokevirtual` vtable fast path the original removal
+commit's comment was about.
+
+**Verifying that hypothesis surfaced two corrections, then the real root
+cause:**
+
+1. `invokespecial` and `invokevirtual` are NOT as cleanly separated as the
+   hypothesis assumed — both route through the same
+   `execute_invoke_kind` -> `try_stackless_invoke` path in
+   `vm/src/runtime/interpreter.rs`, which has its own
+   `synthetic_stub_should_yield_to_real_bytecode` allowlist gate, separate
+   from (and in addition to) `vm_exec.rs`'s `invoke_or_native` gate the
+   coordinator cited. Neither allowlist contained `InputStreamReader`.
+2. `RealSelector::prefers_real()` (`vm/src/runtime/env_cache.rs`) — the
+   general, non-allowlist escape hatch — defaults to `false` for every class
+   unless `CRATONVM_REAL` is explicitly set (it's a differential-testing
+   switch, off by default; matches the existing memory note "CRATONVM_REAL:
+   SyntheticStub wins by default"). So implementing the coordinator's fix
+   literally (re-register `<init>` as SyntheticStub without also adding
+   `InputStreamReader` to both allowlists) would have made the OLD,
+   already-fixed UTF-16 decode bug (`aaf64a5d`'s whole reason for existing)
+   come back for every real-JDK `InputStreamReader`, not fixed the WildFly
+   issue in a targeted way.
+3. Before committing to any of that, added temporary
+   `CRATONVM_DBG_ISRTRACE` instrumentation to
+   `classloading/src/class_manager.rs::load_class` (built, tested, then
+   `git checkout --` reverted — never shipped) to empirically answer the
+   coordinator's own point 2 ("does this actually resolve as a synthetic
+   stub at this point"). It does — but the reason is not a race or a
+   dispatch-path bug at all: `ClassManager::has_real_boot_classes()`
+   returns **`false`** at the point `org.jboss.modules.Main.<clinit>`
+   loads `java/io/InputStreamReader`, because this investigation's test
+   harness sets `JAVA_HOME` to a shim directory (just a `bin/java` symlink,
+   satisfying `domain.sh`'s launcher convention) that CratonVM's own
+   `resolve_java_home()` (`vm/src/config.rs`) ALSO consults for real JDK
+   discovery — finding nothing there. `CRATONVM_JAVA_HOME` is the
+   documented escape hatch for exactly this ("used when JAVA_HOME points at
+   a cratonvm shim tree... but boot modules must come from a real JDK") and
+   had never been set by any probe script in this entire investigation.
+
+**Fix: `CRATONVM_JAVA_HOME=/home/victor/jdk25`, no code change.** Verified
+**10/10** in a controlled batch (same rigor as the original 0/20 finding).
+`docs/known-issues/wildfly-jboss-modules-inputstreamreader-clinit-race.md`
+is retracted (its reproduction data and `has_real_boot_classes()` mechanism
+trace stay for the record, but the "CratonVM race/bug" framing was wrong).
+
+**This unblocked far more than expected.** With real bytecode correctly
+available, a from-scratch boot run (`CRATONVM_DBG_STW_CENSUS=1`,
+`CRATONVM_DBG_XT_JIT_ROOT_SCAN=1`, default `-Xmx512m`) produced **63,367
+log lines** — two orders of magnitude past any previous run in this
+investigation — before finally dying with a genuine
+`OutOfMemoryError: young gen exhausted` (128 MiB from-space full). Findings
+from that run and a `-Xmx1536m` follow-up:
+
+- **BUG-03's specific stall pattern did NOT reproduce as a permanent
+  livelock.** The "STW cross-thread JIT takeover is still waiting..."
+  warning fired exactly ONCE (`pending=1`, far smaller than the earlier
+  `pending=7`) and then resolved — boot continued for 62,000+ more lines
+  afterward. It's plausible (not proven) that the earlier "permanent"
+  characterization of BUG-03 was itself partly an artifact of the same
+  missing-`CRATONVM_JAVA_HOME` gap: with real bytecode unavailable, more
+  classes fall back to synthetic-stub implementations, which may not poll
+  GC safepoints the way real bytecode does, making some thread
+  genuinely un-excusable rather than just transiently busy. BUG-03 is
+  **not re-closed** by this alone — a single successful resolution isn't
+  proof against the underlying livelock risk the GC audit doc describes —
+  but the WildFly repro specifically no longer demonstrates it as a hard
+  blocker. Worth a dedicated repeat-under-load check in a future session
+  before fully retiring it here.
+- **HIB-CV-32's corrupt-Value-cell detector fired ZERO times** across the
+  entire 63K-line run. The detector (`gc/src/gen_heap.rs::read_slot`) is
+  unconditional — `CRATONVM_DIAG_HIB32` only lifts the print cap past the
+  first 32 hits, so a true zero-hit run needs no special flag. This is a
+  genuine, strong signal toward this doc's original closure bar, though
+  boot still doesn't reach a *quiescent running* state (see below), so it
+  isn't the full sustained-load picture yet.
+- **The `OutOfMemoryError` is a heap-sizing artifact, not a leak**: bumping
+  `JBOSS_JAVA_SIZING` from the WildFly-default `-Xmx512m` to `-Xmx1536m`
+  eliminates it entirely (no OOM in the follow-up run) — confirms this
+  specific default is just too small for a Host Controller's full domain
+  boot on CratonVM, not a memory-correctness bug.
+- **New finding, fixed same session**: with the OOM out of the way, boot
+  reaches `start-servers`, which now fails with
+  `WFLYHC0053: Could not get the server inventory in 30 seconds`, followed
+  by a masking `AbstractMethodError: method
+  org/jboss/msc/service/ServiceContainer.isShutdown()Z has no Code
+  attribute` during the boot-failure reporting path itself (so the
+  AbstractMethodError was hiding the real WFLYHC0053 timeout in the log).
+  Same family and same fix pattern as this doc's earlier `provides()` fix:
+  `ServiceContainer.isShutdown()` is a real MSC interface method with no
+  default implementation and zero native backing. Implemented
+  `ServiceContainer::is_shutdown()` (reads the existing `state.shutdown`
+  bool the `shutdown()` method already sets) +
+  `native_service_container_is_shutdown`, registered as `"isShutdown", "()Z"`
+  right after the existing `"shutdown", "()V"` registration in
+  `native-builtins/src/jboss_msc.rs`. `cargo test -p cratonvm-native-builtins
+  --lib`: 2961 passed, the same 5 pre-existing failures, zero new failures
+  (this run did not hit the flaky `denying_sm_blocks_processbuilder_start_stub`
+  parallel-test race noted in the fourth-session entry). Commit `40d05aac`.
+
+**With the AbstractMethodError gone, the real error underneath was no
+longer masked — and Host Controller itself now completes its own boot.**
+Re-running with the fix, boot proceeds through the `WFLYHC0053` failure
+(the `start-servers` operation for the actual managed servers still fails
+and rolls back) but then Host Controller finishes its OWN startup and logs:
+
+```
+INFO [org.jboss.as] WFLYSRV0025: WildFly Full 32.0.1.Final (WildFly Core
+Unknown) (Host Controller) started in 143128ms - Started 0 of 0 services
+(0 services are lazy, passive or on-demand) - Host Controller
+configuration files in use: domain.xml, host.xml
+```
+
+This is the furthest this entire investigation has ever gotten — Host
+Controller reports itself fully started, something no prior session
+reached. "Started 0 of 0 services" confirms the managed *application*
+servers never came up (consistent with the `WFLYHC0053` failure above),
+but the Host Controller process itself is healthy and stable at this point,
+not crashed, not livelocked, not OOM'd.
+
+**`WFLYHC0053: Could not get the server inventory in 30 seconds` is now
+the front line** — not yet investigated. This is a genuinely new, different
+failure from anything previously tracked in this doc (not the four
+original residuals, not `Container is down`, not BUG-03). `start-servers`
+timing out waiting for server inventory suggests either a slow/stuck
+Process Controller <-> Host Controller handshake or a managed server
+process that never reports in — worth checking with `CRATONVM_DBG_MSC=1`
+and a live process list the same way the demand-propagation deadlock was
+diagnosed, plus checking whether the managed server's own child process
+ever actually spawns (`ps aux` during the 30s window).
+
+**The four original front-line residuals
+(`AttributeChangeNotification`, `ContentCleanerService`,
+`FileInputStream(File)`, `WFLYHC0034`) still have not been individually
+re-confirmed** — they did not appear verbatim in this run's 63K lines
+(none of the four signature strings matched), but boot also never reached a
+fully-up, steady state to be confident they're truly gone rather than just
+not-yet-reached. Re-check once `WFLYHC0053` is resolved.

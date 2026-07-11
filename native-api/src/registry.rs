@@ -8,7 +8,7 @@
 
 // AUDIT 2026-05-16: std::collections::HashMap is unused — the registry
 // migrated to rustc_hash::FxHashMap (T10.9.B). Import removed.
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// NIO-SERVER-SOCKET (route 1): cached check of the `CRATONVM_REAL_NET_SOCKETS`
 /// env var. When set, the native registry drops all synthetic
@@ -2180,6 +2180,38 @@ pub trait NativeContext {
         self.invoke(class_name, method_name, descriptor, args)
     }
 
+    /// Like [`Self::invoke_special`] but for a native that IS ITSELF the
+    /// native registered for `(class_name, method_name, descriptor)` and
+    /// must run that class's own real bytecode body directly.
+    ///
+    /// [`Self::invoke_special`] re-finds ANY registered native FIRST (see its
+    /// own contract) -- calling it from inside that same native re-enters it
+    /// (unbounded Rust-stack recursion). This variant skips that check
+    /// entirely and resolves straight to `class_name`'s own bytecode, still
+    /// with true invokespecial semantics: static binding on `class_name`'s
+    /// hierarchy, never virtual dispatch to a receiver's overriding
+    /// subclass. That distinction is the whole point -- the bug this exists
+    /// to fix was a native registered on `ThreadPoolExecutor.shutdown()`,
+    /// reached via `ScheduledThreadPoolExecutor.shutdown()`'s
+    /// `super.shutdown()`, which used `invoke_virtual_bytecode_only` (dynamic
+    /// receiver class) and so re-dispatched straight back into the STPE
+    /// override that called it -- `StackOverflowError` from infinite
+    /// self-recursion.
+    ///
+    /// `args[0]` MUST be the receiver, same contract as [`Self::invoke_special`].
+    ///
+    /// Default implementation falls back to [`Self::invoke_special`] -- safe
+    /// for any context with no such native-reentrancy hazard (mocks, tests).
+    fn invoke_special_bytecode_only(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        self.invoke_special(class_name, method_name, descriptor, args)
+    }
+
     // -- Scoped Values (JEP 446, Java 25) --
 
     /// Look up a scoped value binding by key_id on the current thread's stack.
@@ -2553,6 +2585,22 @@ pub trait NativeContext {
     /// no-op keeps mock/test contexts compiling.
     fn touch_soft_reference(&mut self, _reference_obj: ObjectRef) {}
 
+    /// INT-8: GC keep-alive for a referent a `Reference.get()` just handed to
+    /// the mutator — the HotSpot `G1ReferenceGet` intrinsic barrier
+    /// equivalent. While a G1 concurrent mark cycle is active, the marker
+    /// deliberately does NOT trace through referent slots (referent-slot
+    /// hiding); a mutator that reads a referent and stores it into an
+    /// already-scanned (black) object would create the only strong path via
+    /// an edge the snapshot cannot see, and the remark-time reference
+    /// processor could then clear the weak ref and free the referent while
+    /// strongly reachable (use-after-free). The VM overrides this with the
+    /// heap's SATB pre-barrier (`VmHeap::write_barrier_pre`), which logs the
+    /// value as a mark root when marking is active and is a no-op otherwise.
+    /// `refersTo` intentionally does NOT call this — its JDK contract is to
+    /// test the referent WITHOUT keeping it alive. The default no-op keeps
+    /// mock/test contexts compiling.
+    fn gc_reference_keep_alive(&mut self, _referent: ObjectRef) {}
+
     /// Record a JFR thread sleep event. Called by Thread.sleep implementations.
     /// Default is no-op; the VM overrides this with the real JFR recorder.
     fn record_thread_sleep(&mut self, _sleep_nanos: i64, _actual_duration_nanos: u64) {}
@@ -2824,6 +2872,55 @@ pub struct StackTraceEntry {
 /// - `Ok(None)` — method returned void
 /// - `Err(MethodCallFailed)` — method threw an exception or had an internal error
 pub type NativeCallback = fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult;
+
+/// Event emitted by the native `ByteArrayOutputStream` implementation before
+/// it falls back to growing its in-heap byte buffer.
+///
+/// Most streams are ordinary buffers, so observers return `Ok(false)` and the
+/// I/O crate performs its normal operation.  A small number of bridge APIs
+/// expose a ByteArrayOutputStream-shaped Java object while the bytes must go to
+/// a native sink immediately (legacy fixed-length HttpURLConnection is one).
+/// Keeping that opt-in at the API boundary avoids making native-io depend on a
+/// higher-level protocol crate.
+pub enum BaosEvent {
+    WriteByte(u8),
+    /// A Java byte-array slice.  The observer must read it through `ctx` only
+    /// after deciding it owns this stream, keeping the ordinary BAOS hot path
+    /// allocation-free.
+    WriteArray {
+        array: ObjectRef,
+        offset: usize,
+        len: usize,
+    },
+    Flush,
+    Close,
+}
+
+/// Return `Ok(true)` when the event was consumed and the ordinary BAOS path
+/// must be skipped; `Ok(false)` leaves the receiver's normal buffering intact.
+pub type BaosEventHook =
+    fn(&mut dyn NativeContext, ObjectRef, BaosEvent) -> Result<bool, MethodCallFailed>;
+
+static BAOS_EVENT_HOOK: OnceLock<BaosEventHook> = OnceLock::new();
+
+/// Install the process-wide optional BAOS bridge hook.  Registration happens
+/// during native bootstrap; repeated registrations are harmless because the
+/// first (and only) bridge implementation wins.
+pub fn install_baos_event_hook(hook: BaosEventHook) {
+    let _ = BAOS_EVENT_HOOK.set(hook);
+}
+
+/// Offer a BAOS event to the optional bridge hook.
+pub fn dispatch_baos_event(
+    ctx: &mut dyn NativeContext,
+    stream: ObjectRef,
+    event: BaosEvent,
+) -> Result<bool, MethodCallFailed> {
+    match BAOS_EVENT_HOOK.get() {
+        Some(hook) => hook(ctx, stream, event),
+        None => Ok(false),
+    }
+}
 
 /// Classification of a registered native method.
 ///

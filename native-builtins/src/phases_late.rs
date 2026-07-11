@@ -13346,11 +13346,62 @@ fn p57_alloc_enum(
 // ---------------------------------------------------------------------------
 const PB_FIELD_COMMAND: usize = 0;
 const PB_FIELD_DIRECTORY: usize = 1;
+const PB_FIELD_ENVIRONMENT: usize = 2;
 
 const PROC_FIELD_EXIT: usize = 0;
 const PROC_FIELD_STDOUT: usize = 1;
 const PROC_FIELD_STDERR: usize = 2;
 const PROC_FIELD_PID: usize = 3;
+
+/// Walk a `java.util.Map`'s entries via its own `entrySet()`/`iterator()`/
+/// `Map.Entry` protocol (virtual dispatch on the receiver's real class, not a
+/// bucket-scan keyed on a hard-coded layout) so this works for whatever
+/// concrete `Map` `ProcessBuilder.environment()` returns, regardless of its
+/// exact internal representation. Mirrors the same technique and the same
+/// rationale as `cratonvm_native_collections`'s private
+/// `collect_entries_via_iterator_inner` (not exported cross-crate, so
+/// replicated here for this one call site rather than plumbing a new public
+/// API through for it).
+fn collect_map_entries_as_strings(
+    ctx: &mut dyn NativeContext,
+    map: ObjectRef,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let set = match ctx.invoke_virtual(map, "entrySet", "()Ljava/util/Set;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        _ => return out,
+    };
+    let it = match ctx.invoke_virtual(set, "iterator", "()Ljava/util/Iterator;", &[]) {
+        Ok(Some(Value::Object(Some(i)))) => i,
+        _ => return out,
+    };
+    loop {
+        let has_next = matches!(
+            ctx.invoke_virtual(it, "hasNext", "()Z", &[]),
+            Ok(Some(Value::Int(n))) if n != 0
+        );
+        if !has_next {
+            break;
+        }
+        let entry = match ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(e)))) => e,
+            _ => break,
+        };
+        let key = match ctx.invoke_virtual(entry, "getKey", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(k)))) => ctx.read_string(k),
+            _ => None,
+        };
+        let value = match ctx.invoke_virtual(entry, "getValue", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(v)))) => ctx.read_string(v),
+            Ok(Some(Value::Object(None))) => Some(String::new()),
+            _ => None,
+        };
+        if let Some(k) = key {
+            out.push((k, value.unwrap_or_default()));
+        }
+    }
+    out
+}
 
 pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -13553,6 +13604,33 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         if let Some(ref dir) = work_dir {
             command.current_dir(dir);
         }
+
+        // --- Apply environment overrides from the `environment()` map, if any ---
+        // BUG FIX (2026-07-10): this native previously never consulted
+        // `PB_FIELD_ENVIRONMENT` at all, so any `ProcessBuilder.environment()`
+        // mutation the Java caller made (`.clear()`, `.put(...)`, `.putAll(...)`,
+        // `.remove(...)`) was silently discarded — the spawned child always got
+        // `std::process::Command`'s bare default (full inheritance from THIS
+        // process), regardless of what the Java code asked for. Real JDK
+        // semantics: if `environment()` was never called, the child inherits
+        // the parent's environment unmodified (matches `Command`'s own
+        // default, so leave it alone in that case); if it WAS called, the
+        // child's environment is EXACTLY the live map's current contents at
+        // `start()` time (`env_clear()` then repopulate). `PB_FIELD_ENVIRONMENT`
+        // is only ever populated by the `environment()` registration below,
+        // which now returns a genuinely-working, pre-populated-from-this-
+        // process's-real-environment HashMap (see that registration's own
+        // fix note) — so a caller that reads, mutates, and never fully
+        // replaces the map still ends up with a sensible "inherit + edits"
+        // result, matching real `ProcessBuilder` behavior.
+        if let Value::Object(Some(env_map)) = ctx.get_field(this, PB_FIELD_ENVIRONMENT) {
+            let pairs = collect_map_entries_as_strings(ctx, env_map);
+            command.env_clear();
+            for (k, v) in pairs {
+                command.env(k, v);
+            }
+        }
+
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
 
@@ -13626,18 +13704,61 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
     r.register(pb, "environment", "()Ljava/util/Map;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         // Check if env map already stored in field 2
-        if let Value::Object(Some(map)) = ctx.get_field(this, 2) {
+        if let Value::Object(Some(map)) = ctx.get_field(this, PB_FIELD_ENVIRONMENT) {
             return Ok(Some(Value::Object(Some(map))));
         }
-        // Create a new HashMap with current process environment
-        // Pin across the map alloc below — a moving young GC there would
-        // relocate `this` (native stale-local family).
+        // BUG FIX (2026-07-10): the previous implementation hand-allocated a
+        // "java/util/HashMap"-tagged object via `alloc_concurrent_synthetic`
+        // but only ever wrote field 1 (size=0) — field 0 (the bucket array
+        // every `native_map_put`/`native_map_get`/`entrySet`/etc. requires,
+        // see `native_map_init`'s own doc comment) was left as the
+        // zero-initialized default (`Object(None)`), so EVERY subsequent
+        // `.put()`/`.get()`/`.entrySet()` on the returned map silently
+        // no-op'd — this call site just never got the fix `native_map_init`
+        // already applies for the general case. On top of that, real
+        // `ProcessBuilder.environment()` is documented to return a map
+        // PRE-POPULATED with the same entries as `System.getenv()`
+        // ("Initially, the returned map contains the same key-value pairs as
+        // the environment"), which this stub never did either — so even a
+        // correctly-working map would have started empty instead of
+        // inheriting. Fix both: build a genuinely-working `HashMap` the same
+        // way other native call sites in this codebase do (`new_object_initialized`,
+        // falling back to the manual alloc+`native_map_init` recipe — mirrors
+        // `antlr_new_linked_hash_map` in `lib.rs`), then seed it from the
+        // real process environment via the same `native_map_put` every other
+        // `Map.put()` call in the VM goes through (so a caller that later
+        // does `.get()`/`.entrySet()`/`.remove()` sees a fully-functional,
+        // spec-shaped map, not a lookalike).
         let this_pin = ctx.pin_native_root(this);
-        let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 4);
+        let mut map = match ctx.new_object_initialized("java/util/HashMap", "()V", &[]) {
+            Ok(Some(Value::Object(Some(m)))) => m,
+            _ => {
+                let m = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+                cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(m))])?;
+                m
+            }
+        };
+        let map_pin = ctx.pin_native_root(map);
+        for (key, value) in std::env::vars() {
+            let key_obj = ctx.create_string(&key);
+            let key_pin = ctx.pin_native_root(key_obj);
+            let val_obj = ctx.create_string(&value);
+            let key_obj = ctx.read_native_pin(key_pin, key_obj);
+            ctx.unpin_native_roots(key_pin);
+            map = ctx.read_native_pin(map_pin, map);
+            let _ = cratonvm_native_collections::native_map_put_pub(
+                ctx,
+                &[
+                    Value::Object(Some(map)),
+                    Value::Object(Some(key_obj)),
+                    Value::Object(Some(val_obj)),
+                ],
+            )?;
+        }
+        map = ctx.read_native_pin(map_pin, map);
+        ctx.unpin_native_roots(map_pin);
         let this = ctx.read_native_pin(this_pin, this);
-        ctx.set_field(map, 1, Value::Int(0)); // size = 0
-                                              // Store for future access
-        ctx.set_field(this, 2, Value::Object(Some(map)));
+        ctx.set_field(this, PB_FIELD_ENVIRONMENT, Value::Object(Some(map)));
         ctx.unpin_native_roots(this_pin);
         Ok(Some(Value::Object(Some(map))))
     });

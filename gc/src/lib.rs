@@ -116,7 +116,11 @@ pub use reference::{
     ReferenceEntry, ReferenceProcessingResult, ReferenceProcessingStats, ReferenceProcessor,
     ReferenceQueue, ReferenceType,
 };
-pub use region::{RegionHeap, RegionType, RememberedSet};
+// G1CORE-11: `RegionHeap` is intentionally NOT re-exported — it is an
+// unused prototype with known-unsound conservative slot rewriting (see the
+// `#[deprecated]` note on the type). The production region-based collector
+// is `G1Collector` (`g1.rs`), reached through `VmHeap::G1`.
+pub use region::{RegionType, RememberedSet};
 pub use satb::{flush_thread_satb_buffer, satb_thread_local_log, SatbBuffer, SatbQueue};
 pub use tlab::Tlab;
 pub use vm_heap::{GcBackend, VmHeap};

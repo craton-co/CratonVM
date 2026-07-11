@@ -439,28 +439,50 @@ impl VmHeap {
     }
 
     /// BUG-03 — whether this heap backend supports the cross-thread STW JIT
-    /// TLAB skip-region protocol (i.e. its young collection is the
-    /// generational non-moving sweep that consumes
-    /// [`GenerationalHeap::set_jit_tlab_skip_regions`]). The collector only
-    /// engages the forcible in-JIT-peer take-over when this is `true`, so the
-    /// G1 path keeps its existing (cooperative-wait) behaviour.
+    /// TLAB skip-region protocol, i.e. it can collect safely while a frozen
+    /// in-JIT peer holds an un-retired TLAB:
+    ///
+    /// - Generational: the young collection degrades to the non-moving sweep
+    ///   that consumes [`GenerationalHeap::set_jit_tlab_skip_regions`].
+    /// - G1 (INT-3): the published tails are skipped by every region walker
+    ///   and their regions (plus every region holding a conservative frozen-
+    ///   peer root — the VM pins those via
+    ///   [`crate::gc_quiescence::add_pinned_jit_root`]) are excluded from the
+    ///   CSet, so nothing a frozen peer can address moves.
+    /// - ZGC (INT-3 residual): trivially safe — `ZgcRealHeap` is a
+    ///   non-moving STW mark-sweep whose sweep walks the allocation-base
+    ///   REGISTRY (never linear memory), and [`Self::refill_tlab`] never
+    ///   hands ZGC mutators a TLAB, so un-retired tails cannot exist. A
+    ///   frozen peer's conservative roots are ordinary (pinned-by-design)
+    ///   mark roots.
+    ///
+    /// The collector only engages the forcible in-JIT-peer take-over when
+    /// this is `true` — now on every backend.
     pub fn supports_jit_tlab_skip(&self) -> bool {
-        matches!(self, VmHeap::Generational(_))
+        true
     }
 
-    /// BUG-03 — publish/clear the reserved TLAB tails of forcibly-stopped
-    /// in-JIT peers so the next non-moving young sweep skips them. No-op on
-    /// backends without the protocol (see [`Self::supports_jit_tlab_skip`]).
+    /// BUG-03 / INT-3 — publish the reserved TLAB tails of forcibly-stopped
+    /// in-JIT peers so the collection skips them (non-moving-sweep skip list
+    /// on Generational; region-walker skip + CSet exclusion on G1). No-op on
+    /// ZGC, whose mutators never hold TLABs (the published list is always
+    /// empty there — see [`Self::supports_jit_tlab_skip`]).
     pub fn set_jit_tlab_skip_regions(&self, regions: &[(usize, usize)]) {
-        if let VmHeap::Generational(h) = self {
-            h.set_jit_tlab_skip_regions(regions);
+        match self {
+            VmHeap::Generational(h) => h.set_jit_tlab_skip_regions(regions),
+            VmHeap::G1(h) => h.set_jit_tlab_skip_regions(regions),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => {}
         }
     }
 
-    /// BUG-03 — clear any published JIT TLAB skip regions.
+    /// BUG-03 / INT-3 — clear any published JIT TLAB skip regions.
     pub fn clear_jit_tlab_skip_regions(&self) {
-        if let VmHeap::Generational(h) = self {
-            h.clear_jit_tlab_skip_regions();
+        match self {
+            VmHeap::Generational(h) => h.clear_jit_tlab_skip_regions(),
+            VmHeap::G1(h) => h.clear_jit_tlab_skip_regions(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => {}
         }
     }
 
@@ -619,6 +641,25 @@ impl VmHeap {
         #[cfg(debug_assertions)]
         clear_pending_pre_barrier();
         dispatch!(self, set_field(obj, index, value))
+    }
+
+    /// INT-8: field store with the G1 SATB pre-barrier SUPPRESSED. Reserved
+    /// for the weak-reference PROTOCOL writes (the pre-collection referent
+    /// null pass and the remark-time referent clears): those are not
+    /// semantic overwrites, and SATB-logging them recorded every active
+    /// referent as a mark root — the taint that made bitmap-based reference
+    /// processing inert (see `G1Collector::set_field_no_satb`). On the
+    /// Generational and ZGC backends this is a plain `set_field`: their
+    /// reference protocols never depended on hiding these writes (Gen uses
+    /// the watched-referents channel; ZGC processes references against its
+    /// own non-moving mark), so no behavior change there.
+    pub fn set_field_suppress_satb(&self, obj: ObjectRef, index: usize, value: Value) {
+        #[cfg(debug_assertions)]
+        clear_pending_pre_barrier();
+        match self {
+            VmHeap::G1(h) => h.collector.set_field_no_satb(obj, index, value),
+            other => dispatch!(other, set_field(obj, index, value)),
+        }
     }
 
     pub fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
@@ -1061,9 +1102,13 @@ impl VmHeap {
                 }
             }
             VmHeap::Generational(h) => {
-                if let Some(q) = h.satb_queue_handle() {
+                // Clone-free: this runs on EVERY JIT helper entry, and the
+                // common case (no concurrent old-gen mark running) is a
+                // single Acquire load — don't pay an Arc refcount round
+                // trip just to check `is_active`.
+                if let Some(q) = h.satb_queue_ref() {
                     if q.is_active() {
-                        crate::satb::flush_thread_satb_buffer(&q);
+                        crate::satb::flush_thread_satb_buffer(q);
                     }
                 }
             }
@@ -1270,6 +1315,18 @@ impl VmHeap {
         }
     }
 
+    /// INT-8: publish the referent-slot skip set for the cycle that
+    /// [`Self::g1_start_concurrent_mark`] just opened — the Weak/Soft/Phantom
+    /// `Reference` OBJECT addresses from the VM's reference registry,
+    /// snapshotted inside the same initial-mark STW. Must run BEFORE
+    /// [`Self::g1_mark_roots`] seeds the gray set (the skip set gates how
+    /// Reference objects are scanned). No-op on other backends.
+    pub fn g1_set_reference_skip_set(&self, addrs: &[usize]) {
+        if let VmHeap::G1(state) = self {
+            state.collector.set_reference_skip_set(addrs);
+        }
+    }
+
     /// Mark roots into G1's mark bitmap.
     pub fn g1_mark_roots(&self, roots: &[cratonvm_types::ObjectRef]) {
         if let VmHeap::G1(g1) = self {
@@ -1335,14 +1392,30 @@ impl VmHeap {
     /// 3. drains the gray set to a fixed point (including the overflow
     ///    rescans — `concurrent_mark_step` returns `false` until both the
     ///    worklist is empty and no overflow recovery is pending);
-    /// 4. `cleanup()` — per-region liveness, in-place free of wholly-dead
+    /// 4. INT-8 — when `process_refs` is supplied, invokes it with the
+    ///    post-remark liveness predicate (`G1Collector::is_live_after_mark`:
+    ///    bitmap + TAMS snapshot; conservative LIVE without positive
+    ///    evidence). The callback runs the VM's reference processing
+    ///    (clears, queue links, finalizer/cleaner submissions) and returns
+    ///    the addresses that must be RESURRECTED — dead finalizables about
+    ///    to run `finalize()`, pending cleaner chains, policy-retained soft
+    ///    referents. Those are marked gray and the closure re-drained, so
+    ///    step 5 cannot free them. This window — bitmap complete, nothing
+    ///    freed yet — is the only point in the cycle where weak/soft refs
+    ///    to dead OLD-region referents can be cleared (evacuation pauses
+    ///    only ever see CSet deaths);
+    /// 5. `cleanup()` — per-region liveness, in-place free of wholly-dead
     ///    Old regions, humongous reclaim, SATB deactivation — while the
     ///    world is still stopped.
     ///
     /// Returns `false` (and does nothing) when no cycle is active, so a
     /// second initiator that lost the STW race cannot re-run remark against
     /// an already-completed cycle.
-    pub fn g1_final_remark_and_cleanup(&self, roots: &[cratonvm_types::ObjectRef]) -> bool {
+    pub fn g1_final_remark_and_cleanup(
+        &self,
+        roots: &[cratonvm_types::ObjectRef],
+        process_refs: Option<&mut dyn FnMut(&dyn Fn(usize) -> bool) -> Vec<usize>>,
+    ) -> bool {
         if let VmHeap::G1(state) = self {
             let Some(ctrl) = state.concurrent_mark.lock().take() else {
                 // Defensive: a marking-active phase with no controller is an
@@ -1370,6 +1443,15 @@ impl VmHeap {
                 steps,
                 outcome.is_ok(),
             );
+            // INT-8 (step 4): reference processing against the completed
+            // bitmap, then resurrection of everything the processor handed
+            // out, BEFORE cleanup can free it.
+            if let Some(cb) = process_refs {
+                let collector = &state.collector;
+                let is_live = |addr: usize| collector.is_live_after_mark(addr);
+                let resurrect = cb(&is_live);
+                collector.resurrect_after_remark(&resurrect);
+            }
             state
                 .collector
                 .gc_state
