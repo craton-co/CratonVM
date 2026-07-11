@@ -17,9 +17,9 @@
 //!
 //! # Tuning
 //!
-//! For choosing a backend (Generational vs G1 vs ZGC), sizing the heap,
-//! interpreting JFR GC events, and diagnosing common pause / allocation
-//! symptoms, see [`docs/gc-tuning.md`](https://github.com/craton-co/cratonvm/blob/main/docs/gc-tuning.md)
+//! For the backend architectures (Generational vs G1 vs ZGC), the VM↔GC
+//! protocol, correctness status, tuning knobs and the diagnostic
+//! switches, see [`docs/GC.md`](https://github.com/craton-co/cratonvm/blob/main/docs/GC.md)
 //! in the workspace root.
 
 // Pre-existing clippy lints in this low-level GC crate that are style/judgment
