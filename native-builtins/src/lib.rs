@@ -58415,15 +58415,17 @@ fn native_cb_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 // ===========================================================================
 // Base64 — Encoder/Decoder for basic, URL-safe, and MIME variants
-// Encoder = 1-field synthetic (field 0 = Int variant tag)
+// Encoder = 1-field synthetic (field 0 = Int variant tag plus flags)
 // Decoder = 1-field synthetic (field 0 = Int variant tag)
-// Tags: 0 = basic, 1 = url-safe, 2 = MIME
+// Tags: 0 = basic, 1 = url-safe, 2 = MIME; bit 2 = no padding.
 // ===========================================================================
 
 const B64_FIELD_VARIANT: usize = 0;
 const B64_VARIANT_BASIC: i32 = 0;
 const B64_VARIANT_URL: i32 = 1;
 const B64_VARIANT_MIME: i32 = 2;
+const B64_VARIANT_MASK: i32 = 0b11;
+const B64_FLAG_NO_PADDING: i32 = 1 << 2;
 
 const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const B64_URL_CHARS: &[u8; 64] =
@@ -58708,9 +58710,13 @@ fn b64_write_byte_array(ctx: &mut dyn NativeContext, data: &[u8]) -> ObjectRef {
 /// Helper: get variant tag from encoder/decoder `this`
 fn b64_variant(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
     match ctx.get_field(this, B64_FIELD_VARIANT) {
-        Value::Int(v) => v,
+        Value::Int(v) => v & B64_VARIANT_MASK,
         _ => B64_VARIANT_BASIC,
     }
+}
+
+fn b64_no_padding(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    matches!(ctx.get_field(this, B64_FIELD_VARIANT), Value::Int(v) if v & B64_FLAG_NO_PADDING != 0)
 }
 
 fn native_b64_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -58723,8 +58729,9 @@ fn native_b64_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(None),
     };
     let variant = b64_variant(ctx, this);
+    let no_padding = b64_no_padding(ctx, this);
     let bytes = b64_read_byte_array(ctx, src);
-    let encoded = b64_encode(&bytes, variant, false);
+    let encoded = b64_encode(&bytes, variant, no_padding);
     let result = b64_write_byte_array(ctx, &encoded);
     Ok(Some(Value::Object(Some(result))))
 }
@@ -58739,8 +58746,9 @@ fn native_b64_encode_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => return Ok(None),
     };
     let variant = b64_variant(ctx, this);
+    let no_padding = b64_no_padding(ctx, this);
     let bytes = b64_read_byte_array(ctx, src);
-    let encoded = b64_encode(&bytes, variant, false);
+    let encoded = b64_encode(&bytes, variant, no_padding);
     let s = String::from_utf8_lossy(&encoded);
     let result = ctx.create_string(&s);
     Ok(Some(Value::Object(Some(result))))
@@ -58751,8 +58759,11 @@ fn native_b64_without_padding(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let variant = b64_variant(ctx, this);
-    b64_alloc_encoder(ctx, variant)
+    let state = match ctx.get_field(this, B64_FIELD_VARIANT) {
+        Value::Int(v) => v,
+        _ => B64_VARIANT_BASIC,
+    };
+    b64_alloc_encoder(ctx, state | B64_FLAG_NO_PADDING)
 }
 
 fn native_b64_decode_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -78590,6 +78601,48 @@ mod vector_support_essential_tests {
             ctx.get_field_by_name(queue, "count"),
             Value::Object(Some(count))
         );
+    }
+}
+
+#[cfg(test)]
+mod base64_encoder_tests {
+    use super::*;
+    use crate::test_utils::MockNativeContext;
+    use cratonvm_types::ArrayElementType;
+
+    #[test]
+    fn url_encoder_without_padding_preserves_flag_for_encode_to_string() {
+        let mut ctx = MockNativeContext::new();
+        let encoder = match native_b64_get_url_encoder(&mut ctx, &[])
+            .expect("getUrlEncoder succeeds")
+            .expect("getUrlEncoder returns encoder")
+        {
+            Value::Object(Some(value)) => value,
+            other => panic!("expected encoder, got {other:?}"),
+        };
+        let unpadded = match native_b64_without_padding(&mut ctx, &[Value::Object(Some(encoder))])
+            .expect("withoutPadding succeeds")
+            .expect("withoutPadding returns encoder")
+        {
+            Value::Object(Some(value)) => value,
+            other => panic!("expected encoder, got {other:?}"),
+        };
+        let input = ctx.new_array(ArrayElementType::Byte, 2);
+        ctx.set_array_element(input, 0, Value::Int(0xff));
+        ctx.set_array_element(input, 1, Value::Int(0xff));
+
+        let encoded = match native_b64_encode_to_string(
+            &mut ctx,
+            &[Value::Object(Some(unpadded)), Value::Object(Some(input))],
+        )
+        .expect("encodeToString succeeds")
+        .expect("encodeToString returns a string")
+        {
+            Value::Object(Some(value)) => value,
+            other => panic!("expected String, got {other:?}"),
+        };
+
+        assert_eq!(ctx.read_string(encoded).as_deref(), Some("__8"));
     }
 }
 
