@@ -106,6 +106,16 @@ churn probes, not on deep recursion. Also: Gen+JIT BinaryTrees(16)
 produces no output within 600s on BOTH the wave-3 dev binary and the INT-3
 binary (pre-existing; JIT-frame-scan throughput class, cf. BUG-01).
 
+FRESHNESS CHECK (2026-07-11, dev tip incl. all four waves + INT-3
+residuals, binary `gcprobes-0710/cratonvm-docverify`, idle host): MTChurn
+G1+JIT passed 9/9 — the multi-threaded lost-increment manifestation is now
+substantially rarer than the original ~1/5 (the INT-3 takeover + wave
+fixes narrowed the window; NOT proven closed — it remains load-sensitive
+and the quota-race mechanism is still present on dev). BinaryTrees(16)
+G1+JIT remains the reliable reproducer (TOTAL 89207 vs 14723759 this
+run). Everything else in the kit — RefCheck/RefCheckOld/Churn/Copy/
+Humongous/SpinPoll × Gen/G1/ZGC — is HotSpot-identical on this tip.
+
 ## 2. G1/ZGC: STW hang risk when a JIT thread never polls (INT-3)
 `stw_take_over_and_wait` falls back to a plain unbounded `wait_for_all()`
 for non-Generational backends (`supports_jit_tlab_skip()` was

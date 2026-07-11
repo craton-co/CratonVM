@@ -4,6 +4,67 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-11 WildFly Surefire-fork boot-crash follow-up: 2 more GC-staleness sites FIXED (6/10 → 9/10 sample); residual narrowed to a concurrent extension-loading race + the known STW JIT-takeover stall
+
+Follow-up to the entry directly below. Investigating the residual's two reported symptoms
+(`ProcessorInfo.readCPUMask()` `NoSuchMethodError`, `ParallelBootOperationStepHandler` NPE) found the
+identical unpinned-`ObjectRef`-across-`ensure_class_initialized`+`alloc_object` pattern in two more
+functions, both backing *every* `InputStreamReader`/`OutputStreamWriter` construction VM-wide:
+
+- FIXED: `native-io/src/stream_decoder.rs::alloc_stream_decoder` and
+  `native-io/src/stream_encoder.rs::alloc_stream_encoder` held their `InputStream`/`OutputStream`
+  parameter across the same two GC-risking calls (`ensure_class_initialized("sun/nio/cs/StreamDecoder"
+  /StreamEncoder")`, `alloc_object`) before storing it into the new `StreamDecoder`/`StreamEncoder`'s
+  field — same "Family 1" pattern as the sibling `lang_class.rs` fix. Verified: re-running the identical
+  10-class sample against a binary with all three fixes raised the "clears the original crash" rate from
+  6/10 to **9/10**.
+- OPEN, better characterized (updated): [`wildfly-parallel-boot-stale-objectref-residual.md`](wildfly-parallel-boot-stale-objectref-residual.md) —
+  the one remaining class in the sample does **not** deterministically hit the original crash: 3 runs
+  against the identical fixed binary gave 3 *different* outcomes, including a *new* signature
+  (`WFLYCTL0153: No META-INF/services/org.jboss.as.controller.Extension found`) for a *different*
+  specific extension each time. This points at a genuinely concurrent race in WildFly's own
+  `DeferredExtensionContext`/`FutureTask`-based extension loading, not another single fixed
+  unprotected-`ObjectRef` site. Separately reconfirmed (via a live-attach attempt, though it missed the
+  exact stall window) that the STW cross-thread JIT-takeover stall documented in
+  `wildfly-gc-barrier-boot-hang-and-harness-fixes.md` (main-thread instance fixed; the
+  EnhancedQueueExecutor-worker-parked-in-futex instance explicitly left OPEN as high-regression-risk
+  deep GC-barrier work) still reproduces on current dev — several "boots further, still fails" classes
+  show the identical `rounds=64 ... taken=0` signature.
+
+## 2026-07-11 WildFly Surefire-fork boot-crash (96% of suite failures) FIXED — reflection-object GC-staleness; residual stale-`ObjectRef` sites found elsewhere in boot
+
+Root-caused and fixed the dominant blocker for the WildFly suite under CratonVM: the managed server
+spawned by Arquillian from within a CratonVM-run Surefire fork exited with code 1 before writing a
+single line to `server.log`, in 583/605 (96%) of `testsuite/integration/basic` failures in round 6.
+
+- FIXED/RETIRED: [`wildfly-standalone-managed-server-boot-fails-under-surefire-fork.md`](../internal/fixed-suite-bugs/wildfly-standalone-managed-server-boot-fails-under-surefire-fork.md) —
+  `create_constructor_object`/`create_method_object`/`create_field_object`
+  (`native-builtins/src/lang_class.rs`) held their freshly-`alloc_object`'d instance (and its
+  `class_mirror`/`parameterTypes`/etc. locals) as unpinned `ObjectRef`s across several subsequent
+  GC-triggering classloading calls, in violation of the documented `pin_native_root` contract. A moving
+  GC landing in that window (reliably triggered by WildFly's `ServiceLoader`-based extension bootstrap,
+  ~500-750 module jars) corrupted the returned reflection object, surfacing as
+  `Constructor.newInstance: no declaring class` for several `Extension` SPI providers (Elytron, IO,
+  SecurityManager, clustering) — which silently dropped those extensions from the registry, cascading
+  into `AbstractControllerService`'s `this.controller is null` NPE crashing boot before any logging
+  subsystem could open `server.log`. Isolated repros of the exact same captured launch command never
+  reproduced this because a minimal, non-Surefire-forked process doesn't generate enough concurrent
+  classloading pressure to reliably land a GC in the danger window. Fixed by pinning + re-reading
+  forwarded references in all three constructors, mirroring the pattern `build_mirror_array_comp`
+  already used internally. Verified against the real harness (not an isolated repro): the specific
+  `ServiceLoader` corruption warning is gone in every subsequent run, and 6/10 sampled previously-crashing
+  classes now boot far past the original crash point (60-70s of real subsystem processing instead of an
+  instant 8-13s crash).
+- OPEN (new, split off — same general bug class, different call sites, not fixed by the above):
+  [`wildfly-parallel-boot-stale-objectref-residual.md`](wildfly-parallel-boot-stale-objectref-residual.md) —
+  4/10 sampled classes still hit the identical `this.controller is null` crash (deterministically for at
+  least one class across 3 retries), and classes that now boot further sometimes hit a *different* pair
+  of failures bearing the same "stale `ObjectRef` resolves to a reused all-zero-header slot" fingerprint:
+  a `NoSuchMethodError: java/lang/Object.read([CII)I` in `ProcessorInfo.readCPUMask()`, and a
+  `NullPointerException` on `ModelValue.has` inside `ParallelBootOperationStepHandler`'s
+  `EnhancedQueueExecutor` worker threads (a genuinely multi-threaded context). Needs its own
+  investigation before a full-suite re-run can give an accurate post-fix failure count.
+
 ## 2026-07-11 Uncaught-exception fatal-error misattribution FIXED (`java/lang/Thread`/`CommonToken` reported instead of the real Throwable); 2 real bugs unmasked
 
 Investigated the confirmed-but-unexplained pattern already flagged in

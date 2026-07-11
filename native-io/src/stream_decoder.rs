@@ -108,6 +108,17 @@ pub(crate) fn alloc_stream_decoder(
     charset_name: &str,
     prop: Option<PropState>,
 ) -> ObjectRef {
+    // GC-safety: `is` is a Rust local the caller extracted from its own args
+    // slice before calling in (see `native_sd_for_isr_charset`/`_name`), and
+    // `ensure_class_initialized` below runs `<clinit>` bytecode — arbitrary,
+    // allocating — before `is` is finally stored into the new object's `in`
+    // field. Per the `pin_native_root` contract, a moving GC in that window
+    // leaves `is` stale (resolving to whatever now occupies the reused slot),
+    // silently corrupting the StreamDecoder's own `in` field. Same "Family 1"
+    // native-stale-local pattern as the WildFly Surefire-fork boot-crash fix
+    // in `native-builtins/src/lang_class.rs` — pin now, re-read right before
+    // use.
+    let is_pin = ctx.pin_native_root(is);
     let cid = match ctx.ensure_class_initialized("sun/nio/cs/StreamDecoder") {
         Ok(c) => c,
         // `ensure_class_initialized` can transiently fail under concurrent
@@ -132,7 +143,9 @@ pub(crate) fn alloc_stream_decoder(
     // hand-picked scratch few (see module doc for why hardcoding a smaller
     // count and indexing into it corrupted real fields).
     let obj = ctx.alloc_object(cid, 0);
+    let is = ctx.read_native_pin(is_pin, is);
     ctx.set_field_by_name(obj, "in", Value::Object(Some(is)));
+    ctx.unpin_native_roots(is_pin);
     let key = sd_key(ctx, obj);
     sd_table().lock().unwrap().insert(
         key,

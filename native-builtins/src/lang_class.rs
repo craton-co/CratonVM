@@ -3834,14 +3834,33 @@ pub(crate) fn create_field_object(
     let base = core::cmp::max(FIELD_NUM_FIELDS_LEGACY_FLOOR, jdk_layout_fields);
     let num_fields = base + FIELD_EXTRA_SLOTS;
     let obj = ctx.alloc_object(class_id, num_fields);
+    // GC-safety: `get_class_mirror`/`create_string`/`descriptor_to_class_mirror_via_loader`
+    // below can all trigger classloading (and therefore GC). A moving collection
+    // between `alloc_object` and the `set_field_by_name` block leaves these raw
+    // `ObjectRef`s stale — per `pin_native_root`'s contract, a stale ref then
+    // resolves to whatever now occupies the reused slot (typically a bare
+    // `java.lang.Object`), so the Field would silently get a wrong/missing
+    // `clazz`/`name`/`type`. Pin everything now and re-read the forwarded
+    // reference right before use (mirrors `create_method_object`).
+    let obj_pin = ctx.pin_native_root(obj);
 
     let class_mirror = ctx.get_class_mirror(meta.declaring_class_id);
+    let class_mirror_pin = ctx.pin_native_root(class_mirror);
     let name_str = ctx.create_string(&meta.name);
+    let name_str_pin = ctx.pin_native_root(name_str);
     // Loader-faithful field type (gated): a field on a bytecode-enhanced /
     // child-loader class reports that loader's copy of the field type.
     let type_mirror =
         descriptor_to_class_mirror_via_loader(ctx, &meta.descriptor, meta.declaring_class_id);
+    let type_mirror_pin = ctx.pin_native_root(type_mirror);
     let desc_str = ctx.create_string(&meta.descriptor);
+    let desc_str_pin = ctx.pin_native_root(desc_str);
+
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    let class_mirror = ctx.read_native_pin(class_mirror_pin, class_mirror);
+    let name_str = ctx.read_native_pin(name_str_pin, name_str);
+    let type_mirror = ctx.read_native_pin(type_mirror_pin, type_mirror);
+    let desc_str = ctx.read_native_pin(desc_str_pin, desc_str);
 
     // --- Real JDK Field layout (visible to Java bytecode via Getfield) ---
     ctx.set_field_by_name(obj, "clazz", Value::Object(Some(class_mirror)));
@@ -3865,6 +3884,7 @@ pub(crate) fn create_field_object(
     );
     ctx.set_field(obj, base + FIELD_EXTRA_OFFSET_ACCESSIBLE, Value::Int(0));
 
+    ctx.unpin_native_roots(obj_pin);
     obj
 }
 
@@ -5008,9 +5028,27 @@ pub(crate) fn create_method_object(
     let base = core::cmp::max(METHOD_NUM_FIELDS_LEGACY_FLOOR, jdk_layout_fields);
     let num_fields = base + METHOD_EXTRA_SLOTS;
     let obj = ctx.alloc_object(class_id, num_fields);
+    // GC-safety: every reflective mirror/array/string built below can trigger
+    // classloading (and therefore GC) via `get_class_mirror` /
+    // `descriptor_to_class_mirror[_via_loader]` / `build_mirror_array_comp` /
+    // `create_string`. A moving collection between `alloc_object` and the
+    // `set_field_by_name` block leaves these raw `ObjectRef`s stale — per
+    // `pin_native_root`'s contract, a stale ref then resolves to whatever now
+    // occupies the reused slot (typically a bare `java.lang.Object`), so the
+    // Method silently gets a wrong/missing `clazz`/`name`/etc. Under light
+    // allocation pressure this is rare enough to go unnoticed; under the heavy
+    // classloading churn of WildFly's ServiceLoader-based extension bootstrap
+    // (500+ module jars) it reproduces deterministically as
+    // "Constructor.newInstance: no declaring class" (the analogous
+    // `create_constructor_object` bug it shares this pattern with — see
+    // docs/internal/fixed-suite-bugs/wildfly-standalone-managed-server-boot-fails-under-surefire-fork.md).
+    // Pin everything now and re-read the forwarded reference right before use.
+    let obj_pin = ctx.pin_native_root(obj);
 
     let class_mirror = ctx.get_class_mirror(meta.declaring_class_id);
+    let class_mirror_pin = ctx.pin_native_root(class_mirror);
     let name_str = ctx.create_string(&meta.name);
+    let name_str_pin = ctx.pin_native_root(name_str);
 
     // Parse descriptor for param types and return type. Resolve reference types
     // through the declaring class's own loader (loader-faithful) so a method on a
@@ -5018,6 +5056,7 @@ pub(crate) fn create_method_object(
     // return / parameter types (gated; see `descriptor_to_class_mirror_via_loader`).
     let (param_descs, ret_desc) = parse_descriptor_param_and_return(&meta.descriptor);
     let ret_mirror = descriptor_to_class_mirror_via_loader(ctx, &ret_desc, meta.declaring_class_id);
+    let ret_mirror_pin = ctx.pin_native_root(ret_mirror);
 
     // Parameter type mirrors array. GC-safe: `descriptor_to_class_mirror`
     // allocates/loads classes, so the array is pinned across the fill loop
@@ -5027,6 +5066,7 @@ pub(crate) fn create_method_object(
     let param_arr = build_mirror_array_comp(ctx, class_comp, param_descs.len(), |ctx, i| {
         descriptor_to_class_mirror_via_loader(ctx, &param_descs[i], decl_cid)
     });
+    let param_arr_pin = ctx.pin_native_root(param_arr);
 
     // G2: Always allocate non-null array fields. JDK 25 `Method` and its
     // parent `Executable` declare `exceptionTypes` (Class[]) and several
@@ -5053,7 +5093,19 @@ pub(crate) fn create_method_object(
             let desc = format!("L{};", exception_names[i]);
             descriptor_to_class_mirror(ctx, &desc)
         });
+    let exception_arr_pin = ctx.pin_native_root(exception_arr);
     let desc_str = ctx.create_string(&meta.descriptor);
+    let desc_str_pin = ctx.pin_native_root(desc_str);
+
+    // Re-read every pinned local's forwarded reference now that all the
+    // classloading/allocation above has settled.
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    let class_mirror = ctx.read_native_pin(class_mirror_pin, class_mirror);
+    let name_str = ctx.read_native_pin(name_str_pin, name_str);
+    let ret_mirror = ctx.read_native_pin(ret_mirror_pin, ret_mirror);
+    let param_arr = ctx.read_native_pin(param_arr_pin, param_arr);
+    let exception_arr = ctx.read_native_pin(exception_arr_pin, exception_arr);
+    let desc_str = ctx.read_native_pin(desc_str_pin, desc_str);
 
     // --- Real JDK Method layout (visible to Java bytecode via Getfield) ---
     ctx.set_field_by_name(obj, "clazz", Value::Object(Some(class_mirror)));
@@ -5170,10 +5222,15 @@ pub(crate) fn create_method_object(
     // Signature attribute for `Field.getGenericType()`.
     if let Some(sig) = ctx.method_signature(meta.declaring_class_id, &meta.name, &meta.descriptor) {
         let sig_obj = ctx.create_string(&sig);
+        // `method_signature`/`create_string` above can also allocate/classload —
+        // re-read `obj` before writing into it.
+        let obj = ctx.read_native_pin(obj_pin, obj);
         ctx.set_field_by_name(obj, "signature", Value::Object(Some(sig_obj)));
     }
 
     // --- CratonVM extra metadata (append after JDK layout) ---
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    let desc_str = ctx.read_native_pin(desc_str_pin, desc_str);
     ctx.set_field(
         obj,
         base + METHOD_EXTRA_OFFSET_DESC,
@@ -5186,6 +5243,7 @@ pub(crate) fn create_method_object(
     );
     ctx.set_field(obj, base + METHOD_EXTRA_OFFSET_ACCESSIBLE, Value::Int(0));
 
+    ctx.unpin_native_roots(obj_pin);
     obj
 }
 
@@ -7353,8 +7411,30 @@ pub(crate) fn create_constructor_object(
     let base = core::cmp::max(CONSTRUCTOR_NUM_FIELDS_LEGACY_FLOOR, jdk_layout_fields);
     let num_fields = base + CONSTRUCTOR_EXTRA_SLOTS;
     let obj = ctx.alloc_object(class_id, num_fields);
+    // GC-safety (root cause of
+    // docs/internal/fixed-suite-bugs/wildfly-standalone-managed-server-boot-fails-under-surefire-fork.md):
+    // every reflective mirror/array/string built below can trigger classloading
+    // (and therefore GC) via `get_class_mirror` / `descriptor_to_class_mirror[_via_loader]`
+    // / `build_mirror_array_comp` / `create_string`. A moving collection between
+    // `alloc_object` and the `set_field_by_name` block below left these raw
+    // `ObjectRef`s stale — per `pin_native_root`'s contract, a stale ref resolves
+    // to whatever now occupies the reused slot (typically a bare
+    // `java.lang.Object`, which has no `clazz` field) — so the Constructor
+    // silently got a wrong/missing `clazz`, surfacing later as
+    // "Constructor.newInstance: no declaring class". This was rare enough to go
+    // unnoticed under light allocation pressure, but reproduced deterministically
+    // under WildFly's ServiceLoader-based extension bootstrap (500+ module jars
+    // loaded on the flat WF32-fix classpath), which skipped several extensions
+    // (Elytron, IO, SecurityManager, the clustering ones) via exactly this path,
+    // cascading into the ModelController never getting registered and a
+    // `NullPointerException` ("this.controller is null") crashing server boot
+    // before jboss-logmanager could even open server.log. Pin everything now and
+    // re-read the forwarded reference right before use (mirrors
+    // `create_method_object`, which has the identical pattern).
+    let obj_pin = ctx.pin_native_root(obj);
 
     let class_mirror = ctx.get_class_mirror(meta.declaring_class_id);
+    let class_mirror_pin = ctx.pin_native_root(class_mirror);
 
     // Parse descriptor for param types
     let (param_descs, _) = parse_descriptor_param_and_return(&meta.descriptor);
@@ -7366,7 +7446,9 @@ pub(crate) fn create_constructor_object(
     let param_arr = build_mirror_array_comp(ctx, class_comp, param_descs.len(), |ctx, i| {
         descriptor_to_class_mirror_via_loader(ctx, &param_descs[i], ctor_decl_cid)
     });
+    let param_arr_pin = ctx.pin_native_root(param_arr);
     let desc_str = ctx.create_string(&meta.descriptor);
+    let desc_str_pin = ctx.pin_native_root(desc_str);
 
     // WP2.1 вЂ” populate `exceptionTypes` from the JVMS В§4.7.5 `Exceptions`
     // attribute. The JDK `Constructor.getExceptionTypes()` Java method
@@ -7383,6 +7465,15 @@ pub(crate) fn create_constructor_object(
             let desc = format!("L{};", exception_names[i]);
             descriptor_to_class_mirror(ctx, &desc)
         });
+    let exception_arr_pin = ctx.pin_native_root(exception_arr);
+
+    // Re-read every pinned local's forwarded reference now that all the
+    // classloading/allocation above has settled.
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    let class_mirror = ctx.read_native_pin(class_mirror_pin, class_mirror);
+    let param_arr = ctx.read_native_pin(param_arr_pin, param_arr);
+    let desc_str = ctx.read_native_pin(desc_str_pin, desc_str);
+    let exception_arr = ctx.read_native_pin(exception_arr_pin, exception_arr);
 
     // --- Real JDK Constructor layout ---
     ctx.set_field_by_name(obj, "clazz", Value::Object(Some(class_mirror)));
@@ -7402,10 +7493,15 @@ pub(crate) fn create_constructor_object(
     // `Constructor.getGenericParameterTypes()` (a registered native) was correct.
     if let Some(sig) = ctx.method_signature(meta.declaring_class_id, &meta.name, &meta.descriptor) {
         let sig_obj = ctx.create_string(&sig);
+        // `method_signature`/`create_string` above can also allocate/classload —
+        // re-read `obj` before writing into it.
+        let obj = ctx.read_native_pin(obj_pin, obj);
         ctx.set_field_by_name(obj, "signature", Value::Object(Some(sig_obj)));
     }
 
     // --- CratonVM extra metadata ---
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    let desc_str = ctx.read_native_pin(desc_str_pin, desc_str);
     ctx.set_field(
         obj,
         base + CONSTRUCTOR_EXTRA_OFFSET_DESC,
@@ -7424,6 +7520,7 @@ pub(crate) fn create_constructor_object(
 
     register_constructor_mirror_side(obj, &meta.descriptor, param_descs.len() as i32, false);
 
+    ctx.unpin_native_roots(obj_pin);
     obj
 }
 
@@ -13976,6 +14073,41 @@ pub(crate) fn native_class_get_annotated_interfaces(
         }
     }
     Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `TypeVariable.getAnnotatedBounds()[Ljava/lang/reflect/AnnotatedType;`.
+///
+/// Synthetic TypeVariable mirrors have a native `getBounds()` but the JDK's
+/// default `getAnnotatedBounds()` body cannot run on the synthetic interface
+/// receiver. Materialize the same bound list as minimal AnnotatedTypes so
+/// ByteBuddy can inspect a mocked type's generic methods.
+pub(crate) fn native_type_variable_get_annotated_bounds(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let bounds = match ctx.invoke_virtual(
+        this,
+        "getBounds",
+        "()[Ljava/lang/reflect/Type;",
+        &[],
+    )? {
+        Some(Value::Object(Some(bounds))) => bounds,
+        _ => {
+            let empty = ctx.new_ref_array(ClassId::new(0), 0);
+            return Ok(Some(Value::Object(Some(empty))));
+        }
+    };
+
+    let len = ctx.array_length(bounds);
+    let annotated = ctx.new_ref_array(ClassId::new(0), len);
+    for i in 0..len {
+        if let Value::Object(Some(bound)) = ctx.get_array_element(bounds, i) {
+            let annotated_bound = make_annotated_type(ctx, bound);
+            ctx.set_array_element(annotated, i, Value::Object(Some(annotated_bound)));
+        }
+    }
+    Ok(Some(Value::Object(Some(annotated))))
 }
 
 /// Build a minimal synthetic `AnnotatedType` object wrapping a `Type`

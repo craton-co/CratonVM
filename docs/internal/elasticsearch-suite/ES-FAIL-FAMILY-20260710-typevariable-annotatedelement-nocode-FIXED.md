@@ -1,6 +1,6 @@
 # ES FAIL family - TypeVariable AnnotatedElement no-Code breaks RestClient Mockito tests
 
-Status: OPEN
+Status: RESOLVED
 
 Observed in:
 - Run: `esfull-20260710-083851`
@@ -60,3 +60,34 @@ Interpretation:
 Not duplicates:
 - This is not a Mockito bug. Mockito is only the first framework to exercise the broken reflection path in this suite slice.
 - Keep this as one family doc for the three RestClient unit rows.
+
+## Resolution (2026-07-11)
+
+Fixed by supplying a native `TypeVariable.getAnnotatedBounds()` bridge for both
+synthetic `java/lang/reflect/TypeVariable` objects and real
+`TypeVariableImpl` objects. The bridge obtains the existing `Type[]` bounds
+and wraps every entry in the same `AnnotatedType` implementation used by the
+other reflection natives.
+
+Validated on Azure host `20.83.144.174` from isolated worktree
+`/data/data/wt-es-typevariable-annotatedelement-20260711-141500`, branch
+`codex/es-typevariable-annotatedelement-20260711-141500`, with unique binary:
+`/data/data/cratonvm-targets/es-typevariable-annotatedelement-20260711-141500/release/cratonvm-es-typevariable-annotatedelement-20260711-141500-r2`.
+
+Focused JIT-on Elasticsearch run:
+`esprobe-typevariable-annotatedelement-20260711-141500-r2`.
+
+- `RestClientMultipleHostsTests`: PASS, 5 tests, 2.233s.
+- `RestClientSingleHostTests`: PASS, 9 tests, 2.805s.
+- `RestClientTests`: PASS, 10 tests, 3.606s.
+- With `CRATONVM_DBG_NOCODE=1`, none of the three target logs contained a
+  `TypeVariable`, `AnnotatedElement`, or `getAnnotatedBounds` no-Code marker.
+
+The neighboring `RestClientSingleHostIntegTests` still has separate Basic-auth
+assertion failures; it was not part of this three-row TypeVariable family.
+
+Evidence: `/data/data/es-typevariable-annotatedelement-20260711-141500-suite/results/esprobe-typevariable-annotatedelement-20260711-141500-r2/jit-typevariable-annotatedelement-r2/results.tsv`.
+
+Post-merge revalidation: after merging current `origin/dev`, run
+`esprobe-typevariable-annotatedelement-20260711-141500-r3-mergeddev` again
+passed all three target unit classes with JIT on (1.432s, 1.801s, and 2.439s).
