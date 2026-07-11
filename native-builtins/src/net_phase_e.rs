@@ -502,16 +502,53 @@ pub(crate) fn inet_addr_get(this: ObjectRef) -> Option<(String, String)> {
     inet_addr_side_table().lock().get(&this).cloned()
 }
 
+/// GC root scan for [`inet_addr_side_table`]. Same stale-pointer hazard this
+/// pattern already fixes elsewhere in this file (`gc_scan_re10_handler_roots`)
+/// and in `lib.rs` (`gc_scan_locale_roots`): the table is a process-global
+/// `HashMap<ObjectRef, _>` keyed by the synthetic mirror's identity, invisible
+/// to every other scan, so a moving young GC that relocates a live
+/// `InetAddress` mirror leaves the table keyed on a vacated from-space slot —
+/// `getHostAddress()`/`getAddress()`/`toString()` then silently miss the table
+/// and fall through to the real-JDK `holder` fallback in [`inet_addr_resolve`],
+/// which reports `0.0.0.0` instead of the mirror's real address (ES
+/// `InetAddressRandomBinaryDocValuesRangeQueryTests` CONTAINS-query false
+/// negative). Remap companion: [`gc_update_inet_addr_refs`].
+pub fn gc_scan_inet_addr_roots(out: &mut Vec<ObjectRef>) {
+    for k in inet_addr_side_table().lock().keys() {
+        out.push(*k);
+    }
+}
+
+/// Companion to [`gc_scan_inet_addr_roots`]: after a moving collection,
+/// re-key the side table so lookups keyed on the OLD `ObjectRef` still
+/// resolve — the mirror's identity is now the relocated address.
+pub fn gc_update_inet_addr_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let mut map = inet_addr_side_table().lock();
+    let drained: Vec<_> = map.drain().collect();
+    for (k, v) in drained {
+        let nk = pointer_map
+            .get(&(k.as_ptr() as usize))
+            .map(|&n| unsafe { ObjectRef::from_raw(n as *mut u8) })
+            .unwrap_or(k);
+        map.insert(nk, v);
+    }
+}
+
 /// Read an InetAddress's `(hostName, ipAddress)` resolving through every
 /// known layout: ObjectRef-keyed side table first, then the real-JDK
-/// `holder` reference field (`InetAddress$InetAddressHolder.hostName` +
-/// `.address`/`.family`), then `None`.
+/// `holder`/`holder6` reference fields (`InetAddress$InetAddressHolder.hostName`
+/// + `.address`/`.family`, `Inet6Address$Inet6AddressHolder.ipaddress`), then
+/// `None`.
 ///
 /// This is the layout-aware reader the report calls for: an `InetAddress`
-/// that was allocated by real-JDK `<init>` (not by `alloc_inet_address`)
-/// still resolves correctly because `populate_inet_holder` mirrors host/IP
-/// into the real `holder`. `pub(crate)` so sibling modules' duplicate
-/// InetAddress natives consult the same path.
+/// that was allocated by real-JDK `<init>` (not by `alloc_inet_address`) —
+/// e.g. via the un-overridden `InetAddress.getByAddress(String, byte[])`
+/// two-arg factory — still resolves correctly because `populate_inet_holder`
+/// mirrors host/IP into the real `holder`/`holder6`. `pub(crate)` so sibling
+/// modules' duplicate InetAddress natives consult the same path.
 pub(crate) fn inet_addr_resolve(
     ctx: &dyn NativeContext,
     this: ObjectRef,
@@ -526,14 +563,37 @@ pub(crate) fn inet_addr_resolve(
             Value::Object(Some(s)) => ctx.read_string(s),
             _ => None,
         };
-        let ip = match ctx.get_field_by_name(holder, "address") {
-            Value::Int(packed) => {
-                // `InetAddressHolder.address` is the IPv4 address packed
-                // big-endian into an int (Inet4Address layout).
-                let b = (packed as u32).to_be_bytes();
-                Some(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]).to_string())
-            }
-            _ => None,
+        // A real-JDK `Inet6Address` stores its 16-byte address in a SEPARATE
+        // `holder6` field (`Inet6Address$Inet6AddressHolder.ipaddress`); the
+        // base `holder.address` int is always 0 for v6 (see
+        // `populate_inet_holder`). Without checking `holder6` first, any
+        // Inet6Address that reaches this fallback reads `address == 0` and
+        // reports "0.0.0.0" instead of its real 16-byte value.
+        let ip = match ctx.get_field_by_name(this, "holder6") {
+            Value::Object(Some(holder6)) => match ctx.get_field_by_name(holder6, "ipaddress") {
+                Value::Object(Some(arr)) if ctx.array_length(arr) == 16 => {
+                    let mut octets = [0u8; 16];
+                    for (i, o) in octets.iter_mut().enumerate() {
+                        *o = match ctx.get_array_element(arr, i) {
+                            Value::Int(b) => (b & 0xff) as u8,
+                            _ => 0,
+                        };
+                    }
+                    Some(hotspot_ip_string(
+                        &std::net::Ipv6Addr::from(octets).to_string(),
+                    ))
+                }
+                _ => None,
+            },
+            _ => match ctx.get_field_by_name(holder, "address") {
+                Value::Int(packed) => {
+                    // `InetAddressHolder.address` is the IPv4 address packed
+                    // big-endian into an int (Inet4Address layout).
+                    let b = (packed as u32).to_be_bytes();
+                    Some(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]).to_string())
+                }
+                _ => None,
+            },
         };
         if host.is_some() || ip.is_some() {
             return Some((host.unwrap_or_default(), ip.unwrap_or_default()));
