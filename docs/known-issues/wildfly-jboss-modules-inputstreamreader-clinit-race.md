@@ -1,6 +1,16 @@
-# WildFly domain boot: `InputStreamReader(InputStream, Charset)` real-bytecode resolution now fails ~always during `org/jboss/modules/Main.<clinit>` — NEW blocking finding, gates the whole domain-boot investigation
+# RETRACTED: `InputStreamReader(InputStream, Charset)` "real-bytecode resolution race" during `org/jboss/modules/Main.<clinit>` — was a test-harness `JAVA_HOME` gap, not a CratonVM bug
 
-**Status: OPEN, blocking. Not fixed. Not root-caused. This is now the front-line**
+**Status: RETRACTED (2026-07-11, see the dated section at the end of this**
+**file for the full correction). This was never a CratonVM defect — set**
+**`CRATONVM_JAVA_HOME` alongside any `JAVA_HOME` shim directory used to**
+**satisfy a launcher script. Kept for the reproduction methodology and the**
+**`has_real_boot_classes()` mechanism trace, which are still accurate and**
+**useful; do not treat the "race"/"blocking" framing below as current.**
+
+<details>
+<summary>Original (incorrect) write-up, kept for history</summary>
+
+**Status (ORIGINAL, WRONG): OPEN, blocking. Not fixed. Not root-caused. This was believed to be the front-line**
 **gate for `wildfly-domain-heap-corrupt-value-timeout.md` (including BUG-03),**
 **ahead of everything previously tracked there.**
 
@@ -137,3 +147,67 @@ JAVA_HOME=<javahome> PATH=<javahome>/bin:$PATH CRATONVM_MSC_REAL_START=1 \
   timeout 5 ./bin/domain.sh
 # grep for InputStreamReader in the output — expect to see it essentially every time.
 ```
+
+
+</details>
+
+---
+
+## RETRACTED (2026-07-11, same-day follow-up) — this was never a CratonVM bug; it was a test-harness `JAVA_HOME` misconfiguration
+
+**This doc's core claim — a timing-sensitive real-bytecode resolution race
+specific to the jboss-modules.jar bootstrap — is WRONG.** Root-caused via
+temporary `CRATONVM_DBG_ISRTRACE` instrumentation added to
+`classloading/src/class_manager.rs::load_class` (added, tested, then
+reverted — never committed): at the exact point `Main.<clinit>` loads
+`java/io/InputStreamReader`, `ClassManager::has_real_boot_classes()`
+(`self.bootstrap.find_class_bytes("java/lang/Object")`) returns **`false`**,
+which routes the load through the `is_jdk_class(name) && !has_real_boot_classes()`
+fallback and fabricates a synthetic stub (whose `<init>` is declared
+`ACC_NATIVE` with no backing registration in real-JDK-mode builds, per
+`aaf64a5d`) instead of surfacing real bytecode.
+
+The reason `has_real_boot_classes()` was false: every probe script this
+investigation used (across all sessions, not just this one) sets
+`JAVA_HOME=<a directory containing only a `bin/java` symlink to the CratonVM
+binary>` — required by `domain.sh`'s own launcher convention (it execs
+`$JAVA_HOME/bin/java`). But `vm/src/config.rs::resolve_java_home` (called by
+`ClassManager`'s own boot-classpath discovery) **also** consults that exact
+same `JAVA_HOME` env var to decide where to search for real JDK class files
+(`jmods`/`lib/modules`) — and finds nothing there, because the shim directory
+only ever had the one symlink. There is a dedicated escape hatch for exactly
+this shape of conflict — `CRATONVM_JAVA_HOME`, documented in
+`resolve_java_home`'s own source comment: *"used when JAVA_HOME points at a
+cratonvm shim tree (Maven, Gradle) but boot modules must come from a real
+JDK"* — which no probe script in this investigation had ever set.
+
+**Fix: none needed in CratonVM.** Setting `CRATONVM_JAVA_HOME=<real JDK 25
+install, e.g. /home/victor/jdk25>` alongside the existing `JAVA_HOME` shim
+resolves it completely — verified **10/10** in a controlled batch (same
+methodology as the original 0/20 finding), on both a fresh WildFly extraction
+and the reused probe directory, with both the pre-existing and freshly-built
+binaries. This doc's own "isolated repros all succeed" section was actually
+already exercising a *different*, correctly-configured environment (those
+repros were run by invoking the CratonVM binary directly, with no `JAVA_HOME`
+env var set at all, letting `resolve_java_home`'s step-4 PATH-based
+auto-detection find a real system JDK) — which is why they never reproduced
+the failure the real `domain.sh`-driven runs hit 100% of the time. The
+"ruled out" list in this doc (launch mode, JVM flags, JIT on/off, binary
+version, probe-directory staleness) is still accurate — none of those were
+ever the cause — it was simply never comparing like-for-like environments.
+
+**Retiring this doc.** Boot correctly configured this way goes vastly
+further — see `wildfly-domain-heap-corrupt-value-timeout.md`'s next dated
+entry for the full downstream picture (reaching genuine sustained load,
+63K+ log lines, for the first time in this entire investigation). This file
+is kept for the historical record (the reproduction methodology and the
+`has_real_boot_classes()` mechanism trace are both independently useful) but
+should not be treated as an open CratonVM defect. Consider moving to
+`docs/internal/` once linked from the resolution above.
+
+**Lesson for future sessions on this codebase**: when a probe/test harness
+sets `JAVA_HOME` purely to satisfy a launcher SCRIPT's own convention (not
+because it's a real JDK install), also set `CRATONVM_JAVA_HOME` to a real
+JDK. This is easy to miss because the failure mode (a stray synthetic-stub
+fallback deep in early bootstrap) looks nothing like a classpath
+misconfiguration.
