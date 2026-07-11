@@ -268,3 +268,36 @@ binaries green, except two PRE-EXISTING, unrelated SIGSEGVs in `intrinsic_string
 `intrinsic_string_search` (confirmed independent of this flag — crash identically with
 `CRATONVM_JIT_GETFIELD_HELPER=1` forcing the old default too; spun off as a separate follow-up,
 not investigated further here).
+
+---
+
+## 2026-07-11 addendum: independent JIT-cache invalidation gap found (unrelated to this SIGSEGV's actual cause)
+
+While independently re-investigating this cluster (in parallel with, and
+without visibility into, the `fix/ivfknn-guarded-getfield-reverify-20260710`
+work documented immediately above), found and fixed a real but **separate**
+defect: `ClassManager::upgrade_synthetic_class` / `recompute_subclass_layouts`
+(`classloading/src/class_manager.rs`) can change a class's field layout
+mid-run (synthetic JDK stub -> real `.class` bytecode found on the
+classpath), shifting the byte offsets already-JIT-compiled `getfield`/
+`putfield` code may have baked in as x86 immediates — and nothing evicted
+that stale-compiled code. `install_jit_invalidate_hook` already existed
+(already called from `redefine_class`'s Step 8) but had **zero installers
+anywhere in the VM**, so that call was always a silent no-op.
+
+This is NOT the cause of this doc's SIGSEGV — that is conclusively the
+fabricated-`(0, false)`-compact-slot bug described in the follow-up section
+above, verified against this doc's own repro with a clean run (no SIGSEGV,
+no dmesg entry). This is a different, independently-real gap surfaced while
+looking at the same code paths: nothing else in the VM evicted JIT code
+after a layout-changing synthetic-stub upgrade, so a similar "stale baked
+offset" corruption could occur through that mechanism even with the
+fabricated-slot bug fixed. Fixed by wiring up `install_jit_invalidate_hook`
+in `vm/src/vm/vm_init.rs` (mirroring the existing
+`resolution_invalidate_adapter` pattern) and calling it from both
+layout-changing paths. Regression test added in
+`classloading/src/class_manager.rs`
+(`recompute_subclass_layouts_fires_jit_invalidate_hook_for_changed_descendants`,
+verified to fail without the fix). Full `cratonvm-classloading` (549 tests),
+`cratonvm-jit --lib` (889 tests), and targeted `cratonvm-vm` redefine tests
+pass with the fix.
