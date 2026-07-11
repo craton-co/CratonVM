@@ -67,3 +67,15 @@ recipe. Summary for this class specifically:
   `testSkewedIndex` — each produced a `NOTE: reproduce with` line before the
   timeout) that were not investigated in this session; only the hang
   (`testRandomWithFilter`) was in scope.
+
+
+---
+
+## 2026-07-10 follow-up: confirmed as the GC audit's Finding 1 (STW/monitor race)
+
+Same conclusion as
+[the DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests doc](ES-HANG-20260709-server-org-elasticsearch-search-vectors-diversifyingchildrenivfknnfloatslicedvectorquerytests-3ff8aa1c4b.md)
+— see that doc and `docs/known-issues/gc-audit-2026-07-10-open-findings.md`
+finding 1 for the full writeup. This is a VM-core GC/monitor race
+(actively investigated separately, WIP fix parked as unsafe), not an
+ES/Lucene-specific bug. Status stays OPEN.

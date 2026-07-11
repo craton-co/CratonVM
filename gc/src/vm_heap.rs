@@ -439,28 +439,44 @@ impl VmHeap {
     }
 
     /// BUG-03 — whether this heap backend supports the cross-thread STW JIT
-    /// TLAB skip-region protocol (i.e. its young collection is the
-    /// generational non-moving sweep that consumes
-    /// [`GenerationalHeap::set_jit_tlab_skip_regions`]). The collector only
-    /// engages the forcible in-JIT-peer take-over when this is `true`, so the
-    /// G1 path keeps its existing (cooperative-wait) behaviour.
+    /// TLAB skip-region protocol, i.e. it can collect safely while a frozen
+    /// in-JIT peer holds an un-retired TLAB:
+    ///
+    /// - Generational: the young collection degrades to the non-moving sweep
+    ///   that consumes [`GenerationalHeap::set_jit_tlab_skip_regions`].
+    /// - G1 (INT-3): the published tails are skipped by every region walker
+    ///   and their regions (plus every region holding a conservative frozen-
+    ///   peer root — the VM pins those via
+    ///   [`crate::gc_quiescence::add_pinned_jit_root`]) are excluded from the
+    ///   CSet, so nothing a frozen peer can address moves.
+    ///
+    /// The collector only engages the forcible in-JIT-peer take-over when
+    /// this is `true`; ZGC still takes the cooperative-wait path (and so
+    /// keeps INT-3's livelock exposure there).
     pub fn supports_jit_tlab_skip(&self) -> bool {
-        matches!(self, VmHeap::Generational(_))
+        matches!(self, VmHeap::Generational(_) | VmHeap::G1(_))
     }
 
-    /// BUG-03 — publish/clear the reserved TLAB tails of forcibly-stopped
-    /// in-JIT peers so the next non-moving young sweep skips them. No-op on
+    /// BUG-03 / INT-3 — publish the reserved TLAB tails of forcibly-stopped
+    /// in-JIT peers so the collection skips them (non-moving-sweep skip list
+    /// on Generational; region-walker skip + CSet exclusion on G1). No-op on
     /// backends without the protocol (see [`Self::supports_jit_tlab_skip`]).
     pub fn set_jit_tlab_skip_regions(&self, regions: &[(usize, usize)]) {
-        if let VmHeap::Generational(h) = self {
-            h.set_jit_tlab_skip_regions(regions);
+        match self {
+            VmHeap::Generational(h) => h.set_jit_tlab_skip_regions(regions),
+            VmHeap::G1(h) => h.set_jit_tlab_skip_regions(regions),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => {}
         }
     }
 
-    /// BUG-03 — clear any published JIT TLAB skip regions.
+    /// BUG-03 / INT-3 — clear any published JIT TLAB skip regions.
     pub fn clear_jit_tlab_skip_regions(&self) {
-        if let VmHeap::Generational(h) = self {
-            h.clear_jit_tlab_skip_regions();
+        match self {
+            VmHeap::Generational(h) => h.clear_jit_tlab_skip_regions(),
+            VmHeap::G1(h) => h.clear_jit_tlab_skip_regions(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => {}
         }
     }
 
@@ -1080,9 +1096,13 @@ impl VmHeap {
                 }
             }
             VmHeap::Generational(h) => {
-                if let Some(q) = h.satb_queue_handle() {
+                // Clone-free: this runs on EVERY JIT helper entry, and the
+                // common case (no concurrent old-gen mark running) is a
+                // single Acquire load — don't pay an Arc refcount round
+                // trip just to check `is_active`.
+                if let Some(q) = h.satb_queue_ref() {
                     if q.is_active() {
-                        crate::satb::flush_thread_satb_buffer(&q);
+                        crate::satb::flush_thread_satb_buffer(q);
                     }
                 }
             }
