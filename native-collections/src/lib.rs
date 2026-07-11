@@ -6649,8 +6649,17 @@ pub fn make_hashset_with_elements(ctx: &mut dyn NativeContext, elems: &[Value]) 
             .unwrap_or(0)
             + 1;
 
+        // GC-SAFETY: `buckets`/`backing_map`/`set` are bare locals held
+        // across every later `alloc_object` call below (backing_map, set,
+        // and one per element for `node`) -- a stress-GC during any of them
+        // can leave these stale, and `set` is the function's return value,
+        // so a stale `set` hands the CALLER a dangling receiver. Pin each
+        // right after its own allocation and re-read before every later
+        // use, mirroring `map_alloc_node`/`native_map_put_evict_pinned`.
         let buckets = alloc_ref_array(ctx, cap);
+        let pin_base = ctx.pin_native_root(buckets);
         let backing_map = ctx.alloc_object(hashmap_class_id, map_n_fields);
+        let buckets = ctx.read_native_pin(pin_base, buckets);
         ctx.set_field(backing_map, f_table, Value::Object(Some(buckets)));
         ctx.set_field(backing_map, f_size, Value::Int(0));
         ctx.set_field(backing_map, f_threshold, Value::Int((cap as i32 * 3) / 4));
@@ -6663,14 +6672,22 @@ pub fn make_hashset_with_elements(ctx: &mut dyn NativeContext, elems: &[Value]) 
             .resolve_field_index("java/util/HashSet", "map")
             .unwrap_or(HS_FIELD_MAP);
         let hs_n_fields = std::cmp::max(hs_map_slot + 1, HS_NUM_FIELDS);
+        let backing_map_pin = ctx.pin_native_root(backing_map);
         let set = alloc_synthetic(ctx, "java/util/HashSet", hs_n_fields);
+        let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
         ctx.set_field(set, hs_map_slot, Value::Object(Some(backing_map)));
+        let set_pin = ctx.pin_native_root(set);
+
+        // `elems` is the caller's raw arg slice -- also just a bare `Vec`
+        // from this function's perspective, so it needs the same
+        // per-element re-read treatment across the node alloc below.
+        let (_, elem_pins) = pin_value_slice(ctx, elems);
 
         let sentinel = Value::Object(None); // PRESENT marker; null is fine for "is in set"
         let mut size = 0i32;
-        for elem in elems {
-            let key_obj = match elem {
-                Value::Object(Some(obj)) => *obj,
+        for (i, elem) in elems.iter().enumerate() {
+            let key_obj = match read_pinned_elem(ctx, elem_pins[i], *elem) {
+                Value::Object(Some(obj)) => obj,
                 _ => continue, // skip nulls / primitives we can't hash
             };
             // `make_hashset_with_elements` cannot propagate exceptions
@@ -6681,6 +6698,8 @@ pub fn make_hashset_with_elements(ctx: &mut dyn NativeContext, elems: &[Value]) 
             // hold JDK-internal types (String, wrappers, enum constants).
             let raw_hash =
                 map_hash_key(ctx, key_obj).unwrap_or_else(|_| ctx.identity_hash_code(key_obj));
+            let key_obj = ctx.read_native_pin(elem_pins[i], key_obj);
+            let buckets = ctx.read_native_pin(pin_base, buckets);
             // map_hash_key already applies the (h ^ h>>>16) spread; the
             // bucket index uses raw_hash as-is for power-of-two cap.
             let idx = ((cap as u32 - 1) & raw_hash as u32) as usize;
@@ -6706,36 +6725,62 @@ pub fn make_hashset_with_elements(ctx: &mut dyn NativeContext, elems: &[Value]) 
                 continue;
             }
             // Re-read head in case ctx mutated between probes (defensive).
+            let buckets = ctx.read_native_pin(pin_base, buckets);
             existing_head = ctx.get_array_element(buckets, idx);
 
+            // `alloc_object` below can move `key_obj`/`existing_head`; pin
+            // + re-read across it (mirrors `map_alloc_node`).
+            let existing_head_pin = pin_value(ctx, existing_head);
             let node = ctx.alloc_object(node_class_id, node_n_fields);
+            let key_obj = ctx.read_native_pin(elem_pins[i], key_obj);
+            let existing_head = read_pinned_elem(ctx, existing_head_pin, existing_head);
             ctx.set_field(node, n_hash, Value::Int(raw_hash));
             ctx.set_field(node, n_key, Value::Object(Some(key_obj)));
             ctx.set_field(node, n_value, sentinel);
             ctx.set_field(node, n_next, existing_head);
+            let buckets = ctx.read_native_pin(pin_base, buckets);
             ctx.set_array_element(buckets, idx, Value::Object(Some(node)));
             size += 1;
         }
+        let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
         ctx.set_field(backing_map, f_size, Value::Int(size));
+        let set = ctx.read_native_pin(set_pin, set);
+        ctx.unpin_native_roots(pin_base);
         return set;
     }
 
     // Legacy fallback: synthetic 3-field (buckets, size, capacity) layout.
     // Used when real HashMap/Node classes aren't resolvable yet.
+    //
+    // GC-SAFETY: same hazard as the real-layout branch above -- `set` and
+    // `backing_map` are bare locals re-used across further allocating
+    // calls (each other's alloc, plus one `native_map_put` per element,
+    // which itself allocates map nodes/resizes the table). Pin `set`
+    // first so its handle is the base for the final `unpin_native_roots`.
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+    let set_pin = ctx.pin_native_root(set);
     let backing_map = alloc_backing_map(ctx);
+    let backing_map_pin = ctx.pin_native_root(backing_map);
     let buckets = alloc_ref_array(ctx, cap);
+    let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
     ctx.set_field(backing_map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
     set_map_size(ctx, backing_map, 0);
     ctx.set_field(backing_map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    let set = ctx.read_native_pin(set_pin, set);
+    let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
 
+    let (_, elem_pins) = pin_value_slice(ctx, elems);
     let sentinel = Value::Int(1);
-    for elem in elems {
+    for (i, elem) in elems.iter().enumerate() {
+        let elem = read_pinned_elem(ctx, elem_pins[i], *elem);
+        let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
         // Best-effort populate; ignore errors so callers see a non-empty
         // set even if a single put failed (e.g. unhashable wrapper).
-        let _ = native_map_put(ctx, &[Value::Object(Some(backing_map)), *elem, sentinel]);
+        let _ = native_map_put(ctx, &[Value::Object(Some(backing_map)), elem, sentinel]);
     }
+    let set = ctx.read_native_pin(set_pin, set);
+    ctx.unpin_native_roots(set_pin);
     set
 }
 
