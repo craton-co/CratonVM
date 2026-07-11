@@ -1727,6 +1727,9 @@ fn native_jul_logger_log_level_msg(
         .and_then(|o| ctx.read_string(o))
         .unwrap_or_default();
     eprintln!("{level_name} [{logger_name}] {message}");
+    if let (Some(logger), Some(level), Some(message)) = (this, level_obj, message_obj) {
+        publish_to_jul_handlers(ctx, logger, level, message)?;
+    }
     Ok(None)
 }
 
@@ -1910,7 +1913,72 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     } else {
         eprintln!("{tag} [{logger_name}] {message}");
     }
+    if let (Some(logger), Some(level), Some(message)) = (this, level_obj, message_obj) {
+        publish_to_jul_handlers(ctx, logger, level, message)?;
+    }
     Ok(None)
+}
+
+/// Deliver a native-intercepted JUL call to handlers added to the synthetic
+/// logger. The LogManager bridge owns `logp` and `log(Level, String)`, so
+/// printing those calls alone bypassed JULI's `AsyncFileHandler` entirely.
+fn publish_to_jul_handlers(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+    level: ObjectRef,
+    message: ObjectRef,
+) -> MethodCallResult {
+    let base_pin = ctx.pin_native_root(logger);
+    let level_pin = ctx.pin_native_root(level);
+    let message_pin = ctx.pin_native_root(message);
+    let result = (|| {
+        let logger = ctx.read_native_pin(base_pin, logger);
+        let level = ctx.read_native_pin(level_pin, level);
+        let message = ctx.read_native_pin(message_pin, message);
+        let handlers = match ctx.get_field(logger, LOGGER_FIELD_PARENT) {
+            Value::Object(Some(list)) => list,
+            _ => return Ok(None),
+        };
+        let handlers_pin = ctx.pin_native_root(handlers);
+        let record = match ctx.new_object_initialized(
+            "java/util/logging/LogRecord",
+            "(Ljava/util/logging/Level;Ljava/lang/String;)V",
+            &[Value::Object(Some(level)), Value::Object(Some(message))],
+        )? {
+            Some(Value::Object(Some(record))) => record,
+            _ => return Ok(None),
+        };
+        let record_pin = ctx.pin_native_root(record);
+        let handlers = ctx.read_native_pin(handlers_pin, handlers);
+        let size = match ctx.invoke_virtual(handlers, "size", "()I", &[])? {
+            Some(Value::Int(size)) if size > 0 => size as usize,
+            _ => return Ok(None),
+        };
+        for index in 0..size {
+            let handlers = ctx.read_native_pin(handlers_pin, handlers);
+            let handler = match ctx.invoke_virtual(
+                handlers,
+                "get",
+                "(I)Ljava/lang/Object;",
+                &[Value::Int(index as i32)],
+            )? {
+                Some(Value::Object(Some(handler))) => handler,
+                _ => continue,
+            };
+            let handler_pin = ctx.pin_native_root(handler);
+            let handler = ctx.read_native_pin(handler_pin, handler);
+            let record = ctx.read_native_pin(record_pin, record);
+            let _ = ctx.invoke_virtual(
+                handler,
+                "publish",
+                "(Ljava/util/logging/LogRecord;)V",
+                &[Value::Object(Some(record))],
+            );
+        }
+        Ok(None)
+    })();
+    ctx.unpin_native_roots(base_pin);
+    result
 }
 
 /// Resolve a JUL log message argument that is EITHER a `String` OR a
@@ -2170,19 +2238,43 @@ fn native_jul_logger_is_loggable(ctx: &mut dyn NativeContext, args: &[Value]) ->
 
 fn native_jul_logger_info(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     log_simple(ctx, args, "INFO");
+    publish_jul_convenience(ctx, args, "INFO")?;
     Ok(None)
 }
 fn native_jul_logger_warning(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     log_simple(ctx, args, "WARN");
+    publish_jul_convenience(ctx, args, "WARNING")?;
     Ok(None)
 }
 fn native_jul_logger_severe(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     log_simple(ctx, args, "ERROR");
+    publish_jul_convenience(ctx, args, "SEVERE")?;
     Ok(None)
 }
 fn native_jul_logger_fine(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // Suppress fine/finer/finest — too noisy and not useful for boot visibility.
     Ok(None)
+}
+
+fn publish_jul_convenience(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    level_name: &str,
+) -> MethodCallResult {
+    let (Some(Value::Object(Some(logger))), Some(Value::Object(Some(message)))) =
+        (args.first(), args.get(1))
+    else {
+        return Ok(None);
+    };
+    let level_class = ctx.ensure_class_initialized("java/util/logging/Level")?;
+    let Some(level_index) = ctx.static_field_index_by_name(level_class, level_name) else {
+        return Ok(None);
+    };
+    let level = match ctx.get_static_field(level_class, level_index) {
+        Value::Object(Some(level)) => level,
+        _ => return Ok(None),
+    };
+    publish_to_jul_handlers(ctx, *logger, level, *message)
 }
 
 fn log_simple(ctx: &mut dyn NativeContext, args: &[Value], level: &str) {

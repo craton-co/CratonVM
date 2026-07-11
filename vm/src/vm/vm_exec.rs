@@ -11588,6 +11588,15 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/lang/Thread"
                             && method_name == "getThreadGroup"
                             && descriptor == "()Ljava/lang/ThreadGroup;")
+                        || (class_name == "java/util/logging/Handler"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("<init>", "()V")
+                                    | ("getLevel", "()Ljava/util/logging/Level;")
+                                    | ("isLoggable", "(Ljava/util/logging/LogRecord;)Z")
+                                    | ("getFormatter", "()Ljava/util/logging/Formatter;")
+                                    | ("setFormatter", "(Ljava/util/logging/Formatter;)V")
+                            ))
                         || (class_name == "org/jboss/threads/JBossThread"
                             && method_name == "run"
                             && descriptor == "()V")
@@ -12732,6 +12741,12 @@ fn invoke_on_class_shared_inner(
                                 method_name,
                                 "log" | "info" | "warning" | "severe"
                                     | "fine" | "finer" | "finest"
+                                    // Synthetic LogManager-backed loggers
+                                    // store handlers in their native slot 2.
+                                    // Letting real Logger.addHandler bytecode
+                                    // run loses that state, so JULI
+                                    // AsyncFileHandler never sees a record.
+                                    | "addHandler" | "removeHandler" | "getHandlers"
                                     // JULI's `DirectJDKLog` (Tomcat) routes
                                     // every log call through `Logger.logp`,
                                     // not `warning`/`log`. Without `logp`
@@ -12748,6 +12763,17 @@ fn invoke_on_class_shared_inner(
                                     // log call short-circuits to a no-op.
                                     | "isLoggable"
                             ))
+                        || (class_name == "java/util/logging/LogRecord"
+                            && matches!(method_name, "<init>" | "getLevel" | "getMessage"))
+                        || (class_name == "java/util/concurrent/ThreadPoolExecutor"
+                            && matches!(
+                                method_name,
+                                "execute" | "shutdown" | "isShutdown" | "isTerminated" | "awaitTermination"
+                            ))
+                        || (class_name == "org/apache/juli/AsyncFileHandler$LoggerExecutorService"
+                            && matches!(method_name, "shutdown" | "isShutdown" | "awaitTermination"))
+                        || (class_name == "org/apache/juli/FileHandler"
+                            && method_name == "clean")
                         || (class_name == "org/jboss/logmanager/Logger"
                             && matches!(
                                 method_name,

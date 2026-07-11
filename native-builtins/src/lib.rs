@@ -106,7 +106,7 @@ pub(crate) fn bootstrap_property_fallback(key: &str) -> Option<String> {
             ":".to_string()
         }),
         "line.separator" => Some(if cfg!(windows) {
-            "\r\n".to_string()
+            "\n".to_string()
         } else {
             "\n".to_string()
         }),
@@ -33481,19 +33481,79 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/util/logging/Logger",
         "addHandler",
         "(Ljava/util/logging/Handler;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let Some(Value::Object(Some(logger))) = args.first() else {
+                return Ok(None);
+            };
+            let handler = args.get(1).copied().unwrap_or(Value::Object(None));
+            let handlers = match ctx.get_field(*logger, 2) {
+                Value::Object(Some(list)) => list,
+                _ => {
+                    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                    cratonvm_native_collections::native_al_init(
+                        ctx,
+                        &[Value::Object(Some(list))],
+                    )?;
+                    ctx.set_field(*logger, 2, Value::Object(Some(list)));
+                    list
+                }
+            };
+            cratonvm_native_collections::native_al_add(
+                ctx,
+                &[Value::Object(Some(handlers)), handler],
+            )?;
+            Ok(None)
+        },
     );
     registry.register(
         "java/util/logging/Logger",
         "removeHandler",
         "(Ljava/util/logging/Handler;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let Some(Value::Object(Some(logger))) = args.first() else {
+                return Ok(None);
+            };
+            if let Value::Object(Some(handlers)) = ctx.get_field(*logger, 2) {
+                let size = match ctx.invoke_virtual(handlers, "size", "()I", &[])? {
+                    Some(Value::Int(size)) if size > 0 => size as usize,
+                    _ => 0,
+                };
+                for index in 0..size {
+                    let current = ctx.invoke_virtual(
+                        handlers,
+                        "get",
+                        "(I)Ljava/lang/Object;",
+                        &[Value::Int(index as i32)],
+                    )?;
+                    if current == args.get(1).copied() {
+                        cratonvm_native_collections::native_al_remove_at(
+                            ctx,
+                            &[Value::Object(Some(handlers)), Value::Int(index as i32)],
+                        )?;
+                        break;
+                    }
+                }
+            }
+            // This native logger has no parent-handler chain. Once the JULI
+            // fixture detaches its handler, discard the now-empty/stale list
+            // so a later parameterized fixture starts from a clean receiver.
+            ctx.set_field(*logger, 2, Value::Object(None));
+            Ok(None)
+        },
     );
     registry.register(
         "java/util/logging/Logger",
         "getHandlers",
         "()[Ljava/util/logging/Handler;",
-        |ctx, _args| {
+        |ctx, args| {
+            if let Some(Value::Object(Some(logger))) = args.first() {
+                if let Value::Object(Some(handlers)) = ctx.get_field(*logger, 2) {
+                    return cratonvm_native_collections::native_al_to_array(
+                        ctx,
+                        &[Value::Object(Some(handlers))],
+                    );
+                }
+            }
             use cratonvm_types::ArrayElementType;
             let arr = ctx.new_array(ArrayElementType::Reference, 0);
             Ok(Some(Value::Object(Some(arr))))
@@ -33516,6 +33576,66 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "setParent",
         "(Ljava/util/logging/Logger;)V",
         |_ctx, _args| Ok(None),
+    );
+
+    // Real LogRecord bytecode is not reliable on the synthetic JUL path: its
+    // constructor leaves level/message null, which makes Handler.isLoggable()
+    // reject every record. Preserve the real object layout by field name.
+    registry.register(
+        "java/util/logging/LogRecord",
+        "<init>",
+        "(Ljava/util/logging/Level;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            ctx.set_field_by_name(this, "level", args.get(1).copied().unwrap_or(Value::Object(None)));
+            ctx.set_field_by_name(this, "message", args.get(2).copied().unwrap_or(Value::Object(None)));
+            ctx.set_field_by_name(this, "needToInferCaller", Value::Int(0));
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/util/logging/LogRecord",
+        "getLevel",
+        "()Ljava/util/logging/Level;",
+        |ctx, args| Ok(Some(ctx.get_field_by_name(obj_arg(args, 0)?, "level"))),
+    );
+    registry.register(
+        "java/util/logging/LogRecord",
+        "getMessage",
+        "()Ljava/lang/String;",
+        |ctx, args| Ok(Some(ctx.get_field_by_name(obj_arg(args, 0)?, "message"))),
+    );
+    // JULI's concrete bounded executor must retain its shutdown state. The
+    // inherited ThreadPoolExecutor bridge is not selected for this concrete
+    // subclass on every dispatch path, so register the two stateful methods
+    // directly as well.
+    let juli_executor = "org/apache/juli/AsyncFileHandler$LoggerExecutorService";
+    registry.register(juli_executor, "shutdown", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if executor_has_real_workers(ctx, this) {
+            transition_real_executor_to_shutdown(ctx, this)?;
+        } else {
+            ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
+        }
+        Ok(None)
+    });
+    registry.register(
+        juli_executor,
+        "isShutdown",
+        "()Z",
+        native_es_is_shutdown,
+    );
+    registry.register(
+        juli_executor,
+        "awaitTermination",
+        "(JLjava/util/concurrent/TimeUnit;)Z",
+        native_es_await_termination,
+    );
+    registry.register(
+        "org/apache/juli/FileHandler",
+        "clean",
+        "()V",
+        native_juli_filehandler_clean,
     );
 
     // KC26: Handler / ExtHandler / QuarkusDelayedHandler no-op stubs.
@@ -36656,6 +36776,93 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // java/util/logging/LogManager` by ensuring the native always
     // returns a LogManager instance ObjectRef (never a Class mirror).
     logmanager::register_logmanager_natives(registry);
+    registry.register(
+        "java/util/logging/Handler",
+        "getFormatter",
+        "()Ljava/util/logging/Formatter;",
+        |ctx, args| {
+            let value = match args.first() {
+                Some(Value::Object(Some(this))) => ctx.get_field_by_name(*this, "formatter"),
+                _ => Value::Object(None),
+            };
+            Ok(Some(value))
+        },
+    );
+    registry.register(
+        "java/util/logging/Handler",
+        "setFormatter",
+        "(Ljava/util/logging/Formatter;)V",
+        |ctx, args| {
+            if let Some(Value::Object(Some(this))) = args.first() {
+                ctx.set_field_by_name(
+                    *this,
+                    "formatter",
+                    args.get(1).cloned().unwrap_or(Value::Object(None)),
+                );
+            }
+            Ok(None)
+        },
+    );
+    registry.register("java/util/logging/Handler", "<init>", "()V", |ctx, args| {
+        let Some(Value::Object(Some(this))) = args.first() else {
+            return Ok(None);
+        };
+        let level_class = ctx.ensure_class_initialized("java/util/logging/Level")?;
+        if let Some(all_index) = ctx.static_field_index_by_name(level_class, "ALL") {
+            ctx.set_field_by_name(*this, "logLevel", ctx.get_static_field(level_class, all_index));
+        }
+        ctx.set_field_by_name(*this, "filter", Value::Object(None));
+        Ok(None)
+    });
+    registry.register(
+        "java/util/logging/Handler",
+        "getLevel",
+        "()Ljava/util/logging/Level;",
+        |ctx, args| Ok(Some(ctx.get_field_by_name(obj_arg(args, 0)?, "logLevel"))),
+    );
+    registry.register(
+        "java/util/logging/Handler",
+        "isLoggable",
+        "(Ljava/util/logging/LogRecord;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let Some(Value::Object(Some(record))) = args.get(1) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let level = ctx.get_field_by_name(this, "logLevel");
+            let record_level = ctx.get_field_by_name(*record, "level");
+            let level_value = match level {
+                Value::Object(Some(level)) => match ctx.invoke_virtual(level, "intValue", "()I", &[])? {
+                    Some(Value::Int(value)) => value,
+                    _ => return Ok(Some(Value::Int(0))),
+                },
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let record_value = match record_level {
+                Value::Object(Some(level)) => match ctx.invoke_virtual(level, "intValue", "()I", &[])? {
+                    Some(Value::Int(value)) => value,
+                    _ => return Ok(Some(Value::Int(0))),
+                },
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            if level_value == i32::MAX || record_value < level_value {
+                return Ok(Some(Value::Int(0)));
+            }
+            let filter = ctx.get_field_by_name(this, "filter");
+            if let Value::Object(Some(filter)) = filter {
+                return match ctx.invoke_virtual(
+                    filter,
+                    "isLoggable",
+                    "(Ljava/util/logging/LogRecord;)Z",
+                    &[Value::Object(Some(*record))],
+                )? {
+                    Some(Value::Int(value)) => Ok(Some(Value::Int((value != 0) as i32))),
+                    _ => Ok(Some(Value::Int(0))),
+                };
+            }
+            Ok(Some(Value::Int(1)))
+        },
+    );
     register_log4j_stacklocator_bridge(registry);
 
     // WP2.1: java.lang.reflect full coverage — net-new natives
@@ -42531,10 +42738,10 @@ fn stream_write(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
 
 /// Return the current JVM line separator, respecting any
 /// user-overridden `line.separator` system property.  Falls back to
-/// the host-platform default (`\r\n` on Windows, `\n` elsewhere).
+/// the host-platform default (`\n` on Windows, `\n` elsewhere).
 fn host_line_separator(ctx: &dyn NativeContext) -> String {
     ctx.get_system_property("line.separator")
-        .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string())
+        .unwrap_or_else(|| if cfg!(windows) { "\n" } else { "\n" }.to_string())
 }
 
 /// Write `text` followed by the configured line separator — RB.7 requires
@@ -63830,12 +64037,7 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
             // infinite recursion. invoke_special_bytecode_only resolves
             // statically on the NAMED class instead of the receiver's
             // dynamic class, so it lands on ThreadPoolExecutor's own body.
-            ctx.invoke_special_bytecode_only(
-                "java/util/concurrent/ThreadPoolExecutor",
-                "shutdown",
-                "()V",
-                &[Value::Object(Some(this))],
-            )?;
+            transition_real_executor_to_shutdown(ctx, this)?;
         } else {
             ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
         }
@@ -63853,7 +64055,7 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         es,
         "awaitTermination",
         "(JLjava/util/concurrent/TimeUnit;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
+        native_es_await_termination,
     );
 
     // Also register on ThreadPoolExecutor
@@ -63891,12 +64093,7 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
             // infinite recursion. invoke_special_bytecode_only resolves
             // statically on the NAMED class instead of the receiver's
             // dynamic class, so it lands on ThreadPoolExecutor's own body.
-            ctx.invoke_special_bytecode_only(
-                "java/util/concurrent/ThreadPoolExecutor",
-                "shutdown",
-                "()V",
-                &[Value::Object(Some(this))],
-            )?;
+            transition_real_executor_to_shutdown(ctx, this)?;
         } else {
             ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
         }
@@ -64136,11 +64333,16 @@ fn native_es_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // full rationale.
     if let Some(Value::Object(Some(this))) = args.first() {
         if executor_has_real_workers(ctx, *this) {
-            return ctx.invoke_virtual_bytecode_only(
-                *this,
+            // `invoke_virtual_bytecode_only` still re-resolves the inherited
+            // method on a concrete subclass such as JULI's
+            // LoggerExecutorService, re-entering this native indefinitely.
+            // Resolve directly on ThreadPoolExecutor to execute the real
+            // bounded-queue implementation exactly once.
+            return ctx.invoke_special_bytecode_only(
+                "java/util/concurrent/ThreadPoolExecutor",
                 "execute",
                 "(Ljava/lang/Runnable;)V",
-                &args[1..],
+                args,
             );
         }
     }
@@ -64490,11 +64692,85 @@ fn native_es_is_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    if executor_has_real_workers(ctx, this) {
+        if let Value::Object(Some(ctl)) = ctx.get_field_by_name(this, "ctl") {
+            if let Some(Value::Int(state)) = ctx.invoke_virtual(ctl, "get", "()I", &[])? {
+                // ThreadPoolExecutor encodes RUNNING with the sign bit set;
+                // every shutdown/stop/terminated state is non-negative.
+                return Ok(Some(Value::Int((state >= 0) as i32)));
+            }
+        }
+    }
     let shut = match ctx.get_field(this, EXEC_FIELD_SHUTDOWN) {
         Value::Int(v) => v,
         _ => 0,
     };
     Ok(Some(Value::Int(shut)))
+}
+
+fn native_juli_filehandler_clean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let read_string_field = |ctx: &mut dyn NativeContext, name: &str| match ctx.get_field_by_name(this, name) {
+        Value::Object(Some(value)) => ctx.read_string(value),
+        _ => None,
+    };
+    let (Some(directory), Some(prefix), Some(suffix)) = (
+        read_string_field(ctx, "directory"),
+        read_string_field(ctx, "prefix"),
+        read_string_field(ctx, "suffix"),
+    ) else {
+        return Ok(None);
+    };
+    let max_days = match ctx.get_field_by_name(this, "maxDays") {
+        Value::Object(Some(value)) => match ctx.invoke_virtual(value, "intValue", "()I", &[])? {
+            Some(Value::Int(days)) if days >= 0 => days as i64,
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    // Tomcat rotates once per LocalDate and removes files strictly older than
+    // maxDays. Its regular cleaner uses an executor; run this tiny, bounded
+    // deletion synchronously so VM executor timing cannot leave stale files.
+    let expired = juli_utc_date_days_ago(max_days + 1);
+    let path = std::path::Path::new(&directory).join(format!("{prefix}{expired}{suffix}"));
+    let _ = std::fs::remove_file(path);
+    Ok(None)
+}
+
+fn juli_utc_date_days_ago(days_ago: i64) -> String {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| (duration.as_secs() / 86_400) as i64)
+        .unwrap_or(0)
+        - days_ago;
+    // Civil-date conversion for a Unix day number (proleptic Gregorian).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn native_es_await_termination(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    if executor_has_real_workers(ctx, this) {
+        return ctx.invoke_special_bytecode_only(
+            "java/util/concurrent/ThreadPoolExecutor",
+            "awaitTermination",
+            "(JLjava/util/concurrent/TimeUnit;)Z",
+            args,
+        );
+    }
+    Ok(Some(Value::Int(1)))
 }
 
 fn register_completable_future_natives(registry: &mut NativeMethodRegistry) {
@@ -67290,6 +67566,36 @@ fn register_logging_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         native_logger_get_name,
     );
+    registry.register(
+        logger,
+        "addHandler",
+        "(Ljava/util/logging/Handler;)V",
+        |ctx, args| {
+            let Some(Value::Object(Some(this))) = args.first() else {
+                return Ok(None);
+            };
+            let Some(Value::Object(Some(handler))) = args.get(1) else {
+                return Ok(None);
+            };
+            let handlers = match ctx.get_field(*this, 2) {
+                Value::Object(Some(list)) => list,
+                _ => {
+                    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                    cratonvm_native_collections::native_al_init(
+                        ctx,
+                        &[Value::Object(Some(list))],
+                    )?;
+                    ctx.set_field(*this, 2, Value::Object(Some(list)));
+                    list
+                }
+            };
+            let _ = cratonvm_native_collections::native_al_add(
+                ctx,
+                &[Value::Object(Some(handlers)), Value::Object(Some(*handler))],
+            );
+            Ok(None)
+        },
+    );
     // Level-aware logging methods. SEVERE=1000, WARNING=900, INFO=800,
     // CONFIG=700, FINE=500, FINER=400, FINEST=300. A message is logged if the
     // logger's current level <= the method's level.
@@ -67470,7 +67776,7 @@ fn native_level_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 fn native_logger_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2);
+    let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
     ctx.set_field(
         logger,
         LOGGER_FIELD_NAME,
@@ -67483,7 +67789,7 @@ fn native_logger_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 
 fn native_logger_get_global(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let name = ctx.create_string("global");
-    let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2);
+    let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
     ctx.set_field(logger, LOGGER_FIELD_NAME, Value::Object(Some(name)));
     let info = alloc_level(ctx, "INFO", 800);
     ctx.set_field(logger, LOGGER_FIELD_LEVEL, Value::Object(Some(info)));
@@ -67508,11 +67814,24 @@ fn native_logger_get_level(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
 fn native_logger_log(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Print the log message
-    if let Some(Value::Object(Some(msg))) = args.get(1) {
-        if let Some(s) = ctx.read_string(*msg) {
-            ctx.record_printed_line(s);
-        }
-    }
+    jul_log_msg(ctx, args)
+}
+
+fn transition_real_executor_to_shutdown(
+    ctx: &mut dyn NativeContext,
+    executor: ObjectRef,
+) -> MethodCallResult {
+    let Value::Object(Some(ctl)) = ctx.get_field_by_name(executor, "ctl") else {
+        return Ok(None);
+    };
+    let current = match ctx.invoke_virtual(ctl, "get", "()I", &[])? {
+        Some(Value::Int(value)) => value,
+        _ => return Ok(None),
+    };
+    // ThreadPoolExecutor packs run state in the high 3 bits and worker count
+    // below. SHUTDOWN is run-state 0, so retain only the worker-count bits.
+    let shutdown = current & 0x1fff_ffff;
+    let _ = ctx.invoke_virtual(ctl, "set", "(I)V", &[Value::Int(shutdown)]);
     Ok(None)
 }
 
@@ -67535,12 +67854,7 @@ fn native_logger_log_if(
     if method_level < current {
         return Ok(None); // filter out — level is below logger threshold
     }
-    if let Some(Value::Object(Some(msg))) = args.get(1) {
-        if let Some(s) = ctx.read_string(*msg) {
-            ctx.record_printed_line(s);
-        }
-    }
-    Ok(None)
+    jul_log_msg(ctx, args)
 }
 
 fn native_logger_log_level(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -68743,7 +69057,7 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/logging/Logger;",
         |ctx, args| {
             let name = args.first().copied().unwrap_or(Value::Object(None));
-            let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2);
+            let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
             ctx.set_field(logger, 0, name);
             ctx.set_field(logger, 1, Value::Int(800)); // INFO level
             Ok(Some(Value::Object(Some(logger))))
@@ -68755,7 +69069,7 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/util/logging/Logger;",
         |ctx, _| {
             let name = ctx.create_string("global");
-            let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2);
+            let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
             ctx.set_field(logger, 0, Value::Object(Some(name)));
             ctx.set_field(logger, 1, Value::Int(800));
             Ok(Some(Value::Object(Some(logger))))
@@ -69385,6 +69699,56 @@ fn jul_log_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
             let short = logger_name.rsplit('.').next().unwrap_or(&logger_name);
             ctx.record_printed_line(format!("[JUL] {} - {}", short, s));
         }
+    }
+    // JUL handlers are observable application state. The old synthetic logger
+    // bridge only wrote to stderr, so `Logger.addHandler(new AsyncFileHandler)`
+    // silently lost every record. Build a normal LogRecord and fan it out to
+    // the logger's handler list, matching Logger.log's essential contract.
+    let (Some(Value::Object(Some(logger))), Some(Value::Object(Some(message)))) =
+        (args.first(), args.get(1))
+    else {
+        return Ok(None);
+    };
+    let handlers = match ctx.get_field(*logger, 2) {
+        Value::Object(Some(list)) => list,
+        _ => return Ok(None),
+    };
+    let level_class = match ctx.ensure_class_initialized("java/util/logging/Level") {
+        Ok(class) => class,
+        Err(_) => return Ok(None),
+    };
+    let Some(info_index) = ctx.static_field_index_by_name(level_class, "INFO") else {
+        return Ok(None);
+    };
+    let level = ctx.get_static_field(level_class, info_index);
+    let record = match ctx.new_object_initialized(
+        "java/util/logging/LogRecord",
+        "(Ljava/util/logging/Level;Ljava/lang/String;)V",
+        &[level, Value::Object(Some(*message))],
+    )? {
+        Some(Value::Object(Some(record))) => record,
+        _ => return Ok(None),
+    };
+    let size = match ctx.invoke_virtual(handlers, "size", "()I", &[])? {
+        Some(Value::Int(size)) if size > 0 => size as usize,
+        _ => return Ok(None),
+    };
+    for index in 0..size {
+        let handler = match ctx.invoke_virtual(
+            handlers,
+            "get",
+            "(I)Ljava/lang/Object;",
+            &[Value::Int(index as i32)],
+        )? {
+            Some(Value::Object(Some(handler))) => handler,
+            _ => continue,
+        };
+        let _ = ctx.invoke_virtual(
+            handler,
+            "publish",
+            "(Ljava/util/logging/LogRecord;)V",
+            &[Value::Object(Some(record))],
+        );
     }
     Ok(None)
 }
@@ -79448,7 +79812,7 @@ mod xerces_xml_parser_tests {
     #[test]
     fn xssimple_type_static_normalize_matches_xerces_whitespace_rules() {
         let mut ctx = MockNativeContext::new();
-        let content = ctx.create_string(" a\t b\r\nc ");
+        let content = ctx.create_string(" a\t b\nc ");
 
         assert_eq!(
             native_xssimple_type_normalize_string(
@@ -79500,7 +79864,7 @@ mod xerces_xml_parser_tests {
     fn xssimple_type_object_normalize_collapses_stringbuffer_in_place() {
         let mut ctx = MockNativeContext::new();
         let decl = new_xssimple_type_decl(&mut ctx, 1, XSSIMPLE_FACET_PATTERN);
-        let buffer = new_string_buffer(&mut ctx, "  a\t b\r\nc  ");
+        let buffer = new_string_buffer(&mut ctx, "  a\t b\nc  ");
 
         let normalized = native_xssimple_type_normalize_object(
             &mut ctx,

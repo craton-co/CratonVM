@@ -1145,7 +1145,7 @@ fn try_delegate_to_real_provider(
 /// return `false`).
 pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/ThreadImpl";
 
     // ThreadImpl.getThreadInfo(long, int) allocates an output array and asks
@@ -1168,9 +1168,11 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
                     Value::Int(id) if id > 0 => id as i64,
                     _ => continue,
                 };
-                let info = alloc_basic_thread_info(ctx, thread_id)?;
-                let out = ctx.read_native_pin(out_pin, out);
-                ctx.set_array_element(out, i, Value::Object(Some(info)));
+                if let Some(name) = registered_thread_name(ctx, thread_id) {
+                    let info = alloc_named_thread_info(ctx, thread_id, &name);
+                    let out = ctx.read_native_pin(out_pin, out);
+                    ctx.set_array_element(out, i, Value::Object(Some(info)));
+                }
             }
             ctx.unpin_native_roots(ids_pin);
             Ok(None)
@@ -2231,6 +2233,23 @@ fn jmx_class_id_or_object(ctx: &mut dyn NativeContext, class_name: &str) -> Clas
         .unwrap_or(ClassId::new(0))
 }
 
+fn registered_thread_name(ctx: &dyn NativeContext, thread_id: i64) -> Option<String> {
+    ctx.enumerate_threads(256).into_iter().find_map(|thread_obj| {
+        let id = match ctx.get_field_by_name(thread_obj, "tid") {
+            Value::Long(id) => id,
+            Value::Int(id) => id as i64,
+            _ => return None,
+        };
+        if id != thread_id {
+            return None;
+        }
+        match ctx.get_field_by_name(thread_obj, "name") {
+            Value::Object(Some(name)) => ctx.read_string(name),
+            _ => None,
+        }
+    })
+}
+
 fn alloc_basic_thread_info(
     ctx: &mut dyn NativeContext,
     thread_id: i64,
@@ -2446,8 +2465,18 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
                     _ => None,
                 })
                 .unwrap_or_else(|| ctx.thread_id().max(1) as i64);
-            let info = alloc_basic_thread_info(ctx, thread_id)?;
-            Ok(Some(Value::Object(Some(info))))
+            if thread_id <= 0 {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "Invalid thread ID parameter".into(),
+                }
+                .into());
+            }
+            match registered_thread_name(ctx, thread_id) {
+                Some(name) => Ok(Some(Value::Object(Some(alloc_named_thread_info(
+                    ctx, thread_id, &name,
+                ))))),
+                None => Ok(Some(Value::Object(None))),
+            }
         },
     );
     // Surefire ForkedBooter.generateThreadDump: getThreadInfo([J, I) returns
