@@ -42,17 +42,10 @@ static TEST_REGION_BOUNDS: [std::sync::atomic::AtomicUsize; 6] = [
 ];
 
 fn dummy_helpers() -> JitRuntimeHelpers {
-    // guarded_inline_getfield_enabled() defaults OFF since 2026-07-10 (a
-    // real getfield-guard SIGSEGV found via the ES IVF-KNN vector suite —
-    // see its doc comment in jit/src/x64.rs). This whole file's contract
-    // ("no runtime helper reachable" via the wide-open TEST_REGION_BOUNDS
-    // above) requires the guarded-inline path to actually be taken, so opt
-    // in explicitly here. Not OnceLock-cached in the source (compile-time
-    // gate only), so this plain env var set is race-free against the other
-    // tests in this same integration-test binary.
-    unsafe {
-        std::env::set_var("CRATONVM_JIT_GUARDED_GETFIELD", "1");
-    }
+    // guarded_inline_getfield_enabled() is default-ON (jit/src/x64.rs) --
+    // this whole file's contract ("no runtime helper reachable" via the
+    // wide-open TEST_REGION_BOUNDS above) relies on the guarded-inline path
+    // being taken, which now happens without an explicit opt-in.
     unsafe extern "C" fn stub() {
         panic!("ir_vs_singlepass invoked an unwired runtime helper");
     }
@@ -1123,8 +1116,11 @@ fn compile_opt_fields(
     field_resolver: &dyn Fn(u16) -> Option<(usize, u8)>,
     optimize: bool,
 ) -> Option<CompiledMethod> {
+    // No registered CompactLayout for this test's synthetic buffers -- None
+    // (not a fabricated (0, false)) is the correct "no compact slot" value;
+    // see cp_field_resolver's Option<(u32, bool)> contract in jit/src/lib.rs.
     let field_resolver_with_compact =
-        |cp_idx| field_resolver(cp_idx).map(|(field_index, tag)| (field_index, tag, 0, false));
+        |cp_idx| field_resolver(cp_idx).map(|(field_index, tag)| (field_index, tag, None));
     try_compile(
         cm,
         None,

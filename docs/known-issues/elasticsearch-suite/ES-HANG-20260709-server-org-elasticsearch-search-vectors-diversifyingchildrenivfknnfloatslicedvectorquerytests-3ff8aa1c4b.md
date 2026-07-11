@@ -235,3 +235,36 @@ that doc. Summary:
 known, tracked, actively-investigated VM-core defect rather than an
 ES/Lucene-specific bug. Not expected to be independently fixable without
 the GC-audit team's monitor/STW-barrier work landing first.
+
+
+---
+
+## 2026-07-10 follow-up: guarded-inline-getfield SIGSEGV root-caused and FIXED; flag re-enabled default-ON
+
+The unproven fast path this doc flipped to opt-in has been root-caused, in a different
+investigation the same day: the WildFly Host Controller invoke-inline-cache SIGSEGV
+(`docs/internal/wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver-FIXED.md`).
+Root cause: the vm-side JIT field resolvers (`vm/src/runtime/interpreter.rs`) fabricated a
+`(0, false)` "compact slot" for any field with NO genuine registered `CompactLayout` entry
+(`compact_field_slot(...).unwrap_or((0, false))`), and the compact-offset inline getfield arm
+(`jit/src/x64.rs`) trusted it — a REFERENCE field with the fabricated `is_ref=false` fell into
+the int-category match arm and got a 32-bit `MOVSXD` (sign-extended) load of half a 16-byte
+`Value` cell, producing exactly this doc's "receiver `0x40`, a small int value used as an array
+pointer" shape (the loaded bytes are the cell's uninitialized tag/payload boundary padding —
+non-null, 8-aligned, and totally bogus). Fixed: the resolver now returns `Option<(u32, bool)>`
+for the compact slot (never fabricates), and `'L'`/`'['` type tags get an explicit 64-bit
+payload load in the compact arm as defense-in-depth.
+
+Re-verified clean on branch `fix/ivfknn-guarded-getfield-reverify-20260710`: ran this doc's
+exact repro (`testSlicesDense`, same seed) with `CRATONVM_JIT_GUARDED_GETFIELD=1` — **no
+SIGSEGV, no dmesg segfault entry**. Both this run and a baseline run (flag unset) hit the
+IDENTICAL pre-existing watchdog-timeout abort (the STW/monitor-race hang described below,
+unaffected by this flag) at the 90s `--stack-dump-on-timeout` mark — confirming the SIGSEGV is
+gone and the only remaining blocker for this class is the already-tracked, separate hang.
+`guarded_inline_getfield_enabled()` is re-enabled default-ON (opt out with
+`CRATONVM_JIT_GETFIELD_HELPER=1`); `cargo test --release -p cratonvm-jit` — `--lib` 889/889,
+`ir_vs_singlepass` 82/82 (matching this doc's own prior baseline), all other integration test
+binaries green, except two PRE-EXISTING, unrelated SIGSEGVs in `intrinsic_string_access`/
+`intrinsic_string_search` (confirmed independent of this flag — crash identically with
+`CRATONVM_JIT_GETFIELD_HELPER=1` forcing the old default too; spun off as a separate follow-up,
+not investigated further here).
