@@ -33,9 +33,13 @@ than repeating the pin dance inline.
   this session's code, confirmed by reproducing the identical failure against the last verified-good
   binary from a prior session. See the residual doc's "Follow-up session 3" section for the full story
   and what whoever next has a working harness should re-run.
-- Also scoped (not implemented, lower priority): a debug-build assertion that would catch every future
-  instance of this bug class deterministically instead of relying on sweeps —
-  [`../internal/wildfly-stale-objectref-debug-assertion-scoping.md`](../internal/wildfly-stale-objectref-debug-assertion-scoping.md).
+- Also **implemented** (same session, after initial scoping): a debug-build assertion,
+  `CRATONVM_DBG_STALE_OBJREF=1`, that catches this whole bug class deterministically at runtime for the
+  `Generational` (default) GC backend — a stale native local read within one GC cycle of evacuation now
+  hard-panics instead of silently corrupting. Reuses the GC's own existing forwarding-pointer header field
+  (no new tombstone format needed) behind a one-cycle quarantine delay on reclaiming evacuated memory; see
+  [`../internal/wildfly-stale-objectref-debug-assertion-scoping.md`](../internal/wildfly-stale-objectref-debug-assertion-scoping.md)
+  for the mechanism and its explicit scope boundaries (G1/ZGC not covered).
 - Remaining untriaged: `lang_class.rs`'s other 114 candidates, `lang_invoke.rs`, `servlet.rs`,
   `jboss_msc.rs`, the `wildfly_*.rs` files, `spring_startup_bootstrap.rs`, and three giant
   "Phase N native registration" files (`lib.rs`/`phases_late.rs`/`phases_early.rs`, ~1550 combined
