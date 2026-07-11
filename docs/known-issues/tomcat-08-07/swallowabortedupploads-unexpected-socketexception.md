@@ -1239,3 +1239,111 @@ needing to catch a live crash at all — a static/logged trace of one run
 through the `AbortedPOSTClient` code path, cross-referenced against the
 bytecode's actual receiver-liveness, may be enough to confirm or refute it
 directly.
+
+## 2026-07-11: SB-CRASH-04 default-path fix landed — `precise_maps` now implies the full-GPR safepoint register spill
+
+Implemented and merged the fix the mechanism-narrowing section above pointed
+at, closing the specific, source-verified gap: `emit_pre_safepoint_spill`
+(`jit/src/x64.rs`) is called at every GC-capable safepoint under the
+default-on `precise_maps` path, and several call sites' own comments — the
+MIC/PIC inline-dispatch cascade in particular ("the caller's register-only
+oops must be spilled BEFORE the cascade to be visible to the conservative
+scan") — document register spilling as their purpose. But the function's
+actual GPR-blind-spill block was gated purely on the separate
+`CRATONVM_JIT_SAFEPOINT_REG_SPILL` env var, off by default — so under
+default settings, that documented protection never actually ran. Confirmed
+from source, not inference: `precise_maps`'s own branch in the same function
+only ever wrote the safepoint-id slot for oop-map lookup, nothing register-
+related.
+
+**The fix** (branch `fix/sb-crash-04-precise-reg-spill-20260711`, merged to
+`dev`): fold `precise_maps` into the same decision that already gates
+`safepoint_reg_spill`/`safepoint_reg_spill_all`, at the one place both get
+computed (`jit/src/x64.rs`, `Compiler::new`). This makes the already-built,
+already-documented-as-safe `=all` full-GPR spill ("fully conservative — the
+scanner re-validates each slot via `is_object_address`... can only
+over-retain, never corrupt" under the non-moving young sweep this VM runs
+whenever JIT frames are live) run by default, everywhere
+`emit_pre_safepoint_spill` is already called — roughly a dozen call sites
+(invoke dispatch, the MIC/PIC cascade, allocation helpers,
+checkcast/instanceof, self-recursive calls), all unchanged, since they all
+already consult the same two fields. The FULL GPR file (not just
+callee-saved) matters specifically because a receiver/args staged into
+`ARG_REGS` immediately before a GC-capable call — exactly this crash's
+disassembly shape, `rsi` being a caller-saved/argument register in the
+x86-64 SysV ABI — is invisible to the callee-saved-only spill.
+`CRATONVM_NO_PRECISE_REG_SPILL=1` reverts to the pre-fix, env-var-only
+gating for bisection. Total diff: one new ~15-line function plus two lines
+changed at the single construction site; every downstream consumer
+(frame-size reservation, the spill loop itself, all call sites) inherited
+the new behavior automatically.
+
+### Verification
+
+Built in an isolated worktree off `origin/dev` and validated extensively
+before merging, given the correctness-critical/system-wide blast radius:
+
+- **Correctness probe** (the 43-case `String(char[])` edge-case probe from
+  the earlier fix in this doc): 43/43 pass, unchanged.
+- **`cratonvm-jit` unit tests**: 893/893 pass.
+- **`cratonvm-vm` unit tests**: 2181/2193 pass; the 12 failures are
+  byte-for-byte identical (same test names) on a same-commit baseline
+  binary without the fix — 8 are `lock_order` tests that only assert
+  under debug-build `debug_assert!` (expected to fail when run
+  `--release`, a test-methodology artifact unrelated to this fix), the
+  rest are pre-existing/stale (a hardcoded native-count threshold, an
+  unrelated BouncyCastle JIT carveout test, a system-streams test).
+  Confirmed pre-existing, not a regression.
+- **Crash-hunt repro** (the same `MultiMethodRunner` loop over
+  `testAbortedPOSTOKSwallow`/`testAbortedPOST413Swallow`/
+  `testAbortedPOSTOKNoSwallow` from the section above): 330 clean
+  invocations on the fix binary across two independent runs (20 and 30
+  rounds), zero crashes. **However**, a further 270 invocations against
+  the *unpatched baseline* (90 + 180 rounds, built at the same commit)
+  *also* completed with zero crashes — confirming, a fourth time this
+  session, that this specific SIGSEGV's reproduction is too rare/
+  timing-sensitive under current host conditions to serve as a live A/B
+  confirmation either way. This fix is NOT validated by "the crash no
+  longer reproduces" — it could not be reproduced on either binary today.
+  It is validated by closing a source-verified gap between documented
+  intent and actual default-path behavior, using an already-tested-safe
+  mechanism, with zero regressions found elsewhere.
+- **Full-class `TestSwallowAbortedUploads`** (`org.junit.runner.JUnitCore`,
+  all 10 methods): the separate, already-documented, unrelated
+  `testChunkedPUTNoLimit` "charset" `NullPointerException` crash (see the
+  "blank-response follow-up" section above) is unchanged — identical
+  crash, same signature, on both the fix and the baseline. Confirms this
+  fix neither helps nor hurts that separate bug, as expected (it was
+  already established as unrelated to the char[]-ctor/SB-CRASH-04 work).
+- **Spring regression**: the same 20 `org.springframework.util`/`util.xml`
+  classes used to validate the `String(char[])` fix earlier in this doc —
+  17/20 clean, and the 3 with failures (`StringUtilsTests` 85/86,
+  `ObjectUtilsTests` 131/140, `ExponentialBackOffTests` 9/10) show the
+  *exact same* failure counts already established as a pre-existing,
+  unrelated (`HIB-CV-32`-family) bug earlier in this doc — not a new
+  regression.
+- **Performance**: a call-heavy microbenchmark (200M iterations,
+  monomorphic + polymorphic virtual dispatch — close to worst-case for
+  this fix, since every dispatch is now a spilling safepoint) showed
+  roughly 10-12% wall-clock overhead versus a same-commit baseline run
+  back-to-back on the same host. Both runs were under heavy, uneven
+  multi-tenant host contention (load average 5.9-9.9 on a 16-core shared
+  box with 15+ other concurrent sessions), so the absolute delta is noisy,
+  but the direction and rough magnitude are consistent with "spill 14
+  GPRs at every GC-capable safepoint by default" being a real, non-trivial
+  but bounded cost — the same category of tradeoff this codebase already
+  accepted elsewhere for closing a different receiver-validation SIGSEGV
+  (a 4.7x regression, later optimized down with a guarded fast path). No
+  attempt was made to optimize this further (e.g. scoping the spill to
+  only the specific call shapes that need it, rather than every safepoint)
+  — left as a known, disclosed, opt-out-able cost; a future session could
+  narrow the blast radius if the overhead proves unacceptable in practice.
+
+**Not claimed**: that this is confirmed, with a live reproduction, to be
+*the* fix for the swallow-upload SIGSEGV specifically. What's confirmed:
+this closes a real, source-verified correctness gap in the codebase's own
+documented SB-CRASH-04 mitigation, using a mechanism the codebase itself
+already built and validated as safe, with no regressions across an
+extensive test matrix — a legitimate, low-risk, high-value default-path
+improvement to the general register-invisibility problem regardless of
+whether it happens to be the exact mechanism behind this one crash.
