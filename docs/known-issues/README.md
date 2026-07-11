@@ -4,6 +4,39 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-10 `testNonBlockingReadIgnoreIsReady`'s old theory REFUTED; real cause is a general ~2s NioEndpoint Acceptor/Poller-thread latency, split into its own doc
+
+Re-investigated
+[`tomcat-08-07/nonblockingreadignoreisready-async-error-response-completion-gap.md`](tomcat-08-07/nonblockingreadignoreisready-async-error-response-completion-gap.md).
+Its "container commits an implicit 200 response that never flushes" theory
+does not hold up: verified directly against real HotSpot that the test
+actually passes via a genuine client-side `IOException` thrown mid-upload,
+not `rc=200`. Root-caused via a correlated Rust+Java timeline instead: the
+client finishes its entire ~2s, `Thread.sleep`-paced write loop and closes
+its socket *before* CratonVM's Tomcat connector ever performs its first
+read — so the timing race HotSpot depends on (server reacting to a
+misbehaving `ReadListener` before the client's next write) never happens.
+Confirmed this is not a JIT-warm-up artifact (reproduces identically even
+after a same-JVM warm-up test) and not the earlier-hypothesized
+`native-io` socket-close/drain-timeout issue (tested directly, zero
+effect — the peer had already sent EOF long before close() ran).
+
+- OPEN (new): [`nio-poller-acceptor-thread-scheduling-latency.md`](nio-poller-acceptor-thread-scheduling-latency.md)
+  — the actual mechanism: the NioEndpoint `Acceptor` thread appears to make
+  no progress for ~2 seconds (two full `Poller` `selectorTimeout=1000` ms
+  cycles) while the `Poller` thread is independently parked in blocking
+  `select()`/`WSAPoll` calls, then both make rapid progress together.
+  Isolated Rust unit tests confirm the low-level `wakeup()`/`select()`/
+  registration primitives are each individually fast and correct — the
+  bug (if it is one mechanism at all) is in how CratonVM schedules/runs
+  the two threads concurrently, not in the selector's own logic. Not
+  Tomcat-specific: likely affects any app with one thread parked in a
+  long blocking native call while another needs to make independent
+  progress. Needs VM-core threading/scheduling ownership to pick up with
+  proper `Thread.start()`/blocking-region instrumentation.
+- Updated: the original doc now documents the refutation and cross-links
+  here; it stays OPEN (not fixed) pending the above.
+
 ## 2026-07-10 ES suite-wide RandomizedRunner CCE FIXED (bisected to `aa21e334`); new pre-existing StringJoiner content bug filed
 
 - FIXED/RETIRED: [`ES-FAIL-20260710-randomizedrunner-classmodel-modifier-stringjoiner-cce-FIXED.md`](../internal/elasticsearch-suite/ES-FAIL-20260710-randomizedrunner-classmodel-modifier-stringjoiner-cce-FIXED.md) — every `RandomizedRunner`-based ES test class failed at bootstrap with `ClassCastException: ArrayList cannot be cast to String[]` in `Modifier.toString`/`StringJoiner.add`, blocking the whole suite. Bisected to dev `aa21e334` ("Fix Spring SpEL evaluation edge cases"), which made `StringJoiner` yield to real bytecode for the first time at the interpreter's own dispatch loop — exposing a deterministic heap-reference-integrity defect (`gen_heap::read_slot` "corrupt Value cell"/`HIB-CV-32` guard) in real `StringJoiner.add()`'s `elts[size++]=elt` bytecode pattern that does not reproduce for an equivalent user-defined class (ruled out via two standalone `MicroProbe` repros). Fixed by excluding `java/util/StringJoiner` from the new dispatch check's allowlist, reverting only that one class at that one dispatch point back to its proven-safe pre-`aa21e334` behavior (`vm/src/vm/vm_exec.rs`'s separate, older allowlist for the same class is untouched). Verified: the doc's exact repro (6 classes) now 6/6 PASS; a 60-class broader sweep matches a prior session's pre-regression baseline byte-for-byte (zero new failures).
