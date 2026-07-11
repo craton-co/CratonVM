@@ -58791,7 +58791,7 @@ fn native_b64_without_padding(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let variant = b64_decoder_variant(ctx, this);
+    let variant = b64_variant(ctx, this);
     b64_alloc_encoder(ctx, variant, true)
 }
 
@@ -58820,7 +58820,7 @@ fn native_b64_decode_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let variant = b64_variant(ctx, this);
+    let variant = b64_decoder_variant(ctx, this);
     let src_str = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => String::new(),
