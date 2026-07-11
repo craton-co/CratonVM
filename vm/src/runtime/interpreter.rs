@@ -21849,6 +21849,18 @@ fn force_native_over_real_jdk_bytecode(
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
+    // Base64 encoders are represented by VM-side synthetic state.  The real
+    // JDK bytecode instead reads its private object layout, which is not
+    // populated for those synthetic instances and silently falls back to the
+    // basic, padded encoding.  Keep this in sync with vm_exec's slow-path
+    // override gate so warmed invoke caches also use the native implementation.
+    if matches!(
+        class_name,
+        "java/util/Base64" | "java/util/Base64$Encoder" | "java/util/Base64$Decoder"
+    ) {
+        return true;
+    }
+
     if class_name == "java/lang/Object"
         && method_name == "clone"
         && method_descriptor == "()Ljava/lang/Object;"
