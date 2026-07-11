@@ -41497,6 +41497,11 @@ fn collection_display_kind(stamp: &str) -> Option<GetClassDisplay> {
     match stamp {
         "cratonvm/internal/UnmodifiableList" => Some(GetClassDisplay::CollList),
         "cratonvm/internal/UnmodifiableSet" => Some(GetClassDisplay::CollSet),
+        // entrySet() view — same display family as a plain UnmodifiableSet
+        // (real JDK's `Collections$UnmodifiableMap$UnmodifiableEntrySet` is a
+        // distinct inner class, but the existing keySet()/entrySet() display
+        // was already unified under CollSet before this class existed).
+        "cratonvm/internal/UnmodifiableEntrySet" => Some(GetClassDisplay::CollSet),
         "cratonvm/internal/UnmodifiableSortedSet" => Some(GetClassDisplay::CollSortedSet),
         "cratonvm/internal/UnmodifiableNavigableSet" => Some(GetClassDisplay::CollNavigableSet),
         "cratonvm/internal/UnmodifiableMap" => Some(GetClassDisplay::CollMap),

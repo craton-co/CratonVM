@@ -1016,6 +1016,7 @@ fn build_request_head(
         let _ = write!(&mut out, "Host: {}:{}\r\n", parsed.host, parsed.port);
     }
     let mut has_user_agent = false;
+    let mut has_connection = false;
     let mut has_content_length = false;
     let mut has_content_type = false;
     let mut has_authorization = false;
@@ -1023,6 +1024,9 @@ fn build_request_head(
         let lk = k.to_ascii_lowercase();
         if lk == "user-agent" {
             has_user_agent = true;
+        }
+        if lk == "connection" {
+            has_connection = true;
         }
         if lk == "content-length" {
             has_content_length = true;
@@ -1049,6 +1053,13 @@ fn build_request_head(
     }
     if !has_user_agent {
         out.extend_from_slice(b"User-Agent: Java/CratonVM\r\n");
+    }
+    // The legacy JDK HttpURLConnection client keeps HTTP/1.1 connections
+    // alive by default and sends the explicit compatibility header. Tomcat
+    // exposes that choice in its response header set, including when it drops
+    // an invalid response header before committing the response.
+    if !has_connection {
+        out.extend_from_slice(b"Connection: keep-alive\r\n");
     }
     let is_output_method = has_output || matches!(method, "POST" | "PUT" | "PATCH");
     if !has_content_length && is_output_method {
@@ -2886,6 +2897,7 @@ mod http_url_connection_tests {
         assert!(s.starts_with("GET /foo HTTP/1.1\r\n"));
         assert!(s.contains("Host: example.com\r\n"));
         assert!(s.contains("User-Agent: Java/CratonVM\r\n"));
+        assert!(s.contains("Connection: keep-alive\r\n"));
     }
 
     #[test]
