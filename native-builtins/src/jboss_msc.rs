@@ -3003,7 +3003,12 @@ fn drive_starts(
                 continue;
             }
         };
+        // The callback receiver comes from a process-global side table, not
+        // the current Java frame. Keep it rooted across StartContext creation
+        // and dependency injection: both paths can invoke Java and move it.
+        let svc_pin = ctx.pin_native_root(svc);
         let sctx = build_start_context(ctx, id);
+        let sctx_pin = ctx.pin_native_root(sctx);
         {
             let mut map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
             map.entry(id).or_default().start_began = Some(std::time::Instant::now());
@@ -3013,16 +3018,24 @@ fn drive_starts(
         }
         // Real MSC injects legacy dependency values BEFORE start(); an
         // injection failure is a start failure (same handling arm below).
-        // invoke_virtual prepends the receiver; `args` is parameters ONLY.
+        // Re-read both roots only after injection, immediately before the
+        // callback, so AbstractControllerService.start never sees a stale
+        // receiver or StartContext.
         let res = match inject_dependency_values(ctx, id) {
-            Ok(()) => ctx.invoke_virtual(
-                svc,
-                "start",
-                "(Lorg/jboss/msc/service/StartContext;)V",
-                &[Value::Object(Some(sctx))],
-            ),
+            Ok(()) => {
+                let svc = ctx.read_native_pin(svc_pin, svc);
+                let sctx = ctx.read_native_pin(sctx_pin, sctx);
+                ctx.invoke_virtual(
+                    svc,
+                    "start",
+                    "(Lorg/jboss/msc/service/StartContext;)V",
+                    &[Value::Object(Some(sctx))],
+                )
+            }
             Err(e) => Err(e),
         };
+        ctx.unpin_native_roots(sctx_pin);
+        ctx.unpin_native_roots(svc_pin);
         match res {
             Ok(_) => {
                 if msc_dbg() {
@@ -3150,6 +3163,10 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
         Value::Object(Some(o)) => Some(o),
         _ => None,
     };
+    // The service object is retained in a Rust-side root map only after the
+    // controller mirror is allocated below. Pin it now: reading mode/deps and
+    // allocating that mirror can move the service before the map sees it.
+    let service_pin = service_ref.map(|service| (ctx.pin_native_root(service), service));
     let mode = match ctx.get_field_by_name(builder, "initialMode") {
         Value::Object(o) => read_mode_by_name(ctx, o),
         _ => Mode::Active,
@@ -3172,6 +3189,9 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
     ) {
         Ok(id) => id,
         Err(msg) => {
+            if let Some((pin, _)) = service_pin {
+                ctx.unpin_native_roots(pin);
+            }
             if msc_dbg() {
                 eprintln!(
                     "[msc] install {}: add_service error: {msg}",
@@ -3206,9 +3226,14 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
     {
         let mut map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
         let r = map.entry(id).or_default();
-        r.service = service_ref;
+        r.service = service_pin
+            .as_ref()
+            .map(|(pin, original)| ctx.read_native_pin(*pin, *original));
         r.controller_mirror = Some(ctrl_obj);
         r.child_target = child_target;
+    }
+    if let Some((pin, _)) = service_pin {
+        ctx.unpin_native_roots(pin);
     }
 
     // P3 value plumbing: connect this builder's provides-consumers and the
@@ -3473,7 +3498,12 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         native_service_container_add_service,
     );
     r.register(cont, "shutdown", "()V", native_service_container_shutdown);
-    r.register(cont, "isShutdown", "()Z", native_service_container_is_shutdown);
+    r.register(
+        cont,
+        "isShutdown",
+        "()Z",
+        native_service_container_is_shutdown,
+    );
     for stability_class in [
         cont,
         "org/jboss/msc/service/ServiceContainerImpl",

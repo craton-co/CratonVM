@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-07-11 GPU offload — first real-hardware validation and feature completion
+
+First systematic validation of the GPU offload stack on real hardware (RTX
+2060, sm_75, CUDA driver 591.86, `--features gpu-driver`). Two passes the same
+day: a morning validation run that found and fixed two dispatch-correctness
+bugs, and an evening feature wave that closed most of the follow-ups the
+morning pass turned up. See
+`docs/known-issues/gpu-offload-followups-20260711.md` for full detail and
+remaining open items.
+
+#### Fixed (morning validation pass)
+- Offload-eligible `invokestatic` call sites were being promoted into the interpreter's invoke cache after their first dispatch (or first per-call `--gpu-min-work` rejection), permanently bypassing the GPU offload hook on every later call at that site — a cached target dispatches straight to the CPU body and never re-enters `try_dispatch`. Fixed by never promoting a `Handled`/`HandledWithValue`/`FallThroughKeepHooked` site into the invoke cache (`vm/src/runtime/offload.rs`, `DispatchOutcome`).
+- A failed kernel's bounds-check `failure_flag` was drained *after* the kernel's array writebacks, so a bounds-check failure let partially-corrupted device state copy into the Java heap before the failure was observed — violating the documented "the interpreter observes no partial GPU state on kernel failure" guarantee. Fixed by draining `FailureFlag` writebacks first regardless of push order (`vm/src/runtime/offload.rs::finalize_submission`).
+- Benchmarked the fixed dispatch path against HotSpot JDK 25 (C2) and TornadoVM 4.0.1 (PTX backend) on an RTX 2060, checksums matching HotSpot bit-for-bit at every size: div-chain kernel (48 data-dependent integer divisions/element, unvectorizable on x86) 204–235× over the best CPU; 96-multiply-add kernel (a shape HotSpot C2 *can* auto-vectorize) ties or beats vectorized HotSpot C2 and outruns TornadoVM ~2× on the same kernel. See `bench-gpu/results/` and the README "GPU offload benchmarks" section.
+
+#### Added (evening feature wave)
+- Transparent offload for integer/long reduction kernels (`)I`/`)J`-returning methods, e.g. `sum += a[i]*b[i]`) — the interpreter's void-return-only dispatch gate is lifted for proven reductions, with the scalar result pushed onto the operand stack. `)F`/`)D` reductions stay CPU-only by design (GPU float atomic-add is not bit-identical to Java's sequential fp accumulation). Found and fixed in the process: the reduction PTX epilogue emitted the 2-operand `atom.global.add` form, which `ptxas` rejects with "Arguments mismatch" — every reduction kernel had been silently failing module load and falling back to CPU since the epilogue was written; fixed to the 1-operand `red.global.add` accumulate form, with new `ptxas` round-trip tests added for all six lowering shapes (`jit-cuda/src/lowering.rs`). Measured (RTX 2060, N = 2²⁴, `bench-gpu/GpuDotBench.java`, checksum bit-exact): CratonVM-GPU 18 ms vs CratonVM-CPU 76 ms vs HotSpot C2 7 ms — the GPU beats CratonVM's own CPU 4.2× but not vectorized HotSpot C2 at this size (the kernel is PCIe-bound plus single-cell atomic contention); the value is completing the transparent-offload surface for a reduction shape TornadoVM 4.0.1's own PTX backend currently throws `TornadoInternalError: unimplemented` on (`bench-tornado/TornadoDotBench.java`).
+- Offload eligibility and lowering for `ldc`/`ldc_w`/`ldc2_w` constant-pool loads (int constants outside `sipush` range, and any float/double/long literal) — previously any such constant killed eligibility for the whole method. Measured: `bench-gpu/GpuLdcBench.java` (96-step multiply-add chain, N = 2²⁴) warm 8 ms on GPU vs ~2,000 ms CPU-bound before, sample bit-exact vs HotSpot.
+- A curated `Math`/`StrictMath` GPU-intrinsics table under the existing `ALLOW_INTRINSIC_CALLS` admission hint — `sqrt`(double), `abs`/`min`/`max`(int/long/float/double, NaN- and signed-zero-correct per Java's contract), `fma`(float/double) — replacing the previous analyzer hole where any `invokestatic` was admitted but the emitter had no lowering for any of them, so every such method silently blacklisted itself to the CPU. `sin`/`cos`/`exp`/`log`/`pow` are deliberately excluded: PTX only offers `.approx` transcendentals, which would silently violate Java's `Math`/`StrictMath` precision contract. See `docs/gpu/annotations.md`.
+- `frem`/`drem` (IEEE remainder) lowering, gated behind the existing `ALLOW_DIV_BY_ZERO` admission hint (reused rather than adding a new hint for one opcode pair); exact only for bounded quotients.
+- `lcmp`/`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg` value-form lowering (bit-exact `setp`/`selp` sequences, correct NaN-result asymmetry between the `l`/`g` variants). A compare that feeds a branch still rejects at the branch opcode, so no new false eligibility was introduced.
+- Non-zero-start counted loops (`i = K; i < bound; i++` with `K >= 0`, `K` sourced from an `ldc`).
+- A JIT-caller admission gate (`vm/src/runtime/offload_jit_gate.rs`) that denies JIT/OSR compilation of any caller method containing an offload-eligible call site while `--gpu` is active, wired into all 5 JIT/OSR admission checks in the interpreter — closes the "a hot caller's OSR silently degrades offload back to CPU" structural gap. Hardware-validated: 100 hot repetitions of a caller loop at N = 2²² hold steady at 2 ms warm per call.
+- `dispatch_async` launch-configuration fixes: the thread-count floor no longer clamps every launch to a minimum of 2²⁰ threads (the real per-call array length wins when known), and block size now comes from `cuOccupancyMaxPotentialBlockSize` instead of a fixed 256-thread block.
+- Async API surface: a non-blocking `poll_submission_status` now backs `Native.futureIsDone`/`futureStatus` (a real device probe via a best-effort `cuLaunchHostFunc` host callback, falling back to non-blocking `Event::query`/`cuEventQuery`), finalizing a submission inline the moment the device reports done — `isDone()` returning `true` now means the submission is really finalized, not just "probably." `Native.futureGetResult` now surfaces real scalar reduction results (boxed as `Integer`/`Long`/`Float`/`Double`) from the real submission registry instead of only the pre-Phase-6 synthetic stub map. `GpuExecutor`'s default CUDA stream is now real and shared across an executor's submissions instead of a fresh private stream per dispatch (`resolve_or_create_default_stream`); `newStream()` also now mints a genuine CUDA stream, though nothing yet routes a dispatch onto it explicitly. `GpuArray.allocate`'s Rust-side native shims (`arrayAllocateInt/Long/Float/Double`) landed; the `craton-gpu-java` jar binding is still pending. `i8`/`i16` bulk array marshalling. `--print-gpu-decisions` is now self-sufficient — it no longer requires a separate `RUST_LOG=info` to see any output.
+- `.github/workflows/gpu-selfhosted.yml` + `bench-gpu/ci-gate.sh` — weekly self-hosted-GPU-runner CI scaffolding for the `bench-gpu/` benchmark suite (checksum-verified); runner enrollment against the workflow's runner label is still pending.
+
+#### Known follow-ups
+- `GpuFuture` completion is now poll-driven but still not push-driven: `isDone()`/`getNow()` do a real non-blocking device check and finalize inline, but nothing drives that check without an application thread calling it — no background thread or driver callback completes a future on its own yet.
+- 2-D/nested loops and general (non-loop-guard) branches are still rejected by the analyzer; `)F`/`)D` reductions remain CPU-only by design.
+- Full open-items list in `docs/known-issues/gpu-offload-followups-20260711.md`.
+
+---
+
 ### 2026-06 multi-agent review remediation
 
 A second, larger review-driven remediation pass (one Opus agent per finding, merged in

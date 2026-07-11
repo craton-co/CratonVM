@@ -528,6 +528,24 @@ fn pin_value_for_native_call(shared: &SharedVm, roots: &mut Vec<ObjectRef>, v: &
     }
 }
 
+/// `java.lang.Object`'s `ClassId`, resolved once and cached lock-free
+/// thereafter. `java.lang.Object` is always loaded before any bytecode runs
+/// (it roots the class hierarchy the VM needs to bootstrap), so in practice
+/// the lookup below succeeds on the very first call — but if it were ever to
+/// return `None`, nothing is cached and the next call retries the real
+/// lookup rather than permanently disabling the stale-receiver check.
+#[inline]
+fn object_class_id(shared: &SharedVm) -> Option<ClassId> {
+    use std::sync::OnceLock;
+    static OBJECT_CLASS_ID: OnceLock<ClassId> = OnceLock::new();
+    if let Some(id) = OBJECT_CLASS_ID.get() {
+        return Some(*id);
+    }
+    let resolved = shared.class_manager.read().find_class_by_name("java/lang/Object")?;
+    let _ = OBJECT_CLASS_ID.set(resolved); // races are harmless; loser just re-resolves next time
+    Some(resolved)
+}
+
 fn recover_stale_lambda_receiver_from_native_pins(
     shared: &SharedVm,
     thread: &JvmThread,
@@ -540,14 +558,14 @@ fn recover_stale_lambda_receiver_from_native_pins(
         return None;
     }
 
+    // Perf: check the cheap sentinel/cached-ClassId comparisons before ever
+    // taking the `class_manager` RwLock — this runs on EVERY non-Object-method
+    // invoke_virtual (e.g. every `HashMap.put`/`.get` call), and the vast
+    // majority of receivers are ordinary, non-stale objects. See
+    // reference_hashmap_native_call_dispatch_overhead_20260711.
     let stale_object_receiver = receiver_class_id == ClassId::new(0)
         || receiver_class_id == ClassId::new(u32::MAX)
-        || shared
-            .class_manager
-            .read()
-            .get_class(receiver_class_id)
-            .map(|class| class.name.as_ref() == "java/lang/Object")
-            .unwrap_or(false);
+        || object_class_id(shared) == Some(receiver_class_id);
     if !stale_object_receiver {
         return None;
     }
@@ -1024,12 +1042,13 @@ pub(crate) fn monitor_enter_blocking(
     let mut ctx = NativeContextImpl { shared, thread };
     let pin_base = ctx.thread.native_pin_roots.len();
     ctx.thread.native_pin_roots.push(obj);
-    // CRIT (TLAB UAF) — retire the TLAB before blocking on a contended
-    // `synchronized` acquire (see monitor_wait): a STW GC can grow/realloc the
-    // young arena while we are parked, freeing the buffer the TLAB points into.
-    // Finding 1(a): retire BEFORE the deposit — `deposit_root_snapshot`
-    // raises `in_blocked_region`, after which a pause may collect concurrently
-    // with this thread; the retire's gap-filler write must not race that walk.
+    // GCAUDIT-0711-FIX (finding 1a, adjacent): retire BEFORE deposit —
+    // `deposit_root_snapshot` publishes `in_blocked_region`, the signal a
+    // concurrent STW census uses to decide THIS thread needs no further
+    // waiting. Once that flag is visible, nothing on this thread may still
+    // write to the heap — retiring the TLAB writes a filler object into the
+    // young arena, which would otherwise race a collector that (correctly,
+    // per the now-true flag) proceeded without waiting for us.
     ctx.thread.tlab.retire();
     ctx.deposit_root_snapshot();
     // Gated diagnostic only (CRATONVM_DBG_MONENTER, default OFF): deposit this
@@ -1046,9 +1065,11 @@ pub(crate) fn monitor_enter_blocking(
         if blk.pre_stw {
             // A STW was already in progress when we became blocked —
             // arrive at the barrier so its `wait_for_all` completes.
-            // Census-aware (finding 1(a)): if the pause's census ran after
-            // our deposit raised `in_blocked_region`, we are EXCLUDED and
-            // must not fill a counted mutator's quota slot.
+            // GCAUDIT-0711-FIX (finding 1a): `_auto`, not plain
+            // `arrive_and_wait` — `deposit_root_snapshot` above already
+            // raised `in_blocked_region`, so this pause's own census may
+            // have already excluded us; only the exclusion snapshot the
+            // census recorded (not this thread's guess) can say which.
             let _ = shared.gc_barrier.arrive_and_wait_auto(tid);
         }
         m.block_enter(tid);
@@ -1098,15 +1119,16 @@ pub(crate) fn monitor_enter_synchronized_method(
 
     let tid = thread.thread_id;
     let mut ctx = NativeContextImpl { shared, thread };
-    // A parked contender must not retain a TLAB into a young arena that a
-    // concurrent STW can grow/reallocate while this thread is blocked.
-    // Finding 1(a): retire BEFORE the deposit (see monitor_enter_blocking).
+    // GCAUDIT-0711-FIX (finding 1a, adjacent): retire BEFORE deposit — see
+    // `monitor_enter_blocking`. A parked contender must not retain a TLAB
+    // into a young arena that a concurrent STW can grow/reallocate while
+    // this thread is blocked, AND must not still be writing to the heap
+    // after `in_blocked_region` tells a census it is done doing so.
     ctx.thread.tlab.retire();
     ctx.deposit_root_snapshot();
     {
         let blk = ctx.shared.gc_barrier.enter_blocked();
         if blk.pre_stw {
-            // Census-aware (finding 1(a)) — see monitor_enter_blocking.
             let _ = ctx.shared.gc_barrier.arrive_and_wait_auto(tid);
         }
         monitor.block_enter(tid);
@@ -2361,7 +2383,8 @@ impl NativeThreadBlocker for VmNativeThreadBlocker {
             .mark_native_thread_blocked(self.thread_id);
         let pre_stw = self.shared.gc_barrier.mark_blocked_region_enter();
         if pre_stw {
-            // Census-aware (finding 1(a)) — see monitor_enter_blocking.
+            // GCAUDIT-0711-FIX (finding 1a): `mark_native_thread_blocked`
+            // above already raised `in_blocked_region`, so `_auto`.
             let _ = self.shared.gc_barrier.arrive_and_wait_auto(self.thread_id);
         }
     }
@@ -2742,17 +2765,183 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
-    /// Phase 6 #4: query the real GPU submission registry.
+    /// GpuStream affinity — override the stream-mint escape hatch.
+    /// Delegates to `OffloadCache::stream_create` on the per-VM
+    /// default-ordinal cache when the gpu-offload feature is on;
+    /// otherwise returns `None` (the trait's default).
+    fn gpu_stream_create(&mut self) -> Option<u64> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            self.shared
+                .offload_registry
+                .get_or_create(self.shared.config.gpu_device_ordinal, &self.shared.config)
+                .stream_create()
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            None
+        }
+    }
+
+    /// GpuStream affinity — override the stream-release escape hatch.
+    /// Delegates to `OffloadCache::stream_release`; a no-op when the
+    /// gpu-offload feature is off (the trait's default already
+    /// covers that, but the cache lookup itself is guarded the same
+    /// way every other GPU override in this impl is).
+    fn gpu_stream_release(&mut self, handle: u64) {
+        #[cfg(feature = "gpu-offload")]
+        {
+            self.shared
+                .offload_registry
+                .get_or_create(self.shared.config.gpu_device_ordinal, &self.shared.config)
+                .stream_release(handle);
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+        }
+    }
+
+    /// GpuStream affinity — stream-affine sibling of
+    /// `gpu_dispatch_method`. Delegates to
+    /// `crate::runtime::offload::dispatch_method_from_native_on_stream`
+    /// (same class/method resolution + marshalling as
+    /// `gpu_dispatch_method`, plus the `stream_handle` resolution
+    /// step) when the gpu-offload feature is on; otherwise returns
+    /// `None` (the trait's default, which itself falls back to
+    /// `gpu_dispatch_method`).
+    fn gpu_dispatch_method_on_stream(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        java_args: &[Value],
+        stream_handle: Option<u64>,
+    ) -> Option<u64> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            Some(
+                crate::runtime::offload::dispatch_method_from_native_on_stream(
+                    self.shared,
+                    class_name,
+                    method_name,
+                    descriptor,
+                    java_args,
+                    stream_handle,
+                ),
+            )
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = (class_name, method_name, descriptor, java_args, stream_handle);
+            None
+        }
+    }
+
+    /// Phase 6 #4 (2026-07-11: switched to the non-blocking poll) —
+    /// query the real GPU submission registry for `handle`'s completion
+    /// state.
+    ///
+    /// Previously a pure `sub.status.lock()` peek: it read whatever
+    /// `SubmissionStatus` the submission already carried but never
+    /// asked the device anything, so it could never observe a
+    /// completion that some other caller (`futureSynchronize`/`get()`)
+    /// hadn't already finalized — `futureIsDone` stayed `false` forever
+    /// for a submission nobody was blocking on. Now delegates to
+    /// `runtime::offload::poll_submission_status`, which finalizes the
+    /// submission inline (bounded work only — by the time it does, the
+    /// device event has already fired) the first time it observes the
+    /// device-side work as done. `Native.futureIsDone`/`futureStatus`
+    /// (`native-builtins/src/craton_gpu.rs`) are therefore now
+    /// genuinely non-blocking-but-live rather than only ever reporting
+    /// stale `Running`.
     fn gpu_future_status(&self, handle: u64) -> Option<i32> {
         #[cfg(feature = "gpu-offload")]
         {
+            let outcome = crate::runtime::offload::poll_submission_status(self.shared, handle)?;
+            Some(match outcome {
+                crate::runtime::offload::PollOutcome::Running => 0,
+                crate::runtime::offload::PollOutcome::Completed => 1,
+                crate::runtime::offload::PollOutcome::Failed => 2,
+            })
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+            None
+        }
+    }
+
+    /// 2026-07-11 — `NativeContext::gpu_future_take_result` override.
+    /// See the trait doc comment (`native-api/src/registry.rs`) for the
+    /// full contract; this is the read half that hands back a completed
+    /// submission's `SerializedResult` (translated into the
+    /// `native-api`-side `GpuFutureResult` transport enum, since
+    /// `native-api` cannot depend on this crate's `offload` types).
+    ///
+    /// Reuses `poll_submission_status` — the same non-blocking,
+    /// finalize-only-if-the-device-already-reported-done path
+    /// `gpu_future_status` now uses — so a caller that already observed
+    /// `isDone() == true` gets the result with no wait, and a caller
+    /// that hasn't gets `None` rather than an implicit block.
+    fn gpu_future_take_result(&self, handle: u64) -> Option<cratonvm_native_api::registry::GpuFutureResult> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            use crate::runtime::offload::{PollOutcome, SerializedResult, SubmissionStatus};
+
+            // Only a terminal `Completed` outcome carries a result;
+            // `Running` and `Failed` (and an unknown handle, which
+            // `poll_submission_status` already reports as `None`) don't.
+            // This never blocks: `poll_submission_status` only ever
+            // finalizes inline when the device has already reported the
+            // work done, never by waiting for it to.
+            if crate::runtime::offload::poll_submission_status(self.shared, handle)?
+                != PollOutcome::Completed
+            {
+                return None;
+            }
             let sub = crate::runtime::offload::lookup_submission(handle)?;
             let status = sub.status.lock();
-            Some(match *status {
-                crate::runtime::offload::SubmissionStatus::Running => 0,
-                crate::runtime::offload::SubmissionStatus::Completed { .. } => 1,
-                crate::runtime::offload::SubmissionStatus::Failed { .. } => 2,
-            })
+            match &*status {
+                SubmissionStatus::Completed { result } => Some(match result {
+                    SerializedResult::Void => cratonvm_native_api::registry::GpuFutureResult::Void,
+                    SerializedResult::ScalarI32(v) => {
+                        cratonvm_native_api::registry::GpuFutureResult::ScalarI32(*v)
+                    }
+                    SerializedResult::ScalarI64(v) => {
+                        cratonvm_native_api::registry::GpuFutureResult::ScalarI64(*v)
+                    }
+                    SerializedResult::ScalarF32(v) => {
+                        cratonvm_native_api::registry::GpuFutureResult::ScalarF32(*v)
+                    }
+                    SerializedResult::ScalarF64(v) => {
+                        cratonvm_native_api::registry::GpuFutureResult::ScalarF64(*v)
+                    }
+                    // `finalize_submission` never actually constructs one
+                    // of these today: array outputs are copied back to
+                    // the caller's own Java array via `MarshalWriteback`
+                    // writeback entries (drained by `finalize_submission`
+                    // itself), not stamped into `SerializedResult` — its
+                    // `scalar_result` local is only ever set by the
+                    // single Part-E scalar writeback kind, so a
+                    // `Completed` status here only ever holds `Void` or a
+                    // `Scalar*` variant in practice. These arms are
+                    // therefore unreachable today; map to `Void`
+                    // defensively rather than panic if that ever changes.
+                    SerializedResult::PrimitiveArrayI32 { .. }
+                    | SerializedResult::PrimitiveArrayI64 { .. }
+                    | SerializedResult::PrimitiveArrayF32 { .. }
+                    | SerializedResult::PrimitiveArrayF64 { .. } => {
+                        cratonvm_native_api::registry::GpuFutureResult::Void
+                    }
+                }),
+                // `poll_submission_status` just reported `Completed`
+                // under its own lock acquisition; this re-locks and
+                // should see the same terminal state (a submission never
+                // regresses out of a terminal status). Stay defensive
+                // rather than assume that invariant instead of checking it.
+                _ => None,
+            }
         }
         #[cfg(not(feature = "gpu-offload"))]
         {
@@ -4298,11 +4487,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 crate::error::VmError::Runtime(crate::error::RuntimeError::InterruptedException),
             ));
         }
-        // Finding 1(a): retire the TLAB BEFORE the deposit raises
-        // `in_blocked_region` — the retire's gap-filler write is a heap write
-        // and must not race a pause that the raised flag lets collect
-        // concurrently with us. (The retire used to sit after the deposit,
-        // just before `enter_blocked`.)
+        // GCAUDIT-0711-FIX (finding 1a, adjacent): retire BEFORE deposit —
+        // see `monitor_enter_blocking`. Moved ahead of the snapshot deposit
+        // below (which raises `in_blocked_region`) so no heap-mutating TLAB
+        // filler write can happen after a concurrent census has already
+        // decided it may proceed without waiting for this thread.
         self.thread.tlab.retire();
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
@@ -4319,15 +4508,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // early-returns — so the barrier's `expected` accounting cannot
         // leak. The guard is dropped immediately after the wait so a
         // *subsequent* STW correctly waits for this now-running thread.
-        //
-        // CRIT (TLAB UAF) — the TLAB was retired above, BEFORE the deposit,
-        // while the young arena was still valid (finding 1(a) ordering). A
-        // STW moving GC on another thread can grow() (realloc) the young
-        // arena while we are parked here, freeing the old backing buffer; a
-        // retained TLAB into it would dangle and the first post-wait
-        // fast-path bump would SIGSEGV in init_object_header. Object.wait /
-        // Condition.await / blocking-queue take all funnel through here, so
-        // this is the dominant blocking path under concurrency.
+        // (TLAB already retired above, before the root-snapshot deposit —
+        // see the GCAUDIT-0711-FIX comment there.)
         let was_interrupted = {
             let blk = self.shared.gc_barrier.enter_blocked();
             if blk.pre_stw {
@@ -4346,6 +4528,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 // `synchronized` exit handler loops on it forever → the joiner
                 // livelocks off the GC safepoint and wedges the next STW. Remap
                 // `obj` through the pointer map the barrier hands back.
+                //
+                // GCAUDIT-0711-FIX (finding 1a): `_auto` — the deposit above
+                // already raised `in_blocked_region` before this check, so
+                // this pause's own census may have excluded us; the pointer
+                // map is still returned either way (see `arrive_and_wait_inner`),
+                // only the `arrived` quota bookkeeping differs.
                 let pm = self
                     .shared
                     .gc_barrier
@@ -4931,7 +5119,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     if contended {
                         let blk = shared_arc.gc_barrier.enter_blocked();
                         if blk.pre_stw {
-                            // Census-aware (finding 1(a)).
+                            // GCAUDIT-0711-FIX (finding 1a): `_auto` for
+                            // uniformity with every other barrier arrival —
+                            // this thread never raises `in_blocked_region`
+                            // before this point, so it resolves identically
+                            // to the old `arrive_and_wait`.
                             let _ = shared_arc.gc_barrier.arrive_and_wait_auto(tid);
                         }
                         monitor.block_enter(tid);
@@ -4968,7 +5160,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // still included in `threads_blocked`.
             let term_blk = shared_arc.gc_barrier.enter_blocked();
             if term_blk.pre_stw {
-                // Census-aware (finding 1(a)).
+                // GCAUDIT-0711-FIX (finding 1a): `_auto` for uniformity —
+                // see the identical note a few lines up.
                 let _ = shared_arc.gc_barrier.arrive_and_wait_auto(tid);
             }
             term_blk.finish_after(|| {
@@ -5012,17 +5205,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // T19.H1 — mark GC-blocked across the join so a stop-the-world
         // GC excludes this thread from `wait_for_all` (it is parked in
         // `JoinHandle::join` and cannot reach an interpreter safepoint).
-        // CRIT (TLAB UAF) — retire the TLAB before blocking (see monitor_wait):
-        // a STW GC can grow/realloc the young arena while we are joined.
-        // Finding 1(a): retire BEFORE the deposit raises `in_blocked_region`
-        // (the gap-filler write must not race a concurrent collection).
+        // GCAUDIT-0711-FIX (finding 1a, adjacent): retire BEFORE deposit —
+        // see `monitor_enter_blocking`. CRIT (TLAB UAF): a STW GC can
+        // grow/realloc the young arena while we are joined.
         self.thread.tlab.retire();
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
         {
             let blk = self.shared.gc_barrier.enter_blocked();
             if blk.pre_stw {
-                // Census-aware (finding 1(a)).
+                // GCAUDIT-0711-FIX (finding 1a): `_auto` — the deposit above
+                // already raised `in_blocked_region` before this check.
                 let _ = self
                     .shared
                     .gc_barrier
@@ -5604,7 +5797,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if self.shared.gc_barrier.mark_blocked_region_enter() {
             // A STW was already in progress — arrive at the barrier so
             // the initiator's `wait_for_all` can complete.
-            // Census-aware (finding 1(a)).
+            // GCAUDIT-0711-FIX (finding 1a): `_auto` — the deposit above
+            // already raised `in_blocked_region` before this check.
             let _ = self
                 .shared
                 .gc_barrier
@@ -6002,11 +6196,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 blocker_pin = Some(self.pin_native_root(blocker));
             }
         }
-        // CRIT (TLAB UAF) — retire the TLAB before parking (see monitor_wait):
-        // a STW GC can grow/realloc the young arena while this thread is parked,
-        // freeing the buffer the TLAB points into.
-        // Finding 1(a): retire BEFORE the deposit raises `in_blocked_region`
-        // (the gap-filler write must not race a concurrent collection).
+        // GCAUDIT-0711-FIX (finding 1a, adjacent): retire BEFORE deposit —
+        // see `monitor_enter_blocking`. CRIT (TLAB UAF): a STW GC can
+        // grow/realloc the young arena while this thread is parked, freeing
+        // the buffer the TLAB points into.
         self.thread.tlab.retire();
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
@@ -6053,7 +6246,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         {
             let blk = self.shared.gc_barrier.enter_blocked();
             if blk.pre_stw {
-                // Census-aware (finding 1(a)).
+                // GCAUDIT-0711-FIX (finding 1a): `_auto` — the deposit above
+                // already raised `in_blocked_region` before this check.
                 let _ = self
                     .shared
                     .gc_barrier
@@ -11648,6 +11842,12 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/lang/Thread"
                             && method_name == "getThreadGroup"
                             && descriptor == "()Ljava/lang/ThreadGroup;")
+                        || (class_name == "java/util/logging/Handler"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("getFormatter", "()Ljava/util/logging/Formatter;")
+                                    | ("setFormatter", "(Ljava/util/logging/Formatter;)V")
+                            ))
                         || (class_name == "org/jboss/threads/JBossThread"
                             && method_name == "run"
                             && descriptor == "()V")
@@ -12802,12 +13002,21 @@ fn invoke_on_class_shared_inner(
                                     // output" symptom. Force the native
                                     // (registered in logmanager.rs) to win.
                                     | "logp"
+                                    // Synthetic Logger mirrors do not carry the
+                                    // JDK ConfigurationData handler list. Route
+                                    // explicit handler installation through the
+                                    // JUL bridge so in-process captures observe
+                                    // the same records as the console sink.
+                                    | "addHandler" | "removeHandler"
                                     // `isLoggable` gates JULI's emit path;
                                     // the real bytecode returns false for our
                                     // parent-less synthetic Logger, so every
                                     // log call short-circuits to a no-op.
                                     | "isLoggable"
                             ))
+                        || (class_name == "java/util/logging/LogRecord"
+                            && method_name == "getMessage"
+                            && descriptor == "()Ljava/lang/String;")
                         || (class_name == "org/jboss/logmanager/Logger"
                             && matches!(
                                 method_name,

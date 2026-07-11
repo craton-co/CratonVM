@@ -285,6 +285,43 @@ This is an evolving surface. Be aware of the following:
   semver-stable Rust contract. Prefer them over depending on `cratonvm-vm`
   internals directly.
 
+## GPU offload for embedders
+
+CratonVM's transparent GPU offload (`--gpu`, validated on real hardware 2026-07-11 — see
+[`docs/gpu/README.md`](gpu/README.md) and [`ROADMAP.md`](../ROADMAP.md#gpu-offload)) is a
+`VmConfig` field + Cargo-feature surface today, not a `cratonvm_*` C API or JNI surface. What
+that means per embedding path:
+
+- **Rust facade (`cratonvm-embed`) — reachable, one feature flag either way.**
+  `cratonvm-embed` forwards a `gpu-offload` feature to `cratonvm-vm/gpu-offload`, and `VmConfig`
+  re-exports the four GPU fields unchanged — `gpu_offload_enabled`, `gpu_device_ordinal`,
+  `gpu_min_work`, `print_gpu_decisions` (all `pub`, gated on that feature —
+  `vm/src/config.rs`) — so an embedder can set them directly on a `VmConfig` value via struct
+  update syntax. There is no `with_gpu_offload(...)`-style builder method the way there is for
+  `max_heap_size`/`jdwp`/etc. `gpu-offload` alone only links `cuda-bridge`'s stub backend (every
+  device probe returns `DeviceError::NoDriver`) — useful for testing the config plumbing without
+  a GPU present, but not for real dispatch. For the real CUDA driver, enable `cratonvm-embed`'s
+  `gpu-driver` feature instead (`cratonvm-embed/Cargo.toml`): it implies `gpu-offload` and adds
+  `cuda-bridge/cuda`, mirroring `vm-cli`'s own composite feature
+  (`gpu-driver = ["gpu", "cuda-bridge/cuda"]`, `vm-cli/Cargo.toml`). `cuda-bridge` is a direct
+  optional dependency of `cratonvm-embed` for exactly this reason — Cargo only allows a
+  `<dep>/<feature>` reference against a *direct* dependency, and `cuda-bridge` otherwise only
+  arrives transitively via `cratonvm-vm`. As with `vm-cli`, the NVIDIA driver is dlopened at
+  runtime rather than linked at build time, so `--features gpu-driver` does not require CUDA on
+  the build machine, only on whatever machine runs the resulting binary with
+  `gpu_offload_enabled = true`.
+- **C ABI (`libcratonvm`) — not reachable.** `libcratonvm/Cargo.toml` does not forward the
+  `gpu-offload` feature at all — its `cratonvm-vm` dependency's `features` list omits it — so a
+  `libcratonvm` build never compiles the GPU config fields in, and neither the flat `cratonvm_*`
+  API nor the JNI Invocation API has any function or option string that reaches
+  `gpu_offload_enabled`/`gpu_device_ordinal`/`gpu_min_work` (there are no GPU references anywhere
+  in `libcratonvm/src/lib.rs`). A C/FFI host cannot enable GPU offload without patching
+  `libcratonvm`'s own manifest and adding new C entry points — this is a real gap, not just an
+  undocumented-but-possible path.
+
+For the state of the offload path itself (independent of this embedding-surface gap), see
+[`docs/known-issues/gpu-offload-followups-20260711.md`](known-issues/gpu-offload-followups-20260711.md).
+
 ## See also
 
 - [`libcratonvm/include/cratonvm.h`](../libcratonvm/include/cratonvm.h) — the

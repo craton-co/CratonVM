@@ -352,3 +352,45 @@ Follow-up session 3 (static-analysis sweep, 2026-07-11):
     a real fix needs the actual build module's Galleon provisioning re-run, not attempted (out of scope,
     high risk on a busy shared host)
 ```
+
+
+## Follow-up session 4 (2026-07-11): live harness restored; ServiceLoader + MSC callback stale-reference fixes
+
+The Azure harness was made usable without changing tracked source: its missing
+`apps/wildfly/build/target/wildfly-32.0.1.Final` provisioning output is an
+ignored build artifact, so it now symlinks to the already-present
+`testsuite/integration/basic/target/wildfly` distribution (including
+`modules/`). This permitted real server-side retries again.
+
+A crucial harness correction: setting `CRATONVM_BIN` changes the Surefire
+**client** JVM only. Arquillian starts the WildFly server from
+`-Dcontainer.java.home=<home>/bin/java`. Initial comparison attempts therefore
+left the server on an older binary and are evidence only of the residual's
+continued reproducibility. Subsequent runs used unique, SHA-256-verified
+Java-home shims per frozen binary, so both the client and server executed the
+intended build.
+
+Two more high-confidence Family-1 sites were fixed:
+
+- `native-builtins/src/service_loader.rs`: `discover_providers` now roots the
+  `ServiceLoader`, service `Class`, and module/custom loader across Java
+  dispatches; `load_provider_class` roots the loader across `create_string` +
+  `findClass`/`loadClass`; `native_sl_iterator` roots the provider `Class`
+  across its allocating empty-parameter-array creation before
+  `getDeclaredConstructor`.
+- `native-builtins/src/jboss_msc.rs`: the service object retained in the
+  Rust-side `service_roots` map is refreshed after controller-mirror
+  allocation, and `drive_starts` roots/re-reads both the service receiver and
+  `StartContext` after dependency injection immediately before
+  `Service.start`. This is directly on the `AbstractControllerService.start`
+  path whose later boot step reports `this.controller is null`.
+
+`cargo check -p cratonvm-native-builtins` passed after both changes, as did
+release builds of the before/after and final probes. The corrected
+server-side samples still reproduce the **independent** controller-null and
+STW-takeover residuals (final MSC-root build: 3/4 controller-null, 1/4 STW),
+so this issue remains open. The samples did not produce `WFLYCTL0153` after
+these fixes, but the controlled current-dev sample also missed it in six
+retries; that is encouraging but not enough to mark the extension residual
+closed. The STW live-attach poll caught the warning but missed the process by
+a narrow race again; no GC-barrier change was attempted.

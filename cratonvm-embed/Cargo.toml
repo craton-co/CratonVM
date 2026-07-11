@@ -36,9 +36,37 @@ experimental-serialization = ["cratonvm-vm/experimental-serialization"]
 experimental-aot = ["cratonvm-vm/experimental-aot"]
 experimental-debug = ["cratonvm-vm/experimental-debug"]
 gpu-offload = ["cratonvm-vm/gpu-offload"]
+# `gpu-offload` alone only links cuda-bridge's *stub* backend — every device
+# probe returns `DeviceError::NoDriver`, which is enough to exercise the
+# `VmConfig` GPU-field plumbing without a GPU present, but not enough to
+# actually dispatch work to a device. `gpu-driver` additionally turns on
+# cuda-bridge's real CUDA Driver API bindings so a device probe can succeed.
+# `cuda-bridge` has to be a *direct* optional dependency of this crate (see
+# `[dependencies.cuda-bridge]` below) for the `"cuda-bridge/cuda"` reference
+# here to be legal at all — Cargo only allows `<dep>/<feature>` syntax
+# against a package's own direct dependencies, not one pulled in only
+# transitively through `cratonvm-vm`. Mirrors vm-cli's
+# `gpu-driver = ["gpu", "cuda-bridge/cuda"]` (vm-cli/Cargo.toml). Enabling
+# this feature does not require CUDA on the *build* machine: cuda-bridge
+# dlopens the NVIDIA driver library at runtime, not link time, so the actual
+# GPU/driver only needs to be present wherever the resulting binary runs
+# with `gpu_offload_enabled = true`.
+gpu-driver = ["gpu-offload", "cuda-bridge/cuda"]
 
 [dependencies]
 cratonvm-vm = { path = "../vm", version = "0.3.0", default-features = false }
+
+# Optional direct dependency so the `gpu-driver` feature above can legally
+# reference `cuda-bridge/cuda` (see the comment on that feature for why a
+# direct dependency is required, not just a transitive one via
+# cratonvm-vm). Mirrors vm-cli/Cargo.toml's `[dependencies.cuda-bridge]`
+# stanza. Stays out of the dependency graph entirely unless `gpu-driver` (or
+# an embedder's own feature unification) turns it on.
+[dependencies.cuda-bridge]
+path = "../cuda-bridge"
+version = "0.3.0"
+optional = true
+package = "cratonvm-cuda-bridge"
 
 [lints]
 workspace = true

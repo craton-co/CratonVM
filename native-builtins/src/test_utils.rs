@@ -7,6 +7,7 @@
 //! field access, and array operations — enough to test most native methods
 //! without pulling in the full VM.
 
+use cratonvm_native_api::registry::GpuFutureResult;
 use cratonvm_native_api::{
     AnnotationData, FieldMetadata, MethodMetadata, NativeContext, StackTraceEntry,
 };
@@ -689,6 +690,27 @@ pub(crate) struct MockNativeContext {
     /// Per-field TYPE_USE annotation overrides for tests.
     pub(crate) field_type_annotations_override:
         UnsafeCell<HashMap<(u32, String), Vec<AnnotationData>>>,
+    /// 2026-07-11: per-handle canned answer for `gpu_future_take_result`.
+    /// Empty by default, so the mock uses the trait's default (`None`)
+    /// and `craton_gpu.rs`'s handlers fall through to the local
+    /// synthetic `FutureState` map — same shape as `gpu_future_status`
+    /// being unscripted. Tests that want to exercise the *real-registry*
+    /// branch of `builtin_future_get_result` populate this via
+    /// `set_gpu_future_take_result(handle, result)`.
+    pub(crate) gpu_future_take_result_override: UnsafeCell<HashMap<u64, GpuFutureResult>>,
+    /// GpuStream affinity: canned answer for `gpu_stream_create`.
+    /// `None` by default (the trait's default, "no device"). Tests
+    /// that want to verify `resolve_or_create_default_stream`'s
+    /// caching behavior set this via `set_gpu_stream_create_result`.
+    pub(crate) gpu_stream_create_override: UnsafeCell<Option<u64>>,
+    /// GpuStream affinity: number of times `gpu_stream_create` has
+    /// been called. Read via `gpu_stream_create_call_count()` — the
+    /// caching test's whole point is that this stays `1` across
+    /// repeated calls for the same executor handle.
+    pub(crate) gpu_stream_create_calls: UnsafeCell<u32>,
+    /// GpuStream affinity: every handle passed to `gpu_stream_release`,
+    /// in call order. Read via `gpu_stream_release_calls()`.
+    pub(crate) gpu_stream_release_calls: UnsafeCell<Vec<u64>>,
 }
 
 impl MockNativeContext {
@@ -750,6 +772,10 @@ impl MockNativeContext {
             method_return_type_annotations_override: UnsafeCell::new(HashMap::new()),
             method_parameter_type_annotations_override: UnsafeCell::new(HashMap::new()),
             field_type_annotations_override: UnsafeCell::new(HashMap::new()),
+            gpu_future_take_result_override: UnsafeCell::new(HashMap::new()),
+            gpu_stream_create_override: UnsafeCell::new(None),
+            gpu_stream_create_calls: UnsafeCell::new(0),
+            gpu_stream_release_calls: UnsafeCell::new(Vec::new()),
         }
     }
 
@@ -850,6 +876,50 @@ impl MockNativeContext {
         unsafe {
             (*self.nest_host_override.get()).insert(child_id.as_u32(), host.to_string());
         }
+    }
+
+    /// 2026-07-11: script `gpu_future_take_result(handle)` to answer
+    /// `Some(result)`. Lets `craton_gpu.rs` unit tests exercise
+    /// `builtin_future_get_result`'s real-registry branch (the one that
+    /// calls `ctx.gpu_future_take_result` before ever consulting the
+    /// local synthetic `FutureState` map) without a real GPU submission
+    /// registry, mirroring how `record_done_scalar` stamps the
+    /// synthetic-map fallback directly.
+    #[allow(dead_code)]
+    pub(crate) fn set_gpu_future_take_result(&self, handle: u64, result: GpuFutureResult) {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.gpu_future_take_result_override.get()).insert(handle, result);
+        }
+    }
+
+    /// GpuStream affinity: script `gpu_stream_create()` to answer
+    /// `result` on every subsequent call. Lets `craton_gpu.rs` unit
+    /// tests exercise `resolve_or_create_default_stream`'s
+    /// create-once-then-cache behavior without a real GPU stream
+    /// registry.
+    #[allow(dead_code)]
+    pub(crate) fn set_gpu_stream_create_result(&self, result: Option<u64>) {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            *self.gpu_stream_create_override.get() = result;
+        }
+    }
+
+    /// GpuStream affinity: how many times `gpu_stream_create` has
+    /// been invoked so far.
+    #[allow(dead_code)]
+    pub(crate) fn gpu_stream_create_call_count(&self) -> u32 {
+        // SAFETY: single-threaded test code.
+        unsafe { *self.gpu_stream_create_calls.get() }
+    }
+
+    /// GpuStream affinity: every handle passed to `gpu_stream_release`
+    /// so far, in call order.
+    #[allow(dead_code)]
+    pub(crate) fn gpu_stream_release_calls(&self) -> Vec<u64> {
+        // SAFETY: single-threaded test code.
+        unsafe { (*self.gpu_stream_release_calls.get()).clone() }
     }
 
     /// WP8.11.5: read the most recent `DefineClassFull` options passed
@@ -2193,6 +2263,39 @@ impl NativeContext for MockNativeContext {
         _target_class_id: ClassId,
     ) -> Result<(), String> {
         Ok(())
+    }
+
+    /// 2026-07-11: honour any test-provided `gpu_future_take_result_override`;
+    /// defaults to the trait's default (`None`, "no GPU offload") when no
+    /// override is set for `handle`. See `set_gpu_future_take_result`.
+    fn gpu_future_take_result(&self, handle: u64) -> Option<GpuFutureResult> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.gpu_future_take_result_override.get())
+                .get(&handle)
+                .copied()
+        }
+    }
+
+    /// GpuStream affinity: counts the call and returns whatever
+    /// `set_gpu_stream_create_result` scripted (`None` by default —
+    /// the trait's own default, "no device"). See
+    /// `gpu_stream_create_call_count`.
+    fn gpu_stream_create(&mut self) -> Option<u64> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            *self.gpu_stream_create_calls.get() += 1;
+            *self.gpu_stream_create_override.get()
+        }
+    }
+
+    /// GpuStream affinity: records `handle` for
+    /// `gpu_stream_release_calls()` to read back.
+    fn gpu_stream_release(&mut self, handle: u64) {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.gpu_stream_release_calls.get()).push(handle);
+        }
     }
 }
 

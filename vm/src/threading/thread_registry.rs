@@ -1271,17 +1271,18 @@ impl ThreadRegistry {
     /// against on that thread until it actually marks itself ready, at which
     /// point it becomes visible to the NEXT pause's snapshot as normal.
     ///
-    /// Finding 1(a): the returned `Vec<u64>` carries the IDENTITIES
-    /// (`ThreadId.0`) of exactly the threads counted in `blocked`, so the
-    /// barrier can refuse quota participation from precisely the threads
-    /// this census excluded from `expected` (see
-    /// `GcBarrier::arrive_and_wait_auto`).
+    /// GCAUDIT-0711-FIX (finding 1a): also returns the IDENTITIES
+    /// (`ThreadId.0`) of the alive threads counted in `blocked`, so
+    /// `GcBarrier::request_stw_counted_with_live_blocked` can publish exactly
+    /// which threads THIS pause excluded — see
+    /// `GcBarrierInner::excluded_blocked`'s doc for why per-thread identity,
+    /// not just a count, is required for a race-free arrival decision.
     pub fn alive_count_blocked_and_os_tids(&self) -> (usize, usize, Vec<u32>, Vec<u64>) {
         let threads = self.threads.lock();
         let mut alive = 0usize;
         let mut blocked = 0usize;
         let mut tids = Vec::with_capacity(threads.len());
-        let mut blocked_tids: Vec<u64> = Vec::new();
+        let mut blocked_tids = Vec::new();
         for (tid, e) in threads.iter() {
             if e.alive.load(Ordering::Acquire) && e.stw_ready.load(Ordering::Acquire) {
                 alive += 1;
