@@ -1,36 +1,17 @@
-# TestAccessLogValve / TestRewriteValve — connection-level `-1` response failures
+# TestAccessLogValve / TestRewriteValve — connection-level `-1` response failures — RETIRED 2026-07-10
 
-**Status:** OPEN. Six layered root causes found across this investigation.
-Five are FIXED and landed on `dev`: Layer 1 (`URL.openConnection()` CCE),
-Layer 2 (`ByteBuffer.address`), Layer 3 (`StringReader.read()`), a
-cross-cutting fourth (`SocketWrapperBase.lock`, tracked in the
-swallow-uploads doc), and a **fifth, found and fixed 2026-07-10**: a JIT
-miscompile of `ConcurrentLinkedQueue`'s allocate-then-CAS hot methods
-(`offer`/`tryCasSuccessor`), which crashed `TestAccessLogValve` with a
-message-less `NullPointerException` **during JUnit test discovery, before
-any HTTP request ever happened** — a regression that appeared on `dev`
-sometime between this doc's 2026-07-10 morning re-run and the afternoon
-follow-up, and which fully explained the "no server-side exception is ever
-logged" mystery from the earlier fifth-cause hunt below (the crash was never
-server-side at all — it was client-side JUnit machinery blowing up before a
-server ever started). See the "2026-07-10 (afternoon): fifth cause found —
-JIT ConcurrentLinkedQueue miscompile" section. **`TestRewriteValve` improved
-dramatically** (was: 0/121 complete hang → 80/121 → now **110/121 pass**,
-remaining 11 are UTF-8/percent-encoding query-string residuals, a narrower
-and different issue than the `302`-vs-`200`/`400` rewrite-rule bug
-previously blamed for the bulk of the 41). **`TestAccessLogValve` now gets
-past test discovery and runs real HTTP-based test cases for the first time**
-(was: 0/94, immediate crash) but hits a **sixth cause — a SIGSEGV around test
-#8** on an `http-nio` worker thread, inside JIT-compiled Tomcat NIO code.
-This is confirmed (register-signature match) to be the same already-tracked,
-currently-OPEN "register-invisible JIT root" bug family documented in
-`docs/internal/fixed-suite-bugs/dohead-jit-heap-corruption-register-invisibility-FIXED.md`
-and `swallowabortedupploads-unexpected-socketexception.md` — deep JIT/GC
-root-precision infrastructure work (precise oop maps / shadow stack), not a
-skip-list-sized fix, and deliberately NOT attempted here. Keep this doc in
-`known-issues/` until the sixth cause is fixed (or until whoever owns the
-precise-JIT-maps/shadow-stack roadmap item lands a fix and this can be
-re-verified). **HotSpot:** PASS on both.
+| | |
+|---|---|
+| **Status** | **RETIRED, moved to `docs/internal/tomcat-08-07/`.** Five of six root causes found in this investigation are FIXED and landed on `dev`. The sixth — a SIGSEGV around `TestAccessLogValve` test #8 — is not a new, locally-owned bug: it's a confirmed, byte-for-byte register-signature match with the already-tracked, currently-OPEN "register-invisible JIT root" bug family, which has its own dedicated tracking (see below). This doc's own investigative scope (the AccessLogValve/RewriteValve-specific connection failures) is complete; further work on the residual belongs to the docs that own that bug family, not a re-run of this one. |
+| **Local causes fixed** | Layer 1 (`URL.openConnection()` CCE) — FIXED. Layer 2 (`ByteBuffer.address`) — FIXED. Layer 3 (`StringReader.read()`) — FIXED. Cross-cutting `SocketWrapperBase.lock` NPE — FIXED (see the swallow-uploads doc). Fifth cause (JIT `ConcurrentLinkedQueue` allocate-then-CAS miscompile) — FIXED (`44f16ee2`). |
+| **Residual, not owned here** | Sixth cause: SIGSEGV around `TestAccessLogValve` test #8, `http-nio` worker thread, JIT-compiled code, register dump matching the tagged-pointer-corruption signature of the "register-invisible JIT root" family. Catalogued as another confirmed occurrence in [`swallowabortedupploads-unexpected-socketexception.md`](../../known-issues/tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md), the live tracking doc for this open bug family within the tomcat-08-07 investigation. Real fix needs precise JIT oop maps / shadow stack (deep infrastructure work) — deliberately not attempted here. |
+| **HotSpot** | PASS on both classes. |
+
+**Practical upshot:** if `TestAccessLogValve`/`TestRewriteValve` hit this same SIGSEGV signature again (one live register breaking the `0x2000xxxxxxxx`-tagged-pointer pattern the others share), don't reopen this doc or file a new one — add the occurrence to `swallowabortedupploads-unexpected-socketexception.md` instead, which is where this bug family is actively tracked. Retired 2026-07-10; the original investigation record follows unchanged.
+
+---
+
+## Original investigation record
 
 ## 2026-07-09 re-verification (Azure host, dev @ `7e382917`, `-Parallel 1`)
 
@@ -90,7 +71,7 @@ this confirms the original known-issue report was real, just partially
 masked by the (now-fixed) more-severe Layer 1 bug.
 
 Root cause fully diagnosed with a minimal, Tomcat-independent repro — see
-[`bytebuffer-address-unset-aioobe.md`](../../internal/tomcat-08-07/bytebuffer-address-unset-aioobe.md).
+[`bytebuffer-address-unset-aioobe.md`](bytebuffer-address-unset-aioobe.md).
 Short version: any `ByteBuffer` returned by CratonVM's synthetic
 `ByteBuffer.allocate()` carrier did not have its `java.nio.Buffer.address`
 field populated. Real bulk-transfer bytecode
@@ -117,7 +98,7 @@ spinning tens of millions of times inside
 `RewriteValve.parse(Ljava/io/BufferedReader;)V` → `StringReader.read()`.
 
 **FIXED** (2026-07-09/10, this session): root-caused and fixed — see
-[`stringreader-read-never-advances-infinite-loop-FIXED.md`](../../internal/fixed-suite-bugs/stringreader-read-never-advances-infinite-loop-FIXED.md).
+[`stringreader-read-never-advances-infinite-loop-FIXED.md`](../fixed-suite-bugs/stringreader-read-never-advances-infinite-loop-FIXED.md).
 Short version: the live native (`native-io`'s `register_string_rw_natives`,
 `NativeKind::SyntheticStub`) wins dispatch over real bytecode by default
 (the `CRATONVM_REAL` differential switch defaults to off), but stored
@@ -377,6 +358,18 @@ cycle runs while that register is the *only* reference to the object, the
 object is reclaimed even though a live-but-invisible reference to it still
 exists, and the register is left holding a stale/garbage value.
 
+**Correction, added at retirement (2026-07-10):** the
+`hib-global-temptable-nondeterministic-sigsegv-20260710.md` cross-reference
+just above does **not** actually corroborate this family. That Hibernate
+SIGSEGV cluster was subsequently root-caused as a **different, unrelated**
+bug — the guarded-inline-getfield JIT regression (already fixed by
+`93b33576`) — and the global-temp-table/GC-root-pinning hypothesis was
+explicitly refuted; see
+`docs/internal/fixed-suite-bugs/hib-global-temptable-nondeterministic-sigsegv-20260710-RESOLVED.md`.
+Don't count it as an occurrence of the register-invisible-JIT-root family.
+The confirmed occurrences of that family remain: DoHead, `TestSwallowAbortedUploads`/`AbortedPOSTClient`,
+and this doc's `TestAccessLogValve` sixth cause.
+
 Consistent with that doc's evidence: `CRATONVM_JIT_VIRTUAL_TIERUP=0` (which
 disables the whole instance-method tier-up feature, not just the CLQ family)
 also avoids this SIGSEGV — the run got **5x further** (41 test cases started
@@ -398,9 +391,10 @@ symptom no longer reproduces, superseded first by the fifth cause (now
 fixed) and now blocked by the sixth. Whoever next picks up the
 precise-JIT-maps/shadow-stack roadmap item should treat
 `org.apache.catalina.valves.TestAccessLogValve` (full 94-case run, default
-JIT, 2 GB heap) as a fifth independent reproduction case for that bug
-family, alongside the DoHead, Hibernate, and `TestSwallowAbortedUploads`
-ones already tracked.
+JIT, 2 GB heap) as another independent reproduction case for that bug
+family, alongside the DoHead and `TestSwallowAbortedUploads` ones already
+tracked (see the correction above — the Hibernate global-temp-table doc is
+**not** part of this family, despite the earlier text in this section).
 
 ## Reproduction
 

@@ -1312,3 +1312,149 @@ session did not have time for after the characterization work.
    repeated runs under real load (not once), and the existing GC-audit
    probe kit (`/data/data/gcprobes-0710/`) if reachable — park, don't merge,
    on any flake.
+
+
+## 2026-07-11 update (sixth session, same day) — the InputStreamReader "blocker" was a test-harness bug, not a CratonVM defect; genuine sustained load reached for the first time; one more MSC AbstractMethodError fixed
+
+The coordinator proposed a specific hypothesis for the InputStreamReader
+finding above: re-register `<init>` as a `NativeKind::SyntheticStub`-tagged
+native (the same technique used for the ThreadPoolExecutor/Cleaner fixes),
+reasoning that `invokespecial` goes through a different, category-respecting
+dispatch path than the `invokevirtual` vtable fast path the original removal
+commit's comment was about.
+
+**Verifying that hypothesis surfaced two corrections, then the real root
+cause:**
+
+1. `invokespecial` and `invokevirtual` are NOT as cleanly separated as the
+   hypothesis assumed — both route through the same
+   `execute_invoke_kind` -> `try_stackless_invoke` path in
+   `vm/src/runtime/interpreter.rs`, which has its own
+   `synthetic_stub_should_yield_to_real_bytecode` allowlist gate, separate
+   from (and in addition to) `vm_exec.rs`'s `invoke_or_native` gate the
+   coordinator cited. Neither allowlist contained `InputStreamReader`.
+2. `RealSelector::prefers_real()` (`vm/src/runtime/env_cache.rs`) — the
+   general, non-allowlist escape hatch — defaults to `false` for every class
+   unless `CRATONVM_REAL` is explicitly set (it's a differential-testing
+   switch, off by default; matches the existing memory note "CRATONVM_REAL:
+   SyntheticStub wins by default"). So implementing the coordinator's fix
+   literally (re-register `<init>` as SyntheticStub without also adding
+   `InputStreamReader` to both allowlists) would have made the OLD,
+   already-fixed UTF-16 decode bug (`aaf64a5d`'s whole reason for existing)
+   come back for every real-JDK `InputStreamReader`, not fixed the WildFly
+   issue in a targeted way.
+3. Before committing to any of that, added temporary
+   `CRATONVM_DBG_ISRTRACE` instrumentation to
+   `classloading/src/class_manager.rs::load_class` (built, tested, then
+   `git checkout --` reverted — never shipped) to empirically answer the
+   coordinator's own point 2 ("does this actually resolve as a synthetic
+   stub at this point"). It does — but the reason is not a race or a
+   dispatch-path bug at all: `ClassManager::has_real_boot_classes()`
+   returns **`false`** at the point `org.jboss.modules.Main.<clinit>`
+   loads `java/io/InputStreamReader`, because this investigation's test
+   harness sets `JAVA_HOME` to a shim directory (just a `bin/java` symlink,
+   satisfying `domain.sh`'s launcher convention) that CratonVM's own
+   `resolve_java_home()` (`vm/src/config.rs`) ALSO consults for real JDK
+   discovery — finding nothing there. `CRATONVM_JAVA_HOME` is the
+   documented escape hatch for exactly this ("used when JAVA_HOME points at
+   a cratonvm shim tree... but boot modules must come from a real JDK") and
+   had never been set by any probe script in this entire investigation.
+
+**Fix: `CRATONVM_JAVA_HOME=/home/victor/jdk25`, no code change.** Verified
+**10/10** in a controlled batch (same rigor as the original 0/20 finding).
+`docs/known-issues/wildfly-jboss-modules-inputstreamreader-clinit-race.md`
+is retracted (its reproduction data and `has_real_boot_classes()` mechanism
+trace stay for the record, but the "CratonVM race/bug" framing was wrong).
+
+**This unblocked far more than expected.** With real bytecode correctly
+available, a from-scratch boot run (`CRATONVM_DBG_STW_CENSUS=1`,
+`CRATONVM_DBG_XT_JIT_ROOT_SCAN=1`, default `-Xmx512m`) produced **63,367
+log lines** — two orders of magnitude past any previous run in this
+investigation — before finally dying with a genuine
+`OutOfMemoryError: young gen exhausted` (128 MiB from-space full). Findings
+from that run and a `-Xmx1536m` follow-up:
+
+- **BUG-03's specific stall pattern did NOT reproduce as a permanent
+  livelock.** The "STW cross-thread JIT takeover is still waiting..."
+  warning fired exactly ONCE (`pending=1`, far smaller than the earlier
+  `pending=7`) and then resolved — boot continued for 62,000+ more lines
+  afterward. It's plausible (not proven) that the earlier "permanent"
+  characterization of BUG-03 was itself partly an artifact of the same
+  missing-`CRATONVM_JAVA_HOME` gap: with real bytecode unavailable, more
+  classes fall back to synthetic-stub implementations, which may not poll
+  GC safepoints the way real bytecode does, making some thread
+  genuinely un-excusable rather than just transiently busy. BUG-03 is
+  **not re-closed** by this alone — a single successful resolution isn't
+  proof against the underlying livelock risk the GC audit doc describes —
+  but the WildFly repro specifically no longer demonstrates it as a hard
+  blocker. Worth a dedicated repeat-under-load check in a future session
+  before fully retiring it here.
+- **HIB-CV-32's corrupt-Value-cell detector fired ZERO times** across the
+  entire 63K-line run. The detector (`gc/src/gen_heap.rs::read_slot`) is
+  unconditional — `CRATONVM_DIAG_HIB32` only lifts the print cap past the
+  first 32 hits, so a true zero-hit run needs no special flag. This is a
+  genuine, strong signal toward this doc's original closure bar, though
+  boot still doesn't reach a *quiescent running* state (see below), so it
+  isn't the full sustained-load picture yet.
+- **The `OutOfMemoryError` is a heap-sizing artifact, not a leak**: bumping
+  `JBOSS_JAVA_SIZING` from the WildFly-default `-Xmx512m` to `-Xmx1536m`
+  eliminates it entirely (no OOM in the follow-up run) — confirms this
+  specific default is just too small for a Host Controller's full domain
+  boot on CratonVM, not a memory-correctness bug.
+- **New finding, fixed same session**: with the OOM out of the way, boot
+  reaches `start-servers`, which now fails with
+  `WFLYHC0053: Could not get the server inventory in 30 seconds`, followed
+  by a masking `AbstractMethodError: method
+  org/jboss/msc/service/ServiceContainer.isShutdown()Z has no Code
+  attribute` during the boot-failure reporting path itself (so the
+  AbstractMethodError was hiding the real WFLYHC0053 timeout in the log).
+  Same family and same fix pattern as this doc's earlier `provides()` fix:
+  `ServiceContainer.isShutdown()` is a real MSC interface method with no
+  default implementation and zero native backing. Implemented
+  `ServiceContainer::is_shutdown()` (reads the existing `state.shutdown`
+  bool the `shutdown()` method already sets) +
+  `native_service_container_is_shutdown`, registered as `"isShutdown", "()Z"`
+  right after the existing `"shutdown", "()V"` registration in
+  `native-builtins/src/jboss_msc.rs`. `cargo test -p cratonvm-native-builtins
+  --lib`: 2961 passed, the same 5 pre-existing failures, zero new failures
+  (this run did not hit the flaky `denying_sm_blocks_processbuilder_start_stub`
+  parallel-test race noted in the fourth-session entry). Commit `40d05aac`.
+
+**With the AbstractMethodError gone, the real error underneath was no
+longer masked — and Host Controller itself now completes its own boot.**
+Re-running with the fix, boot proceeds through the `WFLYHC0053` failure
+(the `start-servers` operation for the actual managed servers still fails
+and rolls back) but then Host Controller finishes its OWN startup and logs:
+
+```
+INFO [org.jboss.as] WFLYSRV0025: WildFly Full 32.0.1.Final (WildFly Core
+Unknown) (Host Controller) started in 143128ms - Started 0 of 0 services
+(0 services are lazy, passive or on-demand) - Host Controller
+configuration files in use: domain.xml, host.xml
+```
+
+This is the furthest this entire investigation has ever gotten — Host
+Controller reports itself fully started, something no prior session
+reached. "Started 0 of 0 services" confirms the managed *application*
+servers never came up (consistent with the `WFLYHC0053` failure above),
+but the Host Controller process itself is healthy and stable at this point,
+not crashed, not livelocked, not OOM'd.
+
+**`WFLYHC0053: Could not get the server inventory in 30 seconds` is now
+the front line** — not yet investigated. This is a genuinely new, different
+failure from anything previously tracked in this doc (not the four
+original residuals, not `Container is down`, not BUG-03). `start-servers`
+timing out waiting for server inventory suggests either a slow/stuck
+Process Controller <-> Host Controller handshake or a managed server
+process that never reports in — worth checking with `CRATONVM_DBG_MSC=1`
+and a live process list the same way the demand-propagation deadlock was
+diagnosed, plus checking whether the managed server's own child process
+ever actually spawns (`ps aux` during the 30s window).
+
+**The four original front-line residuals
+(`AttributeChangeNotification`, `ContentCleanerService`,
+`FileInputStream(File)`, `WFLYHC0034`) still have not been individually
+re-confirmed** — they did not appear verbatim in this run's 63K lines
+(none of the four signature strings matched), but boot also never reached a
+fully-up, steady state to be confident they're truly gone rather than just
+not-yet-reached. Re-check once `WFLYHC0053` is resolved.
