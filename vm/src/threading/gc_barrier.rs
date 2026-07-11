@@ -606,10 +606,6 @@ impl GcBarrier {
         // safepoint. (Reproduces with 6 threads each looping `System.gc()` —
         // scratch_churn/Churn.java.)
         let arrival_gen = self.gc_generation.load(Ordering::Acquire);
-        // `None` (auto) = decide from the pause's excluded set, under the
-        // same lock `request_stw_counted_locked` filled it.
-        let participating =
-            participating.unwrap_or_else(|| !inner.excluded_blocked.contains(&tid.0));
         // Signal arrival — but only for threads the initiator is actually
         // waiting for. An excluded (blocked) thread that wakes mid-STW must
         // not inflate `arrived`: it was never in `expected`, so counting it
