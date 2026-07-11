@@ -262,6 +262,26 @@ pub(crate) fn impl_jars_load_class(
         let Some(listing_bytes) = first_bytes.or_else(|| ctx.find_resource(&listing_path)) else {
             continue;
         };
+        if module_name == "x-content" {
+            let app_loader = crate::classloader::get_or_create_app_loader(ctx);
+            let module_name_obj = ctx.create_string(&module_name);
+            if let Ok(Some(Value::Object(Some(loader)))) = ctx.invoke(
+                "org/elasticsearch/core/internal/provider/EmbeddedImplClassLoader",
+                "getInstance",
+                "(Ljava/lang/ClassLoader;Ljava/lang/String;)Lorg/elasticsearch/core/internal/provider/EmbeddedImplClassLoader;",
+                &[Value::Object(Some(app_loader)), Value::Object(Some(module_name_obj))],
+            ) {
+                let name_obj = ctx.create_string(&dotted);
+                if let Ok(Some(Value::Object(Some(mirror)))) = ctx.invoke_virtual(
+                    loader,
+                    "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[Value::Object(Some(name_obj))],
+                ) {
+                    return Some(mirror);
+                }
+            }
+        }
         let listing_text = String::from_utf8_lossy(&listing_bytes).into_owned();
         for jar_name in listing_text
             .lines()
