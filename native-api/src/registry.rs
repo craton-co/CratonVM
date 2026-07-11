@@ -1104,13 +1104,13 @@ pub trait NativeContext {
     /// Returns `ArrayElementType::Reference` for non-array objects or reference arrays.
     fn heap_element_type_of(&self, obj: ObjectRef) -> ArrayElementType;
 
-    /// Create a Java String object from a Rust &str. Returns the ObjectRef.
+    /// Create a fresh, reclaimable Java String object from a Rust &str.
     ///
-    /// Consults and populates the VM's interned-string pool: equal text yields
-    /// the *same* ObjectRef. Use only for content that should behave like a
-    /// string literal. For dynamically produced strings — `StringBuilder
-    /// .toString()`, `substring`, etc. — use [`create_string_uninterned`]
-    /// (Self::create_string_uninterned) so `==` reports them as distinct.
+    /// This is the dynamic-result path: it must not populate the VM intern
+    /// pool, and equal calls must return distinct object identities. The VM's
+    /// `ldc` implementation and [`create_string_interned`](Self::create_string_interned)
+    /// are the only paths that retain canonical string objects.
+    /// Implementations must not retain this result in an intern pool.
     fn create_string(&mut self, text: &str) -> ObjectRef;
 
     /// Create a Java String object from a Rust &str **without** interning.
@@ -1121,6 +1121,16 @@ pub trait NativeContext {
     /// the constant pool. Defaults to [`create_string`](Self::create_string)
     /// for mock/test contexts.
     fn create_string_uninterned(&mut self, text: &str) -> ObjectRef {
+        self.create_string(text)
+    }
+
+    /// Create or return the canonical interned String for `text`.
+    ///
+    /// Native results normally use [`create_string`](Self::create_string),
+    /// which must be reclaimable. This explicit operation is for
+    /// `String.intern()` and literal-like VM paths only. Mock/test contexts
+    /// may implement it as an ordinary fresh String.
+    fn create_string_interned(&mut self, text: &str) -> ObjectRef {
         self.create_string(text)
     }
 

@@ -846,7 +846,7 @@ pub(crate) fn native_string_intern(
     // subsequent calls hit the pool's read path with no allocation.
     let text = ctx.read_string(this).unwrap_or_default();
     let arc = intern_arc(&text);
-    let interned = ctx.create_string(&arc);
+    let interned = ctx.create_string_interned(&arc);
     Ok(Some(Value::Object(Some(interned))))
 }
 
