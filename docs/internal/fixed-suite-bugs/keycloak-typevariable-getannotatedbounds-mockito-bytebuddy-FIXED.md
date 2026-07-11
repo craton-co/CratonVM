@@ -1,8 +1,24 @@
 # `java.lang.reflect.TypeVariable.getAnnotatedBounds()` has no Code attribute — breaks Mockito/ByteBuddy mocking of any generic interface
 
-Status: open — genuine CratonVM interface-method gap, broad potential impact (Mockito + ByteBuddy are extremely widely used)
+Status: fixed — native annotated-bounds dispatch is present for both real and synthetic TypeVariable mirrors; Mockito/Byte Buddy regression probe passes.
 
 Date observed: 2026-07-10/11 (fresh-binary rerun from current dev, branch fix/keycloak-nonpassed-rerun-v2-20260710)
+
+**Resolved (2026-07-11):** `46294c2b` registers
+`TypeVariable.getAnnotatedBounds()[Ljava/lang/reflect/AnnotatedType;` for both
+the JDK `TypeVariableImpl` and CratonVM's synthetic `TypeVariable` mirrors.
+The shared native materializes the `getBounds()` list as matching
+`AnnotatedType` implementations, including parameterized bounds such as
+`Comparable<T>`, so Byte Buddy's reflective dispatcher no longer reaches a
+no-Code interface declaration.
+
+Verification used a fresh uniquely named Linux release build in
+`/data/data/cratonvm-targets/typevariable-annotatedbounds-20260711`, copied to
+`/data/data/cratonvm-binaries/cratonvm-typevariable-annotatedbounds-20260711`.
+A standalone `interface Bounded<T extends Comparable<T>>` probe confirmed its
+annotated `Comparable<T>` bound and then successfully ran
+`Mockito.mock(Bounded.class)` with Mockito 5.21.0 and Byte Buddy 1.17.8 under
+CratonVM: `TYPEVARIABLE_ANNOTATED_BOUNDS_MOCKITO_OK`.
 
 ## Summary
 
