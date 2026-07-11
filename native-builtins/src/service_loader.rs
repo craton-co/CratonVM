@@ -1139,6 +1139,19 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 continue;
             }
         };
+        // GC-safety: `ctor` is held across two intervening allocating calls
+        // (`setAccessible` invoke, `new_ref_array` for `empty_args`) before
+        // its second use in `newInstance` below. Per the `pin_native_root`
+        // contract, a moving GC in that window leaves `ctor` stale — reading
+        // its `clazz` field then resolves to whatever now occupies the
+        // reused slot, throwing "Constructor.newInstance: no declaring
+        // class" for what looks like an entirely unrelated, arbitrary
+        // provider each time (this was the residual behind the WildFly
+        // DeferredExtensionContext "No META-INF/services/... found for
+        // <extension>" flakiness even after `create_constructor_object`
+        // itself was fixed — the Constructor object created there was fine;
+        // it went stale HERE, one call site later).
+        let ctor_pin = ctx.pin_native_root(ctor);
         // setAccessible(true)
         let _ = ctx.invoke(
             "java/lang/reflect/AccessibleObject",
@@ -1151,6 +1164,8 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 .unwrap_or(cratonvm_types::ClassId::new(0)),
             0,
         );
+        let ctor = ctx.read_native_pin(ctor_pin, ctor);
+        ctx.unpin_native_roots(ctor_pin);
         let inst_result = ctx.invoke(
             "java/lang/reflect/Constructor",
             "newInstance",
