@@ -136,12 +136,27 @@ cycle's pointer map to its frames, so under an evacuating collector those
 objects must not move (Generational gets this for free from its non-moving
 frozen-cycle sweep).
 
-Still OPEN within INT-3:
-- ZGC keeps the unbounded cooperative wait (no skip/pin protocol).
-- The G1 concurrent-mark STW points (`brief_stw_counted*` in initial mark
-  and final remark) still call plain `wait_for_all()` — a never-polling
-  JIT loop livelocks those pauses too; they need the takeover threaded
-  through (mark-only ⇒ no pin/skip required, just freeze + scan + excuse).
+**Residuals CLOSED (2026-07-10, second pass — pending probe-host
+validation of this pass):**
+- ZGC: `supports_jit_tlab_skip()` now returns true for every backend. ZGC
+  is trivially safe for the takeover — `ZgcRealHeap` is a non-moving STW
+  mark-sweep whose sweep walks the allocation-base REGISTRY (never linear
+  memory), and `VmHeap::refill_tlab` never hands ZGC mutators a TLAB, so
+  un-retired tails cannot exist; frozen peers' conservative roots are
+  ordinary mark roots.
+- The four concurrent-mark STW pauses (Generational initial-mark + remark
+  in `maybe_concurrent_gc`, G1 initial-mark in `g1_concurrent_mark_cycle`,
+  G1 final-remark in `g1_final_remark_cleanup`, which `g1_force_full_cycle`
+  reuses) are open-coded as request → `stw_take_over_and_wait` → work →
+  clear/resume → `complete_gc` instead of `brief_stw_counted*`'s plain
+  internal `wait_for_all()`. Frozen peers' conservative roots join the
+  MARK root sets (their stale deposit snapshot alone could miss a live
+  root → cleanup/sweep frees a live object). Mark pauses move nothing, so
+  no pins — but the G1 final-remark `cleanup` linearly walks every
+  non-Free region, so the takeover's frozen-TLAB-tail publication is
+  load-bearing there and stays.
+
+Remaining note:
 - (The A5 unregistered-JIT-frame detector's Linux port is NOT part of
   this item — it already landed in the third wave.)
 

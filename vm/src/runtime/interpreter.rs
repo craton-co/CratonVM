@@ -483,9 +483,10 @@ fn stw_take_over_and_wait(
     // Generational degrades to the non-moving sweep that consumes the JIT
     // TLAB skip regions; G1 (INT-3) skips the published tails in every region
     // walker and pins everything a frozen peer can address out of the CSet
-    // (see `pin_frozen_peer_roots_for_g1`). ZGC has neither protocol yet and
-    // keeps the legacy unbounded cooperative wait — a compiled loop that
-    // never allocates nor re-enters the interpreter can still livelock it.
+    // (see `pin_frozen_peer_roots_for_g1`); ZGC (INT-3 residual) is trivially
+    // safe — non-moving, registry-walked sweep, and its mutators never hold
+    // TLABs. The `supports_jit_tlab_skip` gate is retained for any future
+    // backend that can't make one of those arguments.
     if !xt::enabled() || !shared.heap.supports_jit_tlab_skip() {
         shared.gc_barrier.wait_for_all();
         return xt::TakenOver::default();
@@ -2970,49 +2971,69 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
         shared.concurrent_gc_state.clone(),
     );
 
-    // Phase 1: Initial Mark — brief STW pause
-    let initial_mark_done = shared.gc_barrier.brief_stw_counted_with_live_blocked(
-        thread.thread_id,
-        || {
-            let (n, blocked, _tids) = shared.thread_registry.alive_count_blocked_and_os_tids();
+    // Phase 1: Initial Mark — brief STW pause.
+    //
+    // INT-3 residual fix: open-coded (request → takeover-wait → work →
+    // complete) instead of `brief_stw_counted_with_live_blocked`, whose
+    // internal plain `wait_for_all()` stalls forever on a peer spinning in
+    // compiled code — and whose root set covered such a peer only by its
+    // STALE deposit snapshot. Mark-only pause: the frozen peers' fresh
+    // conservative roots are extra MARK roots; nothing moves, so no
+    // pin/pointer-map concerns.
+    let mut counted_os_tids: Vec<u32> = Vec::new();
+    let initial_mark_done = shared
+        .gc_barrier
+        .request_stw_counted_with_live_blocked(thread.thread_id, || {
+            let (n, blocked, tids) = shared.thread_registry.alive_count_blocked_and_os_tids();
+            counted_os_tids = tids;
             (
                 u32::try_from(n).unwrap_or(u32::MAX),
                 u32::try_from(blocked).unwrap_or(u32::MAX),
             )
-        },
-        || {
-            // Collect root pointers for old-gen marking
-            let roots = collect_roots(shared, thread);
-            let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
-            let mut root_ptrs: Vec<*mut u8> = roots
-                .iter()
-                .chain(snapshot_roots.iter())
-                .map(|r| r.as_ptr())
-                .collect();
-            // fork6 GC_STRESS fix — young→old references are mandatory
-            // old-marking roots. `initial_mark` filters this list with
-            // `old_gen.contains`, so an old object whose only path from a
-            // root goes THROUGH a young object (root → young holder → old
-            // target) was invisible and the sweep freed it live. Selective
-            // promotion mass-produces exactly that shape (it tenures a
-            // pinned young holder's children), which is why the Fork6Hard
-            // GC_STRESS lane corrupted even single-threaded during clinit.
-            // Safe here: brief STW, mutators quiesced, TLABs retired.
-            root_ptrs.extend(
-                shared
-                    .heap
-                    .collect_young_to_old_roots()
-                    .into_iter()
-                    .map(|a| a as *mut u8),
-            );
-            if let Some(guard) = shared.heap.old_gen_lock() {
-                marker.initial_mark(&root_ptrs, &*guard);
-            }
-        },
-    );
-
+        });
     if !initial_mark_done {
         return; // Another STW was in progress
+    }
+    {
+        // Forcibly stop + conservatively scan in-JIT peers, then wait for
+        // the cooperative mutators (byte-identical to wait_for_all() when
+        // no thread is in JIT).
+        let mut xt_roots: Vec<ObjectRef> = Vec::new();
+        let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
+        // Collect root pointers for old-gen marking
+        let roots = collect_roots(shared, thread);
+        let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
+        let mut root_ptrs: Vec<*mut u8> = roots
+            .iter()
+            .chain(snapshot_roots.iter())
+            // INT-3 — frozen in-JIT peers' conservative register/stack roots.
+            .chain(xt_roots.iter())
+            .map(|r| r.as_ptr())
+            .collect();
+        // fork6 GC_STRESS fix — young→old references are mandatory
+        // old-marking roots. `initial_mark` filters this list with
+        // `old_gen.contains`, so an old object whose only path from a
+        // root goes THROUGH a young object (root → young holder → old
+        // target) was invisible and the sweep freed it live. Selective
+        // promotion mass-produces exactly that shape (it tenures a
+        // pinned young holder's children), which is why the Fork6Hard
+        // GC_STRESS lane corrupted even single-threaded during clinit.
+        // Safe here: brief STW, mutators quiesced, TLABs retired.
+        root_ptrs.extend(
+            shared
+                .heap
+                .collect_young_to_old_roots()
+                .into_iter()
+                .map(|a| a as *mut u8),
+        );
+        if let Some(guard) = shared.heap.old_gen_lock() {
+            marker.initial_mark(&root_ptrs, &*guard);
+        }
+        // Clear TLAB skip regions + resume frozen peers BEFORE reopening
+        // the world (same race rationale as maybe_gc's epilogue).
+        shared.heap.clear_jit_tlab_skip_regions();
+        crate::jit::xt_root_scan::resume(taken);
+        shared.gc_barrier.complete_gc(std::collections::HashMap::new());
     }
 
     // Phase 2: Concurrent Mark — runs while app threads continue
@@ -3020,39 +3041,53 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
         marker.concurrent_mark(&*guard);
     }
 
-    // Phase 3: Remark — brief STW pause
-    let remark_done = shared.gc_barrier.brief_stw_counted(
-        thread.thread_id,
-        || u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX),
-        || {
-            // Round-5 fix (CRIT — UAF): drain the initiator's per-thread
-            // SATB buffer before remark drains the global queue. Other
-            // mutators flushed when they arrived at the STW barrier;
-            // the initiator must drain its own.
-            shared.heap.flush_thread_satb();
-            let roots = collect_roots(shared, thread);
-            let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
-            let mut root_ptrs: Vec<*mut u8> = roots
-                .iter()
-                .chain(snapshot_roots.iter())
-                .map(|r| r.as_ptr())
-                .collect();
-            // fork6 GC_STRESS fix — refresh the young→old roots at remark
-            // too: a young→old edge created during the concurrent phase
-            // (e.g. a promoted child stored into a fresh young holder) must
-            // be in the final bitmap before the sweep.
-            root_ptrs.extend(
-                shared
-                    .heap
-                    .collect_young_to_old_roots()
-                    .into_iter()
-                    .map(|a| a as *mut u8),
-            );
-            if let Some(guard) = shared.heap.old_gen_lock() {
-                marker.remark(&root_ptrs, &*guard);
-            }
-        },
-    );
+    // Phase 3: Remark — brief STW pause.
+    // INT-3 residual fix: open-coded for the same takeover-wait reason as
+    // Phase 1 above (a never-polling in-JIT peer must not stall the remark
+    // nor be covered only by its stale deposit snapshot).
+    let mut counted_os_tids: Vec<u32> = Vec::new();
+    let remark_done = shared.gc_barrier.request_stw_counted(thread.thread_id, || {
+        let (n, tids) = shared.thread_registry.alive_count_and_os_tids();
+        counted_os_tids = tids;
+        u32::try_from(n).unwrap_or(u32::MAX)
+    });
+    if remark_done {
+        let mut xt_roots: Vec<ObjectRef> = Vec::new();
+        let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
+        // Round-5 fix (CRIT — UAF): drain the initiator's per-thread
+        // SATB buffer before remark drains the global queue. Other
+        // mutators flushed when they arrived at the STW barrier;
+        // the initiator must drain its own.
+        shared.heap.flush_thread_satb();
+        let roots = collect_roots(shared, thread);
+        let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
+        let mut root_ptrs: Vec<*mut u8> = roots
+            .iter()
+            .chain(snapshot_roots.iter())
+            // INT-3 — frozen in-JIT peers' conservative register/stack roots.
+            .chain(xt_roots.iter())
+            .map(|r| r.as_ptr())
+            .collect();
+        // fork6 GC_STRESS fix — refresh the young→old roots at remark
+        // too: a young→old edge created during the concurrent phase
+        // (e.g. a promoted child stored into a fresh young holder) must
+        // be in the final bitmap before the sweep.
+        root_ptrs.extend(
+            shared
+                .heap
+                .collect_young_to_old_roots()
+                .into_iter()
+                .map(|a| a as *mut u8),
+        );
+        if let Some(guard) = shared.heap.old_gen_lock() {
+            marker.remark(&root_ptrs, &*guard);
+        }
+        // Clear TLAB skip regions + resume frozen peers BEFORE reopening
+        // the world (same race rationale as maybe_gc's epilogue).
+        shared.heap.clear_jit_tlab_skip_regions();
+        crate::jit::xt_root_scan::resume(taken);
+        shared.gc_barrier.complete_gc(std::collections::HashMap::new());
+    }
 
     // fork6 GC_STRESS fix — the remark STW is NOT optional. If another
     // thread's STW won the race (`brief_stw_counted` returned false — a
@@ -3091,40 +3126,58 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
 /// 3. Remark (brief STW) — drain SATB buffers, re-mark roots
 /// 4. Cleanup — compute per-region liveness, free empty regions
 fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
-    // Phase 1: Initial Mark — brief STW pause
-    // Activates SATB write barrier and marks root-reachable objects
-    let initial_mark_done = shared.gc_barrier.brief_stw_counted_with_live_blocked(
-        thread.thread_id,
-        || {
-            let (n, blocked, _tids) = shared.thread_registry.alive_count_blocked_and_os_tids();
+    // Phase 1: Initial Mark — brief STW pause.
+    // Activates SATB write barrier and marks root-reachable objects.
+    //
+    // INT-3 residual fix: open-coded (request → takeover-wait → work →
+    // complete) instead of `brief_stw_counted_with_live_blocked`, whose
+    // internal plain `wait_for_all()` stalls forever on a peer spinning in
+    // compiled code — and whose root set covered such a peer only by its
+    // STALE deposit snapshot (a missed mark root here = cleanup frees a
+    // live object). Mark-only pause: the frozen peers' fresh conservative
+    // roots are extra MARK roots; nothing moves, so no pin/pointer-map
+    // concerns.
+    let mut counted_os_tids: Vec<u32> = Vec::new();
+    let initial_mark_done = shared
+        .gc_barrier
+        .request_stw_counted_with_live_blocked(thread.thread_id, || {
+            let (n, blocked, tids) = shared.thread_registry.alive_count_blocked_and_os_tids();
+            counted_os_tids = tids;
             (
                 u32::try_from(n).unwrap_or(u32::MAX),
                 u32::try_from(blocked).unwrap_or(u32::MAX),
             )
-        },
-        || {
-            // Round-5 fix (CRIT — UAF): drain the initiator's per-thread
-            // SATB buffer on the way into initial-mark. Other mutators
-            // already flushed on their `safepoint_check` arrival; the
-            // initiator hasn't, and any buffered overwrites from before
-            // SATB activation must reach the global queue before the
-            // marker starts consuming it.
-            shared.heap.flush_thread_satb();
-            shared.heap.g1_start_concurrent_mark();
-            // Mark roots into the G1 mark bitmap
-            let roots = collect_roots(shared, thread);
-            let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
-            let all_roots: Vec<cratonvm_types::ObjectRef> = roots
-                .into_iter()
-                .chain(snapshot_roots.into_iter())
-                .collect();
-            shared.heap.g1_mark_roots(&all_roots);
-            tracing::debug!("[G1] Initial mark: {} roots marked", all_roots.len());
-        },
-    );
-
+        });
     if !initial_mark_done {
         return; // Another STW in progress
+    }
+    {
+        let mut xt_roots: Vec<ObjectRef> = Vec::new();
+        let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
+        // Round-5 fix (CRIT — UAF): drain the initiator's per-thread
+        // SATB buffer on the way into initial-mark. Other mutators
+        // already flushed on their `safepoint_check` arrival; the
+        // initiator hasn't, and any buffered overwrites from before
+        // SATB activation must reach the global queue before the
+        // marker starts consuming it.
+        shared.heap.flush_thread_satb();
+        shared.heap.g1_start_concurrent_mark();
+        // Mark roots into the G1 mark bitmap
+        let roots = collect_roots(shared, thread);
+        let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
+        let all_roots: Vec<cratonvm_types::ObjectRef> = roots
+            .into_iter()
+            .chain(snapshot_roots.into_iter())
+            // INT-3 — frozen in-JIT peers' conservative register/stack roots.
+            .chain(xt_roots.into_iter())
+            .collect();
+        shared.heap.g1_mark_roots(&all_roots);
+        tracing::debug!("[G1] Initial mark: {} roots marked", all_roots.len());
+        // Clear TLAB skip regions + resume frozen peers BEFORE reopening
+        // the world (same race rationale as maybe_gc's epilogue).
+        shared.heap.clear_jit_tlab_skip_regions();
+        crate::jit::xt_root_scan::resume(taken);
+        shared.gc_barrier.complete_gc(std::collections::HashMap::new());
     }
 
     // Phase 2: Concurrent Mark — the background worker that drains
@@ -3167,29 +3220,47 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
 /// `maybe_concurrent_gc` retries. Unlike the generational remark there is
 /// nothing to abort: no sweep decision has been made yet.
 fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread) {
-    let done = shared.gc_barrier.brief_stw_counted(
-        thread.thread_id,
-        || u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX),
-        || {
-            // Drain the initiator's per-thread SATB buffer; the other
-            // mutators' buffers are pulled by `remark` itself
-            // (`flush_all_thread_satb_buffers`) now that they are parked.
-            shared.heap.flush_thread_satb();
-            let roots = collect_roots(shared, thread);
-            let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
-            let all_roots: Vec<cratonvm_types::ObjectRef> = roots
-                .into_iter()
-                .chain(snapshot_roots.into_iter())
-                .collect();
-            let completed = shared.heap.g1_final_remark_and_cleanup(&all_roots);
-            tracing::debug!(
-                "[G1] Final remark: {} roots, cycle_completed={}",
-                all_roots.len(),
-                completed
-            );
-        },
-    );
-    if !done {
+    // INT-3 residual fix: open-coded (request → takeover-wait → work →
+    // complete) so a never-polling in-JIT peer neither stalls the pause
+    // forever nor is covered only by its stale deposit snapshot (a missed
+    // mark root here = cleanup frees a live object). Unlike the young/mixed
+    // pauses nothing moves, so no pins — but `cleanup` DOES linearly walk
+    // every non-Free region computing live bytes, so the takeover's
+    // frozen-TLAB-tail publication (consumed by the region walkers' skip
+    // checks) is load-bearing here too.
+    let mut counted_os_tids: Vec<u32> = Vec::new();
+    let done = shared.gc_barrier.request_stw_counted(thread.thread_id, || {
+        let (n, tids) = shared.thread_registry.alive_count_and_os_tids();
+        counted_os_tids = tids;
+        u32::try_from(n).unwrap_or(u32::MAX)
+    });
+    if done {
+        let mut xt_roots: Vec<ObjectRef> = Vec::new();
+        let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
+        // Drain the initiator's per-thread SATB buffer; the other
+        // mutators' buffers are pulled by `remark` itself
+        // (`flush_all_thread_satb_buffers`) now that they are parked.
+        shared.heap.flush_thread_satb();
+        let roots = collect_roots(shared, thread);
+        let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
+        let all_roots: Vec<cratonvm_types::ObjectRef> = roots
+            .into_iter()
+            .chain(snapshot_roots.into_iter())
+            // INT-3 — frozen in-JIT peers' conservative register/stack roots.
+            .chain(xt_roots.into_iter())
+            .collect();
+        let completed = shared.heap.g1_final_remark_and_cleanup(&all_roots);
+        tracing::debug!(
+            "[G1] Final remark: {} roots, cycle_completed={}",
+            all_roots.len(),
+            completed
+        );
+        // Clear TLAB skip regions + resume frozen peers BEFORE reopening
+        // the world (same race rationale as maybe_gc's epilogue).
+        shared.heap.clear_jit_tlab_skip_regions();
+        crate::jit::xt_root_scan::resume(taken);
+        shared.gc_barrier.complete_gc(std::collections::HashMap::new());
+    } else {
         tracing::debug!("[G1] Final remark lost the STW race — retrying at next GC");
     }
 }
