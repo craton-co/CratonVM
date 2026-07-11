@@ -1,0 +1,35 @@
+diff --git a/vm/src/vm/vm_exec.rs b/vm/src/vm/vm_exec.rs
+--- a/vm/src/vm/vm_exec.rs
++++ b/vm/src/vm/vm_exec.rs
+@@ -4189,6 +4189,28 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
+             .unwrap_or(0);
+         let slots = num_fields.max(real_fields);
++        // Native callbacks execute on the mutator's own `JvmThread`, so small
++        // objects can use the same lock-free TLAB path as interpreted/JIT
++        // `new`. Historically this method went straight to `GenHeap`, taking
++        // the shared young-arena lock until young filled and then the old-gen
++        // lock for every allocation. Autobox-heavy code (notably
++        // HashMap<Integer, Integer>) therefore serialized millions of tiny
++        // wrapper allocations through global locks despite an available TLAB.
++        //
++        // This path deliberately does not initiate GC from inside the native
++        // callback: `tlab_alloc_object` only bumps/refills young space and
++        // returns `None` when it cannot. The existing `heap.alloc_object`
++        // fallback retains the previous spill/OOM behavior and native rooting
++        // contract.
++        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
++        let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
++        if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
++            if let Some(obj) = crate::runtime::interpreter::tlab_alloc_object(
++                self.thread,
++                self.shared,
++                class_id,
++                slots,
++                requested_size,
++            ) {
++                return obj;
++            }
++        }
+         self.shared.heap.alloc_object(class_id, slots)
+     }
+ 
