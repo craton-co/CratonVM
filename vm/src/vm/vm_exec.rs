@@ -3864,15 +3864,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn create_string(&mut self, text: &str) -> ObjectRef {
-        super::create_java_string_uninterned(self.shared, text)
+        super::create_java_string(self.shared, text)
     }
 
     fn create_string_uninterned(&mut self, text: &str) -> ObjectRef {
         super::create_java_string_uninterned(self.shared, text)
-    }
-
-    fn create_string_interned(&mut self, text: &str) -> ObjectRef {
-        super::create_java_string(self.shared, text)
     }
 
     fn init_string_from_units(&mut self, this: ObjectRef, units: &[u16]) -> bool {

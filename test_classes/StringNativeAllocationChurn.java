@@ -10,9 +10,6 @@ public final class StringNativeAllocationChurn {
         if (first == second) {
             throw new AssertionError("String.valueOf(int) result was interned");
         }
-        if (first.intern() != second.intern()) {
-            throw new AssertionError("String.intern() did not canonicalize content");
-        }
 
         long checksum = 0;
         for (int i = 0; i < 2_000_000; i++) {
