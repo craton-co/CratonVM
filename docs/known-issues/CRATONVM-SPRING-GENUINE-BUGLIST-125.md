@@ -270,8 +270,21 @@ Affected (for reference — do not action individually, root cause is shared):
 ### `core.task.SimpleAsyncTaskExecutorTests` — FAIL
 - taskTerminationTimeoutWithImmediateCancel() :: java.lang.AssertionError: 
 
-### `core.test.tools.CompiledTests` — FAIL
-- getInstanceWhenNoDefaultConstructorThrowsException() :: java.lang.AssertionError: 
+### `core.test.tools.CompiledTests` — FIXED (2026-07-11)
+- getInstanceWhenNoDefaultConstructorThrowsException() :: java.lang.AssertionError:
+  Expecting code to raise a throwable. Root cause: `cl_real_load_class_base`'s
+  step-1 `ctx.load_class` (real-JDK mode) resolved through CratonVM's flat
+  global class store with no defining-loader visibility check, unlike the
+  synthetic-JDK path's `resolve_global_if_visible`/`cid_visible_mirror` -- a
+  second dynamically-defined `com.example.HelloWorld` from a sibling
+  `ClassLoader` (non-null parent) got back the FIRST loader's `Class` object
+  instead of defining its own, so the no-default-constructor probe found the
+  wrong constructor set and never threw. Fixed by wrapping that lookup (and
+  the HIB-CV-24 deferred-resolution fallback) with the same
+  `cid_visible_mirror` check via a new `load_class_visible_to` helper in
+  `native-builtins/src/classloader_real.rs`. Verified: 14/14 on
+  `org.springframework.core.test.tools.CompiledTests`, plus two standalone
+  sibling-loader isolation probes (null-parent and non-null-parent cases).
 
 ### `core.test.tools.TestCompilerTests` — TIMEOUT
 - (hard timeout at 120s, no stack captured)
