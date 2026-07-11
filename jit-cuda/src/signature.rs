@@ -86,8 +86,34 @@ pub struct KernelSignature {
     pub is_reduction: bool,
 
     /// Annotation policy propagated from `@GpuKernel(admit =
-    /// ALLOW_DIV_BY_ZERO)`. When true, integer `idiv`/`ldiv`/`irem`/`lrem`
-    /// lowering skips only the explicit divisor-zero deopt guard. Other
-    /// guards, such as signed-minimum divided by `-1`, remain in force.
+    /// ALLOW_DIV_BY_ZERO)`. Despite the name, this single flag gates two
+    /// independent lowering decisions — see the "AllowDivByZero-reuse"
+    /// note on `analyzer::classify`'s `0x72 | 0x73` arm and the doc
+    /// comment on `analyzer::Reason::FloatRemainder` for the full "why
+    /// one hint, not two" rationale:
+    ///
+    /// - Integer `idiv`/`ldiv`/`irem`/`lrem`: when true, lowering skips
+    ///   only the explicit divisor-zero deopt guard. Other guards, such
+    ///   as signed-minimum divided by `-1`, remain in force.
+    /// - `frem`/`drem` (AUDIT 2026-07-11): the analyzer only admits
+    ///   these two opcodes at all under this hint — under `Strict` they
+    ///   still reject with `Reason::FloatRemainder` before ever reaching
+    ///   lowering. The div+truncate+fma identity
+    ///   (`lowering::emit::Emitter::frem_f32`/`drem_f64`) is bit-exact
+    ///   only while the quotient magnitude `|dividend / divisor|` stays
+    ///   within the type's exactly-representable-integer range (`<
+    ///   2^24` for `float`, `< 2^53` for `double`); this flag is the
+    ///   opt-in that accepts that approximation, reused rather than a
+    ///   dedicated `AdmissionHint` variant because it is already the
+    ///   "accept looser numeric edge-case semantics for a
+    ///   division-family opcode" opt-in and `frem`/`drem` are literally
+    ///   the floating counterparts of `irem`/`lrem`.
+    ///
+    /// `lcmp`/`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg` do NOT consult this flag —
+    /// unlike `frem`/`drem`, their `setp`+`selp` lowering
+    /// (`lowering::emit::Emitter::lcmp`/`cmp_f32`/`cmp_f64`) is
+    /// unconditionally bit-exact, so the analyzer admits them under
+    /// `Strict` with no gating hint at all (see
+    /// `analyzer::Reason::Compare`'s doc comment).
     pub allow_div_by_zero: bool,
 }

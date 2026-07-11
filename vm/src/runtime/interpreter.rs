@@ -882,12 +882,13 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 shared
                     .gc_barrier
                     .request_stw_counted_with_live_blocked(thread.thread_id, || {
-                        let (n, blocked, tids) =
+                        let (n, blocked, tids, blocked_tids) =
                             shared.thread_registry.alive_count_blocked_and_os_tids();
                         counted_os_tids = tids;
                         (
                             u32::try_from(n).unwrap_or(u32::MAX),
                             u32::try_from(blocked).unwrap_or(u32::MAX),
+                            blocked_tids,
                         )
                     })
             };
@@ -1026,12 +1027,13 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             shared
                 .gc_barrier
                 .request_stw_counted_with_live_blocked(thread.thread_id, || {
-                    let (n, blocked, tids) =
+                    let (n, blocked, tids, blocked_tids) =
                         shared.thread_registry.alive_count_blocked_and_os_tids();
                     counted_os_tids = tids;
                     (
                         u32::try_from(n).unwrap_or(u32::MAX),
                         u32::try_from(blocked).unwrap_or(u32::MAX),
+                        blocked_tids,
                     )
                 })
         };
@@ -1218,12 +1220,13 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             shared
                 .gc_barrier
                 .request_stw_counted_with_live_blocked(thread.thread_id, || {
-                    let (n, blocked, tids) =
+                    let (n, blocked, tids, blocked_tids) =
                         shared.thread_registry.alive_count_blocked_and_os_tids();
                     counted_os_tids = tids;
                     (
                         u32::try_from(n).unwrap_or(u32::MAX),
                         u32::try_from(blocked).unwrap_or(u32::MAX),
+                        blocked_tids,
                     )
                 })
         };
@@ -3003,11 +3006,13 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
     let initial_mark_done = shared
         .gc_barrier
         .request_stw_counted_with_live_blocked(thread.thread_id, || {
-            let (n, blocked, tids) = shared.thread_registry.alive_count_blocked_and_os_tids();
+            let (n, blocked, tids, blocked_tids) =
+                shared.thread_registry.alive_count_blocked_and_os_tids();
             counted_os_tids = tids;
             (
                 u32::try_from(n).unwrap_or(u32::MAX),
                 u32::try_from(blocked).unwrap_or(u32::MAX),
+                blocked_tids,
             )
         });
     if !initial_mark_done {
@@ -3160,11 +3165,13 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
     let initial_mark_done = shared
         .gc_barrier
         .request_stw_counted_with_live_blocked(thread.thread_id, || {
-            let (n, blocked, tids) = shared.thread_registry.alive_count_blocked_and_os_tids();
+            let (n, blocked, tids, blocked_tids) =
+                shared.thread_registry.alive_count_blocked_and_os_tids();
             counted_os_tids = tids;
             (
                 u32::try_from(n).unwrap_or(u32::MAX),
                 u32::try_from(blocked).unwrap_or(u32::MAX),
+                blocked_tids,
             )
         });
     if !initial_mark_done {
@@ -4375,12 +4382,28 @@ pub fn execute(
         // the FIRST-CALL JIT compile path here too.
         let env_disable_jit = crate::runtime::env_cache::disable_jit();
         let redefine_jit_quiesced = crate::classloading::any_class_redefined();
+        // GPU-offload JIT admission gate (known-issues followups item 2):
+        // while `--gpu` is active, a caller whose bytecode contains an
+        // offload-eligible invokestatic must stay interpreted, or its
+        // JIT-compiled body would bypass the offload hook and silently
+        // end GPU dispatch for that call site. One bool read when --gpu
+        // is off; see offload_jit_gate for the cache/scan details.
+        #[cfg(feature = "gpu-offload")]
+        let gpu_gate_skip = crate::runtime::offload_jit_gate::caller_blocks_jit_by_name(
+            shared,
+            class_id,
+            method_name,
+            method_descriptor,
+        );
+        #[cfg(not(feature = "gpu-offload"))]
+        let gpu_gate_skip = false;
         if env_disable_jit
             || redefine_jit_quiesced
             || already_skipped
             || static_skip_reason.is_some()
             || fjp_skip
             || native_skip
+            || gpu_gate_skip
         {
             // Method has known JIT issues — skip JIT.
         } else {
@@ -22670,6 +22693,29 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // `String.substring(int,int)` — gate mismatch fix. `check_override`
+    // (vm_exec.rs, the invoke-slow-path native selector) already lists
+    // `java/lang/String.substring` as forced-native ("RKC16N.6 RECON":
+    // real-JDK String bytecode resolution issues during JDK class clinits),
+    // but that allowlist is CONSULTED ONLY on a vtable cache miss. The
+    // per-call-site cached vtable fast path (this function's own caller)
+    // resolves and caches its native-vs-bytecode decision independently, and
+    // `substring` was never added HERE — so once a call site's vtable entry
+    // warms, every subsequent `substring` call ran the real bytecode
+    // regardless of `check_override`'s intent. `native_string_substring`
+    // (native-builtins/src/lang_string.rs) already has a "read only the
+    // requested range" fast path specifically written to avoid decoding the
+    // WHOLE parent string per call — a real fix that this gate gap left
+    // completely unreachable. Confirmed via runtime instrumentation: a tight
+    // `text.substring(pos, pos+5)` loop over a large parent `String` cost
+    // O(n^2) instead of O(subLen) with this entry absent (see
+    // `docs/known-issues/substring-large-parent-quadratic-allocation.md`).
+    if class_name == "java/lang/String"
+        && method_name == "substring"
+        && method_descriptor == "(II)Ljava/lang/String;"
+    {
+        return true;
+    }
     // java.net.DatagramSocket / MulticastSocket — real-JDK delegate architecture.
     // Since JDK 14 these classes are thin wrappers that forward every operation
     // to an internal `delegate` (a `DatagramSocketImpl`-backed socket) created
@@ -24404,7 +24450,13 @@ fn execute_invokestatic(
     // preservation as self-calls; resolving by flat name can pick the app copy.
     let static_dispatch_class_id = self_class_id.or_else(|| {
         if crate::runtime::env_cache::loader_aware_resolution() {
-            lookup_loader_initiated(shared, current_class_id, &method_class_name)
+            // Preserve the initiating loader even when the global classpath
+            // already has a same-named class. This is required for nested
+            // implementation jars whose owner is only visible to the caller
+            // loader.
+            lookup_loader_initiated(shared, current_class_id, &method_class_name).or_else(|| {
+                drive_defining_loader_load(shared, thread, current_class_id, &method_class_name)
+            })
         } else {
             None
         }
@@ -24489,10 +24541,19 @@ fn execute_invokestatic(
     // GPU offload hook (Part E). Behind `gpu-offload`: with the
     // feature off, the entire block is removed by the preprocessor
     // and `execute_invokestatic` falls through to the existing CPU
-    // path unchanged. On Hit we consult the OffloadCache; the actual
-    // marshal-and-launch glue is deliberately scoped to a separate
-    // follow-up because it needs real GPU hardware to validate — see
-    // `crate::runtime::offload::try_dispatch` for the contract.
+    // path unchanged. On Hit the OffloadCache marshals, launches, and
+    // writes back via `crate::runtime::offload::try_dispatch`.
+    //
+    // Invoke-cache interaction (found 2026-07-11): the interpreter
+    // consults `thread.invoke_cache` BEFORE this slow path, so a site
+    // promoted into the cache dispatches straight to the CPU body and
+    // never re-enters this hook. An offloaded (or gated-but-eligible)
+    // site must therefore never be promoted, or the SECOND call at
+    // the site silently stops offloading — exactly the shape of a
+    // warm benchmark loop. The slow-path re-entry cost is noise next
+    // to any kernel that clears `--gpu-min-work`.
+    #[cfg_attr(not(feature = "gpu-offload"), allow(unused_mut))]
+    let mut suppress_invoke_cache = false;
     #[cfg(feature = "gpu-offload")]
     {
         if shared.config.gpu_offload_enabled
@@ -24511,8 +24572,35 @@ fn execute_invokestatic(
                 &args,
             )? {
                 crate::runtime::offload::DispatchOutcome::Handled => {
-                    populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+                    // Deliberately NOT populating the invoke cache —
+                    // see the block comment above.
                     return Ok(CachedCallResult::Handled);
+                }
+                crate::runtime::offload::DispatchOutcome::HandledWithValue(value) => {
+                    // Part E — reduction kernel completed on the device;
+                    // push its scalar return value onto the operand
+                    // stack EXACTLY the way the fallback invokestatic
+                    // path a few dozen lines below does it (tag-exact
+                    // 2-slot push for `Value::Long`, then the
+                    // native-pending-return clear so a stale pinned
+                    // ObjectRef can't outlive this call site across GC —
+                    // moot for Int/Long today, but this is the one push
+                    // sequence and it must stay identical for either
+                    // caller).
+                    let ret = crate::jit::return_type(&method_descriptor);
+                    let value = coerce_value_for_return(value, ret);
+                    push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
+                    crate::vm::native_return_pushed_to_stack(shared, thread);
+                    // Deliberately NOT populating the invoke cache —
+                    // same reasoning as the plain `Handled` arm above.
+                    return Ok(CachedCallResult::Handled);
+                }
+                crate::runtime::offload::DispatchOutcome::FallThroughKeepHooked => {
+                    // Eligible kernel, but a per-call gate (e.g.
+                    // --gpu-min-work) declined this particular call.
+                    // Run the CPU path but keep the site un-promoted
+                    // so a future call can still offload.
+                    suppress_invoke_cache = true;
                 }
                 crate::runtime::offload::DispatchOutcome::FallThrough => {
                     // Method is ineligible / blacklisted / launch
@@ -24537,11 +24625,15 @@ fn execute_invokestatic(
         static_dispatch_class_id,
     )? {
         CachedCallResult::FramePushed => {
-            populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+            if !suppress_invoke_cache {
+                populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+            }
             return Ok(CachedCallResult::FramePushed);
         }
         CachedCallResult::Handled => {
-            populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+            if !suppress_invoke_cache {
+                populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+            }
             return Ok(CachedCallResult::Handled);
         }
         CachedCallResult::CacheMiss => {}
@@ -24589,7 +24681,9 @@ fn execute_invokestatic(
     }
 
     // Populate invoke cache for future fast-path hits
-    populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+    if !suppress_invoke_cache {
+        populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+    }
 
     Ok(CachedCallResult::Handled)
 }
@@ -25542,6 +25636,19 @@ fn compile_osr_artifact(
     )
     .is_some()
     {
+        return None;
+    }
+    // GPU-offload JIT admission gate — the OSR path is the exact case
+    // the gate exists for: OSR-compiling a hot loop that contains an
+    // offload-eligible invokestatic would silently end GPU dispatch at
+    // that call site (known-issues followups item 2).
+    #[cfg(feature = "gpu-offload")]
+    if crate::runtime::offload_jit_gate::caller_blocks_jit_by_name(
+        shared,
+        class_id,
+        method_name_check,
+        &method_descriptor,
+    ) {
         return None;
     }
     // Get method info from frame metadata
@@ -27114,6 +27221,18 @@ fn try_jit_upgrade_with_gate(
         {
             return None;
         }
+        // GPU-offload JIT admission gate — see offload_jit_gate: a
+        // promoted caller containing an offload-eligible invokestatic
+        // would bypass the interpreter offload hook.
+        #[cfg(feature = "gpu-offload")]
+        if crate::runtime::offload_jit_gate::caller_blocks_jit_by_name(
+            shared,
+            cached.declaring_class_id,
+            &cached.method_name,
+            &cached.method_descriptor,
+        ) {
+            return None;
+        }
     }
     // Check shared JIT cache first
     {
@@ -27466,6 +27585,16 @@ fn try_jit_upgrade_with_gate(
                 )
                 .is_some()
                 {
+                    return None;
+                }
+                // GPU-offload JIT admission gate — see offload_jit_gate.
+                #[cfg(feature = "gpu-offload")]
+                if crate::runtime::offload_jit_gate::caller_blocks_jit_by_name(
+                    shared,
+                    callee_cached.declaring_class_id,
+                    callee_method,
+                    &callee_cached.method_descriptor,
+                ) {
                     return None;
                 }
             }
@@ -28224,6 +28353,16 @@ fn try_jit_compile_callee_slow(
         )
         .is_some()
         {
+            return None;
+        }
+        // GPU-offload JIT admission gate — see offload_jit_gate.
+        #[cfg(feature = "gpu-offload")]
+        if crate::runtime::offload_jit_gate::caller_blocks_jit_by_name(
+            shared,
+            cached.declaring_class_id,
+            method_name,
+            &cached.method_descriptor,
+        ) {
             return None;
         }
     }

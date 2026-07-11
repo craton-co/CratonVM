@@ -548,6 +548,13 @@ pub fn update_all_roots(
     //      `NoSuchMethodError: java/lang/Object.handle` storm under GC pressure).
     cratonvm_native_builtins::net_phase_e::gc_update_re10_handler_refs(pointer_map);
 
+    // Process-global InetAddress side table (companion to roots.rs, right
+    // after the re10 handler scan). Repoint the mirror's (hostName,
+    // ipAddress) entry to its relocated key after a moving GC so
+    // getHostAddress()/getAddress()/toString() keep resolving the real
+    // address instead of falling back to "0.0.0.0".
+    cratonvm_native_builtins::net_phase_e::gc_update_inet_addr_refs(pointer_map);
+
     //      ScheduledThreadPoolExecutor pending runnables + XNIO IoFuture
     //      notifier/attachment/result refs: relocate the stored ObjectRefs after
     //      a moving GC so the pump / future-settle invokes the live object, not a

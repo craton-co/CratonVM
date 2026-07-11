@@ -256,6 +256,14 @@ pub(crate) fn alloc_stream_encoder(
     os: ObjectRef,
     charset_name: &str,
 ) -> ObjectRef {
+    // GC-safety: `os` is a Rust local the caller extracted from its own args
+    // slice before calling in, and `ensure_class_initialized` below runs
+    // `<clinit>` bytecode — arbitrary, allocating — before `os` is finally
+    // stored into the new object's `out` field. Same "Family 1" native-stale-
+    // local pattern as `alloc_stream_decoder`'s matching fix (and the WildFly
+    // Surefire-fork boot-crash fix in native-builtins/src/lang_class.rs) —
+    // pin now, re-read right before use.
+    let os_pin = ctx.pin_native_root(os);
     let cid = match ctx.ensure_class_initialized("sun/nio/cs/StreamEncoder") {
         Ok(c) => c,
         // See the matching fix in stream_decoder.rs's alloc_stream_decoder:
@@ -275,7 +283,9 @@ pub(crate) fn alloc_stream_encoder(
     // hand-picked scratch few (see module doc for why hardcoding a smaller
     // count and indexing into it corrupted real fields).
     let obj = ctx.alloc_object(cid, 0);
+    let os = ctx.read_native_pin(os_pin, os);
     ctx.set_field_by_name(obj, "out", Value::Object(Some(os)));
+    ctx.unpin_native_roots(os_pin);
     ctx.set_field_by_name(obj, "closed", Value::Int(0));
     let key = se_key(ctx, obj);
     se_table().lock().unwrap().insert(

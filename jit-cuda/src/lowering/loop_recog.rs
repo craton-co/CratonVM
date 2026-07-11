@@ -46,15 +46,42 @@
 //! * `i != bound` (`if_icmpeq` exit) is not equivalent to `tid < bound`.
 //! * a non-`+1` `iinc` stride means element `stride*tid` is read as
 //!   element `tid`.
-//! * a non-zero start (`for (i = 5; ...)`) offsets every array access.
 //!
-//! [`classify_counted_loop`] therefore validates all three properties
-//! and rejects (via [`crate::emitter::LoweringError::UnsupportedNode`],
+//! # Non-zero (but non-negative) start values
+//!
+//! `for (int i = K; i < bound; i++)` with a compile-time-constant
+//! `K >= 0` *is* accepted: the emitter folds `K` into the induction
+//! register once (`tid + K`, computed a single time right after `tid`
+//! itself — see [`crate::lowering::emit::Emitter::apply_loop_start_offset`])
+//! and uses that combined register everywhere the raw `tid` used to be
+//! used, both for the `iload iv` substitution and the `tid >= bound`
+//! loop-guard comparison (which becomes `tid + K >= bound`). See that
+//! function's doc comment for why `K == 0` is a no-op (byte-for-byte
+//! unchanged PTX from before this feature existed).
+//!
+//! A **negative** `K` is still rejected — not because the register
+//! arithmetic would be wrong (`tid + K` is well-defined for negative
+//! `K` too), but because of how the VM sizes the CUDA grid: the host
+//! (`vm/src/runtime/offload.rs`) launches enough threads to cover the
+//! largest input/output array length, which is `>= bound`. For `K >=
+//! 0` the loop's trip count is `bound - K <= bound`, so a `bound`-sized
+//! (or larger) launch always has enough threads — the guard simply
+//! makes the extra ones exit immediately. For `K < 0` the trip count is
+//! `bound - K > bound`, i.e. *more* iterations than the array is long,
+//! so a `bound`-sized launch would silently under-provision threads and
+//! drop the tail of the loop. Proving the launch is always sized to
+//! `bound - K` (not just `bound`) is out of scope here, so negative
+//! starts are rejected and fall back to the CPU interpreter — the same
+//! "correctness over coverage" policy the rest of this module follows.
+//!
+//! [`classify_counted_loop`] therefore validates all of the above and
+//! rejects (via [`crate::emitter::LoweringError::UnsupportedNode`],
 //! which makes the VM fall back to the CPU interpreter — always safe)
 //! anything that is not exactly the canonical shape. Correctness over
 //! coverage: when in doubt we reject rather than mis-lower.
 
 use crate::emitter::LoweringError;
+use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
 /// Outcome of the loop scan.
 #[derive(Clone, Debug)]
@@ -93,6 +120,15 @@ pub(crate) struct CountedLoop {
     /// loop — `classify_counted_loop` rejects any other value. Kept
     /// for the same reason as `exit_op`.
     pub iv_stride: i32,
+    /// Compile-time-constant loop start value `K` (`for (i = K; ...)`).
+    /// Always `>= 0` for an accepted loop — `classify_counted_loop`
+    /// (via `resolve_start_value`) rejects a negative or non-constant
+    /// start. `0` is by far the common case. The emitter folds this
+    /// into the induction register once, right after computing `tid`
+    /// (see `emit::Emitter::apply_loop_start_offset`), so every
+    /// downstream use of the induction variable — the loop guard and
+    /// every `iload iv` in the body — automatically sees `tid + K`.
+    pub iv_start: i32,
 }
 
 /// `if_icmpge` — the only loop-exit comparison the canonical
@@ -102,13 +138,24 @@ pub(crate) struct CountedLoop {
 const IF_ICMPGE: u8 = 0xA2;
 
 /// Scan a method's bytecode and classify its loop shape.
-pub(crate) fn detect_loop(bytes: &[u8]) -> Result<LoopShape, LoweringError> {
+///
+/// `cp` is the class's constant pool, needed only to resolve a loop
+/// start value pushed by `ldc`/`ldc_w` (a start constant too large for
+/// `iconst`/`bipush`/`sipush`) back to its `Integer` value — see
+/// `resolve_start_value`. `None` is always safe: without a pool an
+/// `ldc`-sourced start simply can't be proven constant and the loop is
+/// rejected (falls back to the CPU), exactly like any other
+/// unprovable start expression.
+pub(crate) fn detect_loop(
+    bytes: &[u8],
+    cp: Option<&ConstantPool>,
+) -> Result<LoopShape, LoweringError> {
     let backs = collect_backward_branches(bytes)?;
     match backs.len() {
         0 => Ok(LoopShape::StraightLine),
         1 => {
             let (branch_pc, header_pc) = backs[0];
-            classify_counted_loop(bytes, branch_pc, header_pc)
+            classify_counted_loop(bytes, branch_pc, header_pc, cp)
         }
         _ => Err(LoweringError::UnsupportedNode(
             "multi-loop or non-canonical control flow".into(),
@@ -177,6 +224,7 @@ fn classify_counted_loop(
     bytes: &[u8],
     back_branch_pc: usize,
     header_pc: usize,
+    cp: Option<&ConstantPool>,
 ) -> Result<LoopShape, LoweringError> {
     let back_op = bytes[back_branch_pc];
     if back_op != 0xA7 && back_op != 0xC8 {
@@ -281,11 +329,15 @@ fn classify_counted_loop(
         )));
     }
 
-    // ── Bug B (start value): the lowering treats `tid` as the loop
-    // variable, which assumes the loop starts at 0. Verify the pre-loop
-    // sets the iv slot to 0 via `iconst_0; istore iv`. Reject otherwise
-    // (`for (i = 5; ...)` would offset every array access by 5).
-    verify_zero_start(bytes, header_pc, iv_slot)?;
+    // ── Bug B (start value): the lowering treats `tid` (optionally
+    // offset by a constant `K`) as the loop variable. Resolve the
+    // pre-loop's constant `istore iv` and require `K >= 0` — a
+    // negative start would need more kernel threads than the host's
+    // `bound`-sized launch provides (see the module doc comment for
+    // the full derivation). `for (i = 5; ...)` is fine (`K = 5`, every
+    // access offset by +5, folded into the induction register once);
+    // `for (i = -5; ...)` is rejected.
+    let iv_start = resolve_start_value(bytes, header_pc, iv_slot, cp)?;
 
     let body_start_pc = exit_if_pc + instr_size(bytes, exit_if_pc)?;
 
@@ -298,6 +350,7 @@ fn classify_counted_loop(
         iv_slot,
         exit_op,
         iv_stride,
+        iv_start,
     }))
 }
 
@@ -361,17 +414,28 @@ fn find_iv_stride(
     Ok(None)
 }
 
-/// Verify the pre-loop region (`0..header_pc`) initialises `iv_slot`
-/// to the constant 0 via `iconst_0; istore iv` (the only loop start
-/// the element-wise lowering can model). The store to `iv` immediately
-/// preceding the header must be fed by `iconst_0`.
+/// Resolve the pre-loop region's (`0..header_pc`) constant initial
+/// value for `iv_slot` — the `K` in `for (i = K; ...)`. The store to
+/// `iv` immediately preceding the header must be fed by a compile-time
+/// integer constant: `iconst_*`/`bipush`/`sipush`, or (AUDIT C31
+/// follow-up, 2026-07-11) `ldc`/`ldc_w` of an `Integer` constant-pool
+/// entry — needed once `K` falls outside `sipush`'s ±32767 range and
+/// javac has no choice but to spill it to the constant pool.
 ///
-/// Errors (rejects the loop) if the start value is missing, is not a
-/// literal `0`, or comes from anything other than `iconst_0`.
-fn verify_zero_start(bytes: &[u8], header_pc: usize, iv_slot: u16) -> Result<(), LoweringError> {
+/// Returns `Ok(K)` for a non-negative compile-time constant. Errors
+/// (rejects the loop) if the start value is missing, is not a provable
+/// compile-time constant, or is negative — see the module doc comment
+/// for why a negative start is unsafe under this lowering even though
+/// the register arithmetic itself would be fine.
+fn resolve_start_value(
+    bytes: &[u8],
+    header_pc: usize,
+    iv_slot: u16,
+    cp: Option<&ConstantPool>,
+) -> Result<i32, LoweringError> {
     // Walk the pre-loop, remembering the most recent constant pushed
     // and the most recent `istore` to `iv_slot`. The canonical prelude
-    // ends `... iconst_0; istore iv` right before the header.
+    // ends `... <push K>; istore iv` right before the header.
     let mut pc = 0usize;
     // Most recent integer constant pushed onto the stack (if the last
     // instruction was a constant push) — `Some(value)` or `None`.
@@ -396,6 +460,14 @@ fn verify_zero_start(bytes: &[u8], header_pc: usize, iv_slot: u16) -> Result<(),
                 *bytes.get(pc + 1).ok_or_else(truncated)?,
                 *bytes.get(pc + 2).ok_or_else(truncated)?,
             ]) as i32), // sipush
+            0x12 => ldc_int_operand(cp, *bytes.get(pc + 1).ok_or_else(truncated)? as u16), // ldc
+            0x13 => ldc_int_operand(
+                cp,
+                u16::from_be_bytes([
+                    *bytes.get(pc + 1).ok_or_else(truncated)?,
+                    *bytes.get(pc + 2).ok_or_else(truncated)?,
+                ]),
+            ), // ldc_w
             _ => None,
         };
         // Identify an `istore` and the slot it writes.
@@ -412,8 +484,8 @@ fn verify_zero_start(bytes: &[u8], header_pc: usize, iv_slot: u16) -> Result<(),
             if slot == iv_slot {
                 // The value stored into `iv` is whatever constant was
                 // pushed immediately before. If the previous op was not
-                // a constant push, `last_const` is `None` → not provably
-                // zero → rejected below.
+                // a provable constant push, `last_const` is `None` →
+                // rejected below.
                 iv_start = last_const;
                 saw_iv_store = true;
             }
@@ -431,16 +503,34 @@ fn verify_zero_start(bytes: &[u8], header_pc: usize, iv_slot: u16) -> Result<(),
         )));
     }
     match iv_start {
-        Some(0) => Ok(()),
+        Some(v) if v >= 0 => Ok(v),
         Some(v) => Err(LoweringError::UnsupportedNode(format!(
-            "non-zero loop start value {v} for induction-variable slot \
-             {iv_slot} — only `for (i = 0; ...)` is lowered; non-zero-start \
-             loops run on the CPU"
+            "negative loop start value {v} for induction-variable slot \
+             {iv_slot} — only `for (i = K; ...)` with a non-negative \
+             compile-time-constant `K` is lowered; negative-start loops \
+             run on the CPU (a negative start needs more kernel threads \
+             than the host's bound-sized launch provides — see \
+             loop_recog.rs's module doc comment)"
         ))),
         None => Err(LoweringError::UnsupportedNode(format!(
             "loop start value for induction-variable slot {iv_slot} is not a \
-             compile-time constant — cannot prove it is 0; loop runs on the CPU"
+             compile-time constant — cannot prove it is non-negative; loop \
+             runs on the CPU"
         ))),
+    }
+}
+
+/// Resolve `ldc`/`ldc_w` constant-pool `index` to its `Integer` value,
+/// if `cp` is available and the entry is in fact an `Integer`.
+/// `None` (from either a missing pool, an out-of-range index, or a
+/// non-`Integer` entry) is always safe here: the caller treats it
+/// exactly like an unrecognised opcode — "not a provable constant" —
+/// which falls back to rejecting the loop (CPU interpreter), never a
+/// mis-lowering.
+fn ldc_int_operand(cp: Option<&ConstantPool>, index: u16) -> Option<i32> {
+    match cp?.get(index)? {
+        ConstantPoolEntry::Integer(v) => Some(*v),
+        _ => None,
     }
 }
 

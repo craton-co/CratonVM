@@ -18,10 +18,11 @@
 //! it encounters something outside the canonical-pattern subset it
 //! returns [`LoweringError::UnsupportedNode`] with a precise message.
 
-use crate::analyzer::ParamKind;
+use crate::analyzer::{resolve_math_intrinsic, MathIntrinsic, ParamKind};
 use crate::emitter::{LoweringError, RegKind};
 use crate::lowering::loop_recog::{instr_size, CountedLoop};
 use crate::signature::KernelSignature;
+use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 use std::fmt::Write;
 
 /// One slot of typed JVM state.
@@ -183,10 +184,21 @@ pub(crate) struct Emitter<'a> {
     /// marshaller can skip the post-launch D→H copy for read-only
     /// array inputs — see `KernelSignature::writes_param_mask`.
     pub writes_param_mask: u64,
+    /// AUDIT C31 follow-up (2026-07-11): the class's constant pool, so
+    /// `ldc`/`ldc_w`/`ldc2_w` (opcodes 0x12/0x13/0x14) can resolve their
+    /// operand to an `Integer`/`Float`/`Long`/`Double` value and push it
+    /// as a PTX immediate — see `ldc`/`ldc2_w` below. `None` when the
+    /// caller went through the CP-free `lowering::lower_method` entry
+    /// point, in which case those three opcodes fail to lower with
+    /// `LoweringError::UnsupportedNode` (they never reach `emit_op` in
+    /// practice, because the CP-free analyzer entry points already
+    /// reject any method containing them — see
+    /// `analyzer::Reason::LoadConstant`).
+    pub cp: Option<&'a ConstantPool>,
 }
 
 impl<'a> Emitter<'a> {
-    pub fn new(bytes: &'a [u8], sig: &'a KernelSignature) -> Self {
+    pub fn new(bytes: &'a [u8], sig: &'a KernelSignature, cp: Option<&'a ConstantPool>) -> Self {
         Self {
             bytes,
             body: String::new(),
@@ -206,6 +218,7 @@ impl<'a> Emitter<'a> {
             hit_back_branch: false,
             ret_value_reg: None,
             writes_param_mask: 0,
+            cp,
         }
     }
 
@@ -289,18 +302,83 @@ impl<'a> Emitter<'a> {
         self.tid_reg = Some(tid_s32);
     }
 
+    /// Fold a counted loop's compile-time-constant start value `K`
+    /// (`for (i = K; ...)`, `K >= 0` — see
+    /// `crate::lowering::loop_recog`'s module doc comment for why a
+    /// negative `K` is rejected before lowering ever reaches this
+    /// point) into `self.tid_reg`, turning the raw physical thread id
+    /// `emit_tid` computed into the SIMT element index `tid + K`.
+    ///
+    /// Call this exactly once, immediately after `emit_tid`, before
+    /// anything else reads `self.tid_reg` — every downstream consumer
+    /// (`emit_loop_guard`'s `tid >= bound` comparison and the `iload
+    /// iv_slot` substitution in `iload` below) then transparently sees
+    /// `tid + K` without needing to know `K` exists. This mirrors
+    /// exactly how the Java loop itself works: the loop variable `i`
+    /// starts at `K`, so the element each thread handles is `K` higher
+    /// than its raw thread index.
+    ///
+    /// `K == 0` (the overwhelmingly common case, and the only case that
+    /// existed before this feature) is a deliberate no-op: emitting
+    /// `add.s32 %rN, tid, 0;` would be correct but wasteful, and — more
+    /// importantly — would change the exact PTX text every existing
+    /// start-at-zero fixture test asserts against. Skipping the `add`
+    /// for `K == 0` keeps this change byte-for-byte invisible to every
+    /// kernel that doesn't use it.
+    ///
+    /// # Why over-launching is safe for `K >= 0` but not `K < 0`
+    ///
+    /// The host (`vm/src/runtime/offload.rs`) sizes the CUDA grid off
+    /// the largest array argument's length, i.e. at least `bound`
+    /// threads. With `K >= 0` the Java loop's trip count is `bound - K
+    /// <= bound`, so a `bound`-sized launch always has threads to
+    /// spare — `emit_loop_guard`'s `tid + K >= bound` check simply
+    /// retires them immediately, same as it already does for the
+    /// `K == 0` case when the grid is over-sized. (This is exactly why
+    /// `loop_recog::resolve_start_value` rejects `K < 0`: that would
+    /// need *more* than `bound` threads.)
+    ///
+    /// # Why the output array's untouched `0..K` prefix is safe
+    ///
+    /// Elements `0..K` of any array the loop writes are never touched
+    /// by any thread (every thread's index is `tid + K >= K`) — which
+    /// matches Java exactly (the loop body never runs for `i < K`).
+    /// That's only a safe *device-side* story because
+    /// `vm/src/runtime/offload.rs::marshal_array_arg` uploads the
+    /// **entire** array to the device before every kernel launch,
+    /// unconditionally, regardless of whether the kernel writes it —
+    /// there is no "allocate output uninitialised" fast path. So the
+    /// device buffer's `0..K` prefix starts out byte-identical to the
+    /// host array's, the kernel never writes it, and the post-launch
+    /// D→H writeback (`gpu_marshal::download_obj_*`, also an
+    /// unconditional full-length copy) writes those same untouched
+    /// bytes straight back — a no-op from the host's point of view.
+    pub fn apply_loop_start_offset(&mut self, start: i32) {
+        if start == 0 {
+            return;
+        }
+        let tid = self.tid_reg.clone().expect("emit_tid was called");
+        let r = self.regs.fresh_reg(RegKind::S32);
+        writeln!(self.body, "    add.s32 {}, {}, {};", r.name, tid.name, start).unwrap();
+        self.tid_reg = Some(r);
+    }
+
     /// Emit `if (tid >= bound) ret;` using a fresh predicate register.
     ///
     /// This `tid >= bound` dispatch (one thread runs iff `0 <= tid <
     /// bound`) is the GPU analogue of the canonical Java loop
     /// `for (int i = 0; i < bound; i++)`. It is *only* correct for that
-    /// exact shape: start value 0, stride +1, strict-`<` exit. The loop
-    /// recognizer ([`crate::lowering::loop_recog::detect_loop`]) has
-    /// already rejected every other shape — `<=`/`!=`/`>`/`>=` exits,
-    /// non-unit strides, non-zero starts — before emission reaches
-    /// here. The `debug_assert!`s below pin that contract: if a future
-    /// change to the recognizer ever lets a non-canonical loop through,
-    /// a debug build trips here instead of silently corrupting data.
+    /// exact shape: stride +1, strict-`<` exit, and a start value that
+    /// is either `0` or has already been folded into `tid` by
+    /// `apply_loop_start_offset` (so `tid` here may really mean
+    /// `tid + K`). The loop recognizer
+    /// ([`crate::lowering::loop_recog::detect_loop`]) has already
+    /// rejected every other shape — `<=`/`!=`/`>`/`>=` exits, non-unit
+    /// strides, negative or non-constant starts — before emission
+    /// reaches here. The `debug_assert!`s below pin that contract: if a
+    /// future change to the recognizer ever lets a non-canonical loop
+    /// through, a debug build trips here instead of silently corrupting
+    /// data.
     pub fn emit_loop_guard(&mut self, bound: &Reg, loop_info: &CountedLoop) {
         debug_assert_eq!(
             loop_info.exit_op, 0xA2,
@@ -489,6 +567,21 @@ impl<'a> Emitter<'a> {
                 writeln!(self.body, "    mov.s32 {}, {};", r.name, v).unwrap();
                 self.stack.push(r);
             }
+            // AUDIT C31 follow-up (2026-07-11): ldc / ldc_w / ldc2_w.
+            // These load a numeric literal that didn't fit `iconst`/
+            // `bipush`/`sipush` (any `int` outside sipush range) or has
+            // no short form at all (`long`/`float`/`double`) — see
+            // `ldc`/`ldc2_w` below for the constant-pool resolution and
+            // immediate-push lowering.
+            0x12 => self.ldc(self.bytes[pc + 1] as u16)?, // ldc: 1-byte CP index
+            0x13 => {
+                // ldc_w: 2-byte CP index.
+                self.ldc(u16::from_be_bytes([self.bytes[pc + 1], self.bytes[pc + 2]]))?;
+            }
+            0x14 => {
+                // ldc2_w: 2-byte CP index, always a wide (Long/Double) entry.
+                self.ldc2_w(u16::from_be_bytes([self.bytes[pc + 1], self.bytes[pc + 2]]))?;
+            }
             // ── locals: load ────────────────────────────────────────
             0x15 => self.iload(self.bytes[pc + 1] as u16)?,
             0x1A..=0x1D => self.iload((op - 0x1A) as u16)?,
@@ -613,20 +706,29 @@ impl<'a> Emitter<'a> {
             0x6F => self.binop_f64("div.f64")?,
             0x70 => self.div_or_rem_i32("rem.s32", false)?,
             0x71 => self.div_or_rem_i64("rem.s64", false)?,
-            // AUDIT 2026-05-16: PTX has no `rem.f32`/`rem.f64` mnemonic.
-            // Emitting one made ptxas reject every kernel that hit this
-            // path. Reject upstream so the analyzer skips these methods
-            // entirely. Proper IEEE remainder lowering is future work.
-            0x72 => {
-                return Err(LoweringError::UnsupportedNode(
-                    "frem (f32 remainder; needs IEEE remainder lowering)".to_string(),
-                ))
-            }
-            0x73 => {
-                return Err(LoweringError::UnsupportedNode(
-                    "drem (f64 remainder; needs IEEE remainder lowering)".to_string(),
-                ))
-            }
+            // AUDIT 2026-05-16 / 2026-07-11: PTX has no `rem.f32`/
+            // `rem.f64` mnemonic — emitting one made ptxas reject every
+            // kernel that hit this path, so this used to reject
+            // unconditionally. `frem_f32`/`drem_f64` below now build
+            // the fmod identity out of PTX instructions that DO exist
+            // (`div.rn` + `cvt.rzi` + `neg` + `fma.rn`, plus an
+            // infinite-divisor correctness patch). The analyzer only
+            // ever lets `0x72`/`0x73` reach this dispatch when the
+            // method was admitted under `AdmissionHint::AllowDivByZero`
+            // (see `analyzer::classify`'s `0x72 | 0x73` arm) — `Strict`
+            // mode still rejects upstream via `Reason::FloatRemainder`,
+            // so this arm is unreachable for a `Strict`-admitted
+            // method. See `frem_f32`'s doc comment for the full JLS
+            // §15.17.3 derivation and exactly which edge cases are (and
+            // are not) handled bit-exactly.
+            //
+            // Java floats never trap on a zero divisor — IEEE 754
+            // division of a float by zero yields ±Infinity or NaN, not
+            // an exception — so, unlike `div_or_rem_i32`/
+            // `div_or_rem_i64`, neither helper below emits (or needs) a
+            // zero-divisor guard branching to `bounds_fail_label`.
+            0x72 => self.frem_f32()?,
+            0x73 => self.drem_f64()?,
             0x74 => self.unop_i32("neg.s32")?,
             0x75 => self.unop_i64("neg.s64")?,
             0x76 => self.unop_f32("neg.f32")?,
@@ -671,19 +773,36 @@ impl<'a> Emitter<'a> {
             0x92 => self.conv_zext_u16()?,       // i2c (unsigned 16)
             0x93 => self.conv_truncate_i32(16)?, // i2s
             // ── compares (push int -1/0/1) ──────────────────────────
-            // AUDIT 2026-05-19: `lcmp` (0x94) was dispatched to
-            // `cmp_long_or_float`, which unconditionally returned `Err`.
-            // That made `lcmp` *look* supported at the dispatch site
-            // while never succeeding. Reject it explicitly here — same
-            // as `fcmpl`/`fcmpg`/`dcmpl`/`dcmpg`, which fall through to
-            // the default `UnsupportedNode` arm. `*cmp*` opcodes only
-            // appear paired with a following `if*`, which the canonical
-            // counted-loop subset never emits inside the body.
-            0x94 => {
-                return Err(LoweringError::UnsupportedNode(
-                    "lcmp is not supported in the element-wise lowering".into(),
-                ));
-            }
+            // AUDIT 2026-05-19: `lcmp` (0x94) used to dispatch to
+            // `cmp_long_or_float`, which unconditionally returned `Err`
+            // — it *looked* supported at the dispatch site while never
+            // succeeding — so it was rejected explicitly here instead,
+            // same as `fcmpl`/`fcmpg`/`dcmpl`/`dcmpg`, which fell through
+            // to the default `UnsupportedNode` arm.
+            //
+            // AUDIT 2026-07-11: all five now have a real, unconditionally
+            // bit-exact lowering (`lcmp`/`cmp_f32`/`cmp_f64` below — a
+            // `setp` + `selp` select chain; see each function's doc
+            // comment for the JVMS semantics and, for the float/double
+            // pair, the explicit `setp.nan` override that gives `fcmpl`/
+            // `dcmpl` a NaN result of `-1` and `fcmpg`/`dcmpg` a NaN
+            // result of `+1`). `analyzer::classify`'s `0x94..=0x98` arm
+            // now admits these opcodes unconditionally too — see that
+            // arm's comment and `analyzer::Reason::Compare`'s doc comment
+            // for the "does this make anything newly offloadable"
+            // reality check: as of this change, no, because every real
+            // javac `*cmp*` is immediately followed by an `if<cond>`
+            // that consumes the pushed value, and general `if*` still
+            // rejects at the `0x99..=0xA4` arm just below. This lowering
+            // is nonetheless the correct building block for that future
+            // cmp-then-branch fusion, and is directly reachable (and
+            // tested) whenever the pushed value is itself stored/used —
+            // a shape real javac never emits but a hand-built body can.
+            0x94 => self.lcmp()?,
+            0x95 => self.cmp_f32(-1)?, // fcmpl: NaN → -1
+            0x96 => self.cmp_f32(1)?,  // fcmpg: NaN → +1
+            0x97 => self.cmp_f64(-1)?, // dcmpl: NaN → -1
+            0x98 => self.cmp_f64(1)?,  // dcmpg: NaN → +1
             // ── branches ────────────────────────────────────────────
             0x99..=0xA4 => {
                 // if* / if_icmp* — we accept these only at the loop
@@ -740,6 +859,21 @@ impl<'a> Emitter<'a> {
             }
             // ── arraylength ─────────────────────────────────────────
             0xBE => self.arraylength()?,
+            // ── invokestatic (curated Math/StrictMath intrinsics) ────
+            // AUDIT 2026-07-11 (intrinsic table follow-up): closes the
+            // documented analyzer/lowering gap (see
+            // `docs/gpu/annotations.md`'s `ALLOW_INTRINSIC_CALLS`
+            // section as of 2026-07-11) — this opcode previously had no
+            // dispatch arm at all and fell through to the catch-all
+            // `UnsupportedNode` below, so every method admitted via
+            // `AdmissionHint::AllowIntrinsicCalls` failed to lower and
+            // was silently blacklisted. See `invokestatic` below for
+            // the constant-pool resolution and dispatch to each
+            // intrinsic's PTX lowering.
+            0xB8 => {
+                let index = u16::from_be_bytes([self.bytes[pc + 1], self.bytes[pc + 2]]);
+                self.invokestatic(index)?;
+            }
             // ── wide ────────────────────────────────────────────────
             0xC4 => {
                 let sub = self.bytes[pc + 1];
@@ -779,10 +913,557 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    // ─────────────────── constant-pool loads ─────────────────────────
+    //
+    // AUDIT C31 follow-up (2026-07-11): `ldc`/`ldc_w` push a fresh
+    // register holding an `Integer`/`Float` constant-pool entry;
+    // `ldc2_w` does the same for `Long`/`Double`. This mirrors exactly
+    // how `iconst_*`/`bipush`/`sipush`/`fconst_*`/`dconst_*` already
+    // push a literal above in `emit_op` — a `mov.<type> %rN, <value>;`
+    // into a fresh register, then the register goes on the simulated
+    // operand stack. Float/double use the same exact-bit PTX hex-literal
+    // encoding (`0f<8 hex digits>` / `0d<16 hex digits>`) the existing
+    // `fconst_0..2`/`dconst_0..1` arms use, rather than a decimal text
+    // literal — PTX accepts both forms for floating-point immediates,
+    // but the hex-bit form is exact (no host/ptxas decimal-rounding
+    // round-trip to worry about), so we stay consistent with what's
+    // already there instead of introducing a second, less precise style.
+    //
+    // Both entry points funnel through `resolve_cp_entry`, which is the
+    // single place that (a) requires `self.cp` to be present and (b)
+    // bounds-checks the constant-pool index. Reaching either "reject"
+    // branch below should be unreachable in practice: the analyzer
+    // (`Reason::LoadConstant`, `analyzer::classify_ldc`) already proved
+    // the exact same CP entry is a matching Integer/Float/Long/Double
+    // before admitting the method, using the same constant pool. The
+    // errors exist purely as defence in depth for a caller that built a
+    // `KernelSignature`/pool mismatch by hand instead of getting both
+    // from the analyzer together.
+
+    /// `ldc` (0x12) / `ldc_w` (0x13) — `index` is the resolved
+    /// (already-widened) constant-pool index. Pushes an `Integer` as an
+    /// s32 immediate or a `Float` as an exact-bit f32 immediate.
+    fn ldc(&mut self, index: u16) -> Result<(), LoweringError> {
+        match self.resolve_cp_entry(index)? {
+            ConstantPoolEntry::Integer(v) => {
+                let r = self.regs.fresh_reg(RegKind::S32);
+                writeln!(self.body, "    mov.s32 {}, {};", r.name, v).unwrap();
+                self.stack.push(r);
+            }
+            ConstantPoolEntry::Float(v) => {
+                let r = self.regs.fresh_reg(RegKind::F32);
+                writeln!(self.body, "    mov.f32 {}, 0f{:08X};", r.name, v.to_bits()).unwrap();
+                self.stack.push(r);
+            }
+            other => {
+                return Err(LoweringError::UnsupportedNode(format!(
+                    "ldc/ldc_w constant-pool index {index} is {other:?}, not Integer/Float — \
+                     the analyzer should have rejected this method upstream"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// `ldc2_w` (0x14) — `index` is the constant-pool index of a `Long`
+    /// or `Double` entry (JVMS §6.5: `ldc2_w` never targets anything
+    /// else). Pushes an s64 or an exact-bit f64 immediate.
+    fn ldc2_w(&mut self, index: u16) -> Result<(), LoweringError> {
+        match self.resolve_cp_entry(index)? {
+            ConstantPoolEntry::Long(v) => {
+                let r = self.regs.fresh_reg(RegKind::S64);
+                writeln!(self.body, "    mov.s64 {}, {};", r.name, v).unwrap();
+                self.stack.push(r);
+            }
+            ConstantPoolEntry::Double(v) => {
+                let r = self.regs.fresh_reg(RegKind::F64);
+                writeln!(self.body, "    mov.f64 {}, 0d{:016X};", r.name, v.to_bits()).unwrap();
+                self.stack.push(r);
+            }
+            other => {
+                return Err(LoweringError::UnsupportedNode(format!(
+                    "ldc2_w constant-pool index {index} is {other:?}, not Long/Double — \
+                     the analyzer should have rejected this method upstream"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Look up constant-pool entry `index`, cloning it out (every
+    /// numeric `ConstantPoolEntry` variant is a cheap `Copy`-able
+    /// primitive, so the clone is free) so the match arms in `ldc` /
+    /// `ldc2_w` don't have to juggle a borrow of `self.cp` alongside
+    /// `&mut self` calls to `self.regs`/`self.stack`.
+    fn resolve_cp_entry(&self, index: u16) -> Result<ConstantPoolEntry, LoweringError> {
+        let cp = self.cp.ok_or_else(|| {
+            LoweringError::UnsupportedNode(
+                "ldc/ldc_w/ldc2_w with no constant pool available to lowering \
+                 (use lowering::lower_method_with_pool instead of lower_method)"
+                    .into(),
+            )
+        })?;
+        cp.get(index).cloned().ok_or_else(|| {
+            LoweringError::UnsupportedNode(format!(
+                "ldc/ldc_w/ldc2_w constant-pool index {index} is out of range"
+            ))
+        })
+    }
+
+    // ─────────────────── invokestatic intrinsics ─────────────────────
+    //
+    // AUDIT 2026-07-11 (intrinsic table follow-up): `invokestatic`
+    // (0xB8) resolves its 2-byte constant-pool index to a
+    // `MethodReference`, then looks the (class, name, descriptor) triple
+    // up in `analyzer::resolve_math_intrinsic` — the single shared
+    // table the analyzer's `classify_invokestatic` already consulted to
+    // admit this method in the first place. Reaching the `None` arm
+    // below should be unreachable for a method that came through the
+    // analyzer; it exists purely as defence in depth, exactly like
+    // `ldc`/`ldc2_w`'s "should have been rejected upstream" arms above.
+
+    /// `invokestatic` (0xB8) — resolve `index` to a `MethodReference`
+    /// and dispatch to the matching intrinsic's PTX lowering. See the
+    /// module-level AUDIT comment above and
+    /// `analyzer::resolve_math_intrinsic` for the curated table and the
+    /// exactness rationale for each entry.
+    fn invokestatic(&mut self, index: u16) -> Result<(), LoweringError> {
+        let cp = self.cp.ok_or_else(|| {
+            LoweringError::UnsupportedNode(
+                "invokestatic with no constant pool available to lowering \
+                 (use lowering::lower_method_with_pool instead of lower_method)"
+                    .into(),
+            )
+        })?;
+        let Some(ConstantPoolEntry::MethodReference {
+            class_index,
+            name_and_type_index,
+        }) = cp.get(index)
+        else {
+            return Err(LoweringError::UnsupportedNode(format!(
+                "invokestatic constant-pool index {index} is not a MethodReference"
+            )));
+        };
+        let (class_index, name_and_type_index) = (*class_index, *name_and_type_index);
+        let class_name = cp.get_class_name(class_index).ok_or_else(|| {
+            LoweringError::UnsupportedNode(format!(
+                "invokestatic constant-pool index {index}: class_index {class_index} does \
+                 not resolve to a class name"
+            ))
+        })?;
+        let (method_name, descriptor) =
+            cp.get_name_and_type(name_and_type_index).ok_or_else(|| {
+                LoweringError::UnsupportedNode(format!(
+                    "invokestatic constant-pool index {index}: name_and_type_index \
+                     {name_and_type_index} does not resolve to a name/descriptor pair"
+                ))
+            })?;
+        match resolve_math_intrinsic(class_name, method_name, descriptor) {
+            Some(MathIntrinsic::SqrtF64) => self.unop_f64("sqrt.rn.f64"),
+            Some(MathIntrinsic::AbsF32) => self.unop_f32("abs.f32"),
+            Some(MathIntrinsic::AbsF64) => self.unop_f64("abs.f64"),
+            Some(MathIntrinsic::AbsI32) => self.abs_i32(),
+            Some(MathIntrinsic::AbsI64) => self.abs_i64(),
+            Some(MathIntrinsic::MinI32) => self.minmax_i32(true),
+            Some(MathIntrinsic::MaxI32) => self.minmax_i32(false),
+            Some(MathIntrinsic::MinI64) => self.minmax_i64(true),
+            Some(MathIntrinsic::MaxI64) => self.minmax_i64(false),
+            Some(MathIntrinsic::MinF32) => self.minmax_f32(true),
+            Some(MathIntrinsic::MaxF32) => self.minmax_f32(false),
+            Some(MathIntrinsic::MinF64) => self.minmax_f64(true),
+            Some(MathIntrinsic::MaxF64) => self.minmax_f64(false),
+            Some(MathIntrinsic::FmaF32) => self.fma_f32(),
+            Some(MathIntrinsic::FmaF64) => self.fma_f64(),
+            None => Err(LoweringError::UnsupportedNode(format!(
+                "invokestatic {class_name}.{method_name}{descriptor} is not a recognised GPU \
+                 intrinsic — the analyzer should have rejected this method upstream \
+                 (see analyzer::resolve_math_intrinsic)"
+            ))),
+        }
+    }
+
+    /// `Math.abs(int)` / `StrictMath.abs(int)`.
+    ///
+    /// JLS/javadoc: "if the argument is equal to the value of
+    /// `Integer.MIN_VALUE`, the most negative representable `int`
+    /// value, the result is that same value" — i.e. Java's `abs` is the
+    /// two's-complement WRAPPING absolute value, not a saturating one.
+    ///
+    /// The PTX ISA's `abs.s32` mnemonic is documented only as `d =
+    /// |a|`, with no stated behaviour at the `Integer.MIN_VALUE`
+    /// boundary (where the mathematical absolute value `2^31` does not
+    /// fit in a signed 32-bit result). Rather than depend on an
+    /// unverified assumption about how a given `ptxas`/driver resolves
+    /// that gap, this emits the standard branchless two's-complement
+    /// absolute-value identity, built entirely from instructions that
+    /// PTX gives an unambiguous, overflow-defined meaning to
+    /// (arithmetic shift, xor, wrapping subtract — none of these have
+    /// an "undefined at the boundary" gap the way `abs` might):
+    ///
+    /// ```text
+    /// mask = a >> 31        // arithmetic shift: all-1s if a < 0, else 0
+    /// abs  = (a ^ mask) - mask
+    /// ```
+    ///
+    /// For `a == Integer.MIN_VALUE` (`0x80000000`): `mask = -1`
+    /// (`0xFFFFFFFF`), `a ^ mask = 0x7FFFFFFF` (`Integer.MAX_VALUE`),
+    /// and `0x7FFFFFFF - 0xFFFFFFFF` wraps (two's-complement subtract,
+    /// same as Java `int` arithmetic) back to `0x80000000` —
+    /// bit-for-bit `Integer.MIN_VALUE`, exactly what `Math.abs` returns.
+    /// For any other `a` this is the textbook branchless `abs`, with no
+    /// boundary case at all.
+    fn abs_i32(&mut self) -> Result<(), LoweringError> {
+        let a = self.stack.pop()?;
+        let mask = self.regs.fresh_reg(RegKind::S32);
+        let flipped = self.regs.fresh_reg(RegKind::S32);
+        let r = self.regs.fresh_reg(RegKind::S32);
+        writeln!(self.body, "    shr.s32 {}, {}, 31;", mask.name, a.name).unwrap();
+        writeln!(
+            self.body,
+            "    xor.b32 {}, {}, {};",
+            flipped.name, a.name, mask.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    sub.s32 {}, {}, {};",
+            r.name, flipped.name, mask.name
+        )
+        .unwrap();
+        self.stack.push(r);
+        Ok(())
+    }
+
+    /// `Math.abs(long)` / `StrictMath.abs(long)` — the 64-bit twin of
+    /// [`abs_i32`](Self::abs_i32); see its doc comment for the full
+    /// derivation (`shr.s64` by 63, `xor.b64`, `sub.s64`; `Long.MIN_VALUE`
+    /// wraps back to itself the same way `Integer.MIN_VALUE` does).
+    fn abs_i64(&mut self) -> Result<(), LoweringError> {
+        let a = self.stack.pop()?;
+        let mask = self.regs.fresh_reg(RegKind::S64);
+        let flipped = self.regs.fresh_reg(RegKind::S64);
+        let r = self.regs.fresh_reg(RegKind::S64);
+        writeln!(self.body, "    shr.s64 {}, {}, 63;", mask.name, a.name).unwrap();
+        writeln!(
+            self.body,
+            "    xor.b64 {}, {}, {};",
+            flipped.name, a.name, mask.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    sub.s64 {}, {}, {};",
+            r.name, flipped.name, mask.name
+        )
+        .unwrap();
+        self.stack.push(r);
+        Ok(())
+    }
+
+    /// `Math.min(int,int)` (`want_min = true`) / `Math.max(int,int)`
+    /// (`want_min = false`), and their `StrictMath` twins. Java's
+    /// integer `min`/`max` is exactly `a < b ? a : b` / `a > b ? a : b`
+    /// — no NaN or signed-zero subtlety like the float/double variants
+    /// below — so this is a direct `setp` + `selp`, bit-exact for every
+    /// input with no gating needed.
+    fn minmax_i32(&mut self, want_min: bool) -> Result<(), LoweringError> {
+        let b = self.stack.pop()?;
+        let a = self.stack.pop()?;
+        let p = self.regs.fresh_reg(RegKind::Pred);
+        let r = self.regs.fresh_reg(RegKind::S32);
+        let cmp = if want_min { "setp.lt.s32" } else { "setp.gt.s32" };
+        writeln!(self.body, "    {} {}, {}, {};", cmp, p.name, a.name, b.name).unwrap();
+        writeln!(
+            self.body,
+            "    selp.s32 {}, {}, {}, {};",
+            r.name, a.name, b.name, p.name
+        )
+        .unwrap();
+        self.stack.push(r);
+        Ok(())
+    }
+
+    /// `Math.min(long,long)` / `Math.max(long,long)` — 64-bit twin of
+    /// [`minmax_i32`](Self::minmax_i32).
+    fn minmax_i64(&mut self, want_min: bool) -> Result<(), LoweringError> {
+        let b = self.stack.pop()?;
+        let a = self.stack.pop()?;
+        let p = self.regs.fresh_reg(RegKind::Pred);
+        let r = self.regs.fresh_reg(RegKind::S64);
+        let cmp = if want_min { "setp.lt.s64" } else { "setp.gt.s64" };
+        writeln!(self.body, "    {} {}, {}, {};", cmp, p.name, a.name, b.name).unwrap();
+        writeln!(
+            self.body,
+            "    selp.s64 {}, {}, {}, {};",
+            r.name, a.name, b.name, p.name
+        )
+        .unwrap();
+        self.stack.push(r);
+        Ok(())
+    }
+
+    /// `Math.min(float,float)` (`want_min = true`) / `Math.max(float,float)`
+    /// (`want_min = false`), and their `StrictMath` twins.
+    ///
+    /// Per the javadoc: "If either value is NaN, then the result is
+    /// NaN." and "Unlike the numerical comparison operators, this
+    /// method considers negative zero to be strictly smaller than
+    /// positive zero. If one argument is positive zero and the other
+    /// negative zero, the result is negative zero [for `min`; positive
+    /// zero for `max`]." PTX's `min.f32`/`max.f32` do NOT implement
+    /// either rule (they return the non-NaN operand on a NaN input, and
+    /// treat +0.0/-0.0 as equal), so this builds the Java-exact
+    /// behaviour explicitly out of ordered predicates and bitwise
+    /// selects — the same "narrow to a predicate, then select" idiom
+    /// `lcmp`/`cmp_f32` already use:
+    ///
+    /// 1. `setp.nan.f32 p_a_nan, a, a` — true iff `a` is NaN (PTX's
+    ///    `nan` comparator is true when EITHER operand is NaN; comparing
+    ///    `a` against itself isolates "is `a` NaN").
+    /// 2. `setp.le.f32`/`setp.ge.f32 p_ordered, a, b` (le for `min`, ge
+    ///    for `max`) + `selp` — the ordinary case. PTX's ordered
+    ///    comparisons are false whenever either operand is NaN, so when
+    ///    `a` is not NaN but `b` is, `p_ordered` is false and this
+    ///    naturally selects `b` (NaN) — correctly propagating a NaN `b`
+    ///    without needing a second NaN check.
+    /// 3. Zero handling: `a == 0.0 && b == 0.0` (numeric `==`, so this
+    ///    is true for any combination of +0.0/-0.0) selects between the
+    ///    ordered result and a bitwise combination of the two operands'
+    ///    raw bit patterns — `OR` for `min` (the sign bit ends up set,
+    ///    i.e. the result is `-0.0`, iff EITHER operand is `-0.0`,
+    ///    matching "the result is negative zero" whenever one of the
+    ///    two is), `AND` for `max` (the sign bit ends up set only if
+    ///    BOTH are `-0.0`, matching "the result is positive zero"
+    ///    whenever the mix is `+0.0`/`-0.0`). This bitwise trick is
+    ///    exact for every one of the four sign combinations — verified
+    ///    directly against the two javadoc sentences above, not merely
+    ///    against a specific `OpenJDK` implementation's source text.
+    /// 4. Final `selp` on `p_a_nan` overrides everything above with `a`
+    ///    when `a` itself is NaN (step 2's `b`-is-NaN case is already
+    ///    handled by the ordered-comparison-is-false fallback, so this
+    ///    is the only extra override needed).
+    fn minmax_f32(&mut self, want_min: bool) -> Result<(), LoweringError> {
+        let b = self.stack.pop()?;
+        let a = self.stack.pop()?;
+        let p_a_nan = self.regs.fresh_reg(RegKind::Pred);
+        let p_a_zero = self.regs.fresh_reg(RegKind::Pred);
+        let p_b_zero = self.regs.fresh_reg(RegKind::Pred);
+        let p_both_zero = self.regs.fresh_reg(RegKind::Pred);
+        let p_ordered = self.regs.fresh_reg(RegKind::Pred);
+        let ordered_result = self.regs.fresh_reg(RegKind::F32);
+        let bits_a = self.regs.fresh_reg(RegKind::U32);
+        let bits_b = self.regs.fresh_reg(RegKind::U32);
+        let bits_combined = self.regs.fresh_reg(RegKind::U32);
+        let zero_result = self.regs.fresh_reg(RegKind::F32);
+        let non_nan_result = self.regs.fresh_reg(RegKind::F32);
+        let r = self.regs.fresh_reg(RegKind::F32);
+
+        writeln!(
+            self.body,
+            "    setp.nan.f32 {}, {}, {};",
+            p_a_nan.name, a.name, a.name
+        )
+        .unwrap();
+        let ord_cmp = if want_min { "setp.le.f32" } else { "setp.ge.f32" };
+        writeln!(
+            self.body,
+            "    {} {}, {}, {};",
+            ord_cmp, p_ordered.name, a.name, b.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    selp.f32 {}, {}, {}, {};",
+            ordered_result.name, a.name, b.name, p_ordered.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    setp.eq.f32 {}, {}, 0f00000000;",
+            p_a_zero.name, a.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    setp.eq.f32 {}, {}, 0f00000000;",
+            p_b_zero.name, b.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    and.pred {}, {}, {};",
+            p_both_zero.name, p_a_zero.name, p_b_zero.name
+        )
+        .unwrap();
+        writeln!(self.body, "    mov.b32 {}, {};", bits_a.name, a.name).unwrap();
+        writeln!(self.body, "    mov.b32 {}, {};", bits_b.name, b.name).unwrap();
+        let bit_op = if want_min { "or.b32" } else { "and.b32" };
+        writeln!(
+            self.body,
+            "    {} {}, {}, {};",
+            bit_op, bits_combined.name, bits_a.name, bits_b.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    mov.b32 {}, {};",
+            zero_result.name, bits_combined.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    selp.f32 {}, {}, {}, {};",
+            non_nan_result.name, zero_result.name, ordered_result.name, p_both_zero.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    selp.f32 {}, {}, {}, {};",
+            r.name, a.name, non_nan_result.name, p_a_nan.name
+        )
+        .unwrap();
+        self.stack.push(r);
+        Ok(())
+    }
+
+    /// `Math.min(double,double)` / `Math.max(double,double)` — the
+    /// `f64` twin of [`minmax_f32`](Self::minmax_f32); see its doc
+    /// comment for the full derivation. Every `f32` mnemonic/immediate
+    /// becomes its `f64`/`b64` counterpart, and the zero-bit-pattern
+    /// comparison target widens to the 64-bit all-zero encoding.
+    fn minmax_f64(&mut self, want_min: bool) -> Result<(), LoweringError> {
+        let b = self.stack.pop()?;
+        let a = self.stack.pop()?;
+        let p_a_nan = self.regs.fresh_reg(RegKind::Pred);
+        let p_a_zero = self.regs.fresh_reg(RegKind::Pred);
+        let p_b_zero = self.regs.fresh_reg(RegKind::Pred);
+        let p_both_zero = self.regs.fresh_reg(RegKind::Pred);
+        let p_ordered = self.regs.fresh_reg(RegKind::Pred);
+        let ordered_result = self.regs.fresh_reg(RegKind::F64);
+        let bits_a = self.regs.fresh_reg(RegKind::U64);
+        let bits_b = self.regs.fresh_reg(RegKind::U64);
+        let bits_combined = self.regs.fresh_reg(RegKind::U64);
+        let zero_result = self.regs.fresh_reg(RegKind::F64);
+        let non_nan_result = self.regs.fresh_reg(RegKind::F64);
+        let r = self.regs.fresh_reg(RegKind::F64);
+
+        writeln!(
+            self.body,
+            "    setp.nan.f64 {}, {}, {};",
+            p_a_nan.name, a.name, a.name
+        )
+        .unwrap();
+        let ord_cmp = if want_min { "setp.le.f64" } else { "setp.ge.f64" };
+        writeln!(
+            self.body,
+            "    {} {}, {}, {};",
+            ord_cmp, p_ordered.name, a.name, b.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    selp.f64 {}, {}, {}, {};",
+            ordered_result.name, a.name, b.name, p_ordered.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    setp.eq.f64 {}, {}, 0d0000000000000000;",
+            p_a_zero.name, a.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    setp.eq.f64 {}, {}, 0d0000000000000000;",
+            p_b_zero.name, b.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    and.pred {}, {}, {};",
+            p_both_zero.name, p_a_zero.name, p_b_zero.name
+        )
+        .unwrap();
+        writeln!(self.body, "    mov.b64 {}, {};", bits_a.name, a.name).unwrap();
+        writeln!(self.body, "    mov.b64 {}, {};", bits_b.name, b.name).unwrap();
+        let bit_op = if want_min { "or.b64" } else { "and.b64" };
+        writeln!(
+            self.body,
+            "    {} {}, {}, {};",
+            bit_op, bits_combined.name, bits_a.name, bits_b.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    mov.b64 {}, {};",
+            zero_result.name, bits_combined.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    selp.f64 {}, {}, {}, {};",
+            non_nan_result.name, zero_result.name, ordered_result.name, p_both_zero.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    selp.f64 {}, {}, {}, {};",
+            r.name, a.name, non_nan_result.name, p_a_nan.name
+        )
+        .unwrap();
+        self.stack.push(r);
+        Ok(())
+    }
+
+    /// `Math.fma(float,float,float)` / `StrictMath.fma(float,float,float)`.
+    ///
+    /// `invokestatic` args are pushed left-to-right (`a`, then `b`, then
+    /// `c`, with `c` on top of the operand stack at the callsite), so
+    /// this pops in reverse: `c`, `b`, `a`. PTX's `fma.rn.f32 d, a, b,
+    /// c` computes `a*b+c` with a single final rounding — exactly what
+    /// both `Math.fma` and `StrictMath.fma` are specified to compute
+    /// ("the exact product of the first two arguments... is then added
+    /// to the third argument and the result is rounded once"), so this
+    /// is bit-exact for every input with no gating hint needed.
+    fn fma_f32(&mut self) -> Result<(), LoweringError> {
+        let c = self.stack.pop()?;
+        let b = self.stack.pop()?;
+        let a = self.stack.pop()?;
+        let r = self.regs.fresh_reg(RegKind::F32);
+        writeln!(
+            self.body,
+            "    fma.rn.f32 {}, {}, {}, {};",
+            r.name, a.name, b.name, c.name
+        )
+        .unwrap();
+        self.stack.push(r);
+        Ok(())
+    }
+
+    /// `Math.fma(double,double,double)` / `StrictMath.fma(double,double,double)`
+    /// — the `f64` twin of [`fma_f32`](Self::fma_f32).
+    fn fma_f64(&mut self) -> Result<(), LoweringError> {
+        let c = self.stack.pop()?;
+        let b = self.stack.pop()?;
+        let a = self.stack.pop()?;
+        let r = self.regs.fresh_reg(RegKind::F64);
+        writeln!(
+            self.body,
+            "    fma.rn.f64 {}, {}, {}, {};",
+            r.name, a.name, b.name, c.name
+        )
+        .unwrap();
+        self.stack.push(r);
+        Ok(())
+    }
+
     // ─────────────────── local-variable helpers ─────────────────────
 
     fn iload(&mut self, slot: u16) -> Result<(), LoweringError> {
-        // If this slot is the induction variable, substitute tid.
+        // If this slot is the induction variable, substitute tid (or
+        // tid + K, when `apply_loop_start_offset` has already folded a
+        // non-zero loop start `K` into `self.tid_reg` — this call site
+        // doesn't need to know which).
         if Some(slot) == self.iv_slot {
             let tid = self
                 .tid_reg
@@ -909,10 +1590,12 @@ impl<'a> Emitter<'a> {
         let b = self.stack.pop()?;
         let a = self.stack.pop()?;
         let r = self.regs.fresh_reg(RegKind::F32);
-        // div/rem on f32 need rounding mode in PTX; rn.f32 family.
-        // AUDIT 2026-05-16: PTX has no `rem.f32` mnemonic — `frem` is
-        // rejected upstream in `emit_op` so this match no longer needs
-        // a `"rem.f32"` arm.
+        // div on f32 needs an explicit rounding mode in PTX; rn.f32
+        // family. AUDIT 2026-05-16/2026-07-11: PTX still has no
+        // `rem.f32` mnemonic, so this single-instruction `binop_f32`
+        // helper still has no `"rem.f32"` arm — `frem` (0x72) is not a
+        // `binop_f32` at all, it dispatches to the dedicated multi-
+        // instruction `frem_f32` helper instead (see its doc comment).
         let m = match mnemonic {
             "div.f32" => "div.rn.f32",
             other => other,
@@ -1064,6 +1747,410 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// AUDIT 2026-07-11: `frem` (0x72) — Java's `%` on `float` operands.
+    ///
+    /// Java `frem`/`drem` (JLS §15.17.3) is the "fmod" flavour of
+    /// remainder: `result = dividend - trunc(dividend / divisor) *
+    /// divisor`, where `trunc` rounds toward zero and the result
+    /// carries the SIGN OF THE DIVIDEND. This is deliberately NOT
+    /// `Math.IEEEremainder`, which rounds the quotient to the NEAREST
+    /// integer (ties to even) instead of truncating — the two
+    /// disagree whenever the true quotient's fractional part exceeds
+    /// 0.5.
+    ///
+    /// PTX has no `rem.f32` mnemonic (see the AUDIT 2026-05-16/
+    /// 2026-07-11 comment at the `0x72`/`0x73` arms in `emit_op`), so
+    /// this builds the fmod identity out of instructions that DO
+    /// exist:
+    ///
+    /// 1. `div.rn.f32 t, a, b`         — correctly-rounded quotient.
+    /// 2. `cvt.rzi.f32.f32 t, t`       — truncate `t` toward zero,
+    ///    staying in `f32` (this is exactly `truncf`).
+    /// 3. `neg.f32 negt, t; fma.rn.f32 r, negt, b, a` — `r = a - t*b`,
+    ///    with the multiply carried at full precision internally by
+    ///    the FMA and only ONE final rounding, instead of a separate
+    ///    `mul.f32` + `sub.f32` (two roundings, strictly more error).
+    ///
+    /// ── Why step 3 is exact once `t` is the right integer ──
+    ///
+    /// The true mathematical fmod result is always exactly
+    /// representable in the source type, for ANY finite `a` and finite
+    /// nonzero `b` — this follows because fmod can equivalently be
+    /// computed as a finite sequence of Sterbenz-safe subtractions
+    /// (`while |a| >= |b|: a -= sign-matched (b * 2^k)`), and each such
+    /// subtraction is individually exact, so the result of the whole
+    /// process is too. An FMA computes `negt * b + a` as if the
+    /// product were formed at infinite precision and rounded only
+    /// once at the very end; if `t` is exactly `trunc(a/b)`, that
+    /// infinite-precision intermediate value IS the true fmod result,
+    /// which we just established is already exactly representable —
+    /// so the FMA's single rounding step has nothing to round away.
+    /// Given a correct `t`, this sequence is therefore bit-exact, not
+    /// merely "correctly rounded".
+    ///
+    /// ── Why this is gated behind `AdmissionHint::AllowDivByZero` ──
+    ///
+    /// Step 1 only recovers the EXACT mathematical integer quotient
+    /// `trunc(a/b)` when that quotient's magnitude is small enough
+    /// that its ULP is < 1 — i.e. `|a/b| < 2^24` for `f32` (24-bit
+    /// significand including the implicit leading bit). Outside that
+    /// range, a single correctly-rounded division can land on the
+    /// wrong side of an integer boundary (worst case: the true
+    /// quotient's fractional part is adversarially close to 0 or 1),
+    /// so `cvt.rzi` truncates to an integer that is off by one (or
+    /// more) from the true quotient. Step 3 then computes `a - t*b`
+    /// for the WRONG `t`, so the result is wrong by a whole multiple
+    /// of `b` — not a rounding-level error, a flatly incorrect answer.
+    /// A fully general, always-exact `fmod` needs an
+    /// arbitrary-precision shift-and-subtract reduction (what glibc's
+    /// `__ieee754_fmodf` does); that is out of scope for a
+    /// single-kernel PTX emitter. See `analyzer::Reason::FloatRemainder`
+    /// and `analyzer::classify`'s `0x72 | 0x73` arm for the analyzer
+    /// side of this gate — `AllowDivByZero` is reused rather than a
+    /// dedicated hint because minting a new `AdmissionHint` variant
+    /// would require editing `annotations.rs`, out of scope for this
+    /// change; it is already the "accept looser numeric edge-case
+    /// semantics for a division-family opcode" opt-in, and `frem` is
+    /// literally the floating counterpart of `irem`.
+    ///
+    /// ── The one edge case patched explicitly: infinite divisor ──
+    ///
+    /// JLS §15.17.3 requires `a % b == a` whenever `a` is finite and
+    /// `b` is `±Infinity`. Steps 1-3 alone get this WRONG: `t = a /
+    /// ±Infinity` rounds to a signed zero, so step 3 computes `∓0 *
+    /// ±Infinity`, which IEEE 754 defines as NaN (zero times
+    /// infinity) — the naive sequence would silently return NaN
+    /// instead of `a`. A finite dividend divided by an infinite
+    /// divisor is not an exotic input (e.g. a prior overflow feeding
+    /// an infinity into this expression), so the extra instructions
+    /// are worth it: compute `|b|`, compare it against the canonical
+    /// `+Infinity` bit pattern, and `selp` the dividend `a` directly
+    /// whenever the divisor is infinite. NaN operands are unaffected:
+    /// `NaN == Infinity` is false under IEEE 754 `eq`, so a NaN
+    /// divisor still falls through to the fma path (which already
+    /// propagates NaN correctly through every step), and a NaN
+    /// dividend selects `a` = NaN on either path.
+    ///
+    /// ── Deliberately NOT patched: sign of an exactly-zero result ──
+    ///
+    /// JLS also requires the result's sign to always match the
+    /// dividend's sign, even when the numeric result is zero (e.g.
+    /// `-0.0f % 5.0f` must yield `-0.0f`, not `+0.0f`). Depending on
+    /// rounding, `fma(negt, b, a)` can produce `+0.0` where Java wants
+    /// `-0.0`, because IEEE 754 addition of two zeros of opposite sign
+    /// rounds to `+0` under round-to-nearest. This is a real, known
+    /// deviation from JLS bit-for-bit sign semantics that is NOT
+    /// corrected here — chasing every signed-zero corner case would
+    /// need extra per-sign predicated logic for a difference that is
+    /// numerically zero either way. Callers who need bit-exact
+    /// signed-zero results must not offload a method containing
+    /// `frem`/`drem` under `AllowDivByZero`.
+    fn frem_f32(&mut self) -> Result<(), LoweringError> {
+        let b = self.stack.pop()?; // divisor
+        let a = self.stack.pop()?; // dividend
+        let t = self.regs.fresh_reg(RegKind::F32);
+        let t_trunc = self.regs.fresh_reg(RegKind::F32);
+        let neg_t = self.regs.fresh_reg(RegKind::F32);
+        let naive = self.regs.fresh_reg(RegKind::F32);
+        let abs_b = self.regs.fresh_reg(RegKind::F32);
+        let p_inf_divisor = self.regs.fresh_reg(RegKind::Pred);
+        let result = self.regs.fresh_reg(RegKind::F32);
+        writeln!(self.body, "    div.rn.f32 {}, {}, {};", t.name, a.name, b.name).unwrap();
+        writeln!(
+            self.body,
+            "    cvt.rzi.f32.f32 {}, {};",
+            t_trunc.name, t.name
+        )
+        .unwrap();
+        writeln!(self.body, "    neg.f32 {}, {};", neg_t.name, t_trunc.name).unwrap();
+        writeln!(
+            self.body,
+            "    fma.rn.f32 {}, {}, {}, {};",
+            naive.name, neg_t.name, b.name, a.name
+        )
+        .unwrap();
+        writeln!(self.body, "    abs.f32 {}, {};", abs_b.name, b.name).unwrap();
+        writeln!(
+            self.body,
+            "    setp.eq.f32 {}, {}, 0f7F800000;",
+            p_inf_divisor.name, abs_b.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    selp.f32 {}, {}, {}, {};",
+            result.name, a.name, naive.name, p_inf_divisor.name
+        )
+        .unwrap();
+        self.stack.push(result);
+        Ok(())
+    }
+
+    /// `drem` (0x73) — the `f64` twin of [`frem_f32`]. See that
+    /// function's doc comment for the full JLS §15.17.3 derivation,
+    /// the precision boundary (`|a/b| < 2^53` here, `double`'s 53-bit
+    /// significand, rather than `f32`'s `2^24`), and exactly which
+    /// edge cases are and are not handled bit-exactly. The PTX
+    /// sequence is identical, mnemonic-for-mnemonic, with every `f32`
+    /// swapped for `f64` and the `+Infinity` bit pattern widened to
+    /// the 64-bit encoding.
+    fn drem_f64(&mut self) -> Result<(), LoweringError> {
+        let b = self.stack.pop()?; // divisor
+        let a = self.stack.pop()?; // dividend
+        let t = self.regs.fresh_reg(RegKind::F64);
+        let t_trunc = self.regs.fresh_reg(RegKind::F64);
+        let neg_t = self.regs.fresh_reg(RegKind::F64);
+        let naive = self.regs.fresh_reg(RegKind::F64);
+        let abs_b = self.regs.fresh_reg(RegKind::F64);
+        let p_inf_divisor = self.regs.fresh_reg(RegKind::Pred);
+        let result = self.regs.fresh_reg(RegKind::F64);
+        writeln!(self.body, "    div.rn.f64 {}, {}, {};", t.name, a.name, b.name).unwrap();
+        writeln!(
+            self.body,
+            "    cvt.rzi.f64.f64 {}, {};",
+            t_trunc.name, t.name
+        )
+        .unwrap();
+        writeln!(self.body, "    neg.f64 {}, {};", neg_t.name, t_trunc.name).unwrap();
+        writeln!(
+            self.body,
+            "    fma.rn.f64 {}, {}, {}, {};",
+            naive.name, neg_t.name, b.name, a.name
+        )
+        .unwrap();
+        writeln!(self.body, "    abs.f64 {}, {};", abs_b.name, b.name).unwrap();
+        writeln!(
+            self.body,
+            "    setp.eq.f64 {}, {}, 0d7FF0000000000000;",
+            p_inf_divisor.name, abs_b.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    selp.f64 {}, {}, {}, {};",
+            result.name, a.name, naive.name, p_inf_divisor.name
+        )
+        .unwrap();
+        self.stack.push(result);
+        Ok(())
+    }
+
+    /// `lcmp` (0x94) — JVMS §6.5 `lcmp`: pop `value2` then `value1` (two
+    /// `long`s), push the `int`
+    ///
+    /// ```text
+    ///  1   if value1 >  value2
+    ///  0   if value1 == value2
+    /// -1   if value1 <  value2
+    /// ```
+    ///
+    /// PTX has no three-way integer compare, so this builds the result
+    /// out of two ordered predicates and a `selp` chain — the same
+    /// "narrow to a predicate, then select" idiom `div_or_rem_i32`'s
+    /// zero-divisor guard uses, just producing a value instead of a
+    /// branch:
+    ///
+    /// 1. `setp.gt.s64 pg, a, b`  — `pg` is true iff `a > b`.
+    /// 2. `setp.lt.s64 pl, a, b`  — `pl` is true iff `a < b`.
+    /// 3. `selp.s32 not_gt, -1, 0, pl` — `not_gt` = `-1` if `a < b`,
+    ///    else `0` (the `a == b` case, since `pl` is false there).
+    /// 4. `selp.s32 r, 1, not_gt, pg` — `r` = `1` if `a > b`, else
+    ///    `not_gt` from step 3.
+    ///
+    /// Integers have no NaN-like non-total-order case, so unlike
+    /// [`cmp_f32`]/[`cmp_f64`] no third predicate is needed — `pg` and
+    /// `pl` are exhaustive and mutually exclusive, so every input lands
+    /// on exactly one of the three branches. This lowering is therefore
+    /// bit-exact for every `long` input, with no gating hint required
+    /// (contrast [`frem_f32`]/[`drem_f64`], which need
+    /// `AdmissionHint::AllowDivByZero` because their fma-based identity
+    /// has a precision boundary — a compare has none).
+    ///
+    /// See the AUDIT comment at the `0x94` arm in `emit_op` for why this
+    /// building block is not yet reachable end-to-end from real javac
+    /// output (every real `lcmp` is immediately consumed by a following
+    /// `if<cond>` branch, which still rejects) and
+    /// `lowering.rs`'s `lcmp_lowers_to_setp_selp_chain` test for the
+    /// hand-built body that exercises this function directly.
+    fn lcmp(&mut self) -> Result<(), LoweringError> {
+        let b = self.stack.pop()?; // value2
+        let a = self.stack.pop()?; // value1
+        let p_gt = self.regs.fresh_reg(RegKind::Pred);
+        let p_lt = self.regs.fresh_reg(RegKind::Pred);
+        let not_gt = self.regs.fresh_reg(RegKind::S32);
+        let r = self.regs.fresh_reg(RegKind::S32);
+        writeln!(
+            self.body,
+            "    setp.gt.s64 {}, {}, {};",
+            p_gt.name, a.name, b.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    setp.lt.s64 {}, {}, {};",
+            p_lt.name, a.name, b.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    selp.s32 {}, -1, 0, {};",
+            not_gt.name, p_lt.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    selp.s32 {}, 1, {}, {};",
+            r.name, not_gt.name, p_gt.name
+        )
+        .unwrap();
+        self.stack.push(r);
+        Ok(())
+    }
+
+    /// `fcmpl` (0x95, `nan_result = -1`) / `fcmpg` (0x96, `nan_result =
+    /// 1`) — JVMS §6.5 `fcmpl`/`fcmpg`: pop `value2` then `value1` (two
+    /// `float`s), push the `int`
+    ///
+    /// ```text
+    ///  1   if value1 >  value2
+    ///  0   if value1 == value2
+    /// -1   if value1 <  value2
+    /// nan_result  if value1 or value2 is NaN
+    /// ```
+    ///
+    /// where `nan_result` is `-1` for `fcmpl` and `+1` for `fcmpg` — the
+    /// two opcodes exist ONLY so the compiler can choose whichever one
+    /// makes a source-level `<`/`>` comparison involving NaN evaluate to
+    /// `false` (JLS §15.20.1): `a < b` lowers to `fcmpg; ifge` (a NaN
+    /// operand must make the branch NOT taken, so the synthetic
+    /// `nan_result = +1` must fail `< 0`), while `a > b` lowers to
+    /// `fcmpl; ifle` (same requirement, mirrored).
+    ///
+    /// Building on the ordered-predicate idiom from [`lcmp`]:
+    ///
+    /// 1. `setp.gt.f32 pg, a, b` / `setp.lt.f32 pl, a, b` — PTX's
+    ///    ordered `gt`/`lt` comparisons are false whenever either
+    ///    operand is NaN (IEEE 754 unordered compare), so `pg`/`pl`
+    ///    alone would silently fall through to the `a == b` case (`0`)
+    ///    for a NaN input — wrong per the table above.
+    /// 2. `setp.nan.f32 pn, a, b` — PTX's `nan` comparison operator is
+    ///    true iff EITHER operand is NaN; this is exactly the override
+    ///    condition needed.
+    /// 3. Compute the ordered `not_gt`/`ordered` result via the same
+    ///    two `selp`s as [`lcmp`] (steps 3-4 there).
+    /// 4. `selp.s32 r, nan_result, ordered, pn` — override with the
+    ///    caller-supplied NaN default when `pn` is true.
+    ///
+    /// A NaN operand is not an exotic input for a kernel fed by prior
+    /// floating-point computation (e.g. a prior `0.0f / 0.0f`), so the
+    /// extra predicate is worth it rather than leaving the NaN case
+    /// silently wrong the way the pre-2026-07-11 `frem`/`drem` lowering
+    /// did before its own infinite-divisor patch.
+    fn cmp_f32(&mut self, nan_result: i32) -> Result<(), LoweringError> {
+        let b = self.stack.pop()?; // value2
+        let a = self.stack.pop()?; // value1
+        let p_gt = self.regs.fresh_reg(RegKind::Pred);
+        let p_lt = self.regs.fresh_reg(RegKind::Pred);
+        let p_nan = self.regs.fresh_reg(RegKind::Pred);
+        let not_gt = self.regs.fresh_reg(RegKind::S32);
+        let ordered = self.regs.fresh_reg(RegKind::S32);
+        let r = self.regs.fresh_reg(RegKind::S32);
+        writeln!(
+            self.body,
+            "    setp.gt.f32 {}, {}, {};",
+            p_gt.name, a.name, b.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    setp.lt.f32 {}, {}, {};",
+            p_lt.name, a.name, b.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    setp.nan.f32 {}, {}, {};",
+            p_nan.name, a.name, b.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    selp.s32 {}, -1, 0, {};",
+            not_gt.name, p_lt.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    selp.s32 {}, 1, {}, {};",
+            ordered.name, not_gt.name, p_gt.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    selp.s32 {}, {}, {}, {};",
+            r.name, nan_result, ordered.name, p_nan.name
+        )
+        .unwrap();
+        self.stack.push(r);
+        Ok(())
+    }
+
+    /// `dcmpl` (0x97, `nan_result = -1`) / `dcmpg` (0x98, `nan_result =
+    /// 1`) — the `f64` twin of [`cmp_f32`]. See that function's doc
+    /// comment for the full JVMS §6.5 / JLS §15.20.1 derivation of why
+    /// two opcodes exist and how `nan_result` implements the
+    /// compiler's choice between them; the PTX sequence here is
+    /// identical, mnemonic-for-mnemonic, with every `f32` swapped for
+    /// `f64` (mirroring how [`drem_f64`] relates to [`frem_f32`]).
+    fn cmp_f64(&mut self, nan_result: i32) -> Result<(), LoweringError> {
+        let b = self.stack.pop()?; // value2
+        let a = self.stack.pop()?; // value1
+        let p_gt = self.regs.fresh_reg(RegKind::Pred);
+        let p_lt = self.regs.fresh_reg(RegKind::Pred);
+        let p_nan = self.regs.fresh_reg(RegKind::Pred);
+        let not_gt = self.regs.fresh_reg(RegKind::S32);
+        let ordered = self.regs.fresh_reg(RegKind::S32);
+        let r = self.regs.fresh_reg(RegKind::S32);
+        writeln!(
+            self.body,
+            "    setp.gt.f64 {}, {}, {};",
+            p_gt.name, a.name, b.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    setp.lt.f64 {}, {}, {};",
+            p_lt.name, a.name, b.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    setp.nan.f64 {}, {}, {};",
+            p_nan.name, a.name, b.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    selp.s32 {}, -1, 0, {};",
+            not_gt.name, p_lt.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    selp.s32 {}, 1, {}, {};",
+            ordered.name, not_gt.name, p_gt.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    selp.s32 {}, {}, {}, {};",
+            r.name, nan_result, ordered.name, p_nan.name
+        )
+        .unwrap();
+        self.stack.push(r);
+        Ok(())
+    }
+
     fn unop_i32(&mut self, mnemonic: &str) -> Result<(), LoweringError> {
         let a = self.stack.pop()?;
         let r = self.regs.fresh_reg(RegKind::S32);
@@ -1175,8 +2262,13 @@ impl<'a> Emitter<'a> {
     }
 
     // AUDIT 2026-05-19: `cmp_long_or_float` was removed — it always
-    // returned `Err`, so every `*cmp*` opcode now rejects explicitly at
-    // the `emit_op` dispatch site instead of routing through dead code.
+    // returned `Err`, so every `*cmp*` opcode rejected explicitly at the
+    // `emit_op` dispatch site instead of routing through dead code.
+    //
+    // AUDIT 2026-07-11: `*cmp*` (0x94-0x98) no longer rejects at all —
+    // see `lcmp`/`cmp_f32`/`cmp_f64` above (grouped with `frem_f32`/
+    // `drem_f64`, the other numeric-edge-case-heavy opcodes) and the
+    // AUDIT comment at the `0x94` arm in `emit_op`.
 
     // ─────────────────── array ops ──────────────────────────────────
 
@@ -1482,15 +2574,25 @@ impl<'a> Emitter<'a> {
             // each CUDA thread carries one iteration's partial term in
             // `value`. A plain `st.global.<suffix>` would have every
             // thread race-overwrite the single `*ret_ptr` slot — silently
-            // wrong sums. Emit `atom.global.add.<atomic_suffix>` so each
+            // wrong sums. Emit `red.global.add.<atomic_suffix>` so each
             // thread's partial contribution accumulates correctly.
+            //
+            // `red`, not `atom` (found 2026-07-11 on real hardware): PTX's
+            // `atom` REQUIRES a destination operand for the fetched old
+            // value — the two-operand `atom.global.add [p], v;` form is a
+            // ptxas error ("Arguments mismatch for instruction 'atom'"),
+            // which made every reduction kernel fail module load with
+            // CUDA_ERROR_INVALID_PTX and silently blacklist to CPU. The
+            // fire-and-forget form that discards the old value is the
+            // `red` (reduction) instruction, which is exactly what an
+            // accumulate-only epilogue wants.
             //
             // PTX atomic-add type suffixes are NOT identical to the
             // load/store suffixes: integer atomics use unsigned widths
-            // (`atom.add.u32` / `atom.add.u64`) — they operate on the raw
+            // (`red.add.u32` / `red.add.u64`) — they operate on the raw
             // bit pattern, which matches Java two's-complement semantics
-            // for signed accumulation. Float atomics use `atom.add.f32`
-            // (sm_20+) / `atom.add.f64` (sm_60+).
+            // for signed accumulation. Float atomics use `.f32`
+            // (sm_20+) / `.f64` (sm_60+).
             //
             // The host marshaller MUST pre-zero `*ret_ptr` before launch;
             // `KernelSignature::is_reduction` documents this contract.
@@ -1507,7 +2609,7 @@ impl<'a> Emitter<'a> {
             };
             writeln!(
                 self.body,
-                "    atom.global.add{} [{}], {};",
+                "    red.global.add{} [{}], {};",
                 atomic_suffix, ret_ptr.name, value.name
             )
             .unwrap();

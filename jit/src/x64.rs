@@ -5878,9 +5878,11 @@ struct LoopBoundsInfo {
 }
 
 /// Speculative bounds check elimination: a deopt guard emitted at the loop header.
-/// For counted loops where IV goes from 0 to N with step 1, we speculatively
-/// eliminate per-element bounds checks and instead emit a single range check
-/// at the loop header: `if (array.length < loop_bound) goto deopt;`
+/// For counted loops where the IV increases by 1 up to N, we speculatively
+/// eliminate per-element bounds checks and instead emit a range check at the
+/// loop header: `if (iv < 0 || array.length < loop_bound) goto deopt;`. The
+/// `iv >= 0` half runs once per header; the length half once per guarded array
+/// (see the per-array note on `covered_pcs`).
 #[derive(Clone)]
 struct SpeculativeBCEGuard {
     /// Bytecode PC of the loop header where the guard should be emitted.
@@ -5889,6 +5891,20 @@ struct SpeculativeBCEGuard {
     array_local: usize,
     /// Local holding the loop bound (N in `for i in 0..N`).
     bound_local: usize,
+    /// Local holding the induction variable. The header guard proves `iv >= 0`
+    /// at loop entry; combined with `find_induction_variable`'s +1-only-step
+    /// invariant, every elided index is non-negative. Without this check a
+    /// `for (i = start; i < n; i++)` loop with a negative runtime `start`
+    /// would silently access below the array base.
+    iv_local: usize,
+    /// The array-access bytecode PCs whose per-element bounds check was elided
+    /// on the strength of THIS guard (one guard per distinct array local per
+    /// header — the guard proves `array.length >= bound` for ITS array only;
+    /// a loop guard on `a.length` says nothing about `out.length`, see
+    /// docs/known-issues/jit-bce-multi-array-oob-store-20260711.md). If the
+    /// guard is dropped (per-bci de-spec), these PCs MUST be removed from
+    /// `bounds_safe_pcs` so their per-element checks are restored.
+    covered_pcs: Vec<usize>,
 }
 
 /// Find induction variables in a loop body.
@@ -6518,52 +6534,70 @@ fn analyze_array_access_operands(
     out
 }
 
-/// Find array accesses in a loop that use the induction variable as index
-/// and an unmodified local as the array reference. Returns the set of
-/// bytecode PCs that are provably safe (index < bound ≤ array.length).
+/// Find array accesses in a loop that are STATICALLY provably safe — no
+/// runtime guard needed. Returns the set of such bytecode PCs.
 ///
-/// The key insight: if the loop bound comes from arraylength (or a local
-/// that holds arraylength), and the index is the induction variable that
-/// starts at 0 and increments by 1 up to bound, all accesses are safe.
+/// The proof (SECURITY FIX: per-array, see
+/// docs/known-issues/jit-bce-multi-array-oob-store-20260711.md): the access
+/// `arr[iv]` under an exclusive loop test `iv < bound` is in range iff
+/// `0 <= iv < bound <= arr.length` at every execution. This function
+/// therefore requires ALL of:
+///   1. `bound_from_array == Some(arr_local)` — whole-method arraylength
+///      provenance (`find_bound_arraylength_provenance`) proving the bound IS
+///      this very array's length. The loop guard `iv < a.length` bounds ONLY
+///      accesses into `a`; any other array indexed by the same IV (the `out`
+///      store of `out[i] = a[i] + b[i]`) gets NO static elision and falls to
+///      the speculative per-array header guard instead.
+///   2. `iv_start_nonneg` — whole-method proof the IV can never be negative
+///      (`find_iv_nonneg_start`).
+///   3. The IV is the access index and is only stepped +1
+///      (`find_induction_variable`), the loop comparator is exclusive, and
+///      both the array local and the bound local are loop-invariant.
 ///
 /// Operand identification is delegated to `analyze_array_access_operands`
 /// (sound producer-stack tracking); `operands` maps each analysable array
 /// access PC to its `(array_local, index_local)`.
 fn find_safe_array_accesses(
-    code: &[u8],
-    header: usize,
-    back_edge_end: usize,
     bounds: &LoopBoundsInfo,
     modified: u64,
     operands: &FxHashMap<usize, (usize, usize)>,
+    bound_from_array: Option<usize>,
+    iv_start_nonneg: bool,
 ) -> FxHashSet<usize> {
     let mut safe_pcs = FxHashSet::default();
 
     // SECURITY FIX (V17): an inclusive comparator (`if_icmpgt` exit /
     // `if_icmple` continue) lets the induction variable reach `bound` itself, so
     // the maximum index accessed is `bound`, requiring `array.length >= bound +
-    // 1`. The header range guard only proves `array.length >= bound`, which is
-    // off-by-one for `index == bound` (an OOB heap read/write one element past
-    // the end). Refuse to mark any access safe for inclusive loops so the
-    // per-element check is always kept.
+    // 1`. Provenance only proves `array.length == bound`, which is off-by-one
+    // for `index == bound` (an OOB heap read/write one element past the end).
+    // Refuse to mark any access safe for inclusive loops so the per-element
+    // check is always kept.
     if bounds.inclusive {
         return safe_pcs;
     }
 
-    // The header range guard (emitted in `compile`) proves `array.length >=
-    // bound` ONCE at entry, so the BOUND local must itself be loop-invariant:
-    // if the body raised `bound` afterwards, the per-iteration exit test
-    // `iv < bound` could admit `iv >= array.length` on a later trip — an
-    // out-of-bounds access past the stale guard (SECURITY FIX V16).
+    // Static elision needs the arraylength provenance and the non-negative IV
+    // start; anything unproven is left for the speculative guard path.
+    let bound_arr = match bound_from_array {
+        Some(a) if iv_start_nonneg => a,
+        _ => return safe_pcs,
+    };
+
+    // Loop-invariance of the bound: if the body raised `bound` after entry,
+    // the per-iteration exit test `iv < bound` could admit `iv >= array.length`
+    // on a later trip (SECURITY FIX V16). Provenance's single-store rule
+    // already implies this; kept as defense in depth.
     match bounds.bound_local {
         Some(bl) if bl < 64 && (modified & (1u64 << bl)) == 0 => {}
         _ => return safe_pcs,
     }
 
     for (&pc, &(arr_local, idx_local)) in operands {
-        // Index must be the induction variable; array ref must be a
-        // loop-invariant local (so the single header guard stays valid).
+        // Index must be the induction variable; the array must be THE array
+        // whose length the bound was taken from, and loop-invariant.
         if idx_local == bounds.induction_var
+            && arr_local == bound_arr
             && arr_local < 64
             && (modified & (1u64 << arr_local)) == 0
         {
@@ -6598,6 +6632,206 @@ fn extract_aload_local(code: &[u8], pc: usize) -> Option<usize> {
         0x19 => code.get(pc + 1).map(|&b| b as usize), // aload
         _ => None,
     }
+}
+
+/// Collect every branch target of the i16-offset branch family (`if*`,
+/// `if_icmp*`, `if_acmp*`, `ifnull`/`ifnonnull`, `goto`) across the whole
+/// method. Returns `None` — "cannot analyze" — when the method contains an
+/// opcode whose targets this scan does not model (`tableswitch`,
+/// `lookupswitch`, `jsr`/`ret`, `goto_w`/`jsr_w`), so callers stay
+/// conservative instead of trusting an incomplete target set.
+///
+/// Used by the whole-method provenance proofs below to reject a pattern that
+/// is *linearly* adjacent but not *control-flow* adjacent (a branch landing
+/// between `arraylength` and its `istore` could store a different value).
+/// Exception-handler entries need no modeling: a handler starts with the
+/// thrown ref as the only stack value, so verified bytecode cannot enter a
+/// pattern at its `arraylength` (needs an array) or value-consuming `istore`
+/// (needs an int) — only at or before the producing `aload`/`iconst`, which
+/// re-executes the whole pattern.
+fn collect_i16_branch_targets(code: &[u8], code_len: usize) -> Option<FxHashSet<usize>> {
+    let mut targets = FxHashSet::default();
+    let mut pc = 0usize;
+    while pc < code_len {
+        match code[pc] {
+            0xaa | 0xab | 0xa8 | 0xa9 | 0xc8 | 0xc9 => return None,
+            op if matches!(op, 0x99..=0xa7 | 0xc6 | 0xc7) && pc + 2 < code_len => {
+                // Cast: value to i32 (branch displacement arithmetic)
+                let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+                let target = pc as i32 + off; // Cast: value to i32
+                if target >= 0 && (target as usize) < code_len {
+                    // Cast: non-negative index to usize
+                    targets.insert(target as usize);
+                }
+            }
+            _ => {}
+        }
+        pc += bytecode_len_at(code, pc);
+    }
+    Some(targets)
+}
+
+/// Whole-method proof that `bound_local` holds `A.length` for some array
+/// local `A` — the proof obligation for a *static* (guard-less) bounds-check
+/// elision of `arr[iv]` under a loop test `iv < bound`: it is only sound for
+/// `arr == A`. Returns `Some(A)` when ALL of:
+///
+/// 1. the method contains EXACTLY ONE store to `bound_local`, and it is the
+///    canonical `aload A ; arraylength ; istore bound` triple (javac's
+///    `int n = a.length;`). JVM definite-assignment then guarantees that
+///    single store dominates every read of `bound_local`, so no dominator
+///    tree is needed;
+/// 2. no branch lands on the `arraylength` or the `istore` (which could
+///    deliver a different stack value into the store — see
+///    `collect_i16_branch_targets` for why handlers cannot);
+/// 3. `bound_local` is never `iinc`'d, and no `wide`-indexed store aliases
+///    it; and
+/// 4. `A` is NEVER reassigned (no `astore A` anywhere), so the array whose
+///    length was read is the same object at every access — in practice `A`
+///    is a parameter or the single-assignment result javac emits.
+///
+/// Everything that fails this proof falls back to the *speculative* per-array
+/// header guard, which checks the runtime lengths instead (see
+/// `SpeculativeBCEGuard`). Before this proof existed, `find_safe_array_accesses`
+/// treated the loop guard `iv < bound` as bounding EVERY array indexed by the
+/// IV — eliding the store check of `out[i] = a[i] + b[i]` from a guard on
+/// `a.length`, a silent out-of-bounds heap write when `out` is shorter
+/// (docs/known-issues/jit-bce-multi-array-oob-store-20260711.md).
+fn find_bound_arraylength_provenance(
+    code: &[u8],
+    code_len: usize,
+    bound_local: usize,
+) -> Option<usize> {
+    let branch_targets = collect_i16_branch_targets(code, code_len)?;
+    // (istore pc, previous instruction pc, the one before that)
+    let mut stores: Vec<(usize, Option<usize>, Option<usize>)> = Vec::new();
+    let mut astored: FxHashSet<usize> = FxHashSet::default();
+    let mut prev1: Option<usize> = None;
+    let mut prev2: Option<usize> = None;
+    let mut pc = 0usize;
+    while pc < code_len {
+        let op = code[pc];
+        // Widening: u8 operand/opcode-relative index -> usize (value fits)
+        let istore_target = match op {
+            0x36 if pc + 1 < code_len => Some(code[pc + 1] as usize),
+            0x3b..=0x3e => Some((op - 0x3b) as usize),
+            _ => None,
+        };
+        if istore_target == Some(bound_local) {
+            stores.push((pc, prev1, prev2));
+        }
+        // Any iinc on the bound makes its value diverge from the recorded
+        // arraylength — refuse.
+        if op == 0x84 && pc + 1 < code_len && code[pc + 1] as usize == bound_local {
+            return None;
+        }
+        // wide-indexed forms can alias the bound (or an array local) with a
+        // 2-byte index; treat a wide istore/iinc on the bound as unprovable
+        // and record wide astores like the short forms.
+        if op == 0xc4 && pc + 3 < code_len {
+            let real = code[pc + 1];
+            // Widening: operand bytes -> usize index (value fits)
+            let idx = ((code[pc + 2] as usize) << 8) | code[pc + 3] as usize;
+            if (real == 0x36 || real == 0x84) && idx == bound_local {
+                return None;
+            }
+            if real == 0x3a {
+                astored.insert(idx);
+            }
+        }
+        match op {
+            // Widening: u8 operand/opcode-relative index -> usize (value fits)
+            0x3a if pc + 1 < code_len => {
+                astored.insert(code[pc + 1] as usize);
+            }
+            0x4b..=0x4e => {
+                astored.insert((op - 0x4b) as usize);
+            }
+            _ => {}
+        }
+        prev2 = prev1;
+        prev1 = Some(pc);
+        pc += bytecode_len_at(code, pc);
+    }
+
+    let (store_pc, p1, p2) = match stores.as_slice() {
+        [(s, Some(p1), Some(p2))] => (*s, *p1, *p2),
+        _ => return None,
+    };
+    if code[p1] != 0xbe {
+        return None; // not arraylength
+    }
+    let array_local = extract_aload_local(code, p2)?;
+    if branch_targets.contains(&p1) || branch_targets.contains(&store_pc) {
+        return None;
+    }
+    if astored.contains(&array_local) {
+        return None;
+    }
+    Some(array_local)
+}
+
+/// Whole-method proof that the induction variable can never be negative: its
+/// only `istore` is a single dominating (definite-assignment) store of a
+/// non-negative constant (`iconst_0..5` / non-negative `bipush`/`sipush`),
+/// no branch lands on that `istore`, and every `iinc` on it is non-negative
+/// (`find_induction_variable` separately guarantees the in-loop step is
+/// exactly +1). Required for the *static* elision path: an elided access
+/// assumes `0 <= iv`, and a `for (i = start; ...)` loop with a negative
+/// `start` would otherwise silently access below the array base. The
+/// speculative path needs no such proof — its header guard tests the runtime
+/// `iv >= 0` at loop entry instead.
+fn find_iv_nonneg_start(code: &[u8], code_len: usize, iv_local: usize) -> bool {
+    let Some(branch_targets) = collect_i16_branch_targets(code, code_len) else {
+        return false;
+    };
+    let mut stores: Vec<(usize, Option<usize>)> = Vec::new();
+    let mut prev1: Option<usize> = None;
+    let mut pc = 0usize;
+    while pc < code_len {
+        let op = code[pc];
+        // Widening: u8 operand/opcode-relative index -> usize (value fits)
+        let istore_target = match op {
+            0x36 if pc + 1 < code_len => Some(code[pc + 1] as usize),
+            0x3b..=0x3e => Some((op - 0x3b) as usize),
+            _ => None,
+        };
+        if istore_target == Some(iv_local) {
+            stores.push((pc, prev1));
+        }
+        // A negative iinc could take the IV below its non-negative start.
+        // Cast: operand byte reinterpreted as the signed iinc constant
+        if op == 0x84
+            && pc + 2 < code_len
+            && code[pc + 1] as usize == iv_local
+            && (code[pc + 2] as i8) < 0
+        {
+            return false;
+        }
+        if op == 0xc4 && pc + 3 < code_len {
+            let real = code[pc + 1];
+            // Widening: operand bytes -> usize index (value fits)
+            let idx = ((code[pc + 2] as usize) << 8) | code[pc + 3] as usize;
+            if (real == 0x36 || real == 0x84) && idx == iv_local {
+                return false;
+            }
+        }
+        prev1 = Some(pc);
+        pc += bytecode_len_at(code, pc);
+    }
+
+    let (store_pc, p1) = match stores.as_slice() {
+        [(s, Some(p1))] => (*s, *p1),
+        _ => return false,
+    };
+    let nonneg_const = match code[p1] {
+        0x03..=0x08 => true, // iconst_0..iconst_5
+        // Cast: operand byte reinterpreted as the signed bipush immediate
+        0x10 if p1 + 1 < code_len => (code[p1 + 1] as i8) >= 0,
+        0x11 if p1 + 2 < code_len => i16::from_be_bytes([code[p1 + 1], code[p1 + 2]]) >= 0,
+        _ => false,
+    };
+    nonneg_const && !branch_targets.contains(&store_pc)
 }
 
 /// Perform bounds check elimination analysis for all loops in the method.
@@ -6639,9 +6873,19 @@ fn analyze_bounds_elimination(
         // of the old positional heuristics that mis-identified scatter stores.
         let operands = analyze_array_access_operands(code, header, back_edge_end);
 
+        // Step 3c: Whole-method provenance facts for the static (guard-less)
+        // path — which array's length the bound provably IS, and whether the
+        // IV provably starts non-negative. Static elision of `arr[iv]` is
+        // per-array: it requires `bound == arr.length` for THAT array
+        // (docs/known-issues/jit-bce-multi-array-oob-store-20260711.md).
+        let bound_from_array = bounds
+            .bound_local
+            .and_then(|bl| find_bound_arraylength_provenance(code, code_len, bl));
+        let iv_start_nonneg = find_iv_nonneg_start(code, code_len, induction_var);
+
         // Step 4: Find safe array accesses (statically proven)
         let loop_safe =
-            find_safe_array_accesses(code, header, back_edge_end, &bounds, modified, &operands);
+            find_safe_array_accesses(&bounds, modified, &operands, bound_from_array, iv_start_nonneg);
         safe_pcs.extend(&loop_safe);
 
         // Step 5: Speculative BCE — for counted loops with IV from 0..N step 1,
@@ -6685,21 +6929,31 @@ fn analyze_bounds_elimination(
             .bound_local
             .filter(|_| bound_invariant && !no_spec_bce)
         {
-            let speculative_accesses =
+            let mut speculative_accesses =
                 find_speculative_array_accesses(&bounds, modified, &loop_safe, &operands);
+            // `operands` is a hash map, so the access order is nondeterministic;
+            // sort so guard emission order (and thus codegen) is reproducible.
+            speculative_accesses.sort_unstable();
             if !speculative_accesses.is_empty() {
-                let mut guard_arrays: Vec<usize> = Vec::new();
+                // One guard per DISTINCT array local: each guard proves
+                // `its_array.length >= bound` for its own array only, and
+                // records which access PCs its pass justifies (`covered_pcs`)
+                // so a later de-spec can restore exactly those checks.
+                let mut guard_arrays: Vec<(usize, Vec<usize>)> = Vec::new();
                 for &(access_pc, arr_local) in &speculative_accesses {
                     safe_pcs.insert(access_pc);
-                    if !guard_arrays.contains(&arr_local) {
-                        guard_arrays.push(arr_local);
+                    match guard_arrays.iter_mut().find(|(a, _)| *a == arr_local) {
+                        Some((_, pcs)) => pcs.push(access_pc),
+                        None => guard_arrays.push((arr_local, vec![access_pc])),
                     }
                 }
-                for arr_local in guard_arrays {
+                for (arr_local, covered_pcs) in guard_arrays {
                     speculative_guards.push(SpeculativeBCEGuard {
                         loop_header: header,
                         array_local: arr_local,
                         bound_local,
+                        iv_local: induction_var,
+                        covered_pcs,
                     });
                 }
             }
@@ -15449,17 +15703,22 @@ impl Compiler {
     fn emit_bounds_check(&mut self, bc_pc: usize) {
         // Skip if loop analysis proved this access is safe.
         //
-        // SECURITY FIX (V16) INVARIANT: `bounds_safe_pcs` only contains a PC
-        // when `analyze_bounds_elimination` proved — for the enclosing counted
-        // loop — that the index IV ranges over `[0, bound)` step 1, the array
-        // local is loop-invariant, AND the bound local is loop-invariant (so a
-        // single `array.length >= bound` header guard, emitted as a
-        // SpeculativeBCEGuard, keeps every elided access in range). All three
-        // invariance facts derive from `find_modified_locals` /
-        // `find_induction_variable`; if ANY of the array-ref, IV, or bound
-        // local is written in the loop body, the PC is excluded here and the
-        // full per-access check below is emitted. Do not add a PC to
-        // `bounds_safe_pcs` from any path that does not establish all three.
+        // SECURITY INVARIANT (V16, per-array 2026-07-11): `bounds_safe_pcs`
+        // only contains a PC when `analyze_bounds_elimination` established,
+        // for the enclosing counted loop (exclusive comparator, IV stepped
+        // only +1, array/bound locals loop-invariant), ONE of:
+        //   * STATIC proof: the bound provably IS this access's array's own
+        //     length (`find_bound_arraylength_provenance` — a bound taken from
+        //     a DIFFERENT array's length proves nothing for this one, see
+        //     docs/known-issues/jit-bce-multi-array-oob-store-20260711.md) and
+        //     the IV provably starts non-negative (`find_iv_nonneg_start`); or
+        //   * SPECULATIVE guard: a `SpeculativeBCEGuard` for exactly this
+        //     access's array, emitted at the loop header (`iv >= 0` and
+        //     `array.length >= bound` or deopt). If that guard is later
+        //     dropped by per-bci de-spec, the guard's `covered_pcs` are
+        //     removed from `bounds_safe_pcs` so this check comes back.
+        // Do not add a PC to `bounds_safe_pcs` from any path that does not
+        // establish one of the two.
         if self.bounds_safe_pcs.contains(&bc_pc) {
             return;
         }
@@ -16718,11 +16977,101 @@ impl Compiler {
                     }
                 }
             }
+            // === Speculative BCE: Emit range guards at loop headers ===
+            // MUST run FIRST in the preheader — before the LICM hoists and the
+            // SIMD batch preheaders below — so a failing guard deopts before
+            // any speculative code (in particular an AVX2 element-wise batch
+            // whose per-element checks were elided on the strength of these
+            // guards) touches the heap. Emitted per header:
+            //   load iv -> EAX; TEST EAX,EAX; JS deopt        (iv >= 0, once)
+            // then for each guarded array:
+            //   load array ref -> RAX
+            //   MOV R10D, [RAX + ARRAY_LENGTH_OFFSET]  (array length)
+            //   load loop bound -> ECX
+            //   CMP R10D, ECX  (array.length vs loop_bound)
+            //   JB deopt_stub  (if array.length < loop_bound, deopt)
+            {
+                // O(1) lookup of this header's guards (indexed once in `compile`)
+                // instead of re-scanning the whole guard vector per loop header.
+                let guards: Vec<SpeculativeBCEGuard> = self
+                    .speculative_bce_guards_by_header
+                    .get(&pc)
+                    .cloned()
+                    .unwrap_or_default();
+                let had_guards = !guards.is_empty();
+                if let Some(first) = guards.first() {
+                    // iv >= 0 at entry: with the +1-only step invariant this
+                    // bounds every elided index from below. All guards at one
+                    // header share the loop's IV, so test it once.
+                    if let Some(reg) = self.reg_for_local(first.iv_local) {
+                        self.emit_mov_reg_reg(RAX, reg);
+                    } else {
+                        self.emit_load_local(RAX, self.local_offset(first.iv_local));
+                    }
+                    // TEST EAX, EAX (85 C0); JS rel32 (0F 88) — negative iv deopts
+                    self.buf.emit(&[0x85, 0xC0]);
+                    self.buf.emit(&[0x0F, 0x88]);
+                    let patch_offset = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    self.deopt_stubs.push((patch_offset, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
+                }
+                for guard in guards {
+                    // Load array reference into RAX
+                    if let Some(reg) = self.reg_for_local(guard.array_local) {
+                        self.emit_mov_reg_reg(RAX, reg);
+                    } else {
+                        self.emit_load_local(RAX, self.local_offset(guard.array_local));
+                    }
+                    // MOV R10D, DWORD [RAX + ARRAY_LENGTH_OFFSET] — array length
+                    self.buf
+                        .emit(&[0x44, 0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // Cast: x86-64 register encoding
+                                                                               // Load loop bound into ECX
+                    if let Some(reg) = self.reg_for_local(guard.bound_local) {
+                        self.emit_mov_reg_reg(RCX, reg);
+                    } else {
+                        self.emit_load_local(RCX, self.local_offset(guard.bound_local));
+                    }
+                    // CMP R10D, ECX — compare array.length vs loop_bound
+                    // Encoding: 44 3B D1 (REX.R + CMP r32, r/m32 + ModRM(11, R10, ECX))
+                    self.buf.emit(&[0x44, 0x3B, 0xD1]);
+                    // JB rel32 — if array.length < loop_bound (unsigned), deopt
+                    self.buf.emit(&[0x0F, 0x82]);
+                    let patch_offset = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    // Route to deopt stub (calls jit_uncommon_trap) instead of AIOOBE
+                    self.deopt_stubs.push((patch_offset, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
+                }
+                // deopt-osr Step 1: record a precise deopt snapshot for this
+                // BCE loop-header guard (emit-and-discard; nothing reads it yet,
+                // so the i64::MIN re-run via deopt_stubs above is unchanged).
+                if had_guards {
+                    self.emit_deopt_snapshot_at_guard(pc);
+                }
+            }
+
             // === LICM: Emit hoisted aaload code at loop headers ===
             // Hoisted code runs BEFORE pc_to_native is set, so back-edges
             // (which use pc_to_native[header]) skip the hoisted computation.
             // On initial loop entry (fall-through from preheader), the hoisted
             // code executes and caches the invariant value in a spill slot.
+            //
+            // SOUNDNESS: the preheader executes UNCONDITIONALLY — even when
+            // the loop is zero-trip, and even when the in-body access the
+            // sequence was hoisted from is behind a conditional the program
+            // would skip (`for(..){ if (m != null) use(m[j][i]); }` with
+            // m == null). The original program may therefore never perform
+            // this load at all, so it must not fault and must not throw
+            // here. Each hoisted load is preceded by a null + unsigned
+            // bounds guard routed to the reason-2 deopt stub: on failure the
+            // interpreter re-runs the loop with real per-access semantics
+            // (throwing NPE/AIOOBE only if the access is actually reached).
+            // Repeated guard failures at this header cross the per-bci
+            // de-spec threshold and the recompile drops the hoist entirely
+            // (see the `despec_contains` filter on `hoist_info` in
+            // `compile_with_param_slots`). Before these guards the hoist was
+            // a raw MOV — a null/OOB row index crashed the VM or fed a
+            // garbage row pointer to the loop body (test_classes/
+            // LicmHoistRepro.java).
             {
                 // Collect hoist data to avoid borrow conflicts with self
                 let loop_hoists: Vec<(usize, usize, i32)> = self
@@ -16732,6 +17081,7 @@ impl Compiler {
                     .filter(|(_, h)| h.loop_header == pc)
                     .map(|(idx, h)| (h.array_local, h.index_local, self.hoist_offsets[idx]))
                     .collect();
+                let had_hoists = !loop_hoists.is_empty();
 
                 for (array_local, index_local, hoist_offset) in loop_hoists {
                     // Load array reference into RAX
@@ -16746,10 +17096,31 @@ impl Compiler {
                     } else {
                         self.emit_load_local(RCX, self.local_offset(index_local));
                     }
+                    // Null guard: TEST RAX, RAX (48 85 C0); JZ deopt (0F 84).
+                    self.buf.emit(&[0x48, 0x85, 0xC0]);
+                    self.buf.emit(&[0x0F, 0x84]);
+                    let null_patch = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    self.deopt_stubs.push((null_patch, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
+                    // Bounds guard: MOV R10D, [RAX + ARRAY_LENGTH_OFFSET];
+                    // CMP ECX, R10D; JAE deopt — unsigned, so a negative
+                    // index is caught as huge (same as emit_bounds_check).
+                    self.buf
+                        .emit(&[0x44, 0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // Cast: x86-64 register encoding
+                    self.buf.emit(&[0x41, 0x3B, 0xCA]);
+                    self.buf.emit(&[0x0F, 0x83]);
+                    let bounds_patch = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    self.deopt_stubs.push((bounds_patch, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
                     // Inline aaload: MOV RAX, [RAX + RCX*8 + HEADER_SIZE]
                     self.emit_ref_aload_regs();
                     // Store hoisted value in dedicated spill slot
                     self.emit_store_local(hoist_offset, RAX);
+                }
+                // Deopt snapshot for the hoist guards at this header (skip if
+                // the speculative-BCE guard block above already recorded one).
+                if had_hoists && !self.deopt_box_ptr_by_bci.contains_key(&pc) {
+                    self.emit_deopt_snapshot_at_guard(pc);
                 }
             }
 
@@ -16984,58 +17355,12 @@ impl Compiler {
                 }
             }
 
-            // === Speculative BCE: Emit range guard at loop headers ===
-            // For each speculative guard at this header, emit:
-            //   load array ref -> RAX
-            //   MOV R10D, [RAX + ARRAY_LENGTH_OFFSET]  (array length)
-            //   load loop bound -> ECX
-            //   CMP R10D, ECX  (array.length vs loop_bound)
-            //   JB deopt_stub  (if array.length < loop_bound, deopt)
-            {
-                // O(1) lookup of this header's guards (indexed once in `compile`)
-                // instead of re-scanning the whole guard vector per loop header.
-                let guards: Vec<SpeculativeBCEGuard> = self
-                    .speculative_bce_guards_by_header
-                    .get(&pc)
-                    .cloned()
-                    .unwrap_or_default();
-                let had_guards = !guards.is_empty();
-                for guard in guards {
-                    // Load array reference into RAX
-                    if let Some(reg) = self.reg_for_local(guard.array_local) {
-                        self.emit_mov_reg_reg(RAX, reg);
-                    } else {
-                        self.emit_load_local(RAX, self.local_offset(guard.array_local));
-                    }
-                    // MOV R10D, DWORD [RAX + ARRAY_LENGTH_OFFSET] — array length
-                    self.buf
-                        .emit(&[0x44, 0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // Cast: x86-64 register encoding
-                                                                               // Load loop bound into ECX
-                    if let Some(reg) = self.reg_for_local(guard.bound_local) {
-                        self.emit_mov_reg_reg(RCX, reg);
-                    } else {
-                        self.emit_load_local(RCX, self.local_offset(guard.bound_local));
-                    }
-                    // CMP R10D, ECX — compare array.length vs loop_bound
-                    // Encoding: 44 3B D1 (REX.R + CMP r32, r/m32 + ModRM(11, R10, ECX))
-                    self.buf.emit(&[0x44, 0x3B, 0xD1]);
-                    // JB rel32 — if array.length < loop_bound (unsigned), deopt
-                    self.buf.emit(&[0x0F, 0x82]);
-                    let patch_offset = self.buf.pos();
-                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-                    // Route to deopt stub (calls jit_uncommon_trap) instead of AIOOBE
-                    self.deopt_stubs.push((patch_offset, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
-                }
-                // deopt-osr Step 1: record a precise deopt snapshot for this
-                // BCE loop-header guard (emit-and-discard; nothing reads it yet,
-                // so the i64::MIN re-run via deopt_stubs above is unchanged).
-                if had_guards {
-                    self.emit_deopt_snapshot_at_guard(pc);
-                }
-            }
+            // (The speculative-BCE range guards are emitted at the TOP of this
+            // preheader — before the LICM hoists and SIMD batch preheaders —
+            // so a failing guard deopts before any speculative code runs.)
 
             // Record mapping from bytecode PC to native offset
-            // (AFTER hoisted/SIMD/speculative-BCE code, so back-edges skip the preheader)
+            // (AFTER speculative-BCE/hoisted/SIMD code, so back-edges skip the preheader)
             self.pc_to_native[pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
 
             // deopt-osr Step 8 (test trigger): at the chosen loop header, emit a
@@ -25521,6 +25846,26 @@ pub fn compile_with_param_slots(
     } else {
         find_loop_hoists(code, code_len, &loops)
     };
+    // Per-bci de-spec (same registry the speculative-BCE guards use): the
+    // hoisted aaload's null+bounds preheader guard deopts at the loop-header
+    // bci; once a header crosses the de-spec threshold, drop its hoists so
+    // the recompile emits the in-loop aaload with its normal checks instead
+    // of re-making the failed speculation. Must run BEFORE `Compiler::new`
+    // pairs `hoist_offsets` with `hoist_info` by index.
+    let hoist_info: Vec<LoopHoist> = hoist_info
+        .into_iter()
+        .filter(|h| {
+            let despec = crate::deopt::despec_contains(method_key, h.loop_header as u32);
+            if despec && std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+                eprintln!(
+                    "[cratonvm-deopt] de-spec: dropping aaload LICM hoist at loop_header \
+                     bci={} for {} (recompile with in-loop checked access)",
+                    h.loop_header, method_key
+                );
+            }
+            !despec
+        })
+        .collect();
 
     // LICM: find loop-invariant integer-arithmetic runs to hoist into the
     // loop pre-header. These are pure, non-faulting ALU expressions on
@@ -25832,27 +26177,85 @@ pub fn compile_with_param_slots(
     compiler.param_jvm_slots = param_jvm_slots.to_vec();
     compiler.param_slot_span = param_slot_span;
     compiler.method_key = method_key.to_string();
-    compiler.bounds_safe_pcs = bounds_safe_pcs;
     // deopt-osr Step 9 follow-up (c): per-bci de-spec. Drop any speculative-BCE
     // guard whose loop header was recorded in the de-spec registry (a guard that
     // repeatedly deopted past the per-bci give-up threshold). Those headers fall
     // back to per-access bounds checks instead of the speculative elide, so the
     // method stays compiled (no whole-method blacklist) but no longer re-makes
-    // the failed speculation. Inert in production / on the `compile()` wrapper:
-    // `despec_contains` returns `false` for an empty key or empty registry, so
-    // `speculative_bce_guards` is unchanged ⇒ byte-identical codegen.
+    // the failed speculation. Dropping a guard MUST also drop the elisions it
+    // justified: each guard's `covered_pcs` are removed from `bounds_safe_pcs`
+    // so those accesses get their per-element checks back — a dropped guard
+    // with the elisions left in place would be an UNGUARDED speculative elide
+    // (silent out-of-bounds access on exactly the input that kept deopting).
+    // Inert in production / on the `compile()` wrapper: `despec_contains`
+    // returns `false` for an empty key or empty registry, so both sets are
+    // unchanged ⇒ byte-identical codegen.
+    let mut bounds_safe_pcs = bounds_safe_pcs;
     let speculative_bce_guards: Vec<SpeculativeBCEGuard> = speculative_bce_guards
         .into_iter()
         .filter(|g| {
             let despec = crate::deopt::despec_contains(method_key, g.loop_header as u32);
-            if despec && std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
-                eprintln!(
-                    "[cratonvm-deopt] de-spec: suppressing speculative-BCE guard at \
-                     loop_header bci={} for {} (recompile without it)",
-                    g.loop_header, method_key
-                );
+            if despec {
+                for covered_pc in &g.covered_pcs {
+                    bounds_safe_pcs.remove(covered_pc);
+                }
+                if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+                    eprintln!(
+                        "[cratonvm-deopt] de-spec: suppressing speculative-BCE guard at \
+                         loop_header bci={} for {} (recompile without it; per-element \
+                         checks restored at {:?})",
+                        g.loop_header, method_key, g.covered_pcs
+                    );
+                }
             }
             !despec
+        })
+        .collect();
+    compiler.bounds_safe_pcs = bounds_safe_pcs;
+
+    // SIMD gating: a SIMD loop transform replaces the per-element accesses of
+    // `arr[i]` for `i` in `[entry_iv, bound)` with an UNCHECKED batch loop, so
+    // it carries the same proof obligation as a BCE elision — for EVERY array
+    // it touches, `bound <= arr.length` (plus a non-negative start index) must
+    // be established either statically (the bound provably IS that array's
+    // length and the IV provably starts >= 0) or by a speculative loop-header
+    // guard that survived de-spec (the guard also tests `iv >= 0`, and is
+    // emitted before the SIMD preheader). An uncovered array — e.g. the OUT
+    // store of `out[i] = a[i] + b[i]` in a loop bounded by `a.length` when
+    // `out` is shorter — would batch-store past the array end with no
+    // exception (docs/known-issues/jit-bce-multi-array-oob-store-20260711.md;
+    // before this gate, `detect_int_array_element_wise` candidates vectorized
+    // with no coupling to the bounds analysis at all).
+    // (`no_bce` also lands here: CRATONVM_JIT_NO_BCE always claimed to disable
+    // "BCE and SIMD", but only the int-sum detection was actually gated on it —
+    // the FP-sum and element-wise transforms kept vectorizing with elided
+    // checks. Routing every SIMD candidate through this coverage check makes
+    // the debug gate true to its documentation.)
+    let simd_covered = |header: usize, arr_local: usize, bound_local: usize, iv_local: usize| {
+        !no_bce
+            && ((find_bound_arraylength_provenance(code, code_len, bound_local)
+                == Some(arr_local)
+                && find_iv_nonneg_start(code, code_len, iv_local))
+                || speculative_bce_guards.iter().any(|g| {
+                    g.loop_header == header
+                        && g.array_local == arr_local
+                        && g.bound_local == bound_local
+                }))
+    };
+    let simd_loops: Vec<SimdIntArraySum> = simd_loops
+        .into_iter()
+        .filter(|s| simd_covered(s.header_pc, s.array_local, s.bound_local, s.iv_local))
+        .collect();
+    let simd_fp_loops: Vec<SimdFpArraySum> = simd_fp_loops
+        .into_iter()
+        .filter(|s| simd_covered(s.header_pc, s.array_local, s.bound_local, s.iv_local))
+        .collect();
+    let simd_element_wise_loops: Vec<SimdArrayElementWise> = simd_element_wise_loops
+        .into_iter()
+        .filter(|e| {
+            simd_covered(e.header_pc, e.out_local, e.bound_local, e.iv_local)
+                && simd_covered(e.header_pc, e.a_local, e.bound_local, e.iv_local)
+                && simd_covered(e.header_pc, e.b_local, e.bound_local, e.iv_local)
         })
         .collect();
     // Index the speculative guards by loop-header PC once, so the per-header
@@ -30968,6 +31371,52 @@ mod tests {
     }
 
     #[test]
+    fn test_find_loop_hoists_conditional_body_still_detected() {
+        // The detector deliberately hoists a sequence that sits BEHIND a
+        // conditional inside the body (`for(..){ if (m != null) m[j]... }`) —
+        // and the loop may also be zero-trip at runtime. That is only sound
+        // because the EMISSION now guards the hoisted load with null+bounds
+        // checks routed to the reason-2 deopt stub (see the preheader "LICM:
+        // Emit hoisted aaload" block and test_classes/LicmHoistRepro.java);
+        // before those guards this shape crashed the VM on m == null. This
+        // test pins the detector contract so an emission-side reader knows
+        // conditional/zero-trip shapes DO reach the guarded preheader.
+        //
+        // Locals: 0=m (Object[]), 1=j, 2=n, 3=i.
+        //   0: iconst_0 ; 1: istore_3                    (i = 0)
+        //   2: iload_3 ; 3: iload_2 ; 4: if_icmpge → 21  (header)
+        //   7: aload_0 ; 8: ifnull → 15                  (skip if m == null)
+        //  11: aload_0 ; 12: iload_1 ; 13: aaload ; 14: pop
+        //  15: iinc 3, 1 ; 18: goto → 2 ; 21: return
+        let code: Vec<u8> = vec![
+            0x03, // 0: iconst_0
+            0x3e, // 1: istore_3
+            0x1d, // 2: iload_3 (header)
+            0x1c, // 3: iload_2
+            0xa2, 0x00, 0x11, // 4: if_icmpge +17 → 21
+            0x2a, // 7: aload_0
+            0xc6, 0x00, 0x07, // 8: ifnull +7 → 15
+            0x2a, // 11: aload_0
+            0x1b, // 12: iload_1
+            0x32, // 13: aaload
+            0x57, // 14: pop
+            0x84, 0x03, 0x01, // 15: iinc 3, 1
+            0xa7, 0xff, 0xf0, // 18: goto -16 → 2
+            0xb1, // 21: return
+        ];
+        let code_len = code.len();
+        let loops = detect_loops(&code, code_len);
+        assert_eq!(loops[0], (2, 18), "loop should be (2, 18), got {loops:?}");
+
+        let hoists = find_loop_hoists(&code, code_len, &loops);
+        assert_eq!(hoists.len(), 1, "conditional-body aaload is hoisted");
+        assert_eq!(hoists[0].loop_header, 2);
+        assert_eq!(hoists[0].seq_start, 11);
+        assert_eq!(hoists[0].array_local, 0);
+        assert_eq!(hoists[0].index_local, 1);
+    }
+
+    #[test]
     fn test_match_invariant_aaload() {
         // aload_0; iload_3; aaload
         let code: Vec<u8> = vec![0x2a, 0x1d, 0x32];
@@ -32034,6 +32483,185 @@ mod tests {
             "iaload at pc=7 should be bounds-safe with javac pattern, got {:?}",
             safe_pcs
         );
+    }
+
+    #[test]
+    fn test_bce_multi_array_per_array_guards() {
+        // Regression: docs/known-issues/jit-bce-multi-array-oob-store-20260711.md
+        // (repro test_classes/gpu/BoundsDeopt2.java). The vectorAdd shape —
+        //   int n = a.length; for (int i = 0; i < n; i++) out[i] = a[i] + b[i];
+        // — must elide statically ONLY the access into `a` (whose length the
+        // bound provably is). `b[i]` and `out[i]` must each get their OWN
+        // speculative header guard; before the per-array fix all three were
+        // "statically" elided from `a`'s guard alone, so a shorter `out`
+        // took silent out-of-bounds heap stores instead of AIOOBE.
+        //
+        // Locals: 0=a, 1=b, 2=out, 3=n, 4=i.
+        //   0: aload_0 ; 1: arraylength ; 2: istore_3      (n = a.length)
+        //   3: iconst_0 ; 4: istore 4                       (i = 0)
+        //   6: iload 4 ; 8: iload_3 ; 9: if_icmpge +22 → 31 (header)
+        //  12: aload_2 ; 13: iload 4                        (out, i)
+        //  15: aload_0 ; 16: iload 4 ; 18: iaload           (a[i])
+        //  19: aload_1 ; 20: iload 4 ; 22: iaload           (b[i])
+        //  23: iadd ; 24: iastore                           (out[i] = ...)
+        //  25: iinc 4, 1 ; 28: goto -22 → 6 ; 31: return
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0xbe, // 1: arraylength
+            0x3e, // 2: istore_3
+            0x03, // 3: iconst_0
+            0x36, 0x04, // 4: istore 4
+            0x15, 0x04, // 6: iload 4 (header)
+            0x1d, // 8: iload_3
+            0xa2, 0x00, 0x16, // 9: if_icmpge +22 → 31
+            0x2c, // 12: aload_2 (out)
+            0x15, 0x04, // 13: iload 4
+            0x2a, // 15: aload_0 (a)
+            0x15, 0x04, // 16: iload 4
+            0x2e, // 18: iaload
+            0x2b, // 19: aload_1 (b)
+            0x15, 0x04, // 20: iload 4
+            0x2e, // 22: iaload
+            0x60, // 23: iadd
+            0x4f, // 24: iastore
+            0x84, 0x04, 0x01, // 25: iinc 4, 1
+            0xa7, 0xff, 0xea, // 28: goto -22 → 6
+            0xb1, // 31: return
+        ];
+        let code_len = code.len();
+        let loops = detect_loops(&code, code_len);
+        assert_eq!(loops[0], (6, 28), "loop should be (6, 28), got {loops:?}");
+
+        // Whole-method provenance: n (local 3) IS a.length (local 0), and the
+        // IV (local 4) provably starts at 0.
+        assert_eq!(
+            find_bound_arraylength_provenance(&code, code_len, 3),
+            Some(0),
+            "n = a.length provenance"
+        );
+        assert_eq!(
+            find_bound_arraylength_provenance(&code, code_len, 4),
+            None,
+            "the IV local is stored from iconst_0, not an arraylength"
+        );
+        assert!(find_iv_nonneg_start(&code, code_len, 4));
+
+        let (safe_pcs, guards) = analyze_bounds_elimination(&code, code_len, &loops);
+
+        // All three accesses end up elided (a statically, b/out behind guards)...
+        for pc in [18usize, 22, 24] {
+            assert!(safe_pcs.contains(&pc), "access at pc={pc} elided, got {safe_pcs:?}");
+        }
+        // ...but `b` (local 1) and `out` (local 2) each need their own guard,
+        // and `a` (local 0) — statically proven — must have none.
+        let mut guarded: Vec<(usize, usize, usize, Vec<usize>)> = guards
+            .iter()
+            .map(|g| (g.array_local, g.bound_local, g.iv_local, g.covered_pcs.clone()))
+            .collect();
+        guarded.sort();
+        assert_eq!(
+            guarded,
+            vec![(1, 3, 4, vec![22]), (2, 3, 4, vec![24])],
+            "b and out each get a per-array guard covering exactly their access; \
+             a gets none"
+        );
+    }
+
+    #[test]
+    fn test_bce_param_bound_goes_speculative_not_static() {
+        // A loop bound that is a plain parameter (no arraylength provenance)
+        // must NOT be statically elided — the elision demotes to a speculative
+        // header guard on the accessed array. Same shape as
+        // `test_bounds_elimination_analysis` (locals: 0=i, 1=arr, 2=n).
+        let code: Vec<u8> = vec![
+            0x1a, // 0: iload_0 (i)
+            0x1c, // 1: iload_2 (n)
+            0xa2, 0x00, 0x0d, // 2: if_icmpge +13 → 15
+            0x2b, // 5: aload_1 (arr)
+            0x1a, // 6: iload_0 (i)
+            0x2e, // 7: iaload
+            0x57, // 8: pop
+            0x84, 0x00, 0x01, // 9: iinc 0, 1
+            0xa7, 0xff, 0xf4, // 12: goto -12 → 0
+            0xb1, // 15: return
+            0, 0,
+        ];
+        let code_len = 16;
+        let loops = detect_loops(&code, code_len);
+        assert_eq!(find_bound_arraylength_provenance(&code, code_len, 2), None);
+
+        let (safe_pcs, guards) = analyze_bounds_elimination(&code, code_len, &loops);
+        assert!(safe_pcs.contains(&7), "elided behind a guard, got {safe_pcs:?}");
+        assert_eq!(guards.len(), 1, "exactly one speculative guard");
+        assert_eq!(
+            (
+                guards[0].loop_header,
+                guards[0].array_local,
+                guards[0].bound_local,
+                guards[0].iv_local,
+                guards[0].covered_pcs.clone(),
+            ),
+            (0, 1, 2, 0, vec![7]),
+        );
+    }
+
+    #[test]
+    fn test_bce_negative_iv_start_not_static() {
+        // `for (int i = -5; i < n; i++) a[i]` with n = a.length: the bound
+        // provenance holds, but the IV provably starts NEGATIVE, so the static
+        // (guard-less) elision must be refused. The access may still be elided
+        // behind the speculative header guard, whose emitted code tests the
+        // runtime `iv >= 0` at loop entry (and deopts for i = -5).
+        // Locals: 0=a, 1=n, 2=i.
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0xbe, // 1: arraylength
+            0x3c, // 2: istore_1 (n = a.length)
+            0x10, 0xfb, // 3: bipush -5
+            0x3d, // 5: istore_2 (i = -5)
+            0x1c, // 6: iload_2 (header)
+            0x1b, // 7: iload_1
+            0xa2, 0x00, 0x0d, // 8: if_icmpge +13 → 21
+            0x2a, // 11: aload_0
+            0x1c, // 12: iload_2
+            0x2e, // 13: iaload
+            0x57, // 14: pop
+            0x84, 0x02, 0x01, // 15: iinc 2, 1
+            0xa7, 0xff, 0xf4, // 18: goto -12 → 6
+            0xb1, // 21: return
+        ];
+        let code_len = code.len();
+        let loops = detect_loops(&code, code_len);
+        assert_eq!(loops[0], (6, 18));
+
+        assert_eq!(find_bound_arraylength_provenance(&code, code_len, 1), Some(0));
+        assert!(
+            !find_iv_nonneg_start(&code, code_len, 2),
+            "bipush -5 start must not prove a non-negative IV"
+        );
+
+        let (safe_pcs, guards) = analyze_bounds_elimination(&code, code_len, &loops);
+        assert!(safe_pcs.contains(&13));
+        assert_eq!(guards.len(), 1, "elision must be guard-backed, not static");
+        assert_eq!(guards[0].array_local, 0);
+        assert_eq!(guards[0].iv_local, 2);
+        assert_eq!(guards[0].covered_pcs, vec![13]);
+    }
+
+    #[test]
+    fn test_bce_two_bound_stores_no_provenance() {
+        // Two stores to the bound local defeat the single-dominating-store
+        // proof: after the second store the bound may exceed a.length.
+        // Locals: 0=a, 1=n, 2=i.
+        //   0: aload_0 ; 1: arraylength ; 2: istore_1   (n = a.length)
+        //   3: iload_1 ; 4: iconst_1 ; 5: iadd ; 6: istore_1  (n = n + 1 !)
+        //   7: return
+        let code: Vec<u8> = vec![
+            0x2a, 0xbe, 0x3c, // n = a.length
+            0x1b, 0x04, 0x60, 0x3c, // n = n + 1
+            0xb1,
+        ];
+        assert_eq!(find_bound_arraylength_provenance(&code, code.len(), 1), None);
     }
 
     #[test]

@@ -9,31 +9,41 @@ If you only want to run the JVM on CPU, you can stop reading. If you
 want to enable GPU offload, route a recurring Java workload through
 it, or extend the feature, read on.
 
+> **Status (2026-07-11).** The full transparent-offload path — analyze
+> → lower to PTX → load → marshal → launch → writeback/deopt — is
+> implemented and validated on real hardware (RTX 2060, sm_75, CUDA
+> driver 591.86). Checksums match HotSpot bit-for-bit on every kernel
+> tested, including integer/long reductions. See
+> [`../../README.md`](../../README.md)'s "GPU offload benchmarks"
+> section and [`../book/src/gpu/benchmarks.md`](../book/src/gpu/benchmarks.md)
+> for numbers. Open items are tracked in
+> [`../known-issues/gpu-offload-followups-20260711.md`](../known-issues/gpu-offload-followups-20260711.md).
+
 ## Document map
 
 | File | What it covers |
 | --- | --- |
 | **`README.md` (this file)** | Top-level reference: what exists, how it fits together, how to build / run / test, file index. |
-| [`plan.md`](plan.md) | The original execution plan with per-part status, deviations from spec, and known follow-ups. |
+| [`COMPARISON.md`](COMPARISON.md) | CratonVM vs. TornadoVM / Project Babylon (HAT) / Aparapi / IBM SDK Java across 15 dimensions, with measured numbers. |
 | [`cuda-oxide-evaluation.md`](cuda-oxide-evaluation.md) | Why [cuda-oxide](https://nvlabs.github.io/cuda-oxide/) (the project that prompted this work) is not on the critical path, and the precise conditions under which we would re-evaluate. |
-| [`first-results.md`](first-results.md) | Acceptance-criteria scaffold for the GPU-equipped verification machine. Empty results table until real numbers land. |
-| [`annotations.md`](annotations.md) | Phase 1 reference: `@GpuKernel`, `@GpuExclude`, `@EnableGpuAsync` directives for user-facing offload control. |
-| [`streams-events.md`](streams-events.md) | Phase 2 reference: `Stream`, `Event`, async memcpy, `launch_on_stream`, stub op log for tests. |
-| [`async-api.md`](async-api.md) | Phase 3 reference: `GpuExecutor`, `GpuFuture<T>`, `GpuArray<T>`, `GpuStream` for explicit async offload. |
-| [`phase7-summary.md`](phase7-summary.md) | Phase 7 wrap-up: real async overlap, device-buffer caching, lambda SAM args. What landed vs. what was deferred for Phase 8. |
-| [`phase8-summary.md`](phase8-summary.md) | Phase 8 wrap-up: device-cache eviction, benchmark scaffold, multi-arg SAMs. What landed vs. what was deferred for Phase 9+. |
-| [`phase9-summary.md`](phase9-summary.md) | Phase 9 wrap-up: deferred-writeback (lazy D→H). Non-static lambdas and CUDA Graph capture remain deferred with more-detailed rationale. |
+| [`first-results.md`](first-results.md) | Pointer to where the real acceptance numbers ended up (`bench-gpu/results/`, the repo README) once a GPU box existed. |
+| [`annotations.md`](annotations.md) | `@GpuKernel` (with `AdmissionHint`), `@GpuExclude`, `@EnableGpuAsync` directives for user-facing offload control, including the curated `Math`/`StrictMath` intrinsics table admitted under `ALLOW_INTRINSIC_CALLS`. |
+| [`streams-events.md`](streams-events.md) | `Stream`, `Event`, async memcpy, `launch_on_stream`, per-buffer `last_write` ordering, stub op log for tests. |
+| [`async-api.md`](async-api.md) | `GpuExecutor`, `GpuFuture<T>`, `GpuArray<T>`, `GpuStream` for explicit async offload — including the current completion model and stream-affinity behavior. |
+| [`ci.md`](ci.md) | The self-hosted GPU CI workflow (`.github/workflows/gpu-selfhosted.yml`) and its checksum/latency gates (`bench-gpu/ci-gate.sh`). |
+| [`../book/src/gpu/overview.md`](../book/src/gpu/overview.md) | User-facing book chapter: what can be offloaded, build modes, CLI flags. |
+| [`../book/src/gpu/benchmarks.md`](../book/src/gpu/benchmarks.md) | The 2026-07-11 RTX 2060 benchmark writeup (methodology + tables). |
+| [`../known-issues/gpu-offload-followups-20260711.md`](../known-issues/gpu-offload-followups-20260711.md) | Dated, itemized status of every open GPU follow-up (what's DONE, what's PARTIAL, what's still open). |
 
 ## At a glance
 
 GPU offload identifies *pure static methods over primitive arrays*,
 lowers them from Java bytecode to NVIDIA PTX, and executes them on a
-CUDA device. Anything that doesn't match the supported shape — calls,
-allocation, field access, monitor ops, exceptions, reference arrays —
-falls through to the existing interpreter / JIT without observable
+CUDA device. Anything that doesn't match the supported shape falls
+through to the existing interpreter / JIT without observable
 difference.
 
-The first offload target is methods like:
+The canonical offload target:
 
 ```java
 public static void vectorAdd(int[] a, int[] b, int[] out) {
@@ -44,7 +54,11 @@ public static void vectorAdd(int[] a, int[] b, int[] out) {
 }
 ```
 
-Real fixtures live under [`test_classes/gpu/`](../../test_classes/gpu/).
+But the accepted shape is considerably broader today than that single
+example suggests — see "What the analyzer accepts" below.
+
+Real fixtures live under [`test_classes/gpu/`](../../test_classes/gpu/)
+(32 real `.java` sources, no synthetic bytecode).
 
 ## Build modes
 
@@ -55,13 +69,23 @@ levels:**
 | --- | --- |
 | `cargo build` | CPU-only JVM. No GPU code linked. No `--gpu*` flags visible. **CPU build is unchanged.** |
 | `cargo build --features gpu` | Above, plus the `cuda-bridge` crate in **stub mode** (probes return `DeviceError::NoDriver`) and the `--gpu*` CLI flags. Useful for testing the GPU plumbing on machines without a driver. |
-| `cargo build --features gpu-driver` | Above, plus real `cudarc` bindings to `libcuda` / `nvcuda.dll`. Requires CUDA Toolkit 12.x. |
+| `cargo build --features gpu-driver` | Above, plus real `cudarc` bindings to `libcuda` / `nvcuda.dll`. Requires a CUDA driver at runtime (dlopened; no CUDA Toolkit install needed just to *run* a build, only to build one — `cudarc` links against the driver API headers at compile time). |
 
 The features compose: `gpu-driver` implies `gpu`, which (when applied
 to `cratonvm-cli`) propagates `cratonvm-vm/gpu-offload`, which in turn
-propagates `cratonvm-gc/gpu-offload`. Pulling on the CLI's `gpu`
+propagates `cratonvm-gc/gpu-offload`, `cratonvm-native-builtins/gpu-offload`,
+and pulls in `jit-cuda` + `cuda-bridge`. Pulling on the CLI's `gpu`
 feature drags the entire stack in; pulling on nothing leaves the CPU
-path pristine.
+path pristine. `cratonvm-embed` mirrors the same `gpu` / `gpu-driver`
+pair for embedders (the C-ABI `libcratonvm` does not expose GPU offload
+at all — out of scope today).
+
+Recommended build recipe (keeps the GPU build's artifacts out of the
+CPU build's cache): `CARGO_TARGET_DIR=target-gpu cargo build --release
+-p cratonvm-cli --bin cratonvm --features gpu-driver` — see
+`build-gpu-driver.bat` at the repo root and
+[`../../BUILD_GUIDE.md`](../../BUILD_GUIDE.md)'s "Building with GPU
+offload" section.
 
 ## CLI surface (only under `--features gpu`)
 
@@ -69,8 +93,8 @@ path pristine.
 | --- | --- | --- |
 | `--gpu` | off | Enable GPU offload of eligible static methods. |
 | `--gpu-device <N>` | 0 | CUDA device ordinal. |
-| `--gpu-min-work <N>` | 4096 | Skip offload when the method's estimated work is below this threshold (avoids round-trip overhead on tiny inputs). |
-| `--print-gpu-decisions` | off | Log one `tracing::info!` line per analyzer verdict. |
+| `--gpu-min-work <N>` | 4096 | Skip offload when the largest array argument's length is below this threshold (avoids H2D/D2H round-trip overhead on tiny inputs). A call below the threshold is *not* blacklisted — a later call at the same site with a bigger array can still offload (`DispatchOutcome::FallThroughKeepHooked`). |
+| `--print-gpu-decisions` | off | Log one line per analyzer verdict (`Eligible`/`Rejected(reason)`) and dispatch outcome. Visible without setting `RUST_LOG` — the flag installs its own `tracing` filter directive for the offload module. |
 | `--gpu-info` | n/a | Probe the device, print name + compute capability + memory, exit. No JVM bootstrap. |
 
 When `--gpu` is requested but the driver is missing:
@@ -80,6 +104,12 @@ When `--gpu` is requested but the driver is missing:
 ```
 
 The flag is silently demoted; the program continues on CPU.
+
+Useful environment variables: `CRATONVM_GPU_TRACE_BYTES=1` (per-submit
+H2D byte count on stderr — the tell for "offload is actually still
+running on CPU because it never touched the device"),
+`CRATONVM_GPU_NO_ZEROCOPY=1` (opt out of the zero-copy DMA marshalling
+path, falling back to a packed-copy upload for every array).
 
 ## Architecture
 
@@ -94,25 +124,49 @@ The flag is silently demoted; the program continues on CPU.
                 │   cratonvm-vm (cfg gpu-offload)            │
                 │                                          │
                 │  execute_invokestatic() hook ─────────┐  │
-                │       │                                │ │
+                │       │  (offload_jit_gate keeps a    │  │
+                │       │   caller with an eligible     │  │
+                │       │   invokestatic un-JIT'd, else  │ │
+                │       │   the hook stops firing once   │ │
+                │       │   OSR promotes the caller)     │ │
                 │       ▼                                │ │
                 │  runtime::offload::try_dispatch ────┐  │ │
                 │       │                              │ │ │
                 │       ▼                              │ │ │
-                │  OffloadCache.lookup_or_compile     │ │ │
-                │       │  (analyze → lower → load)   │ │ │
+                │  OffloadCacheRegistry.get_or_create  │ │ │
+                │       │  → OffloadCache.lookup_or_   │ │ │
+                │       │    compile (analyze → lower  │ │ │
+                │       │    → cuModuleLoad, cached)   │ │ │
                 │       ▼                              │ │ │
                 │  CompiledKernel ◄─── jit-cuda ◄─────┘ │ │
                 │       │                                │ │
                 │       │   ┌─── gpu_marshal ────┐       │ │
                 │       │   │  host_view_<T> /   │       │ │
                 │       │   │  write_back_<T>    │       │ │
+                │       │   │  (bulk copy, i8..f64;      │
+                │       │   │   zero-copy DMA opt-in)    │
                 │       │   └────────────────────┘       │ │
+                │       ▼                                │ │
+                │  dispatch_method_from_native_on_stream │ │
+                │       │  (a registered GpuStream, or   │ │
+                │       │   a fresh private stream for   │ │
+                │       │   the transparent path)        │ │
                 │       ▼                                │ │
                 │  cuda-bridge ──── DeviceContext        │ │
                 │                   DeviceModule         │ │
                 │                   DeviceBuffer<T>      │ │
-                │                   launch_raw           │ │
+                │                   Event::query /       │ │
+                │                   add_host_callback    │ │
+                │       │                                │ │
+                │       ▼                                │ │
+                │  poll_submission_status /              │ │
+                │  finalize_submission                   │ │
+                │  (failure-flag drains BEFORE array      │ │
+                │   writebacks — no partial GPU state     │ │
+                │   reaches the heap on a bounds/div0     │ │
+                │   deopt; scalar reduction results       │ │
+                │   surface as DispatchOutcome::          │ │
+                │   HandledWithValue)                     │ │
                 └────────────────────┬───────────────────┘
                                      │
                 ┌────────────────────▼─────────────────────┐
@@ -122,9 +176,9 @@ The flag is silently demoted; the program continues on CPU.
                 └──────────────────────────────────────────┘
 ```
 
-## The seven new pieces
+## The eight pieces
 
-### 1. `cuda-bridge` (new crate)
+### 1. `cuda-bridge` (crate)
 
 [`cuda-bridge/`](../../cuda-bridge/)
 
@@ -135,7 +189,9 @@ Thin, JVM-agnostic CUDA Driver API wrapper. **Two backends:**
   without a CUDA toolkit.
 - `backend_cuda.rs` — gated by the `cuda` feature. Real bindings via
   the [`cudarc`](https://crates.io/crates/cudarc) crate (pinned to
-  `cuda-12060`).
+  `cuda-12060`). Runs a 3-stream context internally (H2D / compute /
+  D2H) with per-buffer `last_write` event ordering so `launch_raw` and
+  `launch_on_stream` compose safely without manual synchronization.
 
 Public surface:
 
@@ -144,71 +200,157 @@ Public surface:
 | `probe() -> Result<DeviceCaps>` | Discover the attached GPU. |
 | `DeviceContext::new(ordinal: u32)` | Acquire / attach to a context. |
 | `DeviceModule::from_ptx(&ctx, ptx, &[kernel_names])` | Load a PTX text module and resolve named kernels. |
-| `DeviceBuffer<T>` | Typed device-side allocation: `uninit`, `zeros`, `from_host`, `to_host`. `T: bytemuck::Pod`. |
+| `DeviceBuffer<T>` | Typed device-side allocation: `uninit`, `zeros`, `from_host`, `to_host`, async H2D/D2H variants. `T: bytemuck::Pod`. |
 | `KernelArgs` | Builder pattern: `push_device_ptr`, `push_i32`/`i64`/`f32`/`f64`. |
-| `LaunchConfig` + `LaunchConfig::elementwise(n)` | Grid/block dimensions. |
-| `module.launch_raw(&ctx, name, &cfg, args)` | Fire-and-forget kernel launch. Pair with `ctx.synchronize()`. |
+| `LaunchConfig` + `LaunchConfig::elementwise(n)` / `elementwise_for_kernel` | Grid/block dimensions; the latter queries `cuOccupancyMaxPotentialBlockSize` and is what dispatch actually uses. |
+| `Stream` / `Event` | `Event::query()` (non-blocking probe), `Stream::add_host_callback` (`cuLaunchHostFunc` — callback must not call any CUDA API), `record_event`/`wait_event`. |
+| `module.launch_raw(&ctx, name, &cfg, args)` / `launch_on_stream` | Kernel launch, sync or stream-scoped. |
 | `DeviceError` | `NoDriver` + per-stage variants (`Driver`, `Load`, `KernelNotFound`, `Launch`, `Memcpy`). |
 
-### 2. `jit-cuda` (new crate)
+### 2. `jit-cuda` (crate) — Java bytecode → PTX lowering
 
-[`jit-cuda/`](../../jit-cuda/) — Java bytecode → PTX lowering.
+[`jit-cuda/`](../../jit-cuda/)
 
 Two stages:
 
-- **`analyzer`** (`src/analyzer.rs`): `analyze(method) -> OffloadVerdict`. Static gate that decides whether a method is GPU-eligible. Rejects: non-static, synchronized, native/abstract, non-primitive params, allocation, calls, fields, type checks, monitors, switches, throws, jsr/ret, reference arrays. Estimates work via a backward-branch count.
-- **`lowering`** (`src/lowering.rs` + `loop_recog.rs` + `emit.rs`): consumes the bytecode of an eligible method and produces a `PtxModule`. Two-stage design:
-  - `loop_recog` recognises the canonical counted-loop pattern. Returns `UnsupportedNode` for anything fancier (multiple back-edges, nested loops).
-  - `emit` walks the bytecode, simulates the JVM operand stack with PTX virtual registers, emits PTX text.
+- **`analyzer`** (`src/analyzer.rs`): `analyze`/`analyze_with_annotations`/
+  `analyze_with_pool`/`analyze_with_annotations_and_pool` →
+  `OffloadVerdict`. Static gate that decides GPU eligibility. See "What
+  the analyzer accepts" below for the current (much wider than
+  originally shipped) opcode/shape coverage.
+- **`lowering`** (`src/lowering.rs` + `lowering/loop_recog.rs` +
+  `lowering/emit.rs`): consumes the bytecode of an eligible method and
+  produces a `PtxModule`.
+  - `loop_recog` recognizes the canonical counted-loop pattern
+    (`for (i = K; i < bound; i++)`, `K >= 0` constant, unit stride,
+    `if_icmpge` exit) — including `ldc`-sourced large `K`. Returns
+    `UnsupportedNode` for multiple back-edges, nested loops, non-unit
+    strides, or non-`if_icmpge` exits.
+  - `emit` walks the bytecode, simulates the JVM operand stack with
+    PTX virtual registers, emits PTX text. The `tid` register carries
+    `ctaid.x * ntid.x + tid.x + K` (the loop-start offset).
 
 The emitted kernel is SIMT element-wise:
 
-1. Compute `tid = ctaid.x * ntid.x + tid.x`.
+1. Compute `tid = ctaid.x * ntid.x + tid.x`, then add the loop-start
+   offset `K` if non-zero.
 2. Bounds-check `tid` against the loop bound; if outside, `ret`.
-3. Emit the loop body with `iload <iv>` rewritten to `tid` and `iinc <iv>` skipped.
-4. Every `*aload` / `*astore` carries a bounds check that jumps to a shared `L_bounds_fail` label which writes `1` to `*failure_flag` (a u32 device buffer) and `ret`s.
+3. Emit the loop body with `iload <iv>` rewritten to `tid` and `iinc
+   <iv>` skipped.
+4. Every `*aload` / `*astore` carries a bounds check that jumps to a
+   shared `L_bounds_fail` label which writes `1` to `*failure_flag`
+   (a u64 device buffer) and `ret`s. Integer division/remainder by
+   zero routes through the same failure-flag path (predicated guard
+   ahead of `div.s32`/`div.s64`/`rem.s32`/`rem.s64`; skippable per-
+   kernel via `@GpuKernel(admit = AdmissionHint.ALLOW_DIV_BY_ZERO)`,
+   which also gates `frem`/`drem` — see `annotations.md`).
+5. A scalar-return (non-void) kernel's epilogue is either a plain
+   `st.global` (straight-line methods — every thread would compute
+   the same value) or `red.global.add.<suffix>` for a proven
+   loop-carried-accumulator reduction (`is_reduction: true`; the host
+   pre-zeros the 1-element output buffer before launch).
 
-**Kernel parameter convention** (final; matches `build_param_list` in `lowering.rs` and the marshalling layout in `gpu_marshal.rs`):
+**Kernel parameter convention** (matches `build_param_list` in
+`lowering.rs` and the marshalling layout in `gpu_marshal.rs`):
 
 | Java parameter | PTX slots |
 | --- | --- |
 | `int` / `long` / `float` / `double` | one `p<i>: .s32/.s64/.f32/.f64` |
 | Primitive array | two slots: `p<i>_ptr: .u64`, `p<i>_len: .s32` |
-| Array return | trailing `ret_ptr: .u64`, `ret_len: .s32` |
-| Scalar return | trailing `ret_ptr: .u64` (one-element output buffer) |
+| Scalar (int/long) return, reduction | trailing `ret_ptr: .u64` (one-element output buffer, host pre-zeroed) |
+| Scalar return, non-reduction | trailing `ret_ptr: .u64` (every thread writes the same value) |
 | Always last | `failure_flag: .u64` |
+
+### What the analyzer accepts
+
+Beyond the original narrow shape, the analyzer now admits:
+
+- **`ldc`/`ldc_w`/`ldc2_w`** of `Integer`/`Float`/`Long`/`Double`
+  constant-pool entries (any literal, not just `sipush`-range ints).
+  `String`/`Class`/`MethodHandle`/`Dynamic` constants still reject.
+- **`frem`/`drem`** — opt-in under `AdmissionHint::AllowDivByZero`
+  (reused; the flag now also documents its float-remainder meaning).
+  Exact only for `|quotient| < 2^24` (f32) / `2^53` (f64) — see
+  `annotations.md` for the reasoning.
+- **`lcmp`/`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg`** in *value* position
+  (JLS-correct -1/0/1, with NaN semantics for the float/double forms).
+  A comparison immediately consumed by an `if<cond>` branch (the
+  overwhelmingly common javac-emitted shape) still rejects at the
+  branch opcode — no general control flow inside a kernel yet.
+- **Non-zero loop starts** — `for (int i = K; i < bound; i++)`, any
+  non-negative constant `K` (including `ldc`-sourced). Negative `K`
+  still rejects (would need more launch-grid threads than the host
+  sizes for).
+- **A curated `Math`/`StrictMath` intrinsics table** under
+  `AdmissionHint::AllowIntrinsicCalls`: `sqrt(D)D`, `abs` (all 4
+  numeric types, `MIN_VALUE`-correct for int/long), `min`/`max` (all
+  4 types, NaN- and signed-zero-correct for float/double), `fma`
+  (float/double). Anything else — `sin`/`cos`/`exp`/`log`/`pow`/etc.
+  — is deliberately excluded: PTX's approximate transcendentals don't
+  meet Java's relative-error contract.
+
+Still rejected: non-static methods (except `this.field`-only array
+refs), synchronized, native/abstract, non-primitive params, general
+allocation, arbitrary method calls, non-intrinsic field access, type
+checks, `switch`, `throw`, `jsr`/`ret`, reference arrays, general
+branches inside the loop body, nested/2-D loops, `dup2_x1`/`dup2_x2`.
 
 ### 3. `vm::runtime::gpu_marshal` (`#[cfg(feature = "gpu-offload")]`)
 
 [`vm/src/runtime/gpu_marshal.rs`](../../vm/src/runtime/gpu_marshal.rs) — JVM heap ↔ device memory.
 
-For each primitive type (`i32`, `i64`, `f32`, `f64`, `i16`, `i8`):
+For each primitive type (`i32`, `i64`, `f32`, `f64`, `i16`, `i8` — all
+six now bulk-copy, not element-wise):
 
-- `host_view_<T>(obj, &heap, &SafepointToken) -> Vec<T>` — pack a Java primitive array into a host buffer for upload.
-- `write_back_<T>(obj, &mut heap, src, &SafepointToken)` — copy a packed host buffer back into a JVM array's storage.
+- `host_view_<T>(obj, &heap, &SafepointToken) -> Vec<T>` — pack a Java
+  primitive array into a host buffer for upload (`copy_nonoverlapping`
+  over the heap arena; per-element fallback for non-contiguous
+  layouts).
+- `write_back_<T>(obj, &mut heap, src, &SafepointToken)` — copy a
+  packed host buffer back into a JVM array's storage.
+- `upload_obj_<T>` / `download_obj_<T>` (the `direct_xfer!`-generated
+  zero-copy path) — DMA straight against the heap arena when
+  `zerocopy_enabled()` and `zerocopy_shape_ok()` both hold (opt out via
+  `CRATONVM_GPU_NO_ZEROCOPY=1`).
 
-Reuses existing `Heap::get_array_element` / `set_array_element` so it stays correct regardless of the heap's native stride.
-
-Generic helpers `upload<T>(&ctx, &[T]) -> Result<DeviceBuffer<T>>` and `download_into<T>(&buf, &mut [T])` wrap `cuda-bridge`. The `&SafepointToken` parameter is a type-system marker: holding it proves we are in a no-GC critical section (see Part F below).
+Generic helpers `upload<T>(&ctx, &[T]) -> Result<DeviceBuffer<T>>` and
+`download_into<T>(&buf, &mut [T])` wrap `cuda-bridge`. The
+`&SafepointToken` parameter is a type-system marker: holding it proves
+we are in a no-GC critical section (see Part 6 below).
 
 ### 4. `vm::runtime::offload` (`#[cfg(feature = "gpu-offload")]`)
 
-[`vm/src/runtime/offload.rs`](../../vm/src/runtime/offload.rs) — the cache + dispatch hook.
+[`vm/src/runtime/offload.rs`](../../vm/src/runtime/offload.rs) — the cache + dispatch hook. ~2,900 lines; the largest single file in the GPU stack.
 
 | Item | Purpose |
 | --- | --- |
 | `CompiledKernel` | Loaded PTX `DeviceModule` + the `KernelSignature` + the mangled kernel name. |
-| `OffloadCache` | Per-VM cache. Lazily probes the device. `lookup_or_compile(class_id, class_name, method_index, &method) -> LookupOutcome`. |
-| `LookupOutcome::{Hit, Skip, Blacklisted}` | Cache decisions. `Hit` carries an `Arc<CompiledKernel>`. `Skip` is silent fall-through (no device, or method work is below `--gpu-min-work`). `Blacklisted` is "we already rejected this method; don't re-analyze". |
-| `DispatchOutcome::{Handled, FallThrough}` | What the interpreter sees from `try_dispatch`. Today every path returns `FallThrough`; see "Known follow-up" below. |
-| `try_dispatch(shared, thread, frame_idx, class, method, descriptor, args)` | Entry point called from the interpreter hook. Signature is **final**. |
-| `output_array_index(&param_kinds)` | First-cut convention: the *last* array parameter is the output sink. Matches `EligibleVectorAdd(a, b, out)`. |
+| `OffloadCacheRegistry` | Per-VM registry of `OffloadCache`s keyed by device ordinal; also owns the `GpuStream` registry (`stream_create`/`stream_release`/`resolve_stream`) backing executor-default-stream affinity. |
+| `OffloadCache` | Per-device cache. Lazily probes the device. `lookup_or_compile(class_id, class_name, method_index, &method, &constant_pool) -> LookupOutcome`. |
+| `LookupOutcome::{Hit, Skip, Blacklisted}` | `Hit` carries an `Arc<CompiledKernel>`. `Skip`: no device, or (for a later re-check) not yet analyzed. `Blacklisted`: previously rejected; never re-analyzed. |
+| `DispatchOutcome::{Handled, HandledWithValue(Value), FallThrough, FallThroughKeepHooked}` | What the interpreter sees from `try_dispatch`. `Handled`/`HandledWithValue` mean the GPU path completed the call — the call site is deliberately **not** promoted into the invoke cache, so the hook keeps firing on the next call. `FallThroughKeepHooked` is the same non-promotion contract for a per-call gate miss (e.g. below `--gpu-min-work`) on an otherwise-eligible kernel. `FallThrough` is a permanent ineligibility verdict. |
+| `try_dispatch(shared, thread, frame_idx, class, method, descriptor, args)` | Entry point called from the interpreter hook. |
+| `dispatch_method_from_native` / `dispatch_method_from_native_on_stream` | Marshals args, launches (optionally on a caller-supplied `GpuStream` handle), registers a `StreamSubmission`. |
+| `poll_submission_status(shared, handle) -> Option<PollOutcome>` | Non-blocking completion probe (`Event::query`; finalizes inline when the device reports done). Backs `Native.futureIsDone`/`futureStatus`. |
+| `finalize_submission` | Blocking finalize (`event.synchronize()`), used by `get()`. Drains the `FailureFlag` writeback **before** any array writeback — a bounds/div-by-zero deopt never lets partial GPU state reach the heap. |
+| `output_array_index(&param_kinds)` | The *last* array parameter is the output sink (matches `EligibleVectorAdd(a, b, out)`). |
 
-### 5. Interpreter integration (`vm/src/runtime/interpreter.rs`)
+### 5. `vm::runtime::offload_jit_gate` (`#[cfg(feature = "gpu-offload")]`)
 
-The hook lives in `execute_invokestatic`, immediately before the `try_stackless_invoke` call (around line 9709). Behind `#[cfg(feature = "gpu-offload")]`, double-guarded by `shared.config.gpu_offload_enabled && shared.offload_cache.has_device()`. On `DispatchOutcome::Handled` the function returns `CachedCallResult::Handled` (with the operand stack already prepared). On `FallThrough` the existing CPU path runs unchanged.
+[`vm/src/runtime/offload_jit_gate.rs`](../../vm/src/runtime/offload_jit_gate.rs) — keeps offload-eligible **callers** interpreted.
 
-**The default build's `execute_invokestatic` has zero new branches.** With `gpu-offload` off, the cfg-gated block is removed by the preprocessor.
+The transparent-offload hook only fires from the interpreter's
+`execute_invokestatic` slow path. If the *caller* method itself gets
+JIT/OSR-compiled, dispatch moves into JIT-emitted code and the hook is
+never consulted again for that call site. `caller_blocks_jit`/
+`caller_blocks_jit_by_name` scan a caller's bytecode for an
+`invokestatic` whose target resolves `Eligible` (plain, annotation-free
+verdict) and, if found, deny JIT/OSR admission for that caller while
+`--gpu` is active — wired into all five JIT/OSR admission call sites in
+`interpreter.rs` (first-call compile, OSR, and three invocation-count
+promotion paths). Verdicts are cached per `(ClassId, method_index)` for
+the process lifetime; one `bool` read (`gpu_offload_enabled`) when
+`--gpu` is off.
 
 ### 6. `gc::safepoint` (`#[cfg(feature = "gpu-offload")]`)
 
@@ -222,165 +364,265 @@ The hook lives in `execute_invokestatic`, immediately before the `try_stackless_
 | GC delay inside `collect_garbage` / `collect_garbage_with_finalizers` | While `gpu_critical_count > 0` the collector yield-spins (warns after 5s; **never** collects mid-token). |
 | `gpu_critical_count()` / `gpu_blocked_gc_count()` | Observability accessors. |
 
-The root walker visits pinned refs during collection so the JVM cannot move an array while a kernel reads it.
+The root walker visits pinned refs during collection so the JVM cannot
+move an array while a kernel reads it. For the cross-thread deferred-
+finalize path (async futures), a process-wide `GPU_CRITICAL_COUNT` plus
+a `Send`-able `GcCriticalGuard` extends the same guarantee past the
+dispatching thread's stack frame.
 
-### 7. `jit-api::gpu_lowering` (`#[cfg(feature = "gpu-lowering")]`)
+### 7. `native-api` / `native-builtins::craton_gpu` — the Java-facing bridge
 
-[`jit-api/src/gpu_lowering.rs`](../../jit-api/src/gpu_lowering.rs) — a single optional trait, `GpuLowering`, defining the contract a future pluggable PTX producer would satisfy. There is no in-workspace implementor today: `jit-cuda` exposes its concrete analyzer/lowering entry points directly and does not enable `jit-api/gpu-lowering`. The trait exists so that **if** a future story wants to add Rust-authored device helpers (parallel GC mark, atomic intrinsics) compiled via cuda-oxide and linked alongside our own emitter, it can plug in without touching `try_dispatch`. See [`cuda-oxide-evaluation.md`](cuda-oxide-evaluation.md) for the reasoning.
+[`native-api/src/registry.rs`](../../native-api/src/registry.rs) (the
+`NativeContext` trait: `gpu_future_status`, `gpu_future_take_result`,
+`gpu_stream_create`/`gpu_stream_release`, `gpu_dispatch_method_on_stream`
+— all default-`None`/no-op so every other `NativeContext` implementor
+in the workspace is unaffected) and
+[`native-builtins/src/craton_gpu.rs`](../../native-builtins/src/craton_gpu.rs)
+(the `craton.gpu.*` native shims: `submitMethod`, `futureIsDone`/
+`futureGetResult` (now boxes real `Integer`/`Long`/`Float`/`Double`
+reduction results via `GpuFutureResult`), `newStream`/`closeStream`,
+`arrayWrap*`/`arrayAllocate*`/`arrayToHost`/`releaseArray`). This is the
+only layer `native-builtins` can use to reach vm-crate GPU state — it
+has no Cargo dependency on `cratonvm-vm`.
+
+### 8. `jit-api::gpu_lowering` (`#[cfg(feature = "gpu-lowering")]`)
+
+[`jit-api/src/gpu_lowering.rs`](../../jit-api/src/gpu_lowering.rs) — a
+single optional trait, `GpuLowering`, defining the contract a future
+pluggable PTX producer would satisfy. There is no in-workspace
+implementor: `jit-cuda` exposes its concrete analyzer/lowering entry
+points directly and does not enable `jit-api/gpu-lowering`. The trait
+exists so that a future Rust-authored device-helper story (parallel GC
+mark, atomic intrinsics via cuda-oxide) could plug in without touching
+`try_dispatch`. See [`cuda-oxide-evaluation.md`](cuda-oxide-evaluation.md).
 
 ## How a method actually offloads (annotated walk)
 
-Imagine `EligibleVectorAdd.vectorAdd(int[] a, int[] b, int[] out)` is invoked with `n = 1<<20`. With `cargo build --features gpu-driver` and `--gpu` on a real GPU:
+`EligibleVectorAdd.vectorAdd(int[] a, int[] b, int[] out)`, `n = 1<<20`,
+built with `--features gpu-driver`, run with `--gpu` on a real GPU:
 
-1. The interpreter is about to dispatch `invokestatic vectorAdd`. The cfg-gated hook fires.
-2. `try_dispatch` resolves the class via `shared.class_manager`, finds the method index, calls `OffloadCache::lookup_or_compile`.
-3. First call: cache miss. The analyzer says `Eligible(KernelSignature{ param_kinds: [I32Array, I32Array, I32Array], return_kind: Void, estimated_work: 1<<20 })`.
-4. `jit_cuda::lower_method` produces a PTX module. `loop_recog` accepts the counted loop; `emit` produces ~30 lines of PTX including `mad.wide`, `setp.ge.s32`, three `ld.global.s32`, one `add.s32`, one `st.global.s32`, the `L_bounds_fail` label.
-5. `DeviceModule::from_ptx` loads the PTX onto the GPU. The `Arc<CompiledKernel>` is cached under `(ClassId, method_index)`.
-6. **Launch glue (currently a follow-up — see below):**
-   - Acquire `Heap::enter_gpu_critical()`.
-   - For each `int[]` argument: `host_view_i32(obj, &heap, &token)` → `upload(&ctx, &host)` → `KernelArgs::push_device_ptr(&buf).push_i32(len)`. Pin every `ObjectRef`.
-   - Allocate `DeviceBuffer::<u32>::zeros(&ctx, 1)` for `failure_flag`.
-   - `module.launch_raw(&ctx, name, &LaunchConfig::elementwise(n), args)`, then `ctx.synchronize()`.
-   - Read `failure_flag` back. If non-zero → unpin / drop token / return `FallThrough` (interpreter runs unchanged).
-   - Otherwise `download_into` into a `Vec<i32>` and `write_back_i32` into the `out` array via the output-array-index convention. Unpin / drop token / push the return value (here: nothing — void return) → `DispatchOutcome::Handled`.
-7. Subsequent calls skip the analyze/lower step (cache hit) and go straight to step 6.
+1. The interpreter is about to dispatch `invokestatic vectorAdd`. The
+   cfg-gated hook fires (the call site is not in the invoke cache —
+   see Part 4's `DispatchOutcome` note).
+2. `try_dispatch` resolves the class, finds the method index, calls
+   `OffloadCache::lookup_or_compile`.
+3. First call: cache miss. The analyzer says
+   `Eligible(KernelSignature{ param_kinds: [I32Array, I32Array, I32Array], return_kind: Void, estimated_work: 1<<20, is_reduction: false, ... })`.
+4. `jit_cuda::lower_method_with_pool` produces a PTX module (pool-aware,
+   for `ldc` support). `DeviceModule::from_ptx` loads it; the
+   `Arc<CompiledKernel>` is cached under `(ClassId, method_index)`.
+5. `try_dispatch` checks the void-return-or-integer-reduction gate and
+   the `--gpu-min-work` gate against the *runtime* array length (not
+   the analyzer's fixed `estimated_work` placeholder), then calls
+   `dispatch_method_from_native`.
+6. **Launch**, done today: acquire `Heap::enter_gpu_critical()`; for
+   each array argument, `host_view_i32`/zero-copy DMA upload, push a
+   device pointer + length into `KernelArgs`, pin the `ObjectRef`;
+   allocate the trailing `failure_flag` buffer; launch via
+   `LaunchConfig::elementwise_for_kernel` (occupancy-tuned, sized off
+   the actual runtime array length) on either a registered `GpuStream`
+   or a fresh private stream; record a completion `Event`.
+7. **Finalize**: either `poll_submission_status` (non-blocking, driven
+   by `futureIsDone`) or `finalize_submission` (blocking, driven by
+   `get()`/the transparent path) reads `failure_flag` first — non-zero
+   means a bounds or div-by-zero trap inside the kernel, and the call
+   deopts to the interpreter/JIT with **no partial GPU state written**
+   to the heap. Zero means success: array writebacks run, a reduction's
+   scalar result (if any) is read back and surfaces as
+   `DispatchOutcome::HandledWithValue`, the `SafepointToken`/pins are
+   released, and the interpreter gets `Handled`.
+8. Subsequent calls at the same site skip analyze/lower (cache hit) and
+   the invoke cache is never populated for this site (Part 4), so step
+   1 repeats on every call — this is intentional: an eligible site
+   whose array size varies per call must keep re-checking
+   `--gpu-min-work`.
 
 ## Testing
 
 | Crate / target | Tests | What they prove |
 | --- | --- | --- |
-| `cargo test -p cuda-bridge` | 3 | `NoDriver` contract holds when the `cuda` feature is off. |
-| `cargo test -p jit-cuda` | 23 (+2 `#[ignore]`) | Real `.class` fixtures lower to non-trivial PTX; all `Reject*` fixtures classify correctly; non-canonical control flow returns `Unsupported`. The 2 `#[ignore]` tests require `ptxas` and an attached GPU. |
-| `cargo test -p cratonvm-jit-api` | 24 | Unchanged from before GPU work; `GpuLowering` trait compiles under `--features gpu-lowering`. |
-| `cargo test -p cratonvm-gc --features gpu-offload` | 678 (= 672 pre-existing + 6 new) | Token increment/decrement, nested tokens, GC blocks while a token is held, pinned refs survive a real GC cycle (uses `Heap::alloc_array`), root walker visits pinned refs. |
-| `cargo test -p cratonvm-vm --features gpu-offload --lib gpu_marshal` | 9 | Round-trip every primitive array type through a real `Heap`. |
-| `cargo test -p cratonvm-vm --features gpu-offload --lib offload` | 6 | Cache skips on no-device, classifies eligible / ineligible methods from real `.class` files, disabled-config returns `Skip`. |
+| `cargo test -p cratonvm-jit-cuda` | 110 (some `#[ignore]`d without `gpu-it`) | Real `.class` fixtures (32 sources) lower to correct PTX for every accepted shape; every `Reject*` fixture classifies correctly; `ptxas` round-trip tests (feature `gpu-it`) assemble the emitted PTX for vector-add, dot-reduction, `ldc` constants, offset loops, `frem`, and Math intrinsics through the real NVIDIA assembler. |
+| `cargo test -p cratonvm-cuda-bridge` | ~29 (stub-mode; `--features cuda` compiles the real backend too, gated in CI) | `NoDriver` contract; `Event`/`Stream` state machines; `launch.rs`'s H2D→kernel→D2H event-ordering discipline; stub op log. |
+| `cargo test -p cratonvm-vm --features gpu-offload --lib gpu_marshal` | 20 | Round-trip every primitive array type (incl. bulk i16/i8) through a real `Heap`, including odd lengths, zero length, and G1-humongous scale. |
+| `cargo test -p cratonvm-vm --features gpu-offload --lib offload` | 17 | Cache skip/blacklist behavior on no-device, void/reduction/min-work gating, submission registry lifecycle, `poll_submission_status`. |
+| `cargo test -p cratonvm-vm --features gpu-offload --lib offload_jit_gate` | 13 | Bytecode `invokestatic`-scanner correctness (including adversarial byte sequences inside `tableswitch`/`wide`), fail-open on unresolvable methods, config-off short-circuit. |
+| `cargo test -p cratonvm-vm --features gpu-offload --test gpu_offload_features` | 21 (3 `#[ignore] = "requires NVIDIA GPU"`) | Integration-level coverage through a real `SharedVm`; the 3 ignored tests are the ones the CI gate (`ci.md`) runs on real hardware. |
+| `cargo test -p cratonvm-native-builtins --features gpu-offload craton_gpu::` | 43 | Java-facing shim behavior: array wrap/allocate/toHost round-trips, future status/result boxing (incl. the four scalar types), stream create/release idempotency. |
+| `cargo test -p cratonvm-gc --features gpu-offload` | 66 GPU-specific (+ the full non-GPU suite unaffected) | Token increment/decrement, nested tokens, GC blocks while a token is held, pinned refs survive a real GC cycle, root walker visits pinned refs. |
 
-**All tests run on machines without an NVIDIA GPU.** Real-kernel verification on GPU hardware happens against `Benchmark.java` per [`first-results.md`](first-results.md).
+**All of the above run on machines without an NVIDIA GPU** (device-
+requiring paths self-skip). Real-hardware verification is the 3
+`#[ignore]`d tests plus the manual/CI-gate benchmark suite in
+`bench-gpu/` — see [`ci.md`](ci.md) and the repo README.
 
 ### No synthetic stubs
 
-Every test fixture is a real Java source compiled by `javac` via [`jit-cuda/build.rs`](../../jit-cuda/build.rs). There are zero hand-rolled bytecode arrays. The 15 fixtures in [`test_classes/gpu/`](../../test_classes/gpu/) cover:
+Every test fixture is a real Java source compiled by `javac` via
+[`jit-cuda/build.rs`](../../jit-cuda/build.rs). There are zero hand-
+rolled bytecode arrays in the fixture set (a few *lowering* unit tests
+do drive the `Emitter` directly with hand-built bytecode arrays for
+white-box PTX-shape assertions — a different, accepted pattern; see
+`jit-cuda/src/lowering.rs`'s test module). The 32 fixtures in
+[`test_classes/gpu/`](../../test_classes/gpu/) cover eligible shapes
+(vector-add, saxpy, dot-product reduction, `ldc` constants of all four
+types, non-zero loop starts, `frem`, Math intrinsics, comparison-in-
+value-position), every `Reject*` analyzer reason, non-canonical control
+flow, the two bounds-deopt regression fixtures (`BoundsDeopt2`/`3`),
+and a GC stress program (`GcStress`).
 
-- 3 eligible methods (`EligibleVectorAdd`, `EligibleSaxpy`, `EligibleDotProduct`)
-- 7 rejected methods (`RejectAllocation`, `RejectInvoke`, `RejectSynchronized`, `RejectRefArray`, `RejectSwitch`, `RejectThrow`, `RejectFieldAccess`, `RejectTypeCheck` — covering 8 of the analyzer's `Reason` variants)
-- 1 non-canonical control-flow shape (`TwoLoops` — exercises lowering's `Unsupported` path)
-- 1 multi-threaded allocation stress program (`GcStress` — for Part F)
-- 1 driver (`Benchmark`) for the eventual CPU vs GPU comparison
+## Known follow-ups
 
-## Known follow-ups (all flagged in source with "GPU-required follow-up")
+See [`../known-issues/gpu-offload-followups-20260711.md`](../known-issues/gpu-offload-followups-20260711.md)
+for the itemized, dated status of every open item. Summary as of
+2026-07-11 evening:
 
-### The single critical follow-up: launch glue inside `try_dispatch`
-
-[`vm/src/runtime/offload.rs`](../../vm/src/runtime/offload.rs) — the `LookupOutcome::Hit` arm currently logs `tracing::debug!` and returns `DispatchOutcome::FallThrough`. The signature, call-site contract, and `OffloadCache` lookup path are all final. Only the *body* of the `Hit` arm grows in the next iteration. The reason it's deferred: validating `cuLaunchKernel` + the deopt-on-failure dance requires actual NVIDIA hardware, and landing the surrounding cfg-gated wiring first lets us add the dispatch code in a single tightly-scoped change.
-
-Steps to finish on a GPU box: see the "How a method actually offloads" walk above, steps 6.a through 6.f.
-
-### Lower priority
-
-- **`jit-cuda` opcode coverage:** `lcmp`/`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg` return `Unsupported` (rare in element-wise loops). `dup2_x1` / `dup2_x2` also `Unsupported`. `frem` / `drem` emit text that won't `ptxas`-clean (no native rem on f32/f64) — the analyzer admits them but the kernel will fail validation; a software-correct sequence would close this.
-- **Reductions:** `EligibleDotProduct` lowers, but every CUDA thread races on `ret_ptr`. Result is only correct if every thread happens to compute the same value. A proper reduction kernel is needed for genuine sum-reductions.
-- **Analyzer fixture gaps:** `Reason::Monitor` and `Reason::JsrRet` are unreachable through `javac` output (synchronized always emits an exception table, hitting `HasExceptionHandlers` first; `jsr`/`ret` were dropped from `javac` decades ago). These are documented gaps with no synthetic-stub workaround.
-- **`Benchmark.java` real numbers:** awaiting a GPU box. The `docs/gpu/first-results.md` table is empty until then.
-- **GC stress integration test:** `GcStress.java` exists; a Rust integration test under `vm/tests/` that actually runs it while another thread holds a `SafepointToken` belongs to the next iteration.
+- **DONE**: reduction dispatch (int/long only — see "What the analyzer
+  accepts"), the JIT-caller admission gate, the launch-config thread-
+  floor/occupancy fix, `ldc`/`frem`/cmp/non-zero-loop-start/Math-
+  intrinsics opcode coverage, `--print-gpu-decisions` visibility,
+  self-hosted GPU CI scaffolding (runner enrollment still pending).
+- **PARTIAL**: async completion — `Event::query`/host-callback/
+  `poll_submission_status` make `isDone()` genuinely non-blocking, but
+  `get()` still only completes via a blocking `finalize_submission`;
+  there's no push model where a future completes with nobody polling.
+- **Still open**: float (`)F`/`)D`) reductions (GPU atomic-add reorders
+  summation vs. Java's sequential fp semantics — a deliberate
+  correctness/coverage tradeoff, not an oversight); general branches
+  and 2-D/nested loops inside a kernel body; `dup2_x1`/`dup2_x2`; the
+  external `craton-gpu-java` jar's Java-side bindings for the new
+  `GpuArray.allocate`/scalar-future surfaces.
 
 ## File index (just the GPU-touching files)
 
 ```
-cuda-bridge/                         New crate. Optional dep of vm-cli.
+cuda-bridge/                         Optional dep of vm-cli / cratonvm-embed.
   Cargo.toml, README.md
   src/
     lib.rs                           Public API + stub-mode tests
     backend_cuda.rs                  cudarc backend (feature = "cuda")
     backend_stub.rs                  No-driver backend (default)
+    stream.rs, event.rs, launch.rs   Stream/Event, host callbacks, launch choreography
+  tests/stub_op_log.rs               Stub-mode integration tests
 
-jit-cuda/                            New crate. Used by cratonvm-vm under gpu-offload.
+jit-cuda/                            Used by cratonvm-vm under gpu-offload.
   Cargo.toml, build.rs               build.rs compiles test_classes/gpu/*.java
   src/
     lib.rs
-    analyzer.rs                      OffloadVerdict, ParamKind, Reason
+    analyzer.rs                      OffloadVerdict, ParamKind, Reason, MathIntrinsic table
+    annotations.rs                   @GpuKernel / AdmissionHint / @GpuExclude / @EnableGpuAsync
     emitter.rs                       PtxModule / PtxKernel / RegKind
     signature.rs                     KernelSignature
-    lowering.rs                      lower_method entry point
-    lowering/loop_recog.rs           Canonical counted-loop recogniser
+    lowering.rs                      lower_method / lower_method_with_pool entry points
+    lowering/loop_recog.rs           Canonical counted-loop recognizer (incl. offset starts)
     lowering/emit.rs                 Opcode walker + register allocator
     test_support.rs                  load_method(class, method, descriptor)
 
 jit-api/
-  Cargo.toml                         Added gpu-lowering feature
+  Cargo.toml                         gpu-lowering feature
   src/lib.rs                         Conditionally exposes gpu_lowering module
   src/gpu_lowering.rs                GpuLowering trait + LoweredKernel
 
 gc/
-  Cargo.toml                         Added gpu-offload feature
-  src/lib.rs                         Conditionally exposes safepoint module
+  Cargo.toml                         gpu-offload feature
   src/safepoint.rs                   SafepointToken
   src/heap.rs                        Gated fields + enter_gpu_critical + pin_ref + GC delay
+  src/vm_heap.rs                     Process-wide GPU_CRITICAL_COUNT for cross-thread finalize
+
+native-api/
+  src/registry.rs                    NativeContext GPU trait methods + GpuFutureResult
+
+native-builtins/
+  Cargo.toml                         gpu-offload feature
+  src/craton_gpu.rs                  craton.gpu.* native shims
 
 vm/
-  Cargo.toml                         Added gpu-offload feature, optional cuda-bridge / jit-cuda
+  Cargo.toml                         gpu-offload feature, optional cuda-bridge / jit-cuda / bytemuck
   src/config.rs                      Gated VmConfig fields (gpu_offload_enabled, ...)
   src/runtime/mod.rs                 Gated module declarations
   src/runtime/gpu_marshal.rs         Heap ↔ device marshalling
-  src/runtime/offload.rs             OffloadCache + try_dispatch
-  src/runtime/interpreter.rs         Gated hook in execute_invokestatic
-  src/vm/vm_init.rs                  Gated offload_cache field on SharedVm
+  src/runtime/gpu_residency.rs       GpuArray host-byte residency tracker
+  src/runtime/offload.rs             OffloadCacheRegistry + OffloadCache + try_dispatch + poll
+  src/runtime/offload_jit_gate.rs    JIT/OSR admission gate for offload-eligible callers
+  src/runtime/interpreter.rs         Gated hook in execute_invokestatic + 5 JIT-gate call sites
+  src/vm/vm_init.rs                  offload_registry field on SharedVm
+  src/vm/vm_exec.rs                  NativeContext GPU trait impls
+  tests/gpu_offload_features.rs      Integration tests (stub-mode + #[ignore]d hardware tests)
 
 vm-cli/
-  Cargo.toml                         Added gpu / gpu-driver features, optional cuda-bridge
-  src/main.rs                        Gated --gpu* flags + --gpu-info early-exit + plumbing
+  Cargo.toml                         gpu / gpu-driver features, optional cuda-bridge
+  src/main.rs                        Gated --gpu* flags + --gpu-info early-exit + tracing filter
+
+cratonvm-embed/
+  Cargo.toml                         Mirrors vm-cli's gpu / gpu-driver features for embedders
+
+craton-gpu/                          Build-time only: packages @GpuKernel/@Parallel annotation
+                                      sources from an external craton-gpu-java checkout.
 
 test_classes/gpu/
   README.md                          The "no synthetic stubs" rule
-  *.java                             15 real Java fixtures (see Testing above)
-  *.class                            javac output, checked in as intentional fixtures
+  *.java / *.class                   32 real Java fixtures (see Testing above)
 
-docs/gpu/
-  README.md                          This file
-  plan.md                            Execution plan with per-part status
-  cuda-oxide-evaluation.md           Why cuda-oxide is not on the critical path
-  first-results.md                   Acceptance-criteria scaffold
+bench-gpu/, bench-tornado/           Benchmark sources + TornadoVM twins; results in bench-gpu/results/.
+.github/workflows/gpu-selfhosted.yml Self-hosted GPU CI workflow.
 
-Cargo.toml                           Added cuda-bridge and jit-cuda to workspace members
+docs/gpu/                            This directory.
+docs/book/src/gpu/                   User-facing book chapter + benchmarks page.
+docs/known-issues/gpu-offload-followups-20260711.md   Itemized open-work tracker.
+
+Cargo.toml                           cuda-bridge and jit-cuda as workspace members
 Cargo.lock                           Locked cudarc + bytemuck transitives
-README.md                            Link to cuda-oxide-evaluation.md
 ```
 
 ## FAQ
 
 **Q: Why feature flags instead of a runtime config flag?**
-A: A runtime flag would leave dead branches in the interpreter hot path. The `#[cfg(feature = "gpu-offload")]` discipline means the compiled CPU binary contains *no* GPU code at all — easier to audit and impossible to regress accidentally.
+A: A runtime flag would leave dead branches in the interpreter hot
+path. The `#[cfg(feature = "gpu-offload")]` discipline means the
+compiled CPU binary contains *no* GPU code at all — easier to audit and
+impossible to regress accidentally.
 
 **Q: Why not use cuda-oxide directly?**
-A: See [`cuda-oxide-evaluation.md`](cuda-oxide-evaluation.md). Short version: cuda-oxide compiles *Rust source* to PTX. Our problem is *Java bytecode* to PTX. cuda-oxide doesn't help with that path. It might be useful much later for Rust-authored device helpers (parallel GC mark, atomic intrinsics) — the `GpuLowering` trait keeps that door open without a hard dependency today.
+A: See [`cuda-oxide-evaluation.md`](cuda-oxide-evaluation.md). Short
+version: cuda-oxide compiles *Rust source* to PTX. Our problem is *Java
+bytecode* to PTX. cuda-oxide doesn't help with that path. It might be
+useful much later for Rust-authored device helpers (parallel GC mark,
+atomic intrinsics) — the `GpuLowering` trait keeps that door open
+without a hard dependency today.
 
 **Q: What happens to a Java exception thrown inside an offloaded method?**
-A: Currently, only `ArrayIndexOutOfBoundsException`-equivalent failures are handled — the kernel writes `1` to `*failure_flag` and `ret`s; the host detects this and deopts to the interpreter, which observes no partial GPU state (input arrays are *not* written by the bounds-failed path; output arrays are independent buffers materialized on the host *after* the kernel succeeds). `ArithmeticException` for integer division by zero is a planned addition. Any other Java exception means the method isn't actually offload-eligible — the analyzer rejects it.
+A: `ArrayIndexOutOfBoundsException`-equivalent bounds failures and
+integer divide-by-zero (`ArithmeticException`) are both handled: the
+kernel writes `1` to `*failure_flag` and `ret`s; the host detects this
+(draining the failure flag **before** any array writeback) and deopts
+to the interpreter, which observes no partial GPU state and re-runs
+with correct Java semantics — validated on hardware
+(`test_classes/gpu/BoundsDeopt2.java`/`BoundsDeopt3.java`). Any other
+Java exception means the method isn't actually offload-eligible — the
+analyzer rejects it (calls, `throw`, etc. are all rejected shapes).
 
 **Q: How do I add support for a new opcode?**
 A: Three places.
-1. Make sure `jit-cuda/src/analyzer.rs::classify()` admits the opcode (or doesn't reject it for the wrong reason).
+1. Make sure `jit-cuda/src/analyzer.rs::classify()` admits the opcode
+   (or doesn't reject it for the wrong reason).
 2. Add the emission case in `jit-cuda/src/lowering/emit.rs`.
-3. Add a real `.java` fixture under `test_classes/gpu/` that uses the opcode and a test in `jit-cuda/src/analyzer.rs` or a new lowering test that asserts the PTX content contains the right instruction.
+3. Add a real `.java` fixture under `test_classes/gpu/` that uses the
+   opcode, an analyzer test, and a lowering test that asserts the PTX
+   content contains the right instruction (and, if hardware is
+   available, a `ptxas` round-trip test — see the several examples in
+   `jit-cuda/src/lowering.rs`).
 
 **Q: How do I add a new GPU lowering backend (e.g. cuda-oxide-emitted helpers)?**
-A: Implement the `jit_api::gpu_lowering::GpuLowering` trait. Wire it into `OffloadCache::new`'s lowering chain. The interpreter hook never has to change.
+A: Implement the `jit_api::gpu_lowering::GpuLowering` trait. Wire it
+into `OffloadCache::new`'s lowering chain. The interpreter hook never
+has to change.
 
-## Verification snapshot (no-GPU dev box)
-
-```
-$ cargo check --workspace                                 ✔ clean
-$ cargo check --workspace --features cratonvm-cli/gpu      ✔ clean
-$ cargo test -p cuda-bridge                               ✔ 3 passed
-$ cargo test -p jit-cuda                                  ✔ 23 passed, 2 ignored
-$ cargo test -p cratonvm-jit-api                           ✔ 24 passed
-$ cargo test -p cratonvm-gc --features gpu-offload         ✔ 678 passed
-$ cargo test -p cratonvm-vm --features gpu-offload \
-      --lib gpu_marshal                                   ✔ 9 passed
-$ cargo test -p cratonvm-vm --features gpu-offload \
-      --lib offload                                       ✔ 6 passed
-$ ./target/debug/cratonvm.exe --help | grep -i gpu         (no matches — clean)
-$ ./target/debug/cratonvm.exe --gpu-info                   error: unexpected argument '--gpu-info' found
-                                                          (correct — gpu feature is off)
-```
+**Q: I enabled `--gpu` and my kernel still runs on CPU. Why?**
+A: Run with `--print-gpu-decisions` (no `RUST_LOG` needed) and check
+the analyzer verdict. Common reasons: the method isn't in the accepted
+shape (see "What the analyzer accepts" above — check the `Reason`);
+the largest array argument is below `--gpu-min-work` (default 4096);
+the kernel has a non-void, non-integer-reduction return (float/double
+reductions and non-reduction non-void kernels still run on CPU); or the
+caller itself got JIT-compiled before the offload-eligible target was
+first analyzed (rare — the JIT gate should prevent this once the
+target has been seen once; file a bug if you hit it).

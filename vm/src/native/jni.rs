@@ -555,7 +555,9 @@ pub fn host_thread_enter_native() -> bool {
         // the initiator's `wait_for_all` can complete. The id only selects "am I
         // the initiator" — a thread declaring itself in-native is never the
         // initiator — and a non-foreign caller here is the creating thread (id 0).
-        let _ = shared.gc_barrier.arrive_and_wait(ThreadId(0));
+        // GCAUDIT-0711-FIX (finding 1a): auto for uniformity - this call
+        // site never raises in_blocked_region, so it resolves identically.
+        let _ = shared.gc_barrier.arrive_and_wait_auto(ThreadId(0));
     }
     true
 }
@@ -796,10 +798,12 @@ impl Drop for ForeignCallGuard {
             });
             let pre_stw = shared.gc_barrier.mark_blocked_region_enter();
             if pre_stw {
-                // We were counted in the active STW's `expected` (it started
-                // while we were a running mutator); arrive exactly once.
+                // GCAUDIT-0711-FIX (finding 1a): the in_blocked_region store
+                // above already ran, so this pause may already have
+                // excluded us - auto resolves it from that pause's own
+                // exclusion snapshot instead of assuming participation.
                 let tid = with_foreign_thread(|jt| jt.thread_id).unwrap_or(ThreadId(0));
-                let _ = shared.gc_barrier.arrive_and_wait(tid);
+                let _ = shared.gc_barrier.arrive_and_wait_auto(tid);
             }
         }
         if self.counted {
@@ -3463,7 +3467,8 @@ extern "C" fn jni_monitor_enter(_env: JNIEnv, obj: JObject) -> JInt {
         if let Some(m) = shared.monitors.enter_or_contend(oref, ThreadId(0)) {
             let blk = shared.gc_barrier.enter_blocked();
             if blk.pre_stw {
-                let _ = shared.gc_barrier.arrive_and_wait(ThreadId(0));
+                // GCAUDIT-0711-FIX (finding 1a): auto for uniformity.
+                let _ = shared.gc_barrier.arrive_and_wait_auto(ThreadId(0));
             }
             m.block_enter(ThreadId(0));
             drop(blk);

@@ -65,8 +65,8 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{atomic::{AtomicI64, Ordering}, Mutex, OnceLock};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
@@ -139,6 +139,29 @@ fn singleton_cell() -> &'static Mutex<Option<u64>> {
 fn logger_registry() -> &'static Mutex<HashMap<String, u64>> {
     static INSTANCE: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Explicit handlers installed on synthetic JUL loggers. The JDK normally
+/// keeps this state in `Logger.ConfigurationData`; our compact Logger mirror
+/// deliberately does not model that private layout, so keep the Java-visible
+/// handler references here instead. This matters for framework log capture
+/// (Tomcat's `LogCapture` is one such user), not only console output.
+fn logger_handlers() -> &'static Mutex<HashMap<String, Vec<u64>>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<String, Vec<u64>>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Message payloads for minimally-constructed LogRecord mirrors. The real
+/// private LogRecord layout is not initialized on this native-only path, but
+/// `getMessage()` remains a required public contract for JUL handlers.
+fn log_record_messages() -> &'static Mutex<BTreeMap<i64, String>> {
+    static INSTANCE: OnceLock<Mutex<BTreeMap<i64, String>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn next_log_record_id() -> i64 {
+    static NEXT: AtomicI64 = AtomicI64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Validate a logger name. Reject anything that looks like a filesystem
@@ -506,6 +529,12 @@ pub(crate) fn reset_state_for_tests() {
     }
     if let Ok(mut r) = logger_registry().lock() {
         r.clear();
+    }
+    if let Ok(mut h) = logger_handlers().lock() {
+        h.clear();
+    }
+    if let Ok(mut m) = log_record_messages().lock() {
+        m.clear();
     }
     if let Ok(mut g) = jboss_log_context_singleton().lock() {
         *g = None;
@@ -1726,6 +1755,7 @@ fn native_jul_logger_log_level_msg(
     let message = message_obj
         .and_then(|o| ctx.read_string(o))
         .unwrap_or_default();
+    publish_jul_handlers(ctx, this, level_obj, message_obj);
     eprintln!("{level_name} [{logger_name}] {message}");
     Ok(None)
 }
@@ -1833,6 +1863,122 @@ fn native_jul_logger_log_params(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(None)
 }
 
+fn native_jul_log_record_get_message(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(Value::Object(Some(record))) = args.first() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let record_id = ctx.get_field(*record, 1).as_long().unwrap_or_default();
+    let message = log_record_messages()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&record_id)
+        .cloned()
+        .map(|text| ctx.create_string(&text));
+    Ok(Some(Value::Object(message)))
+}
+
+/// Store an explicit handler without relying on the private JDK Logger layout.
+fn native_jul_logger_add_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let (Some(Value::Object(Some(logger))), Some(Value::Object(Some(handler)))) =
+        (args.first(), args.get(1)) else {
+        return Ok(None);
+    };
+    let name = read_jul_logger_name(ctx, *logger);
+    let mut all = logger_handlers().lock().unwrap_or_else(|e| e.into_inner());
+    let handlers = all.entry(name).or_default();
+    if !handlers.iter().any(|&addr| addr == handler.as_ptr() as u64) {
+        handlers.push(handler.as_ptr() as u64);
+    }
+    Ok(None)
+}
+
+fn native_jul_logger_remove_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let (Some(Value::Object(Some(logger))), Some(Value::Object(Some(handler)))) =
+        (args.first(), args.get(1)) else {
+        return Ok(None);
+    };
+    let name = read_jul_logger_name(ctx, *logger);
+    let mut all = logger_handlers().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handlers) = all.get_mut(&name) {
+        handlers.retain(|&addr| addr != handler.as_ptr() as u64);
+    }
+    Ok(None)
+}
+
+/// Publish a real LogRecord to every explicit handler. Console emission alone
+/// is insufficient: JUL users legitimately install in-process handlers to
+/// collect records, including Tomcat's standalone startup test.
+fn publish_jul_handlers(
+    ctx: &mut dyn NativeContext,
+    logger: Option<ObjectRef>,
+    level: Option<ObjectRef>,
+    message: Option<ObjectRef>,
+) {
+    let (Some(logger), Some(level), Some(message)) = (logger, level, message) else {
+        return;
+    };
+    let handlers = logger_handlers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&read_jul_logger_name(ctx, logger))
+        .cloned()
+        .unwrap_or_default();
+    for addr in handlers {
+        // SAFETY: handlers are strongly referenced by Java-side LogCapture for
+        // the whole interval they are registered; this is the same stable-ref
+        // convention used by the existing synthetic logger registry above.
+        let handler = unsafe { object_from_u64(addr) };
+        // The real LogRecord constructor reaches private JDK state that is not
+        // materialized on our compact JUL path. Handlers require the public
+        // record fields, in particular `message`, so initialize that stable
+        // surface directly.
+        let record = match ctx.new_object("java/util/logging/LogRecord") {
+            Ok(Some(Value::Object(Some(record)))) => record,
+            _ => continue,
+        };
+        ctx.set_field_by_name(record, "level", Value::Object(Some(level)));
+        ctx.set_field_by_name(record, "message", Value::Object(Some(message)));
+        // Real JDK LogRecord's instance layout is level, sequenceNumber,
+        // sourceClassName, sourceMethodName, message. Keep a slot fallback for
+        // the private-field resolver path used by compact allocations.
+        ctx.set_field(record, 4, Value::Object(Some(message)));
+        // Prefer the JDK setter too: it writes the resolved private slot even
+        // when the compact allocator has not materialized field metadata yet.
+        let _ = ctx.invoke_virtual(
+            record,
+            "setMessage",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(message))],
+        );
+        // sequenceNumber survives object forwarding and gives the side table a
+        // stable identity across the moving collector.
+        let record_id = next_log_record_id();
+        ctx.set_field(record, 1, Value::Long(record_id));
+        let mut messages = log_record_messages().lock().unwrap_or_else(|e| e.into_inner());
+        messages.insert(record_id, ctx.read_string(message).unwrap_or_default());
+        // A long-lived handler must not turn the bridge into an unbounded
+        // message cache. Records are ephemeral; retain a generous recent
+        // window for in-flight handler delivery only.
+        while messages.len() > 4096 {
+            let oldest = messages.keys().next().copied();
+            if let Some(oldest) = oldest {
+                messages.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        let _ = ctx.invoke_virtual(
+            handler,
+            "publish",
+            "(Ljava/util/logging/LogRecord;)V",
+            &[Value::Object(Some(record))],
+        );
+    }
+}
+
 /// `java/util/logging/Logger.logp(Level, sourceClass, sourceMethod, msg)`
 /// intercept. JULI's `DirectJDKLog` (used by Tomcat for every
 /// `log.warn/error/info(...)` call) delegates to this method instead of
@@ -1887,6 +2033,7 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let message = message_obj
         .and_then(|o| ctx.read_string(o))
         .unwrap_or_default();
+    publish_jul_handlers(ctx, this, level_obj, message_obj);
     if let Some(t) = throwable_obj {
         // Detail-line, mirroring Tomcat's expectation that a throwable
         // is co-located with the message. We pull the throwable's
@@ -2919,6 +3066,25 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         native_jul_static_get_logger_with_bundle,
     );
 
+    registry.register(
+        "java/util/logging/LogRecord",
+        "getMessage",
+        "()Ljava/lang/String;",
+        native_jul_log_record_get_message,
+    );
+    registry.register(
+        CLS_JUL_LOGGER,
+        "addHandler",
+        "(Ljava/util/logging/Handler;)V",
+        native_jul_logger_add_handler,
+    );
+    registry.register(
+        CLS_JUL_LOGGER,
+        "removeHandler",
+        "(Ljava/util/logging/Handler;)V",
+        native_jul_logger_remove_handler,
+    );
+
     // JUL convenience methods for callers that bypass jboss-logging.
     registry.register(
         CLS_JUL_LOGGER,
@@ -3237,6 +3403,53 @@ mod tests {
                 "()Ljava/lang/Object;"
             )
             .is_some());
+    }
+
+    #[test]
+    fn jul_explicit_handler_and_log_record_message_bridge() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        let logger = allocate_logger(&mut ctx, "org.example.capture");
+        let handler = alloc_concurrent_synthetic(&mut ctx, "java/util/logging/Handler", 0);
+        native_jul_logger_add_handler(
+            &mut ctx,
+            &[Value::Object(Some(logger)), Value::Object(Some(handler))],
+        )
+        .unwrap();
+        assert_eq!(
+            logger_handlers()
+                .lock()
+                .unwrap()
+                .get("org.example.capture")
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let record = alloc_concurrent_synthetic(&mut ctx, "java/util/logging/LogRecord", 5);
+        ctx.set_field(record, 1, Value::Long(42));
+        log_record_messages()
+            .lock()
+            .unwrap()
+            .insert(42, "captured banner".to_string());
+        let message = native_jul_log_record_get_message(&mut ctx, &[Value::Object(Some(record))])
+            .unwrap()
+            .unwrap();
+        let Value::Object(Some(message)) = message else {
+            panic!("expected LogRecord message");
+        };
+        assert_eq!(ctx.read_string(message).as_deref(), Some("captured banner"));
+
+        native_jul_logger_remove_handler(
+            &mut ctx,
+            &[Value::Object(Some(logger)), Value::Object(Some(handler))],
+        )
+        .unwrap();
+        assert!(logger_handlers()
+            .lock()
+            .unwrap()
+            .get("org.example.capture")
+            .is_some_and(Vec::is_empty));
     }
 
     #[test]

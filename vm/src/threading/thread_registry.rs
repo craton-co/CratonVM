@@ -1247,16 +1247,48 @@ impl ThreadRegistry {
     /// publication can race ahead of the barrier's anonymous `threads_blocked`
     /// counter. Reading it with the alive set keeps the expected mutator quota
     /// aligned with the root/fixup state the collector will actually scan.
-    pub fn alive_count_blocked_and_os_tids(&self) -> (usize, usize, Vec<u32>) {
+    ///
+    /// STWREADY-GAP-FIX (2026-07-11): also gate on `stw_ready`, matching the
+    /// sibling `alive_count_and_os_tids` (added 2026-07-03, "identity-based
+    /// barrier excusal for xt-takeover"). Without this, a `Thread.start()`
+    /// child is alive (registered in this map) before its carrier can answer
+    /// a safepoint -- `vm_exec.rs`'s `thread_start` startup loop keeps such a
+    /// thread out of `mark_stw_ready` until it observes NO active STW
+    /// (`run_if_no_stw_requested`), and if one IS active when it starts, it
+    /// calls the NON-participating `arrive_and_wait_excluded` -- which never
+    /// increments the barrier's `arrived` counter. A pause whose `expected`
+    /// snapshot (this function) included that same not-yet-ready thread can
+    /// then never satisfy its quota: `arrived` structurally cannot reach
+    /// `expected`, and `wait_for_all`/the STW requester's own wait loop
+    /// blocks forever -- a whole-VM freeze with zero forward progress,
+    /// confirmed via gdb (the stuck threads sit in
+    /// `GcBarrier::arrive_and_wait_excluded` from `thread_start`'s startup
+    /// loop, never having deposited a root snapshot or reached any
+    /// safepoint). A not-yet-`stw_ready` thread cannot yet be executing Java
+    /// bytecode (that is exactly what the gate protects), so excluding it
+    /// from `expected` cannot let it mutate the heap concurrently with an
+    /// evacuating collection -- there is nothing for the collector to race
+    /// against on that thread until it actually marks itself ready, at which
+    /// point it becomes visible to the NEXT pause's snapshot as normal.
+    ///
+    /// GCAUDIT-0711-FIX (finding 1a): also returns the IDENTITIES
+    /// (`ThreadId.0`) of the alive threads counted in `blocked`, so
+    /// `GcBarrier::request_stw_counted_with_live_blocked` can publish exactly
+    /// which threads THIS pause excluded — see
+    /// `GcBarrierInner::excluded_blocked`'s doc for why per-thread identity,
+    /// not just a count, is required for a race-free arrival decision.
+    pub fn alive_count_blocked_and_os_tids(&self) -> (usize, usize, Vec<u32>, Vec<u64>) {
         let threads = self.threads.lock();
         let mut alive = 0usize;
         let mut blocked = 0usize;
         let mut tids = Vec::with_capacity(threads.len());
-        for e in threads.values() {
-            if e.alive.load(Ordering::Acquire) {
+        let mut blocked_tids = Vec::new();
+        for (tid, e) in threads.iter() {
+            if e.alive.load(Ordering::Acquire) && e.stw_ready.load(Ordering::Acquire) {
                 alive += 1;
                 if e.gc_block_state.in_blocked_region.load(Ordering::Acquire) {
                     blocked += 1;
+                    blocked_tids.push(tid.0);
                 }
                 let t = e.os_tid.load(Ordering::Acquire);
                 if t != 0 {
@@ -1264,7 +1296,7 @@ impl ThreadRegistry {
                 }
             }
         }
-        (alive, blocked, tids)
+        (alive, blocked, tids, blocked_tids)
     }
 
     /// Get Java Thread objects for all alive threads (up to `max` entries).
@@ -1595,7 +1627,7 @@ mod tests {
         let root = dummy_aligned_objref(&mut backing);
         registry.set_root_snapshot(tid, Arc::new(Mutex::new(vec![root])));
 
-        let (_, _, tids) = registry.alive_count_blocked_and_os_tids();
+        let (_, _, tids, _) = registry.alive_count_blocked_and_os_tids();
         assert!(!tids.is_empty(), "os tid must be published");
         let roots = registry.root_snapshots_for_os_tids(&tids);
         assert_eq!(roots.len(), 1, "matching alive thread's snapshot returned");

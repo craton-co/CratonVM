@@ -4,6 +4,254 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-11 Spring suite genuine-bug list reconfirmed (125 → 96 open, 29 fixed)
+
+Scoped rerun of exactly the 125-class list from the doc below on dev
+`9948295e` (not a full 516-class HotSpot cross-reference). 29/125 now pass —
+`core.test.tools.CompiledTests` was fixed by commit `2ed5f407`
+(loader-defining-visibility fix in the real-JDK `loadClass` fast path); the
+other 28 most likely benefited from the same fix (shared
+`MockitoException`/`CompilationException`/CGLIB-proxy-`ABEND` symptoms), not
+individually root-caused. 10 of the previously-documented 31 "newly broken /
+HIB-CV-32" classes are among the 29 fixed. Four new failure clusters
+characterized within the remaining 96 (not yet root-caused): an 11-class AOT
+bean-registration TIMEOUT cluster (all hard-hang at the 120s ceiling), an
+8-class Groovy scripting cluster (high per-method failure ratios), a broad
+WebFlux reactive FAIL/EMPTY cluster, and 6 ABEND crashes with `found=0`
+(crash before test discovery, distinct from the mid-run HIB-CV-32 crash
+shape). See
+[`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](CRATONVM-SPRING-GENUINE-BUGLIST-125.md)
+for full detail.
+
+## 2026-07-11 `HashMap` put/get ~230-365x slower than JDK-25 root-caused, partially fixed — fixed per-native-call dispatch overhead, not allocation/GC
+
+Initial hypothesis (Integer autoboxing/allocation pressure) was wrong. cdb
+stack-sampling (same technique used for this repo's `bintrees` GC/allocation-ceiling
+profile) found the ratio is flat across sizes (not O(n²), unlike the sibling
+String/Regex bug below) and NOT allocation-bound: only ~9% of sampled stacks were in
+allocation/boxing paths vs ~90% for an allocation-bound workload. The real cost is
+fixed per-native-call overhead in the JIT-to-native dispatch path — `HashMap.put/get`
+and `Integer.hashCode()/valueOf()` are native Rust functions, and every call pays for
+conservative JIT-frame root scanning (~29% of samples, the largest bucket),
+RwLock-guarded class/field-layout lookups, and generic dispatch-machinery overhead.
+Three targeted, behavior-preserving fixes shipped for the safely-addressable slice
+(key hash/equals check-order in `native-collections/src/lib.rs`, a lock-free
+receiver-corruption fast path in `vm/src/vm/vm_exec.rs`, a lock-free field-layout
+cache in `gc/src/gen_heap.rs` mirroring an already-proven pattern elsewhere in this
+codebase) — isolated 5-round re-measurement averages ~206x post-fix, down from ~357x.
+Root scanning and the SATB GC flush (the largest remaining buckets) are deliberately
+NOT touched — both are correctness-critical with a real prior crash/heap-corruption
+history in this codebase. See
+[`hashmap-native-dispatch-overhead.md`](hashmap-native-dispatch-overhead.md) for the
+full investigation, profile evidence, and remaining-work writeup.
+
+## 2026-07-11 TestParameterMap `replaceAll()` lock-bypass FIXED/RETIRED — real bug was an unwrapped `Map.Entry` escaping `Collections.unmodifiableMap(...).entrySet()`, not field visibility
+
+The doc's own hypothesis (a plain-`boolean` `ParameterMap.locked` field-visibility
+bug) was wrong. `checkLocked()` correctly saw `locked=true` on every call; the
+actual gap was that CratonVM's synthetic `Collections.unmodifiableMap` wrapper's
+`entrySet()` handed back the backing map's real, mutable `Map.Entry` objects
+unwrapped, so `Map.replaceAll`'s default-method body (`for (Entry e :
+entrySet()) e.setValue(v)`) silently mutated the "locked" map instead of
+throwing `UnsupportedOperationException` — real JDK wraps each entry in
+`Collections$UnmodifiableMap$UnmodifiableEntrySet$UnmodifiableEntry`. Also
+found (and fixed by the same change) a previously-undocumented residual: the
+successful mutation corrupted `tearDown()`'s subsequent value assertions.
+Fixed by adding a dedicated `cratonvm/internal/UnmodifiableEntrySet` +
+`UnmodifiableMapEntry` wrapper pair (`native-collections/src/lib.rs`,
+`native-builtins/src/lib.rs`, `vm/src/vm/vm_init.rs`) so `setValue()` throws.
+`TestParameterMap` 4/4 PASS; no regressions in a 31-test sweep of other
+`Collections.unmodifiable*`/`entrySet()` consumers. See
+[`parametermap-immutability-not-locked-FIXED.md`](../internal/tomcat-08-07/parametermap-immutability-not-locked-FIXED.md).
+
+## 2026-07-11 WildFly stale-ObjectRef sweep: systematic static-analysis pass finds+fixes ~37 more sites across 6 files; harness verification blocked by unrelated environment gap
+
+Follow-up session 3 on [`wildfly-parallel-boot-stale-objectref-residual.md`](wildfly-parallel-boot-stale-objectref-residual.md),
+acting on that doc's own recommendation after 2 sessions of one-off manual chasing found only 6-7 sites.
+Built a line-oriented static-analysis scanner (masks comments/strings, tracks `ObjectRef`-like locals,
+two-pass wrapper-hazard discovery for helper functions that internally call a GC-triggering `ctx.*`
+method without being one themselves, interval-based "GC event between bind and use" detection) over
+`native-builtins/src`, `native-io/src`, `classloading/src`. First pass found 1968 candidates; adding
+wrapper-hazard detection found 3247. Manually triaged the ~2200 in files judged hot for WildFly
+boot/reflection/classloading, fixing **~37 confirmed real instances** across
+`jboss_module_loader.rs` (~15, including the singleton `build_local_module_loader` and
+`native_loader_load_module`'s own `this`/`module` locals — directly on the WildFly bootstrap-module
+path), `service_loader.rs` (8, including the `ServiceLoader.load(Class)` entry point itself),
+`classloader.rs` (6), `classloader_real.rs` (4), `lang_reflect.rs` (2), `lang_class.rs` (2, including
+another `Constructor.newInstance`-family site in the serialization-constructor branch, and the
+never-before-fixed `build_serialized_lambda`). All fixed with the same established
+`pin_native_root`/`read_native_pin`/`unpin_native_roots` idiom. Consolidated 9 identical
+exception-construction call sites into one new shared helper (`alloc_single_message_exception`) rather
+than repeating the pin dance inline.
+
+- Verified: clean `cargo check`, full `cargo test -p cratonvm-native-builtins --lib` (2961/2965; the 4
+  failures confirmed via `git stash` to be pre-existing/unrelated), and byte-for-byte non-regression
+  against the last known-good frozen binary on the one live repro attempted.
+- **Not** verified: a live clean WildFly boot improvement — the shared Azure host's provisioned test
+  distribution is missing its `modules/` directory entirely (`apps/wildfly/build/target/`, the Maven
+  module that provisions it, doesn't exist on this checkout), a pre-existing environment gap unrelated to
+  this session's code, confirmed by reproducing the identical failure against the last verified-good
+  binary from a prior session. See the residual doc's "Follow-up session 3" section for the full story
+  and what whoever next has a working harness should re-run.
+- Also **implemented** (same session, after initial scoping): a debug-build assertion,
+  `CRATONVM_DBG_STALE_OBJREF=1`, that catches this whole bug class deterministically at runtime for the
+  `Generational` (default) GC backend — a stale native local read within one GC cycle of evacuation now
+  hard-panics instead of silently corrupting. Reuses the GC's own existing forwarding-pointer header field
+  (no new tombstone format needed) behind a one-cycle quarantine delay on reclaiming evacuated memory; see
+  [`../internal/wildfly-stale-objectref-debug-assertion-scoping.md`](../internal/wildfly-stale-objectref-debug-assertion-scoping.md)
+  for the mechanism and its explicit scope boundaries (G1/ZGC not covered).
+- Remaining untriaged: `lang_class.rs`'s other 114 candidates, `lang_invoke.rs`, `servlet.rs`,
+  `jboss_msc.rs`, the `wildfly_*.rs` files, `spring_startup_bootstrap.rs`, and three giant
+  "Phase N native registration" files (`lib.rs`/`phases_late.rs`/`phases_early.rs`, ~1550 combined
+  candidates) — a spot-check of `lib.rs` alone found another real bug
+  (`spring_xml_set_factory_bool`'s caller), not yet fixed.
+
+## 2026-07-11 JIT BCE: missing AIOOBE + silent OOB heap write on multi-array loops (OPEN, Severity: HIGH)
+
+Found while validating the GPU offload deopt path (the bug itself is in the CPU JIT, not the
+GPU stack). Bounds-check elimination on a counted loop indexing multiple arrays by the same
+induction variable (e.g. `for (i=0;i<a.length;i++) out[i]=a[i]+b[i];` with `out.length <
+a.length`) elides the bounds check on the shorter array using the longer array's length as the
+loop bound — with the JIT/OSR on, the method returns normally with no
+`ArrayIndexOutOfBoundsException` and silently writes past the end of `out` into whatever object
+follows it on the heap. HotSpot JDK 25 and CratonVM `--nojit` both throw the required AIOOBE.
+See [`jit-bce-multi-array-oob-store-20260711.md`](jit-bce-multi-array-oob-store-20260711.md) for
+the minimal repro (`test_classes/gpu/BoundsDeopt2.java`) and the suspected BCE mechanism.
+
+## 2026-07-11 GPU offload: first real-hardware validation passed; 7 follow-ups filed (OPEN, none blocking)
+
+First systematic validation of the GPU offload stack on real hardware (RTX 2060) passed
+end-to-end — checksums matching HotSpot bit-for-bit on every kernel tested, including a
+div-chain kernel at ~210x HotSpot C2 / ~3x TornadoVM PTX (see
+[`bench-gpu/results/`](../../bench-gpu/results/) and [ROADMAP.md](../../ROADMAP.md#gpu-offload)).
+Two bugs found during that validation were fixed in-tree the same day (invoke-cache promotion
+killing repeat offloads; a failure-flag not drained after array writebacks). Seven follow-up
+gaps remain open and are being worked on in parallel (check the doc for current status before
+assuming any is still open): reduction-kernel dispatch never launches (void-return gate),
+JIT-compiled/OSR'd callers can bypass the offload hook, `dispatch_async` is synchronous under
+the hood, small arrays over-launch GPU threads (fixed 2^20-thread minimum), the
+occupancy-tuned block-size API is dead code, several analyzer/lowering coverage gaps (`ldc`,
+`frem`/`drem`, non-canonical loops), and there is no hardware CI. See
+[`gpu-offload-followups-20260711.md`](gpu-offload-followups-20260711.md) for all seven with
+pointers into `vm/src/runtime/offload.rs`.
+
+## 2026-07-11 Regex `find()`+`group()` quadratic slowdown FIXED — two wrong turns (dead-code Matcher bridge, dead-code substring native) before finding the real bug in the live one
+
+A user-reported benchmark (`StringBuilder` append loop + `Pattern.compile().matcher()`
++ `while (m.find()) { m.group(1); }`) showed a CratonVM-vs-JDK slowdown ratio that
+*grew* with input size (18.8×/94.4×/238.8× at 1K/5K/10K entries) — the tell for an
+algorithmic-complexity bug. First diagnosis blamed `Matcher`'s native bridge
+(`matcher_read_input()`) — a real O(n²) bug, but instrumentation proved that
+bridge is unconditionally dropped in real-JDK mode
+(`registry.rs`'s `drop_real_layout_synthetic`, same "synthetic bridge corrupts
+real-layout objects" family as
+[`stringjoiner-synthetic-native-real-jdk-field-mismatch.md`](stringjoiner-synthetic-native-real-jdk-field-mismatch.md))
+— the fix, while correct, was dead code. That led to isolating the actual bug to
+plain `String.substring()` (zero regex involved) — but the FIRST substring native
+found and instrumented (`native_string_substring`,
+`native-builtins/src/lang_string.rs`) was ALSO dead code, this time because its
+registration lives inside `register_synthetic_overrides`,
+`#[cfg(feature = "synthetic-jdk")]`-gated and not compiled into the real-JDK
+build at all. The actual live registration — a separate inline closure in
+`register_essential_natives` — had the identical "decode the entire parent
+string, every call" bug independently. **FIXED**: see
+[`../internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`](../internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md)
+for the full (long) story and the fix. `SubstringOnly` 1283ms→29ms at n=10,000;
+the original combined benchmark 4775ms (never finished at n=50,000)→2295ms
+(completes) — checksums identical to JDK throughout, zero test regressions.
+
+## 2026-07-11 WildFly Surefire-fork boot-crash 2nd follow-up: decompiled DeferredExtensionContext, found+fixed 2 MORE GC-staleness sites (live-caught in the act); residual is a long-tail bug class, not a small fixed set
+
+Follow-up to the entry directly below's higher-priority lead. Decompiled
+`org.jboss.as.controller.parsing.DeferredExtensionContext` (`wildfly-controller-31.0.3.Final.jar`) and
+confirmed it genuinely loads extensions concurrently: one `Callable` per extension submitted to a
+`bootExecutor` `ExecutorService`, each independently calling
+`moduleLoader.loadModule(name).loadService(Extension.class)`, then blocking on `Future.get()` per
+extension (surfacing `ExecutionException` as the observed `IllegalStateException`).
+
+- FIXED: `native_module_load_service`/`native_module_load_service_from_caller_module_loader`
+  (`native-builtins/src/jboss_module_loader.rs`) held `service_type`/`service` (the `Class` mirror for
+  `Extension.class`) across `native_module_get_class_loader` — which lazily allocates a new
+  `ModuleClassLoader` the first time it's asked for a given module, i.e. essentially every
+  extension-loading call during boot — before using it again, unpinned.
+- FIXED: `native_sl_iterator` (`native-builtins/src/service_loader.rs`) held the reflective `Constructor`
+  across an intervening `AccessibleObject.setAccessible` invoke *and* a `new_ref_array` allocation before
+  its second use in `Constructor.newInstance`. Caught directly in the act via a live
+  `CRATONVM_DIAG_SERVICELOADER=1` capture: the module-scoped provider lookup correctly found
+  `org.wildfly.extension.beanvalidation.BeanValidationExtension` (`providers=1`), but a *later* attempt
+  to instantiate that exact class failed with `"Constructor.newInstance: no declaring class"` — the same
+  symptom this whole investigation started with, now proven to recur at an entirely different call site
+  than the one originally fixed.
+- Both fixes verified as real, non-regressing improvements (8-retry targeted sample: 4/8 clear, 3/8
+  original NPE, 1/8 still a related `WFLYCTL0153` failure) but **did not fully eliminate the residual**.
+- OPEN, re-characterized: [`wildfly-parallel-boot-stale-objectref-residual.md`](wildfly-parallel-boot-stale-objectref-residual.md) —
+  after 6-7 total sites of this exact "Family 1" pattern found and fixed across 3 sessions (this one,
+  the one below, and the original fix), with the residual still not fully closed, this is now understood
+  as a **long-tail bug class** rather than a small enumerable set of sites. The doc recommends a
+  systematic static-analysis sweep (scan for `ObjectRef`/`Value` locals bound before an allocating `ctx.*`
+  call and read again without an intervening pin) over continued one-off manual chasing.
+
+## 2026-07-11 WildFly Surefire-fork boot-crash follow-up: 2 more GC-staleness sites FIXED (6/10 → 9/10 sample); residual narrowed to a concurrent extension-loading race + the known STW JIT-takeover stall
+
+Follow-up to the entry directly below. Investigating the residual's two reported symptoms
+(`ProcessorInfo.readCPUMask()` `NoSuchMethodError`, `ParallelBootOperationStepHandler` NPE) found the
+identical unpinned-`ObjectRef`-across-`ensure_class_initialized`+`alloc_object` pattern in two more
+functions, both backing *every* `InputStreamReader`/`OutputStreamWriter` construction VM-wide:
+
+- FIXED: `native-io/src/stream_decoder.rs::alloc_stream_decoder` and
+  `native-io/src/stream_encoder.rs::alloc_stream_encoder` held their `InputStream`/`OutputStream`
+  parameter across the same two GC-risking calls (`ensure_class_initialized("sun/nio/cs/StreamDecoder"
+  /StreamEncoder")`, `alloc_object`) before storing it into the new `StreamDecoder`/`StreamEncoder`'s
+  field — same "Family 1" pattern as the sibling `lang_class.rs` fix. Verified: re-running the identical
+  10-class sample against a binary with all three fixes raised the "clears the original crash" rate from
+  6/10 to **9/10**.
+- OPEN, better characterized (updated): [`wildfly-parallel-boot-stale-objectref-residual.md`](wildfly-parallel-boot-stale-objectref-residual.md) —
+  the one remaining class in the sample does **not** deterministically hit the original crash: 3 runs
+  against the identical fixed binary gave 3 *different* outcomes, including a *new* signature
+  (`WFLYCTL0153: No META-INF/services/org.jboss.as.controller.Extension found`) for a *different*
+  specific extension each time. This points at a genuinely concurrent race in WildFly's own
+  `DeferredExtensionContext`/`FutureTask`-based extension loading, not another single fixed
+  unprotected-`ObjectRef` site. Separately reconfirmed (via a live-attach attempt, though it missed the
+  exact stall window) that the STW cross-thread JIT-takeover stall documented in
+  `wildfly-gc-barrier-boot-hang-and-harness-fixes.md` (main-thread instance fixed; the
+  EnhancedQueueExecutor-worker-parked-in-futex instance explicitly left OPEN as high-regression-risk
+  deep GC-barrier work) still reproduces on current dev — several "boots further, still fails" classes
+  show the identical `rounds=64 ... taken=0` signature.
+
+## 2026-07-11 WildFly Surefire-fork boot-crash (96% of suite failures) FIXED — reflection-object GC-staleness; residual stale-`ObjectRef` sites found elsewhere in boot
+
+Root-caused and fixed the dominant blocker for the WildFly suite under CratonVM: the managed server
+spawned by Arquillian from within a CratonVM-run Surefire fork exited with code 1 before writing a
+single line to `server.log`, in 583/605 (96%) of `testsuite/integration/basic` failures in round 6.
+
+- FIXED/RETIRED: [`wildfly-standalone-managed-server-boot-fails-under-surefire-fork.md`](../internal/fixed-suite-bugs/wildfly-standalone-managed-server-boot-fails-under-surefire-fork.md) —
+  `create_constructor_object`/`create_method_object`/`create_field_object`
+  (`native-builtins/src/lang_class.rs`) held their freshly-`alloc_object`'d instance (and its
+  `class_mirror`/`parameterTypes`/etc. locals) as unpinned `ObjectRef`s across several subsequent
+  GC-triggering classloading calls, in violation of the documented `pin_native_root` contract. A moving
+  GC landing in that window (reliably triggered by WildFly's `ServiceLoader`-based extension bootstrap,
+  ~500-750 module jars) corrupted the returned reflection object, surfacing as
+  `Constructor.newInstance: no declaring class` for several `Extension` SPI providers (Elytron, IO,
+  SecurityManager, clustering) — which silently dropped those extensions from the registry, cascading
+  into `AbstractControllerService`'s `this.controller is null` NPE crashing boot before any logging
+  subsystem could open `server.log`. Isolated repros of the exact same captured launch command never
+  reproduced this because a minimal, non-Surefire-forked process doesn't generate enough concurrent
+  classloading pressure to reliably land a GC in the danger window. Fixed by pinning + re-reading
+  forwarded references in all three constructors, mirroring the pattern `build_mirror_array_comp`
+  already used internally. Verified against the real harness (not an isolated repro): the specific
+  `ServiceLoader` corruption warning is gone in every subsequent run, and 6/10 sampled previously-crashing
+  classes now boot far past the original crash point (60-70s of real subsystem processing instead of an
+  instant 8-13s crash).
+- OPEN (new, split off — same general bug class, different call sites, not fixed by the above):
+  [`wildfly-parallel-boot-stale-objectref-residual.md`](wildfly-parallel-boot-stale-objectref-residual.md) —
+  4/10 sampled classes still hit the identical `this.controller is null` crash (deterministically for at
+  least one class across 3 retries), and classes that now boot further sometimes hit a *different* pair
+  of failures bearing the same "stale `ObjectRef` resolves to a reused all-zero-header slot" fingerprint:
+  a `NoSuchMethodError: java/lang/Object.read([CII)I` in `ProcessorInfo.readCPUMask()`, and a
+  `NullPointerException` on `ModelValue.has` inside `ParallelBootOperationStepHandler`'s
+  `EnhancedQueueExecutor` worker threads (a genuinely multi-threaded context). Needs its own
+  investigation before a full-suite re-run can give an accurate post-fix failure count.
+
 ## 2026-07-11 Uncaught-exception fatal-error misattribution FIXED (`java/lang/Thread`/`CommonToken` reported instead of the real Throwable); 2 real bugs unmasked
 
 Investigated the confirmed-but-unexplained pattern already flagged in
@@ -40,10 +288,10 @@ Investigated the confirmed-but-unexplained pattern already flagged in
   `-Dcraton.trace=1` to pin down further.
 
 
-## 2026-07-10 ES `RandomBinaryDocValuesRangeQueryTests` hang cluster: 3/4 FIXED (compact-field getfield bug, fixed upstream); InetAddress redescribed for a new, unrelated correctness bug
+## 2026-07-10/11 ES `RandomBinaryDocValuesRangeQueryTests` hang cluster: 4/4 FIXED (compact-field getfield bug fixed upstream; InetAddress CONTAINS false negative fixed 2026-07-11)
 
 - FIXED/RETIRED: [`long-random-binary-doc-values-range-query-tests-FIXED.md`](../internal/elasticsearch-suite/long-random-binary-doc-values-range-query-tests-FIXED.md), [`integer-random-binary-doc-values-range-query-tests-FIXED.md`](../internal/elasticsearch-suite/integer-random-binary-doc-values-range-query-tests-FIXED.md), [`double-random-binary-doc-values-range-query-tests-FIXED.md`](../internal/elasticsearch-suite/double-random-binary-doc-values-range-query-tests-FIXED.md) — all three classes' original 600s suite-timeout HANG (collected 2026-07-08, `LRUQueryCache`'s internal `ReentrantReadWriteLock`/`ReentrantLock` write-lock contention) had turned into a 100% deterministic JIT SIGSEGV on a binary built strictly after that collection: `ReentrantLock.unlock()`'s single getfield (`this.sync`) was compiled as a 32-bit sign-extending `movsxd` load instead of a 64-bit `mov`, corrupting the loaded receiver before dispatching `sync.release(1)`. Root cause: `compact_field_slot(...).unwrap_or((0, false))` in three `field_resolver` closures (`vm/src/runtime/interpreter.rs`) silently fabricated "offset 0, not a reference" whenever a field's declaring class had no registered compact layout, and `jit/src/lib.rs`'s scan step trusted that fabrication unconditionally, steering the getfield/putfield inline codegen to treat a genuine reference field as a primitive. Independently root-caused and fixed by a concurrent session via a third, unrelated symptom (WildFly Host Controller invoke-IC SIGSEGV) — see this file's own `7f96c26c`/`be710234`/`93b33576` entries. Verified 2026-07-10 on a clean checkout of dev tip `e768916a` (no local changes needed): all three classes pass cleanly (`OK (6 tests)`) under fully default JIT settings.
-- OPEN, redescribed: [`elasticsearch-suite/ES-HANG-20260709-server-org-elasticsearch-lucene-queries-inetaddressrandombinarydocvaluesrangequerytests-51a9c7ea93.md`](elasticsearch-suite/ES-HANG-20260709-server-org-elasticsearch-lucene-queries-inetaddressrandombinarydocvaluesrangequerytests-51a9c7ea93.md) — the same SIGSEGV/hang mechanism is gone here too, but the class now runs to completion and hits a **different, genuine correctness bug**: a `CONTAINS`-query false negative for a query range spanning an IPv4 min and IPv6 max against a stored box, reproduced twice with different data (`testRandomTiny` and `testRandomMedium`, same seed, different runs). Not yet root-caused; likely a `RangeType.IP` encode/compare asymmetry at the IPv4-mapped boundary. Needs its own investigation.
+- FIXED/RETIRED: [`elasticsearch-suite/ES-HANG-20260709-server-org-elasticsearch-lucene-queries-inetaddressrandombinarydocvaluesrangequerytests-51a9c7ea93-FIXED.md`](../internal/elasticsearch-suite/ES-HANG-20260709-server-org-elasticsearch-lucene-queries-inetaddressrandombinarydocvaluesrangequerytests-51a9c7ea93-FIXED.md) — the same SIGSEGV/hang mechanism was gone here too, but the class ran to completion and hit a **different, genuine correctness bug**: a `CONTAINS`-query false negative for a query range spanning an IPv4 min and IPv6 max against a stored box, whose max always printed with a trailing `/0.0.0.0`. Root-caused 2026-07-11 to two stacked defects in `native-builtins/src/net_phase_e.rs`'s `InetAddress` mirror machinery: (1) its process-global side table was never registered as a GC root (same bug class as `BUG-U`'s stale Locale), so a moving GC relocating a live mirror left it keyed on a vacated slot; (2) the fallback reader never checked the real `Inet6Address` holder6 field, so any miss (or any address built via the un-overridden two-arg `getByAddress(String,byte[])`) reported `"0.0.0.0"` instead of the real value. Fixed by adding `gc_scan_inet_addr_roots`/`gc_update_inet_addr_refs` (mirroring the existing Locale root-scan pattern) and fixing the holder6 fallback. Verified: 6/7 pre-fix runs reproduced the exact signature, 0/9 post-fix runs did. Two unrelated, rare, pre-existing failures surfaced during verification (a `java/util/Set` GC-staleness NPE; a `ClassCastException` since confirmed as a third real-world corroboration of the already-tracked monitor-vs-evacuation race, see `docs/internal/gc-audit-2026-07-10-open-findings.md` finding 1(b)) — neither blocks this retirement.
 
 ## 2026-07-10 AccessLogValve/RewriteValve doc RETIRED (5/6 causes fixed; 6th is the already-tracked register-invisible-JIT-root family, not a new bug)
 

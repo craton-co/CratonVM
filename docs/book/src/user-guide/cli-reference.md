@@ -129,15 +129,49 @@ See [Containers & cgroups](containers.md).
 ## GPU offload (only with `--features gpu`)
 
 These flags exist only in a build compiled with GPU support (see [GPU
-Offload](../gpu/overview.md)):
+Offload](../gpu/overview.md)). `--features gpu` alone gets you the flags
+and a stub CUDA backend that always reports "no driver" (device probing
+never succeeds); add `--features gpu-driver` for the real CUDA Driver API
+bindings (via `cudarc`) that can actually offload work. CUDA-only
+(NVIDIA); Linux and Windows x86_64 — no macOS. Validated on real hardware
+(Windows 11, RTX 2060, sm_75) on 2026-07-11. See
+[`docs/PLATFORMS.md`](../../../PLATFORMS.md) for the platform matrix.
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--gpu` | Enable GPU offload of eligible static methods. | Off |
+| `--gpu` | Enable GPU offload of eligible static methods. If no CUDA driver is found, prints a warning to stderr and self-disables — the run proceeds on the CPU instead of failing. | Off |
 | `--gpu-device <N>` | CUDA device ordinal. | `0` |
 | `--gpu-min-work <N>` | Minimum estimated work before a method is offloaded. | `4096` |
-| `--print-gpu-decisions` | Log one line per offload-analyzer verdict. | Off |
+| `--print-gpu-decisions` | Log one line per offload-analyzer verdict, via `tracing::info!`. | Off |
 | `--gpu-info` | Probe the GPU, print its name/capability/memory, and exit. | — |
+
+`--gpu`'s self-disable happens in `vm-cli/src/main.rs`: when
+`cuda_bridge::probe()` fails, the CLI prints
+`[cratonvm-cli] --gpu requested but no CUDA driver available (...); running
+on CPU` and turns the flag back off for the rest of the run, rather than
+aborting.
+
+### `--print-gpu-decisions` is easy to think is broken — it isn't
+
+`--print-gpu-decisions` only gates *whether* the analyzer-verdict line is
+logged; it does not raise the log level. The line itself is emitted via a
+plain `tracing::info!(...)` call, and CratonVM's default tracing filter is
+`WARN` and above (see `vm-cli/src/main.rs`). That means passing
+`--print-gpu-decisions` by itself produces **no visible output** — you also
+need the ambient log level raised, e.g.:
+
+```text
+RUST_LOG=info cratonvm --gpu --print-gpu-decisions -cp app.jar Main
+```
+
+### GPU-related environment variables
+
+Not wired to a CLI flag, but relevant when running GPU-offloaded code:
+
+| Variable | Effect |
+|---|---|
+| `CRATONVM_GPU_TRACE_BYTES=1` | Logs the cumulative host→device (H2D) byte count after every kernel dispatch — useful for confirming the residency cache and read-only-input suppression are actually avoiding repeat uploads. See the "Phase 10 #2" comments in [`vm/src/runtime/offload.rs`](../../../../vm/src/runtime/offload.rs). |
+| `CRATONVM_GPU_NO_ZEROCOPY` | Set (to any value) to opt out of the zero-copy DMA path that lets CUDA read/write a pinned JVM heap array in place. With it set, every array argument goes through the staged host-buffer copy path instead. Intended for A/B measurement and as a safety fallback. See `zerocopy_enabled()` in [`vm/src/runtime/gpu_marshal.rs`](../../../../vm/src/runtime/gpu_marshal.rs). |
 
 ## System properties & assertions
 

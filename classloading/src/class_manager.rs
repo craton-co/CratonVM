@@ -2682,7 +2682,10 @@ impl ClassManager {
                 // …) reach the class store via `ensure_synthetic_class`, which
                 // registers directly when this load fails — so the CNFE here
                 // does not break them.
-                if is_standard_jdk_namespace(name) && self.has_real_boot_classes() {
+                if is_standard_jdk_namespace(name)
+                    && self.has_real_boot_classes()
+                    && !is_native_backed_jdk_stub(name)
+                {
                     return Err(VmError::ClassFile(ClassFileError::ClassNotFound {
                         class_name: name.to_string(),
                     }));
@@ -2765,14 +2768,6 @@ impl ClassManager {
         }
         // Application last
         if let Ok(bytes) = self.application.find_class_bytes(name) {
-            return Ok((bytes, ClassLoaderId::Application));
-        }
-
-        // ES IMPL-JARS fallback: inner-jar classes stored as directory-prefixed
-        // ZIP entries (IMPL-JARS/<module>/<jar>/<path>.class) in outer module
-        // JARs; the interpreter's class resolution bypasses the ClassLoader
-        // native, so this must live here.
-        if let Some(bytes) = find_in_impl_jars(self.application.class_path(), name) {
             return Ok((bytes, ClassLoaderId::Application));
         }
 
@@ -5411,6 +5406,8 @@ impl ClassManager {
                 | "java/util/concurrent/BlockingQueue"
                 | "java/util/concurrent/BlockingDeque"
                 | "java/util/concurrent/TransferQueue"
+                | "java/lang/ProcessHandle"
+                | "java/lang/ProcessHandle$Info"
         );
         let access_flags = if (name.contains("$") && !is_concrete_dollar_class)
             || name.ends_with("able")
@@ -6747,6 +6744,15 @@ fn is_standard_jdk_namespace(name: &str) -> bool {
         || name.starts_with("sun/")
         || name.starts_with("jdk/")
         || name.starts_with("com/sun/")
+}
+
+/// JDK API types whose behavior CratonVM supplies through native bridges even
+/// when the host JDK image cannot provide their class files.
+fn is_native_backed_jdk_stub(name: &str) -> bool {
+    matches!(
+        name,
+        "java/lang/ProcessHandle" | "java/lang/ProcessHandle$Info"
+    )
 }
 
 /// Non-JDK package prefixes whose classes get a synthetic-stub fallback when
@@ -10150,6 +10156,54 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
             mk("toHandle", "()Ljava/lang/ProcessHandle;"),
         ]);
     }
+    // A missing JDK module entry must not leave SmallRye unable to resolve
+    // these types. Its `Process.<clinit>` declares fields of both interfaces
+    // and immediately calls `ProcessHandle.current().info()`.
+    if name == "java/lang/ProcessHandle" {
+        let mk = |method: &str, descriptor: &str| ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
+            name: cratonvm_types::intern_arc(method),
+            descriptor: cratonvm_types::intern_arc(descriptor),
+            attributes: vec![],
+        };
+        let mk_static = |method: &str, descriptor: &str| ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC
+                | MethodAccessFlags::STATIC
+                | MethodAccessFlags::NATIVE,
+            name: cratonvm_types::intern_arc(method),
+            descriptor: cratonvm_types::intern_arc(descriptor),
+            attributes: vec![],
+        };
+        out.extend([
+            mk_static("current", "()Ljava/lang/ProcessHandle;"),
+            mk("pid", "()J"),
+            mk("isAlive", "()Z"),
+            mk("children", "()Ljava/util/stream/Stream;"),
+            mk("descendants", "()Ljava/util/stream/Stream;"),
+            mk("onExit", "()Ljava/util/concurrent/CompletableFuture;"),
+            mk("parent", "()Ljava/util/Optional;"),
+            mk("supportsNormalTermination", "()Z"),
+            mk("destroy", "()Z"),
+            mk("destroyForcibly", "()Z"),
+            mk("compareTo", "(Ljava/lang/ProcessHandle;)I"),
+            mk("info", "()Ljava/lang/ProcessHandle$Info;"),
+        ]);
+    }
+    if name == "java/lang/ProcessHandle$Info" {
+        let mk = |method: &str, descriptor: &str| ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
+            name: cratonvm_types::intern_arc(method),
+            descriptor: cratonvm_types::intern_arc(descriptor),
+            attributes: vec![],
+        };
+        out.extend([
+            mk("command", "()Ljava/util/Optional;"),
+            mk("arguments", "()Ljava/util/Optional;"),
+            mk("user", "()Ljava/util/Optional;"),
+            mk("startInstant", "()Ljava/util/Optional;"),
+            mk("totalCpuDuration", "()Ljava/util/Optional;"),
+        ]);
+    }
     if name == "java/io/FileDescriptor" {
         out.push(mk_ctor("()V"));
     }
@@ -12437,6 +12491,37 @@ mod tests {
             }),
             "synthetic Thread stub should declare getThreadGroup()"
         );
+    }
+
+    #[test]
+    fn process_handle_native_fallback_has_verifier_visible_callable_shape() {
+        assert!(is_native_backed_jdk_stub("java/lang/ProcessHandle"));
+        assert!(is_native_backed_jdk_stub("java/lang/ProcessHandle$Info"));
+        assert!(!is_native_backed_jdk_stub("java/lang/Runtime"));
+
+        let methods = synthetic_stub_ctor_methods("java/lang/ProcessHandle");
+        for (name, descriptor) in [
+            ("current", "()Ljava/lang/ProcessHandle;"),
+            ("pid", "()J"),
+            ("info", "()Ljava/lang/ProcessHandle$Info;"),
+        ] {
+            assert!(
+                methods
+                    .iter()
+                    .any(|m| &*m.name == name && &*m.descriptor == descriptor),
+                "ProcessHandle fallback must declare {name}{descriptor}",
+            );
+        }
+
+        let mut manager = ClassManager::new(&[], &[], &[]);
+        let handle_id = manager
+            .load_class("java/lang/ProcessHandle")
+            .expect("synthetic ProcessHandle fallback should load");
+        let info_id = manager
+            .load_class("java/lang/ProcessHandle$Info")
+            .expect("synthetic ProcessHandle.Info fallback should load");
+        assert!(manager.get_class(handle_id).unwrap().is_interface());
+        assert!(manager.get_class(info_id).unwrap().is_interface());
     }
 
     /// proxy-real-classfile increment 2 — the synthetic `Proxy$Instance`
