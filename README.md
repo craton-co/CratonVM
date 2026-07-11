@@ -107,6 +107,41 @@ for the full investigation and remaining-work writeup.*
 
 See [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full 26-round JIT optimization journey.
 
+### Benchmark — GPU offload (vs HotSpot C2 & TornadoVM)
+
+CratonVM can transparently offload eligible static methods over primitive
+arrays to an NVIDIA GPU — no annotations, no API, no code changes
+(`cargo build --features gpu-driver`, run with `--gpu`). Measured
+2026-07-11 on a GeForce RTX 2060 (sm_75) against HotSpot JDK 25 (C2) and
+[TornadoVM](https://github.com/beehive-lab/TornadoVM) 4.0.1 (PTX backend,
+`@Parallel`/`@Reduce` + TaskGraph API). All timings are warm and include
+the full per-call H2D + kernel + D2H round-trip; every row's checksum
+matches HotSpot bit-for-bit.
+
+| Benchmark (N = 2²⁴)                              | HotSpot C2 | TornadoVM GPU  | **CratonVM GPU** | vs HotSpot | vs TornadoVM |
+|---------------------------------------------------|------------|----------------|-------------------|------------|--------------|
+| Integer div-chain (48 unvectorizable divs/elem)    | 1,910 ms   | 28 ms          | **9 ms**          | **212x**   | **3.1x**     |
+| 96 multiply-adds/elem (AVX2-vectorized on CPU)     | 8 ms       | 17 ms          | **11 ms**         | 0.7x       | 1.5x         |
+| Dot-product reduction (`int·int` → `long`)         | 7 ms       | unimplemented¹ | **18 ms**         | 0.4x       | n/a¹         |
+
+¹ TornadoVM 4.0.1's PTX backend throws `TornadoInternalError: unimplemented`
+on the equivalent `@Reduce`-over-`LongArray` kernel; CratonVM's transparent
+reduction dispatch handles a shape TornadoVM's own reduction skeleton
+currently can't.
+
+*The div-chain row is the honest "GPU wins big" case: 48 data-dependent
+integer divisions per element that no CPU SIMD unit can vectorize, so the
+GPU wins on raw parallelism. The other two rows are the honest counter-cases
+kept in for the same reason the CPU table above shows CratonVM losing to
+JDK — HotSpot's AVX2 auto-vectorizer (96-MAD) and a PCIe-round-trip-bound
+single-scalar-output kernel (dot-product) are both genuinely hard for any
+GPU dispatch to beat at this size; the GPU still ties or wins overall
+against TornadoVM's own PTX backend on both. Checksums verified identical
+between CratonVM-GPU and HotSpot on every row. Full results — more input
+sizes, `ldc`-constant kernels, cold-start numbers up to N = 2²⁸, sources,
+and methodology — are in "GPU offload benchmarks" further down this file
+and in [docs/gpu/README.md](docs/gpu/README.md).*
+
 ## Quick Start
 
 ```bash
