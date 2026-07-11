@@ -4,6 +4,25 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-11 TestParameterMap `replaceAll()` lock-bypass FIXED/RETIRED — real bug was an unwrapped `Map.Entry` escaping `Collections.unmodifiableMap(...).entrySet()`, not field visibility
+
+The doc's own hypothesis (a plain-`boolean` `ParameterMap.locked` field-visibility
+bug) was wrong. `checkLocked()` correctly saw `locked=true` on every call; the
+actual gap was that CratonVM's synthetic `Collections.unmodifiableMap` wrapper's
+`entrySet()` handed back the backing map's real, mutable `Map.Entry` objects
+unwrapped, so `Map.replaceAll`'s default-method body (`for (Entry e :
+entrySet()) e.setValue(v)`) silently mutated the "locked" map instead of
+throwing `UnsupportedOperationException` — real JDK wraps each entry in
+`Collections$UnmodifiableMap$UnmodifiableEntrySet$UnmodifiableEntry`. Also
+found (and fixed by the same change) a previously-undocumented residual: the
+successful mutation corrupted `tearDown()`'s subsequent value assertions.
+Fixed by adding a dedicated `cratonvm/internal/UnmodifiableEntrySet` +
+`UnmodifiableMapEntry` wrapper pair (`native-collections/src/lib.rs`,
+`native-builtins/src/lib.rs`, `vm/src/vm/vm_init.rs`) so `setValue()` throws.
+`TestParameterMap` 4/4 PASS; no regressions in a 31-test sweep of other
+`Collections.unmodifiable*`/`entrySet()` consumers. See
+[`parametermap-immutability-not-locked-FIXED.md`](../internal/tomcat-08-07/parametermap-immutability-not-locked-FIXED.md).
+
 ## 2026-07-11 WildFly stale-ObjectRef sweep: systematic static-analysis pass finds+fixes ~37 more sites across 6 files; harness verification blocked by unrelated environment gap
 
 Follow-up session 3 on [`wildfly-parallel-boot-stale-objectref-residual.md`](wildfly-parallel-boot-stale-objectref-residual.md),
