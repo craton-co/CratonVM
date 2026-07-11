@@ -1024,11 +1024,14 @@ pub(crate) fn monitor_enter_blocking(
     let mut ctx = NativeContextImpl { shared, thread };
     let pin_base = ctx.thread.native_pin_roots.len();
     ctx.thread.native_pin_roots.push(obj);
-    ctx.deposit_root_snapshot();
     // CRIT (TLAB UAF) — retire the TLAB before blocking on a contended
     // `synchronized` acquire (see monitor_wait): a STW GC can grow/realloc the
     // young arena while we are parked, freeing the buffer the TLAB points into.
+    // Finding 1(a): retire BEFORE the deposit — `deposit_root_snapshot`
+    // raises `in_blocked_region`, after which a pause may collect concurrently
+    // with this thread; the retire's gap-filler write must not race that walk.
     ctx.thread.tlab.retire();
+    ctx.deposit_root_snapshot();
     // Gated diagnostic only (CRATONVM_DBG_MONENTER, default OFF): deposit this
     // thread's frame snapshot so the contended-`enter` poll loop can emit it
     // if a watchdog stack-dump fires while we are blocked acquiring this
@@ -1043,7 +1046,10 @@ pub(crate) fn monitor_enter_blocking(
         if blk.pre_stw {
             // A STW was already in progress when we became blocked —
             // arrive at the barrier so its `wait_for_all` completes.
-            let _ = shared.gc_barrier.arrive_and_wait(tid);
+            // Census-aware (finding 1(a)): if the pause's census ran after
+            // our deposit raised `in_blocked_region`, we are EXCLUDED and
+            // must not fill a counted mutator's quota slot.
+            let _ = shared.gc_barrier.arrive_and_wait_auto(tid);
         }
         m.block_enter(tid);
         drop(blk);
@@ -1092,14 +1098,16 @@ pub(crate) fn monitor_enter_synchronized_method(
 
     let tid = thread.thread_id;
     let mut ctx = NativeContextImpl { shared, thread };
-    ctx.deposit_root_snapshot();
     // A parked contender must not retain a TLAB into a young arena that a
     // concurrent STW can grow/reallocate while this thread is blocked.
+    // Finding 1(a): retire BEFORE the deposit (see monitor_enter_blocking).
     ctx.thread.tlab.retire();
+    ctx.deposit_root_snapshot();
     {
         let blk = ctx.shared.gc_barrier.enter_blocked();
         if blk.pre_stw {
-            let _ = ctx.shared.gc_barrier.arrive_and_wait(tid);
+            // Census-aware (finding 1(a)) — see monitor_enter_blocking.
+            let _ = ctx.shared.gc_barrier.arrive_and_wait_auto(tid);
         }
         monitor.block_enter(tid);
         drop(blk);
@@ -1508,6 +1516,22 @@ impl<'a> NativeContextImpl<'a> {
     /// roots without heap validation (its file is restricted from edits), and
     /// the resulting bogus addresses crash the GC at the next mark/move.
     pub(crate) fn deposit_root_snapshot(&self) {
+        self.deposit_root_snapshot_inner(true);
+    }
+
+    /// Finding 1(c) — snapshot refresh WITHOUT raising `in_blocked_region`.
+    ///
+    /// Used by the wake path (`check_post_block_gc_refs`) AFTER
+    /// `GcBarrier::leave_blocked_region_flagged` has atomically cleared the
+    /// flag: the thread is a counted mutator again, and transiently re-raising
+    /// the flag here would re-open the excluded-while-running window (a pause
+    /// whose census lands on the transient flag excludes a thread that then
+    /// resumes bytecode mid-collection).
+    pub(crate) fn deposit_root_snapshot_no_flag(&self) {
+        self.deposit_root_snapshot_inner(false);
+    }
+
+    fn deposit_root_snapshot_inner(&self, raise_blocked_flag: bool) {
         // fork6 GC_STRESS fix — flush this thread's SATB buffer before it
         // blocks. A concurrent old-gen remark drains only the GLOBAL queue;
         // a thread that logged pre-barrier entries (overwritten refs during
@@ -1707,10 +1731,14 @@ impl<'a> NativeContextImpl<'a> {
         // point on, every GC initiator maintains this thread's roots via
         // `fold_pointer_map_into_blocked` (snapshot remap + frame-fixup
         // composition) until `check_post_block_gc` clears the flag on wake.
-        self.thread
-            .gc_block_state
-            .in_blocked_region
-            .store(true, std::sync::atomic::Ordering::Release);
+        // (Skipped for the wake path's refresh — see
+        // `deposit_root_snapshot_no_flag`.)
+        if raise_blocked_flag {
+            self.thread
+                .gc_block_state
+                .in_blocked_region
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Re-sync this thread's GC state after waking from a blocking region
@@ -1747,17 +1775,30 @@ impl<'a> NativeContextImpl<'a> {
     /// `NativeContext::end_blocking_region_refs`).
     fn check_post_block_gc_refs(&mut self, extra_refs: &mut [Value]) {
         use crate::memory::gc::update_value_ref;
-        use std::sync::atomic::Ordering;
 
-        // Drain any in-flight stop-the-world pause(s). We may have woken
-        // mid-collection; arrive so the initiator's `wait_for_all` can
-        // complete, then re-check (another GC may start immediately).
-        while self.shared.gc_barrier.stw_requested.load(Ordering::Acquire) {
-            let _ = self
-                .shared
-                .gc_barrier
-                .arrive_and_wait(self.thread.thread_id);
-        }
+        // Finding 1(a/c) — atomically drain every in-flight pause AND clear
+        // `in_blocked_region` under one barrier-lock hold. Ordering is the
+        // load-bearing part:
+        //  * Pauses active while our flag is up EXCLUDED us (identity census)
+        //    — we wait them out WITHOUT filling anyone's quota slot (the old
+        //    participating `arrive_and_wait` drain here inflated `arrived`
+        //    and released `wait_for_all` while a counted mutator still ran).
+        //    Their pointer maps reach us via `fold_pointer_map_into_blocked`
+        //    (flag still up ⇒ every such fold covers us, and each fold
+        //    completes before its pause's generation advances).
+        //  * The flag-clear lands under the same lock hold that confirmed no
+        //    pause is active, so no pause can start-and-complete between the
+        //    drain and the clear (the old plain `store(false)` left exactly
+        //    that window: an excluded-but-running thread mutating the heap
+        //    mid-collection — finding 1's corruption family).
+        //  * Only AFTER the clear do we take + apply the fixup below: any
+        //    newer pause counts us in `expected` and cannot complete (or
+        //    fold) until our next safepoint arrival, so the application can
+        //    never race a fold or an evacuation.
+        self.shared.gc_barrier.leave_blocked_region_flagged(
+            self.thread.thread_id,
+            &self.thread.gc_block_state.in_blocked_region,
+        );
 
         // Apply the composed fixup accumulated for every GC we slept through.
         let fixup = {
@@ -1848,13 +1889,10 @@ impl<'a> NativeContextImpl<'a> {
         // Refresh (don't clear) the snapshot: we are runnable again but may
         // not reach a safepoint before the next GC scans roots; an empty
         // snapshot would hide every object reachable only from our frames.
-        // NOTE: `deposit_root_snapshot` re-sets `in_blocked_region`; clear
-        // it right after — we are leaving the blocked region.
-        self.deposit_root_snapshot();
-        self.thread
-            .gc_block_state
-            .in_blocked_region
-            .store(false, Ordering::Release);
+        // Finding 1(c): the no-flag variant — `in_blocked_region` was already
+        // cleared atomically above; transiently re-raising it here would
+        // re-open the excluded-while-running census window.
+        self.deposit_root_snapshot_no_flag();
     }
 
     /// T19.K1 вЂ” Read the daemon flag from a Java `Thread` object.
@@ -2323,7 +2361,8 @@ impl NativeThreadBlocker for VmNativeThreadBlocker {
             .mark_native_thread_blocked(self.thread_id);
         let pre_stw = self.shared.gc_barrier.mark_blocked_region_enter();
         if pre_stw {
-            let _ = self.shared.gc_barrier.arrive_and_wait(self.thread_id);
+            // Census-aware (finding 1(a)) — see monitor_enter_blocking.
+            let _ = self.shared.gc_barrier.arrive_and_wait_auto(self.thread_id);
         }
     }
 
@@ -4259,6 +4298,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 crate::error::VmError::Runtime(crate::error::RuntimeError::InterruptedException),
             ));
         }
+        // Finding 1(a): retire the TLAB BEFORE the deposit raises
+        // `in_blocked_region` — the retire's gap-filler write is a heap write
+        // and must not race a pause that the raised flag lets collect
+        // concurrently with us. (The retire used to sit after the deposit,
+        // just before `enter_blocked`.)
+        self.thread.tlab.retire();
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
         // KC16-watchdog: stash a snapshot of the current frame chain in a
@@ -4275,14 +4320,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // leak. The guard is dropped immediately after the wait so a
         // *subsequent* STW correctly waits for this now-running thread.
         //
-        // CRIT (TLAB UAF) — retire the TLAB before going GC-blocked, while the
-        // young arena is still valid. A STW moving GC on another thread can
-        // grow() (realloc) the young arena while we are parked here, freeing the
-        // old backing buffer; a retained TLAB into it would dangle and the first
-        // post-wait fast-path bump would SIGSEGV in init_object_header. Object
-        // .wait/Condition.await/blocking-queue take all funnel through here, so
+        // CRIT (TLAB UAF) — the TLAB was retired above, BEFORE the deposit,
+        // while the young arena was still valid (finding 1(a) ordering). A
+        // STW moving GC on another thread can grow() (realloc) the young
+        // arena while we are parked here, freeing the old backing buffer; a
+        // retained TLAB into it would dangle and the first post-wait
+        // fast-path bump would SIGSEGV in init_object_header. Object.wait /
+        // Condition.await / blocking-queue take all funnel through here, so
         // this is the dominant blocking path under concurrency.
-        self.thread.tlab.retire();
         let was_interrupted = {
             let blk = self.shared.gc_barrier.enter_blocked();
             if blk.pre_stw {
@@ -4304,7 +4349,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 let pm = self
                     .shared
                     .gc_barrier
-                    .arrive_and_wait(self.thread.thread_id);
+                    .arrive_and_wait_auto(self.thread.thread_id);
                 if let Some(&new) = pm.get(&(obj.as_ptr() as usize)) {
                     // SAFETY: `new` is the relocated header address from the GC
                     // pointer map for the object we hold a live reference to.
@@ -4319,11 +4364,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             );
             drop(blk);
             r
-        }?;
+        };
         crate::vm::vm_init::clear_wait_site_snapshot();
         let wait_dur = wait_start.elapsed();
-        // Check if GC happened while we were blocked
+        // Check if GC happened while we were blocked. Finding 1(a) hygiene:
+        // run this BEFORE propagating a wait() error — the old `}?;` early
+        // return skipped it, leaving `in_blocked_region` raised on a RUNNING
+        // thread (deposit set it; nothing on the error path cleared it), so
+        // every later census permanently excluded the thread and a moving
+        // collection could run concurrently with its bytecode.
         self.check_post_block_gc();
+        let was_interrupted = was_interrupted?;
         // Emit JFR monitor wait event
         {
             let now_ns = std::time::SystemTime::now()
@@ -4880,7 +4931,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     if contended {
                         let blk = shared_arc.gc_barrier.enter_blocked();
                         if blk.pre_stw {
-                            let _ = shared_arc.gc_barrier.arrive_and_wait(tid);
+                            // Census-aware (finding 1(a)).
+                            let _ = shared_arc.gc_barrier.arrive_and_wait_auto(tid);
                         }
                         monitor.block_enter(tid);
                         drop(blk);
@@ -4916,7 +4968,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // still included in `threads_blocked`.
             let term_blk = shared_arc.gc_barrier.enter_blocked();
             if term_blk.pre_stw {
-                let _ = shared_arc.gc_barrier.arrive_and_wait(tid);
+                // Census-aware (finding 1(a)).
+                let _ = shared_arc.gc_barrier.arrive_and_wait_auto(tid);
             }
             term_blk.finish_after(|| {
                 // BUG-03 — stop publishing this worker's TLAB address before
@@ -4956,21 +5009,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         let Some(tid) = resolve_thread_id_from_thread_obj(self.shared, thread_obj) else {
             return Ok(None);
         };
-        // Deposit root snapshot before blocking so GC can scan this thread
-        self.deposit_root_snapshot();
         // T19.H1 — mark GC-blocked across the join so a stop-the-world
         // GC excludes this thread from `wait_for_all` (it is parked in
         // `JoinHandle::join` and cannot reach an interpreter safepoint).
         // CRIT (TLAB UAF) — retire the TLAB before blocking (see monitor_wait):
         // a STW GC can grow/realloc the young arena while we are joined.
+        // Finding 1(a): retire BEFORE the deposit raises `in_blocked_region`
+        // (the gap-filler write must not race a concurrent collection).
         self.thread.tlab.retire();
+        // Deposit root snapshot before blocking so GC can scan this thread
+        self.deposit_root_snapshot();
         {
             let blk = self.shared.gc_barrier.enter_blocked();
             if blk.pre_stw {
+                // Census-aware (finding 1(a)).
                 let _ = self
                     .shared
                     .gc_barrier
-                    .arrive_and_wait(self.thread.thread_id);
+                    .arrive_and_wait_auto(self.thread.thread_id);
             }
             self.shared.thread_registry.join(tid);
             drop(blk);
@@ -5548,10 +5604,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if self.shared.gc_barrier.mark_blocked_region_enter() {
             // A STW was already in progress — arrive at the barrier so
             // the initiator's `wait_for_all` can complete.
+            // Census-aware (finding 1(a)).
             let _ = self
                 .shared
                 .gc_barrier
-                .arrive_and_wait(self.thread.thread_id);
+                .arrive_and_wait_auto(self.thread.thread_id);
         }
     }
 
@@ -5945,12 +6002,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 blocker_pin = Some(self.pin_native_root(blocker));
             }
         }
-        // Deposit root snapshot before blocking so GC can scan this thread
-        self.deposit_root_snapshot();
         // CRIT (TLAB UAF) — retire the TLAB before parking (see monitor_wait):
         // a STW GC can grow/realloc the young arena while this thread is parked,
         // freeing the buffer the TLAB points into.
+        // Finding 1(a): retire BEFORE the deposit raises `in_blocked_region`
+        // (the gap-filler write must not race a concurrent collection).
         self.thread.tlab.retire();
+        // Deposit root snapshot before blocking so GC can scan this thread
+        self.deposit_root_snapshot();
 
         // NEW-15.4: virtual-thread aware park.
         // Non-pinned VTs release their carrier permit so another VT can run.
@@ -5994,10 +6053,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         {
             let blk = self.shared.gc_barrier.enter_blocked();
             if blk.pre_stw {
+                // Census-aware (finding 1(a)).
                 let _ = self
                     .shared
                     .gc_barrier
-                    .arrive_and_wait(self.thread.thread_id);
+                    .arrive_and_wait_auto(self.thread.thread_id);
             }
             self.thread
                 .park_state

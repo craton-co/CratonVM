@@ -66,6 +66,18 @@ struct GcBarrierInner {
     arrived: u32,
     /// Pointer map from the last GC, shared with threads for frame updates.
     pointer_map: HashMap<usize, usize>,
+    /// GC-audit finding 1(a) — identities (`ThreadId.0`) of the threads the
+    /// CURRENT pause's census EXCLUDED from `expected` because their
+    /// `in_blocked_region` flag was visible at request time. Their arrivals
+    /// must NOT count toward the quota: an excluded arrival otherwise fills a
+    /// counted running mutator's slot and `wait_for_all()` releases while
+    /// that mutator still mutates — the collector then relocates objects
+    /// under live frames (the MTChurn lost-increment / stale-monitor family).
+    /// Populated atomically with the census under the barrier transition
+    /// lock; cleared by `complete_gc`. Empty for legacy (anonymous-count)
+    /// requests, whose blocked exclusions carry no identities — production GC
+    /// initiators all use the identity-carrying census.
+    excluded_blocked: rustc_hash::FxHashSet<u64>,
 }
 
 impl GcBarrier {
@@ -80,6 +92,7 @@ impl GcBarrier {
                 expected: 0,
                 arrived: 0,
                 pointer_map: HashMap::new(),
+                excluded_blocked: rustc_hash::FxHashSet::default(),
             }),
             all_arrived: Condvar::new(),
             gc_complete: Condvar::new(),
@@ -116,7 +129,7 @@ impl GcBarrier {
     {
         let mut inner = self.inner.lock();
         let alive_count = alive_count();
-        self.request_stw_counted_locked(&mut inner, initiator, alive_count, None)
+        self.request_stw_counted_locked(&mut inner, initiator, alive_count, None, None)
     }
 
     /// Request a stop-the-world pause with both the alive-thread count and the
@@ -129,17 +142,23 @@ impl GcBarrier {
     /// still useful for legacy callers and diagnostics, but production GC must
     /// key the expected mutator quota off the same registry state that owns the
     /// blocked root/fixup publication.
+    /// The census closure returns `(alive, live_blocked, blocked_tids)`;
+    /// `blocked_tids` are the identities of exactly the threads counted in
+    /// `live_blocked` — the barrier remembers them for the pause's lifetime so
+    /// their arrivals can be refused quota participation (finding 1(a); see
+    /// [`Self::arrive_and_wait_auto`]).
     pub fn request_stw_counted_with_live_blocked<F>(&self, initiator: ThreadId, counts: F) -> bool
     where
-        F: FnOnce() -> (u32, u32),
+        F: FnOnce() -> (u32, u32, Vec<u64>),
     {
         let mut inner = self.inner.lock();
-        let (alive_count, live_blocked_count) = counts();
+        let (alive_count, live_blocked_count, blocked_tids) = counts();
         self.request_stw_counted_locked(
             &mut inner,
             initiator,
             alive_count,
             Some(live_blocked_count),
+            Some(blocked_tids),
         )
     }
 
@@ -149,11 +168,18 @@ impl GcBarrier {
         initiator: ThreadId,
         alive_count: u32,
         live_blocked_count: Option<u32>,
+        excluded_blocked: Option<Vec<u64>>,
     ) -> bool {
         if self.stw_requested.load(Ordering::Acquire) {
             return false;
         }
         inner.initiator = Some(initiator);
+        // Finding 1(a): remember WHICH threads this pause excluded as blocked,
+        // atomically with the counts (same lock hold). Legacy anonymous-count
+        // requests clear the set — their arrivals keep historical behaviour.
+        inner.excluded_blocked = excluded_blocked
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default();
         // T19.H1: exclude threads currently parked in a blocking native
         // from the set we wait for. They are GC-safe (roots already
         // deposited via `deposit_root_snapshot`) and execute no code, so
@@ -354,6 +380,74 @@ impl GcBarrier {
         self.threads_blocked.load(Ordering::Acquire)
     }
 
+    /// Finding 1(a/c) — atomically leave the blocked-region FLAG state:
+    /// drain every active stop-the-world pause, then clear the caller's
+    /// `in_blocked_region` flag under the SAME barrier-lock hold that
+    /// confirmed no pause is active.
+    ///
+    /// Why this must be one atomic step: every pause requested while the flag
+    /// was up EXCLUDED the caller from `expected` (identity census), so the
+    /// caller may not resume bytecode while such a pause is mid-collection —
+    /// but with a plain `store(false)` after a drain loop, a pause requested
+    /// in the window between the drain's last check and the store both
+    /// excludes the thread AND lets it run: the collector relocates objects
+    /// under its live frames (finding 1's corruption family). Clearing under
+    /// the lock closes the window exactly: a census serialized before the
+    /// clear sees the flag up (excluded — we wait it out below), one
+    /// serialized after sees it down (counted — the pause waits for our next
+    /// safepoint arrival, so the caller's post-clear fixup application can
+    /// never race a fold).
+    ///
+    /// While a pause is active we arrive with the census-aware (`auto`)
+    /// participation rule: identity-census pauses excluded us (flag up) — we
+    /// only wait; a legacy anonymous-count pause counted us (our
+    /// `threads_blocked` slot was already released by the guard drop) — we
+    /// arrive exactly once for it. Waiting is generation-keyed per pause
+    /// (see `wait_out_pause_locked`'s rationale), and the re-check after each
+    /// pause happens under the reacquired lock, so back-to-back pauses are
+    /// each classified exactly.
+    ///
+    /// Starvation note: under continuous GC pressure this can wait out
+    /// several consecutive pauses (each finite), but cannot livelock — a new
+    /// pause can only be requested by a mutator holding this same lock, and
+    /// parking_lot's eventual fairness bounds how long a woken waiter can be
+    /// barged past. The parked WIP variant additionally applied the blocked
+    /// fixup BEFORE this synchronization (racing the next pause's fold),
+    /// which is the corruption this ordering eliminates.
+    pub fn leave_blocked_region_flagged(
+        &self,
+        tid: ThreadId,
+        flag: &std::sync::atomic::AtomicBool,
+    ) {
+        let mut inner = self.inner.lock();
+        loop {
+            if !self.stw_requested.load(Ordering::Acquire) || inner.initiator == Some(tid) {
+                flag.store(false, Ordering::Release);
+                return;
+            }
+            // A pause is active. Arrive for it exactly once if its census
+            // counted us (auto rule); either way wait its generation out.
+            let participating = !inner.excluded_blocked.contains(&tid.0);
+            let arrival_gen = self.gc_generation.load(Ordering::Acquire);
+            if participating {
+                inner.arrived += 1;
+                if std::env::var_os("CRATONVM_DBG_STW_CENSUS").is_some() {
+                    eprintln!(
+                        "[stw-arrive] tid={} gen={} arrived={} expected={} (leave-blocked drain)",
+                        tid.0, arrival_gen, inner.arrived, inner.expected
+                    );
+                }
+                if inner.arrived >= inner.expected {
+                    self.all_arrived.notify_all();
+                }
+            }
+            while self.gc_generation.load(Ordering::Acquire) == arrival_gen {
+                self.gc_complete.wait(&mut inner);
+            }
+            // Lock reacquired by the condvar — reclassify from the top.
+        }
+    }
+
     /// Wait for all expected threads to arrive at the barrier.
     /// Called by the GC initiator after `request_stw`.
     pub fn wait_for_all(&self) {
@@ -409,6 +503,7 @@ impl GcBarrier {
         let mut inner = self.inner.lock();
         inner.pointer_map = pointer_map;
         inner.initiator = None;
+        inner.excluded_blocked.clear();
         self.gc_generation.fetch_add(1, Ordering::Release);
         self.stw_requested.store(false, Ordering::Release);
         self.gc_complete.notify_all();
@@ -429,7 +524,7 @@ impl GcBarrier {
     /// `arrived >= expected` quota early and release `wait_for_all` while a
     /// real mutator is still running.
     pub fn arrive_and_wait(&self, tid: ThreadId) -> HashMap<usize, usize> {
-        self.arrive_and_wait_inner(tid, true)
+        self.arrive_and_wait_inner(tid, Some(true))
     }
 
     /// Like [`arrive_and_wait`], but for a thread that is **excluded** from
@@ -445,15 +540,43 @@ impl GcBarrier {
     /// initiator's `wait_for_all` early and letting GC run under a live
     /// mutator.
     pub fn arrive_and_wait_excluded(&self, tid: ThreadId) -> HashMap<usize, usize> {
-        self.arrive_and_wait_inner(tid, false)
+        self.arrive_and_wait_inner(tid, Some(false))
     }
 
-    /// Shared core for [`arrive_and_wait`] / [`arrive_and_wait_excluded`].
+    /// Finding 1(a) — census-aware arrival: participate in the quota UNLESS
+    /// the current pause's census excluded this thread as blocked (its
+    /// `in_blocked_region` flag was visible at request time).
+    ///
+    /// Use this from every wake/entry path of a thread that MAY have been
+    /// flagged blocked when the pause was requested: the `enter_blocked`
+    /// `pre_stw` arms (the flag goes up at `deposit_root_snapshot`, BEFORE
+    /// `enter_blocked` samples `pre_stw`, so a census in that window excludes
+    /// the thread even though `pre_stw` reads true), the blocked-wake drain,
+    /// and the safepoint poll. A participating arrival from an excluded
+    /// thread fills a counted mutator's quota slot and releases
+    /// `wait_for_all` while that mutator still runs — the collector then
+    /// relocates objects under live mutation.
+    ///
+    /// The decision is made under the same lock the census filled the set
+    /// with, so it is exact per pause. Excluded callers still wait the pause
+    /// out and still receive the pointer map.
+    pub fn arrive_and_wait_auto(&self, tid: ThreadId) -> HashMap<usize, usize> {
+        self.arrive_and_wait_inner(tid, None)
+    }
+
+    /// Shared core for [`arrive_and_wait`] / [`arrive_and_wait_excluded`] /
+    /// [`arrive_and_wait_auto`].
     ///
     /// `participating` selects whether this caller counts toward the
-    /// barrier's `arrived` quota. Non-participating (excluded) callers only
-    /// wait for GC to complete and never signal `all_arrived`.
-    fn arrive_and_wait_inner(&self, tid: ThreadId, participating: bool) -> HashMap<usize, usize> {
+    /// barrier's `arrived` quota (`None` = decide from the current pause's
+    /// excluded set, under the same lock the census filled it).
+    /// Non-participating (excluded) callers only wait for GC to complete and
+    /// never signal `all_arrived`.
+    fn arrive_and_wait_inner(
+        &self,
+        tid: ThreadId,
+        participating: Option<bool>,
+    ) -> HashMap<usize, usize> {
         let mut inner = self.inner.lock();
         // If this is the initiator or STW is not active, return immediately
         if !self.stw_requested.load(Ordering::Acquire) || inner.initiator == Some(tid) {
@@ -475,6 +598,10 @@ impl GcBarrier {
         // safepoint. (Reproduces with 6 threads each looping `System.gc()` —
         // scratch_churn/Churn.java.)
         let arrival_gen = self.gc_generation.load(Ordering::Acquire);
+        // `None` (auto) = decide from the pause's excluded set, under the
+        // same lock `request_stw_counted_locked` filled it.
+        let participating =
+            participating.unwrap_or_else(|| !inner.excluded_blocked.contains(&tid.0));
         // Signal arrival — but only for threads the initiator is actually
         // waiting for. An excluded (blocked) thread that wakes mid-STW must
         // not inflate `arrived`: it was never in `expected`, so counting it
@@ -547,7 +674,7 @@ impl GcBarrier {
         work: F,
     ) -> bool
     where
-        C: FnOnce() -> (u32, u32),
+        C: FnOnce() -> (u32, u32, Vec<u64>),
         F: FnOnce(),
     {
         if !self.request_stw_counted_with_live_blocked(initiator, counts) {
@@ -848,7 +975,7 @@ mod tests {
         // for the one live peer.
         barrier.threads_blocked.store(1, Ordering::Release);
 
-        assert!(barrier.request_stw_counted_with_live_blocked(ThreadId(0), || (2, 0)));
+        assert!(barrier.request_stw_counted_with_live_blocked(ThreadId(0), || (2, 0, Vec::new())));
         {
             let inner = barrier.inner.lock();
             assert_eq!(inner.expected, 1);
@@ -865,11 +992,99 @@ mod tests {
         // counter still reads zero.
         barrier.threads_blocked.store(0, Ordering::Release);
 
-        assert!(barrier.request_stw_counted_with_live_blocked(ThreadId(0), || (4, 2)));
+        assert!(
+            barrier.request_stw_counted_with_live_blocked(ThreadId(0), || (4, 2, vec![2, 3]))
+        );
         {
             let inner = barrier.inner.lock();
             assert_eq!(inner.expected, 1);
         }
         barrier.complete_gc(HashMap::new());
+    }
+
+    /// Finding 1(a) — an `arrive_and_wait_auto` call from a thread the
+    /// pause's identity census EXCLUDED must not count toward the quota,
+    /// while the same call from a counted thread must satisfy it.
+    #[test]
+    fn auto_arrival_respects_census_exclusion() {
+        let barrier = Arc::new(GcBarrier::new());
+        // 3 alive: initiator 0, counted mutator 1, blocked (excluded) 2.
+        assert!(
+            barrier.request_stw_counted_with_live_blocked(ThreadId(0), || (3, 1, vec![2]))
+        );
+        {
+            let inner = barrier.inner.lock();
+            assert_eq!(inner.expected, 1);
+        }
+
+        // Excluded thread 2 wakes mid-pause and drains via auto — must NOT
+        // fill the quota.
+        let b = barrier.clone();
+        let hb = std::thread::spawn(move || b.arrive_and_wait_auto(ThreadId(2)));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            barrier.pending_count(),
+            1,
+            "excluded auto arrival must not be counted toward arrived",
+        );
+
+        // Counted mutator 1 arrives via auto — quota satisfied.
+        let m = barrier.clone();
+        let hm = std::thread::spawn(move || m.arrive_and_wait_auto(ThreadId(1)));
+        barrier.wait_for_all();
+        assert_eq!(barrier.pending_count(), 0);
+
+        barrier.complete_gc(HashMap::new());
+        let _ = hm.join();
+        let _ = hb.join();
+    }
+
+    /// Finding 1(c) — `leave_blocked_region_flagged` must not clear the
+    /// caller's `in_blocked_region` flag while a pause that excluded the
+    /// caller is still active; the clear lands only once no pause is active,
+    /// with no start-and-complete window in between.
+    #[test]
+    fn leave_blocked_region_flagged_waits_out_active_pause() {
+        use std::sync::atomic::AtomicBool;
+
+        let barrier = Arc::new(GcBarrier::new());
+        let flag = Arc::new(AtomicBool::new(true));
+
+        // Pause active; thread 2 is excluded by the identity census.
+        assert!(
+            barrier.request_stw_counted_with_live_blocked(ThreadId(0), || (2, 1, vec![2]))
+        );
+
+        let b = barrier.clone();
+        let f = flag.clone();
+        let h = std::thread::spawn(move || b.leave_blocked_region_flagged(ThreadId(2), &f));
+
+        // While the pause is active the flag must stay up (the thread is
+        // waiting the pause out, not resuming).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            flag.load(Ordering::Acquire),
+            "flag must not clear while an excluding pause is active",
+        );
+        // The excluded leave must not have satisfied any quota either.
+        assert_eq!(barrier.pending_count(), 0, "expected was 0 (only initiator + excluded)");
+
+        barrier.complete_gc(HashMap::new());
+        h.join().unwrap();
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "flag clears once no pause is active",
+        );
+    }
+
+    /// `leave_blocked_region_flagged` with no active pause clears the flag
+    /// immediately and never blocks.
+    #[test]
+    fn leave_blocked_region_flagged_immediate_when_idle() {
+        use std::sync::atomic::AtomicBool;
+        let barrier = GcBarrier::new();
+        let flag = AtomicBool::new(true);
+        barrier.leave_blocked_region_flagged(ThreadId(7), &flag);
+        assert!(!flag.load(Ordering::Acquire));
     }
 }

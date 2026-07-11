@@ -52,9 +52,132 @@ receiver bails to the full-barrier helper there (the GC_FLAG_OLD_GEN
 moving-young-coverage check are ported to Linux
 (`pthread_getattr_np`-based stack-high, memoized per thread).
 
-The items below are REAL and still OPEN. Severity ordered.
+Per-item status as of 2026-07-11: finding 1 FIXED (status block inside);
+finding 2 FIXED (earlier); the three Misc items remain OPEN but are inert by
+default (details in §3). Severity ordered.
 
-## 1. STW/monitor race family: GC and monitors vs excluded threads (probe-confirmed; partially root-caused)
+## 1. STW/monitor race family: GC and monitors vs excluded threads — FIXED 2026-07-11 (branch `fix/gc-finding1-stw-monitor-20260711`), see status block below
+
+**STATUS UPDATE (2026-07-11, dedicated fix effort):**
+
+**(a) Barrier quota race — FIXED**, via a from-scratch redesign, NOT the
+parked `wip/gc-stw-quota-race-20260710` (which had two fatal flaws its own
+validation caught: a starvation-prone `while stw_requested` flag-clear loop
+under continuous pause pressure, and — the subtle one — it applied the
+composed blocked-fixup to the frames BEFORE the synchronized flag-clear, so
+a pause starting mid-application could move objects again and its fold was
+keyed against slots the thread was concurrently rewriting: frames resumed
+one pause stale, which is the `scan_and_evacuate_refs` SEGV it kept hitting).
+The landed design:
+- the census (`alive_count_blocked_and_os_tids`) returns the blocked
+  threads' IDENTITIES, stored in `GcBarrierInner::excluded_blocked`
+  atomically with `expected` under the barrier transition lock;
+- `arrive_and_wait_auto` — participation decided per pause from that set,
+  used at every `enter_blocked` `pre_stw` arm, the safepoint poll, and the
+  jni/vm_init/vm_util blocked sites (an excluded arrival can no longer fill
+  a counted mutator's quota slot);
+- `GcBarrier::leave_blocked_region_flagged` — the wake path's drain and the
+  `in_blocked_region` clear are ONE atomic step under the barrier lock
+  (waits out each active pause generation-keyed, arrives auto exactly-once
+  per pause that counted it, clears the flag only under a lock hold that
+  confirmed no pause is active). Only THEN does `check_post_block_gc_refs`
+  take + apply the fixup: any newer pause counts the thread and cannot
+  complete (or fold) until its next safepoint arrival — the fold/fixup race
+  is structurally gone;
+- `deposit_root_snapshot_no_flag` for the wake-path snapshot refresh (the
+  old tail transiently re-raised the flag and then plain-stored it false —
+  the mutation window);
+- TLAB retire reordered BEFORE the deposit at monitor_enter_blocking /
+  monitor_enter_synchronized_method / monitor_wait / thread_join / park /
+  ensure_class_initialized (the retire's gap-filler heap write must precede
+  the flag raise, after which a pause may collect concurrently);
+- both remark pauses (Generational + G1 concurrent-mark) converted from the
+  legacy anonymous census to the identity census.
+
+**(single-threaded component) ROOT-CAUSED + FIXED — it was never a GC race.**
+The BinaryTrees(16) G1+JIT wrong total is a **compact-reference-field-layout
+vs G1 field-accessor mismatch**: G1's `get_field`/`set_field` (and volatile
+variants, `gc/src/g1.rs`) compute `index * SLOT_SIZE` unconditionally — zero
+`GC_FLAG_COMPACT` awareness — while the backend-agnostic JIT inline-TLAB
+allocation (`jit/src/x64.rs::emit_inline_tlab_new`) and `jit_tlab_post_init`
+mark fresh objects of registered-layout classes compact
+(`CRATONVM_COMPACT_REF_FIELDS` default-on). Every compact-marked object is
+then WRITTEN as legacy 16-byte cells through `heap.set_field` (the second
+ref field's cell lands past the object's end — silent neighbour stomp) and
+READ as bare-8-byte compact slots by `jit_getfield`, whose plausibility gate
+degrades the mis-read Value tag word to null. Hence: `Node.l == null` for
+essentially EVERY JIT-built tree (~89k totals = the all-ones floor), the
+occasional NPE from the crossed slot, heap-size independence (8 GB BT12 was
+deterministically wrong with ~no GCs at all), corruption of even 30-node
+d=4 trees no GC could intersect, `--nojit` exact (interpreter is
+self-consistently legacy through the same G1 accessors), Gen exact (its
+accessors are compact-aware), ZGC exact (no TLABs → no compact marking),
+and `CRATONVM_COMPACT_REF_FIELDS=0` exact. Diagnosed by proving the G1 and
+Gen disasm of `make`/`check` byte-identical (CRATONVM_DBG_JIT_DISASM), then
+a minimal probe (`gcprobes-0710/G1Probe.java`) showing JIT'd `chk()` reading
+`n.l == null` while the interpreted caller reads the SAME object correctly.
+FIX: `SharedVm::new` force-disables compact-ref-fields
+(`set_compact_ref_fields_enabled(false)`, first-set-wins, before any
+classloading) whenever `config.gc_algorithm != Generational` — the process
+is uniformly legacy under G1/ZGC, the exact (validated) behaviour of
+`CRATONVM_COMPACT_REF_FIELDS=0`. Real compact support in G1/ZGC accessors,
+scanners, and allocators is future work; until then this gate is the
+correctness boundary. Validated: BT16/BT14/BT12(8g) G1+JIT exact 10/10,
+G1Probe exact, ZGC/Gen-nojit exact, full probe battery green.
+
+**(b) Monitor-vs-evacuation residual — PARTIALLY CLOSED; remainder
+re-classified.** The (a) fix closes every mechanism this finding enumerated
+(quota holes, the flag-clear window, the fold/fixup race, the
+excluded-thread-runs-mid-pause family), and the compact fix removes the
+pervasive G1 source of "impossible" field values. The ES
+`InetAddressRandomBinaryDocValuesRangeQueryTests` IMSE+CCE manifestation,
+however, PERSISTS at the baseline rate (fixed build: clean=18 imse=1 cce=2
+of 20; dev-tip control: clean=17 cce=2 other=1 of 20 — statistically
+identical), so its mechanism was never the barrier. New forensic evidence
+(this effort, `CRATONVM_DBG_MONEXIT` — a new gated diagnostic in
+`MonitorTable::exit`) pins the failure shape exactly:
+
+```
+[MONEXIT-IMSE] arm=thin-arm tid=2 obj=0x200253d3cd0 mark=0x0 state=NEUTRAL
+               class_id=0 num_slots=0 registry_hit=false
+```
+
+— the synchronized-method receiver points at an ENTIRELY ZEROED slot at
+monitorexit time: the object was never copied by the moving young
+collection (a missed MARKING ROOT — not a missed remap: all three
+pointer-map application paths were audited and each forwards frames,
+`monitor_on_exit`, `native_pin_roots`, `java_thread_obj`, scoped values and
+JIT/shadow slots) and young-from was reset over it. Reference processing is
+exonerated as the sole writer: a 25-run arm with `CRATONVM_DBG_NO_REFPROC=1`
+still reproduced the identical IMSE+CCE pair. This is the already-tracked
+**moving-young GC-precision / missed-root family** (lost operand-stack tag
+/ side-structure root gap — see `CRATONVM_GC_VERIFY_STALE`'s doc comment,
+the compact-ref-fields memory's residual section, and the HIB temporal /
+OSR-main corruptor cluster), NOT a monitor/STW-barrier defect. Repro for
+whoever picks it up: `org.junit.runner.JUnitCore
+org.elasticsearch.lucene.queries.InetAddressRandomBinaryDocValuesRangeQueryTests`
+(server-module bundle at `/data/data/es-jit-deopt-gc-bundle-20260708-214648`,
+`-Dtests.seed=B17AC9D3E1F2A0C4 -Dtests.asserts=false -Xmx2g`, ~10-15%/run,
+~40-60s/run) with `CRATONVM_DBG_MONEXIT=1` and `CRATONVM_GC_VERIFY_STALE=1`.
+
+Two adjacent latent holes WERE found and fixed/flagged while ruling
+mechanisms out:
+- `monitor_wait`'s error path early-returned BEFORE `check_post_block_gc`,
+  leaving `in_blocked_region` permanently raised on a running thread (every
+  later census would exclude it → moving GC concurrent with its bytecode).
+  FIXED (run the wake re-sync before propagating the error).
+- The Generational CONCURRENT OLD-GEN SWEEP (`concurrent_mark.rs::
+  concurrent_sweep`) frees old objects with NO dead-address notification:
+  unlike ZGC (which calls `MonitorTable::prune_dead` — "prevents a recycled
+  address from inheriting a dead object's monitor"), Gen never prunes
+  monitor/cas-lock registry entries for swept objects, and
+  `VmHeap::is_addr_live`'s Gen arm treats EVERY old-gen address as live
+  (region-granular), so reference-processing verdicts for old-gen referents
+  cannot see concurrent-sweep kills. Neither was demonstrated as the ES
+  trigger (the forensics point at young-gen zeroing), but both are real
+  recycled-identity hazards — tracked as OPEN follow-ups in §3.
+
+Historical analysis below preserved for context.
 Reproducers: MTChurn (6 threads, `synchronized(locks[i&15]){counters[i&15]++}`,
 -Xmx256m) intermittently loses increments on G1+JIT (~1/5 runs) and — less
 often — on Generational under load; BinaryTrees(16) G1+JIT completes with a
@@ -115,6 +238,19 @@ and the quota-race mechanism is still present on dev). BinaryTrees(16)
 G1+JIT remains the reliable reproducer (TOTAL 89207 vs 14723759 this
 run). Everything else in the kit — RefCheck/RefCheckOld/Churn/Copy/
 Humongous/SpinPoll × Gen/G1/ZGC — is HotSpot-identical on this tip.
+
+VALIDATION APPENDIX (2026-07-11 fix effort, branch
+`fix/gc-finding1-stw-monitor-20260711`, binaries `cratonvm-gcf1-fix{b,c,d}`
+at `/data/wt-gc-finding1-20260711`): full battery green — BT16-G1-JIT 5/5
+exact (14723759, was 0/5 at ~89k), BT14-G1-JIT 3/3, BT12-G1-8g 2/2,
+BT16-ZGC 2/2, BT16-Gen-nojit 1/1, G1Probe-G1 2/2, MTChurn-G1 15/15 +
+8/8 (fixc), MTChurn-Gen 10/10 + 5/5, MTChurn2-G1 10/10 + 5/5, MTChurn3-G1
+10/10 + 5/5, ChurnCheck-G1/Gen 3/3 + 3/3, CopyChurn-G1 3/3,
+HumongousCheck-G1 3/3, RefCheck-G1 3/3, RefCheckOld-G1 2/2, SpinPoll-G1
+3/3, SpinPoll-Gen 2/2. vm-crate `--lib` tests: 2184 passed, 14 failed —
+the identical 14 fail at the unmodified base commit (pre-existing
+release-mode lock_order/vm_init cluster); `threading::` filter 281/281.
+No liveness regressions observed anywhere (the parked WIP's failure mode).
 
 ## 2. G1/ZGC: STW hang risk when a JIT thread never polls (INT-3)
 `stw_take_over_and_wait` falls back to a plain unbounded `wait_for_all()`
@@ -198,8 +334,18 @@ Remaining note:
   this item — it already landed in the third wave.)
 
 ## 3. Misc
+
+Status 2026-07-11: the three OPEN items below are all inert in default
+configuration (no driver / opt-in flag off / feature not wired). They are
+real gaps to close before their features can ship, but none is a live
+correctness issue on a default run. Left OPEN deliberately by the finding-1
+fix effort — each needs its own design work, and bolting quick patches onto
+G1 internals is how the parked quota-race WIP went wrong.
+
 - Class unloading machinery (`gc/src/class_unloading.rs`) has no driver;
-  statics/mirrors/class-locks are immortal roots (INT-7).
+  statics/mirrors/class-locks are immortal roots (INT-7). OPEN — memory
+  growth only (unbounded class-metadata retention), not corruption; needs a
+  real lifecycle design (mirrors/statics/class-locks + JIT code invalidation).
 - **INT-8 FIXED** (branch `fix/int8-g1-remark-refproc-20260710`): G1
   weak/soft refs with dead OLD-region referents now clear at
   concurrent-mark completion, and `finalize()` runs for objects reclaimed
@@ -231,11 +377,51 @@ Remaining note:
   regression batch green (RefCheck/Churn/Copy/Humongous × Gen/G1/ZGC).
 - G1 string-dedup table stores raw addresses, never remapped — API now
   carries a DO-NOT-WIRE-UP doc warning; the remap is still needed before
-  `-XX:+UseStringDeduplication` can do anything (G1CORE-6).
+  `-XX:+UseStringDeduplication` can do anything (G1CORE-6). OPEN — inert
+  (the flag is parsed but the table is never wired up, so no correctness
+  exposure); implement the evacuation-pause remap before wiring.
 - Parallel young evacuator residual race (documented in-code) — keep
-  `CRATONVM_G1_PARALLEL_EVAC` off (G1CORE-5).
+  `CRATONVM_G1_PARALLEL_EVAC` off (G1CORE-5). OPEN — opt-in flag, default
+  off; the serial evacuator is the supported path.
+- NEW (found by the 2026-07-11 finding-1 effort, tracked here): G1 and ZGC
+  have no compact-reference-field-layout support in their field accessors /
+  allocators (see the finding-1 single-threaded-component fix above —
+  compact is now force-disabled for non-Generational backends in
+  `SharedVm::new`). Re-enabling compact under G1/ZGC requires:
+  compact-aware `get_field`/`set_field`(+volatile) and humongous
+  translation, compact-aware evacuation/mark scanners, and compact marking
+  in the backend allocators — plus removing the `SharedVm::new` gate.
+- NEW (2026-07-11 finding-1 effort): the Generational concurrent old-gen
+  sweep frees objects with no dead-address channel — no
+  `MonitorTable::prune_dead` (ZGC has this; a recycled old address can
+  inherit a dead object's monitor/cas-lock registry entry) and no
+  reference-processor reconciliation (`is_addr_live`'s region-granular
+  old-gen arm classifies swept referents as survivors, so a dead old-gen
+  weak referent can be RESTORED into a Reference and, after free-list
+  reuse, `get()` returns an unrelated object — silent type confusion).
+  Fix shape: have `concurrent_sweep` return its freed-address list; the
+  maybe_concurrent_gc driver (interpreter.rs) forwards it to
+  `shared.monitors.prune_dead` and to a new ref-processor
+  dead-referent reconciliation; alternatively/additionally make the Gen
+  `is_addr_live` old-gen arm object-granular via a freed-address set
+  maintained by `OldGen::free`/`alloc`.
 
 ## Cross-confirmation from an independent real-world trigger (2026-07-10)
+
+> STATUS (2026-07-11 fix effort): the IVFKnn hang could NOT be
+> re-confirmed as a deadlock on the fixed build — a live gdb attach during
+> a "hung" `testSlicesDense` run (fix build, `--nojit`, loaded host) shows
+> NO thread in `Monitor::block_enter`: the SUITE worker is actively
+> executing (memcmp/string-eq), main is in a legitimate `Object.wait`, and
+> the launcher in `pthread_join` — i.e. a slow interpreted run under host
+> load (load avg 14+), not the documented lost-wakeup pile-up. The
+> `gen_heap::get_field` OOB WARN burst does still occur and per its own
+> message text can be benign speculative collection-layout probing; treat
+> it as a signal only when correlated with real failures. The
+> InetAddress-range manifestation (section below) is the cheaper, still
+> reproducing tracker for the residual — see finding 1(b)'s status block
+> for its forensic classification (missed-marking-root family, not
+> barrier/monitor).
 
 Investigating the ES `DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests` /
 `IVFKnnFloatVectorQueryTests` hang cluster
@@ -299,6 +485,14 @@ MTChurn/BinaryTrees(16).
 
 
 ## Second cross-confirmation from an independent real-world trigger (2026-07-11)
+
+> STATUS (2026-07-11 fix effort): still reproduces at the same rate on the
+> fixed build (fixed: 18 clean / 1 imse / 2 cce of 20; dev-tip control:
+> 17 clean / 2 cce / 1 other of 20) — mechanism forensically classified as
+> the moving-young missed-marking-root family, NOT the barrier/monitor
+> races this finding originally hypothesized. See finding 1(b)'s status
+> block for the `[MONEXIT-IMSE]` capture and the repro-with-diagnostics
+> recipe.
 
 While investigating a `ClassCastException` spotted once during verification of
 the (separate, since-fixed) `InetAddress` GC-root bug in
