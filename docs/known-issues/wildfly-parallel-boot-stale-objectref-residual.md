@@ -255,15 +255,17 @@ investment than more targeted symptom-chasing:
   description of its algorithm, or improve it further — e.g. it doesn't yet know about
   `ctx.initialize_class`/`ctx.new_object`/`ctx.define_class_full` as additional GC-triggering hazards,
   found by inspection but not added to the tool this session).
-- A debug-build assertion that _validates_ every `ObjectRef` read from a native local against a "known
-  allocation epoch" counter, panicking loudly the moment a stale read is detected (rather than silently
-  resolving to a reused all-zero slot) would convert every future instance of this bug class from
-  "silent, non-deterministic corruption 1-20% of the time" into "always caught in CI/tests". Scoped
-  (not implemented) in follow-up session 3 — see
+- ~~A debug-build assertion that validates every `ObjectRef` read...~~ — **IMPLEMENTED** later in
+  follow-up session 3, for the `Generational` (default) backend: `CRATONVM_DBG_STALE_OBJREF=1` now turns
+  a stale native-local read into a hard, deterministic panic instead of silent corruption, for one full
+  GC cycle after the object is evacuated. See
   [[wildfly-stale-objectref-debug-assertion-scoping]] (`docs/internal/wildfly-stale-objectref-debug-assertion-scoping.md`)
-  for the design sketch (GC-side quarantine + tombstone marker on evacuated from-space regions, checked
-  at the `NativeContext` method boundary) and why it wasn't attempted this session (requires GC/heap
-  cooperation, a larger and riskier change than the sweep itself).
+  for the mechanism (turned out to reuse the GC's own existing forwarding-pointer header field rather than
+  needing a new tombstone format — just a one-cycle quarantine delay on reclaiming evacuated memory) and
+  its explicit scope boundaries (G1/ZGC not covered; a couple of narrower gaps around the JIT's
+  guarded-inline fast path and `load_and_forward`'s own self-healing call sites). Verified via a new
+  `gc/tests/stale_objref_debug_assertion.rs` integration test plus the full `cratonvm-gc` crate suite
+  (823 tests) passing unchanged with the flag off.
 
 ## Also confirmed still present: STW cross-thread JIT-takeover stall (pre-existing, already tracked, NOT attempted)
 
