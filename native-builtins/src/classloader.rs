@@ -3185,10 +3185,17 @@ fn cl_get_resources_impl(
                         }
                         ctx.unpin_native_roots(p_this);
 
-                        if !delegated_urls.is_empty() {
-                            let enm = enumeration_from_url_strings(ctx, &delegated_urls);
-                            return Ok(Some(Value::Object(Some(enm))));
-                        }
+                        // A user-defined loader's default `getResources` is
+                        // strictly parent-delegating. In particular, an empty
+                        // result is meaningful: falling through to CratonVM's
+                        // process-wide classpath scan leaks resources that are
+                        // invisible to the loader (and bypasses test doubles
+                        // such as EasyMock ClassLoaders). The optional
+                        // findResources override above has already contributed
+                        // this loader's local entries, so return the combined
+                        // enumeration even when it is empty.
+                        let enm = enumeration_from_url_strings(ctx, &delegated_urls);
+                        return Ok(Some(Value::Object(Some(enm))));
                     }
                 }
             }
