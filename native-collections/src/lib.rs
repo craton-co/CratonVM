@@ -6083,6 +6083,34 @@ fn native_map_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn native_map_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let value_pin = pin_value(ctx, value);
+    let result = (|| -> MethodCallResult {
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let value = read_pinned_elem(ctx, value_pin, value);
+        let get_result = native_map_get(ctx, &[Value::Object(Some(this)), key, value])?;
+        match get_result {
+            Some(Value::Object(None)) => {
+                let this = ctx.read_native_pin(this_pin, this);
+                let key = read_pinned_elem(ctx, key_pin, key);
+                let value = read_pinned_elem(ctx, value_pin, value);
+                native_map_put(ctx, &[Value::Object(Some(this)), key, value])
+            }
+            _ => Ok(get_result),
+        }
+    })();
+    ctx.unpin_native_roots(this_pin);
+    return result;
+
+    #[allow(unreachable_code)]
     // Check if key exists
     let get_result = native_map_get(ctx, args)?;
     match get_result {
@@ -30450,6 +30478,28 @@ fn native_chm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         }
         .into());
     }
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let value_pin = pin_value(ctx, value);
+    let result = (|| -> MethodCallResult {
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let hash = chm_key_hash(ctx, &key)?;
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let value = read_pinned_elem(ctx, value_pin, value);
+        match chm_segment_for(ctx, this, hash) {
+            Some(seg) => {
+                let _resize_flag = ChmResizeLockGuard::enter();
+                let _guard = ChmMonitorGuard::acquire(ctx, seg);
+                native_map_put_if_absent(ctx, &[Value::Object(Some(seg)), key, value])
+            }
+            None => Ok(Some(Value::Object(None))),
+        }
+    })();
+    ctx.unpin_native_roots(this_pin);
+    return result;
+
+    #[allow(unreachable_code)]
     let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
