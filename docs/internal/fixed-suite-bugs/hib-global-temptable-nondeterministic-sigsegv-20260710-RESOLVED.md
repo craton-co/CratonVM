@@ -60,3 +60,20 @@ The `0x40` small-integer used as a pointer is an exact match to the signature `9
   repro that first surfaced it -- see the follow-up on
   `docs/known-issues/elasticsearch-suite/ES-HANG-20260709-server-org-elasticsearch-search-vectors-diversifyingchildrenivfknnfloatslicedvectorquerytests-3ff8aa1c4b.md`).
   `CRATONVM_JIT_GETFIELD_HELPER=1` is now the (rarely-needed) off-switch.
+
+---
+
+## 2026-07-11 addendum: independent JIT-cache invalidation gap (unrelated to this SIGSEGV's actual cause)
+
+While independently re-investigating the guarded-inline-getfield SIGSEGV
+cluster this doc is part of, found and fixed a real but separate defect:
+`ClassManager::upgrade_synthetic_class` / `recompute_subclass_layouts`
+(`classloading/src/class_manager.rs`) can change a class's field layout
+mid-run without evicting already-JIT-compiled code that baked the old
+offsets in — `install_jit_invalidate_hook` had zero installers anywhere in
+the VM despite already being called from `redefine_class`. This is NOT the
+cause of this doc's SIGSEGV (that is conclusively the fabricated-`(0,
+false)`-compact-slot bug — see
+`docs/known-issues/elasticsearch-suite/ES-HANG-20260709-server-org-elasticsearch-search-vectors-diversifyingchildrenivfknnfloatslicedvectorquerytests-3ff8aa1c4b.md`'s
+"2026-07-10 follow-up" section), but it is a real, independent gap, now
+fixed with a regression test in `classloading/src/class_manager.rs`.
