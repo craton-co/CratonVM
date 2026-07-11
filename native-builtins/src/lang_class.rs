@@ -13978,6 +13978,41 @@ pub(crate) fn native_class_get_annotated_interfaces(
     Ok(Some(Value::Object(Some(arr))))
 }
 
+/// `TypeVariable.getAnnotatedBounds()[Ljava/lang/reflect/AnnotatedType;`.
+///
+/// Synthetic TypeVariable mirrors have a native `getBounds()` but the JDK's
+/// default `getAnnotatedBounds()` body cannot run on the synthetic interface
+/// receiver. Materialize the same bound list as minimal AnnotatedTypes so
+/// ByteBuddy can inspect a mocked type's generic methods.
+pub(crate) fn native_type_variable_get_annotated_bounds(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let bounds = match ctx.invoke_virtual(
+        this,
+        "getBounds",
+        "()[Ljava/lang/reflect/Type;",
+        &[],
+    )? {
+        Some(Value::Object(Some(bounds))) => bounds,
+        _ => {
+            let empty = ctx.new_ref_array(ClassId::new(0), 0);
+            return Ok(Some(Value::Object(Some(empty))));
+        }
+    };
+
+    let len = ctx.array_length(bounds);
+    let annotated = ctx.new_ref_array(ClassId::new(0), len);
+    for i in 0..len {
+        if let Value::Object(Some(bound)) = ctx.get_array_element(bounds, i) {
+            let annotated_bound = make_annotated_type(ctx, bound);
+            ctx.set_array_element(annotated, i, Value::Object(Some(annotated_bound)));
+        }
+    }
+    Ok(Some(Value::Object(Some(annotated))))
+}
+
 /// Build a minimal synthetic `AnnotatedType` object wrapping a `Type`
 /// (typically a `Class` mirror).
 ///

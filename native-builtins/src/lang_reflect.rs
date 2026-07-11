@@ -2183,6 +2183,12 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(wti_bounds_reified(ctx, this, "bounds")))
         },
     );
+    registry.register(
+        tvi_real,
+        "getAnnotatedBounds",
+        "()[Ljava/lang/reflect/AnnotatedType;",
+        crate::lang_class::native_type_variable_get_annotated_bounds,
+    );
     registry.register(tvi_real, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(match ctx.get_field_by_name(this, "name") {
@@ -2249,6 +2255,12 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             Ok(Some(ctx.get_field(this, 1)))
         },
+    );
+    registry.register(
+        "java/lang/reflect/TypeVariable",
+        "getAnnotatedBounds",
+        "()[Ljava/lang/reflect/AnnotatedType;",
+        crate::lang_class::native_type_variable_get_annotated_bounds,
     );
     registry.register(
         "java/lang/reflect/TypeVariable",
