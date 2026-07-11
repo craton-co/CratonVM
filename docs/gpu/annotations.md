@@ -519,9 +519,8 @@ auditable.
 ## Related
 
 - [`README.md`](README.md) — the top-level GPU offload reference.
-- [`plan.md`](plan.md) — execution plan and per-part status.
 - [`cuda-oxide-evaluation.md`](cuda-oxide-evaluation.md) — why
-  cuda-oxide is not on the Phase 1 critical path.
+  cuda-oxide is not on the critical path.
 - [`first-results.md`](first-results.md) — acceptance-criteria
   scaffold for the GPU-equipped verification machine.
 - [`test_classes/gpu/annotations/`](../../test_classes/gpu/annotations/) —

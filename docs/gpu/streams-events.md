@@ -499,6 +499,4 @@ without having to thread the actual `Event` through.
 - [`README.md`](README.md) — top-level GPU offload reference, build
   modes, CLI flags.
 - [`cuda-bridge/README.md`](../../cuda-bridge/README.md) — crate-level
-  layout, FFI surface, feature flags. The Phase 2 section there shows
-  the same examples from the crate's point of view.
-- [`plan.md`](plan.md) — execution plan and per-part status.
+  layout, FFI surface, feature flags.

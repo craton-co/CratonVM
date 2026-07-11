@@ -141,5 +141,5 @@ broader FP-intrinsic support (row 9) but no longer vaporware. See
   [`docs/gpu/annotations.md`](./annotations.md),
   [`docs/gpu/async-api.md`](./async-api.md),
   [`docs/gpu/first-results.md`](./first-results.md),
-  [`docs/gpu/phase9-summary.md`](./phase9-summary.md),
+  [`docs/known-issues/gpu-offload-followups-20260711.md`](../known-issues/gpu-offload-followups-20260711.md),
   [`craton-gpu-java` README](https://github.com/craton-co/craton-gpu-java).

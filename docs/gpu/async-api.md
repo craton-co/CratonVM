@@ -502,8 +502,6 @@ from the by-design [Limitations](#limitations) below.
   to methods bearing this annotation.
 - [`README.md`](README.md) — top-level reference: build matrix
   (`gpu` vs `gpu-driver`), CLI surface, file index.
-- [`plan.md`](plan.md) — per-part execution status, including the
-  Phase 3 milestones.
 - [`docs/known-issues/gpu-offload-followups-20260711.md`](../known-issues/gpu-offload-followups-20260711.md)
   — open follow-ups from the first real-hardware validation pass,
   including the reduction void-return gate and the JIT-caller bypass
