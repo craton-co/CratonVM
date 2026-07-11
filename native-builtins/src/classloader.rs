@@ -1157,6 +1157,18 @@ fn cl_load_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     cl_load_class_base_delegation(ctx, this, name_obj)
 }
 
+fn classloader_parent(ctx: &mut dyn NativeContext, loader: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(loader, "parent") {
+        Value::Object(Some(parent)) => return Some(parent),
+        Value::Object(None) | Value::Int(0) | Value::Long(0) => return None,
+        _ => {}
+    }
+    match ctx.get_field(loader, CL_PARENT_REF) {
+        Value::Object(Some(parent)) => Some(parent),
+        _ => None,
+    }
+}
+
 /// True if `loader` can see a class whose defining loader is `defining` — i.e.
 /// `defining` is `loader` itself or one of its delegation ancestors (parent
 /// chain). JVMS §5.3: a class defined by loader D is visible to L only if L
@@ -1172,21 +1184,14 @@ fn loader_can_see_defining(
     loader: ObjectRef,
     defining: ObjectRef,
 ) -> bool {
-    if loader.as_ptr() == defining.as_ptr() {
-        return true;
-    }
-    let mut cur = loader;
+    let mut cur = Some(loader);
     // Bounded walk up the parent chain (defensive cap against cycles).
     for _ in 0..256 {
-        match ctx.get_field(cur, CL_PARENT_REF) {
-            Value::Object(Some(parent)) => {
-                if parent.as_ptr() == defining.as_ptr() {
-                    return true;
-                }
-                cur = parent;
-            }
-            _ => break,
+        let Some(loader) = cur else { break };
+        if loader.as_ptr() == defining.as_ptr() {
+            return true;
         }
+        cur = classloader_parent(ctx, loader);
     }
     false
 }
@@ -1224,6 +1229,31 @@ fn resolve_global_if_visible(
     internal: &str,
 ) -> Option<ObjectRef> {
     let cid = ctx.ensure_class_initialized(internal).ok()?;
+    if internal == "p/C" || internal == "com/example/HelloWorld" {
+        let this_class = ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .unwrap_or_default();
+        let this_id = ctx.identity_hash_code(this);
+        match defining_loader_for(cid.as_u32()) {
+            Some(def) => {
+                let def_class = ctx
+                    .class_name_of_id(ctx.class_id_of_object(def))
+                    .unwrap_or_default();
+                let def_id = ctx.identity_hash_code(def);
+                let visible = loader_can_see_defining(ctx, this, def);
+                eprintln!(
+                    "[loader-vis-trace] internal={internal} cid={} this={this_class}#{this_id} def={def_class}#{def_id} visible={visible}",
+                    cid.as_u32()
+                );
+            }
+            None => {
+                eprintln!(
+                    "[loader-vis-trace] internal={internal} cid={} this={this_class}#{this_id} def=<none>",
+                    cid.as_u32()
+                );
+            }
+        }
+    }
     cid_visible_mirror(ctx, this, cid)
 }
 
@@ -1241,9 +1271,15 @@ fn cl_load_class_base_delegation(
 ) -> MethodCallResult {
     let dotted = ctx.read_string(name_obj).unwrap_or_default();
     let internal = dotted.replace('.', "/");
-
-    // HIB-CV-24 / SBR-14 — honor a supplied child/isolated `ClassLoader`.
-    //
+    if internal == "p/C" || internal == "com/example/HelloWorld" {
+        let this_class = ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .unwrap_or_default();
+        eprintln!(
+            "[load-base-trace] internal={internal} this={this_class}#{}",
+            ctx.identity_hash_code(this)
+        );
+    }
     // CratonVM stands in for `ClassLoader.loadClass` with this native (it keeps no
     // JDK bytecode for it). The steps below resolve a class through CratonVM's
     // flat global store (`ensure_class_initialized`) BEFORE reaching the
@@ -1259,10 +1295,8 @@ fn cl_load_class_base_delegation(
     // loads the class; `findClass` is not called). Built-in loaders and bootstrap
     // classes keep the permissive global path (CratonVM has no separate bootstrap
     // classpath). Opt-out: `CRATONVM_CL_BOOTSTRAP_SCOPED=0`.
-    let parent_is_null = matches!(
-        ctx.get_field(this, CL_PARENT_REF),
-        Value::Object(None) | Value::Int(0) | Value::Long(0)
-    );
+    let parent = classloader_parent(ctx, this);
+    let parent_is_null = parent.is_none();
     let defer_to_find_class = cl_bootstrap_scoped()
         && parent_is_null
         && !is_bootstrap_class_name(&internal)
@@ -1283,6 +1317,9 @@ fn cl_load_class_base_delegation(
         };
         if let Some(lid) = loader_id {
             if let Some(cid) = ctx.class_id_by_name_and_loader(&internal, lid) {
+                if internal == "p/C" || internal == "com/example/HelloWorld" {
+                    eprintln!("[load-base-trace] own-namespace-hit internal={internal} lid={lid} cid={}", cid.as_u32());
+                }
                 if let Some(mirror) = cid_visible_mirror(ctx, this, cid) {
                     return Ok(Some(Value::Object(Some(mirror))));
                 }
@@ -1291,7 +1328,7 @@ fn cl_load_class_base_delegation(
     }
 
     // 2. Delegate to parent loader first (recursive parent-first delegation)
-    if let Value::Object(Some(parent)) = ctx.get_field(this, CL_PARENT_REF) {
+    if let Some(parent) = parent {
         // Recursively delegate to parent by calling its loadClass
         let parent_type = match ctx.get_field(parent, CL_LOADER_TYPE) {
             Value::Int(v) => v,
@@ -1308,6 +1345,9 @@ fn cl_load_class_base_delegation(
         // .isCacheSafe via `isLoadable`.
         if let Some(pid) = parent_lid {
             if let Some(cid) = ctx.class_id_by_name_and_loader(&internal, pid) {
+                if internal == "p/C" || internal == "com/example/HelloWorld" {
+                    eprintln!("[load-base-trace] parent-namespace-hit internal={internal} pid={pid} cid={}", cid.as_u32());
+                }
                 if let Some(mirror) = cid_visible_mirror(ctx, this, cid) {
                     return Ok(Some(Value::Object(Some(mirror))));
                 }
@@ -2771,7 +2811,10 @@ fn cl_find_loaded_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 fn cl_get_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    Ok(Some(ctx.get_field(this, CL_PARENT_REF)))
+    Ok(Some(match classloader_parent(ctx, this) {
+        Some(parent) => Value::Object(Some(parent)),
+        None => Value::Object(None),
+    }))
 }
 
 fn cl_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
