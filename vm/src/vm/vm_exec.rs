@@ -12742,12 +12742,21 @@ fn invoke_on_class_shared_inner(
                                     // output" symptom. Force the native
                                     // (registered in logmanager.rs) to win.
                                     | "logp"
+                                    // Synthetic Logger mirrors do not carry the
+                                    // JDK ConfigurationData handler list. Route
+                                    // explicit handler installation through the
+                                    // JUL bridge so in-process captures observe
+                                    // the same records as the console sink.
+                                    | "addHandler" | "removeHandler"
                                     // `isLoggable` gates JULI's emit path;
                                     // the real bytecode returns false for our
                                     // parent-less synthetic Logger, so every
                                     // log call short-circuits to a no-op.
                                     | "isLoggable"
                             ))
+                        || (class_name == "java/util/logging/LogRecord"
+                            && method_name == "getMessage"
+                            && descriptor == "()Ljava/lang/String;")
                         || (class_name == "org/jboss/logmanager/Logger"
                             && matches!(
                                 method_name,
