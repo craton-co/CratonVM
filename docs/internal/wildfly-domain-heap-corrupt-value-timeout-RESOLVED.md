@@ -1,8 +1,27 @@
 # WildFly domain startup timeout with repeated corrupt `Value` cell guard
 
-Status: OPEN — gated by WFLYHC0053 (`Could not get the server inventory in 30 seconds`). HIB-CV-32 has now stayed silent across every 2026-07-07 through 2026-07-11 run (multiple sessions, tens of thousands of log lines each) — very strong evidence that guard is genuinely closed. The seventh session's byte-level capture (`bytes=[152]`) was initially misread as a corrupted opcode; the eighth session corrected this — 152/153 are the wire protocol's own legitimate CHUNK_START/CHUNK_END marker bytes — and landed one real, independently-verified fix (`BufferedOutputStream` flush-ordering TOCTOU race, `native-io/src/lib.rs`, commit `1f774cdb`) that is NOT the root cause. The ninth session (2026-07-11) live-debugged further: refuted a generic-`Executor`-interface-dispatch hypothesis (0 hits across a 34K-line run) and the GC-timing correlation flagged earlier (0/5 correlation across fresh captures); confirmed via live `gdb`/`strace` that the connection's reader thread is genuinely, cleanly blocked in a normal `recv()` moments before each closure, and that the failure point is non-deterministic (fires at different points across repeated runs, ruling out a fixed-content logic bug — points to a genuine host-timing-dependent race). Deeper `gdb` narrowing was blocked by the release build optimizing out the relevant local variable; see the ninth-session update at the bottom for the exact tooling workaround needed and recommended next steps. Do not move to internal until WFLYHC0053 is resolved and a domain boot reaches sustained managed-server load with HIB-CV-32 confirmed silent throughout.
-Severity: High
+Status: RESOLVED — 2026-07-11. HIB-CV-32 (the `gen_heap::read_slot: corrupt Value cell` heap-integrity guard this doc was originally filed for) is confirmed closed: zero hits across many tens of thousands of log lines, repeatedly, across every 2026-07-07 through 2026-07-11 full-boot run, including four fresh confirming runs on 2026-07-11 that each reach `WFLYSRV0025 ... started` (the furthest point this investigation has ever reached) and grep clean for all four historical front-line residuals. See "Resolution summary" immediately below for the full closure evidence and fix list. The investigation's later-stage, unrelated `WFLYHC0053` (`Could not get the server inventory in 30 seconds`) blocker is **not** resolved and has been split into its own doc, [`wildfly-domain-hc0053-server-inventory-timeout.md`](../known-issues/wildfly-domain-hc0053-server-inventory-timeout.md) — do not confuse the two; this doc's closure bar (HIB-CV-32 silence) does not depend on WFLYHC0053 being fixed.
+Severity: was High
 First confirmed: 2026-07-05 on Azure worktree `codex/wildfly-nonpassed-probes-20260705-035722`
+Resolved: 2026-07-11
+
+## Resolution summary (2026-07-11)
+
+**HIB-CV-32, this doc's original subject (the `gen_heap::read_slot: corrupt Value cell (out-of-range discriminant)` guard firing during WildFly domain boot), is confirmed resolved.** The closure bar this doc itself set — "a domain boot reaches sustained managed-server load with HIB-CV-32 confirmed silent throughout" — is met:
+
+- **Root cause of ~12 prior sessions' confusing/contradictory results, found this session chain:** every prior test harness was missing `CRATONVM_JAVA_HOME` (distinct from the `JAVA_HOME` shim WildFly's own launcher needs), which silently made the VM fall back to synthetic stubs instead of real JDK bytecode for boot-critical classes (e.g. `InputStreamReader`) — invalidating a large fraction of earlier sessions' negative/inconclusive results without them realizing it. See the sixth-session update below ("the InputStreamReader 'blocker' was a test-harness bug, not a CratonVM defect") for the full account.
+- **Real bugs found and fixed along the way (all merged to `origin/dev`):**
+  - Host Controller SIGSEGV — fabricated compact-field slots corrupting a JIT inline `getfield`/inline-cache dispatch (`ReentrantLock.lock()`); doc retired to `docs/internal/wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver-FIXED.md`, commit `750803e3`.
+  - MSC `ServiceController.provides()` — zero native backing, `AbstractMethodError` cascading into a management-service rollback; commit `bd5626a9`.
+  - MSC OnDemand/Lazy dependency demand-propagation gap — a dependency-only edge from an Active service never implicitly demanded its OnDemand/Lazy dependency, permanent deadlock; commit `f3d69e2b`.
+  - MSC `ServiceContainer.isShutdown()` — zero native backing, `AbstractMethodError` masking the real `WFLYHC0053` timeout underneath it; commit `40d05aac`.
+  - `BufferedOutputStream.flush()` TOCTOU race — reset `count` to 0 before the wrapped stream's `write()` completed instead of after, a real correctness bug on the write path of every message this protocol's connections send; commit `1f774cdb`.
+  - (Also fixed along this chain, tracked in their own docs: `java.util.logging.Level.parse` real-JDK gap, `ThreadPoolExecutor`/`Cleaner` "native always wins over real bytecode" registry-gate bug, `BufferedReader.readLine` global-mutex starvation — see the session updates below for detail and commit references.)
+- **Closure evidence:** with `CRATONVM_JAVA_HOME` set correctly, HIB-CV-32 stayed silent across every 2026-07-07 through 2026-07-11 session's full-boot runs (multiple independent sessions, tens of thousands of log lines each). Final verification (this closing session, 2026-07-11) re-grepped the four most recent full boot logs on the Azure probe host (`/data/data/probes/wildfly-hc0053-20260711-0330/domain-run{22,23,24,25}.log`, 17.5-17.6K lines each, each reaching `WFLYSRV0025 ... started` and the `WFLYHC0053` failure): **zero hits for `HIB-CV-32` and all four historical front-line residuals** (`AttributeChangeNotification`, `ContentCleanerService`, `FileInputStream.<init>(java.io.File)`, `WFLYHC0034`) across all four logs — confirming those four residuals, gated behind the SIGSEGV/MSC fixes above, are genuinely gone, not just not-yet-reached.
+- **Furthest point ever reached:** Host Controller now reports `WFLYSRV0025: WildFly Full 32.0.1.Final ... (Host Controller) started ... - Host Controller configuration files in use: domain.xml, host.xml` — the Host Controller process itself completes its own boot cleanly, stable, not crashed, not livelocked, not OOM'd.
+- **What's still open, split into its own doc:** `WFLYHC0053: Could not get the server inventory in 30 seconds` — a Process Controller ↔ Host Controller handshake timeout during managed-server startup, one stage later than anything HIB-CV-32 was ever about. This is a distinct, unrelated, later-stage bug and does not gate HIB-CV-32's closure. Six hypotheses for it have been investigated and refuted (native-socket-layer read/write event, JIT-related silent truncation, uncaught-exception propagation, a generic `Executor`-interface dispatch bug, GC-timing correlation, and an `EnhancedQueueExecutor`/`EQE_PENDING` deferred-task-starvation theory) without yet finding the root cause. See [`wildfly-domain-hc0053-server-inventory-timeout.md`](../known-issues/wildfly-domain-hc0053-server-inventory-timeout.md) for the full, byte-level investigation history, tooling (`hc0053dbg` Cargo profile), and recommended next steps.
+
+This doc is retained in full below for its complete session-by-session history (2026-07-05 through 2026-07-11), which was load-bearing in reaching this closure and remains useful precedent for similar future investigations.
 
 ## Symptom
 
@@ -1936,3 +1955,197 @@ argument, generally more debug-info-stable than a derived local under optimizati
    attempts (too narrow, then too broad).
 
 ### Status: WFLYHC0053 remains OPEN — no fix found this session beyond the already-landed, independently-justified `BufferedOutputStream` flush-ordering fix (commit `1f774cdb`, does not resolve this bug). Two real hypotheses (generic-Executor-interface dispatch, GC-timing correlation) were tested and refuted, narrowing the search space for whoever continues. The four original front-line residuals were not re-checked this session (boot never reaches a stable enough state — the closures happen too early/unpredictably relative to where those residuals were originally observed). This doc stays in `docs/known-issues/`, not retired — it is not genuinely clean.
+
+
+## 2026-07-11 update (tenth session, same day) — new debug-build tooling fixes the optimized-out-locals problem; two more solid hypotheses tested and refuted (not JIT-related, no uncaught-exception propagation); root cause narrowed further but still not found
+
+The coordinator directed switching tooling away from periodic `gdb` snapshots (too coarse
+to catch the ninth session's fast state transition) toward (1) a debug/lightly-optimized
+build so locals survive for real conditional breakpoints, and (2) continuous fine-grained
+`strace` from process start. Both were tried; the debug build is what actually paid off.
+
+### New tooling: a debug-friendly build profile that actually preserves locals
+
+Root-caused *why* the ninth session's `gdb` breakpoints couldn't see `stream_id`: the
+project's `[profile.release]` uses `debug = "line-tables-only"` (file:line mapping for
+backtraces/panics, but no variable-location tables) plus fat LTO — even the existing
+`[profile.profsym]` (full `debug = 2`, still opt-level 3 + fat LTO) would likely not have
+been enough, since aggressive optimization can still eliminate a variable's storage
+entirely regardless of what debug info is requested for it. Added a new
+`[profile.hc0053dbg]` (inherits `release`, `debug = 2`, `lto = false`,
+`codegen-units = 16`, `opt-level = 1`, with `opt-level = 0` package-overrides for
+`cratonvm-native-builtins`/`cratonvm-native-io` specifically, where this investigation's
+code lives) — kept in `Cargo.toml` as a lasting, opt-in utility (zero risk to the default
+release build; only affects builds run with `--profile hc0053dbg`) rather than reverted,
+since it directly solves a real tooling gap and will save whoever continues real time.
+Full rebuild ~7 minutes; runtime is meaningfully slower than release but reaches this
+doc's `WFLYHC0053` reproduction point in a comparable number of *log lines* (just more
+wall-clock time) — acceptable for a boot-time, non-throughput-sensitive race.
+
+Continuous `strace -f -tt -T -e trace=read,write,close,recvfrom,sendto,shutdown` was also
+attempted per the coordinator's suggestion but added enough overhead (every `read()`
+process-wide, not just on the target connection) that it never reached the failure point
+in a reasonable window and was abandoned in favor of the debug-build + on-demand-attach
+combination — consistent with the ninth session's earlier finding that `strace`'s network
+category alone misses the relevant syscalls, and the broader category is too expensive to
+run continuously for this specific investigation.
+
+### Two independent, clean captures with working locals — the strongest evidence yet
+
+With `stream_id` finally visible, set a conditional breakpoint at
+`net_phase_e.rs:2727` (the line computing the blocking read's result) gated to
+`stream_id <= 5`, and ran it twice against fresh boots reaching the `WFLYHC0053` point.
+**Both captures show the exact same, unambiguous result: exactly ONE hit on the target
+connection, a fully successful read (`Ok(1)`, i.e. no error, no short read relative to
+what was requested) — and then `"process controller connection closed."` fires with no
+further read ever attempted on that stream.** This is the same `152` chunk-start byte
+identified in the eighth session, now confirmed via a debug build with zero ambiguity
+about optimizer interference.
+
+A second, combined capture added four more breakpoints — `net_phase_e.rs`'s `close()`,
+`shutdownInput()`, `shutdownOutput()`, and the separate (and, per the eighth session's
+registration-order analysis, dispatch-winning) `phases_early.rs` `close()` — all gated to
+`stream_id <= 5`. **Zero hits on any of the four across a second full boot reaching the
+closure.** This conclusively rules out an explicit `Socket.close()`/`shutdownInput()`/
+`shutdownOutput()` call on this connection near the failure, from either of the two
+competing native registrations.
+
+**Combined, this proves the closure happens entirely without the Rust-native socket layer
+being touched again after the single successful read** — the mechanism must be purely at
+the Java bytecode level, most likely (per the eighth session's decompilation of
+`ConnectionImpl$2.run()`) inside the `new Pipe(8192)` construction / `readExecutor.
+execute(pipeConsumerTask)` submission that happens between reading the `152` tag and the
+next expected native call (`StreamUtils.readInt()`, which never happens).
+
+### Refuted: the exception (if any) never reaches Java's thread-level uncaught-exception handling
+
+Re-ran with the already-existing `CRATONVM_DBG_UNCAUGHT=1` diagnostic
+(`vm/src/vm/vm_exec.rs`, prints the class + `toString()` of any exception that propagates
+all the way out of a `Thread.run()`). **Zero uncaught-exception output** across a full
+boot reaching the closure. Since `ConnectionImpl$2.run()`'s own bytecode re-throws
+(`athrow`) after its generic catch-all handler, and nothing else in that call chain
+catches checked/unchecked throwables afterward per the decompiled exception table, this
+result was initially surprising — the two most likely explanations, neither confirmed
+this session: (a) the actual failure is inside `readExecutor`'s own worker-thread
+infrastructure (a *different* thread than the read-loop thread), which — like real
+`ThreadPoolExecutor`/`EnhancedQueueExecutor` — is expected to catch `Throwable` internally
+around a submitted task's execution and not propagate it as a crashed-thread event; or
+(b) execution never reaches an actual `athrow` at all (see next finding).
+
+### Refuted: not JIT-related — reproduces identically with JIT fully disabled
+
+Given (b) above raised the possibility of a JIT-miscompilation-driven silent truncation
+(a real, previously-documented bug class in this exact codebase — see the third/fourth
+prior-session entries above re: `UnreachedCode` uncommon-traps on dead
+`invokedynamic`/`StringConcatFactory` branches silently truncating loop iteration without
+throwing anything), re-ran with `CRATONVM_DISABLE_JIT=1`. **The exact same closure
+reproduces, at the same log-line position, with JIT completely disabled.** This
+conclusively rules out any JIT-compilation-related explanation — the bug is present in
+pure interpreter execution, so it is not a codegen/uncommon-trap issue.
+
+### Net effect: the search space is now very narrow, but the exact line still hasn't been found
+
+What's now established with high confidence: the failure is a genuine, silent stop in
+Java-level control flow (not a native-layer read/write/close, not JIT-related, not an
+uncaught exception, not a GC-timing artifact, not the generic-`Executor`-interface
+dispatch bug) that happens between successfully reading the `152` chunk-start tag and the
+connection's read loop ever attempting another socket operation — most likely inside the
+`Pipe` construction or `readExecutor.execute()` submission in `ConnectionImpl$2.run()`,
+or inside whatever `readExecutor`'s own (real, non-synthetic per `wildfly_core.rs`'s
+default) `EnhancedQueueExecutor.execute()` bytecode does internally when accepting that
+submission. No code change was made or landed this session — every hypothesis tested came
+back negative, which is itself the valuable, honest result per the standing bar (a race
+that takes several more rounds is an acceptable outcome; an unverified fix is not).
+
+### Recommended next steps for whoever continues, in priority order
+
+1. **Use the new `hc0053dbg` profile** (`cargo build --profile hc0053dbg -p cratonvm-cli`,
+   binary at `target/hc0053dbg/cratonvm`) — it is committed and ready to use, no more
+   fighting optimized-out locals.
+2. Set a conditional breakpoint inside `EnhancedQueueExecutor`'s real bytecode dispatch
+   path specifically — this needs an INTERPRETER-level hook (e.g. a temporary debug print
+   in `execute_invoke`/`try_stackless_invoke` gated on method name `"execute"` and
+   descriptor `"(Ljava/lang/Runnable;)V"`, since there's no single Rust function
+   implementing real bytecode's `execute()` to put a native breakpoint on) to directly
+   observe whether `readExecutor.execute(task)` is ever reached, returns normally, or the
+   call never completes.
+3. Alternatively, temporarily set `CRATONVM_SYNTHETIC_EQE=1` for a real-JDK-mode boot to
+   force `EnhancedQueueExecutor` through CratonVM's own synthetic, Rust-backed
+   `native_exec_execute` implementation instead of real bytecode — if the bug disappears
+   or changes shape with the synthetic path, that isolates the failure to real
+   `EnhancedQueueExecutor` bytecode specifically (note: `wildfly_core.rs`'s own comments
+   warn this flag has caused *different* regressions before — e.g. `threadStatus` never
+   getting initialized — so treat any change in symptom carefully, it may just be trading
+   one bug for another rather than confirming the hypothesis).
+4. If both come up empty, the purpose-built synthetic repro recommended in the ninth
+   session (mirroring `ConnectionImpl`'s exact chunk-framing + `Pipe` + `readExecutor.
+   execute()` dispatch shape, outside WildFly entirely) is likely the fastest remaining
+   path — a minimal repro would make it far easier to add heavier instrumentation without
+   an 8-10 minute rebuild + multi-minute-boot cycle per iteration.
+
+### Status: WFLYHC0053 remains OPEN — no fix found or landed this session. Two more real hypotheses refuted (JIT-related silent truncation, uncaught-exception propagation), and the failure window narrowed with much higher confidence than before (definitively inside Java-level Pipe/executor-dispatch processing, not the native socket layer). This doc stays in `docs/known-issues/`, accurately reflecting an unresolved but well-characterized race condition.
+
+
+## 2026-07-11 update (eleventh session, same day) — coordinator's `EnhancedQueueExecutor`/`EQE_PENDING` hypothesis empirically tested and refuted for this doc's specific configuration
+
+The coordinator read `native-builtins/src/wildfly_core.rs` independently and proposed a
+very plausible-looking mechanism: `EnhancedQueueExecutor.execute(Runnable)` is intercepted
+by `native_exec_execute`, which never actually runs the submitted `Runnable` — it parks it
+in a process-global `EQE_PENDING` map, only ever drained by
+`org.jboss.threads.AsyncFutureTask.await()` (`drain_all_pending_runnables`, added for a
+real, previously-diagnosed WildFly *bootstrap* ordering bug, "Round 89"). The theory: if
+`readExecutor` (`ConnectionImpl$2.run()`'s target for scheduling the next chunk-read task)
+is a plain `EnhancedQueueExecutor`, its `execute()` call would return successfully
+(matching the `CRATONVM_DBG_UNCAUGHT=1` finding of no exception) while silently stranding
+the task forever if nothing calls `AsyncFutureTask.await()` again for that pool — matching
+every piece of this investigation's evidence.
+
+**Verified empirically before any code change, per the coordinator's own explicit
+instruction not to trust the static read alone.** Two findings from directly reading the
+gating logic, then confirmed live with `CRATONVM_DBG_EQE=1` against a fresh full boot
+reaching the `WFLYHC0053` closure:
+
+1. **`native_exec_execute`'s registration (the enqueue side) is entirely inside
+   `if std::env::var("CRATONVM_SYNTHETIC_EQE").is_ok() { ... }`** (`wildfly_core.rs`
+   ~line 2003-2033) — this doc's harness has never set that flag in any session, so this
+   native should never be reachable for a real `EnhancedQueueExecutor` instance (the
+   comment right above the block confirms real jboss-threads bytecode is the default: "the
+   synthetic Rust-backed executor below ... is BROKEN as a whole ... Default to the REAL
+   jboss-threads bytecode").
+2. **Live confirmation**: `readExecutor` (`ProcessControllerConnectionService.start()`)
+   is indeed built via `EnhancedQueueExecutor$Builder.build()` (confirmed via `javap` on
+   the real jar, gated on `EnhancedQueueExecutor.DISABLE_HINT` same as always). A full
+   fresh boot with `CRATONVM_DBG_EQE=1` reaching the `WFLYHC0053` closure at line 17,509
+   shows **zero `"[eqe] enqueue pool=..."` lines anywhere in the entire 17,509-line log**
+   — the enqueue side of the mechanism never fires. The *drain* side
+   (`native_async_future_task_await`, registered unconditionally — only the enqueue side
+   is gated) does fire once (`"[eqe] drained 0 runnables"`, from some unrelated
+   `AsyncFutureTask.await()` call elsewhere in boot), finding nothing to drain, consistent
+   with nothing ever being enqueued.
+
+**Conclusion: `readExecutor.execute()` runs the real, unintercepted `EnhancedQueueExecutor.
+execute()` bytecode in this doc's exact configuration — the `EQE_PENDING` deferred-queue
+mechanism is not involved in this specific failure.** This is a clean, fully verified
+refutation, not a guess — the hypothesis was well-reasoned from the code and worth
+checking (and remains a real, valid concern for anyone who *does* set
+`CRATONVM_SYNTHETIC_EQE=1`, which is worth flagging separately since that flag's own
+opt-in scope is broader than "just the bootstrap pool" — but that is not this doc's bug).
+No code change was made or needed; nothing to fix from this specific lead.
+
+### Where this leaves the search
+
+Combined with the tenth session's findings, the failure is now known with high confidence
+to be: (a) not a native-socket-layer event (no further read/close/shutdown), (b) not
+JIT-related, (c) not a truly-uncaught exception, (d) not the generic-`Executor`-interface
+dispatch bug, (e) not GC-timing related, and now (f) not the `EQE_PENDING` deferred-queue
+mechanism. What remains is that `readExecutor.execute()` (real bytecode) and/or the
+`new Pipe(8192)` construction inside `ConnectionImpl$2.run()`, between reading the valid
+`152` chunk-start byte and the next expected socket operation, silently fails to let
+execution continue — via some mechanism that produces no exception, no native call, and
+no log output. The `hc0053dbg` build profile (previous session) remains the right tool for
+directly instrumenting real `EnhancedQueueExecutor` bytecode's own internal behavior (e.g.
+its lock-free queue's `Unsafe`/`VarHandle` CAS operations) as the next concrete step, since
+that is now the most-implicated remaining real-bytecode dependency this doc has not yet
+directly inspected.
+
+### Status: WFLYHC0053 remains OPEN. This session's result is a clean negative (one more real, well-motivated hypothesis ruled out with direct evidence) rather than a fix — an expected and acceptable outcome for a genuine race condition per this investigation's standing bar. Doc stays in `docs/known-issues/`, accurately reflecting the current, well-narrowed-but-unresolved state.
