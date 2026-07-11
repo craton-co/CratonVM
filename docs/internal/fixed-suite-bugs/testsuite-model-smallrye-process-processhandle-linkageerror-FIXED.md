@@ -1,10 +1,29 @@
 # `io.smallrye.common.os.Process`/`java.lang.ProcessHandle` incompletely implemented — linkage error in one module, AbstractMethodError in another
 
-Status: open — high impact (37+ classes crash in a single shard, plus at least 1 more in a different module),
-genuine CratonVM gap in `java.lang.ProcessHandle`, confirmed via two distinct failure manifestations of the same
-root cause
+Status: FIXED (2026-07-11) — the native-backed `ProcessHandle` and
+`ProcessHandle.Info` surface is now verifier-visible and callable in real-JDK
+mode.
 
 Date observed: 2026-07-10/11 (fresh-binary rerun from updated dev, branch fix/keycloak-nonpassed-rerun-v2-20260710)
+
+## Resolution
+
+`ProcessHandle` and `ProcessHandle.Info` now have a deliberately narrow
+native-backed fallback when their JDK class-file lookup misses. The fallback
+declares both interface types and all supported methods, so third-party field
+descriptors link correctly. Real-JDK VM initialization now registers the same
+native `ProcessHandle` bridge used in synthetic mode, including `current()`,
+`info()`, and the `Info` accessors. Optional-valued methods return genuine
+empty `Optional` objects rather than Java `null`.
+
+Verified on the Azure Linux host with the unique release binary
+`/data/data/cratonvm-processhandle-smallrye-20260711`:
+
+- A standalone class with `ProcessHandle`/`ProcessHandle.Info` static fields
+  executed `current().info().command()` and printed `process-handle-link-ok=true`.
+- The exact reported `smallrye-common-os-2.16.0.jar` loaded
+  `io.smallrye.common.os.Process` through `Class.forName` and printed
+  `smallrye-process-load-ok`.
 
 ## Summary
 
@@ -90,7 +109,7 @@ classes need *some* minimal real class definition (even a trivial "shape" with f
 code that merely mentions the type, independent of whether the native method registrations backing its actual
 behavior are used or not.
 
-## Next steps
+## Original investigation notes
 
 1. Search `native-builtins/src/` for how CratonVM registers classes as "real but native-backed" elsewhere (e.g.
    how `java.lang.Process` itself, or other similarly-synthetic JDK classes, are exposed to the classloader/

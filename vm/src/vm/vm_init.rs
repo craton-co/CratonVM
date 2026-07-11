@@ -1468,6 +1468,11 @@ impl SharedVm {
                 );
                 native_methods.set_category(__prev_bridge);
                 register_io_natives(&mut native_methods);
+                // The phase bundles are synthetic-only, but SmallRye calls
+                // ProcessHandle.current().info() in real-JDK mode as well.
+                cratonvm_native_builtins::phases_late::register_p60_process_handle(
+                    &mut native_methods,
+                );
                 // Mixed real-JDK mode still routes many collection call sites
                 // through synthetic wrappers; register collection natives so
                 // ArrayList/Iterator/Map operations don't fail linkage.
@@ -1858,6 +1863,9 @@ impl SharedVm {
             );
             native_methods.set_category(__prev_bridge);
             register_io_natives(&mut native_methods);
+            // Keep the default CLI's real-JDK registration in sync with the
+            // synthetic-feature build above.
+            cratonvm_native_builtins::phases_late::register_p60_process_handle(&mut native_methods);
             register_collections_natives(&mut native_methods);
             // Re-register the side-table-backed `java.util.Random` /
             // `SecureRandom` natives AFTER `register_collections_natives`:
