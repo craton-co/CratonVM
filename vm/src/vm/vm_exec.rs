@@ -4720,7 +4720,21 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 // a buggy handler can't take down the VM further than the
                 // original exception already did).
                 if let MethodCallFailed::ExceptionThrown(exc) = &e {
-                    let exc = jvm_thread.native_pending_return.take().unwrap_or(*exc);
+                    // See the identical fix + rationale at the mirror site in
+                    // `runtime::interpreter`'s exception-unwind loop: only
+                    // trust `native_pending_return` as a substitute for the
+                    // real thrown exception when `exc` itself has gone stale
+                    // (GC-relocated during the failing call) — never
+                    // unconditionally, or a leftover native-return value
+                    // (e.g. an ANTLR `CommonToken`) silently misattributes
+                    // the uncaught exception's reported class. Always drain
+                    // the slot so a leftover can't poison a later event.
+                    let pending_return = jvm_thread.native_pending_return.take();
+                    let exc = if shared_arc.heap.is_object_address(exc.as_ptr() as usize).is_some() {
+                        *exc
+                    } else {
+                        pending_return.unwrap_or(*exc)
+                    };
                     // GC-root gap: `exc_ref` is a bare Rust local at this
                     // point — `run()`'s frame has already popped (the
                     // exception unwound past it) and

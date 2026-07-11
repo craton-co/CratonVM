@@ -4,6 +4,42 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-11 Uncaught-exception fatal-error misattribution FIXED (`java/lang/Thread`/`CommonToken` reported instead of the real Throwable); 2 real bugs unmasked
+
+Investigated the confirmed-but-unexplained pattern already flagged in
+`CRATONVM-SPRING-GENUINE-BUGLIST-125.md` (many `ABEND rc=1` classes reporting
+`Exception in thread "main" java/lang/Thread`/`org/antlr/v4/runtime/CommonToken`
+— neither a `Throwable` subclass) via a fresh Hibernate ORM repro
+(`FunctionTests`, `ASTParserLoadingTest`, `DefaultCatalogAndSchemaTest`,
+`OneToOneJoinColumnsEmbeddedIdTest`).
+
+- FIXED/RETIRED: [`uncaught-exception-misattribution-native-pending-return-FIXED.md`](../internal/fixed-suite-bugs/uncaught-exception-misattribution-native-pending-return-FIXED.md)
+  — `JvmThread::native_pending_return` (a native call's return-value GC root,
+  cleared once pushed to the caller's operand stack) was being consulted
+  **unconditionally** at two exception-unwind sites whenever it happened to
+  hold a leftover value from an unrelated earlier native call, silently
+  replacing the real, correctly-thrown exception with whatever stale object
+  (e.g. an ANTLR `CommonToken`, or a `Thread` mirror) was sitting there.
+  Fixed by only falling back to it when the real exception object has
+  actually gone stale (GC-relocated during the failing call), mirroring the
+  staleness check `safe_native_call` already used elsewhere. Verified across
+  all 4 repro classes: zero crashes post-fix (previously 100%), one class
+  (`OneToOneJoinColumnsEmbeddedIdTest`) now runs to full completion.
+- OPEN (new, unmasked by the fix): [`onetoone-embeddedid-propertyaccessexception.md`](onetoone-embeddedid-propertyaccessexception.md)
+  — `OneToOneJoinColumnsEmbeddedIdTest` now completes (previously crashed)
+  but shows a genuine `org.hibernate.PropertyAccessException` on 3/6 tests,
+  setting an embedded-id key field.
+- OPEN (new, unmasked by the fix, host-load-limited): [`functests-astparser-defaultcatalog-post-fix-slow-untriaged.md`](functests-astparser-defaultcatalog-post-fix-slow-untriaged.md)
+  — `FunctionTests`/`ASTParserLoadingTest`/`DefaultCatalogAndSchemaTest` no
+  longer crash and now run far more of the real suite, but didn't reach a
+  clean `@@RESULT` within the time available on a heavily contended shared
+  host (concurrent ES/Tomcat suite runs from other sessions). `FunctionTests`'s
+  masked exception was confirmed (before the fix, via live instrumentation)
+  to be a genuine `NullPointerException` inside the heavily-parameterized
+  `testDurationArithmeticWithParameters`; needs an idle-host rerun with
+  `-Dcraton.trace=1` to pin down further.
+
+
 ## 2026-07-10 ES `RandomBinaryDocValuesRangeQueryTests` hang cluster: 3/4 FIXED (compact-field getfield bug, fixed upstream); InetAddress redescribed for a new, unrelated correctness bug
 
 - FIXED/RETIRED: [`long-random-binary-doc-values-range-query-tests-FIXED.md`](../internal/elasticsearch-suite/long-random-binary-doc-values-range-query-tests-FIXED.md), [`integer-random-binary-doc-values-range-query-tests-FIXED.md`](../internal/elasticsearch-suite/integer-random-binary-doc-values-range-query-tests-FIXED.md), [`double-random-binary-doc-values-range-query-tests-FIXED.md`](../internal/elasticsearch-suite/double-random-binary-doc-values-range-query-tests-FIXED.md) — all three classes' original 600s suite-timeout HANG (collected 2026-07-08, `LRUQueryCache`'s internal `ReentrantReadWriteLock`/`ReentrantLock` write-lock contention) had turned into a 100% deterministic JIT SIGSEGV on a binary built strictly after that collection: `ReentrantLock.unlock()`'s single getfield (`this.sync`) was compiled as a 32-bit sign-extending `movsxd` load instead of a 64-bit `mov`, corrupting the loaded receiver before dispatching `sync.release(1)`. Root cause: `compact_field_slot(...).unwrap_or((0, false))` in three `field_resolver` closures (`vm/src/runtime/interpreter.rs`) silently fabricated "offset 0, not a reference" whenever a field's declaring class had no registered compact layout, and `jit/src/lib.rs`'s scan step trusted that fabrication unconditionally, steering the getfield/putfield inline codegen to treat a genuine reference field as a primitive. Independently root-caused and fixed by a concurrent session via a third, unrelated symptom (WildFly Host Controller invoke-IC SIGSEGV) — see this file's own `7f96c26c`/`be710234`/`93b33576` entries. Verified 2026-07-10 on a clean checkout of dev tip `e768916a` (no local changes needed): all three classes pass cleanly (`OK (6 tests)`) under fully default JIT settings.

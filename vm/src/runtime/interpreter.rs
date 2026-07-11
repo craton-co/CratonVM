@@ -8805,7 +8805,35 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 return Err(MethodCallFailed::InternalError(e));
             }
             Err(MethodCallFailed::ExceptionThrown(exc)) => {
-                let exc = thread.native_pending_return.take().unwrap_or(exc);
+                // `native_pending_return` roots a native call's returned
+                // object across the Rust<->Java boundary until it is pushed
+                // onto the caller's operand stack (see `safe_native_call` /
+                // `native_return_pushed_to_stack`). It is UNRELATED to the
+                // exception being unwound here in the common case — it can
+                // still hold a leftover value if the native call that set it
+                // never reached the "push to stack" step (e.g. its return
+                // value was discarded, or a later, independent exception
+                // fired before the pending value was consumed). Previously
+                // this code unconditionally preferred `native_pending_return`
+                // whenever it was `Some`, which meant a stale leftover object
+                // (observed: a `CommonToken` left over from ANTLR HQL
+                // parsing) silently replaced the REAL exception being
+                // propagated, misattributing the uncaught exception's class
+                // in fatal-error reporting.
+                //
+                // Only fall back to `native_pending_return` when `exc` itself
+                // has gone stale (relocated/reclaimed by a moving GC that ran
+                // during the failing native call, so `exc`'s address is no
+                // longer a valid live object) — mirroring the staleness check
+                // `safe_native_call` already performs in `vm_exec.rs`. The
+                // slot is always drained via `.take()` so a leftover value
+                // can never survive to poison a later, unrelated exception.
+                let pending_return = thread.native_pending_return.take();
+                let exc = if shared.heap.is_object_address(exc.as_ptr() as usize).is_some() {
+                    exc
+                } else {
+                    pending_return.unwrap_or(exc)
+                };
                 // Try to find handler, unwinding through stackless frames
                 // GC-root gap: see the pin in the `pending_java_exception` arm
                 // earlier in this function — same
