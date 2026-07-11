@@ -135,11 +135,20 @@ Verified on the Azure host (`victor@20.83.144.174`):
 - `InetAddressRandomBinaryDocValuesRangeQueryTests` itself
   (`-Dtests.seed=B17AC9D3E1F2A0C4`, `--Xmx 2g`): **6 of 7 pre-fix runs**
   hit this doc's exact `CONTAINS` / `/0.0.0.0` failure signature; **0 of 9
-  post-fix runs** did (8/9 clean `OK (6 tests)`, one hit an unrelated,
-  separately-flagged `java/util/Set` GC-staleness NPE — a different
-  code path, not this bug). The remaining 1/7 pre-fix run hit a different,
-  unrelated, separately-flagged `ClassCastException`. Neither stray
-  failure reproduces this doc's signature.
+  post-fix runs** did (8/9 clean `OK (6 tests)`, one hit an unrelated
+  `java/util/Set` GC-staleness NPE — a different code path, not this bug).
+  The remaining 1/7 pre-fix run hit a different, unrelated
+  `ClassCastException` with no stack trace. Neither stray failure
+  reproduces this doc's signature. Both are pre-existing, already-tracked
+  defects, unrelated to the fix here: the `Set` NPE is a suspected
+  unpinned-local GC hazard in `native-collections`'s `Set.of(...)` builder;
+  the `ClassCastException` is a third independent real-world corroboration
+  of the deep, already-tracked monitor-vs-evacuation race — see
+  [`gc-audit-2026-07-10-open-findings.md`](../gc-audit-2026-07-10-open-findings.md#second-cross-confirmation-from-an-independent-real-world-trigger-2026-07-11)
+  finding 1(b), "Second cross-confirmation" section (a follow-up
+  investigation of this same doc's residual reproduced it 3/20 runs and
+  confirmed a tight correlation with an `IllegalMonitorStateException`
+  precursor). Neither blocks this doc's retirement.
 
 Re-run:
 ```

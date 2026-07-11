@@ -482,6 +482,12 @@ pub trait NativeContext {
     /// back with [`read_native_pin`] before using it. Unpin the whole batch with
     /// [`unpin_native_roots`] passing the index returned by the *first* pin.
     ///
+    /// Forgot to pin somewhere? Run with `CRATONVM_DBG_STALE_OBJREF=1` (the
+    /// `Generational` GC backend only) to turn a stale read into an immediate,
+    /// deterministic panic instead of silent corruption — see
+    /// `gc/src/stale_objref_debug.rs` and
+    /// docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    ///
     /// Default impl is a no-op (handle 0) for test mocks with no moving GC.
     fn pin_native_root(&mut self, _obj: ObjectRef) -> usize {
         0
