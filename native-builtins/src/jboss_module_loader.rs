@@ -2936,7 +2936,7 @@ pub(crate) fn native_module_load_service_from_caller_module_loader(
         }
     };
     let service = match args.get(1) {
-        Some(Value::Object(Some(c))) => Value::Object(Some(*c)),
+        Some(Value::Object(Some(c))) => *c,
         _ => {
             return Err(RuntimeError::NullPointerException {
                 message: Some(
@@ -2946,6 +2946,24 @@ pub(crate) fn native_module_load_service_from_caller_module_loader(
             .into());
         }
     };
+    // GC-safety: `service` (the `Class` mirror for e.g. `Extension.class`) is
+    // captured before two GC-risking calls below (`native_loader_load_module`
+    // resolves + registers a module's resource roots; `native_module_get_class_loader`
+    // lazily allocates a `ModuleClassLoader` the first time it's asked for a
+    // given module — which is every time here, since this runs once per
+    // freshly-loaded extension module during WildFly boot). Per the
+    // `pin_native_root` contract, a moving GC in that window leaves `service`
+    // stale; passed into the final `ServiceLoader.load` native, this silently
+    // constructs a `ServiceLoader` scoped to the WRONG (or a reused, all-zero)
+    // service type, so `discover_providers` searches for the wrong resource
+    // name and returns zero providers — the bytecode caller's own error
+    // message still names the correct service class (a separate, un-corrupted
+    // bytecode-level reference to `Extension.class`), so this manifests as
+    // "No META-INF/services/org.jboss.as.controller.Extension found" for a
+    // seemingly-arbitrary, different extension module each time, exactly the
+    // non-deterministic residual documented in
+    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    let service_pin = ctx.pin_native_root(service);
 
     let loader = build_local_module_loader(ctx);
     let name_obj = ctx.create_string(&module_name);
@@ -2962,11 +2980,13 @@ pub(crate) fn native_module_load_service_from_caller_module_loader(
         Some(Value::Object(Some(cl))) => cl,
         _ => return Err(throw_module_not_found(ctx, &module_name)),
     };
+    let service = ctx.read_native_pin(service_pin, service);
+    ctx.unpin_native_roots(service_pin);
     ctx.invoke(
         "java/util/ServiceLoader",
         "load",
         "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/util/ServiceLoader;",
-        &[service, Value::Object(Some(class_loader))],
+        &[Value::Object(Some(service)), Value::Object(Some(class_loader))],
     )
 }
 
@@ -3019,11 +3039,25 @@ pub(crate) fn native_module_load_service(
             .into());
         }
     };
+    // GC-safety: `service_type` is captured before `native_module_get_class_loader`
+    // below, which lazily allocates a new `ModuleClassLoader` the first time
+    // it's asked for a given module — i.e. every time here, since this runs
+    // once per freshly-loaded extension module during WildFly boot. Per the
+    // `pin_native_root` contract, a moving GC during that allocation leaves
+    // `service_type` stale; passed into the final `ServiceLoader.load` native,
+    // this silently scopes the `ServiceLoader` to the wrong (or reused,
+    // all-zero) service type, so `discover_providers` searches for the wrong
+    // resource name and returns zero providers. See the matching fix in
+    // `native_module_load_service_from_caller_module_loader` above for the
+    // full mechanism writeup.
+    let service_type_pin = ctx.pin_native_root(service_type);
     let class_loader_val = native_module_get_class_loader(ctx, &[Value::Object(Some(this))])?;
     let class_loader = match class_loader_val {
         Some(Value::Object(Some(cl))) => Value::Object(Some(cl)),
         _ => Value::Object(None),
     };
+    let service_type = ctx.read_native_pin(service_type_pin, service_type);
+    ctx.unpin_native_roots(service_type_pin);
     ctx.invoke(
         "java/util/ServiceLoader",
         "load",

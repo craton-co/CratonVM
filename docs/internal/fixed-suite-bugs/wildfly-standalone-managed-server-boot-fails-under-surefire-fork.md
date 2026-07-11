@@ -159,16 +159,31 @@ before/after breakdown.
 The one remaining class in the sample does **not** deterministically hit the original crash — repeated
 runs against the identical fixed binary produced 3 *different* outcomes (the original NPE, a
 later-stage failure, and a *new* signature: `WFLYCTL0153: No META-INF/services/
-org.jboss.as.controller.Extension found` for a *different* specific extension each time). This points
-at a genuinely concurrent race in WildFly's `DeferredExtensionContext`/`FutureTask`-based extension
-loading, not another single fixed unprotected-`ObjectRef` site — plus a separately-confirmed, already-
-tracked STW cross-thread JIT-takeover stall (`docs/internal/fixed-suite-bugs/
-wildfly-gc-barrier-boot-hang-and-harness-fixes.md`'s explicitly-flagged, not-yet-fixed
-EnhancedQueueExecutor-parked-in-futex residual). Both are tracked in
-`docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md` for whoever picks up the next
-session — the first is a promising, well-scoped next investigation; the second is deep GC-barrier work
-already assessed as high regression risk by a prior session and should not be attempted without a fresh
-live-gdb capture at the exact stall.
+org.jboss.as.controller.Extension found` for a *different* specific extension each time).
+
+**UPDATE 2026-07-11 (second follow-up session): 2 MORE sites of the identical pattern found+fixed —
+`native_module_load_service`/`native_module_load_service_from_caller_module_loader`
+(`native-builtins/src/jboss_module_loader.rs`, held `service_type`/`service` across a lazy
+`ModuleClassLoader` allocation) and `native_sl_iterator` (`native-builtins/src/service_loader.rs`, held
+the reflective `Constructor` across `setAccessible` + an array allocation before its second use in
+`Constructor.newInstance`).** The second one was caught directly in the act via a live
+`CRATONVM_DIAG_SERVICELOADER=1` capture: the module-scoped provider lookup correctly found
+`org.wildfly.extension.beanvalidation.BeanValidationExtension` (`providers=1`), but a *later* attempt to
+instantiate that exact class failed with the same `"Constructor.newInstance: no declaring class"` this
+whole investigation started with — proof that `WFLYCTL0153` was in some cases a downstream symptom of
+the very same bug class, recurring at a different call site than the one originally fixed. Both new
+fixes verified as real improvements (not regressions) but did **not** fully eliminate the residual (an
+8-retry targeted sample after both fixes: 4/8 clear, 3/8 original NPE, 1/8 still `WFLYCTL0153`). See
+`docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md`'s "long-tail bug class" section —
+after finding 6-7 total sites of this exact pattern across 3 sessions with the residual still not fully
+closed, that doc recommends a systematic static-analysis sweep over one-off manual chasing for whoever
+continues this.
+
+Separately confirmed still present (both follow-up sessions): the STW cross-thread JIT-takeover stall
+(`docs/internal/fixed-suite-bugs/wildfly-gc-barrier-boot-hang-and-harness-fixes.md`'s explicitly-flagged,
+not-yet-fixed EnhancedQueueExecutor-parked-in-futex residual) — deep GC-barrier work already assessed as
+high regression risk by a prior session; two live-gdb capture attempts across both follow-ups missed the
+exact stall window (need to poll the log for the `rounds=64` warning before attaching, not a fixed sleep).
 
 ## Evidence
 
@@ -177,7 +192,10 @@ Azure host 20.83.144.174, worktree /data/data/wt-wf-surefire-boot-src-20260711 (
   /data/data/wt-wf-surefire-boot-20260711 (repro harness copy)
 Frozen binaries: frozen-cratonvm-wf-surefire-boot-20260711-v1.bin (pre-fix, confirms repro),
   frozen-cratonvm-wf-surefire-boot-20260711-v2.bin (lang_class.rs fix only, 6/10 sample),
-  frozen-cratonvm-wf-surefire-boot-20260711-v3.bin (+ stream_decoder.rs/stream_encoder.rs fixes, 9/10 sample)
+  frozen-cratonvm-wf-surefire-boot-20260711-v3.bin (+ stream_decoder.rs/stream_encoder.rs fixes, 9/10 sample),
+  frozen-cratonvm-wf-surefire-boot-20260711-v4.bin (+ jboss_module_loader.rs service_type/service pin),
+  frozen-cratonvm-wf-surefire-boot-20260711-v5.bin (+ service_loader.rs ctor pin, 8-retry targeted sample:
+  4/8 clear, 3/8 original NPE, 1/8 still WFLYCTL0153 — real but incomplete improvement)
 /data/data/cratonvm/apps/wildfly/testsuite/integration/basic/target/surefire-reports/
   org.jboss.as.test.integration.beanvalidation.BeanValidationTestCase-output.txt (before/after captured
   separately during the investigation)

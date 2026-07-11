@@ -29,6 +29,37 @@ for the full (long) story and the fix. `SubstringOnly` 1283ms→29ms at n=10,000
 the original combined benchmark 4775ms (never finished at n=50,000)→2295ms
 (completes) — checksums identical to JDK throughout, zero test regressions.
 
+## 2026-07-11 WildFly Surefire-fork boot-crash 2nd follow-up: decompiled DeferredExtensionContext, found+fixed 2 MORE GC-staleness sites (live-caught in the act); residual is a long-tail bug class, not a small fixed set
+
+Follow-up to the entry directly below's higher-priority lead. Decompiled
+`org.jboss.as.controller.parsing.DeferredExtensionContext` (`wildfly-controller-31.0.3.Final.jar`) and
+confirmed it genuinely loads extensions concurrently: one `Callable` per extension submitted to a
+`bootExecutor` `ExecutorService`, each independently calling
+`moduleLoader.loadModule(name).loadService(Extension.class)`, then blocking on `Future.get()` per
+extension (surfacing `ExecutionException` as the observed `IllegalStateException`).
+
+- FIXED: `native_module_load_service`/`native_module_load_service_from_caller_module_loader`
+  (`native-builtins/src/jboss_module_loader.rs`) held `service_type`/`service` (the `Class` mirror for
+  `Extension.class`) across `native_module_get_class_loader` — which lazily allocates a new
+  `ModuleClassLoader` the first time it's asked for a given module, i.e. essentially every
+  extension-loading call during boot — before using it again, unpinned.
+- FIXED: `native_sl_iterator` (`native-builtins/src/service_loader.rs`) held the reflective `Constructor`
+  across an intervening `AccessibleObject.setAccessible` invoke *and* a `new_ref_array` allocation before
+  its second use in `Constructor.newInstance`. Caught directly in the act via a live
+  `CRATONVM_DIAG_SERVICELOADER=1` capture: the module-scoped provider lookup correctly found
+  `org.wildfly.extension.beanvalidation.BeanValidationExtension` (`providers=1`), but a *later* attempt
+  to instantiate that exact class failed with `"Constructor.newInstance: no declaring class"` — the same
+  symptom this whole investigation started with, now proven to recur at an entirely different call site
+  than the one originally fixed.
+- Both fixes verified as real, non-regressing improvements (8-retry targeted sample: 4/8 clear, 3/8
+  original NPE, 1/8 still a related `WFLYCTL0153` failure) but **did not fully eliminate the residual**.
+- OPEN, re-characterized: [`wildfly-parallel-boot-stale-objectref-residual.md`](wildfly-parallel-boot-stale-objectref-residual.md) —
+  after 6-7 total sites of this exact "Family 1" pattern found and fixed across 3 sessions (this one,
+  the one below, and the original fix), with the residual still not fully closed, this is now understood
+  as a **long-tail bug class** rather than a small enumerable set of sites. The doc recommends a
+  systematic static-analysis sweep (scan for `ObjectRef`/`Value` locals bound before an allocating `ctx.*`
+  call and read again without an intervening pin) over continued one-off manual chasing.
+
 ## 2026-07-11 WildFly Surefire-fork boot-crash follow-up: 2 more GC-staleness sites FIXED (6/10 → 9/10 sample); residual narrowed to a concurrent extension-loading race + the known STW JIT-takeover stall
 
 Follow-up to the entry directly below. Investigating the residual's two reported symptoms
