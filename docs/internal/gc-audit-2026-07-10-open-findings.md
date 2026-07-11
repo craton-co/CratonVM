@@ -148,8 +148,14 @@ collection (a missed MARKING ROOT — not a missed remap: all three
 pointer-map application paths were audited and each forwards frames,
 `monitor_on_exit`, `native_pin_roots`, `java_thread_obj`, scoped values and
 JIT/shadow slots) and young-from was reset over it. Reference processing is
-exonerated as the sole writer: a 25-run arm with `CRATONVM_DBG_NO_REFPROC=1`
-still reproduced the identical IMSE+CCE pair. This is the already-tracked
+exonerated as the sole writer: 25-run instrumented arms measured plain =
+19 clean / 3 imse / 5 cce vs `CRATONVM_DBG_NO_REFPROC=1` = 21 clean /
+3 imse / 4 cce — statistically identical. A `CRATONVM_GC_VERIFY_STALE=1`
+arm hit the IMSE+CCE pair with the resumed-frame stale-slot verifier
+staying SILENT, so the stale reference does not live in a resumed thread's
+interpreter frames at pointer-map-application time — it enters through a
+side structure or a location the verifier does not walk. This is the
+already-tracked
 **moving-young GC-precision / missed-root family** (lost operand-stack tag
 / side-structure root gap — see `CRATONVM_GC_VERIFY_STALE`'s doc comment,
 the compact-ref-fields memory's residual section, and the HIB temporal /
@@ -417,11 +423,17 @@ G1 internals is how the parked quota-race WIP went wrong.
 > load (load avg 14+), not the documented lost-wakeup pile-up. The
 > `gen_heap::get_field` OOB WARN burst does still occur and per its own
 > message text can be benign speculative collection-layout probing; treat
-> it as a signal only when correlated with real failures. The
-> InetAddress-range manifestation (section below) is the cheaper, still
-> reproducing tracker for the residual — see finding 1(b)'s status block
-> for its forensic classification (missed-marking-root family, not
-> barrier/monitor).
+> it as a signal only when correlated with real failures. A full-JIT
+> 900s-timeout A/B (3 runs each, same seed, loaded host) is statistically
+> identical pre/post fix — dev tip: 2× no-output-in-900s + 1 corrupt
+> failure (NoSuchFileException on a merge segment file, 270s); fixed:
+> 2× no-output-in-900s + 1 corrupt failure (MergeException "writer hit an
+> unrecoverable error", 276s) — so this cluster is NOT barrier-driven;
+> its corrupt-failure flavor matches the same residual corruption family
+> as the InetAddress tracker. The InetAddress-range manifestation
+> (section below) is the cheaper, still-reproducing tracker for that
+> residual — see finding 1(b)'s status block for its forensic
+> classification (missed-marking-root family, not barrier/monitor).
 
 Investigating the ES `DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests` /
 `IVFKnnFloatVectorQueryTests` hang cluster
