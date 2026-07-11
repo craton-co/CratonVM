@@ -31,8 +31,39 @@ production caveats.
 
 - AWT / Swing headful support (current builds are headless-only).
 - Module system: full JEP 261 resolution semantics.
-- GPU offload (opt-in, see [docs/gpu/README.md](docs/gpu/README.md)).
+- GPU offload — see the dedicated section below.
 - Project Panama foreign linker maturity.
+
+## GPU offload
+
+**Validated on real hardware 2026-07-11** (RTX 2060, `--features gpu-driver`): transparent
+`--gpu` offload matches HotSpot checksums bit-for-bit and reaches ~210x over HotSpot C2 and
+~3x over TornadoVM's PTX backend on a 48-division-per-element div-chain kernel at n = 2^24
+(see [`bench-gpu/results/divchain-comparison-20260711.md`](bench-gpu/results/divchain-comparison-20260711.md)
+and [docs/gpu/COMPARISON.md](docs/gpu/COMPARISON.md)). It remains opt-in
+(`--features gpu-offload`/`gpu-driver`, `--gpu` at runtime) and CUDA/NVIDIA-only; see
+[docs/gpu/README.md](docs/gpu/README.md).
+
+In progress (July 2026) — tracked in
+[docs/known-issues/gpu-offload-followups-20260711.md](docs/known-issues/gpu-offload-followups-20260711.md):
+
+- Reduction-kernel dispatch (non-void-return methods currently never launch on GPU).
+- Closing the JIT-caller bypass gap, where an offload-eligible call site inside a
+  JIT-compiled/OSR'd caller skips the interpreter offload hook.
+- True async kernel completion (`dispatch_async` is synchronous under the hood today).
+- Analyzer/lowering coverage: `ldc`/`ldc2_w` constants, `frem`/`drem`, non-canonical loop shapes.
+- Self-hosted hardware CI running the `bench-gpu/` suite on real CUDA hardware on every change.
+
+Longer-horizon:
+
+- 2D / nested counted loops (the analyzer currently accepts only a single canonical
+  `for (i = 0; i < bound; i++)` loop per method).
+- Multi-GPU selection beyond a single `--gpu-device` ordinal.
+- Float/double reductions, pending a deterministic-summation strategy (naive atomic float
+  add is non-associative and would diverge from HotSpot's sequential result).
+- OpenCL/SPIR-V/multi-vendor backends are a non-goal: CratonVM's offload path is deliberately
+  CUDA-only (see the positioning discussion in [docs/gpu/COMPARISON.md](docs/gpu/COMPARISON.md));
+  multi-backend support is TornadoVM's niche, not this project's.
 
 ## Success criteria (aspirational targets)
 

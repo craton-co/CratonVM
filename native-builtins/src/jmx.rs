@@ -1168,9 +1168,11 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
                     Value::Int(id) if id > 0 => id as i64,
                     _ => continue,
                 };
-                let info = alloc_basic_thread_info(ctx, thread_id)?;
-                let out = ctx.read_native_pin(out_pin, out);
-                ctx.set_array_element(out, i, Value::Object(Some(info)));
+                if let Some(name) = registered_thread_name(ctx, thread_id) {
+                    let info = alloc_named_thread_info(ctx, thread_id, &name);
+                    let out = ctx.read_native_pin(out_pin, out);
+                    ctx.set_array_element(out, i, Value::Object(Some(info)));
+                }
             }
             ctx.unpin_native_roots(ids_pin);
             Ok(None)
@@ -2332,6 +2334,26 @@ fn alloc_named_thread_info(
     info
 }
 
+/// Return the real Java name for a live registered thread with the requested
+/// Java `Thread.tid`. JMX APIs must never silently substitute the main thread
+/// when the requested id is unknown.
+fn registered_thread_name(ctx: &dyn NativeContext, thread_id: i64) -> Option<String> {
+    ctx.enumerate_threads(256).into_iter().find_map(|thread_obj| {
+        let id = match ctx.get_field_by_name(thread_obj, "tid") {
+            Value::Long(id) => id,
+            Value::Int(id) => id as i64,
+            _ => return None,
+        };
+        if id != thread_id {
+            return None;
+        }
+        match ctx.get_field_by_name(thread_obj, "name") {
+            Value::Object(Some(name)) => ctx.read_string(name),
+            _ => None,
+        }
+    })
+}
+
 fn alloc_thread_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadMXBean", 6);
     let thread_count = ctx.active_thread_count();
@@ -2446,8 +2468,28 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
                     _ => None,
                 })
                 .unwrap_or_else(|| ctx.thread_id().max(1) as i64);
-            let info = alloc_basic_thread_info(ctx, thread_id)?;
-            Ok(Some(Value::Object(Some(info))))
+            if thread_id <= 0 {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "Invalid thread ID parameter".into(),
+                }
+                .into());
+            }
+
+            // Do not manufacture a `main` ThreadInfo for every requested id.
+            // Tomcat's JULI ThreadNameCache asks ThreadMXBean about a live
+            // worker by its Java Thread.tid; returning `main` poisons that
+            // cache permanently.  Resolve the requested Java thread from the
+            // registry and use its real layout-neutral `name` field.
+            let thread_name = registered_thread_name(ctx, thread_id);
+
+            match thread_name {
+                Some(name) => Ok(Some(Value::Object(Some(alloc_named_thread_info(
+                    ctx, thread_id, &name,
+                ))))),
+                // ThreadMXBean specifies null for an id that no longer names
+                // a live thread.  It must not alias that id to the main thread.
+                None => Ok(Some(Value::Object(None))),
+            }
         },
     );
     // Surefire ForkedBooter.generateThreadDump: getThreadInfo([J, I) returns

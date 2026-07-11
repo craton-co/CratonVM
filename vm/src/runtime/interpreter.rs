@@ -492,9 +492,10 @@ fn stw_take_over_and_wait(
     // Generational degrades to the non-moving sweep that consumes the JIT
     // TLAB skip regions; G1 (INT-3) skips the published tails in every region
     // walker and pins everything a frozen peer can address out of the CSet
-    // (see `pin_frozen_peer_roots_for_g1`). ZGC has neither protocol yet and
-    // keeps the legacy unbounded cooperative wait — a compiled loop that
-    // never allocates nor re-enters the interpreter can still livelock it.
+    // (see `pin_frozen_peer_roots_for_g1`); ZGC (INT-3 residual) is trivially
+    // safe — non-moving, registry-walked sweep, and its mutators never hold
+    // TLABs. The `supports_jit_tlab_skip` gate is retained for any future
+    // backend that can't make one of those arguments.
     if !xt::enabled() || !shared.heap.supports_jit_tlab_skip() {
         shared.gc_barrier.wait_for_all();
         return xt::TakenOver::default();
@@ -881,12 +882,13 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 shared
                     .gc_barrier
                     .request_stw_counted_with_live_blocked(thread.thread_id, || {
-                        let (n, blocked, tids) =
+                        let (n, blocked, tids, blocked_tids) =
                             shared.thread_registry.alive_count_blocked_and_os_tids();
                         counted_os_tids = tids;
                         (
                             u32::try_from(n).unwrap_or(u32::MAX),
                             u32::try_from(blocked).unwrap_or(u32::MAX),
+                            blocked_tids,
                         )
                     })
             };
@@ -1025,12 +1027,13 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             shared
                 .gc_barrier
                 .request_stw_counted_with_live_blocked(thread.thread_id, || {
-                    let (n, blocked, tids) =
+                    let (n, blocked, tids, blocked_tids) =
                         shared.thread_registry.alive_count_blocked_and_os_tids();
                     counted_os_tids = tids;
                     (
                         u32::try_from(n).unwrap_or(u32::MAX),
                         u32::try_from(blocked).unwrap_or(u32::MAX),
+                        blocked_tids,
                     )
                 })
         };
@@ -1217,12 +1220,13 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             shared
                 .gc_barrier
                 .request_stw_counted_with_live_blocked(thread.thread_id, || {
-                    let (n, blocked, tids) =
+                    let (n, blocked, tids, blocked_tids) =
                         shared.thread_registry.alive_count_blocked_and_os_tids();
                     counted_os_tids = tids;
                     (
                         u32::try_from(n).unwrap_or(u32::MAX),
                         u32::try_from(blocked).unwrap_or(u32::MAX),
+                        blocked_tids,
                     )
                 })
         };
@@ -2989,49 +2993,71 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
         shared.concurrent_gc_state.clone(),
     );
 
-    // Phase 1: Initial Mark — brief STW pause
-    let initial_mark_done = shared.gc_barrier.brief_stw_counted_with_live_blocked(
-        thread.thread_id,
-        || {
-            let (n, blocked, _tids) = shared.thread_registry.alive_count_blocked_and_os_tids();
+    // Phase 1: Initial Mark — brief STW pause.
+    //
+    // INT-3 residual fix: open-coded (request → takeover-wait → work →
+    // complete) instead of `brief_stw_counted_with_live_blocked`, whose
+    // internal plain `wait_for_all()` stalls forever on a peer spinning in
+    // compiled code — and whose root set covered such a peer only by its
+    // STALE deposit snapshot. Mark-only pause: the frozen peers' fresh
+    // conservative roots are extra MARK roots; nothing moves, so no
+    // pin/pointer-map concerns.
+    let mut counted_os_tids: Vec<u32> = Vec::new();
+    let initial_mark_done = shared
+        .gc_barrier
+        .request_stw_counted_with_live_blocked(thread.thread_id, || {
+            let (n, blocked, tids, blocked_tids) =
+                shared.thread_registry.alive_count_blocked_and_os_tids();
+            counted_os_tids = tids;
             (
                 u32::try_from(n).unwrap_or(u32::MAX),
                 u32::try_from(blocked).unwrap_or(u32::MAX),
+                blocked_tids,
             )
-        },
-        || {
-            // Collect root pointers for old-gen marking
-            let roots = collect_roots(shared, thread);
-            let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
-            let mut root_ptrs: Vec<*mut u8> = roots
-                .iter()
-                .chain(snapshot_roots.iter())
-                .map(|r| r.as_ptr())
-                .collect();
-            // fork6 GC_STRESS fix — young→old references are mandatory
-            // old-marking roots. `initial_mark` filters this list with
-            // `old_gen.contains`, so an old object whose only path from a
-            // root goes THROUGH a young object (root → young holder → old
-            // target) was invisible and the sweep freed it live. Selective
-            // promotion mass-produces exactly that shape (it tenures a
-            // pinned young holder's children), which is why the Fork6Hard
-            // GC_STRESS lane corrupted even single-threaded during clinit.
-            // Safe here: brief STW, mutators quiesced, TLABs retired.
-            root_ptrs.extend(
-                shared
-                    .heap
-                    .collect_young_to_old_roots()
-                    .into_iter()
-                    .map(|a| a as *mut u8),
-            );
-            if let Some(guard) = shared.heap.old_gen_lock() {
-                marker.initial_mark(&root_ptrs, &*guard);
-            }
-        },
-    );
-
+        });
     if !initial_mark_done {
         return; // Another STW was in progress
+    }
+    {
+        // Forcibly stop + conservatively scan in-JIT peers, then wait for
+        // the cooperative mutators (byte-identical to wait_for_all() when
+        // no thread is in JIT).
+        let mut xt_roots: Vec<ObjectRef> = Vec::new();
+        let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
+        // Collect root pointers for old-gen marking
+        let roots = collect_roots(shared, thread);
+        let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
+        let mut root_ptrs: Vec<*mut u8> = roots
+            .iter()
+            .chain(snapshot_roots.iter())
+            // INT-3 — frozen in-JIT peers' conservative register/stack roots.
+            .chain(xt_roots.iter())
+            .map(|r| r.as_ptr())
+            .collect();
+        // fork6 GC_STRESS fix — young→old references are mandatory
+        // old-marking roots. `initial_mark` filters this list with
+        // `old_gen.contains`, so an old object whose only path from a
+        // root goes THROUGH a young object (root → young holder → old
+        // target) was invisible and the sweep freed it live. Selective
+        // promotion mass-produces exactly that shape (it tenures a
+        // pinned young holder's children), which is why the Fork6Hard
+        // GC_STRESS lane corrupted even single-threaded during clinit.
+        // Safe here: brief STW, mutators quiesced, TLABs retired.
+        root_ptrs.extend(
+            shared
+                .heap
+                .collect_young_to_old_roots()
+                .into_iter()
+                .map(|a| a as *mut u8),
+        );
+        if let Some(guard) = shared.heap.old_gen_lock() {
+            marker.initial_mark(&root_ptrs, &*guard);
+        }
+        // Clear TLAB skip regions + resume frozen peers BEFORE reopening
+        // the world (same race rationale as maybe_gc's epilogue).
+        shared.heap.clear_jit_tlab_skip_regions();
+        crate::jit::xt_root_scan::resume(taken);
+        shared.gc_barrier.complete_gc(std::collections::HashMap::new());
     }
 
     // Phase 2: Concurrent Mark — runs while app threads continue
@@ -3039,39 +3065,53 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
         marker.concurrent_mark(&*guard);
     }
 
-    // Phase 3: Remark — brief STW pause
-    let remark_done = shared.gc_barrier.brief_stw_counted(
-        thread.thread_id,
-        || u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX),
-        || {
-            // Round-5 fix (CRIT — UAF): drain the initiator's per-thread
-            // SATB buffer before remark drains the global queue. Other
-            // mutators flushed when they arrived at the STW barrier;
-            // the initiator must drain its own.
-            shared.heap.flush_thread_satb();
-            let roots = collect_roots(shared, thread);
-            let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
-            let mut root_ptrs: Vec<*mut u8> = roots
-                .iter()
-                .chain(snapshot_roots.iter())
-                .map(|r| r.as_ptr())
-                .collect();
-            // fork6 GC_STRESS fix — refresh the young→old roots at remark
-            // too: a young→old edge created during the concurrent phase
-            // (e.g. a promoted child stored into a fresh young holder) must
-            // be in the final bitmap before the sweep.
-            root_ptrs.extend(
-                shared
-                    .heap
-                    .collect_young_to_old_roots()
-                    .into_iter()
-                    .map(|a| a as *mut u8),
-            );
-            if let Some(guard) = shared.heap.old_gen_lock() {
-                marker.remark(&root_ptrs, &*guard);
-            }
-        },
-    );
+    // Phase 3: Remark — brief STW pause.
+    // INT-3 residual fix: open-coded for the same takeover-wait reason as
+    // Phase 1 above (a never-polling in-JIT peer must not stall the remark
+    // nor be covered only by its stale deposit snapshot).
+    let mut counted_os_tids: Vec<u32> = Vec::new();
+    let remark_done = shared.gc_barrier.request_stw_counted(thread.thread_id, || {
+        let (n, tids) = shared.thread_registry.alive_count_and_os_tids();
+        counted_os_tids = tids;
+        u32::try_from(n).unwrap_or(u32::MAX)
+    });
+    if remark_done {
+        let mut xt_roots: Vec<ObjectRef> = Vec::new();
+        let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
+        // Round-5 fix (CRIT — UAF): drain the initiator's per-thread
+        // SATB buffer before remark drains the global queue. Other
+        // mutators flushed when they arrived at the STW barrier;
+        // the initiator must drain its own.
+        shared.heap.flush_thread_satb();
+        let roots = collect_roots(shared, thread);
+        let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
+        let mut root_ptrs: Vec<*mut u8> = roots
+            .iter()
+            .chain(snapshot_roots.iter())
+            // INT-3 — frozen in-JIT peers' conservative register/stack roots.
+            .chain(xt_roots.iter())
+            .map(|r| r.as_ptr())
+            .collect();
+        // fork6 GC_STRESS fix — refresh the young→old roots at remark
+        // too: a young→old edge created during the concurrent phase
+        // (e.g. a promoted child stored into a fresh young holder) must
+        // be in the final bitmap before the sweep.
+        root_ptrs.extend(
+            shared
+                .heap
+                .collect_young_to_old_roots()
+                .into_iter()
+                .map(|a| a as *mut u8),
+        );
+        if let Some(guard) = shared.heap.old_gen_lock() {
+            marker.remark(&root_ptrs, &*guard);
+        }
+        // Clear TLAB skip regions + resume frozen peers BEFORE reopening
+        // the world (same race rationale as maybe_gc's epilogue).
+        shared.heap.clear_jit_tlab_skip_regions();
+        crate::jit::xt_root_scan::resume(taken);
+        shared.gc_barrier.complete_gc(std::collections::HashMap::new());
+    }
 
     // fork6 GC_STRESS fix — the remark STW is NOT optional. If another
     // thread's STW won the race (`brief_stw_counted` returned false — a
@@ -3110,50 +3150,70 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
 /// 3. Remark (brief STW) — drain SATB buffers, re-mark roots
 /// 4. Cleanup — compute per-region liveness, free empty regions
 fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
-    // Phase 1: Initial Mark — brief STW pause
-    // Activates SATB write barrier and marks root-reachable objects
-    let initial_mark_done = shared.gc_barrier.brief_stw_counted_with_live_blocked(
-        thread.thread_id,
-        || {
-            let (n, blocked, _tids) = shared.thread_registry.alive_count_blocked_and_os_tids();
+    // Phase 1: Initial Mark — brief STW pause.
+    // Activates SATB write barrier and marks root-reachable objects.
+    //
+    // INT-3 residual fix: open-coded (request → takeover-wait → work →
+    // complete) instead of `brief_stw_counted_with_live_blocked`, whose
+    // internal plain `wait_for_all()` stalls forever on a peer spinning in
+    // compiled code — and whose root set covered such a peer only by its
+    // STALE deposit snapshot (a missed mark root here = cleanup frees a
+    // live object). Mark-only pause: the frozen peers' fresh conservative
+    // roots are extra MARK roots; nothing moves, so no pin/pointer-map
+    // concerns.
+    let mut counted_os_tids: Vec<u32> = Vec::new();
+    let initial_mark_done = shared
+        .gc_barrier
+        .request_stw_counted_with_live_blocked(thread.thread_id, || {
+            let (n, blocked, tids, blocked_tids) =
+                shared.thread_registry.alive_count_blocked_and_os_tids();
+            counted_os_tids = tids;
             (
                 u32::try_from(n).unwrap_or(u32::MAX),
                 u32::try_from(blocked).unwrap_or(u32::MAX),
+                blocked_tids,
             )
-        },
-        || {
-            // Round-5 fix (CRIT — UAF): drain the initiator's per-thread
-            // SATB buffer on the way into initial-mark. Other mutators
-            // already flushed on their `safepoint_check` arrival; the
-            // initiator hasn't, and any buffered overwrites from before
-            // SATB activation must reach the global queue before the
-            // marker starts consuming it.
-            shared.heap.flush_thread_satb();
-            shared.heap.g1_start_concurrent_mark();
-            // INT-8: publish the referent-slot skip set for this cycle —
-            // the Weak/Soft/Phantom Reference OBJECT addresses currently
-            // registered. Inside this STW the snapshot is consistent (no
-            // mutator can construct, move, or free a Reference), and it
-            // must land before the roots below seed the gray set so no
-            // Reference is ever scanned without the skip in force. G1
-            // carries the set across every mid-cycle evacuation pause
-            // internally (remap survivors, prune CSet casualties).
-            let ref_objs = shared.ref_processor.lock().reference_object_addresses();
-            shared.heap.g1_set_reference_skip_set(&ref_objs);
-            // Mark roots into the G1 mark bitmap
-            let roots = collect_roots(shared, thread);
-            let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
-            let all_roots: Vec<cratonvm_types::ObjectRef> = roots
-                .into_iter()
-                .chain(snapshot_roots.into_iter())
-                .collect();
-            shared.heap.g1_mark_roots(&all_roots);
-            tracing::debug!("[G1] Initial mark: {} roots marked", all_roots.len());
-        },
-    );
-
+        });
     if !initial_mark_done {
         return; // Another STW in progress
+    }
+    {
+        let mut xt_roots: Vec<ObjectRef> = Vec::new();
+        let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
+        // Round-5 fix (CRIT — UAF): drain the initiator's per-thread
+        // SATB buffer on the way into initial-mark. Other mutators
+        // already flushed on their `safepoint_check` arrival; the
+        // initiator hasn't, and any buffered overwrites from before
+        // SATB activation must reach the global queue before the
+        // marker starts consuming it.
+        shared.heap.flush_thread_satb();
+        shared.heap.g1_start_concurrent_mark();
+        // INT-8: publish the referent-slot skip set for this cycle —
+        // the Weak/Soft/Phantom Reference OBJECT addresses currently
+        // registered. Inside this STW the snapshot is consistent (no
+        // mutator can construct, move, or free a Reference), and it
+        // must land before the roots below seed the gray set so no
+        // Reference is ever scanned without the skip in force. G1
+        // carries the set across every mid-cycle evacuation pause
+        // internally (remap survivors, prune CSet casualties).
+        let ref_objs = shared.ref_processor.lock().reference_object_addresses();
+        shared.heap.g1_set_reference_skip_set(&ref_objs);
+        // Mark roots into the G1 mark bitmap
+        let roots = collect_roots(shared, thread);
+        let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
+        let all_roots: Vec<cratonvm_types::ObjectRef> = roots
+            .into_iter()
+            .chain(snapshot_roots.into_iter())
+            // INT-3 — frozen in-JIT peers' conservative register/stack roots.
+            .chain(xt_roots.into_iter())
+            .collect();
+        shared.heap.g1_mark_roots(&all_roots);
+        tracing::debug!("[G1] Initial mark: {} roots marked", all_roots.len());
+        // Clear TLAB skip regions + resume frozen peers BEFORE reopening
+        // the world (same race rationale as maybe_gc's epilogue).
+        shared.heap.clear_jit_tlab_skip_regions();
+        crate::jit::xt_root_scan::resume(taken);
+        shared.gc_barrier.complete_gc(std::collections::HashMap::new());
     }
 
     // Phase 2: Concurrent Mark — the background worker that drains
@@ -3196,40 +3256,58 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
 /// `maybe_concurrent_gc` retries. Unlike the generational remark there is
 /// nothing to abort: no sweep decision has been made yet.
 fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread) {
-    let done = shared.gc_barrier.brief_stw_counted(
-        thread.thread_id,
-        || u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX),
-        || {
-            // Drain the initiator's per-thread SATB buffer; the other
-            // mutators' buffers are pulled by `remark` itself
-            // (`flush_all_thread_satb_buffers`) now that they are parked.
-            shared.heap.flush_thread_satb();
-            let roots = collect_roots(shared, thread);
-            let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
-            let all_roots: Vec<cratonvm_types::ObjectRef> = roots
-                .into_iter()
-                .chain(snapshot_roots.into_iter())
-                .collect();
-            // INT-8: run VM reference processing against the completed mark
-            // bitmap between the remark drain and cleanup — the only point
-            // in the cycle where a weak/soft ref to a dead OLD-region
-            // referent can be observed dead (evacuation pauses only ever
-            // see CSet deaths). The callback returns the addresses the
-            // heap must resurrect before cleanup's in-place frees.
-            let mut process = |is_live: &dyn Fn(usize) -> bool| -> Vec<usize> {
-                g1_remark_process_references(shared, is_live)
-            };
-            let completed = shared
-                .heap
-                .g1_final_remark_and_cleanup(&all_roots, Some(&mut process));
-            tracing::debug!(
-                "[G1] Final remark: {} roots, cycle_completed={}",
-                all_roots.len(),
-                completed
-            );
-        },
-    );
-    if !done {
+    // INT-3 residual fix: open-coded (request → takeover-wait → work →
+    // complete) so a never-polling in-JIT peer neither stalls the pause
+    // forever nor is covered only by its stale deposit snapshot (a missed
+    // mark root here = cleanup frees a live object). Unlike the young/mixed
+    // pauses nothing moves, so no pins — but `cleanup` DOES linearly walk
+    // every non-Free region computing live bytes, so the takeover's
+    // frozen-TLAB-tail publication (consumed by the region walkers' skip
+    // checks) is load-bearing here too.
+    let mut counted_os_tids: Vec<u32> = Vec::new();
+    let done = shared.gc_barrier.request_stw_counted(thread.thread_id, || {
+        let (n, tids) = shared.thread_registry.alive_count_and_os_tids();
+        counted_os_tids = tids;
+        u32::try_from(n).unwrap_or(u32::MAX)
+    });
+    if done {
+        let mut xt_roots: Vec<ObjectRef> = Vec::new();
+        let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
+        // Drain the initiator's per-thread SATB buffer; the other
+        // mutators' buffers are pulled by `remark` itself
+        // (`flush_all_thread_satb_buffers`) now that they are parked.
+        shared.heap.flush_thread_satb();
+        let roots = collect_roots(shared, thread);
+        let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
+        let all_roots: Vec<cratonvm_types::ObjectRef> = roots
+            .into_iter()
+            .chain(snapshot_roots.into_iter())
+            // INT-3 — frozen in-JIT peers' conservative register/stack roots.
+            .chain(xt_roots.into_iter())
+            .collect();
+        // INT-8: run VM reference processing against the completed mark
+        // bitmap between the remark drain and cleanup — the only point
+        // in the cycle where a weak/soft ref to a dead OLD-region
+        // referent can be observed dead (evacuation pauses only ever
+        // see CSet deaths). The callback returns the addresses the
+        // heap must resurrect before cleanup's in-place frees.
+        let mut process = |is_live: &dyn Fn(usize) -> bool| -> Vec<usize> {
+            g1_remark_process_references(shared, is_live)
+        };
+        let completed = shared
+            .heap
+            .g1_final_remark_and_cleanup(&all_roots, Some(&mut process));
+        tracing::debug!(
+            "[G1] Final remark: {} roots, cycle_completed={}",
+            all_roots.len(),
+            completed
+        );
+        // Clear TLAB skip regions + resume frozen peers BEFORE reopening
+        // the world (same race rationale as maybe_gc's epilogue).
+        shared.heap.clear_jit_tlab_skip_regions();
+        crate::jit::xt_root_scan::resume(taken);
+        shared.gc_barrier.complete_gc(std::collections::HashMap::new());
+    } else {
         tracing::debug!("[G1] Final remark lost the STW race — retrying at next GC");
     }
 }
@@ -4304,12 +4382,28 @@ pub fn execute(
         // the FIRST-CALL JIT compile path here too.
         let env_disable_jit = crate::runtime::env_cache::disable_jit();
         let redefine_jit_quiesced = crate::classloading::any_class_redefined();
+        // GPU-offload JIT admission gate (known-issues followups item 2):
+        // while `--gpu` is active, a caller whose bytecode contains an
+        // offload-eligible invokestatic must stay interpreted, or its
+        // JIT-compiled body would bypass the offload hook and silently
+        // end GPU dispatch for that call site. One bool read when --gpu
+        // is off; see offload_jit_gate for the cache/scan details.
+        #[cfg(feature = "gpu-offload")]
+        let gpu_gate_skip = crate::runtime::offload_jit_gate::caller_blocks_jit_by_name(
+            shared,
+            class_id,
+            method_name,
+            method_descriptor,
+        );
+        #[cfg(not(feature = "gpu-offload"))]
+        let gpu_gate_skip = false;
         if env_disable_jit
             || redefine_jit_quiesced
             || already_skipped
             || static_skip_reason.is_some()
             || fjp_skip
             || native_skip
+            || gpu_gate_skip
         {
             // Method has known JIT issues — skip JIT.
         } else {
@@ -8734,7 +8828,35 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 return Err(MethodCallFailed::InternalError(e));
             }
             Err(MethodCallFailed::ExceptionThrown(exc)) => {
-                let exc = thread.native_pending_return.take().unwrap_or(exc);
+                // `native_pending_return` roots a native call's returned
+                // object across the Rust<->Java boundary until it is pushed
+                // onto the caller's operand stack (see `safe_native_call` /
+                // `native_return_pushed_to_stack`). It is UNRELATED to the
+                // exception being unwound here in the common case — it can
+                // still hold a leftover value if the native call that set it
+                // never reached the "push to stack" step (e.g. its return
+                // value was discarded, or a later, independent exception
+                // fired before the pending value was consumed). Previously
+                // this code unconditionally preferred `native_pending_return`
+                // whenever it was `Some`, which meant a stale leftover object
+                // (observed: a `CommonToken` left over from ANTLR HQL
+                // parsing) silently replaced the REAL exception being
+                // propagated, misattributing the uncaught exception's class
+                // in fatal-error reporting.
+                //
+                // Only fall back to `native_pending_return` when `exc` itself
+                // has gone stale (relocated/reclaimed by a moving GC that ran
+                // during the failing native call, so `exc`'s address is no
+                // longer a valid live object) — mirroring the staleness check
+                // `safe_native_call` already performs in `vm_exec.rs`. The
+                // slot is always drained via `.take()` so a leftover value
+                // can never survive to poison a later, unrelated exception.
+                let pending_return = thread.native_pending_return.take();
+                let exc = if shared.heap.is_object_address(exc.as_ptr() as usize).is_some() {
+                    exc
+                } else {
+                    pending_return.unwrap_or(exc)
+                };
                 // Try to find handler, unwinding through stackless frames
                 // GC-root gap: see the pin in the `pending_java_exception` arm
                 // earlier in this function — same
@@ -11461,6 +11583,23 @@ fn execute_instruction(
     instruction: &Instruction,
     saved_pc: usize,
 ) -> Result<InstructionResult, MethodCallFailed> {
+    // ALV5th GC investigation (temp probe, CRATONVM_DBG_DESCTRACE): trace
+    // EVERY instruction executed while inside org/junit/runner/Description's
+    // addChild, unconditionally, before any opcode-specific logic runs (or
+    // can throw). Removes all assumptions about which opcode/branch fires.
+    if std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some() {
+        let cn = thread.frames[frame_idx].class_name();
+        let mn = thread.frames[frame_idx].method_name();
+        if cn == "org/junit/runner/Description" && mn == "addChild" {
+            eprintln!(
+                "[desctrace-instr] pc={} saved_pc={} instr={:?} stack_len={}",
+                thread.frames[frame_idx].pc,
+                saved_pc,
+                instruction,
+                thread.frames[frame_idx].stack.len(),
+            );
+        }
+    }
     match instruction {
         // -- Constants (T10.9.D direct CompactValue push) --
         Instruction::Nop => {}
@@ -12659,6 +12798,26 @@ fn execute_instruction(
             }
         }
         Instruction::Getfield(index) => {
+            // ALV5th GC investigation (temp probe, CRATONVM_DBG_DESCTRACE):
+            // dump the RAW (undecoded) operand-stack top the instant Getfield
+            // begins, for addChild specifically, before any pop/resolve call
+            // that could itself throw or transform the value. This bypasses
+            // every downstream assumption about which error path fires.
+            if std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some() {
+                let cn = thread.frames[frame_idx].class_name();
+                let mn = thread.frames[frame_idx].method_name();
+                if cn == "org/junit/runner/Description" && mn == "addChild" {
+                    let cv = thread.frames[frame_idx].stack.peek_compact();
+                    let v = thread.frames[frame_idx].stack.peek();
+                    eprintln!(
+                        "[desctrace-entry] Getfield in addChild pc={} stack_top raw_bits=0x{:x} tag={:?} decoded={:?}",
+                        thread.frames[frame_idx].pc,
+                        cv.raw_bits(),
+                        cv.tag(),
+                        v,
+                    );
+                }
+            }
             let current_class_id = thread.frames[frame_idx].class_id;
             // Perf: `resolve_field_name` takes a class_manager RwLock and
             // allocates a `String` — but the name is only needed for the
@@ -12708,7 +12867,37 @@ fn execute_instruction(
                             field_name.as_deref().unwrap_or("?")
                         )
                     }
-                })?;
+                });
+            if crate::runtime::env_cache::any_field_diag()
+                && obj_ref.is_err()
+                && std::env::var_os("CRATONVM_DBG_NULLTHIS").is_some()
+            {
+                let field_name = resolve_field_name(shared, current_class_id, *index);
+                let fr0 = &thread.frames[frame_idx];
+                eprintln!(
+                    "[nullthis] getfield '{}' on null receiver in {}.{}{} pc={}",
+                    field_name.as_deref().unwrap_or("?"),
+                    fr0.class_name(),
+                    fr0.method_name(),
+                    fr0.method_descriptor(),
+                    fr0.pc
+                );
+                for (i, fr) in thread.frames.iter().enumerate().rev().take(30) {
+                    eprintln!(
+                        "  [{}] {}.{}{} pc={}",
+                        i,
+                        fr.class_name(),
+                        fr.method_name(),
+                        fr.method_descriptor(),
+                        fr.pc
+                    );
+                }
+                let fr0 = &thread.frames[frame_idx];
+                for li in 0..fr0.locals_len().min(8) {
+                    eprintln!("  local[{}] = 0x{:x}", li, fr0.get_local_raw(li));
+                }
+            }
+            let obj_ref = obj_ref?;
             let mut field = resolve_field_ref(shared, current_class_id, *index)?;
             if let Some(retargeted) = retarget_instance_field_to_receiver(
                 shared,
@@ -12859,6 +13048,24 @@ fn execute_instruction(
             } else {
                 shared.heap.get_field(obj_ref, field.field_index)
             };
+            // ALV5th GC investigation (temp probe, CRATONVM_DBG_DESCTRACE):
+            // trace every GET of fChildren, especially ones that observe
+            // null (the crash symptom), with the receiver's identity hash.
+            if std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some() {
+                let field_name = resolve_field_name(shared, current_class_id, *index);
+                if field_name.as_deref() == Some("fChildren") {
+                    eprintln!(
+                        "[desctrace-get] fChildren obj=0x{:x} ihash={} value_is_null={} in {}.{}{} pc={}",
+                        obj_ref.as_ptr() as usize,
+                        shared.heap.identity_hash_code(obj_ref),
+                        matches!(value, Value::Object(None)),
+                        thread.frames[frame_idx].class_name(),
+                        thread.frames[frame_idx].method_name(),
+                        thread.frames[frame_idx].method_descriptor(),
+                        thread.frames[frame_idx].pc,
+                    );
+                }
+            }
             // K2 (T10.9.E) — J/D direct-CompactValue fast path.
             //
             // For long/double fields, build the CompactValue with the exact
@@ -13121,6 +13328,26 @@ fn execute_instruction(
                 &field,
             ) {
                 field = retargeted;
+            }
+            // ALV5th GC investigation (temp probe, CRATONVM_DBG_DESCTRACE):
+            // trace every PUT of fChildren, recording the receiver's identity
+            // hash (stable across relocation) so it can be cross-referenced
+            // against [desctrace-fwd] relocation events and [desctrace-get]
+            // read events.
+            if std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some() {
+                let field_name = resolve_field_name(shared, current_class_id, *index);
+                if field_name.as_deref() == Some("fChildren") {
+                    eprintln!(
+                        "[desctrace-put] fChildren obj=0x{:x} ihash={} value_is_null={} in {}.{}{} pc={}",
+                        obj_ref.as_ptr() as usize,
+                        shared.heap.identity_hash_code(obj_ref),
+                        matches!(value, Value::Object(None)),
+                        thread.frames[frame_idx].class_name(),
+                        thread.frames[frame_idx].method_name(),
+                        thread.frames[frame_idx].method_descriptor(),
+                        thread.frames[frame_idx].pc,
+                    );
+                }
             }
             // Perf: ALL of the per-putfield diagnostic blocks below are gated
             // behind a SINGLE cached "any field diagnostic enabled" branch, so
@@ -21735,6 +21962,42 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    // Bulk `get(T[],int,int)`/`put(T[],int,int)` on every typed NIO buffer
+    // (Int/Long/Short/Float/DoubleBuffer) are CONCRETE (not abstract) real
+    // JDK 25 bytecode — `FloatBuffer.getArray`/`putArray` etc. read/write
+    // via `this.address` + `ScopedMemoryAccess` directly for any length
+    // beyond a trivial few elements, bypassing virtual dispatch to the
+    // single-element accessors entirely. Our synthetic abstract-stamped
+    // typed-buffer views (`native-builtins/src/servlet.rs`'s
+    // `s2_typed_buffer_view_fns!`, produced by e.g.
+    // `ByteBuffer.asFloatBuffer()`) never set a real `address` field, so
+    // that fast path silently read/wrote zero bytes for every bulk vector
+    // transfer — the dominant access pattern for ES/Lucene vector codecs
+    // (`buffer.get(vec, 0, dims)`), surfacing as
+    // "expected:<X> but was:<0.0>" across nearly the whole ES vector-codec
+    // test family. Registering the natives (in servlet.rs) is not enough by
+    // itself since real bytecode already exists for these signatures; force
+    // it to win here, mirroring the ByteBuffer block above.
+    if matches!(
+        class_name,
+        "java/nio/IntBuffer" | "java/nio/LongBuffer" | "java/nio/ShortBuffer"
+            | "java/nio/FloatBuffer" | "java/nio/DoubleBuffer"
+    ) && matches!(
+        (method_name, method_descriptor),
+        ("get", "([III)Ljava/nio/IntBuffer;")
+            | ("put", "([III)Ljava/nio/IntBuffer;")
+            | ("get", "([JII)Ljava/nio/LongBuffer;")
+            | ("put", "([JII)Ljava/nio/LongBuffer;")
+            | ("get", "([SII)Ljava/nio/ShortBuffer;")
+            | ("put", "([SII)Ljava/nio/ShortBuffer;")
+            | ("get", "([FII)Ljava/nio/FloatBuffer;")
+            | ("put", "([FII)Ljava/nio/FloatBuffer;")
+            | ("get", "([DII)Ljava/nio/DoubleBuffer;")
+            | ("put", "([DII)Ljava/nio/DoubleBuffer;")
+    ) {
+        return true;
+    }
+
     if class_name == "java/util/concurrent/LinkedBlockingDeque"
         && method_name == "clear"
         && method_descriptor == "()V"
@@ -22354,6 +22617,50 @@ fn force_native_over_real_jdk_bytecode(
     if is_awt_imageio_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
+    // javac calls this helper while scanning standard file-manager locations.
+    // The JDK 25 body is a one-token regex (`\\bMODULE\\b`). Letting that real
+    // regex bytecode run under CratonVM can stall in Pattern$Bound/CharPredicates
+    // during Spring's in-memory compilation tests; the registered native answers
+    // the bytecode-equivalent boolean directly.
+    if class_name == "javax/tools/StandardLocation"
+        && method_name == "computeIsModuleOrientedLocation"
+        && method_descriptor == "(Ljava/lang/String;)Z"
+    {
+        return true;
+    }
+
+    // Same javac location hot path as above: once `inferBinaryName` delegates to
+    // `JavacFileManager`, this guard can be reached for every scanned classfile.
+    // The native preserves the module-oriented rejection while avoiding repeated
+    // interpreted interface/default-method dispatch in the compiler loop.
+    if class_name == "com/sun/tools/javac/file/JavacFileManager"
+        && matches!(
+            (method_name, method_descriptor),
+            ("checkNotModuleOrientedLocation", "(Ljavax/tools/JavaFileManager$Location;)V")
+                | (
+                    "list",
+                    "(Ljavax/tools/JavaFileManager$Location;Ljava/lang/String;Ljava/util/Set;Z)Ljava/lang/Iterable;"
+                )
+        )
+    {
+        return true;
+    }
+
+    if class_name == "com/sun/tools/javac/file/RelativePath"
+        && matches!(
+            (method_name, method_descriptor),
+            ("hashCode", "()I")
+                | ("equals", "(Ljava/lang/Object;)Z")
+                | (
+                    "compareTo",
+                    "(Lcom/sun/tools/javac/file/RelativePath;)I"
+                )
+                | ("getPath", "()Ljava/lang/String;")
+        )
+    {
+        return true;
+    }
+
     // SBR-02 / bug-03: fast native regex. The real-JDK `String.replaceAll` /
     // `replaceFirst` / `matches` bodies run `Pattern.compile(...).matcher(...)`
     // in the interpreter (java.util.regex), which is 30–600× slower than
@@ -22383,6 +22690,29 @@ fn force_native_over_real_jdk_bytecode(
                     "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;"
                 )
         )
+    {
+        return true;
+    }
+    // `String.substring(int,int)` — gate mismatch fix. `check_override`
+    // (vm_exec.rs, the invoke-slow-path native selector) already lists
+    // `java/lang/String.substring` as forced-native ("RKC16N.6 RECON":
+    // real-JDK String bytecode resolution issues during JDK class clinits),
+    // but that allowlist is CONSULTED ONLY on a vtable cache miss. The
+    // per-call-site cached vtable fast path (this function's own caller)
+    // resolves and caches its native-vs-bytecode decision independently, and
+    // `substring` was never added HERE — so once a call site's vtable entry
+    // warms, every subsequent `substring` call ran the real bytecode
+    // regardless of `check_override`'s intent. `native_string_substring`
+    // (native-builtins/src/lang_string.rs) already has a "read only the
+    // requested range" fast path specifically written to avoid decoding the
+    // WHOLE parent string per call — a real fix that this gate gap left
+    // completely unreachable. Confirmed via runtime instrumentation: a tight
+    // `text.substring(pos, pos+5)` loop over a large parent `String` cost
+    // O(n^2) instead of O(subLen) with this entry absent (see
+    // `docs/known-issues/substring-large-parent-quadratic-allocation.md`).
+    if class_name == "java/lang/String"
+        && method_name == "substring"
+        && method_descriptor == "(II)Ljava/lang/String;"
     {
         return true;
     }
@@ -22578,6 +22908,16 @@ fn force_native_over_real_jdk_bytecode(
     matches!(
         (class_name, method_name, method_descriptor),
         ("java/lang/ClassLoader", "setDefaultAssertionStatus", "(Z)V")
+            | (
+                "java/lang/ClassLoader",
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+            )
+            | (
+                "java/lang/ClassLoader",
+                "loadClass",
+                "(Ljava/lang/String;Z)Ljava/lang/Class;",
+            )
             // `EndElementEvent.getNamespaces()` — the JDK Xerces StAX event impl
             // hard-codes an empty `ReadOnlyIterator` return (it computes
             // `fNamespaces.iterator()` then pops it). Our synthetic cursor reports
@@ -24110,7 +24450,13 @@ fn execute_invokestatic(
     // preservation as self-calls; resolving by flat name can pick the app copy.
     let static_dispatch_class_id = self_class_id.or_else(|| {
         if crate::runtime::env_cache::loader_aware_resolution() {
-            lookup_loader_initiated(shared, current_class_id, &method_class_name)
+            // Preserve the initiating loader even when the global classpath
+            // already has a same-named class. This is required for nested
+            // implementation jars whose owner is only visible to the caller
+            // loader.
+            lookup_loader_initiated(shared, current_class_id, &method_class_name).or_else(|| {
+                drive_defining_loader_load(shared, thread, current_class_id, &method_class_name)
+            })
         } else {
             None
         }
@@ -24195,10 +24541,19 @@ fn execute_invokestatic(
     // GPU offload hook (Part E). Behind `gpu-offload`: with the
     // feature off, the entire block is removed by the preprocessor
     // and `execute_invokestatic` falls through to the existing CPU
-    // path unchanged. On Hit we consult the OffloadCache; the actual
-    // marshal-and-launch glue is deliberately scoped to a separate
-    // follow-up because it needs real GPU hardware to validate — see
-    // `crate::runtime::offload::try_dispatch` for the contract.
+    // path unchanged. On Hit the OffloadCache marshals, launches, and
+    // writes back via `crate::runtime::offload::try_dispatch`.
+    //
+    // Invoke-cache interaction (found 2026-07-11): the interpreter
+    // consults `thread.invoke_cache` BEFORE this slow path, so a site
+    // promoted into the cache dispatches straight to the CPU body and
+    // never re-enters this hook. An offloaded (or gated-but-eligible)
+    // site must therefore never be promoted, or the SECOND call at
+    // the site silently stops offloading — exactly the shape of a
+    // warm benchmark loop. The slow-path re-entry cost is noise next
+    // to any kernel that clears `--gpu-min-work`.
+    #[cfg_attr(not(feature = "gpu-offload"), allow(unused_mut))]
+    let mut suppress_invoke_cache = false;
     #[cfg(feature = "gpu-offload")]
     {
         if shared.config.gpu_offload_enabled
@@ -24217,8 +24572,35 @@ fn execute_invokestatic(
                 &args,
             )? {
                 crate::runtime::offload::DispatchOutcome::Handled => {
-                    populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+                    // Deliberately NOT populating the invoke cache —
+                    // see the block comment above.
                     return Ok(CachedCallResult::Handled);
+                }
+                crate::runtime::offload::DispatchOutcome::HandledWithValue(value) => {
+                    // Part E — reduction kernel completed on the device;
+                    // push its scalar return value onto the operand
+                    // stack EXACTLY the way the fallback invokestatic
+                    // path a few dozen lines below does it (tag-exact
+                    // 2-slot push for `Value::Long`, then the
+                    // native-pending-return clear so a stale pinned
+                    // ObjectRef can't outlive this call site across GC —
+                    // moot for Int/Long today, but this is the one push
+                    // sequence and it must stay identical for either
+                    // caller).
+                    let ret = crate::jit::return_type(&method_descriptor);
+                    let value = coerce_value_for_return(value, ret);
+                    push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
+                    crate::vm::native_return_pushed_to_stack(shared, thread);
+                    // Deliberately NOT populating the invoke cache —
+                    // same reasoning as the plain `Handled` arm above.
+                    return Ok(CachedCallResult::Handled);
+                }
+                crate::runtime::offload::DispatchOutcome::FallThroughKeepHooked => {
+                    // Eligible kernel, but a per-call gate (e.g.
+                    // --gpu-min-work) declined this particular call.
+                    // Run the CPU path but keep the site un-promoted
+                    // so a future call can still offload.
+                    suppress_invoke_cache = true;
                 }
                 crate::runtime::offload::DispatchOutcome::FallThrough => {
                     // Method is ineligible / blacklisted / launch
@@ -24243,11 +24625,15 @@ fn execute_invokestatic(
         static_dispatch_class_id,
     )? {
         CachedCallResult::FramePushed => {
-            populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+            if !suppress_invoke_cache {
+                populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+            }
             return Ok(CachedCallResult::FramePushed);
         }
         CachedCallResult::Handled => {
-            populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+            if !suppress_invoke_cache {
+                populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+            }
             return Ok(CachedCallResult::Handled);
         }
         CachedCallResult::CacheMiss => {}
@@ -24295,7 +24681,9 @@ fn execute_invokestatic(
     }
 
     // Populate invoke cache for future fast-path hits
-    populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+    if !suppress_invoke_cache {
+        populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+    }
 
     Ok(CachedCallResult::Handled)
 }
@@ -25248,6 +25636,19 @@ fn compile_osr_artifact(
     )
     .is_some()
     {
+        return None;
+    }
+    // GPU-offload JIT admission gate — the OSR path is the exact case
+    // the gate exists for: OSR-compiling a hot loop that contains an
+    // offload-eligible invokestatic would silently end GPU dispatch at
+    // that call site (known-issues followups item 2).
+    #[cfg(feature = "gpu-offload")]
+    if crate::runtime::offload_jit_gate::caller_blocks_jit_by_name(
+        shared,
+        class_id,
+        method_name_check,
+        &method_descriptor,
+    ) {
         return None;
     }
     // Get method info from frame metadata
@@ -26820,6 +27221,18 @@ fn try_jit_upgrade_with_gate(
         {
             return None;
         }
+        // GPU-offload JIT admission gate — see offload_jit_gate: a
+        // promoted caller containing an offload-eligible invokestatic
+        // would bypass the interpreter offload hook.
+        #[cfg(feature = "gpu-offload")]
+        if crate::runtime::offload_jit_gate::caller_blocks_jit_by_name(
+            shared,
+            cached.declaring_class_id,
+            &cached.method_name,
+            &cached.method_descriptor,
+        ) {
+            return None;
+        }
     }
     // Check shared JIT cache first
     {
@@ -27172,6 +27585,16 @@ fn try_jit_upgrade_with_gate(
                 )
                 .is_some()
                 {
+                    return None;
+                }
+                // GPU-offload JIT admission gate — see offload_jit_gate.
+                #[cfg(feature = "gpu-offload")]
+                if crate::runtime::offload_jit_gate::caller_blocks_jit_by_name(
+                    shared,
+                    callee_cached.declaring_class_id,
+                    callee_method,
+                    &callee_cached.method_descriptor,
+                ) {
                     return None;
                 }
             }
@@ -27930,6 +28353,16 @@ fn try_jit_compile_callee_slow(
         )
         .is_some()
         {
+            return None;
+        }
+        // GPU-offload JIT admission gate — see offload_jit_gate.
+        #[cfg(feature = "gpu-offload")]
+        if crate::runtime::offload_jit_gate::caller_blocks_jit_by_name(
+            shared,
+            cached.declaring_class_id,
+            method_name,
+            &cached.method_descriptor,
+        ) {
             return None;
         }
     }
@@ -29684,6 +30117,20 @@ fn execute_jit_call_decoded(
     // block in `execute_jit_call` for the full rationale.
     let deopt_signaled = sig.deopt;
 
+    // ALV5th GC investigation (temp probe, CRATONVM_DBG_DESCTRACE): identify
+    // exactly which JIT-compiled callee raised the pending-NPE signal, and
+    // dump its receiver/args raw pointers, before the signal is converted
+    // into a message-less Java NullPointerException.
+    if sig.npe && std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some() {
+        eprintln!(
+            "[desctrace-jitnpe] JIT callee {}.{}{} raised pending NPE — args_slice={:?} jit_args_raw={:?}",
+            cached.class_name,
+            cached.method_name,
+            cached.method_descriptor,
+            args_slice,
+            &jit_args[..np],
+        );
+    }
     // Drain pending NPE / AIOOBE set by void-return store helpers (same as
     // execute_jit_call) — route through the JIT'd method's exception table.
     if sig.npe {
@@ -33001,6 +33448,65 @@ mod tests {
                 "{name}{descriptor} must use native Manifest bridge"
             );
         }
+    }
+
+    #[test]
+    fn standard_location_force_native_covers_javac_regex_shortcut() {
+        assert!(force_native_over_real_jdk_bytecode(
+            "javax/tools/StandardLocation",
+            "computeIsModuleOrientedLocation",
+            "(Ljava/lang/String;)Z"
+        ));
+        assert!(!force_native_over_real_jdk_bytecode(
+            "javax/tools/StandardLocation",
+            "locationFor",
+            "(Ljava/lang/String;)Ljavax/tools/JavaFileManager$Location;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "com/sun/tools/javac/file/JavacFileManager",
+            "checkNotModuleOrientedLocation",
+            "(Ljavax/tools/JavaFileManager$Location;)V"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "com/sun/tools/javac/file/JavacFileManager",
+            "list",
+            "(Ljavax/tools/JavaFileManager$Location;Ljava/lang/String;Ljava/util/Set;Z)Ljava/lang/Iterable;"
+        ));
+        assert!(!force_native_over_real_jdk_bytecode(
+            "com/sun/tools/javac/file/JavacFileManager",
+            "inferBinaryName",
+            "(Ljavax/tools/JavaFileManager$Location;Ljavax/tools/JavaFileObject;)Ljava/lang/String;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "com/sun/tools/javac/file/RelativePath",
+            "hashCode",
+            "()I"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "com/sun/tools/javac/file/RelativePath",
+            "equals",
+            "(Ljava/lang/Object;)Z"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "com/sun/tools/javac/file/RelativePath",
+            "compareTo",
+            "(Lcom/sun/tools/javac/file/RelativePath;)I"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "com/sun/tools/javac/file/RelativePath",
+            "getPath",
+            "()Ljava/lang/String;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/lang/ClassLoader",
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/lang/ClassLoader",
+            "loadClass",
+            "(Ljava/lang/String;Z)Ljava/lang/Class;"
+        ));
     }
 
     #[test]

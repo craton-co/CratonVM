@@ -319,6 +319,69 @@ fn three_stage_pipeline() {
     );
 }
 
+/// Test 5: `Event::query` reflects the event's recorded state — `false`
+/// before `Stream::record_event`, and `true` once the recording
+/// stream has synchronized (i.e. the recorded work has definitely
+/// retired). Exercises the non-blocking completion probe that a
+/// VM-side `GpuFuture::isDone()` poller would call directly instead of
+/// blocking in `Event::synchronize`.
+#[test]
+fn event_query_reflects_recorded_state() {
+    let ctx = ctx_or_return!();
+    let stream = Stream::new(&ctx).expect("Stream::new in stub mode after probe succeeded");
+    let ev = Event::new(&ctx).expect("Event::new in stub mode after probe succeeded");
+
+    assert_eq!(
+        ev.query().expect("query before record must not error"),
+        false,
+        "an event that has never been recorded must query as false"
+    );
+
+    stream.record_event(&ev).expect("record_event");
+
+    // Immediately after `record_event` the event may or may not have
+    // fired yet (that depends on how much prior work is queued ahead
+    // of it and how busy the GPU is) — `query` only promises a
+    // non-blocking, consistent read of driver state, not `true` right
+    // away. We only assert it stops erroring here, then drive the
+    // stream to completion and check the now-deterministic `true`.
+    let _ = ev.query().expect("query after record must not error");
+    stream.synchronize().expect("synchronize");
+    assert_eq!(
+        ev.query().expect("query after synchronize must not error"),
+        true,
+        "an event must report complete once its recording stream has synchronized"
+    );
+}
+
+/// Test 6: `Stream::add_host_callback` enqueues a closure that the
+/// driver runs after all work submitted to the stream before the call
+/// has retired. The callback may run asynchronously (on a driver
+/// callback thread) relative to `add_host_callback` returning, so this
+/// test drives the stream to completion via `synchronize` before
+/// asserting the closure ran — see the method's doc comment for the
+/// full CUDA host-callback contract (most importantly: the callback
+/// itself must never call back into this crate's CUDA-driving API).
+#[test]
+fn add_host_callback_runs_after_prior_work() {
+    let ctx = ctx_or_return!();
+    let stream = Stream::new(&ctx).expect("Stream::new in stub mode after probe succeeded");
+
+    let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ran_clone = ran.clone();
+    stream
+        .add_host_callback(Box::new(move || {
+            ran_clone.store(true, std::sync::atomic::Ordering::Release);
+        }))
+        .expect("add_host_callback");
+
+    stream.synchronize().expect("synchronize");
+    assert!(
+        ran.load(std::sync::atomic::Ordering::Acquire),
+        "host callback must have run by the time the stream has synchronized"
+    );
+}
+
 // Note: the dedicated event-ordering integration test mandated by the
 // 2026-05-24 cross-stream ordering audit lives inside the crate in
 // `cuda-bridge/src/launch.rs#tests::kernel_waits_on_h2d_d2h_waits_on_kernel`,

@@ -567,6 +567,16 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     Remap companion in `gc.rs` (`gc_update_re10_handler_refs`).
     cratonvm_native_builtins::net_phase_e::gc_scan_re10_handler_roots(&mut roots);
 
+    //     Process-global InetAddress side table (`net_phase_e.rs`): each
+    //     synthetic InetAddress mirror's (hostName, ipAddress) pair lives only
+    //     in this ObjectRef-keyed map. Without rooting it, a moving young GC
+    //     that relocates a live mirror leaves it keyed on a vacated from-space
+    //     slot, and getHostAddress()/getAddress()/toString() silently fall
+    //     back to reporting "0.0.0.0" (ES
+    //     InetAddressRandomBinaryDocValuesRangeQueryTests CONTAINS-query false
+    //     negative). Remap companion in `gc.rs` (`gc_update_inet_addr_refs`).
+    cratonvm_native_builtins::net_phase_e::gc_scan_inet_addr_roots(&mut roots);
+
     //     NIO SelectionKey table: channel/selector/attachment/key_obj ObjectRefs
     //     live only in `sk_table`; remap was already wired (gc.rs
     //     `sk_table_update_after_gc`) but the root SCAN was missing, so a key

@@ -71,5 +71,13 @@ pub mod gpu_residency;
 #[cfg(feature = "gpu-offload")]
 pub mod offload;
 
+// GPU offload follow-up item 2 (docs/known-issues/gpu-offload-followups-20260711.md):
+// deny JIT/OSR admission of caller methods that invoke an offload-eligible
+// static target, so a JIT-compiled caller can't silently stop offloading.
+// Strictly gated behind the `gpu-offload` feature, same as the rest of the
+// GPU offload plan.
+#[cfg(feature = "gpu-offload")]
+pub mod offload_jit_gate;
+
 pub use call_stack::CallStack;
 pub use value_stack::ValueStack;

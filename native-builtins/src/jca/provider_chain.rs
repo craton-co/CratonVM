@@ -1949,6 +1949,38 @@ fn throw_no_such_algorithm(ctx: &mut dyn NativeContext, msg: &str) -> MethodCall
     .into()
 }
 
+/// Return the name of the first provider in chain order whose service table
+/// has a registered entry for `(type_str, algo)` — mirrors the search order
+/// `getinstance_instance_search` uses, but only reports which provider owns
+/// the algorithm rather than instantiating anything. For natives that build
+/// their own JCA-engine object directly (bypassing `build_jca_instance`)
+/// while still needing to attach the correct owning `Provider` — e.g.
+/// `javax.net.ssl.KeyManagerFactory.getInstance(String)`'s own registration
+/// in `phases_late.rs`, which used to hardcode the "SunJSSE" provider
+/// unconditionally and so ignored any `KeyManagerFactory` service a caller
+/// registered on their own `Provider` via `Security.addProvider` +
+/// `Provider.put("KeyManagerFactory.<algo>", ...)`.
+pub(crate) fn find_service_provider(type_str: &str, algo: &str) -> Option<String> {
+    snapshot()
+        .into_iter()
+        .find(|(name, _, _)| get_service_entry(name, type_str, algo).is_some())
+        .map(|(name, _, _)| name)
+}
+
+/// Resolve `name` to the best available `Provider` object: the REAL
+/// user-registered instance if one is on file (see `real_provider_table` /
+/// `remember_real_provider`), so `getInfo()`/`getName()` return exactly what
+/// the caller's own `Provider` constructor set — otherwise a fresh synthetic
+/// built from the seed-list entry (or a generic `USER_PROVIDER_COVERAGE`
+/// synthetic if `name` isn't in the seed list at all).
+pub(crate) fn resolve_or_make_provider(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
+    if let Some(real) = resolve_real_provider(ctx, name) {
+        return real;
+    }
+    let (ver, coverage) = find(name).unwrap_or((1.0, USER_PROVIDER_COVERAGE));
+    make_provider(ctx, name, ver, coverage)
+}
+
 pub(crate) fn build_jca_impl(
     ctx: &mut dyn NativeContext,
     provider: &str,

@@ -2659,7 +2659,39 @@ impl StringFieldLayout {
                     };
                 }
             }
+            // FALLBACK (compact ref fields globally off, or no CompactLayout
+            // registered yet for string_class_id -- e.g. a class that never
+            // reached ClassStore::add, as every test in
+            // intrinsic_string_access.rs/intrinsic_string_search.rs
+            // deliberately forges via a fake `string_class_id`).
+            //
+            // Every x64.rs call site reconstructs the true address by adding
+            // ITS OWN payload offset to this function's return value
+            // (`FIELD_CELL_PAYLOAD64_OFFSET` for `value`, `_32_OFFSET` for
+            // `coder`/`hash`), and emit_load_string_value_ptr /
+            // emit_load_string_i32_field's own "legacy" branch adds a
+            // FURTHER `+FIELD_CELL_PAYLOAD64_OFFSET` (8) on top of that. So
+            // this fallback must return `legacy_cell_start -
+            // FIELD_CELL_PAYLOAD64_OFFSET` for EVERY field, ref or
+            // primitive alike -- not the bare legacy cell-start unbiased --
+            // so the caller's add + the emitter's own +8 net out to the true
+            // legacy payload address. (The registered branch above only
+            // needs the bias for `is_ref` because its `abs` already IS a
+            // bare-pointer/payload address for non-ref fields; the fallback
+            // formula below is a plain cell-start for every field, so it
+            // always needs the bias.)
+            //
+            // BUG-STRINGINTRINSIC-20260711: this used to return the bare,
+            // unbiased `HEADER_SIZE + idx*SLOT_SIZE`, which put every
+            // fallback field's reconstructed address 8 bytes past its real
+            // payload. For `value` (a byte[] ref) that misread the NEXT
+            // field's (`coder`'s) cell as the array pointer -- combining
+            // `Value::Int`'s zero tag with `coder`'s own int payload into a
+            // bogus 64-bit value (e.g. `0x1_00000000` for coder=1),
+            // non-null and plausible-looking, later dereferenced for the
+            // array-length bounds check. SIGSEGV.
             (cratonvm_types::HEADER_SIZE + idx * cratonvm_types::SLOT_SIZE) as i32
+                - cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET as i32
         };
         StringFieldLayout {
             value_field_index,

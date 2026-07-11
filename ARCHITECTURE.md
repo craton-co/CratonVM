@@ -21,7 +21,7 @@ cratonvm/
   jit/                 cratonvm-jit                 x86-64 / AArch64 JIT compiler
   jit-cuda/            cratonvm-jit-cuda            Java bytecode -> PTX lowering for GPU offload
   cuda-bridge/         cuda-bridge                  Thin CUDA Driver API bridge for GPU offload
-  craton-gpu/          craton-gpu                   GPU offload runtime integration
+  craton-gpu/          craton-gpu                   Build-time-only: packages the @GpuKernel/@Parallel Java annotation sources into a jar for jit-cuda's build script; no runtime code
   classloading/        cratonvm-classloading        Class loading & bytecode verification
   gc/                  cratonvm-gc                  Garbage collectors (default generational semi-space; G1 region-based; experimental feature-gated zgc stub)
   jfr/                 cratonvm-jfr                 Java Flight Recorder
@@ -38,12 +38,18 @@ The `fuzz/` directory is its own standalone workspace (`cratonvm-fuzz`, nightly-
 ```
 vm-cli -> vm -> {classloading, gc, jit, native-builtins, native-collections,
                  native-io, native-awt, jfr}
-                 -> {reader, types, native-api, jit-api, jit-cuda,
-                     cuda-bridge, craton-gpu}
+                 -> {reader, types, native-api, jit-api}
+                 -> (gpu-offload feature only) {jit-cuda, cuda-bridge}
+                     -> also forwards gc/gpu-offload, native-builtins/gpu-offload
 
 libcratonvm  -> vm   (C-ABI / JNI Invocation API embedding shim)
 cratonvm-embed -> vm (curated, semver-stable Rust embedding facade)
 ```
+
+`craton-gpu` does not appear above: it is a *build-dependency* of
+`jit-cuda` only (its `build.rs` compiles the GPU annotation sources and
+exposes their jar path via Cargo's `links` metadata), never a runtime
+dependency of anything.
 
 ## reader — Class File Parser
 
@@ -168,6 +174,52 @@ and thread state.
 - **`monitor.rs`** — Object monitors (synchronized/wait/notify).
 - **`gc_barrier.rs`** — Stop-the-world safepoint coordination.
 - **`virtual_scheduler.rs`** — Virtual thread scheduler (Java 21+).
+
+## GPU Offload (opt-in, `--features gpu-offload`)
+
+Entirely feature-gated: a default build links none of this and the
+interpreter's hot path carries zero extra branches. Gating features:
+`gpu`/`gpu-driver` on `cratonvm-cli`, `gpu-offload` on `cratonvm-vm` (which
+forwards to `cratonvm-gc` and `cratonvm-native-builtins`). See
+[BUILD_GUIDE.md](BUILD_GUIDE.md#building-with-gpu-offload) for the build
+levels and [docs/gpu/README.md](docs/gpu/README.md) for the full reference.
+
+**Crates.** `jit-cuda` lowers Java bytecode to PTX: `analyzer.rs` decides
+whether a static method is GPU-eligible (primitives only, no allocation,
+calls, fields, or reference arrays), `lowering.rs` / `loop_recog.rs` /
+`emit.rs` turn an eligible method's counted loop into PTX text. `cuda-bridge`
+is a thin CUDA Driver API wrapper with a no-driver `backend_stub.rs`
+default and a real `backend_cuda.rs` (behind `cuda-bridge/cuda`) built on
+`cudarc`.
+
+**Pipeline.** The interpreter's `execute_invokestatic` hook
+(`vm/src/runtime/interpreter.rs`) calls `runtime::offload::try_dispatch`
+(`vm/src/runtime/offload.rs`), which asks the per-VM `OffloadCache` to
+analyze-and-lower a callee once and cache the resulting `CompiledKernel`
+(a loaded PTX module) by `(ClassId, method_index)`. On a cache hit,
+`dispatch_method_from_native` / `dispatch_async` marshal the Java
+primitive-array arguments — via `vm/src/runtime/gpu_marshal.rs`'s
+`host_view_<T>`/`write_back_<T>` packed-copy path, or a zero-copy DMA
+straight against the JVM heap arena once an array's element type is
+proven — then hand them to `cuda-bridge`'s `DeviceContext`. The context
+runs the upload, launch, and download on three CUDA streams (`copy_h2d`,
+`compute`, `copy_d2h`) ordered by CUDA events rather than a blocking sync
+per stage. Kernels signal failure (e.g. an out-of-bounds index) by writing
+a device `failure_flag` word instead of throwing; `finalize_submission`
+checks it once the event chain completes and deopts to the CPU
+interpreter — leaving no partial GPU state in the heap — on a failure,
+or copies results back and resumes the Java frame on success.
+`vm/src/runtime/gpu_residency.rs` separately tracks longer-lived
+`GpuArray<T>` host/device residency for the explicit async API, independent
+of this transparent per-call path.
+
+**GC coordination.** While kernel arguments are in flight, the calling
+thread holds a `SafepointToken` from `Heap::enter_gpu_critical()` and pins
+the argument `ObjectRef`s via `Heap::pin_ref` (both in `gc/src/heap.rs`).
+The collector checks the resulting `gpu_critical_count` and yield-spins
+rather than moving or reclaiming while any token is alive; the root walker
+visits pinned refs so a kernel never reads through a stale or relocated
+pointer.
 
 ## vm-cli — Command-Line Interface
 

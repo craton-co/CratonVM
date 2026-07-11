@@ -2768,14 +2768,6 @@ impl ClassManager {
             return Ok((bytes, ClassLoaderId::Application));
         }
 
-        // ES IMPL-JARS fallback: inner-jar classes stored as directory-prefixed
-        // ZIP entries (IMPL-JARS/<module>/<jar>/<path>.class) in outer module
-        // JARs; the interpreter's class resolution bypasses the ClassLoader
-        // native, so this must live here.
-        if let Some(bytes) = find_in_impl_jars(self.application.class_path(), name) {
-            return Ok((bytes, ClassLoaderId::Application));
-        }
-
         Err(VmError::ClassFile(ClassFileError::ClassNotFound {
             class_name: name.to_string(),
         }))
@@ -5917,6 +5909,30 @@ impl ClassManager {
         // must be rebuilt even when the field *count* is unchanged.
         self.class_store.register_compact_layout_if_enabled(id);
 
+        // Unlike JVMTI `redefine_class` (JEP 109 forbids field-layout
+        // changes there), this upgrade path CAN change instance field
+        // count/order/offsets outright: the stub's placeholder descriptors
+        // are replaced by the real class file's. A method already
+        // JIT-compiled against the stub's layout has the stub's field
+        // offsets (`compact_field_off`, or the legacy `field_index *
+        // SLOT_SIZE` cell offset) baked directly into its machine code as
+        // immediates; nothing else here evicted that code, so it went on
+        // reading/writing the WRONG byte offset of any object allocated
+        // under the new (post-upgrade) layout — a stale-offset getfield
+        // could silently return whatever raw bytes sat at the old offset
+        // (e.g. a small int) where a reference was expected, corrupting
+        // anything computed from that value. Found while investigating the
+        // guarded-inline-getfield SIGSEGV cluster
+        // (docs/known-issues/elasticsearch-suite/ES-HANG-20260709-*); that
+        // specific SIGSEGV's actual root cause turned out to be a different,
+        // already-fixed bug (the fabricated-(0,false)-compact-slot issue,
+        // see `be7102344` / the WildFly Host Controller fix), but this
+        // invalidation gap is real and independent of it — nothing else in
+        // the VM ever evicted JIT code after a layout-changing synthetic-
+        // stub upgrade. Mirror `redefine_class`'s own Step 8 and fire the
+        // same hook.
+        fire_jit_invalidate_hook(id.as_u32());
+
         // The upgrade replaced the constant pool and may have shifted
         // field indices for this class and its subclasses; drop any
         // cached `(referring-class, cp-index) -> ResolvedField` entries
@@ -6030,6 +6046,12 @@ impl ClassManager {
             // shifted with its parent's growth — rebuild + re-register it.
             self.class_store
                 .register_compact_layout_if_enabled(ClassId::new(cid));
+            // Same reasoning as `upgrade_synthetic_class`: this descendant's
+            // own field offsets just shifted, so any already-JIT-compiled
+            // method with one of them baked in (compact or legacy cell
+            // offset) is now stale. See the fire_jit_invalidate_hook call
+            // in `upgrade_synthetic_class` for the full explanation.
+            fire_jit_invalidate_hook(cid);
         }
     }
 }
@@ -12031,6 +12053,145 @@ mod tests {
             total2, 5,
             "static fields must not be counted in instance num_total_fields"
         );
+    }
+
+    /// Regression test for an orphaned-hook gap found while investigating
+    /// the guarded-inline-getfield SIGSEGV cluster
+    /// (docs/known-issues/elasticsearch-suite/ES-HANG-20260709-*; that
+    /// SIGSEGV's actual root cause was a separate, already-fixed bug — see
+    /// `fire_jit_invalidate_hook`'s doc comment). Independently of that: a
+    /// class's compact field layout (byte offsets already-JIT-compiled code
+    /// may have baked in as immediates) can shift when a synthetic stub is
+    /// upgraded to real bytecode, and `recompute_subclass_layouts`
+    /// propagates that shift to every affected subclass. Before this fix,
+    /// nothing told the JIT cache such code was stale — `fire_jit_invalidate_hook`
+    /// was called for the resolution cache but never for the JIT cache.
+    /// Verifies the JIT-invalidate hook now fires for every descendant
+    /// whose layout actually shifted.
+    #[test]
+    fn recompute_subclass_layouts_fires_jit_invalidate_hook_for_changed_descendants() {
+        use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering as AtomicOrdering};
+        static FIRED_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static LAST_CLASS_ID: AtomicU32 = AtomicU32::new(u32::MAX);
+        fn hook(class_id: u32) {
+            FIRED_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
+            LAST_CLASS_ID.store(class_id, AtomicOrdering::SeqCst);
+        }
+        install_jit_invalidate_hook(hook);
+
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+
+        // Parent: starts with 1 field, mirroring a synthetic stub that
+        // undercounts the real class's fields (`is_synthetic_stub: true`).
+        let parent_id = mgr.class_store.next_id();
+        mgr.class_store.add(Class {
+            id: parent_id,
+            loader_id: ClassLoaderId::Application,
+            name: cratonvm_types::intern_arc("Parent"),
+            source_file: None,
+            version: ClassFileVersion::JAVA_8,
+            state: ClassState::Loaded,
+            initializing_thread: None,
+            constant_pool: empty_constant_pool(),
+            access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+            superclass: None,
+            interfaces: vec![],
+            fields: vec![make_field("p1", false)],
+            methods: vec![],
+            first_field_index: 0,
+            num_total_fields: 1,
+            bootstrap_methods: vec![],
+            annotations: Vec::new(),
+            nest_host: None,
+            nest_members: Vec::new(),
+            record_components: Vec::new(),
+            permitted_subclasses: Vec::new(),
+            inner_classes: Vec::new(),
+            enclosing_method: None,
+            hidden: false,
+            module_name: None,
+            is_synthetic_stub: true,
+            signature: None,
+            has_finalizer: false,
+            code_source: None,
+            array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        });
+
+        // Child: 1 own field, laid out right after Parent's (stale) 1-field
+        // layout — exactly what a JIT-compiled getfield on `c1` would have
+        // baked in as its offset.
+        let child_id = mgr.class_store.next_id();
+        mgr.class_store.add(Class {
+            id: child_id,
+            loader_id: ClassLoaderId::Application,
+            name: cratonvm_types::intern_arc("Child"),
+            source_file: None,
+            version: ClassFileVersion::JAVA_8,
+            state: ClassState::Loaded,
+            initializing_thread: None,
+            constant_pool: empty_constant_pool(),
+            access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+            superclass: Some(parent_id),
+            interfaces: vec![],
+            fields: vec![make_field("c1", false)],
+            methods: vec![],
+            first_field_index: 1,
+            num_total_fields: 2,
+            bootstrap_methods: vec![],
+            annotations: Vec::new(),
+            nest_host: None,
+            nest_members: Vec::new(),
+            record_components: Vec::new(),
+            permitted_subclasses: Vec::new(),
+            inner_classes: Vec::new(),
+            enclosing_method: None,
+            hidden: false,
+            module_name: None,
+            is_synthetic_stub: false,
+            signature: None,
+            has_finalizer: false,
+            code_source: None,
+            array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        });
+
+        // Simulate "the real .class file was found": Parent grows from 1
+        // field to 2, exactly the direct field mutation
+        // `upgrade_synthetic_class` performs before it calls
+        // `recompute_subclass_layouts`.
+        if let Some(parent) = mgr.class_store.get_mut(parent_id) {
+            parent.fields = vec![make_field("p1", false), make_field("p2", false)];
+            parent.num_total_fields = 2;
+        }
+
+        let before = FIRED_COUNT.load(AtomicOrdering::SeqCst);
+        mgr.recompute_subclass_layouts(parent_id);
+        let fired = FIRED_COUNT.load(AtomicOrdering::SeqCst) - before;
+
+        // Only meaningful if this test won the process-wide OnceLock install
+        // race (it's the only classloading-crate test that installs this
+        // hook, so it always should — but stay defensive, matching
+        // `jit_invalidate_hook_inactive_returns_quietly`'s own guard style).
+        if JIT_INVALIDATE_HOOK_ACTIVE.load(AtomicOrdering::Acquire) {
+            assert_eq!(
+                fired, 1,
+                "Child's first_field_index/num_total_fields shifted with \
+                 Parent's growth (1 -> 2 fields), so the JIT cache must be \
+                 told to evict any code compiled against Child's stale \
+                 field offsets"
+            );
+            assert_eq!(
+                LAST_CLASS_ID.load(AtomicOrdering::SeqCst),
+                child_id.as_u32()
+            );
+        }
+
+        // Sanity check this scenario really is the "layout changed" case
+        // (not a no-op): Child's own layout must reflect Parent's growth.
+        let child = mgr.class_store.get(child_id).unwrap();
+        assert_eq!(child.first_field_index, 2);
+        assert_eq!(child.num_total_fields, 3);
     }
 
     #[test]

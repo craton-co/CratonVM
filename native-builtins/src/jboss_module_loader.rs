@@ -751,10 +751,19 @@ pub fn build_local_module_loader(ctx: &mut dyn NativeContext) -> ObjectRef {
         }
     }
     let loader = alloc_concurrent_synthetic(ctx, CN_MODULE_LOADER, LOADER_FIELD_COUNT);
+    // GC-safety: `create_string` below can trigger a moving GC; `loader` is
+    // used again in the following `set_field` unpinned otherwise -- the same
+    // "Family 1" stale-ObjectRef pattern as the WildFly boot-crash fixes (see
+    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md).
+    // This is the singleton boot module loader, so every module load run
+    // through this path was at risk.
+    let loader_pin = ctx.pin_native_root(loader);
     let root_str = match module_path_root() {
         Some(p) => ctx.create_string(&p.to_string_lossy()),
         None => ctx.create_string(""),
     };
+    let loader = ctx.read_native_pin(loader_pin, loader);
+    ctx.unpin_native_roots(loader_pin);
     ctx.set_field(loader, LOADER_SLOT_ROOT, Value::Object(Some(root_str)));
     // Keep alive + registry-remapped across GC moves (VarHandle-root pattern);
     // key computed on the just-registered address, no allocation in between.
@@ -785,10 +794,18 @@ pub fn build_default_boot_holder_instance(ctx: &mut dyn NativeContext) -> Object
 
 fn build_resource_root_array(ctx: &mut dyn NativeContext, paths: &[PathBuf]) -> ObjectRef {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, paths.len());
+    // GC-safety: `create_string` per iteration can trigger a moving GC; `arr`
+    // is written into again via `set_array_element` afterward, both within
+    // the same iteration and across iterations. Pin once, re-read before
+    // each use.
+    let arr_pin = ctx.pin_native_root(arr);
     for (i, p) in paths.iter().enumerate() {
         let s = ctx.create_string(&p.to_string_lossy());
+        let arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(s)));
     }
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
     arr
 }
 
@@ -800,14 +817,27 @@ fn build_module_object(
     resolved: &ResolvedModule,
 ) -> ObjectRef {
     let module = alloc_concurrent_synthetic(ctx, CN_MODULE, MOD_FIELD_COUNT);
+    // GC-safety: `module` (and the `loader` parameter, reused below) are held
+    // across several subsequent GC-triggering calls (`create_string`,
+    // `build_resource_root_array`, the `mcl` allocation) before their last
+    // use. Same "Family 1" stale-ObjectRef pattern as the WildFly boot-crash
+    // fixes (see docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md)
+    // -- pin both now and re-read the forwarded reference before each use.
+    let module_pin = ctx.pin_native_root(module);
+    let loader_pin = ctx.pin_native_root(loader);
     let name_str = ctx.create_string(name);
+    let module = ctx.read_native_pin(module_pin, module);
     ctx.set_field(module, MOD_SLOT_NAME, Value::Object(Some(name_str)));
+    let loader = ctx.read_native_pin(loader_pin, loader);
     ctx.set_field(module, MOD_SLOT_LOADER, Value::Object(Some(loader)));
     ctx.set_field_by_name(module, "name", Value::Object(Some(name_str)));
     let arr = build_resource_root_array(ctx, &resolved.resource_roots);
+    let module = ctx.read_native_pin(module_pin, module);
+    let loader = ctx.read_native_pin(loader_pin, loader);
     ctx.set_field_by_name(module, "moduleLoader", Value::Object(Some(loader)));
     ctx.set_field(module, MOD_SLOT_RESOURCE_ROOTS, Value::Object(Some(arr)));
     let mcl = alloc_concurrent_synthetic(ctx, CN_MODULE_CLASSLOADER, MCL_FIELD_COUNT);
+    let module = ctx.read_native_pin(module_pin, module);
     ctx.set_field(mcl, MCL_SLOT_MODULE, Value::Object(Some(module)));
     ctx.set_field(module, MOD_SLOT_CLASSLOADER, Value::Object(Some(mcl)));
     ctx.set_field_by_name(module, "moduleClassLoader", Value::Object(Some(mcl)));
@@ -823,16 +853,44 @@ fn build_module_object(
     // Setting by NAME (not slot index) handles the real class's field layout.
     if let Some(main_class) = resolved.mx.main_class.as_deref() {
         let main_str = ctx.create_string(main_class);
+        let module = ctx.read_native_pin(module_pin, module);
         ctx.set_field_by_name(module, "mainClassName", Value::Object(Some(main_str)));
     }
+    let module = ctx.read_native_pin(module_pin, module);
+    ctx.unpin_native_roots(module_pin);
     module
 }
 
 /// Throw `org.jboss.modules.ModuleNotFoundException` with `name`.
-fn throw_module_not_found(ctx: &mut dyn NativeContext, name: &str) -> MethodCallFailed {
-    let exc = alloc_concurrent_synthetic(ctx, CN_MODULE_NOT_FOUND, MNF_FIELD_COUNT);
-    let msg = ctx.create_string(name);
+/// Allocate a single-message exception (`alloc_object` layout: field 0 = the
+/// message `String`) and populate it.
+///
+/// GC-safety: this file has several throw sites of the shape "alloc the
+/// exception object, then `create_string` the message, then `set_field` the
+/// freshly-allocated exception again" -- `create_string` can trigger a
+/// moving GC, which silently corrupts the exception object per the
+/// `pin_native_root` contract (same "Family 1" stale-ObjectRef pattern as the
+/// WildFly boot-crash fixes; see
+/// docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md).
+/// Centralized here instead of repeating the pin/read/unpin dance at each
+/// call site.
+pub(crate) fn alloc_single_message_exception(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    num_fields: usize,
+    message: &str,
+) -> ObjectRef {
+    let exc = alloc_concurrent_synthetic(ctx, class_name, num_fields);
+    let exc_pin = ctx.pin_native_root(exc);
+    let msg = ctx.create_string(message);
+    let exc = ctx.read_native_pin(exc_pin, exc);
+    ctx.unpin_native_roots(exc_pin);
     ctx.set_field(exc, 0, Value::Object(Some(msg)));
+    exc
+}
+
+fn throw_module_not_found(ctx: &mut dyn NativeContext, name: &str) -> MethodCallFailed {
+    let exc = alloc_single_message_exception(ctx, CN_MODULE_NOT_FOUND, MNF_FIELD_COUNT, name);
     MethodCallFailed::ExceptionThrown(exc)
 }
 
@@ -952,6 +1010,13 @@ pub(crate) fn native_loader_load_module(
         Some(Value::Object(Some(o))) => *o,
         _ => build_local_module_loader(ctx),
     };
+    // GC-safety: `extract_receiver_roots` below internally calls
+    // `invoke_virtual` (`File.getAbsolutePath()`), which can trigger a
+    // moving GC; `this` is reused as the `loader` argument to
+    // `build_module_object` further down, unpinned otherwise. Same
+    // "Family 1" pattern as the rest of this file's fixes (see
+    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md).
+    let this_pin = ctx.pin_native_root(this);
     let name_obj = match args.get(1) {
         Some(Value::Object(Some(s))) => *s,
         Some(Value::Object(None)) => {
@@ -1059,7 +1124,16 @@ pub(crate) fn native_loader_load_module(
         }
     };
 
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     let module = build_module_object(ctx, &name, this, &resolved);
+    // GC-safety: several calls further down this function (notably the
+    // RKC19/WF39 brute-force block's `ensure_class_initialized` pre-warm loop,
+    // gated on `is_brute_force_trigger` -- exactly the WildFly bootstrap
+    // module path, e.g. `org.jboss.as.standalone`) can trigger a moving GC
+    // before `module` is used again at `register_var_handle_root`/cache
+    // insertion below.
+    let module_pin = ctx.pin_native_root(module);
 
     // Stash the resolved module so the dependency-closure walker (used by
     // ModuleClassLoader.loadClass / getResource) can re-traverse without
@@ -1297,6 +1371,8 @@ pub(crate) fn native_loader_load_module(
     // Keep the Module alive + registry-remapped across GC moves
     // (VarHandle-root pattern, per cache entry); key computed on the
     // just-registered address, no allocation in between.
+    let module = ctx.read_native_pin(module_pin, module);
+    ctx.unpin_native_roots(module_pin);
     ctx.register_var_handle_root(module);
     let mkey = ctx.identity_hash_code(module);
     // Insert into cache, but check for race-loser. (A race-loser's orphaned
@@ -2217,7 +2293,18 @@ pub(crate) fn native_module_get_class_loader(
     if let Value::Object(Some(existing)) = ctx.get_field(this, MOD_SLOT_CLASSLOADER) {
         return Ok(Some(Value::Object(Some(existing))));
     }
+    // GC-safety: `alloc_concurrent_synthetic` below can trigger a moving GC
+    // (it lazily allocates a `ModuleClassLoader` the first time a given
+    // module is asked for one -- i.e. on essentially every extension load
+    // during WildFly boot); `this` is reused afterward unpinned otherwise.
+    // Same "Family 1" pattern as the caller-side fix in
+    // `native_module_load_service`/`native_module_load_service_from_caller_module_loader`
+    // -- this function is exactly the hazard those callers were protected
+    // against, but it turns out it also needed to protect its own receiver.
+    let this_pin = ctx.pin_native_root(this);
     let mcl = alloc_concurrent_synthetic(ctx, CN_MODULE_CLASSLOADER, MCL_FIELD_COUNT);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     ctx.set_field(mcl, MCL_SLOT_MODULE, Value::Object(Some(this)));
     ctx.set_field(this, MOD_SLOT_CLASSLOADER, Value::Object(Some(mcl)));
     Ok(Some(Value::Object(Some(mcl))))
@@ -2254,9 +2341,8 @@ pub(crate) fn native_module_load_class(
     match ctx.load_class(&internal) {
         Ok(Some(mirror)) => Ok(Some(mirror)),
         _ => {
-            let exc = alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
-            let msg = ctx.create_string(&class_name);
-            ctx.set_field(exc, 0, Value::Object(Some(msg)));
+            let exc =
+                alloc_single_message_exception(ctx, "java/lang/ClassNotFoundException", 1, &class_name);
             Err(MethodCallFailed::ExceptionThrown(exc))
         }
     }
@@ -2393,9 +2479,8 @@ pub(crate) fn native_module_classloader_load_class(
                 if dbg {
                     eprintln!("[mcl.loadClass] jdk-internal: load_class miss");
                 }
-                let exc = alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
-                let msg = ctx.create_string(&class_name);
-                ctx.set_field(exc, 0, Value::Object(Some(msg)));
+                let exc =
+                    alloc_single_message_exception(ctx, "java/lang/ClassNotFoundException", 1, &class_name);
                 Err(MethodCallFailed::ExceptionThrown(exc))
             }
         };
@@ -2460,9 +2545,8 @@ pub(crate) fn native_module_classloader_load_class(
     }
 
     if !visible {
-        let exc = alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
-        let msg = ctx.create_string(&class_name);
-        ctx.set_field(exc, 0, Value::Object(Some(msg)));
+        let exc =
+            alloc_single_message_exception(ctx, "java/lang/ClassNotFoundException", 1, &class_name);
         return Err(MethodCallFailed::ExceptionThrown(exc));
     }
 
@@ -2472,9 +2556,8 @@ pub(crate) fn native_module_classloader_load_class(
             if dbg {
                 eprintln!("[mcl.loadClass] load_class miss after visible: {other:?}");
             }
-            let exc = alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
-            let msg = ctx.create_string(&class_name);
-            ctx.set_field(exc, 0, Value::Object(Some(msg)));
+            let exc =
+                alloc_single_message_exception(ctx, "java/lang/ClassNotFoundException", 1, &class_name);
             Err(MethodCallFailed::ExceptionThrown(exc))
         }
     }
@@ -2525,9 +2608,7 @@ pub(crate) fn native_module_classloader_find_class(
         }
     }
 
-    let exc = alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
-    let msg = ctx.create_string(&class_name);
-    ctx.set_field(exc, 0, Value::Object(Some(msg)));
+    let exc = alloc_single_message_exception(ctx, "java/lang/ClassNotFoundException", 1, &class_name);
     Err(MethodCallFailed::ExceptionThrown(exc))
 }
 
@@ -2617,9 +2698,20 @@ pub(crate) fn build_synthetic_url(ctx: &mut dyn NativeContext, spec: &str) -> Ob
     } else {
         ("file", spec.to_string())
     };
+    // GC-safety: `url` and `proto_obj`/`host_empty` are held across the
+    // subsequent `create_string` calls (each independently GC-triggering)
+    // before their own use in the `set_field_by_name` block below. Pin all
+    // three now and re-read right before use.
+    let url_pin = ctx.pin_native_root(url);
     let proto_obj = ctx.create_string(protocol);
+    let proto_obj_pin = ctx.pin_native_root(proto_obj);
     let host_empty = ctx.create_string("");
+    let host_empty_pin = ctx.pin_native_root(host_empty);
     let file_obj = ctx.create_string(&file_part);
+    let url = ctx.read_native_pin(url_pin, url);
+    let proto_obj = ctx.read_native_pin(proto_obj_pin, proto_obj);
+    let host_empty = ctx.read_native_pin(host_empty_pin, host_empty);
+    ctx.unpin_native_roots(url_pin);
     ctx.set_field_by_name(url, "protocol", Value::Object(Some(proto_obj)));
     ctx.set_field_by_name(url, "host", Value::Object(Some(host_empty)));
     ctx.set_field_by_name(url, "port", Value::Int(-1));
@@ -2709,11 +2801,19 @@ pub(crate) fn native_module_classloader_find_resources(
     }
 
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
+    // GC-safety: `build_synthetic_url` per iteration allocates (transitively
+    // GC-triggering); `arr` is written into again via `set_array_element`
+    // afterward, both within the same iteration and across iterations, and
+    // once more building the enclosing Enumeration below.
+    let arr_pin = ctx.pin_native_root(arr);
     for (i, u) in urls.iter().enumerate() {
         let url_obj = build_synthetic_url(ctx, u);
+        let arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
     }
     let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
     ctx.set_field(enm, 0, Value::Object(Some(arr)));
     ctx.set_field(enm, 1, Value::Int(0));
     Ok(Some(Value::Object(Some(enm))))
@@ -2721,7 +2821,12 @@ pub(crate) fn native_module_classloader_find_resources(
 
 fn build_empty_enumeration(ctx: &mut dyn NativeContext) -> MethodCallResult {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+    // GC-safety: `alloc_concurrent_synthetic` below can trigger a moving GC;
+    // `arr` is reused in the following `set_field` unpinned otherwise.
+    let arr_pin = ctx.pin_native_root(arr);
     let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
     ctx.set_field(enm, 0, Value::Object(Some(arr)));
     ctx.set_field(enm, 1, Value::Int(0));
     Ok(Some(Value::Object(Some(enm))))
@@ -2770,7 +2875,13 @@ pub(crate) fn native_module_classloader_get_resource_as_stream(
             for (i, &b) in bytes.iter().enumerate() {
                 ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
             }
+            // GC-safety: `alloc_concurrent_synthetic` below can trigger a
+            // moving GC; `arr` is reused in the following `set_field`s
+            // unpinned otherwise.
+            let arr_pin = ctx.pin_native_root(arr);
             let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            ctx.unpin_native_roots(arr_pin);
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             ctx.set_field(stream, 1, Value::Int(0));
             ctx.set_field(stream, 2, Value::Int(0));
@@ -2814,7 +2925,13 @@ pub(crate) fn native_module_get_module_loader(
     if let Value::Object(Some(_)) = stored {
         return Ok(Some(stored));
     }
+    // GC-safety: `build_local_module_loader` below can trigger a moving GC
+    // (it allocates the loader singleton on the first call); `this` is
+    // reused in the following `set_field` unpinned otherwise.
+    let this_pin = ctx.pin_native_root(this);
     let l = build_local_module_loader(ctx);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     ctx.set_field(this, MOD_SLOT_LOADER, Value::Object(Some(l)));
     Ok(Some(Value::Object(Some(l))))
 }
@@ -2880,7 +2997,12 @@ pub(crate) fn native_module_get_property_names(
     // Return an empty ArrayList — this matches the "no properties set"
     // case the boot path expects.
     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    // GC-safety: `new_array` below can trigger a moving GC; `list` is reused
+    // in the following `set_field` unpinned otherwise.
+    let list_pin = ctx.pin_native_root(list);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+    let list = ctx.read_native_pin(list_pin, list);
+    ctx.unpin_native_roots(list_pin);
     ctx.set_field(list, 0, Value::Object(Some(arr)));
     ctx.set_field(list, 1, Value::Int(0));
     Ok(Some(Value::Object(Some(list))))
@@ -2936,7 +3058,7 @@ pub(crate) fn native_module_load_service_from_caller_module_loader(
         }
     };
     let service = match args.get(1) {
-        Some(Value::Object(Some(c))) => Value::Object(Some(*c)),
+        Some(Value::Object(Some(c))) => *c,
         _ => {
             return Err(RuntimeError::NullPointerException {
                 message: Some(
@@ -2946,6 +3068,24 @@ pub(crate) fn native_module_load_service_from_caller_module_loader(
             .into());
         }
     };
+    // GC-safety: `service` (the `Class` mirror for e.g. `Extension.class`) is
+    // captured before two GC-risking calls below (`native_loader_load_module`
+    // resolves + registers a module's resource roots; `native_module_get_class_loader`
+    // lazily allocates a `ModuleClassLoader` the first time it's asked for a
+    // given module — which is every time here, since this runs once per
+    // freshly-loaded extension module during WildFly boot). Per the
+    // `pin_native_root` contract, a moving GC in that window leaves `service`
+    // stale; passed into the final `ServiceLoader.load` native, this silently
+    // constructs a `ServiceLoader` scoped to the WRONG (or a reused, all-zero)
+    // service type, so `discover_providers` searches for the wrong resource
+    // name and returns zero providers — the bytecode caller's own error
+    // message still names the correct service class (a separate, un-corrupted
+    // bytecode-level reference to `Extension.class`), so this manifests as
+    // "No META-INF/services/org.jboss.as.controller.Extension found" for a
+    // seemingly-arbitrary, different extension module each time, exactly the
+    // non-deterministic residual documented in
+    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    let service_pin = ctx.pin_native_root(service);
 
     let loader = build_local_module_loader(ctx);
     let name_obj = ctx.create_string(&module_name);
@@ -2962,11 +3102,13 @@ pub(crate) fn native_module_load_service_from_caller_module_loader(
         Some(Value::Object(Some(cl))) => cl,
         _ => return Err(throw_module_not_found(ctx, &module_name)),
     };
+    let service = ctx.read_native_pin(service_pin, service);
+    ctx.unpin_native_roots(service_pin);
     ctx.invoke(
         "java/util/ServiceLoader",
         "load",
         "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/util/ServiceLoader;",
-        &[service, Value::Object(Some(class_loader))],
+        &[Value::Object(Some(service)), Value::Object(Some(class_loader))],
     )
 }
 
@@ -3019,11 +3161,25 @@ pub(crate) fn native_module_load_service(
             .into());
         }
     };
+    // GC-safety: `service_type` is captured before `native_module_get_class_loader`
+    // below, which lazily allocates a new `ModuleClassLoader` the first time
+    // it's asked for a given module — i.e. every time here, since this runs
+    // once per freshly-loaded extension module during WildFly boot. Per the
+    // `pin_native_root` contract, a moving GC during that allocation leaves
+    // `service_type` stale; passed into the final `ServiceLoader.load` native,
+    // this silently scopes the `ServiceLoader` to the wrong (or reused,
+    // all-zero) service type, so `discover_providers` searches for the wrong
+    // resource name and returns zero providers. See the matching fix in
+    // `native_module_load_service_from_caller_module_loader` above for the
+    // full mechanism writeup.
+    let service_type_pin = ctx.pin_native_root(service_type);
     let class_loader_val = native_module_get_class_loader(ctx, &[Value::Object(Some(this))])?;
     let class_loader = match class_loader_val {
         Some(Value::Object(Some(cl))) => Value::Object(Some(cl)),
         _ => Value::Object(None),
     };
+    let service_type = ctx.read_native_pin(service_type_pin, service_type);
+    ctx.unpin_native_roots(service_type_pin);
     ctx.invoke(
         "java/util/ServiceLoader",
         "load",

@@ -8,7 +8,7 @@
 
 // AUDIT 2026-05-16: std::collections::HashMap is unused — the registry
 // migrated to rustc_hash::FxHashMap (T10.9.B). Import removed.
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// NIO-SERVER-SOCKET (route 1): cached check of the `CRATONVM_REAL_NET_SOCKETS`
 /// env var. When set, the native registry drops all synthetic
@@ -267,6 +267,39 @@ pub trait NativeThreadBlocker: Send + Sync {
     fn leave_blocked(&self);
 }
 
+/// Transport-only mirror of `vm::runtime::offload::SerializedResult`'s
+/// scalar variants, returned by [`NativeContext::gpu_future_take_result`].
+///
+/// `native-api` cannot depend on `vm` (the dependency runs the other
+/// way — `vm`'s `NativeContextImpl` implements this crate's
+/// `NativeContext` trait), so a completed GPU submission's
+/// `SerializedResult` can't cross the trait boundary as-is. This enum is
+/// the narrow subset `gpu_future_take_result` needs to hand back: the
+/// four scalar-reduction shapes a `)I`/`)J`/`)F`/`)D`-returning kernel
+/// produces, plus `Void` for a kernel with no return value (or one that
+/// wrote its result into a caller-owned array instead — see the trait
+/// method's doc comment). Primitive-array *future results* are
+/// deliberately not represented here: today `finalize_submission` never
+/// stamps a `SerializedResult::PrimitiveArray*` into a completed
+/// submission (array outputs are delivered via writeback into the
+/// caller's own array), so there is nothing for this enum to carry for
+/// that case.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GpuFutureResult {
+    /// The kernel had a void return, or wrote its result into a
+    /// caller-owned output array via writeback — nothing new to hand
+    /// back through the future's result slot.
+    Void,
+    /// Scalar-return accumulator readback (`)I` descriptor).
+    ScalarI32(i32),
+    /// Scalar-return accumulator readback (`)J` descriptor).
+    ScalarI64(i64),
+    /// Scalar-return accumulator readback (`)F` descriptor).
+    ScalarF32(f32),
+    /// Scalar-return accumulator readback (`)D` descriptor).
+    ScalarF64(f64),
+}
+
 /// Trait providing VM capabilities needed by native method implementations.
 ///
 /// The `Vm` struct implements this trait. Using a trait here avoids circular
@@ -299,6 +332,72 @@ pub trait NativeContext {
         None
     }
 
+    /// GpuStream affinity — mint a new Java-visible CUDA stream on the
+    /// per-VM default-ordinal `OffloadCache`.
+    ///
+    /// Called by `Native.newStream` (wraps the returned handle in a
+    /// `GpuStreamImpl`) and, lazily, by every `submit`/`launch`/
+    /// `submitMethod`/`submitWithArg(s)` handler the first time a given
+    /// `GpuExecutor` handle is used — see
+    /// `native-builtins/src/craton_gpu.rs::resolve_or_create_default_stream`.
+    /// That laziness is what gives an executor a real *default* stream:
+    /// every dispatch through the same executor handle reuses the one
+    /// stream minted on its first submit, instead of each call getting
+    /// its own private one-shot stream (the gap
+    /// `docs/gpu/async-api.md` describes under "GpuStream affinity is
+    /// not wired up").
+    ///
+    /// Returns `None` when there is no device (no driver / `--gpu` off
+    /// / `gpu-offload` compiled off on the VM side) — the default impl
+    /// here, matching every other no-driver fallback in this trait.
+    /// The VM's `NativeContextImpl` overrides under
+    /// `#[cfg(feature = "gpu-offload")]` to call
+    /// `runtime::offload::OffloadCache::stream_create`.
+    fn gpu_stream_create(&mut self) -> Option<u64> {
+        None
+    }
+
+    /// Release a stream minted by [`gpu_stream_create`](Self::gpu_stream_create).
+    /// Safe to call on an unknown or already-released `handle`
+    /// (no-op) — same idempotent-release convention as
+    /// [`gpu_release_array_cache`](Self::gpu_release_array_cache).
+    ///
+    /// Default impl is a no-op (no GPU offload). The VM override calls
+    /// `runtime::offload::OffloadCache::stream_release`.
+    fn gpu_stream_release(&mut self, _handle: u64) {}
+
+    /// Stream-affine sibling of [`gpu_dispatch_method`](Self::gpu_dispatch_method):
+    /// identical contract, plus `stream_handle`.
+    ///
+    /// * `Some(h)` — pin this dispatch onto the CUDA stream previously
+    ///   minted by [`gpu_stream_create`](Self::gpu_stream_create) under
+    ///   handle `h`. Two dispatches pinned to the SAME `h` serialize in
+    ///   submission order (the ordering guarantee a CUDA stream gives
+    ///   for free). An `h` that was never minted, or was already
+    ///   released via [`gpu_stream_release`](Self::gpu_stream_release),
+    ///   is a hard failure (a `Failed` submission), not a silent
+    ///   fresh-stream fallback.
+    /// * `None` — identical to calling
+    ///   [`gpu_dispatch_method`](Self::gpu_dispatch_method) directly: a
+    ///   fresh, private, one-shot stream for this dispatch alone.
+    ///
+    /// Default impl delegates to `gpu_dispatch_method` and ignores
+    /// `stream_handle` — correct for every mock/test context (no GPU
+    /// offload at all) and for a VM build with `gpu-offload` off. The
+    /// VM's `NativeContextImpl` overrides under
+    /// `#[cfg(feature = "gpu-offload")]` to call
+    /// `runtime::offload::dispatch_method_from_native_on_stream`.
+    fn gpu_dispatch_method_on_stream(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        java_args: &[Value],
+        _stream_handle: Option<u64>,
+    ) -> Option<u64> {
+        self.gpu_dispatch_method(class_name, method_name, descriptor, java_args)
+    }
+
     /// Phase 6 #4 — query the real GPU submission registry for the
     /// future at `handle`. Returns:
     ///   * `Some(0)` — Running
@@ -309,6 +408,35 @@ pub trait NativeContext {
     ///                 future state in native-builtins).
     /// Default impl returns None (no GPU offload).
     fn gpu_future_status(&self, _handle: u64) -> Option<i32> {
+        None
+    }
+
+    /// 2026-07-11 — take the real GPU submission's completed result for
+    /// `handle`, without blocking. This is the read half `gpu_future_status`
+    /// was missing: `gpu_future_status` (now backed by
+    /// `runtime::offload::poll_submission_status`) tells a caller *that*
+    /// a submission finished; this method hands back *what it produced*.
+    ///
+    /// Returns:
+    ///   * `Some(GpuFutureResult::Scalar*)` — the submission is complete
+    ///     and its kernel returned a scalar (`)I`/`)J`/`)F`/`)D`).
+    ///   * `Some(GpuFutureResult::Void)` — the submission is complete and
+    ///     either the kernel had a void return, or it wrote its result
+    ///     into a caller-owned primitive array rather than the future's
+    ///     result slot (array results are delivered via writeback into
+    ///     the caller's own arrays, not through the future — see
+    ///     [`GpuFutureResult`]'s doc comment).
+    ///   * `None` — the handle is not in the real registry, the
+    ///     submission is still `Running`, or it failed. This method
+    ///     never blocks and never finalizes-and-waits on the caller's
+    ///     behalf beyond what an already-observed completion allows: a
+    ///     caller that hasn't first seen `gpu_future_status`/
+    ///     `futureIsDone` report completion should treat `None` here as
+    ///     "not ready yet" and fall back to the blocking
+    ///     `gpu_future_synchronize` path, not as a permanent failure.
+    ///
+    /// Default impl returns `None` (no GPU offload).
+    fn gpu_future_take_result(&self, _handle: u64) -> Option<GpuFutureResult> {
         None
     }
 
@@ -481,6 +609,12 @@ pub trait NativeContext {
     /// `java.lang.Object`, slot). After the call, read the forwarded reference
     /// back with [`read_native_pin`] before using it. Unpin the whole batch with
     /// [`unpin_native_roots`] passing the index returned by the *first* pin.
+    ///
+    /// Forgot to pin somewhere? Run with `CRATONVM_DBG_STALE_OBJREF=1` (the
+    /// `Generational` GC backend only) to turn a stale read into an immediate,
+    /// deterministic panic instead of silent corruption — see
+    /// `gc/src/stale_objref_debug.rs` and
+    /// docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
     ///
     /// Default impl is a no-op (handle 0) for test mocks with no moving GC.
     fn pin_native_root(&mut self, _obj: ObjectRef) -> usize {
@@ -2872,6 +3006,55 @@ pub struct StackTraceEntry {
 /// - `Ok(None)` — method returned void
 /// - `Err(MethodCallFailed)` — method threw an exception or had an internal error
 pub type NativeCallback = fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult;
+
+/// Event emitted by the native `ByteArrayOutputStream` implementation before
+/// it falls back to growing its in-heap byte buffer.
+///
+/// Most streams are ordinary buffers, so observers return `Ok(false)` and the
+/// I/O crate performs its normal operation.  A small number of bridge APIs
+/// expose a ByteArrayOutputStream-shaped Java object while the bytes must go to
+/// a native sink immediately (legacy fixed-length HttpURLConnection is one).
+/// Keeping that opt-in at the API boundary avoids making native-io depend on a
+/// higher-level protocol crate.
+pub enum BaosEvent {
+    WriteByte(u8),
+    /// A Java byte-array slice.  The observer must read it through `ctx` only
+    /// after deciding it owns this stream, keeping the ordinary BAOS hot path
+    /// allocation-free.
+    WriteArray {
+        array: ObjectRef,
+        offset: usize,
+        len: usize,
+    },
+    Flush,
+    Close,
+}
+
+/// Return `Ok(true)` when the event was consumed and the ordinary BAOS path
+/// must be skipped; `Ok(false)` leaves the receiver's normal buffering intact.
+pub type BaosEventHook =
+    fn(&mut dyn NativeContext, ObjectRef, BaosEvent) -> Result<bool, MethodCallFailed>;
+
+static BAOS_EVENT_HOOK: OnceLock<BaosEventHook> = OnceLock::new();
+
+/// Install the process-wide optional BAOS bridge hook.  Registration happens
+/// during native bootstrap; repeated registrations are harmless because the
+/// first (and only) bridge implementation wins.
+pub fn install_baos_event_hook(hook: BaosEventHook) {
+    let _ = BAOS_EVENT_HOOK.set(hook);
+}
+
+/// Offer a BAOS event to the optional bridge hook.
+pub fn dispatch_baos_event(
+    ctx: &mut dyn NativeContext,
+    stream: ObjectRef,
+    event: BaosEvent,
+) -> Result<bool, MethodCallFailed> {
+    match BAOS_EVENT_HOOK.get() {
+        Some(hook) => hook(ctx, stream, event),
+        None => Ok(false),
+    }
+}
 
 /// Classification of a registered native method.
 ///

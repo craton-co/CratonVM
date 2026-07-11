@@ -121,9 +121,9 @@ const ZGC_ADDRESS_BITS: u64 = 42; // 4TB heap max
 const ZGC_METADATA_SHIFT: u64 = 42;
 
 // Color bits (bits 42-45)
-const ZGC_COLOR_REMAPPED: u64 = 1 << 42;
-const ZGC_COLOR_MARKED0: u64 = 1 << 43;
-const ZGC_COLOR_MARKED1: u64 = 1 << 44;
+pub(crate) const ZGC_COLOR_REMAPPED: u64 = 1 << 42;
+pub(crate) const ZGC_COLOR_MARKED0: u64 = 1 << 43;
+pub(crate) const ZGC_COLOR_MARKED1: u64 = 1 << 44;
 const ZGC_COLOR_FINALIZABLE: u64 = 1 << 45;
 
 const ZGC_ADDRESS_MASK: u64 = (1 << ZGC_ADDRESS_BITS) - 1;
@@ -1725,12 +1725,24 @@ impl ZgcRealHeap {
     /// Push every reference-typed out-edge of the object at `base` onto
     /// `work`. Mirrors how the semi-space collector enumerates an object's
     /// oops, but reads them in place (non-moving).
-    fn enumerate_references(&self, base: *mut u8, work: &mut Vec<usize>) {
+    /// `skip_index`: for a registered Weak/Soft/Phantom `Reference` object
+    /// (see `ReferenceProcessor::reference_object_addresses`'s INT-8 doc),
+    /// the referent slot (index 0) must NOT be traced as a strong edge —
+    /// otherwise the referent always appears reachable through its own
+    /// Reference object and can never be cleared. Mirrors the G1 marker's
+    /// `g1_set_reference_skip_set` mechanism (see
+    /// `vm/src/runtime/interpreter.rs`), done internally here since
+    /// `ZgcRealHeap::collect_garbage` is self-contained (no interpreter
+    /// pre/post-GC cooperation step).
+    fn enumerate_references(&self, base: *mut u8, work: &mut Vec<usize>, skip_index: Option<usize>) {
         let header = self.header_mut(base);
         match header.kind {
             ObjectKind::Object => {
                 let n = header.num_slots as usize;
                 for i in 0..n {
+                    if skip_index == Some(i) {
+                        continue;
+                    }
                     // SAFETY: i < num_slots so the slot is within the object.
                     let slot = unsafe { base.add(HEADER_SIZE + i * SLOT_SIZE) };
                     let val = unsafe { std::ptr::read(slot as *const Value) };
@@ -2073,6 +2085,27 @@ impl GarbageCollector for ZgcRealHeap {
             self.header_mut(base as *mut u8).gc_flags &= !GC_FLAG_MARKED;
         }
 
+        // INT-8: snapshot the referent-slot skip set — the currently
+        // registered Weak/Soft/Phantom `Reference` object addresses. Their
+        // slot 0 (the referent) must not be traced as a strong edge during
+        // marking, or the referent always appears reachable through its own
+        // Reference object and `process_references` below could never clear
+        // it. Mirrors the G1 marker's `g1_set_reference_skip_set`; see
+        // `enumerate_references`'s doc comment.
+        let ref_skip_objs: FxHashSet<usize> = self
+            .ref_processor
+            .lock()
+            .reference_object_addresses()
+            .into_iter()
+            .collect();
+        let skip_for = |addr: usize| -> Option<usize> {
+            if ref_skip_objs.contains(&addr) {
+                Some(0)
+            } else {
+                None
+            }
+        };
+
         // Trace from roots. A work stack holds base addresses to visit.
         let mut work: Vec<usize> = Vec::new();
         for r in roots.iter() {
@@ -2095,7 +2128,7 @@ impl GarbageCollector for ZgcRealHeap {
                 continue; // already visited
             }
             header.gc_flags |= GC_FLAG_MARKED;
-            self.enumerate_references(addr as *mut u8, &mut work);
+            self.enumerate_references(addr as *mut u8, &mut work, skip_for(addr));
         }
         if wild_skipped > 0 {
             tracing::warn!(
@@ -2131,7 +2164,7 @@ impl GarbageCollector for ZgcRealHeap {
                         continue;
                     }
                     h.gc_flags |= GC_FLAG_MARKED;
-                    self.enumerate_references(a as *mut u8, &mut work);
+                    self.enumerate_references(a as *mut u8, &mut work, skip_for(a));
                 }
             }
             if !resurrected.is_empty() {
@@ -2164,6 +2197,34 @@ impl GarbageCollector for ZgcRealHeap {
                 cleaner_actions = ref_result.cleaner_actions.len(),
                 "zgc real: reference processing produced pending enqueue/finalize/cleaner work"
             );
+        }
+
+        // ---- INT-8 remark: resurrect policy-kept soft referents ----------
+        // A soft referent the LRU policy chose to KEEP (not cleared, not
+        // enqueued) was never traced by the main mark above — its Reference's
+        // slot 0 was hidden by `ref_skip_objs`. If that referent is not ALSO
+        // reachable some other way, the sweep below would reclaim it out
+        // from under the still-live SoftReference. Mark it (and its
+        // transitive closure) alive now, mirroring the interpreter's G1
+        // remark step (`soft_survivor_referents`).
+        {
+            let survivors = self.ref_processor.lock().soft_survivor_referents();
+            for addr in survivors {
+                if registered.contains(&addr) {
+                    work.push(addr);
+                }
+            }
+            while let Some(addr) = work.pop() {
+                if addr == 0 || !registered.contains(&addr) {
+                    continue; // ZGC-4: same wild-child skip as the main loop
+                }
+                let header = self.header_mut(addr as *mut u8);
+                if header.gc_flags & GC_FLAG_MARKED != 0 {
+                    continue;
+                }
+                header.gc_flags |= GC_FLAG_MARKED;
+                self.enumerate_references(addr as *mut u8, &mut work, skip_for(addr));
+            }
         }
 
         // ---- Sweep phase -------------------------------------------------
@@ -3052,8 +3113,17 @@ mod tests {
         heap.set_field(obj, 2, Value::Long(0x1_0000_0001));
         assert_eq!(heap.get_field(obj, 0), Value::Int(42));
         assert_eq!(heap.get_field(obj, 2), Value::Long(0x1_0000_0001));
-        // Unwritten reference slot reads as null.
-        assert_eq!(heap.get_field(obj, 1), Value::Object(None));
+        // An unwritten slot is raw zeroed memory, which decodes as
+        // `Value::Int(0)` (discriminant 0 — see `value_discriminant_is_byte0_low32`
+        // in types/src/value.rs), NOT `Value::Object(None)` (discriminant 4).
+        // This is universal across every backend (heap.rs/gen_heap.rs never
+        // explicitly zero-init a legacy slot to a typed default either — see
+        // heap.rs's `alloc_object_fields_zero_initialized` test, which
+        // deliberately does not assert a specific value for this exact
+        // reason). Real Java field defaults (null for references, 0 for
+        // primitives) are produced by the interpreter's class-layout-aware
+        // initialization at `new` time, not by this raw allocator.
+        assert_eq!(heap.get_field(obj, 1), Value::Int(0));
     }
 
     #[test]

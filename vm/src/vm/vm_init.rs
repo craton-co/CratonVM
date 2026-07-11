@@ -1132,8 +1132,19 @@ impl SharedVm {
             let serializable_id = class_manager
                 .load_class("java/io/Serializable")
                 .expect("java/io/Serializable must be loadable");
+            // `entrySet()`'s Set view and its Map.Entry elements — see
+            // native-collections' `UNMOD_ENTRY_SET_CLASS`/`UNMOD_ENTRY_ITR_CLASS`/
+            // `UNMOD_MAP_ENTRY_CLASS`. Same checkcast/instanceof requirement as
+            // every other synthetic wrapper below: `Map.replaceAll`'s default
+            // body does `Map.Entry<K,V> entry : entrySet()` (an implicit
+            // checkcast to `Map$Entry` on each `Iterator.next()` result), so the
+            // wrapped entry must declare that interface or the cast throws
+            // ClassCastException.
+            let map_entry_id = class_manager
+                .load_class("java/util/Map$Entry")
+                .expect("java/util/Map$Entry must be loadable");
             // (synthetic class name, list of interface ClassIds it implements)
-            let unmod_specs: [(&str, &[ClassId]); 8] = [
+            let unmod_specs: [(&str, &[ClassId]); 11] = [
                 (
                     "cratonvm/internal/UnmodifiableCollection",
                     &[collection_id, serializable_id],
@@ -1169,6 +1180,12 @@ impl SharedVm {
                     "cratonvm/internal/UnmodifiableListItr",
                     &[list_iterator_id, iterator_id],
                 ),
+                (
+                    "cratonvm/internal/UnmodifiableEntrySet",
+                    &[set_id, collection_id, serializable_id],
+                ),
+                ("cratonvm/internal/UnmodifiableEntryItr", &[iterator_id]),
+                ("cratonvm/internal/UnmodifiableMapEntry", &[map_entry_id]),
             ];
             for (name, ifaces) in unmod_specs {
                 let cid = class_manager.ensure_synthetic_class(name, 1);
@@ -2731,6 +2748,18 @@ impl SharedVm {
         // the weak handle is wired.
         cratonvm_classloading::install_resolution_invalidate_hook(resolution_invalidate_adapter);
 
+        // Found while investigating the guarded-inline-getfield SIGSEGV
+        // cluster (that SIGSEGV's actual cause was a separate, already-fixed
+        // bug — see `jit_invalidate_adapter`'s doc comment): `install_jit_invalidate_hook`
+        // itself dates back further (it already backs `redefine_class`'s Step
+        // 8 `fire_jit_invalidate_hook` call) but had no installer anywhere in
+        // the VM, so that call was always a silent no-op. Wire it up so BOTH
+        // `redefine_class` and the synthetic-stub-upgrade path
+        // (`upgrade_synthetic_class` / `recompute_subclass_layouts`, which —
+        // unlike JEP 109 redefine — really can change field layout) actually
+        // evict stale JIT-compiled code.
+        cratonvm_classloading::install_jit_invalidate_hook(jit_invalidate_adapter);
+
         // Catch-up pass: replay every class already in the ClassManager's
         // `vtable_descriptors` through the adapter, so classes loaded
         // during ClassManager bootstrap (before the hook was live) end up
@@ -2841,6 +2870,62 @@ fn resolution_invalidate_adapter(class_id: u32) {
     // `ResolutionCache::invalidate_class` (drops by key-class OR
     // resolved-declaring-class match).
     shared.link_resolver.invalidate_class(cid);
+}
+
+/// The `JitInvalidateHook` adapter handed to
+/// `cratonvm_classloading::install_jit_invalidate_hook`.
+///
+/// Fired whenever a class's field layout may have changed in a way that
+/// already-compiled JIT code cannot safely observe: JVMTI `redefine_class`
+/// (Step 8), and — critically — `upgrade_synthetic_class` /
+/// `recompute_subclass_layouts`, which (unlike JEP 109 redefine) really can
+/// change instance field count/order/offsets when a synthetic JDK stub is
+/// later replaced by its real `.class` bytecode. A method JIT-compiled
+/// against the stub's layout bakes the stub's field offsets
+/// (`compact_field_off`, or the legacy `field_index * SLOT_SIZE` cell
+/// offset) directly into its machine code as immediates; nothing else in
+/// the VM invalidated that code when the layout later grew/reordered, so it
+/// kept reading/writing the WRONG byte offset of any object allocated under
+/// the new layout — a stale-offset getfield could silently return whatever
+/// raw bytes sat at the old offset (e.g. a small int) where a reference was
+/// expected, corrupting anything computed from it. Found while
+/// investigating the guarded-inline-getfield SIGSEGV cluster
+/// (docs/known-issues/elasticsearch-suite/ES-HANG-20260709-*), but that
+/// specific SIGSEGV's confirmed root cause is a different, already-fixed
+/// bug: the vm-side JIT field resolvers used to fabricate a `(0, false)`
+/// compact slot for any field with no genuine registered `CompactLayout`
+/// entry, and the compact-offset inline getfield arm trusted it — see
+/// `be7102344`'s commit message ("perf(jit): re-enable guarded-inline-
+/// getfield default-ON, root cause fixed") and the WildFly Host Controller
+/// fix it cites. This invalidation gap is real and independent of that bug
+/// — nothing else in the VM ever evicted JIT code after a layout-changing
+/// synthetic-stub upgrade, regardless of the fabricated-slot bug's fix.
+///
+/// A full cache flush is used rather than a class-scoped eviction —
+/// mirroring `redefine_class`'s own existing conservative pattern in
+/// `vm_exec.rs` (`jit_cache.write().clear_all()`) — because any OTHER
+/// class's compiled method may hold a getfield/putfield referencing the
+/// changed class's fields, and there is no reverse index of "which
+/// compiled methods read which class's fields" to evict precisely. A full
+/// flush is rare (each synthetic class upgrades at most once) and safe:
+/// `clear_all` retires evicted methods rather than freeing their code
+/// immediately, so any still-active frame stays valid.
+fn jit_invalidate_adapter(class_id: u32) {
+    let weak = match RESOLUTION_INVALIDATE_VM.get() {
+        Some(w) => w,
+        None => return, // hook fired before VM init wired the handle
+    };
+    let shared = match weak.upgrade() {
+        Some(s) => s,
+        None => return, // VM has been dropped; nothing to invalidate
+    };
+    let evicted = shared.jit_cache.write().clear_all();
+    if evicted > 0 {
+        tracing::debug!(
+            "JIT: fully invalidated {evicted} method(s) due to a class layout \
+             change (class_id={class_id})"
+        );
+    }
 }
 
 /// The `ClassInfoHook` adapter handed to `cratonvm_gc::install_class_info_hook`.
@@ -4777,10 +4862,12 @@ impl Vm {
             ctx.deposit_root_snapshot();
         }
         if self.shared.gc_barrier.mark_blocked_region_enter() {
+            // GCAUDIT-0711-FIX (finding 1a): auto - the deposit above
+            // already raised in_blocked_region.
             let _ = self
                 .shared
                 .gc_barrier
-                .arrive_and_wait(self.main_thread.thread_id);
+                .arrive_and_wait_auto(self.main_thread.thread_id);
         }
     }
 
@@ -5803,11 +5890,16 @@ mod tests {
         // `Map`/`ListIterator`/`Serializable` and the 8
         // `cratonvm/internal/Unmodifiable*` synthetic stamps, see
         // `d3474b3e`/`c2d68883`) plus `AssertionError` and `Iterator` and
-        // their transitively-loaded superinterfaces. This count legitimately
-        // grew from 5 as that bootstrap work landed; if it changes again,
-        // verify the new value against `SharedVm::new`'s class-loading calls
-        // rather than assuming a regression.
-        assert_eq!(shared.class_manager.read().loaded_count(), 25);
+        // their transitively-loaded superinterfaces. Grew again from 25 to 29
+        // with `4edaa9ba7`'s 4 new bootstrap loads: `java/util/Map$Entry`
+        // plus the `cratonvm/internal/UnmodifiableEntrySet` +
+        // `UnmodifiableMapEntry` + `UnmodifiableEntryItr` synthetic stamps
+        // (registered in `vm_init.rs` to fix `Collections.unmodifiableMap()
+        // .entrySet()`'s `setValue()` not throwing). This count legitimately
+        // grew from 5 as bootstrap work landed; if it changes again, verify
+        // the new value against `SharedVm::new`'s class-loading calls rather
+        // than assuming a regression.
+        assert_eq!(shared.class_manager.read().loaded_count(), 29);
         assert!(shared.statics.read().is_empty());
         assert!(shared.string_pool.read().is_empty());
         assert!(shared.class_mirrors.read().is_empty());
@@ -5974,8 +6066,9 @@ mod tests {
         let vm = Vm::new(VmConfig::default());
         // self_arc should be set, and get_arc should work
         let arc = vm.shared.get_arc();
-        // Same bootstrap class set as `shared_vm_default_config`.
-        assert_eq!(arc.class_manager.read().loaded_count(), 25);
+        // Same bootstrap class set as `shared_vm_default_config` — see that
+        // test's comment for what's currently in it and why the count moves.
+        assert_eq!(arc.class_manager.read().loaded_count(), 29);
     }
 
     #[test]

@@ -50,7 +50,7 @@ use crate::old_gen::OldGen;
 use crate::satb::SatbQueue;
 use crate::{class_layout, compact_ref_fields_enabled, is_compact_object, object_body_size};
 use cratonvm_types::GC_FLAG_COMPACT;
-use cratonvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_types::{ClassId, CompactLayout, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -527,6 +527,21 @@ pub struct GenerationalHeap {
     young_to: Mutex<Arena>,
     /// Old generation (promoted objects).
     old_gen: Mutex<OldGen>,
+    /// `CRATONVM_DBG_STALE_OBJREF` quarantine arena.
+    ///
+    /// Starts at zero capacity (no cost when the flag is unset). The first
+    /// time [`crate::stale_objref_debug::enabled`] reads true, `collect_garbage_inner`
+    /// grows it to match `young_from`'s capacity and, from then on, routes
+    /// each cycle's just-evacuated (all-garbage) `young_from` arena through
+    /// here instead of resetting it immediately: a stale native `ObjectRef`
+    /// held across that GC still resolves to a header showing
+    /// `is_forwarded() == true` for one *extra* full minor-GC cycle, which
+    /// [`Self::get_header`] turns into a hard panic instead of the object
+    /// silently reading back all-zero (or, worse, a same-slot-reused
+    /// unrelated object) once that memory is actually reclaimed. See
+    /// docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md
+    /// and docs/internal/wildfly-stale-objectref-debug-assertion-scoping.md.
+    quarantine: Mutex<Arena>,
     /// Lock-free cached address bounds `[base, end)` of the three storage
     /// regions (young from-space, young to-space, old gen), published whenever
     /// the regions are (re)allocated so [`is_object_address`] can do its
@@ -687,6 +702,7 @@ impl GenerationalHeap {
             young_from: Mutex::new(Arena::new(young_semi_size)),
             young_to: Mutex::new(Arena::new(young_semi_size)),
             old_gen: Mutex::new(old_gen),
+            quarantine: Mutex::new(Arena::new(0)),
             region_bounds: [
                 (AtomicUsize::new(0), AtomicUsize::new(0)),
                 (AtomicUsize::new(0), AtomicUsize::new(0)),
@@ -1428,7 +1444,34 @@ impl GenerationalHeap {
         // forwarded during GC), so its pointer targets a valid, fully initialized
         // `ObjectHeader` within a heap-owned arena. The reference lifetime is bounded
         // by `&self`, ensuring the arena stays alive.
-        unsafe { &*(obj_ref.as_ptr() as *const ObjectHeader) }
+        let header = unsafe { &*(obj_ref.as_ptr() as *const ObjectHeader) };
+        // CRATONVM_DBG_STALE_OBJREF: `get_header` is the accessor native code
+        // and interpreter bytecode dispatch use to inspect a supposedly-live
+        // object (`get_field`/`set_field`/`class_id_of`/`array_length`/
+        // `identity_hash_code`/etc. all funnel through here) — the GC's own
+        // internal forward/remap machinery reads headers through its own raw
+        // pointer casts instead (see `forward_object_impl`), so it never hits
+        // this check. A forwarded header reaching a caller here means the
+        // caller is holding a raw `ObjectRef` local across a GC-triggering
+        // call without `pin_native_root`/`read_native_pin` — exactly the
+        // "Family 1" stale-ObjectRef pattern documented in
+        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+        // Only reachable when the quarantine dance in `collect_garbage_inner`
+        // is active (see the `quarantine` field), since without it the
+        // evacuated memory would already have been zeroed by the time a
+        // mutator could observe it.
+        if crate::stale_objref_debug::enabled() && header.is_forwarded() {
+            panic!(
+                "CRATONVM_DBG_STALE_OBJREF: stale ObjectRef detected at {:p} — this \
+                 object was evacuated by a moving GC to {:p}, but native/interpreter code \
+                 dereferenced the OLD address. This means a raw ObjectRef local was held \
+                 across a GC-triggering call without pin_native_root/read_native_pin. See \
+                 docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.",
+                obj_ref.as_ptr(),
+                header.forwarding_address(),
+            );
+        }
+        header
     }
 
     /// Get the class id of a heap object.
@@ -3057,6 +3100,10 @@ impl GenerationalHeap {
         let mut young_from = self.young_from.lock();
         let mut young_to = self.young_to.lock();
         let mut old_gen = self.old_gen.lock();
+        // CRATONVM_DBG_STALE_OBJREF: only locked/touched below when the flag
+        // is set (see the `quarantine` field's doc comment); an uncontended
+        // lock of an unused, zero-capacity arena otherwise.
+        let mut quarantine = self.quarantine.lock();
 
         // Publish current (pre-collection) region bounds for the lock-free
         // `is_object_address` used during this cycle's marking/scanning. The
@@ -3925,7 +3972,28 @@ impl GenerationalHeap {
         // a still-live young referent (intermittent stale Locale/ClassLoader
         // corruption). We remap each referrer address through `compact_map`
         // first when a major GC runs (see below).
-        young_from.reset();
+        //
+        // CRATONVM_DBG_STALE_OBJREF: instead of resetting (zeroing) the
+        // just-evacuated `young_from` immediately, route it through the
+        // quarantine arena for one extra cycle so a stale native `ObjectRef`
+        // held into it still resolves to a forwarded header (caught by
+        // `get_header`) rather than reading back all-zero. `quarantine`
+        // currently holds whatever was routed through it LAST cycle (or is
+        // empty, the very first time) — its one-cycle grace period has
+        // elapsed, so it's safe to reset (and grow, if `young_from` has since
+        // expanded) before taking this cycle's garbage in. The final external
+        // effect — which arena ends up serving as `young_from`/`young_to` for
+        // the NEXT cycle — is identical to the plain `young_from.reset()`
+        // this replaces; only the mechanics of clearing memory differ.
+        if crate::stale_objref_debug::enabled() {
+            quarantine.reset();
+            if quarantine.capacity() < young_from.capacity() {
+                quarantine.grow(young_from.capacity());
+            }
+            std::mem::swap(&mut *young_from, &mut *quarantine);
+        } else {
+            young_from.reset();
+        }
 
         // CRIT-P2 fix: convert the internal FxHashMap to the std HashMap
         // expected by `MonitorCleanup::remap_after_gc` (defined in
@@ -7291,6 +7359,25 @@ impl GenerationalHeap {
 
         pointer_map.insert(old_ptr as usize, new_ptr as usize);
         *objects_copied += 1;
+        if desc_trace_enabled() {
+            if let Some((cname, _)) = crate::gc::resolve_class_info(header.class_id.as_u32()) {
+                if cname == "org/junit/runner/Description"
+                    || cname == "java/util/concurrent/ConcurrentLinkedQueue"
+                {
+                    eprintln!(
+                        "[desctrace-fwd] {} ihash={} old=0x{:x} new=0x{:x} promoted={} age={} jit_active={} moving_young={}",
+                        cname,
+                        header.identity_hash_code,
+                        old_ptr as usize,
+                        new_ptr as usize,
+                        landed_in_old_gen,
+                        header.gc_age,
+                        crate::gc_quiescence::is_active(),
+                        crate::gc_quiescence::moving_young_enabled(),
+                    );
+                }
+            }
+        }
         // CRIT-P2 fix: enqueue promoted objects so the alternating Cheney
         // loop can scan them in O(1) per object instead of re-filtering
         // `pointer_map.values()` per iteration. Young to-space copies are
@@ -7953,6 +8040,17 @@ fn gcw_enabled() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_GCWRITE").is_some())
 }
 
+/// Cached CRATONVM_DBG_DESCTRACE gate (temp investigation aid, ALV5th GC
+/// bug): trace every forward_object relocation of a
+/// org/junit/runner/Description or java/util/concurrent/ConcurrentLinkedQueue
+/// instance (old addr -> new addr, identity hash, promoted-or-not, age).
+#[inline]
+fn desc_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some())
+}
+
 /// Cached `CRATONVM_DBG_FWDGUARD` gate (bc math-ec 0x4): log forward_object
 /// candidates whose header class_id does NOT resolve (false interior/stale
 /// roots that would get a forwarding_ptr smashed into live-object interiors).
@@ -8268,7 +8366,32 @@ fn compact_field_slot(header: &ObjectHeader, index: usize) -> Option<(usize, boo
     if !is_compact_object(header) {
         return None;
     }
-    let layout = class_layout(header.class_id.as_u32())?;
+    let cid = header.class_id.as_u32();
+    // Per-thread single-entry cache, mirroring `compact_oop_scan` (heap.rs) —
+    // getfield/putfield on a run of same-class objects (e.g. repeated
+    // `Integer` unboxing, or a HashMap's internal per-entry field writes)
+    // otherwise re-takes the `CLASS_LAYOUTS` registry RwLock on every single
+    // field access. Validated against `layout_generation()` so a redefine
+    // (which bumps the generation) cannot serve a stale layout. See
+    // reference_hashmap_native_call_dispatch_overhead_20260711.
+    thread_local! {
+        static FIELD_SLOT_CACHE: std::cell::RefCell<Option<(u32, u64, Arc<CompactLayout>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let gen = cratonvm_types::layout_generation();
+    let layout = FIELD_SLOT_CACHE.with(|c| {
+        {
+            let cache = c.borrow();
+            if let Some((cached_cid, cached_gen, arc)) = &*cache {
+                if *cached_cid == cid && *cached_gen == gen {
+                    return Some(arc.clone());
+                }
+            }
+        }
+        let arc = class_layout(cid)?;
+        *c.borrow_mut() = Some((cid, gen, arc.clone()));
+        Some(arc)
+    })?;
     let off = layout.field_offset(index)? as usize;
     let is_ref = layout.field_is_ref(index)?;
     Some((off, is_ref))

@@ -1157,6 +1157,18 @@ fn cl_load_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     cl_load_class_base_delegation(ctx, this, name_obj)
 }
 
+fn classloader_parent(ctx: &mut dyn NativeContext, loader: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(loader, "parent") {
+        Value::Object(Some(parent)) => return Some(parent),
+        Value::Object(None) | Value::Int(0) | Value::Long(0) => return None,
+        _ => {}
+    }
+    match ctx.get_field(loader, CL_PARENT_REF) {
+        Value::Object(Some(parent)) => Some(parent),
+        _ => None,
+    }
+}
+
 /// True if `loader` can see a class whose defining loader is `defining` — i.e.
 /// `defining` is `loader` itself or one of its delegation ancestors (parent
 /// chain). JVMS §5.3: a class defined by loader D is visible to L only if L
@@ -1172,21 +1184,14 @@ fn loader_can_see_defining(
     loader: ObjectRef,
     defining: ObjectRef,
 ) -> bool {
-    if loader.as_ptr() == defining.as_ptr() {
-        return true;
-    }
-    let mut cur = loader;
+    let mut cur = Some(loader);
     // Bounded walk up the parent chain (defensive cap against cycles).
     for _ in 0..256 {
-        match ctx.get_field(cur, CL_PARENT_REF) {
-            Value::Object(Some(parent)) => {
-                if parent.as_ptr() == defining.as_ptr() {
-                    return true;
-                }
-                cur = parent;
-            }
-            _ => break,
+        let Some(loader) = cur else { break };
+        if loader.as_ptr() == defining.as_ptr() {
+            return true;
         }
+        cur = classloader_parent(ctx, loader);
     }
     false
 }
@@ -1205,7 +1210,7 @@ fn loader_can_see_defining(
 /// must not report a child loader's class as already globally available; that
 /// reverse leak lets sibling BeanShell interpreters reuse the first generated
 /// `MyMessenger` instead of defining their own.
-fn cid_visible_mirror(
+pub(crate) fn cid_visible_mirror(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     cid: cratonvm_types::ClassId,
@@ -1242,7 +1247,7 @@ fn cl_load_class_base_delegation(
     let dotted = ctx.read_string(name_obj).unwrap_or_default();
     let internal = dotted.replace('.', "/");
 
-    // HIB-CV-24 / SBR-14 — honor a supplied child/isolated `ClassLoader`.
+    // HIB-CV-24 / SBR-14 -- honor a supplied child/isolated `ClassLoader`.
     //
     // CratonVM stands in for `ClassLoader.loadClass` with this native (it keeps no
     // JDK bytecode for it). The steps below resolve a class through CratonVM's
@@ -1259,10 +1264,8 @@ fn cl_load_class_base_delegation(
     // loads the class; `findClass` is not called). Built-in loaders and bootstrap
     // classes keep the permissive global path (CratonVM has no separate bootstrap
     // classpath). Opt-out: `CRATONVM_CL_BOOTSTRAP_SCOPED=0`.
-    let parent_is_null = matches!(
-        ctx.get_field(this, CL_PARENT_REF),
-        Value::Object(None) | Value::Int(0) | Value::Long(0)
-    );
+    let parent = classloader_parent(ctx, this);
+    let parent_is_null = parent.is_none();
     let defer_to_find_class = cl_bootstrap_scoped()
         && parent_is_null
         && !is_bootstrap_class_name(&internal)
@@ -1291,7 +1294,7 @@ fn cl_load_class_base_delegation(
     }
 
     // 2. Delegate to parent loader first (recursive parent-first delegation)
-    if let Value::Object(Some(parent)) = ctx.get_field(this, CL_PARENT_REF) {
+    if let Some(parent) = parent {
         // Recursively delegate to parent by calling its loadClass
         let parent_type = match ctx.get_field(parent, CL_LOADER_TYPE) {
             Value::Int(v) => v,
@@ -2771,7 +2774,10 @@ fn cl_find_loaded_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 fn cl_get_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    Ok(Some(ctx.get_field(this, CL_PARENT_REF)))
+    Ok(Some(match classloader_parent(ctx, this) {
+        Some(parent) => Value::Object(Some(parent)),
+        None => Value::Object(None),
+    }))
 }
 
 fn cl_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3021,11 +3027,19 @@ fn collect_url_enumeration_strings(
 
 fn enumeration_from_url_strings(ctx: &mut dyn NativeContext, urls: &[String]) -> ObjectRef {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
+    // GC-safety: `build_synthetic_url` per iteration allocates (transitively
+    // GC-triggering); `arr` is written into again via `set_array_element`
+    // afterward, both within the same iteration and across iterations, and
+    // once more building the enclosing Enumeration below.
+    let arr_pin = ctx.pin_native_root(arr);
     for (i, u) in urls.iter().enumerate() {
         let url_obj = crate::jboss_module_loader::build_synthetic_url(ctx, u);
+        let arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
     }
     let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
     ctx.set_field(enm, 0, Value::Object(Some(arr)));
     ctx.set_field(enm, 1, Value::Int(0));
     enm
@@ -3171,10 +3185,17 @@ fn cl_get_resources_impl(
                         }
                         ctx.unpin_native_roots(p_this);
 
-                        if !delegated_urls.is_empty() {
-                            let enm = enumeration_from_url_strings(ctx, &delegated_urls);
-                            return Ok(Some(Value::Object(Some(enm))));
-                        }
+                        // A user-defined loader's default `getResources` is
+                        // strictly parent-delegating. In particular, an empty
+                        // result is meaningful: falling through to CratonVM's
+                        // process-wide classpath scan leaks resources that are
+                        // invisible to the loader (and bypasses test doubles
+                        // such as EasyMock ClassLoaders). The optional
+                        // findResources override above has already contributed
+                        // this loader's local entries, so return the combined
+                        // enumeration even when it is empty.
+                        let enm = enumeration_from_url_strings(ctx, &delegated_urls);
+                        return Ok(Some(Value::Object(Some(enm))));
                     }
                 }
             }
@@ -3837,8 +3858,16 @@ fn ucl_setup(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value, parent: 
     };
 
     let count = ctx.array_length(url_arr);
+    // GC-safety: `new_array` below can trigger a moving GC; `this` and
+    // `url_arr` (the caller-supplied source array, read from in the copy
+    // loop) are both reused afterward, unpinned otherwise.
+    let this_pin = ctx.pin_native_root(this);
+    let url_arr_pin = ctx.pin_native_root(url_arr);
     // Copy URLs into a storage array and extract paths for classpath registration.
     let storage = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count.max(16));
+    let this = ctx.read_native_pin(this_pin, this);
+    let url_arr = ctx.read_native_pin(url_arr_pin, url_arr);
+    ctx.unpin_native_roots(this_pin);
     let mut paths = Vec::with_capacity(count);
     for i in 0..count {
         let elem = ctx.get_array_element(url_arr, i);
@@ -4610,25 +4639,34 @@ fn ucl_add_url(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
 
     // Store the URL object in the URLs array
     if let Some(Value::Object(Some(url_obj))) = args.get(1) {
+        let mut url_obj = *url_obj;
         if let Value::Object(Some(urls_arr)) = ctx.get_field(this, UCL_URLS_ARRAY) {
             let arr_len = ctx.array_length(urls_arr);
             if (count as usize) < arr_len {
-                ctx.set_array_element(urls_arr, count as usize, Value::Object(Some(*url_obj)));
+                ctx.set_array_element(urls_arr, count as usize, Value::Object(Some(url_obj)));
             } else {
-                // Grow the array (double capacity)
+                // GC-safety: growing the array below (`new_array`) can
+                // trigger a moving GC; `urls_arr` (copied FROM) and
+                // `url_obj` (the new entry) are both reused afterward,
+                // unpinned otherwise.
+                let urls_arr_pin = ctx.pin_native_root(urls_arr);
+                let url_obj_pin = ctx.pin_native_root(url_obj);
                 let new_cap = arr_len * 2;
                 let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+                let urls_arr = ctx.read_native_pin(urls_arr_pin, urls_arr);
+                url_obj = ctx.read_native_pin(url_obj_pin, url_obj);
+                ctx.unpin_native_roots(urls_arr_pin);
                 for i in 0..arr_len {
                     let elem = ctx.get_array_element(urls_arr, i);
                     ctx.set_array_element(new_arr, i, elem);
                 }
-                ctx.set_array_element(new_arr, count as usize, Value::Object(Some(*url_obj)));
+                ctx.set_array_element(new_arr, count as usize, Value::Object(Some(url_obj)));
                 ctx.set_field(this, UCL_URLS_ARRAY, Value::Object(Some(new_arr)));
             }
         }
 
         // Extract the URL path and extend the classpath dynamically.
-        if let Some(p) = extract_url_path(ctx, *url_obj) {
+        if let Some(p) = extract_url_path(ctx, url_obj) {
             ctx.register_dynamic_classpath(&[p.clone()]);
             tracing::debug!("URLClassLoader.addURL: {} (classpath extended)", p);
         }
@@ -4653,7 +4691,13 @@ fn ucl_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // the URLs are copied into UCL_URLS_ARRAY and their paths registered on
     // the dynamic classpath. The loader id assigned by `alloc_url_classloader`
     // is preserved (ucl_setup doesn't touch UCL_LOADER_ID).
+    //
+    // GC-safety: `ucl_setup` allocates/copies the URL array and can trigger a
+    // moving GC; `obj` is returned afterward, unpinned otherwise.
+    let obj_pin = ctx.pin_native_root(obj);
     ucl_setup(ctx, obj, urls, Value::Object(None));
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(obj_pin);
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -4664,7 +4708,13 @@ fn ucl_new_instance_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // FIX: mirror the `<init>(URL[], ClassLoader)` path — store the URL[] and
     // register its paths so the loader actually searches them (was dropping
     // the URLs and only recording their count). See `ucl_new_instance`.
+    //
+    // GC-safety: `ucl_setup` allocates/copies the URL array and can trigger a
+    // moving GC; `obj` is returned afterward, unpinned otherwise.
+    let obj_pin = ctx.pin_native_root(obj);
     ucl_setup(ctx, obj, urls, parent);
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(obj_pin);
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -5222,6 +5272,10 @@ fn alloc_method_handle(
     method_type: Option<ObjectRef>,
 ) -> ObjectRef {
     let mh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_FIELD_COUNT);
+    // GC-safety: `mirror_class_id`/`build_method_type_from_descriptor` below
+    // can trigger a moving GC (classloading); `mh` is reused in the final
+    // `set_field_by_name` unpinned otherwise.
+    let mh_pin = ctx.pin_native_root(mh);
     ctx.set_field(mh, MH_KIND, Value::Int(kind));
     ctx.set_field(
         mh,
@@ -5250,6 +5304,7 @@ fn alloc_method_handle(
     // Resolve class ID if class mirror is available
     if let Some(mirror) = class_mirror {
         if let Some(cid) = crate::lang_class::mirror_class_id(ctx, mirror) {
+            let mh = ctx.read_native_pin(mh_pin, mh);
             ctx.set_field(mh, MH_CLASS_ID, Value::Int(cid.as_u32() as i32));
         }
     }
@@ -5262,6 +5317,8 @@ fn alloc_method_handle(
     // the Java caller did not pass an explicit MethodType).
     let mt_to_store =
         method_type.or_else(|| crate::lang_invoke::build_method_type_from_descriptor(ctx, "()V"));
+    let mh = ctx.read_native_pin(mh_pin, mh);
+    ctx.unpin_native_roots(mh_pin);
     if let Some(mt) = mt_to_store {
         ctx.set_field_by_name(mh, "type", Value::Object(Some(mt)));
     }

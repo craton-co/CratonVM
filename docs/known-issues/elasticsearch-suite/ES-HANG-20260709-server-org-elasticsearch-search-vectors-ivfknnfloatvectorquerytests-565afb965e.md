@@ -96,3 +96,15 @@ repro (both classes share the same Lucene IndexWriter flush/merge code path) —
 the already-tracked STW/monitor-race hang below. This class's own 3 separate test failures
 (`testScoreEuclidean`, `testScoreCosine`, `testSkewedIndex`, noted in the prior update) were not
 re-investigated here — still open, out of scope for this flag re-verification.
+
+---
+
+## 2026-07-11 addendum: independent JIT-cache invalidation gap (unrelated to this SIGSEGV's actual cause)
+
+Same as [the sibling DiversifyingChildren doc's own 2026-07-11 addendum](ES-HANG-20260709-server-org-elasticsearch-search-vectors-diversifyingchildrenivfknnfloatslicedvectorquerytests-3ff8aa1c4b.md#2026-07-11-addendum-independent-jit-cache-invalidation-gap-found-unrelated-to-this-sigsegvs-actual-cause):
+found and fixed a real but separate JIT-cache invalidation gap
+(`install_jit_invalidate_hook` had zero installers anywhere in the VM)
+while independently re-investigating this cluster. Not the cause of this
+SIGSEGV — that is the fabricated-`(0, false)`-compact-slot bug documented
+above, already fixed and re-verified. See the sibling doc for the full
+writeup.

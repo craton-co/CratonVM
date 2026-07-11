@@ -42,6 +42,7 @@
 # GPU Offload
 
 - [GPU Offload](gpu/overview.md)
+- [Benchmarks](gpu/benchmarks.md)
 
 # Embedding CratonVM
 

@@ -548,6 +548,13 @@ pub fn update_all_roots(
     //      `NoSuchMethodError: java/lang/Object.handle` storm under GC pressure).
     cratonvm_native_builtins::net_phase_e::gc_update_re10_handler_refs(pointer_map);
 
+    // Process-global InetAddress side table (companion to roots.rs, right
+    // after the re10 handler scan). Repoint the mirror's (hostName,
+    // ipAddress) entry to its relocated key after a moving GC so
+    // getHostAddress()/getAddress()/toString() keep resolving the real
+    // address instead of falling back to "0.0.0.0".
+    cratonvm_native_builtins::net_phase_e::gc_update_inet_addr_refs(pointer_map);
+
     //      ScheduledThreadPoolExecutor pending runnables + XNIO IoFuture
     //      notifier/attachment/result refs: relocate the stored ObjectRefs after
     //      a moving GC so the pump / future-settle invokes the live object, not a
@@ -806,12 +813,35 @@ pub fn verify_heap_object_fields(
 /// still holds an ObjectRef whose address appears in the pointer_map (i.e. was
 /// supposed to be relocated), OR points to zeroed-out memory (i.e. was garbage
 /// collected because it wasn't in the root set).
+///
+/// Recycled-destination exception (the SpinPollMark `-Xmx80m` OOM-pressure
+/// false alarm, 2026-07-11): under the G1 evacuation-failure retry
+/// (`retry_after_evacuation_failure`), a drain pass allocates its to-space
+/// from regions the FIRST pass just evacuated and freed — so a first-pass
+/// FROM-address (a pointer_map key) can be handed out again as a drain
+/// DESTINATION (a pointer_map value) for a *different* object. A slot the
+/// remap correctly rewrote to such a recycled destination still matches a
+/// key, but it is a fresh, correct reference to the address's NEW occupant,
+/// not a missed remap (`CRATONVM_DBG_BUG03` traces show the slot being
+/// rewritten `old → recycled` in the very pause that would flag `recycled`).
+/// Such addresses are therefore skipped; with `CRATONVM_GC_VERIFY_STALE=1`
+/// they are reported separately as benign. The same ambiguity is inherent
+/// to the heavy STALE-DEST scan below — a value-and-key address cannot be
+/// classified as "intermediate hop" vs "recycled epoch" from the map alone.
+///
+/// Returns the number of genuine (non-recycled) stale reports, for tests.
 fn verify_no_stale_refs(
     thread: &crate::threading::jvm_thread::JvmThread,
     pointer_map: &HashMap<usize, usize>,
-) {
+) -> usize {
     use crate::types::Value;
     use cratonvm_types::ObjectHeader;
+
+    let mut genuine_reports = 0usize;
+    // Lazily-built set of this pause's destination addresses (map VALUES),
+    // used to recognise recycled destinations. Built only when a candidate
+    // stale slot is actually found, so the common (clean) path pays nothing.
+    let mut destinations: Option<std::collections::HashSet<usize>> = None;
 
     // Allow opt-in heavy diagnostic that walks every Object slot and checks
     // for a zeroed header (class_id=0 && identity_hash_code=0 && num_slots=0).
@@ -853,11 +883,28 @@ fn verify_no_stale_refs(
                 // that actually relocated the object.
                 if let Some(&new_addr) = pointer_map.get(&addr) {
                     if new_addr != addr {
-                        eprintln!(
-                            "POST-GC STALE LOCAL: frame[{}] {}.{} local[{}] still points to \
-                             relocated addr 0x{:x} (should be 0x{:x})",
-                            fi, cname, mname, li, addr, new_addr,
-                        );
+                        let dests = destinations
+                            .get_or_insert_with(|| pointer_map.values().copied().collect());
+                        if dests.contains(&addr) {
+                            // Recycled destination — correctly-rewritten slot
+                            // (see fn doc). Benign; report only under the
+                            // heavy opt-in flag.
+                            if heavy {
+                                eprintln!(
+                                    "POST-GC RECYCLED-DEST LOCAL (benign): frame[{}] {}.{} \
+                                     local[{}] holds 0x{:x} — a drain-pass destination that \
+                                     is also an earlier-pass key (-> 0x{:x})",
+                                    fi, cname, mname, li, addr, new_addr,
+                                );
+                            }
+                        } else {
+                            genuine_reports += 1;
+                            eprintln!(
+                                "POST-GC STALE LOCAL: frame[{}] {}.{} local[{}] still points to \
+                                 relocated addr 0x{:x} (should be 0x{:x})",
+                                fi, cname, mname, li, addr, new_addr,
+                            );
+                        }
                     }
                 }
                 if heavy && addr != 0 {
@@ -896,11 +943,26 @@ fn verify_no_stale_refs(
                 // so this slot is correct (see the locals check above).
                 if let Some(&new_addr) = pointer_map.get(&addr) {
                     if new_addr != addr {
-                        eprintln!(
-                            "POST-GC STALE STACK: frame[{}] {}.{} stack[{}] still points to \
-                             relocated addr 0x{:x} (should be 0x{:x})",
-                            fi, cname, mname, si, addr, new_addr,
-                        );
+                        let dests = destinations
+                            .get_or_insert_with(|| pointer_map.values().copied().collect());
+                        if dests.contains(&addr) {
+                            // Recycled destination — benign (see fn doc).
+                            if heavy {
+                                eprintln!(
+                                    "POST-GC RECYCLED-DEST STACK (benign): frame[{}] {}.{} \
+                                     stack[{}] holds 0x{:x} — a drain-pass destination that \
+                                     is also an earlier-pass key (-> 0x{:x})",
+                                    fi, cname, mname, si, addr, new_addr,
+                                );
+                            }
+                        } else {
+                            genuine_reports += 1;
+                            eprintln!(
+                                "POST-GC STALE STACK: frame[{}] {}.{} stack[{}] still points to \
+                                 relocated addr 0x{:x} (should be 0x{:x})",
+                                fi, cname, mname, si, addr, new_addr,
+                            );
+                        }
                     }
                 }
                 if heavy && addr != 0 {
@@ -929,6 +991,7 @@ fn verify_no_stale_refs(
             }
         }
     }
+    genuine_reports
 }
 
 // ---------------------------------------------------------------------------
@@ -1045,6 +1108,51 @@ mod tests {
             Value::Object(Some(r)) => assert_eq!(r.as_ptr() as usize, 0x2000),
             _ => panic!("expected updated reference"),
         }
+    }
+
+    /// Recycled-destination false-alarm regression (SpinPollMark `-Xmx80m`
+    /// OOM pressure, 2026-07-11): under the G1 evacuation-failure retry a
+    /// drain pass can hand out a first-pass FROM-address as its to-space
+    /// destination, so the composed pointer map legitimately holds both
+    /// `K -> V` (drain move into the recycled region) and `V -> C` (the
+    /// first pass moving V's PREVIOUS occupant out). A slot correctly
+    /// rewritten to `V` must NOT be reported stale; a slot holding a key
+    /// that is NOT also a destination is a genuine missed remap and must be.
+    #[test]
+    fn verify_no_stale_refs_ignores_recycled_destinations() {
+        use crate::runtime::frame::Frame;
+        use crate::threading::jvm_thread::{JvmThread, ThreadId};
+
+        let mut map: HashMap<usize, usize> = HashMap::new();
+        map.insert(0x20013B00000, 0x20010200000); // drain: K -> V (V recycled)
+        map.insert(0x20010200000, 0x20013DC02E8); // pass 1: V -> C (old occupant)
+        map.insert(0x50000000, 0x60000000); // unrelated genuine move
+
+        // local[0] = a correctly-rewritten recycled destination -> benign;
+        // local[1] = a from-address nothing rewrote -> genuine stale.
+        let recycled = unsafe { ObjectRef::from_raw(0x20010200000usize as *mut u8) };
+        let missed = unsafe { ObjectRef::from_raw(0x50000000usize as *mut u8) };
+
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let frame = Frame::new(
+            ClassId::new(0),
+            "TestClass".to_string(),
+            "test".to_string(),
+            "()V".to_string(),
+            None,
+            vec![],
+            vec![],
+            10,
+            2,
+            &[Value::Object(Some(recycled)), Value::Object(Some(missed))],
+        );
+        thread.frames.push(frame);
+
+        assert_eq!(
+            verify_no_stale_refs(&thread, &map),
+            1,
+            "recycled destination must be benign; unrewritten key must report"
+        );
     }
 
     #[test]

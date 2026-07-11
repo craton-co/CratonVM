@@ -74,6 +74,14 @@ pub enum StreamOp {
     EventWait { event_id: u32 },
     /// Synchronize: drain all in-flight work.
     Synchronize,
+    /// A host-side callback was enqueued via [`Stream::add_host_callback`].
+    ///
+    /// The callback closure itself is not (and cannot be, since
+    /// `Box<dyn FnOnce() + Send>` is neither `Clone` nor `PartialEq`)
+    /// stored in the log — this variant only records that a callback
+    /// was submitted at this point in the stream's op sequence, e.g.
+    /// for dependency-graph / test introspection.
+    HostCallback,
 }
 
 // ── Stub-mode internals ───────────────────────────────────────────────
@@ -159,6 +167,49 @@ unsafe impl Sync for Stream {}
 
 #[cfg(feature = "cuda")]
 static CUDA_STREAM_ID_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+// ── Host callback trampoline (cuda mode) ────────────────────────────────
+//
+// `cuLaunchHostFunc` (see [`Stream::add_host_callback`]) takes a raw
+// `CUhostFn = Option<unsafe extern "C" fn(*mut c_void)>` plus a single
+// `void*` of user data — there is no room for a Rust closure directly.
+// `Box<dyn FnOnce() + Send>` is a *fat* pointer (data ptr + vtable), so
+// it does not fit in that one `void*` either; we box it a second time
+// to get a thin pointer to the fat pointer, and this trampoline is the
+// `extern "C"` function the driver actually calls, which unpacks it.
+//
+// cudarc 0.13 has no safe wrapper for `cuLaunchHostFunc` — unlike
+// `cuEventRecord` / `cuEventQuery` (wrapped under
+// `cudarc::driver::result::event`), the raw binding only exists in
+// `cudarc::driver::sys::Lib` (see `cudarc-0.13.9/src/driver/sys/sys_12060.rs`,
+// symbol resolved at `cudarc::driver::sys::lib()`). `Stream::add_host_callback`
+// therefore calls the raw function table directly, exactly the way
+// cudarc's own `result::event::query` does internally for `cuEventQuery`.
+#[cfg(feature = "cuda")]
+unsafe extern "C" fn host_callback_trampoline(user_data: *mut std::ffi::c_void) {
+    // # Safety: `user_data` was produced by `Stream::add_host_callback`
+    // via `Box::into_raw` on a `Box<Box<dyn FnOnce() + Send>>`. The CUDA
+    // driver invokes a given `cuLaunchHostFunc` submission's trampoline
+    // exactly once and never again afterwards (per the `cuLaunchHostFunc`
+    // docs), so reclaiming ownership here with `Box::from_raw` is sound
+    // and cannot double-free or run twice.
+    let f = unsafe { Box::from_raw(user_data as *mut Box<dyn FnOnce() + Send>) };
+    // CUDA CALLBACK RULE (also documented loudly on `add_host_callback`
+    // itself): `f` must NOT call any CUDA Driver or Runtime API —
+    // no `Stream`/`Event`/`DeviceBuffer`/`DeviceModule` method on this
+    // crate, no raw `cudarc` call, nothing. This trampoline runs on an
+    // internal CUDA driver callback thread; re-entering the driver from
+    // it is undefined behaviour per NVIDIA's docs and can deadlock the
+    // driver's callback dispatch machinery for the whole process.
+    //
+    // Guard against unwinding across this `extern "C"` boundary: a
+    // panic inside `f` would otherwise try to unwind into driver-owned
+    // code, which is undefined behaviour. `cuLaunchHostFunc` is a
+    // `void`-returning callback ABI with no channel to surface an
+    // error, so a panicking callback is silently swallowed here rather
+    // than propagated.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+}
 
 // ── Public Stream type ────────────────────────────────────────────────
 
@@ -347,6 +398,106 @@ impl Stream {
             .unwrap_or_else(|p| p.into_inner())
             .push(op);
     }
+
+    /// Enqueue a host-side callback that the CUDA driver runs once all
+    /// work submitted to this stream *before this call* has completed.
+    ///
+    /// This is the non-blocking completion primitive
+    /// `GpuFuture::isDone()` needs: unlike [`Event::synchronize`][sync]
+    /// (blocks the calling thread) or [`Event::query`][query] (the
+    /// caller must poll it), a host callback lets the driver notify the
+    /// caller exactly once, from a driver-owned thread, with no
+    /// busy-waiting on either side. The intended usage from a VM-side
+    /// completion poller: record the buffer/kernel work as usual, then
+    /// `add_host_callback` a closure that flips an atomic, completes a
+    /// channel, or wakes a parked task — and let the driver do the
+    /// waiting internally instead of a VM thread blocking in
+    /// `Event::synchronize`.
+    ///
+    /// [sync]: crate::Event::synchronize
+    /// [query]: crate::Event::query
+    ///
+    /// # CUDA callback rules
+    ///
+    /// The underlying `cuLaunchHostFunc` driver call imposes hard
+    /// requirements on `f` (see the [CUDA docs][culaunchhostfunc]):
+    ///
+    /// - **`f` must not call any CUDA Driver or Runtime API function**
+    ///   — no `Stream` / `Event` / `DeviceBuffer` / `DeviceModule`
+    ///   method from this crate, no raw `cudarc` call, nothing. `f`
+    ///   runs on an internal CUDA driver callback thread; re-entering
+    ///   the driver from it is undefined behaviour and can deadlock the
+    ///   driver's callback dispatch for the whole process.
+    /// - `f` should be short: it blocks forward progress of any work
+    ///   queued after the callback point on this stream (and, per the
+    ///   CUDA docs, MAY delay host-callback delivery on other streams
+    ///   too, depending on driver version) until it returns.
+    /// - `f` runs exactly once, on a thread the caller does not
+    ///   control — hence the `Send` bound. A panic inside `f` is caught
+    ///   and discarded rather than propagated (there is no channel to
+    ///   surface it through `cuLaunchHostFunc`'s `void`-returning ABI).
+    ///
+    /// In stub mode (no driver) every stream operation is modelled as
+    /// completing instantaneously, so `f` runs synchronously, inline,
+    /// on the calling thread, before this call returns.
+    ///
+    /// [culaunchhostfunc]: https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXEC.html#group__CUDA__EXEC_1g05841eaa5f90f27124241baafb3e856f
+    #[cfg(feature = "cuda")]
+    pub fn add_host_callback(&self, f: Box<dyn FnOnce() + Send>) -> Result<()> {
+        // AUDIT (SOUND-1 / H10c pattern): bind the owning primary
+        // context to this thread before driving the stream handle —
+        // same prelude every other stream-driving method in this file
+        // uses.
+        self.inner
+            .device
+            .bind_to_thread()
+            .map_err(|e| crate::DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
+        // Double-box: see the `host_callback_trampoline` module note
+        // above for why. `user_data` is handed to the driver as an
+        // opaque `void*`; ownership transfers to the trampoline on
+        // success (reclaimed there via `Box::from_raw`), or is
+        // reclaimed right here on a synchronous submission failure.
+        let boxed: Box<Box<dyn FnOnce() + Send>> = Box::new(f);
+        let user_data = Box::into_raw(boxed) as *mut std::ffi::c_void;
+        let result = unsafe {
+            cudarc::driver::sys::lib().cuLaunchHostFunc(
+                self.raw(),
+                Some(host_callback_trampoline),
+                user_data,
+            )
+        };
+        match result.result() {
+            Ok(()) => {
+                self.record_op(StreamOp::HostCallback);
+                Ok(())
+            }
+            Err(e) => {
+                // `cuLaunchHostFunc` failed synchronously — the driver
+                // will never call the trampoline for this submission,
+                // so it will never reclaim `user_data`. Reclaim (and
+                // drop) it here or it leaks forever.
+                unsafe {
+                    drop(Box::from_raw(user_data as *mut Box<dyn FnOnce() + Send>));
+                }
+                Err(crate::DeviceError::Driver(format!(
+                    "cuLaunchHostFunc: {e:?}"
+                )))
+            }
+        }
+    }
+
+    /// Stub-mode counterpart. There is no driver queue and stub-mode
+    /// streams model all work as completing instantaneously (see the
+    /// module doc), so `f` runs synchronously on the calling thread
+    /// before this call returns — this always succeeds. Also records
+    /// [`StreamOp::HostCallback`] so op-log-driven tests can assert a
+    /// callback was submitted at the right point in the sequence.
+    #[cfg(not(feature = "cuda"))]
+    pub fn add_host_callback(&self, f: Box<dyn FnOnce() + Send>) -> Result<()> {
+        self.record_op(StreamOp::HostCallback);
+        f();
+        Ok(())
+    }
 }
 
 // ── Test-only stub constructor ────────────────────────────────────────
@@ -427,5 +578,69 @@ mod tests {
         // And further recording must still work afterward.
         s.record_op(StreamOp::Synchronize);
         assert_eq!(s.ops().len(), 3);
+    }
+
+    #[test]
+    fn add_host_callback_runs_synchronously_in_stub_mode() {
+        // Stub-mode contract: "stream is always drained" — the closure
+        // must have already run by the time `add_host_callback`
+        // returns, with no thread hop and no polling required.
+        let s = Stream::for_test();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_clone = ran.clone();
+        s.add_host_callback(Box::new(move || {
+            ran_clone.store(true, Ordering::Relaxed);
+        }))
+        .expect("add_host_callback must succeed in stub mode");
+        assert!(
+            ran.load(Ordering::Relaxed),
+            "callback must have run by the time add_host_callback returns in stub mode"
+        );
+    }
+
+    #[test]
+    fn add_host_callback_records_op() {
+        let s = Stream::for_test();
+        s.add_host_callback(Box::new(|| {}))
+            .expect("add_host_callback");
+        let ops = s.ops();
+        assert_eq!(
+            ops,
+            vec![StreamOp::HostCallback],
+            "stub op log should contain exactly one HostCallback"
+        );
+    }
+
+    #[test]
+    fn add_host_callback_runs_exactly_once() {
+        // Guard against a trampoline/box-reclamation bug that would
+        // either drop the closure without calling it or call it twice.
+        let s = Stream::for_test();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = count.clone();
+        s.add_host_callback(Box::new(move || {
+            count_clone.fetch_add(1, Ordering::Relaxed);
+        }))
+        .expect("add_host_callback");
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn add_host_callback_interleaves_with_other_ops_in_log_order() {
+        // The op log should reflect submission order across mixed op
+        // kinds, the same way EventRecord/EventWait do today.
+        let s = Stream::for_test();
+        s.record_op(StreamOp::UploadAsync { bytes: 64 });
+        s.add_host_callback(Box::new(|| {}))
+            .expect("add_host_callback");
+        s.record_op(StreamOp::DownloadAsync { bytes: 64 });
+        assert_eq!(
+            s.ops(),
+            vec![
+                StreamOp::UploadAsync { bytes: 64 },
+                StreamOp::HostCallback,
+                StreamOp::DownloadAsync { bytes: 64 },
+            ]
+        );
     }
 }

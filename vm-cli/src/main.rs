@@ -1453,17 +1453,6 @@ fn resolve_watchdog_timeout(
 }
 
 fn run() -> Result<()> {
-    // Initialize tracing. B6: route WARN+ diagnostics to stderr so silent
-    // swallow sites surface without polluting the program's stdout (which
-    // Java's System.out also writes to).
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::WARN.into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     // Install the pre-`std::process::exit` hook on `native_system_exit` /
     // `native_runtime_exit`. A silent `System.exit(N)` during real app boot
     // (e.g. Cassandra NodeTool's airline NPE catch path) otherwise tears the
@@ -1472,7 +1461,9 @@ fn run() -> Result<()> {
     // is set it dumps the dispatch-trace ring so the last Java method run
     // before the exit is visible in stderr for diagnosis. First-installer
     // wins (OnceLock), so installing it once here at the top of `run()` is
-    // sufficient.
+    // sufficient. (Installing the hook here only registers the closure; it
+    // doesn't run it, so this can safely stay ahead of the tracing-subscriber
+    // init below.)
     cratonvm_native_builtins::lang_system::set_pre_exit_hook(|code| {
         cleanup_staged_archive_copies();
         if std::env::var("CRATONVM_DBG_EXIT").ok().as_deref() == Some("1") {
@@ -1497,6 +1488,70 @@ fn run() -> Result<()> {
     // non-standard spellings (`-XX:+Foo`, `-agentlib:`) don't confuse it.
     let (filtered_args, hotspot_flags) = extract_hotspot_flags(filtered_args);
     let mut args = Args::parse_from(filtered_args);
+
+    // Initialize tracing. B6: route WARN+ diagnostics to stderr so silent
+    // swallow sites surface without polluting the program's stdout (which
+    // Java's System.out also writes to).
+    //
+    // This used to be the very first thing in `run()`, ahead of CLI
+    // parsing. It's now built after `Args::parse_from` above so the
+    // `--print-gpu-decisions` handling below can consult `args`. Nothing in
+    // between the old and new init point ever logs through `tracing`
+    // (`expand_argfiles`, `insert_program_args_separator`,
+    // `normalize_java_launcher_argv`, `extract_system_properties`,
+    // `extract_hotspot_flags`, and `set_pre_exit_hook` all checked — the
+    // pre-exit hook only *installs* a closure here, it doesn't run it), so
+    // moving the subscriber install past them drops no log lines.
+    let mut env_filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive(tracing::Level::WARN.into());
+
+    // `--gpu --print-gpu-decisions` was a silent no-op: the decision lines
+    // it promises (one per analyzer verdict) are emitted via
+    // `tracing::info!`/`tracing::debug!` in `vm/src/runtime/offload.rs`
+    // (`lookup_or_compile`'s "if self.print_decisions" block, and
+    // `try_dispatch`'s "ran on device" / "fell back to CPU" lines) under
+    // the module-path target `cratonvm_vm::runtime::offload` (crate name is
+    // `cratonvm-vm` per vm/Cargo.toml `[package] name`; Cargo/rustc turns
+    // `-` into `_` for the actual crate identifier used as a tracing
+    // target). The WARN-only default filter above swallows all of that
+    // unless the user separately exports RUST_LOG — the flag shouldn't
+    // require knowing that.
+    //
+    // Add a low-priority default that opens up this one target. This is
+    // *not* a global verbosity bump: EnvFilter picks the most specific
+    // matching directive per callsite by target length, independent of add
+    // order, so any RUST_LOG directive for a different target (crate-wide,
+    // a sibling module, or this same target at a different level written
+    // with a different target string) composes normally on top of this.
+    // The one exception is a RUST_LOG directive for this *exact* target
+    // string (e.g. `RUST_LOG=cratonvm_vm::runtime::offload=error`): that
+    // ties in specificity with the directive added below, and EnvFilter
+    // resolves same-target ties by last-added-wins rather than stacking
+    // them — since this runs after `from_default_env()` has already parsed
+    // RUST_LOG, this directive would win that narrow case. Not worth extra
+    // machinery to special-case an already-obscure override.
+    //
+    // NOTE: the workspace pins `tracing` with the `release_max_level_info`
+    // feature (Cargo.toml ~line 46), which compiles `tracing::debug!` down
+    // to a no-op in release builds. So in a release build only the
+    // INFO-level analyzer-verdict lines from `lookup_or_compile` can ever
+    // appear here, by design/compile-time elision — the DEBUG-level "ran on
+    // device" / "fell back to CPU" lines in `try_dispatch` simply aren't in
+    // the binary to enable. Asking for `debug` below is still correct: it's
+    // the right ceiling for debug builds, and a harmless no-op ceiling in
+    // release builds.
+    #[cfg(feature = "gpu")]
+    {
+        if args.print_gpu_decisions {
+            env_filter =
+                env_filter.add_directive("cratonvm_vm::runtime::offload=debug".parse()?);
+        }
+    }
+
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .init();
 
     // --nojit: surface as the CRATONVM_DISABLE_JIT env var so the
     // already-existing kill-switch in `vm/src/runtime/env_cache.rs`

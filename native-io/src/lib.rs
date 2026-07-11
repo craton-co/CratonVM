@@ -3327,6 +3327,13 @@ fn native_baos_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    if cratonvm_native_api::dispatch_baos_event(
+        ctx,
+        this,
+        cratonvm_native_api::BaosEvent::WriteByte((byte_val & 0xFF) as u8),
+    )? {
+        return Ok(None);
+    }
     if let Some(fd) = process_pipe_output_fd(ctx, this) {
         ctx.fd_table()
             .write_byte(fd, (byte_val & 0xFF) as u8)
@@ -3382,6 +3389,17 @@ fn native_baos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     check_array_bounds(off_i, len_i, ctx.array_length(buf))?;
     let off = off_i as usize;
     let len = len_i as usize;
+    if cratonvm_native_api::dispatch_baos_event(
+        ctx,
+        this,
+        cratonvm_native_api::BaosEvent::WriteArray {
+            array: buf,
+            offset: off,
+            len,
+        },
+    )? {
+        return Ok(None);
+    }
     if let Some(fd) = process_pipe_output_fd(ctx, this) {
         let mut bytes = vec![0u8; len];
         ctx.read_byte_array_into(buf, off, &mut bytes);
@@ -3558,6 +3576,9 @@ fn native_baos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    if cratonvm_native_api::dispatch_baos_event(ctx, this, cratonvm_native_api::BaosEvent::Close)? {
+        return Ok(None);
+    }
     process_pipe_output_close(ctx, this);
     Ok(None)
 }
@@ -3589,6 +3610,9 @@ fn native_baos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    if cratonvm_native_api::dispatch_baos_event(ctx, this, cratonvm_native_api::BaosEvent::Flush)? {
+        return Ok(None);
+    }
     if let Some(fd) = process_pipe_output_fd(ctx, this) {
         ctx.fd_table().flush(fd).map_err(io_err)?;
     }
@@ -6310,6 +6334,16 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
         registry.register(c, "length", "()I", native_bb_remaining);
         registry.register(c, "charAt", "(I)C", native_cb_char_at);
         registry.register(c, "compact", "()Ljava/nio/CharBuffer;", native_cb_compact);
+        registry.register(c, "order", "()Ljava/nio/ByteOrder;", native_cb_order);
+        registry.register(c, "slice", "()Ljava/nio/CharBuffer;", native_cb_slice);
+        registry.register(c, "slice", "(II)Ljava/nio/CharBuffer;", native_cb_slice2);
+        registry.register(c, "duplicate", "()Ljava/nio/CharBuffer;", native_cb_duplicate);
+        registry.register(
+            c,
+            "asReadOnlyBuffer",
+            "()Ljava/nio/CharBuffer;",
+            native_cb_as_read_only,
+        );
     }
 
     // --- IntBuffer ---
@@ -6339,6 +6373,16 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
         registry.register(c, "hasArray", "()Z", native_bb_has_array);
         registry.register(c, "toString", "()Ljava/lang/String;", native_tb_to_string);
         registry.register(c, "compact", "()Ljava/nio/IntBuffer;", native_tb_compact);
+        registry.register(c, "order", "()Ljava/nio/ByteOrder;", native_ib_order);
+        registry.register(c, "slice", "()Ljava/nio/IntBuffer;", native_ib_slice);
+        registry.register(c, "slice", "(II)Ljava/nio/IntBuffer;", native_ib_slice2);
+        registry.register(c, "duplicate", "()Ljava/nio/IntBuffer;", native_ib_duplicate);
+        registry.register(
+            c,
+            "asReadOnlyBuffer",
+            "()Ljava/nio/IntBuffer;",
+            native_ib_as_read_only,
+        );
     }
 
     // --- LongBuffer ---
@@ -6378,6 +6422,16 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
         registry.register(c, "hasArray", "()Z", native_bb_has_array);
         registry.register(c, "toString", "()Ljava/lang/String;", native_tb_to_string);
         registry.register(c, "compact", "()Ljava/nio/LongBuffer;", native_tb_compact);
+        registry.register(c, "order", "()Ljava/nio/ByteOrder;", native_lb_order);
+        registry.register(c, "slice", "()Ljava/nio/LongBuffer;", native_lb_slice);
+        registry.register(c, "slice", "(II)Ljava/nio/LongBuffer;", native_lb_slice2);
+        registry.register(c, "duplicate", "()Ljava/nio/LongBuffer;", native_lb_duplicate);
+        registry.register(
+            c,
+            "asReadOnlyBuffer",
+            "()Ljava/nio/LongBuffer;",
+            native_lb_as_read_only,
+        );
     }
 
     // --- FloatBuffer ---
@@ -6417,6 +6471,22 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
         registry.register(c, "hasArray", "()Z", native_bb_has_array);
         registry.register(c, "toString", "()Ljava/lang/String;", native_tb_to_string);
         registry.register(c, "compact", "()Ljava/nio/FloatBuffer;", native_tb_compact);
+        // `order()` is ALSO registered directly on the literal
+        // "java/nio/FloatBuffer" class in native-builtins (Wave 2 D), which
+        // wins for that exact triple since it registers after this module —
+        // registering it again here too so `HeapFloatBuffer`-stamped
+        // receivers (this loop's second class name) resolve identically
+        // instead of relying on registration order across two crates.
+        registry.register(c, "order", "()Ljava/nio/ByteOrder;", native_fb_order);
+        registry.register(c, "slice", "()Ljava/nio/FloatBuffer;", native_fb_slice);
+        registry.register(c, "slice", "(II)Ljava/nio/FloatBuffer;", native_fb_slice2);
+        registry.register(c, "duplicate", "()Ljava/nio/FloatBuffer;", native_fb_duplicate);
+        registry.register(
+            c,
+            "asReadOnlyBuffer",
+            "()Ljava/nio/FloatBuffer;",
+            native_fb_as_read_only,
+        );
     }
 
     // --- DoubleBuffer ---
@@ -6461,6 +6531,16 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
         registry.register(c, "hasArray", "()Z", native_bb_has_array);
         registry.register(c, "toString", "()Ljava/lang/String;", native_tb_to_string);
         registry.register(c, "compact", "()Ljava/nio/DoubleBuffer;", native_tb_compact);
+        registry.register(c, "order", "()Ljava/nio/ByteOrder;", native_db_order);
+        registry.register(c, "slice", "()Ljava/nio/DoubleBuffer;", native_db_slice);
+        registry.register(c, "slice", "(II)Ljava/nio/DoubleBuffer;", native_db_slice2);
+        registry.register(c, "duplicate", "()Ljava/nio/DoubleBuffer;", native_db_duplicate);
+        registry.register(
+            c,
+            "asReadOnlyBuffer",
+            "()Ljava/nio/DoubleBuffer;",
+            native_db_as_read_only,
+        );
     }
 
     // --- ShortBuffer ---
@@ -6500,6 +6580,16 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
         registry.register(c, "hasArray", "()Z", native_bb_has_array);
         registry.register(c, "toString", "()Ljava/lang/String;", native_tb_to_string);
         registry.register(c, "compact", "()Ljava/nio/ShortBuffer;", native_tb_compact);
+        registry.register(c, "order", "()Ljava/nio/ByteOrder;", native_sb_order);
+        registry.register(c, "slice", "()Ljava/nio/ShortBuffer;", native_sb_slice);
+        registry.register(c, "slice", "(II)Ljava/nio/ShortBuffer;", native_sb_slice2);
+        registry.register(c, "duplicate", "()Ljava/nio/ShortBuffer;", native_sb_duplicate);
+        registry.register(
+            c,
+            "asReadOnlyBuffer",
+            "()Ljava/nio/ShortBuffer;",
+            native_sb_as_read_only,
+        );
     }
     registry.set_category(__prev_cat);
 }
@@ -11695,22 +11785,41 @@ fn native_bos_flush_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             Value::Object(Some(o)) => o,
             _ => return Ok(None),
         };
-        // Reset count BEFORE the write so we hold no native-local oop across the
-        // invoke: a single bulk `out.write(buf, 0, count)` (matches the real
-        // BufferedOutputStream.flushBuffer) instead of a per-byte `write(int)`
-        // loop. The loop held `buf`/`inner`/`this` across N invoke_virtual calls;
-        // a GC firing mid-loop (now that blocking I/O no longer deadlocks STW)
-        // would strand those un-rooted native locals → a relocated `inner`
-        // dispatches `write` against garbage (seen as `Object.write(I)V`). `buf`
-        // and `inner` are passed AS ARGS to the single invoke (rooted for its
-        // duration); nothing is read back afterward.
-        ctx.set_field(this, count_slot, Value::Int(0));
+        // CORRECTNESS FIX (2026-07-11, WildFly WFLYHC0053 investigation): this
+        // used to reset `count` to 0 BEFORE the `out.write(buf, 0, count)`
+        // invoke below, reasoning that it avoided holding a native-local oop
+        // across the call. That reordering is a real behavioral deviation
+        // from the JDK (`BufferedOutputStream.flushBuffer()` resets
+        // `count = 0` AFTER `out.write(...)` returns, never before) and
+        // opens a correctness window: as soon as `count` reads back as 0,
+        // this object's buffer is signaled "empty and available", so any
+        // write(int)/write(byte[]) that reaches this same BufferedOutputStream
+        // while the invoke below is still in flight would start overwriting
+        // `buf[0..]` — the SAME array object still passed as a live argument
+        // to the in-flight `write` call — before its bytes are consumed by
+        // the write inside that call. `buf` and `inner` are passed AS ARGS
+        // to the invoke (rooted for its duration regardless of when `count`
+        // is reset), so moving the reset after the call does not reintroduce
+        // the stale-native-local hazard the original comment was guarding
+        // against — nothing is read back from `this`/`buf`/`inner` after the
+        // invoke either way. This is a real, independently-justified fix
+        // (verified via 2 full WildFly domain-boot runs: no regression, same
+        // subsequent behavior otherwise) — NOTE it was found while
+        // investigating `docs/known-issues/wildfly-domain-heap-corrupt-value-timeout.md`'s
+        // WFLYHC0053 blocker, but is NOT that bug's root cause: the observed
+        // byte value (152) that looked like corruption on first read is
+        // actually the real WildFly wire protocol's own `CHUNK_START` marker
+        // byte (`ConnectionImpl$MessageOutputStream`/`ConnectionImpl$2`'s
+        // `lookupswitch` on 152/153), not a corrupted opcode — see that
+        // doc's own write-up for the corrected mechanism and what's still
+        // open.
         ctx.invoke_virtual(
             inner,
             "write",
             "([BII)V",
             &[Value::Object(Some(buf)), Value::Int(0), Value::Int(count)],
         )?;
+        ctx.set_field(this, count_slot, Value::Int(0));
     }
     Ok(None)
 }
@@ -11795,6 +11904,205 @@ fn alloc_typed_buffer(
     buf_write_metadata(ctx, obj, 0, capacity as i32, capacity as i32, -1);
     obj
 }
+
+/// Fetch a `public static final` singleton field (e.g. `ByteOrder.BIG_ENDIAN`)
+/// off an already-initialized real-JDK class.
+fn tb_static_object(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    field_name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let class_id = ctx.ensure_class_initialized(class_name)?;
+    let field_idx = ctx
+        .static_field_index_by_name(class_id, field_name)
+        .ok_or_else(|| {
+            MethodCallFailed::InternalError(VmError::Internal {
+                message: format!("missing static field {class_name}.{field_name}"),
+            })
+        })?;
+    match ctx.get_static_field(class_id, field_idx) {
+        Value::Object(Some(obj)) => Ok(obj),
+        _ => Err(MethodCallFailed::InternalError(VmError::Internal {
+            message: format!("static field {class_name}.{field_name} is not an object"),
+        })),
+    }
+}
+
+/// `slice`/`slice(int,int)`/`duplicate`/`asReadOnlyBuffer`/`order` are
+/// `public abstract` on every typed NIO buffer subclass in real JDK 25
+/// (CharBuffer/IntBuffer/LongBuffer/FloatBuffer/DoubleBuffer/ShortBuffer) —
+/// unlike ByteBuffer, where all five are concrete bytecode. Every factory
+/// above (`alloc_typed_buffer`) and the `ByteBuffer.asXxxBuffer()` views in
+/// `native-builtins/src/servlet.rs` (`s2_view_buf_fn!`) stamp the returned
+/// object with the LITERAL abstract class name (e.g. `java/nio/FloatBuffer`,
+/// not a concrete `HeapFloatBuffer`/`ByteBufferAsFloatBufferB`), so an
+/// `invokevirtual` for any of these five against that receiver resolves to a
+/// Code-less abstract declaration and throws AbstractMethodError unless
+/// registered directly here — same shape as the `get`/`put`/`compact`
+/// registrations already in each loop below. See
+/// docs/known-issues/elasticsearch-suite/ES-FAIL-FAMILY-20260710-floatbuffer-abstract-receiver-nocode.md.
+macro_rules! tb_abstract_view_fns {
+    ($slice_fn:ident, $slice2_fn:ident, $dup_fn:ident, $ro_fn:ident, $order_fn:ident, $cls:literal, $elem:expr, $suffix:literal) => {
+        fn $slice_fn(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let (arr, pos, lim, _cap) = bb_state(ctx, this)?;
+            let remaining = (lim - pos).max(0) as usize;
+            let new_buf = alloc_typed_buffer(ctx, $cls, $elem, remaining);
+            let (new_arr, _, _, _) = bb_state(ctx, new_buf)?;
+            for i in 0..remaining {
+                let v = ctx.get_array_element(arr, pos as usize + i);
+                ctx.set_array_element(new_arr, i, v);
+            }
+            Ok(Some(Value::Object(Some(new_buf))))
+        }
+
+        fn $slice2_fn(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let index = match args.get(1) {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            let length = match args.get(2) {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            let (arr, _, _, cap) = bb_state(ctx, this)?;
+            if index < 0 || length < 0 || index.checked_add(length).map_or(true, |e| e > cap) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "IndexOutOfBoundsException".to_string(),
+                }
+                .into());
+            }
+            let new_buf = alloc_typed_buffer(ctx, $cls, $elem, length as usize);
+            let (new_arr, _, _, _) = bb_state(ctx, new_buf)?;
+            for i in 0..length as usize {
+                let v = ctx.get_array_element(arr, index as usize + i);
+                ctx.set_array_element(new_arr, i, v);
+            }
+            Ok(Some(Value::Object(Some(new_buf))))
+        }
+
+        fn $dup_fn(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let (arr, pos, lim, cap) = bb_state(ctx, this)?;
+            let mark = buf_read_mark(ctx, this);
+            let cap_usize = cap.max(0) as usize;
+            let new_buf = alloc_typed_buffer(ctx, $cls, $elem, cap_usize);
+            let (new_arr, _, _, _) = bb_state(ctx, new_buf)?;
+            for i in 0..cap_usize {
+                let v = ctx.get_array_element(arr, i);
+                ctx.set_array_element(new_arr, i, v);
+            }
+            buf_write_metadata(ctx, new_buf, pos, lim, cap, mark);
+            Ok(Some(Value::Object(Some(new_buf))))
+        }
+
+        fn $ro_fn(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+            let result = $dup_fn(ctx, args)?;
+            if let Some(Value::Object(Some(o))) = result {
+                ctx.set_field_by_name(o, "isReadOnly", Value::Int(1));
+            }
+            Ok(result)
+        }
+
+        fn $order_fn(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+            let order_name = match args.first() {
+                Some(Value::Object(Some(this))) => {
+                    let cname = ctx
+                        .class_name_of_id(ctx.class_id_of_object(*this))
+                        .unwrap_or_default();
+                    if cname.ends_with(concat!($suffix, "B"))
+                        || cname.ends_with(concat!($suffix, "RB"))
+                    {
+                        "BIG_ENDIAN"
+                    } else if cname.ends_with(concat!($suffix, "L"))
+                        || cname.ends_with(concat!($suffix, "RL"))
+                    {
+                        "LITTLE_ENDIAN"
+                    } else {
+                        "NATIVE_ORDER"
+                    }
+                }
+                _ => "NATIVE_ORDER",
+            };
+            Ok(Some(Value::Object(Some(tb_static_object(
+                ctx,
+                "java/nio/ByteOrder",
+                order_name,
+            )?))))
+        }
+    };
+}
+
+tb_abstract_view_fns!(
+    native_cb_slice,
+    native_cb_slice2,
+    native_cb_duplicate,
+    native_cb_as_read_only,
+    native_cb_order,
+    "java/nio/CharBuffer",
+    ArrayElementType::Char,
+    "CharBuffer"
+);
+tb_abstract_view_fns!(
+    native_ib_slice,
+    native_ib_slice2,
+    native_ib_duplicate,
+    native_ib_as_read_only,
+    native_ib_order,
+    "java/nio/IntBuffer",
+    ArrayElementType::Int,
+    "IntBuffer"
+);
+tb_abstract_view_fns!(
+    native_lb_slice,
+    native_lb_slice2,
+    native_lb_duplicate,
+    native_lb_as_read_only,
+    native_lb_order,
+    "java/nio/LongBuffer",
+    ArrayElementType::Long,
+    "LongBuffer"
+);
+tb_abstract_view_fns!(
+    native_fb_slice,
+    native_fb_slice2,
+    native_fb_duplicate,
+    native_fb_as_read_only,
+    native_fb_order,
+    "java/nio/FloatBuffer",
+    ArrayElementType::Float,
+    "FloatBuffer"
+);
+tb_abstract_view_fns!(
+    native_db_slice,
+    native_db_slice2,
+    native_db_duplicate,
+    native_db_as_read_only,
+    native_db_order,
+    "java/nio/DoubleBuffer",
+    ArrayElementType::Double,
+    "DoubleBuffer"
+);
+tb_abstract_view_fns!(
+    native_sb_slice,
+    native_sb_slice2,
+    native_sb_duplicate,
+    native_sb_as_read_only,
+    native_sb_order,
+    "java/nio/ShortBuffer",
+    ArrayElementType::Short,
+    "ShortBuffer"
+);
 
 // --- CharBuffer ---
 fn native_cb_allocate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
