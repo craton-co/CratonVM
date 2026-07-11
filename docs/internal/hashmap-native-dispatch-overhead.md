@@ -39,7 +39,7 @@ receiver classification, and synthetic HashMap node materialization.
 Azure Linux host `20.83.144.174`, CPU 1 pinned, unique release binary and target
 directory, one million puts plus one million gets:
 
-| Build | Five rounds | Mean |
+| Build | Runs | Mean |
 |---|---:|---:|
 | CratonVM baseline | 17,762 / 18,703 / 17,876 ms | 18,113 ms |
 | CratonVM fixed | 1,722 / 1,722 / 1,719 / 1,715 / 1,719 ms | 1,719 ms |
