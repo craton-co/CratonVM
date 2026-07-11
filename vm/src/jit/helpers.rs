@@ -3422,6 +3422,16 @@ pub unsafe extern "C" fn jit_putstatic_object(
 // Type check helpers
 // ---------------------------------------------------------------------------
 
+thread_local! {
+    /// Last resolved JIT type-check target on this mutator. Compiled loops
+    /// repeatedly execute the same checkcast/instanceof site, whose class-name
+    /// bytes live in the immutable JIT string table. Class IDs are stable for
+    /// a VM, so `(vm, ptr, len)` is a complete cache key.
+    static JIT_TYPECHECK_TARGET_CACHE:
+        std::cell::Cell<Option<(usize, usize, usize, u32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Common type-check resolution shared by `jit_checkcast` and `jit_instanceof`.
 ///
 /// Returns `true` if `obj_ref` (which must be non-null and live) is an instance
@@ -3490,8 +3500,34 @@ unsafe fn jit_typecheck_resolve(
     // rwlock.read().method()` would extend the guard's lifetime to the entire
     // `if let` block (including the `else` branch), deadlocking any path that
     // later calls `load_class_concurrent` (which needs a write lock).
-    let target_class_id_opt = vm.class_manager.read().find_class_by_name(class_name);
+    let cache_key = (
+        vm as *const SharedVm as usize,
+        class_name.as_ptr() as usize,
+        class_name.len(),
+    );
+    let cached_target = JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
+        cache.get().and_then(|(cached_vm, cached_ptr, cached_len, raw)| {
+            (cached_vm == cache_key.0
+                && cached_ptr == cache_key.1
+                && cached_len == cache_key.2)
+                .then(|| ClassId::new(raw))
+        })
+    });
+    let target_class_id_opt = if cached_target.is_some() {
+        cached_target
+    } else {
+        let resolved = vm.class_manager.read().find_class_by_name(class_name);
+        if let Some(target) = resolved {
+            JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
+                cache.set(Some((cache_key.0, cache_key.1, cache_key.2, target.as_u32())))
+            });
+        }
+        resolved
+    };
     if let Some(target_class_id) = target_class_id_opt {
+        if obj_class_id == target_class_id {
+            return true;
+        }
         let is_subclass = vm
             .class_manager
             .read()
@@ -3515,6 +3551,17 @@ unsafe fn jit_typecheck_resolve(
         // (instanceof on an unresolvable target returns false; checkcast
         // would have been linked earlier and is a different failure mode).
         if let Ok(target_class_id) = vm.load_class_concurrent(class_name) {
+            JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
+                cache.set(Some((
+                    cache_key.0,
+                    cache_key.1,
+                    cache_key.2,
+                    target_class_id.as_u32(),
+                )))
+            });
+            if obj_class_id == target_class_id {
+                return true;
+            }
             let is_subclass = vm
                 .class_manager
                 .read()
@@ -3814,6 +3861,10 @@ thread_local! {
     static INTEGER_NATIVE_DISPATCH_CACHE:
         std::cell::RefCell<rustc_hash::FxHashMap<usize, Option<IntegerNativeDispatchCache>>>
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+    /// Real `java/lang/Integer` class discovered from the first ordinary
+    /// `valueOf` result in each VM. A new VM pointer invalidates the entry.
+    static INTEGER_WRAPPER_CLASS_CACHE: std::cell::Cell<Option<(usize, u32)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 // ===========================================================================
@@ -4756,15 +4807,50 @@ fn call_integer_native_raw(
     if args_slice.len() != 1 {
         return None;
     }
+    if matches!(entry.kind, IntegerNativeKind::ValueOf) {
+        let value = args_slice[0] as i32;
+        if !(-128..=127).contains(&value) {
+            let vm_key = vm as *const SharedVm as usize;
+            let cached_class = INTEGER_WRAPPER_CLASS_CACHE.with(|cache| {
+                cache
+                    .get()
+                    .filter(|(cached_vm, _)| *cached_vm == vm_key)
+                    .map(|(_, raw)| ClassId::new(raw))
+            });
+            if let Some(class_id) = cached_class {
+                use cratonvm_native_api::NativeContext as _;
+                let mut ctx = crate::vm::NativeContextImpl { shared: vm, thread };
+                let object = ctx.alloc_object(class_id, 1);
+                ctx.set_field(object, 0, Value::Int(value));
+                // Mirror `safe_native_call`'s object-return handoff root. A
+                // peer STW cannot collect this active JIT mutator until its
+                // next safepoint, but publishing the pending value preserves
+                // the existing root contract and diagnostic visibility.
+                ctx.thread.native_pending_return = Some(object);
+                return Some(object.as_ptr() as i64);
+            }
+        }
+    }
+    if matches!(entry.kind, IntegerNativeKind::IntValue) {
+        let raw = args_slice[0] as u64;
+        if raw == 0 || (raw & 0x7) != 0 || raw >= (1u64 << 48) {
+            return None;
+        }
+        let object = vm.heap.is_object_address(raw as usize)?;
+        // `intrinsic_integer_int_value` delegates to
+        // `native_wrapper_int_value`, whose complete behavior is a read of
+        // wrapper field 0 and `Int`-or-zero normalization. The receiver is
+        // already heap-validated above and this operation cannot allocate or
+        // safepoint, so entering `safe_native_call` adds only rooting/panic/
+        // dispatch overhead on every unbox in a compiled loop.
+        return Some(match vm.heap.get_field(object, 0) {
+            Value::Int(value) => value as i64,
+            _ => 0,
+        });
+    }
     let arg = match entry.kind {
         IntegerNativeKind::ValueOf => Value::Int(args_slice[0] as i32),
-        IntegerNativeKind::IntValue => {
-            let raw = args_slice[0] as u64;
-            if raw == 0 || (raw & 0x7) != 0 || raw >= (1u64 << 48) {
-                return None;
-            }
-            Value::Object(Some(vm.heap.is_object_address(raw as usize)?))
-        }
+        IntegerNativeKind::IntValue => unreachable!("handled above"),
     };
     let result = match crate::vm::safe_native_call_prevalidated_objects(
         vm,
@@ -4775,6 +4861,16 @@ fn call_integer_native_raw(
         Ok(value) => value,
         Err(error) => return Some(handle_jit_dispatch_error(vm, thread, error, info)),
     };
+    if matches!(entry.kind, IntegerNativeKind::ValueOf) {
+        if let Some(Value::Object(Some(object))) = result {
+            INTEGER_WRAPPER_CLASS_CACHE.with(|cache| {
+                cache.set(Some((
+                    vm as *const SharedVm as usize,
+                    vm.heap.class_id_of(object).as_u32(),
+                )))
+            });
+        }
+    }
     Some(match result {
         Some(Value::Int(value)) => value as i64,
         Some(Value::Long(value)) => value,

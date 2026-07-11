@@ -306,6 +306,26 @@ impl VmHeap {
         }
     }
 
+    /// Allocate a same-layout old-generation batch under one allocator lock.
+    /// Only the generational backend currently exposes a non-moving old-gen
+    /// pool; other backends return an empty batch so callers retain their
+    /// ordinary allocation fallback.
+    pub fn try_alloc_objects_old_batch(
+        &self,
+        class_id: ClassId,
+        num_fields: usize,
+        count: usize,
+    ) -> Vec<ObjectRef> {
+        match self {
+            VmHeap::Generational(h) => {
+                h.try_alloc_objects_old_batch(class_id, num_fields, count)
+            }
+            VmHeap::G1(_) => Vec::new(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => Vec::new(),
+        }
+    }
+
     /// Fallible twin of [`alloc_object`](Self::alloc_object): same (no-GC)
     /// allocation path including the old-generation spill, but returns `None`
     /// on true heap exhaustion instead of aborting the VM. Lets the JIT

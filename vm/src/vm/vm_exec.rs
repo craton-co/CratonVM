@@ -1324,11 +1324,32 @@ pub(crate) fn resolve_field_index_in_hierarchy_desc(
 /// Concurrency: the cache write is guarded by `field_descriptor_cache`'s
 /// own `RwLock`; we take a read-first fast path so the hot case (cache
 /// hit) is lock-free beyond the shared read lock.
+thread_local! {
+    /// Per-mutator last descriptor lookup. Native wrapper allocation performs
+    /// millions of consecutive writes to the same `(class, slot)`; once the
+    /// shared cache has a definitive result, repeating its RwLock + hash probe
+    /// adds no correctness value. The VM identity prevents cross-VM reuse.
+    static FIELD_DESCRIPTOR_LAST:
+        std::cell::Cell<Option<(usize, u32, usize, u8)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 fn resolve_field_descriptor_byte_cached(
     shared: &SharedVm,
     class_id: ClassId,
     slot_index: usize,
 ) -> Option<u8> {
+    let vm_key = shared as *const SharedVm as usize;
+    if let Some(cached) = FIELD_DESCRIPTOR_LAST.with(|cache| {
+        cache
+            .get()
+            .filter(|(vm, cid, slot, _)| {
+                *vm == vm_key && *cid == class_id.as_u32() && *slot == slot_index
+            })
+            .map(|(_, _, _, byte)| byte)
+    }) {
+        return if cached == 0 { None } else { Some(cached) };
+    }
     // Fast path: read lock, hash lookup, early return on hit.
     //
     // PERF (negative-result memoization): the cache value `0u8` (NUL) is a
@@ -1344,6 +1365,9 @@ fn resolve_field_descriptor_byte_cached(
     {
         let cache = shared.field_descriptor_cache.read();
         if let Some(&b) = cache.get(&(class_id, slot_index)) {
+            FIELD_DESCRIPTOR_LAST.with(|last| {
+                last.set(Some((vm_key, class_id.as_u32(), slot_index, b)))
+            });
             return if b == 0 { None } else { Some(b) };
         }
     }
@@ -1477,12 +1501,18 @@ fn resolve_field_descriptor_byte_cached(
                 .field_descriptor_cache
                 .write()
                 .insert((class_id, slot_index), b);
+            FIELD_DESCRIPTOR_LAST.with(|last| {
+                last.set(Some((vm_key, class_id.as_u32(), slot_index, b)))
+            });
         }
         None if cacheable => {
             shared
                 .field_descriptor_cache
                 .write()
                 .insert((class_id, slot_index), 0u8);
+            FIELD_DESCRIPTOR_LAST.with(|last| {
+                last.set(Some((vm_key, class_id.as_u32(), slot_index, 0u8)))
+            });
         }
         None => {}
     }
@@ -1690,6 +1720,7 @@ impl<'a> NativeContextImpl<'a> {
             }
         }
         snapshot.extend(self.thread.native_pin_roots.iter().copied());
+        snapshot.extend(self.thread.native_alloc_pool.iter().copied());
         if let Some(r) = self.thread.native_pending_return {
             snapshot.push(r);
         }
@@ -1924,6 +1955,12 @@ impl<'a> NativeContextImpl<'a> {
                 }
             }
             for obj_ref in &mut self.thread.native_pin_roots {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = fixup.get(&old_addr) {
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+            for obj_ref in &mut self.thread.native_alloc_pool {
                 let old_addr = obj_ref.as_ptr() as usize;
                 if let Some(&new_addr) = fixup.get(&old_addr) {
                     *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
@@ -4199,6 +4236,62 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .map(|c| c.num_total_fields)
             .unwrap_or(0);
         let slots = num_fields.max(real_fields);
+        if self.thread.native_alloc_pool_layout == Some((class_id, slots)) {
+            if let Some(obj) = self.thread.native_alloc_pool.pop() {
+                if self.thread.native_alloc_pool.is_empty() {
+                    self.thread.native_alloc_pool_layout = None;
+                }
+                return obj;
+            }
+            self.thread.native_alloc_pool_layout = None;
+        }
+        // Native callbacks execute on the mutator's own `JvmThread`, so small
+        // objects can use the same lock-free TLAB path as interpreted/JIT
+        // `new`. Historically this method went straight to `GenHeap`, taking
+        // the shared young-arena lock until young filled and then the old-gen
+        // lock for every allocation. Autobox-heavy code (notably
+        // HashMap<Integer, Integer>) therefore serialized millions of tiny
+        // wrapper allocations through global locks despite an available TLAB.
+        //
+        // This path deliberately does not initiate GC from inside the native
+        // callback: `tlab_alloc_object` only bumps/refills young space and
+        // returns `None` when it cannot. The existing `heap.alloc_object`
+        // fallback retains the previous spill/OOM behavior and native rooting
+        // contract.
+        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+        let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+        if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
+            if let Some(obj) = crate::runtime::interpreter::tlab_alloc_object(
+                self.thread,
+                self.shared,
+                class_id,
+                slots,
+                requested_size,
+            ) {
+                return obj;
+            }
+        }
+        // Once young space cannot provide another TLAB, amortize the
+        // non-moving old-generation lock and free-list work across a chunk of
+        // same-layout native objects. Unused entries remain rooted and are
+        // remapped with their owning thread; the object popped here cannot be
+        // moved before `safe_native_call` publishes its return root because a
+        // native callback never initiates collection on this path.
+        if self.thread.native_alloc_pool.is_empty() {
+            let mut batch = self
+                .shared
+                .heap
+                .try_alloc_objects_old_batch(class_id, slots, 2048);
+            if let Some(obj) = batch.pop() {
+                self.thread.native_alloc_pool = batch;
+                self.thread.native_alloc_pool_layout = if self.thread.native_alloc_pool.is_empty() {
+                    None
+                } else {
+                    Some((class_id, slots))
+                };
+                return obj;
+            }
+        }
         self.shared.heap.alloc_object(class_id, slots)
     }
 

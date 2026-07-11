@@ -1847,7 +1847,7 @@ pub fn init_primitive_fields(shared: &SharedVm, obj: ObjectRef, class_id: ClassI
 /// `shared.tlab_refill_count` so operators can spot-check the
 /// refill rate against the hit-rate target.
 #[inline(always)]
-fn tlab_alloc_object(
+pub(crate) fn tlab_alloc_object(
     thread: &mut JvmThread,
     shared: &SharedVm,
     class_id: ClassId,
@@ -2374,6 +2374,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         }
     }
     snapshot.extend(thread.native_pin_roots.iter().copied());
+    snapshot.extend(thread.native_alloc_pool.iter().copied());
     if let Some(r) = thread.native_pending_return {
         snapshot.push(r);
     }
@@ -2807,6 +2808,13 @@ pub(crate) fn apply_pointer_map_to_thread(
         let old_addr = obj_ref.as_ptr() as usize;
         if let Some(&new_addr) = pointer_map.get(&old_addr) {
             // SAFETY: new_addr was produced by pointer_map and points at the relocated, valid object header within the heap arena.
+            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
+    for obj_ref in &mut thread.native_alloc_pool {
+        let old_addr = obj_ref.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            // SAFETY: the pointer map contains only relocated live objects.
             *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
         }
     }

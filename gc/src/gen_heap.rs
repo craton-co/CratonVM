@@ -1440,6 +1440,52 @@ impl GenerationalHeap {
         Some(unsafe { ObjectRef::from_raw(ptr) })
     }
 
+    /// Allocate up to `count` identical objects in old generation while
+    /// holding its lock once. Native wrapper allocation uses this after young
+    /// space is exhausted, keeping unused objects in a GC-visible per-thread
+    /// pool. A partial batch is valid when old space runs out.
+    pub fn try_alloc_objects_old_batch(
+        &self,
+        class_id: ClassId,
+        num_fields: usize,
+        count: usize,
+    ) -> Vec<ObjectRef> {
+        let Some((total_size, array_len, compact_flag)) =
+            plan_object_alloc(class_id, num_fields)
+        else {
+            return Vec::new();
+        };
+        let Ok(num_slots) = u32::try_from(num_fields) else {
+            return Vec::new();
+        };
+        let mut objects = Vec::with_capacity(count);
+        let mut og = self.old_gen.lock();
+        for _ in 0..count {
+            let Some(ptr) = og.alloc(total_size, 8) else {
+                break;
+            };
+            let mut header = ObjectHeader::new(
+                class_id,
+                ObjectKind::Object,
+                ArrayElementType::Reference,
+                self.next_hash(),
+                array_len,
+                num_slots,
+            );
+            header.gc_flags |= GC_FLAG_OLD_GEN | compact_flag;
+            // SAFETY: `OldGen::alloc` returned an exclusive, zeroed span and
+            // the old-generation lock remains held until the header is valid.
+            unsafe {
+                std::ptr::write(ptr as *mut ObjectHeader, header);
+                objects.push(ObjectRef::from_raw(ptr));
+            }
+        }
+        self.stats
+            .old_allocations
+            .fetch_add(objects.len() as u64, Ordering::Relaxed);
+        objects
+    }
+
     // ----- Header access -----------------------------------------------------
 
     /// Read the object header from a heap reference.
@@ -11170,6 +11216,36 @@ mod tests {
                 );
             }
             _ => panic!("S29: old→young link lost after promotion+barrier+GC"),
+        }
+    }
+
+    #[test]
+    fn native_old_batch_allocates_distinct_rootable_objects() {
+        let heap = GenerationalHeap::with_sizes(4096, 256 * 1024);
+        let before = heap.stats().snapshot().old_allocations;
+        let mut roots = heap.try_alloc_objects_old_batch(ClassId::new(0), 1, 128);
+
+        assert_eq!(roots.len(), 128);
+        assert_eq!(
+            heap.stats().snapshot().old_allocations - before,
+            roots.len() as u64
+        );
+        let mut addresses: Vec<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
+        addresses.sort_unstable();
+        addresses.dedup();
+        assert_eq!(addresses.len(), roots.len());
+        assert!(roots.iter().all(|r| heap.is_in_old(r.as_ptr())));
+
+        for (index, object) in roots.iter().copied().enumerate() {
+            heap.set_field(object, 0, Value::Int(index as i32));
+        }
+        let young_from = heap.young_from.lock();
+        let mut old_gen = heap.old_gen.lock();
+        let _pointer_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+        drop(old_gen);
+        drop(young_from);
+        for (index, object) in roots.iter().copied().enumerate() {
+            assert_eq!(heap.get_field(object, 0), Value::Int(index as i32));
         }
     }
 }

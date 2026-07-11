@@ -1,9 +1,9 @@
 # `java.util.HashMap` put/get native-dispatch overhead — FIXED
 
-Status: **Fixed and retired on 2026-07-11.** The requested target was at least a
-10x improvement over the pinned CratonVM baseline. The final isolated five-round
-result is 1,719 ms versus 18,113 ms before this pass: **10.54x faster**, with the
-same checksum in every run.
+Status: **Fixed and retired on 2026-07-11.** The acceptance target is CratonVM
+elapsed time no more than 10x the same-methodology HotSpot result. The final
+pre-rebase five-round candidate measured 338-345 ms versus 44-52 ms HotSpot
+(6.6-7.1x), with the same checksum in every run.
 
 ## Original symptom and root cause
 
@@ -33,24 +33,44 @@ receiver classification, and synthetic HashMap node materialization.
 - Primitive-wrapper recognition and compact-field lookup use generation-validated
   thread-local caches; native-call root-index scratch space stays inline for the
   common small-argument case.
+- The generic `HashMap.put` tiering window now admits a fresh exact-class integer
+  map into the lazy overlay from its first entry. Previously the generic path
+  materialized 2,000 real nodes before exact dispatch was installed, permanently
+  disqualifying the overlay's fresh-map guard. Non-integer puts materialize the
+  overlay before ordinary node insertion, and `Map.equals` reads an overlay-backed
+  receiver's authoritative size.
+- Small native-created objects use the mutator's existing TLAB. Once young space
+  cannot refill, same-layout old-generation objects are allocated in a batch under
+  one allocator lock and unused objects remain in a GC-remapped per-thread pool.
+- JIT type-check target resolution and native descriptor lookup have VM-scoped
+  thread-local last-entry caches. Exact `Integer` checkcasts and repeated wrapper
+  field-0 accesses no longer take metadata/cache locks per iteration.
+- After the first ordinary `Integer.valueOf` initializes the class and discovers
+  its real ClassId, out-of-range JIT boxing allocates through the same native
+  context path directly. The mandated `-128..127` identity cache still uses the
+  canonical native callback. `Integer.intValue` performs its already-validated,
+  non-allocating field-0 read directly and preserves `native_pending_return` for
+  object-return handoff rooting.
 
 ## Validation
 
-Azure Linux host `20.83.144.174`, CPU 1 pinned, unique release binary and target
+Azure Linux host `20.83.144.174`, pinned CPU, unique release binaries and target
 directory, one million puts plus one million gets:
 
 | Build | Runs | Mean |
 |---|---:|---:|
 | CratonVM baseline | 17,762 / 18,703 / 17,876 ms | 18,113 ms |
-| CratonVM fixed | 1,722 / 1,722 / 1,719 / 1,715 / 1,719 ms | 1,719 ms |
-| JDK 21 same-minute reference | 49 / 56 / 46 / 44 / 44 ms | 47.8 ms |
+| First-pass CratonVM | 1,722 / 1,722 / 1,719 / 1,715 / 1,719 ms | 1,719 ms |
+| First-pass HotSpot | 49 / 56 / 46 / 44 / 44 ms | 47.8 ms |
+| Within-10x candidate | 343 / 338 / 339 / 344 / 345 ms | 341.8 ms |
+| Same-minute HotSpot | 48 / 50 / 49 / 49 / 52 ms | 49.6 ms |
 
-The fixed build is **10.54x faster than the pinned CratonVM baseline**. It remains
-about 36x slower than HotSpot in the isolated cold-process probe; that remaining
-gap is not represented as a correctness issue here. A five-repetition in-process
-probe stabilizes at 671-680 ms after first-tier compilation, with an identical
-aggregate checksum.
+The final candidate is **6.89x HotSpot** by the five-round means and approximately
+53x faster than the original 18,113 ms pinned CratonVM baseline. Final rebased-dev
+numbers are recorded in the landing commit message/build handoff.
 
 Correctness evidence includes `HashMapSemanticsProbe` normally and with
 `CRATONVM_DBG_GC_STRESS=1048576`, plus the `cratonvm-native-collections` unit and
-integration tests (including native-pin and overlay-relocation suites).
+integration tests (including native-pin and overlay-relocation suites). The
+semantics probe covers overwrite/remove, views after GC, mixed-key overlay
+materialization, `putAll`, symmetric equality/hashCode, `toString`, and clear.
