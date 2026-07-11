@@ -1,70 +1,59 @@
-# `java.util.regex.Matcher`'s native bridge re-decodes the *entire* input string on every `find()`/`group()` call — O(n²) instead of O(n)
+# `java.util.regex.Matcher`'s native bridge re-decodes the *entire* input string on every `find()`/`group()` call — real, but currently DEAD CODE in real-JDK mode
 
-Status: OPEN — confirmed, root-caused, quantified; not fixed (fix direction requires a
-GC-safe cross-call cache, not attempted this session)
+Status: **Bug confirmed + FIXED in the native bridge** (`native-builtins/src/lib.rs`,
+uncommitted-then-committed 2026-07-11), but **that native bridge is not the active
+dispatch path for a real-JDK `Pattern`/`Matcher` program**, so the fix currently has
+no observable effect. The actual performance bug a user hits on today's default
+build is a *different*, deeper issue — see
+[`substring-large-parent-quadratic-allocation.md`](substring-large-parent-quadratic-allocation.md).
 
-Found: 2026-07-11, while investigating a user-reported benchmark
-(`bench/StringRegexOnly.java`: build an N-entry `StringBuilder`, then loop
-`Pattern.compile("value(\\d+),").matcher(text)` + `while (m.find()) { ...
-m.group(1) ... }`) whose CratonVM-vs-JDK-25 slowdown ratio grew with input
-size instead of staying constant (18.8× at 1,000 entries → 94.4× at 5,000 →
-238.8× at 10,000; did not finish in 60s at 50,000) — the classic tell for an
-algorithmic complexity bug, not a constant-factor interpreter/JIT slowdown.
+## Correction (2026-07-11, same day)
 
-## Symptom
+The original version of this doc claimed the redecode bug below was the cause of a
+user-reported quadratic slowdown in a `StringBuilder` + `Pattern.compile().matcher()`
++ `while (m.find()) { m.group(1); }` benchmark. That diagnosis was **wrong about which
+code path is active**. Runtime instrumentation (an unconditional `eprintln!` placed at
+the top of `native_matcher_find`/`native_matcher_group_idx`, rebuilt and run against
+the exact reported repro) proved these functions are **never called** for a real-JDK
+`Pattern`/`Matcher` program:
+
+`native-api/src/registry.rs`'s `register()` silently **drops** every
+`java/util/regex/Pattern`/`Matcher` native registration when
+`drop_real_layout_synthetic` is set — and `vm/src/vm/vm_init.rs` sets that flag
+unconditionally on the real-JDK arm, *before* `register_essential_natives` runs (so
+the "essentials" registration calls this doc originally cited as evidence of forced
+dispatch, `native-builtins/src/lib.rs:24944`/`50933`, are exactly the calls that get
+dropped). The stated rationale (`registry.rs`) is the same "real-shaped object,
+synthetic-index writes" family as
+[`stringjoiner-synthetic-native-real-jdk-field-mismatch.md`](stringjoiner-synthetic-native-real-jdk-field-mismatch.md):
+these legacy natives predate the real JDK's actual `Pattern`/`Matcher` field layout
+and corrupt real-JDK-allocated objects if forced to run against them, so in real-JDK
+mode `Pattern.compile()`/`Matcher.find()`/`group()` always run the **real loaded
+bytecode** instead, by design.
+
+The redecode bug described below is **real** — it's a genuine O(n²) defect in this
+particular native bridge's source code — and the fix is real and committed. But
+because the bridge is unconditionally dropped in real-JDK mode, neither the bug nor
+the fix is currently reachable from any real-JDK program. It's kept (see
+`native-builtins/src/lib.rs`'s `// --- Matcher natives ---` section header comment)
+in case `drop_real_layout_synthetic` is ever narrowed or a non-default config
+re-enables this bridge.
+
+## Symptom (as originally reported — root cause below is corrected, symptom is real)
 
 A tight `while (matcher.find()) { ...; matcher.group(N); }` loop over a
 single, pre-built `String` gets progressively slower **per match** as the
-string grows, even though every individual match only requires local work
-(scan forward from the last match end, extract a bounded-size substring).
-Real HotSpot stays flat; CratonVM's per-call cost grows linearly with the
-*total* string length, producing O(n²) total time for O(n) matches over an
-O(n)-length string.
+string grows. Real HotSpot stays flat; CratonVM's per-call cost grows with the
+*total* string length, producing worse-than-linear total time for O(n) matches
+over an O(n)-length string. **This symptom is real and still open** — see the
+substring/allocation doc linked above for the corrected root cause.
 
-## Quantification
+## The native-bridge bug (real defect, currently unreachable)
 
-Isolated `RegexOnly` (build the `String` **outside** the timed region, time
-only the `Pattern.compile` + `while (m.find()) { m.group(1); }` loop) vs.
-`StringBuilderOnly` (time only the append loop, no regex) confirms the
-quadratic behavior is 100% in the Matcher/Pattern path, not `StringBuilder`
-(whose `sb_ensure_capacity` amortized-doubling growth is correct and scales
-linearly — see `native-builtins/src/lang_string.rs:1472`).
-
-P-core-pinned (`ProcessorAffinity=0xFFFF`), `target/release/cratonvm.exe`,
-JDK-25, checksums identical at every size (pure perf bug, not correctness):
-
-| entries | `StringBuilderOnly` (CratonVM) | `RegexOnly` CratonVM | `RegexOnly` JDK-25 | ratio |
-|---|---|---|---|---|
-| 1,000  | 2 ms  (linear: 0.002 ms/entry) | 79 ms   | 6 ms  | 13.2× |
-| 5,000  | 10 ms (linear: 0.002 ms/entry) | 662 ms  | 8 ms  | 82.8× |
-| 10,000 | 20 ms (linear: 0.002 ms/entry) | 1980 ms | 11 ms | 180×  |
-
-`StringBuilderOnly` is perfectly linear (0.002 ms/entry at every size).
-`RegexOnly`'s CratonVM per-entry cost grows with n (0.079 → 0.132 → 0.198
-ms/entry) while JDK's stays flat — the signature of an O(n²) algorithm on
-CratonVM's side competing against JDK's O(n). These numbers reproduce the
-original combined-benchmark ratios (18.8×/94.4×/238.8×) almost exactly once
-`StringBuilder`'s (correctly linear, negligible) cost is subtracted out.
-
-## Root cause
-
-`java.util.regex.Pattern`/`Matcher` are served by a **synthetic native
-bridge**, not real JDK bytecode — `register_regex_natives`
-(`native-builtins/src/lib.rs:50933`) is called unconditionally from the
-essentials registration path (`native-builtins/src/lib.rs:24944`, comment:
-"Keep regex natives in essentials too... Pattern.compile(String,int) is
-always reachable") and forced over real bytecode during bootstrap per the
-comment at `native-builtins/src/lib.rs:50934-50940`. This is the same
-"real-shaped object, synthetic dispatch" family as
-[`stringjoiner-synthetic-native-real-jdk-field-mismatch.md`](stringjoiner-synthetic-native-real-jdk-field-mismatch.md)
-(allocated with the real `java/util/regex/Matcher`/`Pattern` class id, but
-driven by hardcoded legacy field indices `MAT_FIELD_*`/`PAT_FIELD_*` at
-`native-builtins/src/lib.rs:49590-49604`) — a different bug in the same
-"synthetic bridge instead of real bytecode" architecture, not the same
-symptom (this one is a pure perf bug; the StringJoiner one is silent wrong
-content).
-
-The actual defect: `matcher_read_input()` (`native-builtins/src/lib.rs:51308`)
+`java.util.regex.Pattern`/`Matcher`, when *not* dropped (i.e. in whatever build
+configuration would leave `drop_real_layout_synthetic` unset for these classes),
+are served by a **synthetic native bridge**. Its defect: `matcher_read_input()`
+(`native-builtins/src/lib.rs`, in the `// --- Matcher natives ---` section)
 
 ```rust
 fn matcher_read_input(ctx: &mut dyn NativeContext, mat: ObjectRef) -> String {
@@ -75,86 +64,51 @@ fn matcher_read_input(ctx: &mut dyn NativeContext, mat: ObjectRef) -> String {
 }
 ```
 
-fully decodes the Matcher's entire input `String` (the Java heap's
-UTF-16 `char[]`/Latin-1 `byte[]` → a fresh Rust `String`, an O(n) copy —
-`read_string` in `vm/src/vm/vm_exec.rs:3667` walks the whole backing array)
-— and it is called **from scratch on every single native dispatch**, not
-once per `Matcher`:
+fully decoded the Matcher's entire input `String` (the Java heap's UTF-16
+`char[]`/Latin-1 `byte[]` → a fresh Rust `String`, an O(n) copy) **from scratch
+on every single native dispatch**, not once per `Matcher` — called by
+`native_matcher_find`, `native_matcher_group`/`group_idx`,
+`matcher_group_boundary` (`start(N)`/`end(N)`), `native_matcher_matches`,
+`native_matcher_looking_at`. `group(N)` for `N != 0` additionally re-ran the
+regex search (`re.captures(&input[start..])`) from the last match's start to
+the end of the string on every call — a second O(remaining-length) scan on
+top of the redundant decode.
 
-- `native_matcher_find` (`lib.rs:51325`) calls it at line 51330, on every
-  `find()` invocation.
-- `native_matcher_group`/`native_matcher_group_idx` (`lib.rs:51474`,
-  `51497`) call it again at lines 51492/51512, on every `group()`/`group(N)`
-  invocation — and `group(N)` for `N != 0` **also re-runs the regex search**
-  (`re.captures(&input[start..])`, line 51529) from the last match's start
-  to the end of the string, a second O(remaining-length) scan on top of the
-  redundant decode.
-- The same pattern repeats in `matcher_group_boundary` (`start(N)`/`end(N)`,
-  `lib.rs:51537`), `native_matcher_matches`, `native_matcher_looking_at`.
+### Fix (committed, currently inert)
 
-The user's loop calls both `find()` and `group(1)` once per match, so it
-hits this **twice** per iteration. With ~n matches over an ~n-length input,
-total work is `sum_{i=1}^{n} O(n)` (full redecode each call) `= O(n²)`,
-independent of the regex engine itself (`compile_java_regex`, `lib.rs:50147`,
-**is** properly cached by `(pattern, flags)` and is not the bottleneck —
-confirmed by `RegexOnly`'s growing *per-entry* cost, which a flat compile-cache
-lookup cost cannot explain).
+`matcher_read_input_cached()` replaces `matcher_read_input()`: caches the
+decoded `Arc<str>` per-Matcher, keyed by `ctx.identity_hash_code(matcher)`
+(a value CratonVM's GC explicitly carries across a move — the same
+GC-move-stable property `register_var_handle_root` already relies on
+elsewhere in this VM — rather than by raw `ObjectRef`, which a moving GC can
+both relocate and, after freeing an address, reissue to an unrelated object).
+Validated against `MAT_FIELD_INPUT`'s own identity hash so a
+`reset(CharSequence)` swap is still caught. `find()` additionally now uses
+`re.captures()` instead of `re.find()` and caches the resulting capture-group
+spans (keyed the same way, plus the match's own start offset), so a following
+`group(N)`/`start(N)`/`end(N)` on the same match is an O(1) lookup instead of
+a second full regex re-search — with an always-correct re-search fallback for
+any match-producing call (`find(int)`, `matches()`, `lookingAt()`, `region()`)
+that doesn't populate the cache.
 
-Real JDK's `java.util.regex.Matcher.find()` never re-copies the whole
-`CharSequence`; it walks the existing backing array from the stored `from`
-position via `charAt`/direct indexing, which is why JDK's own numbers stay
-flat (6/8/11 ms) while CratonVM's climb (79/662/1980 ms) on the *identical*
-Java source.
+Two earlier cache designs were tried and found ineffective before landing on
+identity-hash keying — worth recording since the failure mode is subtle and
+easy to reintroduce: keying by raw `ObjectRef` and gating on an unchanged
+`ctx.gc_collection_count()` is *correct* (never returns wrong data) but has
+near-zero hit rate under any GC-active workload, since a benign relocation
+(same logical object, new address — the overwhelmingly common case, not an
+address *reuse*) invalidates the cache identically to a genuine reuse. The
+`gc_collection_count()`-gated version made no measurable performance
+difference over no caching at all in a benchmark that triggers frequent young
+collections. `identity_hash_code` fixes this because it's stable across a
+relocation by construction, only changing (via fresh allocation) on a
+genuinely different object — the cache actually hits.
 
-## Why a naive fix is unsafe
+## Severity of the native-bridge bug itself
 
-The obvious fix — decode `MAT_FIELD_INPUT` once (e.g. in
-`native_pattern_matcher`/`reset()`) and cache the Rust `String` for reuse by
-later `find()`/`group()` calls on the same `Matcher` — cannot key the cache
-by the Matcher's or input String's `ObjectRef` directly:  `ObjectRef` is a
-raw heap pointer (`types/src/value.rs:62`, `NonNull<u8>`), not a stable
-handle, and CratonVM's GC moves objects (see the `pin_native_root`/
-`read_native_pin` dance `sb_ensure_capacity` uses for exactly this reason,
-`native-builtins/src/lang_string.rs:1493-1499`). Several of these Matcher
-natives call `ctx.create_string` (which can itself trigger a GC) while a
-cache lookup/store would be live, and after any GC a since-freed arena
-address can be **reissued to a different object** — a pointer-keyed cache
-would then silently return a different object's cached content: a
-correctness bug, not just a stale-cache miss. A safe fix needs either a
-GC-epoch-qualified cache key, or to store the decoded form as a proper
-GC-managed side-object reachable from the Matcher (so the GC keeps it
-consistent), or to change the whole regex bridge to operate on a live
-zero-copy view of the array (`heap.array_data_ptr`, already used by
-`bulk_array_copy`) instead of an owned decoded `String` at all.
-
-## Suggested fix direction (not attempted this session)
-
-Most robust: change `matcher_read_input`'s callers to slice the *existing*
-backing array via a GC-safe zero-copy accessor (mirroring
-`vm/src/vm/vm_exec.rs`'s `array_data_ptr` fast path used by
-`bulk_array_copy`) re-fetched fresh on every call (cheap — no decode, just a
-pointer + length), rather than owning a decoded `String` at all. This also
-sidesteps the cache-safety problem above entirely, at the cost of needing
-the `regex` crate (or a hand-rolled matcher) to search over UTF-16 code
-units directly instead of a UTF-8 `Rust String`. A cheaper, narrower interim
-mitigation: at minimum, have `group(N)`'s capture re-search only scan
-`&input[start..end_hint]` bounded by a reasonable upper bound instead of
-`&input[start..]` to the end of the string, and avoid the *second*
-full-string redecode+recompile-cache-lookup on `group()` by having `find()`
-stash the already-decoded input/compiled-regex for reuse within the same
-Matcher generation — but any per-Matcher stash still needs the GC-safety
-treatment above.
-
-## Severity
-
-High for any regex-heavy workload with many matches over a long string
-(log parsing, tokenizers, template engines, `AssetUtil.getFullPathForClassResource`-style
-per-class regex scans during archive building — see
-[`../internal/wildfly-suite-bugs/bug-03-regex-perf-deployment-build.md`](../internal/wildfly-suite-bugs/bug-03-regex-perf-deployment-build.md),
-which already documents severe regex slowness via a different, older
-mechanism (real-bytecode interpreter/native-charAt-bridging costs) — that
-doc's analysis pre-dates/doesn't cover this synthetic-bridge native path,
-which is a separate, likely now-dominant cost on the current default
-config. `Pattern.compile()`/`Matcher.find()` loops are extremely common
-(any hand-written parser, `Scanner`-style tokenizer, log scraper), so this
-is a general and easily hit performance cliff, not an edge case.
+Low in practice today (unreachable in the default real-JDK build). Would be
+high if the bridge is ever un-dropped without a broader real-layout fix — but
+per the registry.rs rationale, un-dropping it *without* first fixing the
+real-JDK-layout corruption issue would reintroduce a worse (correctness, not
+just performance) bug, so this fix is not a prerequisite for anything
+currently planned.

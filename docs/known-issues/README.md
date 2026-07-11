@@ -4,26 +4,30 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
-## 2026-07-11 `Matcher.find()`/`group()` native bridge re-decodes the whole input string every call — O(n²) regex loops
+## 2026-07-11 Regex `find()`+`group()` quadratic slowdown: original Matcher-native diagnosis WRONG (dead code); real cause is a deeper substring/allocation bug, still OPEN
 
-New: [`matcher-native-full-input-redecode-quadratic.md`](matcher-native-full-input-redecode-quadratic.md)
-— a user-reported benchmark (`StringBuilder` append loop + `Pattern.compile().matcher()`
-+ `while (m.find()) { m.group(1); }`) showed a CratonVM-vs-JDK slowdown ratio
-that *grew* with input size (18.8×/94.4×/238.8× at 1K/5K/10K entries) instead
-of staying flat — the tell for an algorithmic-complexity bug. Split into
-`StringBuilderOnly` (confirmed linear, not the cause — `sb_ensure_capacity`'s
-amortized-doubling growth is correct) and `RegexOnly` (confirmed O(n²): 79/662/1980 ms
-CratonVM vs. 6/8/11 ms JDK at 1K/5K/10K, ratio climbing 13×→83×→180× in
-isolation). Root-caused to `matcher_read_input()`
-(`native-builtins/src/lib.rs:51308`), which fully decodes the Matcher's
-entire input `String` from the Java heap **on every single `find()`/`group()`
-native call** instead of once per `Matcher` — `n` matches over an `n`-length
-string costs `O(n)` per call × `O(n)` calls = `O(n²)`. A different bug from,
-but the same "synthetic bridge over a real-shaped object" family as,
-[`stringjoiner-synthetic-native-real-jdk-field-mismatch.md`](stringjoiner-synthetic-native-real-jdk-field-mismatch.md).
-OPEN — fix needs a GC-safe cross-call cache or a zero-copy backing-array view
-(`ObjectRef` is a raw, GC-moved pointer, so a naive pointer-keyed cache risks
-returning a different object's content after a GC reissues the address).
+A user-reported benchmark (`StringBuilder` append loop + `Pattern.compile().matcher()`
++ `while (m.find()) { m.group(1); }`) showed a CratonVM-vs-JDK slowdown ratio that
+*grew* with input size (18.8×/94.4×/238.8× at 1K/5K/10K entries) — the tell for an
+algorithmic-complexity bug. First diagnosis blamed `Matcher`'s native bridge
+(`matcher_read_input()` re-decoding the whole input every `find()`/`group()` call,
+`native-builtins/src/lib.rs`) — a real O(n²) bug, and it was fixed (identity-hash-keyed
+cache + capture-group caching, see
+[`matcher-native-full-input-redecode-quadratic.md`](matcher-native-full-input-redecode-quadratic.md)) —
+**but runtime instrumentation then proved that native bridge is unconditionally
+dropped in real-JDK mode** (`registry.rs`'s `drop_real_layout_synthetic`, same
+"synthetic bridge corrupts real-layout objects" family as
+[`stringjoiner-synthetic-native-real-jdk-field-mismatch.md`](stringjoiner-synthetic-native-real-jdk-field-mismatch.md)) —
+real JDK bytecode runs `Pattern`/`Matcher` unconditionally, so the fix, while
+correct, is currently inert.
+
+The **actual, still-OPEN** root cause: [`substring-large-parent-quadratic-allocation.md`](substring-large-parent-quadratic-allocation.md)
+— extracting many small strings from one large parent (`String.substring()`,
+zero regex involved) is independently O(n²) (14/316/1283 ms at 1K/5K/10K vs. a
+perfectly-linear unrelated-allocation control at 2/11/22 ms). The substring→
+`Arrays.copyOfRange`→`System.arraycopy` dispatch chain is proven O(subLen) at
+every hop, so the cost is a side effect (leading suspect: GC/allocator cost
+scaling with the live parent's size) that hasn't been root-caused yet.
 
 ## 2026-07-10 `testNonBlockingReadIgnoreIsReady`'s old theory REFUTED; real cause is a general ~2s NioEndpoint Acceptor/Poller-thread latency, split into its own doc
 
