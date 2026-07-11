@@ -70,6 +70,7 @@ pub mod region;
 pub mod safepoint;
 pub mod satb;
 pub mod shadow_stack;
+pub mod stale_objref_debug;
 pub mod tlab;
 pub mod vm_heap;
 // Round-7 cross-cutting Fix 4: ZGC stub (1884 LOC) gated behind the `zgc`
