@@ -4743,6 +4743,7 @@ fn is_unmod_wrapper(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
             | Some(UNMOD_SET_CLASS)
             | Some(UNMOD_SORTED_SET_CLASS)
             | Some(UNMOD_NAVIGABLE_SET_CLASS)
+            | Some(UNMOD_ENTRY_SET_CLASS)
             | Some(UNMOD_COLLECTION_CLASS)
     )
 }
@@ -31521,6 +31522,18 @@ const UNMOD_MAP_CLASS: &str = "cratonvm/internal/UnmodifiableMap";
 const UNMOD_COLLECTION_CLASS: &str = "cratonvm/internal/UnmodifiableCollection";
 const UNMOD_ITR_CLASS: &str = "cratonvm/internal/UnmodifiableItr";
 const UNMOD_LIST_ITR_CLASS: &str = "cratonvm/internal/UnmodifiableListItr";
+/// `entrySet()` of an unmodifiable/immutable map. Distinct from
+/// [`UNMOD_SET_CLASS`] because its elements are `Map.Entry` — its
+/// `iterator()`/`forEach()` wrap each entry in [`UNMOD_MAP_ENTRY_CLASS`] so
+/// `setValue()` throws instead of mutating the backing map, matching the
+/// JDK's `Collections$UnmodifiableMap$UnmodifiableEntrySet`.
+const UNMOD_ENTRY_SET_CLASS: &str = "cratonvm/internal/UnmodifiableEntrySet";
+/// Iterator over an [`UNMOD_ENTRY_SET_CLASS`] whose `next()` wraps the
+/// backing iterator's `Map.Entry` in [`UNMOD_MAP_ENTRY_CLASS`].
+const UNMOD_ENTRY_ITR_CLASS: &str = "cratonvm/internal/UnmodifiableEntryItr";
+/// Read-only `Map.Entry` view: `getKey`/`getValue`/`toString`/`hashCode`/
+/// `equals` delegate to the backing (real, mutable) entry; `setValue` throws.
+const UNMOD_MAP_ENTRY_CLASS: &str = "cratonvm/internal/UnmodifiableMapEntry";
 
 /// Slot 0 of every wrapper holds the backing collection / iterator.
 const UNMOD_FIELD_BACKING: usize = 0;
@@ -31538,7 +31551,7 @@ const UNMOD_FIELD_IMMUTABLE: usize = 1;
 fn is_unmod_set_class(name: &str) -> bool {
     matches!(
         name,
-        UNMOD_SET_CLASS | UNMOD_SORTED_SET_CLASS | UNMOD_NAVIGABLE_SET_CLASS
+        UNMOD_SET_CLASS | UNMOD_SORTED_SET_CLASS | UNMOD_NAVIGABLE_SET_CLASS | UNMOD_ENTRY_SET_CLASS
     )
 }
 
@@ -31685,6 +31698,7 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
         UNMOD_SET_CLASS,
         UNMOD_SORTED_SET_CLASS,
         UNMOD_NAVIGABLE_SET_CLASS,
+        UNMOD_ENTRY_SET_CLASS,
     ] {
         r.register(c, "size", "()I", native_unmod_size);
         r.register(c, "isEmpty", "()Z", native_unmod_is_empty);
@@ -32443,6 +32457,62 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
         r.register(c, "remove", "()V", native_unmod_throw);
     }
 
+    // ---- UnmodifiableEntrySet — entrySet() of an unmodifiable/immutable
+    // map. Overrides the plain-Set `iterator`/`forEach` registered by the
+    // shared loop above so each yielded `Map.Entry` is wrapped in
+    // `UnmodifiableMapEntry` (setValue() must throw, not silently mutate the
+    // backing map through the "locked" view — see
+    // docs/known-issues/tomcat-08-07/parametermap-immutability-not-locked.md).
+    {
+        let c = UNMOD_ENTRY_SET_CLASS;
+        r.register(
+            c,
+            "iterator",
+            "()Ljava/util/Iterator;",
+            native_unmod_entry_set_iterator,
+        );
+        r.register(
+            c,
+            "forEach",
+            "(Ljava/util/function/Consumer;)V",
+            native_unmod_entry_set_for_each,
+        );
+    }
+
+    // ---- UnmodifiableEntryItr — iterator over an UnmodifiableEntrySet -----
+    {
+        let c = UNMOD_ENTRY_ITR_CLASS;
+        r.register(c, "hasNext", "()Z", native_unmod_itr_has_next);
+        r.register(c, "next", "()Ljava/lang/Object;", native_unmod_entry_itr_next);
+        r.register(c, "remove", "()V", native_unmod_throw);
+    }
+
+    // ---- UnmodifiableMapEntry — read-only Map.Entry view -------------------
+    // Wraps a real (mutable) Map.Entry so setValue() throws
+    // UnsupportedOperationException instead of writing through to the
+    // backing map, matching `Collections$UnmodifiableMap$UnmodifiableEntrySet
+    // $UnmodifiableEntry`. Only entries obtained via UnmodifiableEntrySet's
+    // iterator/forEach are wrapped — entries from other paths (e.g. a direct
+    // `Map.get`) are the real mutable objects.
+    {
+        let c = UNMOD_MAP_ENTRY_CLASS;
+        r.register(c, "getKey", "()Ljava/lang/Object;", |ctx, args| {
+            unmod_delegate(ctx, args, "getKey", "()Ljava/lang/Object;")
+        });
+        r.register(c, "getValue", "()Ljava/lang/Object;", |ctx, args| {
+            unmod_delegate(ctx, args, "getValue", "()Ljava/lang/Object;")
+        });
+        r.register(
+            c,
+            "setValue",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            native_unmod_throw,
+        );
+        r.register(c, "toString", "()Ljava/lang/String;", native_unmod_to_string);
+        r.register(c, "hashCode", "()I", native_unmod_hash_code);
+        r.register(c, "equals", "(Ljava/lang/Object;)Z", native_unmod_equals);
+    }
+
     // ---- UnmodifiableListItr — read-only ListIterator ---------------------
     // A self-contained `ListIterator` over a snapshot of the backing list:
     //   field 0 = Object[] snapshot of the list elements
@@ -32656,6 +32726,72 @@ fn native_unmod_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
 fn native_unmod_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     unmod_delegate(ctx, args, "next", "()Ljava/lang/Object;")
+}
+
+/// `UnmodifiableEntrySet.iterator()` — like `native_unmod_iterator`, but
+/// wraps the backing iterator in `UnmodifiableEntryItr` so each yielded
+/// `Map.Entry` is itself wrapped (see `native_unmod_entry_itr_next`).
+fn native_unmod_entry_set_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let inner = unmod_delegate(ctx, args, "iterator", "()Ljava/util/Iterator;")?;
+    if let Some(Value::Object(Some(itr))) = inner {
+        let w = alloc_unmod_wrapper(ctx, UNMOD_ENTRY_ITR_CLASS, itr);
+        return Ok(Some(Value::Object(Some(w))));
+    }
+    Ok(inner)
+}
+
+/// `UnmodifiableEntryItr.next()` — wraps the backing iterator's `Map.Entry`
+/// in `UnmodifiableMapEntry` so a caller's `setValue()` throws instead of
+/// writing through to the backing map (the `Map.replaceAll` default method
+/// iterates `entrySet()` and calls `entry.setValue(...)` directly, so an
+/// unwrapped entry here silently defeats `ParameterMap`'s lock).
+fn native_unmod_entry_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let next = unmod_delegate(ctx, args, "next", "()Ljava/lang/Object;")?;
+    if let Some(Value::Object(Some(entry))) = next {
+        let w = alloc_unmod_wrapper(ctx, UNMOD_MAP_ENTRY_CLASS, entry);
+        return Ok(Some(Value::Object(Some(w))));
+    }
+    Ok(next)
+}
+
+/// `UnmodifiableEntrySet.forEach(action)` — wraps each entry the same way
+/// the iterator does before invoking the consumer, so `action.accept(entry)`
+/// calling `entry.setValue(...)` still throws instead of mutating the
+/// backing map.
+fn native_unmod_entry_set_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let (this, consumer) = match (args.first(), args.get(1)) {
+        (Some(Value::Object(Some(t))), Some(Value::Object(Some(c)))) => (*t, *c),
+        _ => return Ok(None),
+    };
+    let backing = match unmod_backing(ctx, this) {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let itr = match ctx.invoke_virtual(backing, "iterator", "()Ljava/util/Iterator;", &[])? {
+        Some(Value::Object(Some(i))) => i,
+        _ => return Ok(None),
+    };
+    loop {
+        let has_next = matches!(
+            ctx.invoke_virtual(itr, "hasNext", "()Z", &[])?,
+            Some(Value::Int(n)) if n != 0
+        );
+        if !has_next {
+            break;
+        }
+        let entry = match ctx.invoke_virtual(itr, "next", "()Ljava/lang/Object;", &[])? {
+            Some(Value::Object(Some(e))) => e,
+            _ => break,
+        };
+        let wrapped = alloc_unmod_wrapper(ctx, UNMOD_MAP_ENTRY_CLASS, entry);
+        ctx.invoke_virtual(
+            consumer,
+            "accept",
+            "(Ljava/lang/Object;)V",
+            &[Value::Object(Some(wrapped))],
+        )?;
+    }
+    Ok(None)
 }
 
 /// Slot layout of a `UnmodifiableListItr`.
@@ -32909,10 +33045,14 @@ fn native_unmod_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 /// `entrySet()` returns an unmodifiable Set view of the backing entry set.
+/// Uses `UNMOD_ENTRY_SET_CLASS` (not the plain `UNMOD_SET_CLASS`) so its
+/// iterator/forEach wrap each yielded `Map.Entry` — a raw entry from the
+/// backing map would let `entry.setValue(...)` mutate through the
+/// "unmodifiable" view instead of throwing.
 fn native_unmod_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let es = unmod_delegate(ctx, args, "entrySet", "()Ljava/util/Set;")?;
     if let Some(Value::Object(Some(inner))) = es {
-        let w = alloc_unmod_wrapper(ctx, UNMOD_SET_CLASS, inner);
+        let w = alloc_unmod_wrapper(ctx, UNMOD_ENTRY_SET_CLASS, inner);
         return Ok(Some(Value::Object(Some(w))));
     }
     Ok(es)

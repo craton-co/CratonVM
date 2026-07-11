@@ -1132,8 +1132,19 @@ impl SharedVm {
             let serializable_id = class_manager
                 .load_class("java/io/Serializable")
                 .expect("java/io/Serializable must be loadable");
+            // `entrySet()`'s Set view and its Map.Entry elements — see
+            // native-collections' `UNMOD_ENTRY_SET_CLASS`/`UNMOD_ENTRY_ITR_CLASS`/
+            // `UNMOD_MAP_ENTRY_CLASS`. Same checkcast/instanceof requirement as
+            // every other synthetic wrapper below: `Map.replaceAll`'s default
+            // body does `Map.Entry<K,V> entry : entrySet()` (an implicit
+            // checkcast to `Map$Entry` on each `Iterator.next()` result), so the
+            // wrapped entry must declare that interface or the cast throws
+            // ClassCastException.
+            let map_entry_id = class_manager
+                .load_class("java/util/Map$Entry")
+                .expect("java/util/Map$Entry must be loadable");
             // (synthetic class name, list of interface ClassIds it implements)
-            let unmod_specs: [(&str, &[ClassId]); 8] = [
+            let unmod_specs: [(&str, &[ClassId]); 11] = [
                 (
                     "cratonvm/internal/UnmodifiableCollection",
                     &[collection_id, serializable_id],
@@ -1169,6 +1180,12 @@ impl SharedVm {
                     "cratonvm/internal/UnmodifiableListItr",
                     &[list_iterator_id, iterator_id],
                 ),
+                (
+                    "cratonvm/internal/UnmodifiableEntrySet",
+                    &[set_id, collection_id, serializable_id],
+                ),
+                ("cratonvm/internal/UnmodifiableEntryItr", &[iterator_id]),
+                ("cratonvm/internal/UnmodifiableMapEntry", &[map_entry_id]),
             ];
             for (name, ifaces) in unmod_specs {
                 let cid = class_manager.ensure_synthetic_class(name, 1);
