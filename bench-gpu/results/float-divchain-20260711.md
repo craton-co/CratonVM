@@ -12,27 +12,28 @@ thousands of parallel threads instead of 2-4 AVX2 lanes.
 **Timing:** warm best-of (5 reps GPU/HotSpot/TornadoVM, 2-3 reps CratonVM
 CPU — the CPU path is slow enough at large N that more reps aren't
 practical), full per-call H2D + kernel + D2H round-trip for GPU rows.
-*The CratonVM-CPU cell at 2²⁶ is "not measured": that run was still going
-after several minutes on this shared/loaded box and wasn't worth blocking
-on — the 2²⁰-2²⁴ rows already establish the trend, and the comparison that
-matters (GPU vs. HotSpot/TornadoVM) is complete at every size.*
 **Hardware:** RTX 2060 (sm_75, 12 GiB), driver 591.86 / CUDA 13.1; Intel
 hybrid 24C/32T host. TornadoVM 4.0.1-jdk25 PTX backend; HotSpot = JDK 25.0.1.
 
 | N | CratonVM CPU (JIT) | HotSpot CPU (C2) | CratonVM GPU (`--gpu`) | TornadoVM GPU | CV-GPU vs HotSpot | CV-GPU vs TornadoVM |
 |---|---|---|---|---|---|---|
-| 2²⁰ (1,048,576)  | 435 ms   | 89 ms   | **7 ms**  | 11 ms  | **12.7×** | 1.6× |
-| 2²² (4,194,304)  | 1,856 ms | 400 ms  | **23 ms** | 38 ms  | **17.4×** | 1.65× |
-| 2²⁴ (16,777,216) | 6,299 ms | 1,508 ms | **91 ms** | 129 ms | **16.6×** | 1.4× |
-| 2²⁶ (67,108,864) | not measured* | 5,578 ms | **365 ms** | 482 ms | **15.3×** | 1.3× |
+| 2²⁰ (1,048,576)  | 435 ms    | 89 ms    | **7 ms**   | 11 ms  | **12.7×** | 1.6× |
+| 2²² (4,194,304)  | 1,856 ms  | 400 ms   | **23 ms**  | 38 ms  | **17.4×** | 1.65× |
+| 2²⁴ (16,777,216) | 6,299 ms  | 1,508 ms | **91 ms**  | 129 ms | **16.6×** | 1.4× |
+| 2²⁶ (67,108,864) | 36,082 ms | 5,578 ms | **365 ms** | 482 ms | **15.3×** | 1.3× |
+
+CratonVM-CPU at 2²⁶ took ~99× longer than CratonVM-GPU (36.1s vs 365ms) to
+produce the identical checksum — a concrete illustration of what the GPU
+path buys on a genuinely compute-bound kernel.
 
 **Correctness note (notable):** `FDIV_CHECKSUM` is bit-exact between
-CratonVM-CPU, CratonVM-GPU, and HotSpot at every size tested
-(`div.rn.f64` PTX is IEEE-754 round-to-nearest, identical to x86's
-`vdivpd`). TornadoVM's checksum diverges slightly from HotSpot's at every
-size (e.g. 2.3711976971862224E8 vs 2.3833420668027386E8 at 2²⁶) —
-TornadoVM's PTX backend does not guarantee bit-exact IEEE division.
-CratonVM's GPU path is exact where TornadoVM's is approximate.
+CratonVM-CPU, CratonVM-GPU, and HotSpot at **every** size tested, including
+2²⁶ (`2.3711976971862224E8` on all three) — `div.rn.f64` PTX is IEEE-754
+round-to-nearest, identical to x86's `vdivpd`. TornadoVM's checksum
+diverges slightly from HotSpot's at every size (e.g. `2.3711976971862224E8`
+vs `2.3833420668027386E8` at 2²⁶) — TornadoVM's PTX backend does not
+guarantee bit-exact IEEE division. CratonVM's GPU path is exact where
+TornadoVM's is approximate.
 
 ## Why this kernel (and not the other two) shows a clear win
 

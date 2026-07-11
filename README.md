@@ -441,21 +441,20 @@ per element (`GpuFloatDivChain`). The floating-point counterpart of the
 integer chain above: `vdivpd` has real but low throughput even under AVX2
 (a shared, weakly-pipelined execution unit, unlike multiply/add/FMA), so the
 GPU wins here too, and its `div.rn.f64` is IEEE-754 exact — `FDIV_CHECKSUM`
-matches HotSpot bit-for-bit at every size, unlike TornadoVM's PTX backend
-(checksum diverges slightly there, e.g. `2.3711976971862224E8` vs
-`2.3833420668027386E8` at 2²⁶ — approximate device math):
+matches HotSpot bit-for-bit at every size (including CratonVM-CPU, which
+also matches — the chain is deterministic across all three engines), unlike
+TornadoVM's PTX backend (checksum diverges slightly there, e.g.
+`2.3711976971862224E8` vs `2.3833420668027386E8` at 2²⁶ — approximate
+device math). CratonVM-CPU at 2²⁶ (64M elements × 64 divisions) needed
+~99× longer than CratonVM-GPU to confirm this — a good illustration of why
+the GPU path exists:
 
 | N | CratonVM CPU | HotSpot C2 | **CratonVM GPU** | TornadoVM GPU | GPU vs HotSpot |
 |---|---|---|---|---|---|
 | 2²⁰ | 435 ms | 89 ms | **7 ms** | 11 ms | **12.7×** |
 | 2²² | 1,856 ms | 400 ms | **23 ms** | 38 ms | **17.4×** |
 | 2²⁴ | 6,299 ms | 1,508 ms | **91 ms** | 129 ms | **16.6×** |
-| 2²⁶ | not measured* | 5,578 ms | **365 ms** | 482 ms | **15.3×** |
-
-\* the own-CPU run at 2²⁶ (64M elements × 64 divisions × 3 reps) was still
-running after several minutes on this shared/loaded box and was not worth
-blocking on — the 2²⁰-2²⁴ rows already establish the CratonVM-CPU trend,
-and the comparison that matters (GPU vs. HotSpot/TornadoVM) is complete.
+| 2²⁶ | 36,082 ms | 5,578 ms | **365 ms** | 482 ms | **15.3×** |
 
 **96 multiply-adds per element** (`GpuWarm.heavy`) — a shape HotSpot C2 *can*
 auto-vectorize with AVX2, making it the honest hard case: the GPU still beats
