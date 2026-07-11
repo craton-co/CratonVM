@@ -49,4 +49,14 @@ The `0x40` small-integer used as a pointer is an exact match to the signature `9
 - The 2026-07-10 Hibernate "global-temp-table SIGSEGV cluster" is the guarded-inline-getfield JIT regression, **already resolved on `dev` default builds by `93b33576`**. No new code change was needed.
 - No global-temp-table / DDL-lifecycle / GC-root-pinning bug is involved. That hypothesis is refuted.
 - Residual (pre-existing, separate): `DefaultCatalogAndSchemaTest` and peers can still HANG (rc=124) under host load — the documented environmental hang, not a CV-only defect.
-- Latent (separate follow-up, owned by `93b33576`): the exact x64 codegen defect in the guarded fast path is dormant (opt-in) and not yet root-caused to the instruction. Re-enable with `CRATONVM_JIT_GUARDED_GETFIELD=1` to reproduce for that dedicated bisection.
+- Latent defect: root-caused and FIXED the same day (2026-07-10), in a separate investigation --
+  the WildFly Host Controller invoke-inline-cache SIGSEGV
+  (`docs/internal/wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver-FIXED.md`).
+  The vm-side JIT field resolvers fabricated a `(0, false)` compact-field slot for any field
+  with no genuine registered `CompactLayout`, and the compact-offset inline getfield arm's
+  32-bit `MOVSXD` load of half a `Value` cell for a reference field is exactly this doc's
+  `0x40`/`rax=0x4` "small-int used as a pointer" signature. Fixed on `dev`; guarded-inline
+  getfield is re-enabled default-ON again (re-verified clean against the original ES IVF-KNN
+  repro that first surfaced it -- see the follow-up on
+  `docs/known-issues/elasticsearch-suite/ES-HANG-20260709-server-org-elasticsearch-search-vectors-diversifyingchildrenivfknnfloatslicedvectorquerytests-3ff8aa1c4b.md`).
+  `CRATONVM_JIT_GETFIELD_HELPER=1` is now the (rarely-needed) off-switch.
