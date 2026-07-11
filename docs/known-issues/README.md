@@ -87,6 +87,35 @@ than repeating the pin dance inline.
   candidates) — a spot-check of `lib.rs` alone found another real bug
   (`spring_xml_set_factory_bool`'s caller), not yet fixed.
 
+## 2026-07-11 JIT BCE: missing AIOOBE + silent OOB heap write on multi-array loops (OPEN, Severity: HIGH)
+
+Found while validating the GPU offload deopt path (the bug itself is in the CPU JIT, not the
+GPU stack). Bounds-check elimination on a counted loop indexing multiple arrays by the same
+induction variable (e.g. `for (i=0;i<a.length;i++) out[i]=a[i]+b[i];` with `out.length <
+a.length`) elides the bounds check on the shorter array using the longer array's length as the
+loop bound — with the JIT/OSR on, the method returns normally with no
+`ArrayIndexOutOfBoundsException` and silently writes past the end of `out` into whatever object
+follows it on the heap. HotSpot JDK 25 and CratonVM `--nojit` both throw the required AIOOBE.
+See [`jit-bce-multi-array-oob-store-20260711.md`](jit-bce-multi-array-oob-store-20260711.md) for
+the minimal repro (`test_classes/gpu/BoundsDeopt2.java`) and the suspected BCE mechanism.
+
+## 2026-07-11 GPU offload: first real-hardware validation passed; 7 follow-ups filed (OPEN, none blocking)
+
+First systematic validation of the GPU offload stack on real hardware (RTX 2060) passed
+end-to-end — checksums matching HotSpot bit-for-bit on every kernel tested, including a
+div-chain kernel at ~210x HotSpot C2 / ~3x TornadoVM PTX (see
+[`bench-gpu/results/`](../../bench-gpu/results/) and [ROADMAP.md](../../ROADMAP.md#gpu-offload)).
+Two bugs found during that validation were fixed in-tree the same day (invoke-cache promotion
+killing repeat offloads; a failure-flag not drained after array writebacks). Seven follow-up
+gaps remain open and are being worked on in parallel (check the doc for current status before
+assuming any is still open): reduction-kernel dispatch never launches (void-return gate),
+JIT-compiled/OSR'd callers can bypass the offload hook, `dispatch_async` is synchronous under
+the hood, small arrays over-launch GPU threads (fixed 2^20-thread minimum), the
+occupancy-tuned block-size API is dead code, several analyzer/lowering coverage gaps (`ldc`,
+`frem`/`drem`, non-canonical loops), and there is no hardware CI. See
+[`gpu-offload-followups-20260711.md`](gpu-offload-followups-20260711.md) for all seven with
+pointers into `vm/src/runtime/offload.rs`.
+
 ## 2026-07-11 Regex `find()`+`group()` quadratic slowdown FIXED — two wrong turns (dead-code Matcher bridge, dead-code substring native) before finding the real bug in the live one
 
 A user-reported benchmark (`StringBuilder` append loop + `Pattern.compile().matcher()`

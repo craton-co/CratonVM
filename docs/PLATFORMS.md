@@ -51,10 +51,32 @@ Status legend:
   physical topology ([`gc/src/numa.rs:334`](../gc/src/numa.rs) TODO).
 - **macOS**: not applicable.
 
-## GPU offload (`gpu-offload` feature)
+## GPU offload (`gpu` / `gpu-driver` Cargo features)
 
-CUDA-backed; available only on hosts with a CUDA driver. Off by default in
-every build. See [`docs/gpu/cuda-oxide-evaluation.md`](gpu/cuda-oxide-evaluation.md).
+Opt-in and off by default in every build — a plain `cargo build` never links
+CUDA. Two `cratonvm-cli` features layer on top of each other:
+
+- `gpu` — exposes the `--gpu*` CLI flags and links `cuda-bridge` in its stub
+  backend (device probing always returns `DeviceError::NoDriver`; the CLI
+  surface exists but nothing offloads).
+- `gpu-driver` — implies `gpu`, plus the real CUDA Driver API bindings via
+  the `cudarc` 0.13 crate (`driver`, `cuda-12060` features), dynamically
+  loading `nvcuda.dll` (Windows) / `libcuda.so` (Linux). This is the feature
+  that actually offloads work to a GPU.
+
+Internally `cratonvm-cli`'s `gpu` feature maps to `cratonvm-vm`'s
+`gpu-offload` feature (`vm/Cargo.toml`), which pulls in `cuda-bridge` and
+`jit-cuda`.
+
+| Feature | Linux | Windows | macOS | Source |
+|---|---|---|---|---|
+| GPU offload (CUDA, NVIDIA-only) | Full — same driver-API path as Windows; not exercised as heavily as the Windows dev box | Full — validated on real hardware: Windows 11 + RTX 2060 (sm_75), 2026-07-11 | Not supported — CUDA is NVIDIA-only and NVIDIA ships no CUDA driver for macOS | [`cuda-bridge/`](../cuda-bridge/src/), [`jit-cuda/`](../jit-cuda/src/), [`vm-cli/src/main.rs`](../vm-cli/src/main.rs) |
+
+No AMD/ROCm or Intel/oneAPI backend exists or is planned for Phase 1/2; "GPU
+offload" in CratonVM documentation always means CUDA. See
+[`docs/gpu/annotations.md`](gpu/annotations.md) for the annotation surface and
+[`docs/gpu/cuda-oxide-evaluation.md`](gpu/cuda-oxide-evaluation.md) for why
+the `cuda-oxide` crate is not on the critical path.
 
 ## Runtime flags and environment variables affecting platform behaviour
 
@@ -89,6 +111,9 @@ disabled (interpreter-only).
 - **macOS** kernel-specific paths (`kqueue`, `FSEvents`) are only run when
   the test binary is built on Darwin. CI does not currently include a
   macOS runner; treat macOS as best-effort.
+- **GPU offload** is not part of CI (no CUDA-capable CI runner). It was
+  manually validated on real hardware — Windows 11 + RTX 2060 (sm_75) — on
+  2026-07-11.
 
 ## Further reading
 

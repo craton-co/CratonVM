@@ -26,31 +26,54 @@ let a = DeviceBuffer::from_host(&ctx, &host_a)?;     // blocks
 let b = DeviceBuffer::from_host(&ctx, &host_b)?;     // blocks
 let mut out = DeviceBuffer::<i32>::zeros(&ctx, n)?;
 let cfg = LaunchConfig::elementwise(n);
-module.launch(&ctx, "vector_add", &cfg, (&a, &b, &mut out, n as i32))?;
+let args = KernelArgs::new()
+    .push_device_ptr(&a)
+    .push_device_ptr(&b)
+    .push_device_ptr(&out)
+    .push_i32(n as i32);
+module.launch_raw(&ctx, "vector_add", &cfg, args)?;
 out.to_host(&mut host_out)?;                          // blocks
 ```
 
-**After — async pipeline.** Uploads, the kernel, and the download are
-all queued on one stream and overlap with host work until
-`synchronize()`.
+**After — async pipeline.** Uploads and the kernel launch are queued on
+one stream and return without blocking, so host work between them
+overlaps with the device. (The download step is a separate story — see
+the note after the snippet.)
 
 ```rust,ignore
 let ctx = DeviceContext::new(0)?;
 let module = DeviceModule::from_ptx(&ctx, PTX, &["vector_add"])?;
 let stream = Stream::new(&ctx)?;
 
-let a = DeviceBuffer::from_host_async(&ctx, &stream, &host_a)?;
-let b = DeviceBuffer::from_host_async(&ctx, &stream, &host_b)?;
+let a = DeviceBuffer::from_host_async(&ctx, &host_a, &stream)?;
+let b = DeviceBuffer::from_host_async(&ctx, &host_b, &stream)?;
 let mut out = DeviceBuffer::<i32>::zeros(&ctx, n)?;
 let cfg = LaunchConfig::elementwise(n);
-module.launch_on_stream(&ctx, &stream, "vector_add", &cfg,
-                        (&a, &b, &mut out, n as i32))?;
-out.to_host_async(&stream, &mut host_out)?;
+let args = KernelArgs::new()
+    .push_device_ptr(&a)
+    .push_device_ptr(&b)
+    .push_device_ptr(&out)
+    .push_i32(n as i32);
+module.launch_on_stream(&ctx, "vector_add", &cfg, args, &stream)?;
 
-// ... do other host work here, queued GPU work runs in parallel ...
+// ... do other host work here; the two uploads and the launch above
+// were queued without blocking, so they run in parallel with it ...
 
-stream.synchronize()?;   // host blocks until the queue drains
+out.to_host_async(&mut host_out, &stream)?;
 ```
+
+> **`to_host_async` (the safe wrapper) is not fire-and-forget.** Unlike
+> `from_host_async` and `launch_on_stream`, the safe `to_host_async`
+> downloads into an owned staging buffer and then calls
+> `stream.synchronize()` **internally** before returning — see the
+> `# Current safety contract` doc comment on `DeviceBuffer::to_host_async`
+> in `cuda-bridge/src/lib.rs`. So by the time the call above returns,
+> `stream` has already drained; there is no additional host-work window
+> after it, and an explicit trailing `stream.synchronize()` is
+> redundant (harmless — synchronizing an empty queue is cheap — but
+> redundant). The genuinely non-blocking download is
+> `to_host_async_unchecked`, which hands you the borrowed-destination
+> contract directly instead of synchronizing on your behalf.
 
 ## `Stream`
 
@@ -71,15 +94,15 @@ work is still in flight — the destructor waits.
 ### Op flow
 
 Each async entry point (`from_host_async`, `to_host_async`,
-`launch_on_stream`, `Event::record`, `stream.wait_for`) appends one
-operation to the stream. The driver pulls them off in order and issues
-them to the GPU.
+`launch_on_stream`, `Stream::record_event`, `Stream::wait_event`)
+appends one operation to the stream. The driver pulls them off in
+order and issues them to the GPU.
 
 ```rust,ignore
-let buf = DeviceBuffer::from_host_async(&ctx, &stream, &host)?;   // op 1: H2D
-module.launch_on_stream(&ctx, &stream, "k", &cfg, args)?;          // op 2: launch
-buf.to_host_async(&stream, &mut out)?;                              // op 3: D2H
-stream.synchronize()?;                                              // host wait
+let buf = DeviceBuffer::from_host_async(&ctx, &host, &stream)?;   // op 1: H2D
+module.launch_on_stream(&ctx, "k", &cfg, args, &stream)?;          // op 2: launch
+buf.to_host_async(&mut out, &stream)?;                              // op 3: D2H
+stream.synchronize()?;                                              // host wait (redundant here — see the note above; to_host_async already synced)
 ```
 
 After `synchronize()` returns, every op enqueued before that call has
@@ -104,23 +127,40 @@ dependencies between streams without involving the host.
 
 ### Recording and waiting
 
+There is no single call that both allocates and records an event.
+`Event::new(&ctx)` creates it; `stream.record_event(&event)` enqueues
+it on a stream's queue; `stream.wait_event(&event)` makes a (possibly
+different) stream block on the GPU side until that marker is reached:
+
 ```rust,ignore
 let upload = Stream::new(&ctx)?;
 let compute = Stream::new(&ctx)?;
 
-let buf = DeviceBuffer::from_host_async(&ctx, &upload, &host)?;
-let after_upload = Event::record(&upload)?;
+let buf = DeviceBuffer::from_host_async(&ctx, &host, &upload)?;
+let after_upload = Event::new(&ctx)?;
+upload.record_event(&after_upload)?;
 
 // `compute` will not start until `upload` reaches `after_upload`:
-compute.wait_for(&after_upload)?;
-module.launch_on_stream(&ctx, &compute, "k", &cfg, args)?;
+compute.wait_event(&after_upload)?;
+module.launch_on_stream(&ctx, "k", &cfg, args, &compute)?;
 compute.synchronize()?;
 ```
 
-`Event::record(&stream)` enqueues a marker on `stream` and returns the
-event. `stream.wait_for(&event)` makes `stream` block on the GPU side
-(not the host) until that marker is reached. The host stays unblocked
-the whole time.
+`stream.record_event(&event)` enqueues `event` at the current point in
+`stream`'s queue. `other_stream.wait_event(&event)` makes
+`other_stream` block on the GPU side (not the host) until that marker
+is reached; the host stays unblocked the whole time.
+
+In the snippet above the manual `record_event`/`wait_event` pair is
+actually redundant: `DeviceBuffer::from_host_async` already allocates
+its own completion event and stamps it into the buffer's `last_write`
+slot internally, and `DeviceModule::launch_on_stream` already waits on
+every device-pointer argument's `last_write` event before launching —
+see [Automatic per-buffer ordering](#automatic-per-buffer-ordering-last_write-events)
+below. Reach for `Event::new` / `record_event` / `wait_event` directly
+when you need a happens-before relation that isn't already carried by
+a shared buffer (e.g. gating one stream's kernel on a completely
+separate stream's unrelated kernel).
 
 ### Cross-stream dependency graph: three streams
 
@@ -133,35 +173,86 @@ let s_comp = Stream::new(&ctx)?;   // kernels
 let s_d2h  = Stream::new(&ctx)?;   // device → host downloads
 
 // 1. Upload on s_h2d.
-let a = DeviceBuffer::from_host_async(&ctx, &s_h2d, &host_a)?;
-let b = DeviceBuffer::from_host_async(&ctx, &s_h2d, &host_b)?;
-let e_uploaded = Event::record(&s_h2d)?;
+let a = DeviceBuffer::from_host_async(&ctx, &host_a, &s_h2d)?;
+let b = DeviceBuffer::from_host_async(&ctx, &host_b, &s_h2d)?;
 
-// 2. Compute on s_comp, but only after uploads finish.
-s_comp.wait_for(&e_uploaded)?;
+// 2. Compute on s_comp. No manual wait needed here — see the note
+//    below: `launch_on_stream` waits on each input buffer's own
+//    last_write event automatically.
 let mut out = DeviceBuffer::<i32>::zeros(&ctx, n)?;
-module.launch_on_stream(&ctx, &s_comp, "vector_add", &cfg,
-                        (&a, &b, &mut out, n as i32))?;
-let e_computed = Event::record(&s_comp)?;
+let args = KernelArgs::new()
+    .push_device_ptr(&a)
+    .push_device_ptr(&b)
+    .push_device_ptr(&out)
+    .push_i32(n as i32);
+module.launch_on_stream(&ctx, "vector_add", &cfg, args, &s_comp)?;
 
-// 3. Download on s_d2h, but only after compute finishes.
-s_d2h.wait_for(&e_computed)?;
-out.to_host_async(&s_d2h, &mut host_out)?;
-
-// Host waits only for the final download.
-s_d2h.synchronize()?;
+// 3. Download on s_d2h. Also no manual wait needed — to_host_async
+//    (safe) synchronizes its own stream internally, ordered behind
+//    `out`'s last_write (the kernel above) automatically.
+out.to_host_async(&mut host_out, &s_d2h)?;
 ```
 
-The host issues every op immediately and never blocks until the last
-`synchronize()`. The GPU sees a correct dependency chain.
+The host issues the uploads and the launch without blocking. The GPU
+sees a correct H2D → compute dependency chain even though this
+snippet never calls `Event::new` / `record_event` / `wait_event`
+directly, because both steps are buffer-driven — see the next
+section. (The manual `Event::record`-and-`wait_for`-style choreography
+shown further up this document, in an earlier revision, described a
+step that `launch_on_stream` now performs for you automatically for
+any argument passed via `push_device_ptr`.)
+
+### Automatic per-buffer ordering (`last_write` events)
+
+You do not have to hand-roll the H2D → compute → D2H event chain
+above for buffers that flow through `push_device_ptr`.
+`DeviceModule::launch_on_stream` (`cuda-bridge/src/launch.rs`) owns a
+"cross-stream ordering choreography" keyed on each `DeviceBuffer`'s
+own `last_write` slot:
+
+1. Before launching, for every `KernelArg::DevicePtr` argument whose
+   buffer has a `last_write` event set (populated by a prior
+   `from_host_async` upload or a prior `launch_on_stream` that wrote
+   it), the launch stream calls `wait_event` on it — gating the new
+   kernel behind whatever last touched that buffer, even if that prior
+   write happened on a *different* stream.
+2. After the launch is queued, a fresh `kernel_done` event is recorded
+   on the launch stream and stamped into `last_write` for every
+   device-pointer argument, so the *next* consumer (another
+   `launch_on_stream`, or a `to_host_async` D2H) automatically orders
+   behind this kernel too.
+
+`DeviceBuffer::to_host`/`to_host_async` participate in the same
+scheme on the read side: they wait on the buffer's own `last_write`
+event (not a context-wide event) before downloading, so a D2H copy is
+correctly ordered behind whichever kernel or upload actually produced
+that buffer's current contents — even under concurrent pipelines
+touching unrelated buffers on other streams.
+
+Net effect: as long as you thread the same `DeviceBuffer`s through
+`from_host_async` → `launch_on_stream` → `to_host_async`/`to_host`,
+the streams involved can be freely mixed (one stream per stage, one
+stream for everything, whatever) and the ordering above is enforced
+without any manual `Event`/`wait_event` calls. Reach for the manual
+`Event` API from the previous section only for dependencies that
+aren't mediated by a shared buffer.
 
 ### What events do **not** provide
 
 - **No timing.** Phase 2 events are markers, not timers. There is no
   `event.elapsed_ms(&other)`. Use external profiling for timing.
-- **No host-side polling.** There is no `event.is_complete()`. If the
-  host needs to know, call `stream.synchronize()` on a stream that
-  `wait_for`'d the event.
+- **Host-side polling exists but isn't used by the offload dispatch
+  layer yet.** `Event::query() -> Result<bool>` *is* implemented (both
+  backends — `cuda-bridge/src/event.rs`): in `cuda` mode it wraps
+  `cuEventQuery`, mapping `CUDA_ERROR_NOT_READY` to `Ok(false)`; in
+  stub mode it returns whether the event has been recorded on some
+  stream. It is a genuine non-blocking probe. What's still missing is
+  a consumer: `vm::runtime::offload`'s `GpuFuture` completion path
+  (`finalize_submission`) only ever calls the *blocking*
+  `event.synchronize()`, never `query()` — see
+  [`async-api.md`'s Current limitations](async-api.md#current-limitations).
+  Wiring `query()` into a poll- or callback-driven completion path is
+  in-progress work, not shipped.
 
 ## Async memcpy
 
@@ -169,9 +260,9 @@ Two new entry points on `DeviceBuffer`. Both take a `&Stream` and return
 immediately after queueing the copy.
 
 ```rust,ignore
-let buf = DeviceBuffer::from_host_async(&ctx, &stream, &host)?;
+let buf = DeviceBuffer::from_host_async(&ctx, &host, &stream)?;
 // ... queue more work ...
-buf.to_host_async(&stream, &mut out)?;
+buf.to_host_async(&mut out, &stream)?;
 stream.synchronize()?;
 ```
 
@@ -189,6 +280,22 @@ read the destination buffer until the stream that owns the copy is
 synchronized. The borrow checker enforces the lifetime; it does **not**
 enforce the "don't read until synced" half — that is a contract.
 
+> **This table describes the borrowed contract, which the safe
+> wrappers mostly enforce for you rather than hand you.** `DeviceBuffer::
+> from_host_async` (safe) copies the caller's slice into an
+> owned `Arc<Vec<T>>` staging buffer before queuing the upload, so the
+> caller's original slice does **not** need to stay valid past the
+> call — the borrow-and-don't-mutate rule above literally applies to
+> `from_host_async_unchecked`, the borrowed variant. Symmetrically,
+> the safe `to_host_async` downloads into owned staging memory and
+> then calls `stream.synchronize()` **before returning**, so by the
+> time it hands you `dst` the copy has already completed — you cannot
+> observe undefined bytes through it. The borrowed-and-don't-read-early
+> contract applies to `to_host_async_unchecked`. Use the `_unchecked`
+> variants only when you specifically want to avoid the extra copy /
+> the internal synchronize and are prepared to uphold the lifetime
+> contract yourself.
+
 ### When to use sync vs async
 
 | Use sync (`from_host`, `to_host`) when… | Use async (`*_async`) when… |
@@ -203,24 +310,51 @@ configuration upload is unnecessary ceremony.
 
 ## `launch_on_stream`
 
-Non-blocking kernel launch. Same signature as `launch_raw` plus a
-`&Stream`.
+Non-blocking kernel launch. Same signature as `launch_raw` with a
+`&Stream` appended at the end:
 
 ```rust,ignore
-module.launch_on_stream(&ctx, &stream, "vector_add", &cfg, args)?;
+module.launch_on_stream(&ctx, "vector_add", &cfg, args, &stream)?;
 ```
 
 The call returns once the launch is queued, not once the kernel
 completes. To wait for completion, either:
 
 - `stream.synchronize()?;` — host blocks for the entire queue, **or**
-- `let done = Event::record(&stream)?;` followed by
-  `other_stream.wait_for(&done)?;` — GPU-side dependency on another
-  stream, host stays unblocked.
+- `let done = Event::new(&ctx)?; stream.record_event(&done)?;`
+  followed by `other_stream.wait_event(&done)?;` — GPU-side dependency
+  on another stream, host stays unblocked. In practice you rarely need
+  to do this by hand for buffer-mediated dependencies —
+  `launch_on_stream` already records and stamps a `kernel_done` event
+  per output buffer; see [Automatic per-buffer
+  ordering](#automatic-per-buffer-ordering-last_write-events) above.
 
-Using `launch_raw` on a default stream and `launch_on_stream` on the
-same context interleaves through the default stream's serialization
-rules; prefer to commit to one model per dispatch path.
+### Under the hood: `launch_raw` is not the CUDA legacy default stream
+
+`DeviceModule::launch_raw` (the plain, non-`_on_stream` entry point
+used by the "synchronous" examples in this document) does not issue
+onto CUDA's actual legacy default stream (stream `0`). `DeviceContext`
+owns three dedicated forked streams — `copy_h2d`, `compute`,
+`copy_d2h` — and `launch_raw` always submits onto `ctx.compute`
+(`cuda-bridge/src/backend_cuda.rs`). The same is true of the
+"synchronous" `DeviceBuffer::from_host` (uploads via `copy_h2d`) and
+`to_host` (downloads via `copy_d2h`): even though these calls block
+the host until their own op completes, internally the context
+pipelines H2D, compute, and D2H across three streams tied together
+with barrier events, so back-to-back synchronous calls still get some
+cross-stage overlap for free. "Blocks until done" describes the
+host-visible contract, not literal serial execution on one stream.
+
+Mixing `launch_raw` and `launch_on_stream` (or the sync and async
+`DeviceBuffer` methods) against the *same buffers* is safe: both
+launch paths gate on and update the same per-buffer `last_write`
+event (`cuda-bridge/src/backend_cuda.rs`'s `launch_raw_inner` mirrors
+`launch.rs`'s choreography exactly, fixed 2026-06-17 after a race
+through the old context-wide singleton event). The thing to actually
+watch for is scheduling, not correctness: `launch_raw` always competes
+for `ctx.compute`, so a dispatch path that wants true concurrency
+between two kernels should route both through `launch_on_stream` on
+two distinct user-created streams rather than relying on `launch_raw`.
 
 ## Stub-mode op log
 
@@ -235,20 +369,30 @@ use cuda_bridge::{Stream, StreamOp, DeviceBuffer};
 let ctx = DeviceContext::new(0)?;          // stub context
 let stream = Stream::new(&ctx)?;
 
-let a = DeviceBuffer::from_host_async(&ctx, &stream, &[1i32, 2, 3])?;
-module.launch_on_stream(&ctx, &stream, "k", &cfg, args)?;
-a.to_host_async(&stream, &mut out)?;
+let a = DeviceBuffer::from_host_async(&ctx, &[1i32, 2, 3], &stream)?;
+module.launch_on_stream(&ctx, "k", &cfg, args, &stream)?;
+a.to_host_async(&mut out, &stream)?;
 
 let ops = stream.ops();
-assert!(matches!(ops[0], StreamOp::MemcpyH2DAsync { len: 3, .. }));
-assert!(matches!(ops[1], StreamOp::Launch { ref name, .. } if name == "k"));
-assert!(matches!(ops[2], StreamOp::MemcpyD2HAsync { len: 3, .. }));
+let upload_pos = ops.iter().position(
+    |op| matches!(op, StreamOp::UploadAsync { bytes: 12 })   // 3 × 4-byte i32
+).expect("upload recorded");
+let launch_pos = ops.iter().position(
+    |op| matches!(op, StreamOp::Launch { ref kernel, .. } if kernel == "k")
+).expect("launch recorded");
+let download_pos = ops.iter().position(
+    |op| matches!(op, StreamOp::DownloadAsync { bytes: 12 })
+).expect("download recorded");
+assert!(upload_pos < launch_pos && launch_pos < download_pos);
 ```
 
-`Stream::ops() -> Vec<StreamOp>` returns a snapshot. Repeated calls
-return the cumulative log; `Stream::clear_ops()` resets it. The log is
-only populated under the stub backend — under `cuda` it is always empty
-(zero overhead in release builds).
+`Stream::ops() -> Vec<StreamOp>` returns a snapshot (a clone of the
+internal log, not a drain). Repeated calls return the cumulative log —
+**there is no `Stream::clear_ops()`**; the log only ever grows for the
+lifetime of the `Stream`, so tests that need a clean log should
+construct a fresh `Stream` rather than try to reset an existing one.
+The log is only populated under the stub backend — under `cuda` it is
+always empty (zero overhead in release builds).
 
 This is the **primary way** to test offload pipelines without a GPU.
 A typical assertion sequence:
@@ -262,7 +406,7 @@ fn pipeline_uploads_before_launch() {
 
     let ops = stream.ops();
     let upload_idx = ops.iter().position(|o| matches!(o,
-        StreamOp::MemcpyH2DAsync { .. })).unwrap();
+        StreamOp::UploadAsync { .. })).unwrap();
     let launch_idx = ops.iter().position(|o| matches!(o,
         StreamOp::Launch { .. })).unwrap();
     assert!(upload_idx < launch_idx, "uploads must precede launch");
@@ -273,16 +417,17 @@ fn pipeline_uploads_before_launch() {
 
 | Variant | Recorded by | Carries |
 | --- | --- | --- |
-| `MemcpyH2DAsync { dst_ptr, len, elem_size }` | `DeviceBuffer::from_host_async` | Destination device pointer, element count, element size in bytes. |
-| `MemcpyD2HAsync { src_ptr, len, elem_size }` | `DeviceBuffer::to_host_async` | Source device pointer, element count, element size in bytes. |
-| `Launch { name, grid, block, shared_bytes }` | `DeviceModule::launch_on_stream` | Kernel name (owned `String`), grid dims, block dims, dynamic shared-memory bytes. |
-| `EventRecord { event_id }` | `Event::record` | Stable per-event id usable to correlate with `WaitForEvent`. |
-| `WaitForEvent { event_id }` | `Stream::wait_for` | The id of the event being waited on. |
+| `UploadAsync { bytes }` | `DeviceBuffer::from_host_async` (and `launch_raw`'s internal H2D helper, on `ctx.copy_h2d`) | Total byte count of the upload. No destination-pointer or per-element breakdown. |
+| `DownloadAsync { bytes }` | `DeviceBuffer::to_host_async` | Total byte count of the download. |
+| `Launch { kernel, grid, block }` | `DeviceModule::launch_on_stream` (and `launch_raw`, on `ctx.compute`) | Kernel name (owned `String`), grid dims, block dims. There is no `shared_bytes` field — dynamic shared-memory size is not captured in the op log. |
+| `EventRecord { event_id }` | `Stream::record_event` | Stable per-event id usable to correlate with `EventWait`. |
+| `EventWait { event_id }` | `Stream::wait_event` | The id of the event being waited on. |
 | `Synchronize` | `Stream::synchronize` | (no payload) |
 
-`event_id` is a monotonic counter assigned at `Event::record`; tests can
-correlate "this `WaitForEvent` matches that `EventRecord`" without
-having to thread the actual `Event` through.
+`event_id` is a monotonic counter assigned at `Event::new` (not at
+recording time — an event can be constructed and never recorded);
+tests can correlate "this `EventWait` matches that `EventRecord`"
+without having to thread the actual `Event` through.
 
 ## What this is **not**
 
@@ -308,16 +453,29 @@ having to thread the actual `Event` through.
   thousands of streams will work until the driver complains. The
   expected count for offload dispatch is small (1–3 per active
   kernel).
-- **Events are single-shot semantically.** Recording the same `Event`
-  twice on different streams is undefined — `Event::record` returns a
-  new `Event` each call. Treat events as values, not handles to reuse.
+- **Events are single-shot semantically.** Calling `record_event` on
+  the same `Event` from two different streams is undefined — each
+  `Event::new(&ctx)` is meant to back exactly one `record_event` call.
+  Treat events as values produced fresh per synchronization point, not
+  handles to re-record.
 - **No host callbacks.** There is no `stream.add_host_callback(...)`
   hook. To run host code after a stream completes, call
-  `stream.synchronize()?;` and run it inline.
-- **Default-stream interaction.** `launch_raw` issues on the default
-  CUDA stream; mixing it with `launch_on_stream` in the same dispatch
-  serializes through CUDA's legacy default-stream semantics. Pick one
-  style per code path.
+  `stream.synchronize()?;` and run it inline. (A non-blocking
+  `Event::query()` probe does exist — see [What events do **not**
+  provide](#what-events-do-not-provide) — but nothing in
+  `vm::runtime::offload` consumes it yet; a poll- or callback-driven
+  completion path on top of it is in-progress work elsewhere in the
+  tree, not shipped.)
+- **`launch_raw` competes for one shared stream.** `launch_raw` always
+  submits onto the context's internal `compute` stream (not CUDA's
+  legacy default stream — see [Under the
+  hood](#under-the-hood-launch_raw-is-not-the-cuda-legacy-default-stream)
+  above), so two `launch_raw` calls serialize against each other
+  regardless of buffers touched. Mixing `launch_raw` with
+  `launch_on_stream` on shared buffers is correctness-safe (both paths
+  honor the same per-buffer `last_write` events); it just doesn't buy
+  you concurrency unless the `launch_on_stream` calls use their own
+  distinct streams.
 - **No multi-device awareness.** `Stream` is bound to a single
   `DeviceContext`. Multi-GPU pipelines need one stream per context;
   events do not cross contexts.

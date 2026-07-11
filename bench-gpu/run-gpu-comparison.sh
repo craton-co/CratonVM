@@ -3,6 +3,18 @@
 # Benchmarks: GpuCompute.heavy (compute-heavy) and GpuProbe.vaddMap (memory-bound).
 # Sizes: 2^20 (1M), 2^22 (4M), 2^24 (16M), 2^26 (64M), 2^28 (256M) — 2^28 was crashing before.
 # Usage: bash run-gpu-comparison.sh [output.md]
+#
+# Optional feature-gated benches (off by default so this suite keeps passing
+# before the underlying CratonVM features land — see
+# docs/known-issues/gpu-offload-followups-20260711.md):
+#   BENCH_DOT=1  — also run GpuDotBench.dotReduce (bench-gpu/GpuDotBench.java)
+#                  vs its TornadoVM @Reduce twin (bench-tornado/TornadoDotBench.java).
+#                  Exercises the reduction-dispatch feature (item 1 in the doc
+#                  above); until the dispatch-side result-readback lands,
+#                  --gpu just re-measures the CPU fallback for this one.
+#   BENCH_LDC=1  — GpuLdcBench (ldc-constants feature) is wired into
+#                  run-gpu-warm.sh, not this script; set it there instead.
+#   Usage: BENCH_DOT=1 bash run-gpu-comparison.sh [output.md]
 set +e
 set +o pipefail
 export MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1
@@ -42,6 +54,21 @@ echo "[build] compiling TornadoGpuCompute + TornadoVadd ..."
   "$TVSRC/TornadoGpuCompute.java" "$TVSRC/TornadoVadd.java" 2>&1 \
   && echo "[build] OK" || { echo "[build] FAILED — TornadoVM variants unavailable"; TORNADO_OK=0; }
 TORNADO_OK="${TORNADO_OK:-1}"
+
+# ── optional: compile TornadoDotBench (BENCH_DOT=1 only) ───────────────────────
+BENCH_DOT="${BENCH_DOT:-0}"
+DOT_TORNADO_OK=0
+if [ "$BENCH_DOT" = "1" ] && [ "$TORNADO_OK" = "1" ]; then
+  echo "[build] compiling TornadoDotBench (BENCH_DOT=1) ..."
+  "C:/craton/tornadovm/jdk-25.0.3/bin/javac.exe" -g \
+    --module-path "$TVJARS" \
+    --add-modules tornado.annotation,tornado.api \
+    --patch-module tornado.examples="$GO" \
+    -d "$GO" \
+    "$TVSRC/TornadoDotBench.java" 2>&1 \
+    && { echo "[build] TornadoDotBench OK"; DOT_TORNADO_OK=1; } \
+    || echo "[build] TornadoDotBench FAILED — dot bench will skip the tornadovm column"
+fi
 
 # ── runner helpers ─────────────────────────────────────────────────────────────
 run_cv_cpu() {   # $1=class $2=n
@@ -152,6 +179,52 @@ for n in "${SIZES[@]}"; do
   bench_vadd "$n"
 done
 
+# ── GpuDotBench.dotReduce (optional, BENCH_DOT=1) ───────────────────────────────
+# Reduction-dispatch bench: dotReduce is analyzer-eligible (is_reduction:true)
+# but --gpu transparent dispatch currently falls through to CPU for non-void
+# kernels (docs/known-issues/gpu-offload-followups-20260711.md item 1), so
+# gated off by default — running it before that lands just re-measures the CPU
+# fallback, which is harmless but not informative for a default suite run.
+bench_dot() {
+  local n="$1"
+  echo -n "  dot n=$(numfmt --to=si --suffix='' $n 2>/dev/null || echo $n)"
+  for vm in cv_cpu cv_gpu hotspot; do
+    local out
+    case $vm in
+      cv_cpu)  out=$(run_cv_cpu  GpuDotBench "$n") ;;
+      cv_gpu)  out=$(run_cv_gpu  GpuDotBench "$n") ;;
+      hotspot) out=$(run_hs      GpuDotBench "$n") ;;
+    esac
+    local ms=$(extract dot_ms "$out")
+    local cs=$(extract DOT_CHECKSUM "$out")
+    RES["dot,$n,$vm"]="${ms:-FAIL}"
+    SUMS["dot,$n,$vm"]="${cs:--}"
+    echo -n "  $vm=${ms:-FAIL}ms CS:${cs:-FAIL}"
+  done
+  if [ "$DOT_TORNADO_OK" = "1" ]; then
+    local out=$(run_tvm TornadoDotBench "$n")
+    local ms=$(extract dot_ms "$out")
+    local cs=$(extract DOT_CHECKSUM "$out")
+    RES["dot,$n,tornadovm"]="${ms:-FAIL}"
+    SUMS["dot,$n,tornadovm"]="${cs:--}"
+    echo -n "  tornadovm=${ms:-FAIL}ms CS:${cs:-FAIL}"
+  fi
+  local ref="${SUMS[dot,$n,hotspot]}"
+  local agree="✓"
+  for vm in cv_cpu cv_gpu tornadovm; do
+    local s="${SUMS[dot,$n,$vm]}"
+    [ "$s" != "$ref" ] && [ "$s" != "-" ] && { agree="✗"; break; }
+  done
+  RES["dot,$n,agree"]="$agree"
+  echo "  $agree"
+}
+if [ "$BENCH_DOT" = "1" ]; then
+  echo; echo "=== GpuDotBench.dotReduce (reduction dispatch, BENCH_DOT=1) ==="
+  for n in "${SIZES[@]}"; do
+    bench_dot "$n"
+  done
+fi
+
 # ── print table ───────────────────────────────────────────────────────────────
 echo
 echo "=== RESULTS TABLE ==="
@@ -227,6 +300,17 @@ mkdir -p "$(dirname "$OUT")"
     # RES[vadd,n,tornadovm] already contains "${ms}ms" from bench_vadd
     echo "| 2^${EXPOF[$n]} ($nfmt) | CS:${SUMS[vadd,$n,cv_cpu]:--} | CS:${SUMS[vadd,$n,hotspot]:--} | ${RES[vadd,$n,tornadovm]:--} CS:${SUMS[vadd,$n,tornadovm]:--} |"
   done
+  if [ "$BENCH_DOT" = "1" ]; then
+    echo
+    echo "## GpuDotBench.dotReduce — reduction dispatch (BENCH_DOT=1)"
+    echo
+    echo "| N | CratonVM CPU | CratonVM GPU | HotSpot CPU | TornadoVM GPU | OK |"
+    echo "|---|---|---|---|---|---|"
+    for n in "${SIZES[@]}"; do
+      nfmt=$(numfmt --to=si --suffix='' "$n" 2>/dev/null || printf "%d" "$n")
+      echo "| 2^${EXPOF[$n]} ($nfmt) | ${RES[dot,$n,cv_cpu]:--}ms | ${RES[dot,$n,cv_gpu]:--}ms | ${RES[dot,$n,hotspot]:--}ms | ${RES[dot,$n,tornadovm]:--}ms | ${RES[dot,$n,agree]:--} |"
+    done
+  fi
   echo
   echo "## Notes"
   echo

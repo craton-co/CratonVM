@@ -2721,17 +2721,183 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
-    /// Phase 6 #4: query the real GPU submission registry.
+    /// GpuStream affinity — override the stream-mint escape hatch.
+    /// Delegates to `OffloadCache::stream_create` on the per-VM
+    /// default-ordinal cache when the gpu-offload feature is on;
+    /// otherwise returns `None` (the trait's default).
+    fn gpu_stream_create(&mut self) -> Option<u64> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            self.shared
+                .offload_registry
+                .get_or_create(self.shared.config.gpu_device_ordinal, &self.shared.config)
+                .stream_create()
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            None
+        }
+    }
+
+    /// GpuStream affinity — override the stream-release escape hatch.
+    /// Delegates to `OffloadCache::stream_release`; a no-op when the
+    /// gpu-offload feature is off (the trait's default already
+    /// covers that, but the cache lookup itself is guarded the same
+    /// way every other GPU override in this impl is).
+    fn gpu_stream_release(&mut self, handle: u64) {
+        #[cfg(feature = "gpu-offload")]
+        {
+            self.shared
+                .offload_registry
+                .get_or_create(self.shared.config.gpu_device_ordinal, &self.shared.config)
+                .stream_release(handle);
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+        }
+    }
+
+    /// GpuStream affinity — stream-affine sibling of
+    /// `gpu_dispatch_method`. Delegates to
+    /// `crate::runtime::offload::dispatch_method_from_native_on_stream`
+    /// (same class/method resolution + marshalling as
+    /// `gpu_dispatch_method`, plus the `stream_handle` resolution
+    /// step) when the gpu-offload feature is on; otherwise returns
+    /// `None` (the trait's default, which itself falls back to
+    /// `gpu_dispatch_method`).
+    fn gpu_dispatch_method_on_stream(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        java_args: &[Value],
+        stream_handle: Option<u64>,
+    ) -> Option<u64> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            Some(
+                crate::runtime::offload::dispatch_method_from_native_on_stream(
+                    self.shared,
+                    class_name,
+                    method_name,
+                    descriptor,
+                    java_args,
+                    stream_handle,
+                ),
+            )
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = (class_name, method_name, descriptor, java_args, stream_handle);
+            None
+        }
+    }
+
+    /// Phase 6 #4 (2026-07-11: switched to the non-blocking poll) —
+    /// query the real GPU submission registry for `handle`'s completion
+    /// state.
+    ///
+    /// Previously a pure `sub.status.lock()` peek: it read whatever
+    /// `SubmissionStatus` the submission already carried but never
+    /// asked the device anything, so it could never observe a
+    /// completion that some other caller (`futureSynchronize`/`get()`)
+    /// hadn't already finalized — `futureIsDone` stayed `false` forever
+    /// for a submission nobody was blocking on. Now delegates to
+    /// `runtime::offload::poll_submission_status`, which finalizes the
+    /// submission inline (bounded work only — by the time it does, the
+    /// device event has already fired) the first time it observes the
+    /// device-side work as done. `Native.futureIsDone`/`futureStatus`
+    /// (`native-builtins/src/craton_gpu.rs`) are therefore now
+    /// genuinely non-blocking-but-live rather than only ever reporting
+    /// stale `Running`.
     fn gpu_future_status(&self, handle: u64) -> Option<i32> {
         #[cfg(feature = "gpu-offload")]
         {
+            let outcome = crate::runtime::offload::poll_submission_status(self.shared, handle)?;
+            Some(match outcome {
+                crate::runtime::offload::PollOutcome::Running => 0,
+                crate::runtime::offload::PollOutcome::Completed => 1,
+                crate::runtime::offload::PollOutcome::Failed => 2,
+            })
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+            None
+        }
+    }
+
+    /// 2026-07-11 — `NativeContext::gpu_future_take_result` override.
+    /// See the trait doc comment (`native-api/src/registry.rs`) for the
+    /// full contract; this is the read half that hands back a completed
+    /// submission's `SerializedResult` (translated into the
+    /// `native-api`-side `GpuFutureResult` transport enum, since
+    /// `native-api` cannot depend on this crate's `offload` types).
+    ///
+    /// Reuses `poll_submission_status` — the same non-blocking,
+    /// finalize-only-if-the-device-already-reported-done path
+    /// `gpu_future_status` now uses — so a caller that already observed
+    /// `isDone() == true` gets the result with no wait, and a caller
+    /// that hasn't gets `None` rather than an implicit block.
+    fn gpu_future_take_result(&self, handle: u64) -> Option<cratonvm_native_api::registry::GpuFutureResult> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            use crate::runtime::offload::{PollOutcome, SerializedResult, SubmissionStatus};
+
+            // Only a terminal `Completed` outcome carries a result;
+            // `Running` and `Failed` (and an unknown handle, which
+            // `poll_submission_status` already reports as `None`) don't.
+            // This never blocks: `poll_submission_status` only ever
+            // finalizes inline when the device has already reported the
+            // work done, never by waiting for it to.
+            if crate::runtime::offload::poll_submission_status(self.shared, handle)?
+                != PollOutcome::Completed
+            {
+                return None;
+            }
             let sub = crate::runtime::offload::lookup_submission(handle)?;
             let status = sub.status.lock();
-            Some(match *status {
-                crate::runtime::offload::SubmissionStatus::Running => 0,
-                crate::runtime::offload::SubmissionStatus::Completed { .. } => 1,
-                crate::runtime::offload::SubmissionStatus::Failed { .. } => 2,
-            })
+            match &*status {
+                SubmissionStatus::Completed { result } => Some(match result {
+                    SerializedResult::Void => cratonvm_native_api::registry::GpuFutureResult::Void,
+                    SerializedResult::ScalarI32(v) => {
+                        cratonvm_native_api::registry::GpuFutureResult::ScalarI32(*v)
+                    }
+                    SerializedResult::ScalarI64(v) => {
+                        cratonvm_native_api::registry::GpuFutureResult::ScalarI64(*v)
+                    }
+                    SerializedResult::ScalarF32(v) => {
+                        cratonvm_native_api::registry::GpuFutureResult::ScalarF32(*v)
+                    }
+                    SerializedResult::ScalarF64(v) => {
+                        cratonvm_native_api::registry::GpuFutureResult::ScalarF64(*v)
+                    }
+                    // `finalize_submission` never actually constructs one
+                    // of these today: array outputs are copied back to
+                    // the caller's own Java array via `MarshalWriteback`
+                    // writeback entries (drained by `finalize_submission`
+                    // itself), not stamped into `SerializedResult` — its
+                    // `scalar_result` local is only ever set by the
+                    // single Part-E scalar writeback kind, so a
+                    // `Completed` status here only ever holds `Void` or a
+                    // `Scalar*` variant in practice. These arms are
+                    // therefore unreachable today; map to `Void`
+                    // defensively rather than panic if that ever changes.
+                    SerializedResult::PrimitiveArrayI32 { .. }
+                    | SerializedResult::PrimitiveArrayI64 { .. }
+                    | SerializedResult::PrimitiveArrayF32 { .. }
+                    | SerializedResult::PrimitiveArrayF64 { .. } => {
+                        cratonvm_native_api::registry::GpuFutureResult::Void
+                    }
+                }),
+                // `poll_submission_status` just reported `Completed`
+                // under its own lock acquisition; this re-locks and
+                // should see the same terminal state (a submission never
+                // regresses out of a terminal status). Stay defensive
+                // rather than assume that invariant instead of checking it.
+                _ => None,
+            }
         }
         #[cfg(not(feature = "gpu-offload"))]
         {

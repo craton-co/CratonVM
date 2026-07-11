@@ -42,6 +42,104 @@
 //! The remaining `PHASE4-CUDA-TODO` is the underlying cuda backend
 //! port — when that finishes, the futures stop being unconditionally
 //! `Failed` and the `Done` path becomes hot.
+//!
+//! ## Status (2026-07-11 — scalar futures + non-blocking `isDone`)
+//!
+//! `vm::runtime::offload` gained a `SerializedResult::{ScalarI32,
+//! ScalarI64, ScalarF32, ScalarF64}` family (stamped into
+//! `SubmissionStatus::Completed` by `finalize_submission` for
+//! reduction-style kernels that return a value instead of writing an
+//! `out` array) plus a non-blocking `poll_submission_status` probe
+//! that finalizes a submission inline once the device event is ready,
+//! instead of requiring a blocking `futureSynchronize`/`get()` call
+//! first (see `docs/gpu/async-api.md`'s "Completion model" note and
+//! `docs/known-issues/gpu-offload-followups-20260711.md` items #1/#3).
+//!
+//! This file's contribution:
+//!   * `FutureState::DoneScalar` — a local-registry counterpart to
+//!     `FutureState::Done` that carries a raw scalar `Value` (Int /
+//!     Long / Float / Double) instead of an `ObjectRef`.
+//!   * `builtin_future_get_result` boxes a stored `DoneScalar` payload
+//!     via the crate's canonical `lang_class::box_value` helper (the
+//!     same boxing path `lang_invoke.rs` uses for reflective/
+//!     MethodHandle scalar returns) before handing it back as the
+//!     `Object` the `(J)Ljava/lang/Object;` descriptor promises.
+//!   * `Native.futureIsDone` (`builtin_future_is_done`) — a new,
+//!     dedicated non-blocking completion probe: Running(0) => false,
+//!     Completed(1)/Failed(2) => true, unknown handle => false (the
+//!     same "absent => false" convention `arrayIsResident` uses).
+//!
+//! ## Status (2026-07-11, continued — real-submission scalar results)
+//!
+//! The gap above is closed: `NativeContext::gpu_future_status`'s VM
+//! override now calls `offload::poll_submission_status` instead of
+//! peeking `SubmissionStatus` directly, so it finalizes a submission
+//! inline the first time it observes device-side completion —
+//! `builtin_future_is_done` / `builtin_future_status` are live for a
+//! real dispatch, not just the local synthetic map. A new escape hatch,
+//! `NativeContext::gpu_future_take_result`, mirrors `gpu_future_status`
+//! (same non-blocking contract) and hands back a completed submission's
+//! `SerializedResult` translated into the `native-api`-side
+//! `GpuFutureResult` transport enum. `builtin_future_get_result` (below)
+//! tries this real-registry path FIRST and only falls back to the
+//! local synthetic `FutureState` map (`Done`/`DoneScalar`) when it
+//! returns `None` — which happens for any handle the real dispatcher
+//! never registered (every stub-mode fixture) as well as for a
+//! genuinely not-yet-complete real submission.
+//!
+//! PHASE4-CUDA-TODO (residual, out of this file's reach): there is
+//! still no CUDA device in this environment, so the real-registry path
+//! is exercised by unit tests that install a canned
+//! `gpu_future_take_result` answer on `MockNativeContext` rather than by
+//! an actual device dispatch — see the unit tests below. Primitive-array
+//! future results remain unwired (see `GpuFutureResult`'s doc comment);
+//! array outputs continue to flow through writeback into the caller's
+//! own array, which this file's `arrayToHost`/`gpuArrayDownloadIfDirty`
+//! handlers already cover independently of futures.
+//!
+//! ## Completion-model note (non-blocking `get()`)
+//!
+//! `builtin_future_get_result`'s real-registry branch is genuinely
+//! non-blocking: it only returns a value when
+//! `NativeContext::gpu_future_take_result` does, which in turn requires
+//! the submission to already be observably complete (see that method's
+//! doc comment) — it will not wait for a `Running` submission to
+//! finish. That's fine for the Java-level contract IF the caller
+//! already checked `isDone()` and got `true` first (the `Future.get()`
+//! idiom this backs typically does exactly that, or accepts a `null`
+//! "not ready" answer). A `get()` on a future the caller has *not* first
+//! observed as done still needs to block, and that path is unchanged:
+//! it goes through `Native.futureSynchronize`
+//! (`builtin_future_synchronize`, below) → `gpu_future_synchronize` →
+//! `offload::finalize_submission`, which does wait on the device event.
+//!
+//! ## Status (2026-07-11, continued — device-only array allocation)
+//!
+//! `docs/gpu/async-api.md` documented `GpuArray.allocate(GpuExecutor,
+//! int)` (a device-side allocation with no host source array) but no
+//! matching native shim existed — `register()` above only ever declared
+//! `arrayWrapInt/Long/Float/Double` (upload from an existing Java
+//! array). Neither `docs/internal/gpu/phase3-spec.md` §2.2 nor any
+//! later phase spec defines an `allocate*` native name or descriptor
+//! (`arrayWrap*` is the only `GpuArray`-backing surface either ever
+//! lists), so the names below (`arrayAllocateInt/Long/Float/Double`,
+//! each `"(I)J"`) are new, chosen to mirror the `arrayWrap*` family's
+//! naming precisely — there is no spec text they had to match instead.
+//!
+//! `builtin_array_allocate_*` mints a `state::ArrayEntry` exactly the
+//! way `wrap_primitive_array` does, except the `bytes` mirror starts
+//! zero-filled (`vec![0u8; element_count * element_bytes]`) instead of
+//! being snapshotted from a Java array — this matches Java `new
+//! int[n]`/`new long[n]`/etc. zero-initialization semantics, so a
+//! `toHost()` on a never-uploaded, never-kernel-written handle returns
+//! an all-zero array via the existing `builtin_array_to_host` /
+//! `rebuild_java_array` path unchanged. A negative `length` is a bad
+//! argument; per the file-wide convention that no array shim ever
+//! constructs a Java exception itself (only the submission family does,
+//! via a synthetic `Failed` future — see `wrap_primitive_array`'s
+//! null-host-array case), it returns the sentinel handle `0` without
+//! minting a state entry, the same "bad arg -> handle 0, no entry"
+//! shape `wrap_primitive_array` already uses.
 
 #![cfg_attr(not(feature = "gpu-offload"), allow(dead_code))]
 
@@ -138,6 +236,7 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
     registry.register(KLASS, "closeStream", "(J)V", builtin_close_stream);
 
     registry.register(KLASS, "futureStatus", "(J)I", builtin_future_status);
+    registry.register(KLASS, "futureIsDone", "(J)Z", builtin_future_is_done);
     registry.register(
         KLASS,
         "futureSynchronize",
@@ -161,6 +260,34 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
     registry.register(KLASS, "arrayWrapLong", "([J)J", builtin_array_wrap_long);
     registry.register(KLASS, "arrayWrapFloat", "([F)J", builtin_array_wrap_float);
     registry.register(KLASS, "arrayWrapDouble", "([D)J", builtin_array_wrap_double);
+    // 2026-07-11: device-only allocation (`GpuArray.allocate`, no host
+    // source array) — see the module doc's "device-only array
+    // allocation" note for why these names/descriptors are new rather
+    // than spec-derived.
+    registry.register(
+        KLASS,
+        "arrayAllocateInt",
+        "(I)J",
+        builtin_array_allocate_int,
+    );
+    registry.register(
+        KLASS,
+        "arrayAllocateLong",
+        "(I)J",
+        builtin_array_allocate_long,
+    );
+    registry.register(
+        KLASS,
+        "arrayAllocateFloat",
+        "(I)J",
+        builtin_array_allocate_float,
+    );
+    registry.register(
+        KLASS,
+        "arrayAllocateDouble",
+        "(I)J",
+        builtin_array_allocate_double,
+    );
     registry.register(
         KLASS,
         "arrayToHost",
@@ -209,6 +336,16 @@ mod state {
         Done {
             result_obj: Option<cratonvm_types::ObjectRef>,
         },
+        /// 2026-07-11 — local-registry counterpart to `Done` for a
+        /// kernel that returns a scalar (mirrors one of the
+        /// `vm::runtime::offload::SerializedResult::Scalar{I32,I64,F32,
+        /// F64}` variants) instead of writing into a caller-supplied
+        /// output array. `value` is always `Value::Int` / `Value::Long`
+        /// / `Value::Float` / `Value::Double` — never `Value::Object`
+        /// (that shape stays on `Done`).
+        DoneScalar {
+            value: Value,
+        },
         Failed {
             message: String,
         },
@@ -221,6 +358,17 @@ mod state {
         pub futures: HashMap<u64, FutureState>,
         pub arrays: HashMap<u64, ArrayEntry>,
         pub streams: HashMap<u64, u64>, // stream handle -> owning exec handle
+        /// GpuStream affinity — executor handle -> that executor's
+        /// lazily-created DEFAULT stream handle. Populated by
+        /// `resolve_or_create_default_stream` the first time a given
+        /// executor is used by `submit`/`launch`/`submitMethod`/
+        /// `submitWithArg(s)`; every later call through the same
+        /// executor handle reuses the cached value instead of asking
+        /// `NativeContext::gpu_stream_create` for a new one. Absent
+        /// entirely (not even a `None` sentinel) when creation last
+        /// failed — no device / gpu-offload off — so a box that later
+        /// gains a device isn't permanently stuck on the old answer.
+        pub executor_default_stream: HashMap<u64, u64>,
     }
 
     impl NativeState {
@@ -313,6 +461,42 @@ fn arg_object(args: &[Value], idx: usize) -> Option<cratonvm_types::ObjectRef> {
         Some(Value::Object(o)) => *o,
         _ => None,
     }
+}
+
+/// GpuStream affinity — resolve (lazily creating on first use) the
+/// DEFAULT CUDA stream for `exec`, an executor handle from
+/// `Native.openExecutor`/`builtin_open_executor`.
+///
+/// This is what closes the gap `docs/gpu/async-api.md` describes
+/// under "GpuStream affinity is not wired up": previously every
+/// `submit`/`submitMethod`/`launch`/`submitWithArg(s)` call minted a
+/// fresh, private, one-shot stream (`dispatch_method_from_native`'s
+/// old unconditional `CudaStream::new(ctx)`), so two calls through
+/// the SAME executor never shared a stream and never got the CUDA
+/// same-stream-serializes-in-submission-order guarantee the executor
+/// docs promise. Now the first submit through a given `exec` handle
+/// mints ONE real stream (`ctx.gpu_stream_create()`) and every
+/// subsequent submit through that same `exec` handle reuses it.
+///
+/// Returns `None` when `ctx.gpu_stream_create()` does (no device /
+/// `gpu-offload` off on the VM side) — callers pass that straight
+/// through to `ctx.gpu_dispatch_method_on_stream(..., None)`, which
+/// is byte-identical to the pre-existing `gpu_dispatch_method`
+/// fresh-stream-per-call behavior. Nothing is cached for that case,
+/// so a later call retries rather than being stuck on a stale `None`.
+#[cfg(feature = "gpu-offload")]
+fn resolve_or_create_default_stream(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    exec: u64,
+) -> Option<u64> {
+    if let Some(h) = state::with(|s| s.executor_default_stream.get(&exec).copied()) {
+        return Some(h);
+    }
+    let h = ctx.gpu_stream_create()?;
+    state::with(|s| {
+        s.executor_default_stream.insert(exec, h);
+    });
+    Some(h)
 }
 
 /// Materialize a fresh primitive Java array from a host byte buffer.
@@ -598,15 +782,26 @@ fn builtin_open_executor(
 /// strictly needed — multiple executors share the same global
 /// cache, so closing one wipes residency for the others too — but
 /// `GpuExecutor.close()` is rare and idempotent eviction is safe.)
+///
+/// GpuStream affinity: also releases the executor's lazily-created
+/// default stream (`resolve_or_create_default_stream`), if it ever
+/// minted one — an application that only ever called
+/// `submit`/`submitMethod`/`launch` (never `newStream` explicitly)
+/// still leaves a real CUDA stream registered in the `OffloadCache`
+/// otherwise, with nothing else left to release it.
 #[cfg(feature = "gpu-offload")]
 fn builtin_release_executor(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
-    state::with(|s| {
+    let default_stream = state::with(|s| {
         s.executors.remove(&handle);
+        s.executor_default_stream.remove(&handle)
     });
+    if let Some(stream_handle) = default_stream {
+        ctx.gpu_stream_release(stream_handle);
+    }
     ctx.gpu_clear_input_cache();
     Ok(None)
 }
@@ -638,12 +833,17 @@ fn record_failed_future() -> u64 {
 /// `submit(class, method, descriptor, args)` form). Otherwise we
 /// fall back to recording a synthetic Failed future so the Java
 /// side surfaces a clear error message.
+///
+/// GpuStream affinity: dispatches onto `execHandle`'s lazily-created
+/// default stream (`resolve_or_create_default_stream`) rather than a
+/// fresh one-shot stream, so repeated `submit` calls through the same
+/// executor serialize on one real CUDA stream.
 #[cfg(feature = "gpu-offload")]
 fn builtin_submit(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
-    let _exec = arg_long(args, 0) as u64;
+    let exec = arg_long(args, 0) as u64;
     let callable = match arg_object(args, 1) {
         Some(o) => o,
         None => {
@@ -655,9 +855,14 @@ fn builtin_submit(
     if let Some((class_name, method_name, descriptor, captures)) =
         ctx.gpu_resolve_lambda_target(callable)
     {
-        if let Some(handle) =
-            ctx.gpu_dispatch_method(&class_name, &method_name, &descriptor, &captures)
-        {
+        let stream = resolve_or_create_default_stream(ctx, exec);
+        if let Some(handle) = ctx.gpu_dispatch_method_on_stream(
+            &class_name,
+            &method_name,
+            &descriptor,
+            &captures,
+            stream,
+        ) {
             return instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", handle);
         }
     }
@@ -686,7 +891,7 @@ fn builtin_submit_with_arg(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
-    let _exec = arg_long(args, 0) as u64;
+    let exec = arg_long(args, 0) as u64;
     let lambda = match arg_object(args, 1) {
         Some(o) => o,
         None => {
@@ -704,9 +909,14 @@ fn builtin_submit_with_arg(
         ctx.gpu_resolve_lambda_target(lambda)
     {
         captures.push(sam_arg);
-        if let Some(handle) =
-            ctx.gpu_dispatch_method(&class_name, &method_name, &descriptor, &captures)
-        {
+        let stream = resolve_or_create_default_stream(ctx, exec);
+        if let Some(handle) = ctx.gpu_dispatch_method_on_stream(
+            &class_name,
+            &method_name,
+            &descriptor,
+            &captures,
+            stream,
+        ) {
             return instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", handle);
         }
     }
@@ -731,7 +941,7 @@ fn builtin_submit_with_args(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
-    let _exec = arg_long(args, 0) as u64;
+    let exec = arg_long(args, 0) as u64;
     let lambda = match arg_object(args, 1) {
         Some(o) => o,
         None => {
@@ -751,9 +961,14 @@ fn builtin_submit_with_args(
                 captures.push(ctx.get_array_element(arr_obj, i));
             }
         }
-        if let Some(handle) =
-            ctx.gpu_dispatch_method(&class_name, &method_name, &descriptor, &captures)
-        {
+        let stream = resolve_or_create_default_stream(ctx, exec);
+        if let Some(handle) = ctx.gpu_dispatch_method_on_stream(
+            &class_name,
+            &method_name,
+            &descriptor,
+            &captures,
+            stream,
+        ) {
             return instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", handle);
         }
     }
@@ -773,7 +988,7 @@ fn builtin_launch(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
-    let _exec = arg_long(args, 0) as u64;
+    let exec = arg_long(args, 0) as u64;
     let runnable = match arg_object(args, 1) {
         Some(o) => o,
         None => {
@@ -784,9 +999,14 @@ fn builtin_launch(
     if let Some((class_name, method_name, descriptor, captures)) =
         ctx.gpu_resolve_lambda_target(runnable)
     {
-        if let Some(handle) =
-            ctx.gpu_dispatch_method(&class_name, &method_name, &descriptor, &captures)
-        {
+        let stream = resolve_or_create_default_stream(ctx, exec);
+        if let Some(handle) = ctx.gpu_dispatch_method_on_stream(
+            &class_name,
+            &method_name,
+            &descriptor,
+            &captures,
+            stream,
+        ) {
             return instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", handle);
         }
     }
@@ -807,16 +1027,22 @@ fn builtin_launch(
 /// wrapping the submission handle the Java side polls.
 ///
 /// Stub-mode behavior: the underlying
-/// `dispatch_method_from_native` records a `Failed` submission with
-/// message "no CUDA device" / "class not loaded" / etc., depending
-/// on which check trips first. The Java side surfaces it as
-/// `GpuException` via `futureGetErrorMessage`.
+/// `dispatch_method_from_native_on_stream` records a `Failed`
+/// submission with message "no CUDA device" / "class not loaded" /
+/// etc., depending on which check trips first. The Java side
+/// surfaces it as `GpuException` via `futureGetErrorMessage`.
+///
+/// GpuStream affinity: dispatches onto `execHandle`'s lazily-created
+/// default stream (`resolve_or_create_default_stream`) rather than a
+/// fresh one-shot stream — see that function's doc comment for why
+/// this is what makes repeated `submitMethod` calls through the same
+/// executor share a real, ordered CUDA stream.
 #[cfg(feature = "gpu-offload")]
 fn builtin_submit_method(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
-    let _exec = arg_long(args, 0) as u64;
+    let exec = arg_long(args, 0) as u64;
 
     // Read the three string params. If any is null/unreadable, fail
     // synthetically and let the Java side surface it.
@@ -860,19 +1086,25 @@ fn builtin_submit_method(
     }
 
     // Dispatch via the NativeContext escape hatch. The VM's impl
-    // calls into `runtime::offload::dispatch_method_from_native`.
-    let submission_handle =
-        match ctx.gpu_dispatch_method(&class_name, &method_name, &descriptor, &java_args) {
-            Some(h) => h,
-            None => {
-                // gpu-offload feature off on the VM side. Fall back to
-                // the synthetic Failed-future path so the Java side gets
-                // a coherent error.
-                record_failed_future_with_message(
-                    "submitMethod: gpu-offload feature is disabled in this build",
-                )
-            }
-        };
+    // calls into `runtime::offload::dispatch_method_from_native_on_stream`.
+    let stream = resolve_or_create_default_stream(ctx, exec);
+    let submission_handle = match ctx.gpu_dispatch_method_on_stream(
+        &class_name,
+        &method_name,
+        &descriptor,
+        &java_args,
+        stream,
+    ) {
+        Some(h) => h,
+        None => {
+            // gpu-offload feature off on the VM side. Fall back to
+            // the synthetic Failed-future path so the Java side gets
+            // a coherent error.
+            record_failed_future_with_message(
+                "submitMethod: gpu-offload feature is disabled in this build",
+            )
+        }
+    };
 
     instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", submission_handle)
 }
@@ -908,32 +1140,64 @@ fn record_failed_future_with_message(message: &str) -> u64 {
 
 /// `Native.newStream(long execHandle) -> GpuStream`
 ///
-/// Records the stream → executor mapping in our state and wraps the
-/// new handle in a `GpuStreamImpl`.
+/// Mints a REAL CUDA stream via `ctx.gpu_stream_create()`
+/// (`OffloadCache::stream_create`) when a device is available, and
+/// wraps that handle in a `GpuStreamImpl` — `GpuStream.handle()` is
+/// now a genuine, dispatchable `OffloadCache` stream handle, not pure
+/// bookkeeping. `None` (no driver, or `gpu-offload` off on the VM
+/// side) falls back to a purely local synthetic handle so
+/// `newStream()` still never fails outright — `GpuStreamImpl` still
+/// round-trips through `closeStream`, matching every other
+/// stub-executor "inert but doesn't throw" contract in this file.
+///
+/// Reachability note: per `docs/internal/gpu/phase3-spec.md` §2.2,
+/// `GpuStream`'s only members are `handle()` and `close()` — there is
+/// no `submit`/`synchronize` in the implemented spec or anywhere in
+/// the registered `Native.*` surface, so nothing today lets Java code
+/// aim a dispatch at THIS explicit stream (as opposed to an
+/// executor's lazily-created default stream — see
+/// `resolve_or_create_default_stream`, which every
+/// `submit`/`submitMethod`/`launch`/`submitWithArg(s)` call already
+/// routes through). Reaching that would need the external
+/// `craton-gpu-java` library to add a stream-scoped submit
+/// declaration; the handle this mints is ready to be resolved via
+/// `OffloadCache::resolve_stream` the moment one exists.
 #[cfg(feature = "gpu-offload")]
 fn builtin_new_stream(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
     let exec = arg_long(args, 0) as u64;
-    let handle = state::with(|s| {
-        let h = s.fresh_handle();
-        s.streams.insert(h, exec);
-        h
-    });
+    let handle = match ctx.gpu_stream_create() {
+        Some(real_handle) => state::with(|s| {
+            s.streams.insert(real_handle, exec);
+            real_handle
+        }),
+        None => state::with(|s| {
+            let h = s.fresh_handle();
+            s.streams.insert(h, exec);
+            h
+        }),
+    };
     instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuStreamImpl", handle)
 }
 
 /// `Native.closeStream(long streamHandle)`
+///
+/// Releases the real `OffloadCache`-registered stream (if `handle`
+/// names one — `ctx.gpu_stream_release` is a safe no-op on a
+/// no-device-fallback synthetic handle) in addition to the local
+/// bookkeeping entry.
 #[cfg(feature = "gpu-offload")]
 fn builtin_close_stream(
-    _ctx: &mut dyn cratonvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
     state::with(|s| {
         s.streams.remove(&handle);
     });
+    ctx.gpu_stream_release(handle);
     Ok(None)
 }
 
@@ -962,10 +1226,63 @@ fn builtin_future_status(
     let code = state::with(|s| match s.futures.get(&handle) {
         Some(state::FutureState::Pending) => 0i32,
         Some(state::FutureState::Done { .. }) => 1,
+        // 2026-07-11: a completed scalar-return kernel reports the same
+        // DONE code as the object-result `Done` shape above — only the
+        // payload representation differs (see `builtin_future_get_result`).
+        Some(state::FutureState::DoneScalar { .. }) => 1,
         Some(state::FutureState::Failed { .. }) => 2,
         None => 3,
     });
     Ok(Some(Value::Int(code)))
+}
+
+/// `Native.futureIsDone(long futureHandle) -> boolean`
+///
+/// 2026-07-11 — dedicated non-blocking completion probe, additive
+/// alongside `futureStatus` (which is left untouched: `futureStatus`
+/// keeps backing `get()`'s failure check and the Java-side
+/// `isDone()`/`getNow()` spec shape unchanged; see the module doc for
+/// the exact `Native.futureStatus(handle) != 0` wiring the Phase-3.5
+/// spec documents). This gives the Java surface a purpose-built
+/// boolean entry point to switch `isDone()`/`getNow()` to, so the
+/// intent ("did the device finish?") is not overloaded onto the
+/// 4-way status code.
+///
+/// Prefers the real submission registry via
+/// `NativeContext::gpu_future_status`, same as `futureStatus` above.
+/// That accessor's VM override now calls `offload::poll_submission_status`
+/// (see the module doc's "real-submission scalar results" note), so
+/// this shim has genuine non-blocking-with-finalize semantics for a
+/// real dispatch: once the device reports the kernel done, the very
+/// next `futureIsDone` call observes `true` — no separate blocking call
+/// is needed to make that transition visible.
+///
+/// Mapping: Running(0) => false; Completed(1) / Failed(2) => true.
+/// Falls back to the local synthetic future map (same fallback shape
+/// as `futureStatus`) for handles that never reached the real
+/// dispatcher. An unrecognized handle in *both* registries returns
+/// `false` — the same "absent => false" convention `arrayIsResident`
+/// uses for a released/never-seen array handle, since a plain
+/// `boolean` return has no slot for a dedicated UNKNOWN code the way
+/// `futureStatus`'s `3` does.
+#[cfg(feature = "gpu-offload")]
+fn builtin_future_is_done(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let handle = arg_long(args, 0) as u64;
+    let done = if let Some(code) = ctx.gpu_future_status(handle) {
+        code != 0
+    } else {
+        state::with(|s| match s.futures.get(&handle) {
+            Some(state::FutureState::Pending) => false,
+            Some(state::FutureState::Done { .. }) => true,
+            Some(state::FutureState::DoneScalar { .. }) => true,
+            Some(state::FutureState::Failed { .. }) => true,
+            None => false,
+        })
+    };
+    Ok(Some(Value::Int(if done { 1 } else { 0 })))
 }
 
 /// `Native.futureSynchronize(long futureHandle)`
@@ -985,24 +1302,102 @@ fn builtin_future_synchronize(
     Ok(None)
 }
 
+/// Box a scalar kernel-return `Value` into its Java wrapper object
+/// (`java.lang.Integer` / `Long` / `Float` / `Double`).
+///
+/// Reuses the crate's canonical `lang_class::box_value` helper — the
+/// exact boxing path `lang_invoke.rs` already uses for reflective /
+/// MethodHandle scalar returns — rather than hand-rolling a second
+/// allocator. Mirrors the four `SerializedResult::Scalar{I32,I64,F32,
+/// F64}` variants in `vm::runtime::offload`: the `type_desc` fed to
+/// `box_value` is derived from the `Value`'s own discriminant, so a
+/// `Value::Long` always becomes a `java.lang.Long`, never an `Integer`.
+/// Any non-scalar `Value` (e.g. an already-boxed `Object`, which
+/// `FutureState::DoneScalar` should never hold, but a defensive
+/// pass-through is cheap) is returned unchanged.
+#[cfg(feature = "gpu-offload")]
+fn box_scalar_result(ctx: &mut dyn cratonvm_native_api::NativeContext, value: Value) -> Value {
+    let type_desc = match value {
+        Value::Int(_) => "I",
+        Value::Long(_) => "J",
+        Value::Float(_) => "F",
+        Value::Double(_) => "D",
+        _ => return value,
+    };
+    crate::lang_class::box_value(ctx, value, type_desc)
+}
+
 /// `Native.futureGetResult(long futureHandle) -> Object`
 ///
-/// Returns the stored mirror for `Done` futures, `null` otherwise.
-/// PHASE4-CUDA-TODO: today every synthetic future is `Failed` (no
-/// device); the stored-`Done` path will be exercised once the real
-/// CUDA launch path lands and populates `FutureState::Done` with a
-/// freshly-built primitive-array `ObjectRef`.
+/// 2026-07-11 — tries the real submission registry FIRST via
+/// `NativeContext::gpu_future_take_result`. That accessor is
+/// non-blocking (see its doc comment): it returns `Some` only once the
+/// submission is observably complete, `None` for `Running` (or
+/// `Failed`, or an unknown handle). This is safe to call unconditionally
+/// here because the two ways Java reaches `futureGetResult` both
+/// already guarantee completion (or accept a `null`/empty answer) by
+/// this point:
+///   * `GpuFuture.get()` calls the blocking `Native.futureSynchronize`
+///     first (unchanged — see `builtin_future_synchronize`), so the
+///     submission is always terminal by the time `futureGetResult` runs.
+///   * `GpuFuture.getNow()` / `Optional<T>` peeks are only meaningful
+///     after the caller observed `isDone()`/`futureStatus` report
+///     completion; a `Running` submission correctly yields `null` here
+///     rather than blocking.
+///
+/// `Some(GpuFutureResult::Scalar*)` is boxed via `box_scalar_result`.
+/// `Some(GpuFutureResult::Void)` — a void-return kernel, or one whose
+/// result went to a caller-owned array via writeback rather than the
+/// future's result slot — maps to the same `null` convention every
+/// other "no object result" case below uses.
+///
+/// Falls back to the local synthetic `FutureState` map (`Done` /
+/// `DoneScalar`) when the real registry has nothing for this handle —
+/// every stub-mode fixture (`builtin_submit`/`builtin_launch` records
+/// that never reached the real dispatcher) still round-trips exactly as
+/// before. `Done` futures return the stored mirror `ObjectRef` (e.g. a
+/// primitive array a `Void`-return kernel wrote into); `DoneScalar`
+/// futures get the same `box_scalar_result` boxing as the real path;
+/// anything else (`Pending`, `Failed`, unknown) is `null`.
 #[cfg(feature = "gpu-offload")]
 fn builtin_future_get_result(
-    _ctx: &mut dyn cratonvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
-    let result = state::with(|s| match s.futures.get(&handle) {
-        Some(state::FutureState::Done { result_obj }) => *result_obj,
+
+    if let Some(real_result) = ctx.gpu_future_take_result(handle) {
+        let result = match real_result {
+            cratonvm_native_api::registry::GpuFutureResult::Void => Value::Object(None),
+            cratonvm_native_api::registry::GpuFutureResult::ScalarI32(v) => {
+                box_scalar_result(ctx, Value::Int(v))
+            }
+            cratonvm_native_api::registry::GpuFutureResult::ScalarI64(v) => {
+                box_scalar_result(ctx, Value::Long(v))
+            }
+            cratonvm_native_api::registry::GpuFutureResult::ScalarF32(v) => {
+                box_scalar_result(ctx, Value::Float(v))
+            }
+            cratonvm_native_api::registry::GpuFutureResult::ScalarF64(v) => {
+                box_scalar_result(ctx, Value::Double(v))
+            }
+        };
+        return Ok(Some(result));
+    }
+
+    let stored = state::with(|s| match s.futures.get(&handle) {
+        Some(state::FutureState::Done { result_obj }) => Some(Value::Object(*result_obj)),
+        Some(state::FutureState::DoneScalar { value }) => Some(*value),
         _ => None,
     });
-    Ok(Some(Value::Object(result)))
+    let result = match stored {
+        Some(v @ (Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_))) => {
+            box_scalar_result(ctx, v)
+        }
+        Some(already_boxed) => already_boxed,
+        None => Value::Object(None),
+    };
+    Ok(Some(result))
 }
 
 /// `Native.futureGetErrorMessage(long futureHandle) -> String`
@@ -1108,6 +1503,83 @@ fn builtin_array_wrap_double(
     wrap_primitive_array(ctx, args)
 }
 
+/// Shared implementation for `Native.arrayAllocate{Int,Long,Float,
+/// Double}` — mints a device-only array handle with a zero-filled
+/// host-bytes mirror, `element_bytes` per element (4 for int/float, 8
+/// for long/double). No `NativeContext` calls are needed: like
+/// `wrap_primitive_array`, this only ever touches the local `state`
+/// store; the Java array (if any) is materialized lazily by
+/// `arrayToHost`.
+///
+/// `length` (Java `int`, so it can be negative) is validated first: a
+/// negative value returns the sentinel handle `0` without minting a
+/// state entry — the same bad-arg shape `wrap_primitive_array` uses for
+/// a null host array — rather than `as usize`-wrapping into an
+/// enormous allocation.
+#[cfg(feature = "gpu-offload")]
+fn allocate_primitive_array(
+    element_type: ArrayElementType,
+    element_bytes: usize,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let length = arg_int(args, 0);
+    if length < 0 {
+        return Ok(Some(Value::Long(0)));
+    }
+    let element_count = length as usize;
+    let bytes = vec![0u8; element_count * element_bytes];
+    let handle = state::with(|s| {
+        let h = s.fresh_handle();
+        s.arrays.insert(
+            h,
+            state::ArrayEntry {
+                element_type,
+                element_count,
+                bytes,
+                resident: true,
+            },
+        );
+        h
+    });
+    Ok(Some(Value::Long(handle as i64)))
+}
+
+/// `Native.arrayAllocateInt(int length) -> long`
+#[cfg(feature = "gpu-offload")]
+fn builtin_array_allocate_int(
+    _ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    allocate_primitive_array(ArrayElementType::Int, 4, args)
+}
+
+/// `Native.arrayAllocateLong(int length) -> long`
+#[cfg(feature = "gpu-offload")]
+fn builtin_array_allocate_long(
+    _ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    allocate_primitive_array(ArrayElementType::Long, 8, args)
+}
+
+/// `Native.arrayAllocateFloat(int length) -> long`
+#[cfg(feature = "gpu-offload")]
+fn builtin_array_allocate_float(
+    _ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    allocate_primitive_array(ArrayElementType::Float, 4, args)
+}
+
+/// `Native.arrayAllocateDouble(int length) -> long`
+#[cfg(feature = "gpu-offload")]
+fn builtin_array_allocate_double(
+    _ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    allocate_primitive_array(ArrayElementType::Double, 8, args)
+}
+
 /// `Native.arrayToHost(long arrayHandle) -> Object`
 ///
 /// Looks up the handle in our state and rebuilds a fresh Java primitive
@@ -1179,6 +1651,15 @@ fn builtin_release_array(
 mod tests {
     use super::*;
     use crate::test_utils::MockNativeContext;
+    // Brings `.get_field(...)` (and friends) into scope for direct calls
+    // on a concrete `MockNativeContext` in the scalar-boxing tests below
+    // (elsewhere in this file `ctx` only ever appears as `&mut dyn
+    // NativeContext`, which needs no import for method-call syntax).
+    use cratonvm_native_api::NativeContext;
+    // 2026-07-11: the transport enum `MockNativeContext::
+    // set_gpu_future_take_result` scripts, for the real-registry
+    // `futureGetResult` tests below.
+    use cratonvm_native_api::registry::GpuFutureResult;
 
     fn synthetic_devices() -> Vec<DeviceInfo> {
         vec![
@@ -1318,5 +1799,600 @@ mod tests {
         // A handle that was never recorded.
         let status = builtin_future_status(&mut ctx, &[Value::Long(999_999)]).unwrap();
         assert_eq!(status, Some(Value::Int(3)));
+    }
+
+    // ── 2026-07-11: `futureIsDone` non-blocking probe ────────────────────
+    //
+    // `MockNativeContext` uses the trait's default `gpu_future_status`
+    // (returns `None`), so every case below exercises the local
+    // synthetic-registry fallback — the same fallback `futureStatus`
+    // already relies on for stub-only fixtures.
+
+    #[test]
+    fn future_is_done_unknown_handle_is_false() {
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_future_is_done(&mut ctx, &[Value::Long(424_242)]).unwrap();
+        assert_eq!(r, Some(Value::Int(0)));
+    }
+
+    #[test]
+    fn future_is_done_pending_is_false() {
+        let h = state::with(|s| {
+            let h = s.fresh_handle();
+            s.futures.insert(h, state::FutureState::Pending);
+            h
+        });
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_future_is_done(&mut ctx, &[Value::Long(h as i64)]).unwrap();
+        assert_eq!(r, Some(Value::Int(0)));
+    }
+
+    #[test]
+    fn future_is_done_failed_is_true() {
+        let h = record_failed_future_with_message("boom");
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_future_is_done(&mut ctx, &[Value::Long(h as i64)]).unwrap();
+        assert_eq!(r, Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn future_is_done_done_is_true() {
+        let h = state::with(|s| {
+            let h = s.fresh_handle();
+            s.futures.insert(h, state::FutureState::Done { result_obj: None });
+            h
+        });
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_future_is_done(&mut ctx, &[Value::Long(h as i64)]).unwrap();
+        assert_eq!(r, Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn future_is_done_done_scalar_is_true() {
+        let h = record_done_scalar(Value::Int(7));
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_future_is_done(&mut ctx, &[Value::Long(h as i64)]).unwrap();
+        assert_eq!(r, Some(Value::Int(1)));
+    }
+
+    // ── 2026-07-11: `futureGetResult` scalar boxing ──────────────────────
+    //
+    // Stamps `FutureState::DoneScalar` directly into the local
+    // synthetic registry (there is no producer for it on the
+    // real-dispatch path yet — see the module doc's PHASE4-CUDA-TODO)
+    // and checks `builtin_future_get_result` boxes it via the crate's
+    // canonical `box_value` helper: the returned `Object` must not be
+    // the raw unboxed primitive, and field 0 of the boxed wrapper must
+    // round-trip the original value. (Not asserting on the wrapper's
+    // class name: `lang_math::alloc_wrapper`'s process-wide
+    // `WRAPPER_CIDS` cache is keyed by `ctx.vm_identity()`, which is
+    // `0` for every fresh `MockNativeContext` in this binary, so a
+    // fresh mock's own `class_names` map may not contain the class id
+    // a *different* test's mock resolved and cached first — a
+    // pre-existing cross-test-isolation quirk of the shared boxing
+    // helper, not something specific to this handler.)
+
+    /// Test-only helper: stamp a `DoneScalar` future directly into the
+    /// local synthetic registry, mirroring `record_failed_future_with_message`.
+    fn record_done_scalar(value: Value) -> u64 {
+        state::with(|s| {
+            let h = s.fresh_handle();
+            s.futures.insert(h, state::FutureState::DoneScalar { value });
+            h
+        })
+    }
+
+    #[test]
+    fn scalar_future_get_result_boxes_int() {
+        let h = record_done_scalar(Value::Int(42));
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_future_get_result(&mut ctx, &[Value::Long(h as i64)]).unwrap();
+        match r {
+            Some(Value::Object(Some(obj))) => {
+                assert_eq!(ctx.get_field(obj, 0), Value::Int(42));
+            }
+            other => panic!("expected a boxed Integer object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_future_get_result_boxes_long() {
+        let h = record_done_scalar(Value::Long(123_456_789_012));
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_future_get_result(&mut ctx, &[Value::Long(h as i64)]).unwrap();
+        match r {
+            Some(Value::Object(Some(obj))) => {
+                assert_eq!(ctx.get_field(obj, 0), Value::Long(123_456_789_012));
+            }
+            other => panic!("expected a boxed Long object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_future_get_result_boxes_float() {
+        let h = record_done_scalar(Value::Float(2.5));
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_future_get_result(&mut ctx, &[Value::Long(h as i64)]).unwrap();
+        match r {
+            Some(Value::Object(Some(obj))) => {
+                assert_eq!(ctx.get_field(obj, 0), Value::Float(2.5));
+            }
+            other => panic!("expected a boxed Float object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_future_get_result_boxes_double() {
+        let h = record_done_scalar(Value::Double(3.140_000_1));
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_future_get_result(&mut ctx, &[Value::Long(h as i64)]).unwrap();
+        match r {
+            Some(Value::Object(Some(obj))) => {
+                assert_eq!(ctx.get_field(obj, 0), Value::Double(3.140_000_1));
+            }
+            other => panic!("expected a boxed Double object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn done_object_future_get_result_is_unaffected_by_scalar_boxing() {
+        // Non-scalar `Done` futures (the array/object-result shape) must
+        // keep returning `null` when `result_obj` is `None`, unchanged
+        // from before this file's scalar-boxing addition.
+        let h = state::with(|s| {
+            let h = s.fresh_handle();
+            s.futures.insert(h, state::FutureState::Done { result_obj: None });
+            h
+        });
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_future_get_result(&mut ctx, &[Value::Long(h as i64)]).unwrap();
+        assert_eq!(r, Some(Value::Object(None)));
+    }
+
+    // ── 2026-07-11: `futureGetResult` via the REAL submission registry ──
+    //
+    // `MockNativeContext::set_gpu_future_take_result` scripts the
+    // `NativeContext::gpu_future_take_result` escape hatch directly,
+    // standing in for a real GPU submission registry the same way
+    // `record_done_scalar` stands in for the local `FutureState::
+    // DoneScalar` fallback exercised above. `builtin_future_get_result`
+    // must consult this FIRST and only fall back to the synthetic map
+    // when it returns `None` (see the handler's doc comment).
+
+    #[test]
+    fn real_future_get_result_boxes_int() {
+        let mut ctx = MockNativeContext::new();
+        ctx.set_gpu_future_take_result(7, GpuFutureResult::ScalarI32(42));
+        let r = builtin_future_get_result(&mut ctx, &[Value::Long(7)]).unwrap();
+        match r {
+            Some(Value::Object(Some(obj))) => {
+                assert_eq!(ctx.get_field(obj, 0), Value::Int(42));
+            }
+            other => panic!("expected a boxed Integer object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn real_future_get_result_boxes_long() {
+        let mut ctx = MockNativeContext::new();
+        ctx.set_gpu_future_take_result(7, GpuFutureResult::ScalarI64(123_456_789_012));
+        let r = builtin_future_get_result(&mut ctx, &[Value::Long(7)]).unwrap();
+        match r {
+            Some(Value::Object(Some(obj))) => {
+                assert_eq!(ctx.get_field(obj, 0), Value::Long(123_456_789_012));
+            }
+            other => panic!("expected a boxed Long object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn real_future_get_result_boxes_float() {
+        let mut ctx = MockNativeContext::new();
+        ctx.set_gpu_future_take_result(7, GpuFutureResult::ScalarF32(2.5));
+        let r = builtin_future_get_result(&mut ctx, &[Value::Long(7)]).unwrap();
+        match r {
+            Some(Value::Object(Some(obj))) => {
+                assert_eq!(ctx.get_field(obj, 0), Value::Float(2.5));
+            }
+            other => panic!("expected a boxed Float object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn real_future_get_result_boxes_double() {
+        let mut ctx = MockNativeContext::new();
+        ctx.set_gpu_future_take_result(7, GpuFutureResult::ScalarF64(3.140_000_1));
+        let r = builtin_future_get_result(&mut ctx, &[Value::Long(7)]).unwrap();
+        match r {
+            Some(Value::Object(Some(obj))) => {
+                assert_eq!(ctx.get_field(obj, 0), Value::Double(3.140_000_1));
+            }
+            other => panic!("expected a boxed Double object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn real_future_get_result_void_is_null() {
+        let mut ctx = MockNativeContext::new();
+        ctx.set_gpu_future_take_result(7, GpuFutureResult::Void);
+        let r = builtin_future_get_result(&mut ctx, &[Value::Long(7)]).unwrap();
+        assert_eq!(r, Some(Value::Object(None)));
+    }
+
+    #[test]
+    fn real_future_get_result_preferred_over_synthetic_map() {
+        // Stamp BOTH a real-registry answer and a conflicting synthetic
+        // `DoneScalar` for the same handle; the real-registry answer
+        // must win, since `builtin_future_get_result` consults
+        // `gpu_future_take_result` before the local map.
+        let h = record_done_scalar(Value::Int(999));
+        let mut ctx = MockNativeContext::new();
+        ctx.set_gpu_future_take_result(h, GpuFutureResult::ScalarI32(42));
+        let r = builtin_future_get_result(&mut ctx, &[Value::Long(h as i64)]).unwrap();
+        match r {
+            Some(Value::Object(Some(obj))) => {
+                assert_eq!(ctx.get_field(obj, 0), Value::Int(42));
+            }
+            other => panic!("expected the real-registry value (42), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn future_get_result_falls_back_to_synthetic_map_when_no_real_answer() {
+        // No `set_gpu_future_take_result` call for this handle — the
+        // mock's override returns `None` (the trait default), so this
+        // must fall through to the synthetic `DoneScalar` entry exactly
+        // as the pre-2026-07-11 behavior did.
+        let h = record_done_scalar(Value::Int(13));
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_future_get_result(&mut ctx, &[Value::Long(h as i64)]).unwrap();
+        match r {
+            Some(Value::Object(Some(obj))) => {
+                assert_eq!(ctx.get_field(obj, 0), Value::Int(13));
+            }
+            other => panic!("expected the synthetic-map value (13), got {other:?}"),
+        }
+    }
+
+    // ── GpuStream affinity — `resolve_or_create_default_stream` ─────────
+    //
+    // `MockNativeContext` uses the trait's default `gpu_stream_create`
+    // unless scripted via `set_gpu_stream_create_result`, mirroring
+    // every other GPU trait-method test pattern in this file.
+
+    /// `state::STATE` is one process-wide store shared by every test in
+    /// this file (and this file's tests run in parallel by default).
+    /// Every test below that touches `executor_default_stream` or
+    /// `streams` MUST key off a freshly-minted handle from
+    /// `state::with(|s| s.fresh_handle())` rather than a hardcoded
+    /// literal — two tests hardcoding the same executor handle (e.g.
+    /// both using `1`) race on the same map entry and flake under
+    /// `cargo test`'s default parallelism.
+    fn fresh_test_handle() -> u64 {
+        state::with(|s| s.fresh_handle())
+    }
+
+    #[test]
+    fn default_stream_no_device_returns_none_every_time() {
+        // No override set -> `gpu_stream_create` always answers `None`
+        // (the trait default, "no device"). Nothing should be cached
+        // for a `None` answer, so a second call for the same executor
+        // tries again rather than being stuck.
+        let mut ctx = MockNativeContext::new();
+        let exec = fresh_test_handle();
+        assert_eq!(resolve_or_create_default_stream(&mut ctx, exec), None);
+        assert_eq!(resolve_or_create_default_stream(&mut ctx, exec), None);
+        assert_eq!(ctx.gpu_stream_create_call_count(), 2);
+    }
+
+    #[test]
+    fn default_stream_is_created_once_and_cached_per_executor() {
+        // Script a real-looking answer; the SECOND call for the SAME
+        // executor handle must reuse it without calling
+        // `gpu_stream_create` again — this is the whole point of the
+        // fix: repeated submits on one executor share one stream.
+        let mut ctx = MockNativeContext::new();
+        let exec = fresh_test_handle();
+        ctx.set_gpu_stream_create_result(Some(777));
+        assert_eq!(
+            resolve_or_create_default_stream(&mut ctx, exec),
+            Some(777)
+        );
+        assert_eq!(
+            resolve_or_create_default_stream(&mut ctx, exec),
+            Some(777)
+        );
+        assert_eq!(
+            resolve_or_create_default_stream(&mut ctx, exec),
+            Some(777)
+        );
+        assert_eq!(
+            ctx.gpu_stream_create_call_count(),
+            1,
+            "gpu_stream_create must be called exactly once per executor handle"
+        );
+    }
+
+    #[test]
+    fn default_stream_is_independent_per_executor() {
+        // Two different executor handles must not share a cache entry
+        // — each gets its own default stream.
+        let mut ctx = MockNativeContext::new();
+        let exec_a = fresh_test_handle();
+        let exec_b = fresh_test_handle();
+        ctx.set_gpu_stream_create_result(Some(1));
+        let a = resolve_or_create_default_stream(&mut ctx, exec_a);
+        ctx.set_gpu_stream_create_result(Some(2));
+        let b = resolve_or_create_default_stream(&mut ctx, exec_b);
+        assert_eq!(a, Some(1));
+        assert_eq!(b, Some(2));
+        // Both cached: re-querying returns the same per-executor value
+        // even though the mock's script has since moved on to `Some(2)`.
+        assert_eq!(resolve_or_create_default_stream(&mut ctx, exec_a), Some(1));
+        assert_eq!(ctx.gpu_stream_create_call_count(), 2);
+    }
+
+    #[test]
+    fn release_executor_releases_its_cached_default_stream() {
+        // `builtin_release_executor` must forward the executor's
+        // cached default-stream handle to `ctx.gpu_stream_release`
+        // (not just drop it locally) — otherwise a real CUDA stream
+        // leaks every time an app closes its executor without ever
+        // calling `newStream`/`closeStream` explicitly.
+        let mut ctx = MockNativeContext::new();
+        ctx.set_gpu_stream_create_result(Some(555));
+        let exec = state::with(|s| {
+            let h = s.fresh_handle();
+            s.executors.insert(h, 0);
+            h
+        });
+        assert_eq!(resolve_or_create_default_stream(&mut ctx, exec), Some(555));
+
+        builtin_release_executor(&mut ctx, &[Value::Long(exec as i64)]).unwrap();
+
+        assert_eq!(ctx.gpu_stream_release_calls(), vec![555]);
+        // The executor's cache entry is gone too, so a hypothetical
+        // reuse of the same numeric handle after release would create
+        // a fresh stream rather than resurrecting the released one.
+        let still_cached =
+            state::with(|s| s.executor_default_stream.get(&exec).copied());
+        assert_eq!(still_cached, None);
+    }
+
+    #[test]
+    fn release_executor_without_a_default_stream_does_not_call_release() {
+        // An executor that never submitted anything (no default stream
+        // ever created) must not call `gpu_stream_release` at all —
+        // there is nothing to release, and calling it with a bogus
+        // handle would be misleading in a trace.
+        let mut ctx = MockNativeContext::new();
+        let exec = state::with(|s| {
+            let h = s.fresh_handle();
+            s.executors.insert(h, 0);
+            h
+        });
+
+        builtin_release_executor(&mut ctx, &[Value::Long(exec as i64)]).unwrap();
+
+        assert!(ctx.gpu_stream_release_calls().is_empty());
+    }
+
+    #[test]
+    fn close_stream_forwards_release_to_the_registry() {
+        // `builtin_close_stream` must call `ctx.gpu_stream_release`
+        // with the exact handle it was given, in addition to dropping
+        // the local bookkeeping entry.
+        let mut ctx = MockNativeContext::new();
+        let handle: u64 = 4242;
+        state::with(|s| {
+            s.streams.insert(handle, 0);
+        });
+
+        builtin_close_stream(&mut ctx, &[Value::Long(handle as i64)]).unwrap();
+
+        assert_eq!(ctx.gpu_stream_release_calls(), vec![handle]);
+        assert!(state::with(|s| s.streams.get(&handle).is_none()));
+    }
+
+    #[test]
+    fn new_stream_wraps_the_real_handle_when_a_device_is_available() {
+        // With `gpu_stream_create` scripted to succeed, the handle
+        // `builtin_new_stream` records in local bookkeeping must be
+        // the SAME real handle the registry minted — not a separately
+        // counted local synthetic one — so `resolve_stream` (on the
+        // `OffloadCache` side, not reachable from this mock) would
+        // find the exact stream `newStream()` handed to Java.
+        let mut ctx = MockNativeContext::new();
+        ctx.set_gpu_stream_create_result(Some(9001));
+        let exec = state::with(|s| {
+            let h = s.fresh_handle();
+            s.executors.insert(h, 0);
+            h
+        });
+        let r = builtin_new_stream(&mut ctx, &[Value::Long(exec as i64)]);
+        // `instantiate_handle_wrapper` calls `ctx.new_object` /
+        // `ctx.invoke`, which `MockNativeContext` happily fabricates a
+        // synthetic class + object for (it doesn't need a real
+        // `GpuStreamImpl` on the classpath). What this test actually
+        // checks is the bookkeeping side effect below, not the exact
+        // shape of the wrapper's return value.
+        assert!(r.is_ok());
+        assert_eq!(
+            state::with(|s| s.streams.get(&9001).copied()),
+            Some(exec),
+            "the real gpu_stream_create handle must be the one recorded, not a fresh local one"
+        );
+    }
+
+    // ── 2026-07-11: `arrayAllocate*` — device-only allocation ───────────
+    //
+    // `GpuArray.allocate(exec, len)` has no host source array; the
+    // native shim mints a zero-filled host-bytes mirror instead of
+    // snapshotting a Java array (`wrap_primitive_array`'s job). These
+    // tests exercise allocation, the `arrayToHost` zero-fill round
+    // trip, the negative-length bad-arg convention, and
+    // `releaseArray`'s double-release idempotency.
+
+    #[test]
+    fn allocate_int_round_trips_zeros_via_to_host() {
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_array_allocate_int(&mut ctx, &[Value::Int(4)]).unwrap();
+        let handle = match r {
+            Some(Value::Long(h)) => h,
+            other => panic!("expected a non-zero handle, got {other:?}"),
+        };
+        assert_ne!(handle, 0);
+        assert_eq!(
+            builtin_array_is_resident(&mut ctx, &[Value::Long(handle)]).unwrap(),
+            Some(Value::Int(1)),
+            "an allocated array is resident (host bytes tracked), same as arrayWrap*"
+        );
+
+        let host = builtin_array_to_host(&mut ctx, &[Value::Long(handle)]).unwrap();
+        match host {
+            Some(Value::Object(Some(arr))) => {
+                assert_eq!(ctx.array_length(arr), 4);
+                for i in 0..4 {
+                    assert_eq!(ctx.get_array_element(arr, i), Value::Int(0));
+                }
+            }
+            other => panic!("expected a materialized int[] array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allocate_long_round_trips_zeros_via_to_host() {
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_array_allocate_long(&mut ctx, &[Value::Int(3)]).unwrap();
+        let handle = match r {
+            Some(Value::Long(h)) => h,
+            other => panic!("expected a non-zero handle, got {other:?}"),
+        };
+        let host = builtin_array_to_host(&mut ctx, &[Value::Long(handle)]).unwrap();
+        match host {
+            Some(Value::Object(Some(arr))) => {
+                assert_eq!(ctx.array_length(arr), 3);
+                for i in 0..3 {
+                    assert_eq!(ctx.get_array_element(arr, i), Value::Long(0));
+                }
+            }
+            other => panic!("expected a materialized long[] array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allocate_float_round_trips_zeros_via_to_host() {
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_array_allocate_float(&mut ctx, &[Value::Int(5)]).unwrap();
+        let handle = match r {
+            Some(Value::Long(h)) => h,
+            other => panic!("expected a non-zero handle, got {other:?}"),
+        };
+        let host = builtin_array_to_host(&mut ctx, &[Value::Long(handle)]).unwrap();
+        match host {
+            Some(Value::Object(Some(arr))) => {
+                assert_eq!(ctx.array_length(arr), 5);
+                for i in 0..5 {
+                    assert_eq!(ctx.get_array_element(arr, i), Value::Float(0.0));
+                }
+            }
+            other => panic!("expected a materialized float[] array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allocate_double_round_trips_zeros_via_to_host() {
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_array_allocate_double(&mut ctx, &[Value::Int(2)]).unwrap();
+        let handle = match r {
+            Some(Value::Long(h)) => h,
+            other => panic!("expected a non-zero handle, got {other:?}"),
+        };
+        let host = builtin_array_to_host(&mut ctx, &[Value::Long(handle)]).unwrap();
+        match host {
+            Some(Value::Object(Some(arr))) => {
+                assert_eq!(ctx.array_length(arr), 2);
+                for i in 0..2 {
+                    assert_eq!(ctx.get_array_element(arr, i), Value::Double(0.0));
+                }
+            }
+            other => panic!("expected a materialized double[] array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allocate_zero_length_is_a_valid_empty_array() {
+        // `len == 0` is not an error — Java `new int[0]` is legal and
+        // must round-trip as a real (empty) array, not the bad-arg
+        // sentinel.
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_array_allocate_int(&mut ctx, &[Value::Int(0)]).unwrap();
+        let handle = match r {
+            Some(Value::Long(h)) => h,
+            other => panic!("expected a non-zero handle, got {other:?}"),
+        };
+        assert_ne!(handle, 0);
+        let host = builtin_array_to_host(&mut ctx, &[Value::Long(handle)]).unwrap();
+        match host {
+            Some(Value::Object(Some(arr))) => assert_eq!(ctx.array_length(arr), 0),
+            other => panic!("expected a materialized (empty) int[] array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allocate_negative_length_is_the_bad_arg_sentinel() {
+        // Mirrors `wrap_primitive_array`'s null-host-array convention:
+        // a bad argument returns handle 0 without minting a state
+        // entry, rather than throwing or `as usize`-wrapping into an
+        // enormous allocation.
+        let mut ctx = MockNativeContext::new();
+        for len in [-1, -2, i32::MIN] {
+            let r = builtin_array_allocate_int(&mut ctx, &[Value::Int(len)]).unwrap();
+            assert_eq!(r, Some(Value::Long(0)), "length {len} must yield handle 0");
+        }
+        let r = builtin_array_allocate_long(&mut ctx, &[Value::Int(-5)]).unwrap();
+        assert_eq!(r, Some(Value::Long(0)));
+        let r = builtin_array_allocate_float(&mut ctx, &[Value::Int(-5)]).unwrap();
+        assert_eq!(r, Some(Value::Long(0)));
+        let r = builtin_array_allocate_double(&mut ctx, &[Value::Int(-5)]).unwrap();
+        assert_eq!(r, Some(Value::Long(0)));
+    }
+
+    #[test]
+    fn allocate_release_then_double_release_is_idempotent() {
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_array_allocate_int(&mut ctx, &[Value::Int(8)]).unwrap();
+        let handle = match r {
+            Some(Value::Long(h)) => h,
+            other => panic!("expected a non-zero handle, got {other:?}"),
+        };
+        assert_eq!(
+            builtin_array_is_resident(&mut ctx, &[Value::Long(handle)]).unwrap(),
+            Some(Value::Int(1))
+        );
+
+        builtin_release_array(&mut ctx, &[Value::Long(handle)]).unwrap();
+        assert_eq!(
+            builtin_array_is_resident(&mut ctx, &[Value::Long(handle)]).unwrap(),
+            Some(Value::Int(0)),
+            "released handle reports not-resident, the same absent => false convention"
+        );
+
+        // A second release of the same (already-released) handle must
+        // not panic and must leave the array absent, matching
+        // `ResidencyTracker::release`'s documented idempotency
+        // (`vm/src/runtime/gpu_residency.rs`) and `releaseFuture`'s
+        // remove-is-a-no-op-on-missing-key shape used elsewhere in this
+        // file.
+        builtin_release_array(&mut ctx, &[Value::Long(handle)]).unwrap();
+        assert_eq!(
+            builtin_array_is_resident(&mut ctx, &[Value::Long(handle)]).unwrap(),
+            Some(Value::Int(0))
+        );
+
+        // `arrayToHost` on a released handle returns null, same as an
+        // always-unknown handle.
+        let host = builtin_array_to_host(&mut ctx, &[Value::Long(handle)]).unwrap();
+        assert_eq!(host, Some(Value::Object(None)));
     }
 }

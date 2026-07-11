@@ -76,6 +76,40 @@ across OS threads (one `JvmThread` per Java thread). Native methods are immutabl
 after construction — register them on the `VmConfig` / `SharedVm` before first use.
 One VM per process is the only tested configuration.
 
+## GPU offload for embedders
+
+The `gpu-offload` feature (listed above) forwards to `cratonvm-vm/gpu-offload` and re-exports
+`VmConfig`'s four GPU fields unchanged — `gpu_offload_enabled`, `gpu_device_ordinal`,
+`gpu_min_work`, `print_gpu_decisions` (all `pub`, see `vm/src/config.rs`) — so you can set them
+directly on a `VmConfig` value with struct-update syntax; there is no `with_gpu_offload(...)`
+builder helper here yet. Two things this crate does not do for you today:
+
+- **Enabling `gpu-offload` alone links the stub CUDA backend, not the real driver.** Every
+  device probe returns `DeviceError::NoDriver`; this mode is useful for exercising the
+  `VmConfig` GPU-field plumbing without a GPU present, but it never actually dispatches work
+  to a device. For the real backend, enable `gpu-driver` instead:
+
+  ```toml
+  [dependencies]
+  cratonvm-embed = { version = "0.3", features = ["gpu-driver"] }
+  ```
+
+  `gpu-driver` implies `gpu-offload` and additionally turns on cuda-bridge's real CUDA Driver
+  API bindings, mirroring `vm-cli`'s own composite feature
+  (`gpu-driver = ["gpu", "cuda-bridge/cuda"]`, `vm-cli/Cargo.toml`). The NVIDIA driver itself is
+  dlopened at runtime, not linked at build time, so building with `gpu-driver` does not require
+  CUDA on the build machine — only on whichever machine runs the resulting binary with
+  `gpu_offload_enabled = true`.
+- **No GPU-specific convenience helpers.** This facade adds no `GpuArray`/`GpuExecutor`-style
+  wrapper; you work with the four `VmConfig` fields above and the underlying `cratonvm-vm`
+  offload machinery directly. The explicit-submission Java-side API is documented separately in
+  `docs/gpu/async-api.md`.
+
+See [`docs/EMBEDDING.md`](../docs/EMBEDDING.md#gpu-offload-for-embedders) for the C-ABI
+comparison (GPU offload is **not** reachable from `libcratonvm` at all today) and
+[`docs/known-issues/gpu-offload-followups-20260711.md`](../docs/known-issues/gpu-offload-followups-20260711.md)
+for open gaps in the offload path itself.
+
 ## Minimal usage
 
 ```rust,no_run
