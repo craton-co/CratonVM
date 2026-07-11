@@ -8,7 +8,7 @@
 
 // AUDIT 2026-05-16: std::collections::HashMap is unused — the registry
 // migrated to rustc_hash::FxHashMap (T10.9.B). Import removed.
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// NIO-SERVER-SOCKET (route 1): cached check of the `CRATONVM_REAL_NET_SOCKETS`
 /// env var. When set, the native registry drops all synthetic
@@ -2856,6 +2856,55 @@ pub struct StackTraceEntry {
 /// - `Ok(None)` — method returned void
 /// - `Err(MethodCallFailed)` — method threw an exception or had an internal error
 pub type NativeCallback = fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult;
+
+/// Event emitted by the native `ByteArrayOutputStream` implementation before
+/// it falls back to growing its in-heap byte buffer.
+///
+/// Most streams are ordinary buffers, so observers return `Ok(false)` and the
+/// I/O crate performs its normal operation.  A small number of bridge APIs
+/// expose a ByteArrayOutputStream-shaped Java object while the bytes must go to
+/// a native sink immediately (legacy fixed-length HttpURLConnection is one).
+/// Keeping that opt-in at the API boundary avoids making native-io depend on a
+/// higher-level protocol crate.
+pub enum BaosEvent {
+    WriteByte(u8),
+    /// A Java byte-array slice.  The observer must read it through `ctx` only
+    /// after deciding it owns this stream, keeping the ordinary BAOS hot path
+    /// allocation-free.
+    WriteArray {
+        array: ObjectRef,
+        offset: usize,
+        len: usize,
+    },
+    Flush,
+    Close,
+}
+
+/// Return `Ok(true)` when the event was consumed and the ordinary BAOS path
+/// must be skipped; `Ok(false)` leaves the receiver's normal buffering intact.
+pub type BaosEventHook =
+    fn(&mut dyn NativeContext, ObjectRef, BaosEvent) -> Result<bool, MethodCallFailed>;
+
+static BAOS_EVENT_HOOK: OnceLock<BaosEventHook> = OnceLock::new();
+
+/// Install the process-wide optional BAOS bridge hook.  Registration happens
+/// during native bootstrap; repeated registrations are harmless because the
+/// first (and only) bridge implementation wins.
+pub fn install_baos_event_hook(hook: BaosEventHook) {
+    let _ = BAOS_EVENT_HOOK.set(hook);
+}
+
+/// Offer a BAOS event to the optional bridge hook.
+pub fn dispatch_baos_event(
+    ctx: &mut dyn NativeContext,
+    stream: ObjectRef,
+    event: BaosEvent,
+) -> Result<bool, MethodCallFailed> {
+    match BAOS_EVENT_HOOK.get() {
+        Some(hook) => hook(ctx, stream, event),
+        None => Ok(false),
+    }
+}
 
 /// Classification of a registered native method.
 ///

@@ -170,3 +170,9 @@ linked above; once that lands, re-verify this test (and re-check
 behavior changes, since they share the same underlying connector timing).
 Do not re-investigate the "implicit response commit" angle — it's refuted
 above.
+# Resolved 2026-07-11
+
+`TestNonBlockingAPI.testNonBlockingReadIgnoreIsReady` now passes after the
+fixed-length HTTP streaming repair. The historical investigation below is
+archived with its root-cause record at
+[`httpurlconnection-fixed-length-streaming-deferred.md`](httpurlconnection-fixed-length-streaming-deferred.md).

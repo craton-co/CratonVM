@@ -3327,6 +3327,13 @@ fn native_baos_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    if cratonvm_native_api::dispatch_baos_event(
+        ctx,
+        this,
+        cratonvm_native_api::BaosEvent::WriteByte((byte_val & 0xFF) as u8),
+    )? {
+        return Ok(None);
+    }
     if let Some(fd) = process_pipe_output_fd(ctx, this) {
         ctx.fd_table()
             .write_byte(fd, (byte_val & 0xFF) as u8)
@@ -3382,6 +3389,17 @@ fn native_baos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     check_array_bounds(off_i, len_i, ctx.array_length(buf))?;
     let off = off_i as usize;
     let len = len_i as usize;
+    if cratonvm_native_api::dispatch_baos_event(
+        ctx,
+        this,
+        cratonvm_native_api::BaosEvent::WriteArray {
+            array: buf,
+            offset: off,
+            len,
+        },
+    )? {
+        return Ok(None);
+    }
     if let Some(fd) = process_pipe_output_fd(ctx, this) {
         let mut bytes = vec![0u8; len];
         ctx.read_byte_array_into(buf, off, &mut bytes);
@@ -3558,6 +3576,9 @@ fn native_baos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    if cratonvm_native_api::dispatch_baos_event(ctx, this, cratonvm_native_api::BaosEvent::Close)? {
+        return Ok(None);
+    }
     process_pipe_output_close(ctx, this);
     Ok(None)
 }
@@ -3589,6 +3610,9 @@ fn native_baos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    if cratonvm_native_api::dispatch_baos_event(ctx, this, cratonvm_native_api::BaosEvent::Flush)? {
+        return Ok(None);
+    }
     if let Some(fd) = process_pipe_output_fd(ctx, this) {
         ctx.fd_table().flush(fd).map_err(io_err)?;
     }

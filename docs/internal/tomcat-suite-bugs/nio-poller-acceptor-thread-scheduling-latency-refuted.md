@@ -1,4 +1,7 @@
-# Superseded: NioEndpoint Acceptor/Poller scheduling latency
+# Refuted: NioEndpoint Acceptor/Poller scheduling latency
+
+**Archived 2026-07-11.** The fixed-length HTTP streaming repair passed both
+Tomcat regressions. This was never a VM scheduling defect.
 
 The claimed scheduler/GC-blocking-region issue is **refuted**. The Acceptor
 entered native `accept()` immediately; a direct `Socket` client was accepted

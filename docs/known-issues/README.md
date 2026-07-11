@@ -4,13 +4,18 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
-## 2026-07-10 `testNonBlockingReadIgnoreIsReady`: Acceptor/Poller theory refuted; real cause is deferred `HttpURLConnection` streaming
+## 2026-07-11 `testNonBlockingReadIgnoreIsReady`: fixed-length HTTP streaming FIXED
 
-**Correction (2026-07-11):** The Acceptor/Poller finding below was disproved
+**Resolved (2026-07-11):** The Acceptor/Poller finding below was disproved
 by a minimal fixed-length-streaming `HttpURLConnection` reproducer. The
 legacy bridge buffers its body locally and only opens/sends the request at
 response retrieval; direct `Socket` clients are accepted promptly. The active
-record is [`httpurlconnection-fixed-length-streaming-deferred.md`](httpurlconnection-fixed-length-streaming-deferred.md).
+record is archived at [`httpurlconnection-fixed-length-streaming-deferred.md`](../internal/tomcat-suite-bugs/httpurlconnection-fixed-length-streaming-deferred.md).
+
+The implementation now sends real-carrier fixed-length HTTP request heads and
+body writes immediately; both `testNonBlockingReadIgnoreIsReady` and
+`testNonBlockingRead` pass. The remaining text in this section is retained as
+historical root-cause evidence.
 
 Re-investigated
 [`tomcat-08-07/nonblockingreadignoreisready-async-error-response-completion-gap.md`](tomcat-08-07/nonblockingreadignoreisready-async-error-response-completion-gap.md).
