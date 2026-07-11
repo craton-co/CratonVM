@@ -394,6 +394,35 @@ impl GcBarrier {
         self.threads_blocked.load(Ordering::Acquire)
     }
 
+    /// Drain every pause that excluded `flag`'s owner, then clear the flag
+    /// while still holding the transition lock. A separate drain followed by
+    /// a plain store can let a new pause exclude a thread that has already
+    /// resumed mutating bytecode.
+    pub fn leave_blocked_region_flagged(
+        &self,
+        tid: ThreadId,
+        flag: &std::sync::atomic::AtomicBool,
+    ) {
+        let mut inner = self.inner.lock();
+        loop {
+            if !self.stw_requested.load(Ordering::Acquire) || inner.initiator == Some(tid) {
+                flag.store(false, Ordering::Release);
+                return;
+            }
+            let participating = !inner.excluded_blocked.contains(&tid.0);
+            let arrival_gen = self.gc_generation.load(Ordering::Acquire);
+            if participating {
+                inner.arrived += 1;
+                if inner.arrived >= inner.expected {
+                    self.all_arrived.notify_all();
+                }
+            }
+            while self.gc_generation.load(Ordering::Acquire) == arrival_gen {
+                self.gc_complete.wait(&mut inner);
+            }
+        }
+    }
+
     /// Wait for all expected threads to arrive at the barrier.
     /// Called by the GC initiator after `request_stw`.
     pub fn wait_for_all(&self) {
@@ -659,6 +688,14 @@ impl<'a> BlockedGuard<'a> {
     {
         let this = std::mem::ManuallyDrop::new(self);
         this.barrier.mark_blocked_region_leave_after(f);
+    }
+
+    /// Finish a Java blocking region and publish it runnable under the same
+    /// transition lock.  The registry flag is the authoritative STW census
+    /// input; clearing it after this guard drops would leave a window where a
+    /// newly requested pause excludes an already-running mutator.
+    pub fn finish_flagged(self, flag: &std::sync::atomic::AtomicBool) {
+        self.finish_after(|| flag.store(false, Ordering::Release));
     }
 }
 
@@ -1004,5 +1041,44 @@ mod tests {
             );
         }
         barrier.complete_gc(HashMap::new());
+    }
+
+    #[test]
+    fn blocked_guard_finish_flagged_waits_for_excluding_pause() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+
+        let barrier = Arc::new(GcBarrier::new());
+        let flag = Arc::new(AtomicBool::new(true));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+
+        let b = barrier.clone();
+        let f = flag.clone();
+        let handle = std::thread::spawn(move || {
+            let guard = b.enter_blocked();
+            ready_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+            guard.finish_flagged(&f);
+        });
+        ready_rx.recv().unwrap();
+
+        assert!(barrier.request_stw_counted_with_live_blocked(ThreadId(0), || (2, 1, vec![2])));
+        finish_tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(flag.load(Ordering::Acquire));
+        assert_eq!(barrier.pending_count(), 0);
+        barrier.complete_gc(HashMap::new());
+        handle.join().unwrap();
+        assert!(!flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn leave_blocked_region_flagged_clears_immediately_without_pause() {
+        use std::sync::atomic::AtomicBool;
+        let barrier = GcBarrier::new();
+        let flag = AtomicBool::new(true);
+        barrier.leave_blocked_region_flagged(ThreadId(7), &flag);
+        assert!(!flag.load(Ordering::Acquire));
     }
 }

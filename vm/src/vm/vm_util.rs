@@ -459,7 +459,7 @@ pub fn ensure_class_initialized_shared(
                         let _result = cvar.wait_for(&mut guard, std::time::Duration::from_secs(30));
                     }
                     drop(guard);
-                    drop(blk);
+                    blk.finish_flagged(&ctx.thread.gc_block_state.in_blocked_region);
                     ctx.check_post_block_gc();
                     // Loop back to re-check state (might be Initialized or Error)
                     continue;

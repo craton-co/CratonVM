@@ -511,7 +511,13 @@ fn stw_take_over_and_wait(
     let mut warned = false;
     loop {
         let tids_before = taken.tids.len();
-        let newly = if crate::jit::conservative_roots::any_thread_in_jit() {
+        // The global JIT-depth counter is a fast first-pass hint.  Once a
+        // cooperative wait has actually timed out, do one real RIP-based scan
+        // even if that hint says no JIT call is live: a missed JIT entry/exit
+        // bookkeeping transition must not turn into a permanent STW wait.
+        // `take_over_pass` itself only parks peers whose RIP is in a registered
+        // JIT range; all other peers immediately resume and remain cooperative.
+        let newly = if rounds != 0 || crate::jit::conservative_roots::any_thread_in_jit() {
             xt::take_over_pass(&mut taken, &|a| shared.heap.is_object_address(a), xt_roots)
         } else {
             0
@@ -2658,8 +2664,8 @@ pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
         crate::jit::conservative_roots::invalidate_scan_cache_for_gc();
         update_root_snapshot(shared, thread);
 
-        // Arrive at barrier and wait for GC to complete
-        let pointer_map = shared.gc_barrier.arrive_and_wait(thread.thread_id);
+        // Resolve participation from this pause's identity census.
+        let pointer_map = shared.gc_barrier.arrive_and_wait_auto(thread.thread_id);
 
         // Apply pointer map to this thread's frames
         if !pointer_map.is_empty() {

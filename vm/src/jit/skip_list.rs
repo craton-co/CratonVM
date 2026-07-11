@@ -658,17 +658,14 @@ fn should_skip_jit_internal(
             });
         }
 
-        // j.u.c. queue-synchronizer family (AbstractQueuedSynchronizer /
-        // AbstractQueuedLongSynchronizer / ReentrantReadWriteLock$Sync) —
-        // deliberately NOT gated by `callee_saved_gpr_local_homes_enabled()`.
-        // See `is_known_miscompile_aqs_family`'s doc comment for why this
-        // family must stay unconditional under Conservative even though the
-        // rest of the targeted list now requires opting back into the legacy
-        // GPR-local-homes allocator. Aggressive still lifts it, same as
-        // every other targeted-list entry, so developers can surface new
-        // miscompiles on purpose.
-        if is_known_miscompile_aqs_family(class_name, method_name)
-            && !package_allowed(class_name, allow_packages)
+        // Core-library JIT code is fail-closed under Conservative.  The AQS
+        // probe still corrupts an AQS node after its entire lock package is
+        // interpreted, proving that the remaining producer can be a core-Java
+        // caller or helper outside a hand-maintained method list.  Until the
+        // shared JIT allocation/root-preservation defect is fixed, compile no
+        // `java/` method by default. Aggressive and the package allow-list
+        // retain the diagnostic escape hatch.
+        if class_name.starts_with("java/") && !package_allowed("java/", allow_packages)
         {
             return Some(SkipReason::JavaUtilCollection);
         }
@@ -2529,6 +2526,21 @@ fn is_known_miscompile_aqs_family(class_name: &str, method_name: &str) -> bool {
                 "newConditionNode"
             )
             | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "enableWait")
+            // --- ReentrantLock ---
+            // The outer lock/unlock methods and the Sync implementations feed
+            // directly into the classic AQS queue.  They must be covered by
+            // the same unconditional guard: the legacy outer-method entries
+            // in `is_known_miscompile` are gated by the GPR-local-home switch,
+            // leaving these allocate/CAS queue paths JIT-eligible by default.
+            | ("java/util/concurrent/locks/ReentrantLock", "lock")
+            | ("java/util/concurrent/locks/ReentrantLock", "unlock")
+            | ("java/util/concurrent/locks/ReentrantLock$Sync", "lock")
+            | ("java/util/concurrent/locks/ReentrantLock$Sync", "nonfairTryAcquire")
+            | ("java/util/concurrent/locks/ReentrantLock$Sync", "tryRelease")
+            | ("java/util/concurrent/locks/ReentrantLock$NonfairSync", "initialTryLock")
+            | ("java/util/concurrent/locks/ReentrantLock$NonfairSync", "tryAcquire")
+            | ("java/util/concurrent/locks/ReentrantLock$FairSync", "initialTryLock")
+            | ("java/util/concurrent/locks/ReentrantLock$FairSync", "tryAcquire")
             // --- AbstractQueuedLongSynchronizer (JDK 25+, long state) ---
             | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "acquire")
             | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "release")
@@ -3017,6 +3029,12 @@ mod tests {
                 "java/util/concurrent/locks/AbstractQueuedSynchronizer$Node",
                 "clearStatus",
             ),
+            ("java/util/concurrent/locks/ReentrantLock", "lock"),
+            ("java/util/concurrent/locks/ReentrantLock$Sync", "lock"),
+            (
+                "java/util/concurrent/locks/ReentrantLock$NonfairSync",
+                "tryAcquire",
+            ),
             (
                 "java/util/concurrent/locks/AbstractQueuedLongSynchronizer",
                 "acquire",
@@ -3075,6 +3093,19 @@ mod tests {
             Some(SkipReason::Constructor),
             "HoldCounter.<init> must stay skipped under Conservative (via the general \
              constructor rule)"
+        );
+    }
+
+    #[test]
+    fn concurrent_locks_package_is_conservative_only() {
+        let class_name = "java/util/concurrent/locks/ReentrantLock$Sync";
+        assert_eq!(
+            check(class_name, "lock", false, true, SkipPolicy::Conservative),
+            Some(SkipReason::JavaUtilCollection)
+        );
+        assert_eq!(
+            check(class_name, "lock", false, true, SkipPolicy::Aggressive),
+            None
         );
     }
 
