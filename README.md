@@ -46,9 +46,9 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 | Fibonacci(44)              | 2,774 ms      | 9,321 ms          | 3.36x         |
 | Sieve (100K x 20,000)      | 5,253 ms      | 19,371 ms         | 3.69x         |
 | Matrix 1280x1280           | 2,623 ms      | 10,364 ms         | 3.95x         |
-| HashMap (1M put/get)       | 49 ms         | 17,510 ms         | 357x          |
-| String/Regex (10K)         | 10 ms         | 2,470 ms          | 247x          |
-| **QuickBench TOTAL**       | **13,331 ms** | **70,501 ms**     | **5.29x**     |
+| HashMap (1M put/get)       | 47 ms         | 17,144 ms         | 365x          |
+| String/Regex (10K)         | 12 ms         | 1,110 ms          | 92.5x         |
+| **QuickBench TOTAL**       | **13,331 ms** | **68,775 ms**     | **5.16x**     |
 | Binary Trees (depth=18)    | 382 ms        | 4,916 ms          | 12.9x         |
 
 *Measured 2026-07-10 on the primary Windows dev box (hybrid P/E-core CPU, pinned to
@@ -57,26 +57,53 @@ otherwise get scheduled onto slower E-cores, which skews results) against JDK 25
 and a CratonVM release build off `dev` with the guarded-inline-getfield JIT fast path
 at its default-on state (see below) plus HashMap and String/Regex kernels added to
 close a gap — the original 5 kernels were all math/arrays, with nothing exercising
-hash-map or string/regex workloads. The 6 QuickBench-proper kernels are measured in a
-single combined run (`bench/QuickBenchLong3.java`); Binary Trees is a separate,
-freshly-launched process (5-round average, checksums identical every round) — mixing
-it into the combined run inflates its ratio via accumulated GC/heap pressure from the
-preceding kernels, so it's kept isolated for a representative number, matching how
-`bench/BenchSuite` always measures it elsewhere in this repo. Checksums verified
-identical between CratonVM and JDK on every kernel in every configuration.
-`CRATONVM_JIT_OSR` back-edge OSR is default-on; `guarded_inline_getfield_enabled()` is
-the single largest lever in the first 4 rows — see
-[docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for its find/fix history.
+hash-map or string/regex workloads; HashMap and String/Regex rows re-measured
+2026-07-11 after the fixes described below (Arithmetic/Fibonacci/Sieve/Matrix/Binary
+Trees unchanged since 2026-07-10, not re-verified this pass). The 6 QuickBench-proper
+kernels are measured in a single combined run (`bench/QuickBenchLong3.java`); Binary
+Trees is a separate, freshly-launched process (5-round average, checksums identical
+every round) — mixing it into the combined run inflates its ratio via accumulated
+GC/heap pressure from the preceding kernels, so it's kept isolated for a
+representative number, matching how `bench/BenchSuite` always measures it elsewhere in
+this repo. Checksums verified identical between CratonVM and JDK on every kernel in
+every configuration. `CRATONVM_JIT_OSR` back-edge OSR is default-on;
+`guarded_inline_getfield_enabled()` is the single largest lever in the first 4 rows —
+see [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for its find/fix history.
 
-**HashMap and String/Regex are known-slow outliers, not calibration noise.** Sized far
-below the other kernels because at JDK-comparable scale they don't complete in
-reasonable time: HashMap held a stable ~230x ratio across sizes tested (228.6x at
-250K entries, 233.8x at 1M — a large constant-factor overhead, likely Integer
-autoboxing + allocation/GC pressure, not an algorithmic bug). String/Regex's ratio
-instead GREW with size (18.8x at 1K entries → 94.4x at 5K → 238.8x at 10K; did not
-finish in 60s at 50K), consistent with an O(n²) bug rather than interpreter overhead —
-suspects are StringBuilder growth strategy and `Matcher.find()` cursor advancement
-between successive calls. Tracked as a follow-up investigation, not yet root-caused.*
+**HashMap and String/Regex are known-slow outliers, not calibration noise — but both
+are now root-caused, and partially fixed.** Sized far below the other kernels because
+at JDK-comparable scale they don't complete in reasonable time.
+
+String/Regex's O(n²)-shaped scaling (18.8x at 1K entries → 238.8x at 10K in the
+original profiling) is fixed upstream: `Matcher`'s native find()/group() path and a
+substring-from-large-parent allocation path were both quadratic-allocation bugs, not
+interpreter overhead — see
+[`docs/known-issues/matcher-native-full-input-redecode-quadratic.md`](docs/known-issues/matcher-native-full-input-redecode-quadratic.md)
+and
+[`docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`](docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md)
+(merged `a87901e6`). The combined-run ratio dropped from 247x to 92.5x accordingly.
+
+HashMap's ~230–365x is a *different* shape of bug — cdb stack-sampling (attach-and-dump
+the JIT-compiled benchmark's own call stacks, the same technique used to profile the
+`bintrees` GC/allocation ceiling elsewhere in this repo) showed the ratio is flat across
+sizes (not O(n²)) and is NOT allocation/GC-bound: only ~9% of sampled stacks were in
+allocation/boxing paths, versus ~90% for an allocation-bound workload like `bintrees`.
+The real cost is fixed per-native-call overhead in the JIT-to-native dispatch path —
+`java.util.HashMap.put/get` and `Integer.hashCode()/valueOf()` are native Rust
+functions, and every call into one pays for conservative JIT-frame root scanning
+(~29% of sampled stacks, the largest single bucket), RwLock-guarded class/field-layout
+lookups, and generic dispatch-machinery overhead, none of which a pure-bytecode
+workload like `bintrees` ever touches. Three targeted, behavior-preserving fixes ship
+in this pass for the safely-addressable slice of that overhead (key hash/equals
+check-order, a lock-free receiver-corruption fast path, and a lock-free field-layout
+cache mirroring an already-proven pattern elsewhere in this codebase) — a 5-round,
+isolated (same rationale as Binary Trees above) re-measurement post-fix averages
+**~206x** (14,930 ms CratonVM / 72.6 ms JDK), down from the isolated methodology's
+prior ~357x. Deliberately NOT touched: conservative root scanning and the SATB GC
+flush, both correctness-critical with a real prior crash/heap-corruption history in
+this codebase. See
+[`docs/known-issues/hashmap-native-dispatch-overhead.md`](docs/known-issues/hashmap-native-dispatch-overhead.md)
+for the full investigation and remaining-work writeup.*
 
 See [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full 26-round JIT optimization journey.
 

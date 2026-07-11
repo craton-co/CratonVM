@@ -4,6 +4,28 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-11 `HashMap` put/get ~230-365x slower than JDK-25 root-caused, partially fixed — fixed per-native-call dispatch overhead, not allocation/GC
+
+Initial hypothesis (Integer autoboxing/allocation pressure) was wrong. cdb
+stack-sampling (same technique used for this repo's `bintrees` GC/allocation-ceiling
+profile) found the ratio is flat across sizes (not O(n²), unlike the sibling
+String/Regex bug below) and NOT allocation-bound: only ~9% of sampled stacks were in
+allocation/boxing paths vs ~90% for an allocation-bound workload. The real cost is
+fixed per-native-call overhead in the JIT-to-native dispatch path — `HashMap.put/get`
+and `Integer.hashCode()/valueOf()` are native Rust functions, and every call pays for
+conservative JIT-frame root scanning (~29% of samples, the largest bucket),
+RwLock-guarded class/field-layout lookups, and generic dispatch-machinery overhead.
+Three targeted, behavior-preserving fixes shipped for the safely-addressable slice
+(key hash/equals check-order in `native-collections/src/lib.rs`, a lock-free
+receiver-corruption fast path in `vm/src/vm/vm_exec.rs`, a lock-free field-layout
+cache in `gc/src/gen_heap.rs` mirroring an already-proven pattern elsewhere in this
+codebase) — isolated 5-round re-measurement averages ~206x post-fix, down from ~357x.
+Root scanning and the SATB GC flush (the largest remaining buckets) are deliberately
+NOT touched — both are correctness-critical with a real prior crash/heap-corruption
+history in this codebase. See
+[`hashmap-native-dispatch-overhead.md`](hashmap-native-dispatch-overhead.md) for the
+full investigation, profile evidence, and remaining-work writeup.
+
 ## 2026-07-11 TestParameterMap `replaceAll()` lock-bypass FIXED/RETIRED — real bug was an unwrapped `Map.Entry` escaping `Collections.unmodifiableMap(...).entrySet()`, not field visibility
 
 The doc's own hypothesis (a plain-`boolean` `ParameterMap.locked` field-visibility
