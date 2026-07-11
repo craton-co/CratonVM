@@ -58416,13 +58416,17 @@ fn native_cb_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 // ===========================================================================
 // Base64 — Encoder/Decoder for basic, URL-safe, and MIME variants
 // Encoder fields match the real JDK layout: newline, linemax, isURL, doPadding.
-// Decoder has one isURL field.  Use named fields rather than synthetic field
-// offsets because these classes are loaded from the real JDK in normal mode.
+// Decoder has one isURL field.  Keep the layout explicit because these classes
+// are loaded from the real JDK in normal mode.
 // ===========================================================================
 
 const B64_VARIANT_BASIC: i32 = 0;
 const B64_VARIANT_URL: i32 = 1;
 const B64_VARIANT_MIME: i32 = 2;
+const B64_ENCODER_FIELD_LINEMAX: usize = 1;
+const B64_ENCODER_FIELD_IS_URL: usize = 2;
+const B64_ENCODER_FIELD_DO_PADDING: usize = 3;
+const B64_DECODER_FIELD_IS_URL: usize = 0;
 
 const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const B64_URL_CHARS: &[u8; 64] =
@@ -58657,27 +58661,29 @@ fn b64_alloc_encoder(
     no_padding: bool,
 ) -> MethodCallResult {
     let encoder = alloc_concurrent_synthetic(ctx, "java/util/Base64$Encoder", 4);
-    ctx.set_field_by_name(
+    ctx.set_field(
         encoder,
-        "linemax",
+        B64_ENCODER_FIELD_LINEMAX,
         Value::Int(if variant == B64_VARIANT_MIME { 76 } else { 0 }),
     );
-    ctx.set_field_by_name(
+    ctx.set_field(
         encoder,
-        "isURL",
+        B64_ENCODER_FIELD_IS_URL,
         Value::Int((variant == B64_VARIANT_URL) as i32),
     );
-    ctx.set_field_by_name(encoder, "doPadding", Value::Int((!no_padding) as i32));
+    ctx.set_field(
+        encoder,
+        B64_ENCODER_FIELD_DO_PADDING,
+        Value::Int((!no_padding) as i32),
+    );
     Ok(Some(Value::Object(Some(encoder))))
 }
 
 fn b64_alloc_decoder(ctx: &mut dyn NativeContext, variant: i32) -> MethodCallResult {
     let decoder = alloc_concurrent_synthetic(ctx, "java/util/Base64$Decoder", 1);
-    ctx.set_field_by_name(
-        decoder,
-        "isURL",
-        Value::Int((variant == B64_VARIANT_URL) as i32),
-    );
+    // Preserve MIME as a distinct tag for the native decoder, which must
+    // accept whitespace.  Java only observes this field through native paths.
+    ctx.set_field(decoder, B64_DECODER_FIELD_IS_URL, Value::Int(variant));
     Ok(Some(Value::Object(Some(decoder))))
 }
 
@@ -58724,9 +58730,9 @@ fn b64_write_byte_array(ctx: &mut dyn NativeContext, data: &[u8]) -> ObjectRef {
 
 /// Helper: get variant tag from encoder/decoder `this`
 fn b64_variant(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    if matches!(ctx.get_field_by_name(this, "isURL"), Value::Int(v) if v != 0) {
+    if matches!(ctx.get_field(this, B64_ENCODER_FIELD_IS_URL), Value::Int(v) if v != 0) {
         B64_VARIANT_URL
-    } else if matches!(ctx.get_field_by_name(this, "linemax"), Value::Int(v) if v > 0) {
+    } else if matches!(ctx.get_field(this, B64_ENCODER_FIELD_LINEMAX), Value::Int(v) if v > 0) {
         B64_VARIANT_MIME
     } else {
         B64_VARIANT_BASIC
@@ -58734,7 +58740,15 @@ fn b64_variant(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
 }
 
 fn b64_no_padding(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
-    matches!(ctx.get_field_by_name(this, "doPadding"), Value::Int(0))
+    matches!(ctx.get_field(this, B64_ENCODER_FIELD_DO_PADDING), Value::Int(0))
+}
+
+fn b64_decoder_variant(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    match ctx.get_field(this, B64_DECODER_FIELD_IS_URL) {
+        Value::Int(B64_VARIANT_URL) => B64_VARIANT_URL,
+        Value::Int(B64_VARIANT_MIME) => B64_VARIANT_MIME,
+        _ => B64_VARIANT_BASIC,
+    }
 }
 
 fn native_b64_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -58777,7 +58791,7 @@ fn native_b64_without_padding(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let variant = b64_variant(ctx, this);
+    let variant = b64_decoder_variant(ctx, this);
     b64_alloc_encoder(ctx, variant, true)
 }
 
@@ -58790,7 +58804,7 @@ fn native_b64_decode_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let variant = b64_variant(ctx, this);
+    let variant = b64_decoder_variant(ctx, this);
     let bytes = b64_read_byte_array(ctx, src);
     match b64_decode(&bytes, variant) {
         Ok(decoded) => {
