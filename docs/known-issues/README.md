@@ -23,7 +23,7 @@ shape). See
 [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](CRATONVM-SPRING-GENUINE-BUGLIST-125.md)
 for full detail.
 
-## 2026-07-11 `HashMap` put/get ~230-365x slower than JDK-25 root-caused, partially fixed — fixed per-native-call dispatch overhead, not allocation/GC
+## 2026-07-11 `HashMap` native-dispatch overhead — FIXED/RETIRED
 
 Initial hypothesis (Integer autoboxing/allocation pressure) was wrong. cdb
 stack-sampling (same technique used for this repo's `bintrees` GC/allocation-ceiling
@@ -38,12 +38,11 @@ Three targeted, behavior-preserving fixes shipped for the safely-addressable sli
 (key hash/equals check-order in `native-collections/src/lib.rs`, a lock-free
 receiver-corruption fast path in `vm/src/vm/vm_exec.rs`, a lock-free field-layout
 cache in `gc/src/gen_heap.rs` mirroring an already-proven pattern elsewhere in this
-codebase) — isolated 5-round re-measurement averages ~206x post-fix, down from ~357x.
-Root scanning and the SATB GC flush (the largest remaining buckets) are deliberately
-NOT touched — both are correctness-critical with a real prior crash/heap-corruption
-history in this codebase. See
-[`hashmap-native-dispatch-overhead.md`](hashmap-native-dispatch-overhead.md) for the
-full investigation, profile evidence, and remaining-work writeup.
+codebase) — isolated 5-round re-measurement averaged ~206x post-fix, down from ~357x.
+A follow-up addressed the root-publication and dispatch residual and reached 10.54x
+the pinned CratonVM baseline; the
+completed investigation is archived at
+[`../internal/hashmap-native-dispatch-overhead.md`](../internal/hashmap-native-dispatch-overhead.md).
 
 ## 2026-07-11 TestParameterMap `replaceAll()` lock-bypass FIXED/RETIRED — real bug was an unwrapped `Map.Entry` escaping `Collections.unmodifiableMap(...).entrySet()`, not field visibility
 
@@ -1594,4 +1593,3 @@ Index + per-bug reports: [spring-boot-probe-sweep/INDEX.md](../internal/spring-b
   **SBR-08/09/10/11/13** object-identity cluster (CV synthesizes JDK objects as abstract/base-typed —
   jar conn, NIO FS, IntStream, MethodHandle, ProtectionDomain); **SBR-12** `cratonvm.internal.UnmodifiableList`
   name leak (needs real `ImmutableCollections` or a guarded alias).
-

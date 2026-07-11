@@ -726,6 +726,13 @@ pub trait NativeContext {
     /// Get the class id of a heap object.
     fn class_id_of_object(&self, obj: ObjectRef) -> ClassId;
 
+    /// VM-accelerated primitive-wrapper recognition. `None` means this context
+    /// does not implement the fast path; `Some(None)` means the object is not a
+    /// wrapper; `Some(Some(value))` is the unboxed primitive.
+    fn fast_unbox_primitive_wrapper(&self, _obj: ObjectRef) -> Option<Option<Value>> {
+        None
+    }
+
     /// True when the named class is loaded as a synthetic stub (no real
     /// `.class` bytes). Used to branch native helpers that must mirror JDK
     /// behaviour without registering natives that would override real JDK

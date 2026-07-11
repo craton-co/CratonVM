@@ -546,6 +546,13 @@ fn object_class_id(shared: &SharedVm) -> Option<ClassId> {
     Some(resolved)
 }
 
+thread_local! {
+    /// Last primitive-wrapper class observed by this host thread, scoped to a
+    /// specific SharedVm so sequential in-process VMs cannot alias ClassIds.
+    static PRIMITIVE_WRAPPER_CLASS_CACHE: std::cell::Cell<Option<(usize, ClassId)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 fn recover_stale_lambda_receiver_from_native_pins(
     shared: &SharedVm,
     thread: &JvmThread,
@@ -665,6 +672,29 @@ pub fn safe_native_call(
     callback: NativeCallback,
     args: &[Value],
 ) -> MethodCallResult {
+    safe_native_call_impl(shared, thread, callback, args, false)
+}
+
+/// Variant for dispatch paths that have already validated every non-null
+/// `Value::Object` against this VM's heap. It preserves ordinary native-call
+/// pinning and all return/exception handling while avoiding a duplicate heap
+/// membership search for each argument.
+pub(crate) fn safe_native_call_prevalidated_objects(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    callback: NativeCallback,
+    args: &[Value],
+) -> MethodCallResult {
+    safe_native_call_impl(shared, thread, callback, args, true)
+}
+
+fn safe_native_call_impl(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    callback: NativeCallback,
+    args: &[Value],
+    prevalidated_objects: bool,
+) -> MethodCallResult {
     // letsgo postmortem: record native dispatch with the caller frame's
     // identity so a SEGV inside a native callback leaves a breadcrumb of
     // *who* called it. The callback itself is an opaque fn-pointer, but
@@ -700,12 +730,25 @@ pub fn safe_native_call(
     // popped from the operand stack into this Rust slice and are otherwise
     // invisible to `collect_roots` / frame scanning during a safepoint GC.
     let pin_base = thread.native_pin_roots.len();
-    let mut arg_root_indices = Vec::with_capacity(args.len());
-    for a in args {
+    let mut inline_root_indices = [None; 4];
+    let mut overflow_root_indices =
+        (args.len() > inline_root_indices.len()).then(|| Vec::with_capacity(args.len()));
+    for (index, a) in args.iter().enumerate() {
         let before = thread.native_pin_roots.len();
-        pin_value_for_native_call(shared, &mut thread.native_pin_roots, a);
-        arg_root_indices.push((thread.native_pin_roots.len() > before).then_some(before));
+        match (prevalidated_objects, a) {
+            (true, Value::Object(Some(object))) => thread.native_pin_roots.push(*object),
+            _ => pin_value_for_native_call(shared, &mut thread.native_pin_roots, a),
+        }
+        let root_index = (thread.native_pin_roots.len() > before).then_some(before);
+        if let Some(indices) = overflow_root_indices.as_mut() {
+            indices.push(root_index);
+        } else {
+            inline_root_indices[index] = root_index;
+        }
     }
+    let arg_root_indices: &[Option<usize>] = overflow_root_indices
+        .as_deref()
+        .unwrap_or(&inline_root_indices[..args.len()]);
     let native_pin_base = thread.native_pin_roots.len();
 
     let mut remapped_args = None;
@@ -982,7 +1025,23 @@ pub fn safe_native_call(
     // exception as a handoff pin above the argument-root watermark; do not use
     // those temporary pins to reinterpret normal object returns.
     thread.native_pin_roots.truncate(pin_base);
-    if thread.native_pending_return.is_some() {
+    // A running JIT thread cannot be collected from this ordinary (non-blocking)
+    // return boundary: a peer-requested STW waits for the thread to reach its
+    // next safepoint, which refreshes the authoritative snapshot. Keep the
+    // object in native_pending_return across the short Rust-to-JIT handoff and
+    // avoid a full precise/conservative JIT-frame scan on every object-returning
+    // native call. Blocking natives publish through deposit_root_snapshot before
+    // they park, and interpreted callers retain the eager publication below.
+    //
+    // This matters for native collection bridges: HashMap.get returns an object
+    // on every operation, and eagerly scanning the active compiled frame made
+    // root publication dominate the entire benchmark.
+    let running_jit_handoff = crate::jit::conservative_roots::current_thread_jit_depth() != 0
+        && !shared
+            .gc_barrier
+            .stw_requested
+            .load(std::sync::atomic::Ordering::Acquire);
+    if thread.native_pending_return.is_some() && !running_jit_handoff {
         crate::runtime::interpreter::update_root_snapshot(shared, thread);
     }
 
@@ -2718,6 +2777,49 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn class_id_of_object(&self, obj: ObjectRef) -> ClassId {
         self.shared.heap.class_id_of(obj)
+    }
+
+    fn fast_unbox_primitive_wrapper(&self, obj: ObjectRef) -> Option<Option<Value>> {
+        let class_id = self.shared.heap.class_id_of(obj);
+        let vm_key = self.shared as *const SharedVm as usize;
+        let cached =
+            PRIMITIVE_WRAPPER_CLASS_CACHE.with(|cache| cache.get() == Some((vm_key, class_id)));
+        let is_wrapper = cached || {
+            let class_name = self
+                .shared
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|class| class.name.clone());
+            let recognized = class_name.as_deref().is_some_and(|name| {
+                matches!(
+                    name,
+                    "java/lang/Integer"
+                        | "java/lang/Long"
+                        | "java/lang/Boolean"
+                        | "java/lang/Character"
+                        | "java/lang/Byte"
+                        | "java/lang/Short"
+                        | "java/lang/Float"
+                        | "java/lang/Double"
+                )
+            });
+            if recognized {
+                PRIMITIVE_WRAPPER_CLASS_CACHE.with(|cache| {
+                    cache.set(Some((vm_key, class_id)));
+                });
+            }
+            recognized
+        };
+        if !is_wrapper {
+            return Some(None);
+        }
+        Some(match self.shared.heap.get_field(obj, 0) {
+            value @ (Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_)) => {
+                Some(value)
+            }
+            _ => None,
+        })
     }
 
     /// Phase 5: override the GPU dispatch escape hatch. Delegates
