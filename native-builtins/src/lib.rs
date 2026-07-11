@@ -25448,63 +25448,36 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             }
         },
     );
+    // These two were inline closures that called `ctx.read_string(this)`
+    // (decode the ENTIRE parent String) followed by `s.chars().collect()`
+    // (ANOTHER full-string pass into a `Vec<char>`) on every single call,
+    // regardless of how small the requested substring range was -- O(parent
+    // length) instead of O(substring length) per call. This is the real,
+    // active registration for `java/lang/String.substring` in real-JDK mode
+    // (register_essential_natives; NOT the lang_string.rs `native_string_substring`
+    // this file also defines, which is only reachable in
+    // `register_synthetic_overrides`, `#[cfg(feature = "synthetic-jdk")]`-gated
+    // and therefore never compiled into the default build -- a dead end this
+    // investigation went down first). Root-caused via a `while
+    // (m.find()) { m.group(N); }`-shaped user benchmark that turned out to
+    // reduce to plain `String.substring()` on a large parent string scaling
+    // O(n^2); see docs/internal/fixed-suite-bugs/
+    // substring-large-parent-quadratic-allocation-FIXED.md.
+    // `native_string_substring`/`native_string_substring_one` already have a
+    // "read only the requested range, don't materialize the whole String
+    // first" fast path (peeks at the backing array length + slices directly)
+    // -- delegate to them instead of duplicating (and re-introducing) the bug.
     registry.register(
         "java/lang/String",
         "substring",
         "(II)Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let begin = match args.get(1) {
-                Some(Value::Int(v)) => *v as usize,
-                _ => 0,
-            };
-            let end = match args.get(2) {
-                Some(Value::Int(v)) => *v as usize,
-                _ => 0,
-            };
-            let s = ctx.read_string(this).unwrap_or_default();
-            let chars: Vec<char> = s.chars().collect();
-            if end > chars.len() || begin > end {
-                return Err(
-                    cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
-                        index: begin as i32,
-                    }
-                    .into(),
-                );
-            }
-            let slice: String = chars[begin..end].iter().collect();
-            Ok(Some(Value::Object(Some(ctx.create_string(&slice)))))
-        },
+        native_string_substring,
     );
     registry.register(
         "java/lang/String",
         "substring",
         "(I)Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let begin = match args.get(1) {
-                Some(Value::Int(v)) => *v as usize,
-                _ => 0,
-            };
-            let s = ctx.read_string(this).unwrap_or_default();
-            let chars: Vec<char> = s.chars().collect();
-            if begin > chars.len() {
-                return Err(
-                    cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
-                        index: begin as i32,
-                    }
-                    .into(),
-                );
-            }
-            let slice: String = chars[begin..].iter().collect();
-            Ok(Some(Value::Object(Some(ctx.create_string(&slice)))))
-        },
+        lang_string::native_string_substring_one,
     );
     registry.register(
         "java/lang/String",
@@ -51631,12 +51604,200 @@ fn native_pattern_split_impl(
 }
 
 // --- Matcher natives ---
+//
+// CURRENTLY UNREACHABLE IN DEFAULT (real-JDK) BUILDS. `register()`
+// (`native-api/src/registry.rs`) silently drops every
+// `java/util/regex/Pattern`/`Matcher` registration when
+// `drop_real_layout_synthetic` is set — which `vm/src/vm/vm_init.rs` does
+// unconditionally on the real-JDK arm, before `register_essential_natives`
+// runs. Rationale (`registry.rs`): these natives predate the real JDK's
+// actual field layout and corrupt real-JDK-allocated objects if forced to
+// run against them, so in real-JDK mode `Pattern.compile()`/`Matcher.find()`
+// /`group()` always run the REAL loaded bytecode instead — confirmed at
+// runtime via unconditional instrumentation (an `eprintln!` at the top of
+// `native_matcher_find`/`native_matcher_group_idx` never fired for a real-JDK
+// `Pattern`/`Matcher` program).
+//
+// The functions below fix a genuine O(n^2) bug in THIS native bridge (full
+// input redecode per `find()`/`group()` call, see
+// `docs/known-issues/matcher-native-full-input-redecode-quadratic.md` for
+// the corrected writeup) — but because the bridge is dropped by default,
+// this fix currently has NO effect on any real-JDK program. It's kept
+// in case `drop_real_layout_synthetic` is ever narrowed (e.g. once the
+// legacy-layout/real-layout mismatch above is fixed at the root) or a
+// non-default config re-enables this bridge. The ACTUAL performance bug a
+// user hits with `Pattern`/`Matcher` on today's default build is upstream of
+// here, in the real JDK bytecode CratonVM's interpreter actually runs — see
+// `docs/known-issues/substring-large-parent-quadratic-allocation.md`.
 
-fn matcher_read_input(ctx: &mut dyn NativeContext, mat: cratonvm_types::ObjectRef) -> String {
-    match ctx.get_field(mat, MAT_FIELD_INPUT) {
-        Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
-        _ => String::new(),
+/// One cached decode of a `Matcher`'s input `String`, keyed by the
+/// `Matcher` object's own **identity hash**, not its `ObjectRef`
+/// (see [`matcher_read_input_cached`]).
+struct MatcherInputCacheEntry {
+    /// Identity hash of the `MAT_FIELD_INPUT` object this decode was taken
+    /// from — like the outer key, GC-move-stable but reassigned to a fresh
+    /// value on a genuinely new allocation, so a `reset(CharSequence)` swap
+    /// is detected without needing any GC to have happened.
+    input_identity: i32,
+    decoded: std::sync::Arc<str>,
+    /// Capture-group spans from the most recent `find()`-produced match on
+    /// this `Matcher`, if any — see [`matcher_cache_store_captures`].
+    captures: Option<MatcherCaptures>,
+}
+
+/// Capture-group byte offsets (absolute, into the SAME `decoded` string they
+/// were computed against) from a single `find()` call, cached so an
+/// immediately-following `group(N)`/`start(N)`/`end(N)` — the overwhelmingly
+/// common `while (m.find()) { m.group(N); }` idiom — doesn't have to re-run
+/// the regex engine a second time just to recover boundaries `find()` already
+/// computed (`native_matcher_group_idx`/`matcher_group_boundary`'s old
+/// unconditional `re.captures(&input[start..])` re-search cost was itself
+/// the dominant remaining O(n) driver even after the input-redecode fix —
+/// confirmed by an isolated `find()`-only benchmark scaling linearly while
+/// the `find()+group()` benchmark stayed superlinear).
+struct MatcherCaptures {
+    /// The match this was computed for (the Matcher's `MAT_FIELD_MATCH_START`
+    /// at capture time). Only trusted by a reader when it still equals the
+    /// Matcher's CURRENT match start — any match-producing path that doesn't
+    /// populate this (`find(int)`, `matches()`, `lookingAt()`, `region()`)
+    /// simply leaves it stale/mismatched, and callers fall back to a fresh,
+    /// always-correct re-search.
+    match_start: usize,
+    groups: Vec<Option<(usize, usize)>>,
+    named: std::collections::HashMap<String, usize>,
+}
+
+/// Keyed by `ctx.identity_hash_code(matcher)`, NOT `ObjectRef`.
+///
+/// `ObjectRef` is a raw heap pointer that CratonVM's moving GC relocates on
+/// every collection — an early version of this cache keyed by `ObjectRef`
+/// (and separately gated on an unchanged `ctx.gc_collection_count()`) was
+/// *correct* but had near-zero hit rate on any allocation-heavy find()-loop
+/// (this Matcher benchmark's `group()`/`create_string`/`Long.parseLong`
+/// churn triggers young-gen collections often enough that almost every call
+/// saw a bumped collection count, so almost every call redecoded anyway —
+/// confirmed by a before/after benchmark showing no measurable improvement).
+///
+/// `identity_hash_code` (`vm/src/vm/vm_exec.rs`) is a value stored in the
+/// object header and explicitly carried across a move by the GC — the same
+/// "stable across moves" property `register_var_handle_root`
+/// (`vm/src/vm/vm_exec.rs`, "Keyed by identity hash (stable across moves)
+/// for dedup") already relies on elsewhere in this VM. Using it as the cache
+/// key means a benign relocation (same logical object, new address) is
+/// invisible to this cache — only a genuinely different object (a fresh
+/// allocation reusing a freed address gets its own freshly-assigned identity
+/// hash, vanishingly unlikely to collide with the old one) causes a miss.
+/// [`MatcherInputCacheEntry::input_identity`] gives the same treatment to
+/// `MAT_FIELD_INPUT`, so a `reset(CharSequence)` swap is still caught.
+fn matcher_input_cache(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<i32, MatcherInputCacheEntry>> {
+    static CACHE: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<i32, MatcherInputCacheEntry>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Store capture-group spans for the match `find()` just produced, so a
+/// following `group(N)`/`start(N)`/`end(N)` on the SAME match can read them
+/// back instead of re-running the regex engine. No-op if the input cache
+/// entry is somehow absent (shouldn't happen — `find()` always calls
+/// [`matcher_read_input_cached`], which inserts one, before this); callers
+/// that miss simply take the slower, always-correct re-search fallback.
+fn matcher_cache_store_captures(
+    mat_identity: i32,
+    match_start: usize,
+    groups: Vec<Option<(usize, usize)>>,
+    named: std::collections::HashMap<String, usize>,
+) {
+    let cache = matcher_input_cache();
+    let mut guard = cache.lock();
+    if let Some(entry) = guard.get_mut(&mat_identity) {
+        entry.captures = Some(MatcherCaptures {
+            match_start,
+            groups,
+            named,
+        });
     }
+}
+
+/// Fetch cached capture-group spans for `match_start` on this `Matcher`, if
+/// [`matcher_cache_store_captures`] populated them for exactly this match.
+fn matcher_cache_lookup_captures(
+    mat_identity: i32,
+    match_start: usize,
+) -> Option<(
+    Vec<Option<(usize, usize)>>,
+    std::collections::HashMap<String, usize>,
+)> {
+    let cache = matcher_input_cache();
+    let guard = cache.lock();
+    let entry = guard.get(&mat_identity)?;
+    let caps = entry.captures.as_ref()?;
+    if caps.match_start == match_start {
+        Some((caps.groups.clone(), caps.named.clone()))
+    } else {
+        None
+    }
+}
+
+/// Read a `Matcher`'s input `String`, reusing a cached UTF-16→UTF-8 decode
+/// across repeated `find()`/`group()`/`start()`/`end()` calls on the same
+/// `Matcher` instead of re-decoding the entire backing array from the Java
+/// heap on every single native dispatch. Without this, an n-match `find()`
+/// loop over an n-length string cost O(n) per call * O(n) calls = O(n^2)
+/// (see `docs/known-issues/matcher-native-full-input-redecode-quadratic.md`).
+///
+/// Returns `Arc<str>` rather than `String` so a cache HIT is an O(1)
+/// refcount bump, not an O(n) copy — the point of caching is lost if every
+/// caller clones the decoded string back out.
+///
+/// Cache safety: see [`matcher_input_cache`] for why this is keyed by
+/// identity hash rather than by `ObjectRef` or gated on a GC-collection
+/// counter.
+fn matcher_read_input_cached(
+    ctx: &mut dyn NativeContext,
+    mat: cratonvm_types::ObjectRef,
+) -> std::sync::Arc<str> {
+    let input_obj = match ctx.get_field(mat, MAT_FIELD_INPUT) {
+        Value::Object(Some(r)) => r,
+        _ => return std::sync::Arc::from(""),
+    };
+    let mat_identity = ctx.identity_hash_code(mat);
+    let input_identity = ctx.identity_hash_code(input_obj);
+
+    let cache = matcher_input_cache();
+    {
+        let guard = cache.lock();
+        if let Some(entry) = guard.get(&mat_identity) {
+            if entry.input_identity == input_identity {
+                return entry.decoded.clone();
+            }
+        }
+    }
+
+    let decoded: std::sync::Arc<str> = ctx.read_string(input_obj).unwrap_or_default().into();
+
+    // Bounded cache: Matchers have no finalizer hook back into this table, so
+    // long-running programs that create many short-lived Matchers need a
+    // cap. Mirrors `compile_java_regex`'s eviction policy (simple,
+    // allocation-free: drop the whole map and start over) — the steady-state
+    // working set for realistic find()-loop usage is far below the cap.
+    const MATCHER_INPUT_CACHE_CAP: usize = 4096;
+    let mut guard = cache.lock();
+    if guard.len() >= MATCHER_INPUT_CACHE_CAP {
+        guard.clear();
+    }
+    guard.insert(
+        mat_identity,
+        MatcherInputCacheEntry {
+            input_identity,
+            decoded: decoded.clone(),
+            // A fresh entry (new input generation) invalidates any cached
+            // captures — they'd be offsets into a DIFFERENT decoded string.
+            captures: None,
+        },
+    );
+    decoded
 }
 
 fn matcher_get_pattern(
@@ -51654,7 +51815,7 @@ fn native_matcher_find(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let input = matcher_read_input(ctx, this);
+    let input = matcher_read_input_cached(ctx, this);
     let pat_obj = match matcher_get_pattern(ctx, this) {
         Some(p) => p,
         None => return Ok(Some(Value::Int(0))),
@@ -51671,11 +51832,33 @@ fn native_matcher_find(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         return Ok(Some(Value::Int(0)));
     }
 
-    if let Some(m) = re.find(&input[offset..]) {
-        let abs_start = offset + m.start;
-        let abs_end = offset + m.end;
+    // Use `captures` rather than `find` so a following `group(N)`/`start(N)`/
+    // `end(N)` — the common `while (m.find()) { m.group(N); }` idiom — can be
+    // served from `matcher_cache_store_captures` below instead of re-running
+    // the regex engine a second time. This was the dominant remaining O(n)
+    // cost even after fixing the input-redecode: `group(N)`'s old
+    // unconditional `re.captures(&input[start..])` re-search, confirmed by an
+    // isolated find()-only benchmark scaling linearly while find()+group()
+    // stayed superlinear.
+    if let Some(caps) = re.captures(&input[offset..]) {
+        let Some(whole) = caps.get(0) else {
+            ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(-1));
+            ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(-1));
+            return Ok(Some(Value::Int(0)));
+        };
+        let abs_start = offset + whole.start;
+        let abs_end = offset + whole.end;
         ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(abs_start as i32));
         ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(abs_end as i32));
+        let groups: Vec<Option<(usize, usize)>> = (0..caps.len())
+            .map(|i| caps.get(i).map(|g| (offset + g.start, offset + g.end)))
+            .collect();
+        matcher_cache_store_captures(
+            ctx.identity_hash_code(this),
+            abs_start,
+            groups,
+            caps.named.clone(),
+        );
         // Java `Matcher.find()` semantics: the next search starts at the end
         // of this match. But for a **zero-width** match (`abs_end == abs_start`)
         // the next search MUST advance by one position — otherwise `find()`
@@ -51735,7 +51918,7 @@ fn native_matcher_find_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let input = matcher_read_input(ctx, this);
+    let input = matcher_read_input_cached(ctx, this);
     let pat_obj = match matcher_get_pattern(ctx, this) {
         Some(p) => p,
         None => return Ok(Some(Value::Int(0))),
@@ -51776,7 +51959,7 @@ fn native_matcher_matches(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let input = matcher_read_input(ctx, this);
+    let input = matcher_read_input_cached(ctx, this);
     let pat_obj = match matcher_get_pattern(ctx, this) {
         Some(p) => p,
         None => return Ok(Some(Value::Int(0))),
@@ -51816,7 +51999,7 @@ fn native_matcher_group(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Value::Int(e) if e >= 0 => e as usize,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let input = matcher_read_input(ctx, this);
+    let input = matcher_read_input_cached(ctx, this);
     let group = &input[start..end.min(input.len())];
     Ok(Some(Value::Object(Some(ctx.create_string(group)))))
 }
@@ -51835,13 +52018,7 @@ fn native_matcher_group_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         return native_matcher_group(ctx, args);
     }
 
-    // For capture groups, re-run the regex on the last match region
-    let input = matcher_read_input(ctx, this);
-    let pat_obj = match matcher_get_pattern(ctx, this) {
-        Some(p) => p,
-        None => return Ok(Some(Value::Object(None))),
-    };
-    let re = read_pattern_regex(ctx, pat_obj)?;
+    let input = matcher_read_input_cached(ctx, this);
     let start = match ctx.get_field(this, MAT_FIELD_MATCH_START) {
         Value::Int(s) if s >= 0 => s as usize,
         _ => {
@@ -51852,7 +52029,27 @@ fn native_matcher_group_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         }
     };
 
-    // Search from the last match start to find capture groups
+    // Fast path: `find()` already computed this match's capture-group spans
+    // (`matcher_cache_store_captures`) — reuse them instead of re-running the
+    // regex engine over `input[start..]` a second time.
+    if let Some((groups, _named)) = matcher_cache_lookup_captures(ctx.identity_hash_code(this), start) {
+        return match groups.get(idx).copied().flatten() {
+            Some((g_start, g_end)) => Ok(Some(Value::Object(Some(
+                ctx.create_string(&input[g_start..g_end.min(input.len())]),
+            )))),
+            None => Ok(Some(Value::Object(None))),
+        };
+    }
+
+    // Fallback (cache miss — e.g. the current match came from `find(int)`/
+    // `matches()`/`lookingAt()`/`region()`, none of which populate the
+    // capture cache, or a GC invalidated it since `find()` ran): re-run the
+    // regex on the last match region. Always correct, just not fast.
+    let pat_obj = match matcher_get_pattern(ctx, this) {
+        Some(p) => p,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let re = read_pattern_regex(ctx, pat_obj)?;
     if let Some(caps) = re.captures(&input[start..]) {
         if let Some(g) = caps.get(idx) {
             return Ok(Some(Value::Object(Some(ctx.create_string(&g.text)))));
@@ -51867,7 +52064,7 @@ fn matcher_group_boundary(
     idx: usize,
     want_end: bool,
 ) -> MethodCallResult {
-    let input = matcher_read_input(ctx, mat);
+    let input = matcher_read_input_cached(ctx, mat);
     let pat_obj = match matcher_get_pattern(ctx, mat) {
         Some(p) => p,
         None => return Ok(Some(Value::Int(-1))),
@@ -51890,6 +52087,18 @@ fn matcher_group_boundary(
             }
             .into(),
         );
+    }
+
+    // Fast path: reuse `find()`'s cached capture-group spans for this match
+    // instead of re-running the regex engine (see `native_matcher_group_idx`
+    // for the full rationale).
+    if let Some((groups, _named)) = matcher_cache_lookup_captures(ctx.identity_hash_code(mat), match_start) {
+        return match groups.get(idx).copied().flatten() {
+            Some((g_start, g_end)) => {
+                Ok(Some(Value::Int((if want_end { g_end } else { g_start }) as i32)))
+            }
+            None => Ok(Some(Value::Int(-1))),
+        };
     }
 
     let Some(caps) = re.captures(&input[match_start..]) else {
@@ -51963,7 +52172,7 @@ fn native_matcher_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
         _ => String::new(),
     };
-    let input = matcher_read_input(ctx, this);
+    let input = matcher_read_input_cached(ctx, this);
     let pat_obj = match matcher_get_pattern(ctx, this) {
         Some(p) => p,
         None => return Ok(Some(Value::Object(Some(ctx.create_string(&input))))),
@@ -51982,7 +52191,7 @@ fn native_matcher_replace_first(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
         _ => String::new(),
     };
-    let input = matcher_read_input(ctx, this);
+    let input = matcher_read_input_cached(ctx, this);
     let pat_obj = match matcher_get_pattern(ctx, this) {
         Some(p) => p,
         None => return Ok(Some(Value::Object(Some(ctx.create_string(&input))))),
@@ -52024,7 +52233,7 @@ fn native_matcher_looking_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let input = matcher_read_input(ctx, this);
+    let input = matcher_read_input_cached(ctx, this);
     let pat_obj = match matcher_get_pattern(ctx, this) {
         Some(p) => p,
         None => return Ok(Some(Value::Int(0))),
@@ -52088,7 +52297,7 @@ fn native_matcher_region(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => 0,
     };
     // Read current input, take the substring, store as new input
-    let input = matcher_read_input(ctx, this);
+    let input = matcher_read_input_cached(ctx, this);
     let sub = if start <= end && end <= input.len() {
         &input[start..end]
     } else {
@@ -52113,7 +52322,7 @@ fn native_matcher_region_end(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let input = matcher_read_input(ctx, this);
+    let input = matcher_read_input_cached(ctx, this);
     Ok(Some(Value::Int(input.len() as i32)))
 }
 
@@ -52127,7 +52336,7 @@ fn native_matcher_group_named(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(None))),
     };
-    let input = matcher_read_input(ctx, this);
+    let input = matcher_read_input_cached(ctx, this);
     let pat_obj = match matcher_get_pattern(ctx, this) {
         Some(p) => p,
         None => return Ok(Some(Value::Object(None))),
@@ -52200,7 +52409,7 @@ fn native_matcher_append_replacement(
         _ => String::new(),
     };
 
-    let input = matcher_read_input(ctx, this);
+    let input = matcher_read_input_cached(ctx, this);
     let match_start = ctx
         .get_field(this, MAT_FIELD_MATCH_START)
         .as_int()
@@ -52273,7 +52482,7 @@ fn native_matcher_append_tail(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let input = matcher_read_input(ctx, this);
+    let input = matcher_read_input_cached(ctx, this);
     let last_append = ctx
         .get_field(this, MAT_FIELD_LAST_APPEND)
         .as_int()

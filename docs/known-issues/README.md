@@ -4,6 +4,31 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-11 Regex `find()`+`group()` quadratic slowdown FIXED — two wrong turns (dead-code Matcher bridge, dead-code substring native) before finding the real bug in the live one
+
+A user-reported benchmark (`StringBuilder` append loop + `Pattern.compile().matcher()`
++ `while (m.find()) { m.group(1); }`) showed a CratonVM-vs-JDK slowdown ratio that
+*grew* with input size (18.8×/94.4×/238.8× at 1K/5K/10K entries) — the tell for an
+algorithmic-complexity bug. First diagnosis blamed `Matcher`'s native bridge
+(`matcher_read_input()`) — a real O(n²) bug, but instrumentation proved that
+bridge is unconditionally dropped in real-JDK mode
+(`registry.rs`'s `drop_real_layout_synthetic`, same "synthetic bridge corrupts
+real-layout objects" family as
+[`stringjoiner-synthetic-native-real-jdk-field-mismatch.md`](stringjoiner-synthetic-native-real-jdk-field-mismatch.md))
+— the fix, while correct, was dead code. That led to isolating the actual bug to
+plain `String.substring()` (zero regex involved) — but the FIRST substring native
+found and instrumented (`native_string_substring`,
+`native-builtins/src/lang_string.rs`) was ALSO dead code, this time because its
+registration lives inside `register_synthetic_overrides`,
+`#[cfg(feature = "synthetic-jdk")]`-gated and not compiled into the real-JDK
+build at all. The actual live registration — a separate inline closure in
+`register_essential_natives` — had the identical "decode the entire parent
+string, every call" bug independently. **FIXED**: see
+[`../internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`](../internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md)
+for the full (long) story and the fix. `SubstringOnly` 1283ms→29ms at n=10,000;
+the original combined benchmark 4775ms (never finished at n=50,000)→2295ms
+(completes) — checksums identical to JDK throughout, zero test regressions.
+
 ## 2026-07-11 WildFly Surefire-fork boot-crash follow-up: 2 more GC-staleness sites FIXED (6/10 → 9/10 sample); residual narrowed to a concurrent extension-loading race + the known STW JIT-takeover stall
 
 Follow-up to the entry directly below. Investigating the residual's two reported symptoms

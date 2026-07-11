@@ -22670,6 +22670,29 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // `String.substring(int,int)` — gate mismatch fix. `check_override`
+    // (vm_exec.rs, the invoke-slow-path native selector) already lists
+    // `java/lang/String.substring` as forced-native ("RKC16N.6 RECON":
+    // real-JDK String bytecode resolution issues during JDK class clinits),
+    // but that allowlist is CONSULTED ONLY on a vtable cache miss. The
+    // per-call-site cached vtable fast path (this function's own caller)
+    // resolves and caches its native-vs-bytecode decision independently, and
+    // `substring` was never added HERE — so once a call site's vtable entry
+    // warms, every subsequent `substring` call ran the real bytecode
+    // regardless of `check_override`'s intent. `native_string_substring`
+    // (native-builtins/src/lang_string.rs) already has a "read only the
+    // requested range" fast path specifically written to avoid decoding the
+    // WHOLE parent string per call — a real fix that this gate gap left
+    // completely unreachable. Confirmed via runtime instrumentation: a tight
+    // `text.substring(pos, pos+5)` loop over a large parent `String` cost
+    // O(n^2) instead of O(subLen) with this entry absent (see
+    // `docs/known-issues/substring-large-parent-quadratic-allocation.md`).
+    if class_name == "java/lang/String"
+        && method_name == "substring"
+        && method_descriptor == "(II)Ljava/lang/String;"
+    {
+        return true;
+    }
     // java.net.DatagramSocket / MulticastSocket — real-JDK delegate architecture.
     // Since JDK 14 these classes are thin wrappers that forward every operation
     // to an internal `delegate` (a `DatagramSocketImpl`-backed socket) created
