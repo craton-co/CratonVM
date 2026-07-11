@@ -1,11 +1,13 @@
 # ES FAIL - libs/tdigest org.elasticsearch.tdigest.SortingDigestTests correctness residual
 
-Status: PARTIALLY FIXED — the `-Jit off` cluster (`NoSuchMethodError`
-receiver-identity-loss + the log4j `ClassCastException`s) is FIXED as of dev
-commit `3e489a1c` (merged `d8aee876`). The `-Jit on` cluster (garbage-index
-`ArrayIndexOutOfBoundsException` + wrong quantile/count values) is a
-SEPARATE, still-OPEN bug — see "Update 2026-07-10: `-Jit on` investigation"
-below for everything learned this session.
+Status: RETIRED (all correctness clusters FIXED) — see "Final update
+2026-07-10 (retirement)" at the bottom. The `-Jit off` cluster was fixed by
+dev `3e489a1c`; the `-Jit on` cluster was an IR-lowerer miscompile of
+`java/util/DualPivotQuicksort`, fixed on `fix/es-tdigest-jiton-20260710`;
+the last `testMonotonicity` NSME stopped reproducing after merging dev
+`395f7246` (concurrent GC-audit work). The one remaining suite failure is a
+PERFORMANCE timeout, split into
+[`ES-FAIL-20260710-libs-tdigest-testmonotonicity-suite-timeout-slowness.md`](../../known-issues/elasticsearch-suite/ES-FAIL-20260710-libs-tdigest-testmonotonicity-suite-timeout-slowness.md).
 
 Found while retiring
 [`ES-CRASH-20260709-libs-tdigest-org-elasticsearch-tdigest-sortingdigesttests-0249530511-FIXED.md`](../../internal/fixed-suite-bugs/ES-CRASH-20260709-libs-tdigest-org-elasticsearch-tdigest-sortingdigesttests-0249530511-FIXED.md)
@@ -325,3 +327,79 @@ Extensive investigation this session did **not** find the root cause of the
 - Not yet checked whether other `*DigestTests` classes in
   `libs/tdigest` (e.g. `AVLTreeDigestTests`, `MergingDigestTests`) hit the
   same `-Jit on` residual — worth a quick category sweep once it's fixed.
+
+## Final update 2026-07-10 (retirement)
+
+The `-Jit on` cluster was **root-caused and fixed** on branch
+`fix/es-tdigest-jiton-20260710`. It was never a dispatch/receiver bug: the
+C2/IR backend (`jit/src/ir_lower.rs`) zero-initialises its `node_slot` table
+and `slot_of()` silently returned that `0` default for an SSA node the
+scheduler never placed in an emitted block. Compiling
+`java/util/DualPivotQuicksort.insertionSort([DII)V` (IR-eligible pure
+compute) left the pc17 `ArrayLoad(Double)` feeding a GVN-collapsed loop phi
+unallocated, so the `a[i+1] = ai` store read `[rbp - 0]` — the saved caller
+RBP — as the double value and wrote **stack addresses into the array**
+(subnormal doubles ~6e-310 with pointer bit patterns; the insertion shift
+then smeared them). Every large `Arrays.sort(double[])` under `-Jit on` was
+silently mis-sorted; the "garbage index" AIOOBEs and all the wrong
+quantile/count values in this doc were downstream of sorting on corrupted
+data. Fix: latch any unallocated-slot readback and bail the lowering to the
+single-pass backend.
+
+Diagnosis chain, for the record: `CRATONVM_JIT_BISECT_SKIP` narrowed the
+failures to `DualPivotQuicksort.sort`'s compiled callees; a standalone
+`Arrays.sort(double[10000])` driver reproduced in 30 s; per-callee bisect
+plus `CRATONVM_JIT_IR_FP=0` isolated the IR backend; a hardware watchpoint
+(gdb, ASLR off) caught the poisoning `movsd [rax+rcx*8+0x28], xmm0` writing
+`rbp+0x2E0` into `a[0]`; the annotated disasm showed the `movsd xmm0,[rbp]`
+load; an env-gated `slot_of` probe named the unallocated node.
+
+Three companion soundness gaps found on the way are fixed in the same
+commit: the OSR dead-local mask ignored XMM-resident locals (garbage seeded
+into coalesced double locals on OSR entry at `sort`'s bci 575/599 — this was
+the doc's original "OSR-reuse" lead); the raw self-recursive CALL path
+pushed a phantom RAX "return value" for void methods; and the precise-maps
+innermost-RBP mirror was never restored when a compiled callee returned into
+Rust dispatch helpers.
+
+The prior working theory in this doc (receiver-decode in
+`jit_invoke_dispatch` / caller-side register clobber) is REFUTED — the
+dispatch machinery was fine; per-callee-skip experiments only appeared to
+implicate call linkage because skipping a callee also removed its
+IR-compiled artifact.
+
+Verification on the merge of `fix/es-tdigest-jiton-20260710` +
+dev `395f7246`:
+
+- Standalone sort repros (10K-120K doubles): corrupted → ALL OK.
+- `SortingDigestTests -Jit on`: 19/20 method passes on the fix binary
+  (pre-merge run, 50 s wall) with only the then-open `testMonotonicity` NSME;
+  on the merged tip the NSME is gone and every executed method passes — the
+  class-level FAIL that remains is `testMonotonicity` abandoned at the
+  RandomizedRunner suite timeout (it did not complete even with the budget
+  raised to 3,600 s; run `.suite-long3`, wall 3,611 s, "Tests run: 18,
+  Failures: 2" where both entries are the timeout wrappers). That is the
+  split-off PERFORMANCE issue, not a correctness failure.
+- `SortingDigestTests -Jit off`: the NSME-cluster fix (`3e489a1c`) was
+  verified at class level in the earlier session (all original 6 failures
+  gone). A runner-level re-run on the merged tip is blocked by the SAME
+  slowness: interpreted `testMonotonicity` needs 13+ CPU-minutes, beyond the
+  runner's default 580 s suite budget (two attempts at a raised budget were
+  killed by host-wide OOM during a post-reboot load spike — the box was
+  running 13+ concurrent sessions; not a VM failure).
+- `cargo test -p cratonvm-vm --lib`: 2174 passed, 12 failed — every failure
+  confirmed identical on unmodified dev `395f7246` (the 11 from this doc's
+  earlier baseline + `bouncycastle_crypto_hotpath_carveout_keeps_math_ec_banned`,
+  which is new origin/dev drift, verified by running it on a detached
+  `395f7246` checkout).
+
+The `testMonotonicity` `-Jit on` `NoSuchMethodError: java/lang/Object.get(I)D`
+that surfaced once the AIOOBE was gone (stale pointer baked into the lambda
+proxy's capture field; no forwarding pointer; fresh field re-read returns
+the same dead address — see the `[lambda-nsme-diag]` gated diagnostic landed
+in `try_lambda_dispatch`) stopped reproducing after merging dev `395f7246`
+and is credited to the concurrent GC-audit work (`35436546` region, not
+bisected). The remaining suite-visible failure is the pre-documented
+`testMonotonicity` slowness, now a suite-timeout at the default
+`-Dtests.timeoutSuite=580000!` — tracked in the split-off doc named in the
+Status line.
