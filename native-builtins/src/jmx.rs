@@ -1145,7 +1145,7 @@ fn try_delegate_to_real_provider(
 /// return `false`).
 pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/ThreadImpl";
 
     // ThreadImpl.getThreadInfo(long, int) allocates an output array and asks
@@ -2233,6 +2233,7 @@ fn jmx_class_id_or_object(ctx: &mut dyn NativeContext, class_name: &str) -> Clas
         .unwrap_or(ClassId::new(0))
 }
 
+
 fn alloc_basic_thread_info(
     ctx: &mut dyn NativeContext,
     thread_id: i64,
@@ -2474,20 +2475,10 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-
-            // Do not manufacture a `main` ThreadInfo for every requested id.
-            // Tomcat's JULI ThreadNameCache asks ThreadMXBean about a live
-            // worker by its Java Thread.tid; returning `main` poisons that
-            // cache permanently.  Resolve the requested Java thread from the
-            // registry and use its real layout-neutral `name` field.
-            let thread_name = registered_thread_name(ctx, thread_id);
-
-            match thread_name {
+            match registered_thread_name(ctx, thread_id) {
                 Some(name) => Ok(Some(Value::Object(Some(alloc_named_thread_info(
                     ctx, thread_id, &name,
                 ))))),
-                // ThreadMXBean specifies null for an id that no longer names
-                // a live thread.  It must not alias that id to the main thread.
                 None => Ok(Some(Value::Object(None))),
             }
         },

@@ -5159,7 +5159,7 @@ fn native_map_put_evict(
     args: &[Value],
     evict: bool,
 ) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -5193,8 +5193,26 @@ fn native_map_put_evict(
     // in attributes for annotation [...ComponentScan$Filter]` in
     // `ComponentScanAnnotationParser.parse` for `@SpringBootApplication`.
     let cid = ctx.class_id_of_object(this);
+    let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
     if let Some(name) = ctx.class_name_of_id(cid) {
-        if name != "java/util/HashMap" {
+        if name == "java/util/HashMap" {
+            // Exact dispatch is installed only after the callsite becomes
+            // hot. Start the integer overlay during the generic tiering
+            // window; once real nodes exist the fresh-map guard must refuse
+            // the overlay to preserve the already-materialized contents.
+            if evict {
+                if let Some(result) = try_hm_int_fast_put(ctx, this, key_val, value) {
+                    return result;
+                }
+            }
+            // A non-integer put (or serialization put with `evict=false`)
+            // transitions an overlay-backed exact HashMap to its ordinary JDK
+            // node table before inserting the new entry. Without this, the
+            // node path sees an empty heap map and silently strands all prior
+            // integer entries in the side store.
+            this = materialize_hm_int_fast(ctx, this)?;
+        } else {
             // Walk parent chain to detect LinkedHashMap or TreeMap ancestry.
             // Without the TreeMap branch, the `java/util/Map.put` interface
             // override (registered as an abstract-method native) falls
@@ -5245,9 +5263,6 @@ fn native_map_put_evict(
             }
         }
     }
-    let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
-    let value = args.get(2).copied().unwrap_or(Value::Object(None));
-
     // `map_hash_key` / `map_keys_equal` dispatch arbitrary Java code. When
     // this path is reached by a direct native-to-native call (for example
     // HashSet.add -> HashMap.put while Selector.selectedKeys() builds a set),
@@ -6183,7 +6198,9 @@ fn native_map_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // resolve to whatever natives or bytecode `other`'s real class provides,
     // restoring `AbstractMap.equals` semantics for cross-implementation
     // comparisons.
-    let (_, size_a, _) = map_state(ctx, this);
+    let size_a = hm_int_fast_len(ctx, this)
+        .map(|size| size as i32)
+        .unwrap_or_else(|| map_state(ctx, this).1);
     let size_b = match ctx.invoke_virtual(other, "size", "()I", &[])? {
         Some(Value::Int(s)) => s,
         // Defensive: a Map whose `size()` did not yield an int — fall back to

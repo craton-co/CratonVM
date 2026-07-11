@@ -730,25 +730,20 @@ fn safe_native_call_impl(
     // popped from the operand stack into this Rust slice and are otherwise
     // invisible to `collect_roots` / frame scanning during a safepoint GC.
     let pin_base = thread.native_pin_roots.len();
-    let mut inline_root_indices = [None; 4];
-    let mut overflow_root_indices =
-        (args.len() > inline_root_indices.len()).then(|| Vec::with_capacity(args.len()));
-    for (index, a) in args.iter().enumerate() {
+    // Retain a root index for every argument. The former four-element inline
+    // buffer could be selected before a re-entrant native path exposed a
+    // longer argument slice, leading to a bounds panic while remapping roots
+    // at the next safepoint.
+    let mut arg_root_indices = Vec::with_capacity(args.len());
+    for a in args {
         let before = thread.native_pin_roots.len();
         match (prevalidated_objects, a) {
             (true, Value::Object(Some(object))) => thread.native_pin_roots.push(*object),
             _ => pin_value_for_native_call(shared, &mut thread.native_pin_roots, a),
         }
         let root_index = (thread.native_pin_roots.len() > before).then_some(before);
-        if let Some(indices) = overflow_root_indices.as_mut() {
-            indices.push(root_index);
-        } else {
-            inline_root_indices[index] = root_index;
-        }
+        arg_root_indices.push(root_index);
     }
-    let arg_root_indices: &[Option<usize>] = overflow_root_indices
-        .as_deref()
-        .unwrap_or(&inline_root_indices[..args.len()]);
     let native_pin_base = thread.native_pin_roots.len();
 
     let mut remapped_args = None;
@@ -1329,11 +1324,32 @@ pub(crate) fn resolve_field_index_in_hierarchy_desc(
 /// Concurrency: the cache write is guarded by `field_descriptor_cache`'s
 /// own `RwLock`; we take a read-first fast path so the hot case (cache
 /// hit) is lock-free beyond the shared read lock.
+thread_local! {
+    /// Per-mutator last descriptor lookup. Native wrapper allocation performs
+    /// millions of consecutive writes to the same `(class, slot)`; once the
+    /// shared cache has a definitive result, repeating its RwLock + hash probe
+    /// adds no correctness value. The VM identity prevents cross-VM reuse.
+    static FIELD_DESCRIPTOR_LAST:
+        std::cell::Cell<Option<(usize, u32, usize, u8)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 fn resolve_field_descriptor_byte_cached(
     shared: &SharedVm,
     class_id: ClassId,
     slot_index: usize,
 ) -> Option<u8> {
+    let vm_key = shared as *const SharedVm as usize;
+    if let Some(cached) = FIELD_DESCRIPTOR_LAST.with(|cache| {
+        cache
+            .get()
+            .filter(|(vm, cid, slot, _)| {
+                *vm == vm_key && *cid == class_id.as_u32() && *slot == slot_index
+            })
+            .map(|(_, _, _, byte)| byte)
+    }) {
+        return if cached == 0 { None } else { Some(cached) };
+    }
     // Fast path: read lock, hash lookup, early return on hit.
     //
     // PERF (negative-result memoization): the cache value `0u8` (NUL) is a
@@ -1349,6 +1365,9 @@ fn resolve_field_descriptor_byte_cached(
     {
         let cache = shared.field_descriptor_cache.read();
         if let Some(&b) = cache.get(&(class_id, slot_index)) {
+            FIELD_DESCRIPTOR_LAST.with(|last| {
+                last.set(Some((vm_key, class_id.as_u32(), slot_index, b)))
+            });
             return if b == 0 { None } else { Some(b) };
         }
     }
@@ -1482,12 +1501,18 @@ fn resolve_field_descriptor_byte_cached(
                 .field_descriptor_cache
                 .write()
                 .insert((class_id, slot_index), b);
+            FIELD_DESCRIPTOR_LAST.with(|last| {
+                last.set(Some((vm_key, class_id.as_u32(), slot_index, b)))
+            });
         }
         None if cacheable => {
             shared
                 .field_descriptor_cache
                 .write()
                 .insert((class_id, slot_index), 0u8);
+            FIELD_DESCRIPTOR_LAST.with(|last| {
+                last.set(Some((vm_key, class_id.as_u32(), slot_index, 0u8)))
+            });
         }
         None => {}
     }
@@ -1597,6 +1622,22 @@ impl<'a> NativeContextImpl<'a> {
     /// roots without heap validation (its file is restricted from edits), and
     /// the resulting bogus addresses crash the GC at the next mark/move.
     pub(crate) fn deposit_root_snapshot(&self) {
+        self.deposit_root_snapshot_inner(true);
+    }
+
+    /// Finding 1(c) — snapshot refresh WITHOUT raising `in_blocked_region`.
+    ///
+    /// Used by the wake path (`check_post_block_gc_refs`) AFTER
+    /// `GcBarrier::leave_blocked_region_flagged` has atomically cleared the
+    /// flag: the thread is a counted mutator again, and transiently re-raising
+    /// the flag here would re-open the excluded-while-running window (a pause
+    /// whose census lands on the transient flag excludes a thread that then
+    /// resumes bytecode mid-collection).
+    pub(crate) fn deposit_root_snapshot_no_flag(&self) {
+        self.deposit_root_snapshot_inner(false);
+    }
+
+    fn deposit_root_snapshot_inner(&self, raise_blocked_flag: bool) {
         // fork6 GC_STRESS fix — flush this thread's SATB buffer before it
         // blocks. A concurrent old-gen remark drains only the GLOBAL queue;
         // a thread that logged pre-barrier entries (overwritten refs during
@@ -1679,6 +1720,7 @@ impl<'a> NativeContextImpl<'a> {
             }
         }
         snapshot.extend(self.thread.native_pin_roots.iter().copied());
+        snapshot.extend(self.thread.native_alloc_pool.iter().copied());
         if let Some(r) = self.thread.native_pending_return {
             snapshot.push(r);
         }
@@ -1796,10 +1838,14 @@ impl<'a> NativeContextImpl<'a> {
         // point on, every GC initiator maintains this thread's roots via
         // `fold_pointer_map_into_blocked` (snapshot remap + frame-fixup
         // composition) until `check_post_block_gc` clears the flag on wake.
-        self.thread
-            .gc_block_state
-            .in_blocked_region
-            .store(true, std::sync::atomic::Ordering::Release);
+        // (Skipped for the wake path's refresh — see
+        // `deposit_root_snapshot_no_flag`.)
+        if raise_blocked_flag {
+            self.thread
+                .gc_block_state
+                .in_blocked_region
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Re-sync this thread's GC state after waking from a blocking region
@@ -1836,30 +1882,30 @@ impl<'a> NativeContextImpl<'a> {
     /// `NativeContext::end_blocking_region_refs`).
     fn check_post_block_gc_refs(&mut self, extra_refs: &mut [Value]) {
         use crate::memory::gc::update_value_ref;
-        use std::sync::atomic::Ordering;
 
-        // Drain any in-flight stop-the-world pause(s). We may have woken
-        // mid-collection; arrive so the initiator's `wait_for_all` can
-        // complete, then re-check (another GC may start immediately).
-        //
-        // GCAUDIT-0711-FIX (finding 1a): `in_blocked_region` is still TRUE
-        // for this thread throughout this loop (cleared only at the end of
-        // this function, after the fixup below) — every pause observed
-        // `stw_requested == true` here was requested with our flag already
-        // up, so its own census may have excluded us. `arrive_and_wait_auto`
-        // resolves that from the pause's own exclusion snapshot instead of
-        // assuming participation: the old plain `arrive_and_wait` could
-        // inflate `arrived` past what an excluded thread's pause actually
-        // expected, releasing the initiator's `wait_for_all` before a real
-        // counted mutator arrived — the STW barrier quota race behind the
-        // MTChurn lost-increment / BinaryTrees wrong-total / ES IVF-KNN
-        // Lucene-merge-thread lost-wakeup family (GC audit finding 1a).
-        while self.shared.gc_barrier.stw_requested.load(Ordering::Acquire) {
-            let _ = self
-                .shared
-                .gc_barrier
-                .arrive_and_wait_auto(self.thread.thread_id);
-        }
+        // Finding 1(a/c) — atomically drain every in-flight pause AND clear
+        // `in_blocked_region` under one barrier-lock hold. Ordering is the
+        // load-bearing part:
+        //  * Pauses active while our flag is up EXCLUDED us (identity census)
+        //    — we wait them out WITHOUT filling anyone's quota slot (the old
+        //    participating `arrive_and_wait` drain here inflated `arrived`
+        //    and released `wait_for_all` while a counted mutator still ran).
+        //    Their pointer maps reach us via `fold_pointer_map_into_blocked`
+        //    (flag still up ⇒ every such fold covers us, and each fold
+        //    completes before its pause's generation advances).
+        //  * The flag-clear lands under the same lock hold that confirmed no
+        //    pause is active, so no pause can start-and-complete between the
+        //    drain and the clear (the old plain `store(false)` left exactly
+        //    that window: an excluded-but-running thread mutating the heap
+        //    mid-collection — finding 1's corruption family).
+        //  * Only AFTER the clear do we take + apply the fixup below: any
+        //    newer pause counts us in `expected` and cannot complete (or
+        //    fold) until our next safepoint arrival, so the application can
+        //    never race a fold or an evacuation.
+        self.shared.gc_barrier.leave_blocked_region_flagged(
+            self.thread.thread_id,
+            &self.thread.gc_block_state.in_blocked_region,
+        );
 
         // Apply the composed fixup accumulated for every GC we slept through.
         let fixup = {
@@ -1914,6 +1960,12 @@ impl<'a> NativeContextImpl<'a> {
                     *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
                 }
             }
+            for obj_ref in &mut self.thread.native_alloc_pool {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = fixup.get(&old_addr) {
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
             if let Some(ref mut obj_ref) = self.thread.native_pending_return {
                 let old_addr = obj_ref.as_ptr() as usize;
                 if let Some(&new_addr) = fixup.get(&old_addr) {
@@ -1950,13 +2002,10 @@ impl<'a> NativeContextImpl<'a> {
         // Refresh (don't clear) the snapshot: we are runnable again but may
         // not reach a safepoint before the next GC scans roots; an empty
         // snapshot would hide every object reachable only from our frames.
-        // NOTE: `deposit_root_snapshot` re-sets `in_blocked_region`; clear
-        // it right after — we are leaving the blocked region.
-        self.deposit_root_snapshot();
-        self.thread
-            .gc_block_state
-            .in_blocked_region
-            .store(false, Ordering::Release);
+        // Finding 1(c): the no-flag variant — `in_blocked_region` was already
+        // cleared atomically above; transiently re-raising it here would
+        // re-open the excluded-while-running census window.
+        self.deposit_root_snapshot_no_flag();
     }
 
     /// T19.K1 вЂ” Read the daemon flag from a Java `Thread` object.
@@ -4187,6 +4236,62 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .map(|c| c.num_total_fields)
             .unwrap_or(0);
         let slots = num_fields.max(real_fields);
+        if self.thread.native_alloc_pool_layout == Some((class_id, slots)) {
+            if let Some(obj) = self.thread.native_alloc_pool.pop() {
+                if self.thread.native_alloc_pool.is_empty() {
+                    self.thread.native_alloc_pool_layout = None;
+                }
+                return obj;
+            }
+            self.thread.native_alloc_pool_layout = None;
+        }
+        // Native callbacks execute on the mutator's own `JvmThread`, so small
+        // objects can use the same lock-free TLAB path as interpreted/JIT
+        // `new`. Historically this method went straight to `GenHeap`, taking
+        // the shared young-arena lock until young filled and then the old-gen
+        // lock for every allocation. Autobox-heavy code (notably
+        // HashMap<Integer, Integer>) therefore serialized millions of tiny
+        // wrapper allocations through global locks despite an available TLAB.
+        //
+        // This path deliberately does not initiate GC from inside the native
+        // callback: `tlab_alloc_object` only bumps/refills young space and
+        // returns `None` when it cannot. The existing `heap.alloc_object`
+        // fallback retains the previous spill/OOM behavior and native rooting
+        // contract.
+        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+        let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+        if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
+            if let Some(obj) = crate::runtime::interpreter::tlab_alloc_object(
+                self.thread,
+                self.shared,
+                class_id,
+                slots,
+                requested_size,
+            ) {
+                return obj;
+            }
+        }
+        // Once young space cannot provide another TLAB, amortize the
+        // non-moving old-generation lock and free-list work across a chunk of
+        // same-layout native objects. Unused entries remain rooted and are
+        // remapped with their owning thread; the object popped here cannot be
+        // moved before `safe_native_call` publishes its return root because a
+        // native callback never initiates collection on this path.
+        if self.thread.native_alloc_pool.is_empty() {
+            let mut batch = self
+                .shared
+                .heap
+                .try_alloc_objects_old_batch(class_id, slots, 2048);
+            if let Some(obj) = batch.pop() {
+                self.thread.native_alloc_pool = batch;
+                self.thread.native_alloc_pool_layout = if self.thread.native_alloc_pool.is_empty() {
+                    None
+                } else {
+                    Some((class_id, slots))
+                };
+                return obj;
+            }
+        }
         self.shared.heap.alloc_object(class_id, slots)
     }
 
@@ -4647,11 +4752,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             );
             drop(blk);
             r
-        }?;
+        };
         crate::vm::vm_init::clear_wait_site_snapshot();
         let wait_dur = wait_start.elapsed();
-        // Check if GC happened while we were blocked
+        // Check if GC happened while we were blocked. Finding 1(a) hygiene:
+        // run this BEFORE propagating a wait() error — the old `}?;` early
+        // return skipped it, leaving `in_blocked_region` raised on a RUNNING
+        // thread (deposit set it; nothing on the error path cleared it), so
+        // every later census permanently excluded the thread and a moving
+        // collection could run concurrently with its bytecode.
         self.check_post_block_gc();
+        let was_interrupted = was_interrupted?;
         // Emit JFR monitor wait event
         {
             let now_ns = std::time::SystemTime::now()
@@ -11949,7 +12060,10 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/util/logging/Handler"
                             && matches!(
                                 (method_name, descriptor),
-                                ("getFormatter", "()Ljava/util/logging/Formatter;")
+                                ("<init>", "()V")
+                                    | ("getLevel", "()Ljava/util/logging/Level;")
+                                    | ("isLoggable", "(Ljava/util/logging/LogRecord;)Z")
+                                    | ("getFormatter", "()Ljava/util/logging/Formatter;")
                                     | ("setFormatter", "(Ljava/util/logging/Formatter;)V")
                             ))
                         || (class_name == "org/jboss/threads/JBossThread"
@@ -13123,22 +13237,13 @@ fn invoke_on_class_shared_inner(
                                 method_name,
                                 "log" | "info" | "warning" | "severe"
                                     | "fine" | "finer" | "finest"
-                                    // JULI's `DirectJDKLog` (Tomcat) routes
-                                    // every log call through `Logger.logp`,
-                                    // not `warning`/`log`. Without `logp`
-                                    // here the bytecode runs against our
-                                    // synthetic Logger (no Handler chain) and
-                                    // the message is silently dropped — that
-                                    // was the "Tomcat Bootstrap rc=0, no
-                                    // output" symptom. Force the native
-                                    // (registered in logmanager.rs) to win.
+                                    // Synthetic LogManager-backed loggers
+                                    // store handlers in their native slot 2.
+                                    // Letting real Logger.addHandler bytecode
+                                    // run loses that state, so JULI
+                                    // AsyncFileHandler never sees a record.
+                                    | "addHandler" | "removeHandler" | "getHandlers"
                                     | "logp"
-                                    // Synthetic Logger mirrors do not carry the
-                                    // JDK ConfigurationData handler list. Route
-                                    // explicit handler installation through the
-                                    // JUL bridge so in-process captures observe
-                                    // the same records as the console sink.
-                                    | "addHandler" | "removeHandler"
                                     // `isLoggable` gates JULI's emit path;
                                     // the real bytecode returns false for our
                                     // parent-less synthetic Logger, so every
@@ -13146,8 +13251,16 @@ fn invoke_on_class_shared_inner(
                                     | "isLoggable"
                             ))
                         || (class_name == "java/util/logging/LogRecord"
-                            && method_name == "getMessage"
-                            && descriptor == "()Ljava/lang/String;")
+                            && matches!(method_name, "<init>" | "getLevel" | "getMessage"))
+                        || (class_name == "java/util/concurrent/ThreadPoolExecutor"
+                            && matches!(
+                                method_name,
+                                "execute" | "shutdown" | "isShutdown" | "isTerminated" | "awaitTermination"
+                            ))
+                        || (class_name == "org/apache/juli/AsyncFileHandler$LoggerExecutorService"
+                            && matches!(method_name, "shutdown" | "isShutdown" | "awaitTermination"))
+                        || (class_name == "org/apache/juli/FileHandler"
+                            && method_name == "clean")
                         || (class_name == "org/jboss/logmanager/Logger"
                             && matches!(
                                 method_name,

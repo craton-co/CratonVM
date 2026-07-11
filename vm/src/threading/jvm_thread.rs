@@ -30,6 +30,7 @@ use crate::native::registry::StackTraceEntry;
 use crate::runtime::frame::Frame;
 use crate::runtime::fx_collections::FxHashMap;
 use crate::types::{ObjectRef, Value};
+use cratonvm_types::ClassId;
 
 /// Pool type for SoA locals and stack vecs: (values, tags).
 pub type SoaPool = Vec<(Vec<u64>, Vec<u8>)>;
@@ -356,6 +357,16 @@ pub struct JvmThread {
     /// `enhance` returns the original `Class`).
     pub native_pin_roots: Vec<ObjectRef>,
 
+    /// Unused objects reserved in one old-generation allocation batch for
+    /// small native allocations. Keeping the pool on the owning thread makes
+    /// it a normal GC root set; every GC snapshot/remap path treats these
+    /// entries exactly like `native_pin_roots` until `alloc_object` hands one
+    /// to a native callback.
+    pub native_alloc_pool: Vec<ObjectRef>,
+    /// `(class_id, slot_count)` shared by every entry in
+    /// `native_alloc_pool`. `None` when the pool is empty.
+    pub native_alloc_pool_layout: Option<(ClassId, usize)>,
+
     /// Object result from the last `safe_native_call`: either an object return
     /// value before the interpreter pushes it onto the operand stack, or a
     /// native-thrown Java exception before the interpreter routes it through a
@@ -548,6 +559,8 @@ impl JvmThread {
             rs_cache_gen: 0,
             gc_block_state: Arc::new(GcBlockState::new()),
             native_pin_roots: Vec::new(),
+            native_alloc_pool: Vec::new(),
+            native_alloc_pool_layout: None,
             native_pending_return: None,
             invoke_cache: InvokeCache::new(),
             native_shadow_cache: FxHashMap::default(),
