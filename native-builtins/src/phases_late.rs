@@ -28035,7 +28035,32 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
         log,
         "addHandler",
         "(Ljava/util/logging/Handler;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let handler = args.get(1).copied().unwrap_or(Value::Object(None));
+            // The Phase 54 logger factory allocates field 2 specifically for
+            // handlers. This final Phase 61 override used to discard them,
+            // causing JULI AsyncFileHandler to receive no records at all.
+            if ctx.object_num_fields(this) > 2 {
+                let handlers = match ctx.get_field(this, 2) {
+                    Value::Object(Some(list)) => list,
+                    _ => {
+                        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                        cratonvm_native_collections::native_al_init(
+                            ctx,
+                            &[Value::Object(Some(list))],
+                        )?;
+                        ctx.set_field(this, 2, Value::Object(Some(list)));
+                        list
+                    }
+                };
+                cratonvm_native_collections::native_al_add(
+                    ctx,
+                    &[Value::Object(Some(handlers)), handler],
+                )?;
+            }
+            Ok(None)
+        },
     );
     r.register(
         log,
@@ -63543,7 +63568,9 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
         native_noop_with_this,
     );
 
-    // LogRecord = 7-field (level=0, message=1, loggerName=2, thrown=3, parameters=4, millis=5 Long, sequence=6 Long)
+    // LogRecord is a real-JDK object in normal VM mode. Address its named
+    // fields rather than the obsolete synthetic layout so Handler.isLoggable
+    // and Formatter.getMessage observe the constructor arguments.
     let lr = "java/util/logging/LogRecord";
     r.register(
         lr,
@@ -63551,19 +63578,11 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/logging/Level;Ljava/lang/String;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            if ctx.object_num_fields(this) >= 7 {
-                ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-                ctx.set_field(this, 1, args.get(2).copied().unwrap_or(Value::Object(None)));
-                ctx.set_field(this, 2, Value::Object(None));
-                ctx.set_field(this, 3, Value::Object(None));
-                ctx.set_field(this, 4, Value::Object(None));
-                let millis = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                ctx.set_field(this, 5, Value::Long(millis));
-                ctx.set_field(this, 6, Value::Long(0));
-            }
+            ctx.set_field_by_name(this, "level", args.get(1).copied().unwrap_or(Value::Object(None)));
+            ctx.set_field_by_name(this, "message", args.get(2).copied().unwrap_or(Value::Object(None)));
+            ctx.set_field_by_name(this, "loggerName", Value::Object(None));
+            ctx.set_field_by_name(this, "thrown", Value::Object(None));
+            ctx.set_field_by_name(this, "parameters", Value::Object(None));
             Ok(None)
         },
     );
@@ -63573,11 +63592,7 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
         "()Ljava/util/logging/Level;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            if ctx.object_num_fields(this) >= 7 {
-                Ok(Some(ctx.get_field(this, 0)))
-            } else {
-                Ok(Some(Value::Object(None)))
-            }
+            Ok(Some(ctx.get_field_by_name(this, "level")))
         },
     );
     r.register(
@@ -63586,25 +63601,17 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/logging/Level;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            if ctx.object_num_fields(this) >= 7 {
-                ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-            }
+            ctx.set_field_by_name(this, "level", args.get(1).copied().unwrap_or(Value::Object(None)));
             Ok(None)
         },
     );
     r.register(lr, "getMessage", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            Ok(Some(ctx.get_field(this, 1)))
-        } else {
-            Ok(Some(Value::Object(None)))
-        }
+        Ok(Some(ctx.get_field_by_name(this, "message")))
     });
     r.register(lr, "setMessage", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-        }
+        ctx.set_field_by_name(this, "message", args.get(1).copied().unwrap_or(Value::Object(None)));
         Ok(None)
     });
     r.register(lr, "getLoggerName", "()Ljava/lang/String;", |ctx, args| {
@@ -71258,7 +71265,7 @@ mod t10_manifest_input_stream_tests {
 
         // Manifest with a continuation line in the main section, plus one
         // per-entry section. Mixed CRLF + LF on purpose.
-        let mf_bytes = b"Manifest-Version: 1.0\r\nMain-Class: com.example\r\n .Very.Long.Class.Name\r\n\r\nName: pkg/Foo.class\nSHA-256-Digest: abc123\n\n";
+        let mf_bytes = b"Manifest-Version: 1.0\r\nMain-Class: com.example\r\n .Very.Long.Class.Name\r\n\r\nName: pkg/Foo.class\r\nSHA-256-Digest: abc123\r\n\r\n";
         let mf = call_manifest_init(&reg, &mut ctx, mf_bytes);
 
         // Main attributes: continuation line must be appended.

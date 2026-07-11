@@ -23,7 +23,7 @@ shape). See
 [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](CRATONVM-SPRING-GENUINE-BUGLIST-125.md)
 for full detail.
 
-## 2026-07-11 `HashMap` put/get ~230-365x slower than JDK-25 root-caused, partially fixed — fixed per-native-call dispatch overhead, not allocation/GC
+## 2026-07-11 `HashMap` native-dispatch overhead — FIXED/RETIRED
 
 Initial hypothesis (Integer autoboxing/allocation pressure) was wrong. cdb
 stack-sampling (same technique used for this repo's `bintrees` GC/allocation-ceiling
@@ -38,12 +38,11 @@ Three targeted, behavior-preserving fixes shipped for the safely-addressable sli
 (key hash/equals check-order in `native-collections/src/lib.rs`, a lock-free
 receiver-corruption fast path in `vm/src/vm/vm_exec.rs`, a lock-free field-layout
 cache in `gc/src/gen_heap.rs` mirroring an already-proven pattern elsewhere in this
-codebase) — isolated 5-round re-measurement averages ~206x post-fix, down from ~357x.
-Root scanning and the SATB GC flush (the largest remaining buckets) are deliberately
-NOT touched — both are correctness-critical with a real prior crash/heap-corruption
-history in this codebase. See
-[`hashmap-native-dispatch-overhead.md`](hashmap-native-dispatch-overhead.md) for the
-full investigation, profile evidence, and remaining-work writeup.
+codebase) — isolated 5-round re-measurement averaged ~206x post-fix, down from ~357x.
+A follow-up addressed the root-publication and dispatch residual and reached 10.54x
+the pinned CratonVM baseline; the
+completed investigation is archived at
+[`../internal/hashmap-native-dispatch-overhead.md`](../internal/hashmap-native-dispatch-overhead.md).
 
 ## 2026-07-11 TestParameterMap `replaceAll()` lock-bypass FIXED/RETIRED — real bug was an unwrapped `Map.Entry` escaping `Collections.unmodifiableMap(...).entrySet()`, not field visibility
 
@@ -145,7 +144,7 @@ algorithmic-complexity bug. First diagnosis blamed `Matcher`'s native bridge
 bridge is unconditionally dropped in real-JDK mode
 (`registry.rs`'s `drop_real_layout_synthetic`, same "synthetic bridge corrupts
 real-layout objects" family as
-[`stringjoiner-synthetic-native-real-jdk-field-mismatch.md`](stringjoiner-synthetic-native-real-jdk-field-mismatch.md))
+[`stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md`](../internal/fixed-suite-bugs/stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md))
 — the fix, while correct, was dead code. That led to isolating the actual bug to
 plain `String.substring()` (zero regex involved) — but the FIRST substring native
 found and instrumented (`native_string_substring`,
@@ -307,8 +306,12 @@ Investigated the confirmed-but-unexplained pattern already flagged in
 
 ## 2026-07-10 AccessLogValve/RewriteValve doc RETIRED (5/6 causes fixed; 6th is the already-tracked register-invisible-JIT-root family, not a new bug)
 
-- RETIRED: [`tomcat-08-07/accesslogvalve-rewritevalve-connection-failures-RESOLVED.md`](../internal/tomcat-08-07/accesslogvalve-rewritevalve-connection-failures-RESOLVED.md) (moved from `known-issues/tomcat-08-07/`) — five of six root causes found across this investigation (`URL.openConnection()` CCE, `ByteBuffer.address`, `StringReader.read()`, the cross-cutting `SocketWrapperBase.lock` NPE, and a JIT `ConcurrentLinkedQueue` allocate-then-CAS miscompile) are FIXED and landed on `dev`. The sixth — a SIGSEGV around `TestAccessLogValve` test #8 — is a confirmed, byte-for-byte register-signature match with the already-tracked, currently-OPEN "register-invisible JIT root" bug family (real fix needs precise JIT oop maps / shadow stack, deep infrastructure work, deliberately not attempted). Catalogued as another occurrence in [`tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md`](tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md), the live tracking doc for this family — don't reopen the retired doc for a repeat of this signature, add it there instead.
+- RETIRED: [`tomcat-08-07/accesslogvalve-rewritevalve-connection-failures-RESOLVED.md`](../internal/tomcat-08-07/accesslogvalve-rewritevalve-connection-failures-RESOLVED.md) (moved from `known-issues/tomcat-08-07/`) — five of six root causes found across this investigation (`URL.openConnection()` CCE, `ByteBuffer.address`, `StringReader.read()`, the cross-cutting `SocketWrapperBase.lock` NPE, and a JIT `ConcurrentLinkedQueue` allocate-then-CAS miscompile) are FIXED and landed on `dev`. The sixth — a SIGSEGV around `TestAccessLogValve` test #8 — is a confirmed, byte-for-byte register-signature match with the already-tracked, currently-OPEN "register-invisible JIT root" bug family (real fix needs precise JIT oop maps / shadow stack, deep infrastructure work, deliberately not attempted). Catalogued as another occurrence in [`tomcat-08-07/swallowabortedupploads-unexpected-socketexception-RESOLVED.md`](../internal/tomcat-08-07/swallowabortedupploads-unexpected-socketexception-RESOLVED.md) (also since retired — see below), the tracking doc for this family — don't reopen either retired doc for a repeat of this signature, catalogue it as a new occurrence somewhere fresh instead.
 - **Correction while retiring:** the retired doc's sixth-cause section had cited `hib-global-temptable-nondeterministic-sigsegv-20260710.md` as a corroborating occurrence of this family. That's stale — see the entry above (2026-07-10 Hibernate remote rerun SIGSEGV cluster RESOLVED): that cluster was a different, unrelated, already-fixed bug. Corrected in both the retired doc and the swallow-uploads tracking doc.
+
+## 2026-07-11 `TestSwallowAbortedUploads` doc RETIRED — full class passes clean
+
+- RETIRED: [`tomcat-08-07/swallowabortedupploads-unexpected-socketexception-RESOLVED.md`](../internal/tomcat-08-07/swallowabortedupploads-unexpected-socketexception-RESOLVED.md) (moved from `known-issues/tomcat-08-07/`) — `org.apache.catalina.core.TestSwallowAbortedUploads` now passes all 10 tests clean (`OK (10 tests)`, verified 4×). This doc's history spans 8 distinct, genuine defects across ~10 sessions (the original socket-close overcorrection, a `ScheduledThreadPoolExecutor` boot blocker, a `ByteBuffer` connector `AbstractMethodError`, the cross-cutting `SocketWrapperBase.lock`/`LinkedBlockingDeque` synthetic-layout NPE, a `String(char[])` interpreter-throughput gap that tripped a 3s connector timeout, the register-invisible-JIT-root `SB-CRASH-04` SIGSEGV, and finally the `sc_close` swallow-vs-abort gap itself plus a `java.net.Socket` write-path exception-classification bug) — read the retired doc's own chronology for the full arc before assuming a superficially-similar future symptom is one of these already-closed causes.
 
 ## 2026-07-11 `testNonBlockingReadIgnoreIsReady`: fixed-length HTTP streaming FIXED
 
@@ -394,7 +397,7 @@ effect — the peer had already sent EOF long before close() ran).
 ## 2026-07-10 ES suite-wide RandomizedRunner CCE FIXED (bisected to `aa21e334`); new pre-existing StringJoiner content bug filed
 
 - FIXED/RETIRED: [`ES-FAIL-20260710-randomizedrunner-classmodel-modifier-stringjoiner-cce-FIXED.md`](../internal/elasticsearch-suite/ES-FAIL-20260710-randomizedrunner-classmodel-modifier-stringjoiner-cce-FIXED.md) — every `RandomizedRunner`-based ES test class failed at bootstrap with `ClassCastException: ArrayList cannot be cast to String[]` in `Modifier.toString`/`StringJoiner.add`, blocking the whole suite. Bisected to dev `aa21e334` ("Fix Spring SpEL evaluation edge cases"), which made `StringJoiner` yield to real bytecode for the first time at the interpreter's own dispatch loop — exposing a deterministic heap-reference-integrity defect (`gen_heap::read_slot` "corrupt Value cell"/`HIB-CV-32` guard) in real `StringJoiner.add()`'s `elts[size++]=elt` bytecode pattern that does not reproduce for an equivalent user-defined class (ruled out via two standalone `MicroProbe` repros). Fixed by excluding `java/util/StringJoiner` from the new dispatch check's allowlist, reverting only that one class at that one dispatch point back to its proven-safe pre-`aa21e334` behavior (`vm/src/vm/vm_exec.rs`'s separate, older allowlist for the same class is untouched). Verified: the doc's exact repro (6 classes) now 6/6 PASS; a 60-class broader sweep matches a prior session's pre-regression baseline byte-for-byte (zero new failures).
-- OPEN (new, pre-existing, unrelated to the above): [`stringjoiner-synthetic-native-real-jdk-field-mismatch.md`](stringjoiner-synthetic-native-real-jdk-field-mismatch.md) — `StringJoiner`'s `SyntheticStub` native uses a legacy 5-field layout that doesn't match the real JDK's actual 7-field layout, so in real-JDK mode it silently produces wrong content (`Modifier.toString()`/any `StringJoiner.toString()` returns `""` instead of the joined string) — confirmed present identically on dev `4b08ffad`, well before `aa21e334`, i.e. not a new regression, just newly noticed. Non-crashing, low urgency.
+- FIXED/RETIRED (2026-07-11, pre-existing, unrelated to the above): [`stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md`](../internal/fixed-suite-bugs/stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md) — `StringJoiner`'s `SyntheticStub` native used a legacy 5-field layout that didn't match the real JDK's actual 7-field layout, so in real-JDK mode it silently produced wrong content (`Modifier.toString()`/any `StringJoiner.toString()` returned `""` instead of the joined string) — confirmed present identically on dev `4b08ffad`, well before `aa21e334`, i.e. not a regression from that commit. Fixed by resolving the real class's field indices by name and reimplementing `add`/`toString`/`length`/`merge`/`setEmptyValue` against the real 7-field layout (falling back to the untouched legacy path in synthetic-JDK mode); verified byte-for-byte against HotSpot including a reflection field dump.
 - FIXED/RETIRED (same root cause, found concurrently by a different session): [`junit-consolelauncher-picocli-classcastexception-arraylist-stringarray-FIXED.md`](../internal/fixed-suite-bugs/junit-consolelauncher-picocli-classcastexception-arraylist-stringarray-FIXED.md) — identical `ArrayList`→`String[]` CCE via `StringJoiner.add`←`Modifier.toString`←`Field.toGenericString`, reached through picocli's `CommandLine$Model$TypedMember.getToString` instead of `RandomizedRunner`'s `ClassModel`. That session's bisection window `(8cdc1c011..c3c2b9ee2]` contains `aa21e334`, confirming the same root cause; not independently re-run against its own commons-math/picocli repro (no commons-math test classpath available on the collection host), so reopen if that specific repro still fails.
 
 ## 2026-07-10 Executors factory mainlock NPE FIXED (layer 2); two unrelated dev regressions found while verifying
@@ -1590,4 +1593,3 @@ Index + per-bug reports: [spring-boot-probe-sweep/INDEX.md](../internal/spring-b
   **SBR-08/09/10/11/13** object-identity cluster (CV synthesizes JDK objects as abstract/base-typed —
   jar conn, NIO FS, IntStream, MethodHandle, ProtectionDomain); **SBR-12** `cratonvm.internal.UnmodifiableList`
   name leak (needs real `ImmutableCollections` or a guarded alias).
-

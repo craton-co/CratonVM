@@ -21,6 +21,7 @@ synthetic-jdk = []
 cratonvm-types = { path = "../types", version = "0.3.0" }
 cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
 parking_lot.workspace = true
+rustc-hash.workspace = true
 
 [dev-dependencies]
 # Behavioural-coverage integration tests in `tests/` build a heap-backed
