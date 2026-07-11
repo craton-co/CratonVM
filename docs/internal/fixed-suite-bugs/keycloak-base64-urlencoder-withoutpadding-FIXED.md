@@ -20,6 +20,18 @@ Status: open — high-confidence, foundational CratonVM bug in a core, extremely
 
 Date observed: 2026-07-10/11 (fresh-binary rerun from current dev, branch fix/keycloak-nonpassed-rerun-v2-20260710)
 
+## Resolution
+
+Fixed in July 2026. CratonVM's Base64 intrinsics were registered but their
+encoder configuration had two defects: concrete JDK methods were not forced
+through the native override path, and the intrinsic stored its configuration in
+synthetic slot 0. In the real JDK `Base64$Encoder`, slot 0 is the `newline`
+reference; the actual `linemax`, `isURL`, and `doPadding` fields occupy slots
+1, 2, and 3. The VM now dispatches the Base64 API family to the intrinsics and
+uses that real layout. Remote VM probes verify URL-safe output (`-_8=`),
+unpadded output (`-_8`), SHA-1 length 27, SHA-256 length 43, and preservation
+of normal padded output.
+
 ## Summary
 
 `crypto/elytron :: ElytronPemUtilsTest` fails both of its Base64URL-thumbprint-length tests by exactly one
