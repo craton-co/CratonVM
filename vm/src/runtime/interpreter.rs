@@ -882,12 +882,13 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 shared
                     .gc_barrier
                     .request_stw_counted_with_live_blocked(thread.thread_id, || {
-                        let (n, blocked, tids) =
+                        let (n, blocked, tids, blocked_tids) =
                             shared.thread_registry.alive_count_blocked_and_os_tids();
                         counted_os_tids = tids;
                         (
                             u32::try_from(n).unwrap_or(u32::MAX),
                             u32::try_from(blocked).unwrap_or(u32::MAX),
+                            blocked_tids,
                         )
                     })
             };
@@ -1026,12 +1027,13 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             shared
                 .gc_barrier
                 .request_stw_counted_with_live_blocked(thread.thread_id, || {
-                    let (n, blocked, tids) =
+                    let (n, blocked, tids, blocked_tids) =
                         shared.thread_registry.alive_count_blocked_and_os_tids();
                     counted_os_tids = tids;
                     (
                         u32::try_from(n).unwrap_or(u32::MAX),
                         u32::try_from(blocked).unwrap_or(u32::MAX),
+                        blocked_tids,
                     )
                 })
         };
@@ -1218,12 +1220,13 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             shared
                 .gc_barrier
                 .request_stw_counted_with_live_blocked(thread.thread_id, || {
-                    let (n, blocked, tids) =
+                    let (n, blocked, tids, blocked_tids) =
                         shared.thread_registry.alive_count_blocked_and_os_tids();
                     counted_os_tids = tids;
                     (
                         u32::try_from(n).unwrap_or(u32::MAX),
                         u32::try_from(blocked).unwrap_or(u32::MAX),
+                        blocked_tids,
                     )
                 })
         };
@@ -3003,11 +3006,13 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
     let initial_mark_done = shared
         .gc_barrier
         .request_stw_counted_with_live_blocked(thread.thread_id, || {
-            let (n, blocked, tids) = shared.thread_registry.alive_count_blocked_and_os_tids();
+            let (n, blocked, tids, blocked_tids) =
+                shared.thread_registry.alive_count_blocked_and_os_tids();
             counted_os_tids = tids;
             (
                 u32::try_from(n).unwrap_or(u32::MAX),
                 u32::try_from(blocked).unwrap_or(u32::MAX),
+                blocked_tids,
             )
         });
     if !initial_mark_done {
@@ -3160,11 +3165,13 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
     let initial_mark_done = shared
         .gc_barrier
         .request_stw_counted_with_live_blocked(thread.thread_id, || {
-            let (n, blocked, tids) = shared.thread_registry.alive_count_blocked_and_os_tids();
+            let (n, blocked, tids, blocked_tids) =
+                shared.thread_registry.alive_count_blocked_and_os_tids();
             counted_os_tids = tids;
             (
                 u32::try_from(n).unwrap_or(u32::MAX),
                 u32::try_from(blocked).unwrap_or(u32::MAX),
+                blocked_tids,
             )
         });
     if !initial_mark_done {

@@ -425,11 +425,15 @@ pub fn ensure_class_initialized_shared(
                     // GC-blocked (collections proceed and fold our frame
                     // fixups), wait, then re-sync on wake.
                     let mut ctx = crate::vm::vm_exec::NativeContextImpl { shared, thread };
-                    ctx.deposit_root_snapshot();
+                    // GCAUDIT-0711-FIX (finding 1a, adjacent): retire BEFORE
+                    // deposit - see vm_exec.rs::monitor_enter_blocking.
                     ctx.thread.tlab.retire();
+                    ctx.deposit_root_snapshot();
                     let blk = shared.gc_barrier.enter_blocked();
                     if blk.pre_stw {
-                        let _ = shared.gc_barrier.arrive_and_wait(
+                        // GCAUDIT-0711-FIX (finding 1a): auto - the deposit
+                        // above already raised in_blocked_region.
+                        let _ = shared.gc_barrier.arrive_and_wait_auto(
                             crate::threading::jvm_thread::ThreadId(current_thread_id),
                         );
                     }

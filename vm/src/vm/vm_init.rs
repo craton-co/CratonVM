@@ -4862,10 +4862,12 @@ impl Vm {
             ctx.deposit_root_snapshot();
         }
         if self.shared.gc_barrier.mark_blocked_region_enter() {
+            // GCAUDIT-0711-FIX (finding 1a): auto - the deposit above
+            // already raised in_blocked_region.
             let _ = self
                 .shared
                 .gc_barrier
-                .arrive_and_wait(self.main_thread.thread_id);
+                .arrive_and_wait_auto(self.main_thread.thread_id);
         }
     }
 

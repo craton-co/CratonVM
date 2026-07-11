@@ -1270,16 +1270,25 @@ impl ThreadRegistry {
     /// evacuating collection -- there is nothing for the collector to race
     /// against on that thread until it actually marks itself ready, at which
     /// point it becomes visible to the NEXT pause's snapshot as normal.
-    pub fn alive_count_blocked_and_os_tids(&self) -> (usize, usize, Vec<u32>) {
+    ///
+    /// GCAUDIT-0711-FIX (finding 1a): also returns the IDENTITIES
+    /// (`ThreadId.0`) of the alive threads counted in `blocked`, so
+    /// `GcBarrier::request_stw_counted_with_live_blocked` can publish exactly
+    /// which threads THIS pause excluded — see
+    /// `GcBarrierInner::excluded_blocked`'s doc for why per-thread identity,
+    /// not just a count, is required for a race-free arrival decision.
+    pub fn alive_count_blocked_and_os_tids(&self) -> (usize, usize, Vec<u32>, Vec<u64>) {
         let threads = self.threads.lock();
         let mut alive = 0usize;
         let mut blocked = 0usize;
         let mut tids = Vec::with_capacity(threads.len());
-        for e in threads.values() {
+        let mut blocked_tids = Vec::new();
+        for (tid, e) in threads.iter() {
             if e.alive.load(Ordering::Acquire) && e.stw_ready.load(Ordering::Acquire) {
                 alive += 1;
                 if e.gc_block_state.in_blocked_region.load(Ordering::Acquire) {
                     blocked += 1;
+                    blocked_tids.push(tid.0);
                 }
                 let t = e.os_tid.load(Ordering::Acquire);
                 if t != 0 {
@@ -1287,7 +1296,7 @@ impl ThreadRegistry {
                 }
             }
         }
-        (alive, blocked, tids)
+        (alive, blocked, tids, blocked_tids)
     }
 
     /// Get Java Thread objects for all alive threads (up to `max` entries).
@@ -1618,7 +1627,7 @@ mod tests {
         let root = dummy_aligned_objref(&mut backing);
         registry.set_root_snapshot(tid, Arc::new(Mutex::new(vec![root])));
 
-        let (_, _, tids) = registry.alive_count_blocked_and_os_tids();
+        let (_, _, tids, _) = registry.alive_count_blocked_and_os_tids();
         assert!(!tids.is_empty(), "os tid must be published");
         let roots = registry.root_snapshots_for_os_tids(&tids);
         assert_eq!(roots.len(), 1, "matching alive thread's snapshot returned");
