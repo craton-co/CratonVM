@@ -165,7 +165,7 @@ next* operation on that same reader fails with `in` already null, no
 null immediately after being set in the constructor is the exact symptom
 shape already root-caused (and then *re*-root-caused after an initial
 misdiagnosis) in
-[`swallowabortedupploads-unexpected-socketexception.md`](../../known-issues/tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md)'s
+[`swallowabortedupploads-unexpected-socketexception-RESOLVED.md`](swallowabortedupploads-unexpected-socketexception-RESOLVED.md)'s
 2026-07-10 bisection section: **not a GC/JIT stale-local bug** (that theory
 was tested and explicitly retracted there) but a **synthetic native writing
 a fake/undersized field layout onto an object stamped with the real

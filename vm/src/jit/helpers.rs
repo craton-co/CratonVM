@@ -3781,6 +3781,24 @@ struct DispatchCache {
     needs_context: bool,
 }
 
+#[derive(Clone, Copy)]
+struct NativeDispatchCache {
+    receiver_class_id: u32,
+    callback: cratonvm_native_api::NativeCallback,
+}
+
+#[derive(Clone, Copy)]
+enum IntegerNativeKind {
+    ValueOf,
+    IntValue,
+}
+
+#[derive(Clone, Copy)]
+struct IntegerNativeDispatchCache {
+    kind: IntegerNativeKind,
+    callback: cratonvm_native_api::NativeCallback,
+}
+
 // Thread-local map from JitInvokeInfo pointer -> cached JIT entry.
 // Using a thread-local avoids synchronization on the hot path.
 // T10.9.B: FxHashMap — pointer values are internal; this is touched on every
@@ -3789,6 +3807,12 @@ thread_local! {
     static DISPATCH_CACHE: std::cell::RefCell<rustc_hash::FxHashMap<usize, DispatchCache>>
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
     static DISPATCH_COUNTER: std::cell::RefCell<rustc_hash::FxHashMap<usize, u32>>
+        = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+    static HASHMAP_NATIVE_DISPATCH_CACHE:
+        std::cell::RefCell<rustc_hash::FxHashMap<usize, NativeDispatchCache>>
+        = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+    static INTEGER_NATIVE_DISPATCH_CACHE:
+        std::cell::RefCell<rustc_hash::FxHashMap<usize, Option<IntegerNativeDispatchCache>>>
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 }
 
@@ -4240,6 +4264,42 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         std::slice::from_raw_parts(args_ptr as *const i64, num_args as usize)
     };
 
+    let info_key = info_ptr as usize;
+    if !crate::classloading::any_class_redefined() {
+        let cached =
+            INTEGER_NATIVE_DISPATCH_CACHE.with(|cache| cache.borrow().get(&info_key).copied());
+        let integer_native = match cached {
+            Some(entry) => entry,
+            None => {
+                let entry = match (info.class_name, info.method_name, info.descriptor) {
+                    ("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;") => {
+                        Some(IntegerNativeDispatchCache {
+                            kind: IntegerNativeKind::ValueOf,
+                            callback: cratonvm_native_builtins::intrinsics::integer::intrinsic_integer_value_of,
+                        })
+                    }
+                    ("java/lang/Integer", "intValue", "()I") => {
+                        Some(IntegerNativeDispatchCache {
+                            kind: IntegerNativeKind::IntValue,
+                            callback: cratonvm_native_builtins::intrinsics::integer::intrinsic_integer_int_value,
+                        })
+                    }
+                    _ => None,
+                };
+                INTEGER_NATIVE_DISPATCH_CACHE.with(|cache| {
+                    cache.borrow_mut().insert(info_key, entry);
+                });
+                entry
+            }
+        };
+        if let Some(entry) = integer_native {
+            if let Some((thread, _guard)) = jit_thread_mut() {
+                if let Some(result) = call_integer_native_raw(vm, thread, info, args_slice, entry) {
+                    return result;
+                }
+            }
+        }
+    }
     // BUG-1: native-stack recursion guard for the JIT→JIT dispatch path. Bump
     // the per-thread JIT-dispatch depth and check it against the native-stack
     // ceiling BEFORE we recurse into any compiled callee. On overflow this
@@ -4253,7 +4313,6 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
 
     // Fast path: check thread-local dispatch cache for a previously-compiled callee.
     // This avoids the JIT cache lock on every call.
-    let info_key = info_ptr as usize;
     // Virtual/interface dispatch (invoke_kind 0/2) must resolve on the RUNTIME
     // receiver type. The callsite-keyed entry cache below and the
     // `info.class_name` (static CP class) JIT-cache lookup both assume static
@@ -4440,6 +4499,66 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         }
     };
 
+    // Registered natives cannot populate DISPATCH_CACHE because they have no
+    // compiled entry pointer. Cache the callback and exact receiver ClassId for
+    // the hot monomorphic HashMap put/get sites instead of repeating virtual
+    // resolution and a failed compile probe on every iteration.
+    if matches!(info.invoke_kind, 0 | 2)
+        && !crate::classloading::any_class_redefined()
+        && hashmap_native_arg_count(info).is_some()
+        && !args_slice.is_empty()
+    {
+        let receiver_raw = args_slice[0] as u64;
+        if receiver_raw != 0 && (receiver_raw & 0x7) == 0 && receiver_raw < (1u64 << 48) {
+            if let Some(receiver) = vm.heap.is_object_address(receiver_raw as usize) {
+                let receiver_class_id = vm.heap.class_id_of(receiver).as_u32();
+                let cached = HASHMAP_NATIVE_DISPATCH_CACHE.with(|cache| {
+                    cache
+                        .borrow()
+                        .get(&info_key)
+                        .copied()
+                        .filter(|entry| entry.receiver_class_id == receiver_class_id)
+                });
+                if let Some(entry) = cached {
+                    if let Some(result) = call_hashmap_native_raw(
+                        vm,
+                        thread,
+                        info,
+                        receiver,
+                        args_slice,
+                        entry.callback,
+                    ) {
+                        return result;
+                    }
+                } else {
+                    let is_exact_hashmap = {
+                        let classes = vm.class_manager.read();
+                        classes
+                            .get_class(ClassId::new(receiver_class_id))
+                            .map(|class| class.name.as_ref() == "java/util/HashMap")
+                            .unwrap_or(false)
+                    };
+                    if is_exact_hashmap {
+                        if let Some(callback) = hashmap_native_callback(info) {
+                            let entry = NativeDispatchCache {
+                                receiver_class_id,
+                                callback,
+                            };
+                            HASHMAP_NATIVE_DISPATCH_CACHE.with(|cache| {
+                                cache.borrow_mut().insert(info_key, entry);
+                            });
+                            if let Some(result) = call_hashmap_native_raw(
+                                vm, thread, info, receiver, args_slice, callback,
+                            ) {
+                                return result;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Round-5 CRIT-1 fix: share arg-decoding with the three cache-hit
     // overflow bailouts above via `decode_dispatch_values`.
     let values = decode_dispatch_values(vm, info, args_slice);
@@ -4624,6 +4743,116 @@ unsafe fn try_compile_callee(vm: &SharedVm, info: &JitInvokeInfo) -> Option<(usi
     use crate::runtime::interpreter::try_jit_compile_callee;
     // JIT-dispatch callee compile — optimized (C2-equivalent) tier.
     try_jit_compile_callee(vm, info.class_name, info.method_name, info.descriptor, true)
+}
+
+#[inline]
+fn call_integer_native_raw(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+    args_slice: &[i64],
+    entry: IntegerNativeDispatchCache,
+) -> Option<i64> {
+    if args_slice.len() != 1 {
+        return None;
+    }
+    let arg = match entry.kind {
+        IntegerNativeKind::ValueOf => Value::Int(args_slice[0] as i32),
+        IntegerNativeKind::IntValue => {
+            let raw = args_slice[0] as u64;
+            if raw == 0 || (raw & 0x7) != 0 || raw >= (1u64 << 48) {
+                return None;
+            }
+            Value::Object(Some(vm.heap.is_object_address(raw as usize)?))
+        }
+    };
+    let result = match crate::vm::safe_native_call_prevalidated_objects(
+        vm,
+        thread,
+        entry.callback,
+        std::slice::from_ref(&arg),
+    ) {
+        Ok(value) => value,
+        Err(error) => return Some(handle_jit_dispatch_error(vm, thread, error, info)),
+    };
+    Some(match result {
+        Some(Value::Int(value)) => value as i64,
+        Some(Value::Long(value)) => value,
+        Some(Value::Object(Some(object))) => object.as_ptr() as i64,
+        Some(Value::Object(None)) | None => 0,
+        _ => 0,
+    })
+}
+
+#[inline]
+fn hashmap_native_arg_count(info: &JitInvokeInfo) -> Option<usize> {
+    match (info.method_name, info.descriptor) {
+        ("put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;") => Some(3),
+        ("get", "(Ljava/lang/Object;)Ljava/lang/Object;") => Some(2),
+        _ => None,
+    }
+}
+
+#[inline]
+fn hashmap_native_callback(info: &JitInvokeInfo) -> Option<cratonvm_native_api::NativeCallback> {
+    match (info.method_name, info.descriptor) {
+        ("put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;") => {
+            Some(cratonvm_native_collections::native_hashmap_put_exact)
+        }
+        ("get", "(Ljava/lang/Object;)Ljava/lang/Object;") => {
+            Some(cratonvm_native_collections::native_hashmap_get_exact)
+        }
+        _ => None,
+    }
+}
+
+/// Invoke a cached HashMap bridge directly from raw JIT argument slots.
+#[inline]
+fn call_hashmap_native_raw(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+    receiver_ref: ObjectRef,
+    args_slice: &[i64],
+    callback: cratonvm_native_api::NativeCallback,
+) -> Option<i64> {
+    let expected_len = match args_slice.len() {
+        len @ (2 | 3) => len,
+        _ => return None,
+    };
+
+    let mut values = [Value::Object(None); 3];
+    values[0] = Value::Object(Some(receiver_ref));
+    for (index, &raw) in args_slice[1..].iter().enumerate() {
+        if raw == 0 {
+            continue;
+        }
+        let bits = raw as u64;
+        if (bits & 0x7) != 0 || bits >= (1u64 << 48) {
+            return None;
+        }
+        let object = vm.heap.is_object_address(bits as usize)?;
+        values[index + 1] = Value::Object(Some(object));
+    }
+
+    let result = match crate::vm::safe_native_call_prevalidated_objects(
+        vm,
+        thread,
+        callback,
+        &values[..expected_len],
+    ) {
+        Ok(value) => value,
+        Err(error) => return Some(handle_jit_dispatch_error(vm, thread, error, info)),
+    };
+    Some(match result {
+        Some(Value::Int(value)) => value as i64,
+        Some(Value::Long(value)) => value,
+        Some(Value::Float(value)) => value.to_bits() as i64,
+        Some(Value::Double(value)) => value.to_bits() as i64,
+        Some(Value::Object(Some(object))) => object.as_ptr() as i64,
+        Some(Value::Object(None)) | None => 0,
+        _ => 0,
+    })
 }
 
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.

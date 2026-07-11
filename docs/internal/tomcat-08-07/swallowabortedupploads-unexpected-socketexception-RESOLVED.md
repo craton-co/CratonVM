@@ -1,6 +1,10 @@
 # TestSwallowAbortedUploads — client sees `SocketException` when none expected
 
-**Status:** OPEN. **Severity:** medium. **HotSpot:** PASS.
+**Status:** ✅ RESOLVED (2026-07-11) — see the final section at the bottom.
+`org.apache.catalina.core.TestSwallowAbortedUploads` now passes all 10
+tests clean (`OK (10 tests)`), verified across 4 consecutive runs including
+a build off the exact commit merged to `dev`. **Severity:** medium.
+**HotSpot:** PASS.
 
 ## Summary
 
@@ -1396,3 +1400,100 @@ family** (tomcat-08-07 investigation): DoHead
 `TestSwallowAbortedUploads`/`AbortedPOSTClient` (this doc, above), and
 `TestAccessLogValve` (this section). The Hibernate global-temp-table cluster
 is explicitly **not** part of this list per the correction above.
+
+## 2026-07-11: RESOLVED — `sc_close` gap fixed now that the crash risk is gone; full class passes clean
+
+Picked up the two remaining open threads from this doc's "6 genuine
+failures" tally (the `sc_close` swallow-vs-abort behavioral gap and the
+`AbortedPOSTClient` blank-response investigation) now that the dependency
+chain above (`String(char[])` intrinsic, `LinkedBlockingDeque` synthetic
+drop, SB-CRASH-04 full-GPR safepoint spill) had all landed.
+
+**Re-confirmed the crash risk that blocked a clean `sc_close` fix earlier is
+gone.** Built two throwaway worktrees, both applying the "obvious" fix this
+doc's earlier sections stopped short of (remove `lingering_channel_close`'s
+background drain thread entirely, keep only the write-side FIN):
+
+- **Before `02b91823`** (SB-CRASH-04): the *exact same* code change SIGSEGVs
+  3/3 times, deterministically during `testAbortedPOST413Swallow`'s teardown
+  (`exit 139`, confirmed via `EXIT=$?` after the shell reported "Segmentation
+  fault") — this is why earlier sections of this doc kept the background-drain
+  workaround despite its known behavioral gap.
+- **After `02b91823`** (i.e. on top of current `dev`, same code change): 3/3
+  clean runs, zero crashes, `Tests run: 10, Failures: 3` (down from 6) every
+  time. The two `AbortedUploadClient`/`AbortedPOSTClient` tests that want a
+  `SocketException` on swallow-disabled abort still failed to get one, and
+  `testChunkedPUTLimit` started throwing an *uncaught* `java.io.IOException:
+  Socket write failed: Broken pipe` instead of a bare `AssertionError` — i.e.
+  the connection genuinely *was* now getting reset (proving the architectural
+  theory from the "2026-07-10 blocker #3" section correct: Tomcat's own
+  swallow-input loop, once nothing upstream corrupts it, drains correctly
+  when swallow is enabled and correctly does nothing when it's disabled,
+  making the background-drain workaround unnecessary) — but
+  `doTestChunkedPUT`'s own `catch (SocketException e)` doesn't match a plain
+  `IOException`, so the reset surfaced as a test failure anyway.
+
+**Second fix: `java.net.Socket`'s write path wasn't classifying connection
+resets as `SocketException`.** `native-builtins/src/net_phase_e.rs::re1_socket_write_stream`
+(the native behind `java.net.Socket.getOutputStream().write()` — the
+*non-NIO* blocking socket API `doTestChunkedPUT`'s raw `Socket` uses, as
+opposed to `native-io/src/socket_channel.rs`'s NIO `SocketChannel` path)
+wrapped every write failure in a bare `java.io.IOException` via `ioex(...)`,
+regardless of the underlying OS error. `native-io/src/socket_channel.rs::map_err`
+already classifies `ConnectionAborted`/`ConnectionReset`/etc. as
+`SocketException` for the NIO path; `re1_socket_write_stream` had no
+equivalent. Fixed by classifying `BrokenPipe`/`ConnectionReset`/
+`ConnectionAborted`/`NotConnected` and throwing a real, constructed
+`java.net.SocketException` (via `ctx.new_object_initialized`, the same
+pattern already used a few hundred lines up in the same file for
+`ServerSocket.accept()`'s "Socket closed" case) instead of a generic
+`IOException`.
+
+**Result: both fixes together take the class from 6 failures to 0.**
+Verified 4 times total (2 pre-merge on the isolated worktree, 1 after
+merging a fast-moving `origin/dev` into the worktree mid-session, 1 more
+after that merge — including a `native-io` `cargo test` run, 7/7 pass, with
+the pre-existing `tomcat0807_http_lingering_channel_close_drains_peer_upload`
+unit test updated to assert the new, narrower, still-true guarantee — a
+peer's blocking read sees EOF after the write-side FIN — rather than the
+removed "arbitrary-sized upload always drains without a reset" guarantee):
+
+```
+$ <EXE> ... org.junit.runner.JUnitCore org.apache.catalina.core.TestSwallowAbortedUploads
+..........
+Time: 113-127s (host-load-dependent)
+
+OK (10 tests)
+```
+
+**Landed on `dev`** (commit `d88d4d15`, merged via
+`fix/scclose-nobg-sbcrash04-20260711`):
+`native-io/src/socket_channel.rs` (`lingering_channel_close` simplified —
+no more background thread) and `native-builtins/src/net_phase_e.rs`
+(`re1_socket_write_stream`'s error classification).
+
+**What this doc's whole arc turned out to be**, end to end: a single
+originally-reported symptom (unexpected `SocketException` with swallow
+enabled) that required, in order: (1) a socket-close fix
+(`420e4a55`/`27c3e9ac`) that *itself* introduced a narrower regression by
+being too broad a workaround; (2) fixing an unrelated `ScheduledThreadPoolExecutor`
+synthetic-layout bug just to get the test class booting; (3) fixing an
+unrelated `ByteBuffer` heap-address bug to get past a connector `AbstractMethodError`;
+(4) diagnosing (but initially misattributing to a "deep GC/JIT root-scanning
+bug") a `SocketWrapperBase.lock`-is-null NPE that turned out to be the
+`LinkedBlockingDeque` synthetic-native-layout bug family, cross-cutting into
+three other Tomcat test classes; (5) a genuine interpreter-throughput gap
+(`String(char[])` had no native intrinsic, ~5-6s for a 10M-char array,
+tripping a 3s connector read-timeout) that needed a real performance fix,
+not a workaround; (6) a real, hard-to-reproduce SIGSEGV in JIT-compiled code
+(register-invisible root across a GC-capable safepoint, `SB-CRASH-04`) that
+several independent sessions chased via crash-dump analysis before a
+default-path fix landed; and only *then*, with all of the above as
+prerequisites, (7) the original doc's actual subject — `sc_close`'s
+swallow-vs-abort behavioral gap — could be fixed correctly (removing a
+workaround, not adding one) plus (8) one small, previously-invisible
+exception-classification bug in the non-NIO socket write path. Each of these
+was a genuine, independent defect; none were red herrings, but several were
+initially misdiagnosed as a different one of the others before being
+untangled. Retiring this doc to `docs/internal/` — see that copy for the
+canonical, closed version of this investigation.

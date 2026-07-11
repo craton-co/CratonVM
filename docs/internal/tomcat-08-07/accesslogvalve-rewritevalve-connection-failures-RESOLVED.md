@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | **RETIRED, moved to `docs/internal/tomcat-08-07/`.** Five of six root causes found in this investigation are FIXED and landed on `dev`. The sixth — a SIGSEGV around `TestAccessLogValve` test #8 — is not a new, locally-owned bug: it's a confirmed, byte-for-byte register-signature match with the already-tracked, currently-OPEN "register-invisible JIT root" bug family, which has its own dedicated tracking (see below). This doc's own investigative scope (the AccessLogValve/RewriteValve-specific connection failures) is complete; further work on the residual belongs to the docs that own that bug family, not a re-run of this one. |
 | **Local causes fixed** | Layer 1 (`URL.openConnection()` CCE) — FIXED. Layer 2 (`ByteBuffer.address`) — FIXED. Layer 3 (`StringReader.read()`) — FIXED. Cross-cutting `SocketWrapperBase.lock` NPE — FIXED (see the swallow-uploads doc). Fifth cause (JIT `ConcurrentLinkedQueue` allocate-then-CAS miscompile) — FIXED (`44f16ee2`). |
-| **Residual, not owned here** | Sixth cause: SIGSEGV around `TestAccessLogValve` test #8, `http-nio` worker thread, JIT-compiled code, register dump matching the tagged-pointer-corruption signature of the "register-invisible JIT root" family. Catalogued as another confirmed occurrence in [`swallowabortedupploads-unexpected-socketexception.md`](../../known-issues/tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md), the live tracking doc for this open bug family within the tomcat-08-07 investigation. Real fix needs precise JIT oop maps / shadow stack (deep infrastructure work) — deliberately not attempted here. |
+| **Residual, not owned here** | Sixth cause: SIGSEGV around `TestAccessLogValve` test #8, `http-nio` worker thread, JIT-compiled code, register dump matching the tagged-pointer-corruption signature of the "register-invisible JIT root" family. Catalogued as another confirmed occurrence in [`swallowabortedupploads-unexpected-socketexception-RESOLVED.md`](swallowabortedupploads-unexpected-socketexception-RESOLVED.md) (also since retired — the underlying bug family fix, `SB-CRASH-04`, has since landed on `dev`; see that doc's final section). Real fix needed precise JIT oop maps / shadow stack (deep infrastructure work) — landed 2026-07-11. |
 | **HotSpot** | PASS on both classes. |
 
 **Practical upshot:** if `TestAccessLogValve`/`TestRewriteValve` hit this same SIGSEGV signature again (one live register breaking the `0x2000xxxxxxxx`-tagged-pointer pattern the others share), don't reopen this doc or file a new one — add the occurrence to `swallowabortedupploads-unexpected-socketexception.md` instead, which is where this bug family is actively tracked. Retired 2026-07-10; the original investigation record follows unchanged.
@@ -130,7 +130,7 @@ distinct, previously-undocumented issue" in an earlier version of this
 section is neither distinct nor previously undocumented — it's the exact
 `SocketWrapperBase`/`SocketProcessorBase` NPE root-caused across two prior
 sessions in
-`docs/known-issues/tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md`
+`docs/internal/tomcat-08-07/swallowabortedupploads-unexpected-socketexception-RESOLVED.md`
 (root-caused as a stale/lost local variable, `TestSwallowAbortedUploads`;
 also hit `TestNonBlockingAPI`/`TestHttp11Processor` per
 `nonblockingapi-http11processor-http2limits-bare-assertions.md`).

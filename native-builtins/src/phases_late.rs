@@ -27387,10 +27387,33 @@ pub(crate) fn register_p60_match_result(r: &mut NativeMethodRegistry) {
 // ProcessHandle expansion — children, descendants, onExit, info
 // =============================================================================
 
-pub(crate) fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
+fn p60_empty_optional(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let optional = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+    ctx.set_field(optional, 0, Value::Object(None));
+    Ok(Some(Value::Object(Some(optional))))
+}
+
+/// Register the native-backed ProcessHandle surface in both synthetic- and
+/// real-JDK modes. SmallRye invokes `current().info()` during class init.
+pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let ph = "java/lang/ProcessHandle";
+    r.register(
+        ph,
+        "current",
+        "()Ljava/lang/ProcessHandle;",
+        |ctx, _args| {
+            let handle = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1);
+            ctx.set_field(handle, 0, Value::Long(std::process::id() as i64));
+            Ok(Some(Value::Object(Some(handle))))
+        },
+    );
+    r.register(ph, "pid", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 0)))
+    });
+    r.register(ph, "isAlive", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
     r.register(
         ph,
         "children",
@@ -27423,9 +27446,7 @@ pub(crate) fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(cf))))
         },
     );
-    r.register(ph, "parent", "()Ljava/util/Optional;", |_ctx, _args| {
-        Ok(Some(Value::Object(None))) // empty Optional
-    });
+    r.register(ph, "parent", "()Ljava/util/Optional;", p60_empty_optional);
     r.register(ph, "supportsNormalTermination", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
@@ -27451,26 +27472,25 @@ pub(crate) fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         },
     );
     let phi = "java/lang/ProcessHandle$Info";
-    r.register(phi, "command", "()Ljava/util/Optional;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(phi, "arguments", "()Ljava/util/Optional;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(phi, "user", "()Ljava/util/Optional;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
+    r.register(phi, "command", "()Ljava/util/Optional;", p60_empty_optional);
+    r.register(
+        phi,
+        "arguments",
+        "()Ljava/util/Optional;",
+        p60_empty_optional,
+    );
+    r.register(phi, "user", "()Ljava/util/Optional;", p60_empty_optional);
     r.register(
         phi,
         "startInstant",
         "()Ljava/util/Optional;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        p60_empty_optional,
     );
     r.register(
         phi,
         "totalCpuDuration",
         "()Ljava/util/Optional;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        p60_empty_optional,
     );
     r.set_category(__prev_cat);
 }

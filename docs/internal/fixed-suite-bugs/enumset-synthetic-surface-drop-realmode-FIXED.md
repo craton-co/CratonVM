@@ -127,7 +127,7 @@ initializing the real inherited `ThreadPoolExecutor` state (`ctl`,
 breaking Tomcat's `ContainerBase.scheduleWithFixedDelay` →
 `delayedExecute` path (and independently, `TestSwallowAbortedUploads`,
 tracked in a separate concurrent investigation of
-`docs/known-issues/tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md`
+`docs/internal/tomcat-08-07/swallowabortedupploads-unexpected-socketexception-RESOLVED.md`
 — this fix resolves that blocker too). Fixed the same way: the synthetic
 override and its `Executors.newScheduledThreadPool`/
 `newSingleThreadScheduledExecutor` factory overrides are dropped in

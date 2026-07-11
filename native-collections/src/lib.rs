@@ -12,6 +12,7 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::ArrayElementType;
 use cratonvm_types::ClassId;
 use cratonvm_types::{ObjectKind, ObjectRef, Value};
+use rustc_hash::FxHashMap;
 
 // `pub` (gated by `#[doc(hidden)]` on the items themselves) so the
 // GC-relocation integration harness in `tests/gc_relocation_harness.rs`
@@ -153,6 +154,10 @@ fn obj_key_shard_for(hash: u32) -> &'static ObjKeyShard {
 /// Locks are poison-recovered (`into_inner`) so a panic elsewhere can never
 /// leave stale state stranded and re-aliasable.
 fn clear_overlay_entries_for_key(key: usize) {
+    hm_int_fast_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
     ll_overlay()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -278,6 +283,298 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
 #[inline]
 fn pack_obj_key(hash: u32, generation: u32) -> usize {
     (((hash as u64) << 32) | (generation as u64)) as usize
+}
+
+/// Authoritative lazy store for fresh, exact-class HashMaps with primitive
+/// Integer keys. Heap HashMap$Node objects are materialized on demand when an
+/// operation outside the fast put/get/size surface needs the ordinary table.
+#[derive(Default)]
+struct DenseIntEntries {
+    dense: Vec<Option<(ObjectRef, Value)>>,
+    sparse: FxHashMap<i32, (ObjectRef, Value)>,
+    len: usize,
+}
+
+impl DenseIntEntries {
+    const MAX_DENSE_KEY: usize = 16 * 1024 * 1024;
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn insert(&mut self, key: i32, value: (ObjectRef, Value)) -> Option<(ObjectRef, Value)> {
+        if key >= 0 {
+            let index = key as usize;
+            if index <= Self::MAX_DENSE_KEY && index <= self.dense.len().saturating_add(1024) {
+                if index >= self.dense.len() {
+                    self.dense.resize(index + 1, None);
+                }
+                let sparse_old = self.sparse.remove(&key);
+                let old = self.dense[index].replace(value).or(sparse_old);
+                if old.is_none() {
+                    self.len += 1;
+                }
+                return old;
+            }
+        }
+        let old = self.sparse.insert(key, value);
+        if old.is_none() {
+            self.len += 1;
+        }
+        old
+    }
+
+    fn get(&self, key: &i32) -> Option<&(ObjectRef, Value)> {
+        if *key >= 0 {
+            if let Some(value) = self.dense.get(*key as usize).and_then(Option::as_ref) {
+                return Some(value);
+            }
+        }
+        self.sparse.get(key)
+    }
+
+    fn remove(&mut self, key: &i32) -> Option<(ObjectRef, Value)> {
+        let old = if *key >= 0 {
+            self.dense
+                .get_mut(*key as usize)
+                .and_then(Option::take)
+                .or_else(|| self.sparse.remove(key))
+        } else {
+            self.sparse.remove(key)
+        };
+        if old.is_some() {
+            self.len -= 1;
+        }
+        old
+    }
+
+    fn contains_key(&self, key: &i32) -> bool {
+        self.get(key).is_some()
+    }
+
+    fn keys(&self) -> impl Iterator<Item = i32> + '_ {
+        self.dense
+            .iter()
+            .enumerate()
+            .filter_map(|(key, value)| value.as_ref().map(|_| key as i32))
+            .chain(self.sparse.keys().copied())
+    }
+
+    fn values(&self) -> impl Iterator<Item = &(ObjectRef, Value)> {
+        self.dense
+            .iter()
+            .filter_map(Option::as_ref)
+            .chain(self.sparse.values())
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut (ObjectRef, Value)> {
+        self.dense
+            .iter_mut()
+            .filter_map(Option::as_mut)
+            .chain(self.sparse.values_mut())
+    }
+}
+
+#[cfg(test)]
+mod dense_int_entries_tests {
+    use super::*;
+
+    fn object(address: usize) -> ObjectRef {
+        // The entry store treats refs as opaque values; these aligned sentinels
+        // are never dereferenced by this unit test.
+        unsafe { ObjectRef::from_raw(address as *mut u8) }
+    }
+
+    #[test]
+    fn dense_and_sparse_integer_keys_preserve_map_semantics() {
+        let mut entries = DenseIntEntries::default();
+        assert_eq!(entries.insert(0, (object(0x1000), Value::Int(10))), None);
+        assert_eq!(entries.insert(1024, (object(0x2000), Value::Int(20))), None);
+        assert_eq!(entries.insert(-7, (object(0x3000), Value::Int(30))), None);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries.get(&1024).map(|(_, value)| *value),
+            Some(Value::Int(20))
+        );
+        assert_eq!(
+            entries.insert(1024, (object(0x4000), Value::Int(21))),
+            Some((object(0x2000), Value::Int(20)))
+        );
+        assert_eq!(entries.len(), 3);
+        assert!(entries.contains_key(&-7));
+        assert_eq!(entries.remove(&-7), Some((object(0x3000), Value::Int(30))));
+        assert_eq!(entries.len(), 2);
+        let mut keys: Vec<_> = entries.keys().collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec![0, 1024]);
+    }
+}
+
+#[derive(Default)]
+struct HmIntFastState {
+    entries: DenseIntEntries,
+}
+
+fn hm_int_fast_table() -> &'static Mutex<FxHashMap<usize, HmIntFastState>> {
+    static TABLE: std::sync::OnceLock<Mutex<FxHashMap<usize, HmIntFastState>>> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+thread_local! {
+    static HM_INT_FAST_LAST_KEY: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[inline]
+fn hm_int_fast_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    let ptr = this.as_ptr() as usize;
+    if let Some((_, key)) = HM_INT_FAST_LAST_KEY
+        .with(|cache| cache.get())
+        .filter(|(cached_ptr, _)| *cached_ptr == ptr)
+    {
+        return key;
+    }
+    let key = widened_obj_key(ctx, this);
+    HM_INT_FAST_LAST_KEY.with(|cache| cache.set(Some((ptr, key))));
+    key
+}
+
+fn hm_int_fast_len(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
+    let key = hm_int_fast_obj_key(ctx, this);
+    hm_int_fast_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .map(|state| state.entries.len())
+}
+
+fn try_hm_int_fast_put(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key_value: Value,
+    value: Value,
+) -> Option<MethodCallResult> {
+    let key_ref = match key_value {
+        Value::Object(Some(key)) => key,
+        _ => return None,
+    };
+    let int_key = match unbox_wrapper(ctx, key_ref) {
+        Some(Value::Int(value)) => value,
+        _ => return None,
+    };
+    let object_key = hm_int_fast_obj_key(ctx, this);
+    {
+        let mut table = hm_int_fast_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = table.get_mut(&object_key) {
+            let old = state
+                .entries
+                .insert(int_key, (key_ref, value))
+                .map(|(_, old_value)| old_value);
+            return Some(Ok(Some(old.unwrap_or(Value::Object(None)))));
+        }
+    }
+    let (_, size, _) = map_state(ctx, this);
+    if size != 0 {
+        return None;
+    }
+
+    let old = {
+        let mut table = hm_int_fast_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = table.entry(object_key).or_default();
+        let old = state
+            .entries
+            .insert(int_key, (key_ref, value))
+            .map(|(_, old_value)| old_value);
+        old
+    };
+    Some(Ok(Some(old.unwrap_or(Value::Object(None)))))
+}
+
+fn try_hm_int_fast_get(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    key_value: Value,
+) -> Option<MethodCallResult> {
+    let key_ref = match key_value {
+        Value::Object(Some(key)) => key,
+        _ => return None,
+    };
+    let int_key = match unbox_wrapper(ctx, key_ref) {
+        Some(Value::Int(value)) => value,
+        _ => return None,
+    };
+    let object_key = hm_int_fast_obj_key(ctx, this);
+    let table = hm_int_fast_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let state = table.get(&object_key)?;
+    Some(Ok(Some(
+        state
+            .entries
+            .get(&int_key)
+            .map(|(_, value)| *value)
+            .unwrap_or(Value::Object(None)),
+    )))
+}
+
+fn materialize_hm_int_fast(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let object_key = hm_int_fast_obj_key(ctx, this);
+    let int_keys: Vec<i32> = {
+        let table = hm_int_fast_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(state) = table.get(&object_key) else {
+            return Ok(this);
+        };
+        state.entries.keys().collect()
+    };
+
+    let map_pin = ctx.pin_native_root(this);
+    let current = ctx.read_native_pin(map_pin, this);
+    set_map_size(ctx, current, 0);
+    for int_key in int_keys {
+        let (key_ref, value) = {
+            let table = hm_int_fast_table()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            table
+                .get(&object_key)
+                .and_then(|state| state.entries.get(&int_key))
+                .copied()
+                .expect("fast HashMap entry disappeared during materialization")
+        };
+        let iter_pin_base = ctx.pin_native_root(key_ref);
+        let value_pin = pin_value(ctx, value);
+        let current = ctx.read_native_pin(map_pin, this);
+        let key_ref = ctx.read_native_pin(iter_pin_base, key_ref);
+        let value = read_pinned_elem(ctx, value_pin, value);
+        native_map_put_evict_pinned(
+            ctx,
+            current,
+            Value::Object(Some(key_ref)),
+            value,
+            true,
+            map_pin,
+            iter_pin_base,
+            value_pin,
+        )?;
+        ctx.unpin_native_roots(iter_pin_base);
+    }
+    hm_int_fast_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&object_key);
+    let current = ctx.read_native_pin(map_pin, this);
+    ctx.unpin_native_roots(map_pin);
+    Ok(current)
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,6 +1319,9 @@ fn display_array_class_name(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
 /// Unbox a wrapper object (Integer, Long, Boolean, etc.) to its primitive Value.
 /// Returns None if the object is not a recognized JDK wrapper type.
 fn unbox_wrapper(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<Value> {
+    if let Some(result) = ctx.fast_unbox_primitive_wrapper(obj) {
+        return result;
+    }
     let class_name = ctx.class_name_of_id(ctx.class_id_of_object(obj))?;
     if !matches!(
         class_name.as_str(),
@@ -3525,19 +3825,6 @@ fn enum_set_contains_member(
 /// non-Int from hashCode) still fall back to identity since those are not
 /// exceptional control flow.
 fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<i32, MethodCallFailed> {
-    // Try to read as string for better distribution (the common case, so it
-    // is checked first).
-    // Must match Java's String.hashCode (UTF-16 code units, i32 wrapping mul+add),
-    // otherwise non-ASCII keys hash differently from bytecode-computed hashes and
-    // HashMap.containsKey silently returns false. See vm::vm_exec::java_string_hash.
-    if let Some(s) = ctx.read_string(key) {
-        let mut h: i32 = 0;
-        for cu in s.encode_utf16() {
-            h = h.wrapping_mul(31).wrapping_add(cu as i32);
-        }
-        // Spread bits (like HashMap.hash in JDK)
-        return Ok(h ^ ((h as u32) >> 16) as i32);
-    }
     // Wrapper types: hash by their primitive value (matches JDK Integer.hashCode
     // etc.) — checked BEFORE the enum check (perf: a JDK wrapper class can never
     // be a `java/lang/Enum` subclass, so this reorder is behavior-preserving; see
@@ -3556,6 +3843,16 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<i32, Meth
             }
             _ => ctx.identity_hash_code(key),
         };
+        return Ok(h ^ ((h as u32) >> 16) as i32);
+    }
+    // Strings: hash by UTF-16 code units. Wrappers are checked first because
+    // the two class sets are disjoint and wrapper-heavy maps otherwise take a
+    // class-manager lock just to reject String before every unbox.
+    if let Some(s) = ctx.read_string(key) {
+        let mut h: i32 = 0;
+        for cu in s.encode_utf16() {
+            h = h.wrapping_mul(31).wrapping_add(cu as i32);
+        }
         return Ok(h ^ ((h as u32) >> 16) as i32);
     }
     // Enum constants: hash by (declaring class name, constant name) — the
@@ -3658,10 +3955,6 @@ fn map_keys_equal(
     if std::ptr::eq(a.as_ptr(), b.as_ptr()) {
         return Ok(true);
     }
-    // String value equality (the common case, checked first).
-    if let (Some(sa), Some(sb)) = (ctx.read_string(a), ctx.read_string(b)) {
-        return Ok(sa == sb);
-    }
     // Wrapper type equality: unbox and compare primitives. Checked before the
     // Thread-mirror and enum checks below (perf: neither Thread nor any enum
     // class can also be a JDK wrapper class, so this reorder is
@@ -3680,6 +3973,11 @@ fn map_keys_equal(
             (Value::Long(x), Value::Int(y)) => x == (y as i64),
             _ => false,
         });
+    }
+    // String value equality. Wrappers are checked first because the type sets
+    // are disjoint and primitive-wrapper maps avoid two failed String checks.
+    if let (Some(sa), Some(sb)) = (ctx.read_string(a), ctx.read_string(b)) {
+        return Ok(sa == sb);
     }
     // `java.lang.Thread` mirrors are VM-owned identity objects. A moving GC
     // preserves the header identity hash, but some real-JDK weak-key paths can
@@ -4142,6 +4440,21 @@ fn unwrap_unmod(ctx: &dyn NativeContext, obj: ObjectRef) -> ObjectRef {
 
 fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     let this = unwrap_unmod(ctx, this);
+    let object_key = hm_int_fast_obj_key(ctx, this);
+    if let Some(keys) = hm_int_fast_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&object_key)
+        .map(|state| {
+            state
+                .entries
+                .values()
+                .map(|(key, _)| Value::Object(Some(*key)))
+                .collect()
+        })
+    {
+        return keys;
+    }
     if let Some(chm) = properties_backing_chm(ctx, this) {
         return chm_collect_all_keys(ctx, chm);
     }
@@ -4175,6 +4488,15 @@ fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
 /// Collect all values from a HashMap into a Vec.
 fn map_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     let this = unwrap_unmod(ctx, this);
+    let object_key = hm_int_fast_obj_key(ctx, this);
+    if let Some(values) = hm_int_fast_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&object_key)
+        .map(|state| state.entries.values().map(|(_, value)| *value).collect())
+    {
+        return values;
+    }
     if let Some(chm) = properties_backing_chm(ctx, this) {
         return chm_collect_all_values(ctx, chm);
     }
@@ -4203,6 +4525,21 @@ fn map_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
 /// Collect all key-value pairs as (key, value) from a HashMap.
 fn map_collect_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, Value)> {
     let this = unwrap_unmod(ctx, this);
+    let object_key = hm_int_fast_obj_key(ctx, this);
+    if let Some(entries) = hm_int_fast_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&object_key)
+        .map(|state| {
+            state
+                .entries
+                .values()
+                .map(|(key, value)| (Value::Object(Some(*key)), *value))
+                .collect()
+        })
+    {
+        return entries;
+    }
     if let Some(chm) = properties_backing_chm(ctx, this) {
         return chm_collect_all_entries(ctx, chm);
     }
@@ -4385,6 +4722,17 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    let ptr = this.as_ptr() as usize;
+    if let Some((_, stale_key)) = HM_INT_FAST_LAST_KEY
+        .with(|cache| cache.get())
+        .filter(|(cached_ptr, _)| *cached_ptr == ptr)
+    {
+        hm_int_fast_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&stale_key);
+        HM_INT_FAST_LAST_KEY.with(|cache| cache.set(None));
+    }
     // Legacy synthetic layout — what every other native HashMap op expects.
     let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
     ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
@@ -4716,6 +5064,9 @@ fn native_map_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     if is_chm_receiver(ctx, this) {
         return native_chm_size(ctx, args);
     }
+    if let Some(size) = hm_int_fast_len(ctx, this) {
+        return Ok(Some(Value::Int(size as i32)));
+    }
     let (buckets, size, _) = map_state(ctx, this);
     if buckets.is_none() {
         if let Some(r) = try_delegate_real_collection(ctx, this, "java/util/Map", "size", "()I") {
@@ -4735,6 +5086,9 @@ fn native_map_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     }
     if is_chm_receiver(ctx, this) {
         return native_chm_is_empty(ctx, args);
+    }
+    if let Some(size) = hm_int_fast_len(ctx, this) {
+        return Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })));
     }
     let (buckets, size, _) = map_state(ctx, this);
     if buckets.is_none() {
@@ -4910,6 +5264,37 @@ fn native_map_put_evict(
         key_val,
         value,
         evict,
+        put_pin_base,
+        key_pin,
+        value_pin,
+    );
+    ctx.unpin_native_roots(put_pin_base);
+    result
+}
+
+/// Exact-class HashMap put entry used after the VM has already guarded the
+/// receiver ClassId. This skips the generic Map/CHM/LHM/TreeMap classification
+/// while retaining the identical pinning, resize, node, and eviction logic.
+pub fn native_hashmap_put_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    if let Some(result) = try_hm_int_fast_put(ctx, this, key_val, value) {
+        return result;
+    }
+    let this = materialize_hm_int_fast(ctx, this)?;
+    let put_pin_base = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key_val);
+    let value_pin = pin_value(ctx, value);
+    let result = native_map_put_evict_pinned(
+        ctx,
+        this,
+        key_val,
+        value,
+        true,
         put_pin_base,
         key_pin,
         value_pin,
@@ -5115,7 +5500,20 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     if is_lhm_receiver(ctx, this) {
         return native_lhm_get(ctx, args);
     }
+    native_hashmap_get_exact(ctx, args)
+}
+
+/// Exact-class HashMap get entry used after a receiver-ClassId guard.
+pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
+    if let Some(result) = try_hm_int_fast_get(ctx, this, key_val) {
+        return result;
+    }
+    let this = materialize_hm_int_fast(ctx, this)?;
 
     let (key_ref, hash, is_null_key) = match key_val {
         Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k)?, false),
@@ -5197,7 +5595,7 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 }
 
 fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -5215,10 +5613,28 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     }
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
-    let remove_pin_base = ctx.pin_native_root(this);
+    if let Value::Object(Some(key_ref)) = key_val {
+        if let Some(Value::Int(int_key)) = unbox_wrapper(ctx, key_ref) {
+            let object_key = hm_int_fast_obj_key(ctx, this);
+            let mut table = hm_int_fast_table()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(state) = table.get_mut(&object_key) {
+                let old = state.entries.remove(&int_key).map(|(_, value)| value);
+                return Ok(Some(old.unwrap_or(Value::Object(None))));
+            }
+        }
+    }
+
     let key_pin = pin_value(ctx, key_val);
-    let result = native_map_remove_pinned(ctx, this, key_val, remove_pin_base, key_pin);
+    this = materialize_hm_int_fast(ctx, this)?;
+    let key_val = read_pinned_elem(ctx, key_pin, key_val);
+
+    let remove_pin_base = ctx.pin_native_root(this);
+    let remove_key_pin = pin_value(ctx, key_val);
+    let result = native_map_remove_pinned(ctx, this, key_val, remove_pin_base, remove_key_pin);
     ctx.unpin_native_roots(remove_pin_base);
+    ctx.unpin_native_roots(key_pin);
     result
 }
 
@@ -5334,7 +5750,7 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // `ConfigDef.parse` puts `early.start.listeners` with a null default;
     // `AbstractConfig.get` then calls `values.containsKey(...)` and would
     // wrongly throw "Unknown configuration" if we returned false here.)
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -5348,6 +5764,24 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         return native_lhm_contains_key(ctx, args);
     }
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
+
+    if let Value::Object(Some(key_ref)) = key_val {
+        if let Some(Value::Int(int_key)) = unbox_wrapper(ctx, key_ref) {
+            let object_key = hm_int_fast_obj_key(ctx, this);
+            let table = hm_int_fast_table()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(state) = table.get(&object_key) {
+                return Ok(Some(Value::Int(
+                    state.entries.contains_key(&int_key) as i32,
+                )));
+            }
+        }
+    }
+
+    let key_pin = pin_value(ctx, key_val);
+    this = materialize_hm_int_fast(ctx, this)?;
+    let key_val = read_pinned_elem(ctx, key_pin, key_val);
 
     let (key_ref, hash, is_null_key) = match key_val {
         Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k)?, false),
@@ -5392,11 +5826,12 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         node_val = ctx.get_field(node, NODE_FIELD_NEXT);
     }
 
+    ctx.unpin_native_roots(key_pin);
     Ok(Some(Value::Int(0)))
 }
 
 fn native_map_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -5404,6 +5839,9 @@ fn native_map_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     if is_chm_receiver(ctx, this) {
         return native_chm_contains_value(ctx, args);
     }
+    let target_pin = pin_value(ctx, target);
+    this = materialize_hm_int_fast(ctx, this)?;
+    let target = read_pinned_elem(ctx, target_pin, target);
     // Properties-backed ConcurrentHashMap path: keep the existing
     // segment-aware collection (rare; correctness over speed).
     if properties_backing_chm(ctx, this).is_some() {
@@ -5438,6 +5876,7 @@ fn native_map_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             }
         }
     }
+    ctx.unpin_native_roots(target_pin);
     Ok(Some(Value::Int(0)))
 }
 
@@ -5452,6 +5891,15 @@ fn native_map_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     if is_chm_receiver(ctx, this) {
         return native_chm_clear(ctx, args);
     }
+    let object_key = hm_int_fast_obj_key(ctx, this);
+    if hm_int_fast_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&object_key)
+        .is_some()
+    {
+        return Ok(None);
+    }
     let (buckets, _, cap) = map_state(ctx, this);
     if let Some(b) = buckets {
         for i in 0..(cap as usize) {
@@ -5463,7 +5911,7 @@ fn native_map_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 }
 
 fn native_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -5478,7 +5926,7 @@ fn native_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -5505,7 +5953,7 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -5606,7 +6054,7 @@ pub fn make_static_entry_set(
 }
 
 fn native_map_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -6662,8 +7110,17 @@ pub fn make_hashset_with_elements(ctx: &mut dyn NativeContext, elems: &[Value]) 
             .unwrap_or(0)
             + 1;
 
+        // GC-SAFETY: `buckets`/`backing_map`/`set` are bare locals held
+        // across every later `alloc_object` call below (backing_map, set,
+        // and one per element for `node`) -- a stress-GC during any of them
+        // can leave these stale, and `set` is the function's return value,
+        // so a stale `set` hands the CALLER a dangling receiver. Pin each
+        // right after its own allocation and re-read before every later
+        // use, mirroring `map_alloc_node`/`native_map_put_evict_pinned`.
         let buckets = alloc_ref_array(ctx, cap);
+        let pin_base = ctx.pin_native_root(buckets);
         let backing_map = ctx.alloc_object(hashmap_class_id, map_n_fields);
+        let buckets = ctx.read_native_pin(pin_base, buckets);
         ctx.set_field(backing_map, f_table, Value::Object(Some(buckets)));
         ctx.set_field(backing_map, f_size, Value::Int(0));
         ctx.set_field(backing_map, f_threshold, Value::Int((cap as i32 * 3) / 4));
@@ -6676,14 +7133,22 @@ pub fn make_hashset_with_elements(ctx: &mut dyn NativeContext, elems: &[Value]) 
             .resolve_field_index("java/util/HashSet", "map")
             .unwrap_or(HS_FIELD_MAP);
         let hs_n_fields = std::cmp::max(hs_map_slot + 1, HS_NUM_FIELDS);
+        let backing_map_pin = ctx.pin_native_root(backing_map);
         let set = alloc_synthetic(ctx, "java/util/HashSet", hs_n_fields);
+        let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
         ctx.set_field(set, hs_map_slot, Value::Object(Some(backing_map)));
+        let set_pin = ctx.pin_native_root(set);
+
+        // `elems` is the caller's raw arg slice -- also just a bare `Vec`
+        // from this function's perspective, so it needs the same
+        // per-element re-read treatment across the node alloc below.
+        let (_, elem_pins) = pin_value_slice(ctx, elems);
 
         let sentinel = Value::Object(None); // PRESENT marker; null is fine for "is in set"
         let mut size = 0i32;
-        for elem in elems {
-            let key_obj = match elem {
-                Value::Object(Some(obj)) => *obj,
+        for (i, elem) in elems.iter().enumerate() {
+            let key_obj = match read_pinned_elem(ctx, elem_pins[i], *elem) {
+                Value::Object(Some(obj)) => obj,
                 _ => continue, // skip nulls / primitives we can't hash
             };
             // `make_hashset_with_elements` cannot propagate exceptions
@@ -6694,6 +7159,8 @@ pub fn make_hashset_with_elements(ctx: &mut dyn NativeContext, elems: &[Value]) 
             // hold JDK-internal types (String, wrappers, enum constants).
             let raw_hash =
                 map_hash_key(ctx, key_obj).unwrap_or_else(|_| ctx.identity_hash_code(key_obj));
+            let key_obj = ctx.read_native_pin(elem_pins[i], key_obj);
+            let buckets = ctx.read_native_pin(pin_base, buckets);
             // map_hash_key already applies the (h ^ h>>>16) spread; the
             // bucket index uses raw_hash as-is for power-of-two cap.
             let idx = ((cap as u32 - 1) & raw_hash as u32) as usize;
@@ -6719,36 +7186,62 @@ pub fn make_hashset_with_elements(ctx: &mut dyn NativeContext, elems: &[Value]) 
                 continue;
             }
             // Re-read head in case ctx mutated between probes (defensive).
+            let buckets = ctx.read_native_pin(pin_base, buckets);
             existing_head = ctx.get_array_element(buckets, idx);
 
+            // `alloc_object` below can move `key_obj`/`existing_head`; pin
+            // + re-read across it (mirrors `map_alloc_node`).
+            let existing_head_pin = pin_value(ctx, existing_head);
             let node = ctx.alloc_object(node_class_id, node_n_fields);
+            let key_obj = ctx.read_native_pin(elem_pins[i], key_obj);
+            let existing_head = read_pinned_elem(ctx, existing_head_pin, existing_head);
             ctx.set_field(node, n_hash, Value::Int(raw_hash));
             ctx.set_field(node, n_key, Value::Object(Some(key_obj)));
             ctx.set_field(node, n_value, sentinel);
             ctx.set_field(node, n_next, existing_head);
+            let buckets = ctx.read_native_pin(pin_base, buckets);
             ctx.set_array_element(buckets, idx, Value::Object(Some(node)));
             size += 1;
         }
+        let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
         ctx.set_field(backing_map, f_size, Value::Int(size));
+        let set = ctx.read_native_pin(set_pin, set);
+        ctx.unpin_native_roots(pin_base);
         return set;
     }
 
     // Legacy fallback: synthetic 3-field (buckets, size, capacity) layout.
     // Used when real HashMap/Node classes aren't resolvable yet.
+    //
+    // GC-SAFETY: same hazard as the real-layout branch above -- `set` and
+    // `backing_map` are bare locals re-used across further allocating
+    // calls (each other's alloc, plus one `native_map_put` per element,
+    // which itself allocates map nodes/resizes the table). Pin `set`
+    // first so its handle is the base for the final `unpin_native_roots`.
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+    let set_pin = ctx.pin_native_root(set);
     let backing_map = alloc_backing_map(ctx);
+    let backing_map_pin = ctx.pin_native_root(backing_map);
     let buckets = alloc_ref_array(ctx, cap);
+    let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
     ctx.set_field(backing_map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
     set_map_size(ctx, backing_map, 0);
     ctx.set_field(backing_map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    let set = ctx.read_native_pin(set_pin, set);
+    let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
 
+    let (_, elem_pins) = pin_value_slice(ctx, elems);
     let sentinel = Value::Int(1);
-    for elem in elems {
+    for (i, elem) in elems.iter().enumerate() {
+        let elem = read_pinned_elem(ctx, elem_pins[i], *elem);
+        let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
         // Best-effort populate; ignore errors so callers see a non-empty
         // set even if a single put failed (e.g. unhashable wrapper).
-        let _ = native_map_put(ctx, &[Value::Object(Some(backing_map)), *elem, sentinel]);
+        let _ = native_map_put(ctx, &[Value::Object(Some(backing_map)), elem, sentinel]);
     }
+    let set = ctx.read_native_pin(set_pin, set);
+    ctx.unpin_native_roots(set_pin);
     set
 }
 
@@ -25595,6 +26088,21 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
     // always yields the protected map, so the scan/remap sees every table
     // unconditionally.
     //
+    // Fresh exact HashMap<Integer, ?> fast stores. Both the canonical key
+    // object and value are authoritative roots until lazy materialization.
+    {
+        let mut maps = hm_int_fast_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for state in maps.values_mut() {
+            for (key, value) in state.entries.values_mut() {
+                f(key);
+                if let Value::Object(Some(object)) = value {
+                    f(object);
+                }
+            }
+        }
+    }
     // Inner name -> Value overlays (LinkedList head/tail/size, LinkedHashMap
     // table/head/tail/…).
     {
@@ -25784,6 +26292,15 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
     }
     if dead_keys.is_empty() {
         return;
+    }
+
+    {
+        let mut hm = hm_int_fast_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for k in &dead_keys {
+            hm.remove(k);
+        }
     }
 
     // 2. Drop the dead objects' overlay/cache entries everywhere they are keyed

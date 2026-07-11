@@ -1847,7 +1847,7 @@ pub fn init_primitive_fields(shared: &SharedVm, obj: ObjectRef, class_id: ClassI
 /// `shared.tlab_refill_count` so operators can spot-check the
 /// refill rate against the hit-rate target.
 #[inline(always)]
-fn tlab_alloc_object(
+pub(crate) fn tlab_alloc_object(
     thread: &mut JvmThread,
     shared: &SharedVm,
     class_id: ClassId,
@@ -2658,11 +2658,8 @@ pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
         crate::jit::conservative_roots::invalidate_scan_cache_for_gc();
         update_root_snapshot(shared, thread);
 
-        // Arrive at barrier and wait for GC to complete. Census-aware (auto):
-        // a genuine safepoint arrival is normally counted, but if this pause's
-        // census excluded us as blocked (a finding-1(a) window), participating
-        // would fill a counted mutator's quota slot.
-        let pointer_map = shared.gc_barrier.arrive_and_wait_auto(thread.thread_id);
+        // Arrive at barrier and wait for GC to complete
+        let pointer_map = shared.gc_barrier.arrive_and_wait(thread.thread_id);
 
         // Apply pointer map to this thread's frames
         if !pointer_map.is_empty() {
@@ -3073,20 +3070,10 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // Phase 1 above (a never-polling in-JIT peer must not stall the remark
     // nor be covered only by its stale deposit snapshot).
     let mut counted_os_tids: Vec<u32> = Vec::new();
-    let remark_done = shared.gc_barrier.request_stw_counted_with_live_blocked(thread.thread_id, || {
-        // Finding 1(a): remark pauses use the identity census too, so blocked
-        // threads are excluded BY IDENTITY and their wake-time arrivals cannot
-        // satisfy this pause's quota (`arrive_and_wait_auto`). The anonymous
-        // `threads_blocked` subtraction this replaces excluded the same
-        // population without recording who it excluded.
-        let (n, blocked, tids, blocked_tids) =
-            shared.thread_registry.alive_count_blocked_and_os_tids();
+    let remark_done = shared.gc_barrier.request_stw_counted(thread.thread_id, || {
+        let (n, tids) = shared.thread_registry.alive_count_and_os_tids();
         counted_os_tids = tids;
-        (
-            u32::try_from(n).unwrap_or(u32::MAX),
-            u32::try_from(blocked).unwrap_or(u32::MAX),
-            blocked_tids,
-        )
+        u32::try_from(n).unwrap_or(u32::MAX)
     });
     if remark_done {
         let mut xt_roots: Vec<ObjectRef> = Vec::new();
@@ -3278,20 +3265,10 @@ fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread) {
     // frozen-TLAB-tail publication (consumed by the region walkers' skip
     // checks) is load-bearing here too.
     let mut counted_os_tids: Vec<u32> = Vec::new();
-    let done = shared.gc_barrier.request_stw_counted_with_live_blocked(thread.thread_id, || {
-        // Finding 1(a): remark pauses use the identity census too, so blocked
-        // threads are excluded BY IDENTITY and their wake-time arrivals cannot
-        // satisfy this pause's quota (`arrive_and_wait_auto`). The anonymous
-        // `threads_blocked` subtraction this replaces excluded the same
-        // population without recording who it excluded.
-        let (n, blocked, tids, blocked_tids) =
-            shared.thread_registry.alive_count_blocked_and_os_tids();
+    let done = shared.gc_barrier.request_stw_counted(thread.thread_id, || {
+        let (n, tids) = shared.thread_registry.alive_count_and_os_tids();
         counted_os_tids = tids;
-        (
-            u32::try_from(n).unwrap_or(u32::MAX),
-            u32::try_from(blocked).unwrap_or(u32::MAX),
-            blocked_tids,
-        )
+        u32::try_from(n).unwrap_or(u32::MAX)
     });
     if done {
         let mut xt_roots: Vec<ObjectRef> = Vec::new();

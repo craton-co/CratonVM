@@ -1,18 +1,29 @@
-# CratonVM Spring suite — genuine bug list (updated, dev `b02601ab`)
+# CratonVM Spring suite — genuine bug list (updated, dev `9948295e`)
 
 Baseline: fresh HotSpot run over 516 non-passed classes with corrected
 classpath (spring-websocket/oxm/jms/orm/core-test jars were missing before —
 `./gradlew jar testFixturesJar testClasses` fixed it). 430/516 pass on HotSpot
 (86 excluded: 13 FAIL + 73 EMPTY on HotSpot itself — not CratonVM bugs).
 
-## Progression across two dev updates
+## Progression across dev updates
 
 | dev commit | agree w/ HotSpot (OK) | genuine bugs |
 |---|--:|--:|
 | `9298db15` | 258/430 | 159 |
-| `b02601ab` (current) | **305/430** | **125** |
+| `b02601ab` | 305/430 | 125 |
+| `9948295e` (current) | — | **96 open** (29 fixed since `b02601ab`) |
 
-**65 classes newly fixed** between the two runs, most notably:
+This latest update is a **scoped rerun of just the 125-class list** (not a
+full 516-class HotSpot cross-reference), so the "agree w/ HotSpot" column
+isn't recomputed here. 29/125 now pass; see "29 classes newly fixed" below.
+`core.test.tools.CompiledTests` was fixed by a real code change (commit
+`2ed5f407`, loader-defining-visibility fix in the real-JDK `loadClass` fast
+path); the other 28 most likely benefited from the same fix given the shared
+classloader-visibility symptoms (`MockitoException`, `CompilationException:
+Unable to compile source`, CGLIB-proxy `ABEND`s) — not individually
+root-caused.
+
+**65 classes newly fixed** between the first two runs, most notably:
 - The entire SpEL cluster (11 classes: `LiteralTests`, `OperatorTests`,
   `ParsingTests`, `SpelParserTests`, `ArrayConstructorTests`,
   `ConstructorInvocationTests`, `MethodInvocationTests`,
@@ -23,9 +34,9 @@ classpath (spring-websocket/oxm/jms/orm/core-test jars were missing before —
   jar was previously missing.
 - `BufferedImageHttpMessageConverterTests`, `RetryTemplateTests`, and more.
 
-## ⚠️ 31 classes appear "newly broken" — NOT genuine regressions
+## ⚠️ 31 classes appeared "newly broken" (21 still unresolved) — NOT genuine regressions
 
-All 31 are **exclusively ABEND** (zero FAIL/TIMEOUT among them) — a strong
+All 31 were **exclusively ABEND** (zero FAIL/TIMEOUT among them) — a strong
 signal against 31 independent logic regressions. Root-caused: 25/31 crash
 with `rc=139` (SIGSEGV), and at least 2 show the explicit
 `corrupt Value cell ... see HIB-CV-32` heap-reference-integrity guard message
@@ -40,15 +51,15 @@ exact binary hours earlier — direct confirmation this is load-dependent, not
 a code regression. These are **already covered by the existing HIB-CV-32
 tracking**, not new bugs requiring separate docs.
 
-Affected (for reference — do not action individually, root cause is shared):
+Affected — 21 of the original 31 (for reference — do not action individually,
+root cause is shared; 10 of the original 31 are now fixed, see "29 classes
+newly fixed" below — most were in this bucket, consistent with the
+classloader-visibility fix also clearing some HIB-CV-32-flagged crashes that
+were themselves triggered by the isolation bug rather than true heap
+corruption):
 - `cache.jcache.JCacheEhCacheAnnotationTests`
-- `context.annotation.ClassPathBeanDefinitionScannerTests`
-- `context.annotation.ComponentScanParserScopedProxyTests`
-- `context.annotation.EnableAspectJAutoProxyTests`
-- `context.annotation.PropertySourceAnnotationTests`
 - `http.client.JettyClientHttpRequestFactoryTests`
 - `jdbc.config.JdbcNamespaceIntegrationTests`
-- `jms.annotation.JmsListenerAnnotationBeanPostProcessorTests`
 - `messaging.rsocket.RSocketBufferLeakTests`
 - `test.context.groovy.AbsolutePathGroovySpringContextTests`
 - `test.context.groovy.DefaultScriptDetectionGroovySpringContextTests`
@@ -57,8 +68,6 @@ Affected (for reference — do not action individually, root cause is shared):
 - `test.context.groovy.RelativePathGroovySpringContextTests`
 - `test.context.web.BasicGroovyWacTests`
 - `test.web.reactive.server.samples.JsonContentTests`
-- `test.web.servlet.samples.standalone.ViewResolutionTests`
-- `web.client.support.RestClientProxyRegistryIntegrationTests`
 - `web.reactive.config.WebFluxConfigurationSupportTests`
 - `web.reactive.config.WebFluxViewResolutionIntegrationTests`
 - `web.reactive.function.client.support.WebClientProxyRegistryIntegrationTests`
@@ -68,12 +77,11 @@ Affected (for reference — do not action individually, root cause is shared):
 - `web.reactive.result.method.annotation.RequestMappingViewResolutionIntegrationTests`
 - `web.reactive.result.view.LocaleContextResolverIntegrationTests`
 - `web.reactive.result.view.freemarker.FreeMarkerMacroTests`
-- `web.reactive.result.view.freemarker.FreeMarkerViewTests`
 - `web.socket.WebSocketHandshakeTests`
-- `web.socket.adapter.standard.ConvertingEncoderDecoderSupportTests`
-- `web.socket.messaging.OrderedMessageSendingIntegrationTests`
 
-## Module breakdown (all 125)
+## Module breakdown
+
+Original 125 (2026-07-09):
 
 ```
      46 web
@@ -96,6 +104,122 @@ Affected (for reference — do not action individually, root cause is shared):
       1 aot
       1 aop
 ```
+
+Still-open 96 (2026-07-11, dev `9948295e`):
+
+```
+     36 web
+     14 test
+     11 context
+     10 beans
+      5 core
+      4 scripting
+      4 orm
+      3 http
+      1 util
+      1 scheduling
+      1 messaging
+      1 jms
+      1 jdbc
+      1 expression
+      1 cache
+      1 aot
+      1 aop
+```
+
+## 29 classes fixed since dev `b02601ab` (now 96 open)
+
+Reconfirmed via a fresh scoped rerun of exactly this 125-class list on dev
+`9948295e` (binary `cratonvm-rerun4-20260711.bin`), 2 shards, 2026-07-11:
+
+- `beans.factory.aot.DefaultBeanRegistrationCodeFragmentsTests`
+- `beans.factory.config.PropertyResourceConfigurerTests`
+- `context.annotation.ClassPathBeanDefinitionScannerTests`
+- `context.annotation.ComponentScanParserScopedProxyTests`
+- `context.annotation.EnableAspectJAutoProxyTests`
+- `context.annotation.PropertySourceAnnotationTests`
+- `core.task.SimpleAsyncTaskExecutorTests`
+- `core.test.tools.CompiledTests` (root-caused, see detail below)
+- `expression.spel.standard.SpelCompilerTests`
+- `jms.annotation.JmsListenerAnnotationBeanPostProcessorTests`
+- `mock.web.MockHttpServletResponseTests`
+- `oxm.xstream.XStreamMarshallerTests`
+- `oxm.xstream.XStreamUnmarshallerTests`
+- `test.web.servlet.assertj.AbstractMockHttpServletResponseAssertTests`
+- `test.web.servlet.client.samples.bind.FilterTests`
+- `test.web.servlet.result.JsonPathResultMatchersTests`
+- `test.web.servlet.result.PrintingResultHandlerTests`
+- `test.web.servlet.result.XpathResultMatchersTests`
+- `test.web.servlet.samples.standalone.ViewResolutionTests`
+- `web.client.support.RestClientProxyRegistryIntegrationTests`
+- `web.context.support.HttpRequestHandlerTests`
+- `web.reactive.result.view.freemarker.FreeMarkerViewTests`
+- `web.servlet.DispatcherServletTests`
+- `web.servlet.handler.HandlerMappingIntrospectorTests`
+- `web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolverTests`
+- `web.servlet.tags.EvalTagTests`
+- `web.socket.adapter.standard.ConvertingEncoderDecoderSupportTests`
+- `web.socket.messaging.OrderedMessageSendingIntegrationTests`
+- `web.socket.messaging.SubProtocolWebSocketHandlerTests`
+
+## Newly characterized clusters within the 96 still-open bugs
+
+Patterns observed in the dev-`9948295e` reconfirmation run that weren't
+called out before — grouped for future investigation, not yet root-caused:
+
+**AOT bean-registration TIMEOUT cluster (11 classes)** — all hit the exact
+120000ms ceiling with `found=0/succ=0/fail=0` (hard hang, not a slow test):
+`beans.factory.annotation.AutowiredAnnotationBeanRegistrationAotContributionTests`,
+`beans.factory.aot.BeanDefinitionMethodGeneratorTests`,
+`beans.factory.aot.BeanDefinitionPropertiesCodeGeneratorTests`,
+`beans.factory.aot.BeanRegistrationsAotContributionTests`,
+`beans.factory.aot.InstanceSupplierCodeGeneratorTests`,
+`context.annotation.CommonAnnotationBeanRegistrationAotContributionTests`,
+`context.annotation.ConfigurationClassPostProcessorAotContributionTests`,
+`context.aot.ApplicationContextAotGeneratorTests`,
+`orm.jpa.support.PersistenceAnnotationBeanPostProcessorAotContributionTests`,
+`test.context.aot.TestClassScannerTests`,
+`test.context.aot.TestContextAotGeneratorIntegrationTests`. All exercise
+Spring's AOT code-generation path (same machinery `CompiledTests` used —
+in-memory javac compilation of generated sources); likely one shared root
+cause in that pipeline, separate from the classloader-visibility fix that
+resolved `CompiledTests` itself.
+
+**Groovy scripting cluster (8 classes)** — `scripting.groovy.GroovyAspectTests`,
+`scripting.groovy.GroovyAspectIntegrationTests`,
+`scripting.groovy.GroovyScriptFactoryTests` (TIMEOUT),
+`context.groovy.GroovyBeanDefinitionReaderTests`,
+`test.context.groovy.AbsolutePathGroovySpringContextTests`,
+`test.context.groovy.DefaultScriptDetectionGroovySpringContextTests`,
+`test.context.groovy.GroovySpringContextTests`,
+`test.context.groovy.MixedXmlAndGroovySpringContextTests`,
+`test.context.groovy.RelativePathGroovySpringContextTests` — mostly FAIL with
+high failure ratios (e.g. `GroovyBeanDefinitionReaderTests` 35/36 methods
+failing), consistent with a systemic Groovy-script-loading gap rather than
+scattered individual bugs.
+
+**WebFlux reactive cluster** — a broad mix of FAIL/EMPTY across
+`web.reactive.result.method.annotation.*` (e.g.
+`JacksonHintsIntegrationTests` 36/36 fail, `CoroutinesIntegrationTests`,
+`RequestMappingDataBindingIntegrationTests`) and
+`web.reactive.result.view.*` (several EMPTY with `found=1` — the class loads
+but discovers no runnable tests, e.g. `GlobalCorsConfigIntegrationTests`,
+`MessageReaderArgumentResolverTests`, `ProtobufIntegrationTests`,
+`FreeMarkerMacroTests`). The EMPTY pattern (found=1, not found=0) suggests a
+JUnit discovery/filtering gap specific to WebFlux's reactive test style,
+distinct from the FAIL cluster's runtime failures.
+
+**6 ABEND crashes with `found=0`** — crash before any test method is
+discovered (immediate crash on class load, not mid-test):
+`beans.factory.aot.BeanDefinitionPropertyValueCodeGeneratorDelegatesTests`,
+`core.codec.ResourceRegionEncoderTests`,
+`jdbc.config.JdbcNamespaceIntegrationTests`,
+`scheduling.quartz.QuartzSupportTests`,
+`scripting.config.ScriptingDefaultsTests`,
+`test.web.servlet.htmlunit.MockWebResponseBuilderTests`. Worth checking
+whether these are the same class-load-time crash shape (vs. the previously
+documented mid-run `rc=139` HIB-CV-32 pattern) before assuming shared root
+cause with that cluster.
 
 ## Per-class detail
 
@@ -135,7 +259,7 @@ Affected (for reference — do not action individually, root cause is shared):
     [2m2026-07-09T08:04:08.921592Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: File separator/pathSeparator populated (4/4)
     timeout: the monitored command dumped core
 
-### `beans.factory.aot.DefaultBeanRegistrationCodeFragmentsTests` — FAIL
+### `beans.factory.aot.DefaultBeanRegistrationCodeFragmentsTests` — FIXED (2026-07-11, dev `9948295e`)
 - customizedGenerateInstanceSupplierCodeDoesNotResolveInstantiationDescriptor() :: java.lang.NoClassDefFoundError: org/springframework/aot/generate/MethodName
 - getTargetOnConstructorToProtectedFactoryBean() :: java.lang.NoClassDefFoundError: org/springframework/aot/generate/MethodName
 - getTargetOnConstructorToPublicGenericFactoryBeanExtractTargetFromFactoryBeanType() :: java.lang.NoClassDefFoundError: org/springframework/aot/generate/MethodName
@@ -149,7 +273,7 @@ Affected (for reference — do not action individually, root cause is shared):
 ### `beans.factory.aot.InstanceSupplierCodeGeneratorTests` — TIMEOUT
 - (hard timeout at 120s, no stack captured)
 
-### `beans.factory.config.PropertyResourceConfigurerTests` — LOADERR
+### `beans.factory.config.PropertyResourceConfigurerTests` — FIXED (2026-07-11, dev `9948295e`)
 - java.lang.OutOfMemoryError: Java heap space (new_object class_id 929 fields 11)
 
 ### `beans.factory.xml.XmlBeanFactoryTests` — ABEND
@@ -167,7 +291,7 @@ Affected (for reference — do not action individually, root cause is shared):
     [2m2026-07-09T08:07:02.345563Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
     timeout: the monitored command dumped core
 
-### `context.annotation.ClassPathBeanDefinitionScannerTests` — ABEND
+### `context.annotation.ClassPathBeanDefinitionScannerTests` — FIXED (2026-07-11, dev `9948295e`)
     == org.springframework.context.annotation.ClassPathBeanDefinitionScannerTests ABEND rc=1 ==
     [2m2026-07-09T07:57:24.789210Z[0m [31mERROR[0m [2mcratonvm::gc::guard[0m[2m:[0m gen_heap::read_slot: corrupt Value cell (out-of-range discriminant) — returning null instead of a UB-on-match Value. Heap reference-integrity defect (see HIB-CV-32). [3mslot[0m[2m=[0m0x20017621c18 [3mraw0[0m[2m=[0m"0x000002001760e050" [3mraw1[0m[2m=[0m"0x000002001760e0b8"
     [2m2026-07-09T07:57:24.789238Z[0m [31mERROR[0m [2mcratonvm::gc::guard[0m[2m:[0m gen_heap::read_slot: corrupt Value cell (out-of-range discriminant) — returning null instead of a UB-on-match Value. Heap reference-integrity defect (see HIB-CV-32). [3mslot[0m[2m=[0m0x20017621c18 [3mraw0[0m[2m=[0m"0x000002001760e050" [3mraw1[0m[2m=[0m"0x000002001760e0b8"
@@ -186,7 +310,7 @@ Affected (for reference — do not action individually, root cause is shared):
     [cratonvm-cli] (no Java stack frames were captured for this exception)
     [cratonvm-cli] the per-thread trace store has no entry for this throwable either — the exception was likely thrown on a non-main thread, or its constructor was shadowed by a native that skipped fillInStackTrace.
 
-### `context.annotation.ComponentScanParserScopedProxyTests` — ABEND
+### `context.annotation.ComponentScanParserScopedProxyTests` — FIXED (2026-07-11, dev `9948295e`)
     == org.springframework.context.annotation.ComponentScanParserScopedProxyTests ABEND rc=1 ==
     [2m2026-07-09T07:57:27.957218Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: UnsafeConstants populated (5/5)
     [2m2026-07-09T07:57:28.131469Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: File separator/pathSeparator populated (4/4)
@@ -208,7 +332,7 @@ Affected (for reference — do not action individually, root cause is shared):
     [cratonvm-cli] (no Java stack frames were captured for this exception)
     [cratonvm-cli] the per-thread trace store has no entry for this throwable either — the exception was likely thrown on a non-main thread, or its constructor was shadowed by a native that skipped fillInStackTrace.
 
-### `context.annotation.EnableAspectJAutoProxyTests` — ABEND
+### `context.annotation.EnableAspectJAutoProxyTests` — FIXED (2026-07-11, dev `9948295e`)
     == org.springframework.context.annotation.EnableAspectJAutoProxyTests ABEND rc=139 ==
     [2m2026-07-09T07:57:42.711825Z[0m [31mERROR[0m [2mcratonvm::gc::guard[0m[2m:[0m gen_heap::read_slot: corrupt Value cell (out-of-range discriminant) — returning null instead of a UB-on-match Value. Heap reference-integrity defect (see HIB-CV-32). [3mslot[0m[2m=[0m0x200160bcf50 [3mraw0[0m[2m=[0m"0x00000200160bcf58" [3mraw1[0m[2m=[0m"0x0000000000000006"
     [2m2026-07-09T07:57:43.014943Z[0m [31mERROR[0m [2mcratonvm::gc::guard[0m[2m:[0m gen_heap::read_slot: corrupt Value cell (out-of-range discriminant) — returning null instead of a UB-on-match Value. Heap reference-integrity defect (see HIB-CV-32). [3mslot[0m[2m=[0m0x20016d48280 [3mraw0[0m[2m=[0m"0x0000020016d37df0" [3mraw1[0m[2m=[0m"0x000000000000020f"
@@ -223,7 +347,7 @@ Affected (for reference — do not action individually, root cause is shared):
 - jakartaAnnotationsWithCustomSameMethodNamesWithAotProcessingAndAotRuntime() :: java.lang.ArrayIndexOutOfBoundsException: null
 - jakartaAnnotationsWithPackagePrivateInitDestroyMethodsWithAotProcessingAndAotRuntime() :: java.lang.ArrayIndexOutOfBoundsException: null
 
-### `context.annotation.PropertySourceAnnotationTests` — ABEND
+### `context.annotation.PropertySourceAnnotationTests` — FIXED (2026-07-11, dev `9948295e`)
     == org.springframework.context.annotation.PropertySourceAnnotationTests ABEND rc=1 ==
     [2m2026-07-09T08:07:04.175036Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: File separator/pathSeparator populated (4/4)
     [CCE] enhance: defined org/springframework/context/annotation/PropertySourceAnnotationTests$ConfigWithExplicitName$$EnhancerByCGLIB$$0 (super=org/springframework/context/annotation/PropertySourceAnnotationTests$ConfigWithExplicitName, marker=org/springframework/context/annotation/ConfigurationClassEnhancer$EnhancedConfiguration, intercepted @Bean methods=1)
@@ -267,10 +391,10 @@ Affected (for reference — do not action individually, root cause is shared):
     [2m2026-07-09T07:59:36.774397Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: UnsafeConstants populated (5/5)
     timeout: the monitored command dumped core
 
-### `core.task.SimpleAsyncTaskExecutorTests` — FAIL
+### `core.task.SimpleAsyncTaskExecutorTests` — FIXED (2026-07-11, dev `9948295e`)
 - taskTerminationTimeoutWithImmediateCancel() :: java.lang.AssertionError: 
 
-### `core.test.tools.CompiledTests` — FIXED (2026-07-11)
+### `core.test.tools.CompiledTests` — FIXED (2026-07-11, dev `9948295e`)
 - getInstanceWhenNoDefaultConstructorThrowsException() :: java.lang.AssertionError:
   Expecting code to raise a throwable. Root cause: `cl_real_load_class_base`'s
   step-1 `ctx.load_class` (real-JDK mode) resolved through CratonVM's flat
@@ -292,7 +416,7 @@ Affected (for reference — do not action individually, root cause is shared):
 ### `expression.spel.EvaluationTests` — FAIL
 - matchesWithPatternAccessThreshold() :: java.lang.AssertionError: 
 
-### `expression.spel.standard.SpelCompilerTests` — TIMEOUT
+### `expression.spel.standard.SpelCompilerTests` — FIXED (2026-07-11, dev `9948295e`)
 - (hard timeout at 120s, no stack captured)
 
 ### `http.client.JettyClientHttpRequestFactoryTests` — ABEND
@@ -327,7 +451,7 @@ Affected (for reference — do not action individually, root cause is shared):
     [cratonvm-cli] (no Java stack frames were captured for this exception)
     [cratonvm-cli] the per-thread trace store has no entry for this throwable either — the exception was likely thrown on a non-main thread, or its constructor was shadowed by a native that skipped fillInStackTrace.
 
-### `jms.annotation.JmsListenerAnnotationBeanPostProcessorTests` — ABEND
+### `jms.annotation.JmsListenerAnnotationBeanPostProcessorTests` — FIXED (2026-07-11, dev `9948295e`)
     == org.springframework.jms.annotation.JmsListenerAnnotationBeanPostProcessorTests ABEND rc=1 ==
     [2m2026-07-09T08:04:14.052572Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
     [CCE] enhance: defined org/springframework/jms/annotation/JmsListenerAnnotationBeanPostProcessorTests$ProxyConfig$$EnhancerByCGLIB$$0 (super=org/springframework/jms/annotation/JmsListenerAnnotationBeanPostProcessorTests$ProxyConfig, marker=org/springframework/context/annotation/ConfigurationClassEnhancer$EnhancedConfiguration, intercepted @Bean methods=1)
@@ -351,7 +475,7 @@ Affected (for reference — do not action individually, root cause is shared):
     [2m2026-07-09T08:19:48.535123Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: File separator/pathSeparator populated (4/4)
     [2m2026-07-09T08:19:48.537952Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_exec[0m[2m:[0m Missing native method in real-JDK mode [3mmethod[0m[2m=[0mjdk/jfr/internal/JVM.subscribeLogLevel(Ljdk/jfr/internal/LogTag;I)V
 
-### `mock.web.MockHttpServletResponseTests` — FAIL
+### `mock.web.MockHttpServletResponseTests` — FIXED (2026-07-11, dev `9948295e`)
 - contentAsStringEncodingWithJson() :: org.opentest4j.AssertionFailedError: 
 - servletWriterAutoFlushedForString() :: org.opentest4j.AssertionFailedError: 
 
@@ -367,14 +491,14 @@ Affected (for reference — do not action individually, root cause is shared):
 ### `orm.jpa.support.PersistenceInjectionTests` — FAIL
 - publicExtendedPersistenceContextSetterWithSerialization() :: org.opentest4j.AssertionFailedError: 
 
-### `oxm.xstream.XStreamMarshallerTests` — FAIL
+### `oxm.xstream.XStreamMarshallerTests` — FIXED (2026-07-11, dev `9948295e`)
 - aliasesByTypeStringClassMap() :: java.lang.VerifyError: com/thoughtworks/xstream/core/util/SerializationMembers.callWriteObject: at bytecode offset 155: athrow: operand ObjectRef("java/lang/Object") is not assignable to java/lang/Throwable
 - jettisonDriver() :: java.lang.VerifyError: com/thoughtworks/xstream/core/util/SerializationMembers.callWriteObject: at bytecode offset 155: athrow: operand ObjectRef("java/lang/Object") is not assignable to java/lang/Throwable
 - marshalStaxResultXMLStreamWriter() :: java.lang.VerifyError: com/thoughtworks/xstream/core/util/SerializationMembers.callWriteObject: at bytecode offset 155: athrow: operand ObjectRef("java/lang/Object") is not assignable to java/lang/Throwable
 - marshalStaxResultXMLStreamWriterDefaultNamespace() :: java.lang.VerifyError: com/thoughtworks/xstream/core/util/SerializationMembers.callWriteObject: at bytecode offset 155: athrow: operand ObjectRef("java/lang/Object") is not assignable to java/lang/Throwable
 - marshalStreamResultOutputStream() :: java.lang.VerifyError: com/thoughtworks/xstream/core/util/SerializationMembers.callWriteObject: at bytecode offset 155: athrow: operand ObjectRef("java/lang/Object") is not assignable to java/lang/Throwable
 
-### `oxm.xstream.XStreamUnmarshallerTests` — FAIL
+### `oxm.xstream.XStreamUnmarshallerTests` — FIXED (2026-07-11, dev `9948295e`)
 - unmarshalDomSource() :: java.lang.VerifyError: com/thoughtworks/xstream/core/util/SerializationMembers.callWriteObject: at bytecode offset 155: athrow: operand ObjectRef("java/lang/Object") is not assignable to java/lang/Throwable
 - unmarshalStaxSourceXmlStreamReader() :: java.lang.VerifyError: com/thoughtworks/xstream/core/util/SerializationMembers.callWriteObject: at bytecode offset 155: athrow: operand ObjectRef("java/lang/Object") is not assignable to java/lang/Throwable
 - unmarshalStreamSourceInputStream() :: java.lang.VerifyError: com/thoughtworks/xstream/core/util/SerializationMembers.callWriteObject: at bytecode offset 155: athrow: operand ObjectRef("java/lang/Object") is not assignable to java/lang/Throwable
@@ -488,7 +612,7 @@ Affected (for reference — do not action individually, root cause is shared):
     DEBUG [org.hibernate.validator.internal.xml.config.ResourceLoaderHelper] Trying to load META-INF/validation.xml via TCCL
     DEBUG [org.hibernate.validator.internal.xml.config.ResourceLoaderHelper] Trying to load META-INF/validation.xml via Hibernate Validator's class loader
 
-### `test.web.servlet.assertj.AbstractMockHttpServletResponseAssertTests` — FAIL
+### `test.web.servlet.assertj.AbstractMockHttpServletResponseAssertTests` — FIXED (2026-07-11, dev `9948295e`)
 - bodyJsonCanLoadResourceRelativeToClass() :: java.lang.IllegalStateException: org.json.JSONException: Unparsable JSON string: 
 - bodyJsonWithJsonPath() :: java.lang.IllegalArgumentException: json can not be null or empty
 - bodyText() :: org.opentest4j.AssertionFailedError: 
@@ -499,27 +623,27 @@ Affected (for reference — do not action individually, root cause is shared):
 - debugCanPrintToCustomOutputStream() :: java.lang.AssertionError: 
 - debugUsesSystemOutByDefault() :: java.lang.AssertionError: 
 
-### `test.web.servlet.client.samples.bind.FilterTests` — FAIL
+### `test.web.servlet.client.samples.bind.FilterTests` — FIXED (2026-07-11, dev `9948295e`)
 - filter() :: java.lang.AssertionError: Response body expected:<It works!> but was:<null>
 
 ### `test.web.servlet.htmlunit.MockWebResponseBuilderTests` — FAIL
 - buildContent() :: org.opentest4j.AssertionFailedError: 
 
-### `test.web.servlet.result.JsonPathResultMatchersTests` — FAIL
+### `test.web.servlet.result.JsonPathResultMatchersTests` — FIXED (2026-07-11, dev `9948295e`)
 - valueWithJsonPrefix() :: java.lang.AssertionError: JSON prefix "prefix" not found
 
-### `test.web.servlet.result.PrintingResultHandlerTests` — FAIL
+### `test.web.servlet.result.PrintingResultHandlerTests` — FIXED (2026-07-11, dev `9948295e`)
 - printResponseWithCharacterEncoding() :: org.opentest4j.AssertionFailedError: [For label 'Body' under heading 'MockHttpServletResponse' =>] 
 - printResponseWithDefaultCharacterEncoding() :: org.opentest4j.AssertionFailedError: [For label 'Body' under heading 'MockHttpServletResponse' =>] 
 
-### `test.web.servlet.result.XpathResultMatchersTests` — FAIL
+### `test.web.servlet.result.XpathResultMatchersTests` — FIXED (2026-07-11, dev `9948295e`)
 - exists() :: org.xml.sax.SAXParseException: Premature end of file.
 - nodeListNoMatch() :: java.lang.AssertionError: 
 - nodeNoMatch() :: java.lang.AssertionError: 
 - numberNoMatch() :: java.lang.AssertionError: 
 - stringNoMatch() :: java.lang.AssertionError: 
 
-### `test.web.servlet.samples.standalone.ViewResolutionTests` — ABEND
+### `test.web.servlet.samples.standalone.ViewResolutionTests` — FIXED (2026-07-11, dev `9948295e`)
     == org.springframework.test.web.servlet.samples.standalone.ViewResolutionTests ABEND rc=139 ==
     FINE [jakarta.xml.bind]   not found
     FINE [jakarta.xml.bind] Checking system property jakarta.xml.bind.context.factory
@@ -530,7 +654,7 @@ Affected (for reference — do not action individually, root cause is shared):
 ### `util.function.SingletonSupplierTests` — FAIL
 - repetition 77 of 100 :: java.lang.AssertionError: 
 
-### `web.client.support.RestClientProxyRegistryIntegrationTests` — ABEND
+### `web.client.support.RestClientProxyRegistryIntegrationTests` — FIXED (2026-07-11, dev `9948295e`)
     == org.springframework.web.client.support.RestClientProxyRegistryIntegrationTests ABEND rc=139 ==
     [2m2026-07-09T08:18:07.152236Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: UnsafeConstants populated (5/5)
     SLF4J(W): No SLF4J providers were found.
@@ -546,7 +670,7 @@ Affected (for reference — do not action individually, root cause is shared):
     [cratonvm-cli] (no Java stack frames were captured for this exception)
     [cratonvm-cli] the per-thread trace store has no entry for this throwable either — the exception was likely thrown on a non-main thread, or its constructor was shadowed by a native that skipped fillInStackTrace.
 
-### `web.context.support.HttpRequestHandlerTests` — FAIL
+### `web.context.support.HttpRequestHandlerTests` — FIXED (2026-07-11, dev `9948295e`)
 - httpRequestHandlerServletPassThrough() :: org.opentest4j.AssertionFailedError: 
 
 ### `web.reactive.config.WebFluxConfigurationSupportTests` — ABEND
@@ -696,7 +820,7 @@ Affected (for reference — do not action individually, root cause is shared):
     SLF4J(W): No SLF4J providers were found.
     SLF4J(W): Defaulting to no-operation (NOP) logger implementation
 
-### `web.reactive.result.view.freemarker.FreeMarkerViewTests` — ABEND
+### `web.reactive.result.view.freemarker.FreeMarkerViewTests` — FIXED (2026-07-11, dev `9948295e`)
     == org.springframework.web.reactive.result.view.freemarker.FreeMarkerViewTests ABEND rc=139 ==
     [2m2026-07-09T08:12:17.722259Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: UnsafeConstants populated (5/5)
     [2m2026-07-09T08:12:17.950903Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: File separator/pathSeparator populated (4/4)
@@ -734,7 +858,7 @@ Affected (for reference — do not action individually, root cause is shared):
 - basicListingWithAot() :: java.lang.ArrayIndexOutOfBoundsException: null
 - basicScanWithAot() :: java.lang.ArrayIndexOutOfBoundsException: null
 
-### `web.servlet.DispatcherServletTests` — FAIL
+### `web.servlet.DispatcherServletTests` — FIXED (2026-07-11, dev `9948295e`)
 - parsedRequestPathIsRestoredOnForward() :: org.opentest4j.AssertionFailedError: 
 - shouldAttemptToResetResponseBufferIfCommitted() :: java.lang.AssertionError: 
 
@@ -754,12 +878,12 @@ Affected (for reference — do not action individually, root cause is shared):
     DEBUG [org.hibernate.validator.internal.xml.config.ResourceLoaderHelper] Trying to load META-INF/validation.xml via user class loader
     DEBUG [org.hibernate.validator.internal.xml.config.ResourceLoaderHelper] Trying to load META-INF/validation.xml via TCCL
 
-### `web.servlet.handler.HandlerMappingIntrospectorTests` — FAIL
+### `web.servlet.handler.HandlerMappingIntrospectorTests` — FIXED (2026-07-11, dev `9948295e`)
 - [1] uri = "/test" :: org.opentest4j.AssertionFailedError: 
 - [2] uri = "/resource/1234****" :: org.opentest4j.AssertionFailedError: 
 - cacheFilterWithNestedDispatch() :: org.opentest4j.AssertionFailedError: 
 
-### `web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolverTests` — FAIL
+### `web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolverTests` — FIXED (2026-07-11, dev `9948295e`)
 - resolveExceptionResponseWriter() :: org.opentest4j.AssertionFailedError: 
 
 ### `web.servlet.mvc.method.annotation.FragmentRenderingStreamTests` — ABEND
@@ -778,7 +902,7 @@ Affected (for reference — do not action individually, root cause is shared):
     DEBUG [org.hibernate.validator.internal.xml.config.ResourceLoaderHelper] Trying to load META-INF/validation.xml via TCCL
     DEBUG [org.hibernate.validator.internal.xml.config.ResourceLoaderHelper] Trying to load META-INF/validation.xml via Hibernate Validator's class loader
 
-### `web.servlet.tags.EvalTagTests` — FAIL
+### `web.servlet.tags.EvalTagTests` — FIXED (2026-07-11, dev `9948295e`)
 - environmentAccess() :: org.opentest4j.AssertionFailedError: 
 - mapAccess() :: org.opentest4j.AssertionFailedError: 
 - printHtmlEscapedAttributeResult() :: org.opentest4j.AssertionFailedError: 
@@ -802,7 +926,7 @@ Affected (for reference — do not action individually, root cause is shared):
     INFO [org.apache.coyote.http11.Http11NioProtocol] Starting ProtocolHandler ["http-nio-auto-1-43139"]
     INFO [org.apache.catalina.core.ContainerBase.[Tomcat].[localhost].[/]] Initializing Spring DispatcherServlet 'dispatcherServlet'
 
-### `web.socket.adapter.standard.ConvertingEncoderDecoderSupportTests` — ABEND
+### `web.socket.adapter.standard.ConvertingEncoderDecoderSupportTests` — FIXED (2026-07-11, dev `9948295e`)
     == org.springframework.web.socket.adapter.standard.ConvertingEncoderDecoderSupportTests ABEND rc=139 ==
     [2m2026-07-09T08:20:25.313031Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: UnsafeConstants populated (5/5)
     [CCE] enhance: defined org/springframework/web/socket/adapter/standard/ConvertingEncoderDecoderSupportTests$Config$$EnhancerByCGLIB$$0 (super=org/springframework/web/socket/adapter/standard/ConvertingEncoderDecoderSupportTests$Config, marker=org/springframework/context/annotation/ConfigurationClassEnhancer$EnhancedConfiguration, intercepted @Bean methods=1)
@@ -812,7 +936,7 @@ Affected (for reference — do not action individually, root cause is shared):
 ### `web.socket.config.MessageBrokerBeanDefinitionParserTests` — FAIL
 - simpleBroker() :: org.opentest4j.AssertionFailedError: 
 
-### `web.socket.messaging.OrderedMessageSendingIntegrationTests` — ABEND
+### `web.socket.messaging.OrderedMessageSendingIntegrationTests` — FIXED (2026-07-11, dev `9948295e`)
     == org.springframework.web.socket.messaging.OrderedMessageSendingIntegrationTests ABEND rc=139 ==
     [2m2026-07-09T08:20:46.554337Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: UnsafeConstants populated (5/5)
     [2m2026-07-09T08:20:46.577174Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
@@ -826,7 +950,7 @@ Affected (for reference — do not action individually, root cause is shared):
     [2m2026-07-09T08:16:12.779491Z[0m [31mERROR[0m [2mcratonvm::gc::guard[0m[2m:[0m gen_heap::get_field: out-of-bounds field read dropped (undersized object layout — class declares more fields than the object was allocated with) [3mobj[0m[2m=[0m0x2001a8661e0 [3mindex[0m[2m=[0m0 [3mnum_slots[0m[2m=[0m0 [3mclass_id[0m[2m=[0mClassId(6) [3mclass_name[0m[2m=[0mjava/lang/String [3mreal_field_count[0m[2m=[0mSome(4)
     [2m2026-07-09T08:16:12.779537Z[0m [31mERROR[0m [2mcratonvm::gc::guard[0m[2m:[0m gen_heap::get_field: out-of-bounds field read dropped (undersized object layout — class declares more fields than the object was allocated with) [3mobj[0m[2m=[0m0x2001a8661e0 [3mindex[0m[2m=[0m0 [3mnum_slots[0m[2m=[0m0 [3mclass_id[0m[2m=[0mClassId(6) [3mclass_name[0m[2m=[0mjava/lang/String [3mreal_field_count[0m[2m=[0mSome(4)
 
-### `web.socket.messaging.SubProtocolWebSocketHandlerTests` — FAIL
+### `web.socket.messaging.SubProtocolWebSocketHandlerTests` — FIXED (2026-07-11, dev `9948295e`)
 - checkSession() :: java.lang.IllegalStateException: No handler for 'v12.stomp' among {}
 - subProtocolDefaultHandlerOnly() :: java.lang.IllegalStateException: No handler for 'v12.sToMp' among {}
 - subProtocolMatch() :: java.lang.IllegalStateException: No handler for 'v12.sToMp' among {}
