@@ -43,44 +43,39 @@ fn osr_deny_list() -> &'static RwLock<HashSet<MethodKey>> {
     LIST.get_or_init(|| RwLock::new(HashSet::new()))
 }
 
-/// Methods statically known to corrupt state when OSR-entered, pending a
-/// full root-cause fix. Denying OSR for a method does not stop it from
-/// tiering up to normal (non-OSR) JIT compilation from a fresh call -- it
-/// only forces an already-interpreting invocation to keep interpreting
-/// rather than jumping into compiled code mid-loop.
-///
-/// `java/util/DualPivotQuicksort.sort` (both the `([DIII)V` entry point and
-/// the `(Ldk$Sorter;[DIII)V` worker it delegates to) is denied here:
-/// ES's `libs/tdigest` `SortingDigestTests` (`testSorted`, `testMonotonicity`,
-/// `testMidPointRule`, `testSingletonAtEnd`, `testFewRepeatedValues`) reads a
-/// garbage `ArrayIndexOutOfBoundsException` index -- always a plausible heap
-/// pointer (e.g. `0x20048466300`), never a plausible array index -- out of
-/// `SortingDigest.compress()`'s `values.sort()` call, which bottoms out in
-/// `Arrays.sort(double[])` -> `DualPivotQuicksort.sort`. `CRATONVM_DBG_OSR=1`
-/// on the failing repro shows these are the ONLY two methods ever OSR-entered
-/// during the run; `CRATONVM_JIT_OSR=0` (disabling OSR VM-wide) makes all 5
-/// failures disappear with no other behavior change. Both overloads are
-/// self-recursive (standard dual-pivot partitioning), and an OSR-entered
-/// frame's `stack_floor_slot_off` is seeded to the OSR trampoline's
-/// usize::MAX sentinel (see `emit_osr_trampoline`), which makes every
-/// self-recursive call site's inline fast-path check
-/// (`RSP > floor`) always false -- so an OSR-entered instance of either
-/// method ALWAYS routes its recursive calls through the `self_call_stack_guard`
-/// helper path (jit/src/x64.rs, the `guard_skip_patch` block), a
-/// combination (OSR entry + self-recursion) that gets far less exercise than
-/// either feature alone. That is the leading suspect, not a pinpointed
-/// single instruction -- this is a scoped mitigation, not a root-cause fix.
-fn statically_osr_denied(key: &MethodKey) -> bool {
-    key.class_name == "java/util/DualPivotQuicksort"
-        && key.method_name == "sort"
-        && (key.descriptor == "([DIII)V"
-            || key.descriptor == "(Ljava/util/DualPivotQuicksort$Sorter;[DIII)V")
-}
-
 /// Returns true when OSR is permanently disabled for this method, without
 /// affecting normal invocation-counted JIT compilation.
+///
+/// `java/util/DualPivotQuicksort.sort` was statically denied here for one
+/// day (commit 05f6930e, "Deny OSR for DualPivotQuicksort.sort") as a
+/// scoped mitigation for the ES `SortingDigestTests` garbage-index
+/// corruption. A parallel, independent investigation the same day
+/// (a8c5825d, "Fix IR-lowerer unallocated-slot miscompile corrupting
+/// Arrays.sort(double[]) under JIT") found and fixed the actual root
+/// cause -- the IR/C2 backend's `slot_of()` returned a bogus `0` default
+/// for SSA nodes the scheduler never placed in an emitted block, so an
+/// emitted use read `[rbp - 0]` (the saved caller RBP) as data; plus a
+/// phantom-return-value push on the raw self-recursive-CALL path for VOID
+/// methods, an OSR dead-local mask gap for XMM-resident locals, and a
+/// precise-maps RBP-mirror restore gap around Rust-side compiled-entry
+/// calls. With those fixed, OSR-entering `DualPivotQuicksort.sort` is safe
+/// (`ES SortingDigestTests -Jit on` verified 19/20 with the static deny
+/// REMOVED, same as with it present -- the deny was never load-bearing for
+/// correctness once a8c5825d landed).
+///
+/// The static deny stayed in place afterward purely as a perf/complexity
+/// artifact of the parallel-fix landing, but it has a real cost: routing
+/// every self-recursive call of a denied method through the
+/// `self_call_stack_guard` helper path (instead of the fast inlined
+/// stack-floor check) on every OSR-entered invocation is itself the
+/// documented dominant per-level cost for recursion-heavy code
+/// (`perf/throughput-20260710`), and CratonVM's `on_backedge`/`request_osr`
+/// dispatch is a per-loop-back-edge hot path -- so a static string-keyed
+/// deny check sitting there is pure overhead once nothing needs denying.
+/// Removed: OSR is now available for `DualPivotQuicksort.sort` again, and
+/// `is_osr_denied` only consults the *dynamic* `osr_deny_list`.
 pub fn is_osr_denied(key: &MethodKey) -> bool {
-    statically_osr_denied(key) || osr_deny_list().read().contains(key)
+    osr_deny_list().read().contains(key)
 }
 
 /// Permanently disable OSR for this method in the current VM process.
