@@ -4409,6 +4409,304 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         r.register(cls, "isReadOnly", "()Z", |_, _| Ok(Some(Value::Int(0))));
     }
 
+    // `order`/`slice`/`slice(int,int)`/`duplicate`/`asReadOnlyBuffer` are
+    // `public abstract` on every typed NIO buffer subclass in real JDK 25
+    // (unlike ByteBuffer, where they're concrete bytecode) — `get`/`put`
+    // (relative + absolute) and `compact` are abstract too, but only
+    // IntBuffer has working overrides below (legacy). Every view-buffer
+    // instance handed out by `s2_view_buf_fn!` above (`ByteBuffer.asXxxBuffer()`)
+    // is stamped with the LITERAL abstract class name, so an `invokevirtual`
+    // for any of these against that receiver resolves to a Code-less abstract
+    // declaration and throws AbstractMethodError unless registered directly
+    // here. See
+    // docs/known-issues/elasticsearch-suite/ES-FAIL-FAMILY-20260710-floatbuffer-abstract-receiver-nocode.md
+    // (found via `FloatBuffer.order()`/`put(int,float)` on a raw vector slice
+    // view — `ES814HnswScalarQuantizedVectorsFormatTests.testRescoreUsesRawVectorSlice`
+    // — and `IntBuffer.order()` in `PreconditionerTests`).
+    //
+    // `bs` below is the byte-offset (within the shared backing byte[]) where
+    // this view's element 0 starts — encoded by `s2_view_buf_fn!`/`slice`/
+    // `slice(II)` as `-(bs+1)` in the indexed `BB_MARK` slot (mirroring the
+    // existing IntBuffer get/put below, which reads it the same way).
+    macro_rules! s2_typed_buffer_view_fns {
+        (
+            $get:ident, $get_abs:ident, $put:ident, $put_abs:ident,
+            $order:ident, $slice:ident, $slice2:ident, $dup:ident, $ro:ident, $compact:ident,
+            $cls:literal, $width:expr, $read:ident, $write:ident,
+            $to_value:expr, $from_value:expr
+        ) => {
+            fn $get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                let this = obj_arg(args, 0)?;
+                let pos = s2_bb_pos(ctx, this);
+                if pos >= s2_bb_limit(ctx, this) {
+                    return Err(RuntimeError::BufferUnderflowException.into());
+                }
+                let bs = {
+                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+                    if m < 0 { -(m + 1) } else { 0 }
+                };
+                let off = pos
+                    .checked_mul($width)
+                    .and_then(|b| bs.checked_add(b))
+                    .unwrap_or(-1);
+                let raw = $read(ctx, this, off);
+                ctx.set_field(this, BB_POS, Value::Int(pos + 1));
+                Ok(Some(($to_value)(raw)))
+            }
+            fn $get_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                let this = obj_arg(args, 0)?;
+                let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+                let bs = {
+                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+                    if m < 0 { -(m + 1) } else { 0 }
+                };
+                let off = idx
+                    .checked_mul($width)
+                    .and_then(|b| bs.checked_add(b))
+                    .unwrap_or(-1);
+                let raw = $read(ctx, this, off);
+                Ok(Some(($to_value)(raw)))
+            }
+            fn $put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                let this = obj_arg(args, 0)?;
+                let v = args.get(1).cloned().unwrap_or(Value::Int(0));
+                let pos = s2_bb_pos(ctx, this);
+                if pos >= s2_bb_limit(ctx, this) {
+                    return Err(RuntimeError::BufferOverflowException.into());
+                }
+                let bs = {
+                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+                    if m < 0 { -(m + 1) } else { 0 }
+                };
+                let off = pos
+                    .checked_mul($width)
+                    .and_then(|b| bs.checked_add(b))
+                    .unwrap_or(-1);
+                $write(ctx, this, off, ($from_value)(&v));
+                ctx.set_field(this, BB_POS, Value::Int(pos + 1));
+                Ok(Some(Value::Object(Some(this))))
+            }
+            fn $put_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                let this = obj_arg(args, 0)?;
+                let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+                let v = args.get(2).cloned().unwrap_or(Value::Int(0));
+                let bs = {
+                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+                    if m < 0 { -(m + 1) } else { 0 }
+                };
+                let off = idx
+                    .checked_mul($width)
+                    .and_then(|b| bs.checked_add(b))
+                    .unwrap_or(-1);
+                $write(ctx, this, off, ($from_value)(&v));
+                Ok(Some(Value::Object(Some(this))))
+            }
+            fn $order(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                let this = obj_arg(args, 0)?;
+                let obj = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
+                ctx.set_field(obj, 0, Value::Int(s2_bb_order(ctx, this)));
+                Ok(Some(Value::Object(Some(obj))))
+            }
+            fn $slice(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                let this = obj_arg(args, 0)?;
+                let pos = s2_bb_pos(ctx, this);
+                let lim = s2_bb_limit(ctx, this);
+                let remaining = (lim - pos).max(0);
+                let bs = {
+                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+                    if m < 0 { -(m + 1) } else { 0 }
+                };
+                let new_bs = pos
+                    .checked_mul($width)
+                    .and_then(|b| bs.checked_add(b))
+                    .unwrap_or(bs);
+                let vb = alloc_concurrent_synthetic(ctx, $cls, 6);
+                ctx.set_field(vb, BB_ARRAY, ctx.get_field(this, BB_ARRAY));
+                ctx.set_field(vb, BB_POS, Value::Int(0));
+                ctx.set_field(vb, BB_LIMIT, Value::Int(remaining));
+                ctx.set_field(vb, BB_CAP, Value::Int(remaining));
+                ctx.set_field(vb, BB_MARK, Value::Int(-(new_bs + 1)));
+                let ord = s2_bb_order(ctx, this);
+                s2_bb_set_order(ctx, vb, ord);
+                Ok(Some(Value::Object(Some(vb))))
+            }
+            fn $slice2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                let this = obj_arg(args, 0)?;
+                let index = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+                let length = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+                let cap = s2_bb_cap(ctx, this);
+                if index < 0 || length < 0 || index.checked_add(length).map_or(true, |e| e > cap) {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: "IndexOutOfBoundsException".to_string(),
+                    }
+                    .into());
+                }
+                let bs = {
+                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+                    if m < 0 { -(m + 1) } else { 0 }
+                };
+                let new_bs = index
+                    .checked_mul($width)
+                    .and_then(|b| bs.checked_add(b))
+                    .unwrap_or(bs);
+                let vb = alloc_concurrent_synthetic(ctx, $cls, 6);
+                ctx.set_field(vb, BB_ARRAY, ctx.get_field(this, BB_ARRAY));
+                ctx.set_field(vb, BB_POS, Value::Int(0));
+                ctx.set_field(vb, BB_LIMIT, Value::Int(length));
+                ctx.set_field(vb, BB_CAP, Value::Int(length));
+                ctx.set_field(vb, BB_MARK, Value::Int(-(new_bs + 1)));
+                let ord = s2_bb_order(ctx, this);
+                s2_bb_set_order(ctx, vb, ord);
+                Ok(Some(Value::Object(Some(vb))))
+            }
+            fn $dup(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                let this = obj_arg(args, 0)?;
+                let pos = s2_bb_pos(ctx, this);
+                let lim = s2_bb_limit(ctx, this);
+                let cap = s2_bb_cap(ctx, this);
+                let bs_field = ctx.get_field(this, BB_MARK);
+                let vb = alloc_concurrent_synthetic(ctx, $cls, 6);
+                ctx.set_field(vb, BB_ARRAY, ctx.get_field(this, BB_ARRAY));
+                ctx.set_field(vb, BB_POS, Value::Int(pos));
+                ctx.set_field(vb, BB_LIMIT, Value::Int(lim));
+                ctx.set_field(vb, BB_CAP, Value::Int(cap));
+                ctx.set_field(vb, BB_MARK, bs_field);
+                let ord = s2_bb_order(ctx, this);
+                s2_bb_set_order(ctx, vb, ord);
+                Ok(Some(Value::Object(Some(vb))))
+            }
+            fn $ro(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                $dup(ctx, args)
+            }
+            fn $compact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                let this = obj_arg(args, 0)?;
+                let pos = s2_bb_pos(ctx, this);
+                let lim = s2_bb_limit(ctx, this);
+                let cap = s2_bb_cap(ctx, this);
+                let bs = {
+                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+                    if m < 0 { -(m + 1) } else { 0 }
+                };
+                let remaining = (lim - pos).max(0);
+                for i in 0..remaining {
+                    let src_off = (pos + i)
+                        .checked_mul($width)
+                        .and_then(|b| bs.checked_add(b))
+                        .unwrap_or(-1);
+                    let dst_off = i
+                        .checked_mul($width)
+                        .and_then(|b| bs.checked_add(b))
+                        .unwrap_or(-1);
+                    let raw = $read(ctx, this, src_off);
+                    $write(ctx, this, dst_off, raw);
+                }
+                ctx.set_field(this, BB_POS, Value::Int(remaining));
+                ctx.set_field(this, BB_LIMIT, Value::Int(cap));
+                Ok(Some(Value::Object(Some(this))))
+            }
+        };
+    }
+
+    s2_typed_buffer_view_fns!(
+        s2_ib_get, s2_ib_get_abs, s2_ib_put, s2_ib_put_abs,
+        s2_ib_order, s2_ib_slice, s2_ib_slice2, s2_ib_dup, s2_ib_ro, s2_ib_compact,
+        "java/nio/IntBuffer", 4, s2_bb_read4, s2_bb_write4,
+        |v: i32| Value::Int(v), |v: &Value| v.as_int().unwrap_or(0)
+    );
+    s2_typed_buffer_view_fns!(
+        s2_lb_get, s2_lb_get_abs, s2_lb_put, s2_lb_put_abs,
+        s2_lb_order, s2_lb_slice, s2_lb_slice2, s2_lb_dup, s2_lb_ro, s2_lb_compact,
+        "java/nio/LongBuffer", 8, s2_bb_read8, s2_bb_write8,
+        |v: i64| Value::Long(v),
+        |v: &Value| match v {
+            Value::Long(l) => *l,
+            other => other.as_int().unwrap_or(0) as i64,
+        }
+    );
+    s2_typed_buffer_view_fns!(
+        s2_sb_get, s2_sb_get_abs, s2_sb_put, s2_sb_put_abs,
+        s2_sb_order, s2_sb_slice, s2_sb_slice2, s2_sb_dup, s2_sb_ro, s2_sb_compact,
+        "java/nio/ShortBuffer", 2, s2_bb_read2, s2_bb_write2,
+        |v: i16| Value::Int(v as i32), |v: &Value| v.as_int().unwrap_or(0) as i16
+    );
+    s2_typed_buffer_view_fns!(
+        s2_fb_get, s2_fb_get_abs, s2_fb_put, s2_fb_put_abs,
+        s2_fb_order, s2_fb_slice, s2_fb_slice2, s2_fb_dup, s2_fb_ro, s2_fb_compact,
+        "java/nio/FloatBuffer", 4, s2_bb_read4, s2_bb_write4,
+        |v: i32| Value::Float(f32::from_bits(v as u32)),
+        |v: &Value| match v {
+            Value::Float(f) => f.to_bits() as i32,
+            other => other.as_int().unwrap_or(0),
+        }
+    );
+    s2_typed_buffer_view_fns!(
+        s2_db_get, s2_db_get_abs, s2_db_put, s2_db_put_abs,
+        s2_db_order, s2_db_slice, s2_db_slice2, s2_db_dup, s2_db_ro, s2_db_compact,
+        "java/nio/DoubleBuffer", 8, s2_bb_read8, s2_bb_write8,
+        |v: i64| Value::Double(f64::from_bits(v as u64)),
+        |v: &Value| match v {
+            Value::Double(d) => d.to_bits() as i64,
+            other => other.as_int().unwrap_or(0) as i64,
+        }
+    );
+
+    // IntBuffer keeps its own long-standing get/put above (untouched); only
+    // register the previously-missing abstract methods for it.
+    r.register(ib, "order", "()Ljava/nio/ByteOrder;", s2_ib_order);
+    r.register(ib, "slice", "()Ljava/nio/IntBuffer;", s2_ib_slice);
+    r.register(ib, "slice", "(II)Ljava/nio/IntBuffer;", s2_ib_slice2);
+    r.register(ib, "duplicate", "()Ljava/nio/IntBuffer;", s2_ib_dup);
+    r.register(ib, "asReadOnlyBuffer", "()Ljava/nio/IntBuffer;", s2_ib_ro);
+    r.register(ib, "compact", "()Ljava/nio/IntBuffer;", s2_ib_compact);
+
+    let lb = "java/nio/LongBuffer";
+    r.register(lb, "get", "()J", s2_lb_get);
+    r.register(lb, "get", "(I)J", s2_lb_get_abs);
+    r.register(lb, "put", "(J)Ljava/nio/LongBuffer;", s2_lb_put);
+    r.register(lb, "put", "(IJ)Ljava/nio/LongBuffer;", s2_lb_put_abs);
+    r.register(lb, "order", "()Ljava/nio/ByteOrder;", s2_lb_order);
+    r.register(lb, "slice", "()Ljava/nio/LongBuffer;", s2_lb_slice);
+    r.register(lb, "slice", "(II)Ljava/nio/LongBuffer;", s2_lb_slice2);
+    r.register(lb, "duplicate", "()Ljava/nio/LongBuffer;", s2_lb_dup);
+    r.register(lb, "asReadOnlyBuffer", "()Ljava/nio/LongBuffer;", s2_lb_ro);
+    r.register(lb, "compact", "()Ljava/nio/LongBuffer;", s2_lb_compact);
+
+    let sb = "java/nio/ShortBuffer";
+    r.register(sb, "get", "()S", s2_sb_get);
+    r.register(sb, "get", "(I)S", s2_sb_get_abs);
+    r.register(sb, "put", "(S)Ljava/nio/ShortBuffer;", s2_sb_put);
+    r.register(sb, "put", "(IS)Ljava/nio/ShortBuffer;", s2_sb_put_abs);
+    r.register(sb, "order", "()Ljava/nio/ByteOrder;", s2_sb_order);
+    r.register(sb, "slice", "()Ljava/nio/ShortBuffer;", s2_sb_slice);
+    r.register(sb, "slice", "(II)Ljava/nio/ShortBuffer;", s2_sb_slice2);
+    r.register(sb, "duplicate", "()Ljava/nio/ShortBuffer;", s2_sb_dup);
+    r.register(sb, "asReadOnlyBuffer", "()Ljava/nio/ShortBuffer;", s2_sb_ro);
+    r.register(sb, "compact", "()Ljava/nio/ShortBuffer;", s2_sb_compact);
+
+    let fb = "java/nio/FloatBuffer";
+    r.register(fb, "get", "()F", s2_fb_get);
+    r.register(fb, "get", "(I)F", s2_fb_get_abs);
+    r.register(fb, "put", "(F)Ljava/nio/FloatBuffer;", s2_fb_put);
+    r.register(fb, "put", "(IF)Ljava/nio/FloatBuffer;", s2_fb_put_abs);
+    r.register(fb, "order", "()Ljava/nio/ByteOrder;", s2_fb_order);
+    r.register(fb, "slice", "()Ljava/nio/FloatBuffer;", s2_fb_slice);
+    r.register(fb, "slice", "(II)Ljava/nio/FloatBuffer;", s2_fb_slice2);
+    r.register(fb, "duplicate", "()Ljava/nio/FloatBuffer;", s2_fb_dup);
+    r.register(fb, "asReadOnlyBuffer", "()Ljava/nio/FloatBuffer;", s2_fb_ro);
+    r.register(fb, "compact", "()Ljava/nio/FloatBuffer;", s2_fb_compact);
+
+    let db = "java/nio/DoubleBuffer";
+    r.register(db, "get", "()D", s2_db_get);
+    r.register(db, "get", "(I)D", s2_db_get_abs);
+    r.register(db, "put", "(D)Ljava/nio/DoubleBuffer;", s2_db_put);
+    r.register(db, "put", "(ID)Ljava/nio/DoubleBuffer;", s2_db_put_abs);
+    r.register(db, "order", "()Ljava/nio/ByteOrder;", s2_db_order);
+    r.register(db, "slice", "()Ljava/nio/DoubleBuffer;", s2_db_slice);
+    r.register(db, "slice", "(II)Ljava/nio/DoubleBuffer;", s2_db_slice2);
+    r.register(db, "duplicate", "()Ljava/nio/DoubleBuffer;", s2_db_dup);
+    r.register(db, "asReadOnlyBuffer", "()Ljava/nio/DoubleBuffer;", s2_db_ro);
+    r.register(db, "compact", "()Ljava/nio/DoubleBuffer;", s2_db_compact);
+
     // equals / hashCode / compareTo / toString
     r.register(bb, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
