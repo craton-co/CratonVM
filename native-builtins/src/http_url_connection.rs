@@ -1016,6 +1016,7 @@ fn build_request_head(
         let _ = write!(&mut out, "Host: {}:{}\r\n", parsed.host, parsed.port);
     }
     let mut has_user_agent = false;
+    let mut has_connection = false;
     let mut has_content_length = false;
     let mut has_content_type = false;
     let mut has_authorization = false;
@@ -1023,6 +1024,9 @@ fn build_request_head(
         let lk = k.to_ascii_lowercase();
         if lk == "user-agent" {
             has_user_agent = true;
+        }
+        if lk == "connection" {
+            has_connection = true;
         }
         if lk == "content-length" {
             has_content_length = true;
@@ -1049,6 +1053,13 @@ fn build_request_head(
     }
     if !has_user_agent {
         out.extend_from_slice(b"User-Agent: Java/CratonVM\r\n");
+    }
+    // The legacy JDK HttpURLConnection client keeps HTTP/1.1 connections
+    // alive by default and sends the explicit compatibility header. Tomcat
+    // exposes that choice in its response header set, including when it drops
+    // an invalid response header before committing the response.
+    if !has_connection {
+        out.extend_from_slice(b"Connection: keep-alive\r\n");
     }
     let is_output_method = has_output || matches!(method, "POST" | "PUT" | "PATCH");
     if !has_content_length && is_output_method {
@@ -1121,6 +1132,14 @@ fn read_eof_tolerant<S: Read>(stream: &mut S, buf: &mut [u8]) -> std::io::Result
     }
 }
 
+/// Decode an HTTP header-field value using the byte-preserving mapping used by
+/// `HttpURLConnection`. Header values are wire octets, not UTF-8 text: Tomcat
+/// legitimately emits ISO-8859-1-compatible `obs-text` (0x80..=0xff), and a
+/// strict UTF-8 conversion turns a valid response into a parse failure.
+fn header_value_from_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|&byte| char::from(byte)).collect()
+}
+
 fn read_response<S: Read>(
     stream: &mut S,
     head: bool,
@@ -1157,9 +1176,7 @@ fn read_response<S: Read>(
     let mut chunked = false;
     for h in resp.headers.iter() {
         let name = h.name.to_string();
-        let value = std::str::from_utf8(h.value)
-            .map_err(|e| format!("non-utf8 header value for {name}: {e}"))?
-            .to_string();
+        let value = header_value_from_bytes(h.value);
         let lname = name.to_ascii_lowercase();
         if lname == "content-length" {
             content_length = value.trim().parse::<usize>().ok();
@@ -2882,6 +2899,7 @@ mod http_url_connection_tests {
         assert!(s.starts_with("GET /foo HTTP/1.1\r\n"));
         assert!(s.contains("Host: example.com\r\n"));
         assert!(s.contains("User-Agent: Java/CratonVM\r\n"));
+        assert!(s.contains("Connection: keep-alive\r\n"));
     }
 
     #[test]
@@ -3010,6 +3028,21 @@ mod http_url_connection_tests {
         let (status, _h, body) = read_response(&mut data, false).unwrap();
         assert_eq!(status, 200);
         assert_eq!(body, b"HELLO");
+    }
+
+    #[test]
+    fn test_read_response_preserves_latin1_header_value() {
+        // HTTP header field-values are byte sequences. Tomcat uses an
+        // ISO-8859-1-compatible byte mapping when serializing \u{00a0}; a
+        // strict UTF-8 parse must not reject the otherwise valid response.
+        let mut data: &[u8] =
+            b"HTTP/1.1 200 OK\r\nX-Test: \xa0 should be OK\r\nContent-Length: 0\r\n\r\n";
+        let (status, headers, body) = read_response(&mut data, false).unwrap();
+        assert_eq!(status, 200);
+        assert!(body.is_empty());
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == "X-Test" && value == "\u{00a0} should be OK"));
     }
 
     #[test]
