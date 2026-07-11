@@ -1,6 +1,6 @@
 # WildFly domain startup timeout with repeated corrupt `Value` cell guard
 
-Status: OPEN — gated by WFLYHC0053 (`Could not get the server inventory in 30 seconds`). HIB-CV-32 has now stayed silent across every 2026-07-07 through 2026-07-11 run (multiple sessions, tens of thousands of log lines each) — very strong evidence that guard is genuinely closed. The seventh session's byte-level capture (`bytes=[152]`) was initially misread as a corrupted opcode; the eighth session (2026-07-11) corrected this via decompilation of the real WildFly protocol classes — 152/153 are the wire protocol's own legitimate CHUNK_START/CHUNK_END marker bytes, not corruption — and precisely narrowed the actual failure to the Host Controller read-task's Pipe-construction/`readExecutor.execute()` submission step (between reading a valid 152 chunk-start byte and the next expected read), landing one real, independently-verified fix along the way (a `BufferedOutputStream` flush-ordering TOCTOU race, `native-io/src/lib.rs`) that is NOT itself the root cause. See the 2026-07-11 eighth-session update at the bottom for the exact mechanism and next steps (most promising: live gdb on the read-task thread to see whether `readExecutor.execute()` throws). Do not move to internal until WFLYHC0053 is resolved and a domain boot reaches sustained managed-server load with HIB-CV-32 confirmed silent throughout.
+Status: OPEN — gated by WFLYHC0053 (`Could not get the server inventory in 30 seconds`). HIB-CV-32 has now stayed silent across every 2026-07-07 through 2026-07-11 run (multiple sessions, tens of thousands of log lines each) — very strong evidence that guard is genuinely closed. The seventh session's byte-level capture (`bytes=[152]`) was initially misread as a corrupted opcode; the eighth session corrected this — 152/153 are the wire protocol's own legitimate CHUNK_START/CHUNK_END marker bytes — and landed one real, independently-verified fix (`BufferedOutputStream` flush-ordering TOCTOU race, `native-io/src/lib.rs`, commit `1f774cdb`) that is NOT the root cause. The ninth session (2026-07-11) live-debugged further: refuted a generic-`Executor`-interface-dispatch hypothesis (0 hits across a 34K-line run) and the GC-timing correlation flagged earlier (0/5 correlation across fresh captures); confirmed via live `gdb`/`strace` that the connection's reader thread is genuinely, cleanly blocked in a normal `recv()` moments before each closure, and that the failure point is non-deterministic (fires at different points across repeated runs, ruling out a fixed-content logic bug — points to a genuine host-timing-dependent race). Deeper `gdb` narrowing was blocked by the release build optimizing out the relevant local variable; see the ninth-session update at the bottom for the exact tooling workaround needed and recommended next steps. Do not move to internal until WFLYHC0053 is resolved and a domain boot reaches sustained managed-server load with HIB-CV-32 confirmed silent throughout.
 Severity: High
 First confirmed: 2026-07-05 on Azure worktree `codex/wildfly-nonpassed-probes-20260705-035722`
 
@@ -1797,3 +1797,142 @@ line. This doc stays in `docs/known-issues/`.
    lines each — strong standing evidence, just needs one clean end-to-end confirmation
    once boot can get past `WFLYHC0053` to a genuinely running state) before retiring this
    doc.
+
+
+## 2026-07-11 update (ninth session, same day) — the generic-`Executor`-interface hypothesis is refuted; the GC-timing correlation is refuted; live evidence confirms this is a genuine, host-timing-dependent race, not a deterministic logic bug; root cause still not found; hit real tooling limits this session
+
+Continued directly from the eighth session's precisely-narrowed failure window (between
+Host Controller's read task successfully reading a valid `152` chunk-start byte and the
+next expected socket read). The coordinator asked to (1) live-`gdb` the read-task thread
+at the `readExecutor.execute()` submission step and check `EnhancedQueueExecutor` for
+another instance of the "native always wins over real bytecode" bug class, (2) fix
+whatever is found, (3) only chase the GC-timing correlation if the direct trace comes up
+empty, (4) re-check residuals and retire the doc if genuinely clean.
+
+### Hypothesis: a generic, unconditional `java/util/concurrent/Executor.execute()` native was intercepting real executors — investigated, then refuted
+
+Found a real, concerning-looking candidate first: `native-builtins/src/phases_late.rs`
+registers `"execute", "(Ljava/lang/Runnable;)V"` on the literal **interface** name
+`java/util/concurrent/Executor` (not a concrete class), intended only for
+`CompletableFuture.delayedExecutor()`'s synthetic 1-field return object (it reads field
+index 0 as a delay-in-millis `Long`, defaulting to "run immediately" if that read doesn't
+match). If this registration's dispatch reached real `EnhancedQueueExecutor` instances
+(which implement `Executor` transitively) via interface-based fallback resolution, it
+would run submitted tasks **synchronously, inline, on the calling thread** — a correctness
+bug for any real async executor, and a plausible self-deadlock mechanism for exactly this
+investigation's read-task/Pipe-consumer relationship (the read task calling
+`readExecutor.execute(pipeConsumerTask)` synchronously would block itself inside the very
+task that's waiting for bytes only the read task's own subsequent loop iterations can
+supply).
+
+Added a temporary flag-gated diagnostic (`CRATONVM_DBG_EXEC_INTERFACE`, reverted before
+finishing — not committed) directly in this native. **Result: zero hits across a full
+34,000+-line boot run that included two `start-servers` cycles and a `WFLYHC0053`-shaped
+connection closure.** This registration is never reached by `EnhancedQueueExecutor.
+execute()` — confirming `org/jboss/threads/EnhancedQueueExecutor` genuinely dispatches
+`execute()` through its own class-exact registration path (or real bytecode, per
+`wildfly_core.rs`'s own comment: EnhancedQueueExecutor defaults to real jboss-threads
+bytecode unless `CRATONVM_SYNTHETIC_EQE=1`, which this investigation's harness never sets).
+**This specific hypothesis is refuted.** The registration itself is still a latent
+correctness landmine for *some* other real-`Executor`-implementing class that doesn't have
+its own exact-class registration — worth flagging for a future cleanup pass (scope it to
+only apply to the actual synthetic delayed-executor object, e.g. by checking the object's
+real class name equals a synthetic marker rather than matching on the bare interface name)
+— but it is conclusively not this doc's bug.
+
+### Live `gdb` capture: the read task is genuinely, cleanly blocked in a normal `recv()` moments before closure — not stuck in a Pipe/executor deadlock at the moment observed
+
+Captured a full `thread apply all bt` on Host Controller right as a boot stalled at the
+exact log-line position `WFLYHC0053`'s trigger always occurs at. Found the connection's
+dedicated reader thread (`"Read thread for..."`, spawned via `native_jboss_thread_run`)
+sitting in a completely ordinary blocking chain: `re1_socket_read_stream` →
+`std::net::TcpStream::read` → `recv_with_flags` → `libc::recv` — i.e. genuinely,
+correctly waiting for the Process Controller to send more bytes, not wedged inside Pipe
+construction or `readExecutor.execute()` as the eighth session's static bytecode analysis
+suggested might be the failure point. A second capture taken immediately after
+`"process controller connection closed."` printed (moments later) showed that same thread
+had already disappeared (42 live threads vs. 43 in the first snapshot, and no thread named
+`"Read thread for..."` remained) — i.e. whatever happens, happens fast, between one
+`recv()` return and the thread completing/being recycled, too fast to catch with
+periodic `gdb` snapshots.
+
+### `strace` capture: no raw socket EOF/error observed — but with an important tooling caveat
+
+Attached `strace -e trace=network,close` to Host Controller through a full boot to a
+`WFLYHC0053` closure. **Zero `recvfrom`/`read`/`write` calls returned an EOF (`= 0`) or an
+error (`ECONNRESET`/`EPIPE`/etc.) anywhere in the entire trace** — arguing against a raw
+TCP-level connection reset as the trigger. **Caveat, important for whoever continues:**
+`strace -e trace=network` only captured 5 `recvfrom` and 3 `sendto` calls in the entire
+run, even though this investigation's own earlier byte-level traces (eighth session) show
+dozens of reads/writes on this exact connection — meaning the vast majority of this
+connection's I/O goes through the plain `read`/`write` syscalls Rust's `TcpStream`
+actually uses for an already-connected socket, which `trace=network` does **not** include.
+A follow-up attempt with `-e trace=network,read,write,close` was so much slower (every
+`read()` call process-wide, including all bytecode/classloading I/O, gets traced) that it
+never reached the failure point in a reasonable window and was abandoned. **A future
+attempt should filter to a specific fd** (e.g. via `-e trace=read,write` combined with
+`-P /proc/<pid>/fd/<N>` if the strace version on this host supports path-based filtering,
+or attach only in a narrow window right before the expected failure point using the log
+line count as a timing signal, as this session did for the `gdb` captures).
+
+### Confirmed: the failure is genuinely non-deterministic, not tied to a specific message
+
+Across 5 fresh full-boot runs this session, `"process controller connection closed."`
+fired at five different points: line ~17,470-17,477 three times (matching prior sessions'
+usual position, on the *second* `start-servers(enabled-auto-start=true)` call), but also
+once on the *first*, simpler `start-servers(enabled-auto-start=false)` call at line
+~34,915, and once at line ~18,206. **This rules out a bug tied to specific message
+content or a fixed sequence position** — it is a genuine race, most likely dependent on
+host scheduling jitter (this shared host consistently ran at load average ~11/16 cores
+with 20+ concurrent user sessions throughout this investigation).
+
+### The GC-timing correlation flagged in the seventh/eighth session is refuted
+
+Per the coordinator's own instruction to only chase this if the direct trace came up
+empty: checked all 5 of this session's captured closures for `gen_heap::mark_young:
+rejecting` conservative-root-rejection warnings in the 200 lines immediately preceding
+each closure. **Zero warnings found near any of the 5 closures.** The single prior
+occurrence (seventh session, one run) that motivated this lead was very likely
+coincidental noise from unrelated allocation activity elsewhere in that specific boot, not
+a causal factor. **This lead is closed — no further reason to suspect `gen_heap`/GC-timing
+involvement, and per the standing guardrail, `gc_barrier` territory was correctly not
+touched this session.**
+
+### Attempted deeper live narrowing — blocked by a genuine release-build tooling limitation
+
+Attempted a `gdb` Python script attaching a breakpoint at `net_phase_e.rs:2727` (the line
+computing `n` from the blocking read's result inside `re1_socket_read_stream`), intending
+to filter to only our target connection's low `stream_id` values and log the exact
+`read_result` (success-with-byte-count vs. `io::Error`) for every relevant read leading up
+to the closure. **The `stream_id` local variable is optimized out of the release binary's
+debug info at that exact program point in every one of ~1,000 breakpoint hits captured**
+(`No symbol "stream_id" in current context"` from `gdb`, consistently) — a real limitation
+of debugging a `[optimized + debuginfo]` release build, not a dead end in the underlying
+question. Ran out of session time to retry with the function's `this` parameter (a real
+argument, generally more debug-info-stable than a derived local under optimization) or a
+`-C opt-level=1`/debug build of just this one function.
+
+### Recommended next steps for whoever continues, in priority order
+
+1. Retry the `gdb` live-narrowing approach using the function parameter `this` (not the
+   derived local `stream_id`) at `net_phase_e.rs`'s `re1_socket_read_stream`, computing
+   `stream_id` at break time via the object's own side-table lookup if needed (or simply
+   log every hit's `this` pointer plus `read_result`, and post-filter using the known
+   pointer values from a `CRATONVM_DBG_SOCK`-style parallel run to identify which `this`
+   corresponds to the target connection) — this should avoid the optimized-out-local
+   problem entirely.
+2. Given the confirmed non-determinism, budget for **several** repeated attempts per
+   debugging session (this session needed 5 full ~3-minute boots just to observe the
+   closure point shift around) — a single capture is not representative.
+3. If live capture continues to be too fragile/slow to catch reliably, consider a
+   purpose-built synthetic repro outside WildFly entirely: two real OS processes, a
+   from-scratch `Connection`-like class mirroring `ConnectionImpl`'s exact chunk-framing +
+   `Pipe` + `readExecutor.execute()` dispatch shape, hammered under load — matching this
+   whole investigation's own repeated pattern of "narrow WildFly-specific repros down to a
+   minimal, iteration-friendly synthetic one" (see e.g. the fourth session's
+   `FieldSpawn.java` for the AB-BA lock-order bug earlier in this doc).
+4. The `strace` fd-filtering caveat above (network-only misses the real `read`/`write`
+   syscalls) should save the next session from repeating this session's two failed
+   attempts (too narrow, then too broad).
+
+### Status: WFLYHC0053 remains OPEN — no fix found this session beyond the already-landed, independently-justified `BufferedOutputStream` flush-ordering fix (commit `1f774cdb`, does not resolve this bug). Two real hypotheses (generic-Executor-interface dispatch, GC-timing correlation) were tested and refuted, narrowing the search space for whoever continues. The four original front-line residuals were not re-checked this session (boot never reaches a stable enough state — the closures happen too early/unpredictably relative to where those residuals were originally observed). This doc stays in `docs/known-issues/`, not retired — it is not genuinely clean.
