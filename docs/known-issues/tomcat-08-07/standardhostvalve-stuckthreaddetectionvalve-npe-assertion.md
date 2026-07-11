@@ -1,6 +1,6 @@
 # TestStandardHostValve / TestStuckThreadDetectionValve — valve-layer NPE and bare assertion
 
-**Status:** OPEN. **Severity:** medium. **HotSpot:** PASS on both
+**Status:** PARTIALLY FIXED. **Severity:** medium. **HotSpot:** PASS on both
 (fresh-verified).
 
 ## Summary
@@ -57,3 +57,13 @@ For `TestStandardHostValve`: add targeted logging around
 `assertNotNull` in `testIncompleteResponse` to capture what's actually
 null before investing further (the bare assertion currently gives no
 signal to work from).
+
+## Investigation findings (2026-07-11)
+
+- **TestStandardHostValve fixed.** The real-JDK HttpURLConnection adapter converted a premature transport close into response status -1. TomcatBaseTest.getUrl() then selected an empty input stream instead of surfacing the expected IOException. The adapter now propagates that failure as IOException; a fresh remote run passes all 8 methods in TestStandardHostValve.
+- **TestStuckThreadDetectionValve.testInterruption remains open.** The interrupted servlet is observed to complete, but Tomcat\x27s default NIO connector closes the client path before a response head is available. The client therefore sees no response body and ByteChunk.toString() remains null.
+- The failure is **not** JIT-specific (--nojit reproduces it), and a standalone ServerSocket probe successfully catches InterruptedException and returns OK to its client. Clearing the VM and Java interrupt state did not change the Tomcat failure; suppressing interrupt unpark caused a hang. The remaining defect is isolated to Tomcat NIO connector response handoff after interruption.
+
+Current targeted verification: TestStandardHostValve PASS (8 tests); TestStuckThreadDetectionValve FAIL (testInterruption only).
+
+The original issue document remains under docs/known-issues because the stuck-thread connector issue is not yet resolved.
