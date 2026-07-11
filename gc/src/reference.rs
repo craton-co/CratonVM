@@ -859,6 +859,69 @@ impl ReferenceProcessor {
         self.finalization_queue.pop_front()
     }
 
+    /// INT-8: addresses of every registered Weak/Soft/Phantom `Reference`
+    /// OBJECT (not referent). The G1 marker hides slot 0 (the referent) of
+    /// exactly these objects for the duration of a concurrent mark cycle so
+    /// the trace cannot keep weak referents alive through their References.
+    ///
+    /// Deliberately EXCLUDED:
+    /// - Finalizer entries — their `reference_obj` IS the finalizable object
+    ///   itself; its slot 0 is an ordinary strong field.
+    /// - Cleaner entries — the registered object is the cleanable, whose
+    ///   layout is not the referent-at-slot-0 `Reference` shape; hiding a
+    ///   strong slot would under-mark (freed-live corruption), whereas
+    ///   including nothing merely over-retains cleaner referents one cycle.
+    ///
+    /// Cleared/enqueued entries are included: their referent slot is already
+    /// null, so hiding it is a no-op either way and the set stays cheap to
+    /// build (no per-entry filtering).
+    pub fn reference_object_addresses(&self) -> Vec<usize> {
+        self.weak_refs
+            .iter()
+            .chain(self.soft_refs.iter())
+            .chain(self.phantom_refs.iter())
+            .map(|e| e.reference_obj)
+            .collect()
+    }
+
+    /// INT-8: referents of soft references that the last processing round
+    /// chose to KEEP (uncleared, unenqueued). Under referent-slot hiding the
+    /// marker never traced these, so a softly-only-reachable referent is
+    /// unmarked even though the policy retained it — the remark driver must
+    /// resurrect (mark) each one before cleanup frees regions, or the kept
+    /// soft reference's `get()` would return a dangling pointer. HotSpot
+    /// does the same: policy-retained soft referents are kept alive by
+    /// reference processing itself.
+    pub fn soft_survivor_referents(&self) -> Vec<usize> {
+        self.soft_refs
+            .iter()
+            .filter(|e| !e.cleared && !e.enqueued)
+            .map(|e| e.referent)
+            .collect()
+    }
+
+    /// INT-8: addresses of registered, not-yet-fired `Cleanable` objects
+    /// whose action may still run — the remark driver resurrects these so a
+    /// cleanup in-place free can never invalidate a pending cleaner chain
+    /// (the HotSpot equivalent is the Cleaner's internal strong list of
+    /// PhantomCleanables). Two exclusions:
+    /// - entries whose action already fired (`action_emitted`) — nothing
+    ///   left to protect;
+    /// - SELF-REFERENT entries (`reference_obj == referent`, the
+    ///   finalizer-style `discover_reference(3, obj, obj, ..)` shape) —
+    ///   resurrecting those would keep the referent itself alive forever
+    ///   and the cleaner would never fire.
+    ///
+    /// Note the Cleanable's heap layout holds only the ACTION (slot 0), not
+    /// the referent, so keeping it live cannot retain the referent.
+    pub fn cleaner_pending_object_addresses(&self) -> Vec<usize> {
+        self.cleaner_refs
+            .iter()
+            .filter(|e| !e.action_emitted && e.reference_obj != e.referent)
+            .map(|e| e.reference_obj)
+            .collect()
+    }
+
     /// Return the referent addresses of all registered (non-cleared, non-enqueued)
     /// finalizer references.  Used before GC to add them as resurrection roots.
     pub fn finalizer_referent_addresses(&self) -> Vec<usize> {
@@ -867,6 +930,34 @@ impl ReferenceProcessor {
             .filter(|e| !e.cleared && !e.enqueued)
             .map(|e| e.referent)
             .collect()
+    }
+
+    /// Mark the finalizer entries whose CURRENT referent address appears in
+    /// `referents` as enqueued.
+    ///
+    /// Called by the VM after the GC's resurrection channel
+    /// (`collect_garbage_with_finalizers`) reports which finalizables were
+    /// dead-but-resurrected: without this flag, a resurrected object looks
+    /// ALIVE to the next collection's `is_marked` (it is in the pointer map),
+    /// so `process_final_refs` never claims it and
+    /// `finalizer_referent_addresses` keeps re-returning it — the GC then
+    /// resurrects and re-enqueues it EVERY cycle and `finalize()` runs
+    /// repeatedly (observed 3× per object) instead of exactly once.
+    ///
+    /// Must be called AFTER `update_after_gc` for the same collection, so
+    /// entry referents already hold the post-GC addresses the resurrection
+    /// channel reports.
+    pub fn mark_finalizer_enqueued(&mut self, referents: &[usize]) {
+        if referents.is_empty() {
+            return;
+        }
+        let set: HashSet<usize> = referents.iter().copied().collect();
+        for e in &mut self.finalizer_refs {
+            if !e.enqueued && set.contains(&e.referent) {
+                e.enqueued = true;
+                self.stats.finalizer_refs_enqueued += 1;
+            }
+        }
     }
 
     // -- Stats & config -----------------------------------------------------
@@ -1917,6 +2008,61 @@ mod tests {
         assert!(proc.soft_ref_lru_index.contains_key(&(0, 0)));
         // Index size unchanged (re-key, not add).
         assert_eq!(proc.soft_ref_lru_index.len(), 2);
+    }
+
+    // INT-8: reference_object_addresses returns weak/soft/phantom Reference
+    // OBJECT addresses (cleared included), never finalizer/cleaner entries.
+    #[test]
+    fn reference_object_addresses_covers_weak_soft_phantom_only() {
+        let mut proc = ReferenceProcessor::new();
+        proc.discover_reference(ReferenceType::Weak, 0x10, 0x11, None);
+        proc.discover_reference(ReferenceType::Soft, 0x20, 0x21, None);
+        proc.discover_reference(ReferenceType::Phantom, 0x30, 0x31, Some(0x99));
+        proc.discover_reference(ReferenceType::Finalizer, 0x40, 0x40, None);
+        proc.discover_reference(ReferenceType::Cleaner, 0x50, 0x51, None);
+        let mut addrs = proc.reference_object_addresses();
+        addrs.sort_unstable();
+        assert_eq!(addrs, vec![0x10, 0x20, 0x30]);
+    }
+
+    // INT-8: cleaner_pending_object_addresses excludes self-referent
+    // (finalizer-style) registrations and already-fired actions.
+    #[test]
+    fn cleaner_pending_object_addresses_excludes_self_and_fired() {
+        let mut proc = ReferenceProcessor::new();
+        proc.discover_reference(ReferenceType::Cleaner, 0x50, 0x51, None); // pending
+        proc.discover_reference(ReferenceType::Cleaner, 0x60, 0x60, None); // self-referent
+        proc.discover_reference(ReferenceType::Cleaner, 0x70, 0x71, None); // will fire
+        // Fire 0x70's action: its referent 0x71 is dead.
+        let result = proc.process_references(&|addr| addr != 0x71, 64, 0);
+        assert!(result.cleaner_actions.contains(&0x70));
+        let addrs = proc.cleaner_pending_object_addresses();
+        assert_eq!(addrs, vec![0x50]);
+    }
+
+    // INT-8: soft_survivor_referents returns kept (uncleared, unenqueued)
+    // soft referents — the set the remark driver must resurrect.
+    #[test]
+    fn soft_survivor_referents_tracks_kept_entries() {
+        let mut proc = ReferenceProcessor::new();
+        proc.discover_reference(ReferenceType::Soft, 0x20, 0x21, None);
+        proc.discover_reference(ReferenceType::Soft, 0x30, 0x31, None);
+        // Plenty of free heap: policy keeps both even though 0x31 is dead.
+        let _ = proc.process_references(&|addr| addr != 0x31, 1024, 0);
+        let mut kept = proc.soft_survivor_referents();
+        kept.sort_unstable();
+        // Whatever the policy decided, the accessor must mirror the
+        // uncleared set exactly.
+        let expected: Vec<usize> = proc
+            .soft_refs
+            .iter()
+            .filter(|e| !e.cleared && !e.enqueued)
+            .map(|e| e.referent)
+            .collect();
+        let mut expected_sorted = expected;
+        expected_sorted.sort_unstable();
+        assert_eq!(kept, expected_sorted);
+        assert!(kept.contains(&0x21), "live soft referent is always kept");
     }
 
     // 58. touch on an unknown address is a no-op (O(1) miss, no scan needed).

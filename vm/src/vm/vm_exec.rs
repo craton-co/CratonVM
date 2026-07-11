@@ -1593,6 +1593,15 @@ impl<'a> NativeContextImpl<'a> {
         if let Some(r) = self.thread.native_pending_return {
             snapshot.push(r);
         }
+        // JNI local references (INT-5): this thread's `JNI_LOCAL_FRAMES`
+        // handles. A JNI native that obtained local refs and then re-entered
+        // Java (parking at a safepoint) or blocked leaves them populated —
+        // and a cross-thread collector marks this thread ONLY from this
+        // deposited snapshot, so an object reachable solely through a parked
+        // thread's JNI local was reclaimed. Thread-local storage; this
+        // deposit always runs on the owning thread. The wake-side remap is
+        // `update_local_refs_after_gc` in `check_post_block_gc_refs`.
+        crate::native::jni::collect_local_ref_roots(&mut snapshot);
         // This thread's own `java.lang.Thread` mirror (and any pending async
         // exception). They live in `JvmThread` fields, not on any frame, so the
         // frame scan never captures them — yet `Thread.currentThread()` hands
@@ -1827,6 +1836,13 @@ impl<'a> NativeContextImpl<'a> {
             for val in extra_refs.iter_mut() {
                 update_value_ref(val, &fixup);
             }
+            // JNI local references (INT-2, blocked-wake half): rewrite THIS
+            // thread's `JNI_LOCAL_FRAMES` handles through the composed fixup —
+            // a JNI native that blocked mid-call (monitor, join, park) and
+            // slept through moving collections must not resume with dangling
+            // local jobjects. The storage is thread-local, so this wake path
+            // is the only place that can reach this thread's handles.
+            crate::native::jni::update_local_refs_after_gc(&fixup);
         }
 
         // Refresh (don't clear) the snapshot: we are runnable again but may
@@ -2563,11 +2579,28 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
-        // WP2.9 вЂ” invokespecial semantics: invoke the *resolved* method on
+        // WP2.9 -- invokespecial semantics: invoke the *resolved* method on
         // `class_name` with no virtual dispatch and no iface/abstract retarget
         // to the receiver's concrete class. Required for `Lookup.findSpecial`
         // private-to-private calls and default-method super-call patterns.
         invoke_special_shared(
+            self.shared,
+            self.thread,
+            class_name,
+            method_name,
+            descriptor,
+            args,
+        )
+    }
+
+    fn invoke_special_bytecode_only(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        invoke_special_bytecode_only_shared(
             self.shared,
             self.thread,
             class_name,
@@ -3625,6 +3658,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn create_string_uninterned(&mut self, text: &str) -> ObjectRef {
         super::create_java_string_uninterned(self.shared, text)
+    }
+
+    fn init_string_from_units(&mut self, this: ObjectRef, units: &[u16]) -> bool {
+        super::populate_java_string_fields(self.shared, this, units)
     }
 
     fn read_string(&self, obj: ObjectRef) -> Option<String> {
@@ -7695,6 +7732,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .touch_soft_reference(ref_addr, now_ms);
     }
 
+    /// INT-8: `Reference.get()` keep-alive — route the just-read referent
+    /// through the heap's SATB pre-barrier so an active G1 mark cycle logs
+    /// it as a root (the marker cannot see it through the hidden referent
+    /// slot). No-op when no cycle is active; on Generational/ZGC the
+    /// pre-barrier's own marking-active gate keeps it equally cheap.
+    fn gc_reference_keep_alive(&mut self, referent: ObjectRef) {
+        self.shared
+            .heap
+            .write_barrier_pre(std::ptr::null_mut(), referent);
+    }
+
     fn record_thread_sleep(&mut self, sleep_nanos: i64, actual_duration_nanos: u64) {
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -8769,7 +8817,7 @@ pub fn invoke_special_shared(
     descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
-    // Native override always wins вЂ” same priority order as invoke_or_native.
+    // Native override always wins -- same priority order as invoke_or_native.
     if let Some(callback) = shared
         .native_methods
         .find(class_name, method_name, descriptor)
@@ -8779,7 +8827,7 @@ pub fn invoke_special_shared(
     }
 
     // GC-safety: pin object args across class load + <clinit> and re-read the
-    // forwarded addresses before dispatch — same moving-GC stale-args window
+    // forwarded addresses before dispatch -- same moving-GC stale-args window
     // as `invoke_shared` above.
     let pin_base = thread.native_pin_roots.len();
     let mut has_obj_args = false;
@@ -8834,6 +8882,120 @@ pub fn invoke_special_shared(
         )
     } else {
         invoke_on_class_shared_no_retarget(
+            shared,
+            thread,
+            target_class_id,
+            method_name,
+            descriptor,
+            args,
+        )
+    };
+    thread.native_pin_roots.truncate(pin_base);
+    result
+}
+
+/// Standalone variant of invokespecial semantics for a native that IS ITSELF
+/// the native registered for `(class_name, method_name, descriptor)` and
+/// needs to run THAT class's own real bytecode body directly (true
+/// invokespecial / `super.m()` semantics: resolved statically on
+/// `class_name`'s own hierarchy, never re-dispatched to a receiver's
+/// overriding subclass).
+///
+/// Deliberately independent of [`invoke_special_shared`] -- NOT a thin
+/// wrapper around it or a shared tail with it. Two things a native calling
+/// itself must avoid, both of which [`invoke_special_shared`]'s own
+/// machinery would reintroduce:
+///
+/// 1. Its native-check-first step would re-find and re-invoke the very
+///    native calling in (unbounded Rust-stack recursion).
+/// 2. Its bytecode fallback (`invoke_on_class_shared_no_retarget` ->
+///    `invoke_on_class_shared_inner`) does its OWN unconditional
+///    native-registry re-check for any non-interface declaring class
+///    (`override_cb`) -- for a target class that itself has a registered
+///    native, that ALSO re-finds and re-invokes the native forever, this
+///    time as pure Rust-call recursion with no growing Java stack (a raw
+///    native stack overflow / process abort, not even a clean
+///    `StackOverflowError` -- confirmed via a standalone
+///    `ScheduledThreadPoolExecutor.shutdown()` repro during this fix's own
+///    verification).
+///
+/// This is exactly the trap `NativeContext::invoke_virtual_bytecode_only`'s
+/// own doc comment already documents (it calls `interpreter::execute`
+/// directly for the same reason) -- the bug this function exists to fix was
+/// a native registered on `ThreadPoolExecutor.shutdown()`, reached via
+/// `ScheduledThreadPoolExecutor.shutdown()`'s `super.shutdown()`, whose
+/// `invoke_virtual_bytecode_only(this, "shutdown", ...)` call resolved the
+/// declaring class from the STPE receiver's DYNAMIC class -- re-finding
+/// STPE's own overriding shutdown() and looping forever. See
+/// docs/internal/threadpoolexecutor-shutdown-super-call-self-recursion-FIXED.md.
+pub fn invoke_special_bytecode_only_shared(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> MethodCallResult {
+    // GC-safety: pin object args across class load + <clinit> and re-read the
+    // forwarded addresses before dispatch -- same moving-GC stale-args window
+    // as `invoke_shared`/`invoke_special_shared`.
+    let pin_base = thread.native_pin_roots.len();
+    let mut has_obj_args = false;
+    for a in args {
+        if let Value::Object(Some(o)) = a {
+            thread.native_pin_roots.push(*o);
+            has_obj_args = true;
+        }
+    }
+
+    // Resolve and initialize the class.
+    let class_id = match shared.load_class_concurrent(class_name) {
+        Ok(cid) => cid,
+        Err(e) => {
+            thread.native_pin_roots.truncate(pin_base);
+            return Err(e.into());
+        }
+    };
+    if let Err(e) = super::ensure_class_initialized_shared(shared, thread, class_id) {
+        thread.native_pin_roots.truncate(pin_base);
+        return Err(e);
+    }
+
+    // Walk the hierarchy FROM `class_name`'s own class_id (never the
+    // receiver's dynamic class) to the declaring class -- true static
+    // binding, matching `invoke_special_shared`.
+    let target_class_id = {
+        let cm = shared.class_manager.read();
+        let store = &cm.class_store;
+        match crate::classloading::find_method_recursive(class_id, method_name, descriptor, store) {
+            Some((_, declaring_id)) => declaring_id,
+            None => class_id,
+        }
+    };
+
+    // NOT invoke_on_class_shared_no_retarget -- see this function's own doc
+    // comment (point 2) for why. Call `interpreter::execute` directly, the
+    // same "just run this bytecode, no native check" primitive
+    // `NativeContext::invoke_virtual_bytecode_only` uses.
+    let result = if has_obj_args {
+        let mut fresh: Vec<Value> = args.to_vec();
+        let mut k = pin_base;
+        for v in fresh.iter_mut() {
+            if let Value::Object(Some(_)) = v {
+                *v = Value::Object(Some(thread.native_pin_roots[k]));
+                k += 1;
+            }
+        }
+        crate::runtime::interpreter::execute(
+            shared,
+            thread,
+            target_class_id,
+            method_name,
+            descriptor,
+            &fresh,
+        )
+    } else {
+        crate::runtime::interpreter::execute(
             shared,
             thread,
             target_class_id,

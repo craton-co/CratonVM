@@ -1,5 +1,16 @@
 # ES93FlatBFloat16VectorFormatTests.testMultiClose - genuine BufferUnderflowException
 
+Status: FIXED (2026-07-10) — retired the same day it was split out: the
+underflow was the s2 `ByteBuffer.put(ByteBuffer)` direct-buffer silent
+no-op (every buffered `FileChannel` read delivered zero bytes while
+returning correct counts) plus the `order(LITTLE_ENDIAN)` no-op unmasked
+behind it. Root cause, fix, and validation (testMultiClose green,
+`OK (7 tests)` for the class): see
+`ES-FAIL-FAMILY-20260710-vector-codec-exception-cause-object-FIXED.md`
+sections 1 and 3 in this directory.
+
+(Original doc content below; its `Status: OPEN` is superseded.)
+
 Status: OPEN
 
 Split off from `docs/internal/fixed-suite-bugs/throwable-addsuppressed-clobbers-cause-FIXED.md`

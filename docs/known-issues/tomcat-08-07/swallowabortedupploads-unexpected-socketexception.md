@@ -497,3 +497,745 @@ The four `AbortedUploadClient`/multipart tests (`testChunkedPUTNoLimit`,
 `testAbortedUploadUnlimitedSwallow`, `testAbortedUploadLimitedSwallow`,
 `testAbortedUploadUnlimitedNoSwallow`) now pass their real assertions
 cleanly.
+
+## 2026-07-10: `AbortedPOSTClient` empty-response bug root-caused — not a Tomcat/VM logic bug, an interpreter-speed gap
+
+Root-caused via layered live instrumentation of the real Tomcat classes
+(`SocketProcessorBase.run()`, `Http11Processor.service()`/`prepareRequest()`,
+`NioEndpoint`'s Poller timeout check, plus fine-grained client-side timing in
+the test itself — same classpath-override technique used throughout this
+doc). Chain of findings, each ruling out the previous hypothesis:
+
+1. **`doPost()` never runs.** Instrumented `AbortedPOSTServlet.doPost()` to
+   print on entry — it never fires for `testAbortedPOSTOKSwallow`.
+2. **`Http11Processor.service()` never runs either.** Instrumented its
+   `parseRequestLine()`/`parseHeaders()`/`badRequest()` call sites and the
+   adapter-dispatch checkpoint — none fire. Ruled out header-parsing/bad-request
+   theories (absolute-URI host mismatch, `maxPostSize`/`maxSwallowSize`
+   connector-property ordering — tried reordering `AbortedPOSTClient.init()`
+   to match `AbortedUploadClient`'s order, no effect).
+3. **`SocketProcessorBase.run()` itself fires with `event=ERROR`, not
+   `event=OPEN_READ`.** Every working connection (`AbortedUploadClient`,
+   `testChunkedPUTNoLimit`) shows `OPEN_READ`; this one shows `ERROR`. Traced
+   to `NioEndpoint.Poller`'s per-tick timeout scan
+   (`NioEndpoint.java` around the `readTimeout || writeTimeout` check):
+   the connector's read timeout is a hardcoded **3000ms**
+   (`configuredReadTimeout=3000`, same value on every connection — not a
+   config difference), and for this connection **zero bytes were ever read**
+   in that window (`deltaRead` climbs 1ms → 1002ms → 2004ms → 3005ms with
+   `lastRead` frozen the whole time), so the Poller gives up and dispatches
+   `SocketEvent.ERROR` — which `AbstractProtocol$ConnectionHandler.process()`
+   treats as "nothing to do, already handled" and returns `CLOSED` **without
+   ever constructing an `Http11Processor`**. No error is logged anywhere
+   because, from Tomcat's perspective, this is normal, expected connection-
+   timeout handling, not a fault.
+4. **The client hadn't sent a single byte in that window because it was
+   still building the request string.** Added `System.nanoTime()` timing
+   around every step of `AbortedPOSTClient.doRequest()`:
+   ```
+   DBG_TIMING init_ms=5975            (Tomcat startup — happens before connect(), irrelevant to the read-timeout clock)
+   DBG_TIMING connect_ms=0            (TCP handshake — instant, this is when the server's read-timeout clock starts)
+   DBG_TIMING content_build_ms=5108   (new String(body) — body is a 10,000,000-element char[])
+   DBG_TIMING processRequest_ms=36    (once it finally reaches the write, the actual I/O is fast)
+   ```
+   **`new String(char[])` on a 10-million-element array takes ~5.1–6.5
+   seconds** (measured across 3 separate runs) — i.e. *longer than the
+   connector's 3-second read timeout, entirely before the client attempts
+   to send anything*. That's the whole bug: the connection sits open with
+   nothing arriving, times out, and gets torn down while the client is
+   still busy in a **pure in-memory, non-network** operation.
+
+**Root cause, precisely:** `java.lang.String(char[])`'s constructor has
+**no CratonVM native override** — it runs as the real JDK's own bytecode
+(`String(char[], int, int, Void)` → `StringUTF16.compress`/`toBytes`, a
+per-character Latin-1-fits-in-a-byte check + copy loop; confirmed via
+`native-builtins/src/lang_string.rs`'s own comment: *"the real-JDK
+`StringUTF16` bytecode (e.g. the `String(char[])` constructor, which has no
+native override)..."*). Called only 3 times total in this whole test class
+(once per `AbortedPOSTClient` test) — nowhere near the JIT's default
+500-invocation warm-up threshold (`CRATONVM_JIT_THRESHOLD`,
+`vm/src/runtime/env_cache.rs:76`) — so this 10-million-iteration loop stays
+fully interpreted every time, at roughly 500–650ns/char. **Tried
+`CRATONVM_JIT_OSR=1`** (on-stack replacement, which could in principle
+compile a hot loop mid-invocation without needing 500 separate calls) —
+**did not help** (`content_build_ms` was 6464ms with OSR on vs. 5108ms
+without, if anything slightly worse), so this loop shape either doesn't
+qualify for CratonVM's current OSR triggering or the one-shot compile
+overhead isn't worth it for a single invocation either way.
+
+**This is not a Tomcat bug, not a socket/connector bug, and not the same
+family as blocker #3 above** — it's a pure interpreter-throughput gap for a
+specific, extremely common JDK bulk operation (turning a large `char[]`
+into a `String`) that happens to collide with this one test harness's
+hardcoded 3-second connector timeout. `AbortedUploadClient`'s tests build a
+comparably-sized string too (`StringBuilder.append(char[])` +
+`getBytes("UTF-8")` + `new String(byte[], "ASCII")`) but apparently take a
+different, faster path — not confirmed why, but plausibly `StringBuilder`'s
+bulk `append(char[])` and/or the byte[]-based `String` constructors *do*
+have native overrides in this codebase (several are visible in
+`native-builtins/src/deprecated_util.rs`/`lang_string.rs`), unlike the bare
+`String(char[])` constructor.
+
+**Not fixed this session.** The correct fix is a native intrinsic for
+`String(char[])`/`StringUTF16.compress` (bulk Latin-1-fits check + copy in
+Rust, bypassing the interpreted per-char loop) — but this is a
+**very high-blast-radius change** (every `char[]`-to-`String` conversion in
+every Java program run on CratonVM) that needs careful validation against
+CratonVM's existing little-endian compact-string byte layout
+(`vm/src/vm/vm_object.rs::create_java_string`) and the Latin-1/UTF-16 coder
+selection semantics — not something to rush. Left for a dedicated
+performance-focused session. Workaround for this specific test only: none
+attempted (modifying the stock Tomcat test suite isn't appropriate).
+
+**Practical takeaway:** treat this connector 3-second-read-timeout +
+large-char-array-to-String pattern as a known trap for any other
+CratonVM/Tomcat (or any embedded-server) test that builds a multi-megabyte
+string via `new String(char[])` right before sending it — the interpreter
+cost of that one conversion can alone exceed a short test-harness timeout,
+producing a confusing "silent empty response, no error logged" symptom that
+looks like a connector bug but isn't.
+
+## 2026-07-10: `String(char[])`/`String(char[], int, int)` native intrinsic landed — root cause from the previous section FIXED
+
+Implemented the fix the previous section left open: a CratonVM native intrinsic
+for `java.lang.String`'s `char[]` constructors, replacing the interpreted
+per-character `StringUTF16.compress`/`toBytes` loop with a bulk Rust
+implementation.
+
+**What changed** (branch `fix/string-char-array-ctor-intrinsic-20260710`,
+merged to `dev`):
+- `vm/src/vm/vm_object.rs`: extracted `populate_java_string_fields(shared,
+  str_obj, units)` out of `try_alloc_java_string_object_from_units` — the same
+  Latin1-fits-in-a-byte bulk scan + little-endian compact-string layout, now
+  reusable against an *already-allocated* `String` object (not just a
+  freshly-allocated one).
+- `native-api/src/registry.rs`: new `NativeContext::init_string_from_units`
+  trait method (default impl for mock/test contexts; VM override calls
+  `populate_java_string_fields`).
+- `native-builtins/src/lang_string.rs`: two new natives,
+  `native_string_init_from_char_array` (`<init>([C)V`) and
+  `native_string_init_from_char_array_range` (`<init>([CII)V`), registered in
+  `register_string_utf16_natives`. Both bulk-read the source `char[]` via
+  `NativeContext::read_char_array_into` (a single `copy_nonoverlapping` in the
+  VM's override) and hand the raw `u16` units straight to
+  `init_string_from_units` — no Rust `String`/`char` round-trip, so lone
+  surrogates round-trip byte-for-byte exactly like the real JDK bytecode did.
+  The range constructor replicates `checkBoundsOffCount`'s exact bounds-check
+  semantics (factored into a shared `bounds_off_count_violation` helper) and
+  both replicate the real constructors' `NullPointerException`-on-null-array
+  behavior.
+
+**Verification:**
+1. A 43-case Java probe (null array, empty array, ASCII/Latin1, the 0xFF/0x100
+   compact-string coder boundary, non-Latin1 (UTF16 coder), lone/unpaired
+   surrogate round-tripping via `toCharArray()`, the 3-arg range constructor
+   (substring semantics, zero count, full range), all 4 bounds-violation
+   SIOOBE cases, downstream native consistency (`substring`, `indexOf`,
+   `concat`, `StringBuilder.append`, `String.valueOf(char[])`,
+   `String.copyValueOf(char[])`), and the actual bug scenario at scale (a
+   10,000,000-element `char[]`, both all-Latin1 and all-non-Latin1) — all 43
+   pass.
+2. Measured perf on the same 10M-char arrays that took **5.1-6.5s** before
+   this fix: **71ms** (Latin1 path) and **127ms** (UTF16 path) — roughly a
+   **40-90x** speedup, comfortably under the Tomcat connector's 3-second read
+   timeout that started this whole investigation.
+3. Rust unit tests: `cratonvm-vm --lib vm_object::` (28/28 pass, including the
+   existing `create_and_read_string*` family, now exercising the refactored
+   `populate_java_string_fields` code path) and `cratonvm-native-builtins
+   lang_string::` (80/80 pass).
+4. Re-ran `org.apache.catalina.core.TestSwallowAbortedUploads` on the Azure
+   Linux host, comparing a same-commit baseline binary (without this fix)
+   against the patched one, isolating just the 3 `AbortedPOSTClient` methods
+   (`testAbortedPOSTOKSwallow`, `testAbortedPOST413Swallow`,
+   `testAbortedPOSTOKNoSwallow`) via a small `Request.method(...)`-based
+   single-method JUnit runner (the class as a whole hits an unrelated
+   pre-existing crash on `testChunkedPUTNoLimit` — see below — before reaching
+   a full-class summary):
+
+   | | baseline (no fix) | patched |
+   |---|---|---|
+   | `client.getResponseLine()` | `null` (connector timed out, no bytes ever arrived) | non-null (a real response line arrives) |
+   | wall time | 5.7s – 10.7s (over the 3s connector timeout) | 0.35s – 0.46s after warmup (well under it) |
+
+   **The specific root cause this doc identified — the interpreter-speed
+   connector timeout — is confirmed fixed.** The client no longer stalls
+   building the request string long enough to trip Tomcat's read timeout.
+
+   **However, the 3 `AbortedPOSTClient` tests still fail**, for a *different*
+   reason than before: `client.getResponseLine()` now returns a non-null but
+   blank/space-filled string instead of a real `HTTP/1.1 200 OK`-style status
+   line, so the `client.isResponse200()`/`isResponse413()` assertions still
+   fail. This is a **separate, pre-existing bug** in the server's response to
+   this specific large-body swallow-upload scenario, newly *reachable* (not
+   newly *caused*) now that the timeout no longer masks it earlier — matching
+   what the "2026-07-10: bisected" section above already anticipated
+   ("a different, not-yet-diagnosed bug, newly visible once the NPE isn't
+   masking it"). Not investigated further here — flagged as a fresh follow-up
+   for whoever picks this up next; the char[]-constructor performance problem
+   this section exists for is closed.
+
+   Also confirmed, byte-for-byte identical on both the baseline and the
+   patched binary (i.e. **definitely pre-existing, unrelated to this fix**):
+   running the full `TestSwallowAbortedUploads` class via `JUnitCore` (not the
+   isolated single-method runner) crashes the whole VM process on
+   `testChunkedPUTNoLimit` with `Exception in thread "main"
+   java/lang/Thread` / `NullPointerException: charset`, alongside a
+   `cratonvm_gc::gen_heap` "corrupt header" warning
+   (`mark_young: rejecting object ... implausible extent 40`) — a GC/heap
+   integrity issue triggered by that test's malformed-request payload, not by
+   `String(char[])`. Also worth a dedicated follow-up.
+5. Ran 20 `org.springframework.util`/`util.xml` test classes (heavy String
+   usage — `StringUtilsTests`, `AntPathMatcherTests`,
+   `PropertyPlaceholderHelperTests`, `ObjectUtilsTests`, etc.) against the
+   patched binary: 17/20 fully clean. The 3 with failures
+   (`StringUtilsTests`, `ObjectUtilsTests`, `ExponentialBackOffTests`) were
+   re-run against the same-commit baseline binary and fail *identically*
+   (same methods, same assertion messages) — confirmed pre-existing
+   (a `HIB-CV-32`-family array-formatting/heap-integrity gap unrelated to
+   `char[]`-to-`String` construction), not a regression from this change.
+
+**No known regressions from this change.** The two issues surfaced during
+verification (the blank swallow-upload response, and the
+`testChunkedPUTNoLimit` crash) both reproduce identically without this fix
+and are unrelated to `String(char[])`/`StringUTF16` — left open as separate
+follow-ups rather than expanding this change's scope.
+
+## 2026-07-10: blank-response follow-up — does NOT reproduce in isolation; instead
+## found a live SIGSEGV that is almost certainly the same root cause (known
+## "register-invisible JIT root" bug family, already tracked elsewhere as OPEN)
+
+Dedicated follow-up session for the "blank/space-filled response" bug the
+previous section left open. Isolated worktree `wt-swallow-blankresp-20260710`
+(branch `investigate/swallow-blank-response-20260710`) off `origin/dev` @
+`19a91636` (includes the `String(char[])` intrinsic fix), release binary
+`cratonvm-swallow-blankresp-20260710`.
+
+**Headline result: the blank/space-filled `responseLine` symptom could NOT be
+reproduced this session, across ~35 varied trials** (see "What was tried"
+below). But a **different, more severe symptom — a reproducible SIGSEGV — was
+found** using a superset of the same conditions (repeated execution of the
+exact same 3 `AbortedPOSTClient` tests in one JIT-enabled JVM), and its crash
+signature is a byte-for-byte match, on two independent occurrences, for the
+already-documented-elsewhere "register-invisible JIT root" bug family. This is
+almost certainly the same underlying mechanism the previous session hit — a
+stale/garbage-valued register dereferenced where a live heap pointer was
+expected — just with a different (worse) outcome this time (hard crash
+instead of corrupted-but-readable content).
+
+### What was tried (all healthy — no blank response, no crash)
+
+Using a purpose-built `SingleMethodRunner`/`MultiMethodRunner` (`Request.method`
++ `JUnitCore`, same technique as the doc's existing single-method runner
+references) against `testAbortedPOSTOKSwallow`, `testAbortedPOST413Swallow`,
+`testAbortedPOSTOKNoSwallow`:
+- 15× isolated fresh-JVM single-method runs (5 per test): all passed, real
+  `HTTP/1.1 200 `/`HTTP/1.1 413 ` status lines, `SMR_FAIL=0` every time.
+- 3× all-3-methods-sequentially-in-one-JVM: all passed.
+- 6× the same single test run in parallel (contention-inducing): all passed.
+- A debug-instrumented copy of `TestSwallowAbortedUploads.java` (recompiled,
+  placed first on classpath, same technique used earlier in this doc) that
+  unconditionally prints `client.getResponseLine()` with non-printable
+  characters escaped as `\uXXXX` — always showed a clean, correct
+  `len=13 [HTTP/1.1 200 ]` (or 413) with correct headers.
+- The **exact pre-built reference binary from the previous session**
+  (`/data/data/cratonvm-string-char-array-ctor-20260710`, the one that
+  reportedly produced the blank/space response) — re-run 3× this session,
+  passed cleanly every time.
+
+This is strong evidence the symptom is a genuine timing-sensitive race, not a
+deterministic regression — the same binary that (per the previous session's
+report) produced a blank response now does not, on the same host.
+
+### What reliably reproduces: a SIGSEGV under repeated same-JVM execution
+
+Chasing the "maybe it needs JIT warm-up state carried across several
+Tomcat/socket cycles within one JVM" hypothesis (this codebase has precedent
+for JIT-tier-crossing-triggered bugs — see the memory index), `MultiMethodRunner`
+was used to run the same test method(s) back-to-back, many times, in a single
+JVM process:
+
+- 40× `testAbortedPOSTOKSwallow` in one JVM: did not crash, but got stuck at
+  iteration #9 with `STW cross-thread JIT takeover is still waiting for
+  cooperative mutators rounds=64 pending=1 taken=0` (from
+  `vm/src/runtime/interpreter.rs`'s `stw_take_over_and_wait`, the BUG-03
+  cross-thread JIT root-scan machinery) and was killed by a 120s timeout — a
+  hang, not (yet) a crash.
+- Interleaving `testAbortedUploadUnlimitedSwallow` / `...NoSwallow` /
+  `testAbortedUploadLimitedSwallow` (the sibling 10 MB-body tests) for several
+  rounds **before** reaching the target `AbortedPOSTClient` tests: **SIGSEGV**,
+  reproduced twice independently (`exit 139`, `timeout: the monitored command
+  dumped core`), both times around the 10th-11th test invocation in the
+  process (9 and 10 straight invocations completed cleanly in separate control
+  runs; 30 invocations crashed at #11) — consistent with a race that becomes
+  *possible* once some hot method crosses the JIT compile threshold, not a
+  hard deterministic trip count.
+- **Confirmed reproducible using only the 3 assigned target tests**
+  (`testAbortedPOSTOKSwallow` / `testAbortedPOST413Swallow` /
+  `testAbortedPOSTOKNoSwallow`, no `AbortedUploadClient` involved): looping
+  those 3 in one JVM also SIGSEGVs (10 successful invocations, crash on the
+  11th), directly tying the crash to the exact code path this doc is about.
+- **`--nojit` does not crash**: the identical 15-invocation
+  `AbortedUploadClient`-family sequence that reliably SIGSEGVs with JIT on
+  completed all 15 iterations cleanly under `--nojit` (it then hit an
+  unrelated non-daemon-thread shutdown hang at the very end — not a crash,
+  not investigated further). This confirms the crash is JIT-specific.
+
+### Crash analysis: byte-identical signature on two independent occurrences
+
+Repro technique: `sudo sh -c 'echo /path/core-%e-%p.dump > /proc/sys/kernel/core_pattern'`
++ `ulimit -c unlimited` (per the project's own guidance to prefer
+`core_pattern`+`ulimit` over a live gdb wrapper for heisenbugs), then
+`gdb -batch -ex 'thread apply all bt' -ex 'info registers' -ex 'x/10i $pc-20' <exe> <core>`.
+`core_pattern` was restored to the host's original apport pipe and both core
+files (~1.1 GiB on disk each) were deleted after analysis.
+
+Both crashes — one from the `AbortedUploadClient`-family sequence (crashing
+thread named `main-vm`), one from the pure `AbortedPOSTClient`-family sequence
+(crashing thread named `Catalina-utilit[y]`, a Tomcat worker) — disassemble to
+the **exact same instruction sequence** at the fault site (only the absolute
+addresses differ, as expected for independent process runs with ASLR):
+
+```
+mov    -0x10(%rbp),%edi
+mov    -0x38(%rbp),%rsi
+mov    -0x30(%rbp),%rdx
+test   %rsi,%rsi
+je     <skip>
+=> mov    (%rsi),%eax        ; SIGSEGV here
+cmp    (%r10),%eax
+jne    <slow-path>
+cmpb   $0x0,0x28(%r10)
+je     <skip>
+```
+
+This is JIT-generated machine code (the crash PC falls in an anonymous
+executable mapping between `libc.so.6` and `libm.so.6` in `info proc
+mappings` — no backing file, i.e. not resolvable to any symbol, consistent
+with a JIT code buffer) implementing what looks like a null-checked
+class/identity comparison (`test`+`je` null guard, then a class-word compare
+against `r10` — a polymorphic-inline-cache- or `instanceof`-style fast path).
+`rsi` — loaded from stack slot `rbp-0x38`, which should hold a live object
+reference per the null-check just before it — held **not a valid tagged heap
+pointer**: run 1 had `rsi=0xffffffff94a08430` (a sign-extended 32-bit value,
+not a real 64-bit pointer), run 2 had `rsi=0x198ca4f8` (a bare 32-bit value in
+a 64-bit register). Every genuinely live pointer visible elsewhere in the same
+register file in both dumps (`r10`, `r12`, `r14`, `r15`, `rdi`) shares a
+consistent `0x2000xxxxxxxx`-prefixed tagged-pointer shape; `rsi` alone breaks
+that pattern both times — this is a stack slot/register that stopped holding
+a real object reference and started holding garbage (or a truncated/reused
+value), read after a null-check that itself passed because the garbage value
+happened to be non-zero.
+
+### This matches an already-documented, currently-OPEN bug family — not a new one
+
+`docs/internal/fixed-suite-bugs/dohead-jit-heap-corruption-register-invisibility-FIXED.md`
+(filed for `TestHttpServletDoHead*`, root-caused via `CRATONVM_DBG_A2`) documents
+the exact mechanism this looks like: JIT-compiled code can keep a live object
+reference in a register/stack-slot across a GC-capable safepoint (there, a
+`LockSupport.park()`/`AbstractQueuedSynchronizer$ConditionObject.await()` call)
+without it being visible to the conservative root scanner
+(`deposit_root_snapshot`/`scan_active_jit_frames`). If a GC cycle runs while
+that register is the *only* reference to the object, the object gets reclaimed
+as garbage even though a live (but invisible) reference to it still exists;
+later code that trusts the register gets a stale/corrupted value instead of a
+valid pointer. That doc's own "Known accepted residuals" section states
+explicitly: **"Layer 1 (register-invisible roots ... ) is UNCHANGED — the real
+fix remains precise oop maps / shadow stack."** It also documents that the
+obvious mitigations were tried and found insufficient:
+`CRATONVM_JIT_SAFEPOINT_REG_SPILL=all` (still crashed 3/6), `CRATONVM_SHADOW_STACK=1`
+(reduced but did not eliminate; explicitly experimental/non-production),
+`CRATONVM_NO_SELECTIVE_PROMOTE=1` (still crashed), `CRATONVM_PRECISE_JIT_MAPS=1`
+(uninformative, confounded by also switching on the moving young collector).
+
+Independently, `docs/known-issues/hib-global-temptable-nondeterministic-sigsegv-20260710.md`
+(merged to `dev` the same day, unrelated Hibernate global-temp-table DDL
+investigation) describes the **same shape of bug** in a completely different
+subsystem: non-deterministic PASS/HANG/CRASH across identical reruns, works
+once and breaks on a repeat within the same JVM/test-class lifecycle, `--nojit`
+as a planned-but-not-yet-tried control. That doc explicitly says it has **not
+yet** captured a core dump/backtrace ("Next steps: ... not yet done"). This
+session's gdb evidence (above) is a concrete, reproducible data point for
+that same general bug class, from a third, independent code path.
+
+**Conclusion: the "register-invisible JIT root" bug is not fully fixed** (the
+DoHead doc's title says FIXED, but that refers only to the *fatal young-gen
+walk-desync amplifier* it also found and fixed — its own text says Layer 1,
+the register-invisibility itself, is an accepted, unfixed residual). It is
+live and reachable from at least three independent code paths now: Tomcat
+DoHead/AQS-park, Hibernate global-temp-table DDL, and (this session)
+Tomcat's `TestSwallowAbortedUploads` large-body swallow/response path — none
+involving AQS/`park()` obviously in this session's case, which suggests the
+register-invisibility gap is broader than just the `park()` call shape
+already documented, though the exact JIT-compiled method at this session's
+crash site was not identified (the crash PC has no symbol; correlating it to
+a specific Java method/bytecode offset would need the JIT's own compiled-region
+metadata, not attempted here).
+
+**Best-supported explanation for the original blank/space-response symptom
+(not proven, but well-supported):** the previous session's run hit the same
+stale-register condition, but the garbage value in `rsi`-equivalent happened
+to alias into some other *mapped* memory (e.g. a zeroed/reused buffer) instead
+of unmapped memory, so instead of a SIGSEGV, some code path along
+`Http11OutputBuffer`'s response-write chain (or the client's own read) ended up
+reading/writing the wrong buffer's content — producing readable-but-wrong
+bytes (blank/space) instead of a crash. This is consistent with "same root
+cause, different luck of the corrupted address," but was not proven directly:
+this session never caught the blank-response symptom itself in the act, only
+the crash. Whoever next reproduces the blank response directly should check
+for the same `rsi`-not-a-tagged-pointer signature (attach with the same
+`core_pattern`+`ulimit -c unlimited` recipe above) to confirm or refute this
+link.
+
+**Not fixed this session** (deliberately — this is deep JIT/GC root-precision
+infrastructure work already flagged elsewhere as needing "precise oop maps /
+shadow stack," and the previous investigation's own attempted mitigations were
+insufficient; a blind patch here would be exactly the kind of half-fix the
+project's workflow asks not to merge). Recommendation: whoever owns the
+precise-JIT-maps/shadow-stack roadmap item should treat this doc's repro
+(loop `testAbortedPOSTOKSwallow`/`testAbortedPOST413Swallow`/`testAbortedPOSTOKNoSwallow`
+~10-15× in one JIT-enabled JVM via a small `Request.method`-based runner) as a
+third, independent, relatively cheap-to-run reproduction case alongside the
+DoHead and Hibernate ones.
+
+**Repro commands** (adjust binary path):
+```bash
+cd /data/data/apps/tomcat  # fixture; classpath from .suite/cp-linux-fixed.txt
+sudo sh -c 'echo /tmp/core-%e-%p.dump > /proc/sys/kernel/core_pattern'  # optional, for a backtrace
+ulimit -c unlimited
+C=org.apache.catalina.core.TestSwallowAbortedUploads
+ARGS=""
+for i in $(seq 1 15); do
+  ARGS="$ARGS $C testAbortedPOSTOKSwallow $C testAbortedPOST413Swallow $C testAbortedPOSTOKNoSwallow"
+done
+<EXE> --java-home /home/victor/jdk25 -Xmx2g -cp "<MultiMethodRunner-dir>:$(cat .suite/cp-linux-fixed.txt)" \
+  MultiMethodRunner $ARGS
+# expect SIGSEGV (exit 139) somewhere around the 10th-11th invocation, not on every run
+```
+(`MultiMethodRunner` is a ~25-line `Request.method`+`JUnitCore` loop over
+`(className, methodName)` pairs; not committed to the repo, trivial to
+recreate from this description if the original isn't available.)
+
+## 2026-07-10: register-invisible-root diagnostic pass — Case B confirmed (known gap, not a wrong-but-present precise map)
+
+Dedicated diagnostic follow-up to the "blank-response follow-up" SIGSEGV
+section above, per the recommended next step ("reproduce with
+`CRATONVM_DBG_PRECISE=1` / `CRATONVM_DBG_VERIFY_OOP_MAPS=1`... neither tried
+yet"). Isolated worktree `wt-regroots-precisedbg-20260710` (branch
+`investigate/regroots-precisedbg-20260710`) off a freshly-fetched
+`origin/dev` @ `ba23c02b`, release binary
+`cratonvm-regroots-precisedbg-20260710.bin`. **Diagnostic only — no code
+changes**, per this pass's scope.
+
+### First: the two named debug vars, verified from source (not assumed)
+
+Before running anything, grepped `vm/src/jit/conservative_roots.rs`,
+`jit/src/lib.rs`, `jit/src/x64.rs` to confirm what these two vars actually
+do:
+
+- `CRATONVM_DBG_PRECISE=1` — `remap_active_jit_frames` (the Stage-3 *moving*-GC
+  precise relocation walker) prints one `[PRECISE] remap: chain_entries=...
+  precise=... frames_walked=... maps_found=... slots_examined=...
+  slots_rewritten=... reg_size=...` line per call, so `precise=0` throughout a
+  run means no JIT frame ever carried precise-map metadata during any
+  relocation pass on that thread.
+- `CRATONVM_DBG_VERIFY_OOP_MAPS=1` — for every precise-scanned JIT frame during
+  a GC *mark* pass, runs `verify_precise_covers_conservative`: it diffs the
+  frame's oop-map slot union against a conservative sweep of the SAME
+  `[scanner_sp, frame_base)` band and logs `[VERIFY-OOP-MAPS] unmapped in-band
+  oop: ...` for any word that looks like a live heap pointer but isn't
+  recorded by any of the method's oop maps. Read-only; does not change scan
+  behavior.
+
+### Critical scoping fact, discovered from source (not in any existing doc,
+### and corrects a stale assumption several earlier sections in this doc make)
+
+`jit/src/x64.rs::precise_jit_maps_enabled()` — the actual gate for whether the
+JIT emits oop-map metadata at all — has been **DEFAULT ON since commit
+5b8864a0-era work landed 2026-07-07** ("re-flipped 2026-07-07", per its own
+doc comment). `CRATONVM_PRECISE_JIT_MAPS` (the name several earlier sections
+of this doc, and the DoHead doc, refer to as the opt-in switch) is now a
+**no-op**; the only live knob is the opt-*out* `CRATONVM_NO_PRECISE_JIT_MAPS=1`.
+So on the exact `dev` tip this crash reproduces on (2026-07-10, well after the
+flip), every freshly JIT-compiled method already gets: prologue frame-record,
+per-safepoint sp-id slots, operand-stack oop-map entries, a forward
+must-be-oop dataflow for locals (`compute_local_oop_masks`), and (since
+`moving_young` is off by default) a post-safepoint register reload
+(`emit_post_safepoint_reload`). The "no oop maps are written today" comment on
+`JitEntryGuard::enter_with_compiled` in `conservative_roots.rs` is stale,
+predating the flip — verified empirically below (`CRATONVM_DBG_PRECISE=1`
+shows `precise>0`, not `precise=0`, on ordinary runs).
+
+Second scoping fact: which GC actually runs during this crash. Live JIT
+frames make `gc_quiescence::is_active()` true almost continuously while the
+test loop runs, and `gen_heap.rs::collect_garbage_inner` explicitly diverts to
+the **non-moving young mark-sweep + selective promotion** whenever
+conservative JIT roots are live and `CRATONVM_MOVING_YOUNG` (a separate,
+still-default-off flag) isn't set — precisely *because*, per that function's
+own comment, "a semispace cannot pin a conservative JIT root nor rewrite a
+register-resident one, so some live nodes go stale after the swap." So the
+crash's actual collector is a **non-relocating mark-sweep**: nothing moves,
+`remap_active_jit_frames` is not exercised, and correctness depends entirely
+on the *marking* side finding every live root — i.e. exactly the
+precise-oop-map-plus-conservative-backstop machinery `CRATONVM_DBG_PRECISE`
+and `CRATONVM_DBG_VERIFY_OOP_MAPS` instrument.
+
+### The decisive source find: a NAMED, already-catalogued gap in the
+### default-on precise/local-tracking machinery — SB-CRASH-04
+
+`jit/src/x64.rs::emit_pre_safepoint_spill` (~line 8925), verbatim:
+
+> "SB-CRASH-04 (register-invisibility) — blind-spill the CURRENT value of
+> every used callee-saved GPR into its reserved frame slot. The local flush
+> above only covers register-resident *locals*; an oop can also live in a
+> callee-saved register as an operand-stack temporary that survives the call,
+> **or via a value the per-slot oop tracker fails to tag**."
+
+This blind-everything-spill mitigation exists but is gated behind
+`CRATONVM_JIT_SAFEPOINT_REG_SPILL` (`safepoint_reg_spill_enabled()`,
+`jit/src/x64.rs` ~line 2551) — **default OFF**, fully independent of the
+now-default-on `precise_maps`/oop-map gate. The default-on local-oop dataflow
+(`compute_local_oop_masks`) is a forward must-analysis that **intersects
+(AND) at merge points** ("First real predecessor seeds; later ones intersect")
+— a sound-for-"definitely oop" but incomplete-for-"actually still live oop"
+analysis by construction: any control-flow shape where a slot is oop-typed on
+one incoming edge and not on another under-reports that slot as non-oop at
+the merge, exactly the "value the per-slot oop tracker fails to tag" case the
+SB-CRASH-04 comment names. Operand-stack *temporaries* (not named locals) that
+outlive a call are explicitly called out as uncovered by the default path too.
+
+`docs/known-issues/README.md`'s own SB-CRASH-04 entries independently confirm
+this is not hypothetical: for the A3 repro, "every conservative trick
+(`CRATONVM_NO_JIT_SCAN_CACHE`, `CRATONVM_JIT_SAFEPOINT_REG_SPILL`,
+`CRATONVM_DBG_FULLSTACK_SCAN`, and combinations) still crashes — confirming
+the root is genuinely register-resident and unreachable by any stack scan."
+This is the same bug *family*, not necessarily the same site — the swallow-
+upload crash was not traced to a specific Java method/bytecode offset (the
+JIT code buffer is an anonymous mapping; `CRATONVM_DBG_JIT_NAMES=1` /
+`lookup_jit_method_name` would be needed for that, not attempted this pass —
+see "confidence" below).
+
+### Empirical run
+
+Ran the doc's own repro (`MultiMethodRunner`, 3× `AbortedPOSTClient` methods
+looped, JIT on, `--java-home /home/victor/jdk25`) with `core_pattern` +
+`ulimit -c unlimited` core dumping armed (same technique as the section
+above; `core_pattern` restored to its pre-session value afterward), across
+four configurations: both debug vars together, each alone, and a pure
+baseline. **Headline result: this session could NOT reproduce the SIGSEGV at
+all** — 50 completed process launches (heavy dual-flag: 6; `CRATONVM_DBG_PRECISE`
+alone: 15; `CRATONVM_DBG_VERIFY_OOP_MAPS` alone: 15; no debug flags: 11, plus
+an initial 3-attempt sanity check), covering well over 1,500 individual test-
+method invocations, produced zero SIGSEGVs. This is a materially lower hit
+rate than the prior session's (which needed ~10-30 invocations per crash).
+
+The dominant confound: **72% of all attempts (36/50) hung instead**, hitting
+the *already-documented, unrelated* `STW cross-thread JIT takeover is still
+waiting for cooperative mutators` bug (`vm/src/runtime/interpreter.rs`) before
+ever reaching a crash-eligible iteration count — the same hang the prior
+session also hit exploring this exact repro. `ps aux` on the shared host
+during the hunt showed the likely reason: multiple *other* concurrent
+sessions' heavyweight CratonVM processes pegged at high CPU for extended
+periods (an Elasticsearch `SortingDigestTests` run at 100% CPU for 10+
+minutes straight, a WildFly `domain.sh` boot) — genuine host contention that
+starves the STW barrier's bounded-rounds wait, independent of anything this
+pass did. (Side effect worth flagging for whoever investigates next: this
+session's `core_pattern` change is process-wide, so 13 *foreign* core dumps
+from other sessions' unrelated crashes accumulated in this pass's
+`/data/data/regroots-precisedbg-cores/` directory during the hunt — none of
+them are from this pass's own binary, verified by the complete absence of any
+`rc=139` result across all 50 attempts; left untouched since they belong to
+other in-flight investigations.)
+
+One genuine empirical data point was still obtained: in the clean
+(non-hung, non-crashed) runs under `CRATONVM_DBG_PRECISE=1`, `[PRECISE]
+remap:` fired on every `update_all_roots` call (confirming the promotion/
+compaction machinery does run and does produce non-trivial `pointer_map`s —
+observed sizes 8606 to 40843 entries) but **`chain_entries=0 precise=0
+frames_walked=0` every single time**, with `reg_size` (the live JIT-code-range
+count) climbing into the 180-191 range as the run warmed up. This confirms,
+directly, that the *moving*-GC relocation walker (`remap_active_jit_frames`)
+never has any JIT frame registered in its thread-local chain at the instant
+each collection's root-remap phase runs on the calling thread — consistent
+with (not contradicting) the "non-moving sweep + selective promotion is what
+actually runs while JIT frames are live" analysis above: promotions still
+happen (hence the large `pointer_map`s), but they promote only heap-interior
+objects that survived marking, not the JIT-frame-rooted objects themselves
+(those are pinned, per `gen_heap.rs`'s own "PINNING conservative roots +
+tenuring only heap-interior nodes" comment) — so `remap_active_jit_frames`
+finding nothing to do here is expected, not a bug in itself. It does confirm
+that whatever protects a JIT-rooted object from going stale is entirely a
+function of the **marking** side (which `CRATONVM_DBG_VERIFY_OOP_MAPS` probes)
+rather than the relocation side — which is exactly the piece SB-CRASH-04
+documents as incomplete by default.
+
+### Verdict: Case B (known gap), not Case A — with a specific, named root cause
+
+The evidence points cleanly to **Case B**, but more precisely than the two
+generic cases originally sketched: this is not "the crashing safepoint was
+never in a precise-mapped method at all" (precise maps are default-on and
+engage for essentially every JIT-compiled method reached in this repro) — it
+is that the default-on precise/local-tracking machinery has a **named,
+already-catalogued, structurally-inherent incompleteness** (SB-CRASH-04) for
+exactly the shape of value the crash's own disassembly shows (a
+class/identity-comparison fast path reading a stack-resident temporary that
+should have held a live object reference and instead held obvious garbage,
+`0xffffffff94a08430` / `0x198ca4f8` — neither a plausible tagged heap pointer
+nor a "points at now-freed-but-still-mapped memory" shape, consistent with
+the slot's backing memory having been reclaimed as garbage and reused for
+unrelated data). The two structural facts that jointly explain it:
+
+1. The GC that actually runs while this test's JIT frames are live is the
+   **non-moving young sweep**, which relies entirely on *marking* (not
+   relocation) to keep every live JIT-rooted object alive. Marking IS
+   backstopped by a full conservative sweep of `[scanner_sp, frame_base)` for
+   every frame that has a `JitEntryGuard` chain entry — but that backstop only
+   covers what is *in that thread's chain and in-band on the stack at scan
+   time*. It provides zero protection for a value that is register-resident
+   only, or that belongs to a call shape that never pushes a chain entry for
+   the frame in question (an inlined callee, certain nested-call shapes) — the
+   same "narrower-than-it-looks" property the OSR/nested-call machinery in
+   `conservative_roots.rs` and `precise-jit-maps-default.md` repeatedly flags
+   as an accepted, un-closed residual.
+2. The one general-purpose mitigation this codebase already built for exactly
+   this failure mode — `CRATONVM_JIT_SAFEPOINT_REG_SPILL` (blind-spill every
+   used register at every safepoint, `emit_pre_safepoint_spill`) — is **not
+   engaged by default**. `docs/known-issues/README.md`'s own SB-CRASH-04
+   history shows that even with it (and every other conservative-scan
+   diagnostic knob) turned on, at least one known repro in this exact family
+   (`MinRegexProbe`/A3) still crashes, "confirming the root is genuinely
+   register-resident and unreachable by any stack scan." `docs/feature-
+   designs/precise-jit-maps-default.md`'s own acceptance-sweep plan
+   explicitly lists "tomcat-style register-invisibility reclaims named in the
+   README" as work the precise-maps-default rollout has **not yet validated**
+   — i.e. the project's own roadmap already anticipated that a Tomcat-shaped
+   crash like this one could still be open under the current default.
+
+Neither of the two mechanisms this pass's task description offered as
+alternatives to Case B applies: it is not that a *map exists, covers this
+exact safepoint, and is wrong* (Case A) — the map machinery's own doc comments
+are explicit that it is *incomplete by construction* for register-resident
+operand-stack temporaries and certain locals, with a known (but default-off)
+partial fix. This is the deep, general-infrastructure gap, not a narrow,
+easily-patchable soundness bug in one map-generation code path.
+
+### Confidence: high on the classification, not fully closed on the specific site
+
+High confidence that this is the SB-CRASH-04 register-invisible-root family
+(Case B), based on: (a) the structural argument above, grounded in specific,
+quoted source (not inference from symptom-matching alone), (b) the crash
+disassembly's own signature (garbage-looking, non-tagged-pointer bit patterns
+in exactly the "read a value expected to be a live oop" position) matching
+the family's established fingerprint from three independent prior sessions
+(DoHead, Hibernate global-temp-table, and this doc's own prior SIGSEGV
+section), and (c) the project's own design docs independently anticipating
+this exact gap for this exact application (Tomcat) ahead of any of these
+investigations.
+
+**Not fully closed**, and explicitly flagged as such: this pass could not
+reproduce the crash fresh, so — unlike the "SocketWrapperBase.lock" bisection
+earlier in this doc — there is no *this-session* core dump or debug log tying
+the specific faulting PC/frame to a specific Java method or to a live
+`CRATONVM_DBG_VERIFY_OOP_MAPS` "unmapped in-band oop" hit. It remains
+possible (though it would be a coincidence given how well the signature
+matches) that the swallow-upload crash specifically is a related-but-distinct
+bug in the same fragile machinery (e.g. a frame_base/scanner_sp bookkeeping
+error for one particular nested-call shape, rather than a plain uncaptured
+register) rather than the generic "value lived only in a register" case.
+Recommended next steps for whoever revisits this with a quieter host: (1)
+repeat this pass's exact repro with `CRATONVM_JIT_SAFEPOINT_REG_SPILL=all`
+added — if it measurably suppresses the crash (even partially, matching the
+DoHead doc's "still crashed 3/6" outcome for a different repro), that is
+strong independent confirmation; if it does not help at all, that points
+toward the rarer "unreachable by any stack scan" or bookkeeping-bug subtype
+instead; (2) once a fresh core is caught, cross-reference its crash PC against
+`CRATONVM_DBG_JIT_NAMES=1`'s `lookup_jit_method_name` output (not attempted
+this pass) to identify the actual Java method/bytecode offset, which no prior
+session in this bug's history has done.
+
+## 2026-07-11: mechanism narrowed further — locals dataflow ruled OUT, two remaining candidates identified; no fix attempted
+
+Follow-up to the "Case B confirmed" section above, prompted by attempting to
+scope an actual fix. A resumed diagnostic session hit an API session limit
+mid-run (its live-repro attempts — ~50 more launches across a `hunt.sh`
+driver script — reproduced the same picture as the section above: no fresh
+crash, majority hung on the unrelated STW-takeover contention bug); its
+partial draft is folded into this section rather than lost. Direct source
+reading (`jit/src/x64.rs`) this session adds one concrete, load-bearing
+correction and narrows the remaining hypothesis space to two candidates:
+
+**`compute_local_oop_masks`'s AND-intersection at CFG merge points is NOT the
+gap** — its own doc comment carries a rigorous soundness argument grounded in
+JVM bytecode verification: "A live oop that is conditionally a primitive on
+another path merges to 'not definitely oop' and is omitted; such a slot is
+necessarily dead-as-oop at that PC (the verifier forbids reading a slot with
+conflicting types), so the omission is safe." The verifier's own type-merge
+rules already guarantee a local can't be soundly read as a reference at a
+program point where it's oop-typed on one incoming edge and not on another.
+An earlier hypothesis this session considered — switching that AND to an OR
+(over-approximate, "can only over-retain, never corrupt" under the current
+non-moving collector, mirroring the `=all` register-spill argument) — is
+**not the right fix**: it targets a dataflow that is already provably sound
+for locals. **Do not pursue this specific change without addressing why this
+soundness argument would be wrong first** — it would be adding complexity
+without closing the actual gap.
+
+**Where the actual gap lives**, per the SB-CRASH-04 doc comment on
+`emit_pre_safepoint_spill` ("an oop can also live in a callee-saved register
+as an operand-stack temporary that survives the call, **or via a value the
+per-slot oop tracker fails to tag**") and a read of the sibling mechanism,
+`flush_scratch_registers`'s default-on `flush_callee_saved_oops` step
+(`jit/src/x64.rs` ~line 14853-14944): that step only spills a `StackSlot::
+CalleeSaved` operand-stack entry to its frame home if `self.stack_oop_marks`
+— the parallel "per-slot oop tracker" the SB-CRASH-04 comment names — already
+marks that stack index as holding a reference. **If `stack_oop_marks` fails
+to tag a genuinely-reference-valued stack entry (a false negative in that
+tracker, not in the locals dataflow), the default-on flush silently skips
+it**, leaving it register-resident and unprotected. This is a specific,
+falsifiable hypothesis, not yet confirmed: it requires finding a concrete
+operand-stack-producing code path where a reference value can end up on the
+stack without `stack_oop_marks` being set for it (candidates worth checking:
+values produced by inlined/guarded fast paths — the crash disassembly's
+class-identity-check shape strongly resembles `guarded_inline_getfield`/an
+invoke inline-cache fast path, both relatively new/complex codegen — merges
+of stack shapes across conditional branches feeding an invoke's receiver
+slot, or a stack entry produced by a call whose return-oop-ness isn't
+propagated into `stack_oop_marks` correctly).
+
+**A second, structurally different candidate was also identified and is
+NOT yet ruled out**: the crash's faulting instruction reloads `rsi` from a
+stack-relative address (`rbp-0x38`) rather than reading a register directly —
+i.e. this specific crash's immediate cause is a *stale read from a frame
+slot*, not (necessarily) an *unspilled register*. Two sub-hypotheses this
+implies, not distinguished this session:
+  (a) the slot was never populated with the live receiver at all (consistent
+      with the `stack_oop_marks` false-negative theory above — the flush that
+      would have written it never ran), or
+  (b) the slot WAS correctly populated at some earlier point but its backing
+      frame offset got reused/overwritten by unrelated codegen before this
+      reload — a frame-slot-lifetime/aliasing bug, a different and
+      structurally unrelated class of defect from "GC found the root
+      invisible." `reserve_spill_slots`' offset-reuse bookkeeping (not read
+      this session) would be the place to check for (b).
+
+These two candidates need genuinely different fixes ((a): extend
+`stack_oop_marks` propagation at whatever codegen site drops the tag; (b):
+fix spill-slot lifetime tracking so a live oop's frame home is never handed
+out to a different value while still needed) — **implementing either without
+confirming which one applies risks a wrong, unverified change to
+correctness-critical GC/JIT code**, which given the failure mode (silent
+memory corruption, not just a crash) is worse than leaving the bug open and
+well-documented. No code change was attempted this session for this reason.
+
+**Recommended concrete next step for whoever picks this up**: rather than
+another blind crash-hunt on this chronically-busy shared host (three
+consecutive sessions have now hit majority-hang rates from concurrent
+sessions' CPU load — this appears to be the host's steady state, not a
+transient spike), either (1) request a quieter/dedicated window, or (2)
+instrument `stack_oop_marks` writes directly with a temporary debug build
+(log every stack push/pop with its oop-mark bit, keyed by method+bci) and
+compare against `compute_param_oop_mask`-style ground truth for the specific
+inline-cache/invoke codegen path, which would settle hypothesis (a) without
+needing to catch a live crash at all — a static/logged trace of one run
+through the `AbortedPOSTClient` code path, cross-referenced against the
+bytecode's actual receiver-liveness, may be enough to confirm or refute it
+directly.

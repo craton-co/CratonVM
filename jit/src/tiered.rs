@@ -43,10 +43,44 @@ fn osr_deny_list() -> &'static RwLock<HashSet<MethodKey>> {
     LIST.get_or_init(|| RwLock::new(HashSet::new()))
 }
 
+/// Methods statically known to corrupt state when OSR-entered, pending a
+/// full root-cause fix. Denying OSR for a method does not stop it from
+/// tiering up to normal (non-OSR) JIT compilation from a fresh call -- it
+/// only forces an already-interpreting invocation to keep interpreting
+/// rather than jumping into compiled code mid-loop.
+///
+/// `java/util/DualPivotQuicksort.sort` (both the `([DIII)V` entry point and
+/// the `(Ldk$Sorter;[DIII)V` worker it delegates to) is denied here:
+/// ES's `libs/tdigest` `SortingDigestTests` (`testSorted`, `testMonotonicity`,
+/// `testMidPointRule`, `testSingletonAtEnd`, `testFewRepeatedValues`) reads a
+/// garbage `ArrayIndexOutOfBoundsException` index -- always a plausible heap
+/// pointer (e.g. `0x20048466300`), never a plausible array index -- out of
+/// `SortingDigest.compress()`'s `values.sort()` call, which bottoms out in
+/// `Arrays.sort(double[])` -> `DualPivotQuicksort.sort`. `CRATONVM_DBG_OSR=1`
+/// on the failing repro shows these are the ONLY two methods ever OSR-entered
+/// during the run; `CRATONVM_JIT_OSR=0` (disabling OSR VM-wide) makes all 5
+/// failures disappear with no other behavior change. Both overloads are
+/// self-recursive (standard dual-pivot partitioning), and an OSR-entered
+/// frame's `stack_floor_slot_off` is seeded to the OSR trampoline's
+/// usize::MAX sentinel (see `emit_osr_trampoline`), which makes every
+/// self-recursive call site's inline fast-path check
+/// (`RSP > floor`) always false -- so an OSR-entered instance of either
+/// method ALWAYS routes its recursive calls through the `self_call_stack_guard`
+/// helper path (jit/src/x64.rs, the `guard_skip_patch` block), a
+/// combination (OSR entry + self-recursion) that gets far less exercise than
+/// either feature alone. That is the leading suspect, not a pinpointed
+/// single instruction -- this is a scoped mitigation, not a root-cause fix.
+fn statically_osr_denied(key: &MethodKey) -> bool {
+    key.class_name == "java/util/DualPivotQuicksort"
+        && key.method_name == "sort"
+        && (key.descriptor == "([DIII)V"
+            || key.descriptor == "(Ljava/util/DualPivotQuicksort$Sorter;[DIII)V")
+}
+
 /// Returns true when OSR is permanently disabled for this method, without
 /// affecting normal invocation-counted JIT compilation.
 pub fn is_osr_denied(key: &MethodKey) -> bool {
-    osr_deny_list().read().contains(key)
+    statically_osr_denied(key) || osr_deny_list().read().contains(key)
 }
 
 /// Permanently disable OSR for this method in the current VM process.

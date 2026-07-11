@@ -2125,6 +2125,14 @@ pub fn precise_jit_maps_enabled() -> bool {
 /// fresh-object-initialisation pattern (`n.left = newChild`) that dominates
 /// allocation-heavy code (object binarytrees). DEFAULT-OFF pending GC-stress
 /// validation; opt in with `CRATONVM_JIT_INLINE_PUTFIELD`.
+///
+/// INT-6 (GC audit 2026-07-10): the YOUNG test reads `GC_FLAG_OLD_GEN`, which
+/// only the GENERATIONAL backend maintains — under G1/ZGC every object read
+/// as "young" and the fast path elided G1's RSet post-barrier for Old→young
+/// stores. Both inline arms now prepend the guarded-getfield receiver check
+/// (null/alignment/published-region containment): G1/ZGC never publish
+/// region bounds, so every receiver bails to the full-barrier helper there,
+/// making the switch safe to enable on any backend.
 pub fn inline_putfield_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -2145,7 +2153,7 @@ pub fn inline_getfield_enabled() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_INLINE_GETFIELD").is_some())
 }
 
-/// Default-ON guarded inline `getfield` (perf/throughput-20260710).
+/// Opt-IN guarded inline `getfield` (perf/throughput-20260710).
 ///
 /// The 2026-07-09 hardening (`Fix JIT getfield receiver validation`,
 /// 85baa4219) routed EVERY default-path JIT `getfield` through the checked
@@ -2167,12 +2175,37 @@ pub fn inline_getfield_enabled() -> bool {
 /// not publish bounds (G1/ZGC → table all zeros) — branches to the checked
 /// helper, preserving its NPE / `i64::MIN`-sentinel semantics exactly.
 ///
-/// `CRATONVM_JIT_GETFIELD_HELPER=1` restores the helper-only 2026-07-09
-/// behaviour for bisection.
+/// DEFAULT FLIPPED BACK OFF 2026-07-10 (found investigating the ES
+/// DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests /
+/// IVFKnnFloatVectorQueryTests hang cluster,
+/// docs/known-issues/elasticsearch-suite/): with this path default-on,
+/// `testSlicesDense` under JIT SIGSEGVs almost immediately (dmesg: `segfault
+/// at 4c`, gdb: an AALOAD bounds-check dereferencing a receiver of `0x40` —
+/// a small int value used as an array pointer, i.e. a getfield result feeding
+/// a later array access got corrupted). Confirmed by bisection: (a)
+/// `CRATONVM_JIT_GETFIELD_HELPER=1` (this path OFF) makes the SIGSEGV
+/// disappear and the run reverts to the ORIGINAL pre-existing interpreter
+/// hang the known-issue docs already describe — so this guard is a genuine
+/// NEW regression, not a pre-existing bug surfacing; (b)
+/// `CRATONVM_OSR_NEWARRAY=0` (the sibling perf/throughput-20260710 change)
+/// does NOT avoid the crash, ruling out OSR-newarray as the cause. The exact
+/// corrupting instruction was not pinned down (the region-bounds containment
+/// check and the per-object GC_FLAG_COMPACT routing both read correctly on
+/// static review) — reproduces reliably via the repro command in the
+/// known-issue doc, needs dedicated bisection time. Until root-caused,
+/// default to the safe checked-helper path; opt in with
+/// `CRATONVM_JIT_GUARDED_GETFIELD=1` for A/B measurement.
 pub fn guarded_inline_getfield_enabled() -> bool {
-    use std::sync::OnceLock;
-    static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_GETFIELD_HELPER").is_none())
+    // NOT OnceLock-cached (unlike the other flags in this file): this is a
+    // JIT COMPILE-TIME gate, read once per getfield call SITE during
+    // compilation, never on the runtime hot path — so re-reading the env
+    // var every call has no measurable cost. Caching it would make the
+    // opt-in racy against whichever test/thread first triggers ANY getfield
+    // compilation in the process (fixed 2026-07-10: the guarded-inline unit
+    // test below flaked because an unrelated parallel test's compile() call
+    // won the OnceLock race before this test's env::set_var took effect).
+    std::env::var_os("CRATONVM_JIT_GETFIELD_HELPER").is_none()
+        && std::env::var_os("CRATONVM_JIT_GUARDED_GETFIELD").is_some()
 }
 
 /// Default-ON inline self-recursion stack check (perf/throughput-20260710).
@@ -3630,18 +3663,54 @@ fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
 /// The 4-byte `wide; aload` form is not recognised — its prevalence in
 /// real classes is essentially zero, and bailing out is always safe
 /// (we simply emit the regular runtime check).
+///
+/// SOUNDNESS FIX (2026-07-10, ES RestClient JIT-only spurious-NPE family):
+/// the previous implementation guessed the preceding instruction by reading
+/// raw bytes at `code[pc - 1]` / `code[pc - 2]` and matching them against
+/// opcode values — exactly the class of bug `array_receiver_local` above
+/// already documents and fixes ("SOUNDNESS FIX (array_receiver_local)").
+/// That backward guess is unsound: for a multi-byte instruction (e.g.
+/// `getfield`/`putfield`'s big-endian u16 constant-pool index), a trailing
+/// OPERAND byte can numerically collide with the aload_0..3 opcode range
+/// (0x2A..=0x2D) or the `aload <u8>` prefix (0x19). Confirmed instance:
+/// `getfield #42` encodes as bytes `[0xB4, 0x00, 0x2A]` — the low byte of
+/// index 42 is 0x2A, which is ALSO the `aload_0` opcode. For a method whose
+/// `params`-style lazy-init field happened to land at constant-pool index
+/// 42 (`org.apache.http.client.methods.HttpRequestWrapper.getParams()`,
+/// hit by the real-world repro), `ifnonnull` immediately after that
+/// `getfield` misread the getfield's trailing index byte as `aload_0`
+/// (`this`, always non-null) and wrongly proved the null check dead —
+/// eliding it into an unconditional jump. Since `this` is unrelated to the
+/// getfield's *result*, this unsoundly skipped the method's entire
+/// lazy-initialization branch, permanently returning the (still-null)
+/// field. We now validate against a forward-walked instruction-start map
+/// (`instruction_start_map`, the same one `array_receiver_local` uses) and
+/// only accept a decode whose candidate instruction is a genuine boundary
+/// — never a coincidental operand byte. On any misalignment we return
+/// `None`, so the caller conservatively keeps the runtime `TEST`+`Jcc`.
 fn preceding_aload_nonnull_local(code: &[u8], pc: usize) -> Option<usize> {
     if pc == 0 {
         return None;
     }
-    // aload_0..aload_3 — 1-byte opcode at pc-1.
-    let prev1 = code[pc - 1];
-    if (0x2A..=0x2D).contains(&prev1) {
-        // Widening: u8 -> usize (opcode-relative local index, value fits)
-        return Some((prev1 - 0x2A) as usize);
+    let code_len = code.len();
+    if pc > code_len {
+        return None;
     }
-    // aload <u8> — 2 bytes at pc-2.
-    if pc >= 2 && code[pc - 2] == 0x19 {
+    let starts = instruction_start_map(code, code_len);
+    // aload_0..aload_3 — 1-byte opcode; only trust it if the map confirms
+    // `pc - 1` is a real instruction start (aload_0..3 are always exactly
+    // 1 byte long, so a genuine start there necessarily ends at `pc`).
+    if starts[pc - 1] {
+        let prev1 = code[pc - 1];
+        if (0x2A..=0x2D).contains(&prev1) {
+            // Widening: u8 -> usize (opcode-relative local index, value fits)
+            return Some((prev1 - 0x2A) as usize);
+        }
+    }
+    // aload <u8> — 2-byte instruction; only trust it if the map confirms
+    // `pc - 2` is a real instruction start (aload <u8> is always exactly 2
+    // bytes, so a genuine start there necessarily ends at `pc`).
+    if pc >= 2 && starts[pc - 2] && code[pc - 2] == 0x19 {
         // Widening: u8 -> wider int (bytecode operand byte, value fits)
         return Some(code[pc - 1] as usize);
     }
@@ -3857,6 +3926,74 @@ mod array_receiver_local_tests {
         let code = [0x2Au8, 0x11, 0x01, 0x02, 0x32];
         let starts = instruction_start_map(&code, code.len());
         assert_eq!(starts, vec![true, true, false, false, true]);
+    }
+}
+
+#[cfg(test)]
+mod preceding_aload_nonnull_local_tests {
+    use super::preceding_aload_nonnull_local;
+
+    // Regression coverage for the ES RestClient JIT-only spurious-NPE fix
+    // (2026-07-10): `preceding_aload_nonnull_local` used to guess the
+    // instruction preceding `pc` by reading a raw byte at `pc - 1` / `pc - 2`,
+    // the exact unsoundness `array_receiver_local_tests` above already
+    // covers for the sibling array-null-check helper.
+
+    #[test]
+    fn rejects_getfield_operand_collision() {
+        // aload_0; getfield #42; ifnonnull ...
+        // `getfield #42` encodes as [0xB4, 0x00, 0x2A] — the low byte of
+        // the constant-pool index (0x2A) numerically equals the `aload_0`
+        // opcode. A backward byte read at `pc - 1` (pc = the ifnonnull's
+        // own PC, 4) would misidentify the getfield's trailing operand
+        // byte as a genuine `aload_0` and wrongly borrow `this`'s
+        // provable non-nullity for the getfield's *result*. Real-world
+        // hit: org.apache.http.client.methods.HttpRequestWrapper.getParams(),
+        // whose lazily-initialized `params` field sat at constant-pool
+        // index 42 — the miscompiled `ifnonnull` always took the
+        // "already non-null" branch and the lazy-init store never ran.
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0xb4, 0x00, 0x2a, // 1: getfield #42
+            0xc7, 0x00, 0x00, // 4: ifnonnull (target irrelevant here)
+        ];
+        assert_eq!(preceding_aload_nonnull_local(&code, 4), None);
+    }
+
+    #[test]
+    fn accepts_genuine_aload_0() {
+        // aload_0; ifnonnull ... — the legitimate pattern this helper
+        // exists to recognise must still resolve to local 0.
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0xc7, 0x00, 0x00, // 1: ifnonnull
+        ];
+        assert_eq!(preceding_aload_nonnull_local(&code, 1), Some(0));
+    }
+
+    #[test]
+    fn accepts_genuine_aload_u8() {
+        // aload 5; ifnonnull ... — the two-byte wide-index form.
+        let code: Vec<u8> = vec![
+            0x19, 0x05, // 0: aload 5
+            0xc7, 0x00, 0x00, // 2: ifnonnull
+        ];
+        assert_eq!(preceding_aload_nonnull_local(&code, 2), Some(5));
+    }
+
+    #[test]
+    fn rejects_putfield_operand_collision() {
+        // aload_0; aload_1; putfield #298 (0x012A — high byte 0x01, low
+        // byte 0x2A); ifnonnull. Same collision, but on `putfield`'s
+        // trailing operand byte instead of `getfield`'s, and at a larger
+        // constant-pool index to show the bug is not specific to #42.
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0x2b, // 1: aload_1
+            0xb5, 0x01, 0x2a, // 2: putfield #298
+            0xc7, 0x00, 0x00, // 5: ifnonnull
+        ];
+        assert_eq!(preceding_aload_nonnull_local(&code, 5), None);
     }
 }
 
@@ -12934,6 +13071,63 @@ impl Compiler {
         self.patch_rel32_to_here(done);
     }
 
+    /// `TEST BYTE [base+disp8], imm8` -- checks a per-object header flag byte
+    /// (e.g. `GC_FLAG_COMPACT`) without needing any scratch register: the
+    /// memory operand is read and discarded by the CPU, `base` and the
+    /// flags register are the only things touched.
+    fn emit_test_mem8_imm8(&mut self, base: u8, disp8: i32, imm8: u8) {
+        if base >= 8 {
+            self.buf.emit(&[0x41]); // REX.B (extend ModRM.rm to r8-r15)
+        }
+        self.buf.emit(&[0xF6, 0x40 | (base & 7), disp8 as u8, imm8]);
+    }
+
+    /// Load a String receiver's `value` field (the backing `byte[]`/`char[]`
+    /// ref) from `base` into `dst`, correctly handling BOTH object layouts
+    /// that can coexist for `java/lang/String` at runtime:
+    ///
+    ///   * compact-ref-field layout (`compact_offset` as computed by
+    ///     `StringFieldLayout::new` is already correct -- see its doc
+    ///     comment for the offset derivation and the BUG-ES-TASKINFO-20260710
+    ///     history);
+    ///   * a LEGACY-laid-out instance of the same class -- per the getfield
+    ///     (opcode 0xb4) inline path's own comment, "a class with a
+    ///     registered compact layout may still have LEGACY-laid-out
+    ///     instances" (e.g. an allocation whose field count didn't match the
+    ///     registered `CompactLayout` at alloc time). `String.value` is
+    ///     always field index 0, the class's *only* reference field before
+    ///     `coder`/`hash`, so a legacy instance's corresponding `Value` cell
+    ///     sits exactly `SLOT_SIZE - REF_FIELD_SIZE` (8) bytes later than
+    ///     `compact_offset` -- uniformly, regardless of which field.
+    ///
+    /// Dispatches per-object via the `GC_FLAG_COMPACT` header-bit (byte
+    /// offset 21), exactly mirroring the getfield 0xb4 inline path. No
+    /// scratch register needed.
+    fn emit_load_string_value_ptr(&mut self, dst: u8, base: u8, compact_offset: i32) {
+        self.emit_test_mem8_imm8(base, 21, cratonvm_types::GC_FLAG_COMPACT);
+        let legacy = self.emit_jcc_rel32_patch(0x84); // JZ (flag clear => legacy)
+        self.emit_mov_r64_mem_disp32(dst, base, compact_offset);
+        let done = self.emit_jmp_rel32_patch();
+        self.patch_rel32_to_here(legacy);
+        self.emit_mov_r64_mem_disp32(dst, base, compact_offset + 8);
+        self.patch_rel32_to_here(done);
+    }
+
+    /// Sign-extended 32-bit field load (`String.coder` / `String.hash`) with
+    /// the same compact/legacy dual handling as
+    /// [`Self::emit_load_string_value_ptr`] (see its doc comment). `coder`
+    /// and `hash` are always non-negative in practice, so sign- vs
+    /// zero-extension is behaviourally identical here.
+    fn emit_load_string_i32_field(&mut self, dst: u8, base: u8, compact_offset: i32) {
+        self.emit_test_mem8_imm8(base, 21, cratonvm_types::GC_FLAG_COMPACT);
+        let legacy = self.emit_jcc_rel32_patch(0x84);
+        self.emit_movsxd_r64_mem_disp32(dst, base, compact_offset);
+        let done = self.emit_jmp_rel32_patch();
+        self.patch_rel32_to_here(legacy);
+        self.emit_movsxd_r64_mem_disp32(dst, base, compact_offset + 8);
+        self.patch_rel32_to_here(done);
+    }
+
     /// Emit a 32-bit register-to-register ALU op `dst op= src` for the
     /// STRING_SEARCH intrinsics. `opcode` is the primary opcode of the
     /// `r/m32, r32` form (0x01 ADD, 0x29 SUB, 0x39 CMP, 0x89 MOV, 0x31
@@ -19636,6 +19830,20 @@ impl Compiler {
                                         cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                                     );
                                 }
+                                b'L' | b'[' => {
+                                    // Defense-in-depth: contradictory metadata
+                                    // (`c_is_ref == false` for a reference
+                                    // descriptor). A non-ref-classified slot is
+                                    // written as a full 16-byte `Value` cell, so
+                                    // read the 8-byte pointer payload — never the
+                                    // 32-bit MOVSXD below, which sign-extends half
+                                    // a pointer into a bogus non-null receiver.
+                                    self.emit_mov_r64_mem_disp32(
+                                        RAX,
+                                        RAX,
+                                        cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                    );
+                                }
                                 b'F' => {
                                     self.emit_mov_r32_mem_disp32(
                                         RAX,
@@ -19668,6 +19876,17 @@ impl Compiler {
                         } else {
                             match type_tag {
                                 b'J' | b'D' => {
+                                    self.emit_mov_r64_mem_disp32(
+                                        RAX,
+                                        RAX,
+                                        legacy_cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                    );
+                                }
+                                b'L' | b'[' => {
+                                    // Defense-in-depth (see the compact branch):
+                                    // a reference descriptor always reads the
+                                    // legacy cell's 64-bit pointer payload, even
+                                    // when `c_is_ref` wrongly says non-ref.
                                     self.emit_mov_r64_mem_disp32(
                                         RAX,
                                         RAX,
@@ -19963,7 +20182,10 @@ impl Compiler {
                             if let Some(&(c_off, _)) = self
                                 .compact_field_off
                                 .get(&pc)
-                                .filter(|_| cratonvm_types::compact_ref_fields_enabled())
+                                .filter(|_| {
+                                    cratonvm_types::compact_ref_fields_enabled()
+                                        && self.helpers.region_bounds_addr != 0
+                                })
                             {
                                 if std::env::var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
                                     eprintln!("[compact-inline] putfield-ref pc={pc} off={c_off}");
@@ -19980,9 +20202,22 @@ impl Compiler {
                                 let cell_off = (HEADER_SIZE + c_off as usize) as i32; // Cast: disp32
                                 let mut bail: Vec<usize> = Vec::new();
                                 self.load_slot_to_reg(RAX, obj_slot);
-                                // null receiver → helper.
-                                self.emit_test_r64_r64(RAX);
-                                bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+                                // INT-6: null + alignment + published-region
+                                // containment (subsumes the old bare null check).
+                                // The YOUNG test below reads GC_FLAG_OLD_GEN,
+                                // which ONLY the Generational backend maintains —
+                                // under G1/ZGC every object reads as "young" and
+                                // the fast path would skip G1's RSet post-barrier
+                                // for an Old→young store (edge lost, referent
+                                // freed live at the next young pause). G1/ZGC
+                                // publish no region bounds (table all zeros), so
+                                // this guard routes EVERY receiver to the full-
+                                // barrier helper there; under Generational it
+                                // adds the same three containment compares the
+                                // guarded getfield already pays.
+                                bail.extend(self.emit_guarded_getfield_receiver_check(
+                                    self.helpers.region_bounds_addr,
+                                ));
                                                                             // LEGACY receiver (no GC_FLAG_COMPACT) → helper: the
                                                                             // compact 8-byte cell offset is only valid for a
                                                                             // genuinely-compact object. A class with a registered
@@ -20030,14 +20265,26 @@ impl Compiler {
                                 self.patch_rel32_to_here(done);
                             } else if inline_putfield_enabled()
                                 && !cratonvm_types::compact_ref_fields_enabled()
+                                && self.helpers.region_bounds_addr != 0
                             {
                                 let cell_off = (HEADER_SIZE + field_index * SLOT_SIZE) as i32; // Cast: x86-64 disp32
                                 let mut bail: Vec<usize> = Vec::new();
                                 // obj → RAX
                                 self.load_slot_to_reg(RAX, obj_slot);
-                                // null receiver → helper (matches the helper's no-op).
-                                self.emit_test_r64_r64(RAX);
-                                bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+                                // INT-6: null + alignment + published-region
+                                // containment (subsumes the old bare null check;
+                                // null still reaches the helper, matching its
+                                // no-op semantics). The YOUNG test below reads
+                                // GC_FLAG_OLD_GEN, which ONLY the Generational
+                                // backend maintains — under G1/ZGC every object
+                                // reads as "young" and this fast path would elide
+                                // G1's RSet post-barrier for an Old→young store.
+                                // G1/ZGC publish no region bounds (table all
+                                // zeros), so every receiver bails to the full-
+                                // barrier helper there.
+                                bail.extend(self.emit_guarded_getfield_receiver_check(
+                                    self.helpers.region_bounds_addr,
+                                ));
                                                                             // old-gen receiver → helper (card barrier). gc_flags is
                                                                             // the byte at header offset 21; GC_FLAG_OLD_GEN == bit 0.
                                 self.emit_mov_r32_mem_disp32(RCX, RAX, 21);
@@ -22128,7 +22375,30 @@ impl Compiler {
                         // follow-up rather than threading a new descriptor param
                         // through every `x64::compile` caller.
                         self.emit_post_invoke_exception_check(b'I');
-                        self.push_from_rax();
+                        // VOID self-recursive fix (ES SortingDigestTests -Jit
+                        // on): this push was unconditional, so a `void`
+                        // self-recursive callee (DualPivotQuicksort.sort) left
+                        // a PHANTOM entry on the simulated operand stack after
+                        // every non-tail self-call. The extra entry shifts the
+                        // canonical spill-slot layout for everything downstream
+                        // of the next merge point, so later loads read
+                        // neighbouring slots (an array ref read as a double →
+                        // heap addresses stored into double[] elements,
+                        // deterministic mis-sorts and garbage AIOOBE indices —
+                        // no GC involved). The method's own return type IS
+                        // available via `method_key` ("Class.name:descriptor"),
+                        // so only push a return value when there is one. When
+                        // `method_key` is empty (unit-test compiles) keep the
+                        // historical push — those callers never compile void
+                        // self-recursive methods.
+                        let self_ret_ty = self
+                            .method_key
+                            .rfind(')')
+                            .and_then(|i| self.method_key.as_bytes().get(i + 1))
+                            .copied();
+                        if self_ret_ty != Some(b'V') {
+                            self.push_from_rax();
+                        }
                     }
                     pc += 3;
                 }
@@ -22307,20 +22577,18 @@ impl Compiler {
                                 }
 
                                 // RCX = value (byte[]) ref. Null → deopt.
-                                self.emit_mov_r64_mem_disp32(
+                                self.emit_load_string_value_ptr(
                                     RCX,
                                     RAX,
-                                    // Cast: fixed struct/layout offset to i32 instruction displacement
                                     layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                                 );
                                 self.emit_test_r64_r64(RCX);
                                 bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
 
                                 // R10D = coder (0 LATIN1 / 1 UTF16).
-                                self.emit_movsxd_r64_mem_disp32(
+                                self.emit_load_string_i32_field(
                                     R10,
                                     RAX,
-                                    // Cast: fixed struct/layout offset to i32 instruction displacement
                                     layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                                 );
 
@@ -22333,11 +22601,10 @@ impl Compiler {
                                     // back — the returned value is identical
                                     // either way, the cache is a
                                     // non-observable optimisation.)
-                                    self.emit_movsxd_r64_mem_disp32(
+                                    self.emit_load_string_i32_field(
                                         RAX,
                                         RAX,
                                         layout.hash_cell_offset
-                                            // Cast: fixed struct/layout offset to i32 instruction displacement
                                             + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                                     );
                                     // TEST EAX,EAX ; JNZ cached_done
@@ -22359,11 +22626,10 @@ impl Compiler {
                                     // re-pop is not possible. Instead keep value
                                     // ptr safe: recompute from recv_slot.
                                     self.load_slot_to_reg(RDX, recv_slot);
-                                    self.emit_mov_r64_mem_disp32(
+                                    self.emit_load_string_value_ptr(
                                         RDX,
                                         RDX,
                                         layout.value_cell_offset
-                                            // Cast: fixed struct/layout offset to i32 instruction displacement
                                             + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                                     );
                                     // h = 0 (EAX) ; i = 0 (R8D).
@@ -22566,16 +22832,14 @@ impl Compiler {
                             bail.push(self.emit_jcc_rel32_patch(0x85)); // JNE
 
                             // R8 = this.value, R9 = other.value (byte[] refs).
-                            self.emit_mov_r64_mem_disp32(
+                            self.emit_load_string_value_ptr(
                                 R8,
                                 RAX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
-                            self.emit_mov_r64_mem_disp32(
+                            self.emit_load_string_value_ptr(
                                 R9,
                                 RDX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             // Null value array on either side → deopt.
@@ -22586,20 +22850,22 @@ impl Compiler {
 
                             // coder mismatch → deopt.
                             // MOV ECX,[RAX+coder] ; CMP ECX,[RDX+coder]
-                            self.emit_mov_r32_mem_disp32(
+                            self.emit_load_string_i32_field(
                                 RCX,
                                 RAX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
-                            // CMP ECX,[RDX+disp32]: 3B /r, ModRM
-                            // mod=10(disp32) reg=ECX(001) r/m=RDX(010) = 0x8A.
-                            self.buf.emit(&[0x3B, 0x8A]);
-                            self.buf.emit(
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
-                                &(layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32)
-                                    .to_le_bytes(),
+                            // other.coder may come from a legacy-laid-out `other`
+                            // independently of `this` -- load it through the
+                            // same compact/legacy-aware helper (R11 is free
+                            // here) instead of a raw CMP-with-memory-operand,
+                            // then compare register-to-register.
+                            self.emit_load_string_i32_field(
+                                R11,
+                                RDX,
+                                layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
+                            self.emit_alu_r32_r32(0x39, RCX, R11); // CMP ECX,R11D
                             bail.push(self.emit_jcc_rel32_patch(0x85)); // JNE
 
                             // value-array length mismatch → result 0.
@@ -22709,33 +22975,29 @@ impl Compiler {
                             self.emit_test_r64_r64(RDX);
                             bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
                                                                         // R8 = this.value, R9 = other.value; null → deopt.
-                            self.emit_mov_r64_mem_disp32(
+                            self.emit_load_string_value_ptr(
                                 R8,
                                 RAX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
                             bail.push(self.emit_jcc_rel32_patch(0x84));
-                            self.emit_mov_r64_mem_disp32(
+                            self.emit_load_string_value_ptr(
                                 R9,
                                 RDX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC9]); // TEST R9,R9
                             bail.push(self.emit_jcc_rel32_patch(0x84));
                             // R10 = this.coder, R11 = other.coder.
-                            self.emit_movsxd_r64_mem_disp32(
+                            self.emit_load_string_i32_field(
                                 R10,
                                 RAX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
-                            self.emit_movsxd_r64_mem_disp32(
+                            self.emit_load_string_i32_field(
                                 R11,
                                 RDX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
 
@@ -22846,19 +23108,17 @@ impl Compiler {
                             self.emit_test_r64_r64(RAX);
                             bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
                                                                         // R8 = this.value; null → deopt.
-                            self.emit_mov_r64_mem_disp32(
+                            self.emit_load_string_value_ptr(
                                 R8,
                                 RAX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
                             bail.push(self.emit_jcc_rel32_patch(0x84));
                             // R10 = this.coder.
-                            self.emit_movsxd_r64_mem_disp32(
+                            self.emit_load_string_i32_field(
                                 R10,
                                 RAX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
                             // R9D = needle = ch & 0xFFFF.
@@ -22946,33 +23206,29 @@ impl Compiler {
                             self.load_slot_to_reg(RDX, needle_slot);
                             self.emit_test_r64_r64(RDX);
                             bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
-                            self.emit_mov_r64_mem_disp32(
+                            self.emit_load_string_value_ptr(
                                 R8,
                                 RAX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
                             bail.push(self.emit_jcc_rel32_patch(0x84));
-                            self.emit_mov_r64_mem_disp32(
+                            self.emit_load_string_value_ptr(
                                 R9,
                                 RDX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC9]); // TEST R9,R9
                             bail.push(self.emit_jcc_rel32_patch(0x84));
                             // R10 = haystack coder, R11 = needle coder.
-                            self.emit_movsxd_r64_mem_disp32(
+                            self.emit_load_string_i32_field(
                                 R10,
                                 RAX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
-                            self.emit_movsxd_r64_mem_disp32(
+                            self.emit_load_string_i32_field(
                                 R11,
                                 RDX,
-                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
 
@@ -25878,11 +26134,23 @@ pub fn compile_with_param_slots(
     // register. This only touches the OSR metadata copy; the running code's
     // `reg_for_local` (which never asks for a high-half) is unaffected.
     let mut osr_local_assignments = compiler.local_assignments.clone();
+    // ES-tdigest OSR fix: the high-half nulling and the per-PC dead mask below
+    // must cover XMM-resident (float/double) locals exactly like GPR-resident
+    // ones. DualPivotQuicksort.sort coalesces several disjoint-live-range
+    // double locals (pivots, run temporaries) onto one XMM register; an OSR
+    // entry at a PC where one of them is dead loaded the dead local's garbage
+    // over the live owner's XMM value (the GPR-only mask said "safe"), so
+    // Arrays.sort(double[]) silently mis-sorted / threw garbage-index AIOOBE
+    // once the sort loop OSR-entered.
+    let mut osr_xmm_assignments = compiler.xmm_assignments.clone();
     {
         let high_halves = wide_local_high_halves(code, code_len);
         for &hh in &high_halves {
             if hh < osr_local_assignments.len() {
                 osr_local_assignments[hh] = None;
+            }
+            if hh < osr_xmm_assignments.len() {
+                osr_xmm_assignments[hh] = None;
             }
         }
     }
@@ -25904,15 +26172,38 @@ pub fn compile_with_param_slots(
         .enumerate()
         .filter(|(_, a)| a.is_some())
         .fold(0u64, |m, (i, _)| if i < 64 { m | (1u64 << i) } else { m });
+    // XMM-resident locals participate in the same graph-colouring coalescing
+    // as GPR-resident ones, so they need the same dead-at-entry protection
+    // (liveness tracks d/f locals at their base index via dload/dstore).
+    let xmm_resident: u64 = osr_xmm_assignments
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.is_some())
+        .fold(0u64, |m, (i, _)| if i < 64 { m | (1u64 << i) } else { m });
     let mut osr_dead_mask = vec![0u64; code_len + 1];
     for &(pc, live_in) in &compiler.osr_block_live_in {
         if pc < osr_dead_mask.len() {
-            osr_dead_mask[pc] = reg_resident & !live_in;
+            osr_dead_mask[pc] = (reg_resident | xmm_resident) & !live_in;
+        }
+    }
+    if std::env::var_os("CRATONVM_DBG_OSR_META").is_some() {
+        let masked: Vec<(usize, u64)> = compiler
+            .osr_block_live_in
+            .iter()
+            .filter_map(|&(pc, live_in)| {
+                let m = (reg_resident | xmm_resident) & !live_in;
+                if m != 0 { Some((pc, m)) } else { None }
+            })
+            .collect();
+        if !masked.is_empty() {
+            eprintln!(
+                "[osr-meta] gpr_resident={reg_resident:#x} xmm_resident={xmm_resident:#x} masked_entries={masked:x?}"
+            );
         }
     }
     cm.osr_dead_mask = Some(osr_dead_mask);
     cm.osr_local_assignments = Some(osr_local_assignments);
-    cm.osr_xmm_assignments = Some(compiler.xmm_assignments);
+    cm.osr_xmm_assignments = Some(osr_xmm_assignments);
     cm.osr_frame_size = compiler.frame_size;
     cm.osr_callee_saved_base = compiler.callee_saved_base;
     // HIB-CV-20 OSR caller-corruption fix: hand the trampoline the EXACT
@@ -29685,6 +29976,15 @@ mod tests {
     ///     load could produce).
     #[test]
     fn test_getfield_guarded_inline_fast_and_fallback() {
+        // Opt in explicitly: guarded_inline_getfield_enabled() defaults OFF
+        // since 2026-07-10 (see its doc comment) after it was found to
+        // SIGSEGV on a real Elasticsearch IVF-KNN vector workload. Not
+        // OnceLock-cached (compile-time gate only), so this plain env var
+        // set is race-free against other tests in this binary.
+        // SAFETY: test-only, single-purpose env var.
+        unsafe {
+            std::env::set_var("CRATONVM_JIT_GUARDED_GETFIELD", "1");
+        }
         use std::sync::atomic::{AtomicUsize, Ordering};
         static TEST_BOUNDS: [AtomicUsize; 6] = [
             AtomicUsize::new(0),

@@ -5282,6 +5282,23 @@ pub(crate) fn native_string_check_bounds_begin_end(
     Ok(None)
 }
 
+/// Shared bounds check backing `String.checkBoundsOffCount` and the
+/// `String(char[], int, int)` constructor native below (both must agree —
+/// the real constructor calls `checkBoundsOffCount` internally). Spec:
+/// bad iff `offset < 0 || count < 0 || offset > length - count`
+/// (overflow-safe form: `offset + count > length`). Returns `Some(index)`
+/// (the offending arg, matching the JDK's SIOOBE message convention) when
+/// bad, `None` when the range is valid.
+fn bounds_off_count_violation(offset: i32, count: i32, length: i32) -> Option<i32> {
+    let bad_size =
+        offset < 0 || count < 0 || length < 0 || (offset as i64 + count as i64) > length as i64;
+    if bad_size {
+        Some(if offset < 0 { offset } else { count })
+    } else {
+        None
+    }
+}
+
 /// `static int java.lang.String.checkBoundsOffCount(int offset, int count, int length)`
 ///
 /// Spec: throws `StringIndexOutOfBoundsException` iff
@@ -5304,18 +5321,125 @@ pub(crate) fn native_string_check_bounds_off_count(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    // Overflow-safe `offset + count > length`: rearranged as
-    // `offset > length - count` when both `length` and `count` are
-    // non-negative; outside that window the negative-arg check fires first.
-    let bad_size =
-        offset < 0 || count < 0 || length < 0 || (offset as i64 + count as i64) > length as i64;
-    if bad_size {
-        let index = if offset < 0 { offset } else { count };
+    if let Some(index) = bounds_off_count_violation(offset, count, length) {
         return Err(
             cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
         );
     }
     Ok(Some(Value::Int(offset)))
+}
+
+// ---------------------------------------------------------------------------
+// PERF: String(char[]) / String(char[], int, int) constructor intrinsics
+// ---------------------------------------------------------------------------
+//
+// Neither constructor had a CratonVM native override before this. `new
+// String(char[])` ran as the real JDK's own bytecode end to end —
+// `String(char[])` -> `String(char[], int, int)` -> the private
+// `String(char[], int, int, Void)` helper -> `StringUTF16.compress`/
+// `StringUTF16.toBytes` — a per-character Latin1-fits-in-a-byte check + copy
+// loop executed one bytecode at a time by the interpreter. For large arrays
+// this is purely an interpreter-throughput problem: measured at roughly
+// 500-650ns/char (5.1-6.5s for a 10,000,000-element array) because the loop
+// runs inside a single constructor invocation and never approaches the JIT's
+// invocation-count warm-up threshold. This one conversion was slow enough to
+// blow past an unrelated 3-second Tomcat connector read-timeout in
+// `org.apache.catalina.core.TestSwallowAbortedUploads`'s `AbortedPOSTClient`
+// tests — see
+// `docs/known-issues/tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md`
+// ("AbortedPOSTClient empty-response bug root-caused") for the full
+// investigation.
+//
+// Fix: intercept both public constructors directly and do the Latin1-fits
+// bulk scan + copy in Rust via `NativeContext::init_string_from_units`
+// (backed by `populate_java_string_fields` in `vm/src/vm/vm_object.rs`,
+// the same layout logic `create_string` uses), bypassing the interpreted
+// loop entirely. `read_char_array_into` bulk-reads the source `char[]` (a
+// single `copy_nonoverlapping` in the VM's override, not a per-element
+// loop), so the whole constructor becomes O(n) Rust-side work with none of
+// the per-bytecode interpreter dispatch overhead.
+//
+// This is intentionally scoped to exactly the two public constructor
+// entry points real Java source can name (`new String(char[])` and
+// `new String(char[], int, int)`) — the package-private
+// `String(char[], int, int, Void)` helper those two delegate to in real JDK
+// bytecode is never reached once these are registered, so it needs no
+// override of its own.
+
+/// `java.lang.String(char[] value)`
+///
+/// Real JDK semantics: `this(value, 0, value.length)`, i.e. throws
+/// `NullPointerException` for a null array (dereferencing `.length`) and
+/// otherwise always succeeds (offset 0 / count == length is always in
+/// range).
+pub(crate) fn native_string_init_from_char_array(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let arr = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
+    };
+    let len = ctx.array_length(arr);
+    let mut units = vec![0u16; len];
+    let written = ctx.read_char_array_into(arr, 0, &mut units);
+    units.truncate(written);
+    ctx.init_string_from_units(this, &units);
+    Ok(None)
+}
+
+/// `java.lang.String(char[] value, int offset, int count)`
+///
+/// Real JDK semantics: NPE for a null array (dereferencing `.length` inside
+/// `rangeCheck`), then `StringIndexOutOfBoundsException` per
+/// `checkBoundsOffCount`'s spec (see [`bounds_off_count_violation`]) — both
+/// checked *before* touching the array contents, matching the real
+/// constructor's evaluation order.
+pub(crate) fn native_string_init_from_char_array_range(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let arr = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
+    };
+    let offset = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let count = match args.get(3) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let length = ctx.array_length(arr) as i32;
+    if let Some(index) = bounds_off_count_violation(offset, count, length) {
+        return Err(
+            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
+        );
+    }
+    let mut units = vec![0u16; count as usize];
+    let written = ctx.read_char_array_into(arr, offset as usize, &mut units);
+    units.truncate(written);
+    ctx.init_string_from_units(this, &units);
+    Ok(None)
 }
 
 pub(crate) fn register_string_utf16_natives(registry: &mut NativeMethodRegistry) {
@@ -5345,6 +5469,23 @@ pub(crate) fn register_string_utf16_natives(registry: &mut NativeMethodRegistry)
         "checkBoundsOffCount",
         "(III)I",
         native_string_check_bounds_off_count,
+    );
+
+    // PERF: String(char[]) / String(char[], int, int) constructor
+    // intrinsics — bulk Latin1-fits scan + copy in Rust instead of the
+    // interpreted per-char loop in real JDK's `StringUTF16.compress`/
+    // `toBytes`. See the comment block above `native_string_init_from_char_array`.
+    registry.register(
+        "java/lang/String",
+        "<init>",
+        "([C)V",
+        native_string_init_from_char_array,
+    );
+    registry.register(
+        "java/lang/String",
+        "<init>",
+        "([CII)V",
+        native_string_init_from_char_array_range,
     );
 
     // T19.H1 fix: cglib TypeUtils.map relies on String.indexOf(String, int)

@@ -2573,6 +2573,17 @@ impl GenerationalHeap {
         self.satb_queue.clone()
     }
 
+    /// Borrow the SATB queue without cloning the `Arc`. The JIT helper
+    /// entry path (`VmHeap::flush_thread_satb`) checks `is_active()` on
+    /// EVERY slow-path allocation; the refcount round trip of
+    /// [`Self::satb_queue_handle`] is measurable there and buys nothing —
+    /// the queue, once installed by `enable_concurrent_gc`, lives as long
+    /// as the heap.
+    #[inline]
+    pub fn satb_queue_ref(&self) -> Option<&SatbQueue> {
+        self.satb_queue.as_deref()
+    }
+
     /// Get the old generation's base pointer and capacity (for creating a ConcurrentMarker).
     pub fn old_gen_info(&self) -> (usize, usize) {
         let og = self.old_gen.lock();
