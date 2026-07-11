@@ -3538,6 +3538,26 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<i32, Meth
         // Spread bits (like HashMap.hash in JDK)
         return Ok(h ^ ((h as u32) >> 16) as i32);
     }
+    // Wrapper types: hash by their primitive value (matches JDK Integer.hashCode
+    // etc.) — checked BEFORE the enum check (perf: a JDK wrapper class can never
+    // be a `java/lang/Enum` subclass, so this reorder is behavior-preserving; see
+    // reference_hashmap_native_call_dispatch_overhead_20260711 — this is by far
+    // the most common key type and `enum_key_identity`'s superclass-chain walk
+    // took a `class_manager` RwLock read + allocating class-name lookup per hop
+    // just to fail for every Integer/Long/etc. key).
+    if let Some(prim) = unbox_wrapper(ctx, key) {
+        let h = match prim {
+            Value::Int(v) => v,
+            Value::Long(v) => (v ^ (v >> 32)) as i32,
+            Value::Float(v) => v.to_bits() as i32,
+            Value::Double(v) => {
+                let bits = v.to_bits() as i64;
+                (bits ^ (bits >> 32)) as i32
+            }
+            _ => ctx.identity_hash_code(key),
+        };
+        return Ok(h ^ ((h as u32) >> 16) as i32);
+    }
     // Enum constants: hash by (declaring class name, constant name) — the
     // JLS-canonical identity of an enum constant — so an enum-keyed map's
     // `put` and `get` agree on the bucket even if the VM materialised two
@@ -3553,20 +3573,6 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<i32, Meth
         for b in const_name.bytes() {
             h = h.wrapping_mul(31).wrapping_add(b as i32);
         }
-        return Ok(h ^ ((h as u32) >> 16) as i32);
-    }
-    if let Some(prim) = unbox_wrapper(ctx, key) {
-        // Wrapper types: hash by their primitive value (matches JDK Integer.hashCode etc.)
-        let h = match prim {
-            Value::Int(v) => v,
-            Value::Long(v) => (v ^ (v >> 32)) as i32,
-            Value::Float(v) => v.to_bits() as i32,
-            Value::Double(v) => {
-                let bits = v.to_bits() as i64;
-                (bits ^ (bits >> 32)) as i32
-            }
-            _ => ctx.identity_hash_code(key),
-        };
         return Ok(h ^ ((h as u32) >> 16) as i32);
     }
     // S111r-bug-fix (peaceful-sammet): for arbitrary user-defined objects we
@@ -3652,6 +3658,29 @@ fn map_keys_equal(
     if std::ptr::eq(a.as_ptr(), b.as_ptr()) {
         return Ok(true);
     }
+    // String value equality (the common case, checked first).
+    if let (Some(sa), Some(sb)) = (ctx.read_string(a), ctx.read_string(b)) {
+        return Ok(sa == sb);
+    }
+    // Wrapper type equality: unbox and compare primitives. Checked before the
+    // Thread-mirror and enum checks below (perf: neither Thread nor any enum
+    // class can also be a JDK wrapper class, so this reorder is
+    // behavior-preserving; see
+    // reference_hashmap_native_call_dispatch_overhead_20260711 — wrapper keys
+    // are by far the most common case, and both checks below take a
+    // `class_manager` RwLock read + allocating class-name lookup per call
+    // just to fail for every Integer/Long/etc. key).
+    if let (Some(pa), Some(pb)) = (unbox_wrapper(ctx, a), unbox_wrapper(ctx, b)) {
+        return Ok(match (pa, pb) {
+            (Value::Int(x), Value::Int(y)) => x == y,
+            (Value::Long(x), Value::Long(y)) => x == y,
+            (Value::Float(x), Value::Float(y)) => x == y,
+            (Value::Double(x), Value::Double(y)) => x == y,
+            (Value::Int(x), Value::Long(y)) => (x as i64) == y,
+            (Value::Long(x), Value::Int(y)) => x == (y as i64),
+            _ => false,
+        });
+    }
     // `java.lang.Thread` mirrors are VM-owned identity objects. A moving GC
     // preserves the header identity hash, but some real-JDK weak-key paths can
     // still compare an older mirror address against the current thread mirror
@@ -3665,10 +3694,6 @@ fn map_keys_equal(
     {
         return Ok(true);
     }
-    // String value equality (the common case, checked first).
-    if let (Some(sa), Some(sb)) = (ctx.read_string(a), ctx.read_string(b)) {
-        return Ok(sa == sb);
-    }
     // Enum constants: compare by (declaring class, ordinal). `Enum.equals` is
     // `final` identity, so a correct VM never reaches here for two non-equal
     // enum objects; but if the VM produced a duplicate object for the same
@@ -3677,18 +3702,6 @@ fn map_keys_equal(
     // See `enum_key_identity`.
     if let (Some(ia), Some(ib)) = (enum_key_identity(ctx, a), enum_key_identity(ctx, b)) {
         return Ok(ia == ib);
-    }
-    // Wrapper type equality: unbox and compare primitives
-    if let (Some(pa), Some(pb)) = (unbox_wrapper(ctx, a), unbox_wrapper(ctx, b)) {
-        return Ok(match (pa, pb) {
-            (Value::Int(x), Value::Int(y)) => x == y,
-            (Value::Long(x), Value::Long(y)) => x == y,
-            (Value::Float(x), Value::Float(y)) => x == y,
-            (Value::Double(x), Value::Double(y)) => x == y,
-            (Value::Int(x), Value::Long(y)) => (x as i64) == y,
-            (Value::Long(x), Value::Int(y)) => x == (y as i64),
-            _ => false,
-        });
     }
     // S111r-bug-fix (peaceful-sammet): fall back to the user-defined
     // `equals(Object)` so HashMap honours the equals/hashCode contract for

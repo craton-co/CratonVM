@@ -50,7 +50,7 @@ use crate::old_gen::OldGen;
 use crate::satb::SatbQueue;
 use crate::{class_layout, compact_ref_fields_enabled, is_compact_object, object_body_size};
 use cratonvm_types::GC_FLAG_COMPACT;
-use cratonvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_types::{ClassId, CompactLayout, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -8298,7 +8298,32 @@ fn compact_field_slot(header: &ObjectHeader, index: usize) -> Option<(usize, boo
     if !is_compact_object(header) {
         return None;
     }
-    let layout = class_layout(header.class_id.as_u32())?;
+    let cid = header.class_id.as_u32();
+    // Per-thread single-entry cache, mirroring `compact_oop_scan` (heap.rs) —
+    // getfield/putfield on a run of same-class objects (e.g. repeated
+    // `Integer` unboxing, or a HashMap's internal per-entry field writes)
+    // otherwise re-takes the `CLASS_LAYOUTS` registry RwLock on every single
+    // field access. Validated against `layout_generation()` so a redefine
+    // (which bumps the generation) cannot serve a stale layout. See
+    // reference_hashmap_native_call_dispatch_overhead_20260711.
+    thread_local! {
+        static FIELD_SLOT_CACHE: std::cell::RefCell<Option<(u32, u64, Arc<CompactLayout>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let gen = cratonvm_types::layout_generation();
+    let layout = FIELD_SLOT_CACHE.with(|c| {
+        {
+            let cache = c.borrow();
+            if let Some((cached_cid, cached_gen, arc)) = &*cache {
+                if *cached_cid == cid && *cached_gen == gen {
+                    return Some(arc.clone());
+                }
+            }
+        }
+        let arc = class_layout(cid)?;
+        *c.borrow_mut() = Some((cid, gen, arc.clone()));
+        Some(arc)
+    })?;
     let off = layout.field_offset(index)? as usize;
     let is_ref = layout.field_is_ref(index)?;
     Some((off, is_ref))

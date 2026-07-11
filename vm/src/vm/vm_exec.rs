@@ -528,6 +528,24 @@ fn pin_value_for_native_call(shared: &SharedVm, roots: &mut Vec<ObjectRef>, v: &
     }
 }
 
+/// `java.lang.Object`'s `ClassId`, resolved once and cached lock-free
+/// thereafter. `java.lang.Object` is always loaded before any bytecode runs
+/// (it roots the class hierarchy the VM needs to bootstrap), so in practice
+/// the lookup below succeeds on the very first call — but if it were ever to
+/// return `None`, nothing is cached and the next call retries the real
+/// lookup rather than permanently disabling the stale-receiver check.
+#[inline]
+fn object_class_id(shared: &SharedVm) -> Option<ClassId> {
+    use std::sync::OnceLock;
+    static OBJECT_CLASS_ID: OnceLock<ClassId> = OnceLock::new();
+    if let Some(id) = OBJECT_CLASS_ID.get() {
+        return Some(*id);
+    }
+    let resolved = shared.class_manager.read().find_class_by_name("java/lang/Object")?;
+    let _ = OBJECT_CLASS_ID.set(resolved); // races are harmless; loser just re-resolves next time
+    Some(resolved)
+}
+
 fn recover_stale_lambda_receiver_from_native_pins(
     shared: &SharedVm,
     thread: &JvmThread,
@@ -540,14 +558,14 @@ fn recover_stale_lambda_receiver_from_native_pins(
         return None;
     }
 
+    // Perf: check the cheap sentinel/cached-ClassId comparisons before ever
+    // taking the `class_manager` RwLock — this runs on EVERY non-Object-method
+    // invoke_virtual (e.g. every `HashMap.put`/`.get` call), and the vast
+    // majority of receivers are ordinary, non-stale objects. See
+    // reference_hashmap_native_call_dispatch_overhead_20260711.
     let stale_object_receiver = receiver_class_id == ClassId::new(0)
         || receiver_class_id == ClassId::new(u32::MAX)
-        || shared
-            .class_manager
-            .read()
-            .get_class(receiver_class_id)
-            .map(|class| class.name.as_ref() == "java/lang/Object")
-            .unwrap_or(false);
+        || object_class_id(shared) == Some(receiver_class_id);
     if !stale_object_receiver {
         return None;
     }
