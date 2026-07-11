@@ -47,7 +47,7 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 | Sieve (100K x 20,000)               | 5,253 ms      | 19,371 ms         | 3.69x         |
 | Matrix 1280x1280                    | 2,623 ms      | 10,364 ms         | 3.95x         |
 | **QuickBench TOTAL**                | **13,272 ms** | **50,521 ms**     | **3.81x**     |
-| HashMap (1M put/get, isolated)      | 80 ms         | 2,370 ms          | 29.6x         |
+| HashMap (1M put/get, isolated)      | 51.1 ms       | 409.6 ms          | 8.01x         |
 | String/Regex (10K, isolated)        | 11 ms         | 414 ms            | 37.6x         |
 | Binary Trees (depth=18, isolated)   | 382 ms        | 4,916 ms          | 12.9x         |
 
