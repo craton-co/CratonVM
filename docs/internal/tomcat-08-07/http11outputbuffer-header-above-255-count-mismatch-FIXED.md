@@ -1,6 +1,6 @@
 # TestHttp11OutputBuffer — header-count mismatch for headers above 255 bytes
 
-**Status:** OPEN. **Severity:** medium (HTTP/1.1 wire-protocol correctness).
+**Status:** RESOLVED 2026-07-11. **Severity:** medium (HTTP/1.1 wire-protocol correctness).
 **HotSpot:** PASS (fresh-verified).
 
 ## Summary
@@ -47,3 +47,22 @@ what the `5` vs `3` count represents (likely
 test-harness pattern for counting writes to a mock `SocketWrapper`), then
 trace `Http11OutputBuffer`'s buffer-growth logic under CratonVM for a >255
 byte header value to see where the write count diverges from HotSpot's.
+
+## Resolution
+
+The apparent output-buffer mismatch was two `HttpURLConnection` compatibility
+defects in CratonVM's response/client path, not Tomcat server write splitting:
+
+- Response header values were decoded as strict UTF-8. Tomcat's legal
+  ISO-8859-1-compatible `0x80..0xff` header bytes therefore made the client
+  reject the entire response. Header values now use a byte-preserving mapping.
+- The legacy client omitted HotSpot `HttpURLConnection`'s default
+  `Connection: keep-alive` request header. Tomcat then omitted the matching
+  keep-alive response headers, producing the remaining `3` vs `5` count.
+  CratonVM now sends that default unless the caller supplies `Connection`.
+
+Validated on the Azure Linux host with a fresh task-specific release binary:
+`org.apache.coyote.http11.TestHttp11OutputBuffer` passes all four tests,
+including `testHTTPHeaderAbove255` and the adjacent
+`testHTTPHeader128To255` residual. Focused native regression tests also cover
+Latin-1 header parsing and default keep-alive request construction.
