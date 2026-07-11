@@ -13382,7 +13382,17 @@ fn native_stream_sorted_cmp(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
-    let elems = stream_elements(ctx, this)?;
+
+    // `stream_elements` can materialize/dispatch and therefore collect.  Both
+    // inputs arrived as raw native locals, so root them BEFORE that first
+    // potentially-GC-triggering call.  Pinning `comparator` afterwards pins
+    // the old evacuated address and cannot repair it (the WildFly
+    // JmxMetricCollector sorted-stream path exposed exactly that failure).
+    let this_pin = ctx.pin_native_root(this);
+    let cmp_pin = ctx.pin_native_root(comparator);
+    let result = (|| -> MethodCallResult {
+        let this = ctx.read_native_pin(this_pin, this);
+        let elems = stream_elements(ctx, this)?;
 
     // GC-SAFETY: the Comparator dispatch (and any key-extractor `apply`) allocates
     // and re-enters Java → a moving young GC relocates the comparator and the
@@ -13391,7 +13401,6 @@ fn native_stream_sorted_cmp(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // from their pin handles on every comparison; build the result by re-reading
     // in sorted order. Stable merge sort — O(n log n); the comparison is fallible
     // (a comparator that throws short-circuits) and a non-Int return is "equal".
-    let cmp_pin = ctx.pin_native_root(comparator);
     let (_, elem_handles) = pin_value_slice(ctx, &elems);
     let mut idx: Vec<Value> = (0..elems.len() as i32).map(Value::Int).collect();
     let sort_res = merge_sort_fallible(ctx, &mut idx, |c, a, b| {
@@ -13424,9 +13433,12 @@ fn native_stream_sorted_cmp(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             read_pinned_elem(ctx, elem_handles[i], elems[i])
         })
         .collect();
-    ctx.unpin_native_roots(cmp_pin);
     sort_res?;
+    let this = ctx.read_native_pin(this_pin, this);
     make_derived_stream(ctx, this, &sorted)
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn native_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
