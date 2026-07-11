@@ -163,31 +163,35 @@ Remaining note:
 ## 3. Misc
 - Class unloading machinery (`gc/src/class_unloading.rs`) has no driver;
   statics/mirrors/class-locks are immortal roots (INT-7).
-- G1 weak/soft refs with dead OLD-region referents are cleared only when
-  the region is evacuated — concurrent-mark cleanup never feeds reference
-  processing (INT-8). CORRECTED ANALYSIS (third wave): the originally
-  proposed fix — "run the ReferenceProcessor against the mark bitmap
-  after remark" — is INERT as stated, because the mark bitmap is TAINTED
-  for exactly the referents it would judge: (a) the concurrent marker's
-  `scan_object_refs` has no Reference-class awareness and traces straight
-  through the (restored) `referent` slot of every live Reference, and
-  (b) each mid-cycle young pause's `weakref_null_referents_pre_gc` writes
-  fire the SATB pre-barrier, recording every active referent as a
-  mark-cycle root. A real fix needs all four of: (1) marker referent-slot
-  hiding — a Reference-address skip set snapshotted at mark start and
-  remapped across every evacuation pause; (2) SATB suppression on the
-  protocol's null-pass writes (they are not semantic overwrites); (3) a
-  `Reference.get()`/`refersTo` keep-alive barrier while marking is active
-  (single hook family: `native_ref_get`/`native_soft_ref_get` — without
-  it a mutator can `get()` a referent, store it into a black object, and
-  remark clears the weak ref while a strong path exists → UAF, the exact
-  race HotSpot's G1ReferenceGet intrinsic barrier exists for); (4)
-  remark-time reference processing that resurrects `to_finalize` (mark +
-  re-drain) BEFORE `cleanup` frees wholly-dead regions. Related spec gap
-  in the same family: cleanup's in-place free reclaims dead FINALIZABLE
-  objects without resurrection — the post-GC staleness guard then
-  correctly skips them, so no UAF, but their `finalize()` silently never
-  runs.
+- **INT-8 FIXED** (branch `fix/int8-g1-remark-refproc-20260710`): G1
+  weak/soft refs with dead OLD-region referents now clear at
+  concurrent-mark completion, and `finalize()` runs for objects reclaimed
+  by cleanup's in-place frees. The corrected four-part shape from the
+  third-wave analysis was implemented exactly: (1) marker referent-slot
+  hiding — Weak/Soft/Phantom Reference-object addresses snapshotted from
+  the registry at initial mark into `G1Collector::reference_skip`,
+  `scan_object_refs` skips slot 0 of those objects, and every evacuation
+  pause re-keys survivors / prunes CSet casualties (Finalizer/Cleaner
+  registrations excluded — their slot 0 is a strong field); (2) SATB
+  suppression on the protocol writes (`set_field_no_satb` RAII scope: the
+  pre-pause referent null pass and remark-time clears); (3) a
+  `Reference.get()` keep-alive barrier
+  (`NativeContext::gc_reference_keep_alive` → `write_barrier_pre`, the
+  G1ReferenceGet equivalent; `refersTo` stays exempt per its JDK
+  test-without-retain contract); (4) remark-time reference processing —
+  `g1_final_remark_and_cleanup` invokes a VM callback between the
+  fixed-point drain and cleanup with the bitmap+TAMS `is_live_after_mark`
+  predicate, with dead-by-mark staleness guards, and resurrects (mark +
+  re-drain) everything handed out: dead finalizables, cleaner actions,
+  pending cleaner chains, policy-retained soft referents. Plus:
+  `force_gc_from_native` now calls `maybe_concurrent_gc` — a
+  `System.gc()`-driven app could previously never start or complete a G1
+  cycle at all. Validated on the probe host: new `RefCheckOld` probe
+  (old-promoted weak referents in ~95%-live keeper regions + finalizables
+  in wholly-dead regions, `-XX:InitiatingHeapOccupancyPercent=1`) went
+  from `oldCleared=0/64 enqueued=0 finalized=0/32` to HotSpot-identical
+  `64/64 / 64 / 32/32 / softKept=8/8` (5/5 runs, two flag sets); full
+  regression batch green (RefCheck/Churn/Copy/Humongous × Gen/G1/ZGC).
 - G1 string-dedup table stores raw addresses, never remapped — API now
   carries a DO-NOT-WIRE-UP doc warning; the remap is still needed before
   `-XX:+UseStringDeduplication` can do anything (G1CORE-6).
