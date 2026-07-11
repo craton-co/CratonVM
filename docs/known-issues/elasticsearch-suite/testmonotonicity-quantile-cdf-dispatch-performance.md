@@ -84,3 +84,15 @@ movement (not a hang) and see which functions are hot.
   from sparse backtrace samples.
 - Once fixed, re-verify `SortingDigestTests` reaches a clean 20/20 in both
   `-Jit on` and `-Jit off` through the standard suite runner.
+
+## Additional data point (2026-07-10, `fix/es-tdigest-jiton-20260710` binary)
+
+On a binary carrying the IR-lowerer bail but NOT the `05f6930e` OSR deny
+(so `DualPivotQuicksort.sort` itself compiled and its callees fell back to
+the interpreter), `testMonotonicity` under `-Jit on` did not complete even
+at a raised `-Dtests.timeoutSuite=3600000!` budget (run `.suite-long3`,
+wall 3,611 s, abandoned at the 1-hour mark; the other 17 executed methods
+passed in ~2 minutes total). Host was loaded (post-reboot, 13+ concurrent
+sessions), so treat the absolute number loosely — but it confirms the
+dispatch-churn cost dwarfs everything else regardless of which parts of the
+DPQ call tree are compiled.

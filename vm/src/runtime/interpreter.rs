@@ -19366,6 +19366,42 @@ pub(crate) fn try_lambda_dispatch(
                 Value::Object(Some(r)) => Some(shared.heap.class_id_of(*r)),
                 _ => None,
             };
+            // Diagnostic (CRATONVM_DBG_LAMBDA): when a lambda dispatch receiver
+            // resolves to an unknown/zero class (the stale-captured-reference
+            // family — NoSuchMethodError like "java/lang/Object.get(I)D"),
+            // dump the raw pointer, its class id, the load_and_forward result,
+            // and a FRESH re-read of the proxy's capture field. Discriminates
+            // "stale baked into the proxy field" (fresh re-read returns the
+            // same dead pointer) from a transient Rust-local staleness.
+            if crate::runtime::env_cache::lambda_dbg() {
+                if let (Some(cid), Value::Object(Some(r))) = (recv_class_id_opt, &full_args[0]) {
+                    if cid == ClassId::new(0) {
+                        let fwd = shared.heap.load_and_forward(*r);
+                        let fwd_cid = shared.heap.class_id_of(fwd);
+                        let fresh = shared.heap.get_field(obj_ref, 0);
+                        let (fresh_ptr, fresh_cid) = match fresh {
+                            Value::Object(Some(f)) => {
+                                (f.as_ptr() as usize, Some(shared.heap.class_id_of(f)))
+                            }
+                            _ => (0, None),
+                        };
+                        eprintln!(
+                            "[lambda-nsme-diag] recv={:p} cid={:?} fwd={:p} fwd_cid={:?} \
+                             proxy={:p} fresh_field=0x{:x} fresh_cid={:?} impl={}.{}{}",
+                            r.as_ptr(),
+                            cid,
+                            fwd.as_ptr(),
+                            fwd_cid,
+                            obj_ref.as_ptr(),
+                            fresh_ptr,
+                            fresh_cid,
+                            call_site.impl_handle.class_name,
+                            call_site.impl_handle.member_name,
+                            call_site.impl_handle.descriptor,
+                        );
+                    }
+                }
+            }
             let receiver_class = match recv_class_id_opt {
                 Some(rcv_class_id) => shared
                     .class_manager
