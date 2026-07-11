@@ -9,13 +9,18 @@ angles**; this index is the consolidated map. Read it first.
 - RETIRED: [`tomcat-08-07/accesslogvalve-rewritevalve-connection-failures-RESOLVED.md`](../internal/tomcat-08-07/accesslogvalve-rewritevalve-connection-failures-RESOLVED.md) (moved from `known-issues/tomcat-08-07/`) — five of six root causes found across this investigation (`URL.openConnection()` CCE, `ByteBuffer.address`, `StringReader.read()`, the cross-cutting `SocketWrapperBase.lock` NPE, and a JIT `ConcurrentLinkedQueue` allocate-then-CAS miscompile) are FIXED and landed on `dev`. The sixth — a SIGSEGV around `TestAccessLogValve` test #8 — is a confirmed, byte-for-byte register-signature match with the already-tracked, currently-OPEN "register-invisible JIT root" bug family (real fix needs precise JIT oop maps / shadow stack, deep infrastructure work, deliberately not attempted). Catalogued as another occurrence in [`tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md`](tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md), the live tracking doc for this family — don't reopen the retired doc for a repeat of this signature, add it there instead.
 - **Correction while retiring:** the retired doc's sixth-cause section had cited `hib-global-temptable-nondeterministic-sigsegv-20260710.md` as a corroborating occurrence of this family. That's stale — see the entry above (2026-07-10 Hibernate remote rerun SIGSEGV cluster RESOLVED): that cluster was a different, unrelated, already-fixed bug. Corrected in both the retired doc and the swallow-uploads tracking doc.
 
-## 2026-07-10 `testNonBlockingReadIgnoreIsReady`: Acceptor/Poller theory refuted; real cause is deferred `HttpURLConnection` streaming
+## 2026-07-11 `testNonBlockingReadIgnoreIsReady`: fixed-length HTTP streaming FIXED
 
-**Correction (2026-07-11):** The Acceptor/Poller finding below was disproved
+**Resolved (2026-07-11):** The Acceptor/Poller finding below was disproved
 by a minimal fixed-length-streaming `HttpURLConnection` reproducer. The
 legacy bridge buffers its body locally and only opens/sends the request at
 response retrieval; direct `Socket` clients are accepted promptly. The active
-record is [`httpurlconnection-fixed-length-streaming-deferred.md`](httpurlconnection-fixed-length-streaming-deferred.md).
+record is archived at [`httpurlconnection-fixed-length-streaming-deferred-FIXED.md`](../internal/tomcat-08-07/httpurlconnection-fixed-length-streaming-deferred-FIXED.md).
+
+The implementation now sends real-carrier fixed-length HTTP request heads and
+body writes immediately; both `testNonBlockingReadIgnoreIsReady` and
+`testNonBlockingRead` pass. The remaining text in this section is retained as
+historical root-cause evidence.
 
 Re-investigated
 [`tomcat-08-07/nonblockingreadignoreisready-async-error-response-completion-gap.md`](tomcat-08-07/nonblockingreadignoreisready-async-error-response-completion-gap.md).
@@ -42,7 +47,7 @@ effect — the peer had already sent EOF long before close() ran).
   `Socket` client was accepted promptly under the same NIO/Poller shape. The
   apparent stall was entirely client-side (see the correction above). Moved to
   `docs/internal/` — its primary claim is refuted and the real, still-open
-  issue is tracked separately by `httpurlconnection-fixed-length-streaming-deferred.md`
+  issue was resolved in `httpurlconnection-fixed-length-streaming-deferred-FIXED.md`
   (linked above), which is currently owned by another concurrent session.
 
 ## 2026-07-10 ES suite-wide `Build$CurrentHolder` manifest-null FIXED (VM-core `Unsafe` bootstrap bug); new pre-existing Jackson residual filed
