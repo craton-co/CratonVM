@@ -1,7 +1,8 @@
-# KeyPairGenerator: missing Ed448/RSASSA-PSS registrations, plus unrecognized algorithm names get swallowed into a generic "Unknown" error message
+# KeyPairGenerator: Ed25519/Ed448/RSASSA-PSS support and exact unknown-name diagnostics — FIXED
 
-Status: open — two related but distinct CratonVM bugs found together: missing algorithm registrations, and a
-diagnostic bug that hides the actual requested algorithm name
+Status: fixed 2026-07-11 — KeyPairGenerator now routes Ed25519 and Ed448 to the real JDK EdDSA SPIs, maps
+RSASSA-PSS to real RSA key generation, and preserves the exact requested name in all synthetic-generator diagnostics.
+The accompanying native RSASSA-PSS signing path now creates correctly salted signatures as well.
 
 Date observed: 2026-07-10/11 (fresh-binary rerun from current dev, branch fix/keycloak-nonpassed-rerun-v2-20260710)
 
@@ -64,18 +65,14 @@ This is a pure diagnostics/message-correctness bug, but a real one — it active
 actually requested from anyone debugging a `NoSuchAlgorithmException`, for every algorithm CratonVM doesn't
 explicitly recognize by name.
 
-## Next steps
+## Resolution
 
-1. Find CratonVM's `KeyPairGenerator.getInstance()` implementation (likely `native-builtins/src/jca/` per this
-   session's earlier finding of `native-builtins/src/jca/key_factory.rs` — check for a sibling
-   `key_pair_generator.rs` or similar) and fix the not-found branch to interpolate the actual requested algorithm
-   name into the exception message instead of a hardcoded `"Unknown"`.
-2. Separately, consider registering `Ed448` and `RSASSA-PSS` `KeyPairGenerator` support (or confirm they're
-   intentionally out of scope) — `RSASSA-PSS` in particular is a standard, commonly-needed JCA algorithm name
-   (RSA-PSS signatures per RFC 8017), not an exotic one.
-3. Once the message-formatting bug is fixed, re-run the affected classes — the underlying "not available" gaps
-   for `Ed448`/`Ed25519`/`RSASSA-PSS` will still need real implementations, but at least error messages will
-   correctly identify what's missing for future triage.
+- `native-builtins/src/jca/key_factory.rs` records each requested generator name, maps `RSASSA-PSS` to RSA key
+  material, and drives the real JDK Ed25519/Ed448 key-generator SPIs.
+- `native-builtins/src/jca/signature.rs` drives real JDK EdDSA signing and verification, while
+  `native-builtins/src/crypto_impl.rs` implements blinded, randomly salted RSASSA-PSS signing to match its existing
+  native PSS verifier.
+- Unknown names now report e.g. `Probe-Unknown-20260711 KeyPairGenerator not available`, never `Unknown`.
 
 ## Repro
 
@@ -95,3 +92,7 @@ CratonVM-unrecognized algorithm name) under CratonVM — the resulting `NoSuchAl
 2026-07-10/11 rerun with a binary built from current `dev`. Source:
 `apps/keycloak/common/src/main/java/org/keycloak/common/util/KeyUtils.java` (line 77-84),
 `apps/keycloak/crypto/elytron/src/test/java/org/keycloak/crypto/elytron/test/ElytronSignatureAlgTest.java` (line 28).
+
+Final verification used the unique remote binary `/data/data/cratonvm-keypairgen-probe-20260711` on
+2026-07-11. Its standalone probe passed Ed25519 and Ed448 sign/verify, RSASSA-PSS sign/verify (96-byte signature
+with a 768-bit probe key), and exact unknown-name reporting.

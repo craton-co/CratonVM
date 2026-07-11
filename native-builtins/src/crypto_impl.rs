@@ -2745,9 +2745,7 @@ pub fn rsa_key_get_priv(id: u64) -> Option<(Vec<u8>, Vec<u8>)> {
 // JWA's PS256 / PS384 / PS512 map to RSASSA-PSS with MGF1 over the same hash and
 // a salt length equal to the hash length. Keycloak's `JavaAlgorithm` resolves
 // them to BouncyCastle's `SHA{256,384,512}withRSAandMGF1`; the empty CratonVM
-// provider list can't service the real BC SPI, so we verify natively. Verify
-// only (the SD-JWT key-binding path verifies a holder-signed JWT) — signing PSS
-// would need randomised salt and is not on any exercised path.
+// provider list can't service the real BC SPI, so we sign and verify natively.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2788,6 +2786,50 @@ fn pss_mgf1(hash: PssHash, seed: &[u8], len: usize) -> Vec<u8> {
     }
     out.truncate(len);
     out
+}
+
+/// RSASSA-PSS sign with MGF1 over the selected digest and a digest-sized random
+/// salt (RFC 8017 §8.1.1 / §9.1). Returns an empty vector when the modulus is
+/// too small for the chosen digest or secure OS entropy is unavailable.
+pub fn rsa_sign_pss(key: &RsaPrivateKey, hash: PssHash, message: &[u8]) -> Vec<u8> {
+    let mod_bits = key.n.bit_length();
+    if mod_bits <= 1 {
+        return Vec::new();
+    }
+    let k = (mod_bits + 7) / 8;
+    let em_bits = mod_bits - 1;
+    let em_len = (em_bits + 7) / 8;
+    let hlen = hash.hlen();
+    let slen = hlen;
+    if em_len < hlen + slen + 2 {
+        return Vec::new();
+    }
+
+    let mut salt = vec![0u8; slen];
+    if !os_random_bytes(&mut salt) {
+        return Vec::new();
+    }
+    let m_hash = hash.hash(message);
+    let mut m_prime = Vec::with_capacity(8 + hlen + slen);
+    m_prime.extend_from_slice(&[0u8; 8]);
+    m_prime.extend_from_slice(&m_hash);
+    m_prime.extend_from_slice(&salt);
+    let h = hash.hash(&m_prime);
+
+    let ps_len = em_len - hlen - slen - 2;
+    let mut db = vec![0u8; ps_len];
+    db.push(0x01);
+    db.extend_from_slice(&salt);
+    let db_mask = pss_mgf1(hash, &h, db.len());
+    let mut masked_db: Vec<u8> = db.iter().zip(db_mask.iter()).map(|(a, b)| a ^ b).collect();
+    let zero_bits = 8 * em_len - em_bits;
+    masked_db[0] &= 0xFFu8 >> zero_bits;
+
+    let mut em = masked_db;
+    em.extend_from_slice(&h);
+    em.push(0xbc);
+    let m = BigUint::from_bytes_be(&em);
+    rsa_private_modpow_blinded(&m, &key.d, &key.e, &key.n).to_bytes_be_padded(k)
 }
 
 /// RSASSA-PSS verify with MGF1 and salt length == hLen (the JWA convention for
@@ -2878,6 +2920,16 @@ pub fn rsa_verify_pss_by_id(
 ) -> Option<bool> {
     let (n, e) = rsa_key_get_pub(id)?;
     Some(rsa_verify_pss(&n, &e, hash, message, signature))
+}
+
+/// RSASSA-PSS sign against a stored key id. `None` only when the key id is
+/// unknown; an empty signature signals an invalid modulus or unavailable entropy.
+pub fn rsa_sign_pss_by_id(id: u64, hash: PssHash, message: &[u8]) -> Option<Vec<u8>> {
+    let guard = RSA_KEY_STORE.read();
+    guard
+        .as_ref()
+        .and_then(|m| m.get(&id))
+        .map(|kp| rsa_sign_pss(&kp.private_key, hash, message))
 }
 
 // ---------------------------------------------------------------------------
@@ -6314,6 +6366,21 @@ mod tests {
             bad[0] ^= 1;
             assert!(!rsa_verify_pss(&n, &e, h, &bad, &sig), "{:?}: tampered msg", h);
         }
+    }
+
+    #[test]
+    fn rsa_pss_sign_verify_round_trip() {
+        let (public, private) = Rsa::generate_keypair(1024);
+        let message = b"CratonVM RSASSA-PSS round trip";
+        let signature = rsa_sign_pss(&private, PssHash::Sha256, message);
+        assert_eq!(signature.len(), 128);
+        assert!(rsa_verify_pss(
+            &public.n.to_bytes_be(),
+            &public.e.to_bytes_be(),
+            PssHash::Sha256,
+            message,
+            &signature,
+        ));
     }
 
     // RF.10: PKIX chain walker — helper unit coverage.
