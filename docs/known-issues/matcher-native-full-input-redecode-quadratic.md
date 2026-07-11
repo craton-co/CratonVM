@@ -5,7 +5,8 @@ uncommitted-then-committed 2026-07-11), but **that native bridge is not the acti
 dispatch path for a real-JDK `Pattern`/`Matcher` program**, so the fix currently has
 no observable effect. The actual performance bug a user hits on today's default
 build is a *different*, deeper issue — see
-[`substring-large-parent-quadratic-allocation.md`](substring-large-parent-quadratic-allocation.md).
+[`../internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`](../internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md)
+(now FIXED).
 
 ## Correction (2026-07-11, same day)
 

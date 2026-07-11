@@ -25434,63 +25434,36 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             }
         },
     );
+    // These two were inline closures that called `ctx.read_string(this)`
+    // (decode the ENTIRE parent String) followed by `s.chars().collect()`
+    // (ANOTHER full-string pass into a `Vec<char>`) on every single call,
+    // regardless of how small the requested substring range was -- O(parent
+    // length) instead of O(substring length) per call. This is the real,
+    // active registration for `java/lang/String.substring` in real-JDK mode
+    // (register_essential_natives; NOT the lang_string.rs `native_string_substring`
+    // this file also defines, which is only reachable in
+    // `register_synthetic_overrides`, `#[cfg(feature = "synthetic-jdk")]`-gated
+    // and therefore never compiled into the default build -- a dead end this
+    // investigation went down first). Root-caused via a `while
+    // (m.find()) { m.group(N); }`-shaped user benchmark that turned out to
+    // reduce to plain `String.substring()` on a large parent string scaling
+    // O(n^2); see docs/internal/fixed-suite-bugs/
+    // substring-large-parent-quadratic-allocation-FIXED.md.
+    // `native_string_substring`/`native_string_substring_one` already have a
+    // "read only the requested range, don't materialize the whole String
+    // first" fast path (peeks at the backing array length + slices directly)
+    // -- delegate to them instead of duplicating (and re-introducing) the bug.
     registry.register(
         "java/lang/String",
         "substring",
         "(II)Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let begin = match args.get(1) {
-                Some(Value::Int(v)) => *v as usize,
-                _ => 0,
-            };
-            let end = match args.get(2) {
-                Some(Value::Int(v)) => *v as usize,
-                _ => 0,
-            };
-            let s = ctx.read_string(this).unwrap_or_default();
-            let chars: Vec<char> = s.chars().collect();
-            if end > chars.len() || begin > end {
-                return Err(
-                    cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
-                        index: begin as i32,
-                    }
-                    .into(),
-                );
-            }
-            let slice: String = chars[begin..end].iter().collect();
-            Ok(Some(Value::Object(Some(ctx.create_string(&slice)))))
-        },
+        native_string_substring,
     );
     registry.register(
         "java/lang/String",
         "substring",
         "(I)Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let begin = match args.get(1) {
-                Some(Value::Int(v)) => *v as usize,
-                _ => 0,
-            };
-            let s = ctx.read_string(this).unwrap_or_default();
-            let chars: Vec<char> = s.chars().collect();
-            if begin > chars.len() {
-                return Err(
-                    cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
-                        index: begin as i32,
-                    }
-                    .into(),
-                );
-            }
-            let slice: String = chars[begin..].iter().collect();
-            Ok(Some(Value::Object(Some(ctx.create_string(&slice)))))
-        },
+        lang_string::native_string_substring_one,
     );
     registry.register(
         "java/lang/String",

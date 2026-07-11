@@ -4,123 +4,30 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
-## 2026-07-11 WildFly Surefire-fork boot-crash (96% of suite failures) FIXED — reflection-object GC-staleness; residual stale-`ObjectRef` sites found elsewhere in boot
-
-Root-caused and fixed the dominant blocker for the WildFly suite under CratonVM: the managed server
-spawned by Arquillian from within a CratonVM-run Surefire fork exited with code 1 before writing a
-single line to `server.log`, in 583/605 (96%) of `testsuite/integration/basic` failures in round 6.
-
-- FIXED/RETIRED: [`wildfly-standalone-managed-server-boot-fails-under-surefire-fork.md`](../internal/fixed-suite-bugs/wildfly-standalone-managed-server-boot-fails-under-surefire-fork.md) —
-  `create_constructor_object`/`create_method_object`/`create_field_object`
-  (`native-builtins/src/lang_class.rs`) held their freshly-`alloc_object`'d instance (and its
-  `class_mirror`/`parameterTypes`/etc. locals) as unpinned `ObjectRef`s across several subsequent
-  GC-triggering classloading calls, in violation of the documented `pin_native_root` contract. A moving
-  GC landing in that window (reliably triggered by WildFly's `ServiceLoader`-based extension bootstrap,
-  ~500-750 module jars) corrupted the returned reflection object, surfacing as
-  `Constructor.newInstance: no declaring class` for several `Extension` SPI providers (Elytron, IO,
-  SecurityManager, clustering) — which silently dropped those extensions from the registry, cascading
-  into `AbstractControllerService`'s `this.controller is null` NPE crashing boot before any logging
-  subsystem could open `server.log`. Isolated repros of the exact same captured launch command never
-  reproduced this because a minimal, non-Surefire-forked process doesn't generate enough concurrent
-  classloading pressure to reliably land a GC in the danger window. Fixed by pinning + re-reading
-  forwarded references in all three constructors, mirroring the pattern `build_mirror_array_comp`
-  already used internally. Verified against the real harness (not an isolated repro): the specific
-  `ServiceLoader` corruption warning is gone in every subsequent run, and 6/10 sampled previously-crashing
-  classes now boot far past the original crash point (60-70s of real subsystem processing instead of an
-  instant 8-13s crash).
-- OPEN (new, split off — same general bug class, different call sites, not fixed by the above):
-  [`wildfly-parallel-boot-stale-objectref-residual.md`](wildfly-parallel-boot-stale-objectref-residual.md) —
-  4/10 sampled classes still hit the identical `this.controller is null` crash (deterministically for at
-  least one class across 3 retries), and classes that now boot further sometimes hit a *different* pair
-  of failures bearing the same "stale `ObjectRef` resolves to a reused all-zero-header slot" fingerprint:
-  a `NoSuchMethodError: java/lang/Object.read([CII)I` in `ProcessorInfo.readCPUMask()`, and a
-  `NullPointerException` on `ModelValue.has` inside `ParallelBootOperationStepHandler`'s
-  `EnhancedQueueExecutor` worker threads (a genuinely multi-threaded context). Needs its own
-  investigation before a full-suite re-run can give an accurate post-fix failure count.
-
-## 2026-07-11 Uncaught-exception fatal-error misattribution FIXED (`java/lang/Thread`/`CommonToken` reported instead of the real Throwable); 2 real bugs unmasked
-
-Investigated the confirmed-but-unexplained pattern already flagged in
-`CRATONVM-SPRING-GENUINE-BUGLIST-125.md` (many `ABEND rc=1` classes reporting
-`Exception in thread "main" java/lang/Thread`/`org/antlr/v4/runtime/CommonToken`
-— neither a `Throwable` subclass) via a fresh Hibernate ORM repro
-(`FunctionTests`, `ASTParserLoadingTest`, `DefaultCatalogAndSchemaTest`,
-`OneToOneJoinColumnsEmbeddedIdTest`).
-
-- FIXED/RETIRED: [`uncaught-exception-misattribution-native-pending-return-FIXED.md`](../internal/fixed-suite-bugs/uncaught-exception-misattribution-native-pending-return-FIXED.md)
-  — `JvmThread::native_pending_return` (a native call's return-value GC root,
-  cleared once pushed to the caller's operand stack) was being consulted
-  **unconditionally** at two exception-unwind sites whenever it happened to
-  hold a leftover value from an unrelated earlier native call, silently
-  replacing the real, correctly-thrown exception with whatever stale object
-  (e.g. an ANTLR `CommonToken`, or a `Thread` mirror) was sitting there.
-  Fixed by only falling back to it when the real exception object has
-  actually gone stale (GC-relocated during the failing call), mirroring the
-  staleness check `safe_native_call` already used elsewhere. Verified across
-  all 4 repro classes: zero crashes post-fix (previously 100%), one class
-  (`OneToOneJoinColumnsEmbeddedIdTest`) now runs to full completion.
-- OPEN (new, unmasked by the fix): [`onetoone-embeddedid-propertyaccessexception.md`](onetoone-embeddedid-propertyaccessexception.md)
-  — `OneToOneJoinColumnsEmbeddedIdTest` now completes (previously crashed)
-  but shows a genuine `org.hibernate.PropertyAccessException` on 3/6 tests,
-  setting an embedded-id key field.
-- OPEN (new, unmasked by the fix, host-load-limited): [`functests-astparser-defaultcatalog-post-fix-slow-untriaged.md`](functests-astparser-defaultcatalog-post-fix-slow-untriaged.md)
-  — `FunctionTests`/`ASTParserLoadingTest`/`DefaultCatalogAndSchemaTest` no
-  longer crash and now run far more of the real suite, but didn't reach a
-  clean `@@RESULT` within the time available on a heavily contended shared
-  host (concurrent ES/Tomcat suite runs from other sessions). `FunctionTests`'s
-  masked exception was confirmed (before the fix, via live instrumentation)
-  to be a genuine `NullPointerException` inside the heavily-parameterized
-  `testDurationArithmeticWithParameters`; needs an idle-host rerun with
-  `-Dcraton.trace=1` to pin down further.
-
-
-## 2026-07-10 ES `RandomBinaryDocValuesRangeQueryTests` hang cluster: 3/4 FIXED (compact-field getfield bug, fixed upstream); InetAddress redescribed for a new, unrelated correctness bug
-
-- FIXED/RETIRED: [`long-random-binary-doc-values-range-query-tests-FIXED.md`](../internal/elasticsearch-suite/long-random-binary-doc-values-range-query-tests-FIXED.md), [`integer-random-binary-doc-values-range-query-tests-FIXED.md`](../internal/elasticsearch-suite/integer-random-binary-doc-values-range-query-tests-FIXED.md), [`double-random-binary-doc-values-range-query-tests-FIXED.md`](../internal/elasticsearch-suite/double-random-binary-doc-values-range-query-tests-FIXED.md) — all three classes' original 600s suite-timeout HANG (collected 2026-07-08, `LRUQueryCache`'s internal `ReentrantReadWriteLock`/`ReentrantLock` write-lock contention) had turned into a 100% deterministic JIT SIGSEGV on a binary built strictly after that collection: `ReentrantLock.unlock()`'s single getfield (`this.sync`) was compiled as a 32-bit sign-extending `movsxd` load instead of a 64-bit `mov`, corrupting the loaded receiver before dispatching `sync.release(1)`. Root cause: `compact_field_slot(...).unwrap_or((0, false))` in three `field_resolver` closures (`vm/src/runtime/interpreter.rs`) silently fabricated "offset 0, not a reference" whenever a field's declaring class had no registered compact layout, and `jit/src/lib.rs`'s scan step trusted that fabrication unconditionally, steering the getfield/putfield inline codegen to treat a genuine reference field as a primitive. Independently root-caused and fixed by a concurrent session via a third, unrelated symptom (WildFly Host Controller invoke-IC SIGSEGV) — see this file's own `7f96c26c`/`be710234`/`93b33576` entries. Verified 2026-07-10 on a clean checkout of dev tip `e768916a` (no local changes needed): all three classes pass cleanly (`OK (6 tests)`) under fully default JIT settings.
-- OPEN, redescribed: [`elasticsearch-suite/ES-HANG-20260709-server-org-elasticsearch-lucene-queries-inetaddressrandombinarydocvaluesrangequerytests-51a9c7ea93.md`](elasticsearch-suite/ES-HANG-20260709-server-org-elasticsearch-lucene-queries-inetaddressrandombinarydocvaluesrangequerytests-51a9c7ea93.md) — the same SIGSEGV/hang mechanism is gone here too, but the class now runs to completion and hits a **different, genuine correctness bug**: a `CONTAINS`-query false negative for a query range spanning an IPv4 min and IPv6 max against a stored box, reproduced twice with different data (`testRandomTiny` and `testRandomMedium`, same seed, different runs). Not yet root-caused; likely a `RangeType.IP` encode/compare asymmetry at the IPv4-mapped boundary. Needs its own investigation.
-
-## 2026-07-10 AccessLogValve/RewriteValve doc RETIRED (5/6 causes fixed; 6th is the already-tracked register-invisible-JIT-root family, not a new bug)
-
-- RETIRED: [`tomcat-08-07/accesslogvalve-rewritevalve-connection-failures-RESOLVED.md`](../internal/tomcat-08-07/accesslogvalve-rewritevalve-connection-failures-RESOLVED.md) (moved from `known-issues/tomcat-08-07/`) — five of six root causes found across this investigation (`URL.openConnection()` CCE, `ByteBuffer.address`, `StringReader.read()`, the cross-cutting `SocketWrapperBase.lock` NPE, and a JIT `ConcurrentLinkedQueue` allocate-then-CAS miscompile) are FIXED and landed on `dev`. The sixth — a SIGSEGV around `TestAccessLogValve` test #8 — is a confirmed, byte-for-byte register-signature match with the already-tracked, currently-OPEN "register-invisible JIT root" bug family (real fix needs precise JIT oop maps / shadow stack, deep infrastructure work, deliberately not attempted). Catalogued as another occurrence in [`tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md`](tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md), the live tracking doc for this family — don't reopen the retired doc for a repeat of this signature, add it there instead.
-- **Correction while retiring:** the retired doc's sixth-cause section had cited `hib-global-temptable-nondeterministic-sigsegv-20260710.md` as a corroborating occurrence of this family. That's stale — see the entry above (2026-07-10 Hibernate remote rerun SIGSEGV cluster RESOLVED): that cluster was a different, unrelated, already-fixed bug. Corrected in both the retired doc and the swallow-uploads tracking doc.
-
-## 2026-07-11 `testNonBlockingReadIgnoreIsReady`: fixed-length HTTP streaming FIXED
-
-**Resolved (2026-07-11):** The Acceptor/Poller finding below was disproved
-by a minimal fixed-length-streaming `HttpURLConnection` reproducer. The
-legacy bridge buffers its body locally and only opens/sends the request at
-response retrieval; direct `Socket` clients are accepted promptly. The active
-record is archived at [`httpurlconnection-fixed-length-streaming-deferred-FIXED.md`](../internal/tomcat-08-07/httpurlconnection-fixed-length-streaming-deferred-FIXED.md).
-
-The implementation now sends real-carrier fixed-length HTTP request heads and
-body writes immediately; both `testNonBlockingReadIgnoreIsReady` and
-`testNonBlockingRead` pass. The remaining text in this section is retained as
-historical root-cause evidence.
-
-## 2026-07-11 Regex `find()`+`group()` quadratic slowdown: original Matcher-native diagnosis WRONG (dead code); real cause is a deeper substring/allocation bug, still OPEN
+## 2026-07-11 Regex `find()`+`group()` quadratic slowdown FIXED — two wrong turns (dead-code Matcher bridge, dead-code substring native) before finding the real bug in the live one
 
 A user-reported benchmark (`StringBuilder` append loop + `Pattern.compile().matcher()`
 + `while (m.find()) { m.group(1); }`) showed a CratonVM-vs-JDK slowdown ratio that
 *grew* with input size (18.8×/94.4×/238.8× at 1K/5K/10K entries) — the tell for an
 algorithmic-complexity bug. First diagnosis blamed `Matcher`'s native bridge
-(`matcher_read_input()` re-decoding the whole input every `find()`/`group()` call,
-`native-builtins/src/lib.rs`) — a real O(n²) bug, and it was fixed (identity-hash-keyed
-cache + capture-group caching, see
-[`matcher-native-full-input-redecode-quadratic.md`](matcher-native-full-input-redecode-quadratic.md)) —
-**but runtime instrumentation then proved that native bridge is unconditionally
-dropped in real-JDK mode** (`registry.rs`'s `drop_real_layout_synthetic`, same
-"synthetic bridge corrupts real-layout objects" family as
-[`stringjoiner-synthetic-native-real-jdk-field-mismatch.md`](stringjoiner-synthetic-native-real-jdk-field-mismatch.md)) —
-real JDK bytecode runs `Pattern`/`Matcher` unconditionally, so the fix, while
-correct, is currently inert.
-
-The **actual, still-OPEN** root cause: [`substring-large-parent-quadratic-allocation.md`](substring-large-parent-quadratic-allocation.md)
-— extracting many small strings from one large parent (`String.substring()`,
-zero regex involved) is independently O(n²) (14/316/1283 ms at 1K/5K/10K vs. a
-perfectly-linear unrelated-allocation control at 2/11/22 ms). The substring→
-`Arrays.copyOfRange`→`System.arraycopy` dispatch chain is proven O(subLen) at
-every hop, so the cost is a side effect (leading suspect: GC/allocator cost
-scaling with the live parent's size) that hasn't been root-caused yet.
+(`matcher_read_input()`) — a real O(n²) bug, but instrumentation proved that
+bridge is unconditionally dropped in real-JDK mode
+(`registry.rs`'s `drop_real_layout_synthetic`, same "synthetic bridge corrupts
+real-layout objects" family as
+[`stringjoiner-synthetic-native-real-jdk-field-mismatch.md`](stringjoiner-synthetic-native-real-jdk-field-mismatch.md))
+— the fix, while correct, was dead code. That led to isolating the actual bug to
+plain `String.substring()` (zero regex involved) — but the FIRST substring native
+found and instrumented (`native_string_substring`,
+`native-builtins/src/lang_string.rs`) was ALSO dead code, this time because its
+registration lives inside `register_synthetic_overrides`,
+`#[cfg(feature = "synthetic-jdk")]`-gated and not compiled into the real-JDK
+build at all. The actual live registration — a separate inline closure in
+`register_essential_natives` — had the identical "decode the entire parent
+string, every call" bug independently. **FIXED**: see
+[`../internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`](../internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md)
+for the full (long) story and the fix. `SubstringOnly` 1283ms→29ms at n=10,000;
+the original combined benchmark 4775ms (never finished at n=50,000)→2295ms
+(completes) — checksums identical to JDK throughout, zero test regressions.
 
 ## 2026-07-10 `testNonBlockingReadIgnoreIsReady`'s old theory REFUTED; real cause is a general ~2s NioEndpoint Acceptor/Poller-thread latency, split into its own doc
 
@@ -139,18 +46,21 @@ after a same-JVM warm-up test) and not the earlier-hypothesized
 `native-io` socket-close/drain-timeout issue (tested directly, zero
 effect — the peer had already sent EOF long before close() ran).
 
-- SUPERSEDED/RETIRED: [`nio-poller-acceptor-thread-scheduling-latency-SUPERSEDED.md`](../internal/tomcat-08-07/nio-poller-acceptor-thread-scheduling-latency-SUPERSEDED.md)
-  — the originally-claimed mechanism (NioEndpoint `Acceptor` thread appears to
-  make no progress for ~2 seconds while `Poller` is independently parked in
-  blocking `select()`/`WSAPoll`, then both make rapid progress together) does
-  **not** hold up: isolated Rust unit tests confirmed the low-level
-  `wakeup()`/`select()`/registration primitives are each individually fast and
-  correct, the Acceptor entered native `accept()` immediately, and a direct
-  `Socket` client was accepted promptly under the same NIO/Poller shape. The
-  apparent stall was entirely client-side (see the correction above). Moved to
-  `docs/internal/` — its primary claim is refuted and the real, still-open
-  issue was resolved in `httpurlconnection-fixed-length-streaming-deferred-FIXED.md`
-  (linked above), which is currently owned by another concurrent session.
+- OPEN (new): [`nio-poller-acceptor-thread-scheduling-latency.md`](nio-poller-acceptor-thread-scheduling-latency.md)
+  — the actual mechanism: the NioEndpoint `Acceptor` thread appears to make
+  no progress for ~2 seconds (two full `Poller` `selectorTimeout=1000` ms
+  cycles) while the `Poller` thread is independently parked in blocking
+  `select()`/`WSAPoll` calls, then both make rapid progress together.
+  Isolated Rust unit tests confirm the low-level `wakeup()`/`select()`/
+  registration primitives are each individually fast and correct — the
+  bug (if it is one mechanism at all) is in how CratonVM schedules/runs
+  the two threads concurrently, not in the selector's own logic. Not
+  Tomcat-specific: likely affects any app with one thread parked in a
+  long blocking native call while another needs to make independent
+  progress. Needs VM-core threading/scheduling ownership to pick up with
+  proper `Thread.start()`/blocking-region instrumentation.
+- Updated: the original doc now documents the refutation and cross-links
+  here; it stays OPEN (not fixed) pending the above.
 
 ## 2026-07-10 ES suite-wide `Build$CurrentHolder` manifest-null FIXED (VM-core `Unsafe` bootstrap bug); new pre-existing Jackson residual filed
 
