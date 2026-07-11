@@ -42,34 +42,41 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 
 | Benchmark                  | JDK 25 C2     | CratonVM default | Default ratio |
 |----------------------------|---------------|-------------------|---------------|
-| Arithmetic (2B ops)        | 2,384 ms      | 10,845 ms         | 4.55x         |
-| Fibonacci(44)               | 3,229 ms      | 7,785 ms          | 2.41x         |
-| Sieve (100K x 20,000)      | 5,417 ms      | 19,714 ms         | 3.64x         |
-| Matrix 1280x1280           | 2,234 ms      | 14,928 ms         | 6.68x         |
-| **QuickBench TOTAL**       | **13,664 ms** | **53,272 ms**     | **3.90x**     |
-| Binary Trees (depth=18)    | 400 ms        | 12,003 ms         | 30.0x         |
+| Arithmetic (2B ops)        | 2,622 ms      | 11,465 ms         | 4.37x         |
+| Fibonacci(44)              | 2,774 ms      | 9,321 ms          | 3.36x         |
+| Sieve (100K x 20,000)      | 5,253 ms      | 19,371 ms         | 3.69x         |
+| Matrix 1280x1280           | 2,623 ms      | 10,364 ms         | 3.95x         |
+| HashMap (1M put/get)       | 49 ms         | 17,510 ms         | 357x          |
+| String/Regex (10K)         | 10 ms         | 2,470 ms          | 247x          |
+| **QuickBench TOTAL**       | **13,331 ms** | **70,501 ms**     | **5.29x**     |
+| Binary Trees (depth=18)    | 382 ms        | 4,916 ms          | 12.9x         |
 
 *Measured 2026-07-10 on the primary Windows dev box (hybrid P/E-core CPU, pinned to
 the 16 P-core logical processors via `ProcessorAffinity` — single-threaded benchmarks
 otherwise get scheduled onto slower E-cores, which skews results) against JDK 25 C2
-and a CratonVM release build off `dev` at `13011cffd` **plus** a same-day fix restoring
-the guarded-inline-getfield JIT fast path to its intended default-on state (see below).
-All rows measured in a single combined run (`bench/QuickBenchLong2.java`, a further
-rescale of the QuickBench suite: Arithmetic 1.8B → 2B, Fibonacci fib(41)×5 → fib(44)
-single call, Sieve 16,700 → 20,000 reps, Matrix 1230×1230 → 1280×1280); Binary Trees is
-the same kernel run as the suite's 5th test, not a separate process, so its ratio here
-(30.0x) is not directly comparable to a fresh-process `bintrees18` run (which measured
-~13x on this same build — see the JIT optimization doc) — running it back-to-back after
-four other allocation-heavy kernels leaves more GC/heap pressure resident. Checksums
-verified identical between CratonVM and JDK on every kernel. `CRATONVM_JIT_OSR`
-back-edge OSR is default-on; `guarded_inline_getfield_enabled()` (default-on again as of
-this fix) is the single largest lever in this table — a same-day intermediate commit
-had flipped it back to an opt-in checked-helper path after finding a real SIGSEGV on an
-Elasticsearch vector-query workload, which cost ~35-40% throughput on getfield-heavy
-kernels; it was restored to default-on as a deliberate trade-off (the crash is a narrow,
-specific repro, not a general hazard) while the root cause is investigated separately —
-see [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full history and the
-known workaround (`CRATONVM_JIT_GETFIELD_HELPER=1`) if you hit that crash signature.*
+and a CratonVM release build off `dev` with the guarded-inline-getfield JIT fast path
+at its default-on state (see below) plus HashMap and String/Regex kernels added to
+close a gap — the original 5 kernels were all math/arrays, with nothing exercising
+hash-map or string/regex workloads. The 6 QuickBench-proper kernels are measured in a
+single combined run (`bench/QuickBenchLong3.java`); Binary Trees is a separate,
+freshly-launched process (5-round average, checksums identical every round) — mixing
+it into the combined run inflates its ratio via accumulated GC/heap pressure from the
+preceding kernels, so it's kept isolated for a representative number, matching how
+`bench/BenchSuite` always measures it elsewhere in this repo. Checksums verified
+identical between CratonVM and JDK on every kernel in every configuration.
+`CRATONVM_JIT_OSR` back-edge OSR is default-on; `guarded_inline_getfield_enabled()` is
+the single largest lever in the first 4 rows — see
+[docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for its find/fix history.
+
+**HashMap and String/Regex are known-slow outliers, not calibration noise.** Sized far
+below the other kernels because at JDK-comparable scale they don't complete in
+reasonable time: HashMap held a stable ~230x ratio across sizes tested (228.6x at
+250K entries, 233.8x at 1M — a large constant-factor overhead, likely Integer
+autoboxing + allocation/GC pressure, not an algorithmic bug). String/Regex's ratio
+instead GREW with size (18.8x at 1K entries → 94.4x at 5K → 238.8x at 10K; did not
+finish in 60s at 50K), consistent with an O(n²) bug rather than interpreter overhead —
+suspects are StringBuilder growth strategy and `Matcher.find()` cursor advancement
+between successive calls. Tracked as a follow-up investigation, not yet root-caused.*
 
 See [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full 26-round JIT optimization journey.
 
