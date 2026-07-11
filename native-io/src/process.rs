@@ -1768,12 +1768,47 @@ fn process_stream(
     Ok(Some(alloc_pipe_stream(ctx, stream_class, fd_id)))
 }
 
+fn captured_string_stream(ctx: &mut dyn NativeContext, text: &str) -> Value {
+    let cid = match ctx.ensure_class_initialized("java/io/ByteArrayInputStream") {
+        Ok(cid) => cid,
+        Err(_) => ctx.ensure_synthetic_class("java/io/ByteArrayInputStream", 4),
+    };
+    let stream = ctx.alloc_object(cid, 4usize.max(ctx.class_num_total_fields(cid)));
+    let pin = ctx.pin_native_root(stream);
+    let bytes = text.as_bytes();
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+    let stream = ctx.read_native_pin(pin, stream);
+    ctx.unpin_native_roots(pin);
+    for (i, &byte) in bytes.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Int(byte as i8 as i32));
+    }
+    ctx.set_field(stream, 0, Value::Object(Some(arr)));
+    ctx.set_field(stream, 1, Value::Int(0));
+    ctx.set_field(stream, 2, Value::Int(0));
+    ctx.set_field(stream, 3, Value::Int(bytes.len() as i32));
+    Value::Object(Some(stream))
+}
+
+fn legacy_captured_stream(ctx: &mut dyn NativeContext, args: &[Value], field: usize) -> Option<Value> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    match ctx.get_field(this, field) {
+        Value::Object(Some(s)) => ctx.read_string(s).map(|text| captured_string_stream(ctx, &text)),
+        _ => None,
+    }
+}
+
 /// `java.lang.Process.getInputStream()Ljava/io/InputStream;` — the child's
 /// stdout pipe.
 fn native_process_get_input_stream(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    if let Some(stream) = legacy_captured_stream(ctx, args, PROC_FIELD_STDIN_FD) {
+        return Ok(Some(stream));
+    }
     process_stream(
         ctx,
         args,
@@ -1788,6 +1823,9 @@ fn native_process_get_error_stream(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    if let Some(stream) = legacy_captured_stream(ctx, args, PROC_FIELD_STDOUT_FD) {
+        return Ok(Some(stream));
+    }
     process_stream(
         ctx,
         args,
