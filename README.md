@@ -357,6 +357,43 @@ Benchmark sources live in `bench-gpu/` (+ `bench-tornado/` for the TornadoVM twi
 machine with background load; treat CPU baselines as ±25%. Open GPU work is
 tracked in [docs/known-issues/gpu-offload-followups-20260711.md](docs/known-issues/gpu-offload-followups-20260711.md).
 
+### Update 2026-07-11 (evening)
+
+A second wave of hardware-validated work landed the same day: transparent
+offload for **integer/long reduction kernels** (`)I`/`)J`-returning methods —
+`sum += a[i] * b[i]` shapes), offload for **`ldc`-sourced constants** (int
+literals outside `sipush` range, and any float/double/long literal), a JIT-caller
+admission gate that keeps offload-eligible callers interpreted so OSR can no
+longer silently degrade offload back to CPU, and a curated `Math`/`StrictMath`
+intrinsics table (`sqrt`/`abs`/`min`/`max`/`fma`) under `ALLOW_INTRINSIC_CALLS`.
+Full detail in [docs/known-issues/gpu-offload-followups-20260711.md](docs/known-issues/gpu-offload-followups-20260711.md)
+and [docs/gpu/annotations.md](docs/gpu/annotations.md).
+
+**Reduction dispatch** (`bench-gpu/GpuDotBench.java`, `sum += (long) a[i] * b[i]`
+over `int[]`, N = 2²⁴, `DOT_CHECKSUM` bit-exact against HotSpot and an
+independent CPU oracle):
+
+| Kernel | CratonVM-CPU | **CratonVM-GPU** | HotSpot C2 |
+|---|---|---|---|
+| dot-product reduction | 76 ms | **18 ms** | 7 ms |
+
+Honest framing: this kernel is PCIe-bound (small per-element payload, one
+scalar out) plus single-cell atomic contention on the accumulator, so the GPU
+beats CratonVM's own CPU 4.2× but does **not** beat vectorized HotSpot C2 at
+this size — the point isn't winning this particular race, it's completing the
+transparent-offload surface for a shape that TornadoVM 4.0.1's PTX backend
+currently can't handle at all: the equivalent `@Reduce`-over-`LongArray` kernel
+(`bench-tornado/TornadoDotBench.java`) throws
+`TornadoInternalError: unimplemented`.
+
+**`ldc` constants** (`bench-gpu/GpuLdcBench.java`, a 96-step multiply-add chain
+using constants outside `sipush` range so javac emits `ldc` instead of
+`sipush`, N = 2²⁴, `SAMPLE` bit-exact against HotSpot):
+
+| Kernel | Before (CPU-bound, `ldc` rejected) | **CratonVM-GPU, warm** |
+|---|---|---|
+| `ldc`-constant multiply-add chain | ~2,000 ms | **8 ms** |
+
 ## Contributing
 
 **Design constraint:** prefer real `.class` files from the JDK and application classpath over synthetic stub classes for application-visible types; see [docs/internal/app-jvm-bugs/jvm-no-synthetic-stubs.md](docs/internal/app-jvm-bugs/jvm-no-synthetic-stubs.md).

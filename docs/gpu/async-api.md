@@ -38,6 +38,16 @@ try (GpuExecutor exec = GpuExecutor.open()) {
 }
 ```
 
+> This snippet shows the target shape of the API — a kernel that
+> allocates and returns `int[]` directly. As implemented today, the
+> dispatch layer only ever surfaces `SerializedResult::Void`: a kernel
+> that itself returns an array (rather than writing into a
+> caller-supplied output array) is not something the current marshalling
+> path can hand back through `GpuFuture<T>`. Every example in this
+> document that shows a return-value kernel signature should be read as
+> the intended API shape; see [Current limitations](#current-limitations)
+> for exactly what dispatches today.
+
 The explicit form is for code that wants to *overlap* host work with
 kernel execution, *chain* kernels on a single stream (one H2D, multiple
 launches, one D2H), or *fail soft* on machines that have no GPU.
@@ -91,33 +101,64 @@ one owner thread closes it, many threads may submit while it is open.
 ## `GpuFuture<T>`
 
 Returned by every `submit` / `launch`. Modelled on
-`CompletableFuture` but bound to a CUDA stream — completion happens
-when the device finishes the launch.
+`CompletableFuture` but bound to a CUDA stream.
+
+> **Completion model, updated 2026-07-11 evening.** `dispatch_async`
+> (`vm/src/runtime/offload.rs`) launches the kernel, records a CUDA event,
+> and returns immediately with the submission in the `Running` state.
+> `GpuFuture.get()` still works exactly as before: it calls the blocking
+> `Native.futureSynchronize` → `finalize_submission`, which calls
+> `event.synchronize()` (a **blocking** host wait) and drains the
+> writebacks. What's new is that `isDone()` / `futureStatus` are no longer
+> a dead read of stale state: they now call `poll_submission_status`
+> (`vm/src/runtime/offload.rs`), a genuinely non-blocking check that first
+> looks at a `device_done` flag set by a best-effort `cuLaunchHostFunc`
+> host callback registered at dispatch time, and falls back to a
+> non-blocking `Event::query()` (`cuEventQuery`) if the callback hasn't
+> fired yet. If either signals the device is actually done,
+> `poll_submission_status` runs the same finalize work `get()` would have
+> — inline, on the polling thread, with no further device wait (the event
+> has already fired) — so **`isDone()` returning `true` now means the
+> submission really is finalized**, not just "probably." What is still
+> true from before: nothing drives completion *without* a Java thread
+> calling `isDone()`/`getNow()`/`get()` at least once. There is still no
+> background poller or stream callback that completes a `GpuFuture` on its
+> own while the application does something else — see [Current
+> limitations](#current-limitations).
 
 | Method | Semantics |
 | --- | --- |
-| `boolean isDone()` | True once the stream has reached the post-launch event for this future. Non-blocking. |
-| `T get()` | Block the calling thread until done. Throws `GpuException` if the kernel failed or the analyzer rejected the lambda. |
+| `boolean isDone()` | As of 2026-07-11 evening, a real non-blocking device probe (`Native.futureStatus` → `poll_submission_status`): checks a host-callback flag, falls back to non-blocking `Event::query()`, and finalizes inline if the device reports done. Safe to poll in a loop — each call does bounded work, never a blocking device wait. Still requires the caller to actually call it; nothing updates the status spontaneously in the background. |
+| `T get()` | Block the calling thread until done. This is the call that actually finalizes the submission (waits on the CUDA event, drains writebacks) if `isDone()`/`getNow()` haven't already done so. Throws `GpuException` if the kernel failed or the analyzer rejected the lambda. |
 | `T get(long timeout, TimeUnit unit)` | Bounded wait. Throws `TimeoutException` on expiry. |
-| `Optional<T> getNow()` | Non-blocking peek. Returns `Optional.empty()` if the future is still pending. |
-| `<R> GpuFuture<R> thenApplyGpu(Function<T, R> next)` | Chain a second kernel **on the same stream**. The result of this kernel stays on the device; no D2H copy is inserted between the two stages. |
+| `Optional<T> getNow()` | Non-blocking peek, same underlying `poll_submission_status` probe as `isDone()`. Returns the result if the device reports the submission complete (finalizing it inline as a side effect, same as `isDone()`), `Optional.empty()` while still `Running`. |
+| `<R> GpuFuture<R> thenApplyGpu(Function<T, R> next)` | Spec'd stream-resident chaining — see [Current limitations](#current-limitations); today's dispatch layer has no mechanism to hand a kernel's device-side output directly to a second launch without a host round-trip. |
 | `<R> CompletableFuture<R> thenApplyAsync(Function<T, R> next, Executor cpu)` | Standard CPU continuation. Inserts a D2H copy. |
 | `CompletableFuture<T> toCompletableFuture()` | Bridge into JDK async land. Inserts a D2H copy on the first read. |
 
 ### Stream-resident chaining
 
-`thenApplyGpu` is the only continuation that **stays on the device**.
-For it to work, the function must itself be a `@GpuKernel`-eligible
-static method reference. The executor inspects the lambda's bootstrap
-method via the same code path the transparent dispatcher uses; if the
-referenced method is rejected by the analyzer, `thenApplyGpu` returns
-an *already-failed* future containing the rejection reason. This is
-detected synchronously at the call site — no half-issued kernel ever
-reaches the GPU.
+`thenApplyGpu` is *specified* to be the one continuation that stays on
+the device: the function must itself be a `@GpuKernel`-eligible static
+method reference, admitted the same way `submit`'s lambda is. That
+lambda-resolution half is real (`gpu_resolve_lambda_target` /
+`gpu_dispatch_method` in `vm/src/vm/vm_exec.rs`) and is what
+`submit`/`launch`/`submitWithArg(s)` already use.
+
+What is **not** real yet: the actual "stays on the device" part. A
+kernel's result is only ever surfaced to the host as
+`SerializedResult::Void` — the write into the caller-supplied `out`
+array *is* the result; there is no code path that keeps a kernel's
+output as an opaque device-resident handle and feeds it as the next
+kernel's input without a host round-trip (see [Current
+limitations](#current-limitations)). Until that lands, treat
+`thenApplyGpu` chains as target-API documentation rather than a
+working no-D2H fast path, and expect each stage to behave like a
+fresh `submit` against host-visible arrays.
 
 Mixing CPU continuations (`thenApplyAsync`) and GPU continuations
 (`thenApplyGpu`) on the same future is fine. Each CPU continuation
-forces a D2H copy at the boundary; each GPU continuation does not.
+forces a D2H copy at the boundary.
 
 ## `GpuArray<T>`
 
@@ -128,8 +169,8 @@ kernel launch that consumes the array.
 
 | Method | Purpose |
 | --- | --- |
-| `static GpuArray<int[]> wrap(int[] host)` | Create a handle. Pins the host array (via `Heap::pin_ref` on the Rust side) so GC cannot move it while a kernel is in flight. Type parameter `T` is one of the supported primitive-array types. |
-| `static GpuArray<int[]> allocate(GpuExecutor exec, int len)` | Allocate a device-only array. `toHost()` materialises a fresh Java array on first call. |
+| `static GpuArray<int[]> wrap(int[] host)` | Create a handle. `Native.arrayWrap*` takes an eager **byte-copy snapshot** of the array into a Rust-owned buffer (`native-builtins/src/craton_gpu.rs::wrap_primitive_array`) — there is no `Heap::pin_ref` or other GC-pinning call; the snapshot exists precisely so GC moving the original Java array afterward is a non-issue. Type parameter `T` is one of the supported primitive-array types. |
+| `static GpuArray<int[]> allocate(GpuExecutor exec, int len)` | Allocate a device-only array. `toHost()` materialises a fresh Java array on first call. **Rust-side shim landed 2026-07-11 evening, Java jar binding still pending.** `native-builtins/src/craton_gpu.rs` now registers `arrayAllocateInt`/`arrayAllocateLong`/`arrayAllocateFloat`/`arrayAllocateDouble` (`builtin_array_allocate_*`, minting a zero-filled device-only `state::ArrayEntry` the same way `arrayWrap*` does for a host-backed one) alongside the existing `arrayWrapInt/Long/Float/Double`. What's still missing is the `craton-gpu-java` side: the external `craton/gpu/internal/Native` class and the public `GpuArray.allocate(...)` factory method that would call it. Until that binding lands, the native entry points exist and are ready to call but nothing in the Java jar calls them yet. |
 | `CompletableFuture<T> toHost()` | Schedule a D2H copy and return a future for the host array. **Always synchronises the stream.** Treat it as the expensive read-back operation it is. |
 | `int length()` | Element count. Free; does not touch the device. |
 | `void close()` | Release the device buffer. Idempotent. |
@@ -174,18 +215,45 @@ should rely on the executor's implicit default stream.
 | `void synchronize()` | Block until the stream is drained. |
 | `void close()` | Destroy the stream. Outstanding futures complete or fail before close returns. |
 
-Reasons to take a stream explicitly:
+> **Executor default-stream affinity is real (2026-07-11 evening); explicit
+> `GpuStream` routing is still not.** These used to be one limitation; they
+> are now two different states. `submit`/`launch`/`submitWithArg(s)`/
+> `submitMethod` all route through `resolve_or_create_default_stream`
+> (`native-builtins/src/craton_gpu.rs`), which lazily creates one real CUDA
+> stream per `GpuExecutor` handle and caches it (`executor_default_stream:
+> HashMap<u64, u64>`) — every submission on the **same** `GpuExecutor`, with
+> no explicit stream involved, now serializes on that one real device
+> stream, instead of each dispatch minting and tearing down its own
+> one-shot stream. `Native.newStream` also mints a genuine CUDA stream now
+> (`ctx.gpu_stream_create()`, not bookkeeping), but there is still no
+> registered `Native.*` entry point that lets Java code aim a dispatch at
+> *that* explicit handle instead of the executor's default — `GpuStream` in
+> the implemented API surface is `handle()` + `close()` only, no `submit`.
+> So: **one executor implicitly shares one real stream across its
+> submissions today; `newStream()` mints a real stream you cannot yet
+> route work onto.**
 
-- **Overlap**. Two streams + pinned host arrays = concurrent H2D, kernel,
-  and D2H across stages of a pipeline.
+Reasons the API *intends* to let you take a stream explicitly (once
+the routing above lands):
+
+- **Overlap**. Two streams = concurrent H2D, kernel, and D2H across
+  stages of a pipeline. (`cuda-bridge` does not yet expose a
+  page-locked/pinned host-memory allocator — see
+  [`streams-events.md`](streams-events.md#best-practices) — so the
+  overlap benefit here comes from stream concurrency, not pinned
+  transfers.)
 - **Isolation**. Errors in one stream do not affect work queued on
-  another. The default stream is shared across all `submit` calls on the
-  executor; a misbehaving kernel will fail every queued future on it.
+  another.
 - **Deterministic ordering**. Within a single stream, kernels execute
   in submission order. Across streams there is no ordering guarantee
   beyond what the application enforces.
 
-If you don't have a specific reason to call `newStream()`, don't.
+If you don't have a specific reason to call `newStream()`, don't — the
+handle it returns is real, but nothing in the registered `Native.*` surface
+lets you route a dispatch onto it, so it still has no observable effect on
+where work actually runs today. If your goal is "one executor's submissions
+serialize predictably," you already have that from the default stream with no
+`newStream()` call at all.
 
 ## Three-stage pipeline example
 
@@ -298,9 +366,11 @@ try (GpuExecutor exec = GpuExecutor.open();
 }
 ```
 
-The order matters: `GpuArray` closes first, unpinning its host array;
-then the executor closes, synchronising the stream and releasing the
-context.
+The order matters: `GpuArray` closes first, releasing its device-side
+buffer and host-bytes snapshot (see the correction under
+[`GpuArray<T>`](#gpuarrayt) — there is no GC pin to release, just a
+Rust-owned copy and, once uploaded, a cached `DeviceBuffer`); then the
+executor closes, synchronising the stream and releasing the context.
 
 ### `StreamCleaner` daemon
 
@@ -320,6 +390,65 @@ releases the device handles. This is **a backup, not the contract**:
 Always `close()` explicitly. The cleaner exists so that one forgotten
 executor doesn't pin a CUDA context for the JVM's lifetime; it is not
 a substitute for resource management.
+
+## Current limitations
+
+Implementation-status gaps between this document's target API and what
+`vm/src/runtime/offload.rs` / `native-builtins/src/craton_gpu.rs`
+actually do as of 2026-07-11 (post `f4311e5f3`). These are distinct
+from the by-design [Limitations](#limitations) below.
+
+- **Poll-driven, not push-driven, completion model (updated 2026-07-11
+  evening).** `isDone()` / `getNow()` are now real: they call
+  `poll_submission_status`, a non-blocking device probe that finalizes a
+  submission inline the moment it observes the device is done (see the
+  note under [`GpuFuture<T>`](#gpufuturet)). What's still missing is
+  anything that drives that probe *without* a Java call — no background
+  thread, no stream callback that completes a `GpuFuture` on its own while
+  application code is off doing something else. A `cuLaunchHostFunc` host
+  callback primitive now exists on the `cuda-bridge` side
+  (`Stream::add_host_callback`) and `poll_submission_status` already
+  consults a `device_done` flag it can set, but nothing today calls
+  `futureIsDone`/`futureStatus` from outside application code, so in
+  practice a `GpuFuture` still only progresses when the application polls
+  or blocks on it.
+- **Only `Void` results were surfaced until 2026-07-11 evening; scalar
+  reduction results now reach Java too.** `SerializedResult`'s
+  `ScalarI32/I64/F32/F64` variants (integer/long reduction kernels, `)I`/`)J`
+  descriptors with a `red.global.add` epilogue) are wired into
+  `Native.futureGetResult`, which now tries the real submission registry
+  first (`NativeContext::gpu_future_take_result`) and boxes a scalar result
+  via the same `Integer`/`Long`/`Float`/`Double` boxing path
+  (`box_scalar_result` in `native-builtins/src/craton_gpu.rs`), falling
+  back to the old pre-Phase-6 synthetic stub-future map only when the real
+  registry has nothing for that handle. `PrimitiveArrayI32/I64/F32/F64`
+  (a kernel returning a whole array by value, as opposed to writing into a
+  caller-supplied `out` array) are still never constructed — that part of
+  the target API in this document remains aspirational. Every
+  array-**returning** kernel signature shown in this document
+  (`Pipeline.vectorAdd(a, b)`, `Pipeline.histogram`, etc.) still describes
+  the intended surface, not today's behavior; a scalar-returning reduction
+  kernel now genuinely works end to end through `GpuExecutor`.
+- **`GpuStream` affinity is partially wired up (updated 2026-07-11
+  evening).** `resolve_or_create_default_stream` gives every submission on
+  a given `GpuExecutor` — via `submit`/`launch`/`submitWithArg(s)`/
+  `submitMethod`, with no explicit stream involved — one real, shared,
+  lazily-created CUDA stream instead of a fresh private one per dispatch.
+  What's still not wired: `newStream()` mints a genuine CUDA stream, but no
+  registered `Native.*` entry point lets a dispatch be routed onto that
+  explicit handle instead of the executor's default — see the note under
+  [`GpuStream`](#gpustream).
+- **JIT-compiled callers bypass transparent offload.** Not specific to
+  the explicit API in this document (which always calls through a
+  native method, never a JIT-visible `invokestatic`), but relevant if
+  application code mixes both paths: the offload hook lives in
+  `execute_invokestatic`'s interpreter slow path. If the *caller
+  method* containing an offload-eligible call gets JIT-compiled (OSR
+  of a hot loop), dispatch moves into JIT-emitted code and the hook is
+  never consulted again — offload silently stops, structurally, even
+  though the 2026-07-11 fix keeps eligible interpreted call sites
+  re-entering the hook correctly. See
+  `docs/known-issues/gpu-offload-followups-20260711.md` item 2.
 
 ## Limitations
 
@@ -375,3 +504,7 @@ a substitute for resource management.
   (`gpu` vs `gpu-driver`), CLI surface, file index.
 - [`plan.md`](plan.md) — per-part execution status, including the
   Phase 3 milestones.
+- [`docs/known-issues/gpu-offload-followups-20260711.md`](../known-issues/gpu-offload-followups-20260711.md)
+  — open follow-ups from the first real-hardware validation pass,
+  including the reduction void-return gate and the JIT-caller bypass
+  referenced in [Current limitations](#current-limitations).
