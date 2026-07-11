@@ -4272,6 +4272,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         self.shared.class_manager.read().find_class_by_name(name)
     }
 
+    fn class_id_by_name_near(&self, name: &str, near: ClassId) -> Option<ClassId> {
+        let cm = self.shared.class_manager.read();
+        if let Some(loader) = cm.get_loader_id(near) {
+            if let Some(id) = cm.find_class_by_name_in_loader(name, loader) {
+                return Some(id);
+            }
+        }
+        cm.find_class_by_name(name)
+    }
+
     fn is_record_class(&self, class_id: ClassId) -> bool {
         self.shared
             .class_manager
@@ -11668,6 +11678,21 @@ fn invoke_on_class_shared_inner(
                     // (e.g. ByteArrayInputStream created by getResourceAsStream).
                     let check_override = method.is_abstract()
                         || class_name == "java/io/ByteArrayInputStream"
+                        // `java.util.Base64` and its Encoder/Decoder methods
+                        // are concrete JDK bytecode.  CratonVM supplies the
+                        // complete family as native intrinsics so they can
+                        // retain the variant and padding configuration in the
+                        // VM-side synthetic encoder object.  Without this
+                        // gate the JDK bytecode runs instead, silently using
+                        // its default basic/padded path for the synthetic
+                        // object (so getUrlEncoder().withoutPadding() yields
+                        // `+/8=` / `AA==`).
+                        || matches!(
+                            class_name,
+                            "java/util/Base64"
+                                | "java/util/Base64$Encoder"
+                                | "java/util/Base64$Decoder"
+                        )
                         // GENS-1: Class.getGenericInterfaces / getGenericSuperclass
                         // — the real-JDK bytecode goes through ClassRepository →
                         // SignatureParser → Reifier. The Reifier path NPEs in
