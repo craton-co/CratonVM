@@ -32190,7 +32190,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "([Ljava/lang/Object;)Ljava/lang/Object;",
         lang_class::native_constructor_new_instance,
     );
-    registry.register("jdk/internal/misc/ScopedMemoryAccess", "closeScope0", "(Ljdk/internal/misc/ScopedMemoryAccess$Scope;Ljdk/internal/misc/ScopedMemoryAccess$Scope$Error;)V", native_noop);
+    registry.register("jdk/internal/misc/ScopedMemoryAccess", "closeScope0", "(Ljdk/internal/foreign/MemorySessionImpl;Ljdk/internal/misc/ScopedMemoryAccess$ScopedAccessError;)V", native_noop);
     let scoped_memory_access = "jdk/internal/misc/ScopedMemoryAccess";
     for name in ["getByte", "getByteInternal"] {
         registry.register(
@@ -32320,7 +32320,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         registry.register(
             scoped_memory_access,
             name,
-            "(Ljdk/internal/misc/ScopedMemoryAccess$Scope;Ljdk/internal/misc/ScopedMemoryAccess$Scope;Ljava/lang/Object;JLjava/lang/Object;JJ)V",
+            "(Ljdk/internal/foreign/MemorySessionImpl;Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JLjava/lang/Object;JJ)V",
             native_scoped_memory_copy_memory,
         );
     }

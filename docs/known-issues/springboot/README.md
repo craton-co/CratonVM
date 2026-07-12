@@ -16,7 +16,7 @@ clustered.
 | [`disposablebeanadapter-invalid-destruction-signature-cluster.md`](disposablebeanadapter-invalid-destruction-signature-cluster.md) | 34 | HIGH | OPEN, Spring call site pinned |
 | [`unsafe-memoryaccessoption-npe-cluster.md`](unsafe-memoryaccessoption-npe-cluster.md) | 26 | HIGH | OPEN, likely same family as an already-fixed bug |
 | [`httpclient-builder-dead-registration-abstractmethoderror.md`](httpclient-builder-dead-registration-abstractmethoderror.md) | 13 | HIGH | OPEN, fully root-caused (dead `synthetic-jdk` registration) |
-| [`zip-filedatablock-bulk-bytebuffer-put-aioobe.md`](zip-filedatablock-bulk-bytebuffer-put-aioobe.md) | 9 (whole `spring-boot-loader` module) | HIGH | OPEN, characterized |
+| `zip-filedatablock-bulk-bytebuffer-put-aioobe.md` | 9 (whole `spring-boot-loader` module) | HIGH | **FIXED 2026-07-12** — moved to [`../../internal/springboot/zip-filedatablock-bulk-bytebuffer-put-aioobe-FIXED.md`](../../internal/springboot/zip-filedatablock-bulk-bytebuffer-put-aioobe-FIXED.md) |
 
 ## Methodology note (runner fix, not a bug)
 
