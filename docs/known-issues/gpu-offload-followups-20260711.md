@@ -14,6 +14,19 @@ closed items 1, 2, 4, 5, and 7 below, and made a real dent in item 6. Item 3
 see `README.md`'s "GPU offload benchmarks" section and `docs/gpu/COMPARISON.md`
 for the numbers this update is based on.
 
+**Update (2026-07-12).** Item 6's 2-D/rectangular-nested-loop gap is closed
+(`ptxas`-validated on the local RTX 2060 box's CUDA toolkit — see item 6 for
+the details and file references). Item 6's other remaining gap, general
+branches inside a loop body, is unchanged; see item 6 for why it's a
+substantially larger, higher-risk piece of work than everything closed so
+far and was deliberately left for its own follow-up.
+
+Item 3 (async completion model) is also closed as of this update: the
+`cuLaunchHostFunc` host callback now drives a submission to
+`Completed`/`Failed` on its own via a background completion reaper, with no
+Java-side poll required — see item 3. That leaves general branches (item 6)
+as the only open item in this file.
+
 ## 1. Reduction kernels never dispatch (void-return gate) — DONE
 
 `try_dispatch` used to only launch kernels for methods whose descriptor ends in
@@ -75,27 +88,46 @@ Hardware-validated: 100 hot repetitions of a caller loop at N = 2²² stay at a
 steady 2 ms warm per call — before the gate, caller OSR silently degraded
 offload back to CPU once the caller itself got hot enough to JIT.
 
-## 3. `dispatch_async` is synchronous under the hood — PARTIALLY DONE
+## 3. `dispatch_async` is synchronous under the hood — DONE
 
-Real progress, but the fundamental completion model described below is
-unchanged: `get()` is still the only thing that finalizes a submission.
-
-**Landed:** a non-blocking device-side probe now backs `Native.futureIsDone` /
-`Native.futureStatus` (`poll_submission_status` in `vm/src/runtime/offload.rs`,
+The 2026-07-11 evening wave landed the non-blocking poll half: `Native.futureIsDone`
+/ `Native.futureStatus` (`poll_submission_status` in `vm/src/runtime/offload.rs`,
 built on a real `Event::query()` — `cuEventQuery` — added to `cuda-bridge`),
-so calling `isDone()` actually asks the driver whether the kernel finished
-instead of only reporting whatever the last blocking `get()` left behind. A
-`cuLaunchHostFunc` host-callback primitive was also added to `cuda-bridge`
-(`Stream::add_host_callback` in `cuda-bridge/src/stream.rs`) — the driver-level
-building block for a future callback-driven future.
+plus a `cuLaunchHostFunc` host-callback primitive (`Stream::add_host_callback`
+in `cuda-bridge/src/stream.rs`) that set a best-effort `device_done` flag —
+the driver-level building block for a real callback-driven future, not yet
+wired to anything that acted on its own.
 
-**Still open:** nothing spontaneously drives a submission to `Completed`
-without a Java call. `isDone()`/`getNow()` are poll-based, not push-based — you
-have to call them (or `get()`) for the status to update; there is still no
-background thread or stream callback that flips a `GpuFuture` to done on its
-own while the application does something else. Wiring the new
-`cuLaunchHostFunc` primitive up to actually complete a `GpuFuture` from a
-driver-thread callback, with no Java-side poll required, remains open work.
+**Closed this update (2026-07-12).** That callback now drives completion
+spontaneously, with no Java call required. A process-wide completion reaper
+thread (`ensure_completion_reaper_started`/`completion_reaper_loop` in
+`vm/src/runtime/offload.rs`, modelled on the existing background-JIT-compiler
+worker: `Once`-guarded singleton spawn, captures a `Weak<SharedVm>` so it
+can't keep a torn-down VM alive, deliberately unregistered with the GC
+thread registry since it never holds a managed `ObjectRef` on its own stack)
+wakes on a condvar the host callback notifies (`enqueue_completion`) and
+runs `finalize_submission` itself — draining writebacks, releasing the
+GC-critical guard, and flipping the submission to `Completed`/`Failed` —
+entirely off the mutator. `isDone()`/`get()` now frequently just read an
+already-terminal status instead of doing any work at all.
+
+Fixing this exposed a real attach-order race: `dispatch_async` used to
+register the host callback *before* its caller
+(`dispatch_method_from_native_on_stream`) attached the pending writebacks
+to the submission, which was harmless when only a flag-setting callback
+could run early but became a genuine bug once the callback could trigger a
+real finalize — a callback firing first would see no writebacks to drain
+and give up, permanently orphaning the submission. Fixed by moving the
+writeback/GC-guard attachment inside `dispatch_async` itself, before the
+callback is registered (100% reproducible in stub mode, where
+`add_host_callback` runs synchronously; see the regression tests
+`reaper_finalizes_submission_without_any_poll_call` and
+`finalize_enqueued_handle_*` in `vm/src/runtime/offload.rs`).
+
+A `SharedVm` not constructed via `Vm::new` (most unit tests, and any
+future embedding that skips it) never populates `self_arc`, so the reaper's
+`Weak<SharedVm>` never upgrades — that degrades gracefully to the
+pre-existing poll-only behavior rather than panicking or hanging.
 
 ## 4. Small-array thread over-launch (min 2²⁰ threads per launch) — DONE
 
@@ -143,12 +175,57 @@ Closed this update:
   constant-pool callee against a curated table
   (`analyzer::resolve_math_intrinsic`) and only admits a call that actually
   lowers; see `docs/gpu/annotations.md` for the full supported/excluded list.
+- **2-D / rectangular nested loops** (2026-07-12) — `for (i...) for (j...)`
+  is now recognized and lowered when the inner loop is the outer loop's
+  *entire* body and both loops start at `0`
+  (`jit-cuda/src/lowering/loop_recog.rs`'s `detect_nested_loop`/
+  `NestedLoop`/`validate_rectangular_nesting`). The SIMT model treats the
+  flattened `[0, R*C)` iteration space as the thread-index domain and
+  recovers `i = tid / C`, `j = tid % C` on-device
+  (`Emitter::emit_nested_loop_guard_and_decompose` in
+  `jit-cuda/src/lowering/emit.rs`) — no changes were needed in
+  `vm/src/runtime/offload.rs` or `cuda-bridge`, because the existing 1-D
+  grid sizing (`runtime_work` = the largest array argument's length) already
+  equals `R*C` for any flattened row-major array, and `div.s32`/`rem.s32`
+  by the inner bound is provably safe because a thread only reaches the
+  division after passing the `tid < R*C` guard. Both loop bounds still have
+  to resolve the same way a single loop's bound does — a compile-time
+  literal or an `arraylength` of an array parameter hoisted to a local
+  (see `EligibleOffsetLoop.java`'s doc comment) — a bound that is itself
+  the outer induction variable (a triangular loop) or any other expression
+  is rejected at lowering, not silently mis-lowered. Two-level nesting only
+  (three-or-more levels, e.g. a 3-D loop, still reject — same "multi-loop or
+  non-canonical control flow" reason two *sequential* loops already got).
+  Fixture: `test_classes/gpu/EligibleNestedLoop.java`; tests + a real
+  `ptxas` round-trip in `jit-cuda/src/lowering.rs`
+  (`nested_loop_*`/`ptxas_round_trip_nested_loop`/`triangular_nested_loop_is_rejected`).
 
-Still open (unchanged from the original report, scope reduced):
+Still open (unchanged from the original report):
 
-- 2-D / nested loops still reject.
-- General branches (anything other than a compare-and-branch loop guard) still
-  reject.
+- **General branches** (anything other than a compare-and-branch loop guard)
+  still reject — and this is now the last item in this file. Unlike the 2-D
+  loop work above, this is NOT a small extension of the existing recognizer:
+  the emitter (`jit-cuda/src/lowering/emit.rs`) has no basic-block/CFG
+  concept at all today — `Emitter::walk` emits one straight-line PTX `body`
+  string per bytecode range, and the simulated `OpStack`/`Locals` assume a
+  single linear pass with no join-point reconciliation. Supporting a real
+  `if`/`else` (or any other branch) inside the loop body needs (a)
+  basic-block discovery inside the loop body, (b) minting real PTX labels
+  and translating `if_icmp*`/`if*` into `setp` + `@pred bra` instead of the
+  two fixed, compiler-generated branches the emitter has today (the loop
+  guard and the bounds-check), and (c) a stack/register merge strategy at
+  block joins (either genuine SSA/phi handling, or — much cheaper, and
+  probably the right first cut — restricting admission to a narrow
+  `selp`-lowerable subset: `if`-without-`else` bodies that do a simple
+  predicated store, no early `return`/`break`, no nested `if`). Even that
+  restricted subset is a substantially larger, higher-risk change than
+  everything else in this file — it is the kind of change that can silently
+  miscompile if the block-splitting isn't exactly right, not just reject
+  too conservatively — so it was deliberately left for its own follow-up
+  rather than attempted alongside the 2-D loop work above. The relevant
+  rejection sites to relax, once that machinery exists, are
+  `jit-cuda/src/lowering/emit.rs`'s `0x99..=0xA4` (`if*`/`if_icmp*`) and
+  `0xA7 | 0xC8` (`goto`/`goto_w`) arms in `Emitter::emit_op`.
 - `)F`/`)D` reductions still stay on CPU by design — see item 1.
 
 ## 7. No hardware CI — SCAFFOLDING DONE, runner enrollment pending
