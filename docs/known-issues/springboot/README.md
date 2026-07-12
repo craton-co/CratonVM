@@ -14,7 +14,7 @@ clustered.
 |---|---:|---|---|
 | [`onclasscondition-npe-cast-to-string-array-cluster.md`](onclasscondition-npe-cast-to-string-array-cluster.md) | 75 (348 occurrences) | CRITICAL | OPEN, precisely pinned to `OnClassCondition.addAll` |
 | [`disposablebeanadapter-invalid-destruction-signature-cluster.md`](disposablebeanadapter-invalid-destruction-signature-cluster.md) | 34 | HIGH | OPEN, Spring call site pinned |
-| [`unsafe-memoryaccessoption-npe-cluster.md`](unsafe-memoryaccessoption-npe-cluster.md) | 26 | HIGH | OPEN, likely same family as an already-fixed bug |
+| `sun.misc.Unsafe$MemoryAccessOption` NPE | 26 | HIGH | **FIXED/RETIRED 2026-07-12** — moved to [`../../internal/fixed-suite-bugs/spring-boot-unsafe-memoryaccessoption-npe-FIXED.md`](../../internal/fixed-suite-bugs/spring-boot-unsafe-memoryaccessoption-npe-FIXED.md); same bug independently found+fixed via a concurrent Keycloak investigation, canonical doc is `testsuite-model-unsafe-putorderedlong-memoryaccessoption-npe-FIXED.md` in the same directory |
 | [`httpclient-builder-dead-registration-abstractmethoderror.md`](httpclient-builder-dead-registration-abstractmethoderror.md) | 13 | HIGH | OPEN, fully root-caused (dead `synthetic-jdk` registration) |
 | [`zip-filedatablock-bulk-bytebuffer-put-aioobe.md`](zip-filedatablock-bulk-bytebuffer-put-aioobe.md) | 9 (whole `spring-boot-loader` module) | HIGH | OPEN, characterized |
 
