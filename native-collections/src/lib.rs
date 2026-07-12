@@ -5159,7 +5159,7 @@ fn native_map_put_evict(
     args: &[Value],
     evict: bool,
 ) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -5193,8 +5193,26 @@ fn native_map_put_evict(
     // in attributes for annotation [...ComponentScan$Filter]` in
     // `ComponentScanAnnotationParser.parse` for `@SpringBootApplication`.
     let cid = ctx.class_id_of_object(this);
+    let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
     if let Some(name) = ctx.class_name_of_id(cid) {
-        if name != "java/util/HashMap" {
+        if name == "java/util/HashMap" {
+            // Exact dispatch is installed only after the callsite becomes
+            // hot. Start the integer overlay during the generic tiering
+            // window; once real nodes exist the fresh-map guard must refuse
+            // the overlay to preserve the already-materialized contents.
+            if evict {
+                if let Some(result) = try_hm_int_fast_put(ctx, this, key_val, value) {
+                    return result;
+                }
+            }
+            // A non-integer put (or serialization put with `evict=false`)
+            // transitions an overlay-backed exact HashMap to its ordinary JDK
+            // node table before inserting the new entry. Without this, the
+            // node path sees an empty heap map and silently strands all prior
+            // integer entries in the side store.
+            this = materialize_hm_int_fast(ctx, this)?;
+        } else {
             // Walk parent chain to detect LinkedHashMap or TreeMap ancestry.
             // Without the TreeMap branch, the `java/util/Map.put` interface
             // override (registered as an abstract-method native) falls
@@ -5245,9 +5263,6 @@ fn native_map_put_evict(
             }
         }
     }
-    let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
-    let value = args.get(2).copied().unwrap_or(Value::Object(None));
-
     // `map_hash_key` / `map_keys_equal` dispatch arbitrary Java code. When
     // this path is reached by a direct native-to-native call (for example
     // HashSet.add -> HashMap.put while Selector.selectedKeys() builds a set),
@@ -6183,7 +6198,9 @@ fn native_map_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // resolve to whatever natives or bytecode `other`'s real class provides,
     // restoring `AbstractMap.equals` semantics for cross-implementation
     // comparisons.
-    let (_, size_a, _) = map_state(ctx, this);
+    let size_a = hm_int_fast_len(ctx, this)
+        .map(|size| size as i32)
+        .unwrap_or_else(|| map_state(ctx, this).1);
     let size_b = match ctx.invoke_virtual(other, "size", "()I", &[])? {
         Some(Value::Int(s)) => s,
         // Defensive: a Map whose `size()` did not yield an int — fall back to
@@ -19329,17 +19346,37 @@ fn native_comparator_then_comparing_double(
 // Phase 13 Step 5: StringJoiner
 // ===========================================================================
 
-// StringJoiner is a 5-field synthetic:
+// Synthetic-fallback StringJoiner is a 5-field object, used only when no real
+// JDK `java/util/StringJoiner` class is loaded (see
+// `classloading::class_manager::synthetic_stub_fields`, which declares 5
+// UNNAMED fields `_f0.._f4` for exactly this shape):
 //   field 0 = delimiter (String)
 //   field 1 = prefix (String or null)
 //   field 2 = suffix (String or null)
 //   field 3 = elements ArrayList
 //   field 4 = emptyValue (String or null)
+//
+// In real-JDK mode `new`+`<init>` instead allocate an object shaped like the
+// REAL class (7 NAMED fields: prefix, delimiter, suffix, elts:String[],
+// size, len, emptyValue) — writing through the legacy indices above then
+// silently lands on the wrong real fields (wrong type too: `elts` is a
+// String[], not an ArrayList). See
+// docs/known-issues/stringjoiner-synthetic-native-real-jdk-field-mismatch.md.
+// `sj_real_layout` resolves the real class's actual field indices by name
+// when present; every entry point below branches on it. This is
+// intentionally still a full from-scratch Rust reimplementation of
+// StringJoiner's behavior (NOT a yield to real bytecode) even when it
+// targets the real object's fields: running the real `add()` bytecode
+// against a real StringJoiner exposes a separate, unrelated
+// heap-reference-integrity defect (see interpreter.rs's
+// `synthetic_stub_should_yield_to_real_bytecode` StringJoiner exclusion), so
+// this native must keep owning execution either way.
 const SJ_FIELD_DELIM: usize = 0;
 const SJ_FIELD_PREFIX: usize = 1;
 const SJ_FIELD_SUFFIX: usize = 2;
 const SJ_FIELD_ELEMENTS: usize = 3;
 const SJ_FIELD_EMPTY_VALUE: usize = 4;
+
 fn register_string_joiner_natives_with_category(
     registry: &mut NativeMethodRegistry,
     kind: cratonvm_native_api::NativeKind,
@@ -19401,6 +19438,43 @@ pub fn register_string_joiner_stub_natives(registry: &mut NativeMethodRegistry) 
     );
 }
 
+/// Real JDK `java/util/StringJoiner`'s actual field indices, resolved by
+/// name. `None` when only the synthetic 5-field fallback class is loaded (no
+/// real bytecode present) — callers fall back to the legacy `SJ_FIELD_*`
+/// constants/ArrayList-of-elements representation in that case.
+struct SjRealLayout {
+    prefix: usize,
+    delimiter: usize,
+    suffix: usize,
+    elts: usize,
+    size: usize,
+    len: usize,
+    empty_value: usize,
+}
+
+fn sj_real_layout(ctx: &dyn NativeContext) -> Option<SjRealLayout> {
+    const CN: &str = "java/util/StringJoiner";
+    Some(SjRealLayout {
+        prefix: ctx.resolve_field_index(CN, "prefix")?,
+        delimiter: ctx.resolve_field_index(CN, "delimiter")?,
+        suffix: ctx.resolve_field_index(CN, "suffix")?,
+        elts: ctx.resolve_field_index(CN, "elts")?,
+        size: ctx.resolve_field_index(CN, "size")?,
+        len: ctx.resolve_field_index(CN, "len")?,
+        empty_value: ctx.resolve_field_index(CN, "emptyValue")?,
+    })
+}
+
+/// `String.valueOf`-style coercion of a (possibly null) `CharSequence` arg to
+/// a guaranteed non-null real `java.lang.String` object.
+fn sj_coerce_string(ctx: &mut dyn NativeContext, v: Value) -> Value {
+    let s = match v {
+        Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
+        _ => String::new(),
+    };
+    Value::Object(Some(ctx.create_string(&s)))
+}
+
 fn native_sj_init_delim(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
@@ -19410,7 +19484,28 @@ fn native_sj_init_delim(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(r))) => Value::Object(Some(*r)),
         _ => Value::Object(None),
     };
-    // Create an empty ArrayList for elements
+
+    if let Some(layout) = sj_real_layout(ctx) {
+        // Store each coerced String into `this` immediately after creating
+        // it (rather than creating all three up front) so no raw
+        // `ObjectRef` is ever held across a *later* allocation — once
+        // stored via `set_field`, the object is reachable from `this` (kept
+        // rooted for the whole native call) and any later GC correctly
+        // relocates it via the normal write-barrier-tracked heap graph.
+        let prefix_s = sj_coerce_string(ctx, Value::Object(None));
+        ctx.set_field(this, layout.prefix, prefix_s);
+        let delim_s = sj_coerce_string(ctx, delim);
+        ctx.set_field(this, layout.delimiter, delim_s);
+        let suffix_s = sj_coerce_string(ctx, Value::Object(None));
+        ctx.set_field(this, layout.suffix, suffix_s);
+        ctx.set_field(this, layout.elts, Value::Object(None));
+        ctx.set_field(this, layout.size, Value::Int(0));
+        ctx.set_field(this, layout.len, Value::Int(0));
+        ctx.set_field(this, layout.empty_value, Value::Object(None));
+        return Ok(None);
+    }
+
+    // Legacy 5-field synthetic fallback (no real class loaded).
     let elements = alloc_synthetic(ctx, "java/util/ArrayList", 2);
     let backing = alloc_ref_array(ctx, 10);
     ctx.set_field(elements, 0, Value::Object(Some(backing)));
@@ -19442,6 +19537,21 @@ fn native_sj_init_full(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => Value::Object(None),
     };
 
+    if let Some(layout) = sj_real_layout(ctx) {
+        let prefix_s = sj_coerce_string(ctx, prefix);
+        ctx.set_field(this, layout.prefix, prefix_s);
+        let delim_s = sj_coerce_string(ctx, delim);
+        ctx.set_field(this, layout.delimiter, delim_s);
+        let suffix_s = sj_coerce_string(ctx, suffix);
+        ctx.set_field(this, layout.suffix, suffix_s);
+        ctx.set_field(this, layout.elts, Value::Object(None));
+        ctx.set_field(this, layout.size, Value::Int(0));
+        ctx.set_field(this, layout.len, Value::Int(0));
+        ctx.set_field(this, layout.empty_value, Value::Object(None));
+        return Ok(None);
+    }
+
+    // Legacy 5-field synthetic fallback (no real class loaded).
     let elements = alloc_synthetic(ctx, "java/util/ArrayList", 2);
     let backing = alloc_ref_array(ctx, 10);
     ctx.set_field(elements, 0, Value::Object(Some(backing)));
@@ -19464,7 +19574,97 @@ fn native_sj_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(v) => *v,
         _ => Value::Object(None),
     };
-    // Get the elements ArrayList and add to it
+
+    if let Some(layout) = sj_real_layout(ctx) {
+        // `String.valueOf(newElement)`: null -> "null", else `.toString()`.
+        // Converted to a plain Rust `String` immediately (no live
+        // `ObjectRef` held across the allocations below).
+        let elt_str = match element {
+            Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_else(|| "null".to_string()),
+            _ => "null".to_string(),
+        };
+
+        let size = match ctx.get_field(this, layout.size) {
+            Value::Int(n) => n,
+            _ => 0,
+        };
+        let has_elts = matches!(ctx.get_field(this, layout.elts), Value::Object(Some(_)));
+
+        let base_len = if !has_elts {
+            // First-ever add(): allocate `elts = new String[8]`, matching
+            // real StringJoiner. No delimiter is prepended to `len` yet.
+            let arr = alloc_ref_array(ctx, 8);
+            ctx.set_field(this, layout.elts, Value::Object(Some(arr)));
+            0i32
+        } else {
+            // Re-fetch `elts` fresh from `this` rather than holding a raw
+            // `ObjectRef` across an allocation: `ObjectRef` is a bare
+            // pointer, so a moving GC triggered by `alloc_ref_array` below
+            // could relocate it out from under a stale local copy. `this`
+            // itself stays rooted for the whole native call, so re-reading
+            // its field is always safe.
+            let arr = match ctx.get_field(this, layout.elts) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Object(Some(this)))),
+            };
+            let capacity = ctx.array_length(arr);
+            let delim_len = match ctx.get_field(this, layout.delimiter) {
+                Value::Object(Some(r)) => ctx.read_string(r).map(|s| s.len() as i32).unwrap_or(0),
+                _ => 0,
+            };
+            let existing_len = match ctx.get_field(this, layout.len) {
+                Value::Int(n) => n,
+                _ => 0,
+            };
+            let base_len = existing_len + delim_len;
+            if size as usize >= capacity {
+                // Overflow-safe doubling capped at 1<<30, mirroring the
+                // legacy fallback's own growth policy below.
+                const SJ_MAX_CAPACITY: usize = 1 << 30;
+                let new_cap = std::cmp::min(
+                    std::cmp::max(capacity.saturating_mul(2), capacity.saturating_add(1)),
+                    SJ_MAX_CAPACITY,
+                );
+                if new_cap <= capacity {
+                    return Err(cratonvm_types::error::RuntimeError::OutOfMemoryError {
+                        message: format!(
+                            "StringJoiner backing array exceeds the {SJ_MAX_CAPACITY}-element limit"
+                        ),
+                    }
+                    .into());
+                }
+                let new_arr = alloc_ref_array(ctx, new_cap);
+                // Re-fetch the OLD array fresh (post-allocation) before
+                // reading out of it, for the same reason as above.
+                let arr = match ctx.get_field(this, layout.elts) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(Some(this)))),
+                };
+                for i in 0..capacity {
+                    let v = ctx.get_array_element(arr, i);
+                    ctx.set_array_element(new_arr, i, v);
+                }
+                ctx.set_field(this, layout.elts, Value::Object(Some(new_arr)));
+            }
+            base_len
+        };
+
+        let elt_obj = ctx.create_string(&elt_str);
+        // Re-fetch `elts` once more: `create_string` above is itself an
+        // allocation that could have moved whatever array `this.elts`
+        // points to.
+        let elts_arr = match ctx.get_field(this, layout.elts) {
+            Value::Object(Some(r)) => r,
+            _ => return Ok(Some(Value::Object(Some(this)))),
+        };
+        ctx.set_array_element(elts_arr, size as usize, Value::Object(Some(elt_obj)));
+        ctx.set_field(this, layout.size, Value::Int(size + 1));
+        ctx.set_field(this, layout.len, Value::Int(base_len + elt_str.len() as i32));
+        return Ok(Some(Value::Object(Some(this))));
+    }
+
+    // Legacy 5-field synthetic fallback: elements live in an internal
+    // ArrayList (field SJ_FIELD_ELEMENTS), added to below.
     let elements = match ctx.get_field(this, SJ_FIELD_ELEMENTS) {
         Value::Object(Some(r)) => r,
         _ => return Ok(Some(Value::Object(Some(this)))),
@@ -19513,7 +19713,8 @@ fn native_sj_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     Ok(Some(Value::Object(Some(this))))
 }
 
-/// Helper: read all elements from a StringJoiner's internal ArrayList as strings
+/// Helper: read all elements from a legacy-layout StringJoiner's internal
+/// ArrayList as strings. Only used on the synthetic-fallback path.
 fn sj_read_elements(ctx: &mut dyn NativeContext, sj: ObjectRef) -> Vec<String> {
     let elements = match ctx.get_field(sj, SJ_FIELD_ELEMENTS) {
         Value::Object(Some(r)) => r,
@@ -19539,7 +19740,62 @@ fn sj_read_elements(ctx: &mut dyn NativeContext, sj: ObjectRef) -> Vec<String> {
     result
 }
 
+/// Read all elements from a real-layout StringJoiner's `elts: String[]`
+/// (first `size` slots) as strings.
+fn sj_read_elements_real(
+    ctx: &mut dyn NativeContext,
+    layout: &SjRealLayout,
+    sj: ObjectRef,
+) -> Vec<String> {
+    let size = match ctx.get_field(sj, layout.size) {
+        Value::Int(n) => n as usize,
+        _ => 0,
+    };
+    let elts = match ctx.get_field(sj, layout.elts) {
+        Value::Object(Some(r)) => r,
+        _ => return Vec::new(),
+    };
+    let mut result = Vec::with_capacity(size);
+    for i in 0..size {
+        let s = match ctx.get_array_element(elts, i) {
+            Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_else(|| "null".to_string()),
+            _ => "null".to_string(),
+        };
+        result.push(s);
+    }
+    result
+}
+
 fn sj_build_string(ctx: &mut dyn NativeContext, sj: ObjectRef) -> String {
+    if let Some(layout) = sj_real_layout(ctx) {
+        let prefix = match ctx.get_field(sj, layout.prefix) {
+            Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let suffix = match ctx.get_field(sj, layout.suffix) {
+            Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let size = match ctx.get_field(sj, layout.size) {
+            Value::Int(n) => n,
+            _ => 0,
+        };
+        if size == 0 {
+            if let Value::Object(Some(ev)) = ctx.get_field(sj, layout.empty_value) {
+                return ctx.read_string(ev).unwrap_or_default();
+            }
+            return format!("{prefix}{suffix}");
+        }
+        let delim = match ctx.get_field(sj, layout.delimiter) {
+            Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let elements = sj_read_elements_real(ctx, &layout, sj);
+        let joined = elements.join(&delim);
+        return format!("{prefix}{joined}{suffix}");
+    }
+
+    // Legacy 5-field synthetic fallback.
     let elements = sj_read_elements(ctx, sj);
     let delim = match ctx.get_field(sj, SJ_FIELD_DELIM) {
         Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
@@ -19594,6 +19850,24 @@ fn native_sj_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
+
+    if let Some(layout) = sj_real_layout(ctx) {
+        let other_elements = sj_read_elements_real(ctx, &layout, other);
+        if other_elements.is_empty() {
+            return Ok(Some(Value::Object(Some(this))));
+        }
+        let other_delim = match ctx.get_field(other, layout.delimiter) {
+            Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let merged = other_elements.join(&other_delim);
+        let merged_str = ctx.create_string(&merged);
+        return native_sj_add(
+            ctx,
+            &[Value::Object(Some(this)), Value::Object(Some(merged_str))],
+        );
+    }
+
     // Merge: add all elements from other into this (without other's prefix/suffix)
     let other_elements = sj_read_elements(ctx, other);
     if other_elements.is_empty() {
@@ -19622,6 +19896,13 @@ fn native_sj_set_empty_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(v) => *v,
         _ => Value::Object(None),
     };
+
+    if let Some(layout) = sj_real_layout(ctx) {
+        let coerced = sj_coerce_string(ctx, empty_val);
+        ctx.set_field(this, layout.empty_value, coerced);
+        return Ok(Some(Value::Object(Some(this))));
+    }
+
     ctx.set_field(this, SJ_FIELD_EMPTY_VALUE, empty_val);
     Ok(Some(Value::Object(Some(this))))
 }

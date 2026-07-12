@@ -149,6 +149,7 @@ struct Lowerer<'a> {
     /// Address of the `jit_invoke_dispatch` runtime helper (baked into each
     /// `Op::Call` site as `MOV RAX,imm64 ; CALL RAX`). 0 if no calls.
     invoke_dispatch: usize,
+    lambda_int_to_double: usize,
     /// Address of the `jit_dispatch_threw` peek helper. Baked into a `J`/`D`
     /// (long/double) call site's post-invoke check on the rare `RAX == i64::MIN`
     /// branch to disambiguate a genuine callee exception/deopt from a legitimate
@@ -224,6 +225,9 @@ impl<'a> Lowerer<'a> {
                 // inputs = [ctrl, mem, args…]
                 max_call_args = max_call_args.max(n.inputs.len().saturating_sub(2));
             }
+            if matches!(n.op, Op::LambdaIntToDouble) {
+                needs_context = true;
+            }
             if helpers.getfield != 0 && matches!(n.op, Op::Load(_)) {
                 needs_context = true;
             }
@@ -275,6 +279,7 @@ impl<'a> Lowerer<'a> {
             deopt_stub_patches: Vec::new(),
             deopt_boxes: Vec::new(),
             invoke_dispatch: helpers.invoke_dispatch,
+            lambda_int_to_double: helpers.lambda_int_to_double,
             dispatch_threw: helpers.dispatch_threw,
             frem: helpers.jit_frem,
             drem: helpers.jit_drem,
@@ -1468,6 +1473,15 @@ impl<'a> Lowerer<'a> {
             // `i64::MIN` means the callee threw: jump to the shared bail stub,
             // which returns the sentinel unchanged so the VM takes the pending
             // exception (the same protocol single-pass uses).
+            Op::LambdaIntToDouble => {
+                let slot = self.alloc_slot(id);
+                self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
+                self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(node.inputs[2]));
+                self.load_reg_from_frame(CALL_ARG_REGS[2], self.slot_of(node.inputs[3]));
+                self.emit_mov_reg_imm64(RAX, self.lambda_int_to_double as u64);
+                self.buf.emit(&[0xFF, 0xD0]);
+                self.store_rax(slot);
+            }
             Op::Call { info_ptr } => {
                 let slot = self.alloc_slot(id);
                 let num_args = node.inputs.len().saturating_sub(2);

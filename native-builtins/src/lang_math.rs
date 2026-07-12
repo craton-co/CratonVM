@@ -1557,7 +1557,7 @@ pub(crate) fn native_math_rint(_ctx: &mut dyn NativeContext, args: &[Value]) -> 
 /// avoids the spurious add. We mirror that exact algorithm so half-way and
 /// just-below-half cases match HotSpot bit-for-bit.
 #[inline]
-fn round_double(a: f64) -> i64 {
+pub(crate) fn round_double(a: f64) -> i64 {
     // Layout constants for IEEE-754 binary64.
     const SIGNIFICAND_WIDTH: i64 = 53; // 52 stored bits + implicit leading 1
     const EXP_BIAS: i64 = 1023;
@@ -1601,7 +1601,7 @@ pub(crate) fn native_math_round_double(
 /// round-half-up algorithm as `round_double`, but for IEEE-754 binary32, so the
 /// largest float just below 0.5f rounds to 0 (not 1).
 #[inline]
-fn round_float(a: f32) -> i32 {
+pub(crate) fn round_float(a: f32) -> i32 {
     // Layout constants for IEEE-754 binary32.
     const SIGNIFICAND_WIDTH: i32 = 24; // 23 stored bits + implicit leading 1
     const EXP_BIAS: i32 = 127;

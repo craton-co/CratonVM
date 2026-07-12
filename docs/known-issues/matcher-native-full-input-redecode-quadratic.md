@@ -8,6 +8,19 @@ build is a *different*, deeper issue — see
 [`../internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`](../internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md)
 (now FIXED).
 
+## Update (2026-07-11, later same day): successor fast path landed — this doc's bridge is STILL dead code, unrelated
+
+After the substring fix above closed the O(n²) algorithmic bug, a separate,
+*new* real-JDK-layout fast path
+([`../internal/fixed-suite-bugs/matcher-find-realjdk-fastpath-FIXED.md`](../internal/fixed-suite-bugs/matcher-find-realjdk-fastpath-FIXED.md))
+was added for `find()`/`find(int)`/`start()`/`end()`/`group()` to close the
+remaining constant-factor gap. It is a completely separate set of natives
+from the dead bridge this doc describes — it resolves every field BY NAME
+against whatever real object layout is actually there (never a hardcoded
+slot index), so it doesn't inherit this doc's real-vs-synthetic-layout
+hazard. The dead bridge described below remains exactly as dead as before;
+nothing in the new fast path un-drops or reactivates it.
+
 ## Correction (2026-07-11, same day)
 
 The original version of this doc claimed the redecode bug below was the cause of a

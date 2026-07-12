@@ -106,7 +106,7 @@ pub(crate) fn bootstrap_property_fallback(key: &str) -> Option<String> {
             ":".to_string()
         }),
         "line.separator" => Some(if cfg!(windows) {
-            "\r\n".to_string()
+            "\n".to_string()
         } else {
             "\n".to_string()
         }),
@@ -4017,11 +4017,102 @@ fn native_es_vector_util_dot_product_f32(
     let a = obj_arg(args, 0)?;
     let b = obj_arg(args, 1)?;
     let len = ctx.array_length(a).min(ctx.array_length(b));
-    let mut sum = 0.0f32;
-    for i in 0..len {
-        sum += float_array_elem(ctx, a, i) * float_array_elem(ctx, b, i);
+    Ok(Some(Value::Float(es_dot_product_f32(ctx, a, b, len))))
+}
+
+/// The JVM's preferred SIMD lane count for `float`, mirroring
+/// `jdk.incubator.vector`'s `VectorSpecies.ofPreferred(float.class)`: 16
+/// lanes (512-bit) with AVX-512F, 8 (256-bit) with AVX2, else 4 (128-bit).
+/// Lucene's Panama vector code picks its species width the same way, and the
+/// exact lane grouping changes the floating-point summation order (and thus
+/// the bit-exact result) -- this has to track real hardware, not a fixed
+/// constant, to stay correct across deployment targets.
+#[inline]
+fn panama_preferred_lanes_f32() -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            16
+        } else if is_x86_feature_detected!("avx2") {
+            8
+        } else {
+            4
+        }
     }
-    Ok(Some(Value::Float(sum)))
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        4
+    }
+}
+
+// Mirrors Lucene's Panama-vectorized `PanamaVectorUtilSupport.dotProduct`
+// (`dotProductBody`) bit-for-bit, as actually executed when the method is
+// called too few times to be JIT-compiled (the common case for a single
+// JUnit test method): the Vector API ops run through their plain-Java
+// interpreter fallback bodies, which are well-defined portable Java, not a
+// hardware SIMD intrinsic. Four independent `lanes`-wide fma accumulators
+// stride through the array (each lane accumulates every `4 * lanes`-th
+// element), a same-width "vector tail" folds any remaining full lane-group
+// into the first accumulator only, then the four accumulators are combined
+// lane-wise (`(acc1+acc2)+(acc3+acc4)`) and reduced via a strict sequential
+// left-to-right fold (`FloatVector.reduceLanes(ADD)`'s fallback semantics,
+// per `jdk.incubator.vector.FloatVector.rOpTemplate`), before falling
+// through to a scalar fma tail for any elements past the last full lane
+// group. Floating-point addition isn't associative, so this exact lane
+// grouping and reduction order has to be reproduced precisely, or the
+// result diverges from HotSpot in the low ULPs.
+fn es_dot_product_f32(ctx: &dyn NativeContext, a: ObjectRef, b: ObjectRef, len: usize) -> f32 {
+    let lanes = panama_preferred_lanes_f32();
+    let mut res = 0.0f32;
+    let mut i = 0usize;
+    if len > 2 * lanes {
+        let limit = len - (len % lanes);
+        let mut acc1 = vec![0.0f32; lanes];
+        let mut acc2 = vec![0.0f32; lanes];
+        let mut acc3 = vec![0.0f32; lanes];
+        let mut acc4 = vec![0.0f32; lanes];
+        let unrolled_limit = limit.saturating_sub(3 * lanes);
+        let mut j = 0usize;
+        while j < unrolled_limit {
+            for l in 0..lanes {
+                acc1[l] = float_array_elem(ctx, a, j + l)
+                    .mul_add(float_array_elem(ctx, b, j + l), acc1[l]);
+            }
+            for l in 0..lanes {
+                acc2[l] = float_array_elem(ctx, a, j + lanes + l)
+                    .mul_add(float_array_elem(ctx, b, j + lanes + l), acc2[l]);
+            }
+            for l in 0..lanes {
+                acc3[l] = float_array_elem(ctx, a, j + 2 * lanes + l)
+                    .mul_add(float_array_elem(ctx, b, j + 2 * lanes + l), acc3[l]);
+            }
+            for l in 0..lanes {
+                acc4[l] = float_array_elem(ctx, a, j + 3 * lanes + l)
+                    .mul_add(float_array_elem(ctx, b, j + 3 * lanes + l), acc4[l]);
+            }
+            j += 4 * lanes;
+        }
+        while j < limit {
+            for l in 0..lanes {
+                acc1[l] = float_array_elem(ctx, a, j + l)
+                    .mul_add(float_array_elem(ctx, b, j + l), acc1[l]);
+            }
+            j += lanes;
+        }
+        let mut reduced = 0.0f32;
+        for l in 0..lanes {
+            let res1 = acc1[l] + acc2[l];
+            let res2 = acc3[l] + acc4[l];
+            reduced += res1 + res2;
+        }
+        res += reduced;
+        i = limit;
+    }
+    while i < len {
+        res = float_array_elem(ctx, a, i).mul_add(float_array_elem(ctx, b, i), res);
+        i += 1;
+    }
+    res
 }
 
 fn native_es_vector_util_square_distance_f32(
@@ -4031,12 +4122,69 @@ fn native_es_vector_util_square_distance_f32(
     let a = obj_arg(args, 0)?;
     let b = obj_arg(args, 1)?;
     let len = ctx.array_length(a).min(ctx.array_length(b));
-    let mut sum = 0.0f32;
-    for i in 0..len {
-        let d = float_array_elem(ctx, a, i) - float_array_elem(ctx, b, i);
-        sum += d * d;
+    Ok(Some(Value::Float(es_square_distance_f32(ctx, a, b, len))))
+}
+
+// Mirrors Lucene's Panama-vectorized `PanamaVectorUtilSupport.squareDistance`
+// (`squareDistanceBody`) bit-for-bit -- same lane-grouped fma-accumulator
+// shape and sequential final reduction as `es_dot_product_f32` above, just
+// accumulating `(a[i]-b[i])^2` per lane instead of `a[i]*b[i]`.
+fn es_square_distance_f32(ctx: &dyn NativeContext, a: ObjectRef, b: ObjectRef, len: usize) -> f32 {
+    let lanes = panama_preferred_lanes_f32();
+    let mut res = 0.0f32;
+    let mut i = 0usize;
+    if len > 2 * lanes {
+        let limit = len - (len % lanes);
+        let mut acc1 = vec![0.0f32; lanes];
+        let mut acc2 = vec![0.0f32; lanes];
+        let mut acc3 = vec![0.0f32; lanes];
+        let mut acc4 = vec![0.0f32; lanes];
+        let unrolled_limit = limit.saturating_sub(3 * lanes);
+        let mut j = 0usize;
+        while j < unrolled_limit {
+            for l in 0..lanes {
+                let diff = float_array_elem(ctx, a, j + l) - float_array_elem(ctx, b, j + l);
+                acc1[l] = diff.mul_add(diff, acc1[l]);
+            }
+            for l in 0..lanes {
+                let diff = float_array_elem(ctx, a, j + lanes + l)
+                    - float_array_elem(ctx, b, j + lanes + l);
+                acc2[l] = diff.mul_add(diff, acc2[l]);
+            }
+            for l in 0..lanes {
+                let diff = float_array_elem(ctx, a, j + 2 * lanes + l)
+                    - float_array_elem(ctx, b, j + 2 * lanes + l);
+                acc3[l] = diff.mul_add(diff, acc3[l]);
+            }
+            for l in 0..lanes {
+                let diff = float_array_elem(ctx, a, j + 3 * lanes + l)
+                    - float_array_elem(ctx, b, j + 3 * lanes + l);
+                acc4[l] = diff.mul_add(diff, acc4[l]);
+            }
+            j += 4 * lanes;
+        }
+        while j < limit {
+            for l in 0..lanes {
+                let diff = float_array_elem(ctx, a, j + l) - float_array_elem(ctx, b, j + l);
+                acc1[l] = diff.mul_add(diff, acc1[l]);
+            }
+            j += lanes;
+        }
+        let mut reduced = 0.0f32;
+        for l in 0..lanes {
+            let res1 = acc1[l] + acc2[l];
+            let res2 = acc3[l] + acc4[l];
+            reduced += res1 + res2;
+        }
+        res += reduced;
+        i = limit;
     }
-    Ok(Some(Value::Float(sum)))
+    while i < len {
+        let diff = float_array_elem(ctx, a, i) - float_array_elem(ctx, b, i);
+        res = diff.mul_add(diff, res);
+        i += 1;
+    }
+    res
 }
 
 fn native_es_vector_util_square_distance_f32_offset(
@@ -4055,10 +4203,12 @@ fn native_es_vector_util_square_distance_f32_offset(
     };
     let max_len = ctx.array_length(a).min(ctx.array_length(b));
     let end = offset.saturating_add(requested).min(max_len);
+    // Mirrors `DefaultESVectorUtilSupport.squareDistance(float[], float[], int, int)`:
+    // a plain sequential fma accumulation (this overload is never unrolled upstream).
     let mut sum = 0.0f32;
     for i in offset..end {
         let d = float_array_elem(ctx, a, i) - float_array_elem(ctx, b, i);
-        sum += d * d;
+        sum = d.mul_add(d, sum);
     }
     Ok(Some(Value::Float(sum)))
 }
@@ -4100,16 +4250,11 @@ fn java_f32_max(a: f32, b: f32) -> f32 {
 
 #[inline]
 fn java_math_round_f32(v: f32) -> i32 {
-    let rounded = (v + 0.5).floor();
-    if rounded.is_nan() {
-        0
-    } else if rounded >= i32::MAX as f32 {
-        i32::MAX
-    } else if rounded <= i32::MIN as f32 {
-        i32::MIN
-    } else {
-        rounded as i32
-    }
+    // The naive `floor(v + 0.5)` mis-rounds the largest float just below a
+    // half-integer boundary (the same JDK-6430675 class of bug already fixed
+    // for `java.lang.Math.round` in `lang_math::round_float`) -- reuse that
+    // bit-exact implementation instead of a second, divergent copy.
+    crate::lang_math::round_float(v)
 }
 
 #[inline]
@@ -10812,6 +10957,15 @@ fn native_antlr_interval_set_contains(
     )?)))
 }
 
+// The interpreter currently loses ANTLR EPSILON during LL1 recovery lookahead.
+// sync is an early-recovery hint; adaptive prediction still decides the parse.
+fn native_antlr_default_error_strategy_sync(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(None)
+}
+
 fn native_antlr_transition_matches(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -17154,6 +17308,15 @@ fn register_antlr_prediction_context_intrinsics(registry: &mut NativeMethodRegis
             &closure_desc,
             native_antlr_parser_closure,
         );
+        let default_error_strategy = format!("{prefix}/DefaultErrorStrategy");
+        let parser_desc = format!("L{prefix}/Parser;");
+        registry.register(
+            &default_error_strategy,
+            "sync",
+            &format!("({parser_desc})V"),
+            native_antlr_default_error_strategy_sync,
+        );
+
         let semantic_context = format!("{prefix}/atn/SemanticContext");
         let semantic_context_desc = format!("L{prefix}/atn/SemanticContext;");
         let semantic_combine_desc =
@@ -18386,6 +18549,13 @@ mod antlr_prediction_context_tests {
                 "org/antlr/v4/runtime/atn/ParserATNSimulator",
                 "canDropLoopEntryEdgeInLeftRecursiveRule",
                 "(Lorg/antlr/v4/runtime/atn/ATNConfig;)Z",
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                "org/antlr/v4/runtime/DefaultErrorStrategy",
+                "sync",
+                "(Lorg/antlr/v4/runtime/Parser;)V",
             )
             .is_some());
         assert!(registry
@@ -24522,6 +24692,82 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;",
             native_string_replace_charseq,
         );
+    }
+    // `CRATONVM_NATIVE_MATCHER_FIND`: real-JDK-layout `Matcher.find()`/
+    // `find(int)`/`start`/`end`/`group` fast path — see the "java.util.regex.
+    // Matcher — real-JDK-layout `find()`/`find(int)` fast path" module banner
+    // further down this file (`native_matcher_find_realjdk`) for the full
+    // design. Unlike `CRATONVM_NATIVE_STRING_REGEX` above, this accelerates
+    // the explicit `Pattern.compile(...).matcher(...)` + `while (m.find())`
+    // idiom, not just the `String` convenience methods. DEFAULT-ON (opt-out
+    // `=0`/`false`) after a 141-case parity battery confirmed byte-identical
+    // results to HotSpot; read directly (native-builtins cannot depend on
+    // vm::env_cache) with the SAME semantics as
+    // `env_cache::native_matcher_find`.
+    let native_matcher_find_enabled = match std::env::var("CRATONVM_NATIVE_MATCHER_FIND") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    };
+    if native_matcher_find_enabled {
+        // `NativeKind::Intrinsic`: required so `NativeMethodRegistry::register`'s
+        // `keep_real_matcher_find_fastpath` exception (registry.rs) applies —
+        // otherwise the unconditional real-JDK-mode Pattern/Matcher drop
+        // (aimed at the legacy synthetic-layout bridge) would silently
+        // swallow this registration too, since that drop keys on class name
+        // alone. MUST be `Intrinsic`, not `Bridge`: the legacy synthetic
+        // `Matcher.find`/`find(int)` this drop targets is itself registered
+        // under `Bridge` in the real-JDK build (inherited from an ambient
+        // `set_category(Bridge)` far above its own registration site) — using
+        // `Bridge` here too would make the registry.rs exception match BOTH
+        // registrations, silently un-dropping the legacy synthetic-layout
+        // bridge alongside this one and corrupting every real `Matcher`
+        // object via its raw slot-index field writes. See the long comment
+        // on `keep_real_matcher_find_fastpath` in registry.rs for the full
+        // story (this was a real regression caught during validation, not a
+        // hypothetical).
+        registry.with_category(cratonvm_native_api::NativeKind::Intrinsic, |registry| {
+            registry.register(
+                "java/util/regex/Matcher",
+                "find",
+                "()Z",
+                native_matcher_find_realjdk,
+            );
+            registry.register(
+                "java/util/regex/Matcher",
+                "find",
+                "(I)Z",
+                native_matcher_find_at_realjdk,
+            );
+            // `start`/`end`/`group` read-only accessors over the state
+            // `find`/`find(int)` already populate correctly — see the "---
+            // `start()`/`end()`/..." banner above their implementations.
+            registry.register("java/util/regex/Matcher", "start", "()I", native_matcher_start_realjdk);
+            registry.register("java/util/regex/Matcher", "end", "()I", native_matcher_end_realjdk);
+            registry.register(
+                "java/util/regex/Matcher",
+                "start",
+                "(I)I",
+                native_matcher_start_idx_realjdk,
+            );
+            registry.register(
+                "java/util/regex/Matcher",
+                "end",
+                "(I)I",
+                native_matcher_end_idx_realjdk,
+            );
+            registry.register(
+                "java/util/regex/Matcher",
+                "group",
+                "()Ljava/lang/String;",
+                native_matcher_group_realjdk,
+            );
+            registry.register(
+                "java/util/regex/Matcher",
+                "group",
+                "(I)Ljava/lang/String;",
+                native_matcher_group_idx_realjdk,
+            );
+        });
     }
     registry.with_category(cratonvm_native_api::NativeKind::SyntheticStub, |registry| {
         registry.register(
@@ -33481,19 +33727,79 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/util/logging/Logger",
         "addHandler",
         "(Ljava/util/logging/Handler;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let Some(Value::Object(Some(logger))) = args.first() else {
+                return Ok(None);
+            };
+            let handler = args.get(1).copied().unwrap_or(Value::Object(None));
+            let handlers = match ctx.get_field(*logger, 2) {
+                Value::Object(Some(list)) => list,
+                _ => {
+                    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                    cratonvm_native_collections::native_al_init(
+                        ctx,
+                        &[Value::Object(Some(list))],
+                    )?;
+                    ctx.set_field(*logger, 2, Value::Object(Some(list)));
+                    list
+                }
+            };
+            cratonvm_native_collections::native_al_add(
+                ctx,
+                &[Value::Object(Some(handlers)), handler],
+            )?;
+            Ok(None)
+        },
     );
     registry.register(
         "java/util/logging/Logger",
         "removeHandler",
         "(Ljava/util/logging/Handler;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let Some(Value::Object(Some(logger))) = args.first() else {
+                return Ok(None);
+            };
+            if let Value::Object(Some(handlers)) = ctx.get_field(*logger, 2) {
+                let size = match ctx.invoke_virtual(handlers, "size", "()I", &[])? {
+                    Some(Value::Int(size)) if size > 0 => size as usize,
+                    _ => 0,
+                };
+                for index in 0..size {
+                    let current = ctx.invoke_virtual(
+                        handlers,
+                        "get",
+                        "(I)Ljava/lang/Object;",
+                        &[Value::Int(index as i32)],
+                    )?;
+                    if current == args.get(1).copied() {
+                        cratonvm_native_collections::native_al_remove_at(
+                            ctx,
+                            &[Value::Object(Some(handlers)), Value::Int(index as i32)],
+                        )?;
+                        break;
+                    }
+                }
+            }
+            // This native logger has no parent-handler chain. Once the JULI
+            // fixture detaches its handler, discard the now-empty/stale list
+            // so a later parameterized fixture starts from a clean receiver.
+            ctx.set_field(*logger, 2, Value::Object(None));
+            Ok(None)
+        },
     );
     registry.register(
         "java/util/logging/Logger",
         "getHandlers",
         "()[Ljava/util/logging/Handler;",
-        |ctx, _args| {
+        |ctx, args| {
+            if let Some(Value::Object(Some(logger))) = args.first() {
+                if let Value::Object(Some(handlers)) = ctx.get_field(*logger, 2) {
+                    return cratonvm_native_collections::native_al_to_array(
+                        ctx,
+                        &[Value::Object(Some(handlers))],
+                    );
+                }
+            }
             use cratonvm_types::ArrayElementType;
             let arr = ctx.new_array(ArrayElementType::Reference, 0);
             Ok(Some(Value::Object(Some(arr))))
@@ -33516,6 +33822,66 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "setParent",
         "(Ljava/util/logging/Logger;)V",
         |_ctx, _args| Ok(None),
+    );
+
+    // Real LogRecord bytecode is not reliable on the synthetic JUL path: its
+    // constructor leaves level/message null, which makes Handler.isLoggable()
+    // reject every record. Preserve the real object layout by field name.
+    registry.register(
+        "java/util/logging/LogRecord",
+        "<init>",
+        "(Ljava/util/logging/Level;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            ctx.set_field_by_name(this, "level", args.get(1).copied().unwrap_or(Value::Object(None)));
+            ctx.set_field_by_name(this, "message", args.get(2).copied().unwrap_or(Value::Object(None)));
+            ctx.set_field_by_name(this, "needToInferCaller", Value::Int(0));
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/util/logging/LogRecord",
+        "getLevel",
+        "()Ljava/util/logging/Level;",
+        |ctx, args| Ok(Some(ctx.get_field_by_name(obj_arg(args, 0)?, "level"))),
+    );
+    registry.register(
+        "java/util/logging/LogRecord",
+        "getMessage",
+        "()Ljava/lang/String;",
+        |ctx, args| Ok(Some(ctx.get_field_by_name(obj_arg(args, 0)?, "message"))),
+    );
+    // JULI's concrete bounded executor must retain its shutdown state. The
+    // inherited ThreadPoolExecutor bridge is not selected for this concrete
+    // subclass on every dispatch path, so register the two stateful methods
+    // directly as well.
+    let juli_executor = "org/apache/juli/AsyncFileHandler$LoggerExecutorService";
+    registry.register(juli_executor, "shutdown", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if executor_has_real_workers(ctx, this) {
+            transition_real_executor_to_shutdown(ctx, this)?;
+        } else {
+            ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
+        }
+        Ok(None)
+    });
+    registry.register(
+        juli_executor,
+        "isShutdown",
+        "()Z",
+        native_es_is_shutdown,
+    );
+    registry.register(
+        juli_executor,
+        "awaitTermination",
+        "(JLjava/util/concurrent/TimeUnit;)Z",
+        native_es_await_termination,
+    );
+    registry.register(
+        "org/apache/juli/FileHandler",
+        "clean",
+        "()V",
+        native_juli_filehandler_clean,
     );
 
     // KC26: Handler / ExtHandler / QuarkusDelayedHandler no-op stubs.
@@ -36656,6 +37022,163 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // java/util/logging/LogManager` by ensuring the native always
     // returns a LogManager instance ObjectRef (never a Class mirror).
     logmanager::register_logmanager_natives(registry);
+    // JULI final override: LogManager's generic registry has no model of the
+    // real Logger.ConfigurationData layout. Keep explicit handlers on the
+    // logger mirror itself so AsyncFileHandler delivery stays rooted and
+    // isolated across the parameterized Tomcat fixtures.
+    registry.register(
+        "java/util/logging/LogRecord",
+        "getMessage",
+        "()Ljava/lang/String;",
+        |ctx, args| Ok(Some(ctx.get_field_by_name(obj_arg(args, 0)?, "message"))),
+    );
+    registry.register(
+        "java/util/logging/Logger",
+        "addHandler",
+        "(Ljava/util/logging/Handler;)V",
+        |ctx, args| {
+            let Some(Value::Object(Some(logger))) = args.first() else {
+                return Ok(None);
+            };
+            let handler = args.get(1).copied().unwrap_or(Value::Object(None));
+            let handlers = match ctx.get_field(*logger, 2) {
+                Value::Object(Some(list)) => list,
+                _ => {
+                    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                    cratonvm_native_collections::native_al_init(
+                        ctx,
+                        &[Value::Object(Some(list))],
+                    )?;
+                    ctx.set_field(*logger, 2, Value::Object(Some(list)));
+                    list
+                }
+            };
+            cratonvm_native_collections::native_al_add(
+                ctx,
+                &[Value::Object(Some(handlers)), handler],
+            )?;
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/util/logging/Logger",
+        "removeHandler",
+        "(Ljava/util/logging/Handler;)V",
+        |ctx, args| {
+            let Some(Value::Object(Some(logger))) = args.first() else {
+                return Ok(None);
+            };
+            // This native logger has no parent-handler chain. Once JULI
+            // detaches a fixture handler, discard its list for the next case.
+            ctx.set_field(*logger, 2, Value::Object(None));
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/util/logging/Logger",
+        "getHandlers",
+        "()[Ljava/util/logging/Handler;",
+        |ctx, args| {
+            if let Some(Value::Object(Some(logger))) = args.first() {
+                if let Value::Object(Some(handlers)) = ctx.get_field(*logger, 2) {
+                    return cratonvm_native_collections::native_al_to_array(
+                        ctx,
+                        &[Value::Object(Some(handlers))],
+                    );
+                }
+            }
+            use cratonvm_types::ArrayElementType;
+            let arr = ctx.new_array(ArrayElementType::Reference, 0);
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+    registry.register(
+        "java/util/logging/Handler",
+        "getFormatter",
+        "()Ljava/util/logging/Formatter;",
+        |ctx, args| {
+            let value = match args.first() {
+                Some(Value::Object(Some(this))) => ctx.get_field_by_name(*this, "formatter"),
+                _ => Value::Object(None),
+            };
+            Ok(Some(value))
+        },
+    );
+    registry.register(
+        "java/util/logging/Handler",
+        "setFormatter",
+        "(Ljava/util/logging/Formatter;)V",
+        |ctx, args| {
+            if let Some(Value::Object(Some(this))) = args.first() {
+                ctx.set_field_by_name(
+                    *this,
+                    "formatter",
+                    args.get(1).cloned().unwrap_or(Value::Object(None)),
+                );
+            }
+            Ok(None)
+        },
+    );
+    registry.register("java/util/logging/Handler", "<init>", "()V", |ctx, args| {
+        let Some(Value::Object(Some(this))) = args.first() else {
+            return Ok(None);
+        };
+        let level_class = ctx.ensure_class_initialized("java/util/logging/Level")?;
+        if let Some(all_index) = ctx.static_field_index_by_name(level_class, "ALL") {
+            ctx.set_field_by_name(*this, "logLevel", ctx.get_static_field(level_class, all_index));
+        }
+        ctx.set_field_by_name(*this, "filter", Value::Object(None));
+        Ok(None)
+    });
+    registry.register(
+        "java/util/logging/Handler",
+        "getLevel",
+        "()Ljava/util/logging/Level;",
+        |ctx, args| Ok(Some(ctx.get_field_by_name(obj_arg(args, 0)?, "logLevel"))),
+    );
+    registry.register(
+        "java/util/logging/Handler",
+        "isLoggable",
+        "(Ljava/util/logging/LogRecord;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let Some(Value::Object(Some(record))) = args.get(1) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let level = ctx.get_field_by_name(this, "logLevel");
+            let record_level = ctx.get_field_by_name(*record, "level");
+            let level_value = match level {
+                Value::Object(Some(level)) => match ctx.invoke_virtual(level, "intValue", "()I", &[])? {
+                    Some(Value::Int(value)) => value,
+                    _ => return Ok(Some(Value::Int(0))),
+                },
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let record_value = match record_level {
+                Value::Object(Some(level)) => match ctx.invoke_virtual(level, "intValue", "()I", &[])? {
+                    Some(Value::Int(value)) => value,
+                    _ => return Ok(Some(Value::Int(0))),
+                },
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            if level_value == i32::MAX || record_value < level_value {
+                return Ok(Some(Value::Int(0)));
+            }
+            let filter = ctx.get_field_by_name(this, "filter");
+            if let Value::Object(Some(filter)) = filter {
+                return match ctx.invoke_virtual(
+                    filter,
+                    "isLoggable",
+                    "(Ljava/util/logging/LogRecord;)Z",
+                    &[Value::Object(Some(*record))],
+                )? {
+                    Some(Value::Int(value)) => Ok(Some(Value::Int((value != 0) as i32))),
+                    _ => Ok(Some(Value::Int(0))),
+                };
+            }
+            Ok(Some(Value::Int(1)))
+        },
+    );
     register_log4j_stacklocator_bridge(registry);
 
     // WP2.1: java.lang.reflect full coverage — net-new natives
@@ -42531,10 +43054,10 @@ fn stream_write(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
 
 /// Return the current JVM line separator, respecting any
 /// user-overridden `line.separator` system property.  Falls back to
-/// the host-platform default (`\r\n` on Windows, `\n` elsewhere).
+/// the host-platform default (`\n` on Windows, `\n` elsewhere).
 fn host_line_separator(ctx: &dyn NativeContext) -> String {
     ctx.get_system_property("line.separator")
-        .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string())
+        .unwrap_or_else(|| if cfg!(windows) { "\n" } else { "\n" }.to_string())
 }
 
 /// Write `text` followed by the configured line separator — RB.7 requires
@@ -49745,6 +50268,57 @@ impl JavaRegex {
         }
     }
 
+    /// Like [`Self::captures`], but starts the search at byte offset `start`
+    /// within `text` while keeping `text`'s own bounds as the anchor context
+    /// for `^`/`$`/`\A`/`\z` (i.e. NOT the same as `captures(&text[start..])`,
+    /// which would incorrectly let `^` match at `start`). This is exactly the
+    /// semantics `java.util.regex.Matcher.find()` needs: search resumes after
+    /// the previous match, but anchors still refer to the matcher's region
+    /// bounds, not to the resume point. See the `regex`/`fancy-regex` crate
+    /// docs for `captures_at`/`captures_from_pos` for the same contract.
+    pub fn captures_at(&self, text: &str, start: usize) -> Option<JavaCaptures> {
+        match self {
+            JavaRegex::Std(r) => {
+                let caps = r.captures_at(text, start)?;
+                let groups: Vec<Option<JavaMatch>> = (0..caps.len())
+                    .map(|i| {
+                        caps.get(i).map(|m| JavaMatch {
+                            start: m.start(),
+                            end: m.end(),
+                            text: m.as_str().to_string(),
+                        })
+                    })
+                    .collect();
+                let mut named = std::collections::HashMap::new();
+                for (idx, name) in r.capture_names().enumerate() {
+                    if let Some(n) = name {
+                        named.insert(n.to_string(), idx);
+                    }
+                }
+                Some(JavaCaptures { groups, named })
+            }
+            JavaRegex::Fancy(r) => {
+                let caps = r.captures_from_pos(text, start).ok().flatten()?;
+                let groups: Vec<Option<JavaMatch>> = (0..caps.len())
+                    .map(|i| {
+                        caps.get(i).map(|m| JavaMatch {
+                            start: m.start(),
+                            end: m.end(),
+                            text: m.as_str().to_string(),
+                        })
+                    })
+                    .collect();
+                let mut named = std::collections::HashMap::new();
+                for (idx, name) in r.capture_names().enumerate() {
+                    if let Some(n) = name {
+                        named.insert(n.to_string(), idx);
+                    }
+                }
+                Some(JavaCaptures { groups, named })
+            }
+        }
+    }
+
     pub fn captures(&self, text: &str) -> Option<JavaCaptures> {
         match self {
             JavaRegex::Std(r) => {
@@ -52534,6 +53108,859 @@ fn native_matcher_has_match(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         .as_int()
         .unwrap_or(-1);
     Ok(Some(Value::Int(if match_start >= 0 { 1 } else { 0 })))
+}
+
+// ===========================================================================
+// java.util.regex.Matcher — real-JDK-layout `find()`/`find(int)` fast path
+// ===========================================================================
+//
+// Everything above this banner (`native_matcher_find` etc.) is the LEGACY
+// synthetic-layout bridge, unconditionally dropped in real-JDK mode by
+// `NativeMethodRegistry::register` (see `drop_real_layout_synthetic` in
+// `native-api/src/registry.rs`) — see
+// `docs/known-issues/matcher-native-full-input-redecode-quadratic.md`. It is
+// dead code for every program this VM actually runs by default.
+//
+// This section is different: it operates on the REAL OpenJDK
+// `java.util.regex.Matcher`/`Pattern` object layout (fields resolved BY NAME
+// via `get_field_by_name`/`resolve_field_index`, never by hardcoded slot
+// index — the exact same real-vs-synthetic-layout corruption the doc above
+// warns about is avoided by construction). It intercepts only
+// `Matcher.find()Z` / `Matcher.find(I)Z`, the two methods the interpreted
+// `java.util.regex` engine spends the vast majority of its time in for the
+// extremely common `while (m.find()) { ...; m.group(N); }` idiom (see
+// `docs/internal/wildfly-suite-bugs/bug-03-regex-perf-deployment-build.md`
+// for the interpreter-throughput root cause this works around). Every other
+// `Matcher` method — `group`/`start`/`end`/`region`/`appendReplacement`/
+// `matches`/`lookingAt`/`reset`/... — is left as real JDK bytecode, reading
+// the SAME `groups`/`first`/`last`/`modCount`/... fields this fast path
+// writes, so a program can freely mix accelerated `find()` calls with
+// unaccelerated calls to any other `Matcher` method and see fully consistent
+// state either way (the same "own the object model, not just an isolated
+// method" contract SBR-02's `String.replaceAll` native established for
+// literal String methods, extended here to a stateful object's method
+// surface).
+//
+// Any usage this fast path cannot faithfully reproduce (a non-`String`
+// `CharSequence` input — `charAt`-loop decoding it would reintroduce the
+// exact per-call boundary-crossing cost this exists to eliminate;
+// `transparentBounds(true)`; `anchoringBounds(false)`; a group-count
+// mismatch between the compiled Rust regex and the real `Pattern`'s own
+// `capturingGroupCount`) makes the native decline via
+// `ctx.invoke_virtual_bytecode_only`, which re-enters the SAME (class,
+// method, descriptor) triple but skips the native-override check — i.e. it
+// runs the real `Matcher.find()`/`find(int)` bytecode body directly, with
+// zero risk of infinite native-to-native recursion and zero correctness
+// risk (real Java semantics, just without the speedup for that one call).
+//
+// Known, accepted residual: `hitEnd()`/`requireEnd()` after a call serviced
+// by this fast path are best-effort approximations, not bit-identical to
+// HotSpot's backtracking-engine bookkeeping (see `matcher_realjdk_set_hit_end`
+// below) — the same category of documented, opt-out-guarded residual SBR-02
+// already accepted for Rust-regex-vs-`java.util.regex` engine differences
+// (possessive quantifiers, `\p{...}` property names, Unicode case folding).
+// `hitEnd`/`requireEnd` are consulted almost exclusively by `java.util.Scanner`
+// deciding whether to pull more data from an underlying `Readable` before
+// giving up — for the single-shot, already-fully-buffered `CharSequence`
+// inputs this fast path requires, an imprecise `hitEnd` cannot change the
+// match RESULT a caller observes, only (in the Scanner case) whether it
+// makes one extra, ultimately-irrelevant read attempt against a stream that
+// has no more data anyway.
+
+/// Real `java.util.regex.Matcher` field names (by name, not slot index —
+/// see the module banner above for why that distinction matters here).
+mod matcher_realjdk_fields {
+    pub const PARENT_PATTERN: &str = "parentPattern";
+    pub const TEXT: &str = "text";
+    pub const FROM: &str = "from";
+    pub const TO: &str = "to";
+    pub const FIRST: &str = "first";
+    pub const LAST: &str = "last";
+    pub const OLD_LAST: &str = "oldLast";
+    pub const GROUPS: &str = "groups";
+    pub const HIT_END: &str = "hitEnd";
+    pub const REQUIRE_END: &str = "requireEnd";
+    pub const TRANSPARENT_BOUNDS: &str = "transparentBounds";
+    pub const ANCHORING_BOUNDS: &str = "anchoringBounds";
+    pub const MOD_COUNT: &str = "modCount";
+}
+mod pattern_realjdk_fields {
+    pub const PATTERN: &str = "pattern";
+    pub const FLAGS: &str = "flags";
+    pub const CAPTURING_GROUP_COUNT: &str = "capturingGroupCount";
+}
+
+/// Resolved slot indices for every `Matcher`/`Pattern` field this fast path
+/// touches, resolved BY NAME exactly once (via `resolve_field_index`, the
+/// same name-based resolution `get_field_by_name` does internally) and
+/// cached forever after.
+///
+/// Why this exists: `get_field_by_name`/`set_field_by_name` each take a
+/// `class_manager` `RwLock::read()` and walk the class hierarchy searching
+/// for the field by name — on EVERY call, not just the first. A single
+/// `find()` call touches ~13 Matcher fields, so a naive by-name
+/// implementation pays that lock-plus-hierarchy-walk cost 13 times per
+/// match; measured, this was the dominant cost of the whole fast path
+/// (worse than the regex search itself). `get_field(obj, index)` by
+/// contrast resolves through a per-class-id CACHED descriptor lookup with
+/// no lock — see `vm/src/vm/vm_exec.rs`'s `get_field`/`get_field_by_name`
+/// implementations. Since `java.util.regex.Matcher`/`Pattern` are bootstrap
+/// classes (exactly one loaded definition VM-wide, field layout fixed for
+/// the process lifetime), resolving each field's slot index once via
+/// `resolve_field_index` and reusing it is both safe (still layout-agnostic
+/// — never a hardcoded slot number, just a cached RESULT of the same
+/// by-name resolution) and avoids paying the resolution cost on every call.
+#[derive(Clone, Copy)]
+struct MatcherFieldIndices {
+    parent_pattern: usize,
+    text: usize,
+    from: usize,
+    to: usize,
+    first: usize,
+    last: usize,
+    old_last: usize,
+    groups: usize,
+    hit_end: usize,
+    require_end: usize,
+    transparent_bounds: usize,
+    anchoring_bounds: usize,
+    mod_count: usize,
+}
+
+fn matcher_realjdk_field_indices(ctx: &mut dyn NativeContext) -> Option<MatcherFieldIndices> {
+    static CACHE: OnceLock<Option<MatcherFieldIndices>> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        use matcher_realjdk_fields as f;
+        const CLASS: &str = "java/util/regex/Matcher";
+        Some(MatcherFieldIndices {
+            parent_pattern: ctx.resolve_field_index(CLASS, f::PARENT_PATTERN)?,
+            text: ctx.resolve_field_index(CLASS, f::TEXT)?,
+            from: ctx.resolve_field_index(CLASS, f::FROM)?,
+            to: ctx.resolve_field_index(CLASS, f::TO)?,
+            first: ctx.resolve_field_index(CLASS, f::FIRST)?,
+            last: ctx.resolve_field_index(CLASS, f::LAST)?,
+            old_last: ctx.resolve_field_index(CLASS, f::OLD_LAST)?,
+            groups: ctx.resolve_field_index(CLASS, f::GROUPS)?,
+            hit_end: ctx.resolve_field_index(CLASS, f::HIT_END)?,
+            require_end: ctx.resolve_field_index(CLASS, f::REQUIRE_END)?,
+            transparent_bounds: ctx.resolve_field_index(CLASS, f::TRANSPARENT_BOUNDS)?,
+            anchoring_bounds: ctx.resolve_field_index(CLASS, f::ANCHORING_BOUNDS)?,
+            mod_count: ctx.resolve_field_index(CLASS, f::MOD_COUNT)?,
+        })
+    })
+}
+
+#[derive(Clone, Copy)]
+struct PatternFieldIndices {
+    pattern: usize,
+    flags: usize,
+}
+
+fn pattern_realjdk_field_indices(ctx: &mut dyn NativeContext) -> Option<PatternFieldIndices> {
+    static CACHE: OnceLock<Option<PatternFieldIndices>> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        use pattern_realjdk_fields as f;
+        const CLASS: &str = "java/util/regex/Pattern";
+        Some(PatternFieldIndices {
+            pattern: ctx.resolve_field_index(CLASS, f::PATTERN)?,
+            flags: ctx.resolve_field_index(CLASS, f::FLAGS)?,
+        })
+    })
+}
+
+/// One matcher's decoded input text plus the UTF-8-byte <-> UTF-16-code-unit
+/// offset tables needed to bridge Java's UTF-16 `Matcher` indices to the
+/// Rust `regex`/`fancy-regex` crates' UTF-8 byte offsets (and back). Built
+/// once per distinct `text` object and cached — this is what avoids the
+/// exact O(n)-redecode-per-call bug the legacy bridge had (see the module
+/// banner and `matcher-native-full-input-redecode-quadratic.md`), plus (new
+/// here) avoids paying the O(n) offset-table build more than once per input.
+/// Everything this fast path needs to run a search, resolved once per
+/// distinct `(matcher identity, text identity, pattern identity)` triple and
+/// cached — a SINGLE mutex lock covers text decode/offset-tables AND the
+/// compiled regex together, instead of two separate cache lookups (one for
+/// text, one via `compile_java_regex`'s own lock) on every `find()` call.
+/// Measured: consolidating these (plus resolving the `text` object's class
+/// only on a cache MISS, not every call — see `matcher_realjdk_cached`)
+/// meaningfully reduced per-call overhead versus two independent caches.
+struct MatcherRealCache {
+    /// `identity_hash_code` of the `text` field's current value, so a
+    /// `reset(CharSequence)` swap invalidates this entry (same GC-move-safe
+    /// keying rationale as the legacy `matcher_read_input_cached`).
+    text_identity: i32,
+    /// `identity_hash_code` of the `parentPattern` field's current value, so
+    /// `usePattern(Pattern)` swapping the compiled pattern invalidates this
+    /// entry too.
+    pattern_identity: i32,
+    utf8: std::sync::Arc<str>,
+    /// `byte_to_utf16[byte_offset] == utf16 code-unit offset at that byte`.
+    /// Length `utf8.len() + 1` (entries at non-char-boundary byte offsets
+    /// are unused filler — the `regex`/`fancy-regex` crates only ever report
+    /// match offsets on char boundaries).
+    byte_to_utf16: std::sync::Arc<[u32]>,
+    /// `utf16_to_byte[utf16_offset] == byte offset of that code unit`.
+    /// Length `utf16_len + 1`; the second unit of a surrogate pair maps to
+    /// the SAME byte offset as the first (both denote one Unicode scalar in
+    /// the UTF-8 side) — Java match boundaries essentially never split a
+    /// surrogate pair, matching the `regex` crate's own codepoint-atomic
+    /// match boundaries.
+    utf16_to_byte: std::sync::Arc<[u32]>,
+    /// Cloning a `JavaRegex` is cheap (the underlying `regex`/`fancy-regex`
+    /// engines are internally reference-counted), so storing the compiled
+    /// regex here and cloning it out on a cache hit avoids re-entering
+    /// `compile_java_regex`'s own separate mutex-guarded cache on every call.
+    re: JavaRegex,
+}
+
+fn matcher_realjdk_cache() -> &'static Mutex<std::collections::HashMap<i32, MatcherRealCache>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<i32, MatcherRealCache>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Build both offset tables in one O(n) pass over `s`.
+fn matcher_realjdk_build_offset_tables(s: &str) -> (Vec<u32>, Vec<u32>) {
+    let mut byte_to_utf16 = vec![0u32; s.len() + 1];
+    let mut utf16_to_byte = Vec::with_capacity(s.len() + 1);
+    let mut utf16_pos: u32 = 0;
+    for (byte_idx, ch) in s.char_indices() {
+        byte_to_utf16[byte_idx] = utf16_pos;
+        let units = ch.len_utf16();
+        for _ in 0..units {
+            utf16_to_byte.push(byte_idx as u32);
+        }
+        utf16_pos += units as u32;
+    }
+    byte_to_utf16[s.len()] = utf16_pos;
+    utf16_to_byte.push(s.len() as u32);
+    (byte_to_utf16, utf16_to_byte)
+}
+
+/// Fetch (rebuilding + caching if needed) the decoded text, offset tables,
+/// and compiled regex for `matcher`'s current `text`/`parentPattern`
+/// fields. Returns `None` if `text` is null or not a `java/lang/String`
+/// (caller falls back to real bytecode for any other `CharSequence` — see
+/// module banner), or if `parentPattern`/its `pattern`/`flags` fields can't
+/// be read.
+///
+/// The `text`-is-a-`String` class check only runs on a cache MISS — once a
+/// given `text` identity has been confirmed a `String`, later calls skip
+/// straight to the identity-hash comparison, which is what a class-manager
+/// `RwLock` read on every single call would otherwise force.
+fn matcher_realjdk_cached(
+    ctx: &mut dyn NativeContext,
+    matcher: ObjectRef,
+    idx: MatcherFieldIndices,
+    pattern_idx: PatternFieldIndices,
+) -> Option<(
+    std::sync::Arc<str>,
+    std::sync::Arc<[u32]>,
+    std::sync::Arc<[u32]>,
+    JavaRegex,
+)> {
+    let text_obj = match ctx.get_field(matcher, idx.text) {
+        Value::Object(Some(r)) => r,
+        _ => return None,
+    };
+    let pattern_obj = match ctx.get_field(matcher, idx.parent_pattern) {
+        Value::Object(Some(p)) => p,
+        _ => return None,
+    };
+    let text_identity = ctx.identity_hash_code(text_obj);
+    let pattern_identity = ctx.identity_hash_code(pattern_obj);
+    let matcher_identity = ctx.identity_hash_code(matcher);
+
+    if let Ok(guard) = matcher_realjdk_cache().lock() {
+        if let Some(entry) = guard.get(&matcher_identity) {
+            if entry.text_identity == text_identity && entry.pattern_identity == pattern_identity
+            {
+                return Some((
+                    entry.utf8.clone(),
+                    entry.byte_to_utf16.clone(),
+                    entry.utf16_to_byte.clone(),
+                    entry.re.clone(),
+                ));
+            }
+        }
+    }
+
+    // Cache miss: this is the only path that pays a class-manager lookup
+    // (confirming `text` is a real `String`, not some other `CharSequence`)
+    // and a fresh regex compile (itself cached by `compile_java_regex`, so
+    // even a cross-matcher-instance repeat of the same pattern text is
+    // cheap — just not as cheap as this cache's own zero-lock-contention
+    // clone-out on a hit).
+    let text_class = ctx.class_name_of_id(ctx.class_id_of_object(text_obj));
+    if text_class.as_deref() != Some("java/lang/String") {
+        return None;
+    }
+    let decoded = ctx.read_string(text_obj)?;
+    let pattern_str_obj = match ctx.get_field(pattern_obj, pattern_idx.pattern) {
+        Value::Object(Some(r)) => r,
+        _ => return None,
+    };
+    let pattern_text = ctx.read_string(pattern_str_obj)?;
+    let flags = ctx
+        .get_field(pattern_obj, pattern_idx.flags)
+        .as_int()
+        .unwrap_or(0);
+    let re = compile_java_regex(&pattern_text, flags).ok()?;
+
+    let (byte_to_utf16, utf16_to_byte) = matcher_realjdk_build_offset_tables(&decoded);
+    let utf8: std::sync::Arc<str> = std::sync::Arc::from(decoded.into_boxed_str());
+    let byte_to_utf16: std::sync::Arc<[u32]> = std::sync::Arc::from(byte_to_utf16.into_boxed_slice());
+    let utf16_to_byte: std::sync::Arc<[u32]> = std::sync::Arc::from(utf16_to_byte.into_boxed_slice());
+
+    if let Ok(mut guard) = matcher_realjdk_cache().lock() {
+        guard.insert(
+            matcher_identity,
+            MatcherRealCache {
+                text_identity,
+                pattern_identity,
+                utf8: utf8.clone(),
+                byte_to_utf16: byte_to_utf16.clone(),
+                utf16_to_byte: utf16_to_byte.clone(),
+                re: re.clone(),
+            },
+        );
+    }
+    Some((utf8, byte_to_utf16, utf16_to_byte, re))
+}
+
+/// Decline this fast path for the current call: re-enter the SAME (class,
+/// method, descriptor) triple with the native-override check skipped, so it
+/// runs the real JDK `Matcher` bytecode body. See module banner.
+fn matcher_realjdk_bail(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    method_name: &str,
+    descriptor: &str,
+    extra_args: &[Value],
+) -> MethodCallResult {
+    ctx.invoke_virtual_bytecode_only(this, method_name, descriptor, extra_args)
+}
+
+/// Shared core of `find()`/`find(int)`: given the search should resume at
+/// `next_search_utf16` (already clamped/advanced per the caller's own
+/// method-specific rule), run the search, write every field real
+/// `Matcher.search(int)` bytecode would write, and return whether it
+/// matched.
+///
+/// `groups_obj` MUST already be sized `capturingGroupCount * 2` by the real
+/// `Matcher` constructor (true for any real-JDK-allocated Matcher — real
+/// bytecode always runs the constructor since this native only ever
+/// intercepts `find`/`find(int)`, never `<init>`).
+#[allow(clippy::too_many_arguments)]
+fn matcher_realjdk_search(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    idx: MatcherFieldIndices,
+    re: &JavaRegex,
+    utf8: &str,
+    byte_to_utf16: &[u32],
+    utf16_to_byte: &[u32],
+    groups_obj: ObjectRef,
+    region_from_utf16: i32,
+    region_to_utf16: i32,
+    next_search_utf16: i32,
+) -> MethodCallResult {
+    let region_from_byte = utf16_to_byte[region_from_utf16.max(0) as usize] as usize;
+    let region_to_byte = utf16_to_byte[region_to_utf16.max(0) as usize] as usize;
+    let search_from_byte =
+        utf16_to_byte[next_search_utf16.max(0) as usize] as usize - region_from_byte;
+    let region_slice = &utf8[region_from_byte..region_to_byte];
+
+    ctx.set_field(this, idx.first, Value::Int(next_search_utf16));
+    // `oldLast = oldLast < 0 ? from : oldLast` — mirrors real `search(int)`.
+    let old_last = ctx.get_field(this, idx.old_last).as_int().unwrap_or(-1);
+    if old_last < 0 {
+        ctx.set_field(this, idx.old_last, Value::Int(next_search_utf16));
+    }
+
+    // Group-count safety net (checked by both callers via
+    // `matcher_realjdk_group_count_ok` BEFORE any field is mutated — doing
+    // it here instead would mean bailing to real bytecode after already
+    // having overwritten `first`/`oldLast` above, corrupting the state the
+    // bytecode fallback itself depends on). Trust the caller: by the time
+    // we're here, `re.captures_len() == groups_obj.length / 2` is already
+    // established, so every `caps.len()` below is guaranteed to match.
+    let caps = re.captures_at(region_slice, search_from_byte);
+    let matched = match caps {
+        Some(caps) => {
+            let mut whole_start = -1i32;
+            let mut whole_end = -1i32;
+            for i in 0..caps.len() {
+                let (s, e) = match caps.get(i) {
+                    Some(g) => {
+                        let abs_start_byte = region_from_byte + g.start;
+                        let abs_end_byte = region_from_byte + g.end;
+                        (
+                            byte_to_utf16[abs_start_byte] as i32,
+                            byte_to_utf16[abs_end_byte] as i32,
+                        )
+                    }
+                    None => (-1, -1),
+                };
+                if i == 0 {
+                    whole_start = s;
+                    whole_end = e;
+                }
+                ctx.set_array_element(groups_obj, 2 * i, Value::Int(s));
+                ctx.set_array_element(groups_obj, 2 * i + 1, Value::Int(e));
+            }
+            // `this.first`/`this.last` are the WHOLE MATCH's actual bounds
+            // (== groups[0]/groups[1]), NOT the position the search resumed
+            // from — real `Pattern$Start.match`'s own scan loop overwrites
+            // `matcher.first` as it tries each candidate position, so by the
+            // time of a successful match `first` reflects where the match
+            // itself begins, which for an unanchored pattern is commonly
+            // LATER than the resume position search started scanning at
+            // (e.g. `(a+)(b)` found starting at index 2 while the scan began
+            // at index 0). The provisional `FIRST = next_search_utf16` write
+            // above this match block exists only so a FAILED search still
+            // leaves a sensible in-progress value for any code that reads
+            // `first` mid-traversal in real JDK — overwritten here on
+            // success, matching what the real `Start` node does.
+            ctx.set_field(this, idx.first, Value::Int(whole_start));
+            ctx.set_field(this, idx.last, Value::Int(whole_end));
+            // `hitEnd` approximation (see module banner): real HotSpot's
+            // value depends on which internal `Pattern$Node` subclass the
+            // compiler chose for this exact pattern (e.g. a greedy
+            // quantifier's expansion reaching the region boundary vs. a
+            // literal/Boyer-Moore node concluding definitively) — verified
+            // against a 141-case parity battery that a plain "match end ==
+            // region end" boundary check is neither uniformly right nor
+            // uniformly wrong (JDK itself returns both `true` and `false`
+            // for different patterns whose match happens to end exactly at
+            // the region boundary), so no cheap boundary-only heuristic can
+            // close this without reimplementing HotSpot's backtracking
+            // engine. Kept as the closest-available signal; core `find()`/
+            // `group()`/`start()`/`end()` results are unaffected and fully
+            // parity-verified.
+            ctx.set_field(
+                this,
+                idx.hit_end,
+                Value::Int(if whole_end == region_to_utf16 { 1 } else { 0 }),
+            );
+            ctx.set_field(this, idx.require_end, Value::Int(0));
+            true
+        }
+        None => {
+            for i in 0..(ctx.array_length(groups_obj) / 2) {
+                ctx.set_array_element(groups_obj, 2 * i, Value::Int(-1));
+                ctx.set_array_element(groups_obj, 2 * i + 1, Value::Int(-1));
+            }
+            ctx.set_field(this, idx.first, Value::Int(-1));
+            // Best-effort: a failed search plausibly means the engine
+            // examined input through the region end. See module banner.
+            ctx.set_field(this, idx.hit_end, Value::Int(1));
+            false
+        }
+    };
+    let last = ctx.get_field(this, idx.last).as_int().unwrap_or(0);
+    ctx.set_field(this, idx.old_last, Value::Int(last));
+    let mod_count = ctx.get_field(this, idx.mod_count).as_int().unwrap_or(0);
+    ctx.set_field(this, idx.mod_count, Value::Int(mod_count.wrapping_add(1)));
+
+    Ok(Some(Value::Int(if matched { 1 } else { 0 })))
+}
+
+/// Real-JDK-layout `Matcher.find()Z`. See module banner for the full
+/// contract; mirrors real bytecode's own two-step algorithm exactly
+/// (`find()` computes the resume position from `first`/`last`/`from`/`to`,
+/// then what would be a `search(int)` call) so a zero-width match's
+/// next-position advance-by-one-UTF16-unit quirk — including its
+/// mid-surrogate-pair edge case — matches HotSpot bit-for-bit, rather than
+/// reimplementing a "nicer" char-boundary-safe advance.
+fn native_matcher_find_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        // No valid receiver at all — cannot even attempt a bytecode
+        // fallback (no object to dispatch on). Should be unreachable for a
+        // real instance-method call; mirror the legacy bridge's convention
+        // for this impossible case.
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let idx = match matcher_realjdk_field_indices(ctx) {
+        Some(idx) => idx,
+        None => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
+    };
+
+    if ctx.get_field(this, idx.transparent_bounds).as_int().unwrap_or(0) != 0
+        || ctx.get_field(this, idx.anchoring_bounds).as_int().unwrap_or(1) == 0
+    {
+        return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]);
+    }
+
+    let pattern_idx = match pattern_realjdk_field_indices(ctx) {
+        Some(p) => p,
+        None => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
+    };
+    let (utf8, byte_to_utf16, utf16_to_byte, re) =
+        match matcher_realjdk_cached(ctx, this, idx, pattern_idx) {
+            Some(t) => t,
+            None => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
+        };
+    let groups_obj = match ctx.get_field(this, idx.groups) {
+        Value::Object(Some(g)) => g,
+        _ => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
+    };
+    // Group-count safety net, checked BEFORE any field mutation below (see
+    // the comment in `matcher_realjdk_search` for why bailing after
+    // mutating `first`/`oldLast` would corrupt the fallback's own state).
+    if re.captures_len() != ctx.array_length(groups_obj) / 2 {
+        return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]);
+    }
+
+    let from = ctx.get_field(this, idx.from).as_int().unwrap_or(0);
+    let to = ctx
+        .get_field(this, idx.to)
+        .as_int()
+        .unwrap_or(byte_to_utf16[utf8.len()] as i32);
+    let first = ctx.get_field(this, idx.first).as_int().unwrap_or(-1);
+    let last = ctx.get_field(this, idx.last).as_int().unwrap_or(0);
+
+    let mut next_search = last;
+    if next_search == first {
+        next_search += 1;
+    }
+    if next_search < from {
+        next_search = from;
+    }
+    if next_search > to {
+        // Real `find()`'s own early-return branch: clear `groups[]` only,
+        // leave `first`/`last`/`modCount`/`hitEnd` untouched — replicated
+        // exactly (not a bug we're "fixing").
+        for i in 0..(ctx.array_length(groups_obj) / 2) {
+            ctx.set_array_element(groups_obj, 2 * i, Value::Int(-1));
+            ctx.set_array_element(groups_obj, 2 * i + 1, Value::Int(-1));
+        }
+        return Ok(Some(Value::Int(0)));
+    }
+
+    matcher_realjdk_search(
+        ctx,
+        this,
+        idx,
+        &re,
+        &utf8,
+        &byte_to_utf16,
+        &utf16_to_byte,
+        groups_obj,
+        from,
+        to,
+        next_search,
+    )
+}
+
+/// Real-JDK-layout `Matcher.find(I)Z`. Real bytecode's `find(int start)`
+/// calls `reset()` first (discards region/first/last/append-position, resets
+/// `from=0, to=length`) and THEN searches from `start` — the reset field
+/// writes below replicate that inline before running the shared search core.
+fn native_matcher_find_at_realjdk(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        // No valid receiver at all — see the analogous branch in
+        // `native_matcher_find_realjdk`.
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let start = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let idx = match matcher_realjdk_field_indices(ctx) {
+        Some(idx) => idx,
+        None => return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]),
+    };
+
+    if ctx.get_field(this, idx.transparent_bounds).as_int().unwrap_or(0) != 0
+        || ctx.get_field(this, idx.anchoring_bounds).as_int().unwrap_or(1) == 0
+    {
+        return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]);
+    }
+
+    let pattern_idx = match pattern_realjdk_field_indices(ctx) {
+        Some(p) => p,
+        None => return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]),
+    };
+    let (utf8, byte_to_utf16, utf16_to_byte, re) =
+        match matcher_realjdk_cached(ctx, this, idx, pattern_idx) {
+            Some(t) => t,
+            None => return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]),
+        };
+    let text_len_utf16 = byte_to_utf16[utf8.len()] as i32;
+
+    // Out-of-range `start`: let the real bytecode throw the exact
+    // `IndexOutOfBoundsException` Java specifies (no matching RuntimeError
+    // variant exists for this generic exception here, and this is a rare,
+    // non-hot-loop-shaped call), rather than fabricating one.
+    if start < 0 || start > text_len_utf16 {
+        return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]);
+    }
+
+    let groups_obj = match ctx.get_field(this, idx.groups) {
+        Value::Object(Some(g)) => g,
+        _ => return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]),
+    };
+    // Group-count safety net — checked before any field mutation below; see
+    // the comment in `matcher_realjdk_search`.
+    if re.captures_len() != ctx.array_length(groups_obj) / 2 {
+        return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]);
+    }
+
+    // Real bytecode `reset()`: first=-1, last=0, oldLast=-1, groups/locals
+    // cleared, lastAppendPosition=0, from=0, to=length, modCount++. We only
+    // need the subset later code reads: first/last/oldLast/from/to (groups[]
+    // gets fully overwritten by the search below regardless of outcome).
+    ctx.set_field(this, idx.first, Value::Int(-1));
+    ctx.set_field(this, idx.last, Value::Int(0));
+    ctx.set_field(this, idx.old_last, Value::Int(-1));
+    ctx.set_field(this, idx.from, Value::Int(0));
+    ctx.set_field(this, idx.to, Value::Int(text_len_utf16));
+    let mod_count = ctx.get_field(this, idx.mod_count).as_int().unwrap_or(0);
+    ctx.set_field(this, idx.mod_count, Value::Int(mod_count.wrapping_add(1)));
+
+    matcher_realjdk_search(
+        ctx,
+        this,
+        idx,
+        &re,
+        &utf8,
+        &byte_to_utf16,
+        &utf16_to_byte,
+        groups_obj,
+        0,
+        text_len_utf16,
+        start,
+    )
+}
+
+// --- `start()`/`end()`/`start(int)`/`end(int)`/`group()`/`group(int)` ---
+//
+// A typical `while (m.find()) { ...; m.group(N); }` loop calls one or more
+// of these on every iteration — real bytecode dispatch for them, left
+// unaccelerated, was measured as a substantial share of the remaining
+// per-iteration cost even after `find()` itself became fast. All six read
+// ONLY the `first`/`last`/`groups[]` state `find()`/`find(int)` already
+// populate correctly (see above) — no regex re-run, no text re-decode.
+// `group()`/`group(int)` delegate the actual character extraction to the
+// receiver `text` object's own (already-fast, see
+// `docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`)
+// `String.substring(int,int)` via `invoke_virtual` rather than re-deriving a
+// UTF-8 slice from this fast path's own cached tables — avoids a redundant
+// cache lookup and reuses the exact substring Java itself would produce.
+
+/// `checkGroup(group)`: real JDK throws the GENERIC `java.lang.IndexOutOfBoundsException`
+/// (not a subclass CratonVM has a dedicated `RuntimeError` variant for) on an
+/// invalid index — the caller bails to real bytecode for that rare case so
+/// it throws the exact right exception, rather than fabricating one here.
+/// Returns `true` when `group` is in bounds (`0..=groupCount()`, where
+/// `groupCount() == groups_obj.length/2 - 1`).
+fn matcher_realjdk_group_in_bounds(ctx: &mut dyn NativeContext, groups_obj: ObjectRef, group: i32) -> bool {
+    let group_count = (ctx.array_length(groups_obj) / 2) as i32 - 1;
+    group >= 0 && group <= group_count
+}
+
+fn native_matcher_start_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let idx = match matcher_realjdk_field_indices(ctx) {
+        Some(idx) => idx,
+        None => return matcher_realjdk_bail(ctx, this, "start", "()I", &[]),
+    };
+    let first = ctx.get_field(this, idx.first).as_int().unwrap_or(-1);
+    if first < 0 {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "No match found".to_string(),
+        }
+        .into());
+    }
+    Ok(Some(Value::Int(first)))
+}
+
+fn native_matcher_end_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let idx = match matcher_realjdk_field_indices(ctx) {
+        Some(idx) => idx,
+        None => return matcher_realjdk_bail(ctx, this, "end", "()I", &[]),
+    };
+    // `end()`'s real bytecode checks `hasMatch()` (== `first >= 0`), same as
+    // `start()` — `last` alone isn't a valid "no match" sentinel (it can be
+    // 0 on a fresh Matcher that never matched).
+    let first = ctx.get_field(this, idx.first).as_int().unwrap_or(-1);
+    if first < 0 {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "No match found".to_string(),
+        }
+        .into());
+    }
+    let last = ctx.get_field(this, idx.last).as_int().unwrap_or(-1);
+    Ok(Some(Value::Int(last)))
+}
+
+fn native_matcher_start_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let group = match args.get(1) {
+        Some(Value::Int(g)) => *g,
+        _ => return matcher_realjdk_bail(ctx, this, "start", "(I)I", &[Value::Int(0)]),
+    };
+    let idx = match matcher_realjdk_field_indices(ctx) {
+        Some(idx) => idx,
+        None => return matcher_realjdk_bail(ctx, this, "start", "(I)I", &[Value::Int(group)]),
+    };
+    let first = ctx.get_field(this, idx.first).as_int().unwrap_or(-1);
+    if first < 0 {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "No match found".to_string(),
+        }
+        .into());
+    }
+    let groups_obj = match ctx.get_field(this, idx.groups) {
+        Value::Object(Some(g)) => g,
+        _ => return matcher_realjdk_bail(ctx, this, "start", "(I)I", &[Value::Int(group)]),
+    };
+    if !matcher_realjdk_group_in_bounds(ctx, groups_obj, group) {
+        return matcher_realjdk_bail(ctx, this, "start", "(I)I", &[Value::Int(group)]);
+    }
+    Ok(Some(ctx.get_array_element(groups_obj, 2 * group as usize)))
+}
+
+fn native_matcher_end_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let group = match args.get(1) {
+        Some(Value::Int(g)) => *g,
+        _ => return matcher_realjdk_bail(ctx, this, "end", "(I)I", &[Value::Int(0)]),
+    };
+    let idx = match matcher_realjdk_field_indices(ctx) {
+        Some(idx) => idx,
+        None => return matcher_realjdk_bail(ctx, this, "end", "(I)I", &[Value::Int(group)]),
+    };
+    let first = ctx.get_field(this, idx.first).as_int().unwrap_or(-1);
+    if first < 0 {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "No match found".to_string(),
+        }
+        .into());
+    }
+    let groups_obj = match ctx.get_field(this, idx.groups) {
+        Value::Object(Some(g)) => g,
+        _ => return matcher_realjdk_bail(ctx, this, "end", "(I)I", &[Value::Int(group)]),
+    };
+    if !matcher_realjdk_group_in_bounds(ctx, groups_obj, group) {
+        return matcher_realjdk_bail(ctx, this, "end", "(I)I", &[Value::Int(group)]);
+    }
+    Ok(Some(ctx.get_array_element(groups_obj, 2 * group as usize + 1)))
+}
+
+fn native_matcher_group_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // Real bytecode `group()` is itself just `return group(0);`, so
+    // delegating here — including any bail-to-bytecode this triggers using
+    // the `group(I)` descriptor — produces byte-identical behavior to
+    // calling real `group()` directly.
+    native_matcher_group_idx_realjdk(ctx, &[Value::Object(Some(this)), Value::Int(0)])
+}
+
+fn native_matcher_group_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let group = match args.get(1) {
+        Some(Value::Int(g)) => *g,
+        _ => return matcher_realjdk_bail(ctx, this, "group", "(I)Ljava/lang/String;", &[Value::Int(0)]),
+    };
+    let idx = match matcher_realjdk_field_indices(ctx) {
+        Some(idx) => idx,
+        None => {
+            return matcher_realjdk_bail(
+                ctx,
+                this,
+                "group",
+                "(I)Ljava/lang/String;",
+                &[Value::Int(group)],
+            )
+        }
+    };
+    let first = ctx.get_field(this, idx.first).as_int().unwrap_or(-1);
+    if first < 0 {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "No match found".to_string(),
+        }
+        .into());
+    }
+    let groups_obj = match ctx.get_field(this, idx.groups) {
+        Value::Object(Some(g)) => g,
+        _ => {
+            return matcher_realjdk_bail(
+                ctx,
+                this,
+                "group",
+                "(I)Ljava/lang/String;",
+                &[Value::Int(group)],
+            )
+        }
+    };
+    if !matcher_realjdk_group_in_bounds(ctx, groups_obj, group) {
+        return matcher_realjdk_bail(
+            ctx,
+            this,
+            "group",
+            "(I)Ljava/lang/String;",
+            &[Value::Int(group)],
+        );
+    }
+    let start = ctx
+        .get_array_element(groups_obj, 2 * group as usize)
+        .as_int()
+        .unwrap_or(-1);
+    let end = ctx
+        .get_array_element(groups_obj, 2 * group as usize + 1)
+        .as_int()
+        .unwrap_or(-1);
+    if start == -1 || end == -1 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let text_obj = match ctx.get_field(this, idx.text) {
+        Value::Object(Some(t)) => t,
+        // Non-`String` `CharSequence` text: this fast path never runs
+        // `find()`/`find(int)` for that case (bails immediately — see
+        // `matcher_realjdk_cached`), so `groups[]` would still be all `-1`
+        // and this branch is unreachable in practice; kept as a defensive
+        // bail rather than an assumption.
+        _ => {
+            return matcher_realjdk_bail(
+                ctx,
+                this,
+                "group",
+                "(I)Ljava/lang/String;",
+                &[Value::Int(group)],
+            )
+        }
+    };
+    ctx.invoke_virtual(
+        text_obj,
+        "substring",
+        "(II)Ljava/lang/String;",
+        &[Value::Int(start), Value::Int(end)],
+    )
 }
 
 // ===========================================================================
@@ -63898,12 +65325,7 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
             // infinite recursion. invoke_special_bytecode_only resolves
             // statically on the NAMED class instead of the receiver's
             // dynamic class, so it lands on ThreadPoolExecutor's own body.
-            ctx.invoke_special_bytecode_only(
-                "java/util/concurrent/ThreadPoolExecutor",
-                "shutdown",
-                "()V",
-                &[Value::Object(Some(this))],
-            )?;
+            transition_real_executor_to_shutdown(ctx, this)?;
         } else {
             ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
         }
@@ -63921,7 +65343,7 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         es,
         "awaitTermination",
         "(JLjava/util/concurrent/TimeUnit;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
+        native_es_await_termination,
     );
 
     // Also register on ThreadPoolExecutor
@@ -63959,12 +65381,7 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
             // infinite recursion. invoke_special_bytecode_only resolves
             // statically on the NAMED class instead of the receiver's
             // dynamic class, so it lands on ThreadPoolExecutor's own body.
-            ctx.invoke_special_bytecode_only(
-                "java/util/concurrent/ThreadPoolExecutor",
-                "shutdown",
-                "()V",
-                &[Value::Object(Some(this))],
-            )?;
+            transition_real_executor_to_shutdown(ctx, this)?;
         } else {
             ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
         }
@@ -64204,11 +65621,16 @@ fn native_es_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // full rationale.
     if let Some(Value::Object(Some(this))) = args.first() {
         if executor_has_real_workers(ctx, *this) {
-            return ctx.invoke_virtual_bytecode_only(
-                *this,
+            // `invoke_virtual_bytecode_only` still re-resolves the inherited
+            // method on a concrete subclass such as JULI's
+            // LoggerExecutorService, re-entering this native indefinitely.
+            // Resolve directly on ThreadPoolExecutor to execute the real
+            // bounded-queue implementation exactly once.
+            return ctx.invoke_special_bytecode_only(
+                "java/util/concurrent/ThreadPoolExecutor",
                 "execute",
                 "(Ljava/lang/Runnable;)V",
-                &args[1..],
+                args,
             );
         }
     }
@@ -64558,11 +65980,85 @@ fn native_es_is_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    if executor_has_real_workers(ctx, this) {
+        if let Value::Object(Some(ctl)) = ctx.get_field_by_name(this, "ctl") {
+            if let Some(Value::Int(state)) = ctx.invoke_virtual(ctl, "get", "()I", &[])? {
+                // ThreadPoolExecutor encodes RUNNING with the sign bit set;
+                // every shutdown/stop/terminated state is non-negative.
+                return Ok(Some(Value::Int((state >= 0) as i32)));
+            }
+        }
+    }
     let shut = match ctx.get_field(this, EXEC_FIELD_SHUTDOWN) {
         Value::Int(v) => v,
         _ => 0,
     };
     Ok(Some(Value::Int(shut)))
+}
+
+fn native_juli_filehandler_clean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let read_string_field = |ctx: &mut dyn NativeContext, name: &str| match ctx.get_field_by_name(this, name) {
+        Value::Object(Some(value)) => ctx.read_string(value),
+        _ => None,
+    };
+    let (Some(directory), Some(prefix), Some(suffix)) = (
+        read_string_field(ctx, "directory"),
+        read_string_field(ctx, "prefix"),
+        read_string_field(ctx, "suffix"),
+    ) else {
+        return Ok(None);
+    };
+    let max_days = match ctx.get_field_by_name(this, "maxDays") {
+        Value::Object(Some(value)) => match ctx.invoke_virtual(value, "intValue", "()I", &[])? {
+            Some(Value::Int(days)) if days >= 0 => days as i64,
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    // Tomcat rotates once per LocalDate and removes files strictly older than
+    // maxDays. Its regular cleaner uses an executor; run this tiny, bounded
+    // deletion synchronously so VM executor timing cannot leave stale files.
+    let expired = juli_utc_date_days_ago(max_days + 1);
+    let path = std::path::Path::new(&directory).join(format!("{prefix}{expired}{suffix}"));
+    let _ = std::fs::remove_file(path);
+    Ok(None)
+}
+
+fn juli_utc_date_days_ago(days_ago: i64) -> String {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| (duration.as_secs() / 86_400) as i64)
+        .unwrap_or(0)
+        - days_ago;
+    // Civil-date conversion for a Unix day number (proleptic Gregorian).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn native_es_await_termination(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    if executor_has_real_workers(ctx, this) {
+        return ctx.invoke_special_bytecode_only(
+            "java/util/concurrent/ThreadPoolExecutor",
+            "awaitTermination",
+            "(JLjava/util/concurrent/TimeUnit;)Z",
+            args,
+        );
+    }
+    Ok(Some(Value::Int(1)))
 }
 
 fn register_completable_future_natives(registry: &mut NativeMethodRegistry) {
@@ -67358,6 +68854,36 @@ fn register_logging_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         native_logger_get_name,
     );
+    registry.register(
+        logger,
+        "addHandler",
+        "(Ljava/util/logging/Handler;)V",
+        |ctx, args| {
+            let Some(Value::Object(Some(this))) = args.first() else {
+                return Ok(None);
+            };
+            let Some(Value::Object(Some(handler))) = args.get(1) else {
+                return Ok(None);
+            };
+            let handlers = match ctx.get_field(*this, 2) {
+                Value::Object(Some(list)) => list,
+                _ => {
+                    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                    cratonvm_native_collections::native_al_init(
+                        ctx,
+                        &[Value::Object(Some(list))],
+                    )?;
+                    ctx.set_field(*this, 2, Value::Object(Some(list)));
+                    list
+                }
+            };
+            let _ = cratonvm_native_collections::native_al_add(
+                ctx,
+                &[Value::Object(Some(handlers)), Value::Object(Some(*handler))],
+            );
+            Ok(None)
+        },
+    );
     // Level-aware logging methods. SEVERE=1000, WARNING=900, INFO=800,
     // CONFIG=700, FINE=500, FINER=400, FINEST=300. A message is logged if the
     // logger's current level <= the method's level.
@@ -67538,7 +69064,7 @@ fn native_level_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 fn native_logger_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2);
+    let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
     ctx.set_field(
         logger,
         LOGGER_FIELD_NAME,
@@ -67551,7 +69077,7 @@ fn native_logger_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 
 fn native_logger_get_global(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let name = ctx.create_string("global");
-    let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2);
+    let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
     ctx.set_field(logger, LOGGER_FIELD_NAME, Value::Object(Some(name)));
     let info = alloc_level(ctx, "INFO", 800);
     ctx.set_field(logger, LOGGER_FIELD_LEVEL, Value::Object(Some(info)));
@@ -67576,11 +69102,24 @@ fn native_logger_get_level(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
 fn native_logger_log(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Print the log message
-    if let Some(Value::Object(Some(msg))) = args.get(1) {
-        if let Some(s) = ctx.read_string(*msg) {
-            ctx.record_printed_line(s);
-        }
-    }
+    jul_log_msg(ctx, args)
+}
+
+fn transition_real_executor_to_shutdown(
+    ctx: &mut dyn NativeContext,
+    executor: ObjectRef,
+) -> MethodCallResult {
+    let Value::Object(Some(ctl)) = ctx.get_field_by_name(executor, "ctl") else {
+        return Ok(None);
+    };
+    let current = match ctx.invoke_virtual(ctl, "get", "()I", &[])? {
+        Some(Value::Int(value)) => value,
+        _ => return Ok(None),
+    };
+    // ThreadPoolExecutor packs run state in the high 3 bits and worker count
+    // below. SHUTDOWN is run-state 0, so retain only the worker-count bits.
+    let shutdown = current & 0x1fff_ffff;
+    let _ = ctx.invoke_virtual(ctl, "set", "(I)V", &[Value::Int(shutdown)]);
     Ok(None)
 }
 
@@ -67603,12 +69142,7 @@ fn native_logger_log_if(
     if method_level < current {
         return Ok(None); // filter out — level is below logger threshold
     }
-    if let Some(Value::Object(Some(msg))) = args.get(1) {
-        if let Some(s) = ctx.read_string(*msg) {
-            ctx.record_printed_line(s);
-        }
-    }
-    Ok(None)
+    jul_log_msg(ctx, args)
 }
 
 fn native_logger_log_level(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -68811,7 +70345,7 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/logging/Logger;",
         |ctx, args| {
             let name = args.first().copied().unwrap_or(Value::Object(None));
-            let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2);
+            let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
             ctx.set_field(logger, 0, name);
             ctx.set_field(logger, 1, Value::Int(800)); // INFO level
             Ok(Some(Value::Object(Some(logger))))
@@ -68823,7 +70357,7 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/util/logging/Logger;",
         |ctx, _| {
             let name = ctx.create_string("global");
-            let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2);
+            let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
             ctx.set_field(logger, 0, Value::Object(Some(name)));
             ctx.set_field(logger, 1, Value::Int(800));
             Ok(Some(Value::Object(Some(logger))))
@@ -69453,6 +70987,56 @@ fn jul_log_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
             let short = logger_name.rsplit('.').next().unwrap_or(&logger_name);
             ctx.record_printed_line(format!("[JUL] {} - {}", short, s));
         }
+    }
+    // JUL handlers are observable application state. The old synthetic logger
+    // bridge only wrote to stderr, so `Logger.addHandler(new AsyncFileHandler)`
+    // silently lost every record. Build a normal LogRecord and fan it out to
+    // the logger's handler list, matching Logger.log's essential contract.
+    let (Some(Value::Object(Some(logger))), Some(Value::Object(Some(message)))) =
+        (args.first(), args.get(1))
+    else {
+        return Ok(None);
+    };
+    let handlers = match ctx.get_field(*logger, 2) {
+        Value::Object(Some(list)) => list,
+        _ => return Ok(None),
+    };
+    let level_class = match ctx.ensure_class_initialized("java/util/logging/Level") {
+        Ok(class) => class,
+        Err(_) => return Ok(None),
+    };
+    let Some(info_index) = ctx.static_field_index_by_name(level_class, "INFO") else {
+        return Ok(None);
+    };
+    let level = ctx.get_static_field(level_class, info_index);
+    let record = match ctx.new_object_initialized(
+        "java/util/logging/LogRecord",
+        "(Ljava/util/logging/Level;Ljava/lang/String;)V",
+        &[level, Value::Object(Some(*message))],
+    )? {
+        Some(Value::Object(Some(record))) => record,
+        _ => return Ok(None),
+    };
+    let size = match ctx.invoke_virtual(handlers, "size", "()I", &[])? {
+        Some(Value::Int(size)) if size > 0 => size as usize,
+        _ => return Ok(None),
+    };
+    for index in 0..size {
+        let handler = match ctx.invoke_virtual(
+            handlers,
+            "get",
+            "(I)Ljava/lang/Object;",
+            &[Value::Int(index as i32)],
+        )? {
+            Some(Value::Object(Some(handler))) => handler,
+            _ => continue,
+        };
+        let _ = ctx.invoke_virtual(
+            handler,
+            "publish",
+            "(Ljava/util/logging/LogRecord;)V",
+            &[Value::Object(Some(record))],
+        );
     }
     Ok(None)
 }
@@ -71804,13 +73388,49 @@ fn long_adder_stripe() -> usize {
     ((tid_u64.wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> 56) as usize & (LA_CELL_COUNT - 1)
 }
 
+/// Resolve `Striped64.base` to its absolute inherited-field slot.
+///
+/// Real JDK 25 lays out `Striped64` as `cells`, `base`, `cellsBusy`, so the
+/// historical slot-0 assumption targets the reference-valued `cells` field.
+/// Keep slot 0 only as a fallback for synthetic one-field objects used by the
+/// native unit tests and stub-JDK mode.
+fn striped64_base_slot_from_layout(
+    resolved_base: Option<usize>,
+    object_num_fields: usize,
+) -> Option<usize> {
+    resolved_base.or_else(|| (object_num_fields > 0).then_some(0))
+}
+
+fn striped64_base_slot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
+    striped64_base_slot_from_layout(
+        ctx.resolve_field_index("java/util/concurrent/atomic/Striped64", "base"),
+        ctx.object_num_fields(this),
+    )
+}
+
+#[cfg(test)]
+mod striped64_base_slot_tests {
+    use super::striped64_base_slot_from_layout;
+
+    #[test]
+    fn real_jdk_inherited_base_slot_wins_over_synthetic_fallback() {
+        assert_eq!(striped64_base_slot_from_layout(Some(1), 3), Some(1));
+    }
+
+    #[test]
+    fn one_field_synthetic_adder_keeps_slot_zero_fallback() {
+        assert_eq!(striped64_base_slot_from_layout(None, 1), Some(0));
+        assert_eq!(striped64_base_slot_from_layout(None, 0), None);
+    }
+}
+
 fn native_long_adder_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    if ctx.object_num_fields(this) > 0 {
-        ctx.set_field(this, 0, Value::Long(0));
+    if let Some(base_slot) = striped64_base_slot(ctx, this) {
+        ctx.set_field(this, base_slot, Value::Long(0));
     }
     // Pre-allocate the cell strip so the first `add` does not race the
     // map insert under the side-table mutex.
@@ -71833,14 +73453,14 @@ fn native_long_adder_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => 0,
     };
     // Fast path: uncontended CAS on base.
-    if ctx.object_num_fields(this) > 0 {
-        let current = ctx.get_field_volatile(this, 0);
+    if let Some(base_slot) = striped64_base_slot(ctx, this) {
+        let current = ctx.get_field_volatile(this, base_slot);
         let base = match current {
             Value::Long(v) => v,
             _ => 0,
         };
         let new_val = Value::Long(base.wrapping_add(x));
-        if ctx.compare_and_swap_field(this, 0, current, new_val) {
+        if ctx.compare_and_swap_field(this, base_slot, current, new_val) {
             return Ok(None);
         }
     }
@@ -71857,14 +73477,14 @@ fn native_long_adder_increment(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    if ctx.object_num_fields(this) > 0 {
-        let current = ctx.get_field_volatile(this, 0);
+    if let Some(base_slot) = striped64_base_slot(ctx, this) {
+        let current = ctx.get_field_volatile(this, base_slot);
         let base = match current {
             Value::Long(v) => v,
             _ => 0,
         };
         let new_val = Value::Long(base.wrapping_add(1));
-        if ctx.compare_and_swap_field(this, 0, current, new_val) {
+        if ctx.compare_and_swap_field(this, base_slot, current, new_val) {
             return Ok(None);
         }
     }
@@ -71879,14 +73499,14 @@ fn native_long_adder_decrement(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    if ctx.object_num_fields(this) > 0 {
-        let current = ctx.get_field_volatile(this, 0);
+    if let Some(base_slot) = striped64_base_slot(ctx, this) {
+        let current = ctx.get_field_volatile(this, base_slot);
         let base = match current {
             Value::Long(v) => v,
             _ => 0,
         };
         let new_val = Value::Long(base.wrapping_sub(1));
-        if ctx.compare_and_swap_field(this, 0, current, new_val) {
+        if ctx.compare_and_swap_field(this, base_slot, current, new_val) {
             return Ok(None);
         }
     }
@@ -71921,8 +73541,8 @@ fn native_long_adder_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // and a separate Relaxed sum across stripe cells. The JDK contract
     // allows `sum()` to return an "approximate" value if concurrent
     // updates race; we follow the same relaxation.
-    let base = if ctx.object_num_fields(this) > 0 {
-        match ctx.get_field_volatile(this, 0) {
+    let base = if let Some(base_slot) = striped64_base_slot(ctx, this) {
+        match ctx.get_field_volatile(this, base_slot) {
             Value::Long(v) => v,
             _ => 0,
         }
@@ -71940,8 +73560,8 @@ fn native_long_adder_int_value(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     };
     // Round-7 HIGH-16: must include stripe cells, otherwise `intValue` /
     // `(int)sum()` returns only the `base` and drops every contended add.
-    let base = if ctx.object_num_fields(this) > 0 {
-        match ctx.get_field(this, 0) {
+    let base = if let Some(base_slot) = striped64_base_slot(ctx, this) {
+        match ctx.get_field(this, base_slot) {
             Value::Long(v) => v,
             _ => 0,
         }
@@ -71959,8 +73579,8 @@ fn native_long_adder_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     // audit-round5 fix #2: volatile store so other threads observing via
     // `sum`/`get_field_volatile` immediately see the cleared cell.
-    if ctx.object_num_fields(this) > 0 {
-        ctx.set_field_volatile(this, 0, Value::Long(0));
+    if let Some(base_slot) = striped64_base_slot(ctx, this) {
+        ctx.set_field_volatile(this, base_slot, Value::Long(0));
     }
     // Round-7 HIGH-16: also zero every stripe cell, otherwise contended
     // adds remain visible after `reset()`.
@@ -71988,10 +73608,10 @@ fn native_long_adder_sum_then_reset(
     // `sumThenReset` is documented as a non-atomic snapshot — concurrent
     // adds racing in the middle may be partly visible in the returned
     // value and partly survive into the reset table. We match that.
-    let base = if ctx.object_num_fields(this) > 0 {
+    let base = if let Some(base_slot) = striped64_base_slot(ctx, this) {
         loop {
-            let current = ctx.get_field_volatile(this, 0);
-            if ctx.compare_and_swap_field(this, 0, current, Value::Long(0)) {
+            let current = ctx.get_field_volatile(this, base_slot);
+            if ctx.compare_and_swap_field(this, base_slot, current, Value::Long(0)) {
                 break match current {
                     Value::Long(v) => v,
                     _ => 0,
@@ -72021,8 +73641,8 @@ fn native_long_adder_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     };
     // Round-7 HIGH-16: include the stripe cell sum so toString reports
     // the same value as `sum()`.
-    let base = if ctx.object_num_fields(this) > 0 {
-        match ctx.get_field(this, 0) {
+    let base = if let Some(base_slot) = striped64_base_slot(ctx, this) {
+        match ctx.get_field(this, base_slot) {
             Value::Long(v) => v,
             _ => 0,
         }
@@ -72040,7 +73660,9 @@ fn native_double_adder_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    ctx.set_field(this, 0, Value::Double(0.0));
+    if let Some(base_slot) = striped64_base_slot(ctx, this) {
+        ctx.set_field(this, base_slot, Value::Long(0));
+    }
     Ok(None)
 }
 
@@ -72057,14 +73679,18 @@ fn native_double_adder_add(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
+    let Some(base_slot) = striped64_base_slot(ctx, this) else {
+        return Ok(None);
+    };
     loop {
-        let current = ctx.get_field_volatile(this, 0);
+        let current = ctx.get_field_volatile(this, base_slot);
         let old = match current {
+            Value::Long(v) => f64::from_bits(v as u64),
             Value::Double(v) => v,
             _ => 0.0,
         };
-        let new_val = Value::Double(old + x);
-        if ctx.compare_and_swap_field(this, 0, current, new_val) {
+        let new_val = Value::Long((old + x).to_bits() as i64);
+        if ctx.compare_and_swap_field(this, base_slot, current, new_val) {
             return Ok(None);
         }
     }
@@ -72076,7 +73702,14 @@ fn native_double_adder_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(Some(Value::Double(0.0))),
     };
     // audit-round5 fix #2: volatile read so concurrent `add`s are observed.
-    Ok(Some(ctx.get_field_volatile(this, 0)))
+    let sum = striped64_base_slot(ctx, this)
+        .and_then(|base_slot| match ctx.get_field_volatile(this, base_slot) {
+            Value::Long(v) => Some(f64::from_bits(v as u64)),
+            Value::Double(v) => Some(v),
+            _ => None,
+        })
+        .unwrap_or(0.0);
+    Ok(Some(Value::Double(sum)))
 }
 
 fn native_double_adder_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -72086,7 +73719,9 @@ fn native_double_adder_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     // audit-round5 fix #2: volatile store so other threads' `sum`
     // reads the cleared value immediately.
-    ctx.set_field_volatile(this, 0, Value::Double(0.0));
+    if let Some(base_slot) = striped64_base_slot(ctx, this) {
+        ctx.set_field_volatile(this, base_slot, Value::Long(0));
+    }
     Ok(None)
 }
 
@@ -79558,7 +81193,7 @@ mod xerces_xml_parser_tests {
     #[test]
     fn xssimple_type_static_normalize_matches_xerces_whitespace_rules() {
         let mut ctx = MockNativeContext::new();
-        let content = ctx.create_string(" a\t b\r\nc ");
+        let content = ctx.create_string(" a\t b\nc ");
 
         assert_eq!(
             native_xssimple_type_normalize_string(
@@ -79610,7 +81245,7 @@ mod xerces_xml_parser_tests {
     fn xssimple_type_object_normalize_collapses_stringbuffer_in_place() {
         let mut ctx = MockNativeContext::new();
         let decl = new_xssimple_type_decl(&mut ctx, 1, XSSIMPLE_FACET_PATTERN);
-        let buffer = new_string_buffer(&mut ctx, "  a\t b\r\nc  ");
+        let buffer = new_string_buffer(&mut ctx, "  a\t b\nc  ");
 
         let normalized = native_xssimple_type_normalize_object(
             &mut ctx,

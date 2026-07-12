@@ -1154,6 +1154,7 @@ impl MonitorTable {
                     } else {
                         // Not held by us (thin, but different owner; or
                         // neutral) — raise IMSE.
+                        self.dbg_monexit_forensics(obj_ref, thread_id, cur, "thin-arm");
                         return Err(MethodCallFailed::InternalError(VmError::Runtime(
                             RuntimeError::IllegalMonitorStateException {
                                 message: format!(
@@ -1170,6 +1171,12 @@ impl MonitorTable {
         let monitor = self.lookup_inflated(obj_ref);
         match monitor {
             Some(m) => m.exit(thread_id).map_err(|MonitorError::NotOwner| {
+                self.dbg_monexit_forensics(
+                    obj_ref,
+                    thread_id,
+                    header.mark_word.load(Ordering::Acquire),
+                    "inflated-notowner",
+                );
                 MethodCallFailed::InternalError(VmError::Runtime(
                     RuntimeError::IllegalMonitorStateException {
                         message: format!(
@@ -1180,6 +1187,12 @@ impl MonitorTable {
             }),
             None => {
                 // No monitor exists for this object — thread never entered it
+                self.dbg_monexit_forensics(
+                    obj_ref,
+                    thread_id,
+                    header.mark_word.load(Ordering::Acquire),
+                    "registry-miss",
+                );
                 Err(MethodCallFailed::InternalError(VmError::Runtime(
                     RuntimeError::IllegalMonitorStateException {
                         message: format!(
@@ -1189,6 +1202,52 @@ impl MonitorTable {
                 )))
             }
         }
+    }
+
+    /// GC-audit finding 1(b) forensics (gated: `CRATONVM_DBG_MONEXIT`, default
+    /// OFF, zero cost when unset). On a monitorexit IMSE, dump everything
+    /// needed to classify the failure shape post-hoc: the raw mark word and
+    /// its decode (NEUTRAL = zeroed/stale header, THIN by another tid =
+    /// identity confusion, INFLATED = owner mismatch), the object header's
+    /// class_id/num_slots words (a zeroed pair = the "zeroed live object"
+    /// recycled-slot shape), and the registry's view of the inflated monitor.
+    #[cold]
+    fn dbg_monexit_forensics(&self, obj_ref: ObjectRef, tid: ThreadId, mark: u64, arm: &str) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_MONEXIT").is_some()) {
+            return;
+        }
+        let key = obj_ref.as_ptr() as usize;
+        let state = ObjectHeader::mark_state(mark);
+        let (class_id, num_slots) = unsafe {
+            let p = obj_ref.as_ptr() as *const u8;
+            (
+                std::ptr::read(p as *const u32),
+                std::ptr::read(p.add(16) as *const u32),
+            )
+        };
+        let (reg_hit, reg_owner, reg_count) = {
+            let monitors = self.monitors.lock().expect("monitors registry poisoned");
+            match monitors.get(&key) {
+                Some(m) => {
+                    let st = m.state.lock();
+                    (true, st.owner, st.entry_count)
+                }
+                None => (false, None, 0),
+            }
+        };
+        eprintln!(
+            "[MONEXIT-IMSE] arm={arm} tid={} obj={key:#x} mark={mark:#x} state={} thin_owner={} thin_rec={} class_id={class_id} num_slots={num_slots} registry_hit={reg_hit} reg_owner={reg_owner:?} reg_entry_count={reg_count}",
+            tid.0,
+            match state {
+                s if s == types::MARK_NEUTRAL => "NEUTRAL",
+                s if s == types::MARK_THIN_LOCKED => "THIN",
+                s if s == types::MARK_INFLATED => "INFLATED",
+                _ => "RESERVED",
+            },
+            ObjectHeader::thin_lock_owner(mark),
+            ObjectHeader::thin_lock_recursion(mark),
+        );
     }
 
     /// Round-7 HIGH (vm #5): record on the monitor for `obj_ref` that the

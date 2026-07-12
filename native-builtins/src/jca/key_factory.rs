@@ -270,6 +270,33 @@ fn drive_real_eddsa_keypair(ctx: &mut dyn NativeContext, algo: i32) -> MethodCal
     ctx.invoke_virtual(spi, "generateKeyPair", "()Ljava/security/KeyPair;", &[])
 }
 
+/// Return the curve-specific JDK EdDSA `KeyFactorySpi` implementation for an
+/// Ed25519 or Ed448 factory. Like the matching key-pair generators above,
+/// these classes fix the curve in their constructor and accept
+/// `EdECPublicKeySpec` directly.
+fn eddsa_keyfactory_spi_class(algo: i32) -> Option<&'static str> {
+    match algo {
+        ALGO_ED25519 => Some("sun/security/ec/ed/EdDSAKeyFactory$Ed25519"),
+        ALGO_ED448 => Some("sun/security/ec/ed/EdDSAKeyFactory$Ed448"),
+        _ => None,
+    }
+}
+
+/// Drive the real curve-specific JDK EdDSA `KeyFactorySpi` over the supplied
+/// `EdECPublicKeySpec`, returning a concrete Ed25519/Ed448 public key. This is
+/// the JWK OKP import path used by Keycloak's SD-JWT tests.
+fn drive_real_eddsa_keyfactory(
+    ctx: &mut dyn NativeContext,
+    algo: i32,
+    spec: ObjectRef,
+    engine: &'static str,
+    ret_desc: &'static str,
+) -> MethodCallResult {
+    let spi_class = eddsa_keyfactory_spi_class(algo)
+        .expect("EdDSA KeyFactory route called for non-EdDSA algorithm");
+    drive_keyspec_spi(ctx, spi_class, spec, engine, ret_desc)
+}
+
 /// Drive a real EC `KeyPairGenerator` SPI (SunEC or BouncyCastle) honouring the
 /// stored keysize / `ECGenParameterSpec` curve, returning a real `KeyPair`.
 fn drive_ec_keypair_spi(
@@ -1494,6 +1521,21 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Value::Int(i) => i,
         _ => -1,
     };
+    // EdDSA: reconstruct concrete SunEC Ed25519/Ed448 keys from the standard
+    // EdECPublicKeySpec. Keycloak builds this spec while importing OKP JWKs;
+    // leaving it on the synthetic path made both curves throw
+    // InvalidKeySpecException despite working key-pair generation.
+    if let Some(Value::Object(Some(spec))) = args.get(1) {
+        if eddsa_keyfactory_spi_class(algo).is_some() {
+            return drive_real_eddsa_keyfactory(
+                ctx,
+                algo,
+                *spec,
+                "engineGeneratePublic",
+                "Ljava/security/PublicKey;",
+            );
+        }
+    }
     // EC: drive the real SunEC KeyFactory over the ECPublicKeySpec → real
     // ECPublicKeyImpl (the synthetic path can't honour an ECPublicKeySpec).
     if algo == ALGO_EC && crate::route_ec_to_real() {
@@ -2609,6 +2651,19 @@ mod tests {
                 "{algo} generatePrivate: expected ExceptionThrown(InvalidKeySpecException), got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn eddsa_keyfactory_spi_classes_are_curve_specific() {
+        assert_eq!(
+            eddsa_keyfactory_spi_class(ALGO_ED25519),
+            Some("sun/security/ec/ed/EdDSAKeyFactory$Ed25519")
+        );
+        assert_eq!(
+            eddsa_keyfactory_spi_class(ALGO_ED448),
+            Some("sun/security/ec/ed/EdDSAKeyFactory$Ed448")
+        );
+        assert_eq!(eddsa_keyfactory_spi_class(ALGO_EC), None);
     }
 
     /// Guard the real RSA public-key import path: a valid SubjectPublicKeyInfo
