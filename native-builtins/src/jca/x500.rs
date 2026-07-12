@@ -166,34 +166,140 @@ fn push_rdn(out: &mut Vec<(String, String)>, raw: String) {
     }
 }
 
+/// Split a DN component at unescaped separators while retaining the escapes
+/// for the attribute-value parser.
+fn split_unescaped(raw: &str, separator: char) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if escaped {
+            current.push('\\');
+            current.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == separator {
+            out.push(std::mem::take(&mut current));
+        } else {
+            current.push(ch);
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    out.push(current);
+    out
+}
+
+fn parse_attribute(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    let mut escaped = false;
+    let mut eq = None;
+    for (idx, ch) in trimmed.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '=' {
+            eq = Some(idx);
+            break;
+        }
+    }
+    let eq = eq?;
+    let key = trimmed[..eq].trim().to_string();
+    let mut value = String::new();
+    let mut chars = trimmed[eq + 1..].trim().chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(next) = chars.next() {
+                value.push(next);
+            }
+        } else {
+            value.push(ch);
+        }
+    }
+    Some((key, value))
+}
+
+/// Parse an RFC-4514 DN preserving the attributes that share one `+` RDN.
+///
+/// `X500Principal.getName()` renders a multi-valued RDN as
+/// `OU=Keycloak+CN=899700252580`. Treating that as a single `OU` value loses
+/// the CN when `getEncoded()` re-derives the principal's DER.
+fn parse_grouped_rdns(s: &str) -> Vec<Vec<(String, String)>> {
+    split_unescaped(s, ',')
+        .into_iter()
+        .filter_map(|rdn| {
+            let attrs = split_unescaped(&rdn, '+')
+                .into_iter()
+                .filter_map(|attr| parse_attribute(&attr))
+                .collect::<Vec<_>>();
+            (!attrs.is_empty()).then_some(attrs)
+        })
+        .collect()
+}
+
+fn grouped_render_rdns(groups: &[Vec<(String, String)>]) -> Vec<(String, String)> {
+    groups
+        .iter()
+        .filter_map(|group| match group.as_slice() {
+            [] => None,
+            [attribute] => Some(attribute.clone()),
+            _ => Some((
+                String::new(),
+                group
+                    .iter()
+                    .map(|(key, value)| {
+                        format!("{}={}", key.to_ascii_uppercase(), escape_value(value))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("+"),
+            )),
+        })
+        .collect()
+}
+
 /// Encode a DN (parsed RDN list, in RFC-4514 string order) to DER.
 ///
 /// The JDK emits the X.500 `Name` SEQUENCE in *most-specific-last* order —
 /// the opposite of the RFC 4514 string order — so we reverse before
 /// emitting.
 pub fn encode_rdns_to_der(rdns: &[(String, String)]) -> Vec<u8> {
+    let groups = rdns
+        .iter()
+        .cloned()
+        .map(|attribute| vec![attribute])
+        .collect::<Vec<_>>();
+    encode_grouped_rdns_to_der(&groups)
+}
+
+fn encode_grouped_rdns_to_der(groups: &[Vec<(String, String)>]) -> Vec<u8> {
     // Pre-allocate the SEQUENCE OF RDN content.
     let mut seq_inner = Vec::new();
-    for (k, v) in rdns.iter().rev() {
-        // OID lookup with a synthetic dotted fallback to keep encoding
-        // total — unknown attribute names are dotted-decimal already.
-        let oid = name_to_oid(k).unwrap_or(k.as_str());
-        let oid_der = asn1::encode_oid(oid).unwrap_or_else(|_| {
-            // Last-ditch: encode the literal name as a UTF8String OID
-            // placeholder.  The decoder's symmetric fallback round-trips
-            // this via the dotted-decimal name, so equality survives.
-            asn1::encode_tlv(asn1::TAG_UTF8_STRING, k.as_bytes())
-        });
-        let val_der = asn1::encode_directory_string(v);
-        // AttributeTypeAndValue := SEQUENCE { OID, DirectoryString }
-        let mut inner = Vec::new();
-        inner.extend_from_slice(&oid_der);
-        inner.extend_from_slice(&val_der);
-        let attr_seq = asn1::encode_sequence(&inner);
-        // RDN := SET OF AttributeTypeAndValue (we emit single-attribute
-        // RDNs only, which sort trivially).
-        let rdn = asn1::encode_set(&attr_seq);
-        seq_inner.extend_from_slice(&rdn);
+    for group in groups.iter().rev() {
+        let mut attrs = Vec::new();
+        for (key, value) in group {
+            // OID lookup with a synthetic dotted fallback to keep encoding
+            // total — unknown attribute names are dotted-decimal already.
+            let oid = name_to_oid(key).unwrap_or(key.as_str());
+            let oid_der = asn1::encode_oid(oid).unwrap_or_else(|_| {
+                // Last-ditch: encode the literal name as a UTF8String OID
+                // placeholder. The decoder's symmetric fallback round-trips
+                // this via the dotted-decimal name, so equality survives.
+                asn1::encode_tlv(asn1::TAG_UTF8_STRING, key.as_bytes())
+            });
+            let val_der = asn1::encode_directory_string(value);
+            let mut inner = Vec::new();
+            inner.extend_from_slice(&oid_der);
+            inner.extend_from_slice(&val_der);
+            attrs.push(asn1::encode_sequence(&inner));
+        }
+        // DER SET elements are ordered lexicographically by their complete
+        // encodings; this also makes equivalent multi-valued RDNs stable.
+        attrs.sort();
+        let rdn_inner = attrs.into_iter().flatten().collect::<Vec<_>>();
+        seq_inner.extend_from_slice(&asn1::encode_set(&rdn_inner));
     }
     asn1::encode_sequence(&seq_inner)
 }
@@ -373,9 +479,9 @@ fn populate(ctx: &mut dyn NativeContext, this: ObjectRef, canonical: &str, _der:
 
 /// Populate from a string DN.
 fn init_from_string(ctx: &mut dyn NativeContext, this: ObjectRef, dn: &str) {
-    let rdns = parse_dn_string(dn);
-    let der = encode_rdns_to_der(&rdns);
-    let canon = render_canonical(&rdns);
+    let groups = parse_grouped_rdns(dn);
+    let der = encode_grouped_rdns_to_der(&groups);
+    let canon = render_canonical(&grouped_render_rdns(&groups));
     populate(ctx, this, &canon, &der);
 }
 
@@ -421,9 +527,9 @@ fn get_canonical(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<String>
 fn get_der(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<u8> {
     // Re-encode from the canonical string preserved by `populate`.
     if let Some(canon) = get_canonical(ctx, this) {
-        let rdns = parse_dn_string(&canon);
-        if !rdns.is_empty() {
-            return encode_rdns_to_der(&rdns);
+        let groups = parse_grouped_rdns(&canon);
+        if !groups.is_empty() {
+            return encode_grouped_rdns_to_der(&groups);
         }
     }
     Vec::new()
@@ -730,5 +836,16 @@ mod tests {
         let canon = render_canonical(&parsed);
         assert!(canon.starts_with("CN=test"));
         assert!(canon.contains("O=ACME"));
+    }
+
+    #[test]
+    fn grouped_rdn_preserves_each_attribute_in_der() {
+        let groups = parse_grouped_rdns("C=US,O=Craton,OU=Keycloak+CN=899700252580");
+        assert_eq!(groups[2].len(), 2);
+        let der = encode_grouped_rdns_to_der(&groups);
+        let decoded = decode_rdns(&der).expect("decode");
+        let canonical = render_canonical(&decoded);
+        assert!(canonical.contains("CN=899700252580"));
+        assert!(canonical.contains("OU=Keycloak"));
     }
 }
