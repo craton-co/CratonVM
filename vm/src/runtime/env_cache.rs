@@ -538,6 +538,48 @@ pub fn native_string_regex() -> bool {
         Err(_) => true,
     })
 }
+
+/// `CRATONVM_NATIVE_MATCHER_FIND` — route `java.util.regex.Matcher.find()` /
+/// `find(int)` / `start()` / `start(int)` / `end()` / `end(int)` / `group()`
+/// / `group(int)` to a fast Rust-native fast path operating directly on the
+/// REAL OpenJDK `Matcher`/`Pattern` object layout (fields resolved by name,
+/// never a hardcoded slot index), instead of the real JDK bytecode's
+/// interpreted state-machine engine.
+///
+/// `CRATONVM_NATIVE_STRING_REGEX` above only accelerates the `String`
+/// convenience methods (`replaceAll`/`replaceFirst`/`matches`); it does
+/// nothing for the extremely common explicit `while (m.find()) { ...;
+/// m.group(N); }` idiom, which still ran the interpreted engine — this is
+/// what the README's `String/Regex` QuickBench kernel actually measures.
+/// `start`/`end`/`group` are included because they sit on the same hot loop
+/// and only read state `find`/`find(int)` already populate — measured,
+/// leaving them interpreted left most of the per-iteration cost on the
+/// table (find-only: ~3.2x of the full win; find+start+end+group: the rest).
+/// See `native-builtins/src/lib.rs`'s "real-JDK-layout `find()`/`find(int)`
+/// fast path" module banner for the full design (offset-table UTF-16↔UTF-8
+/// bridging, bail-to-real-bytecode escape hatch for anything the fast path
+/// can't faithfully reproduce, and the `hitEnd`/`requireEnd` approximation
+/// residual).
+///
+/// **DEFAULT-ON** (opt-out `CRATONVM_NATIVE_MATCHER_FIND=0`/`false`), after a
+/// 141-case parity battery confirmed `find`/`find(int)`/`start`/`end`/`group`
+/// results byte-identical to HotSpot (the only observed differences are the
+/// documented `hitEnd`/`requireEnd` approximation and the pre-existing
+/// Windows-console non-ASCII display artifact — same residual category
+/// `CRATONVM_NATIVE_STRING_REGEX` already accepted before its own flag
+/// flipped default-ON). Reduced the README `String/Regex (10K)` kernel's
+/// CratonVM-vs-HotSpot ratio from 37.6x to roughly 16x on an equivalent
+/// standalone benchmark (see docs/known-issues for the measurement).
+#[inline]
+pub fn native_matcher_find() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("CRATONVM_NATIVE_MATCHER_FIND") {
+        // Explicit opt-out only: `0` / `false` disable; unset or any other
+        // value (incl. `1`, empty) enables.
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    })
+}
 cached_is_set!(jit_mic_dbg, "CRATONVM_DBG_JIT_MIC");
 cached_is_set!(jit_entry_dbg, "CRATONVM_DBG_JIT_ENTRY");
 cached_is_set!(jit_putfield_diag, "CRATONVM_DBG_JIT_PUTFIELD");

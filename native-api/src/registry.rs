@@ -726,6 +726,13 @@ pub trait NativeContext {
     /// Get the class id of a heap object.
     fn class_id_of_object(&self, obj: ObjectRef) -> ClassId;
 
+    /// VM-accelerated primitive-wrapper recognition. `None` means this context
+    /// does not implement the fast path; `Some(None)` means the object is not a
+    /// wrapper; `Some(Some(value))` is the unboxed primitive.
+    fn fast_unbox_primitive_wrapper(&self, _obj: ObjectRef) -> Option<Option<Value>> {
+        None
+    }
+
     /// True when the named class is loaded as a synthetic stub (no real
     /// `.class` bytes). Used to branch native helpers that must mirror JDK
     /// behaviour without registering natives that would override real JDK
@@ -1302,6 +1309,28 @@ pub trait NativeContext {
 
     /// Get the ClassId for a loaded class by name. Returns None if not loaded.
     fn class_id_by_name(&self, name: &str) -> Option<ClassId>;
+
+    /// Resolve `name` to a `ClassId`, preferring whichever loaded class is
+    /// registered under the SAME classloader as `near`'s own declaring
+    /// context, falling back to the normal global (bootstrap-first) search
+    /// used by [`Self::class_id_by_name`].
+    ///
+    /// A plain by-name lookup can silently resolve to an unrelated
+    /// same-named class loaded under a DIFFERENT classloader when the JVM
+    /// spec's (loader, name) identity legitimately produces two distinct
+    /// classes with the same name -- e.g. Hibernate ORM's bytecode
+    /// enhancement reloads an `@EmbeddedId` class under its own private
+    /// ByteBuddy classloader. Resolving a field/parameter's declared type
+    /// via plain name search can then find the FIRST-loaded (often stale)
+    /// variant instead of the one the caller's own class actually sees,
+    /// causing a real, correctly-typed value to be rejected as an
+    /// assignability mismatch. Use this instead of `class_id_by_name`
+    /// whenever `name` is a symbolic reference that must match the specific
+    /// class variant visible to a known class (`near`) -- e.g. a
+    /// `Field`/`Method`/`Constructor`'s own declaring class.
+    fn class_id_by_name_near(&self, name: &str, _near: ClassId) -> Option<ClassId> {
+        self.class_id_by_name(name)
+    }
 
     /// For a synthetic lambda-proxy `ClassId` (created by `register_lambda_proxy`,
     /// class id `>= 0x8000_0000`, not in the class store), return the internal
@@ -3480,11 +3509,59 @@ impl NativeMethodRegistry {
         // Pattern/Matcher bytecode observes impossible state (for example a
         // Matcher whose `locals` field is not an int[]). Let the JDK regex
         // bytecode own both object construction and matching in real mode.
+        //
+        // EXCEPTION (`CRATONVM_NATIVE_MATCHER_FIND`) — keep the real-JDK-layout
+        // `Matcher.find()`/`find(int)` fast path. Unlike the legacy natives
+        // this drop exists to suppress, that fast path never assumes a
+        // synthetic field layout: it resolves every field by name against
+        // whatever real OpenJDK object is actually there (see
+        // `native-builtins/src/lib.rs`'s `native_matcher_find_realjdk`), so
+        // it does not corrupt anything the way the old slot-index bridge did
+        // — a correct, same-answer-just-faster fast path is exactly what
+        // `NativeKind::Intrinsic` means per this enum's own doc comment.
+        //
+        // Registered under `NativeKind::Intrinsic` SPECIFICALLY BECAUSE the
+        // legacy synthetic-layout `Matcher.find`/`find(int)` registrations
+        // this drop targets run under `NativeKind::Bridge` in the real-JDK
+        // build (inherited from a persistent `set_category(Bridge)` far
+        // above their registration site) — an earlier version of this
+        // exception keyed on `Bridge` and, because of that inherited
+        // category, ALSO accidentally un-dropped the legacy bridge, which
+        // then corrupted every real `Matcher` via its raw synthetic slot
+        // indices (symptom: `Matcher.start()` throwing after a second
+        // `find()`, reproduced even with `CRATONVM_NATIVE_MATCHER_FIND`
+        // unset). `Intrinsic` is registered nowhere else in this file for
+        // `java/util/regex/Pattern`/`Matcher` under `drop_real_layout_synthetic`
+        // (confirmed: the only other `register_regex_natives()` call site
+        // that runs under `Intrinsic` is `register_synthetic_overrides`,
+        // which only executes when `drop_real_layout_synthetic` is unset in
+        // the first place, so the outer `if` below short-circuits before this
+        // exception is even consulted there) — category-matching is
+        // otherwise inherently fragile (any future `set_category` reshuffle
+        // upstream of either registration site can silently reintroduce this
+        // exact collision), so treat `Intrinsic` here as load-bearing: do not
+        // change this registration's category without re-auditing every
+        // `set_category`/`with_category` call between both `register_regex_natives`
+        // call sites and the top of `register_essential_natives`.
+        let keep_real_matcher_find_fastpath = self.current_category == NativeKind::Intrinsic
+            && class_name == "java/util/regex/Matcher"
+            && matches!(
+                (method_name, descriptor),
+                ("find", "()Z")
+                    | ("find", "(I)Z")
+                    | ("start", "()I")
+                    | ("start", "(I)I")
+                    | ("end", "()I")
+                    | ("end", "(I)I")
+                    | ("group", "()Ljava/lang/String;")
+                    | ("group", "(I)Ljava/lang/String;")
+            );
         if self.drop_real_layout_synthetic
             && matches!(
                 class_name,
                 "java/util/regex/Pattern" | "java/util/regex/Matcher"
             )
+            && !keep_real_matcher_find_fastpath
         {
             return;
         }

@@ -40,70 +40,100 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 
 ### Benchmark (vs HotSpot JDK 25 C2)
 
-| Benchmark                  | JDK 25 C2     | CratonVM default | Default ratio |
-|----------------------------|---------------|-------------------|---------------|
-| Arithmetic (2B ops)        | 2,622 ms      | 11,465 ms         | 4.37x         |
-| Fibonacci(44)              | 2,774 ms      | 9,321 ms          | 3.36x         |
-| Sieve (100K x 20,000)      | 5,253 ms      | 19,371 ms         | 3.69x         |
-| Matrix 1280x1280           | 2,623 ms      | 10,364 ms         | 3.95x         |
-| HashMap (1M put/get)       | 47 ms         | 17,144 ms         | 365x          |
-| String/Regex (10K)         | 12 ms         | 1,110 ms          | 92.5x         |
-| **QuickBench TOTAL**       | **13,331 ms** | **68,775 ms**     | **5.16x**     |
-| Binary Trees (depth=18)    | 382 ms        | 4,916 ms          | 12.9x         |
+| Benchmark                          | JDK 25 C2     | CratonVM default | Default ratio |
+|-------------------------------------|---------------|-------------------|---------------|
+| Arithmetic (2B ops)                 | 2,622 ms      | 11,465 ms         | 4.37x         |
+| Fibonacci(44)                       | 2,774 ms      | 9,321 ms          | 3.36x         |
+| Sieve (100K x 20,000)               | 5,253 ms      | 19,371 ms         | 3.69x         |
+| Matrix 1280x1280                    | 2,623 ms      | 10,364 ms         | 3.95x         |
+| **QuickBench TOTAL**                | **13,272 ms** | **50,521 ms**     | **3.81x**     |
+| HashMap (1M put/get, isolated)      | 51.1 ms       | 409.6 ms          | 8.01x         |
+| String/Regex (10K, isolated)        | 8 ms          | 153 ms            | 19.1x         |
+| Binary Trees (depth=18, isolated)   | 382 ms        | 4,916 ms          | 12.9x         |
 
-*Measured 2026-07-10 on the primary Windows dev box (hybrid P/E-core CPU, pinned to
-the 16 P-core logical processors via `ProcessorAffinity` — single-threaded benchmarks
-otherwise get scheduled onto slower E-cores, which skews results) against JDK 25 C2
-and a CratonVM release build off `dev` with the guarded-inline-getfield JIT fast path
-at its default-on state (see below) plus HashMap and String/Regex kernels added to
-close a gap — the original 5 kernels were all math/arrays, with nothing exercising
-hash-map or string/regex workloads; HashMap and String/Regex rows re-measured
-2026-07-11 after the fixes described below (Arithmetic/Fibonacci/Sieve/Matrix/Binary
-Trees unchanged since 2026-07-10, not re-verified this pass). The 6 QuickBench-proper
-kernels are measured in a single combined run (`bench/QuickBenchLong3.java`); Binary
-Trees is a separate, freshly-launched process (5-round average, checksums identical
-every round) — mixing it into the combined run inflates its ratio via accumulated
-GC/heap pressure from the preceding kernels, so it's kept isolated for a
-representative number, matching how `bench/BenchSuite` always measures it elsewhere in
-this repo. Checksums verified identical between CratonVM and JDK on every kernel in
-every configuration. `CRATONVM_JIT_OSR` back-edge OSR is default-on;
-`guarded_inline_getfield_enabled()` is the single largest lever in the first 4 rows —
-see [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for its find/fix history.
+*Arithmetic/Fibonacci/Sieve/Matrix measured 2026-07-10 on the primary Windows dev box
+(hybrid P/E-core CPU, pinned to the 16 P-core logical processors via
+`ProcessorAffinity` — single-threaded benchmarks otherwise get scheduled onto slower
+E-cores, which skews results) against JDK 25 C2 and a CratonVM release build off `dev`
+with the guarded-inline-getfield JIT fast path at its default-on state (see below);
+not re-verified since. HashMap, String/Regex, and Binary Trees are each measured as a
+**separate, isolated, freshly-launched process** (not part of the combined run above,
+median/mean of several rounds, checksums identical every round) — mixing any of them
+into the combined run inflates its ratio via accumulated GC/heap pressure from the
+preceding kernels in the same process, so each is kept isolated for a representative
+number (same rationale `bench/BenchSuite` already used for Binary Trees; HashMap and
+String/Regex were originally folded into the combined run before that inflation was
+understood — see their sections below). Checksums verified identical between CratonVM
+and JDK in every configuration measured. `CRATONVM_JIT_OSR` back-edge OSR is
+default-on; `guarded_inline_getfield_enabled()` is the single largest lever in the
+first 4 rows — see [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for its
+find/fix history.
 
-**HashMap and String/Regex are known-slow outliers, not calibration noise — but both
-are now root-caused, and partially fixed.** Sized far below the other kernels because
-at JDK-comparable scale they don't complete in reasonable time.
+**HashMap and String/Regex were known-slow outliers as of 2026-07-10 (365x and 247x in
+the original combined-run measurement); both are now root-caused and substantially
+fixed.**
 
 String/Regex's O(n²)-shaped scaling (18.8x at 1K entries → 238.8x at 10K in the
-original profiling) is fixed upstream: `Matcher`'s native find()/group() path and a
-substring-from-large-parent allocation path were both quadratic-allocation bugs, not
+original profiling) was a `Matcher` native find()/group() path and a
+substring-from-large-parent allocation path, both quadratic-allocation bugs, not
 interpreter overhead — see
 [`docs/known-issues/matcher-native-full-input-redecode-quadratic.md`](docs/known-issues/matcher-native-full-input-redecode-quadratic.md)
 and
 [`docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`](docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md)
-(merged `a87901e6`). The combined-run ratio dropped from 247x to 92.5x accordingly.
+(merged `a87901e6`). That landed the algorithmic (O(n²)→O(n)) fix and left a
+**37.6x** constant-factor gap (11 ms JDK / 414 ms CratonVM) — the interpreted
+`java.util.regex` engine itself, one JIT-tier-up/intrinsic layer short of HotSpot's
+compiled state machine.
 
-HashMap's ~230–365x is a *different* shape of bug — cdb stack-sampling (attach-and-dump
-the JIT-compiled benchmark's own call stacks, the same technique used to profile the
-`bintrees` GC/allocation ceiling elsewhere in this repo) showed the ratio is flat across
-sizes (not O(n²)) and is NOT allocation/GC-bound: only ~9% of sampled stacks were in
-allocation/boxing paths, versus ~90% for an allocation-bound workload like `bintrees`.
-The real cost is fixed per-native-call overhead in the JIT-to-native dispatch path —
-`java.util.HashMap.put/get` and `Integer.hashCode()/valueOf()` are native Rust
-functions, and every call into one pays for conservative JIT-frame root scanning
-(~29% of sampled stacks, the largest single bucket), RwLock-guarded class/field-layout
-lookups, and generic dispatch-machinery overhead, none of which a pure-bytecode
-workload like `bintrees` ever touches. Three targeted, behavior-preserving fixes ship
-in this pass for the safely-addressable slice of that overhead (key hash/equals
-check-order, a lock-free receiver-corruption fast path, and a lock-free field-layout
-cache mirroring an already-proven pattern elsewhere in this codebase) — a 5-round,
-isolated (same rationale as Binary Trees above) re-measurement post-fix averages
-**~206x** (14,930 ms CratonVM / 72.6 ms JDK), down from the isolated methodology's
-prior ~357x. Deliberately NOT touched: conservative root scanning and the SATB GC
-flush, both correctness-critical with a real prior crash/heap-corruption history in
-this codebase. See
-[`docs/known-issues/hashmap-native-dispatch-overhead.md`](docs/known-issues/hashmap-native-dispatch-overhead.md)
-for the full investigation and remaining-work writeup.*
+That remaining constant-factor gap is now also closed, most of the way:
+`CRATONVM_NATIVE_MATCHER_FIND` (**default-ON** since 2026-07-11) routes the explicit
+`Pattern.compile(...).matcher(...)` + `while (m.find()) { ...; m.group(N); }` idiom —
+the shape `bench/StringRegexOnly.java` exercises, and the common shape in real
+parsers/tokenizers — to a Rust-native fast path operating directly on the real OpenJDK
+`Matcher`/`Pattern` object layout (fields resolved by name, never a hardcoded slot
+index, so it can't corrupt a real object the way the pre-2026-07-11 legacy synthetic
+bridge would have). Covers `find()`, `find(int)`, `start()`, `start(int)`, `end()`,
+`end(int)`, `group()`, `group(int)` — the same hot loop's `start`/`end`/`group` calls
+dominated the *remaining* per-iteration cost once `find()` alone was fast, so all
+eight are accelerated together. See
+[`docs/internal/fixed-suite-bugs/matcher-find-realjdk-fastpath-FIXED.md`](docs/internal/fixed-suite-bugs/matcher-find-realjdk-fastpath-FIXED.md)
+for the full design (UTF-16↔UTF-8 offset bridging, bail-to-real-bytecode escape hatch,
+and the one documented residual: `hitEnd()`/`requireEnd()`, used almost exclusively by
+`java.util.Scanner`'s stream-refill logic, are a best-effort approximation rather than
+bit-identical to HotSpot's backtracking-engine bookkeeping — verified against a 141-case
+parity battery to have zero effect on `find`/`group`/`start`/`end` correctness).
+`CRATONVM_NATIVE_MATCHER_FIND=0` reverts to real JDK bytecode as the safety net.
+
+The table above uses a freshly-verified **19.1x** (8 ms JDK / 153 ms CratonVM, best of
+5, `bench/StringRegexOnly.java` standalone, `CRATONVM_NATIVE_MATCHER_FIND` at its new
+default) — down from 37.6x, though not yet at the 5-7x range the other constant-factor
+rows sit in. The residual is believed to be the same fixed per-native-call VM dispatch
+tax the HashMap section below documents (each `find`/`group`/`start`/`end` call is a
+separate native dispatch, each paying that tax) rather than anything specific to
+regex — the HashMap section below describes two rounds of fixes already landed for
+exactly that class of overhead (357x isolated → 29.6x), so applying the same
+root-publication/dispatch-residual technique to `Matcher`'s natives is a promising,
+not-yet-attempted follow-up here, rather than a hypothetical one. Like the String/Regex
+row above it, an isolated re-measurement not yet re-run through the exact combined-suite
+harness.
+
+HashMap's slowdown was a *different* shape of bug — flat across sizes (not O(n²)), and
+cdb stack-sampling showed it was NOT allocation/GC-bound (only ~9% of sampled stacks in
+allocation/boxing paths, vs ~90% for an allocation-bound workload like `bintrees`
+elsewhere in this repo) but fixed per-native-call overhead in the JIT-to-native
+dispatch path: `HashMap.put/get` and `Integer.hashCode()/valueOf()` are native Rust
+functions, and every call paid for conservative JIT-frame root scanning, RwLock-guarded
+class/field-layout lookups, and generic dispatch-machinery overhead that a pure-bytecode
+workload like `bintrees` never touches. Two rounds of fixes landed: first, three
+narrow, behavior-preserving reorders/caches for the safely-addressable slice of that
+overhead (root scanning and the SATB GC flush were deliberately left alone —
+correctness-critical, with a real prior crash/heap-corruption history in this codebase);
+then a larger follow-up addressed the root-publication and dispatch residual directly,
+plus added a GC-integrated fast-path overlay for `Integer`-keyed maps. Combined,
+isolated ratio (13 rounds, median): **29.6x** — down from the original 357x isolated /
+365x combined-run figures. See
+[`docs/internal/hashmap-native-dispatch-overhead.md`](docs/internal/hashmap-native-dispatch-overhead.md)
+for the full implementation and validation record.*
 
 See [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full 26-round JIT optimization journey.
 
@@ -121,26 +151,37 @@ matches HotSpot bit-for-bit.
 | Benchmark (N = 2²⁴)                              | HotSpot C2 | TornadoVM GPU  | **CratonVM GPU** | vs HotSpot | vs TornadoVM |
 |---------------------------------------------------|------------|----------------|-------------------|------------|--------------|
 | Integer div-chain (48 unvectorizable divs/elem)    | 1,910 ms   | 28 ms          | **9 ms**          | **212x**   | **3.1x**     |
+| Double div-chain (64 divs/elem, IEEE-exact)¹        | 1,508 ms   | 129 ms         | **91 ms**         | **16.6x**  | **1.4x**     |
 | 96 multiply-adds/elem (AVX2-vectorized on CPU)     | 8 ms       | 17 ms          | **11 ms**         | 0.7x       | 1.5x         |
-| Dot-product reduction (`int·int` → `long`)         | 7 ms       | unimplemented¹ | **18 ms**         | 0.4x       | n/a¹         |
+| Dot-product reduction (`int·int` → `long`)         | 7 ms       | unimplemented²  | **18 ms**         | 0.4x       | n/a²          |
 
-¹ TornadoVM 4.0.1's PTX backend throws `TornadoInternalError: unimplemented`
+¹ `FDIV_CHECKSUM` is **bit-exact** between CratonVM-GPU and HotSpot at
+every size tested (`div.rn.f64` PTX is IEEE-754 round-to-nearest, same as
+x86 `vdivpd`); TornadoVM's checksum diverges slightly from HotSpot's —
+its PTX backend doesn't guarantee bit-exact division.
+
+² TornadoVM 4.0.1's PTX backend throws `TornadoInternalError: unimplemented`
 on the equivalent `@Reduce`-over-`LongArray` kernel; CratonVM's transparent
 reduction dispatch handles a shape TornadoVM's own reduction skeleton
 currently can't.
 
-*The div-chain row is the honest "GPU wins big" case: 48 data-dependent
-integer divisions per element that no CPU SIMD unit can vectorize, so the
-GPU wins on raw parallelism. The other two rows are the honest counter-cases
-kept in for the same reason the CPU table above shows CratonVM losing to
-JDK — HotSpot's AVX2 auto-vectorizer (96-MAD) and a PCIe-round-trip-bound
-single-scalar-output kernel (dot-product) are both genuinely hard for any
-GPU dispatch to beat at this size; the GPU still ties or wins overall
-against TornadoVM's own PTX backend on both. Checksums verified identical
-between CratonVM-GPU and HotSpot on every row. Full results — more input
-sizes, `ldc`-constant kernels, cold-start numbers up to N = 2²⁸, sources,
-and methodology — are in "GPU offload benchmarks" further down this file
-and in [docs/gpu/README.md](docs/gpu/README.md).*
+*The two div-chain rows are the "GPU wins big" cases: neither integer nor
+double division has a competitive CPU-vectorized form the way multiply/add
+does, so the GPU wins on raw parallelism at every size tested (confirmed
+2²⁰ through 2²⁶ for the double kernel — see sources below; the ratio holds
+steady, it isn't a one-off at this particular N). The other two rows are
+the honest counter-cases kept in for the same reason the CPU table above
+shows CratonVM losing to JDK, and neither has a scale-up fix: 96-MAD's
+AVX2 auto-vectorizer stays competitive with the GPU at every N large enough
+to escape millisecond-timer noise (an earlier "GPU wins at 2²²" reading was
+that noise, not a real result — see sources), and dot-product's ratio holds
+flat from 2²² through 2²⁶ because a single atomic-accumulator cell doesn't
+get relatively cheaper with more elements; a real fix needs a proper
+tree/shared-memory reduction, tracked as an open item. Checksums verified
+identical between CratonVM-GPU and HotSpot on every row. Full results —
+more input sizes, `ldc`-constant kernels, cold-start numbers up to N = 2²⁸,
+sources, and methodology — are in "GPU offload benchmarks" further down
+this file and in [docs/gpu/README.md](docs/gpu/README.md).*
 
 ## Quick Start
 
@@ -401,6 +442,26 @@ no CPU JIT can vectorize this shape; the GPU wins on raw parallelism:
 | 2²⁴ | 2,232 ms | 1,910 ms | **9 ms** | 28 ms | **212×** |
 | 2²⁶ | 9,162 ms | 6,735 ms | **33 ms** | 86 ms | **204×** |
 
+**Double-precision division chain** — 64 sequential `x = x / b[i] + c` steps
+per element (`GpuFloatDivChain`). The floating-point counterpart of the
+integer chain above: `vdivpd` has real but low throughput even under AVX2
+(a shared, weakly-pipelined execution unit, unlike multiply/add/FMA), so the
+GPU wins here too, and its `div.rn.f64` is IEEE-754 exact — `FDIV_CHECKSUM`
+matches HotSpot bit-for-bit at every size (including CratonVM-CPU, which
+also matches — the chain is deterministic across all three engines), unlike
+TornadoVM's PTX backend (checksum diverges slightly there, e.g.
+`2.3711976971862224E8` vs `2.3833420668027386E8` at 2²⁶ — approximate
+device math). CratonVM-CPU at 2²⁶ (64M elements × 64 divisions) needed
+~99× longer than CratonVM-GPU to confirm this — a good illustration of why
+the GPU path exists:
+
+| N | CratonVM CPU | HotSpot C2 | **CratonVM GPU** | TornadoVM GPU | GPU vs HotSpot |
+|---|---|---|---|---|---|
+| 2²⁰ | 435 ms | 89 ms | **7 ms** | 11 ms | **12.7×** |
+| 2²² | 1,856 ms | 400 ms | **23 ms** | 38 ms | **17.4×** |
+| 2²⁴ | 6,299 ms | 1,508 ms | **91 ms** | 129 ms | **16.6×** |
+| 2²⁶ | 36,082 ms | 5,578 ms | **365 ms** | 482 ms | **15.3×** |
+
 **96 multiply-adds per element** (`GpuWarm.heavy`) — a shape HotSpot C2 *can*
 auto-vectorize with AVX2, making it the honest hard case: the GPU still beats
 or ties the vectorized CPU and outruns TornadoVM ~2× on the same kernel:
@@ -411,8 +472,19 @@ or ties the vectorized CPU and outruns TornadoVM ~2× on the same kernel:
 | 2²⁴ | 1,955 ms | 8 ms | **11 ms** | 17 ms | 178× |
 | 2²⁶ | 7,689 ms | 25 ms | **27 ms** | 51 ms | 285× |
 
+*Does the 96-MAD ratio ever flip in CratonVM-GPU's favor at a smaller N?
+Checked directly: at N ≤ 2²² both HotSpot and CratonVM-GPU round to 0-1 ms,
+which is `System.nanoTime()`/millisecond-timer noise, not a reproducible
+signal (an earlier "2× GPU win at 2²²" reading, visible in the table above,
+was exactly this noise — re-measured and it doesn't hold up). At N ≥ 2²⁴ the
+ratio settles to ~0.7-0.9× and stays there; scaling further doesn't change
+it because both sides scale ~linearly once past the noise floor. The
+double-precision division chain above is the honest floating-point
+alternative that *does* show a clear, reproducible win at every size.*
+
 Sources: [bench-gpu/results/divchain-comparison-20260711.md](bench-gpu/results/divchain-comparison-20260711.md),
 [warm-comparison-20260711.md](bench-gpu/results/warm-comparison-20260711.md),
+[float-divchain-20260711.md](bench-gpu/results/float-divchain-20260711.md),
 and the cold-start 4-way in [gpu-comparison-20260711.md](bench-gpu/results/gpu-comparison-20260711.md)
 (includes N = 2²⁸ / 269M elements: 579 ms on GPU vs 30.8 s CratonVM CPU).
 Benchmark sources live in `bench-gpu/` (+ `bench-tornado/` for the TornadoVM twins). Numbers were taken on a
@@ -447,6 +519,14 @@ transparent-offload surface for a shape that TornadoVM 4.0.1's PTX backend
 currently can't handle at all: the equivalent `@Reduce`-over-`LongArray` kernel
 (`bench-tornado/TornadoDotBench.java`) throws
 `TornadoInternalError: unimplemented`.
+
+Does scaling N help? No: the ratio holds roughly flat (~3× slower on GPU)
+from N=2²² through N=2²⁶ (12 ms → 41 ms GPU vs 4 ms → 19 ms HotSpot at
+2²⁴/2²⁶). The kernel is memory-bandwidth-bound on both sides, and every GPU
+thread races an atomic add on the *same* accumulator cell — that
+contention doesn't improve with more elements. A real win here needs a
+proper tree/shared-memory reduction instead of a single atomic cell
+(tracked as an open item, not yet built).
 
 **`ldc` constants** (`bench-gpu/GpuLdcBench.java`, a 96-step multiply-add chain
 using constants outside `sipush` range so javac emits `ldc` instead of

@@ -762,12 +762,16 @@ impl ForeignCallGuard {
                 }
             }
         };
-        shared.gc_barrier.mark_blocked_region_leave();
-        with_foreign_thread(|jt| {
-            jt.gc_block_state
-                .in_blocked_region
-                .store(false, std::sync::atomic::Ordering::Release);
-            jt.root_snapshot.lock().clear();
+        // Publish the idle->running transition atomically with the barrier
+        // census. A separate leave followed by a flag store can let a new STW
+        // exclude an already-running foreign mutator.
+        shared.gc_barrier.mark_blocked_region_leave_after(|| {
+            with_foreign_thread(|jt| {
+                jt.gc_block_state
+                    .in_blocked_region
+                    .store(false, std::sync::atomic::Ordering::Release);
+                jt.root_snapshot.lock().clear();
+            });
         });
         // A fresh local-ref frame scopes this call's JNI local refs (freed on
         // return, per JNI semantics) so the thread holds none across the idle

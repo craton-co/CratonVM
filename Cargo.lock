@@ -670,6 +670,7 @@ dependencies = [
  "cratonvm-native-api",
  "cratonvm-types",
  "parking_lot",
+ "rustc-hash",
 ]
 
 [[package]]

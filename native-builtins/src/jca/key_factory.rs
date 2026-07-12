@@ -63,6 +63,7 @@ use crate::crypto_impl;
 const ALGO_RSA: i32 = 6;
 const ALGO_EC: i32 = 7;
 const ALGO_ED25519: i32 = 8;
+const ALGO_ED448: i32 = 10;
 
 // ---------------------------------------------------------------------------
 // Real-JDK class instance-field counts (number of slots used by the real
@@ -123,6 +124,23 @@ fn set_kpg_algo(this: ObjectRef, idx: i32) {
 
 fn get_kpg_algo(this: ObjectRef) -> Option<i32> {
     kpg_algo_table().lock().get(&this).copied()
+}
+
+/// Preserve the caller's requested spelling for `getAlgorithm()` and diagnostic
+/// errors. An algorithm index alone cannot represent unrecognised names.
+fn kpg_name_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, String>> {
+    use std::sync::OnceLock;
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, String>>> =
+        OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+fn set_kpg_name(this: ObjectRef, name: String) {
+    kpg_name_table().lock().insert(this, name);
+}
+
+fn get_kpg_name(this: ObjectRef) -> Option<String> {
+    kpg_name_table().lock().get(&this).cloned()
 }
 
 fn set_kpg_keysize(this: ObjectRef, bits: i32) {
@@ -230,6 +248,26 @@ fn drive_real_ec_keypair(ctx: &mut dyn NativeContext, this: ObjectRef) -> Method
         "sun/security/ec/ECKeyPairGenerator"
     };
     drive_ec_keypair_spi(ctx, this, spi_class)
+}
+
+/// Drive SunEC's curve-specific EdDSA key generators. Their public constructors
+/// lock the requested curve, so no follow-up `initialize` call is required.
+fn drive_real_eddsa_keypair(ctx: &mut dyn NativeContext, algo: i32) -> MethodCallResult {
+    let spi_class = match algo {
+        ALGO_ED25519 => "sun/security/ec/ed/EdDSAKeyPairGenerator$Ed25519",
+        ALGO_ED448 => "sun/security/ec/ed/EdDSAKeyPairGenerator$Ed448",
+        _ => unreachable!("EdDSA route called for non-EdDSA algorithm"),
+    };
+    let spi = match ctx.new_object_initialized(spi_class, "()V", &[])? {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            return Err(RuntimeError::NotImplemented {
+                feature: spi_class.into(),
+            }
+            .into())
+        }
+    };
+    ctx.invoke_virtual(spi, "generateKeyPair", "()Ljava/security/KeyPair;", &[])
 }
 
 /// Drive a real EC `KeyPairGenerator` SPI (SunEC or BouncyCastle) honouring the
@@ -917,8 +955,12 @@ fn algo_idx(name: &str) -> i32 {
         "ML-DSA-65" => 4,
         "ML-DSA-87" => 5,
         "RSA" => ALGO_RSA,
+        // RSASSA-PSS uses standard RSA key material; the PSS choice belongs to
+        // Signature, not KeyPairGenerator.
+        "RSASSA-PSS" => ALGO_RSA,
         "EC" | "ECDSA" => ALGO_EC,
         "ED25519" | "EDDSA" => ALGO_ED25519,
+        "ED448" => ALGO_ED448,
         "X25519" => 9,
         _ => -1,
     }
@@ -935,6 +977,7 @@ fn algo_name(idx: i32) -> &'static str {
         ALGO_RSA => "RSA",
         ALGO_EC => "EC",
         ALGO_ED25519 => "Ed25519",
+        ALGO_ED448 => "Ed448",
         9 => "X25519",
         _ => "Unknown",
     }
@@ -1196,6 +1239,7 @@ fn kpg_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // the algorithm index reliably across the call chain, mirroring the
     // proven pattern in `message_digest::accumulators`.
     set_kpg_algo(kpg, idx);
+    set_kpg_name(kpg, alg.clone());
     // Record a BouncyCastle provider request (getInstance(alg, "BC"|BCprovider))
     // so EC keygen can hand out genuine BC keys (see `kpg_bcprov_table`).
     set_kpg_bcprov(kpg, is_bc);
@@ -1386,6 +1430,10 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         )))));
     }
 
+    if crate::route_ec_to_real() && matches!(algo, ALGO_ED25519 | ALGO_ED448) {
+        return drive_real_eddsa_keypair(ctx, algo);
+    }
+
     // ML-DSA / ML-KEM: drive the real JDK 25 PQC KeyPairGenerator SPI (SUN /
     // SunJCE) for a genuine, HotSpot-equivalent keypair. Safe now that the
     // native `SHA3.keccak` override makes SHAKE256 produce real output (without
@@ -1399,9 +1447,10 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // JDK contract and throw `NoSuchAlgorithmException` rather than minting a
     // KeyPair with empty key material (no-synthetic-stubs policy). RSA and EC
     // returned above with real keys.
+    let requested = get_kpg_name(this).unwrap_or_else(|| algo_name(algo).to_string());
     Err(throw_no_such_algorithm(
         ctx,
-        &format!("{} KeyPairGenerator not available", algo_name(algo)),
+        &format!("{requested} KeyPairGenerator not available"),
     ))
 }
 
@@ -1412,7 +1461,8 @@ fn kpg_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Value::Int(i) => i,
         _ => -1,
     };
-    let s = ctx.create_string(algo_name(idx));
+    let name = get_kpg_name(this).unwrap_or_else(|| algo_name(idx).to_string());
+    let s = ctx.create_string(&name);
     Ok(Some(Value::Object(Some(s))))
 }
 
@@ -2357,6 +2407,8 @@ mod tests {
         assert_eq!(algo_idx("EC"), ALGO_EC);
         assert_eq!(algo_idx("ECDSA"), ALGO_EC);
         assert_eq!(algo_idx("Ed25519"), ALGO_ED25519);
+        assert_eq!(algo_idx("Ed448"), ALGO_ED448);
+        assert_eq!(algo_idx("RSASSA-PSS"), ALGO_RSA);
         assert_eq!(algo_idx("Garbage"), -1);
     }
 
@@ -2365,7 +2417,31 @@ mod tests {
         assert_eq!(algo_name(ALGO_RSA), "RSA");
         assert_eq!(algo_name(ALGO_EC), "EC");
         assert_eq!(algo_name(ALGO_ED25519), "Ed25519");
+        assert_eq!(algo_name(ALGO_ED448), "Ed448");
         assert_eq!(algo_name(-1), "Unknown");
+    }
+
+    #[test]
+    fn keypairgenerator_preserves_requested_algorithm_name() {
+        for requested in ["RSASSA-PSS", "Ed448", "Totally-Bogus"] {
+            let mut ctx = crate::test_utils::MockNativeContext::new();
+            let name = ctx.create_string(requested);
+            let kpg = kpg_get_instance(&mut ctx, &[Value::Object(Some(name))])
+                .unwrap()
+                .unwrap();
+            let kpg_ref = match kpg {
+                Value::Object(Some(o)) => o,
+                other => panic!("expected KeyPairGenerator, got {other:?}"),
+            };
+            let result = kpg_get_algorithm(&mut ctx, &[Value::Object(Some(kpg_ref))])
+                .unwrap()
+                .unwrap();
+            let actual = match result {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap(),
+                other => panic!("expected algorithm String, got {other:?}"),
+            };
+            assert_eq!(actual, requested);
+        }
     }
 
     #[test]
@@ -2379,8 +2455,8 @@ mod tests {
     }
 
     /// No-synthetic-stubs policy: a `KeyPairGenerator` for an algorithm we
-    /// recognise but cannot implement (ML-KEM, ML-DSA, Ed25519, X25519) — or an
-    /// outright unknown name — must throw from `generateKeyPair`, never return a
+    /// recognise but cannot implement (ML-KEM, ML-DSA, X25519) — or an outright
+    /// unknown name — must throw from `generateKeyPair`, never return a
     /// `KeyPair` with empty key material. The previous fallback minted an
     /// empty-DER / `key_id == 0` key, presenting failed keygen as success.
     #[test]
@@ -2391,7 +2467,6 @@ mod tests {
             "ML-DSA-44",
             "ML-DSA-65",
             "X25519",
-            "Ed25519",
             "Totally-Bogus",
         ] {
             let mut ctx = crate::test_utils::MockNativeContext::new();

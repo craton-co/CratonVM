@@ -70,7 +70,7 @@ fared *worse* (hung instead of completing). This rules out the
 - No stack trace/exception was captured beyond Tomcat's own one-line JULI log
   of the parse failure — root-causing this will need the same
   "recompile with a temporary instrumented copy on the classpath" technique
-  used throughout the sibling `../../known-issues/tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md`
+  used throughout the sibling `swallowabortedupploads-unexpected-socketexception-RESOLVED.md`
   and `form-authenticator-cookie-session-bare-assertion-FIXED.md` investigations,
   applied to `Http11InputBuffer`/the NIO accept path instead.
 
