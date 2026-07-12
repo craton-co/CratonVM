@@ -72535,9 +72535,12 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
     let rl = "java/util/concurrent/locks/ReentrantReadWriteLock$ReadLock";
     let wl = "java/util/concurrent/locks/ReentrantReadWriteLock$WriteLock";
 
-    // ReentrantReadWriteLock = 3-field synthetic (readers=0, writer=1, fair=2)
-    registry.register(rwl, "<init>", "()V", native_rwl_init);
-    registry.register(rwl, "<init>", "(Z)V", native_rwl_init_fair);
+    // Do not intercept the real-JDK constructors. Their three reference
+    // fields are { readerLock, writerLock, sync }; the historical synthetic
+    // initializer wrote integer state into those slots, so a method reference
+    // such as ReentrantReadWriteLock::readLock received null. Let genuine
+    // bytecode initialize the layout, while keeping the native lock-operation
+    // backend below for the returned lock views.
     registry.register(
         rwl,
         "readLock",
