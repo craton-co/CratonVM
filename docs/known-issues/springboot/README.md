@@ -19,6 +19,28 @@ clustered.
 | `sun.misc.Unsafe$MemoryAccessOption` NPE | 26 | HIGH | **FIXED/RETIRED 2026-07-12** — moved to [`../../internal/fixed-suite-bugs/spring-boot-unsafe-memoryaccessoption-npe-FIXED.md`](../../internal/fixed-suite-bugs/spring-boot-unsafe-memoryaccessoption-npe-FIXED.md); same bug independently found+fixed via a concurrent Keycloak investigation, canonical doc is `testsuite-model-unsafe-putorderedlong-memoryaccessoption-npe-FIXED.md` in the same directory |
 | [`httpclient-builder-dead-registration-abstractmethoderror.md`](httpclient-builder-dead-registration-abstractmethoderror.md) | 13 | HIGH | OPEN, fully root-caused (dead `synthetic-jdk` registration) |
 | [`zip-filedatablock-bulk-bytebuffer-put-aioobe.md`](zip-filedatablock-bulk-bytebuffer-put-aioobe.md) | 9 (whole `spring-boot-loader` module) | HIGH | OPEN, characterized |
+| [`flyway-cglib-heap-corruption-sigsegv-crash.md`](flyway-cglib-heap-corruption-sigsegv-crash.md) | 1 (`FlywayAutoConfigurationTests`) | HIGH (SIGSEGV) | OPEN, characterized — likely a new occurrence of the tracked HIB-CV-32 heap-corruption family |
+| [`testcompiler-annotation-classes-not-found-cluster.md`](testcompiler-annotation-classes-not-found-cluster.md) | 7 (`spring-boot-configuration-processor`) | MEDIUM | OPEN, characterized |
+
+## HANG-rerun follow-up (150 classes @ 1500s timeout)
+
+Reran the original 150 HANG classes at 5x the timeout (see
+`apps/spring-boot-suite-runner/RESULTS-20260711.md` "HANG rerun" section):
+90 still hung, 51 turned FAIL, 7 PASS, 2 CRASH. Of the 51 FAILs: 7 are the
+`testcompiler-annotation-classes-not-found-cluster.md` above; ~16 more
+overlap with the `onclasscondition-npe-cast-to-string-array-cluster.md` and
+the two retired clusters (destroy-method resolution, `MemoryAccessOption`)
+above — those classes just needed more wall time to *reach* the
+already-known failure instead of timing out first. The remaining ~28 are a
+scattered long tail (mostly one-off `AssertionError`s, a couple of
+`GroovyRuntimeException`s from the Thymeleaf layout-dialect integration, two
+`ParameterResolutionException`s for `WebTestClient` autowiring) — not yet
+clustered; no single dominant pattern found. Of the 2 CRASHes: one
+(`FlywayAutoConfigurationTests`) is the new heap-corruption doc above; the
+other (`OriginTrackedYamlLoaderTests`, `NoClassDefFoundError:
+org/junit/platform/commons/util/ExceptionUtils`) is a **runner classpath
+artifact** (likely pathing-jar manifest truncation for a very long
+classpath), not a CratonVM bug — not filed.
 
 ## Methodology note (runner fix, not a bug)
 
