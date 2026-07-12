@@ -7565,6 +7565,43 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         |_ctx, args| Ok(Some(args[0])),
     );
 
+    // These are abstract interface methods. In the real-JDK build `newBuilder`
+    // creates this one-field synthetic directly, so every fluent method must be
+    // registered here rather than in the synthetic-only HTTP/2 registrar.
+    for (method, descriptor) in [
+        (
+            "version",
+            "(Ljava/net/http/HttpClient$Version;)Ljava/net/http/HttpClient$Builder;",
+        ),
+        ("priority", "(I)Ljava/net/http/HttpClient$Builder;"),
+        (
+            "executor",
+            "(Ljava/util/concurrent/Executor;)Ljava/net/http/HttpClient$Builder;",
+        ),
+        (
+            "cookieHandler",
+            "(Ljava/net/CookieHandler;)Ljava/net/http/HttpClient$Builder;",
+        ),
+        (
+            "proxy",
+            "(Ljava/net/ProxySelector;)Ljava/net/http/HttpClient$Builder;",
+        ),
+        (
+            "authenticator",
+            "(Ljava/net/Authenticator;)Ljava/net/http/HttpClient$Builder;",
+        ),
+        (
+            "sslContext",
+            "(Ljavax/net/ssl/SSLContext;)Ljava/net/http/HttpClient$Builder;",
+        ),
+        (
+            "sslParameters",
+            "(Ljavax/net/ssl/SSLParameters;)Ljava/net/http/HttpClient$Builder;",
+        ),
+    ] {
+        r.register(bld, method, descriptor, |_ctx, args| Ok(Some(args[0])));
+    }
+
     r.register(
         hc,
         "send",
@@ -11340,5 +11377,49 @@ mod tests {
         let (stream, _) = listener.accept().unwrap();
         let req = parse_http_request(stream).unwrap();
         assert_eq!(req.body, b"hi");
+    }
+
+    #[test]
+    fn re5_real_jdk_http_client_builder_fluent_methods_are_registered() {
+        let mut registry = NativeMethodRegistry::new();
+        register_re5_http_client(&mut registry);
+        for (method, descriptor) in [
+            (
+                "version",
+                "(Ljava/net/http/HttpClient$Version;)Ljava/net/http/HttpClient$Builder;",
+            ),
+            ("priority", "(I)Ljava/net/http/HttpClient$Builder;"),
+            (
+                "executor",
+                "(Ljava/util/concurrent/Executor;)Ljava/net/http/HttpClient$Builder;",
+            ),
+            (
+                "cookieHandler",
+                "(Ljava/net/CookieHandler;)Ljava/net/http/HttpClient$Builder;",
+            ),
+            (
+                "proxy",
+                "(Ljava/net/ProxySelector;)Ljava/net/http/HttpClient$Builder;",
+            ),
+            (
+                "authenticator",
+                "(Ljava/net/Authenticator;)Ljava/net/http/HttpClient$Builder;",
+            ),
+            (
+                "sslContext",
+                "(Ljavax/net/ssl/SSLContext;)Ljava/net/http/HttpClient$Builder;",
+            ),
+            (
+                "sslParameters",
+                "(Ljavax/net/ssl/SSLParameters;)Ljava/net/http/HttpClient$Builder;",
+            ),
+        ] {
+            assert!(
+                registry
+                    .find("java/net/http/HttpClient$Builder", method, descriptor)
+                    .is_some(),
+                "missing {method}{descriptor}"
+            );
+        }
     }
 }

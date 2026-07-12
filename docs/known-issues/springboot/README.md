@@ -7,8 +7,8 @@ suite run against CratonVM (1975 classes; see
 five clusters were characterized here, together accounting for ~146 of them
 directly (many more indirectly, via the "Unstarted application context"/
 "Failed to parse configuration class" wrapper noise these root causes
-produce). Two have since been retired (fixed or found not to reproduce on
-current dev, see table); three remain OPEN (97 classes). The rest is an
+produce). Three have since been retired (fixed or found not to reproduce on
+current dev, see table); two of the original clusters remain OPEN (84 classes). The rest is an
 uncharacterized long tail of smaller/individual differences not yet
 clustered.
 
@@ -17,7 +17,7 @@ clustered.
 | [`onclasscondition-npe-cast-to-string-array-cluster.md`](onclasscondition-npe-cast-to-string-array-cluster.md) | 75 (348 occurrences) | CRITICAL | OPEN, precisely pinned to `OnClassCondition.addAll` |
 | `DisposableBeanAdapter` "Invalid destruction signature" | 34 | HIGH | **RESOLVED 2026-07-12** — moved to [`../../internal/fixed-suite-bugs/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md`](../../internal/fixed-suite-bugs/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md); a direct probe against current dev found the destroy-method reflection path works fine, closing the cluster (no distinct residual identified) |
 | `sun.misc.Unsafe$MemoryAccessOption` NPE | 26 | HIGH | **FIXED/RETIRED 2026-07-12** — moved to [`../../internal/fixed-suite-bugs/spring-boot-unsafe-memoryaccessoption-npe-FIXED.md`](../../internal/fixed-suite-bugs/spring-boot-unsafe-memoryaccessoption-npe-FIXED.md); same bug independently found+fixed via a concurrent Keycloak investigation, canonical doc is `testsuite-model-unsafe-putorderedlong-memoryaccessoption-npe-FIXED.md` in the same directory |
-| [`httpclient-builder-dead-registration-abstractmethoderror.md`](httpclient-builder-dead-registration-abstractmethoderror.md) | 13 | HIGH | OPEN, fully root-caused (dead `synthetic-jdk` registration) |
+| `HttpClient.Builder` dead registration | 13 | HIGH | **RESOLVED 2026-07-12** — moved to [`../../internal/fixed-suite-bugs/springboot-httpclient-builder-dead-registration-abstractmethoderror-FIXED.md`](../../internal/fixed-suite-bugs/springboot-httpclient-builder-dead-registration-abstractmethoderror-FIXED.md); the active real-JDK registrar now covers every Java 17 fluent builder method |
 | [`zip-filedatablock-bulk-bytebuffer-put-aioobe.md`](zip-filedatablock-bulk-bytebuffer-put-aioobe.md) | 9 (whole `spring-boot-loader` module) | HIGH | OPEN, characterized |
 | [`flyway-cglib-heap-corruption-sigsegv-crash.md`](flyway-cglib-heap-corruption-sigsegv-crash.md) | 1 (`FlywayAutoConfigurationTests`) | HIGH (SIGSEGV) | OPEN, characterized — likely a new occurrence of the tracked HIB-CV-32 heap-corruption family |
 | [`testcompiler-annotation-classes-not-found-cluster.md`](testcompiler-annotation-classes-not-found-cluster.md) | 7 (`spring-boot-configuration-processor`) | MEDIUM | OPEN, characterized |
