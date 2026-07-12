@@ -673,6 +673,110 @@ fn device_vector_add_below_min_work_keeps_call_site_hooked() {
     assert_eq!(outcome, DispatchOutcome::FallThroughKeepHooked);
 }
 
+/// Known-issues followups item 3 (2026-07-12) — hardware validation of
+/// the completion reaper. Unlike every other test in this file,
+/// dispatches through `dispatch_method_from_native` directly (the same
+/// entry point `Native.submitMethod` uses) rather than `try_dispatch`,
+/// because `try_dispatch`'s transparent path finalizes synchronously
+/// before returning `Handled` — it would trivially "pass" this test
+/// regardless of whether the reaper does anything, since the calling
+/// thread itself would be the one finalizing.
+///
+/// After dispatch, this makes **zero** calls to `poll_submission_status`
+/// / `finalize_submission` / anything that could itself drive
+/// completion — it only sleeps, then reads `StreamSubmission::status`
+/// directly (bypassing the registry's public accessors entirely) to
+/// observe whatever state the completion reaper left it in. `Completed`
+/// there can only mean the reaper's host callback woke
+/// `completion_reaper_loop`, which called `finalize_submission` on its
+/// own thread — nothing else in this test's call graph could have done
+/// it.
+#[test]
+#[ignore = "requires NVIDIA GPU"]
+fn device_submission_completes_spontaneously_without_any_poll_call() {
+    use cratonvm_vm::runtime::offload::SubmissionStatus;
+
+    let n = 1 << 22; // comfortably above --gpu-min-work, real device time
+    let config = gpu_config();
+    let mut vm = Vm::new(config);
+
+    let class_id = vm
+        .shared
+        .load_class_concurrent("EligibleVectorAdd")
+        .expect("EligibleVectorAdd must load from the fixtures classpath");
+    ensure_class_initialized_shared(&vm.shared, &mut vm.main_thread, class_id)
+        .expect("EligibleVectorAdd must initialize cleanly");
+
+    let a = vm.shared.heap.alloc_array(ClassId::new(1), ArrayElementType::Int, n);
+    let b = vm.shared.heap.alloc_array(ClassId::new(1), ArrayElementType::Int, n);
+    let out = vm.shared.heap.alloc_array(ClassId::new(1), ArrayElementType::Int, n);
+    let mut expected = vec![0i32; n];
+    for i in 0..n {
+        let av = i as i32;
+        let bv = 2 * i as i32;
+        vm.shared.heap.set_array_element(a, i, Value::Int(av)).unwrap();
+        vm.shared.heap.set_array_element(b, i, Value::Int(bv)).unwrap();
+        expected[i] = av.wrapping_add(bv);
+    }
+
+    // Warmup through the same entry point, fully finalized, so the
+    // timed dispatch below hits an already-compiled kernel.
+    let warm_args = [
+        Value::Object(Some(a)),
+        Value::Object(Some(b)),
+        Value::Object(Some(out)),
+    ];
+    let warm_handle = dispatch_method_from_native(
+        &vm.shared,
+        "EligibleVectorAdd",
+        "vectorAdd",
+        "([I[I[I)V",
+        &warm_args,
+    );
+    let warm_sub = lookup_submission(warm_handle).expect("warmup submission must be registered");
+    finalize_submission(&vm.shared, &warm_sub).expect("warmup finalize must succeed");
+    release_submission(warm_handle);
+
+    let handle = dispatch_method_from_native(
+        &vm.shared,
+        "EligibleVectorAdd",
+        "vectorAdd",
+        "([I[I[I)V",
+        &warm_args,
+    );
+    let submission = lookup_submission(handle).expect("submission must be registered");
+
+    // NO poll_submission_status / finalize_submission / futureIsDone
+    // equivalent call between here and the status read below — only a
+    // sleep. Give the device comfortably more time than an N=2^22
+    // vectorAdd needs (single-digit ms per the item-2 hardware
+    // validation numbers in the known-issues doc).
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let status_after_sleep = match &*submission.status.lock() {
+        SubmissionStatus::Running => "Running",
+        SubmissionStatus::Completed { .. } => "Completed",
+        SubmissionStatus::Failed { message } => {
+            panic!("submission failed without any poll call: {message}")
+        }
+    };
+    assert_eq!(
+        status_after_sleep, "Completed",
+        "completion reaper did not finalize the submission spontaneously within 500ms; \
+         status is still {status_after_sleep} despite zero poll/get calls",
+    );
+
+    for i in 0..n {
+        assert_eq!(
+            vm.shared.heap.get_array_element(out, i).unwrap(),
+            Value::Int(expected[i]),
+            "out[{i}] mismatch — reaper-driven finalize must drain writebacks correctly, not just flip status",
+        );
+    }
+
+    release_submission(handle);
+}
+
 // ═════════════════════════════════════════════════════════════════════
 // Known gaps this file does NOT cover (documented per the task's
 // "be honest rather than fabricating" instruction):

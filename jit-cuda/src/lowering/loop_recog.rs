@@ -90,6 +90,27 @@ pub(crate) enum LoopShape {
     StraightLine,
     /// Single counted loop matching the canonical pattern.
     Counted(CountedLoop),
+    /// Two-level rectangular nested counted loop
+    /// (`for (i...) { for (j...) { body } }`) — see [`NestedLoop`] and
+    /// [`detect_nested_loop`].
+    Nested(NestedLoop),
+}
+
+/// A strictly nested, rectangular 2-D counted loop recognized by
+/// [`detect_nested_loop`]: the inner loop is the outer loop's entire
+/// body (nothing before or after it), both start at `0`, and each
+/// individually satisfies every invariant [`classify_counted_loop`]
+/// already enforces for a single loop (stride `+1`, `if_icmpge` exit,
+/// …). The SIMT lowering
+/// (`crate::lowering::emit::Emitter::emit_nested_loop_guard_and_decompose`)
+/// treats the flattened iteration space `[0, R*C)` as the thread-index
+/// domain and recovers `(i, j)` from the linear thread index `tid` via
+/// `i = tid / C`, `j = tid % C` — see that function's doc comment for
+/// why the division is always safe.
+#[derive(Clone, Debug)]
+pub(crate) struct NestedLoop {
+    pub outer: CountedLoop,
+    pub inner: CountedLoop,
 }
 
 #[derive(Clone, Debug)]
@@ -155,12 +176,195 @@ pub(crate) fn detect_loop(
         0 => Ok(LoopShape::StraightLine),
         1 => {
             let (branch_pc, header_pc) = backs[0];
-            classify_counted_loop(bytes, branch_pc, header_pc, cp)
+            let loop_ = classify_counted_loop(bytes, branch_pc, header_pc, cp)?;
+            Ok(LoopShape::Counted(loop_))
         }
+        2 => detect_nested_loop(bytes, backs[0], backs[1], cp),
         _ => Err(LoweringError::UnsupportedNode(
             "multi-loop or non-canonical control flow".into(),
         )),
     }
+}
+
+/// Given exactly two backward branches, determine whether they form a
+/// strictly nested rectangular 2-D counted loop
+/// (`for (i...) { for (j...) { body } }`, the inner loop being the
+/// entirety of the outer loop's body) and, if so, classify both levels.
+/// Anything else — two sequential loops (e.g. `TwoLoops.clearTwice`),
+/// overlapping/crossing back-edges, or an outer body containing more
+/// than just the inner loop — is rejected with the same "multi-loop or
+/// non-canonical control flow" reason two sequential loops already got
+/// before this feature existed.
+fn detect_nested_loop(
+    bytes: &[u8],
+    a: (usize, usize),
+    b: (usize, usize),
+    cp: Option<&ConstantPool>,
+) -> Result<LoopShape, LoweringError> {
+    let non_canonical =
+        || LoweringError::UnsupportedNode("multi-loop or non-canonical control flow".into());
+    // A back-branch pair is `(branch_pc, header_pc)`. The outer loop's
+    // header comes first and its back-branch comes last — the inner
+    // loop's whole span (`header..branch`) must sit strictly inside the
+    // outer's (`outer_header < inner_header < inner_branch <
+    // outer_branch`). Anything else (sequential loops, crossing
+    // back-edges) is not nesting.
+    let ((outer_branch, outer_header), (inner_branch, inner_header)) = if a.1 < b.1 && b.0 < a.0 {
+        (a, b)
+    } else if b.1 < a.1 && a.0 < b.0 {
+        (b, a)
+    } else {
+        return Err(non_canonical());
+    };
+    let outer = classify_counted_loop(bytes, outer_branch, outer_header, cp)?;
+    let inner = classify_counted_loop(bytes, inner_branch, inner_header, cp)?;
+
+    // The 2-D SIMT lowering computes both loop variables directly from
+    // the flattened thread index (`i = tid / C`, `j = tid % C`) and
+    // never executes either loop's own iv-init prelude — see
+    // `validate_rectangular_nesting`'s doc comment. That is only sound
+    // when both loops start at 0; a non-zero start would need the
+    // offset folded in per-dimension (safe in principle, same as the
+    // single-loop `K` fold — see the module doc comment above — but not
+    // implemented for the 2-D case) so reject it here instead of
+    // mis-lowering.
+    if outer.iv_start != 0 || inner.iv_start != 0 {
+        return Err(LoweringError::UnsupportedNode(
+            "nested loop with a non-zero start value is not yet supported — only \
+             `for (i = 0; ...) for (j = 0; ...)` is lowered"
+                .into(),
+        ));
+    }
+    validate_rectangular_nesting(bytes, &outer, &inner)?;
+
+    Ok(LoopShape::Nested(NestedLoop { outer, inner }))
+}
+
+/// Structurally validate that `outer`'s body is exactly
+/// `{ <inner iv init to 0>; <inner loop>; }` with nothing else — i.e.
+/// the inner loop is the outer loop's entire body, and the outer
+/// induction-variable `iinc` immediately follows the inner loop with no
+/// other instructions in between. This is what `javac` emits for
+/// `for (int i = 0; i < R; i++) { for (int j = 0; j < C; j++) { body } }`
+/// with no code before or after the inner loop inside the outer body.
+///
+/// Rejecting anything else is deliberate: the 2-D lowering never
+/// executes the outer body's raw bytecode between `outer.body_start_pc`
+/// and `inner.header_pc` (nor between `inner.exit_pc` and
+/// `outer.back_branch_pc`) — it recomputes `i`/`j` directly from the
+/// thread index and jumps straight to the inner loop's own body. Any
+/// instruction in those two spans beyond the expected `j = 0` prelude /
+/// outer `iinc` would be silently dropped, which is exactly the
+/// "mis-lower" outcome the rest of this module refuses to risk —
+/// reject instead.
+fn validate_rectangular_nesting(
+    bytes: &[u8],
+    outer: &CountedLoop,
+    inner: &CountedLoop,
+) -> Result<(), LoweringError> {
+    // 1. `outer.body_start_pc` must be exactly a zero-constant push
+    //    immediately followed by an `istore` to `inner.iv_slot`, ending
+    //    exactly at `inner.header_pc`.
+    let push_pc = outer.body_start_pc;
+    if push_pc >= bytes.len() {
+        return Err(LoweringError::UnsupportedNode(
+            "truncated bytecode between outer loop guard and inner loop".into(),
+        ));
+    }
+    let push_size = instr_size(bytes, push_pc)?;
+    let is_zero_push = bytes[push_pc] == 0x03 // iconst_0
+        || (bytes[push_pc] == 0x10 && bytes.get(push_pc + 1) == Some(&0)) // bipush 0
+        || (bytes[push_pc] == 0x11
+            && bytes.get(push_pc + 1) == Some(&0)
+            && bytes.get(push_pc + 2) == Some(&0)); // sipush 0
+    if !is_zero_push {
+        return Err(LoweringError::UnsupportedNode(format!(
+            "outer loop body at pc={push_pc} does not open with a zero-constant push \
+             for the inner loop's induction variable — non-canonical nested loop"
+        )));
+    }
+    let store_pc = push_pc + push_size;
+    let store_slot = istore_slot_at(bytes, store_pc)?;
+    if store_slot != Some(inner.iv_slot) {
+        return Err(LoweringError::UnsupportedNode(format!(
+            "outer loop body at pc={store_pc} does not initialise the inner loop's \
+             induction variable (slot {}) immediately after entering the outer body \
+             — non-canonical nested loop",
+            inner.iv_slot
+        )));
+    }
+    let store_size = instr_size(bytes, store_pc)?;
+    if store_pc + store_size != inner.header_pc {
+        return Err(LoweringError::UnsupportedNode(
+            "outer loop body contains code between the inner loop's induction-variable \
+             init and the inner loop header — non-canonical nested loop (only a bare \
+             inner `for` as the entire outer body is supported)"
+                .into(),
+        ));
+    }
+
+    // 2. `inner.exit_pc` must be exactly the outer loop's own `iinc`,
+    //    ending exactly at `outer.back_branch_pc`.
+    let iinc_pc = inner.exit_pc;
+    if iinc_pc >= bytes.len() {
+        return Err(LoweringError::UnsupportedNode(
+            "truncated bytecode between inner loop exit and outer loop back-branch".into(),
+        ));
+    }
+    let iinc_slot = iinc_target_slot(bytes, iinc_pc)?;
+    if iinc_slot != Some(outer.iv_slot) {
+        return Err(LoweringError::UnsupportedNode(format!(
+            "inner loop exit at pc={iinc_pc} is not immediately followed by the outer \
+             loop's own `iinc` (slot {}) — non-canonical nested loop (only a bare inner \
+             `for` as the entire outer body is supported)",
+            outer.iv_slot
+        )));
+    }
+    let iinc_size = instr_size(bytes, iinc_pc)?;
+    if iinc_pc + iinc_size != outer.back_branch_pc {
+        return Err(LoweringError::UnsupportedNode(
+            "outer loop body contains code between the outer `iinc` and the outer \
+             back-branch — non-canonical nested loop"
+                .into(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// If the instruction at `pc` is an `istore` (narrow, short-form, or
+/// wide), return the local slot it writes. `None` for any other opcode
+/// or an out-of-range `pc`.
+fn istore_slot_at(bytes: &[u8], pc: usize) -> Result<Option<u16>, LoweringError> {
+    if pc >= bytes.len() {
+        return Ok(None);
+    }
+    Ok(match bytes[pc] {
+        0x36 => bytes.get(pc + 1).map(|&b| b as u16), // istore
+        0x3B..=0x3E => Some((bytes[pc] - 0x3B) as u16), // istore_0..3
+        0xC4 if bytes.get(pc + 1) == Some(&0x36) => Some(u16::from_be_bytes([
+            *bytes.get(pc + 2).ok_or_else(truncated)?,
+            *bytes.get(pc + 3).ok_or_else(truncated)?,
+        ])),
+        _ => None,
+    })
+}
+
+/// If the instruction at `pc` is an `iinc` (narrow or wide), return the
+/// local slot it targets. `None` for any other opcode or an
+/// out-of-range `pc`.
+fn iinc_target_slot(bytes: &[u8], pc: usize) -> Result<Option<u16>, LoweringError> {
+    if pc >= bytes.len() {
+        return Ok(None);
+    }
+    Ok(match bytes[pc] {
+        0x84 => Some(*bytes.get(pc + 1).ok_or_else(truncated)? as u16),
+        0xC4 if bytes.get(pc + 1) == Some(&0x84) => Some(u16::from_be_bytes([
+            *bytes.get(pc + 2).ok_or_else(truncated)?,
+            *bytes.get(pc + 3).ok_or_else(truncated)?,
+        ])),
+        _ => None,
+    })
 }
 
 /// Return all (branch_pc, target_pc) pairs where target_pc < branch_pc.
@@ -225,7 +429,7 @@ fn classify_counted_loop(
     back_branch_pc: usize,
     header_pc: usize,
     cp: Option<&ConstantPool>,
-) -> Result<LoopShape, LoweringError> {
+) -> Result<CountedLoop, LoweringError> {
     let back_op = bytes[back_branch_pc];
     if back_op != 0xA7 && back_op != 0xC8 {
         return Err(LoweringError::UnsupportedNode(format!(
@@ -341,7 +545,7 @@ fn classify_counted_loop(
 
     let body_start_pc = exit_if_pc + instr_size(bytes, exit_if_pc)?;
 
-    Ok(LoopShape::Counted(CountedLoop {
+    Ok(CountedLoop {
         header_pc,
         exit_if_pc,
         body_start_pc,
@@ -351,7 +555,7 @@ fn classify_counted_loop(
         exit_op,
         iv_stride,
         iv_start,
-    }))
+    })
 }
 
 /// If the instruction at `pc` is an `iload` (narrow `iload`, the

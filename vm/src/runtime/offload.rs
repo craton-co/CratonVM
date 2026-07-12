@@ -1077,8 +1077,8 @@ mod tests {
         });
         register_submission(sub.clone());
 
-        ensure_completion_reaper_started(weak_vm);
-        enqueue_completion(handle);
+        ensure_completion_reaper_started();
+        enqueue_completion(handle, weak_vm);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -1878,13 +1878,14 @@ impl OffloadCache {
         //    be freed out from under a kernel that's still in-flight
         //    on the device, even if every other reference (registry +
         //    caller) is dropped first.
-        ensure_completion_reaper_started(weak_vm);
+        ensure_completion_reaper_started();
         let cb_submission = submission.clone();
+        let cb_weak_vm = weak_vm;
         if let Err(e) = stream.add_host_callback(Box::new(move || {
             cb_submission
                 .device_done
                 .store(true, std::sync::atomic::Ordering::Release);
-            enqueue_completion(cb_submission.handle);
+            enqueue_completion(cb_submission.handle, cb_weak_vm);
         })) {
             tracing::debug!(
                 "gpu offload: add_host_callback registration failed ({e}); \
@@ -1988,9 +1989,29 @@ pub fn release_submission(handle: u64) {
 // `notify_one` that would wake the reaper never runs. Independent
 // statics sidestep the issue entirely — `REAPER_QUEUE`'s mutex is the
 // only lock the condvar wait ever touches.
+//
+// The queue holds a `(handle, weak_vm)` pair per entry, NOT a bare
+// handle — an earlier version captured a single `Weak<SharedVm>` once,
+// at thread-spawn time, and reused it for every drained handle for the
+// rest of the process's life. That is correct for a single
+// long-lived production VM (matching `SUBMISSIONS`/
+// `NEXT_SUBMISSION_HANDLE`, which really are process-global-for-life
+// data), but it is WRONG the moment more than one `SharedVm` exists
+// over the process's lifetime — e.g. an integration-test binary that
+// constructs and drops a fresh `Vm::new()` per test. Real-hardware
+// validation caught this: with several such tests running in the same
+// process, the reaper's captured `weak_vm` belonged to whichever
+// test's dispatch happened to start the reaper thread first; once
+// *that* test's `Vm` was dropped, `upgrade()` failed forever after —
+// silently stranding every later test's (otherwise perfectly valid)
+// submissions in `Running`. Carrying the correct `Weak<SharedVm>`
+// alongside each queued handle instead of pinning one to the thread's
+// whole lifetime fixes this for any number of concurrent or
+// sequential `SharedVm` instances.
 #[cfg(feature = "gpu-offload")]
-static REAPER_QUEUE: parking_lot::Mutex<std::collections::VecDeque<u64>> =
-    parking_lot::Mutex::new(std::collections::VecDeque::new());
+static REAPER_QUEUE: parking_lot::Mutex<
+    std::collections::VecDeque<(u64, std::sync::Weak<crate::vm::SharedVm>)>,
+> = parking_lot::Mutex::new(std::collections::VecDeque::new());
 #[cfg(feature = "gpu-offload")]
 static REAPER_WAKE: parking_lot::Condvar = parking_lot::Condvar::new();
 #[cfg(feature = "gpu-offload")]
@@ -2003,27 +2024,16 @@ static COMPLETION_REAPER_INIT: std::sync::Once = std::sync::Once::new();
 
 /// Idempotently start the GPU completion reaper thread. Safe to call
 /// on every `dispatch_async` — the spawn happens at most once
-/// (guarded by [`Once`](std::sync::Once)), regardless of how many
-/// times or with how many different `weak_vm` values it's called;
-/// whichever call wins the race supplies the `Weak<SharedVm>` the
-/// worker uses for the rest of the process's life. That matches the
-/// rest of the GPU offload registry (`SUBMISSIONS`,
-/// `NEXT_SUBMISSION_HANDLE`), which is already process-global rather
-/// than per-`SharedVm`.
-///
-/// If `weak_vm` is `Weak::default()` (i.e. `shared.self_arc` was
-/// never populated — true for any `SharedVm` constructed outside
-/// `Vm::new`, including most unit tests), the worker simply drains
-/// the queue without ever being able to upgrade it, so every enqueued
-/// handle is silently skipped. That is harmless: the existing
-/// poll-based path (`poll_submission_status`, `get()`) remains fully
-/// correct and is exactly what such callers already rely on.
+/// (guarded by [`Once`](std::sync::Once)). Takes no `SharedVm`
+/// reference: the worker is VM-agnostic, since each queued handle
+/// carries its own `Weak<SharedVm>` (see the doc comment on
+/// `REAPER_QUEUE` for why that matters).
 #[cfg(feature = "gpu-offload")]
-fn ensure_completion_reaper_started(weak_vm: std::sync::Weak<crate::vm::SharedVm>) {
+fn ensure_completion_reaper_started() {
     COMPLETION_REAPER_INIT.call_once(|| {
         match std::thread::Builder::new()
             .name("cratonvm-gpu-completion-reaper".to_string())
-            .spawn(move || completion_reaper_loop(weak_vm))
+            .spawn(completion_reaper_loop)
         {
             Ok(h) => *REAPER_HANDLE.lock() = Some(h),
             Err(e) => {
@@ -2037,20 +2047,20 @@ fn ensure_completion_reaper_started(weak_vm: std::sync::Weak<crate::vm::SharedVm
 }
 
 /// Body of the completion reaper thread. Blocks on `REAPER_WAKE` (no
-/// busy-polling); for each drained handle, upgrades `weak_vm` and
-/// runs the same [`finalize_submission`] work `get()` would have —
-/// off the mutator, with no Java thread involved.
-/// `finalize_submission`'s own errors are already recorded on
-/// `StreamSubmission::status`; there is nothing further to do with
+/// busy-polling); for each drained `(handle, weak_vm)` pair, upgrades
+/// that entry's own `weak_vm` and runs the same [`finalize_submission`]
+/// work `get()` would have — off the mutator, with no Java thread
+/// involved. `finalize_submission`'s own errors are already recorded
+/// on `StreamSubmission::status`; there is nothing further to do with
 /// its `Result` here.
 #[cfg(feature = "gpu-offload")]
-fn completion_reaper_loop(weak_vm: std::sync::Weak<crate::vm::SharedVm>) {
+fn completion_reaper_loop() {
     loop {
-        let handle = {
+        let item = {
             let mut queue = REAPER_QUEUE.lock();
             loop {
-                if let Some(h) = queue.pop_front() {
-                    break Some(h);
+                if let Some(item) = queue.pop_front() {
+                    break Some(item);
                 }
                 if REAPER_SHUTDOWN.load(std::sync::atomic::Ordering::Acquire) {
                     break None;
@@ -2063,8 +2073,8 @@ fn completion_reaper_loop(weak_vm: std::sync::Weak<crate::vm::SharedVm>) {
                 REAPER_WAKE.wait(&mut queue);
             }
         };
-        let handle = match handle {
-            Some(h) => h,
+        let (handle, weak_vm) = match item {
+            Some(item) => item,
             None => return,
         };
         finalize_enqueued_handle(&weak_vm, handle);
@@ -2098,18 +2108,21 @@ fn finalize_enqueued_handle(weak_vm: &std::sync::Weak<crate::vm::SharedVm>, hand
     }
 }
 
-/// Push `handle` onto the reaper's work queue and wake it. Called
-/// from the `cuLaunchHostFunc` callback registered in
-/// `dispatch_async`, so this must stay cheap and must never call back
-/// into the CUDA driver: a `parking_lot::Mutex` lock + `VecDeque`
-/// push + `Condvar::notify_one` is the same class of "plain host
-/// memory operation" the callback already performs for `device_done`.
-/// A push before the reaper thread exists yet (a caller that races
-/// `ensure_completion_reaper_started`'s spawn) is harmless — the
-/// handle just sits in the queue until the worker starts draining it.
+/// Push `(handle, weak_vm)` onto the reaper's work queue and wake it.
+/// `weak_vm` travels with the handle rather than being fixed once for
+/// the reaper thread's whole life — see the doc comment on
+/// `REAPER_QUEUE` for why that distinction matters. Called from the
+/// `cuLaunchHostFunc` callback registered in `dispatch_async`, so this
+/// must stay cheap and must never call back into the CUDA driver: a
+/// `parking_lot::Mutex` lock + `VecDeque` push + `Condvar::notify_one`
+/// is the same class of "plain host memory operation" the callback
+/// already performs for `device_done`. A push before the reaper thread
+/// exists yet (a caller that races `ensure_completion_reaper_started`'s
+/// spawn) is harmless — the entry just sits in the queue until the
+/// worker starts draining it.
 #[cfg(feature = "gpu-offload")]
-fn enqueue_completion(handle: u64) {
-    REAPER_QUEUE.lock().push_back(handle);
+fn enqueue_completion(handle: u64, weak_vm: std::sync::Weak<crate::vm::SharedVm>) {
+    REAPER_QUEUE.lock().push_back((handle, weak_vm));
     REAPER_WAKE.notify_one();
 }
 
