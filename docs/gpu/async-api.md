@@ -119,16 +119,24 @@ Returned by every `submit` / `launch`. Modelled on
 > `poll_submission_status` runs the same finalize work `get()` would have
 > — inline, on the polling thread, with no further device wait (the event
 > has already fired) — so **`isDone()` returning `true` now means the
-> submission really is finalized**, not just "probably." What is still
-> true from before: nothing drives completion *without* a Java thread
-> calling `isDone()`/`getNow()`/`get()` at least once. There is still no
-> background poller or stream callback that completes a `GpuFuture` on its
-> own while the application does something else — see [Current
-> limitations](#current-limitations).
+> submission really is finalized**, not just "probably."
+>
+> **Update, 2026-07-12.** Completion no longer requires a Java thread to
+> call anything. The same `cuLaunchHostFunc` host callback that sets
+> `device_done` also wakes a process-wide completion reaper thread
+> (`ensure_completion_reaper_started`/`completion_reaper_loop` in
+> `vm/src/runtime/offload.rs`) that runs `finalize_submission` itself, off
+> the mutator entirely — draining writebacks, releasing the GC-critical
+> guard, and flipping the submission to `Completed`/`Failed` while the
+> application does something else. `isDone()`/`get()` now frequently just
+> read an already-terminal status. The reaper is a single background
+> daemon thread for the whole process (modelled on the existing
+> background-JIT-compiler worker), started lazily on first dispatch and
+> captures a `Weak<SharedVm>` so it can never keep a torn-down VM alive.
 
 | Method | Semantics |
 | --- | --- |
-| `boolean isDone()` | As of 2026-07-11 evening, a real non-blocking device probe (`Native.futureStatus` → `poll_submission_status`): checks a host-callback flag, falls back to non-blocking `Event::query()`, and finalizes inline if the device reports done. Safe to poll in a loop — each call does bounded work, never a blocking device wait. Still requires the caller to actually call it; nothing updates the status spontaneously in the background. |
+| `boolean isDone()` | A real non-blocking device probe (`Native.futureStatus` → `poll_submission_status`): checks a host-callback flag, falls back to non-blocking `Event::query()`, and finalizes inline if the device reports done. Safe to poll in a loop — each call does bounded work, never a blocking device wait. As of 2026-07-12, the submission is often already finalized by the background completion reaper by the time this is called at all. |
 | `T get()` | Block the calling thread until done. This is the call that actually finalizes the submission (waits on the CUDA event, drains writebacks) if `isDone()`/`getNow()` haven't already done so. Throws `GpuException` if the kernel failed or the analyzer rejected the lambda. |
 | `T get(long timeout, TimeUnit unit)` | Bounded wait. Throws `TimeoutException` on expiry. |
 | `Optional<T> getNow()` | Non-blocking peek, same underlying `poll_submission_status` probe as `isDone()`. Returns the result if the device reports the submission complete (finalizing it inline as a side effect, same as `isDone()`), `Optional.empty()` while still `Running`. |
@@ -398,20 +406,19 @@ Implementation-status gaps between this document's target API and what
 actually do as of 2026-07-11 (post `f4311e5f3`). These are distinct
 from the by-design [Limitations](#limitations) below.
 
-- **Poll-driven, not push-driven, completion model (updated 2026-07-11
-  evening).** `isDone()` / `getNow()` are now real: they call
-  `poll_submission_status`, a non-blocking device probe that finalizes a
-  submission inline the moment it observes the device is done (see the
-  note under [`GpuFuture<T>`](#gpufuturet)). What's still missing is
-  anything that drives that probe *without* a Java call — no background
-  thread, no stream callback that completes a `GpuFuture` on its own while
-  application code is off doing something else. A `cuLaunchHostFunc` host
-  callback primitive now exists on the `cuda-bridge` side
-  (`Stream::add_host_callback`) and `poll_submission_status` already
-  consults a `device_done` flag it can set, but nothing today calls
-  `futureIsDone`/`futureStatus` from outside application code, so in
-  practice a `GpuFuture` still only progresses when the application polls
-  or blocks on it.
+- **Push-driven completion model (closed 2026-07-12).** `isDone()` /
+  `getNow()` still work exactly as described under
+  [`GpuFuture<T>`](#gpufuturet): a non-blocking `poll_submission_status`
+  probe that finalizes a submission inline the moment it observes the
+  device is done. What used to be missing — anything that drives
+  completion *without* a Java call — now exists: the `cuLaunchHostFunc`
+  host callback (`Stream::add_host_callback`) wakes a background
+  completion reaper thread (`ensure_completion_reaper_started` in
+  `vm/src/runtime/offload.rs`) that finalizes the submission itself, off
+  the mutator, while application code is doing something else entirely.
+  This was formerly the last item in
+  `docs/known-issues/gpu-offload-followups-20260711.md`; that file's item
+  3 is now closed.
 - **Only `Void` results were surfaced until 2026-07-11 evening; scalar
   reduction results now reach Java too.** `SerializedResult`'s
   `ScalarI32/I64/F32/F64` variants (integer/long reduction kernels, `)I`/`)J`
