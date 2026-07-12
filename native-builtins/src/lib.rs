@@ -45944,8 +45944,19 @@ fn native_class_atomic_cas_annotation_data(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // Round-9 Bug 7: ctx is now required for identity-hash keying.
-    class_atomic_cas_impl(ctx, args, 2)
+    // `Class.annotationData()` reads this field directly before retrying its
+    // CAS loop.  Keep that heap field coherent with the GC-safe side table,
+    // just as `casReflectionData` does: otherwise every read observes null
+    // even after a successful CAS and rebuilds the annotation graph.
+    let result = class_atomic_cas_impl(ctx, args, 2)?;
+    if matches!(result, Some(Value::Int(1))) {
+        if let (Some(Value::Object(Some(class_mirror))), Some(new_value)) =
+            (args.first(), args.get(2))
+        {
+            ctx.set_field_by_name(*class_mirror, "annotationData", *new_value);
+        }
+    }
+    Ok(result)
 }
 
 fn native_unsafe_object_field_offset(
@@ -73128,14 +73139,11 @@ fn register_atomic_extras_natives(registry: &mut NativeMethodRegistry) {
 // purpose. With striping, contending threads hash to different cells and
 // only conflict pairwise on hash collision.
 //
-// Cell storage lives in a process-wide side table keyed by the LongAdder
-// `ObjectRef`'s raw pointer. We cannot reshape the JDK's LongAdder synthetic
-// layout (other natives + reflection read field 0 as the `base` long), so
-// the cells are stored out-of-band. `base` (field 0) is the uncontended
-// path; the cells absorb contention.
-//
-// `sum()` returns `base + cells.iter().sum()`. `reset()` zeroes both. The
-// per-cell atomicity guarantee from the previous CAS-loop is preserved.
+// Cell storage lives in a process-wide side table keyed by the LongAdder's
+// GC-stable identity hash. Real JDK `LongAdder` inherits `Striped64`, whose
+// instance fields precede the subclass layout, so a native must never assume
+// heap field 0 is the numeric base. All contributions therefore live in the
+// side table; `sum()` reads it and `reset()` clears it.
 
 /// Number of striped cells per LongAdder. The real JDK grows up to NCPU
 /// rounded to a power of two. 8 is a fixed compromise: enough to give
@@ -73223,9 +73231,6 @@ fn native_long_adder_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    if ctx.object_num_fields(this) > 0 {
-        ctx.set_field(this, 0, Value::Long(0));
-    }
     // Pre-allocate the cell strip so the first `add` does not race the
     // map insert under the side-table mutex.
     let _ = long_adder_cells(ctx, this);
@@ -73246,20 +73251,9 @@ fn native_long_adder_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    // Fast path: uncontended CAS on base.
-    if ctx.object_num_fields(this) > 0 {
-        let current = ctx.get_field_volatile(this, 0);
-        let base = match current {
-            Value::Long(v) => v,
-            _ => 0,
-        };
-        let new_val = Value::Long(base.wrapping_add(x));
-        if ctx.compare_and_swap_field(this, 0, current, new_val) {
-            return Ok(None);
-        }
-    }
-    // Contended path: stripe to a cell, do an uncontended atomic add.
-    // `fetch_add` on `AtomicI64` is wait-free, no CAS-loop, no spinning.
+    // A real JDK LongAdder inherits `Striped64` fields before its own
+    // layout, so field 0 is not a numeric base. Keep every contribution in
+    // the GC-safe side table rather than touching raw heap slots.
     let idx = long_adder_stripe();
     let cells = long_adder_cells(ctx, this);
     cells.cells[idx].fetch_add(x, std::sync::atomic::Ordering::Relaxed);
@@ -73271,17 +73265,6 @@ fn native_long_adder_increment(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    if ctx.object_num_fields(this) > 0 {
-        let current = ctx.get_field_volatile(this, 0);
-        let base = match current {
-            Value::Long(v) => v,
-            _ => 0,
-        };
-        let new_val = Value::Long(base.wrapping_add(1));
-        if ctx.compare_and_swap_field(this, 0, current, new_val) {
-            return Ok(None);
-        }
-    }
     let idx = long_adder_stripe();
     let cells = long_adder_cells(ctx, this);
     cells.cells[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -73293,24 +73276,13 @@ fn native_long_adder_decrement(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    if ctx.object_num_fields(this) > 0 {
-        let current = ctx.get_field_volatile(this, 0);
-        let base = match current {
-            Value::Long(v) => v,
-            _ => 0,
-        };
-        let new_val = Value::Long(base.wrapping_sub(1));
-        if ctx.compare_and_swap_field(this, 0, current, new_val) {
-            return Ok(None);
-        }
-    }
     let idx = long_adder_stripe();
     let cells = long_adder_cells(ctx, this);
     cells.cells[idx].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     Ok(None)
 }
 
-/// Sum the per-cell strip into a single i64. Caller adds `base` separately.
+/// Sum the per-cell strip into a single i64.
 fn long_adder_cells_sum(ctx: &mut dyn NativeContext, this: ObjectRef) -> i64 {
     // Fast path: no cells allocated yet (init / never contended).
     let key = ctx.identity_hash_code(this);
@@ -73335,16 +73307,8 @@ fn native_long_adder_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // and a separate Relaxed sum across stripe cells. The JDK contract
     // allows `sum()` to return an "approximate" value if concurrent
     // updates race; we follow the same relaxation.
-    let base = if ctx.object_num_fields(this) > 0 {
-        match ctx.get_field_volatile(this, 0) {
-            Value::Long(v) => v,
-            _ => 0,
-        }
-    } else {
-        0
-    };
     let cells = long_adder_cells_sum(ctx, this);
-    Ok(Some(Value::Long(base.wrapping_add(cells))))
+    Ok(Some(Value::Long(cells)))
 }
 
 fn native_long_adder_int_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -73352,17 +73316,8 @@ fn native_long_adder_int_value(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    // Round-7 HIGH-16: must include stripe cells, otherwise `intValue` /
-    // `(int)sum()` returns only the `base` and drops every contended add.
-    let base = if ctx.object_num_fields(this) > 0 {
-        match ctx.get_field(this, 0) {
-            Value::Long(v) => v,
-            _ => 0,
-        }
-    } else {
-        0
-    };
-    let total = base.wrapping_add(long_adder_cells_sum(ctx, this));
+    // Keep `intValue()` consistent with `sum()`.
+    let total = long_adder_cells_sum(ctx, this);
     Ok(Some(Value::Int(total as i32)))
 }
 
@@ -73373,9 +73328,6 @@ fn native_long_adder_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     // audit-round5 fix #2: volatile store so other threads observing via
     // `sum`/`get_field_volatile` immediately see the cleared cell.
-    if ctx.object_num_fields(this) > 0 {
-        ctx.set_field_volatile(this, 0, Value::Long(0));
-    }
     // Round-7 HIGH-16: also zero every stripe cell, otherwise contended
     // adds remain visible after `reset()`.
     let key = ctx.identity_hash_code(this);
@@ -73402,20 +73354,7 @@ fn native_long_adder_sum_then_reset(
     // `sumThenReset` is documented as a non-atomic snapshot — concurrent
     // adds racing in the middle may be partly visible in the returned
     // value and partly survive into the reset table. We match that.
-    let base = if ctx.object_num_fields(this) > 0 {
-        loop {
-            let current = ctx.get_field_volatile(this, 0);
-            if ctx.compare_and_swap_field(this, 0, current, Value::Long(0)) {
-                break match current {
-                    Value::Long(v) => v,
-                    _ => 0,
-                };
-            }
-        }
-    } else {
-        0
-    };
-    let mut total = base;
+    let mut total: i64 = 0;
     let key = ctx.identity_hash_code(this);
     let t = long_adder_cells_table().lock();
     if let Some(c) = t.get(&key).cloned() {
@@ -73433,17 +73372,8 @@ fn native_long_adder_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // Round-7 HIGH-16: include the stripe cell sum so toString reports
-    // the same value as `sum()`.
-    let base = if ctx.object_num_fields(this) > 0 {
-        match ctx.get_field(this, 0) {
-            Value::Long(v) => v,
-            _ => 0,
-        }
-    } else {
-        0
-    };
-    let total = base.wrapping_add(long_adder_cells_sum(ctx, this));
+    // Keep `toString()` consistent with `sum()`.
+    let total = long_adder_cells_sum(ctx, this);
     let s = ctx.create_string(&total.to_string());
     Ok(Some(Value::Object(Some(s))))
 }
