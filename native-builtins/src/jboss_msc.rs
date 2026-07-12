@@ -2494,18 +2494,24 @@ pub fn gc_update_msc_service_refs(pointer_map: &std::collections::HashMap<usize,
 // ===========================================================================
 // P2/P3 — drive the real Java `service.start(StartContext)` callback.
 //
-// Gated behind `CRATONVM_MSC_REAL_START` (default-OFF): when off, the
-// `ServiceBuilderImpl.install()` / `StartContext.getController()` etc. natives
-// below are NOT registered, so WildFly's real MSC bytecode runs exactly as
-// before (no regression risk). When on, `install()` extracts the service from
-// the builder, registers it in the Rust container, and drives `start()`.
-// `CRATONVM_DBG_MSC` traces the install/start sequence.
+// Enabled by default: `ServiceBuilderImpl.install()` extracts the service from
+// the builder, registers it in the Rust container, and drives its real
+// `start()` callback.  Faking the controller state as `Up` leaves
+// `AbstractControllerService.controller` unset and deterministically breaks
+// managed-server boot. `CRATONVM_MSC_REAL_START=0` is a temporary diagnostic
+// escape hatch; `CRATONVM_DBG_MSC` traces the install/start sequence.
 // ===========================================================================
 
-/// Cached check of the `CRATONVM_MSC_REAL_START` gate.
+/// Cached check of the real-MSC mode. It is the production default; accept a
+/// conventional false value only as a diagnostic escape hatch.
 fn msc_real_start_enabled() -> bool {
     static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| std::env::var_os("CRATONVM_MSC_REAL_START").is_some())
+    *F.get_or_init(|| {
+        !matches!(
+            std::env::var("CRATONVM_MSC_REAL_START"),
+            Ok(value) if matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF")
+        )
+    })
 }
 
 /// Cached check of the `CRATONVM_DBG_MSC` trace flag.
@@ -2728,6 +2734,78 @@ fn native_service_controller_get_value(
         },
         None => Ok(Some(Value::Object(None))),
     }
+}
+
+/// `ServiceController.getService()` on the synthetic controller mirror.
+/// The real MSC controller exposes its installed service instance; retain the
+/// equivalent identity held by the shadow container so management operations
+/// can inspect it without hitting an abstract interface method.
+fn native_service_controller_get_service(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let id = match ctx.get_field(this, SC_FIELD_ID) {
+        Value::Long(l) => l as u64,
+        _ => 0,
+    };
+    let service = service_roots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+        .and_then(|roots| roots.service);
+    Ok(Some(match service {
+        Some(service) => Value::Object(Some(service)),
+        None => Value::Object(None),
+    }))
+}
+
+/// `ServiceController.getName()` on the synthetic controller mirror.  The
+/// controller is allocated with its primary `ServiceName` in slot zero, so
+/// preserve the Java-visible identity rather than forcing callers through the
+/// shadow container again.
+fn native_service_controller_get_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(ctx.get_field(this, SC_FIELD_NAME)))
+}
+
+/// `ServiceRegistry.getServiceNames()` is an abstract MSC interface method.
+/// Return a real Java List containing every primary shadow-container name;
+/// callers use it for diagnostics and validation during real service starts.
+fn native_service_registry_get_service_names(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let names: Vec<Arc<ServiceName>> = {
+        let container = global_container();
+        let state = container.inner.lock().unwrap_or_else(|e| e.into_inner());
+        state.services.keys().cloned().collect()
+    };
+    let list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[]) {
+        Ok(Some(Value::Object(Some(list)))) => list,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let list_pin = ctx.pin_native_root(list);
+    for name in names {
+        let name_obj = alloc_java_service_name(ctx, &name);
+        let name_pin = ctx.pin_native_root(name_obj);
+        let list = ctx.read_native_pin(list_pin, list);
+        let name_obj = ctx.read_native_pin(name_pin, name_obj);
+        let result = ctx.invoke_virtual(
+            list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(name_obj))],
+        );
+        ctx.unpin_native_roots(name_pin);
+        result?;
+    }
+    let list = ctx.read_native_pin(list_pin, list);
+    ctx.unpin_native_roots(list_pin);
+    Ok(Some(Value::Object(Some(list))))
 }
 
 /// Capture the builder's legacy `addDependency(name, type, Injector)` wiring:
@@ -3555,6 +3633,23 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Set;",
         native_service_controller_provides,
     );
+    // These are abstract interface methods. Register them unconditionally so
+    // interface resolution cannot depend on whether the later real-start block
+    // was reached before this controller class was loaded.
+    for cls in [ctrl, "org/jboss/msc/service/ServiceControllerImpl"] {
+        r.register(
+            cls,
+            "getService",
+            "()Lorg/jboss/msc/Service;",
+            native_service_controller_get_service,
+        );
+        r.register(
+            cls,
+            "getName",
+            "()Lorg/jboss/msc/service/ServiceName;",
+            native_service_controller_get_name,
+        );
+    }
 
     // R63 WildFly: Lockable acquire/release shims (see native_lockable_lock_noop).
     let lockable = "org/jboss/msc/service/Lockable";
@@ -3812,10 +3907,11 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // P2/P3 (WildFly real service.start): GATED behind CRATONVM_MSC_REAL_START
-    // (default-OFF). When off, none of these are registered so WildFly's real
-    // MSC bytecode runs unchanged. When on, we intercept ServiceBuilder.install
-    // and drive the real start() callback. See native_service_builder_install.
+    // P2/P3 (WildFly real service.start): enabled by default. Intercept
+    // ServiceBuilder.install and drive the real start() callback so service
+    // state mirrors its Java-visible initialization. See
+    // native_service_builder_install. CRATONVM_MSC_REAL_START=0 disables this
+    // only for diagnostic comparison.
     if msc_real_start_enabled() {
         let sbi = "org/jboss/msc/service/ServiceBuilderImpl";
         r.register(
@@ -3882,6 +3978,12 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
                 "(Lorg/jboss/msc/service/ServiceName;)Lorg/jboss/msc/service/ServiceController;",
                 native_service_container_get_required_service,
             );
+            r.register(
+                cls,
+                "getServiceNames",
+                "()Ljava/util/List;",
+                native_service_registry_get_service_names,
+            );
         }
         // Bug 15 follow-ups (wildfly-domain-managed-servers-timeout.md,
         // 2026-07-07): lifecycle listeners on the synthetic controller mirror.
@@ -3915,6 +4017,35 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
             "()Ljava/lang/Object;",
             native_service_controller_get_value,
         );
+        r.register(
+            ctrl,
+            "getService",
+            "()Lorg/jboss/msc/Service;",
+            native_service_controller_get_service,
+        );
+        r.register(
+            ctrl,
+            "getName",
+            "()Lorg/jboss/msc/service/ServiceName;",
+            native_service_controller_get_name,
+        );
+        // Concrete controller bytecode sometimes resolves these inherited
+        // abstract interface declarations against ServiceControllerImpl rather
+        // than ServiceController. Register both owners so real MSC callbacks
+        // never fall through to a code-less interface method.
+        let ctrl_impl = "org/jboss/msc/service/ServiceControllerImpl";
+        r.register(
+            ctrl_impl,
+            "getService",
+            "()Lorg/jboss/msc/Service;",
+            native_service_controller_get_service,
+        );
+        r.register(
+            ctrl_impl,
+            "getName",
+            "()Lorg/jboss/msc/service/ServiceName;",
+            native_service_controller_get_name,
+        );
         // requires()-supplier read path — must resolve BOTH modern
         // (injector-wired) and legacy (Service.getValue) providers against
         // the shadow container.
@@ -3943,6 +4074,16 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
             native_stability_monitor_controller_noop,
         );
     }
+
+    // Native dispatch is keyed by the class selected by method resolution, not
+    // by Java's interface hierarchy. Copy the complete controller bridge onto
+    // the concrete implementation only after all interface registrations are
+    // present; otherwise inherited methods such as getService() can reach an
+    // abstract, code-less declaration during real MSC startup.
+    r.alias_class(
+        "org/jboss/msc/service/ServiceController",
+        "org/jboss/msc/service/ServiceControllerImpl",
+    );
 
     let _ = CTX_NUM_SLOTS; // silence unused constant when debug builds elide.
     r.set_category(__prev_cat);
