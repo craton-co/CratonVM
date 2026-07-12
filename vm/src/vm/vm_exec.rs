@@ -748,7 +748,7 @@ fn safe_native_call_impl(
     }
     let arg_root_indices: &[Option<usize>] = overflow_root_indices
         .as_deref()
-        .unwrap_or(&inline_root_indices[..args.len()]);
+        .unwrap_or_else(|| &inline_root_indices[..args.len()]);
     let native_pin_base = thread.native_pin_roots.len();
 
     let mut remapped_args = None;
