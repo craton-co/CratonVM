@@ -4017,11 +4017,102 @@ fn native_es_vector_util_dot_product_f32(
     let a = obj_arg(args, 0)?;
     let b = obj_arg(args, 1)?;
     let len = ctx.array_length(a).min(ctx.array_length(b));
-    let mut sum = 0.0f32;
-    for i in 0..len {
-        sum += float_array_elem(ctx, a, i) * float_array_elem(ctx, b, i);
+    Ok(Some(Value::Float(es_dot_product_f32(ctx, a, b, len))))
+}
+
+/// The JVM's preferred SIMD lane count for `float`, mirroring
+/// `jdk.incubator.vector`'s `VectorSpecies.ofPreferred(float.class)`: 16
+/// lanes (512-bit) with AVX-512F, 8 (256-bit) with AVX2, else 4 (128-bit).
+/// Lucene's Panama vector code picks its species width the same way, and the
+/// exact lane grouping changes the floating-point summation order (and thus
+/// the bit-exact result) -- this has to track real hardware, not a fixed
+/// constant, to stay correct across deployment targets.
+#[inline]
+fn panama_preferred_lanes_f32() -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            16
+        } else if is_x86_feature_detected!("avx2") {
+            8
+        } else {
+            4
+        }
     }
-    Ok(Some(Value::Float(sum)))
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        4
+    }
+}
+
+// Mirrors Lucene's Panama-vectorized `PanamaVectorUtilSupport.dotProduct`
+// (`dotProductBody`) bit-for-bit, as actually executed when the method is
+// called too few times to be JIT-compiled (the common case for a single
+// JUnit test method): the Vector API ops run through their plain-Java
+// interpreter fallback bodies, which are well-defined portable Java, not a
+// hardware SIMD intrinsic. Four independent `lanes`-wide fma accumulators
+// stride through the array (each lane accumulates every `4 * lanes`-th
+// element), a same-width "vector tail" folds any remaining full lane-group
+// into the first accumulator only, then the four accumulators are combined
+// lane-wise (`(acc1+acc2)+(acc3+acc4)`) and reduced via a strict sequential
+// left-to-right fold (`FloatVector.reduceLanes(ADD)`'s fallback semantics,
+// per `jdk.incubator.vector.FloatVector.rOpTemplate`), before falling
+// through to a scalar fma tail for any elements past the last full lane
+// group. Floating-point addition isn't associative, so this exact lane
+// grouping and reduction order has to be reproduced precisely, or the
+// result diverges from HotSpot in the low ULPs.
+fn es_dot_product_f32(ctx: &dyn NativeContext, a: ObjectRef, b: ObjectRef, len: usize) -> f32 {
+    let lanes = panama_preferred_lanes_f32();
+    let mut res = 0.0f32;
+    let mut i = 0usize;
+    if len > 2 * lanes {
+        let limit = len - (len % lanes);
+        let mut acc1 = vec![0.0f32; lanes];
+        let mut acc2 = vec![0.0f32; lanes];
+        let mut acc3 = vec![0.0f32; lanes];
+        let mut acc4 = vec![0.0f32; lanes];
+        let unrolled_limit = limit.saturating_sub(3 * lanes);
+        let mut j = 0usize;
+        while j < unrolled_limit {
+            for l in 0..lanes {
+                acc1[l] = float_array_elem(ctx, a, j + l)
+                    .mul_add(float_array_elem(ctx, b, j + l), acc1[l]);
+            }
+            for l in 0..lanes {
+                acc2[l] = float_array_elem(ctx, a, j + lanes + l)
+                    .mul_add(float_array_elem(ctx, b, j + lanes + l), acc2[l]);
+            }
+            for l in 0..lanes {
+                acc3[l] = float_array_elem(ctx, a, j + 2 * lanes + l)
+                    .mul_add(float_array_elem(ctx, b, j + 2 * lanes + l), acc3[l]);
+            }
+            for l in 0..lanes {
+                acc4[l] = float_array_elem(ctx, a, j + 3 * lanes + l)
+                    .mul_add(float_array_elem(ctx, b, j + 3 * lanes + l), acc4[l]);
+            }
+            j += 4 * lanes;
+        }
+        while j < limit {
+            for l in 0..lanes {
+                acc1[l] = float_array_elem(ctx, a, j + l)
+                    .mul_add(float_array_elem(ctx, b, j + l), acc1[l]);
+            }
+            j += lanes;
+        }
+        let mut reduced = 0.0f32;
+        for l in 0..lanes {
+            let res1 = acc1[l] + acc2[l];
+            let res2 = acc3[l] + acc4[l];
+            reduced += res1 + res2;
+        }
+        res += reduced;
+        i = limit;
+    }
+    while i < len {
+        res = float_array_elem(ctx, a, i).mul_add(float_array_elem(ctx, b, i), res);
+        i += 1;
+    }
+    res
 }
 
 fn native_es_vector_util_square_distance_f32(
@@ -4031,12 +4122,69 @@ fn native_es_vector_util_square_distance_f32(
     let a = obj_arg(args, 0)?;
     let b = obj_arg(args, 1)?;
     let len = ctx.array_length(a).min(ctx.array_length(b));
-    let mut sum = 0.0f32;
-    for i in 0..len {
-        let d = float_array_elem(ctx, a, i) - float_array_elem(ctx, b, i);
-        sum += d * d;
+    Ok(Some(Value::Float(es_square_distance_f32(ctx, a, b, len))))
+}
+
+// Mirrors Lucene's Panama-vectorized `PanamaVectorUtilSupport.squareDistance`
+// (`squareDistanceBody`) bit-for-bit -- same lane-grouped fma-accumulator
+// shape and sequential final reduction as `es_dot_product_f32` above, just
+// accumulating `(a[i]-b[i])^2` per lane instead of `a[i]*b[i]`.
+fn es_square_distance_f32(ctx: &dyn NativeContext, a: ObjectRef, b: ObjectRef, len: usize) -> f32 {
+    let lanes = panama_preferred_lanes_f32();
+    let mut res = 0.0f32;
+    let mut i = 0usize;
+    if len > 2 * lanes {
+        let limit = len - (len % lanes);
+        let mut acc1 = vec![0.0f32; lanes];
+        let mut acc2 = vec![0.0f32; lanes];
+        let mut acc3 = vec![0.0f32; lanes];
+        let mut acc4 = vec![0.0f32; lanes];
+        let unrolled_limit = limit.saturating_sub(3 * lanes);
+        let mut j = 0usize;
+        while j < unrolled_limit {
+            for l in 0..lanes {
+                let diff = float_array_elem(ctx, a, j + l) - float_array_elem(ctx, b, j + l);
+                acc1[l] = diff.mul_add(diff, acc1[l]);
+            }
+            for l in 0..lanes {
+                let diff = float_array_elem(ctx, a, j + lanes + l)
+                    - float_array_elem(ctx, b, j + lanes + l);
+                acc2[l] = diff.mul_add(diff, acc2[l]);
+            }
+            for l in 0..lanes {
+                let diff = float_array_elem(ctx, a, j + 2 * lanes + l)
+                    - float_array_elem(ctx, b, j + 2 * lanes + l);
+                acc3[l] = diff.mul_add(diff, acc3[l]);
+            }
+            for l in 0..lanes {
+                let diff = float_array_elem(ctx, a, j + 3 * lanes + l)
+                    - float_array_elem(ctx, b, j + 3 * lanes + l);
+                acc4[l] = diff.mul_add(diff, acc4[l]);
+            }
+            j += 4 * lanes;
+        }
+        while j < limit {
+            for l in 0..lanes {
+                let diff = float_array_elem(ctx, a, j + l) - float_array_elem(ctx, b, j + l);
+                acc1[l] = diff.mul_add(diff, acc1[l]);
+            }
+            j += lanes;
+        }
+        let mut reduced = 0.0f32;
+        for l in 0..lanes {
+            let res1 = acc1[l] + acc2[l];
+            let res2 = acc3[l] + acc4[l];
+            reduced += res1 + res2;
+        }
+        res += reduced;
+        i = limit;
     }
-    Ok(Some(Value::Float(sum)))
+    while i < len {
+        let diff = float_array_elem(ctx, a, i) - float_array_elem(ctx, b, i);
+        res = diff.mul_add(diff, res);
+        i += 1;
+    }
+    res
 }
 
 fn native_es_vector_util_square_distance_f32_offset(
@@ -4055,10 +4203,12 @@ fn native_es_vector_util_square_distance_f32_offset(
     };
     let max_len = ctx.array_length(a).min(ctx.array_length(b));
     let end = offset.saturating_add(requested).min(max_len);
+    // Mirrors `DefaultESVectorUtilSupport.squareDistance(float[], float[], int, int)`:
+    // a plain sequential fma accumulation (this overload is never unrolled upstream).
     let mut sum = 0.0f32;
     for i in offset..end {
         let d = float_array_elem(ctx, a, i) - float_array_elem(ctx, b, i);
-        sum += d * d;
+        sum = d.mul_add(d, sum);
     }
     Ok(Some(Value::Float(sum)))
 }
@@ -4100,16 +4250,11 @@ fn java_f32_max(a: f32, b: f32) -> f32 {
 
 #[inline]
 fn java_math_round_f32(v: f32) -> i32 {
-    let rounded = (v + 0.5).floor();
-    if rounded.is_nan() {
-        0
-    } else if rounded >= i32::MAX as f32 {
-        i32::MAX
-    } else if rounded <= i32::MIN as f32 {
-        i32::MIN
-    } else {
-        rounded as i32
-    }
+    // The naive `floor(v + 0.5)` mis-rounds the largest float just below a
+    // half-integer boundary (the same JDK-6430675 class of bug already fixed
+    // for `java.lang.Math.round` in `lang_math::round_float`) -- reuse that
+    // bit-exact implementation instead of a second, divergent copy.
+    crate::lang_math::round_float(v)
 }
 
 #[inline]
