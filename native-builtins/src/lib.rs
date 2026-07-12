@@ -32223,7 +32223,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "([Ljava/lang/Object;)Ljava/lang/Object;",
         lang_class::native_constructor_new_instance,
     );
-    registry.register("jdk/internal/misc/ScopedMemoryAccess", "closeScope0", "(Ljdk/internal/misc/ScopedMemoryAccess$Scope;Ljdk/internal/misc/ScopedMemoryAccess$Scope$Error;)V", native_noop);
+    registry.register("jdk/internal/misc/ScopedMemoryAccess", "closeScope0", "(Ljdk/internal/foreign/MemorySessionImpl;Ljdk/internal/misc/ScopedMemoryAccess$ScopedAccessError;)V", native_noop);
     let scoped_memory_access = "jdk/internal/misc/ScopedMemoryAccess";
     for name in ["getByte", "getByteInternal"] {
         registry.register(
@@ -32353,7 +32353,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         registry.register(
             scoped_memory_access,
             name,
-            "(Ljdk/internal/misc/ScopedMemoryAccess$Scope;Ljdk/internal/misc/ScopedMemoryAccess$Scope;Ljava/lang/Object;JLjava/lang/Object;JJ)V",
+            "(Ljdk/internal/foreign/MemorySessionImpl;Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JLjava/lang/Object;JJ)V",
             native_scoped_memory_copy_memory,
         );
     }
@@ -72568,9 +72568,12 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
     let rl = "java/util/concurrent/locks/ReentrantReadWriteLock$ReadLock";
     let wl = "java/util/concurrent/locks/ReentrantReadWriteLock$WriteLock";
 
-    // ReentrantReadWriteLock = 3-field synthetic (readers=0, writer=1, fair=2)
-    registry.register(rwl, "<init>", "()V", native_rwl_init);
-    registry.register(rwl, "<init>", "(Z)V", native_rwl_init_fair);
+    // Do not intercept the real-JDK constructors. Their three reference
+    // fields are { readerLock, writerLock, sync }; the historical synthetic
+    // initializer wrote integer state into those slots, so a method reference
+    // such as ReentrantReadWriteLock::readLock received null. Let genuine
+    // bytecode initialize the layout, while keeping the native lock-operation
+    // backend below for the returned lock views.
     registry.register(
         rwl,
         "readLock",

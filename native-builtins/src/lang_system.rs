@@ -622,7 +622,8 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
         }
         ctx.record_thread_sleep(millis * 1_000_000, actual_dur.as_nanos() as u64);
         // Check interrupted after sleeping (with clear).
-        if interrupted || ctx.is_interrupted(true) {
+        let interrupted_after_sleep = ctx.is_interrupted(true);
+        if interrupted || interrupted_after_sleep {
             return Err(cratonvm_types::error::MethodCallFailed::InternalError(
                 cratonvm_types::error::VmError::Runtime(
                     cratonvm_types::error::RuntimeError::InterruptedException,

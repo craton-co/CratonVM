@@ -10,7 +10,11 @@ Fixed CratonVM's synthetic JUL bridge so explicit `Logger` handlers are retained
 Validation:
 
 - `cargo test -p cratonvm-native-builtins jul_explicit_handler_and_log_record_message_bridge --lib` passes.
-- The exact `TestTomcatStandalone` CratonVM probe proceeds past `assertVersionLoggerListenerOutput`; all three VersionLoggerListener banner lines are captured. The probe subsequently reaches an unrelated, pre-existing `URL.openConnection()` carrier cast failure at `TomcatBaseTest.methodUrl`, after the resolved assertion.
+- The exact `TestTomcatStandalone` CratonVM probe passes with all three VersionLoggerListener banner lines captured.
+
+## Complete follow-up (2026-07-12)
+
+The downstream `URLConnection` cast was caused by the failed NIO connector: `NioEndpoint` creates `new InetSocketAddress(null, port)` for an unspecified bind address, which the native constructor incorrectly rejected. It now substitutes the wildcard local address as the JDK specifies; the connector binds an ephemeral port and the exact JUnit test passes (`OK (1 test)`).
 
 ## Summary
 

@@ -40,7 +40,27 @@ CP=$(cat /data/data/apps/tomcat/.suite/cp-linux-fixed.txt)
   org.apache.catalina.startup.TestWebappServiceLoader
 ```
 
-## Recommendation
+## Resolution
+
+The native ClassLoader.getResources implementation previously fell through to
+CratonVM's process-wide classpath scan when a custom loader returned no parent
+or local URLs. That leaked resources that the custom loader could not see;
+Tomcat then read the leaked provider entry and invoked loadClass on EasyMock's
+strict mock.
+
+Commit 570ab1eb changed the custom-loader path to return its combined parent
+and findResources enumeration even when it is empty. The empty result is
+therefore preserved, matching the real JDK delegation contract and preventing
+the extra provider lookup.
+
+## Fresh validation
+
+On 2026-07-12, current dev (e3c68c20) was rebuilt in an isolated Azure
+worktree and the exact JUnit class passed on CratonVM with JIT enabled:
+OK (7 tests). The matching /home/victor/jdk25 HotSpot control also passed:
+OK (7 tests).
+
+## Prior investigation hypothesis
 
 Read `org.apache.catalina.startup.WebappServiceLoader`'s implementation
 alongside `TestWebappServiceLoader.testNoInitializersFound`'s mock setup —

@@ -701,9 +701,8 @@ fn huc_real_perform(
                 e.trim_start_matches(TLS_HANDSHAKE_FAILURE_SENTINEL),
             ))
         }
-        // Other I/O failures (premature EOF, connection refused) follow the
-        // real JDK's `getResponseCode` contract of returning -1.
-        Err(_) => Ok(-1),
+        // A transport failure before a response is available is an IOException.
+        Err(e) => Err(ioex(format!("HttpURLConnection response failed: {e}"))),
     }
 }
 
