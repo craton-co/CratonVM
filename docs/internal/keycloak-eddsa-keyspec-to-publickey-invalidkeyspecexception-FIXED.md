@@ -1,7 +1,7 @@
 # EdDSA KeyFactory KeySpec reconstruction fixed
 
-Status: fixed  
-Observed: 2026-07-11  
+Status: fixed
+Observed: 2026-07-11
 Fixed: 2026-07-12
 
 ## Root cause
