@@ -2619,12 +2619,31 @@ fn s2_bb_get_byte(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i8 {
             return 0;
         }
         ctx.get_array_element(arr, i).as_int().unwrap_or(0) as i8
+    } else if let Some(addr) = s2_bb_direct_addr(ctx, buf) {
+        // DIRECT buffer (no heap array): fall back to native-memory
+        // access, mirroring `put(Ljava/nio/ByteBuffer;)`'s direct-buffer
+        // fix. Reached whenever an s2-forced native touches a genuine
+        // direct receiver that real-JDK `DirectByteBuffer`'s own
+        // overridden bytecode didn't intercept first (slices/duplicates
+        // of a direct buffer, typed views over one, etc). This helper has
+        // no `MethodCallResult` to propagate a Java exception through (it
+        // is a private byte-level primitive called from ~15 sites), so a
+        // failed native-memory read stays panic-free and benign (0),
+        // matching this function's existing out-of-range convention —
+        // callers that DO have a `MethodCallResult` (the bulk get/put
+        // registrations below) throw `IllegalStateException` instead.
+        let mut b = [0u8; 1];
+        if ctx.copy_from_native_memory(addr.saturating_add(idx as i64), &mut b) {
+            b[0] as i8
+        } else {
+            0
+        }
     } else {
         0
     }
 }
 
-fn s2_bb_put_byte(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32, b: i8) {
+fn s2_bb_put_byte(ctx: &mut dyn NativeContext, buf: ObjectRef, idx: i32, b: i8) {
     // B8: mirror the read-side bound check — a negative or out-of-range
     // index is silently dropped rather than panicking / clobbering memory.
     if idx < 0 {
@@ -2636,6 +2655,12 @@ fn s2_bb_put_byte(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32, b: i8) {
             return;
         }
         ctx.set_array_element(arr, i, Value::Int(b as i32));
+    } else if let Some(addr) = s2_bb_direct_addr(ctx, buf) {
+        // DIRECT buffer: mirror the get-side fallback above. Best-effort —
+        // see `s2_bb_get_byte`'s comment for why this stays panic-free
+        // and benign (silently drops the write) rather than surfacing a
+        // Java exception from this deep a helper.
+        let _ = ctx.copy_to_native_memory(addr.saturating_add(idx as i64), &[b as u8]);
     }
 }
 
@@ -2690,7 +2715,7 @@ fn s2_bb_read2(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i16 {
     }
 }
 
-fn s2_bb_write2(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32, val: i16) {
+fn s2_bb_write2(ctx: &mut dyn NativeContext, buf: ObjectRef, idx: i32, val: i16) {
     let (b0, b1) = if s2_bb_order(ctx, buf) == 1 {
         (val as u8, (val >> 8) as u8)
     } else {
@@ -2712,7 +2737,7 @@ fn s2_bb_read4(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i32 {
     }
 }
 
-fn s2_bb_write4(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32, val: i32) {
+fn s2_bb_write4(ctx: &mut dyn NativeContext, buf: ObjectRef, idx: i32, val: i32) {
     let bytes = if s2_bb_order(ctx, buf) == 1 {
         val.to_le_bytes()
     } else {
@@ -2735,7 +2760,7 @@ fn s2_bb_read8(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i64 {
     }
 }
 
-fn s2_bb_write8(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32, val: i64) {
+fn s2_bb_write8(ctx: &mut dyn NativeContext, buf: ObjectRef, idx: i32, val: i64) {
     let bytes = if s2_bb_order(ctx, buf) == 1 {
         val.to_le_bytes()
     } else {
@@ -3721,10 +3746,36 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             return Err(RuntimeError::BufferUnderflowException.into());
         }
         let off = off as usize;
-        let arr = s2_bb_arr(ctx, this).unwrap_or(dst);
-        for i in 0..len as usize {
-            let b = ctx.get_array_element(arr, pos as usize + i);
-            ctx.set_array_element(dst, off + i, b);
+        // Mirrors put(Ljava/nio/ByteBuffer;)'s direct-buffer fix
+        // (2026-07-10): the pre-fix `s2_bb_arr(ctx, this).unwrap_or(dst)`
+        // made `dst` its own copy source whenever `this` is a DIRECT
+        // buffer (no heap array) — a silent self-copy that left `dst`
+        // untouched while position still advanced and the call reported
+        // success. `IOUtil.read` routes every buffered `FileChannel` read
+        // through a temporary direct buffer and then bulk-`get`s it into a
+        // byte[], so this exact path is how Lucene's footer/checksum bytes
+        // came back as zero (ES-FAIL-FAMILY-20260709).
+        if let Some(arr) = s2_bb_arr(ctx, this) {
+            for i in 0..len as usize {
+                let b = ctx.get_array_element(arr, pos as usize + i);
+                ctx.set_array_element(dst, off + i, b);
+            }
+        } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
+            let mut bytes = vec![0u8; len as usize];
+            if !ctx.copy_from_native_memory(addr.saturating_add(pos as i64), &mut bytes) {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "ByteBuffer.get([BII): direct source read failed".to_string(),
+                }
+                .into());
+            }
+            for (i, byte) in bytes.iter().enumerate() {
+                ctx.set_array_element(dst, off + i, Value::Int(*byte as i8 as i32));
+            }
+        } else {
+            // Genuinely storage-less synthetic buffer — keep the historic
+            // silent no-op (position unchanged), matching
+            // put(ByteBuffer;)'s same fallback for half-built synthetics.
+            return Ok(Some(Value::Object(Some(this))));
         }
         ctx.set_field(this, BB_POS, Value::Int(pos + len));
         Ok(Some(Value::Object(Some(this))))
@@ -3737,10 +3788,24 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         if pos + len > s2_bb_limit(ctx, this) {
             return Err(RuntimeError::BufferUnderflowException.into());
         }
-        let arr = s2_bb_arr(ctx, this).unwrap_or(dst);
-        for i in 0..len as usize {
-            let b = ctx.get_array_element(arr, pos as usize + i);
-            ctx.set_array_element(dst, i, b);
+        if let Some(arr) = s2_bb_arr(ctx, this) {
+            for i in 0..len as usize {
+                let b = ctx.get_array_element(arr, pos as usize + i);
+                ctx.set_array_element(dst, i, b);
+            }
+        } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
+            let mut bytes = vec![0u8; len as usize];
+            if !ctx.copy_from_native_memory(addr.saturating_add(pos as i64), &mut bytes) {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "ByteBuffer.get([B): direct source read failed".to_string(),
+                }
+                .into());
+            }
+            for (i, byte) in bytes.iter().enumerate() {
+                ctx.set_array_element(dst, i, Value::Int(*byte as i8 as i32));
+            }
+        } else {
+            return Ok(Some(Value::Object(Some(this))));
         }
         ctx.set_field(this, BB_POS, Value::Int(pos + len));
         Ok(Some(Value::Object(Some(this))))
@@ -3795,10 +3860,26 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             return Err(RuntimeError::BufferOverflowException.into());
         }
         let off = off as usize;
-        let arr = s2_bb_arr(ctx, this).unwrap_or(src);
-        for i in 0..len as usize {
-            let b = ctx.get_array_element(src, off + i);
-            ctx.set_array_element(arr, pos as usize + i, b);
+        // Mirrors put(Ljava/nio/ByteBuffer;)'s direct-buffer fix — see
+        // get([BII)'s comment above for the matching read-side rationale.
+        if let Some(arr) = s2_bb_arr(ctx, this) {
+            for i in 0..len as usize {
+                let b = ctx.get_array_element(src, off + i);
+                ctx.set_array_element(arr, pos as usize + i, b);
+            }
+        } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
+            let mut bytes = vec![0u8; len as usize];
+            for (i, byte) in bytes.iter_mut().enumerate() {
+                *byte = ctx.get_array_element(src, off + i).as_int().unwrap_or(0) as u8;
+            }
+            if !ctx.copy_to_native_memory(addr.saturating_add(pos as i64), &bytes) {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "ByteBuffer.put([BII): direct destination write failed".to_string(),
+                }
+                .into());
+            }
+        } else {
+            return Ok(Some(Value::Object(Some(this))));
         }
         ctx.set_field(this, BB_POS, Value::Int(pos + len));
         Ok(Some(Value::Object(Some(this))))
@@ -3811,10 +3892,24 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         if pos + len > s2_bb_limit(ctx, this) {
             return Err(RuntimeError::BufferOverflowException.into());
         }
-        let arr = s2_bb_arr(ctx, this).unwrap_or(src);
-        for i in 0..len as usize {
-            let b = ctx.get_array_element(src, i);
-            ctx.set_array_element(arr, pos as usize + i, b);
+        if let Some(arr) = s2_bb_arr(ctx, this) {
+            for i in 0..len as usize {
+                let b = ctx.get_array_element(src, i);
+                ctx.set_array_element(arr, pos as usize + i, b);
+            }
+        } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
+            let mut bytes = vec![0u8; len as usize];
+            for (i, byte) in bytes.iter_mut().enumerate() {
+                *byte = ctx.get_array_element(src, i).as_int().unwrap_or(0) as u8;
+            }
+            if !ctx.copy_to_native_memory(addr.saturating_add(pos as i64), &bytes) {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "ByteBuffer.put([B): direct destination write failed".to_string(),
+                }
+                .into());
+            }
+        } else {
+            return Ok(Some(Value::Object(Some(this))));
         }
         ctx.set_field(this, BB_POS, Value::Int(pos + len));
         Ok(Some(Value::Object(Some(this))))
