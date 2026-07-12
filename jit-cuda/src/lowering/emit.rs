@@ -20,7 +20,7 @@
 
 use crate::analyzer::{resolve_math_intrinsic, MathIntrinsic, ParamKind};
 use crate::emitter::{LoweringError, RegKind};
-use crate::lowering::loop_recog::{instr_size, CountedLoop};
+use crate::lowering::loop_recog::{instr_size, CountedLoop, NestedLoop};
 use crate::signature::KernelSignature;
 use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 use std::fmt::Write;
@@ -158,11 +158,24 @@ pub(crate) struct Emitter<'a> {
     pub param_len_name: Vec<String>,
     /// Local slot of the loop induction variable (if we are in a loop).
     pub iv_slot: Option<u16>,
+    /// 2-D nested-loop follow-up: local slot of the INNER loop's
+    /// induction variable, when lowering a nested (2-D) counted loop
+    /// (see [`NestedLoop`]). `None` for a straight-line or single-loop
+    /// kernel. Checked by `iload`/`iinc` alongside `iv_slot` so both `i`
+    /// and `j` substitute to their own computed index register.
+    pub iv_slot_inner: Option<u16>,
     /// Loop-bound register; populated once we emit the prologue. Used
     /// only for the early-out at kernel entry.
     pub bound_reg: Option<Reg>,
-    /// Register holding `tid` (computed once in the prologue).
+    /// Register holding `tid` (computed once in the prologue). For a
+    /// nested (2-D) loop this becomes the outer loop's recovered index
+    /// `i` once `emit_nested_loop_guard_and_decompose` runs.
     pub tid_reg: Option<Reg>,
+    /// 2-D nested-loop follow-up: register holding the inner loop's
+    /// recovered index `j` (`tid % C`), populated by
+    /// `emit_nested_loop_guard_and_decompose`. `None` outside a nested
+    /// loop.
+    pub tid_reg_inner: Option<Reg>,
     /// Label used to signal an out-of-bounds bounds-check failure.
     /// Emitted once at kernel epilogue; jump from each `*aload`/`*astore`.
     pub bounds_fail_label: String,
@@ -211,8 +224,10 @@ impl<'a> Emitter<'a> {
                 .map(|i| format!("p{i}_len"))
                 .collect(),
             iv_slot: None,
+            iv_slot_inner: None,
             bound_reg: None,
             tid_reg: None,
+            tid_reg_inner: None,
             bounds_fail_label: "L_bounds_fail".into(),
             used_bounds_label: false,
             hit_back_branch: false,
@@ -401,6 +416,94 @@ impl<'a> Emitter<'a> {
         )
         .unwrap();
         writeln!(self.body, "    @{} bra L_done;", p.name).unwrap();
+    }
+
+    /// 2-D nested-loop follow-up: emit the nested-loop guard and index
+    /// decomposition — `total = R * C; if (tid >= total) ret; i = tid /
+    /// C; j = tid % C;`.
+    ///
+    /// This is the 2-D analogue of [`emit_loop_guard`] — see that
+    /// function's doc comment for the general "one thread per
+    /// iteration" dispatch model this extends. Here one thread handles
+    /// one `(i, j)` pair from the flattened `R*C`-element iteration
+    /// space instead of one `i` from a `bound`-element space.
+    ///
+    /// # Why the division is always safe (no zero-divisor guard needed)
+    ///
+    /// `div.s32`/`rem.s32` by `inner_bound` only execute for threads
+    /// that already passed the `tid >= total` guard, i.e. `tid < R*C`.
+    /// If `inner_bound (C) <= 0` then `total = R*C <= 0`, and a
+    /// non-negative `tid` can never satisfy `tid < total` — every
+    /// thread branches to `L_done` before reaching the division. So a
+    /// thread only ever divides by a `C` it has already proven is
+    /// `> 0`.
+    ///
+    /// Call this once, after both bound registers are materialised.
+    /// Sets `self.iv_slot`/`self.tid_reg` (outer `i`) and
+    /// `self.iv_slot_inner`/`self.tid_reg_inner` (inner `j`) so every
+    /// subsequent `iload` of either induction variable substitutes
+    /// transparently — the 2-D counterpart of how the single-loop path
+    /// pairs `emit_loop_guard` with `self.iv_slot`/`self.tid_reg`.
+    pub fn emit_nested_loop_guard_and_decompose(
+        &mut self,
+        outer_bound: &Reg,
+        inner_bound: &Reg,
+        nested: &NestedLoop,
+    ) {
+        debug_assert_eq!(
+            nested.outer.exit_op, 0xA2,
+            "emit_nested_loop_guard_and_decompose: outer loop reached emission with a \
+             non-`if_icmpge` exit — loop_recog must reject it"
+        );
+        debug_assert_eq!(
+            nested.outer.iv_stride, 1,
+            "emit_nested_loop_guard_and_decompose: outer loop reached emission with a \
+             non-unit stride — loop_recog must reject it"
+        );
+        debug_assert_eq!(
+            nested.inner.exit_op, 0xA2,
+            "emit_nested_loop_guard_and_decompose: inner loop reached emission with a \
+             non-`if_icmpge` exit — loop_recog must reject it"
+        );
+        debug_assert_eq!(
+            nested.inner.iv_stride, 1,
+            "emit_nested_loop_guard_and_decompose: inner loop reached emission with a \
+             non-unit stride — loop_recog must reject it"
+        );
+        let tid = self.tid_reg.clone().expect("emit_tid was called");
+        let total = self.regs.fresh_reg(RegKind::S32);
+        writeln!(
+            self.body,
+            "    mul.lo.s32 {}, {}, {};",
+            total.name, outer_bound.name, inner_bound.name
+        )
+        .unwrap();
+        let p = self.regs.fresh_reg(RegKind::Pred);
+        writeln!(
+            self.body,
+            "    setp.ge.s32 {}, {}, {};",
+            p.name, tid.name, total.name
+        )
+        .unwrap();
+        writeln!(self.body, "    @{} bra L_done;", p.name).unwrap();
+        let i = self.regs.fresh_reg(RegKind::S32);
+        let j = self.regs.fresh_reg(RegKind::S32);
+        writeln!(
+            self.body,
+            "    div.s32 {}, {}, {};",
+            i.name, tid.name, inner_bound.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    rem.s32 {}, {}, {};",
+            j.name, tid.name, inner_bound.name
+        )
+        .unwrap();
+        self.iv_slot = Some(nested.outer.iv_slot);
+        self.tid_reg = Some(i);
+        self.iv_slot_inner = Some(nested.inner.iv_slot);
+        self.tid_reg_inner = Some(j);
     }
 
     /// Append the bounds-check failure block and the kernel epilogue
@@ -1472,6 +1575,16 @@ impl<'a> Emitter<'a> {
             self.stack.push(tid);
             return Ok(());
         }
+        // 2-D nested-loop follow-up: the inner loop's induction variable
+        // substitutes to its own recovered index register (`j`), set up
+        // by `emit_nested_loop_guard_and_decompose`.
+        if Some(slot) == self.iv_slot_inner {
+            let j = self.tid_reg_inner.clone().ok_or_else(|| {
+                LoweringError::Internal("inner loop index not initialised".into())
+            })?;
+            self.stack.push(j);
+            return Ok(());
+        }
         let r = self.locals.get(slot as usize).cloned().ok_or_else(|| {
             LoweringError::UnsupportedNode(format!("iload from uninitialised local {slot}"))
         })?;
@@ -1537,9 +1650,9 @@ impl<'a> Emitter<'a> {
     }
 
     fn iinc(&mut self, slot: u16, delta: i32) -> Result<(), LoweringError> {
-        if Some(slot) == self.iv_slot {
-            // Induction variable iinc is implicit in the parallel-for
-            // dispatch — skip.
+        if Some(slot) == self.iv_slot || Some(slot) == self.iv_slot_inner {
+            // Induction variable iinc (outer or, for a nested loop,
+            // inner) is implicit in the parallel-for dispatch — skip.
             return Ok(());
         }
         let cur = self.locals.get(slot as usize).cloned().ok_or_else(|| {

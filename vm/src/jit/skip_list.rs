@@ -633,6 +633,17 @@ fn should_skip_jit_internal(
             }
         }
 
+        // Hibernate mapping metadata initializes JAXB's QName-heavy runtime
+        // graph.  JITting org.glassfish.jaxb currently corrupts that graph and
+        // produces a self-cast `QName cannot be cast to QName`; interpreting
+        // the package reproduces the no-JIT result.  Keep this scoped guard
+        // liftable for bisection.
+        if let Some(prefix) = jaxb_mapping_residual_skip_prefix(class_name) {
+            if !package_allowed(prefix, allow_packages) {
+                return Some(SkipReason::RustJvmTestFixture);
+            }
+        }
+
         // ES-JIT-DEOPT-GC.1 (2026-07-08) - Elasticsearch interval-provider
         // tests crash under JIT while serializing through Jackson YAML. Package
         // bisection narrowed the producer from org/yaml/snakeyaml/emitter/ to
@@ -1508,6 +1519,16 @@ fn is_elasticsearch_suite_jit_fragile_cluster(class_name: &str, _method_name: &s
 fn hibernate_temporal_residual_skip_prefix(class_name: &str) -> Option<&'static str> {
     const SLASH_PREFIX: &str = "org/hibernate/";
     const DOT_PREFIX: &str = "org.hibernate.";
+    if class_name.starts_with(SLASH_PREFIX) {
+        Some(SLASH_PREFIX)
+    } else {
+        class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
+    }
+}
+
+fn jaxb_mapping_residual_skip_prefix(class_name: &str) -> Option<&'static str> {
+    const SLASH_PREFIX: &str = "org/glassfish/jaxb/";
+    const DOT_PREFIX: &str = "org.glassfish.jaxb.";
     if class_name.starts_with(SLASH_PREFIX) {
         Some(SLASH_PREFIX)
     } else {
@@ -2962,6 +2983,31 @@ mod tests {
                 true,
                 SkipPolicy::Conservative,
                 &["org.hibernate."],
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn jaxb_mapping_package_skipped_conservatively_and_lifts_for_bisection() {
+        for cls in [
+            "org/glassfish/jaxb/runtime/v2/runtime/reflect/Accessor",
+            "org.glassfish.jaxb.runtime.v2.runtime.reflect.Accessor",
+        ] {
+            assert_eq!(
+                check(cls, "get", false, true, SkipPolicy::Conservative),
+                Some(SkipReason::RustJvmTestFixture),
+                "{cls} should stay interpreted under the JAXB mapping guard"
+            );
+        }
+        assert_eq!(
+            check_with(
+                "org/glassfish/jaxb/runtime/v2/runtime/reflect/Accessor",
+                "get",
+                false,
+                true,
+                SkipPolicy::Conservative,
+                &["org/glassfish/jaxb/"],
             ),
             None
         );

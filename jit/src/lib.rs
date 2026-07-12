@@ -4851,6 +4851,16 @@ fn hibernate_temporal_jit_deny_prefix(class_name: &str) -> Option<&'static str> 
     }
 }
 
+fn jaxb_mapping_jit_deny_prefix(class_name: &str) -> Option<&'static str> {
+    const SLASH_PREFIX: &str = "org/glassfish/jaxb/";
+    const DOT_PREFIX: &str = "org.glassfish.jaxb.";
+    if class_name.starts_with(SLASH_PREFIX) {
+        Some(SLASH_PREFIX)
+    } else {
+        class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
+    }
+}
+
 fn snakeyaml_emitter_emit_jit_deny_prefix(
     class_name: &str,
     method_name: &str,
@@ -5127,6 +5137,12 @@ pub fn try_compile(
     // `CRATONVM_JIT_DENY=org/hibernate/`, so keep Hibernate bytecode interpreted
     // here too unless the package is explicitly allowed for bisection.
     if let Some(prefix) = hibernate_temporal_jit_deny_prefix(&cached.class_name) {
+        if !jit_allow_package(prefix) {
+            return None;
+        }
+    }
+
+    if let Some(prefix) = jaxb_mapping_jit_deny_prefix(&cached.class_name) {
         if !jit_allow_package(prefix) {
             return None;
         }
@@ -5553,6 +5569,13 @@ fn try_compile_inner(
         // `prologue_param_slots` above.
         let num_params = prologue_param_slots;
         let mut builder = ir::IrBuilder::new(num_params, cached.max_locals as usize);
+        builder.tdigest_scalar_kernel = cached.class_name.as_ref()
+            == "org/elasticsearch/tdigest/Dist"
+            && matches!(
+                (&*cached.method_name, &*cached.method_descriptor),
+                ("quantile", "(DILjava/util/function/Function;)D")
+                    | ("cdf", "(DILjava/util/function/Function;)D")
+            );
         // Type each `Param` node from the descriptor. Two consumers depend on
         // this:
         //   * inc 25 (long gate): re-lay-out the parameter locals with the JVM
@@ -7482,6 +7505,19 @@ mod tests {
             Some("org.hibernate.")
         );
         assert_eq!(hibernate_temporal_jit_deny_prefix("org/example/Foo"), None);
+    }
+
+    #[test]
+    fn jaxb_mapping_jit_deny_matches_slash_and_dot_names() {
+        assert_eq!(
+            jaxb_mapping_jit_deny_prefix("org/glassfish/jaxb/runtime/v2/ContextFactory"),
+            Some("org/glassfish/jaxb/")
+        );
+        assert_eq!(
+            jaxb_mapping_jit_deny_prefix("org.glassfish.jaxb.runtime.v2.ContextFactory"),
+            Some("org.glassfish.jaxb.")
+        );
+        assert_eq!(jaxb_mapping_jit_deny_prefix("org/glassfish/other/Foo"), None);
     }
 
     #[test]

@@ -3509,11 +3509,59 @@ impl NativeMethodRegistry {
         // Pattern/Matcher bytecode observes impossible state (for example a
         // Matcher whose `locals` field is not an int[]). Let the JDK regex
         // bytecode own both object construction and matching in real mode.
+        //
+        // EXCEPTION (`CRATONVM_NATIVE_MATCHER_FIND`) — keep the real-JDK-layout
+        // `Matcher.find()`/`find(int)` fast path. Unlike the legacy natives
+        // this drop exists to suppress, that fast path never assumes a
+        // synthetic field layout: it resolves every field by name against
+        // whatever real OpenJDK object is actually there (see
+        // `native-builtins/src/lib.rs`'s `native_matcher_find_realjdk`), so
+        // it does not corrupt anything the way the old slot-index bridge did
+        // — a correct, same-answer-just-faster fast path is exactly what
+        // `NativeKind::Intrinsic` means per this enum's own doc comment.
+        //
+        // Registered under `NativeKind::Intrinsic` SPECIFICALLY BECAUSE the
+        // legacy synthetic-layout `Matcher.find`/`find(int)` registrations
+        // this drop targets run under `NativeKind::Bridge` in the real-JDK
+        // build (inherited from a persistent `set_category(Bridge)` far
+        // above their registration site) — an earlier version of this
+        // exception keyed on `Bridge` and, because of that inherited
+        // category, ALSO accidentally un-dropped the legacy bridge, which
+        // then corrupted every real `Matcher` via its raw synthetic slot
+        // indices (symptom: `Matcher.start()` throwing after a second
+        // `find()`, reproduced even with `CRATONVM_NATIVE_MATCHER_FIND`
+        // unset). `Intrinsic` is registered nowhere else in this file for
+        // `java/util/regex/Pattern`/`Matcher` under `drop_real_layout_synthetic`
+        // (confirmed: the only other `register_regex_natives()` call site
+        // that runs under `Intrinsic` is `register_synthetic_overrides`,
+        // which only executes when `drop_real_layout_synthetic` is unset in
+        // the first place, so the outer `if` below short-circuits before this
+        // exception is even consulted there) — category-matching is
+        // otherwise inherently fragile (any future `set_category` reshuffle
+        // upstream of either registration site can silently reintroduce this
+        // exact collision), so treat `Intrinsic` here as load-bearing: do not
+        // change this registration's category without re-auditing every
+        // `set_category`/`with_category` call between both `register_regex_natives`
+        // call sites and the top of `register_essential_natives`.
+        let keep_real_matcher_find_fastpath = self.current_category == NativeKind::Intrinsic
+            && class_name == "java/util/regex/Matcher"
+            && matches!(
+                (method_name, descriptor),
+                ("find", "()Z")
+                    | ("find", "(I)Z")
+                    | ("start", "()I")
+                    | ("start", "(I)I")
+                    | ("end", "()I")
+                    | ("end", "(I)I")
+                    | ("group", "()Ljava/lang/String;")
+                    | ("group", "(I)Ljava/lang/String;")
+            );
         if self.drop_real_layout_synthetic
             && matches!(
                 class_name,
                 "java/util/regex/Pattern" | "java/util/regex/Matcher"
             )
+            && !keep_real_matcher_find_fastpath
         {
             return;
         }

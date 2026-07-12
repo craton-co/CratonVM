@@ -48,7 +48,7 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 | Matrix 1280x1280                    | 2,623 ms      | 10,364 ms         | 3.95x         |
 | **QuickBench TOTAL**                | **13,272 ms** | **50,521 ms**     | **3.81x**     |
 | HashMap (1M put/get, isolated)      | 51.1 ms       | 409.6 ms          | 8.01x         |
-| String/Regex (10K, isolated)        | 11 ms         | 414 ms            | 37.6x         |
+| String/Regex (10K, isolated)        | 8 ms          | 153 ms            | 19.1x         |
 | Binary Trees (depth=18, isolated)   | 382 ms        | 4,916 ms          | 12.9x         |
 
 *Arithmetic/Fibonacci/Sieve/Matrix measured 2026-07-10 on the primary Windows dev box
@@ -80,7 +80,42 @@ interpreter overhead — see
 [`docs/known-issues/matcher-native-full-input-redecode-quadratic.md`](docs/known-issues/matcher-native-full-input-redecode-quadratic.md)
 and
 [`docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`](docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md)
-(merged `a87901e6`). Isolated ratio: **37.6x** (best of 5, `StringRegexOnly.java`).
+(merged `a87901e6`). That landed the algorithmic (O(n²)→O(n)) fix and left a
+**37.6x** constant-factor gap (11 ms JDK / 414 ms CratonVM) — the interpreted
+`java.util.regex` engine itself, one JIT-tier-up/intrinsic layer short of HotSpot's
+compiled state machine.
+
+That remaining constant-factor gap is now also closed, most of the way:
+`CRATONVM_NATIVE_MATCHER_FIND` (**default-ON** since 2026-07-11) routes the explicit
+`Pattern.compile(...).matcher(...)` + `while (m.find()) { ...; m.group(N); }` idiom —
+the shape `bench/StringRegexOnly.java` exercises, and the common shape in real
+parsers/tokenizers — to a Rust-native fast path operating directly on the real OpenJDK
+`Matcher`/`Pattern` object layout (fields resolved by name, never a hardcoded slot
+index, so it can't corrupt a real object the way the pre-2026-07-11 legacy synthetic
+bridge would have). Covers `find()`, `find(int)`, `start()`, `start(int)`, `end()`,
+`end(int)`, `group()`, `group(int)` — the same hot loop's `start`/`end`/`group` calls
+dominated the *remaining* per-iteration cost once `find()` alone was fast, so all
+eight are accelerated together. See
+[`docs/internal/fixed-suite-bugs/matcher-find-realjdk-fastpath-FIXED.md`](docs/internal/fixed-suite-bugs/matcher-find-realjdk-fastpath-FIXED.md)
+for the full design (UTF-16↔UTF-8 offset bridging, bail-to-real-bytecode escape hatch,
+and the one documented residual: `hitEnd()`/`requireEnd()`, used almost exclusively by
+`java.util.Scanner`'s stream-refill logic, are a best-effort approximation rather than
+bit-identical to HotSpot's backtracking-engine bookkeeping — verified against a 141-case
+parity battery to have zero effect on `find`/`group`/`start`/`end` correctness).
+`CRATONVM_NATIVE_MATCHER_FIND=0` reverts to real JDK bytecode as the safety net.
+
+The table above uses a freshly-verified **19.1x** (8 ms JDK / 153 ms CratonVM, best of
+5, `bench/StringRegexOnly.java` standalone, `CRATONVM_NATIVE_MATCHER_FIND` at its new
+default) — down from 37.6x, though not yet at the 5-7x range the other constant-factor
+rows sit in. The residual is believed to be the same fixed per-native-call VM dispatch
+tax the HashMap section below documents (each `find`/`group`/`start`/`end` call is a
+separate native dispatch, each paying that tax) rather than anything specific to
+regex — the HashMap section below describes two rounds of fixes already landed for
+exactly that class of overhead (357x isolated → 29.6x), so applying the same
+root-publication/dispatch-residual technique to `Matcher`'s natives is a promising,
+not-yet-attempted follow-up here, rather than a hypothetical one. Like the String/Regex
+row above it, an isolated re-measurement not yet re-run through the exact combined-suite
+harness.
 
 HashMap's slowdown was a *different* shape of bug — flat across sizes (not O(n²)), and
 cdb stack-sampling showed it was NOT allocation/GC-bound (only ~9% of sampled stacks in

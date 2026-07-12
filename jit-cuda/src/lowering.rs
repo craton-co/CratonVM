@@ -168,6 +168,45 @@ fn lower_method_with_pool_impl(
             emitter.clear_back_branch();
             emitter.walk(li.exit_pc, bytes.len(), None)?;
         }
+        LoopShape::Nested(nl) => {
+            // 2-D nested loop: one CUDA thread handles one `(i, j)` pair
+            // from the flattened `R*C`-element iteration space. Both
+            // bounds are resolved (but not yet emitted) before anything
+            // else, exactly like the single-loop path's `locate_bound`.
+            emitter.emit_tid();
+            let outer_bound = match locate_bound(bytes, &nl.outer, sig)? {
+                BoundSource::ParamLen(idx) => emitter.materialise_param_len(idx),
+                BoundSource::Literal(v) => emitter.materialise_literal_s32(v),
+            };
+            let inner_bound = match locate_bound(bytes, &nl.inner, sig)? {
+                BoundSource::ParamLen(idx) => emitter.materialise_param_len(idx),
+                BoundSource::Literal(v) => emitter.materialise_literal_s32(v),
+            };
+            // Pre-loop: any straight-line setup before the outer loop
+            // header (e.g. a local caching `arr.length`), same as the
+            // single-loop pre-loop walk. Neither loop's own guard nor
+            // the inner induction-variable init is ever walked raw —
+            // see `loop_recog::validate_rectangular_nesting`'s doc
+            // comment for why skipping them is sound here.
+            emitter.walk(0, nl.outer.header_pc, None)?;
+            if emitter.stack_len() != 0 {
+                return Err(LoweringError::Internal(format!(
+                    "pre-loop walk left {} operand(s) on the stack",
+                    emitter.stack_len()
+                )));
+            }
+            emitter.emit_nested_loop_guard_and_decompose(&outer_bound, &inner_bound, &nl);
+            // Body — the inner loop's own body; walks until it hits the
+            // back-branch goto to the inner header.
+            emitter.walk(
+                nl.inner.body_start_pc,
+                nl.inner.back_branch_pc + 5,
+                Some(&nl.inner),
+            )?;
+            // Post-loop — anything from the outer loop's exit_pc on.
+            emitter.clear_back_branch();
+            emitter.walk(nl.outer.exit_pc, bytes.len(), None)?;
+        }
     }
 
     emitter.finalize_epilogue();
@@ -1081,6 +1120,18 @@ mod tests {
         not(feature = "gpu-it"),
         ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
     )]
+    fn ptxas_round_trip_nested_loop() {
+        let m = lower_fixture("EligibleNestedLoop", "fill", "([I[I[I)V");
+        ptxas_round_trip(&m.render(), "nested_loop_fill");
+        let m = lower_fixture("EligibleNestedLoop", "addRows", "([I[I[I[I)V");
+        ptxas_round_trip(&m.render(), "nested_loop_add_rows");
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-it"),
+        ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
+    )]
     fn ptxas_round_trip_frem() {
         let m = lower_fixture_with_pool_and_hint(
             "EligibleFrem",
@@ -1332,6 +1383,120 @@ mod tests {
             }
             other => panic!("expected Counted loop, got {other:?}"),
         }
+    }
+
+    // ─────────────── 2-D nested counted loops ────────────────────────
+    //
+    // `EligibleNestedLoop.java` is the dedicated fixture for the
+    // "analyzer/lowering coverage gaps" follow-up's "2-D / nested loops"
+    // item: a strictly nested, rectangular `for (i...) for (j...)` loop
+    // is now recognized and lowered to a flattened-thread-index kernel
+    // (see `loop_recog::NestedLoop` and
+    // `emit::Emitter::emit_nested_loop_guard_and_decompose`). Anything
+    // that isn't exactly that shape (extra code in the outer body, a
+    // non-rectangular/triangular inner bound) still rejects — same
+    // "correctness over coverage" policy as every other loop-shape
+    // guard in this module.
+
+    #[test]
+    fn nested_loop_lowers_to_real_ptx() {
+        let m = lower_fixture("EligibleNestedLoop", "fill", "([I[I[I)V");
+        let text = m.render();
+        assert!(text.contains(".visible .entry EligibleNestedLoop__fill_"));
+        // Flattened total = R * C, guarded, then decomposed.
+        assert!(text.contains("mul.lo.s32"));
+        assert!(text.contains("setp.ge.s32"));
+        assert!(text.contains("L_done"));
+        assert!(text.contains("div.s32"));
+        assert!(text.contains("rem.s32"));
+        // Both bounds are materialised from their respective `_len`
+        // params (`rows` is p1, `cols` is p2).
+        assert!(text.contains("[p1_len]"));
+        assert!(text.contains("[p2_len]"));
+        // The body still lowers normally: one store per thread.
+        assert!(text.contains("st.global.s32"));
+        assert!(text.contains("L_bounds_fail:"));
+    }
+
+    #[test]
+    fn nested_loop_recognizer_records_both_levels() {
+        // White-box: `detect_loop` returns `LoopShape::Nested` with two
+        // independently-canonical `CountedLoop` records.
+        let method = load_method("EligibleNestedLoop", "fill", "([I[I[I)V");
+        let code = method.code().expect("fill has a Code attribute");
+        let shape = super::loop_recog::detect_loop(&code.code, None)
+            .expect("rectangular nested loop must be recognized");
+        match shape {
+            super::loop_recog::LoopShape::Nested(nl) => {
+                assert_eq!(nl.outer.exit_op, 0xA2);
+                assert_eq!(nl.outer.iv_stride, 1);
+                assert_eq!(nl.outer.iv_start, 0);
+                assert_eq!(nl.inner.exit_op, 0xA2);
+                assert_eq!(nl.inner.iv_stride, 1);
+                assert_eq!(nl.inner.iv_start, 0);
+                assert_ne!(
+                    nl.outer.iv_slot, nl.inner.iv_slot,
+                    "outer and inner induction variables must be distinct locals"
+                );
+            }
+            other => panic!("expected Nested loop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_loop_with_array_bound_lowers() {
+        // `addRows`: exercises the ParamLen bound-resolution path for
+        // both the outer (`rows`, p2) and inner (`cols`, p3) loop of a
+        // nested loop with two distinct array sources.
+        let m = lower_fixture("EligibleNestedLoop", "addRows", "([I[I[I[I)V");
+        let text = m.render();
+        assert!(text.contains(".visible .entry EligibleNestedLoop__addRows_"));
+        assert!(text.contains("[p2_len]"));
+        assert!(text.contains("[p3_len]"));
+        assert!(text.contains("mul.lo.s32"));
+        assert!(text.contains("div.s32"));
+        assert!(text.contains("rem.s32"));
+        assert!(text.contains("add.s32"));
+    }
+
+    #[test]
+    fn nested_loop_with_trailing_outer_code_is_rejected() {
+        // The outer body is `{ inner loop; out[i] = i; }` — more than
+        // just the inner loop. The 2-D lowering never walks that
+        // trailing statement, so it must reject rather than drop it.
+        let method = load_method("EligibleNestedLoop", "trailingCode", "([I[I[I)V");
+        let sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("expected trailingCode to be analyzer-eligible, got {v:?}"),
+        };
+        let err = lower_method("EligibleNestedLoop", &method, &sig, 7, 5)
+            .expect_err("nested loop with trailing outer-body code must not lower");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("non-canonical nested loop") || msg.contains("multi-loop"),
+            "expected a non-canonical-nesting rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn triangular_nested_loop_is_rejected() {
+        // `for (j = 0; j < i; j++)` — the inner bound is the outer
+        // induction variable, not an array length. Both loops are
+        // individually canonical, so recognition succeeds, but
+        // `locate_bound` cannot prove the inner bound and lowering must
+        // reject.
+        let method = load_method("EligibleNestedLoop", "triangular", "([I[I)V");
+        let sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("expected triangular to be analyzer-eligible, got {v:?}"),
+        };
+        let err = lower_method("EligibleNestedLoop", &method, &sig, 7, 5)
+            .expect_err("triangular (non-rectangular) nested loop must not lower");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("bound is unknown") || msg.contains("not a recognized"),
+            "expected an unresolvable-bound rejection, got: {msg}"
+        );
     }
 
     // ─── AUDIT 2026-07-11 (constant-start offset): EligibleOffsetLoop ─

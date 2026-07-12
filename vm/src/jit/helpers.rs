@@ -2053,8 +2053,8 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
                     return jit_alloc_oom(
                         vm,
                         &format!(
-                            "Java heap space (new_object class_id {class_id_raw} fields {num_fields})"
-                        ),
+                        "Java heap space (new_object class_id {class_id_raw} fields {num_fields})"
+                    ),
                     )
                 }
             }
@@ -2267,8 +2267,11 @@ pub unsafe extern "C" fn jit_anewarray_object(
     // abort in alloc_young. The `anewarray` codegen's emit_post_alloc_oom_check
     // bails on the 0/null sentinel and routes the OOME through the method's
     // exception table (matching the interpreter's gc_alloc_array).
-    let arr = match heap.try_alloc_array_full(class_id, ArrayElementType::Reference, length as usize)
-    {
+    let arr = match heap.try_alloc_array_full(
+        class_id,
+        ArrayElementType::Reference,
+        length as usize,
+    ) {
         Some(a) => a,
         None => {
             // G1 last-ditch full cycle + one retry (see jit_newarray).
@@ -3865,6 +3868,13 @@ thread_local! {
     /// `valueOf` result in each VM. A new VM pointer invalidates the entry.
     static INTEGER_WRAPPER_CLASS_CACHE: std::cell::Cell<Option<(usize, u32)>> =
         const { std::cell::Cell::new(None) };
+    // Virtual/interface call sites are keyed by their JIT metadata pointer AND
+    // the receiver's actual class id. A static CP owner is not sound here:
+    // an interface method may resolve to a receiver override.
+    static VIRTUAL_DISPATCH_CACHE: std::cell::RefCell<rustc_hash::FxHashMap<(usize, u32), DispatchCache>>
+        = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+    static VIRTUAL_DISPATCH_COUNTER: std::cell::RefCell<rustc_hash::FxHashMap<(usize, u32), u32>>
+        = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 }
 
 // ===========================================================================
@@ -4379,6 +4389,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     let redefine_jit_quiesced = crate::classloading::any_class_redefined();
     if redefine_jit_quiesced {
         DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+        VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
     }
     // C1→C2 supersede: the dispatch cache holds raw entry pointers captured
     // at first resolution. When the background worker publishes a replacing
@@ -4392,9 +4403,78 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             if e.get() != epoch {
                 e.set(epoch);
                 DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+                VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
             }
         });
     }
+
+    // A JIT call-site's CP owner is often an interface. Resolve once on the
+    // actual receiver class, then cache and directly enter the compiled
+    // concrete body. The generic helper otherwise re-enters invoke_virtual on
+    // every element access, rebuilding conservative JIT roots each time.
+    if !statically_bound && !redefine_jit_quiesced && !args_slice.is_empty() {
+        let raw = args_slice[0] as u64;
+        if raw != 0 && (raw & 7) == 0 && raw < (1u64 << 48) {
+            let receiver = ObjectRef::from_raw(raw as usize as *mut u8);
+            let receiver_cid = vm.heap.class_id_of(receiver);
+            let target = virtual_dispatch_target_for_receiver(vm, receiver, info);
+            let globally_named = target.cacheable_receiver
+                && vm
+                    .class_manager
+                    .read()
+                    .get_loaded_class_id(&target.class_name)
+                    == Some(receiver_cid);
+            if globally_named && !mic_callee_has_exception_table(vm, receiver_cid, info) {
+                let key = (info_key, receiver_cid.as_u32());
+                if let Some(cached) = VIRTUAL_DISPATCH_CACHE
+                    .with(|dc| dc.borrow().get(&key).map(|c| (c.entry, c.needs_context)))
+                {
+                    if let Some(rc) =
+                        try_call_compiled_entry_reentrant(cached.0, cached.1, vm_ptr, args_slice)
+                    {
+                        return route_implicit_exc_through_callee(vm, info, args_slice, rc);
+                    }
+                } else {
+                    let should_compile = VIRTUAL_DISPATCH_COUNTER.with(|dc| {
+                        let mut counts = dc.borrow_mut();
+                        let count = counts.entry(key).or_insert(0);
+                        *count += 1;
+                        *count == crate::runtime::env_cache::jit_invocation_threshold()
+                    });
+                    if should_compile {
+                        if let Some((entry, needs_context)) =
+                            crate::runtime::interpreter::try_jit_compile_callee(
+                                vm,
+                                &target.class_name,
+                                info.method_name,
+                                info.descriptor,
+                                true,
+                            )
+                        {
+                            VIRTUAL_DISPATCH_CACHE.with(|dc| {
+                                dc.borrow_mut().insert(
+                                    key,
+                                    DispatchCache {
+                                        entry,
+                                        needs_context,
+                                    },
+                                );
+                            });
+                            if let Some(rc) = try_call_compiled_entry_reentrant(
+                                entry,
+                                needs_context,
+                                vm_ptr,
+                                args_slice,
+                            ) {
+                                return route_implicit_exc_through_callee(vm, info, args_slice, rc);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let cached_entry = if statically_bound && !redefine_jit_quiesced {
         DISPATCH_CACHE.with(|dc| {
             dc.borrow()
@@ -4605,6 +4685,29 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // Lambda proxies are synthetic and therefore cannot participate in the
+    // class-store MIC. Give the erased primitive adapter its own receiver-guarded
+    // direct path before allocating decoded Values for the generic fallback.
+    if matches!(info.invoke_kind, 0 | 2) && args_slice.len() == 2 {
+        if let Some(proxy) = vm.heap.is_object_address(args_slice[0] as usize) {
+            let proxy_class_id = vm.heap.class_id_of(proxy);
+            if vm.lambda_proxies.read().contains_key(&proxy_class_id) {
+                match try_fast_lambda_int_to_double_apply(
+                    vm,
+                    thread,
+                    proxy,
+                    proxy_class_id,
+                    info,
+                    args_slice,
+                ) {
+                    Ok(Some(result)) => return result,
+                    Ok(None) => {}
+                    Err(error) => return handle_jit_dispatch_error(vm, thread, error, info),
                 }
             }
         }
@@ -4951,6 +5054,194 @@ fn call_hashmap_native_raw(
     })
 }
 
+/// Specialize a lambda proxy's erased `Function.apply(Object)` call when its
+/// implementation is a concrete `(int) -> double` virtual/interface target.
+///
+/// The generic lambda route allocates vectors, reparses descriptors, and builds
+/// an interpreter frame for each application. TDigest invokes this shape in
+/// its quantile/cdf numeric kernels, so dispatch directly to the already-JITed
+/// receiver method and only retain the Java-mandated boxed Double result.
+// SAFETY: called by the JIT peephole for Dist private numeric kernels.
+pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, index: i64) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    jit_safepoint_flush_satb(vm_ptr);
+    let vm = &*(vm_ptr as *const SharedVm);
+    let Some(proxy) = vm.heap.is_object_address(proxy_raw as usize) else {
+        return f64::NAN.to_bits() as i64;
+    };
+    let proxy_class_id = vm.heap.class_id_of(proxy);
+    let call_site = match vm.lambda_proxies.read().get(&proxy_class_id).cloned() {
+        Some(call_site) => call_site,
+        None => return f64::NAN.to_bits() as i64,
+    };
+    if call_site.functional_interface.as_ref() != "java/util/function/Function"
+        || call_site.sam_method_name.as_ref() != "apply"
+        || call_site.sam_descriptor.as_ref() != "(Ljava/lang/Object;)Ljava/lang/Object;"
+        || call_site.capture_types.len() != 1
+        || call_site.impl_handle.member_name.as_ref() != "get"
+        || call_site.impl_handle.descriptor.as_ref() != "(I)D"
+        || !matches!(
+            call_site.impl_handle.kind,
+            crate::classloading::resolution::MethodHandleKind::InvokeVirtual
+                | crate::classloading::resolution::MethodHandleKind::InvokeInterface
+        )
+    {
+        return f64::NAN.to_bits() as i64;
+    }
+    let receiver = match vm.heap.get_field(proxy, 0) {
+        Value::Object(Some(receiver)) => receiver,
+        _ => return f64::NAN.to_bits() as i64,
+    };
+    let receiver_class_id = vm.heap.class_id_of(receiver);
+    let class_name = match vm.class_manager.read().get_class(receiver_class_id) {
+        Some(class) => class.name.clone(),
+        None => return f64::NAN.to_bits() as i64,
+    };
+    let mut compiled = {
+        let cache = vm.jit_cache.read();
+        cache.get(&class_name, "get", "(I)D")
+    };
+    if compiled.is_none() {
+        // This direct scalar route bypasses the normal bytecode invocation
+        // counter, so publish the receiver-specialized getter once here.
+        let _ = crate::runtime::interpreter::try_jit_compile_callee(
+            vm,
+            &class_name,
+            "get",
+            "(I)D",
+            true,
+        );
+        compiled = vm.jit_cache.read().get(&class_name, "get", "(I)D");
+    }
+    if let Some(compiled) = compiled {
+        let args = [receiver.as_ptr() as i64, index as i32 as i64];
+        // The scalar helper is entered by a JIT caller that already owns the
+        // active-root chain entry. Mirror the established virtual-dispatch
+        // cache and re-enter this leaf directly: a second guard would mutate
+        // that chain (and invalidate its scan cache) for every element.
+        if let Some(result) = try_call_compiled_entry_reentrant(
+            compiled.entry_ptr() as usize,
+            compiled.needs_context(),
+            vm_ptr,
+            &args,
+        ) {
+            return result;
+        }
+    }
+    let Some((thread, _guard)) = jit_thread_mut() else {
+        return f64::NAN.to_bits() as i64;
+    };
+    match crate::vm::invoke_on_class_shared(
+        vm,
+        thread,
+        receiver_class_id,
+        "get",
+        "(I)D",
+        &[Value::Object(Some(receiver)), Value::Int(index as i32)],
+    ) {
+        Ok(Some(Value::Double(value))) => value.to_bits() as i64,
+        _ => f64::NAN.to_bits() as i64,
+    }
+}
+
+unsafe fn try_fast_lambda_int_to_double_apply(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    proxy: ObjectRef,
+    proxy_class_id: ClassId,
+    info: &JitInvokeInfo,
+    args: &[i64],
+) -> Result<Option<i64>, crate::error::MethodCallFailed> {
+    if info.method_name != "apply"
+        || info.descriptor != "(Ljava/lang/Object;)Ljava/lang/Object;"
+        || args.len() != 2
+    {
+        return Ok(None);
+    }
+    let call_site = match vm.lambda_proxies.read().get(&proxy_class_id).cloned() {
+        Some(call_site) => call_site,
+        None => return Ok(None),
+    };
+    if call_site.sam_method_name.as_ref() != "apply"
+        || call_site.sam_descriptor.as_ref() != "(Ljava/lang/Object;)Ljava/lang/Object;"
+        || call_site.capture_types.len() != 1
+        || call_site.impl_handle.member_name.as_ref() != "get"
+        || call_site.impl_handle.descriptor.as_ref() != "(I)D"
+        || !matches!(
+            call_site.impl_handle.kind,
+            crate::classloading::resolution::MethodHandleKind::InvokeVirtual
+                | crate::classloading::resolution::MethodHandleKind::InvokeInterface
+        )
+    {
+        return Ok(None);
+    }
+    let index = match vm.heap.is_object_address(args[1] as usize) {
+        Some(index_box) => match vm.heap.get_field(index_box, 0) {
+            Value::Int(index) => index,
+            _ => return Ok(None),
+        },
+        None => return Ok(None),
+    };
+    let receiver = match vm.heap.get_field(proxy, 0) {
+        Value::Object(Some(receiver)) => receiver,
+        _ => return Ok(None),
+    };
+    let receiver_class_id = vm.heap.class_id_of(receiver);
+    let class_name = match vm.class_manager.read().get_class(receiver_class_id) {
+        Some(class) => class.name.clone(),
+        None => return Ok(None),
+    };
+    let compiled = {
+        let cache = vm.jit_cache.read();
+        cache.get(&class_name, "get", "(I)D")
+    };
+    let Some(compiled) = compiled else {
+        return Ok(None);
+    };
+    // A compiled leaf may itself contain a safe dispatch helper. That is not a
+    // reason to discard a receiver-guarded entry: JitEntryGuard covers its
+    // roots and the nested helper preserves normal Java dispatch semantics.
+    let jit_args = [receiver.as_ptr() as i64, index as i64];
+    let vm_ptr = vm as *const _ as i64;
+    let _guard = crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
+    let bits = if compiled.needs_context() {
+        compiled.try_call_with_context(vm_ptr, &jit_args)
+    } else {
+        compiled.try_call(&jit_args)
+    };
+    let value = match bits {
+        Ok(bits) => f64::from_bits(bits as u64),
+        Err(_) => return Ok(None),
+    };
+    let box_args = [value.to_bits() as i64];
+    if let Some((entry, needs_context)) = crate::runtime::interpreter::try_jit_compile_callee(
+        vm,
+        "java/lang/Double",
+        "valueOf",
+        "(D)Ljava/lang/Double;",
+        true,
+    ) {
+        if let Some(boxed) =
+            try_call_compiled_entry_reentrant(entry, needs_context, vm_ptr, &box_args)
+        {
+            return Ok(Some(boxed));
+        }
+    }
+    let boxed = crate::vm::invoke_or_native(
+        vm,
+        thread,
+        "java/lang/Double",
+        "valueOf",
+        "(D)Ljava/lang/Double;",
+        &[Value::Double(value)],
+    )?;
+    Ok(Some(match boxed {
+        Some(Value::Object(Some(obj))) => obj.as_ptr() as i64,
+        Some(Value::Object(None)) | None => 0,
+        _ => return Ok(None),
+    }))
+}
+
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
 // info_ptr must point to a live JitInvokeInfo. args_ptr/num_args form a valid i64 slice.
 // mic_ptr must point to a live JitMICSlot used for monomorphic inline cache dispatch.
@@ -5136,6 +5427,18 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // invokeinterface route: dispatch through the lambda's SAM impl_handle.
     if vm.lambda_proxies.read().contains_key(&receiver_class_id) {
         mic_prof::bump(&mic_prof::MIC_LAMBDA);
+        match try_fast_lambda_int_to_double_apply(
+            vm,
+            thread,
+            receiver_ref,
+            receiver_class_id,
+            info,
+            args_slice,
+        ) {
+            Ok(Some(result)) => return result,
+            Ok(None) => {}
+            Err(error) => return handle_jit_dispatch_error(vm, thread, error, info),
+        }
         let values = decode_values();
         let rest: Vec<Value> = values[1..].to_vec();
         match crate::runtime::interpreter::try_lambda_dispatch(
@@ -7254,6 +7557,7 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         throw_arithmetic: jit_throw_arithmetic as *const () as usize,
         invoke_dispatch: jit_invoke_dispatch as *const () as usize,
         invoke_virtual_mic: jit_invoke_virtual_mic as *const () as usize,
+        lambda_int_to_double: jit_lambda_int_to_double as *const () as usize,
         write_barrier: jit_write_barrier as *const () as usize,
         // Round-7 fix (CRIT, UAF in JIT): SATB pre-write barrier so JIT-
         // overwritten references are logged before the concurrent marker

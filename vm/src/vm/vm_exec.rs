@@ -12923,6 +12923,33 @@ fn invoke_on_class_shared_inner(
                                 | "contains"
                                 | "split"
                             ))
+                        // `CRATONVM_NATIVE_MATCHER_FIND`: real-JDK-layout
+                        // `Matcher.find()`/`find(int)`/`start`/`end`/`group`
+                        // fast path — companion entry to the one in
+                        // `force_native_over_real_jdk_bytecode` (interpreter.rs),
+                        // kept in sync with it the same way the `String` block
+                        // just above mirrors that gate for `substring` et al.
+                        // Concrete (non-`ACC_NATIVE`) JDK bytecode methods, so
+                        // without an entry here the COLD (first, per call
+                        // site, before the vtable cache warms) dispatch would
+                        // run interpreted bytecode instead of the registered
+                        // `NativeKind::Intrinsic` native — correct either way,
+                        // just slower for that one call. See
+                        // `native_matcher_find_realjdk`'s module banner in
+                        // native-builtins/src/lib.rs.
+                        || (class_name == "java/util/regex/Matcher"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("find", "()Z")
+                                    | ("find", "(I)Z")
+                                    | ("start", "()I")
+                                    | ("start", "(I)I")
+                                    | ("end", "()I")
+                                    | ("end", "(I)I")
+                                    | ("group", "()Ljava/lang/String;")
+                                    | ("group", "(I)Ljava/lang/String;")
+                            )
+                            && crate::runtime::env_cache::native_matcher_find())
                         // Wave 3 Task C: NIO Selector — the real-JDK
                         // SelectorImpl bytecode walks `keys` / `selectedKeys`
                         // HashMaps that we don't populate (we don't run
@@ -14174,6 +14201,58 @@ fn invoke_on_class_shared_inner(
                         {
                             native = true;
                             declaring_id_out = class_id;
+                        }
+                    }
+                    // ES-SEGALLOC: the `class_id != declaring_id` gate above only
+                    // fires when the earlier C25 retarget (top of
+                    // `invoke_on_class_shared_inner`) already re-pointed `class_id`
+                    // at the receiver's own runtime class. That retarget requires
+                    // `recv_is_concrete` (`!c.is_interface()`) -- a real invariant for
+                    // ordinary Java objects, whose runtime class is never literally an
+                    // interface. CratonVM's own synthetic factories break that
+                    // invariant: `Arena.ofAuto()/ofConfined()/ofShared()/global()`
+                    // (native-builtins/src/panama.rs::register_pe_arena) allocate
+                    // their return value under the literal interface name
+                    // `java/lang/foreign/Arena`, so `recv_is_concrete` is false and
+                    // `class_id` never leaves `java/lang/foreign/SegmentAllocator`.
+                    // A default method inherited from `SegmentAllocator` (e.g.
+                    // `allocate(MemoryLayout)` / `allocate(long)`, both real-JDK
+                    // bytecode) then does `this.allocate(byteSize, byteAlignment)` --
+                    // an `invokeinterface SegmentAllocator.allocate(JJ)` whose
+                    // `class_id == declaring_id` (both resolve to the abstract
+                    // `SegmentAllocator` declaration), so the block above never even
+                    // looks at Arena's native registry and this throws
+                    // `AbstractMethodError: SegmentAllocator.allocate(JJ)... has no
+                    // Code attribute` instead of dispatching to the already-registered
+                    // `Arena.allocate(JJ)` native. Recover the receiver's *actual*
+                    // runtime class directly from `args[0]` (independent of whether
+                    // the interface-exclusion above retargeted `class_id`) and check
+                    // its native registry too -- this generalises the rescue to any
+                    // interface-stamped synthetic receiver, not just concrete ones.
+                    if !native && method.is_abstract() {
+                        let recv_actual_cid = args.first().and_then(|v| {
+                            if let Value::Object(Some(o)) = v {
+                                let rc = shared.heap.class_id_of(*o);
+                                if rc != ClassId::new(0) && rc != declaring_id {
+                                    Some(rc)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(rc) = recv_actual_cid {
+                            let recv_name = store.get(rc).map(|c| &*c.name).unwrap_or("");
+                            if !recv_name.is_empty()
+                                && shared
+                                    .native_methods
+                                    .find(recv_name, method_name, descriptor)
+                                    .is_some()
+                            {
+                                native = true;
+                                declaring_id_out = rc;
+                            }
                         }
                     }
                     if !native

@@ -1034,6 +1034,147 @@ mod tests {
         release_submission(handle);
     }
 
+    // ── Known-issues followups #3: completion reaper ──────────────────
+    //
+    // These test the reaper mechanism directly against hand-built
+    // `StreamSubmission`s (same rationale as the `poll_submission_status`
+    // tests above: no real `Stream`/`Event` on this no-GPU dev box) —
+    // `stream`/`event` stay `None`, so `finalize_submission` skips the
+    // event-sync step and goes straight to draining `writebacks` and
+    // transitioning status, exactly as it would for a real submission
+    // whose event has already fired. `dispatch_async`'s own wiring
+    // (`ensure_completion_reaper_started` + the host callback calling
+    // `enqueue_completion`) needs a live CUDA context to reach its
+    // success path at all and is validated on GPU hardware instead
+    // (see `docs/known-issues/gpu-offload-followups-20260711.md`).
+
+    #[test]
+    fn reaper_finalizes_submission_without_any_poll_call() {
+        // The whole point of this followup: completion happens with
+        // zero calls to `poll_submission_status` / `finalize_submission`
+        // / `get()` — only `enqueue_completion`, exactly like the host
+        // callback in `dispatch_async` performs on its own.
+        let vm = crate::vm::Vm::new(VmConfig::default());
+        let weak_vm = vm
+            .shared
+            .self_arc
+            .read()
+            .as_ref()
+            .cloned()
+            .expect("Vm::new populates self_arc");
+
+        let handle = NEXT_SUBMISSION_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sub = std::sync::Arc::new(StreamSubmission {
+            handle,
+            stream: None,
+            event: None,
+            status: parking_lot::Mutex::new(SubmissionStatus::Running),
+            finalize: parking_lot::Mutex::new(Some(FinalizeState {
+                writebacks: Vec::new(),
+                _gc_critical: GcCriticalGuard::acquire(),
+            })),
+            device_done: std::sync::atomic::AtomicBool::new(false),
+        });
+        register_submission(sub.clone());
+
+        ensure_completion_reaper_started();
+        enqueue_completion(handle, weak_vm);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !matches!(&*sub.status.lock(), SubmissionStatus::Running) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "completion reaper did not finalize handle={handle} within 5s",
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            matches!(&*sub.status.lock(), SubmissionStatus::Completed { .. }),
+            "expected Completed, got {:?}",
+            std::mem::discriminant(&*sub.status.lock()),
+        );
+
+        release_submission(handle);
+    }
+
+    // `finalize_enqueued_handle` (the per-handle work
+    // `completion_reaper_loop` does, factored out — see its doc
+    // comment) is tested directly here rather than through the
+    // process-global reaper thread: `ensure_completion_reaper_started`
+    // is `Once`-guarded for the whole test binary process, so only
+    // ONE test may ever call it (that's
+    // `reaper_finalizes_submission_without_any_poll_call` below) — a
+    // second test racing it for which `weak_vm` "wins" would be
+    // order-dependent and flaky.
+
+    #[test]
+    fn finalize_enqueued_handle_upgrades_and_finalizes() {
+        let vm = crate::vm::Vm::new(VmConfig::default());
+        let weak_vm = vm
+            .shared
+            .self_arc
+            .read()
+            .as_ref()
+            .cloned()
+            .expect("Vm::new populates self_arc");
+
+        let handle = NEXT_SUBMISSION_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sub = std::sync::Arc::new(StreamSubmission {
+            handle,
+            stream: None,
+            event: None,
+            status: parking_lot::Mutex::new(SubmissionStatus::Running),
+            finalize: parking_lot::Mutex::new(Some(FinalizeState {
+                writebacks: Vec::new(),
+                _gc_critical: GcCriticalGuard::acquire(),
+            })),
+            device_done: std::sync::atomic::AtomicBool::new(false),
+        });
+        register_submission(sub.clone());
+
+        finalize_enqueued_handle(&weak_vm, handle);
+
+        assert!(matches!(&*sub.status.lock(), SubmissionStatus::Completed { .. }));
+        release_submission(handle);
+    }
+
+    #[test]
+    fn finalize_enqueued_handle_noop_when_vm_dropped() {
+        // A `SharedVm` built directly (not via `Vm::new`, as most of
+        // this file's own tests do) never populates `self_arc`, so
+        // `Weak::default()` is what `dispatch_method_from_native_on_stream`
+        // would pass through. `finalize_enqueued_handle` must degrade
+        // to a no-op in that case rather than panicking — the
+        // existing poll-based path (`poll_submission_status`, `get()`)
+        // is what such a caller relies on instead. Also covers the
+        // genuine "VM torn down mid-flight" case, since an upgrade
+        // failure looks identical either way.
+        let weak_vm: std::sync::Weak<crate::vm::SharedVm> = std::sync::Weak::default();
+        assert!(weak_vm.upgrade().is_none());
+
+        let handle = NEXT_SUBMISSION_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sub = std::sync::Arc::new(StreamSubmission {
+            handle,
+            stream: None,
+            event: None,
+            status: parking_lot::Mutex::new(SubmissionStatus::Running),
+            finalize: parking_lot::Mutex::new(Some(FinalizeState {
+                writebacks: Vec::new(),
+                _gc_critical: GcCriticalGuard::acquire(),
+            })),
+            device_done: std::sync::atomic::AtomicBool::new(false),
+        });
+        register_submission(sub.clone());
+
+        finalize_enqueued_handle(&weak_vm, handle);
+
+        assert!(matches!(&*sub.status.lock(), SubmissionStatus::Running));
+        release_submission(handle);
+    }
+
     // ── GpuStream affinity — stream registry ─────────────────────────
     //
     // Exercise `OffloadCache::stream_create` / `stream_release` /
@@ -1566,6 +1707,26 @@ impl OffloadCache {
     /// `max(n, 2^20)`. `runtime_work > 0` now wins outright; `estimated_work`
     /// is consulted only for the `0`-sentinel scalar-only case, where
     /// there is no array length to derive a grid from.
+    ///
+    /// `finalize_state`, if present, is attached to the returned
+    /// submission's [`StreamSubmission::finalize`] *before* the
+    /// completion host callback is registered (see step 6/7 below) —
+    /// this ordering is load-bearing, not incidental: known-issues
+    /// followups #3's completion reaper can run `finalize_submission`
+    /// as soon as the callback fires, and if that fired before
+    /// `finalize` were populated it would find `None` and give up
+    /// without ever completing the submission. `None` means "no
+    /// writebacks to drain" (a caller with nothing to finalize, or a
+    /// test harness).
+    ///
+    /// `weak_vm` is what the completion reaper (spawned lazily, at
+    /// most once per process — see [`ensure_completion_reaper_started`])
+    /// upgrades to call `finalize_submission` from its own thread,
+    /// off the caller entirely. A `Weak::default()` (unpopulated
+    /// `SharedVm::self_arc`, true for any `SharedVm` not constructed
+    /// via `Vm::new`) degrades gracefully: the reaper's `upgrade()`
+    /// always fails, and the existing poll-based completion path
+    /// (`poll_submission_status`, `get()`) remains fully correct.
     pub fn dispatch_async(
         &self,
         stream: std::sync::Arc<Stream>,
@@ -1573,6 +1734,8 @@ impl OffloadCache {
         method_index: u16,
         args: cuda_bridge::KernelArgs,
         runtime_work: u32,
+        finalize_state: Option<FinalizeState>,
+        weak_vm: std::sync::Weak<crate::vm::SharedVm>,
     ) -> std::sync::Arc<StreamSubmission> {
         let handle = NEXT_SUBMISSION_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -1677,37 +1840,52 @@ impl OffloadCache {
 
         // 6. Build the Running submission. The status flips to
         //    Completed inside `finalize_submission` after the event
-        //    fires and the writebacks complete. Callers attach the
-        //    writebacks + token via `attach_finalize_state` before
-        //    registering the submission.
+        //    fires and the writebacks complete.
         let submission = make_with_event(SubmissionStatus::Running, Some(event));
 
-        // 7. Known-issues followups #3 — best-effort non-blocking
-        //    completion fast path. Register a host callback right
-        //    after the event so `poll_submission_status` can answer
-        //    `isDone()` without a driver round trip once the
-        //    callback fires. This is purely an optimization: if
-        //    registration fails for any reason, `poll_submission_status`
-        //    falls back to `Event::query`, which is always correct on
-        //    its own.
+        // 6b. Attach `finalize_state` BEFORE registering the host
+        //     callback below (step 7) — see the ordering note on this
+        //     function's doc comment. Both stub mode (where
+        //     `add_host_callback` runs the closure synchronously,
+        //     before it even returns) and real hardware (where the
+        //     kernel can in principle complete before this host
+        //     thread's next instruction runs) can otherwise race the
+        //     callback against this attach.
+        *submission.finalize.lock() = finalize_state;
+
+        // 7. Known-issues followups #3 — start (idempotent) the
+        //    process-wide completion reaper, then register a host
+        //    callback that both flags `device_done` (the existing
+        //    poll-fast-path optimization for `isDone()`/`getNow()`)
+        //    and enqueues this submission's handle onto the reaper so
+        //    it gets finalized on its own, with no Java call required.
+        //    Registration failing for any reason is non-fatal:
+        //    `poll_submission_status` falls back to `Event::query`,
+        //    which is always correct on its own, and a still-`Running`
+        //    submission just waits for an explicit `get()`/`isDone()`
+        //    exactly like before this followup landed.
         //
-        //    The closure clones the submission's `Arc` and touches
-        //    nothing else — `cuLaunchHostFunc` callbacks run on a
-        //    driver-owned thread and must never re-enter the CUDA
-        //    driver (no `Stream`/`Event`/`DeviceBuffer` calls), and a
-        //    plain `AtomicBool::store` is the only thing that's safe
-        //    to do there. Keeping the submission alive via the clone
-        //    until the callback fires is a side effect, not a goal,
-        //    but it is a benign one: it means the submission (and any
-        //    device buffers referenced by its pending `FinalizeState`)
-        //    can't be freed out from under a kernel that's still
-        //    in-flight on the device, even if every other reference
-        //    (registry + caller) is dropped first.
+        //    The closure clones the submission's `Arc` and otherwise
+        //    only touches `AtomicBool::store` + `enqueue_completion`
+        //    (a plain mutex/condvar push, no CUDA driver call) —
+        //    `cuLaunchHostFunc` callbacks run on a driver-owned thread
+        //    and must never re-enter the CUDA driver (no
+        //    `Stream`/`Event`/`DeviceBuffer` calls) or block for long.
+        //    Keeping the submission alive via the clone until the
+        //    callback fires is a side effect, not a goal, but it is a
+        //    benign one: it means the submission (and any device
+        //    buffers referenced by its pending `FinalizeState`) can't
+        //    be freed out from under a kernel that's still in-flight
+        //    on the device, even if every other reference (registry +
+        //    caller) is dropped first.
+        ensure_completion_reaper_started();
         let cb_submission = submission.clone();
+        let cb_weak_vm = weak_vm;
         if let Err(e) = stream.add_host_callback(Box::new(move || {
             cb_submission
                 .device_done
                 .store(true, std::sync::atomic::Ordering::Release);
+            enqueue_completion(cb_submission.handle, cb_weak_vm);
         })) {
             tracing::debug!(
                 "gpu offload: add_host_callback registration failed ({e}); \
@@ -1771,6 +1949,181 @@ pub fn lookup_submission(handle: u64) -> Option<std::sync::Arc<StreamSubmission>
 #[cfg(feature = "gpu-offload")]
 pub fn release_submission(handle: u64) {
     submissions().write().remove(&handle);
+}
+
+// ── Known-issues followups #3: spontaneous completion reaper ─────────
+//
+// The missing half of the async completion model: until now, nothing
+// drove a submission to `Completed`/`Failed` except a Java thread
+// calling `get()` / `isDone()` / `getNow()`. This background thread
+// is what the `cuLaunchHostFunc` callback registered in
+// `dispatch_async` wakes up — it runs `finalize_submission` itself,
+// off any Java thread, as soon as the device reports a kernel done.
+//
+// Modelled directly on `jit::tiered::ensure_background_compiler` /
+// `BACKGROUND_COMPILER` (`jit/src/tiered.rs`): a single process-wide
+// worker, started at most once via `Once`, parked in a static so it
+// isn't dropped. And on `interpreter.rs`'s
+// `ensure_bg_compiler_started`/`background_compile_task`: the worker
+// captures a `Weak<SharedVm>` (never an `Arc`, so it cannot keep the
+// VM alive past teardown) and no-ops when `upgrade()` fails.
+//
+// Deliberately NOT registered with the thread registry / STW barrier
+// — same reasoning as the background JIT compiler: this thread never
+// holds a managed `ObjectRef` across a GC point on its own native
+// stack. Its only heap touch is the bounded call into
+// `finalize_submission`, which already uses the cross-thread-safe
+// `GcCriticalGuard`/`GPU_CRITICAL_COUNT` gate built specifically so
+// finalization "may run on a different thread from dispatch" (see
+// `FinalizeState`'s doc comment above).
+
+// Flat top-level statics rather than one struct behind a single
+// `Mutex` — deliberately. An earlier version of this design put
+// `queue`/`wake`/`shutdown` behind one outer `Mutex<Option<..>>` that
+// `completion_reaper_loop` held for the *entire* condvar wait
+// (`parking_lot::Condvar::wait` only releases the *inner* lock it's
+// given, not any other lock the caller happens to be holding). That
+// deadlocks `enqueue_completion` forever against a parked reaper: the
+// reaper holds the outer lock while parked, so the enqueuer's own
+// attempt to take that same outer lock never succeeds, so the
+// `notify_one` that would wake the reaper never runs. Independent
+// statics sidestep the issue entirely — `REAPER_QUEUE`'s mutex is the
+// only lock the condvar wait ever touches.
+//
+// The queue holds a `(handle, weak_vm)` pair per entry, NOT a bare
+// handle — an earlier version captured a single `Weak<SharedVm>` once,
+// at thread-spawn time, and reused it for every drained handle for the
+// rest of the process's life. That is correct for a single
+// long-lived production VM (matching `SUBMISSIONS`/
+// `NEXT_SUBMISSION_HANDLE`, which really are process-global-for-life
+// data), but it is WRONG the moment more than one `SharedVm` exists
+// over the process's lifetime — e.g. an integration-test binary that
+// constructs and drops a fresh `Vm::new()` per test. Real-hardware
+// validation caught this: with several such tests running in the same
+// process, the reaper's captured `weak_vm` belonged to whichever
+// test's dispatch happened to start the reaper thread first; once
+// *that* test's `Vm` was dropped, `upgrade()` failed forever after —
+// silently stranding every later test's (otherwise perfectly valid)
+// submissions in `Running`. Carrying the correct `Weak<SharedVm>`
+// alongside each queued handle instead of pinning one to the thread's
+// whole lifetime fixes this for any number of concurrent or
+// sequential `SharedVm` instances.
+#[cfg(feature = "gpu-offload")]
+static REAPER_QUEUE: parking_lot::Mutex<
+    std::collections::VecDeque<(u64, std::sync::Weak<crate::vm::SharedVm>)>,
+> = parking_lot::Mutex::new(std::collections::VecDeque::new());
+#[cfg(feature = "gpu-offload")]
+static REAPER_WAKE: parking_lot::Condvar = parking_lot::Condvar::new();
+#[cfg(feature = "gpu-offload")]
+static REAPER_SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "gpu-offload")]
+static REAPER_HANDLE: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>> =
+    parking_lot::Mutex::new(None);
+#[cfg(feature = "gpu-offload")]
+static COMPLETION_REAPER_INIT: std::sync::Once = std::sync::Once::new();
+
+/// Idempotently start the GPU completion reaper thread. Safe to call
+/// on every `dispatch_async` — the spawn happens at most once
+/// (guarded by [`Once`](std::sync::Once)). Takes no `SharedVm`
+/// reference: the worker is VM-agnostic, since each queued handle
+/// carries its own `Weak<SharedVm>` (see the doc comment on
+/// `REAPER_QUEUE` for why that matters).
+#[cfg(feature = "gpu-offload")]
+fn ensure_completion_reaper_started() {
+    COMPLETION_REAPER_INIT.call_once(|| {
+        match std::thread::Builder::new()
+            .name("cratonvm-gpu-completion-reaper".to_string())
+            .spawn(completion_reaper_loop)
+        {
+            Ok(h) => *REAPER_HANDLE.lock() = Some(h),
+            Err(e) => {
+                tracing::debug!(
+                    "gpu offload: failed to spawn completion reaper thread ({e}); \
+                     falling back to poll-only completion",
+                );
+            }
+        }
+    });
+}
+
+/// Body of the completion reaper thread. Blocks on `REAPER_WAKE` (no
+/// busy-polling); for each drained `(handle, weak_vm)` pair, upgrades
+/// that entry's own `weak_vm` and runs the same [`finalize_submission`]
+/// work `get()` would have — off the mutator, with no Java thread
+/// involved. `finalize_submission`'s own errors are already recorded
+/// on `StreamSubmission::status`; there is nothing further to do with
+/// its `Result` here.
+#[cfg(feature = "gpu-offload")]
+fn completion_reaper_loop() {
+    loop {
+        let item = {
+            let mut queue = REAPER_QUEUE.lock();
+            loop {
+                if let Some(item) = queue.pop_front() {
+                    break Some(item);
+                }
+                if REAPER_SHUTDOWN.load(std::sync::atomic::Ordering::Acquire) {
+                    break None;
+                }
+                // `Condvar::wait` atomically releases `queue` while
+                // parked and re-acquires it on wake, so a
+                // `notify_one` from `enqueue_completion` landing
+                // between the empty-check above and this wait can
+                // never be missed once we're inside `wait`.
+                REAPER_WAKE.wait(&mut queue);
+            }
+        };
+        let (handle, weak_vm) = match item {
+            Some(item) => item,
+            None => return,
+        };
+        finalize_enqueued_handle(&weak_vm, handle);
+    }
+}
+
+/// Attempt to finalize one reaper-queued handle: upgrade `weak_vm`
+/// and, if that succeeds and the handle is still registered, run
+/// [`finalize_submission`]. A failed upgrade (VM torn down, or
+/// `self_arc` was never populated) is a silent no-op — the
+/// submission is simply left for the existing poll-based path
+/// (`poll_submission_status`, `get()`) to finalize later, exactly as
+/// it always has. Keeping the caller (`completion_reaper_loop`)
+/// draining rather than exiting on a failed upgrade avoids leaking
+/// the thread's role as the queue's sole consumer for as long as the
+/// process runs multiple short-lived VMs (tests).
+///
+/// Factored out of `completion_reaper_loop`'s body so both the
+/// VM-alive and VM-torn-down paths are unit-testable directly,
+/// without spawning a thread or touching the process-global reaper
+/// statics (which, being `Once`-guarded singletons, can only be
+/// exercised by one test in the whole binary — see
+/// `reaper_finalizes_submission_without_any_poll_call`).
+#[cfg(feature = "gpu-offload")]
+fn finalize_enqueued_handle(weak_vm: &std::sync::Weak<crate::vm::SharedVm>, handle: u64) {
+    let Some(shared) = weak_vm.upgrade() else {
+        return;
+    };
+    if let Some(sub) = lookup_submission(handle) {
+        let _ = finalize_submission(&shared, &sub);
+    }
+}
+
+/// Push `(handle, weak_vm)` onto the reaper's work queue and wake it.
+/// `weak_vm` travels with the handle rather than being fixed once for
+/// the reaper thread's whole life — see the doc comment on
+/// `REAPER_QUEUE` for why that distinction matters. Called from the
+/// `cuLaunchHostFunc` callback registered in `dispatch_async`, so this
+/// must stay cheap and must never call back into the CUDA driver: a
+/// `parking_lot::Mutex` lock + `VecDeque` push + `Condvar::notify_one`
+/// is the same class of "plain host memory operation" the callback
+/// already performs for `device_done`. A push before the reaper thread
+/// exists yet (a caller that races `ensure_completion_reaper_started`'s
+/// spawn) is harmless — the entry just sits in the queue until the
+/// worker starts draining it.
+#[cfg(feature = "gpu-offload")]
+fn enqueue_completion(handle: u64, weak_vm: std::sync::Weak<crate::vm::SharedVm>) {
+    REAPER_QUEUE.lock().push_back((handle, weak_vm));
+    REAPER_WAKE.notify_one();
 }
 
 // ── Phase 5: explicit named-method dispatch from native shims ────────
@@ -2506,41 +2859,36 @@ pub fn dispatch_method_from_native_on_stream(
         );
     }
     let runtime_work: u32 = u32::try_from(max_array_len).unwrap_or(u32::MAX);
+    // The thread-local SafepointToken's role is over (marshal is
+    // done). The cross-thread GcCriticalGuard (moved into
+    // `FinalizeState` below) takes over.
+    drop(token);
+    // 9. Known-issues followups #3 — the writebacks + GC-critical
+    //    guard are handed to `dispatch_async` itself now, rather than
+    //    attached by this caller after the call returns: attaching
+    //    them here (post-return) raced the completion reaper's host
+    //    callback, which can fire before this function resumes
+    //    (guaranteed in stub mode, possible in principle on real
+    //    hardware for a fast-completing kernel). `dispatch_async`
+    //    attaches `finalize_state` to the submission before
+    //    registering that callback, closing the race. If the dispatch
+    //    itself fails (no device, kernel not in cache, launch error),
+    //    `dispatch_async` simply drops the `FinalizeState` it was
+    //    handed — no kernel ran, nothing to finalize — same as this
+    //    caller used to do explicitly in the `needs_finalize == false`
+    //    case.
     let submission = cache.dispatch_async(
         stream.clone(),
         class_id,
         method_index,
         kernel_args,
         runtime_work,
-    );
-
-    // 9. If the dispatch itself failed (no device, kernel not in
-    //    cache, launch error), there is nothing to finalize — the
-    //    submission is already Failed. Otherwise attach the
-    //    writebacks + the GC-critical token to the submission so
-    //    `finalize_submission` can drain them on the first
-    //    `future.get()` call. The token moves into the
-    //    FinalizeState — its `Drop` runs when finalization completes
-    //    or when the submission is dropped without ever being
-    //    finalized.
-    let needs_finalize = {
-        let status = submission.status.lock();
-        matches!(*status, SubmissionStatus::Running)
-    };
-    // The thread-local SafepointToken's role is over (marshal
-    // is done). The cross-thread GcCriticalGuard takes over.
-    drop(token);
-    if needs_finalize {
-        *submission.finalize.lock() = Some(FinalizeState {
+        Some(FinalizeState {
             writebacks,
             _gc_critical: gc_guard,
-        });
-    } else {
-        // Failed submission — guard drops here, writebacks
-        // discarded (no kernel ran).
-        drop(gc_guard);
-        let _ = writebacks;
-    }
+        }),
+        shared.self_arc.read().as_ref().cloned().unwrap_or_default(),
+    );
 
     // 10. Register the submission and return its handle. The Java
     //     side wraps this handle in `GpuFutureImpl`.
