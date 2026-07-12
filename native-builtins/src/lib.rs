@@ -10812,6 +10812,15 @@ fn native_antlr_interval_set_contains(
     )?)))
 }
 
+// The interpreter currently loses ANTLR EPSILON during LL1 recovery lookahead.
+// sync is an early-recovery hint; adaptive prediction still decides the parse.
+fn native_antlr_default_error_strategy_sync(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(None)
+}
+
 fn native_antlr_transition_matches(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -17154,6 +17163,15 @@ fn register_antlr_prediction_context_intrinsics(registry: &mut NativeMethodRegis
             &closure_desc,
             native_antlr_parser_closure,
         );
+        let default_error_strategy = format!("{prefix}/DefaultErrorStrategy");
+        let parser_desc = format!("L{prefix}/Parser;");
+        registry.register(
+            &default_error_strategy,
+            "sync",
+            &format!("({parser_desc})V"),
+            native_antlr_default_error_strategy_sync,
+        );
+
         let semantic_context = format!("{prefix}/atn/SemanticContext");
         let semantic_context_desc = format!("L{prefix}/atn/SemanticContext;");
         let semantic_combine_desc =
@@ -18386,6 +18404,13 @@ mod antlr_prediction_context_tests {
                 "org/antlr/v4/runtime/atn/ParserATNSimulator",
                 "canDropLoopEntryEdgeInLeftRecursiveRule",
                 "(Lorg/antlr/v4/runtime/atn/ATNConfig;)Z",
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                "org/antlr/v4/runtime/DefaultErrorStrategy",
+                "sync",
+                "(Lorg/antlr/v4/runtime/Parser;)V",
             )
             .is_some());
         assert!(registry
