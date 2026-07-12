@@ -1302,6 +1302,17 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
+        // SPB-FLYWAY-HSQLDB.1: Flyway's HSQLDB integration runs this package
+        // through a dense add/update path. With JIT enabled it SIGSEGVs after
+        // CGLIB configuration enhancement; CRATONVM_JIT_DENY=org/hsqldb/
+        // consistently completes all test methods. Keep it interpreted until
+        // the lowering defect is isolated. Opt in for bisection with
+        // CRATONVM_JIT_ALLOW_PACKAGES=org/hsqldb/.
+        if class_name.starts_with("org/hsqldb/")
+            && !package_allowed("org/hsqldb/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
         // SPB.9b (Session 114) — companion blanket ban for the Spring
         // Boot loader + reactive web context, plus the Spring Beans
         // factory support layer. After SPB.9 pins the per-class logger

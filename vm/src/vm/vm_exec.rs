@@ -4028,6 +4028,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn read_string(&self, obj: ObjectRef) -> Option<String> {
         let class_id = self.shared.heap.class_id_of(obj);
+        // Reference arrays carry their component class ID; a String[] is not
+        // a String.
+        if self.shared.heap.kind_of(obj) != ObjectKind::Object {
+            return None;
+        }
         // Guard by class identity BEFORE the structural reader. `read_java_string`
         // below duck-types a String from the char[]/byte[] in field 0, but a
         // CratonVM synthetic `StringBuilder`/`StringBuffer` is *also* char[]-backed
