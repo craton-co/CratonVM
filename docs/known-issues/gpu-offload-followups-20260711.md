@@ -102,8 +102,7 @@ wired to anything that acted on its own.
 spontaneously, with no Java call required. A process-wide completion reaper
 thread (`ensure_completion_reaper_started`/`completion_reaper_loop` in
 `vm/src/runtime/offload.rs`, modelled on the existing background-JIT-compiler
-worker: `Once`-guarded singleton spawn, captures a `Weak<SharedVm>` so it
-can't keep a torn-down VM alive, deliberately unregistered with the GC
+worker: `Once`-guarded singleton spawn, deliberately unregistered with the GC
 thread registry since it never holds a managed `ObjectRef` on its own stack)
 wakes on a condvar the host callback notifies (`enqueue_completion`) and
 runs `finalize_submission` itself — draining writebacks, releasing the
@@ -127,7 +126,41 @@ callback is registered (100% reproducible in stub mode, where
 A `SharedVm` not constructed via `Vm::new` (most unit tests, and any
 future embedding that skips it) never populates `self_arc`, so the reaper's
 `Weak<SharedVm>` never upgrades — that degrades gracefully to the
-pre-existing poll-only behavior rather than panicking or hanging.
+pre-existing poll-only behavior rather than panicking or hanging. Each
+queued handle carries its own `Weak<SharedVm>` rather than the reaper
+thread capturing a single one at spawn time — real-hardware validation
+(below) caught that the naive "capture once" version permanently strands
+every submission from any `SharedVm` constructed *after* whichever one
+happened to start the reaper thread first, the moment that first `SharedVm`
+is dropped.
+
+**Hardware-validated (2026-07-12, RTX 2060).** New test
+`device_submission_completes_spontaneously_without_any_poll_call`
+(`vm/tests/gpu_offload_features.rs`) dispatches through
+`dispatch_method_from_native` directly (not `try_dispatch`, which
+finalizes synchronously on the calling thread and would trivially "pass"
+regardless of the reaper), sleeps with **zero** calls to
+`poll_submission_status`/`finalize_submission`/anything else that could
+itself drive completion, then reads `StreamSubmission::status` directly —
+bypassing every public accessor — to confirm the reaper alone flipped it
+to `Completed` and drained the writebacks correctly. Passes.
+
+This run also surfaced a separate, real finding, NOT a defect in the
+completion reaper: running all four `#[ignore]`d hardware tests in this
+file under `cargo test`'s default parallel test threads intermittently
+panics an unrelated background thread with `CUDA_ERROR_NOT_PERMITTED`
+inside `cudarc`'s `CudaStream::drop`. Root cause: each test independently
+constructs its own `Vm::new()`/`DeviceContext`, but `cudarc::CudaDevice::new(0)`
+resolves to the SAME reference-counted CUDA primary context for device 0
+across all of them in-process — one test's teardown can release/invalidate
+that shared context while another test's still-in-flight async submission
+is finalizing on a background thread. Confirmed absent running any single
+test alone and running all four with `--test-threads=1`; the doc comment
+at the top of `gpu_offload_features.rs` now says so explicitly. This is a
+multi-`Vm`-per-process test-harness hazard specific to having several
+independent `DeviceContext`s alive for the same device at once — a real
+single-VM production process (the normal `cratonvm` deployment shape)
+never hits it.
 
 ## 4. Small-array thread over-launch (min 2²⁰ threads per launch) — DONE
 

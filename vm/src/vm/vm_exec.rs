@@ -730,10 +730,10 @@ fn safe_native_call_impl(
     // popped from the operand stack into this Rust slice and are otherwise
     // invisible to `collect_roots` / frame scanning during a safepoint GC.
     let pin_base = thread.native_pin_roots.len();
-    // Retain a root index for every argument. The former four-element inline
-    // buffer could be selected before a re-entrant native path exposed a
-    // longer argument slice, leading to a bounds panic while remapping roots
-    // at the next safepoint.
+    // Retain a root index for every argument. Native calls are not restricted
+    // to the former four-element inline buffer: a re-entrant call with a
+    // longer slice (for example Set.of during Surefire bootstrap) must remain
+    // remappable at a safepoint without an out-of-bounds access.
     let mut arg_root_indices = Vec::with_capacity(args.len());
     for a in args {
         let before = thread.native_pin_roots.len();
@@ -11947,6 +11947,27 @@ fn invoke_on_class_shared_inner(
                             && (method_name == "getTypeParameters"
                                 || method_name == "getGenericInterfaces"
                                 || method_name == "getGenericSuperclass"))
+                        // Lambda method references are dispatched through
+                        // `invoke_on_class_shared`, which normally permits a
+                        // concrete JDK method body to win over a registered
+                        // native.  That is invalid for Class mirrors: the
+                        // real JDK bodies read the host layout, while Craton
+                        // mirrors keep their metadata VM-side.  In particular
+                        // `SomeClass::getDeclaredAnnotations` returned an
+                        // empty array (and `SomeClass::getName` an internal
+                        // slash-separated name) although direct invokevirtual
+                        // calls correctly used the overrides.  Hibernate
+                        // Models constructs its annotation supplier with that
+                        // method-reference form, silently dropping every
+                        // mapped entity.  Keep these Class mirror accessors
+                        // native regardless of whether their JDK declaration
+                        // is concrete or ACC_NATIVE.
+                        || (class_name == "java/lang/Class"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("getName", "()Ljava/lang/String;")
+                                    | ("getDeclaredAnnotations", "()[Ljava/lang/annotation/Annotation;")
+                            ))
                         // Spring generic metadata: Method/Constructor/Field generic
                         // accessors are concrete JDK bytecode methods, but their
                         // sun.reflect.generics repository path is incomplete under

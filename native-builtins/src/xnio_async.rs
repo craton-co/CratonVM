@@ -870,30 +870,44 @@ fn native_builder_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
 
+    // Decode an object value before any helper below can allocate.  The native
+    // entry frame roots its arguments, while `builder_from_this` and
+    // `read_option_coords` may enter allocation-capable VM code.  In
+    // particular, resolving the XNIO option used to leave a stale String
+    // reference for this later `read_string` call during a real MSC start.
+    let v = match value {
+        Value::Int(n) => OptionValue::Int(n),
+        Value::Long(n) => OptionValue::Long(n),
+        Value::Object(Some(s)) => match ctx.read_string(s) {
+            Some(t) => OptionValue::Str(t),
+            None => OptionValue::Obj(Some(s)),
+        },
+        Value::Object(None) => OptionValue::Obj(None),
+        _ => OptionValue::Obj(None),
+    };
+
+    // The side-table lookup and option-coordinate extraction below can enter
+    // VM helpers which allocate. Keep the receiver and option rooted through
+    // that work; `v` is now Rust-owned and no longer retains a Java object
+    // requiring a later heap read.
+    let this_pin = ctx.pin_native_root(this);
+    let opt_pin = ctx.pin_native_root(opt);
+    let this = ctx.read_native_pin(this_pin, this);
     let b = builder_from_this(ctx, this)?;
     check_builder_live(&b)?;
 
+    let opt = ctx.read_native_pin(opt_pin, opt);
     let (decl, name) =
         read_option_coords(ctx, opt).ok_or_else(|| iae("Builder.set: option has no name"))?;
     let key = OptionKey {
         declaring_class: decl,
         name,
     };
-    let v = match value {
-        Value::Int(n) => OptionValue::Int(n),
-        Value::Long(n) => OptionValue::Long(n),
-        Value::Object(Some(s)) => {
-            // Try to extract a string payload; else treat as opaque object.
-            match ctx.read_string(s) {
-                Some(t) => OptionValue::Str(t),
-                None => OptionValue::Obj(Some(s)),
-            }
-        }
-        Value::Object(None) => OptionValue::Obj(None),
-        _ => OptionValue::Obj(None),
-    };
     b.pending.lock().insert(key, v);
     // Return `this` for chaining.
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(opt_pin);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(this))))
 }
 

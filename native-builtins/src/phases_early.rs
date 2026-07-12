@@ -10554,7 +10554,14 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
     });
     r.register(isa, "<init>", "(Ljava/net/InetAddress;I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let addr = obj_arg(args, 1)?;
+        // JDK InetSocketAddress(InetAddress, int) explicitly accepts null and
+        // substitutes InetAddress.anyLocalAddress(). Tomcat's NioEndpoint
+        // relies on that for an unspecified bind address; rejecting it here
+        // leaves the connector FAILED before it can allocate an ephemeral port.
+        let addr = match args.get(1) {
+            Some(Value::Object(Some(addr))) => *addr,
+            _ => crate::net_phase_e::alloc_inet_address_external(ctx, "0.0.0.0", "0.0.0.0"),
+        };
         let port = args[2].as_int().unwrap_or(0);
         let host_val = p52_isa_host_from_addr(ctx, addr);
         p52_isa_set(ctx, this, host_val, Value::Object(Some(addr)), port);

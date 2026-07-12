@@ -38,10 +38,31 @@
 //! Tests that need only a `SharedVm` (no CUDA driver) run unconditionally.
 //! Tests that need a compiled kernel and a real launch are `#[ignore]`d
 //! with `"requires NVIDIA GPU"`; run them explicitly on the RTX 2060 box:
-//! `cargo test -p cratonvm-vm --features gpu-offload -- --ignored`
+//! `cargo test -p cratonvm-vm --features gpu-offload -- --ignored --test-threads=1`
 //! (plus whatever additionally activates `cuda-bridge`'s real `cuda`
 //! backend on that host — see `cratonvm-embed/Cargo.toml`'s `gpu-driver`
 //! feature for the alias other crates in this workspace use).
+//!
+//! **`--test-threads=1` is required, not optional, for the `--ignored`
+//! run.** Each `#[ignore]`d test below constructs its own `Vm::new()`
+//! (and thus its own `DeviceContext`), but `cudarc::CudaDevice::new(0)`
+//! resolves to the SAME reference-counted CUDA primary context for
+//! device 0 across all of them within one process. Running these tests
+//! in parallel (`cargo test`'s default) lets one test's `Vm` teardown
+//! release/invalidate that shared primary context while another test's
+//! still-in-flight async submission (see
+//! `device_submission_completes_spontaneously_without_any_poll_call`)
+//! is finalizing on a background thread — observed on real hardware as
+//! a `cudarc::driver::safe::core::CudaStream::drop` panic
+//! (`CUDA_ERROR_NOT_PERMITTED`) on an unrelated, unnamed thread. It
+//! does not fail the test it happens to interrupt (the panic is on a
+//! detached thread, not the test's own), and it reproduces ONLY under
+//! parallel execution — confirmed absent both running each test alone
+//! and running all four with `--test-threads=1`. This is a shared
+//! multi-`Vm`-per-process test-harness hazard, not a defect in the
+//! completion-reaper logic itself (2026-07-12); a real, single-VM
+//! production process never constructs more than one `DeviceContext`
+//! for the same device concurrently.
 //!
 //! # Honesty note (per the task's instructions)
 //!

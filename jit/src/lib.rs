@@ -4860,6 +4860,16 @@ fn hsqldb_jit_deny_prefix(class_name: &str) -> Option<&'static str> {
         class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
     }
 }
+fn jaxb_mapping_jit_deny_prefix(class_name: &str) -> Option<&'static str> {
+    const SLASH_PREFIX: &str = "org/glassfish/jaxb/";
+    const DOT_PREFIX: &str = "org.glassfish.jaxb.";
+    if class_name.starts_with(SLASH_PREFIX) {
+        Some(SLASH_PREFIX)
+    } else {
+        class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
+    }
+}
+
 fn snakeyaml_emitter_emit_jit_deny_prefix(
     class_name: &str,
     method_name: &str,
@@ -5132,15 +5142,6 @@ pub fn try_compile(
     // HIB-TEMPORAL.1 (2026-07-08): final fail-closed Hibernate guard. The VM
     // skip-list catches most eligibility paths, but tiered/background compile
     // can still reach this crate's final `try_compile` gate. The proven stable
-    // control for the temporal residuals is exactly the same shape as
-    // `CRATONVM_JIT_DENY=org/hibernate/`, so keep Hibernate bytecode interpreted
-    // here too unless the package is explicitly allowed for bisection.
-    if let Some(prefix) = hibernate_temporal_jit_deny_prefix(&cached.class_name) {
-        if !jit_allow_package(prefix) {
-            return None;
-        }
-    }
-
     // SPB-FLYWAY-HSQLDB.1: Keep the final admission gate aligned with the VM
     // skip-list. The Flyway HSQLDB integration SIGSEGVs under JIT, while the
     // package-level interpreted control completes the entire class. Background
@@ -5150,6 +5151,21 @@ pub fn try_compile(
             return None;
         }
     }
+    // control for the temporal residuals is exactly the same shape as
+    // `CRATONVM_JIT_DENY=org/hibernate/`, so keep Hibernate bytecode interpreted
+    // here too unless the package is explicitly allowed for bisection.
+    if let Some(prefix) = hibernate_temporal_jit_deny_prefix(&cached.class_name) {
+        if !jit_allow_package(prefix) {
+            return None;
+        }
+    }
+
+    if let Some(prefix) = jaxb_mapping_jit_deny_prefix(&cached.class_name) {
+        if !jit_allow_package(prefix) {
+            return None;
+        }
+    }
+
     // ES-JIT-DEOPT-GC.1: final fail-closed companion to the VM skip-list guard
     // for `org/yaml/snakeyaml/emitter/Emitter.emit`. Tiered/background compile
     // can reach this crate after the VM-side enqueue path has logged work; keep
@@ -7492,6 +7508,18 @@ pub fn invokestatic_self_call_uses_tail_jump(code: &[u8], code_len: usize, pc: u
 // Tests
 // ---------------------------------------------------------------------------
 
+    #[test]
+    fn hsqldb_jit_deny_matches_slash_and_dot_names() {
+        assert_eq!(
+            hsqldb_jit_deny_prefix("org/hsqldb/map/BaseHashMap"),
+            Some("org/hsqldb/")
+        );
+        assert_eq!(
+            hsqldb_jit_deny_prefix("org.hsqldb.map.BaseHashMap"),
+            Some("org.hsqldb.")
+        );
+        assert_eq!(hsqldb_jit_deny_prefix("org/example/Foo"), None);
+    }
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7510,17 +7538,18 @@ mod tests {
     }
 
     #[test]
-    fn hsqldb_jit_deny_matches_slash_and_dot_names() {
+    fn jaxb_mapping_jit_deny_matches_slash_and_dot_names() {
         assert_eq!(
-            hsqldb_jit_deny_prefix("org/hsqldb/map/BaseHashMap"),
-            Some("org/hsqldb/")
+            jaxb_mapping_jit_deny_prefix("org/glassfish/jaxb/runtime/v2/ContextFactory"),
+            Some("org/glassfish/jaxb/")
         );
         assert_eq!(
-            hsqldb_jit_deny_prefix("org.hsqldb.map.BaseHashMap"),
-            Some("org.hsqldb.")
+            jaxb_mapping_jit_deny_prefix("org.glassfish.jaxb.runtime.v2.ContextFactory"),
+            Some("org.glassfish.jaxb.")
         );
-        assert_eq!(hsqldb_jit_deny_prefix("org/example/Foo"), None);
+        assert_eq!(jaxb_mapping_jit_deny_prefix("org/glassfish/other/Foo"), None);
     }
+
     #[test]
     fn hibernate_temporal_jit_allow_entries_are_prefix_based() {
         assert!(jit_allow_entry_allows_prefix(

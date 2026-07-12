@@ -2,9 +2,32 @@
 
 | | |
 |---|---|
-| **Status** | 🔴 OPEN — 14 classes, all sharing an identical exception signature. HotSpot confirmation pending. |
+| **Status** | ✅ FIXED — 2026-07-12. All 14 affected classes pass on the fixed CratonVM default-JIT build. |
 | **Discovered** | 2026-07-11 full 4548-class suite audit, `dev` post `44f16ee2`+. |
 | **Area** | ANTLR-based parsing of Hibernate's legacy entity-graph string syntax (`@NamedEntityGraph`/graph-parser DSL). |
+
+
+## Resolution
+
+The reported ANTLR RuleNode getChildCount NPE was a downstream symptom, not an
+ANTLR parse-tree construction fault. Hibernate Models uses bound method
+references such as Class::getDeclaredAnnotations and Class::getName while
+building its annotation model. CratonVM method-reference dispatch selected
+concrete real-JDK Class bytecode instead of the registered native accessor
+required by its VM-side Class mirrors. As a result, getDeclaredAnnotations
+returned an empty array and getName returned an internal slash-separated name;
+Hibernate silently built zero entity bindings, causing the graph-parser failures.
+
+invoke_on_class_shared_inner now forces the registered native overrides for
+Class.getDeclaredAnnotations and Class.getName through this method-reference path.
+
+## Validation
+
+- HotSpot JDK 25: representative class passed.
+- Fixed CratonVM: no-JIT method-reference probe reported real annotations and
+  dot-form class names; direct SessionFactory probe built three entity bindings.
+- Fixed CratonVM default-JIT rerun: all 14 listed classes passed, with no
+  RuleNode or entity-binding residual.
 
 ## Symptom
 
@@ -42,7 +65,7 @@ ANTLR-based parser for the legacy string-form graph syntax (e.g.
 `"name(attr1 attr2)"` fetch-graph definitions), not the annotation-based
 form.
 
-## Root-cause hypothesis (not yet confirmed)
+## Original root-cause hypothesis (superseded)
 
 `org.antlr.v4.runtime.tree.RuleNode.getChildCount()` is called on a `null`
 `node` reference somewhere in Hibernate's graph-parser visitor/listener code
@@ -66,7 +89,7 @@ echo org.hibernate.orm.test.entitygraph.EntityGraphFunctionalTests > /tmp/one.tx
 <cratonvm> --java-home <jdk25> --Xmx 1500m @common.linux.args -Dcraton.batch=1 CratonRunner /tmp/one.txt 0
 ```
 
-## Next steps (not yet done)
+## Original next steps (completed)
 
 - Get a full stack trace (`CRATONVM_DBG_ATHROW=1`) to find exactly which
   Hibernate parser/visitor method calls `getChildCount()` on the null node,

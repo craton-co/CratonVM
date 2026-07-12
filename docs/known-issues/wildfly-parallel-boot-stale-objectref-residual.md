@@ -394,3 +394,112 @@ these fixes, but the controlled current-dev sample also missed it in six
 retries; that is encouraging but not enough to mark the extension residual
 closed. The STW live-attach poll caught the warning but missed the process by
 a narrow race again; no GC-barrier change was attempted.
+
+## Follow-up session 5 (2026-07-12): real-MSC controller wiring and detector-guided boot hardening
+
+This session used a fresh isolated source worktree and binary on the Azure
+host:
+
+```text
+source: /data/data/wt-wildfly-stale-objectref-complete-20260711
+binary: /data/data/target-wildfly-stale-objectref-complete-20260711/release/cratonvm
+harness: /data/data/wt-wf-surefire-boot-20260711
+```
+
+The decisive controller-null finding was that the MSC shadow container had
+been *fake-completing* services unless `CRATONVM_MSC_REAL_START` was set. In
+that mode `AbstractControllerService.start(StartContext)` was never actually
+called, so its `controller` field remained null and later
+`ModelControllerImpl.getManagementModel()` deterministically raised the
+documented NPE. The production behavior was changed so real MSC
+`Service.start()` callbacks are enabled by default; setting
+`CRATONVM_MSC_REAL_START=0` is retained only as a diagnostic escape hatch.
+
+Enabling the real callback path exposed further genuine stale-reference sites,
+all detected with `CRATONVM_DBG_STALE_OBJREF=1` and addressed using the normal
+native-root / re-read discipline:
+
+- `service_loader.rs`: provider class, constructor argument array, constructor,
+  and provider instance lifetimes across reflective construction and
+  `ArrayList.add`.
+- `xnio_async.rs`: `OptionMap.Builder.set` object-value decoding before the
+  allocation-capable builder/option lookup path.
+- `native-collections`: HashMap put-chain, CHM get/segment-chain, CHM compute
+  callbacks, and live HashSet view resynchronization paths.
+- `jboss_msc.rs`: synthetic `ServiceController` operations needed by real MSC
+  (`getService`, `getName`, `getServiceNames`) and the controller service
+  object retained in the shadow container.
+
+The real-MSC path also exposed an abstract-interface dispatch issue:
+`ServiceController.getService()` initially continued to resolve to a code-less
+method. Registering methods only under the interface/concrete class names was
+not sufficient because native dispatch is class-keyed. The current source
+therefore aliases `org/jboss/msc/service/ServiceController` onto
+`ServiceControllerImpl` *after* all controller registrations are installed.
+
+### Live verification performed
+
+`cargo check -p cratonvm-native-builtins` passed repeatedly on Azure after the
+changes, and each updated binary was built from the isolated target directory.
+The server Java-home shim had the real-MSC opt-in removed, proving that the new
+default, rather than a test-only environment variable, selected real starts.
+
+The focused probe was:
+
+```text
+org.jboss.as.test.integration.jca.flushing.FlushOperationsTestCase
+```
+
+It progressed from immediate controller-null / interface / detector failures
+to real starts past hundreds of MSC services (the trace reached service IDs
+above 500, clustering services, JDBC registration, and transaction recovery).
+The latest focused logs did not contain the earlier controller-null NPE,
+`ServiceController.getService` `AbstractMethodError`, or a new stale-object
+detector panic. They instead ended at Arquillian's managed-server startup
+deadline:
+
+```text
+java.util.concurrent.TimeoutException:
+  Managed server was not started within [60] s
+```
+
+One Azure-host reboot interrupted a detached long probe; the source worktree,
+target binary, and harness artifacts survived. A later broad six-shard run was
+started accidentally and immediately stopped; it is not evidence for this
+issue. The intended six-shard regression run used the exact ten classes from
+`sample_results_v4.txt`:
+
+```text
+BeanValidationTestCase
+DefaultManagedThreadFactoryTestCase
+DataSourceDefinitionTestCase
+SharedBeanInEarsUnitTestCase
+MetadataCompleteCustomDescriptorTestCase
+OverriddenAppNameTestCase
+SingletonReentrantTestCase
+DisabledValidationTestCase
+FlushOperationsTestCase
+EjbRefLookupTestCase
+```
+
+All 10 currently fail by the same 60-second managed-server-start timeout
+(rather than the original NPE / extension-race signatures). The focused result
+directories are:
+
+```text
+/data/data/wt-wf-surefire-boot-20260711/out/
+  wildfly-stale-regression-six-20260712-2038-s*-nojit-real-others-20260712-204321
+```
+
+### Current conclusion
+
+The original controller-null mechanism has been identified and addressed: real
+MSC starts must be the default. The stale-reference detector also no longer
+reported a fresh failure in the latest focused controller-start traces.
+However, a detector-clean *completed* WildFly server boot has not yet been
+demonstrated: all ten targeted classes still hit the harness's 60-second
+managed-server startup deadline. This issue must remain OPEN. The next session
+should capture the live post-service-500 wait state (with GDB or the existing
+STW census only after the timeout condition is observed) and distinguish a
+remaining MSC dependency/liveness problem from a test-harness startup limit
+before making further broad changes.

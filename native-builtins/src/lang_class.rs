@@ -7838,6 +7838,11 @@ pub(crate) fn native_constructor_new_instance(
             .into())
         }
     };
+    let args_array_early = match args.get(1) {
+        Some(Value::Object(Some(arr))) => Some(*arr),
+        _ => None,
+    };
+    let args_array_pin = args_array_early.map(|arr| (ctx.pin_native_root(arr), arr));
 
     // Serialization constructor: allocate the real target type.
     //
@@ -8045,10 +8050,8 @@ pub(crate) fn native_constructor_new_instance(
     let (param_descs, _) = parse_descriptor_param_and_return(&descriptor);
 
     // Extract arguments from Object[] (args[1])
-    let args_array = match args.get(1) {
-        Some(Value::Object(Some(arr))) => Some(*arr),
-        _ => None,
-    };
+    let args_array = args_array_pin
+        .map(|(pin, arr)| ctx.read_native_pin(pin, arr));
     let actual_arg_count = match args_array {
         Some(arr) => ctx.array_length(arr),
         None => 0,
