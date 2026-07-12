@@ -19306,6 +19306,14 @@ fn try_invoke_cached_lambda_impl(
             let Some(class) = store.get(declaring_id) else {
                 return Ok(None);
             };
+            // Cached bytecode bypasses native dispatch, which must retain precedence.
+            if shared
+                .native_methods
+                .find(&class.name, method_name, descriptor)
+                .is_some()
+            {
+                return Ok(None);
+            }
             let c = Arc::new(CachedBytecodeMethod {
                 declaring_class_id: declaring_id,
                 class_name: Arc::clone(&class.name),

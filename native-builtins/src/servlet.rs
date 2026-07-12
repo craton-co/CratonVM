@@ -2339,6 +2339,24 @@ fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> ObjectRef {
 /// (e.g. `ByteBuffer.hasArray`, `ByteBuffer.array`) sees null because
 /// the indexed slot 0 landed on Buffer.mark (int descriptor → Object
 /// coerced to Int by descriptor-aware set_field).
+///
+/// BUG (found 2026-07-12): on a real-JDK-shaped object the indexed
+/// fallback below does not land on a harmless/unused slot 0 — the real
+/// `Buffer` layout is `mark@0/position@1/limit@2/capacity@3/address@4/
+/// segment@5`, so `BB_MARK` (index 4) aliases `address` and `BB_ORDER`
+/// (index 5) aliases `segment`. Since this fallback runs AFTER the
+/// correct by-name writes, `set_field(buf, BB_MARK, Int(-1))` clobbered
+/// the real `address` field (needed by every bulk `get`/`put` via
+/// `ScopedMemoryAccess.copyMemory`) with -1, and `set_field(buf,
+/// BB_ARRAY, Object(arr))` clobbered real `mark` with a coerced,
+/// truncated array-pointer int. `ByteBuffer.allocate(n)` then threw
+/// `ArrayIndexOutOfBoundsException` on the very first bulk put/get (see
+/// docs/known-issues/springboot/zip-filedatablock-bulk-bytebuffer-put-aioobe.md).
+/// Reuse the same `s2_bb_synthetic_layout` discriminator the
+/// 2026-07-11 typed-buffer-view fix uses for the identical slot-5/
+/// segment collision: only apply the indexed fallback when the object
+/// is genuinely the bare 6-slot synthetic layout, not a real-JDK class
+/// whose by-name writes above already did the job.
 pub(crate) fn bb_write_hb(ctx: &mut dyn NativeContext, buf: ObjectRef, arr: ObjectRef, cap: i32) {
     ctx.set_field_by_name(buf, "hb", Value::Object(Some(arr)));
     ctx.set_field_by_name(buf, "offset", Value::Int(0));
@@ -2359,13 +2377,24 @@ pub(crate) fn bb_write_hb(ctx: &mut dyn NativeContext, buf: ObjectRef, arr: Obje
         "nativeByteOrder",
         Value::Int(if cfg!(target_endian = "big") { 1 } else { 0 }),
     );
-    // Synthetic-mode indexed fallback.
-    ctx.set_field(buf, BB_ARRAY, Value::Object(Some(arr)));
-    ctx.set_field(buf, BB_POS, Value::Int(0));
-    ctx.set_field(buf, BB_LIMIT, Value::Int(cap));
-    ctx.set_field(buf, BB_CAP, Value::Int(cap));
-    ctx.set_field(buf, BB_MARK, Value::Int(-1));
-    ctx.set_field(buf, BB_ORDER, Value::Int(0));
+    // Real HeapByteBuffer seeds Buffer.address to ARRAY_BYTE_BASE_OFFSET +
+    // offset (16 for a fresh, zero-offset heap buffer). Bulk get/put
+    // bytecode routes through ScopedMemoryAccess and expects this
+    // base-offset-relative value when copying from/to hb.
+    ctx.set_field_by_name(buf, "address", Value::Long(16));
+    // Synthetic-mode indexed fallback — ONLY for the bare synthetic layout
+    // (no real Buffer/ByteBuffer field metadata). On a real-JDK-shaped
+    // object these indices alias real fields (mark@0, address@4,
+    // segment@5) that the by-name writes above already set correctly;
+    // redoing them here would clobber address/mark as described above.
+    if s2_bb_synthetic_layout(ctx, buf) {
+        ctx.set_field(buf, BB_ARRAY, Value::Object(Some(arr)));
+        ctx.set_field(buf, BB_POS, Value::Int(0));
+        ctx.set_field(buf, BB_LIMIT, Value::Int(cap));
+        ctx.set_field(buf, BB_CAP, Value::Int(cap));
+        ctx.set_field(buf, BB_MARK, Value::Int(-1));
+        ctx.set_field(buf, BB_ORDER, Value::Int(0));
+    }
 }
 
 #[inline]
@@ -6458,5 +6487,68 @@ mod tests {
         let id = s2_next_free_id(&mut reg);
         assert_ne!(id, 0, "id must never be 0");
         assert_ne!(id, 1, "id 1 already in use, must be skipped");
+    }
+
+    // =======================================================================
+    // bb_write_hb — real-JDK Buffer field layout (mark@0/position@1/limit@2/
+    // capacity@3/address@4/hb@5/offset@6, per `mock_buffer_field_slot`) must
+    // not be clobbered by the legacy BB_* indexed-slot fallback. Regression
+    // test for the AIOOBE in
+    // docs/known-issues/springboot/zip-filedatablock-bulk-bytebuffer-put-aioobe.md:
+    // BB_MARK(4)/BB_ARRAY(0) used to alias real `address`/`mark` and were
+    // written unconditionally AFTER the correct by-name writes, silently
+    // resetting `address` to -1 and `mark` to a truncated array pointer.
+    // =======================================================================
+
+    #[test]
+    fn bb_write_hb_real_layout_preserves_address_and_mark() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let class_id = ctx
+            .ensure_class_initialized("java/nio/ByteBuffer")
+            .expect("class init");
+        // A real-JDK-shaped ByteBuffer has more than the bare 6 synthetic
+        // fields (mark/position/limit/capacity/address/segment plus
+        // ByteBuffer's own hb/offset/...); allocate more than 6 slots so
+        // `s2_bb_synthetic_layout` correctly identifies this as real, not
+        // the pure-synthetic fallback layout.
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 64);
+        let buf = ctx.alloc_object(class_id, 10);
+
+        bb_write_hb(&mut ctx, buf, arr, 64);
+
+        assert_eq!(
+            ctx.get_field_by_name(buf, "address"),
+            Value::Long(16),
+            "real Buffer.address must be seeded to ARRAY_BYTE_BASE_OFFSET, not clobbered by BB_MARK"
+        );
+        assert_eq!(
+            ctx.get_field_by_name(buf, "mark"),
+            Value::Int(-1),
+            "real Buffer.mark must stay -1, not clobbered by BB_ARRAY's array reference"
+        );
+        assert_eq!(ctx.get_field_by_name(buf, "hb"), Value::Object(Some(arr)));
+        assert_eq!(ctx.get_field_by_name(buf, "position"), Value::Int(0));
+        assert_eq!(ctx.get_field_by_name(buf, "limit"), Value::Int(64));
+        assert_eq!(ctx.get_field_by_name(buf, "capacity"), Value::Int(64));
+    }
+
+    #[test]
+    fn bb_write_hb_pure_synthetic_layout_still_gets_indexed_fallback() {
+        // A genuinely synthetic (non-real-JDK) 6-field ByteBuffer carrier —
+        // no field-name metadata resolves, so the indexed BB_* fallback is
+        // the only way these natives can round-trip state. Guard against a
+        // regression where the fix above accidentally suppresses the
+        // fallback for this legitimate case too.
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let class_id = ClassId::new(9999); // never registered by name
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 32);
+        let buf = ctx.alloc_object(class_id, 6);
+
+        bb_write_hb(&mut ctx, buf, arr, 32);
+
+        assert_eq!(ctx.get_field(buf, BB_ARRAY), Value::Object(Some(arr)));
+        assert_eq!(ctx.get_field(buf, BB_LIMIT), Value::Int(32));
+        assert_eq!(ctx.get_field(buf, BB_CAP), Value::Int(32));
+        assert_eq!(ctx.get_field(buf, BB_MARK), Value::Int(-1));
     }
 }
