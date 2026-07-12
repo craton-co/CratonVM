@@ -649,13 +649,31 @@ fn parse_transformation(algo: &str) -> (String, String, bool) {
 }
 
 /// Whether `algo` names the RFC 3394 AES Key Wrap cipher supplied by SunJCE.
-/// `AESWrap` is the historical alias used by Keycloak/Elytron; JDK callers may
-/// also use the canonical `AES/KW/NoPadding` transformation.
+/// `AESWrap` and the size-specific `AESWrap_128` aliases are used by
+/// Keycloak/Elytron; JDK callers may also use the canonical
+/// `AES/KW/NoPadding` transformation.
 fn is_aes_key_wrap_transformation(algo: &str) -> bool {
     matches!(
         algo.to_ascii_uppercase().as_str(),
-        "AESWRAP" | "AES/KW" | "AES/KW/NOPADDING"
+        "AESWRAP"
+            | "AESWRAP_128"
+            | "AESWRAP128"
+            | "AESWRAP_192"
+            | "AESWRAP192"
+            | "AESWRAP_256"
+            | "AESWRAP256"
+            | "AES/KW"
+            | "AES/KW/NOPADDING"
     )
+}
+
+fn aes_wrap_expected_kek_len(algo: &str) -> Option<usize> {
+    match algo.to_ascii_uppercase().as_str() {
+        "AESWRAP_128" | "AESWRAP128" => Some(16),
+        "AESWRAP_192" | "AESWRAP192" => Some(24),
+        "AESWRAP_256" | "AESWRAP256" => Some(32),
+        _ => None,
+    }
 }
 
 const AES_KW_DEFAULT_IV: [u8; 8] = [0xA6; 8];
@@ -768,6 +786,20 @@ fn cipher_wrap_impl(
         }
         .into());
     }
+    if let Some(expected_len) = aes_wrap_expected_kek_len(&state.algorithm) {
+        if state.key_bytes.len() != expected_len {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/security/InvalidKeyException",
+                &format!(
+                    "{} requires a {}-bit key-encryption key, got {} bits",
+                    state.algorithm,
+                    expected_len * 8,
+                    state.key_bytes.len() * 8
+                ),
+            ));
+        }
+    }
     let encoded = extract_key_bytes(ctx, key_to_wrap);
     if encoded.is_empty() {
         return Err(crate::phases_early::throw_jca_exc(
@@ -810,6 +842,20 @@ fn cipher_unwrap_impl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             message: format!("Cipher.unwrap not implemented for {}", state.algorithm),
         }
         .into());
+    }
+    if let Some(expected_len) = aes_wrap_expected_kek_len(&state.algorithm) {
+        if state.key_bytes.len() != expected_len {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/security/InvalidKeyException",
+                &format!(
+                    "{} requires a {}-bit key-encryption key, got {} bits",
+                    state.algorithm,
+                    expected_len * 8,
+                    state.key_bytes.len() * 8
+                ),
+            ));
+        }
     }
     // Cipher.SECRET_KEY is 3. AES Key Wrap returns raw symmetric key material;
     // public/private-key reconstruction requires algorithm-specific parsers and
@@ -2019,8 +2065,12 @@ mod tests {
     #[test]
     fn aes_key_wrap_recognises_sunjce_and_keycloak_names() {
         assert!(is_aes_key_wrap_transformation("AESWrap"));
+        assert!(is_aes_key_wrap_transformation("AESWrap_128"));
         assert!(is_aes_key_wrap_transformation("AES/KW/NoPadding"));
         assert!(!is_aes_key_wrap_transformation("AES/KWP/NoPadding"));
+        assert_eq!(aes_wrap_expected_kek_len("AESWrap_128"), Some(16));
+        assert_eq!(aes_wrap_expected_kek_len("AESWrap_192"), Some(24));
+        assert_eq!(aes_wrap_expected_kek_len("AESWrap_256"), Some(32));
     }
 
     #[test]
