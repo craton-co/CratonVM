@@ -46114,8 +46114,19 @@ fn native_class_atomic_cas_annotation_data(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // Round-9 Bug 7: ctx is now required for identity-hash keying.
-    class_atomic_cas_impl(ctx, args, 2)
+    // `Class.annotationData()` reads this field directly before retrying its
+    // CAS loop.  Keep that heap field coherent with the GC-safe side table,
+    // just as `casReflectionData` does: otherwise every read observes null
+    // even after a successful CAS and rebuilds the annotation graph.
+    let result = class_atomic_cas_impl(ctx, args, 2)?;
+    if matches!(result, Some(Value::Int(1))) {
+        if let (Some(Value::Object(Some(class_mirror))), Some(new_value)) =
+            (args.first(), args.get(2))
+        {
+            ctx.set_field_by_name(*class_mirror, "annotationData", *new_value);
+        }
+    }
+    Ok(result)
 }
 
 fn native_unsafe_object_field_offset(

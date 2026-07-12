@@ -1,8 +1,23 @@
-// Hardware validation for known-issues followups item 3 (2026-07-12):
-// a GpuFuture must complete on its own, with ZERO isDone()/getNow()/
-// get() calls in between dispatch and completion — driven by the
-// vm/src/runtime/offload.rs completion reaper thread waking off the
-// cuLaunchHostFunc host callback, not by the application polling.
+// Java-level counterpart to the hardware validation for known-issues
+// followups item 3 (2026-07-12): a GpuFuture must complete on its own,
+// with ZERO isDone()/getNow()/get() calls in between dispatch and
+// completion — driven by the vm/src/runtime/offload.rs completion
+// reaper thread waking off the cuLaunchHostFunc host callback, not by
+// the application polling.
+//
+// NOT YET RUN: this needs the external craton-gpu-java repo (the
+// `craton.gpu.GpuExecutor`/`GpuFuture` classes below) checked out
+// beside this workspace or at C:/craton/craton-gpu-java — see
+// craton-gpu/build.rs. That repo isn't present on this box, so the
+// actual 2026-07-12 hardware validation used the lower-level Rust
+// entry point instead: `device_submission_completes_spontaneously_without_any_poll_call`
+// in vm/tests/gpu_offload_features.rs, which dispatches through
+// `dispatch_method_from_native` directly and reads `StreamSubmission::status`
+// with no `GpuFuture`-equivalent call at all — passed on the RTX 2060.
+// This file is kept as the intended Java-level equivalent for whenever
+// the craton-gpu-java jar is available; the proof technique is the
+// same (read the host array directly, no future API call), just one
+// layer higher.
 //
 // The test below deliberately never calls any GpuFuture method between
 // submit() and the sleep. It proves the reaper ran by reading the
