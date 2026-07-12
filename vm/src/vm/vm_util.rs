@@ -1147,6 +1147,15 @@ fn initialize_class_shared(
                 if matches!(&*class_name_for_jfr, "jdk/internal/misc/Unsafe") {
                     post_clinit_fixup(shared, class_id, &class_name_for_jfr);
                 }
+                // JDK 25's legacy sun.misc.Unsafe derives its memory-access
+                // policy from the nested MemoryAccessOption enum during
+                // <clinit>. Real-JDK execution can leave the final result
+                // field null even though the enum value itself is available;
+                // repair that slot before any ordered Unsafe access reaches
+                // beforeMemoryAccessSlow().
+                if matches!(&*class_name_for_jfr, "sun/misc/Unsafe") {
+                    post_clinit_fixup(shared, class_id, &class_name_for_jfr);
+                }
                 // (Removed) R15 WildFly Module.<clinit> post-success fixup.
                 // The earlier band-aid unconditionally overwrote
                 // `BOOT_MODULE_LOADER` (and conditionally backfilled
@@ -2226,6 +2235,87 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 n += set_static_by_name(name, Value::Int(scale)) as i32;
             }
             tracing::warn!("Post-clinit fixup: Unsafe ARRAY_*_BASE_OFFSET/INDEX_SCALE populated ({n}/18)");
+        }
+        "sun/misc/Unsafe" => {
+            // JDK 25's `Unsafe.<clinit>` stores the result of
+            // `MemoryAccessOption.value()` in MEMORY_ACCESS_OPTION. In a
+            // real-JDK CratonVM boot, that particular static store can remain
+            // null even though both the configured property and the enum
+            // constants are already live. Every legacy Unsafe memory access
+            // then enters beforeMemoryAccessSlow and dereferences null via
+            // `MEMORY_ACCESS_OPTION.ordinal()`.
+            //
+            // Preserve the JDK's option semantics rather than always forcing
+            // ALLOW: the VM default is `allow`, while an explicit user
+            // override may request warn/debug/deny. Only repair a missing
+            // value so a correctly initialized future implementation remains
+            // authoritative.
+            let policy_field = match shared
+                .system_properties
+                .read()
+                .get("sun.misc.unsafe.memory.access")
+                .map(String::as_str)
+            {
+                Some("allow") => "ALLOW",
+                Some("debug") => "DEBUG",
+                Some("deny") => "DENY",
+                Some("warn") | None => "WARN",
+                Some(_) => "WARN",
+            };
+            let unsafe_option_slot = {
+                let cm = shared.class_manager.read();
+                cm.get_class(class_id).and_then(|unsafe_class| {
+                    let mut static_idx = 0usize;
+                    for field in &unsafe_class.fields {
+                        if field.is_static() {
+                            if &*field.name == "MEMORY_ACCESS_OPTION" {
+                                return Some(static_idx);
+                            }
+                            static_idx += 1;
+                        }
+                    }
+                    None
+                })
+            };
+            let already_initialized = unsafe_option_slot.is_some_and(|static_idx| {
+                matches!(
+                    super::vm_object::get_static_shared(shared, class_id, static_idx),
+                    Value::Object(Some(_))
+                )
+            });
+            let enum_slot = {
+                let cm = shared.class_manager.read();
+                cm.find_class_by_name("sun/misc/Unsafe$MemoryAccessOption")
+                    .and_then(|enum_class_id| cm.get_class(enum_class_id))
+                    .and_then(|enum_class| {
+                        let mut static_idx = 0usize;
+                        for field in &enum_class.fields {
+                            if field.is_static() {
+                                if &*field.name == policy_field {
+                                    return Some((enum_class.id, static_idx));
+                                }
+                                static_idx += 1;
+                            }
+                        }
+                        None
+                    })
+            };
+            let repaired = if already_initialized {
+                false
+            } else if let Some((enum_class_id, static_idx)) = enum_slot {
+                match super::vm_object::get_static_shared(shared, enum_class_id, static_idx) {
+                    Value::Object(Some(option)) => set_static_by_name(
+                        "MEMORY_ACCESS_OPTION",
+                        Value::Object(Some(option)),
+                    ),
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            tracing::warn!(
+                "Post-clinit fixup: sun.misc.Unsafe MEMORY_ACCESS_OPTION policy={policy_field} repaired={repaired}"
+            );
         }
         "java/io/File" => {
             // See the success-path call site (`init_class`) for the full

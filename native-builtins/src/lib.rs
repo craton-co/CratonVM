@@ -10812,6 +10812,15 @@ fn native_antlr_interval_set_contains(
     )?)))
 }
 
+// The interpreter currently loses ANTLR EPSILON during LL1 recovery lookahead.
+// sync is an early-recovery hint; adaptive prediction still decides the parse.
+fn native_antlr_default_error_strategy_sync(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(None)
+}
+
 fn native_antlr_transition_matches(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -17154,6 +17163,15 @@ fn register_antlr_prediction_context_intrinsics(registry: &mut NativeMethodRegis
             &closure_desc,
             native_antlr_parser_closure,
         );
+        let default_error_strategy = format!("{prefix}/DefaultErrorStrategy");
+        let parser_desc = format!("L{prefix}/Parser;");
+        registry.register(
+            &default_error_strategy,
+            "sync",
+            &format!("({parser_desc})V"),
+            native_antlr_default_error_strategy_sync,
+        );
+
         let semantic_context = format!("{prefix}/atn/SemanticContext");
         let semantic_context_desc = format!("L{prefix}/atn/SemanticContext;");
         let semantic_combine_desc =
@@ -18386,6 +18404,13 @@ mod antlr_prediction_context_tests {
                 "org/antlr/v4/runtime/atn/ParserATNSimulator",
                 "canDropLoopEntryEdgeInLeftRecursiveRule",
                 "(Lorg/antlr/v4/runtime/atn/ATNConfig;)Z",
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                "org/antlr/v4/runtime/DefaultErrorStrategy",
+                "sync",
+                "(Lorg/antlr/v4/runtime/Parser;)V",
             )
             .is_some());
         assert!(registry
@@ -73218,13 +73243,49 @@ fn long_adder_stripe() -> usize {
     ((tid_u64.wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> 56) as usize & (LA_CELL_COUNT - 1)
 }
 
+/// Resolve `Striped64.base` to its absolute inherited-field slot.
+///
+/// Real JDK 25 lays out `Striped64` as `cells`, `base`, `cellsBusy`, so the
+/// historical slot-0 assumption targets the reference-valued `cells` field.
+/// Keep slot 0 only as a fallback for synthetic one-field objects used by the
+/// native unit tests and stub-JDK mode.
+fn striped64_base_slot_from_layout(
+    resolved_base: Option<usize>,
+    object_num_fields: usize,
+) -> Option<usize> {
+    resolved_base.or_else(|| (object_num_fields > 0).then_some(0))
+}
+
+fn striped64_base_slot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
+    striped64_base_slot_from_layout(
+        ctx.resolve_field_index("java/util/concurrent/atomic/Striped64", "base"),
+        ctx.object_num_fields(this),
+    )
+}
+
+#[cfg(test)]
+mod striped64_base_slot_tests {
+    use super::striped64_base_slot_from_layout;
+
+    #[test]
+    fn real_jdk_inherited_base_slot_wins_over_synthetic_fallback() {
+        assert_eq!(striped64_base_slot_from_layout(Some(1), 3), Some(1));
+    }
+
+    #[test]
+    fn one_field_synthetic_adder_keeps_slot_zero_fallback() {
+        assert_eq!(striped64_base_slot_from_layout(None, 1), Some(0));
+        assert_eq!(striped64_base_slot_from_layout(None, 0), None);
+    }
+}
+
 fn native_long_adder_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    if ctx.object_num_fields(this) > 0 {
-        ctx.set_field(this, 0, Value::Long(0));
+    if let Some(base_slot) = striped64_base_slot(ctx, this) {
+        ctx.set_field(this, base_slot, Value::Long(0));
     }
     // Pre-allocate the cell strip so the first `add` does not race the
     // map insert under the side-table mutex.
@@ -73247,14 +73308,14 @@ fn native_long_adder_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => 0,
     };
     // Fast path: uncontended CAS on base.
-    if ctx.object_num_fields(this) > 0 {
-        let current = ctx.get_field_volatile(this, 0);
+    if let Some(base_slot) = striped64_base_slot(ctx, this) {
+        let current = ctx.get_field_volatile(this, base_slot);
         let base = match current {
             Value::Long(v) => v,
             _ => 0,
         };
         let new_val = Value::Long(base.wrapping_add(x));
-        if ctx.compare_and_swap_field(this, 0, current, new_val) {
+        if ctx.compare_and_swap_field(this, base_slot, current, new_val) {
             return Ok(None);
         }
     }
@@ -73271,14 +73332,14 @@ fn native_long_adder_increment(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    if ctx.object_num_fields(this) > 0 {
-        let current = ctx.get_field_volatile(this, 0);
+    if let Some(base_slot) = striped64_base_slot(ctx, this) {
+        let current = ctx.get_field_volatile(this, base_slot);
         let base = match current {
             Value::Long(v) => v,
             _ => 0,
         };
         let new_val = Value::Long(base.wrapping_add(1));
-        if ctx.compare_and_swap_field(this, 0, current, new_val) {
+        if ctx.compare_and_swap_field(this, base_slot, current, new_val) {
             return Ok(None);
         }
     }
@@ -73293,14 +73354,14 @@ fn native_long_adder_decrement(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    if ctx.object_num_fields(this) > 0 {
-        let current = ctx.get_field_volatile(this, 0);
+    if let Some(base_slot) = striped64_base_slot(ctx, this) {
+        let current = ctx.get_field_volatile(this, base_slot);
         let base = match current {
             Value::Long(v) => v,
             _ => 0,
         };
         let new_val = Value::Long(base.wrapping_sub(1));
-        if ctx.compare_and_swap_field(this, 0, current, new_val) {
+        if ctx.compare_and_swap_field(this, base_slot, current, new_val) {
             return Ok(None);
         }
     }
@@ -73335,8 +73396,8 @@ fn native_long_adder_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // and a separate Relaxed sum across stripe cells. The JDK contract
     // allows `sum()` to return an "approximate" value if concurrent
     // updates race; we follow the same relaxation.
-    let base = if ctx.object_num_fields(this) > 0 {
-        match ctx.get_field_volatile(this, 0) {
+    let base = if let Some(base_slot) = striped64_base_slot(ctx, this) {
+        match ctx.get_field_volatile(this, base_slot) {
             Value::Long(v) => v,
             _ => 0,
         }
@@ -73354,8 +73415,8 @@ fn native_long_adder_int_value(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     };
     // Round-7 HIGH-16: must include stripe cells, otherwise `intValue` /
     // `(int)sum()` returns only the `base` and drops every contended add.
-    let base = if ctx.object_num_fields(this) > 0 {
-        match ctx.get_field(this, 0) {
+    let base = if let Some(base_slot) = striped64_base_slot(ctx, this) {
+        match ctx.get_field(this, base_slot) {
             Value::Long(v) => v,
             _ => 0,
         }
@@ -73373,8 +73434,8 @@ fn native_long_adder_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     // audit-round5 fix #2: volatile store so other threads observing via
     // `sum`/`get_field_volatile` immediately see the cleared cell.
-    if ctx.object_num_fields(this) > 0 {
-        ctx.set_field_volatile(this, 0, Value::Long(0));
+    if let Some(base_slot) = striped64_base_slot(ctx, this) {
+        ctx.set_field_volatile(this, base_slot, Value::Long(0));
     }
     // Round-7 HIGH-16: also zero every stripe cell, otherwise contended
     // adds remain visible after `reset()`.
@@ -73402,10 +73463,10 @@ fn native_long_adder_sum_then_reset(
     // `sumThenReset` is documented as a non-atomic snapshot — concurrent
     // adds racing in the middle may be partly visible in the returned
     // value and partly survive into the reset table. We match that.
-    let base = if ctx.object_num_fields(this) > 0 {
+    let base = if let Some(base_slot) = striped64_base_slot(ctx, this) {
         loop {
-            let current = ctx.get_field_volatile(this, 0);
-            if ctx.compare_and_swap_field(this, 0, current, Value::Long(0)) {
+            let current = ctx.get_field_volatile(this, base_slot);
+            if ctx.compare_and_swap_field(this, base_slot, current, Value::Long(0)) {
                 break match current {
                     Value::Long(v) => v,
                     _ => 0,
@@ -73435,8 +73496,8 @@ fn native_long_adder_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     };
     // Round-7 HIGH-16: include the stripe cell sum so toString reports
     // the same value as `sum()`.
-    let base = if ctx.object_num_fields(this) > 0 {
-        match ctx.get_field(this, 0) {
+    let base = if let Some(base_slot) = striped64_base_slot(ctx, this) {
+        match ctx.get_field(this, base_slot) {
             Value::Long(v) => v,
             _ => 0,
         }
@@ -73454,7 +73515,9 @@ fn native_double_adder_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    ctx.set_field(this, 0, Value::Double(0.0));
+    if let Some(base_slot) = striped64_base_slot(ctx, this) {
+        ctx.set_field(this, base_slot, Value::Long(0));
+    }
     Ok(None)
 }
 
@@ -73471,14 +73534,18 @@ fn native_double_adder_add(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
+    let Some(base_slot) = striped64_base_slot(ctx, this) else {
+        return Ok(None);
+    };
     loop {
-        let current = ctx.get_field_volatile(this, 0);
+        let current = ctx.get_field_volatile(this, base_slot);
         let old = match current {
+            Value::Long(v) => f64::from_bits(v as u64),
             Value::Double(v) => v,
             _ => 0.0,
         };
-        let new_val = Value::Double(old + x);
-        if ctx.compare_and_swap_field(this, 0, current, new_val) {
+        let new_val = Value::Long((old + x).to_bits() as i64);
+        if ctx.compare_and_swap_field(this, base_slot, current, new_val) {
             return Ok(None);
         }
     }
@@ -73490,7 +73557,14 @@ fn native_double_adder_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(Some(Value::Double(0.0))),
     };
     // audit-round5 fix #2: volatile read so concurrent `add`s are observed.
-    Ok(Some(ctx.get_field_volatile(this, 0)))
+    let sum = striped64_base_slot(ctx, this)
+        .and_then(|base_slot| match ctx.get_field_volatile(this, base_slot) {
+            Value::Long(v) => Some(f64::from_bits(v as u64)),
+            Value::Double(v) => Some(v),
+            _ => None,
+        })
+        .unwrap_or(0.0);
+    Ok(Some(Value::Double(sum)))
 }
 
 fn native_double_adder_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -73500,7 +73574,9 @@ fn native_double_adder_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     // audit-round5 fix #2: volatile store so other threads' `sum`
     // reads the cleared value immediately.
-    ctx.set_field_volatile(this, 0, Value::Double(0.0));
+    if let Some(base_slot) = striped64_base_slot(ctx, this) {
+        ctx.set_field_volatile(this, base_slot, Value::Long(0));
+    }
     Ok(None)
 }
 

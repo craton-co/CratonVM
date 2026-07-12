@@ -653,7 +653,23 @@ function Invoke-Mode {
   $java = @((Join-Path $javaBin 'java.exe'), (Join-Path $javaBin 'java')) | Where-Object { Test-Path $_ } | Select-Object -First 1
   if (-not $java) { Die "HotSpot java executable not found under: $javaBin" }
   $craton = ''
-  if ($Vm -eq 'craton') { $craton = Resolve-CratonExe }
+  if ($Vm -eq 'craton') {
+    $craton = Resolve-CratonExe
+    # Matches tomcat-suite-runner's craton knobs. CRATONVM_REAL_NET_SOCKETS in
+    # particular is load-bearing here: without it, java.net.ServerSocket uses
+    # the legacy synthetic layout whose field-slot mapping doesn't match the
+    # real JDK-25 class (declaration order impl@0/created@1/bound@2/closed@3/
+    # socketLock@4/options@5), so socketLock reads back null and any real
+    # bind (Hazelcast, embedded servers, etc.) throws
+    # "NullPointerException: Cannot enter synchronized block because
+    # this.socketLock is null" — see docs/known-issues (reference_server_socket_gap
+    # in memory) for the full history; this is a known, already-fixed-behind-
+    # a-flag issue, not something to re-report as a new bug.
+    $env:CRATONVM_REAL_NET_SOCKETS = '1'
+    $env:CRATONVM_REAL_AQS = '1'
+    $env:CRATONVM_DISABLE_DEFAULT_WATCHDOG = '1'
+    $env:CRATONVM_ROOTSNAP_CACHE = '1'
+  }
 
   $run = $RunName
   if (-not $run) { $run = Get-Date -Format 'yyyyMMdd-HHmmss' }
