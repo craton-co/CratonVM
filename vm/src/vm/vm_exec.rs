@@ -730,10 +730,10 @@ fn safe_native_call_impl(
     // popped from the operand stack into this Rust slice and are otherwise
     // invisible to `collect_roots` / frame scanning during a safepoint GC.
     let pin_base = thread.native_pin_roots.len();
-    // Retain a root index for every argument. The former four-element inline
-    // buffer could be selected before a re-entrant native path exposed a
-    // longer argument slice, leading to a bounds panic while remapping roots
-    // at the next safepoint.
+    // Retain a root index for every argument. Native calls are not restricted
+    // to the former four-element inline buffer: a re-entrant call with a
+    // longer slice (for example Set.of during Surefire bootstrap) must remain
+    // remappable at a safepoint without an out-of-bounds access.
     let mut arg_root_indices = Vec::with_capacity(args.len());
     for a in args {
         let before = thread.native_pin_roots.len();

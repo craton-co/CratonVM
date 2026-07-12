@@ -1173,8 +1173,14 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 .unwrap_or(cratonvm_types::ClassId::new(0)),
             0,
         );
+        // `NativeContext::invoke` may resolve/initialize its target before it
+        // has copied the supplied argument slice into a Java frame.  Keep both
+        // freshly-created arguments rooted through that pre-dispatch window;
+        // otherwise a collection relocates `class` or `empty_types` before
+        // getDeclaredConstructor reads them.
+        let empty_types_pin = ctx.pin_native_root(empty_types);
         let class = ctx.read_native_pin(class_pin, class);
-        ctx.unpin_native_roots(class_pin);
+        let empty_types = ctx.read_native_pin(empty_types_pin, empty_types);
         let ctor = ctx
             .invoke(
                 "java/lang/Class",
@@ -1184,6 +1190,8 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             )
             .ok()
             .and_then(|v| v);
+        ctx.unpin_native_roots(empty_types_pin);
+        ctx.unpin_native_roots(class_pin);
         let ctor = match ctor {
             Some(Value::Object(Some(c))) => c,
             _ => {
@@ -1218,14 +1226,17 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 .unwrap_or(cratonvm_types::ClassId::new(0)),
             0,
         );
+        let empty_args_pin = ctx.pin_native_root(empty_args);
         let ctor = ctx.read_native_pin(ctor_pin, ctor);
-        ctx.unpin_native_roots(ctor_pin);
+        let empty_args = ctx.read_native_pin(empty_args_pin, empty_args);
         let inst_result = ctx.invoke(
             "java/lang/reflect/Constructor",
             "newInstance",
             "([Ljava/lang/Object;)Ljava/lang/Object;",
             &[Value::Object(Some(ctor)), Value::Object(Some(empty_args))],
         );
+        ctx.unpin_native_roots(empty_args_pin);
+        ctx.unpin_native_roots(ctor_pin);
         // An `InternalError` here (Linkage/NoClassDefFoundError, etc.) is a
         // genuine VM-side failure -- the class was resolved successfully
         // moments ago (`load_provider_class` above found it), so a linkage
@@ -1258,12 +1269,20 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         };
         // Re-read the (possibly forwarded) list reference before mutating it.
         list = ctx.read_native_pin(list_pin, list);
-        ctx.invoke(
+        // `ArrayList.add` can resolve/initialize code before it has copied its
+        // argument slice into a Java frame. The provider instance just returned
+        // by Constructor.newInstance is therefore another native local that
+        // must remain rooted through the call.
+        let inst_pin = ctx.pin_native_root(inst);
+        let inst = ctx.read_native_pin(inst_pin, inst);
+        let add_result = ctx.invoke(
             al_cls,
             "add",
             "(Ljava/lang/Object;)Z",
             &[Value::Object(Some(list)), Value::Object(Some(inst))],
-        )?;
+        );
+        ctx.unpin_native_roots(inst_pin);
+        add_result?;
     }
     // Loop done: pick up the final forwarded list reference (still pinned).
     list = ctx.read_native_pin(list_pin, list);
