@@ -4851,6 +4851,15 @@ fn hibernate_temporal_jit_deny_prefix(class_name: &str) -> Option<&'static str> 
     }
 }
 
+fn hsqldb_jit_deny_prefix(class_name: &str) -> Option<&'static str> {
+    const SLASH_PREFIX: &str = "org/hsqldb/";
+    const DOT_PREFIX: &str = "org.hsqldb.";
+    if class_name.starts_with(SLASH_PREFIX) {
+        Some(SLASH_PREFIX)
+    } else {
+        class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
+    }
+}
 fn snakeyaml_emitter_emit_jit_deny_prefix(
     class_name: &str,
     method_name: &str,
@@ -5132,6 +5141,15 @@ pub fn try_compile(
         }
     }
 
+    // SPB-FLYWAY-HSQLDB.1: Keep the final admission gate aligned with the VM
+    // skip-list. The Flyway HSQLDB integration SIGSEGVs under JIT, while the
+    // package-level interpreted control completes the entire class. Background
+    // compilation can bypass VM eligibility checks, so fail closed here too.
+    if let Some(prefix) = hsqldb_jit_deny_prefix(&cached.class_name) {
+        if !jit_allow_package(prefix) {
+            return None;
+        }
+    }
     // ES-JIT-DEOPT-GC.1: final fail-closed companion to the VM skip-list guard
     // for `org/yaml/snakeyaml/emitter/Emitter.emit`. Tiered/background compile
     // can reach this crate after the VM-side enqueue path has logged work; keep
@@ -7491,6 +7509,18 @@ mod tests {
         assert_eq!(hibernate_temporal_jit_deny_prefix("org/example/Foo"), None);
     }
 
+    #[test]
+    fn hsqldb_jit_deny_matches_slash_and_dot_names() {
+        assert_eq!(
+            hsqldb_jit_deny_prefix("org/hsqldb/map/BaseHashMap"),
+            Some("org/hsqldb/")
+        );
+        assert_eq!(
+            hsqldb_jit_deny_prefix("org.hsqldb.map.BaseHashMap"),
+            Some("org.hsqldb.")
+        );
+        assert_eq!(hsqldb_jit_deny_prefix("org/example/Foo"), None);
+    }
     #[test]
     fn hibernate_temporal_jit_allow_entries_are_prefix_based() {
         assert!(jit_allow_entry_allows_prefix(
