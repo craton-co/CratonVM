@@ -24,7 +24,6 @@ correct JVM.
 
 ## Clusters (this audit), ranked by class count
 
-- [hib-statistics-counters-always-zero-cluster.md](hib-statistics-counters-always-zero-cluster.md) — **94 classes, the single largest cluster in this audit (35% of all FAIL).** Every Hibernate `Statistics` counter (2nd-level cache hit/miss/put, query-cache hit/miss, insert/update/delete counts, query execution counts, natural-id cache counts) reads back exactly `0` regardless of real activity. Highest-value fix target — likely one root cause behind ~90+ classes.
 - [hib-bytecode-enhancement-propertyaccessexception-setter-cluster.md](hib-bytecode-enhancement-propertyaccessexception-setter-cluster.md) — 19 classes. Loader-faithful bytecode-enhancement setter/reflection gap.
 - [hib-entitygraph-antlr-rulenode-npe-cluster.md](hib-entitygraph-antlr-rulenode-npe-cluster.md) — 14 classes. ANTLR parse-tree NPE in legacy entity-graph string-syntax parsing.
 - [hib-immutable-entitywithmutablecollection-hang-cluster.md](hib-immutable-entitywithmutablecollection-hang-cluster.md) — 17 classes (+`ImmutableTest`), all HANG, 100% hit rate. Immutable entity + mutable collection interaction.
