@@ -4685,6 +4685,11 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
     // Lambda proxies are synthetic and therefore cannot participate in the
     // class-store MIC. Give the erased primitive adapter its own receiver-guarded
     // direct path before allocating decoded Values for the generic fallback.
