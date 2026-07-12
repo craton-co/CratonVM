@@ -4,6 +4,28 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-11 Spring Boot full-suite run (1975 classes) triaged; 5 bug clusters filed under `springboot/`
+
+First full run of the real Spring Boot 4.1.0-SNAPSHOT test suite via the new
+`apps/spring-boot-suite-runner` (see
+[[project_spring_boot_suite_runner_20260711]]): 1975 classes, 1225 PASS / 508
+FAIL / 150 HANG / 49 CRASH / 43 EMPTY. Triaged the 508 FAILs by log-signature
+clustering; five distinct root causes characterized and filed under
+[`springboot/`](springboot/README.md), covering ~146 classes directly (more
+indirectly, since several of these produce the generic "Unstarted
+application context" wrapper Spring shows at the test level):
+
+- [`springboot/onclasscondition-npe-cast-to-string-array-cluster.md`](springboot/onclasscondition-npe-cast-to-string-array-cluster.md) — **the largest single cluster** (75 classes, 348 occurrences): `OnClassCondition.addAll` receives a live `NullPointerException` object where a `String[]` annotation attribute belongs (`ClassCastException: java.lang.NullPointerException cannot be cast to [Ljava.lang.String;`), breaking `@ConditionalOnClass` broadly. Likely the same bug family as the still-open SB-04 finding in [[reference_spring_boot_functional_suite]], now with a much more specific, standalone-reproducible entry point.
+- [`springboot/disposablebeanadapter-invalid-destruction-signature-cluster.md`](springboot/disposablebeanadapter-invalid-destruction-signature-cluster.md) — 34 classes: Spring's destroy-method reflection resolution fails for beans whose destroy method is inherited from a JDK interface (`AutoCloseable`/`Closeable`).
+- [`springboot/unsafe-memoryaccessoption-npe-cluster.md`](springboot/unsafe-memoryaccessoption-npe-cluster.md) — 26 classes: `sun.misc.Unsafe$MemoryAccessOption.ordinal()` NPEs, likely the same `<clinit>`-bootstrap-timing family as the already-fixed `Unsafe`/`Build$CurrentHolder` bug (also hits indirectly via Netty's internal `Unsafe` usage — "failed to create a child event loop").
+- [`springboot/httpclient-builder-dead-registration-abstractmethoderror.md`](springboot/httpclient-builder-dead-registration-abstractmethoderror.md) — 13 classes, **fully root-caused**: `HttpClient$Builder.proxy`/`sslContext`/`cookieHandler`/etc. throw `AbstractMethodError` because their complete native registration only exists behind the `synthetic-jdk` feature (compiled out of every real-JDK build) — the recurring "synthetic-only registration missing in essential" meta-pattern.
+- [`springboot/zip-filedatablock-bulk-bytebuffer-put-aioobe.md`](springboot/zip-filedatablock-bulk-bytebuffer-put-aioobe.md) — breaks the entire `spring-boot-loader` module (9/9 classes): bulk `ByteBuffer.put(ByteBuffer)`/`ScopedMemoryAccess.copyMemory` throws `ArrayIndexOutOfBoundsException` reading any zip/jar file through Spring Boot's own nested-jar loader.
+
+Also fixed a general, VM-wide, deterministic crash found by this run (not
+Spring-specific): [[reference_native_call_arg_pinning_unwrap_or_eager_eval_panic]]
+— `Option::unwrap_or` evaluates its argument eagerly in Rust, panicking on
+any native call with more than 4 arguments.
+
 ## 2026-07-11 Spring suite genuine-bug list reconfirmed (125 → 96 open, 29 fixed)
 
 Scoped rerun of exactly the 125-class list from the doc below on dev
