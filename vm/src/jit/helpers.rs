@@ -5052,6 +5052,8 @@ fn call_hashmap_native_raw(
         Some(Value::Object(None)) | None => 0,
         _ => 0,
     })
+}
+
 /// Specialize a lambda proxy's erased `Function.apply(Object)` call when its
 /// implementation is a concrete `(int) -> double` virtual/interface target.
 ///
