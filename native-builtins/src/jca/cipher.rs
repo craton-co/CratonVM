@@ -84,7 +84,7 @@ use cratonvm_types::{ObjectRef, Value};
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 
-use crate::crypto_impl::{Aes, AesGcm};
+use crate::crypto_impl::{Aes, AesGcm, AesKey};
 use crate::phases_early::CIPHER_IV;
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
@@ -646,6 +646,183 @@ fn parse_transformation(algo: &str) -> (String, String, bool) {
         .map(|p| !p.eq_ignore_ascii_case("NoPadding"))
         .unwrap_or(true);
     (cipher_name, mode, pad)
+}
+
+/// RFC 3394 default initial value.  `AESWrap_128` is SunJCE's name for
+/// AES Key Wrap with a 128-bit key-encryption key; the same RFC construction
+/// also covers the generic `AESWrap` transformation.
+const AES_KEY_WRAP_IV: [u8; 8] = [0xA6; 8];
+
+fn aes_wrap_expected_kek_len(algo: &str) -> Option<usize> {
+    match algo.to_ascii_uppercase().as_str() {
+        "AESWRAP_128" | "AESWRAP128" => Some(16),
+        "AESWRAP_192" | "AESWRAP192" => Some(24),
+        "AESWRAP_256" | "AESWRAP256" => Some(32),
+        _ => None,
+    }
+}
+
+fn is_aes_key_wrap(algo: &str) -> bool {
+    algo.to_ascii_uppercase().starts_with("AESWRAP")
+}
+
+/// RFC 3394 AES Key Wrap, section 2.2.1.  RFC 5649 padded key wrap is a
+/// different transformation and deliberately remains outside this path.
+fn aes_key_wrap(kek: &AesKey, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    if plaintext.len() < 16 || plaintext.len() % 8 != 0 {
+        return Err(format!(
+            "AES Key Wrap requires at least two 64-bit blocks, got {} bytes",
+            plaintext.len()
+        ));
+    }
+
+    let n = plaintext.len() / 8;
+    let mut a = AES_KEY_WRAP_IV;
+    let mut r = plaintext.to_vec();
+    for j in 0..6 {
+        for i in 0..n {
+            let mut block = [0u8; 16];
+            block[..8].copy_from_slice(&a);
+            block[8..].copy_from_slice(&r[i * 8..(i + 1) * 8]);
+            let encrypted = Aes::encrypt_block(kek, &block);
+            let t = (n * j + i + 1) as u64;
+            a = (u64::from_be_bytes(encrypted[..8].try_into().expect("eight bytes")) ^ t)
+                .to_be_bytes();
+            r[i * 8..(i + 1) * 8].copy_from_slice(&encrypted[8..]);
+        }
+    }
+
+    let mut wrapped = Vec::with_capacity(plaintext.len() + 8);
+    wrapped.extend_from_slice(&a);
+    wrapped.extend_from_slice(&r);
+    Ok(wrapped)
+}
+
+/// RFC 3394 AES Key Unwrap, section 2.2.2.  The final IV comparison is the
+/// mandatory integrity check; returning key bytes before it succeeds would
+/// turn tampered JWE ciphertext into a usable content-encryption key.
+fn aes_key_unwrap(kek: &AesKey, wrapped: &[u8]) -> Result<Vec<u8>, String> {
+    if wrapped.len() < 24 || wrapped.len() % 8 != 0 {
+        return Err(format!(
+            "AES Key Wrap ciphertext requires an IV plus at least two 64-bit blocks, got {} bytes",
+            wrapped.len()
+        ));
+    }
+
+    let n = wrapped.len() / 8 - 1;
+    let mut a: [u8; 8] = wrapped[..8].try_into().expect("eight-byte IV");
+    let mut r = wrapped[8..].to_vec();
+    for j in (0..6).rev() {
+        for i in (0..n).rev() {
+            let t = (n * j + i + 1) as u64;
+            let mut block = [0u8; 16];
+            let a_xor_t = u64::from_be_bytes(a) ^ t;
+            block[..8].copy_from_slice(&a_xor_t.to_be_bytes());
+            block[8..].copy_from_slice(&r[i * 8..(i + 1) * 8]);
+            let decrypted = Aes::decrypt_block(kek, &block);
+            a.copy_from_slice(&decrypted[..8]);
+            r[i * 8..(i + 1) * 8].copy_from_slice(&decrypted[8..]);
+        }
+    }
+
+    if a != AES_KEY_WRAP_IV {
+        return Err("AES Key Wrap integrity check failed".into());
+    }
+    Ok(r)
+}
+
+fn aes_wrap_cipher_state(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    required_mode: i32,
+    operation: &str,
+) -> Result<CipherState, cratonvm_types::error::MethodCallFailed> {
+    let key = obj_key(ctx, this);
+    let Some(state) = with_table_read(|t| t.get(&key).cloned()) else {
+        return Err(RuntimeError::IllegalStateException {
+            message: format!("Cipher state missing while attempting to {operation}"),
+        }
+        .into());
+    };
+    if state.mode != required_mode {
+        return Err(RuntimeError::IllegalStateException {
+            message: format!("Cipher not initialized for {operation}"),
+        }
+        .into());
+    }
+    if !is_aes_key_wrap(&state.algorithm) {
+        return Err(RuntimeError::IllegalStateException {
+            message: format!("Cipher.{operation} not implemented for {}", state.algorithm),
+        }
+        .into());
+    }
+    if let Some(expected_len) = aes_wrap_expected_kek_len(&state.algorithm) {
+        if state.key_bytes.len() != expected_len {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!(
+                    "{} requires a {}-bit key-encryption key, got {} bits",
+                    state.algorithm,
+                    expected_len * 8,
+                    state.key_bytes.len() * 8
+                ),
+            }
+            .into());
+        }
+    }
+    Ok(state)
+}
+
+fn cipher_wrap_key(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key_to_wrap: ObjectRef,
+) -> MethodCallResult {
+    let state = aes_wrap_cipher_state(ctx, this, 3, "wrap")?;
+    let key_bytes = extract_key_bytes(ctx, key_to_wrap);
+    if key_bytes.is_empty() {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Cannot wrap a key with no encodable bytes".into(),
+        }
+        .into());
+    }
+    let kek = Aes::key_expansion(&state.key_bytes).map_err(|e| {
+        RuntimeError::IllegalArgumentException {
+            message: format!("Invalid AES key-encryption key: {e:?}"),
+        }
+    })?;
+    let wrapped = aes_key_wrap(&kek, &key_bytes)
+        .map_err(|message| RuntimeError::IllegalArgumentException { message })?;
+    let table_key = obj_key(ctx, this);
+    finish_cipher_bytes(ctx, table_key, &wrapped)
+}
+
+fn cipher_unwrap_key(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    wrapped: ObjectRef,
+    algorithm: ObjectRef,
+    key_type: i32,
+) -> MethodCallResult {
+    const SECRET_KEY: i32 = 3;
+    if key_type != SECRET_KEY {
+        return Err(RuntimeError::IllegalStateException {
+            message: "AES Key Wrap unwrap only supports Cipher.SECRET_KEY".into(),
+        }
+        .into());
+    }
+    let state = aes_wrap_cipher_state(ctx, this, 4, "unwrap")?;
+    let kek = Aes::key_expansion(&state.key_bytes).map_err(|e| {
+        RuntimeError::IllegalArgumentException {
+            message: format!("Invalid AES key-encryption key: {e:?}"),
+        }
+    })?;
+    let key_bytes = aes_key_unwrap(&kek, &read_bytes(ctx, wrapped))
+        .map_err(|message| RuntimeError::IllegalArgumentException { message })?;
+    let encoded = make_bytes_array(ctx, &key_bytes);
+    let key = alloc_concurrent_synthetic(ctx, "javax/crypto/spec/SecretKeySpec", 2);
+    ctx.set_field(key, 0, Value::Object(Some(encoded)));
+    ctx.set_field(key, 1, Value::Object(Some(algorithm)));
+    Ok(Some(Value::Object(Some(key))))
 }
 
 /// Execute `doFinal` against the configured cipher state.
@@ -1358,6 +1535,29 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         cipher_do_final_impl(ctx, this)
     });
 
+    // Keycloak's Elytron JWE providers use SunJCE's `AESWrap_128` alias and
+    // call these public Cipher APIs directly rather than feeding the CEK to
+    // `doFinal`. The native Cipher object has no real CipherSpi behind it, so
+    // registering the two calls is required even though their RFC 3394 block
+    // operations use the same in-tree AES primitive as the other AES modes.
+    r.register(cipher, "wrap", "(Ljava/security/Key;)[B", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let key = obj_arg(args, 1)?;
+        cipher_wrap_key(ctx, this, key)
+    });
+    r.register(
+        cipher,
+        "unwrap",
+        "([BLjava/lang/String;I)Ljava/security/Key;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let wrapped = obj_arg(args, 1)?;
+            let algorithm = obj_arg(args, 2)?;
+            let key_type = args[3].as_int().unwrap_or(0);
+            cipher_unwrap_key(ctx, this, wrapped, algorithm, key_type)
+        },
+    );
+
     // `doFinal(input, inputOffset, inputLen)` → byte[]. The offset/length
     // variant keycloak's AES-GCM decrypt and several BC callers use.
     r.register(cipher, "doFinal", "([BII)[B", |ctx, args| {
@@ -1738,6 +1938,16 @@ mod tests {
             )
             .is_some());
         assert!(r.find("javax/crypto/Cipher", "doFinal", "([B)[B").is_some());
+        assert!(r
+            .find("javax/crypto/Cipher", "wrap", "(Ljava/security/Key;)[B")
+            .is_some());
+        assert!(r
+            .find(
+                "javax/crypto/Cipher",
+                "unwrap",
+                "([BLjava/lang/String;I)Ljava/security/Key;"
+            )
+            .is_some());
 
         // Spec-type constructors
         assert!(r
@@ -1774,5 +1984,35 @@ mod tests {
         assert_eq!(cipher, "AES");
         assert_eq!(mode, "ECB");
         assert!(pad);
+    }
+
+    #[test]
+    fn aes_key_wrap_rfc3394_128_bit_vector_round_trips() {
+        // RFC 3394, section 4.1: 128-bit KEK wrapping 128 bits of key data.
+        let kek = Aes::key_expansion(&[
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x0E, 0x0F,
+        ])
+        .unwrap();
+        let plaintext = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF,
+        ];
+        let expected = [
+            0x1F, 0xA6, 0x8B, 0x0A, 0x81, 0x12, 0xB4, 0x47, 0xAE, 0xF3, 0x4B, 0xD8, 0xFB, 0x5A,
+            0x7B, 0x82, 0x9D, 0x3E, 0x86, 0x23, 0x71, 0xD2, 0xCF, 0xE5,
+        ];
+
+        let wrapped = aes_key_wrap(&kek, &plaintext).unwrap();
+        assert_eq!(wrapped, expected);
+        assert_eq!(aes_key_unwrap(&kek, &wrapped).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn aes_key_unwrap_rejects_tampered_integrity_value() {
+        let kek = Aes::key_expansion(&[0x55; 16]).unwrap();
+        let mut wrapped = aes_key_wrap(&kek, &[0x11; 16]).unwrap();
+        wrapped[0] ^= 1;
+        assert!(aes_key_unwrap(&kek, &wrapped).is_err());
     }
 }
