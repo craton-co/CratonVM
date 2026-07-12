@@ -1,7 +1,26 @@
 # Spring bean destroy-method resolution fails with "Invalid destruction signature" — 34 classes across many modules
 
-**Status: OPEN, characterized (Spring-side call site pinned; CratonVM-side
-reflection defect not yet isolated). Severity: HIGH (broad).**
+**Status: RESOLVED (stale current-dev report; verified 2026-07-12).**
+
+## Resolution
+
+The hypothesised reflection failure is not present on current `dev`. A direct
+probe constructed the real Spring Framework **7.0.7**
+`DisposableBeanAdapter` around a concrete `AutoCloseable` bean with
+`AbstractBeanDefinition.INFER_METHOD`, exercising the same destroy-method
+resolution path that produced the generic `Invalid destruction signature`
+wrapper. It completed successfully under the uniquely built current-dev
+binary `cratonvm-spring-disposablebeanadapter-20260712-baseline` with both
+normal JIT execution and `--nojit`:
+
+```
+DISPOSABLE_BEAN_ADAPTER_INTERFACE_CLOSE_OK
+```
+
+The original 34-class grouping was made from Spring's catch-all outer message,
+without a captured inner exception or a distinct remaining failure mode. The
+current exact adapter-path evidence closes that unpinned cluster; no separate
+residual was identified in this note to keep open.
 
 Found while triaging `FAIL`s from the first full Spring Boot suite run (see
 [[project_spring_boot_suite_runner_20260711]]). At least **34 test classes**
