@@ -1,8 +1,18 @@
-# `sun.misc.Unsafe$MemoryAccessOption.ordinal()` NPE — likely a `<clinit>`-time bootstrap gap, same family as the already-fixed `Unsafe`/`Build$CurrentHolder` bug
+# `sun.misc.Unsafe$MemoryAccessOption.ordinal()` NPE — Spring Boot occurrence of an already-FIXED bug
 
-**Status: OPEN, characterized. Severity: HIGH (≥26 classes; two call shapes,
-one root cause).**
+**Status: FIXED/RETIRED 2026-07-12.** This was independently found here
+(Spring Boot suite, Couchbase/Lettuce/Netty call paths) and, in the same
+time window, by another session investigating Keycloak/Infinispan — same
+root cause, same fix. The canonical writeup + validation is
+[`testsuite-model-unsafe-putorderedlong-memoryaccessoption-npe-FIXED.md`](testsuite-model-unsafe-putorderedlong-memoryaccessoption-npe-FIXED.md)
+in this same directory (fix landed in `vm/src/vm/vm_util.rs`: repairs the
+missing `sun/misc/Unsafe.MEMORY_ACCESS_OPTION` static after class
+initialization). This doc is kept as a second corroborating occurrence with
+the Spring Boot-specific symptom shapes (below), not as an active tracking
+doc — see the canonical doc for the fix/validation.
 
+Original characterization, preserved for the corroborating call shapes it
+found (≥26 Spring Boot classes across two symptom shapes, one root cause).
 Found while triaging `FAIL`s from the first full Spring Boot suite run (see
 [[project_spring_boot_suite_runner_20260711]]). Two symptom shapes, same
 underlying NPE:
@@ -55,15 +65,13 @@ yet this early in real-JDK bootstrap, silently returning 0 instead of
 throwing" (see the `docs/known-issues/README.md` "ES suite-wide
 `Build$CurrentHolder` manifest-null FIXED" entry, fixed via a
 post-clinit success-path backfill in `vm/src/vm/vm_util.rs`). That fix
-covered `Unsafe`'s own constants and `UnsafeConstants`; it did not
-necessarily cover `Unsafe$MemoryAccessOption`'s separate `<clinit>` (a
-nested class with its own bootstrap timing). Needs the same treatment: find
-what `Unsafe$MemoryAccessOption.<clinit>`/`defaultValue()` depends on that
-isn't available yet at this point in real-JDK bootstrap, and either make it
-available earlier or add a post-clinit backfill mirroring the existing
-pattern in `vm_util.rs`.
+covered `Unsafe`'s own constants and `UnsafeConstants`; it did not cover
+`Unsafe.MEMORY_ACCESS_OPTION` (a sibling static, not nested-class `<clinit>`
+timing as originally guessed here — see the canonical doc's "Resolution"
+section for the actual mechanism). **Confirmed fixed** with the same
+post-clinit-backfill treatment, applied to `MEMORY_ACCESS_OPTION` directly.
 
-## Repro
+## Repro (historical — fixed, not currently reproducible on dev)
 
 ```powershell
 apps\spring-boot-suite-runner\run-spring-boot-suite.ps1 -SpringBootRoot C:\craton\CratonVM\apps\spring-boot `
