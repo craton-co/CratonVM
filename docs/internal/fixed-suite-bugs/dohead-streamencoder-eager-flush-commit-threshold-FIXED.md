@@ -1,6 +1,48 @@
 # Tomcat `TestHttpServletDoHead*` (legacy HEAD) — StreamEncoder eager-flush broke the byte-count commit threshold (FIXED)
 
-**Note (2026-07-13):** restored from `docs/internal/fixed-suite-bugs/`
+**Update (2026-07-13, later the same day): the eager-flush behaviour this
+doc describes came BACK — via a different file — and is re-fixed.** The
+same 8-parameter family (useLegacy=true, useWriter=true, resetType=FULL,
+bufferSize 16/8192 — params 46/47/58/59/118/119/130/131) failed again with
+the same signature pairs (`testDoHead`: `expected:<2> but was:<3>`;
+`testDoHeadHttp2`: GET commits `content-length: 8192` while the paired
+HEAD goes chunked), deterministically on both Windows and Linux. The
+regression is NOT in `native-io/src/stream_encoder.rs` (whose buffering —
+since rewritten to by-name field access + an identity-hash-keyed side
+table — is correct and was verified innocent): commit `b448f2039` ("Fix
+WildFly process-controller bootstrap residuals", 2026-07-09) added a full
+`java.io.OutputStreamWriter` native surface to
+`register_essential_natives` (native-builtins/src/lib.rs): `<init>`×3,
+`write`×4, `flush`, `close`. Registered natives shadow real bytecode at
+every interpreter dispatch site (WP0.1 native-override-priority), so
+real-JDK mode stopped running the real OSW bytecode → the
+`sun.nio.cs.StreamEncoder` shim (and its pending-byte buffering) went
+completely unreached. The replacement
+(`write_bytes_from_output_stream_writer`) encodes EVERY `write()` call
+straight to the wrapped stream — one underlying `write([BII)` per Writer
+call, i.e. exactly the eager-flush behaviour this doc's fix removed. It
+also hard-codes UTF-8 (`String::into_bytes()`, ignoring the writer's
+charset) and its `<init>` clobbers real slot 0 (`Writer.writeBuffer`)
+while never creating the `se` field.
+
+Standalone confirmation (1024 × 16-char `Writer` writes into a counting
+OutputStream): dev tip delivered 1024 × 16-byte underlying writes vs
+HotSpot's 32 × 512 — for BOTH `PrintWriter` and bare `OutputStreamWriter`
+paths.
+
+**Re-fix:** gate the entire OSW block under
+`cfg!(feature = "synthetic-jdk")` ("fix(io): gate the OutputStreamWriter
+native surface to synthetic-JDK builds", branch
+`fix/dohead-family-regressions-v2-20260713`, same precedent as the
+BufferedInputStream block beside it). Post-fix: the standalone repro
+batches 32 × 512 exactly like HotSpot, and
+`TestHttpServletDoHeadInvalidWrite1024ValidWrite512` runs 288 tests with
+zero commit-threshold failures on the Windows suite runner. The same
+branch fixes the `javax/net/SocketFactory`-under-RNS Socket cluster (see
+the main doc); the `Logger` handler corruption was independently fixed on
+dev (`d94712f2a`).
+
+**Note (2026-07-13, earlier):** restored from `docs/internal/fixed-suite-bugs/`
 alongside `dohead-jit-heap-corruption-register-invisibility.md`. This
 specific fix (commit `1773d3df2`) is confirmed merged to `dev` and remains
 accurate — the byte-count commit-threshold bug it describes is genuinely
