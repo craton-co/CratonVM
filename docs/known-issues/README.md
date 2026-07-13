@@ -4,6 +4,30 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-13 WildFly `AttributeAccess` CCE confirmed as register-invisible-JIT-root family; NEW "Family 1" stale-ObjectRef residual found alongside it
+
+- 🔴 NEW: [`wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`](wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md)
+  — follow-up to the `AttributeDefinition` CCE fix (`70154861`)'s flagged residual: `ClassCastException:
+  java.lang.Object cannot be cast to org.jboss.as.controller.registry.AttributeAccess`, also during
+  `parallel-extension-add`. Confirmed from source (not a fresh live capture — see below) as an occurrence
+  of the already-tracked, currently-OPEN "register-invisible JIT root" family (`SB-CRASH-04`'s residual in
+  the default-on precise-JIT-oop-map machinery): `jit_typecheck_resolve`'s fast path (the path an
+  already-loaded class like `AttributeAccess` takes) makes zero GC-triggering calls, so staleness must
+  originate upstream of the checkcast helper; and Generational's young collector is confirmed (from source,
+  not aspirationally) to never relocate objects while any JIT frame is active, structurally excluding the
+  classic "moving GC left a dangling pointer" mechanism for this JIT-required bug — leaving the non-moving
+  sweep's marking phase missing a live root at a cooperative safepoint as the only mechanism consistent with
+  the symptom, matching three independent 2026-07-10 occurrences of the same family (DoHead,
+  `TestSwallowAbortedUploads`, `TestAccessLogValve`). Not fixed, per this family's established
+  document-don't-speculatively-patch policy. Live reproduction of the CCE itself was inconclusive this
+  session — the host was under heavy external CPU contention (confirmed via `wmic`/`ps`), and a **separate,
+  real "Family 1" stale-`ObjectRef`-across-GC bug** (unrelated native code holding a raw `ObjectRef` across a
+  GC-triggering call, unpinned) fired instead in 9/20 diagnostic (`CRATONVM_DBG_STALE_OBJREF=1`) attempts,
+  immediately as `parallel-extension-add`'s worker threads spin up — a fresh occurrence found on a build
+  forked *after* `docs/internal/wildfly-parallel-boot-stale-objectref-residual.md`'s own "Status: FIXED"
+  date, not yet root-caused to an exact call site (Windows backtrace symbolication did not resolve despite a
+  matching `.pdb`), flagged as its own separate follow-up (see the new doc's "Separate finding" section).
+
 ## 2026-07-13 s2 ByteBuffer real-JDK direct-buffer/interop gaps RETIRED (all 7 items fixed; compound-file residual refuted)
 
 - FIXED/RETIRED (moved to `docs/internal/`): [`fixed-suite-bugs/s2-bytebuffer-natives-real-jdk-direct-buffer-gaps-FIXED.md`](../internal/fixed-suite-bugs/s2-bytebuffer-natives-real-jdk-direct-buffer-gaps-FIXED.md) — every remaining item closed in one pass via the doc's own suggested single storage-view helper (`servlet.rs::s2_bb_storage`: heap array + real `offset` base OR direct native address). (2) `equals`/`hashCode`/`compareTo` now storage-aware (and `hashCode` now iterates backward like real `Buffer.hashCode` — the old forward loop diverged from HotSpot on every 2+-byte buffer); (3) `slice()`/new `slice(II)`/`duplicate()`/`asReadOnlyBuffer()`/typed views are now genuine ALIASING views over heap (array-base `offset`, honoured by every accessor, returned by `arrayOffset()`) or direct (`address`) storage — the old copies meant writes through a slice never reached the parent; `isDirect`/`isReadOnly`/`hasArray`/`array` answer from storage/flags and read-only mutation throws the new `ReadOnlyBufferException`; (4) the `ChecksumIndexInput.getChecksum()` HotSpot divergence was NOT a ByteBuffer bug: a synthetic-era native override of Lucene's `BufferedChecksumIndexInput.getChecksum()` re-read the file and recomputed CRC over `length-8` bytes whenever position was within 8 bytes of EOF (right answer ONLY in CodecUtil's footer idiom — which is why self-verifies passed; ProbeNIOFS2's full-file read got CRC(first 4992 bytes) = 170114997, verified arithmetically); it now returns `digest.getValue()` like the real bytecode; (5) the `ByteBuffersDirectory` reflective `NoSuchMethodException: <init>` was `Class.asSubclass` never throwing `ClassCastException` — Lucene's `newFSDirectory` USES that CCE to fall back to a random FSDirectory for a non-FS forced `tests.directory`; asSubclass now enforces the subtype check; (6) `ByteOrder.toString`/`equals` decoded real `name`-String field 0 as an int (everything printed BIG_ENDIAN) and `nativeOrder()`/static getters allocated fresh synthetics per call (identity comparisons always false) — all now return/decode the canonical real statics, and `buffer.order()` ensures `ByteOrder.<clinit>` ran; (7) the 7-vs-53 JIT iteration divergence does not reproduce: 53/53 PASS JIT-on and `--nojit`. **The 2026-07-13 "compound-file copyBytes loses 46 bytes" residual (`remaining=-30, expected=16, fp=2517`) is NOT a dev bug**: the exact forced-NIOFS `testMultiClose` repro passes on the dev tip (3/3 runs) and on the fixed build; it reproduces ONLY under the uncommitted ~460-line `allocateDirect` rework left in worktree `cratonvm-s2-bytebuffer-real-direct-20260712` (verified by running that session's binary against the identical command). Verified: probe battery vs HotSpot jdk25 (buffer semantics incl. aliasing + JDK-reference hashCode, CRC32 paths, checksum-input bulk/per-byte/mixed/footer-idiom, ByteOrder identity, asSubclass, reflective Directory shapes), `testMultiClose` PASS under forced NIOFSDirectory AND forced ByteBuffersDirectory, full `ES93FlatBFloat16VectorFormatTests` 53/53 JIT-on + `--nojit`, regression sweep (`ES813FlatVectorFormatTests` 53/53, `ES815BitFlatVectorFormatTests` 6/6, `ES93HnswBFloat16VectorsFormatTests`), zero unit-test regressions in `cratonvm-native-builtins`/`cratonvm-types`.

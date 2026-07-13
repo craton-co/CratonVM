@@ -1511,14 +1511,28 @@ impl GenerationalHeap {
         // evacuated memory would already have been zeroed by the time a
         // mutator could observe it.
         if crate::stale_objref_debug::enabled() && header.is_forwarded() {
+            // DIAGNOSTIC-ONLY (attrib-cce-investigate, 2026-07-13): read the
+            // object's REAL, fully-valid header at the forwarded (new)
+            // address so the panic message identifies which class/kind went
+            // stale — the old-address header is just a forwarding marker by
+            // this point. Not a functional change: only executed on the
+            // already-panicking path, gated behind the same debug flag.
+            let fwd_ptr = header.forwarding_address();
+            let (fwd_class_id, fwd_kind) = if !fwd_ptr.is_null() {
+                let fwd_header = unsafe { &*(fwd_ptr as *const ObjectHeader) };
+                (fwd_header.class_id.as_u32(), format!("{:?}", fwd_header.kind))
+            } else {
+                (u32::MAX, "<null-forward>".to_string())
+            };
             panic!(
                 "CRATONVM_DBG_STALE_OBJREF: stale ObjectRef detected at {:p} — this \
-                 object was evacuated by a moving GC to {:p}, but native/interpreter code \
+                 object was evacuated by a moving GC to {:p} (class_id={fwd_class_id} \
+                 kind={fwd_kind}), but native/interpreter code \
                  dereferenced the OLD address. This means a raw ObjectRef local was held \
                  across a GC-triggering call without pin_native_root/read_native_pin. See \
                  docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.",
                 obj_ref.as_ptr(),
-                header.forwarding_address(),
+                fwd_ptr,
             );
         }
         header
