@@ -3005,7 +3005,7 @@ fn native_socket_input_stream_read_one(
 /// Returns the (possibly GC-relocated) `this` — callers that keep using the
 /// Socket afterward MUST use the returned value, not their original local.
 #[must_use]
-fn re1_init_socket_locks(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
+pub(crate) fn re1_init_socket_locks(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
     // GC-safety: `this` is a raw ObjectRef parameter, and `new_object` below
     // is a re-entrant, allocating call (it can trigger a GC). This is called
     // right after a fresh Socket allocation -- for a freshly-accepted Socket
