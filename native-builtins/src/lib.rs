@@ -51650,12 +51650,29 @@ fn javac_empty_array_list(ctx: &mut dyn NativeContext) -> ObjectRef {
 
 fn javac_array_list_from_values(ctx: &mut dyn NativeContext, values: &[Value]) -> ObjectRef {
     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let pin_base = ctx.pin_native_root(list);
+    let value_pins: Vec<Option<(usize, ObjectRef)>> = values
+        .iter()
+        .map(|value| match value {
+            Value::Object(Some(obj)) => Some((ctx.pin_native_root(*obj), *obj)),
+            _ => None,
+        })
+        .collect();
     let data = ctx.new_array(cratonvm_types::ArrayElementType::Reference, values.len());
+    let data_pin = ctx.pin_native_root(data);
     for (idx, value) in values.iter().copied().enumerate() {
+        let value = match value_pins[idx] {
+            Some((pin, fallback)) => Value::Object(Some(ctx.read_native_pin(pin, fallback))),
+            None => value,
+        };
+        let data = ctx.read_native_pin(data_pin, data);
         ctx.set_array_element(data, idx, value);
     }
+    let list = ctx.read_native_pin(pin_base, list);
+    let data = ctx.read_native_pin(data_pin, data);
     ctx.set_field_by_name(list, "elementData", Value::Object(Some(data)));
     ctx.set_field_by_name(list, "size", Value::Int(values.len() as i32));
+    ctx.unpin_native_roots(pin_base);
     list
 }
 
@@ -51689,69 +51706,161 @@ fn native_javac_file_manager_list(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let location = args.get(1).copied().unwrap_or(Value::Object(None));
-    let location_name = match location {
-        Value::Object(Some(location_obj)) => {
-            match ctx.invoke_virtual(location_obj, "getName", "()Ljava/lang/String;", &[])? {
-                Some(Value::Object(Some(name_obj))) => ctx.read_string(name_obj).unwrap_or_default(),
-                _ => String::new(),
-            }
-        }
-        _ => String::new(),
+    let package = args.get(2).copied().unwrap_or(Value::Object(None));
+    let kinds = args.get(3).copied().unwrap_or(Value::Object(None));
+    // Every branch below can allocate or call back into javac. Keep the native
+    // arguments and every accumulated JavaFileObject live and relocatable until
+    // the result list is fully materialized. Without these pins, a young GC in
+    // getJavaFileForInput truncated java.lang.annotation to the three objects
+    // that happened to remain at their old addresses.
+    let pin_base = ctx.pin_native_root(this);
+    let location_pin = match location {
+        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+        _ => None,
     };
-    let package_name = match args.get(2) {
-        Some(Value::Object(Some(name_obj))) => ctx.read_string(*name_obj).unwrap_or_default(),
-        _ => String::new(),
+    let package_pin = match package {
+        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+        _ => None,
     };
-    if location_name == "CLASS_PATH"
-        && (package_name == "java"
-            || package_name.starts_with("java.")
-            || package_name == "com"
-            || package_name == "com.example"
-            || package_name.starts_with("com.example."))
-    {
-        return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
-    }
-    if let Some(module_name) = location_name
-        .strip_prefix("SYSTEM_MODULES[")
-        .and_then(|name| name.strip_suffix(']'))
-    {
-        if let Some(java_home) = ctx.get_system_property("java.home") {
-            let recurse = matches!(args.get(4), Some(Value::Int(v)) if *v != 0);
-            let class_names = phases_late::jrtfs_list_class_binary_names(
-                &java_home,
-                module_name,
-                &package_name,
-                recurse,
-            );
-            if class_names.is_empty() {
-                return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
-            }
-            let Some(kind_class) = javac_java_file_object_kind_class(ctx) else {
-                return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
-            };
-            let mut files = Vec::with_capacity(class_names.len());
-            for class_name in &class_names {
-                if let Some(Value::Object(Some(file))) = javac_platform_class_file_object(
-                    ctx,
-                    this,
-                    location,
-                    kind_class,
-                    class_name,
-                )? {
-                    files.push(Value::Object(Some(file)));
+    let kinds_pin = match kinds {
+        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+        _ => None,
+    };
+    let result = (|| -> MethodCallResult {
+        let this = ctx.read_native_pin(pin_base, this);
+        let location = match location_pin {
+            Some((pin, fallback)) => Value::Object(Some(ctx.read_native_pin(pin, fallback))),
+            None => location,
+        };
+        let location_name = match location {
+            Value::Object(Some(location_obj)) => {
+                match ctx.invoke_virtual(location_obj, "getName", "()Ljava/lang/String;", &[])? {
+                    Some(Value::Object(Some(name_obj))) => {
+                        ctx.read_string(name_obj).unwrap_or_default()
+                    }
+                    _ => String::new(),
                 }
             }
-            return Ok(Some(Value::Object(Some(javac_array_list_from_values(
-                ctx, &files,
-            )))));
+            _ => String::new(),
+        };
+        let package = match package_pin {
+            Some((pin, fallback)) => Value::Object(Some(ctx.read_native_pin(pin, fallback))),
+            None => package,
+        };
+        let package_name = match package {
+            Value::Object(Some(name_obj)) => ctx.read_string(name_obj).unwrap_or_default(),
+            _ => String::new(),
+        };
+        if location_name == "CLASS_PATH"
+            && (package_name == "java"
+                || package_name.starts_with("java.")
+                || package_name == "com"
+                || package_name == "com.example"
+                || package_name.starts_with("com.example."))
+        {
+            return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
         }
-    }
-    ctx.invoke_virtual_bytecode_only(
-        this,
-        "list",
-        "(Ljavax/tools/JavaFileManager$Location;Ljava/lang/String;Ljava/util/Set;Z)Ljava/lang/Iterable;",
-        &args[1..],
-    )
+        if let Some(module_name) = location_name
+            .strip_prefix("SYSTEM_MODULES[")
+            .and_then(|name| name.strip_suffix(']'))
+        {
+            if let Some(java_home) = ctx.get_system_property("java.home") {
+                let recurse = matches!(args.get(4), Some(Value::Int(v)) if *v != 0);
+                let class_names = phases_late::jrtfs_list_class_binary_names(
+                    &java_home,
+                    module_name,
+                    &package_name,
+                    recurse,
+                );
+                if class_names.is_empty() {
+                    return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
+                }
+                let Some(kind_class) = javac_java_file_object_kind_class(ctx) else {
+                    return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
+                };
+                let kinds = match kinds_pin {
+                    Some((pin, fallback)) => {
+                        Value::Object(Some(ctx.read_native_pin(pin, fallback)))
+                    }
+                    None => kinds,
+                };
+                let accepts_classes = match kinds {
+                    Value::Object(Some(kinds_obj)) => matches!(
+                        ctx.invoke_virtual(
+                            kinds_obj,
+                            "contains",
+                            "(Ljava/lang/Object;)Z",
+                            &[kind_class],
+                        )?,
+                        Some(Value::Int(value)) if value != 0
+                    ),
+                    _ => false,
+                };
+                if !accepts_classes {
+                    return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
+                }
+                // Materialize directly into a pinned Java list. java.lang alone
+                // contains hundreds of classes; retaining every JavaFileObject
+                // in a Rust Vec plus one native pin per entry exhausted the
+                // native-root window before javac reached annotation packages.
+                let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                let list_pin = ctx.pin_native_root(list);
+                let data =
+                    ctx.new_array(cratonvm_types::ArrayElementType::Reference, class_names.len());
+                let data_pin = ctx.pin_native_root(data);
+                let mut file_count = 0usize;
+                for class_name in &class_names {
+                    let this = ctx.read_native_pin(pin_base, this);
+                    let location = match location_pin {
+                        Some((pin, fallback)) => {
+                            Value::Object(Some(ctx.read_native_pin(pin, fallback)))
+                        }
+                        None => location,
+                    };
+                    if let Some(Value::Object(Some(file))) = javac_platform_class_file_object(
+                        ctx,
+                        this,
+                        location,
+                        kind_class,
+                        class_name,
+                    )? {
+                        let data = ctx.read_native_pin(data_pin, data);
+                        ctx.set_array_element(data, file_count, Value::Object(Some(file)));
+                        file_count += 1;
+                    }
+                }
+                let list = ctx.read_native_pin(list_pin, list);
+                let data = ctx.read_native_pin(data_pin, data);
+                ctx.set_field_by_name(list, "elementData", Value::Object(Some(data)));
+                ctx.set_field_by_name(list, "size", Value::Int(file_count as i32));
+                ctx.unpin_native_roots(list_pin);
+                return Ok(Some(Value::Object(Some(list))));
+            }
+        }
+        let this = ctx.read_native_pin(pin_base, this);
+        let location = match location_pin {
+            Some((pin, fallback)) => Value::Object(Some(ctx.read_native_pin(pin, fallback))),
+            None => location,
+        };
+        let mut forwarded_args = args[1..].to_vec();
+        forwarded_args[0] = location;
+        forwarded_args[1] = match package_pin {
+            Some((pin, fallback)) => Value::Object(Some(ctx.read_native_pin(pin, fallback))),
+            None => package,
+        };
+        forwarded_args[2] = match kinds_pin {
+            Some((pin, fallback)) => Value::Object(Some(ctx.read_native_pin(pin, fallback))),
+            None => kinds,
+        };
+        ctx.invoke_virtual_bytecode_only(
+            this,
+            "list",
+            "(Ljavax/tools/JavaFileManager$Location;Ljava/lang/String;Ljava/util/Set;Z)Ljava/lang/Iterable;",
+            &forwarded_args,
+        )
+    })();
+    ctx.unpin_native_roots(pin_base);
+    result
 }
 
 fn javac_relative_path_string(ctx: &mut dyn NativeContext, obj: ObjectRef) -> String {

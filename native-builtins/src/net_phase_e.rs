@@ -5329,6 +5329,28 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // hit the unsupported-scheme arm, leaving Felix's static
             // `DEFAULTS` field null and tripping a downstream NPE on
             // `DEFAULTS.isEmpty()`.
+            //
+            // Spring's in-memory compiler deliberately uses the same
+            // `resource:` spelling for URLs backed by an application-provided
+            // URLStreamHandler. Prefer that handler when present: generated
+            // annotation-processor outputs live only in its heap-resident
+            // DynamicResourceFileObject and cannot be found through the VM's
+            // static classpath resource index. Craton-synthesized resource
+            // URLs have no handler and continue through the existing lookup.
+            if let Some(conn) = url_custom_handler_connection(ctx, this)? {
+                match conn {
+                    Value::Object(Some(conn)) => {
+                        let stream = ctx.invoke_virtual(
+                            conn,
+                            "getInputStream",
+                            "()Ljava/io/InputStream;",
+                            &[],
+                        )?;
+                        return Ok(Some(stream.unwrap_or(Value::Object(None))));
+                    }
+                    _ => return Ok(Some(Value::Object(None))),
+                }
+            }
             let name = name.trim_start_matches('/');
             ctx.find_resource(name)
                 .ok_or_else(|| ioex(format!("URL.openStream: resource not found: {name}")))?

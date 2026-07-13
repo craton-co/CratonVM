@@ -20,14 +20,14 @@ clustered.
 | `HttpClient.Builder` dead registration | 13 | HIGH | **RESOLVED 2026-07-12** — moved to [`../../internal/fixed-suite-bugs/springboot-httpclient-builder-dead-registration-abstractmethoderror-FIXED.md`](../../internal/fixed-suite-bugs/springboot-httpclient-builder-dead-registration-abstractmethoderror-FIXED.md); the active real-JDK registrar now covers every Java 17 fluent builder method |
 | `zip-filedatablock-bulk-bytebuffer-put-aioobe.md` | 9 (whole `spring-boot-loader` module) | HIGH | **FIXED 2026-07-12** — moved to [`../../internal/springboot/zip-filedatablock-bulk-bytebuffer-put-aioobe-FIXED.md`](../../internal/springboot/zip-filedatablock-bulk-bytebuffer-put-aioobe-FIXED.md) |
 | [`flyway-cglib-heap-corruption-sigsegv-crash.md`](flyway-cglib-heap-corruption-sigsegv-crash.md) | 1 (`FlywayAutoConfigurationTests`) | HIGH (SIGSEGV) | OPEN, characterized — likely a new occurrence of the tracked HIB-CV-32 heap-corruption family |
-| [`testcompiler-annotation-classes-not-found-cluster.md`](testcompiler-annotation-classes-not-found-cluster.md) | 7 (`spring-boot-configuration-processor`) | MEDIUM | OPEN, characterized |
+| `TestCompiler` annotation/platform listing cluster | 7 (`spring-boot-configuration-processor`) | MEDIUM | **FIXED/RETIRED 2026-07-13** — moved to [`../../internal/springboot/testcompiler-annotation-classes-not-found-cluster-FIXED.md`](../../internal/springboot/testcompiler-annotation-classes-not-found-cluster-FIXED.md); full JRT package listing and generated in-memory `resource:` URL handling fixed, 94/94 tests pass |
 
 ## HANG-rerun follow-up (150 classes @ 1500s timeout)
 
 Reran the original 150 HANG classes at 5x the timeout (see
 `apps/spring-boot-suite-runner/RESULTS-20260711.md` "HANG rerun" section):
 90 still hung, 51 turned FAIL, 7 PASS, 2 CRASH. Of the 51 FAILs: 7 are the
-`testcompiler-annotation-classes-not-found-cluster.md` above; ~16 more
+the now-retired `TestCompiler` cluster above; ~16 more
 overlap with the `onclasscondition-npe-cast-to-string-array-cluster.md` and
 the two retired clusters (destroy-method resolution, `MemoryAccessOption`)
 above — those classes just needed more wall time to *reach* the

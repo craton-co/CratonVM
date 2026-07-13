@@ -4,13 +4,13 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
-## 2026-07-12 Spring Boot HANG-rerun follow-up: 2 more clusters filed (heap-corruption SIGSEGV + TestCompiler classpath gap)
+## 2026-07-12 Spring Boot HANG-rerun follow-up: 2 more clusters filed (1 now fixed)
 
 Rerunning the original 150 HANG classes at 5x timeout (1500s; see
 `springboot/README.md` "HANG-rerun follow-up") surfaced two new findings:
 
 - [`springboot/flyway-cglib-heap-corruption-sigsegv-crash.md`](springboot/flyway-cglib-heap-corruption-sigsegv-crash.md) — `FlywayAutoConfigurationTests` SIGSEGVs after ~3.5 minutes of repeated heap-corruption warnings at the same three stable addresses (the VM's own guard names the already-tracked HIB-CV-32 family), with a CGLIB `@Configuration` enhancement event partway through. Likely a new occurrence of the existing corruption family, not a fresh root cause.
-- [`springboot/testcompiler-annotation-classes-not-found-cluster.md`](springboot/testcompiler-annotation-classes-not-found-cluster.md) — 7 classes in `spring-boot-configuration-processor`: Spring's in-memory `TestCompiler` (real `javax.tools.JavaCompiler` via `ToolProvider`) can't resolve `java.lang.annotation.*` types when invoked reflectively from inside CratonVM — likely incomplete `java.base` module exposure to the compiler's classloader.
+- **FIXED/RETIRED 2026-07-13**: [`testcompiler-annotation-classes-not-found-cluster-FIXED.md`](../internal/springboot/testcompiler-annotation-classes-not-found-cluster-FIXED.md) — all 7 `spring-boot-configuration-processor` classes now pass (94/94 tests). The complete fix made forced-native `JavacFileManager.list` GC-safe while streaming the full JRT package inventory, then preserved application-provided `URLStreamHandler` semantics for Spring's generated in-memory `resource:` URLs.
 
 Most of the rest of the 51 reclassified-to-FAIL classes overlap with
 already-filed clusters (`OnClassCondition` NPE, destroy-method resolution,
