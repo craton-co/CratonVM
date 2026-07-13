@@ -943,6 +943,21 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                         let (n, blocked, tids, blocked_tids) =
                             shared.thread_registry.alive_count_blocked_and_os_tids();
                         counted_os_tids = tids;
+                        // DIAGNOSTIC (2026-07-13, STW takeover 5-class cluster
+                        // investigation): print the EXACT identity set counted
+                        // as "expected" (alive AND NOT in_blocked_region) at
+                        // the instant this pause is requested, to disambiguate
+                        // whether a thread later seen parked was already
+                        // excluded at request time or genuinely raced in.
+                        if std::env::var_os("CRATONVM_DBG_STW_EXPECTED_IDS").is_some() {
+                            let expected_ids: Vec<u64> = shared
+                                .thread_registry
+                                .alive_thread_ids_excluding(&blocked_tids);
+                            eprintln!(
+                                "[stw-expected] initiator={} n={} blocked={} expected_ids={:?}",
+                                thread.thread_id.0, n, blocked, expected_ids
+                            );
+                        }
                         (
                             u32::try_from(n).unwrap_or(u32::MAX),
                             u32::try_from(blocked).unwrap_or(u32::MAX),
@@ -1539,6 +1554,52 @@ fn process_references_after_gc(
             &is_marked,
             pointer_map,
         );
+        // Prune dead entries from the overlay-backed-collection side-tables
+        // (LinkedList / LinkedHashMap / TreeMap / TreeSet — `roots.rs` step 17
+        // / `native_collections::gc_scan_collection_overlay_roots`). This
+        // function existed but was never called from anywhere in the tree
+        // (confirmed: `gc_prune_dead_collection_overlays` had zero call
+        // sites) — a collection whose OWN object becomes genuinely
+        // unreachable left its registry entry (and every element it ever
+        // held) permanently behind, since nothing ever shrank these tables.
+        // Wiring this in is a real, independent, safe fix (verified: prunes
+        // ~1000/1470 stale entries per GC cycle in the Tomcat suite) with no
+        // change to rooting behavior — it only removes bookkeeping for
+        // collections `is_marked` already agrees are dead.
+        //
+        // NOTE: this does NOT fully close
+        // `docs/known-issues/tomcat-08-07/defaultinstancemanager-classunloading-count-mismatch.md`.
+        // `roots.rs` step 17 itself has a separate, deeper bug this session
+        // found but did not fix: `gc_scan_collection_overlay_roots` roots
+        // EVERY element of EVERY overlay-backed collection unconditionally,
+        // with no gate on whether the backing collection is reachable. A
+        // scratch `List<StackMapFrame>` the JDT compiler uses transiently
+        // during JSP compilation gets its elements force-rooted this way;
+        // forward-tracing from that illegitimate root walks back through the
+        // compiler's real field references into the evicted JSP's
+        // `JspServletWrapper` and its `ClassLoader`, keeping the whole
+        // cluster permanently, artificially reachable — confirmed via a
+        // root-membership closure check (21 direct hits, all contributed by
+        // step 17, not by any other root source). A full fix needs the same
+        // conditional-rooting + mark-time-propagation treatment this session
+        // gave `class_mirrors` (see `cratonvm_types::mirror_pin`), but scoped
+        // to every overlay table instead of just one cache — a materially
+        // larger, higher-risk change than fit in this session; left for a
+        // dedicated follow-up.
+        //
+        // Called here (not `update_all_roots`/gc.rs, where the existing
+        // remap call `gc_update_collection_overlay_refs` lives) for the same
+        // reason `reconcile_class_mirrors` is here and not there:
+        // `update_all_roots` early-returns when `pointer_map` is empty (the
+        // common case for the non-moving JIT-active sweep), so it would
+        // never run for that path. `is_marked` already handles PRE-GC
+        // addresses correctly for both the moving and non-moving cases
+        // (pointer_map lookup for moved survivors, `is_addr_live` for
+        // not-moved ones) — the same pattern `gc_reconcile_defining_loaders`
+        // above already relies on — so pruning here with pre-remap addresses
+        // is correct; the later `gc_update_collection_overlay_refs` remap
+        // pass in `update_all_roots` only touches whatever prune left behind.
+        cratonvm_native_collections::gc_prune_dead_collection_overlays(&is_marked);
         // Companion reconciliation for the class-mirror cache — see
         // `memory::gc::reconcile_class_mirrors` / `roots.rs` step 6. Same
         // "before the no_refproc short-circuit" rationale: the cache must
@@ -11756,6 +11817,7 @@ fn execute_instruction(
     instruction: &Instruction,
     saved_pc: usize,
 ) -> Result<InstructionResult, MethodCallFailed> {
+    hotpath_counts::bump(&hotpath_counts::TOTAL_INSTRUCTIONS);
     match instruction {
         // -- Constants (T10.9.D direct CompactValue push) --
         Instruction::Nop => {}
@@ -16107,6 +16169,7 @@ fn lookup_loader_initiated(
     referencing_class_id: ClassId,
     name: &str,
 ) -> Option<ClassId> {
+    hotpath_counts::bump(&hotpath_counts::LOOKUP_LOADER_INITIATED_CALLS);
     if !should_use_loader_initiated_resolution(shared, referencing_class_id) {
         return None;
     }
@@ -16494,6 +16557,7 @@ fn retarget_instance_field_to_receiver(
     receiver_class_id: ClassId,
     field: &ResolvedField,
 ) -> Option<ResolvedField> {
+    hotpath_counts::bump(&hotpath_counts::RETARGET_FIELD_CALLS);
     if field.is_static
         || receiver_class_id == ClassId::new(0)
         || receiver_class_id == field.declaring_class_id
@@ -17246,6 +17310,18 @@ fn execute_invoke_kind(
 
     let (method_class_name, method_name, method_descriptor, num_params) =
         resolve_method_ref(shared, current_class_id, cp_index)?;
+
+    if crate::runtime::env_cache::dbg_hang_sample() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CALL_COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n % 200_000 == 0 {
+            eprintln!(
+                "[HANG_SAMPLE_V1] call#{n} {}.{}{}",
+                &*method_class_name, &*method_name, &*method_descriptor
+            );
+        }
+    }
 
     // KAFKA-DEFAULT-RESCUE: snapshot the CP-resolved class id (if loaded)
     // before any downstream code can move `method_class_name`. The default-
@@ -22325,11 +22401,44 @@ pub(crate) fn is_reflection_factory_serialization_native_override(
     )
 }
 
+/// Temporary call-count instrumentation for the silent-hang-no-signature-
+/// cluster throughput residual (2026-07-13). Tallies invocations of several
+/// suspected interpreter dispatch hot-path functions, reported periodically
+/// via `CRATONVM_DBG_HOTPATH_COUNTS=1` — independent of wall-clock timing,
+/// so it stays valid signal even on a heavily contended/noisy host.
+pub(crate) mod hotpath_counts {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static FORCE_NATIVE_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static RESOLVE_METHOD_REF_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static LOOKUP_LOADER_INITIATED_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static RETARGET_FIELD_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static TOTAL_INSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn bump(counter: &AtomicU64) {
+        if !crate::runtime::env_cache::dbg_hotpath_counts() {
+            return;
+        }
+        let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() || n % 1_000_000 == 0 {
+            eprintln!(
+                "[hotpath-counts] force_native={} resolve_method_ref={} \
+                 lookup_loader_initiated={} retarget_field={} total_instr={}",
+                FORCE_NATIVE_CALLS.load(Ordering::Relaxed),
+                RESOLVE_METHOD_REF_CALLS.load(Ordering::Relaxed),
+                LOOKUP_LOADER_INITIATED_CALLS.load(Ordering::Relaxed),
+                RETARGET_FIELD_CALLS.load(Ordering::Relaxed),
+                TOTAL_INSTRUCTIONS.load(Ordering::Relaxed),
+            );
+        }
+    }
+}
+
 fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
+    hotpath_counts::bump(&hotpath_counts::FORCE_NATIVE_CALLS);
     if is_class_mirror_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
@@ -33134,6 +33243,7 @@ fn resolve_method_ref(
     current_class_id: ClassId,
     cp_index: u16,
 ) -> Result<(Arc<str>, Arc<str>, Arc<str>, usize), MethodCallFailed> {
+    hotpath_counts::bump(&hotpath_counts::RESOLVE_METHOD_REF_CALLS);
     // Check cache first — Arc::clone is a cheap refcount bump, not an allocation.
     if let Some(cached) = shared
         .resolution_cache

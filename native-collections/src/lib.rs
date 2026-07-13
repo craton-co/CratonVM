@@ -26764,6 +26764,21 @@ pub fn gc_update_collection_overlay_refs(pointer_map: &StdHashMap<usize, usize>)
 /// this crate's scope and is flagged in the change report rather than edited
 /// here.
 pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
+    let dbg = std::env::var_os("CRATONVM_DBG_MIRRORPIN").is_some();
+    if dbg {
+        let total_slots: usize = obj_key_shards()
+            .iter()
+            .map(|s| {
+                s.lock()
+                    .map(|reg| reg.values().map(|v| v.len()).sum::<usize>())
+                    .unwrap_or(0)
+            })
+            .sum();
+        eprintln!(
+            "[DBG_MIRRORPIN] gc_prune_dead_collection_overlays CALLED, total_slots={}",
+            total_slots
+        );
+    }
     // 1. Collect the packed keys of dead collection objects from the registry,
     //    and rebuild the registry without their slots. Done as an explicit
     //    two-pass walk (collect dead keys, then drop slots) to keep the
@@ -26792,6 +26807,12 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
                 !slots.is_empty()
             });
         }
+    }
+    if dbg {
+        eprintln!(
+            "[DBG_MIRRORPIN] gc_prune_dead_collection_overlays dead_keys={}",
+            dead_keys.len()
+        );
     }
     if dead_keys.is_empty() {
         return;

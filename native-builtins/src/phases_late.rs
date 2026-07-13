@@ -19384,6 +19384,19 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     });
     r.register(zi, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // Propagate to the wrapped underlying InputStream (field 0), same
+        // as real `ZipInputStream.close()` → `InflaterInputStream.close()`
+        // → `FilterInputStream.close()` → `in.close()`. `<init>` eagerly
+        // drains `this` into in-memory byte arrays, so nothing here itself
+        // holds an OS handle open — but the underlying stream might (e.g. a
+        // caller-supplied `Closeable`-backed stream). This synthetic path
+        // only runs under `--synthetic-jdk` (real-JDK boot dispatches to the
+        // genuine `ZipInputStream`/`InflaterInputStream` bytecode instead,
+        // per `check_override` in vm_exec.rs) — kept correct for parity with
+        // that mode rather than leaving an unconditional no-op here.
+        if let Value::Object(Some(underlying)) = ctx.get_field(this, 0) {
+            let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
+        }
         ctx.set_field(this, 1, Value::Object(None));
         ctx.set_field(this, 2, Value::Object(None));
         Ok(None)
@@ -19547,11 +19560,48 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
+    // `InflaterInputStream.close()` — NOT a blanket no-op. Real bytecode is
+    // `if (!closed) { if (usesDefaultInflater) inf.end(); in.close(); closed
+    // = true; }`; mirror it via by-name field access (real-layout objects,
+    // not a synthetic fixed-slot convention).
+    //
+    // NOTE: empirically this native is NOT reached under real-JDK-boot mode
+    // (the default) for concrete subclasses like Spring Boot loader's
+    // `ZipInflaterInputStream` — the interpreter correctly prefers real
+    // `InflaterInputStream.close()` bytecode there (confirmed via a
+    // standalone repro: closing a 3-arg-constructed `InflaterInputStream`
+    // wrapping a tracing stream correctly reached the tracing stream's
+    // `close()` both with and without this native registered). The actual
+    // cause of the Spring Boot `SecurityInfoTests`/`NestedJarFileTests`
+    // file-handle leak was a DIFFERENT, more impactful bug — see the
+    // `DataInputStream`/`BufferedInputStream` `"close"` registrations in
+    // `native-builtins/src/classloader.rs`. This fix is kept regardless:
+    // it's still correct, and matters for `--synthetic-jdk` mode (no real
+    // bytecode to fall back to) or if dispatch precedence ever changes.
     r.register(
         "java/util/zip/InflaterInputStream",
         "close",
         "()V",
-        native_noop_with_this,
+        |ctx, args| {
+            eprintln!("[IIS_CLOSE_DBG] native InflaterInputStream.close invoked");
+            let this = obj_arg(args, 0)?;
+            if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
+                return Ok(None);
+            }
+            if matches!(
+                ctx.get_field_by_name(this, "usesDefaultInflater"),
+                Value::Int(1)
+            ) {
+                if let Value::Object(Some(inf)) = ctx.get_field_by_name(this, "inf") {
+                    let _ = ctx.invoke_virtual(inf, "end", "()V", &[]);
+                }
+            }
+            if let Value::Object(Some(underlying)) = ctx.get_field_by_name(this, "in") {
+                let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
+            }
+            ctx.set_field_by_name(this, "closed", Value::Int(1));
+            Ok(None)
+        },
     );
     r.register(
         "java/util/zip/DeflaterOutputStream",
@@ -26147,7 +26197,15 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
     );
     r.register(bfa, "isDirectory", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 3)))
+        // Coerce like `isRegularFile` below: an out-of-bounds/undersized-layout
+        // receiver makes `get_field` return `Value::Object(None)` (a dropped
+        // read), which must not leak out of a `()Z`-descriptor native as a
+        // reference value where the interpreter/JIT expects a boolean.
+        let is_dir = match ctx.get_field(this, 3) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(is_dir)))
     });
     r.register(bfa, "isRegularFile", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -35903,6 +35961,36 @@ fn p98_invoke_file_visitor(
     })
 }
 
+/// Build a real 5-field `BasicFileAttributes` (see `p59_files_read_attributes`
+/// for the canonical layout: creation=0, lastAccess=1, lastMod=2, isDir=3,
+/// size=4) for a `Files.walkFileTree` visitor callback.
+///
+/// `p98_walk_dir` used to hand every `preVisitDirectory`/`visitFile` callback
+/// a zero-field placeholder (`alloc_concurrent_synthetic(ctx, bfa, 0)`). Any
+/// real-bytecode `FileVisitor` that actually calls a `BasicFileAttributes`
+/// accessor on that placeholder (`isDirectory()`, `size()`, `creationTime()`,
+/// ...) hits the GC-guard's out-of-bounds-field-read path — silently dropped
+/// to a default rather than throwing, so the bug was invisible unless
+/// `CRATONVM_DBG_OOBFIELD`/`RUST_LOG=warn` was on. `isDirectory()` in
+/// particular (`register_p59_file_attributes`) returns the raw
+/// (out-of-bounds) `get_field` result verbatim for a `()Z`-descriptor method
+/// instead of coercing it to an `Int` — on this placeholder that silently
+/// returns `Value::Object(None)` where a boolean was expected, a type
+/// confusion that a defensively-coded caller (`isRegularFile`, which matches
+/// on `Value::Int` and falls back to `0`) tolerates but a naive caller
+/// (`isDirectory`) does not. Give every callback the real, correctly-shaped
+/// object instead of relying on the guard's fallback.
+fn p98_alloc_basic_file_attributes(ctx: &mut dyn NativeContext, is_dir: bool, size: i64) -> ObjectRef {
+    let bfa = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 5);
+    let ft = filetime_alloc(ctx, 0);
+    ctx.set_field(bfa, 0, Value::Object(Some(ft)));
+    ctx.set_field(bfa, 1, Value::Object(Some(ft)));
+    ctx.set_field(bfa, 2, Value::Object(Some(ft)));
+    ctx.set_field(bfa, 3, Value::Int(if is_dir { 1 } else { 0 }));
+    ctx.set_field(bfa, 4, Value::Long(if is_dir { 0 } else { size }));
+    bfa
+}
+
 fn p98_walk_dir(
     ctx: &mut dyn NativeContext,
     dir: &str,
@@ -35910,7 +35998,7 @@ fn p98_walk_dir(
     dir_path_obj: ObjectRef,
     skip_file_callbacks: bool,
 ) -> Result<bool, MethodCallFailed> {
-    let attrs = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 0);
+    let attrs = p98_alloc_basic_file_attributes(ctx, true, 0);
     // preVisitDirectory
     let pre = p98_invoke_file_visitor(
         ctx,
@@ -35945,11 +36033,8 @@ fn p98_walk_dir(
                     return Ok(false);
                 }
             } else if !skip_file_callbacks {
-                let fa = alloc_concurrent_synthetic(
-                    ctx,
-                    "java/nio/file/attribute/BasicFileAttributes",
-                    0,
-                );
+                let size = jarfs_entry_size(&jar, &child).unwrap_or(0);
+                let fa = p98_alloc_basic_file_attributes(ctx, false, size);
                 let vr = p98_invoke_file_visitor(
                     ctx,
                     visitor,
@@ -35978,11 +36063,8 @@ fn p98_walk_dir(
                     return Ok(false);
                 }
             } else if !skip_file_callbacks {
-                let fa = alloc_concurrent_synthetic(
-                    ctx,
-                    "java/nio/file/attribute/BasicFileAttributes",
-                    0,
-                );
+                let size = jrtfs_entry_size(&java_home, &child).unwrap_or(0);
+                let fa = p98_alloc_basic_file_attributes(ctx, false, size);
                 let vr = p98_invoke_file_visitor(
                     ctx,
                     visitor,
@@ -36011,11 +36093,8 @@ fn p98_walk_dir(
                     return Ok(false);
                 }
             } else if !skip_file_callbacks {
-                let fa = alloc_concurrent_synthetic(
-                    ctx,
-                    "java/nio/file/attribute/BasicFileAttributes",
-                    0,
-                );
+                let size = entry.metadata().map(|m| m.len() as i64).unwrap_or(0);
+                let fa = p98_alloc_basic_file_attributes(ctx, false, size);
                 let vr = p98_invoke_file_visitor(
                     ctx,
                     visitor,
@@ -43839,7 +43918,22 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         cf,
         "getInstance",
         "(Ljava/lang/String;)Ljava/security/cert/CertificateFactory;",
-        |ctx, _args| {
+        |ctx, args| {
+            // Real-JCA bring-up: prefer a genuine `CertificateFactory` wrapping
+            // a real provider SPI over the synthetic 1-field stub below — see
+            // `provider_chain::try_build_real_certificate_factory`'s doc
+            // comment for the root-cause story (real-bytecode-only methods
+            // like `generateCertPath` NPE on the synthetic stub's absent
+            // `certFacSpi`). Falls back to the stub when the algorithm can't
+            // be resolved (e.g. pure-synthetic mode, or an exotic type
+            // nothing seeds).
+            if crate::real_jca_mode() || crate::route_ec_to_real() || crate::route_dsa_to_real() {
+                if let Some(real_cf) =
+                    crate::jca::provider_chain::try_build_real_certificate_factory(ctx, args)
+                {
+                    return Ok(Some(Value::Object(Some(real_cf))));
+                }
+            }
             let obj = alloc_concurrent_synthetic(ctx, "java/security/cert/CertificateFactory", 1);
             ctx.set_field(obj, 0, Value::Object(None));
             Ok(Some(Value::Object(Some(obj))))
