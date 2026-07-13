@@ -11896,6 +11896,21 @@ fn invoke_on_class_shared_inner(
                     // (e.g. ByteArrayInputStream created by getResourceAsStream).
                     let check_override = method.is_abstract()
                         || class_name == "java/io/ByteArrayInputStream"
+                        // Jandex constructs a real-JDK BufferedInputStream around
+                        // a resource stream.  Its registered native methods use
+                        // the inherited `in` field, so its constructor must use
+                        // the matching native layout initialization as well.
+                        || (class_name == "java/io/BufferedInputStream"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("<init>", "(Ljava/io/InputStream;)V")
+                                    | ("<init>", "(Ljava/io/InputStream;I)V")
+                            ))
+                        || (class_name == "java/io/FilterInputStream"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("<init>", "(Ljava/io/InputStream;)V") | ("skip", "(J)J")
+                            ))
                         // `java.util.Base64` and its Encoder/Decoder methods
                         // are concrete JDK bytecode.  CratonVM supplies the
                         // complete family as native intrinsics so they can
@@ -11947,27 +11962,6 @@ fn invoke_on_class_shared_inner(
                             && (method_name == "getTypeParameters"
                                 || method_name == "getGenericInterfaces"
                                 || method_name == "getGenericSuperclass"))
-                        // Lambda method references are dispatched through
-                        // `invoke_on_class_shared`, which normally permits a
-                        // concrete JDK method body to win over a registered
-                        // native.  That is invalid for Class mirrors: the
-                        // real JDK bodies read the host layout, while Craton
-                        // mirrors keep their metadata VM-side.  In particular
-                        // `SomeClass::getDeclaredAnnotations` returned an
-                        // empty array (and `SomeClass::getName` an internal
-                        // slash-separated name) although direct invokevirtual
-                        // calls correctly used the overrides.  Hibernate
-                        // Models constructs its annotation supplier with that
-                        // method-reference form, silently dropping every
-                        // mapped entity.  Keep these Class mirror accessors
-                        // native regardless of whether their JDK declaration
-                        // is concrete or ACC_NATIVE.
-                        || (class_name == "java/lang/Class"
-                            && matches!(
-                                (method_name, descriptor),
-                                ("getName", "()Ljava/lang/String;")
-                                    | ("getDeclaredAnnotations", "()[Ljava/lang/annotation/Annotation;")
-                            ))
                         // Spring generic metadata: Method/Constructor/Field generic
                         // accessors are concrete JDK bytecode methods, but their
                         // sun.reflect.generics repository path is incomplete under
@@ -13497,7 +13491,9 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/io/BufferedInputStream"
                             && matches!(
                                 (method_name, descriptor),
-                                ("read", "()I")
+                                ("<init>", "(Ljava/io/InputStream;)V")
+                                    | ("<init>", "(Ljava/io/InputStream;I)V")
+                                    | ("read", "()I")
                                     | ("read", "([BII)I")
                                     | ("skip", "(J)J")
                                     | ("available", "()I")
@@ -13505,6 +13501,11 @@ fn invoke_on_class_shared_inner(
                                     | ("reset", "()V")
                                     | ("markSupported", "()Z")
                                     | ("close", "()V")
+                            ))
+                        || (class_name == "java/io/FilterInputStream"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("<init>", "(Ljava/io/InputStream;)V") | ("skip", "(J)J")
                             ))
                         || (matches!(class_name, "java/lang/Iterable" | "java/util/Collection" | "java/util/Set" | "java/util/EnumSet")
                             && method_name == "iterator"
@@ -14079,6 +14080,11 @@ fn invoke_on_class_shared_inner(
                         // getTypeAnnotationBytes0 + unexposed ConstantPool. Shared
                         // source of truth with `force_native_over_real_jdk_bytecode`.
                         || crate::runtime::interpreter::is_typeuse_annotation_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_class_mirror_native_override(
                             class_name,
                             method_name,
                             descriptor,
