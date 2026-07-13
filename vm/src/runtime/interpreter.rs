@@ -19297,12 +19297,6 @@ fn try_invoke_cached_lambda_impl(
             ) else {
                 return Ok(None);
             };
-            if method.is_static() || method.is_synchronized() || method.is_native() {
-                return Ok(None);
-            }
-            let Some(code_attr) = method.code() else {
-                return Ok(None);
-            };
             let Some(class) = store.get(declaring_id) else {
                 return Ok(None);
             };
@@ -19314,6 +19308,12 @@ fn try_invoke_cached_lambda_impl(
             {
                 return Ok(None);
             }
+            if method.is_static() || method.is_synchronized() || method.is_native() {
+                return Ok(None);
+            }
+            let Some(code_attr) = method.code() else {
+                return Ok(None);
+            };
             let c = Arc::new(CachedBytecodeMethod {
                 declaring_class_id: declaring_id,
                 class_name: Arc::clone(&class.name),
@@ -20427,6 +20427,45 @@ pub(crate) fn is_typeuse_annotation_native_override(
         ),
         _ => false,
     }
+}
+
+/// java.lang.Class methods whose registered natives operate on CratonVM's
+/// class-mirror and annotation side tables. Ordinary bytecode invokes already
+/// prefer these registrations, but bound virtual method references dispatch
+/// through invoke_on_class_shared, whose concrete-bytecode precedence needs
+/// an explicit shared gate.
+pub(crate) fn is_class_mirror_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/lang/Class"
+        && matches!(
+            (method_name, descriptor),
+            ("getName", "()Ljava/lang/String;")
+                | ("getAnnotations", "()[Ljava/lang/annotation/Annotation;")
+                | (
+                    "getDeclaredAnnotations",
+                    "()[Ljava/lang/annotation/Annotation;"
+                )
+                | (
+                    "getAnnotation",
+                    "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"
+                )
+                | (
+                    "getDeclaredAnnotation",
+                    "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"
+                )
+                | ("isAnnotationPresent", "(Ljava/lang/Class;)Z")
+                | (
+                    "getAnnotationsByType",
+                    "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;"
+                )
+                | (
+                    "getDeclaredAnnotationsByType",
+                    "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;"
+                )
+        )
 }
 
 pub(crate) fn is_reflection_access_native_override(
@@ -22199,6 +22238,9 @@ fn force_native_over_real_jdk_bytecode(
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
+    if is_class_mirror_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
     // Base64 encoders are represented by VM-side synthetic state.  The real
     // JDK bytecode instead reads its private object layout, which is not
     // populated for those synthetic instances and silently falls back to the
@@ -22390,13 +22432,37 @@ fn force_native_over_real_jdk_bytecode(
     if class_name == "java/io/BufferedInputStream"
         && matches!(
             (method_name, method_descriptor),
-            ("read", "()I")
+            ("<init>", "(Ljava/io/InputStream;)V")
+                | ("<init>", "(Ljava/io/InputStream;I)V")
+                | ("read", "()I")
                 | ("read", "([BII)I")
                 | ("skip", "(J)J")
                 | ("available", "()I")
                 | ("mark", "(I)V")
                 | ("reset", "()V")
                 | ("markSupported", "()Z")
+                | ("close", "()V")
+        )
+    {
+        return true;
+    }
+
+    if class_name == "java/io/FilterInputStream"
+        && matches!(
+            (method_name, method_descriptor),
+            ("<init>", "(Ljava/io/InputStream;)V") | ("skip", "(J)J")
+        )
+    {
+        return true;
+    }
+
+    if class_name == "java/io/ByteArrayInputStream"
+        && matches!(
+            (method_name, method_descriptor),
+            ("read", "()I")
+                | ("read", "([BII)I")
+                | ("available", "()I")
+                | ("skip", "(J)J")
                 | ("close", "()V")
         )
     {
@@ -33740,6 +33806,93 @@ mod tests {
             "await",
             "()V"
         ));
+    }
+
+    #[test]
+    fn class_mirror_force_native_covers_bound_method_reference_surface() {
+        let class = "java/lang/Class";
+        for (name, descriptor) in [
+            ("getName", "()Ljava/lang/String;"),
+            ("getAnnotations", "()[Ljava/lang/annotation/Annotation;"),
+            (
+                "getDeclaredAnnotations",
+                "()[Ljava/lang/annotation/Annotation;",
+            ),
+            (
+                "getAnnotation",
+                "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+            ),
+            (
+                "getDeclaredAnnotation",
+                "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+            ),
+            ("isAnnotationPresent", "(Ljava/lang/Class;)Z"),
+            (
+                "getAnnotationsByType",
+                "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;",
+            ),
+            (
+                "getDeclaredAnnotationsByType",
+                "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;",
+            ),
+        ] {
+            assert!(is_class_mirror_native_override(class, name, descriptor));
+            assert!(force_native_over_real_jdk_bytecode(class, name, descriptor));
+        }
+        assert!(!is_class_mirror_native_override(
+            class,
+            "getMethods",
+            "()[Ljava/lang/reflect/Method;"
+        ));
+    }
+
+    #[test]
+    fn buffered_input_stream_force_native_covers_constructors_and_io_surface() {
+        let buffered = "java/io/BufferedInputStream";
+        for (name, descriptor) in [
+            ("<init>", "(Ljava/io/InputStream;)V"),
+            ("<init>", "(Ljava/io/InputStream;I)V"),
+            ("read", "()I"),
+            ("read", "([BII)I"),
+            ("skip", "(J)J"),
+            ("available", "()I"),
+            ("mark", "(I)V"),
+            ("reset", "()V"),
+            ("markSupported", "()Z"),
+            ("close", "()V"),
+        ] {
+            assert!(
+                force_native_over_real_jdk_bytecode(buffered, name, descriptor),
+                "BufferedInputStream.{name}{descriptor} must use its registered native"
+            );
+        }
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/io/FilterInputStream",
+            "skip",
+            "(J)J"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/io/FilterInputStream",
+            "<init>",
+            "(Ljava/io/InputStream;)V"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/io/ByteArrayInputStream",
+            "skip",
+            "(J)J"
+        ));
+        for (name, descriptor) in [
+            ("read", "()I"),
+            ("read", "([BII)I"),
+            ("available", "()I"),
+            ("close", "()V"),
+        ] {
+            assert!(force_native_over_real_jdk_bytecode(
+                "java/io/ByteArrayInputStream",
+                name,
+                descriptor
+            ));
+        }
     }
 
     #[test]

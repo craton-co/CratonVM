@@ -513,10 +513,106 @@ fn buffered_input_stream_input(ctx: &dyn NativeContext, this: ObjectRef) -> Opti
 fn buffered_input_stream_init(ctx: &mut dyn NativeContext, this: ObjectRef, input: Value) {
     ctx.set_field_by_name(this, "in", input);
     ctx.set_field(this, 0, input);
+    // Native reads delegate directly to `in`, but inherited real-JDK methods
+    // such as FilterInputStream.skip can still enter BufferedInputStream.skip.
+    // Keep the real layout in a valid empty-buffer state so ensureOpen() does
+    // not interpret this freshly constructed stream as closed.
+    let buffer = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 8192);
+    ctx.set_field_by_name(this, "buf", Value::Object(Some(buffer)));
+    ctx.set_field_by_name(this, "count", Value::Int(0));
+    ctx.set_field_by_name(this, "pos", Value::Int(0));
+    ctx.set_field_by_name(this, "markpos", Value::Int(-1));
+    ctx.set_field_by_name(this, "marklimit", Value::Int(0));
     buffered_input_stream_marks()
         .lock()
         .unwrap()
         .remove(&ctx.identity_hash_code(this));
+}
+
+fn byte_array_input_stream_skip(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    requested: i64,
+) -> i64 {
+    if requested <= 0 {
+        return 0;
+    }
+    let pos = ctx
+        .get_field_by_name(this, "pos")
+        .as_int()
+        .unwrap_or(0)
+        .max(0) as i64;
+    let count = ctx
+        .get_field_by_name(this, "count")
+        .as_int()
+        .unwrap_or(0)
+        .max(0) as i64;
+    let skipped = requested.min(count.saturating_sub(pos));
+    ctx.set_field_by_name(this, "pos", Value::Int((pos + skipped) as i32));
+    skipped
+}
+
+fn buffered_input_stream_skip(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    requested: i64,
+) -> Result<i64, MethodCallFailed> {
+    if requested <= 0 {
+        return Ok(0);
+    }
+    let mut skipped = 0i64;
+    while skipped < requested && buffered_input_stream_read_one(ctx, this)? >= 0 {
+        skipped += 1;
+    }
+    Ok(skipped)
+}
+
+fn filter_input_stream_skip(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    requested: i64,
+) -> Result<i64, MethodCallFailed> {
+    if requested <= 0 {
+        return Ok(0);
+    }
+    // Match InputStream.skip's bounded discard buffer instead of issuing one
+    // virtual read per byte. Besides avoiding quadratic class-file scanning,
+    // invoking read([BII) on the receiver preserves FilterInputStream's virtual
+    // delegation semantics for DataInputStream and other subclasses.
+    let capacity = requested.min(2048) as usize;
+    let buffer = ctx.new_array(cratonvm_types::ArrayElementType::Byte, capacity);
+    let buffer_pin = ctx.pin_native_root(buffer);
+    let this_pin = ctx.pin_native_root(this);
+    let mut skipped = 0i64;
+    while skipped < requested {
+        let current_this = ctx.read_native_pin(this_pin, this);
+        let current_buffer = ctx.read_native_pin(buffer_pin, buffer);
+        let chunk = (requested - skipped).min(capacity as i64) as i32;
+        let result = ctx.invoke_virtual(
+            current_this,
+            "read",
+            "([BII)I",
+            &[
+                Value::Object(Some(current_buffer)),
+                Value::Int(0),
+                Value::Int(chunk),
+            ],
+        );
+        let read = match result {
+            Ok(Some(Value::Int(read))) => read,
+            Ok(_) => -1,
+            Err(error) => {
+                ctx.unpin_native_roots(buffer_pin);
+                return Err(error);
+            }
+        };
+        if read <= 0 {
+            break;
+        }
+        skipped += read as i64;
+    }
+    ctx.unpin_native_roots(buffer_pin);
+    Ok(skipped)
 }
 
 fn buffered_input_stream_record_byte(ctx: &dyn NativeContext, this: ObjectRef, byte: u8) {
@@ -547,6 +643,15 @@ fn buffered_input_stream_replay_byte(ctx: &dyn NativeContext, this: ObjectRef) -
     } else {
         None
     }
+}
+
+fn buffered_input_stream_can_delegate_bulk(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let key = ctx.identity_hash_code(this);
+    buffered_input_stream_marks()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .is_none_or(|state| !state.mark_active)
 }
 
 fn buffered_input_stream_read_one(
@@ -26636,6 +26741,21 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         },
     );
     registry.register(
+        "java/io/FilterInputStream",
+        "skip",
+        "(J)J",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(object))) => *object,
+                _ => return Ok(Some(Value::Long(0))),
+            };
+            let requested = args.get(1).and_then(|value| value.as_long()).unwrap_or(0);
+            Ok(Some(Value::Long(filter_input_stream_skip(
+                ctx, this, requested,
+            )?)))
+        },
+    );
+    registry.register(
         "java/io/FilterOutputStream",
         "write",
         "([B)V",
@@ -26748,6 +26868,26 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Int(-1)));
             }
             let limit = len.min(arr_len - off);
+            // With no active mark/replay state, BufferedInputStream may pass a
+            // large read straight to its delegate. This is the common Jandex
+            // class-file path and avoids turning every bulk read into thousands
+            // of single-byte virtual calls.
+            if buffered_input_stream_can_delegate_bulk(ctx, this) {
+                if let Some(input) = buffered_input_stream_input(ctx, this) {
+                    return Ok(ctx
+                        .invoke_virtual(
+                            input,
+                            "read",
+                            "([BII)I",
+                            &[
+                                Value::Object(Some(arr)),
+                                Value::Int(off as i32),
+                                Value::Int(limit as i32),
+                            ],
+                        )?
+                        .or(Some(Value::Int(-1))));
+                }
+            }
             let mut read = 0usize;
             for i in 0..limit {
                 let b = buffered_input_stream_read_one(ctx, this)?;
@@ -34132,6 +34272,36 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let pos = ctx.get_field(this, pos_idx).as_int().unwrap_or(0);
             let count = ctx.get_field(this, count_idx).as_int().unwrap_or(0);
             Ok(Some(Value::Int(count - pos)))
+        },
+    );
+    registry.register(
+        "java/io/BufferedInputStream",
+        "skip",
+        "(J)J",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(object))) => *object,
+                _ => return Ok(Some(Value::Long(0))),
+            };
+            let requested = args.get(1).and_then(|value| value.as_long()).unwrap_or(0);
+            Ok(Some(Value::Long(buffered_input_stream_skip(
+                ctx, this, requested,
+            )?)))
+        },
+    );
+    registry.register(
+        "java/io/ByteArrayInputStream",
+        "skip",
+        "(J)J",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(object))) => *object,
+                _ => return Ok(Some(Value::Long(0))),
+            };
+            let requested = args.get(1).and_then(|value| value.as_long()).unwrap_or(0);
+            Ok(Some(Value::Long(byte_array_input_stream_skip(
+                ctx, this, requested,
+            ))))
         },
     );
     registry.register(
