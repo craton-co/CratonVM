@@ -6469,6 +6469,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // emits its current frames — no per-park snapshot cost needed.
         {
             let blk = self.shared.gc_barrier.enter_blocked();
+            // DIAGNOSTIC (2026-07-13, STW takeover 5-class cluster
+            // investigation): correlate against [stw-expected]'s identity
+            // list to see whether this thread's park() call landed before
+            // or after the pause was requested, and whether pre_stw-gated
+            // arrival actually fires.
+            if std::env::var_os("CRATONVM_DBG_STW_EXPECTED_IDS").is_some() {
+                eprintln!(
+                    "[stw-park] tid={} pre_stw={}",
+                    self.thread.thread_id.0, blk.pre_stw
+                );
+            }
             if blk.pre_stw {
                 // GCAUDIT-0711-FIX (finding 1a): `_auto` — the deposit above
                 // already raised `in_blocked_region` before this check.
@@ -9390,12 +9401,26 @@ pub fn invoke_special_shared(
     args: &[Value],
 ) -> MethodCallResult {
     // Native override always wins -- same priority order as invoke_or_native.
+    // EXCEPT for SyntheticStub-tagged natives on real-protected classes with
+    // loaded bytecode: invokespecial is how constructors and super-calls
+    // arrive, and running a stub <init> here while the method surface yields
+    // to real bytecode leaves the object half-initialized (observed
+    // 2026-07-13 with the since-removed OutputStreamWriter stub surface:
+    // the stub ctor never built the real StreamEncoder, so the real
+    // OSW.flush() bytecode NPE'd on `this.se`).
     if let Some(callback) = shared
         .native_methods
         .find(class_name, method_name, descriptor)
     {
-        return safe_native_call(shared, thread, callback, args)
-            .map(|v| coerce_native_return(v, descriptor));
+        if !crate::runtime::interpreter::synthetic_stub_should_yield_to_real_bytecode(
+            shared,
+            class_name,
+            method_name,
+            descriptor,
+        ) {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|v| coerce_native_return(v, descriptor));
+        }
     }
 
     // GC-safety: pin object args across class load + <clinit> and re-read the
@@ -15655,6 +15680,17 @@ fn invoke_on_class_shared_inner(
             && !force_ffm_group_layout_interface_native
             && !force_ffm_memory_layout_interface_native
         {
+            None
+        } else if crate::runtime::interpreter::synthetic_stub_should_yield_to_real_bytecode(
+            shared,
+            &class_name_for_override,
+            method_name,
+            descriptor,
+        ) {
+            // SyntheticStub-tagged native on a real-protected class whose real
+            // bytecode is loaded: the stub body exists only for stub-phase
+            // bootstraps — run the bytecode (same yield the other dispatch
+            // sites apply; without it this re-check kept serving the stub).
             None
         } else {
             shared

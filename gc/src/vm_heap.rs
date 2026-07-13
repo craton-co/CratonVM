@@ -1658,6 +1658,34 @@ impl VmHeap {
     pub fn walk_objects(&self) -> Vec<(*mut u8, usize)> {
         dispatch!(self, walk_objects())
     }
+
+    /// TEMPORARY diagnostic (CRATONVM_DBG_MIRRORPIN / TestDefaultInstanceManager
+    /// investigation): scan every live object in the heap for a reference to
+    /// `target_addr`, returning `(holder_addr, holder_class_id)` for each
+    /// match. Must be called during a GC safepoint (same contract as
+    /// `walk_objects`, which this is built on). O(live objects × avg field
+    /// count) — debug-only, never on a hot path. Remove once the
+    /// investigation concludes.
+    pub fn find_referrers(&self, target_addr: usize) -> Vec<(usize, u32)> {
+        let mut out = Vec::new();
+        for (obj_ptr, _size) in self.walk_objects() {
+            // SAFETY: `walk_objects` yields the start of each live object, so
+            // `obj_ptr` targets a valid, fully-initialized `ObjectHeader`.
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            let mut found = false;
+            unsafe {
+                crate::gen_heap::for_each_ref_slot(obj_ptr, header, |ref_ptr, _slot| {
+                    if ref_ptr as usize == target_addr {
+                        found = true;
+                    }
+                });
+            }
+            if found {
+                out.push((obj_ptr as usize, header.class_id.as_u32()));
+            }
+        }
+        out
+    }
 }
 
 // ─── Phase 6 #1: GPU/GC coordination tests ───────────────────────────

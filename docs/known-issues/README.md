@@ -990,6 +990,17 @@ it under `docs/internal`.
   Its one real residual (Layer 1, register-invisible roots) is now retired by
   the Fork6/A4 fix; see
   [`fork6-fjp-multithread-jit-root-reclamation-FIXED.md`](../internal/fixed-suite-bugs/fork6-fjp-multithread-jit-root-reclamation-FIXED.md).
+- FIXED/RETIRED (2026-07-13): `abstractajpprocessor-socket-not-connected.md`
+  (AJP, `TestAbstractAjpProcessor` 30/30 fail) shared its exact root cause
+  with the HTTP/2 `Socket is closed` cluster fixed the same day —
+  `SimpleAjpClient.connect()` goes through the same
+  `javax/net/SocketFactory.getDefault().createSocket(...)` call as
+  `Http2TestBase`. Doc moved to
+  [`abstractajpprocessor-socket-not-connected-FIXED.md`](../internal/tomcat-08-07/abstractajpprocessor-socket-not-connected-FIXED.md).
+  Fixing the whole-class failure uncovered two narrower, genuine, still-OPEN
+  residuals (HotSpot passes both):
+  [`ajp-testsecret-secret-attribute-not-enforced.md`](tomcat-08-07/ajp-testsecret-secret-attribute-not-enforced.md),
+  [`ajp-testnoheaders-response-body-not-empty.md`](tomcat-08-07/ajp-testnoheaders-response-body-not-empty.md).
 
 ## How many distinct bugs are here?
 

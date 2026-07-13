@@ -9268,6 +9268,56 @@ fn jul_logger_config_is_real(ctx: &mut dyn NativeContext, obj: ObjectRef) -> boo
         .unwrap_or(false)
 }
 
+/// GC-safe side table for `java.util.logging.Logger`'s handler list, keyed by
+/// `identity_hash_code` (same pattern as `net_phase_e.rs`'s `ss_side_table` /
+/// `stream_owner_table`). `addHandler`/`removeHandler`/`getHandlers` are
+/// fully native-overridden (never fall through to real bytecode), so they
+/// don't need to live in any particular instance field slot -- and MUST NOT,
+/// because real-JDK 25's `Logger` has no `handlers` instance field at all
+/// (handlers moved inside `Logger$ConfigurationData`, referenced from slot 0
+/// / `config`) and slot 2 is actually `name` (a `String`). The old code
+/// stored/read the handler `ArrayList` at raw field slot 2, which on a
+/// real-bytecode-constructed `Logger` collided with `name`:
+/// `ctx.invoke_virtual(nameString, "size", "()I", ...)` then threw
+/// `NoSuchMethodError: java/lang/String.size()I` (surfaced from
+/// `org.apache.juli.ClassLoaderLogManager.resetLoggers`, which calls
+/// `logger.getHandlers()` during webapp/classloader shutdown -- see
+/// docs/known-issues/tomcat-08-07/largeclienthello-string-size-nosuchmethod.md).
+/// Keying by identity hash and holding the list as a global GC root
+/// sidesteps field layout entirely -- correct for both real and synthetic
+/// loggers, and immune to future real-JDK field-order changes.
+fn jul_logger_handlers_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, usize>>
+{
+    static T: OnceLock<std::sync::Mutex<std::collections::HashMap<i32, usize>>> = OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub(crate) fn jul_logger_handlers_get(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+) -> Option<ObjectRef> {
+    let key = ctx.identity_hash_code(logger);
+    let handle = *jul_logger_handlers_table().lock().unwrap().get(&key)?;
+    ctx.resolve_global_root(handle)
+}
+
+pub(crate) fn jul_logger_handlers_set(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+    list: ObjectRef,
+) {
+    let handle = ctx.add_global_root(list);
+    let key = ctx.identity_hash_code(logger);
+    jul_logger_handlers_table().lock().unwrap().insert(key, handle);
+}
+
+pub(crate) fn jul_logger_handlers_clear(ctx: &mut dyn NativeContext, logger: ObjectRef) {
+    let key = ctx.identity_hash_code(logger);
+    if let Some(handle) = jul_logger_handlers_table().lock().unwrap().remove(&key) {
+        ctx.remove_global_root(handle);
+    }
+}
+
 const ANTLR_PC: &str = "org/antlr/v4/runtime/atn/PredictionContext";
 const ANTLR_SINGLETON_PC: &str = "org/antlr/v4/runtime/atn/SingletonPredictionContext";
 const ANTLR_EMPTY_PC: &str = "org/antlr/v4/runtime/atn/EmptyPredictionContext";
@@ -26682,54 +26732,77 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "([B)V",
         native_output_stream_write_all,
     );
-    for descriptor in [
-        "(Ljava/io/OutputStream;)V",
-        "(Ljava/io/OutputStream;Ljava/nio/charset/Charset;)V",
-        "(Ljava/io/OutputStream;Ljava/lang/String;)V",
-    ] {
+    // Synthetic-JDK builds only. In real-JDK mode this OutputStreamWriter
+    // surface (added 2026-07-09 by the WildFly process-controller bootstrap
+    // batch, b448f2039) shadowed the real OSW bytecode at every dispatch
+    // site (WP0.1 native-override-priority) and REGRESSED the StreamEncoder
+    // commit-threshold fix (1773d3df2, docs/known-issues/
+    // dohead-streamencoder-eager-flush-commit-threshold.md):
+    // `write_bytes_from_output_stream_writer` encodes every `write()` call
+    // straight to the wrapped stream — one underlying `write([BII)` per
+    // Writer call instead of real StreamEncoder's 512-byte batches — which
+    // broke `NoBodyOutputStream.checkCommit`'s byte-count commit threshold
+    // again (Tomcat `TestHttpServletDoHead*`: the 8 useLegacy+useWriter+FULL
+    // params fail `expected:<2> but was:<3>` / GET has content-length while
+    // HEAD goes chunked). It also encodes with `String::into_bytes()` — i.e.
+    // hard-coded UTF-8, ignoring the writer's charset — and its `<init>`
+    // native writes the OutputStream into raw slot 0 (real layout:
+    // `Writer.writeBuffer`) while never creating the `se` StreamEncoder the
+    // real bytecode needs, breaking the CharsetEncoder-ctor delegation
+    // workaround above too. Real-JDK mode runs the real OSW bytecode →
+    // `sun.nio.cs.StreamEncoder` shim (native-io/src/stream_encoder.rs),
+    // which was validated byte-for-byte against HotSpot's flush granularity.
+    // Same gating precedent as the BufferedInputStream block below.
+    if cfg!(feature = "synthetic-jdk") {
+        for descriptor in [
+            "(Ljava/io/OutputStream;)V",
+            "(Ljava/io/OutputStream;Ljava/nio/charset/Charset;)V",
+            "(Ljava/io/OutputStream;Ljava/lang/String;)V",
+        ] {
+            registry.register(
+                "java/io/OutputStreamWriter",
+                "<init>",
+                descriptor,
+                native_output_stream_writer_init,
+            );
+        }
         registry.register(
             "java/io/OutputStreamWriter",
-            "<init>",
-            descriptor,
-            native_output_stream_writer_init,
+            "write",
+            "(I)V",
+            native_output_stream_writer_write_int,
+        );
+        registry.register(
+            "java/io/OutputStreamWriter",
+            "write",
+            "([CII)V",
+            native_output_stream_writer_write_chars,
+        );
+        registry.register(
+            "java/io/OutputStreamWriter",
+            "write",
+            "(Ljava/lang/String;)V",
+            native_output_stream_writer_write_string,
+        );
+        registry.register(
+            "java/io/OutputStreamWriter",
+            "write",
+            "(Ljava/lang/String;II)V",
+            native_output_stream_writer_write_string_range,
+        );
+        registry.register(
+            "java/io/OutputStreamWriter",
+            "flush",
+            "()V",
+            native_output_stream_writer_flush,
+        );
+        registry.register(
+            "java/io/OutputStreamWriter",
+            "close",
+            "()V",
+            native_output_stream_writer_close,
         );
     }
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "write",
-        "(I)V",
-        native_output_stream_writer_write_int,
-    );
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "write",
-        "([CII)V",
-        native_output_stream_writer_write_chars,
-    );
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "write",
-        "(Ljava/lang/String;)V",
-        native_output_stream_writer_write_string,
-    );
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "write",
-        "(Ljava/lang/String;II)V",
-        native_output_stream_writer_write_string_range,
-    );
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "flush",
-        "()V",
-        native_output_stream_writer_flush,
-    );
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "close",
-        "()V",
-        native_output_stream_writer_close,
-    );
 
     // Real JDK BufferedInputStream has a layout and close protocol that the
     // old synthetic bridge cannot emulate safely.  In particular, dispatching
@@ -33844,16 +33917,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let Some(Value::Object(Some(logger))) = args.first() else {
                 return Ok(None);
             };
+            let logger = *logger;
             let handler = args.get(1).copied().unwrap_or(Value::Object(None));
-            let handlers = match ctx.get_field(*logger, 2) {
-                Value::Object(Some(list)) => list,
-                _ => {
+            let handlers = match jul_logger_handlers_get(ctx, logger) {
+                Some(list) => list,
+                None => {
                     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
                     cratonvm_native_collections::native_al_init(
                         ctx,
                         &[Value::Object(Some(list))],
                     )?;
-                    ctx.set_field(*logger, 2, Value::Object(Some(list)));
+                    jul_logger_handlers_set(ctx, logger, list);
                     list
                 }
             };
@@ -33872,7 +33946,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let Some(Value::Object(Some(logger))) = args.first() else {
                 return Ok(None);
             };
-            if let Value::Object(Some(handlers)) = ctx.get_field(*logger, 2) {
+            let logger = *logger;
+            if let Some(handlers) = jul_logger_handlers_get(ctx, logger) {
                 let size = match ctx.invoke_virtual(handlers, "size", "()I", &[])? {
                     Some(Value::Int(size)) if size > 0 => size as usize,
                     _ => 0,
@@ -33896,7 +33971,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // This native logger has no parent-handler chain. Once the JULI
             // fixture detaches its handler, discard the now-empty/stale list
             // so a later parameterized fixture starts from a clean receiver.
-            ctx.set_field(*logger, 2, Value::Object(None));
+            jul_logger_handlers_clear(ctx, logger);
             Ok(None)
         },
     );
@@ -33906,7 +33981,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/util/logging/Handler;",
         |ctx, args| {
             if let Some(Value::Object(Some(logger))) = args.first() {
-                if let Value::Object(Some(handlers)) = ctx.get_field(*logger, 2) {
+                let logger = *logger;
+                if let Some(handlers) = jul_logger_handlers_get(ctx, logger) {
                     return cratonvm_native_collections::native_al_to_array(
                         ctx,
                         &[Value::Object(Some(handlers))],
@@ -37199,16 +37275,17 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
             let Some(Value::Object(Some(logger))) = args.first() else {
                 return Ok(None);
             };
+            let logger = *logger;
             let handler = args.get(1).copied().unwrap_or(Value::Object(None));
-            let handlers = match ctx.get_field(*logger, 2) {
-                Value::Object(Some(list)) => list,
-                _ => {
+            let handlers = match jul_logger_handlers_get(ctx, logger) {
+                Some(list) => list,
+                None => {
                     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
                     cratonvm_native_collections::native_al_init(
                         ctx,
                         &[Value::Object(Some(list))],
                     )?;
-                    ctx.set_field(*logger, 2, Value::Object(Some(list)));
+                    jul_logger_handlers_set(ctx, logger, list);
                     list
                 }
             };
@@ -37229,7 +37306,7 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
             };
             // This native logger has no parent-handler chain. Once JULI
             // detaches a fixture handler, discard its list for the next case.
-            ctx.set_field(*logger, 2, Value::Object(None));
+            jul_logger_handlers_clear(ctx, *logger);
             Ok(None)
         },
     );
@@ -37239,7 +37316,8 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
         "()[Ljava/util/logging/Handler;",
         |ctx, args| {
             if let Some(Value::Object(Some(logger))) = args.first() {
-                if let Value::Object(Some(handlers)) = ctx.get_field(*logger, 2) {
+                let logger = *logger;
+                if let Some(handlers) = jul_logger_handlers_get(ctx, logger) {
                     return cratonvm_native_collections::native_al_to_array(
                         ctx,
                         &[Value::Object(Some(handlers))],
@@ -72847,7 +72925,17 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         if let Some(addr) = rwl_parent_addr(ctx, this) {
+            // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
+            // rw_read_lock's internal contended wait is a raw
+            // parking_lot::Condvar::wait with NO GC-blocking-region bracket
+            // and no Java-heap touch inside — a thread contending for this
+            // lock while a writer holds it stays counted in the STW
+            // barrier's `expected` forever (not in JIT, never reaches a
+            // safepoint), livelocking any cross-thread STW pause requested
+            // while it waits.
+            ctx.begin_blocking_region();
             crate::stamped_lock::rw_read_lock(addr, ctx.thread_id());
+            ctx.end_blocking_region();
         }
         Ok(None)
     });
@@ -72897,7 +72985,10 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         if let Some(addr) = rwl_parent_addr(ctx, this) {
+            // GC-blocking audit — see the plain `lock()` registration above.
+            ctx.begin_blocking_region();
             crate::stamped_lock::rw_read_lock(addr, ctx.thread_id());
+            ctx.end_blocking_region();
         }
         Ok(None)
     });
@@ -72910,7 +73001,19 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         if let Some(addr) = rwl_parent_addr(ctx, this) {
+            // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
+            // rw_write_lock's internal contended wait is a raw
+            // parking_lot::Condvar::wait with NO GC-blocking-region bracket
+            // and no Java-heap touch inside — see the read-lock `lock()`
+            // registration above for the full rationale. Confirmed via
+            // symbolicated cdb stacks: TestOrderInterceptor's stuck
+            // ForkJoinPool worker threads were parked exactly here, not in
+            // LockSupport.park (which IS correctly bracketed) — this was the
+            // actual root cause of the STW takeover livelock, not a
+            // ForkJoinPool/AQS-specific issue.
+            ctx.begin_blocking_region();
             crate::stamped_lock::rw_write_lock(addr, ctx.thread_id());
+            ctx.end_blocking_region();
         }
         Ok(None)
     });
@@ -72957,7 +73060,10 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         if let Some(addr) = rwl_parent_addr(ctx, this) {
+            // GC-blocking audit — see the plain `lock()` registration above.
+            ctx.begin_blocking_region();
             crate::stamped_lock::rw_write_lock(addr, ctx.thread_id());
+            ctx.end_blocking_region();
         }
         Ok(None)
     });
@@ -73227,7 +73333,14 @@ fn native_stamped_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         None => return Ok(Some(Value::Long(0))),
     };
     let addr = stamped_addr_for_obj(ctx, obj);
+    // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
+    // stamped_write_lock's contended wait is a raw parking_lot::Condvar::wait
+    // with NO GC-blocking-region bracket — same missing-bracket bug as
+    // ReentrantReadWriteLock's rw_write_lock (see that registration's
+    // comment for the full rationale and how this was diagnosed).
+    ctx.begin_blocking_region();
     let stamp = crate::stamped_lock::stamped_write_lock(addr);
+    ctx.end_blocking_region();
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(stamp)))
 }
@@ -73238,7 +73351,10 @@ fn native_stamped_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         None => return Ok(Some(Value::Long(0))),
     };
     let addr = stamped_addr_for_obj(ctx, obj);
+    // GC-blocking audit — see `native_stamped_write_lock` above.
+    ctx.begin_blocking_region();
     let stamp = crate::stamped_lock::stamped_read_lock(addr);
+    ctx.end_blocking_region();
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(stamp)))
 }
@@ -73270,7 +73386,10 @@ fn native_stamped_write_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) -
         return Ok(None);
     };
     let addr = stamped_addr_for_obj(ctx, parent);
+    // GC-blocking audit — see `native_stamped_write_lock` above.
+    ctx.begin_blocking_region();
     crate::stamped_lock::stamped_write_lock(addr);
+    ctx.end_blocking_region();
     mirror_stamped_state(ctx, parent, addr);
     Ok(None)
 }
@@ -73311,7 +73430,10 @@ fn native_stamped_read_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) ->
         return Ok(None);
     };
     let addr = stamped_addr_for_obj(ctx, parent);
+    // GC-blocking audit — see `native_stamped_write_lock` above.
+    ctx.begin_blocking_region();
     crate::stamped_lock::stamped_read_lock(addr);
+    ctx.end_blocking_region();
     mirror_stamped_state(ctx, parent, addr);
     Ok(None)
 }

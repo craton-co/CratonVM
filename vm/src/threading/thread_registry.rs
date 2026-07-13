@@ -1299,6 +1299,28 @@ impl ThreadRegistry {
         (alive, blocked, tids, blocked_tids)
     }
 
+    /// DIAGNOSTIC (2026-07-13, STW takeover 5-class cluster investigation):
+    /// `ThreadId`s of every alive, `stw_ready` thread NOT in `excluded` —
+    /// i.e. the exact identity set a `request_stw_counted_with_live_blocked`
+    /// caller is about to count as "expected". Not lock-atomic with a prior
+    /// `alive_count_blocked_and_os_tids` call, but both are invoked from
+    /// inside the SAME `request_stw_counted_with_live_blocked` closure, which
+    /// runs under the barrier's transition lock — no mutator can flip
+    /// `in_blocked_region` in a way that would matter between the two calls
+    /// for diagnostic purposes.
+    pub fn alive_thread_ids_excluding(&self, excluded: &[u64]) -> Vec<u64> {
+        let threads = self.threads.lock();
+        threads
+            .iter()
+            .filter(|(tid, e)| {
+                e.alive.load(Ordering::Acquire)
+                    && e.stw_ready.load(Ordering::Acquire)
+                    && !excluded.contains(&tid.0)
+            })
+            .map(|(tid, _)| tid.0)
+            .collect()
+    }
+
     /// Get Java Thread objects for all alive threads (up to `max` entries).
     pub fn alive_thread_objects(&self, max: usize) -> Vec<ObjectRef> {
         self.threads
