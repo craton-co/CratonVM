@@ -127,7 +127,7 @@ Remaining follow-ups — reduction kernels (non-`void` return) not yet wired
 into the dispatch path, JIT-compiled callers bypassing the offload hook,
 broader opcode coverage in the lowering stage, and a few smaller items — are
 tracked in
-[`docs/known-issues/gpu-offload-followups-20260711.md`](https://github.com/craton-co/cratonvm/blob/dev/docs/known-issues/gpu-offload-followups-20260711.md).
+[`docs/internal/gpu-offload-followups-20260711.md`](https://github.com/craton-co/cratonvm/blob/dev/docs/internal/gpu-offload-followups-20260711.md).
 
 ## FAQ
 
