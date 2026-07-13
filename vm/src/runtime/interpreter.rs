@@ -24149,7 +24149,7 @@ fn surefire_lazy_launcher_discover_native(
 /// Synthetic stubs are fallback implementations for fake or incomplete JDK
 /// classes. When the real class bytecode is loaded and explicitly protected,
 /// dispatch must prefer that bytecode over the approximate stub.
-fn synthetic_stub_should_yield_to_real_bytecode(
+pub(crate) fn synthetic_stub_should_yield_to_real_bytecode(
     shared: &SharedVm,
     class_name: &str,
     method_name: &str,
@@ -24163,7 +24163,37 @@ fn synthetic_stub_should_yield_to_real_bytecode(
         return false;
     }
 
-    let real_protected_stub = crate::runtime::env_cache::real_bytecode_selector()
+    if !real_protected_stub_class(class_name) {
+        return false;
+    }
+
+    let cm = shared.class_manager.read();
+    cm.get_loaded_class_id(class_name)
+        .and_then(|cid| {
+            cm.get_class(cid).and_then(|cls| {
+                if cls.is_synthetic_stub {
+                    None
+                } else {
+                    crate::classloading::find_method_recursive(
+                        cid,
+                        method_name,
+                        descriptor,
+                        &cm.class_store,
+                    )
+                    .map(|(m, _)| !m.is_native() && m.code().is_some())
+                }
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// The class allowlist for [`synthetic_stub_should_yield_to_real_bytecode`]
+/// (and `populate_invoke_cache`'s inline copy of the same predicate, which
+/// cannot call the full helper while holding the class-manager read lock):
+/// classes whose SyntheticStub natives exist only for stub-phase bootstraps
+/// and must yield to loaded real bytecode.
+pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
+    crate::runtime::env_cache::real_bytecode_selector()
         .prefers_real(class_name)
         || matches!(
             class_name,
@@ -24193,29 +24223,7 @@ fn synthetic_stub_should_yield_to_real_bytecode(
                 | "java/lang/ref/Cleaner"
                 | "java/lang/ref/Cleaner$Cleanable"
                 | "java/lang/management/ManagementFactory"
-        );
-    if !real_protected_stub {
-        return false;
-    }
-
-    let cm = shared.class_manager.read();
-    cm.get_loaded_class_id(class_name)
-        .and_then(|cid| {
-            cm.get_class(cid).and_then(|cls| {
-                if cls.is_synthetic_stub {
-                    None
-                } else {
-                    crate::classloading::find_method_recursive(
-                        cid,
-                        method_name,
-                        descriptor,
-                        &cm.class_store,
-                    )
-                    .map(|(m, _)| !m.is_native() && m.code().is_some())
-                }
-            })
-        })
-        .unwrap_or(false)
+        )
 }
 
 /// Stackless invoke: resolve a method and either call native (Handled) or push
@@ -25385,9 +25393,29 @@ fn populate_invoke_cache(
     // bytecode body, the cached Native entry must invalidate.  Look up
     // the class_id here rather than synthesizing a never-stale gate so
     // even native-resolved entries participate in JEP 109 invalidation.
+    //
+    // SyntheticStub yield: a stub-tagged native on a real-protected class
+    // whose real bytecode is loaded must NOT be cached (and especially not
+    // promoted to the cross-thread cache) — the stub body exists only for
+    // stub-phase bootstraps. Without this, a call site whose first
+    // resolution goes through this population path permanently pins the
+    // stub even though the slow-path dispatch sites correctly yield
+    // (observed 2026-07-13 with the since-removed OutputStreamWriter stub
+    // surface: `HttpServlet$NoBodyPrintWriter.resetBuffer`'s
+    // `new OutputStreamWriter` kept minting encoders with a null `se`
+    // while the sibling constructor call site ran the real ctor).
+    // Fall through to the bytecode resolution below instead.
     if let Some(callback) = shared
         .native_methods
         .find(&class_name, &method_name, &descriptor)
+        .filter(|_| {
+            !synthetic_stub_should_yield_to_real_bytecode(
+                shared,
+                &class_name,
+                &method_name,
+                &descriptor,
+            )
+        })
     {
         let cm = shared.class_manager.read();
         let gate = match cm.get_loaded_class_id(&class_name) {
@@ -25490,26 +25518,43 @@ fn populate_invoke_cache(
     // restored by the `cd396a04` "Merge branch 'main' into dev" merge).
     {
         let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
-        if let Some(callback) =
-            shared
-                .native_methods
-                .find(declaring_name, &method_name, &descriptor)
-        {
-            let gate = RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
-            drop(cm);
-            let target = CachedInvokeTarget::Native {
-                callback,
-                // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
-                num_params: num_params as u16,
-                gate,
-            };
-            shared
-                .shared_resolution
-                .insert_promoted_invoke(promoted_key, target.clone());
-            thread
-                .invoke_cache
-                .put(caller_class_id, cp_index, is_special, target);
-            return;
+        // Inline SyntheticStub yield (the full helper re-acquires the
+        // class-manager read lock, which is already held here): a stub-tagged
+        // native on a real-protected declaring class whose resolved method is
+        // real bytecode yields — do not cache the stub. `method`/`declaring_id`
+        // are the already-resolved real method/class from
+        // `find_method_recursive` above.
+        let stub_yields = shared
+            .native_methods
+            .kind_of(declaring_name, &method_name, &descriptor)
+            == Some(cratonvm_native_api::NativeKind::SyntheticStub)
+            && real_protected_stub_class(declaring_name)
+            && store.get(declaring_id).is_some_and(|c| !c.is_synthetic_stub)
+            && !method.is_native()
+            && method.code().is_some();
+        if !stub_yields {
+            if let Some(callback) =
+                shared
+                    .native_methods
+                    .find(declaring_name, &method_name, &descriptor)
+            {
+                let gate =
+                    RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
+                drop(cm);
+                let target = CachedInvokeTarget::Native {
+                    callback,
+                    // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
+                    num_params: num_params as u16,
+                    gate,
+                };
+                shared
+                    .shared_resolution
+                    .insert_promoted_invoke(promoted_key, target.clone());
+                thread
+                    .invoke_cache
+                    .put(caller_class_id, cp_index, is_special, target);
+                return;
+            }
         }
     }
 
