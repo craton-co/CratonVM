@@ -1,5 +1,24 @@
 # HTTP/2 test-connection `Socket is closed` — broader than DoHead (2+ classes)
 
+**Status: FIXED (2026-07-13, branch `fix/dohead-family-regressions-v2-20260713`).**
+The root cause identified in the 2026-07-13 note below (synthetic
+`javax/net/SocketFactory.createSocket` natives from `be6055605` feeding a
+never-really-constructed `java/net/Socket` to real Socket bytecode under
+`CRATONVM_REAL_NET_SOCKETS=1`) is now fixed on dev: the RNS registry
+drop-filter also drops `javax/net/SocketFactory`, so real
+`SocketFactory`/`DefaultSocketFactory` bytecode constructs sockets through
+the real `Socket` constructors (`javax/net/ServerSocketFactory` is
+deliberately kept — its natives delegate to real constructors and are
+layout-correct). Post-fix validation on the Windows suite runner:
+`TestCancelledUpload` OK (2 tests) (was 2/2 failing);
+`TestHttp2Section_5_1` 23/26 (was 26/26 failing — the 3 remaining are
+newly-VISIBLE protocol-behavior residuals, split off to
+[http2-section51-maxactivestreams-rst-behavior.md](http2-section51-maxactivestreams-rst-behavior.md));
+the DoHead family's `testDoHeadHttp2` parameterizations pass modulo load
+flakes, with zero occurrences of any of the three signatures.
+
+Original write-up follows for the record.
+
 **Status:** OPEN. **Severity:** high. **HotSpot:** PASS (fresh-verified).
 **Related:** [dohead-jit-heap-corruption-register-invisibility.md](dohead-jit-heap-corruption-register-invisibility.md)
 — that doc's "new blocker" section documents the identical signature for

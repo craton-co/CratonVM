@@ -26732,54 +26732,77 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "([B)V",
         native_output_stream_write_all,
     );
-    for descriptor in [
-        "(Ljava/io/OutputStream;)V",
-        "(Ljava/io/OutputStream;Ljava/nio/charset/Charset;)V",
-        "(Ljava/io/OutputStream;Ljava/lang/String;)V",
-    ] {
+    // Synthetic-JDK builds only. In real-JDK mode this OutputStreamWriter
+    // surface (added 2026-07-09 by the WildFly process-controller bootstrap
+    // batch, b448f2039) shadowed the real OSW bytecode at every dispatch
+    // site (WP0.1 native-override-priority) and REGRESSED the StreamEncoder
+    // commit-threshold fix (1773d3df2, docs/known-issues/
+    // dohead-streamencoder-eager-flush-commit-threshold.md):
+    // `write_bytes_from_output_stream_writer` encodes every `write()` call
+    // straight to the wrapped stream — one underlying `write([BII)` per
+    // Writer call instead of real StreamEncoder's 512-byte batches — which
+    // broke `NoBodyOutputStream.checkCommit`'s byte-count commit threshold
+    // again (Tomcat `TestHttpServletDoHead*`: the 8 useLegacy+useWriter+FULL
+    // params fail `expected:<2> but was:<3>` / GET has content-length while
+    // HEAD goes chunked). It also encodes with `String::into_bytes()` — i.e.
+    // hard-coded UTF-8, ignoring the writer's charset — and its `<init>`
+    // native writes the OutputStream into raw slot 0 (real layout:
+    // `Writer.writeBuffer`) while never creating the `se` StreamEncoder the
+    // real bytecode needs, breaking the CharsetEncoder-ctor delegation
+    // workaround above too. Real-JDK mode runs the real OSW bytecode →
+    // `sun.nio.cs.StreamEncoder` shim (native-io/src/stream_encoder.rs),
+    // which was validated byte-for-byte against HotSpot's flush granularity.
+    // Same gating precedent as the BufferedInputStream block below.
+    if cfg!(feature = "synthetic-jdk") {
+        for descriptor in [
+            "(Ljava/io/OutputStream;)V",
+            "(Ljava/io/OutputStream;Ljava/nio/charset/Charset;)V",
+            "(Ljava/io/OutputStream;Ljava/lang/String;)V",
+        ] {
+            registry.register(
+                "java/io/OutputStreamWriter",
+                "<init>",
+                descriptor,
+                native_output_stream_writer_init,
+            );
+        }
         registry.register(
             "java/io/OutputStreamWriter",
-            "<init>",
-            descriptor,
-            native_output_stream_writer_init,
+            "write",
+            "(I)V",
+            native_output_stream_writer_write_int,
+        );
+        registry.register(
+            "java/io/OutputStreamWriter",
+            "write",
+            "([CII)V",
+            native_output_stream_writer_write_chars,
+        );
+        registry.register(
+            "java/io/OutputStreamWriter",
+            "write",
+            "(Ljava/lang/String;)V",
+            native_output_stream_writer_write_string,
+        );
+        registry.register(
+            "java/io/OutputStreamWriter",
+            "write",
+            "(Ljava/lang/String;II)V",
+            native_output_stream_writer_write_string_range,
+        );
+        registry.register(
+            "java/io/OutputStreamWriter",
+            "flush",
+            "()V",
+            native_output_stream_writer_flush,
+        );
+        registry.register(
+            "java/io/OutputStreamWriter",
+            "close",
+            "()V",
+            native_output_stream_writer_close,
         );
     }
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "write",
-        "(I)V",
-        native_output_stream_writer_write_int,
-    );
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "write",
-        "([CII)V",
-        native_output_stream_writer_write_chars,
-    );
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "write",
-        "(Ljava/lang/String;)V",
-        native_output_stream_writer_write_string,
-    );
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "write",
-        "(Ljava/lang/String;II)V",
-        native_output_stream_writer_write_string_range,
-    );
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "flush",
-        "()V",
-        native_output_stream_writer_flush,
-    );
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "close",
-        "()V",
-        native_output_stream_writer_close,
-    );
 
     // Real JDK BufferedInputStream has a layout and close protocol that the
     // old synthetic bridge cannot emulate safely.  In particular, dispatching
