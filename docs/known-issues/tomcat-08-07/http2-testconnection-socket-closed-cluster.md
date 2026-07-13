@@ -7,6 +7,28 @@ the DoHead family; this doc extends the finding to non-DoHead HTTP/2 test
 classes, confirming it's a general `Http2TestBase` connection-handling
 issue, not something specific to DoHead's servlet code path.
 
+**2026-07-13:** re-verified live on `TestCancelledUpload` — still
+reproduces; a run with debug env vars added surfaced a `socketLock`-is-null
+NPE instead of the `String.setOption` NoSuchMethodError below, which
+initially looked like GC-timing non-determinism. It is not: this rules out
+a shared-vtable-dispatch-bug hypothesis raised while investigating
+`largeclienthello-string-size-nosuchmethod.md` (now fixed, see
+`docs/internal/tomcat-08-07/largeclienthello-string-size-nosuchmethod-FIXED.md`'s
+"Refuted hypothesis" section — that bug was a deterministic, unrelated
+`java.util.logging.Logger` field-layout collision), but a **concurrent
+2026-07-13 investigation** ([[project_dohead_third_cause_socketfactory_synthetic_20260713]]
+in project memory) found the real, fully deterministic root cause: commit
+`be6055605` (2026-07-09) added synthetic `javax/net/SocketFactory
+.createSocket` natives building a 5-slot synthetic-layout `Socket`, while
+`CRATONVM_REAL_NET_SOCKETS=1` (set by this suite runner) drops every
+`java/net/Socket` native so real bytecode consumes that synthetic object —
+a producer/consumer layout split-brain, reproducible with `--nojit`. Which
+of the three faces you see depends on the exact construction path (e.g.
+`useAsyncIO`), not GC timing. Fix (drop `javax/net/SocketFactory` natives
+under the same real-net-sockets registry filter) was prepared in that
+session's worktree but not yet merged — check dev history before
+re-investigating.
+
 ## Summary
 
 `org.apache.coyote.http2.TestCancelledUpload` and

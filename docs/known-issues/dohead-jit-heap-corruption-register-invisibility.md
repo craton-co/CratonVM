@@ -13,6 +13,37 @@ documented root causes were genuinely fixed and merged to `dev`:
   See `dohead-streamencoder-eager-flush-commit-threshold.md` (also restored
   from `docs/internal/fixed-suite-bugs/`).
 
+**2026-07-13 cross-reference note (CORRECTED):** the `String.setOption`
+signature below was hypothesized (in `largeclienthello-string-size-nosuchmethod.md`,
+now fixed and moved to `docs/internal/tomcat-08-07/`) to share a root cause
+with an unrelated `NoSuchMethodError: java/lang/String.size()I` in
+`ClassLoaderLogManager.resetLoggers()`. That specific hypothesis is
+**refuted** — the `resetLoggers` bug was a deterministic, unrelated
+real-vs-synthetic `java.util.logging.Logger` field-slot collision (fixed;
+see that doc's "Refuted hypothesis" section).
+
+However, the `Socket.setSoTimeout` family here is **not** the deep
+register-invisible-root/GC family either — a concurrent 2026-07-13
+investigation ([[project_dohead_third_cause_socketfactory_synthetic_20260713]]
+in project memory) root-caused it **deterministically**: commit `be6055605`
+(2026-07-09) added synthetic `javax/net/SocketFactory.createSocket`
+natives that fabricate a 5-slot synthetic-layout `java/net/Socket`; under
+`CRATONVM_REAL_NET_SOCKETS=1` (set by the Tomcat/Spring suite runners) every
+`java/net/Socket` native is dropped so *real* `Socket` bytecode consumes
+that synthetic object — a producer/consumer layout split-brain. Which of
+the three faces (`String.setOption`, `socketLock`-null NPE, `Socket is
+closed`) you hit depends on which garbage byte pattern lands in which real
+field slot for a given call path (e.g. `useAsyncIO` true/false take
+different construction routes) — reproducible and JIT-independent
+(reproduces with `--nojit`), not a GC-timing race. A minimal
+`new Socket(host,port)` probe doesn't reproduce it because that goes
+through `Socket`'s own real constructor directly, never through the buggy
+`SocketFactory.getDefault().createSocket(...)` producer path that
+`Http2TestBase.openClientConnection` actually uses. Fix (drop
+`javax/net/SocketFactory` natives too under the same registry filter) was
+prepared but not yet merged as of this note — check dev history / that
+project memory before re-investigating from scratch.
+
 **However, the whole DoHead family still does not pass today.** A fresh
 full-suite rerun on `dev` (commit `080e79256`, 2026-07-12, real JDK, JIT on,
 1200s timeout) shows all ~19

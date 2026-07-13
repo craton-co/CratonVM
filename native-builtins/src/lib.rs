@@ -9268,6 +9268,56 @@ fn jul_logger_config_is_real(ctx: &mut dyn NativeContext, obj: ObjectRef) -> boo
         .unwrap_or(false)
 }
 
+/// GC-safe side table for `java.util.logging.Logger`'s handler list, keyed by
+/// `identity_hash_code` (same pattern as `net_phase_e.rs`'s `ss_side_table` /
+/// `stream_owner_table`). `addHandler`/`removeHandler`/`getHandlers` are
+/// fully native-overridden (never fall through to real bytecode), so they
+/// don't need to live in any particular instance field slot -- and MUST NOT,
+/// because real-JDK 25's `Logger` has no `handlers` instance field at all
+/// (handlers moved inside `Logger$ConfigurationData`, referenced from slot 0
+/// / `config`) and slot 2 is actually `name` (a `String`). The old code
+/// stored/read the handler `ArrayList` at raw field slot 2, which on a
+/// real-bytecode-constructed `Logger` collided with `name`:
+/// `ctx.invoke_virtual(nameString, "size", "()I", ...)` then threw
+/// `NoSuchMethodError: java/lang/String.size()I` (surfaced from
+/// `org.apache.juli.ClassLoaderLogManager.resetLoggers`, which calls
+/// `logger.getHandlers()` during webapp/classloader shutdown -- see
+/// docs/known-issues/tomcat-08-07/largeclienthello-string-size-nosuchmethod.md).
+/// Keying by identity hash and holding the list as a global GC root
+/// sidesteps field layout entirely -- correct for both real and synthetic
+/// loggers, and immune to future real-JDK field-order changes.
+fn jul_logger_handlers_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, usize>>
+{
+    static T: OnceLock<std::sync::Mutex<std::collections::HashMap<i32, usize>>> = OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub(crate) fn jul_logger_handlers_get(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+) -> Option<ObjectRef> {
+    let key = ctx.identity_hash_code(logger);
+    let handle = *jul_logger_handlers_table().lock().unwrap().get(&key)?;
+    ctx.resolve_global_root(handle)
+}
+
+pub(crate) fn jul_logger_handlers_set(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+    list: ObjectRef,
+) {
+    let handle = ctx.add_global_root(list);
+    let key = ctx.identity_hash_code(logger);
+    jul_logger_handlers_table().lock().unwrap().insert(key, handle);
+}
+
+pub(crate) fn jul_logger_handlers_clear(ctx: &mut dyn NativeContext, logger: ObjectRef) {
+    let key = ctx.identity_hash_code(logger);
+    if let Some(handle) = jul_logger_handlers_table().lock().unwrap().remove(&key) {
+        ctx.remove_global_root(handle);
+    }
+}
+
 const ANTLR_PC: &str = "org/antlr/v4/runtime/atn/PredictionContext";
 const ANTLR_SINGLETON_PC: &str = "org/antlr/v4/runtime/atn/SingletonPredictionContext";
 const ANTLR_EMPTY_PC: &str = "org/antlr/v4/runtime/atn/EmptyPredictionContext";
@@ -33844,16 +33894,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let Some(Value::Object(Some(logger))) = args.first() else {
                 return Ok(None);
             };
+            let logger = *logger;
             let handler = args.get(1).copied().unwrap_or(Value::Object(None));
-            let handlers = match ctx.get_field(*logger, 2) {
-                Value::Object(Some(list)) => list,
-                _ => {
+            let handlers = match jul_logger_handlers_get(ctx, logger) {
+                Some(list) => list,
+                None => {
                     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
                     cratonvm_native_collections::native_al_init(
                         ctx,
                         &[Value::Object(Some(list))],
                     )?;
-                    ctx.set_field(*logger, 2, Value::Object(Some(list)));
+                    jul_logger_handlers_set(ctx, logger, list);
                     list
                 }
             };
@@ -33872,7 +33923,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let Some(Value::Object(Some(logger))) = args.first() else {
                 return Ok(None);
             };
-            if let Value::Object(Some(handlers)) = ctx.get_field(*logger, 2) {
+            let logger = *logger;
+            if let Some(handlers) = jul_logger_handlers_get(ctx, logger) {
                 let size = match ctx.invoke_virtual(handlers, "size", "()I", &[])? {
                     Some(Value::Int(size)) if size > 0 => size as usize,
                     _ => 0,
@@ -33896,7 +33948,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // This native logger has no parent-handler chain. Once the JULI
             // fixture detaches its handler, discard the now-empty/stale list
             // so a later parameterized fixture starts from a clean receiver.
-            ctx.set_field(*logger, 2, Value::Object(None));
+            jul_logger_handlers_clear(ctx, logger);
             Ok(None)
         },
     );
@@ -33906,7 +33958,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/util/logging/Handler;",
         |ctx, args| {
             if let Some(Value::Object(Some(logger))) = args.first() {
-                if let Value::Object(Some(handlers)) = ctx.get_field(*logger, 2) {
+                let logger = *logger;
+                if let Some(handlers) = jul_logger_handlers_get(ctx, logger) {
                     return cratonvm_native_collections::native_al_to_array(
                         ctx,
                         &[Value::Object(Some(handlers))],
@@ -37199,16 +37252,17 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
             let Some(Value::Object(Some(logger))) = args.first() else {
                 return Ok(None);
             };
+            let logger = *logger;
             let handler = args.get(1).copied().unwrap_or(Value::Object(None));
-            let handlers = match ctx.get_field(*logger, 2) {
-                Value::Object(Some(list)) => list,
-                _ => {
+            let handlers = match jul_logger_handlers_get(ctx, logger) {
+                Some(list) => list,
+                None => {
                     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
                     cratonvm_native_collections::native_al_init(
                         ctx,
                         &[Value::Object(Some(list))],
                     )?;
-                    ctx.set_field(*logger, 2, Value::Object(Some(list)));
+                    jul_logger_handlers_set(ctx, logger, list);
                     list
                 }
             };
@@ -37229,7 +37283,7 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
             };
             // This native logger has no parent-handler chain. Once JULI
             // detaches a fixture handler, discard its list for the next case.
-            ctx.set_field(*logger, 2, Value::Object(None));
+            jul_logger_handlers_clear(ctx, *logger);
             Ok(None)
         },
     );
@@ -37239,7 +37293,8 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
         "()[Ljava/util/logging/Handler;",
         |ctx, args| {
             if let Some(Value::Object(Some(logger))) = args.first() {
-                if let Value::Object(Some(handlers)) = ctx.get_field(*logger, 2) {
+                let logger = *logger;
+                if let Some(handlers) = jul_logger_handlers_get(ctx, logger) {
                     return cratonvm_native_collections::native_al_to_array(
                         ctx,
                         &[Value::Object(Some(handlers))],
