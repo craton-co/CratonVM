@@ -572,15 +572,19 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     cratonvm_native_builtins::lang_invoke::gc_scan_lambda_callsite_cache_roots(&mut roots);
 
     // 17. Overlay-backed collections (LinkedList / LinkedHashMap / TreeMap /
-    //     TreeSet). These keep their backing arrays + nodes in process-global
-    //     Rust side-tables, invisible to the field-tracing scan above. Without
-    //     this, a moving young-gen GC reclaims/relocates a backing array
-    //     reachable only through an overlay, leaving a dangling pointer that
-    //     later reads as a zero-header (class_id=0) object — the
-    //     `LinkedHashMap.get` crash on DaCapo's Config map. The matching
-    //     post-compaction remap lives in `gc.rs`
-    //     (`gc_update_collection_overlay_refs`).
-    cratonvm_native_collections::gc_scan_collection_overlay_roots(&mut roots);
+    //     TreeSet). These keep backing arrays + nodes in Rust side-tables,
+    //     invisible to ordinary field tracing. The moving/G1/ZGC paths retain
+    //     the conservative global-root behavior because their marker has no
+    //     stable-address overlay propagation. The Generational non-moving
+    //     marker, however, can propagate an overlay only after its OWNER has
+    //     been marked (gen_heap.rs): globally rooting every entry there turns a
+    //     dead scratch collection into a permanent root chain.
+    let conditional_overlay_marking = shared.config.gc_algorithm
+        == crate::config::GcAlgorithm::Generational
+        && cratonvm_gc::gc_quiescence::is_active();
+    if !conditional_overlay_marking {
+        cratonvm_native_collections::gc_scan_collection_overlay_roots(&mut roots);
+    }
 
     // 18. Singleton built-in class loaders (app / platform). These synthetic
     //     `ClassLoader` objects live ONLY in process-global mutexes in

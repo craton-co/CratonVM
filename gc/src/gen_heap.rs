@@ -4668,6 +4668,20 @@ impl GenerationalHeap {
         // next collection still sees these old→young references.
         self.card_table.mark_dirty_bulk(&redirty_cards);
 
+        // Overlay-backed collections have old→young edges that do not occupy
+        // a Java heap slot, so no card can describe them. A minor collection
+        // leaves old gen intact and cannot decide which old owners will later
+        // be dead; retain edges of every current old owner here just as the
+        // card scan does. The major marker below applies the precise
+        // owner-reachable rule before it compacts old space.
+        for overlay_ref in
+            cratonvm_native_collections::gc_overlay_roots_for_matching_owners(|owner_addr| {
+                old_gen.contains(owner_addr as *mut u8)
+            })
+        {
+            mark_young(overlay_ref.as_ptr(), &mut worklist, &mut side_marks);
+        }
+
         // DBG (CRATONVM_DBG_SEED_ALL_OLD): decisive test for the sweep-edges
         // verdict that bt18's leak is an old→young CLEAN-CARD miss. Seed the mark
         // from EVERY old-gen object's young references (not just dirty cards). If
@@ -4700,6 +4714,17 @@ impl GenerationalHeap {
                 for_each_ref_slot(obj_ptr, header, |ref_ptr, _| {
                     mark_young(ref_ptr, &mut worklist, &mut side_marks);
                 });
+            }
+            // Collection-overlay liveness pin: an overlay is an out-of-heap
+            // edge owned by its backing collection, not a process-global root.
+            // This non-moving marker has stable object addresses, so once this
+            // collection itself is marked we can follow only ITS side-table
+            // references. The root gatherer omits the unconditional overlay
+            // scan for this exact collector mode.
+            for overlay_ref in
+                cratonvm_native_collections::gc_overlay_roots_for_collection(obj_ptr as usize)
+            {
+                mark_young(overlay_ref.as_ptr(), &mut worklist, &mut side_marks);
             }
             // HIB-CV-24: also mark this object's defining ClassLoader so a live
             // (e.g. leaked-via-ThreadLocal) instance keeps its loader alive.
@@ -6528,6 +6553,26 @@ impl GenerationalHeap {
         // Seed: young from-space references into old gen
         Self::mark_young_to_old_refs(young_from, old_gen, &mut worklist);
 
+        // `mark_young_to_old_refs` walks only real Java heap fields. Follow
+        // the equivalent out-of-heap edges for all current young owners too;
+        // young from-space is conservatively retained for this major cycle,
+        // matching the ordinary cross-generation seed's contract.
+        for overlay_ref in
+            cratonvm_native_collections::gc_overlay_roots_for_matching_owners(|owner_addr| {
+                young_from.contains(owner_addr as *mut u8)
+            })
+        {
+            let overlay_ptr = overlay_ref.as_ptr();
+            if old_gen.contains(overlay_ptr) {
+                // SAFETY: `overlay_ptr` lies in old gen, verified above.
+                let h = unsafe { &mut *(overlay_ptr as *mut ObjectHeader) };
+                if h.gc_flags & GC_FLAG_MARKED == 0 {
+                    h.gc_flags |= GC_FLAG_MARKED;
+                    worklist.push(overlay_ptr);
+                }
+            }
+        }
+
         // BFS: transitively mark all reachable old-gen objects
         // HIB-CV-24: a live object keeps its class's defining ClassLoader alive
         // (instance→loader). Conservative — only ever marks MORE live, so it can
@@ -6536,6 +6581,24 @@ impl GenerationalHeap {
         let loader_pin_on = cratonvm_types::loader_pin::loader_pinning_enabled();
         while let Some(obj_ptr) = worklist.pop() {
             Self::scan_object_for_old_refs(obj_ptr, old_gen, &mut worklist);
+            // Same owner→overlay propagation as the young non-moving marker
+            // above. Major GC also uses stable pre-compaction addresses, so it
+            // can reclaim an unreachable old collection and its side-table
+            // graph together instead of treating every entry as a global root.
+            for overlay_ref in
+                cratonvm_native_collections::gc_overlay_roots_for_collection(obj_ptr as usize)
+            {
+                let overlay_ptr = overlay_ref.as_ptr();
+                if old_gen.contains(overlay_ptr) {
+                    // SAFETY: `overlay_ptr` is in old gen; this is the same
+                    // marking transition used by the defining-loader pin below.
+                    let h = unsafe { &mut *(overlay_ptr as *mut ObjectHeader) };
+                    if h.gc_flags & GC_FLAG_MARKED == 0 {
+                        h.gc_flags |= GC_FLAG_MARKED;
+                        worklist.push(overlay_ptr);
+                    }
+                }
+            }
             if loader_pin_on {
                 // SAFETY: `obj_ptr` is a marked old-gen object with a valid header.
                 let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
