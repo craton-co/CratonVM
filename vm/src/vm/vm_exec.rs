@@ -4656,22 +4656,59 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn monitor_enter(&mut self, obj: ObjectRef) {
-        // Gated diagnostic only (CRATONVM_DBG_MONENTER, default OFF): deposit
-        // this thread's frame snapshot so the contended-`enter` poll loop can
-        // emit it if a watchdog stack-dump fires while we are blocked here.
-        // No cost in normal runs — the flag is read once and cached.
-        let dbg_mon_dump = crate::threading::monitor::mon_enter_dump_enabled();
-        if dbg_mon_dump {
-            crate::vm::vm_init::set_wait_site_snapshot(&*self.thread);
-        }
-        // NOTE deliberately NOT monitor_enter_blocking: the calling native
-        // holds raw `Value` copies (its args slice) that are neither rooted
-        // nor remappable across a GC-blocked wait; block as an EXPECTED
-        // mutator instead (a concurrent STW waits for us).
-        self.shared.monitors.enter(obj, self.thread.thread_id);
-        if dbg_mon_dump {
-            crate::vm::vm_init::clear_wait_site_snapshot();
-        }
+        // STW-TAKEOVER-FIX (2026-07-13, WildFly parallel-extension-add
+        // deadlock — "STW cross-thread JIT takeover ... pending=N taken=0"):
+        // this used to call `self.shared.monitors.enter(...)` directly.
+        // THAT function's own doc comment already names the hazard: "prefer
+        // enter_or_contend ... so the contended wait can be wrapped in the
+        // GC-blocked protocol ... the H2 TestScript three-way wedge". A
+        // contended call from a native (e.g. `CountDownLatch.await()`'s
+        // `native_cdl_await` polling loop) stayed counted in the STW
+        // barrier's `expected` set for the ENTIRE contended wait. When the
+        // monitor's other users are themselves properly parked in a
+        // GC-blocked `Object.wait()` inside that SAME polling loop, and can
+        // only resume once the current pause completes
+        // (`GcBarrier::leave_blocked_region_flagged` waits out any in-flight
+        // pause even for already-excluded, non-participating threads), the
+        // pause can never gather its last arrival: the eventual monitor
+        // owner waits for the pause to finish before it can loop back around
+        // to release the monitor, the pause waits for this thread to arrive,
+        // and this thread waits for the monitor — a real deadlock, not mere
+        // slowness. Root-caused via a live gdb capture during WildFly's
+        // `parallel-extension-add` boot step (30-40 `EnhancedQueueExecutor`
+        // workers concurrently calling `native_cdl_await` on a shared
+        // handshake latch): every worker but one was correctly parked in
+        // `Object.wait()` (GC-blocked, excluded from the barrier); the lone
+        // holdout sat in `Monitor::block_enter`'s condvar wait — uncounted
+        // as blocked, forever expected, never arriving.
+        //
+        // Fix: delegate to `monitor_enter_blocking` — the SAME contended-
+        // path GC-blocked protocol (deposit root snapshot, retire TLAB,
+        // `GcBarrier::enter_blocked`/`arrive_and_wait_auto`, `block_enter`,
+        // `mark_blocked_region_leave`/`check_post_block_gc`) that bytecode's
+        // own `monitorenter` instruction already uses, and that
+        // `Monitor::block_enter`'s doc comment requires of every caller. The
+        // FAST (uncontended) path is unaffected — `monitor_enter_blocking`
+        // returns immediately with zero barrier interaction when
+        // `enter_or_contend` acquires without contention (the overwhelming
+        // common case), so this adds no overhead there; the gated
+        // CRATONVM_DBG_MONENTER wait-site dump also lives inside
+        // `monitor_enter_blocking` now, scoped to the contended path where a
+        // watchdog stack-dump could actually observe this thread waiting.
+        //
+        // This trait method's signature returns `()`, so the (possibly
+        // GC-relocated) `obj` resolved internally is not handed back to the
+        // caller. A caller that keeps reusing its own `obj`/`this` copy
+        // across a call that can now genuinely span a completing GC pause
+        // (previously impossible here: an uncooperative contended wait
+        // structurally prevented any pause from completing while it was in
+        // progress) must pin it first via `pin_native_root`/`read_native_pin`
+        // — mirroring the existing `monitor_wait_keepalive` idiom already
+        // used by `native_cdl_await` for the immediately-following
+        // `monitor_wait` call. See `monitor_enter_keepalive` in
+        // native-builtins, applied to the proven repro trigger
+        // (`native_cdl_await`/`native_cdl_await_timeout`/`native_cdl_count_down`).
+        monitor_enter_blocking(self.shared, self.thread, obj);
         // JEP 491: a virtual thread that holds a monitor is pinned to its
         // carrier and cannot be unmounted. Track the pin depth so that
         // subsequent park/sleep calls can emit `jdk.VirtualThreadPinned`.
