@@ -11674,23 +11674,6 @@ fn execute_instruction(
     instruction: &Instruction,
     saved_pc: usize,
 ) -> Result<InstructionResult, MethodCallFailed> {
-    // ALV5th GC investigation (temp probe, CRATONVM_DBG_DESCTRACE): trace
-    // EVERY instruction executed while inside org/junit/runner/Description's
-    // addChild, unconditionally, before any opcode-specific logic runs (or
-    // can throw). Removes all assumptions about which opcode/branch fires.
-    if std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some() {
-        let cn = thread.frames[frame_idx].class_name();
-        let mn = thread.frames[frame_idx].method_name();
-        if cn == "org/junit/runner/Description" && mn == "addChild" {
-            eprintln!(
-                "[desctrace-instr] pc={} saved_pc={} instr={:?} stack_len={}",
-                thread.frames[frame_idx].pc,
-                saved_pc,
-                instruction,
-                thread.frames[frame_idx].stack.len(),
-            );
-        }
-    }
     match instruction {
         // -- Constants (T10.9.D direct CompactValue push) --
         Instruction::Nop => {}
@@ -12889,26 +12872,6 @@ fn execute_instruction(
             }
         }
         Instruction::Getfield(index) => {
-            // ALV5th GC investigation (temp probe, CRATONVM_DBG_DESCTRACE):
-            // dump the RAW (undecoded) operand-stack top the instant Getfield
-            // begins, for addChild specifically, before any pop/resolve call
-            // that could itself throw or transform the value. This bypasses
-            // every downstream assumption about which error path fires.
-            if std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some() {
-                let cn = thread.frames[frame_idx].class_name();
-                let mn = thread.frames[frame_idx].method_name();
-                if cn == "org/junit/runner/Description" && mn == "addChild" {
-                    let cv = thread.frames[frame_idx].stack.peek_compact();
-                    let v = thread.frames[frame_idx].stack.peek();
-                    eprintln!(
-                        "[desctrace-entry] Getfield in addChild pc={} stack_top raw_bits=0x{:x} tag={:?} decoded={:?}",
-                        thread.frames[frame_idx].pc,
-                        cv.raw_bits(),
-                        cv.tag(),
-                        v,
-                    );
-                }
-            }
             let current_class_id = thread.frames[frame_idx].class_id;
             // Perf: `resolve_field_name` takes a class_manager RwLock and
             // allocates a `String` — but the name is only needed for the
@@ -13139,24 +13102,6 @@ fn execute_instruction(
             } else {
                 shared.heap.get_field(obj_ref, field.field_index)
             };
-            // ALV5th GC investigation (temp probe, CRATONVM_DBG_DESCTRACE):
-            // trace every GET of fChildren, especially ones that observe
-            // null (the crash symptom), with the receiver's identity hash.
-            if std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some() {
-                let field_name = resolve_field_name(shared, current_class_id, *index);
-                if field_name.as_deref() == Some("fChildren") {
-                    eprintln!(
-                        "[desctrace-get] fChildren obj=0x{:x} ihash={} value_is_null={} in {}.{}{} pc={}",
-                        obj_ref.as_ptr() as usize,
-                        shared.heap.identity_hash_code(obj_ref),
-                        matches!(value, Value::Object(None)),
-                        thread.frames[frame_idx].class_name(),
-                        thread.frames[frame_idx].method_name(),
-                        thread.frames[frame_idx].method_descriptor(),
-                        thread.frames[frame_idx].pc,
-                    );
-                }
-            }
             // K2 (T10.9.E) — J/D direct-CompactValue fast path.
             //
             // For long/double fields, build the CompactValue with the exact
@@ -13419,26 +13364,6 @@ fn execute_instruction(
                 &field,
             ) {
                 field = retargeted;
-            }
-            // ALV5th GC investigation (temp probe, CRATONVM_DBG_DESCTRACE):
-            // trace every PUT of fChildren, recording the receiver's identity
-            // hash (stable across relocation) so it can be cross-referenced
-            // against [desctrace-fwd] relocation events and [desctrace-get]
-            // read events.
-            if std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some() {
-                let field_name = resolve_field_name(shared, current_class_id, *index);
-                if field_name.as_deref() == Some("fChildren") {
-                    eprintln!(
-                        "[desctrace-put] fChildren obj=0x{:x} ihash={} value_is_null={} in {}.{}{} pc={}",
-                        obj_ref.as_ptr() as usize,
-                        shared.heap.identity_hash_code(obj_ref),
-                        matches!(value, Value::Object(None)),
-                        thread.frames[frame_idx].class_name(),
-                        thread.frames[frame_idx].method_name(),
-                        thread.frames[frame_idx].method_descriptor(),
-                        thread.frames[frame_idx].pc,
-                    );
-                }
             }
             // Perf: ALL of the per-putfield diagnostic blocks below are gated
             // behind a SINGLE cached "any field diagnostic enabled" branch, so
@@ -30726,20 +30651,6 @@ fn execute_jit_call_decoded(
     // block in `execute_jit_call` for the full rationale.
     let deopt_signaled = sig.deopt;
 
-    // ALV5th GC investigation (temp probe, CRATONVM_DBG_DESCTRACE): identify
-    // exactly which JIT-compiled callee raised the pending-NPE signal, and
-    // dump its receiver/args raw pointers, before the signal is converted
-    // into a message-less Java NullPointerException.
-    if sig.npe && std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some() {
-        eprintln!(
-            "[desctrace-jitnpe] JIT callee {}.{}{} raised pending NPE — args_slice={:?} jit_args_raw={:?}",
-            cached.class_name,
-            cached.method_name,
-            cached.method_descriptor,
-            args_slice,
-            &jit_args[..np],
-        );
-    }
     // Drain pending NPE / AIOOBE set by void-return store helpers (same as
     // execute_jit_call) — route through the JIT'd method's exception table.
     if sig.npe {

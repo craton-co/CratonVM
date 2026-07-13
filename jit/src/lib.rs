@@ -6145,7 +6145,27 @@ fn try_compile_inner(
     if !scan.ldc_ops.is_empty() {
         if let Some(resolver) = cp_ldc_resolver {
             for &(pc, cp_idx) in &scan.ldc_ops {
-                let val = resolver(cp_idx)?;
+                let val = match resolver(cp_idx) {
+                    Some(v) => v,
+                    None => {
+                        // RBC.7 — same permanent-bail class as RBC.4 (scan
+                        // reject) / RBC.6 (athrow+handler): this resolver's
+                        // `None` means the constant pool entry at `cp_idx` is
+                        // a String/Class/MethodHandle (not representable as
+                        // an immediate) — a property of the class file that
+                        // never changes, not a resolution-timing miss.
+                        // Without marking it, a hot method containing
+                        // `ldc "str"` re-ran the whole upgrade gauntlet
+                        // (skip-list + native-shadow walks + this scan) every
+                        // JIT_RETRY_STRIDE calls forever (same pathology RBC.4
+                        // fixed for scan rejects — observed as a silent,
+                        // diagnostic-free hang: TestResponsePerformance's
+                        // trivial `getRequestURI() { return "..."; }` bailed
+                        // on every one of ~1M hot-loop calls).
+                        *backend_attempted = true;
+                        return None;
+                    }
+                };
                 ldc_info.push((pc, val));
             }
         }
@@ -6158,7 +6178,16 @@ fn try_compile_inner(
     if !scan.ldc2w_ops.is_empty() {
         let resolver = cp_ldc2w_resolver?;
         for &(pc, cp_idx) in &scan.ldc2w_ops {
-            let (val, _is_double) = resolver(cp_idx)?;
+            let (val, _is_double) = match resolver(cp_idx) {
+                Some(v) => v,
+                None => {
+                    // RBC.7 twin: a non-Long/Double constant at this ldc2_w
+                    // index is likewise fixed by the bytecode — permanent
+                    // bail, not a transient miss. See the ldc arm above.
+                    *backend_attempted = true;
+                    return None;
+                }
+            };
             ldc2w_info.push((pc, val));
         }
     }
