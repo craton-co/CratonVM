@@ -2,6 +2,18 @@
 
 Status: OPEN
 
+## 2026-07-13 cross-reference
+
+See the sibling
+[DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests doc](ES-HANG-20260709-server-org-elasticsearch-search-vectors-diversifyingchildrenivfknnfloatslicedvectorquerytests-3ff8aa1c4b.md)'s
+"2026-07-13 follow-up: array-constructor-reference lambda bug found + fixed"
+section — a real, independent, now-fixed interpreter bug
+(`SomeType[]::new` array-constructor-reference lambdas allocated a corrupted
+object instead of a real array) that reproduces via real Lucene's
+`ByteBuffersDataInput` constructor, shared by both classes in this cluster.
+Not yet confirmed to be this doc's own hang's root cause — re-run this
+class's repro against a build including that fix first.
+
 Observed in:
 - Run: `es-nonpassed-rerun-20260708-191002`
 - Mode/shard: `jit-shard4`
