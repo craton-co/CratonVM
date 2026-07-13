@@ -15,7 +15,7 @@ benchmark whose CratonVM-vs-JDK-25 slowdown ratio grew with input size (18.8× a
 1,000 entries → 94.4× at 5,000 → 238.8× at 10,000; did not finish in 60s at
 50,000). The original investigation misattributed this to a bug in `Matcher`'s
 native bridge (see
-[`matcher-native-full-input-redecode-quadratic.md`](matcher-native-full-input-redecode-quadratic.md),
+[`matcher-native-full-input-redecode-quadratic-FIXED.md`](matcher-native-full-input-redecode-quadratic-FIXED.md),
 corrected) — that bridge is provably **not** the active dispatch path in
 real-JDK mode. This doc covers the actual, now-fixed bug.
 

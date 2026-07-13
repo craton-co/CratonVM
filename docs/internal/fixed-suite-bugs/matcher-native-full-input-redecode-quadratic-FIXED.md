@@ -1,18 +1,13 @@
-# `java.util.regex.Matcher`'s native bridge re-decodes the *entire* input string on every `find()`/`group()` call — real, but currently DEAD CODE in real-JDK mode
-
-Status: **Bug confirmed + FIXED in the native bridge** (`native-builtins/src/lib.rs`,
-uncommitted-then-committed 2026-07-11), but **that native bridge is not the active
-dispatch path for a real-JDK `Pattern`/`Matcher` program**, so the fix currently has
-no observable effect. The actual performance bug a user hits on today's default
-build is a *different*, deeper issue — see
-[`../internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`](../internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md)
+# java.util.regex.Matcher native full-input redecode / repeated-search residual — FIXED (archived)
+Status: **Resolved and archived (2026-07-12).** The legacy bridge cache is fixed and remains intentionally unreachable in real-JDK mode; the active real-JDK quadratic path was independently fixed by bounded String.substring. Default-on, opt-out, and HotSpot probes produced identical checksums, and the active path scaled linearly through 10,000 entries.
+[`substring-large-parent-quadratic-allocation-FIXED.md`](substring-large-parent-quadratic-allocation-FIXED.md)
 (now FIXED).
 
 ## Update (2026-07-11, later same day): successor fast path landed — this doc's bridge is STILL dead code, unrelated
 
 After the substring fix above closed the O(n²) algorithmic bug, a separate,
 *new* real-JDK-layout fast path
-([`../internal/fixed-suite-bugs/matcher-find-realjdk-fastpath-FIXED.md`](../internal/fixed-suite-bugs/matcher-find-realjdk-fastpath-FIXED.md))
+([`matcher-find-realjdk-fastpath-FIXED.md`](matcher-find-realjdk-fastpath-FIXED.md))
 was added for `find()`/`find(int)`/`start()`/`end()`/`group()` to close the
 remaining constant-factor gap. It is a completely separate set of natives
 from the dead bridge this doc describes — it resolves every field BY NAME

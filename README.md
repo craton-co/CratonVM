@@ -77,7 +77,7 @@ String/Regex's O(n²)-shaped scaling (18.8x at 1K entries → 238.8x at 10K in t
 original profiling) was a `Matcher` native find()/group() path and a
 substring-from-large-parent allocation path, both quadratic-allocation bugs, not
 interpreter overhead — see
-[`docs/known-issues/matcher-native-full-input-redecode-quadratic.md`](docs/known-issues/matcher-native-full-input-redecode-quadratic.md)
+[`docs/internal/fixed-suite-bugs/matcher-native-full-input-redecode-quadratic-FIXED.md`](docs/internal/fixed-suite-bugs/matcher-native-full-input-redecode-quadratic-FIXED.md)
 and
 [`docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`](docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md)
 (merged `a87901e6`). That landed the algorithmic (O(n²)→O(n)) fix and left a

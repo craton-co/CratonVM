@@ -52243,7 +52243,7 @@ fn native_pattern_split_impl(
 //
 // The functions below fix a genuine O(n^2) bug in THIS native bridge (full
 // input redecode per `find()`/`group()` call, see
-// `docs/known-issues/matcher-native-full-input-redecode-quadratic.md` for
+// `docs/internal/fixed-suite-bugs/matcher-native-full-input-redecode-quadratic-FIXED.md` for
 // the corrected writeup) — but because the bridge is dropped by default,
 // this fix currently has NO effect on any real-JDK program. It's kept
 // in case `drop_real_layout_synthetic` is ever narrowed (e.g. once the
@@ -52368,7 +52368,7 @@ fn matcher_cache_lookup_captures(
 /// `Matcher` instead of re-decoding the entire backing array from the Java
 /// heap on every single native dispatch. Without this, an n-match `find()`
 /// loop over an n-length string cost O(n) per call * O(n) calls = O(n^2)
-/// (see `docs/known-issues/matcher-native-full-input-redecode-quadratic.md`).
+/// (see `docs/internal/fixed-suite-bugs/matcher-native-full-input-redecode-quadratic-FIXED.md`).
 ///
 /// Returns `Arc<str>` rather than `String` so a cache HIT is an O(1)
 /// refcount bump, not an O(n) copy — the point of caching is lost if every
@@ -53162,7 +53162,7 @@ fn native_matcher_has_match(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 // synthetic-layout bridge, unconditionally dropped in real-JDK mode by
 // `NativeMethodRegistry::register` (see `drop_real_layout_synthetic` in
 // `native-api/src/registry.rs`) — see
-// `docs/known-issues/matcher-native-full-input-redecode-quadratic.md`. It is
+// `docs/internal/fixed-suite-bugs/matcher-native-full-input-redecode-quadratic-FIXED.md`. It is
 // dead code for every program this VM actually runs by default.
 //
 // This section is different: it operates on the REAL OpenJDK
@@ -53317,7 +53317,7 @@ fn pattern_realjdk_field_indices(ctx: &mut dyn NativeContext) -> Option<PatternF
 /// Rust `regex`/`fancy-regex` crates' UTF-8 byte offsets (and back). Built
 /// once per distinct `text` object and cached — this is what avoids the
 /// exact O(n)-redecode-per-call bug the legacy bridge had (see the module
-/// banner and `matcher-native-full-input-redecode-quadratic.md`), plus (new
+/// banner and `matcher-native-full-input-redecode-quadratic-FIXED.md`), plus (new
 /// here) avoids paying the O(n) offset-table build more than once per input.
 /// Everything this fast path needs to run a search, resolved once per
 /// distinct `(matcher identity, text identity, pattern identity)` triple and
