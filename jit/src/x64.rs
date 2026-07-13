@@ -25074,12 +25074,21 @@ impl Compiler {
                         // is smaller, so a legacy fit implies a compact fit.
                         // `emit_inline_tlab_new` computes the real compact size +
                         // writes array_length/GC_FLAG_COMPACT inline.
-                        let can_inline = self.helpers.get_current_thread != 0
+                        // Inline TLAB allocation is not yet safe with the
+                        // precise moving young collector: under Hibernate's
+                        // repeated SessionFactory bootstrap it can leave the
+                        // heap walker at an invalid object boundary
+                        // (kind=Object with array payload metadata), whereas
+                        // the helper path initializes the canonical header
+                        // atomically.  Keep the optimization available for
+                        // focused validation, but require an explicit opt-in
+                        // until its moving-GC contract is proved.
+                        let can_inline = std::env::var_os("CRATONVM_JIT_ENABLE_INLINE_NEW").is_some()
+                            && self.helpers.get_current_thread != 0
                             && self.helpers.tlab_post_init != 0
                             && self.helpers.new_object != 0
                             && total_size <= 256
-                            && self.needs_heap // need vm_ptr in heap_local slot
-                            && std::env::var_os("CRATONVM_JIT_DISABLE_INLINE_NEW").is_none();
+                            && self.needs_heap; // need vm_ptr in heap_local slot
 
                         // Round-8 wave-3: defensive callee-saved spill
                         // before the `new` safepoint (both inline TLAB

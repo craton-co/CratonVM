@@ -19306,6 +19306,22 @@ fn try_invoke_cached_lambda_impl(
             let Some(class) = store.get(declaring_id) else {
                 return Ok(None);
             };
+            // This cache jumps straight into a concrete method's bytecode and
+            // therefore bypasses `invoke_on_class_shared`'s Class-mirror
+            // override.  Class's concrete methods must not run against a
+            // Craton mirror: `SomeClass::getDeclaredAnnotations`, for
+            // example, otherwise reads the host layout and returns no
+            // metadata.  Scope the bypass to Class overrides rather than all
+            // registered overrides; the broader policy makes ORM bootstrap
+            // prohibitively slow.
+            if class.name.as_ref() == "java/lang/Class"
+                && shared
+                    .native_methods
+                    .find(&class.name, method_name, descriptor)
+                    .is_some()
+            {
+                return Ok(None);
+            }
             let c = Arc::new(CachedBytecodeMethod {
                 declaring_class_id: declaring_id,
                 class_name: Arc::clone(&class.name),
@@ -22374,22 +22390,6 @@ fn force_native_over_real_jdk_bytecode(
                 | ("mismatch", "([BI[BII)I")
                 | ("mismatch", "([C[CI)I")
                 | ("mismatch", "([CI[CII)I")
-        )
-    {
-        return true;
-    }
-
-    if class_name == "java/io/BufferedInputStream"
-        && matches!(
-            (method_name, method_descriptor),
-            ("read", "()I")
-                | ("read", "([BII)I")
-                | ("skip", "(J)J")
-                | ("available", "()I")
-                | ("mark", "(I)V")
-                | ("reset", "()V")
-                | ("markSupported", "()Z")
-                | ("close", "()V")
         )
     {
         return true;

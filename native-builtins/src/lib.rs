@@ -26699,6 +26699,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         native_output_stream_writer_close,
     );
 
+    // Real JDK BufferedInputStream has a layout and close protocol that the
+    // old synthetic bridge cannot emulate safely.  In particular, dispatching
+    // its `skip`/`ensureOpen` path through this bridge leaves `buf` looking
+    // closed while Jandex indexes a class stream.  Keep the bridge only for
+    // synthetic-JDK builds; real-JDK execution must use the class bytecode.
+    if cfg!(feature = "synthetic-jdk") {
     registry.register(
         "java/io/BufferedInputStream",
         "<init>",
@@ -26864,6 +26870,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
+    }
     registry.register(
         "org/apache/tomcat/util/buf/CharChunk",
         "equals",

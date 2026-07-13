@@ -5389,18 +5389,34 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             eprintln!("[OSTR-DBG] URL.openStream bytes={}", bytes.len());
         }
         let body = new_java_byte_array(ctx, &bytes);
+        // Until `stream.buf` is published, `body` lives only in this native
+        // local.  The stream allocation is GC-capable, so keep the array in a
+        // remappable native root and reload it before storing the heap edge.
+        // This is especially visible for `jar:file:` resources: losing the
+        // mapping bytes makes Hibernate report an unparseable mapping document.
+        let body_pin = ctx.pin_native_root(body);
         let len = ctx.array_length(body) as i32;
         let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+        let body = ctx.read_native_pin(body_pin, body);
         ctx.set_field(stream, 0, Value::Object(Some(body))); // buf
         ctx.set_field(stream, 1, Value::Int(0)); // pos
         ctx.set_field(stream, 2, Value::Int(0)); // mark
         ctx.set_field(stream, 3, Value::Int(len)); // count
+        // The constructor dispatch can allocate as well.  Pin the newly
+        // allocated stream alongside its backing array, then return the
+        // post-GC stream address rather than the stale Rust local.
+        let stream_pin = ctx.pin_native_root(stream);
+        let stream = ctx.read_native_pin(stream_pin, stream);
+        let body = ctx.read_native_pin(body_pin, body);
         let _ = ctx.invoke(
             "java/io/ByteArrayInputStream",
             "<init>",
             "([B)V",
             &[Value::Object(Some(stream)), Value::Object(Some(body))],
         );
+        let stream = ctx.read_native_pin(stream_pin, stream);
+        ctx.unpin_native_roots(body_pin);
+        ctx.unpin_native_roots(stream_pin);
         Ok(Some(Value::Object(Some(stream))))
     });
 

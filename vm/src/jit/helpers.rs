@@ -878,11 +878,27 @@ unsafe fn try_call_compiled_entry_reentrant(
     vm_ptr: i64,
     args_slice: &[i64],
 ) -> Option<i64> {
+    // This helper is itself called from compiled dispatch code.  Its raw ABI
+    // call used to enter the nested compiled method without registering a
+    // `JitEntryGuard`, so a GC triggered by that callee found a JIT return
+    // address above an empty guard chain.  The moving-young collector then
+    // had to fall back to conservative/non-moving collection and retained
+    // the repeated Hibernate bootstrap graphs until OOM.  Resolve the entry
+    // back to its live CompiledMethod and register the precise frame for the
+    // full duration of the nested call.
+    let jit_root_guard = cratonvm_jit::lookup_jit_code_range(entry).map(|cm_ptr| {
+        // SAFETY: the JIT code-range registry owns this CompiledMethod while
+        // its entry remains callable; the guard is dropped before this helper
+        // returns to the caller that holds the corresponding code cache entry.
+        let compiled = unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
+        crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(compiled)
+    });
     #[cfg(debug_assertions)]
     let borrow = suspend_jit_borrow();
     let result = try_call_compiled_entry(entry, needs_ctx, vm_ptr, args_slice);
     #[cfg(debug_assertions)]
     restore_jit_borrow(borrow);
+    drop(jit_root_guard);
     result
 }
 
