@@ -64,6 +64,17 @@ const ALGO_RSA: i32 = 6;
 const ALGO_EC: i32 = 7;
 const ALGO_ED25519: i32 = 8;
 const ALGO_ED448: i32 = 10;
+// CratonVM has no synthetic DSA key material at all (unlike RSA/EC, which
+// have a fast synthetic path with real-key routing layered on top) — DSA
+// always routes to the real `sun.security.provider.DSAKeyFactory` SPI (see
+// `kf_generate_public`/`kf_generate_private`). Found root-causing
+// `SecurityInfoTests.getWhenJarIsSigned`: `X509Key.parse()` (real bytecode,
+// reached while re-parsing a real X.509 cert's SubjectPublicKeyInfo) calls
+// `KeyFactory.getInstance("DSA").generatePublic(x509KeySpec)`, which — before
+// this fix — fell through to the generic/unrecognized-algorithm synthetic
+// path (`algo_idx("DSA")` was unmapped, returning -1) and failed with
+// `InvalidKeySpecException: cannot generate a usable Unknown public key`.
+const ALGO_DSA: i32 = 11;
 
 // ---------------------------------------------------------------------------
 // Real-JDK class instance-field counts (number of slots used by the real
@@ -401,6 +412,24 @@ fn drive_real_ec_keyfactory(
     ret_desc: &'static str,
 ) -> MethodCallResult {
     drive_keyspec_spi(ctx, "sun/security/ec/ECKeyFactory", spec, engine, ret_desc)
+}
+
+/// Drive the real `sun.security.provider.DSAKeyFactory` SPI. CratonVM has no
+/// synthetic DSA key material to fall back to (unlike RSA/EC) — see the
+/// `ALGO_DSA` doc comment for the root-cause story.
+fn drive_real_dsa_keyfactory(
+    ctx: &mut dyn NativeContext,
+    spec: ObjectRef,
+    engine: &'static str,
+    ret_desc: &'static str,
+) -> MethodCallResult {
+    drive_keyspec_spi(
+        ctx,
+        "sun/security/provider/DSAKeyFactory",
+        spec,
+        engine,
+        ret_desc,
+    )
 }
 
 /// Construct the real `KeyFactorySpi` named by `spi_class` and invoke its
@@ -989,6 +1018,7 @@ fn algo_idx(name: &str) -> i32 {
         "ED25519" | "EDDSA" => ALGO_ED25519,
         "ED448" => ALGO_ED448,
         "X25519" => 9,
+        "DSA" | "DSS" => ALGO_DSA,
         _ => -1,
     }
 }
@@ -1006,6 +1036,7 @@ fn algo_name(idx: i32) -> &'static str {
         ALGO_ED25519 => "Ed25519",
         ALGO_ED448 => "Ed448",
         9 => "X25519",
+        ALGO_DSA => "DSA",
         _ => "Unknown",
     }
 }
@@ -1536,6 +1567,20 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             );
         }
     }
+    // DSA: drive the real sun.security.provider.DSAKeyFactory SPI (no
+    // synthetic DSA key material to fall back to at all). See ALGO_DSA's doc
+    // comment for the root-cause story (X509Key.parse() re-parsing a real
+    // X.509 cert's DSA SubjectPublicKeyInfo).
+    if algo == ALGO_DSA && crate::route_dsa_to_real() {
+        if let Some(Value::Object(Some(spec))) = args.get(1) {
+            return drive_real_dsa_keyfactory(
+                ctx,
+                *spec,
+                "engineGeneratePublic",
+                "Ljava/security/PublicKey;",
+            );
+        }
+    }
     // EC: drive the real SunEC KeyFactory over the ECPublicKeySpec → real
     // ECPublicKeyImpl (the synthetic path can't honour an ECPublicKeySpec).
     if algo == ALGO_EC && crate::route_ec_to_real() {
@@ -1721,6 +1766,18 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Value::Int(i) => i,
         _ => -1,
     };
+    // DSA: drive the real sun.security.provider.DSAKeyFactory SPI. See
+    // ALGO_DSA's doc comment / `kf_generate_public` for the root-cause story.
+    if algo == ALGO_DSA && crate::route_dsa_to_real() {
+        if let Some(Value::Object(Some(spec))) = args.get(1) {
+            return drive_real_dsa_keyfactory(
+                ctx,
+                *spec,
+                "engineGeneratePrivate",
+                "Ljava/security/PrivateKey;",
+            );
+        }
+    }
     // EC: drive the real SunEC KeyFactory over the ECPrivateKeySpec → real
     // ECPrivateKeyImpl (the only private-key import we can satisfy).
     if algo == ALGO_EC && crate::route_ec_to_real() {

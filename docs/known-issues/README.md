@@ -4,6 +4,30 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-13 WildFly `AttributeAccess` CCE confirmed as register-invisible-JIT-root family; NEW "Family 1" stale-ObjectRef residual found alongside it
+
+- 🔴 NEW: [`wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`](wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md)
+  — follow-up to the `AttributeDefinition` CCE fix (`70154861`)'s flagged residual: `ClassCastException:
+  java.lang.Object cannot be cast to org.jboss.as.controller.registry.AttributeAccess`, also during
+  `parallel-extension-add`. Confirmed from source (not a fresh live capture — see below) as an occurrence
+  of the already-tracked, currently-OPEN "register-invisible JIT root" family (`SB-CRASH-04`'s residual in
+  the default-on precise-JIT-oop-map machinery): `jit_typecheck_resolve`'s fast path (the path an
+  already-loaded class like `AttributeAccess` takes) makes zero GC-triggering calls, so staleness must
+  originate upstream of the checkcast helper; and Generational's young collector is confirmed (from source,
+  not aspirationally) to never relocate objects while any JIT frame is active, structurally excluding the
+  classic "moving GC left a dangling pointer" mechanism for this JIT-required bug — leaving the non-moving
+  sweep's marking phase missing a live root at a cooperative safepoint as the only mechanism consistent with
+  the symptom, matching three independent 2026-07-10 occurrences of the same family (DoHead,
+  `TestSwallowAbortedUploads`, `TestAccessLogValve`). Not fixed, per this family's established
+  document-don't-speculatively-patch policy. Live reproduction of the CCE itself was inconclusive this
+  session — the host was under heavy external CPU contention (confirmed via `wmic`/`ps`), and a **separate,
+  real "Family 1" stale-`ObjectRef`-across-GC bug** (unrelated native code holding a raw `ObjectRef` across a
+  GC-triggering call, unpinned) fired instead in 9/20 diagnostic (`CRATONVM_DBG_STALE_OBJREF=1`) attempts,
+  immediately as `parallel-extension-add`'s worker threads spin up — a fresh occurrence found on a build
+  forked *after* `docs/internal/wildfly-parallel-boot-stale-objectref-residual.md`'s own "Status: FIXED"
+  date, not yet root-caused to an exact call site (Windows backtrace symbolication did not resolve despite a
+  matching `.pdb`), flagged as its own separate follow-up (see the new doc's "Separate finding" section).
+
 ## 2026-07-13 Keycloak quarkus/runtime SmallRye Config resolution mismatches FIXED (3/4); PicocliTest hang split out as separate open bug
 
 - FIXED (moved to `docs/internal/`): [`fixed-suite-bugs/keycloak-quarkus-runtime-config-resolution-mismatches.md`](../internal/fixed-suite-bugs/keycloak-quarkus-runtime-config-resolution-mismatches.md) вЂ” landed on `dev` via commit `10a561f21` earlier the same day this doc's investigation resumed. 3 of 4 original symptoms confirmed fixed by rerun: `DatasourcesConfigurationTest` (host-env-leak into `propagatedPropertyNames`, plus the interceptor-context `NoSuchMethodError`), `TracingConfigurationTest` (hardcoded-wrong `isTracingEnabled` native stub removed), `IgnoredArtifactsTest`. A narrower residual remains OPEN and is tracked inline in that doc rather than as a separate file: `ConfigurationTest::testDatabaseProperties` intermittently (~80% of runs) throws a `ClassCastException: Object cannot be cast to String` from `SmallRyeConfig$ConfigSources$PropertyNames.latest()` вЂ” confirmed genuinely racy (diagnostic instrumentation that merely reads extra class-name info per stream iteration made it disappear 6/6 vs failing 5/5 without it), not reproducible in a clean standalone repro (needs accumulated state from ~72 prior tests in the class), root cause not pinned down (leading suspect: `PropertyMappingInterceptor.iterateNames()`'s `mappersWithoutValues.stream()...` combined with `hasInferredValue`'s reentrant `context.restart()` call, but not confirmed).

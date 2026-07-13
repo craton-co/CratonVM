@@ -8223,7 +8223,7 @@ fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
     registry.register(dis, "readFully", "([BII)V", native_dis_read_fully_off);
     registry.register(dis, "skipBytes", "(I)I", native_dis_skip_bytes);
     registry.register(dis, "available", "()I", native_dis_available);
-    registry.register(dis, "close", "()V", native_noop_void);
+    registry.register(dis, "close", "()V", native_dis_close);
 
     let dos = "java/io/DataOutputStream";
     registry.register(dos, "<init>", "(Ljava/io/OutputStream;)V", native_dos_init);
@@ -8844,6 +8844,35 @@ fn native_dis_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let result = ctx.invoke_virtual(inner, "available", "()I", &[])?;
     Ok(Some(result.unwrap_or(Value::Int(0))))
+}
+
+/// `DataInputStream.close()` closes the underlying stream
+/// (`FilterInputStream.close` → `in.close()`). This registration used to be
+/// `native_noop_void`, a straight no-op — safe for a `<init>`-not-registered
+/// class that runs real bytecode for `close()`, but `DataInputStream` (and
+/// `DataOutputStream`, whose own `close` is correctly implemented above as
+/// `native_dos_close`) DOES get a native `close` registered directly on the
+/// class. Since `DataInputStream` declares no bytecode of its own for
+/// `close()` (it inherits `FilterInputStream.close()`), the interpreter's
+/// dispatch prefers this class's own registered native over walking the
+/// hierarchy to find that inherited real bytecode — so the no-op ran
+/// instead, and `close()` never propagated to the wrapped stream. Traced via
+/// a minimal, Spring-Boot-independent repro (`try (DataInputStream d = new
+/// DataInputStream(tracingStream)) {}` never called `tracingStream.close()`)
+/// while root-causing a `FileDataBlock` handle leak in Spring Boot loader's
+/// `SecurityInfoTests`/`NestedJarFileTests` (`SecurityInfo.load()`'s
+/// `JarEntriesStream.matches()` wraps each entry's content in `new
+/// DataInputStream(...)`, so its close() never released the per-entry
+/// `ZipContent.Entry.openContent()` reference).
+fn native_dis_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    if let Value::Object(Some(inner)) = ctx.get_field(this, DIS_FIELD_IN) {
+        ctx.invoke_virtual_declared("java/io/InputStream", inner, "close", "()V", &[])?;
+    }
+    Ok(None)
 }
 
 fn native_dos_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
