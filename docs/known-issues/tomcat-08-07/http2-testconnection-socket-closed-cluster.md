@@ -7,6 +7,20 @@ the DoHead family; this doc extends the finding to non-DoHead HTTP/2 test
 classes, confirming it's a general `Http2TestBase` connection-handling
 issue, not something specific to DoHead's servlet code path.
 
+**2026-07-13:** re-verified live on `TestCancelledUpload` — still
+reproduces, and is confirmed **non-deterministic**: identical reruns
+(only debug env vars added) vary between the `String.setOption`
+NoSuchMethodError below, a `socketLock`-is-null NPE, and a clean
+`Socket is closed`. This rules out a shared-vtable-dispatch-bug hypothesis
+raised while investigating `largeclienthello-string-size-nosuchmethod.md`
+(now fixed, see `docs/internal/tomcat-08-07/largeclienthello-string-size-nosuchmethod-FIXED.md`'s
+"Refuted hypothesis" section) — that bug was a deterministic, unrelated
+`java.util.logging.Logger` field-layout collision. This doc's bug remains
+the register-invisible-root / stale-reference-reuse family the DoHead doc
+already documents; a minimal isolated `Socket` repro (no Tomcat/JUnit
+harness) does not reproduce it at all, consistent with a GC/thread-pressure
+trigger rather than a simple missing-registration bug.
+
 ## Summary
 
 `org.apache.coyote.http2.TestCancelledUpload` and

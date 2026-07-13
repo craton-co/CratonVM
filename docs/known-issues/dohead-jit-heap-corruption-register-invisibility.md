@@ -13,6 +13,22 @@ documented root causes were genuinely fixed and merged to `dev`:
   See `dohead-streamencoder-eager-flush-commit-threshold.md` (also restored
   from `docs/internal/fixed-suite-bugs/`).
 
+**2026-07-13 cross-reference note:** the `String.setOption` signature below
+was hypothesized (in `largeclienthello-string-size-nosuchmethod.md`, now
+fixed and moved to `docs/internal/tomcat-08-07/`) to share a root cause with
+an unrelated `NoSuchMethodError: java/lang/String.size()I` in
+`ClassLoaderLogManager.resetLoggers()`. That hypothesis was investigated and
+**refuted**: the `resetLoggers` bug was a deterministic real-vs-synthetic
+`java.util.logging.Logger` field-slot collision (fixed — see that doc's
+"Refuted hypothesis" section for the full writeup). The `Socket.setSoTimeout`
+family here is a *different*, **non-deterministic** bug — reruns under
+identical conditions vary between `String.setOption` NoSuchMethodError,
+`socketLock`-is-null NPE, and `SocketException: Socket is closed` — which
+points at the register-invisible-root / stale-reference-reuse family this
+doc already documents below, not a shared vtable-dispatch defect. Don't
+re-open the "shared root cause with the Logger bug" angle without new
+evidence.
+
 **However, the whole DoHead family still does not pass today.** A fresh
 full-suite rerun on `dev` (commit `080e79256`, 2026-07-12, real JDK, JIT on,
 1200s timeout) shows all ~19
