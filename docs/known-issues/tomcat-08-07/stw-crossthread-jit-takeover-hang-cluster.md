@@ -122,6 +122,22 @@ already-documented, unrelated `TestHttpServletDoHead*` cluster (see
 
 ## Residual: 4 classes still hang, but NOT an STW-takeover bug
 
+**Update 2026-07-13 (later the same day):** followed this residual up in
+[elinjsp-socket-read-timeout.md](elinjsp-socket-read-timeout.md) — found and
+fixed a real O(n)-per-byte performance bug in `DataInputStream`/
+`RandomAccessFile`'s bulk-read natives (byte-by-byte via a full
+`invoke_virtual` dispatch instead of one bulk `read()` call — thousands of
+interpreter round-trips for a multi-KB class-file/JAR-entry read). Confirmed
+via symbolicated `cdb` that this was actively being hit, and ruled out both
+"just needs a longer timeout" (still didn't finish at 300s) and
+"JIT-specific" (reproduces with `CRATONVM_DISABLE_JIT=1`) along the way.
+**Fixed, but does not fully resolve this residual** — all 4 classes still
+hang at the suite's 90s timeout after the fix, with zero regressions
+elsewhere. See that doc's "Root cause #2" section for the full evidence
+chain and next-step recommendation (get a multi-snapshot, all-threads
+Java-level capture on an idle host to distinguish one genuine stuck point
+from several different slow operations chained together).
+
 Re-ran all 5 original classes against the fully-fixed binary:
 
 | Class | Result |
