@@ -777,21 +777,23 @@ fn native_charset_decode_bytebuf(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // Round 58 — tolerate real-JDK ByteBuffer layouts. Our synthetic
     // ByteBuffer uses (array=0, pos=1, limit=2, cap=3, mark=4) but real-JDK
     // `HeapByteBuffer` stores `hb` at a different slot. Scan field slots
-    // 0..=8 for the first byte[] reference; if found, use its full length
-    // when our normal (pos, limit) read returns an empty range. This lets
+    // 0..=8 for the first byte[] reference when the normal (pos, limit)
+    // lookup cannot identify the buffer layout. This lets
     // Tomcat's `CharsetUtil.isAsciiSuperset` loop (which feeds a 1-byte
     // ByteBuffer into `decode` per iteration) work even though the
     // ByteBuffer came from real-JDK bytecode rather than our `allocate`
     // native.
     let mut bytes: Vec<u8> = Vec::new();
+    let mut read_buffer_state = false;
     if let Some((barr, bpos, blim)) = buf_state(ctx, bb) {
+        read_buffer_state = true;
         let want = (blim - bpos).max(0) as usize;
         if want > 0 {
             bytes = read_byte_array(ctx, barr, bpos as usize, want);
             set_pos(ctx, bb, blim);
         }
     }
-    if bytes.is_empty() {
+    if !read_buffer_state {
         // Layout fallback: probe slots 0..=8 for the first byte[] field.
         for slot in 0..=8 {
             if let Value::Object(Some(arr)) = ctx.get_field(bb, slot) {
@@ -1009,19 +1011,21 @@ pub fn register_real_charset_natives(registry: &mut NativeMethodRegistry) {
 }
 
 /// Read every remaining byte from a ByteBuffer and advance its position to the
-/// limit — mirrors `native_charset_decode_bytebuf`'s robust two-path read
-/// (normal pos/limit, then a slot scan tolerating real-JDK HeapByteBuffer
-/// layouts).
+/// limit — mirrors `native_charset_decode_bytebuf`'s robust two-path read:
+/// normal pos/limit, then a slot scan only when the real-JDK layout cannot be
+/// identified.
 fn read_and_consume_bytebuffer(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Vec<u8> {
     let mut bytes: Vec<u8> = Vec::new();
+    let mut read_buffer_state = false;
     if let Some((barr, bpos, blim)) = buf_state(ctx, bb) {
+        read_buffer_state = true;
         let want = (blim - bpos).max(0) as usize;
         if want > 0 {
             bytes = read_byte_array(ctx, barr, bpos as usize, want);
             set_pos(ctx, bb, blim);
         }
     }
-    if bytes.is_empty() {
+    if !read_buffer_state {
         for slot in 0..=8 {
             if let Value::Object(Some(arr)) = ctx.get_field(bb, slot) {
                 let len = ctx.array_length(arr);
@@ -1216,6 +1220,19 @@ mod tests {
         let cs = make_charset(&mut ctx, "UTF-8");
         let chars = decode_with_charset(&ctx, cs, &[0x41, 0xC2, 0xA9]);
         assert_eq!(String::from_utf16(&chars).unwrap(), "A\u{00A9}");
+    }
+
+    #[test]
+    fn consuming_empty_bytebuffer_does_not_decode_its_backing_array() {
+        // A legitimate empty ByteBuffer may retain a non-empty backing array:
+        // ByteBuffer.wrap(array, offset, 0) is exactly such a view. The
+        // real-layout slot fallback is only for buffers whose state cannot be
+        // read, not for a known empty remaining range.
+        let mut ctx = mock_ctx();
+        let bb = alloc_byte_buffer(&mut ctx, &[b'A', b'B', b'C', b'D']);
+        ctx.set_field(bb, BUF_FIELD_POS, Value::Int(2));
+        ctx.set_field(bb, BUF_FIELD_LIMIT, Value::Int(2));
+        assert!(read_and_consume_bytebuffer(&mut ctx, bb).is_empty());
     }
 
     #[test]
