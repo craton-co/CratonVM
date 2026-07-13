@@ -704,6 +704,25 @@ impl ServiceContainer {
     /// Drain the task queue by running every pending `Start` task
     /// synchronously.  Useful for tests that want deterministic
     /// completion without spawning worker threads.
+    ///
+    /// Under `msc_real_start_enabled()` (the production default since
+    /// `0cac9cc80`), `add_service`/`demand`/`schedule_dependents_of`
+    /// deliberately leave `task_queue` empty — that queue is also drained by
+    /// the always-running `worker_loop` background threads on
+    /// `global_container()`, and letting them race the real `drive_starts()`
+    /// loop (which invokes actual Java `start()`) was Bug 15: a worker would
+    /// bookkeeping-only fake-complete a service the real loop hadn't started
+    /// yet. So once the queue empties, fall back to the same scan-based
+    /// selection `drive_starts()` uses (`take_ready_start`/`finish_start`)
+    /// instead of just returning early — this is what makes the method work
+    /// under both real-start settings rather than silently doing nothing
+    /// under the default. It's safe here specifically because this fallback
+    /// never invokes real Java code (no `NativeContext` available to a plain
+    /// `&self` method), and every production caller picks *either*
+    /// `drive_starts` *or* `drain_tasks_locally` for a given real-start
+    /// setting — see `native_service_controller_set_mode` — so this never
+    /// runs concurrently with a real `drive_starts()` driving the same
+    /// container.
     pub fn drain_tasks_locally(&self) {
         loop {
             let task = {
@@ -711,7 +730,10 @@ impl ServiceContainer {
                 state.task_queue.pop_front()
             };
             match task {
-                Some(Task::Start(id)) => self.run_start_local(id),
+                Some(Task::Start(id)) => {
+                    self.run_start_local(id);
+                    continue;
+                }
                 Some(Task::Stop(id)) => {
                     let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(name) = state.by_id.get(&id).cloned() {
@@ -719,7 +741,12 @@ impl ServiceContainer {
                             c.state = ServiceState::Down;
                         }
                     }
+                    continue;
                 }
+                None => {}
+            }
+            match self.take_ready_start() {
+                Some(id) => self.finish_start(id),
                 None => break,
             }
         }
@@ -1375,10 +1402,24 @@ fn native_service_container_add_service(
     ctx.set_field(ctrl_obj, SC_FIELD_VALUE, Value::Object(None));
     ctx.set_field(ctrl_obj, SC_FIELD_ID, Value::Long(id as i64));
 
-    // Run the task queue locally so the mirror's state reflects the
-    // transition before we return.  When real Java `start()` callbacks
-    // are wired in T19.2 this will shift onto the worker threads.
-    container.drain_tasks_locally();
+    // Drive the service to completion before returning, same as
+    // `native_service_controller_set_mode`'s Active/Passive branch: under
+    // `msc_real_start_enabled()` (the default since `0cac9cc80`) only
+    // `drive_starts` invokes the real Java `start()` callback, so this
+    // legacy 2-arg `addService` must route through it too instead of always
+    // calling `drain_tasks_locally` — that unconditional call predates the
+    // real-start default and, left as-is, would silently bookkeeping-fake
+    // the service straight to `Up` without ever running its `start()`.
+    if msc_real_start_enabled() {
+        let was_driving = DRIVING.with(|d| d.replace(true));
+        if !was_driving {
+            let res = drive_starts(ctx, &container);
+            DRIVING.with(|d| d.set(false));
+            res?;
+        }
+    } else {
+        container.drain_tasks_locally();
+    }
     reflect_controller(ctx, ctrl_obj, &container, id);
 
     Ok(Some(Value::Object(Some(ctrl_obj))))
