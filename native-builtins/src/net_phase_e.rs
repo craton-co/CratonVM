@@ -831,9 +831,76 @@ pub(crate) fn url_custom_handler_connection(
     Ok(Some(conn.unwrap_or(Value::Object(None))))
 }
 
+/// Resolve the jar-file component of a `jar:...!/entry` URL when that
+/// component is itself a Tomcat `war:file:<war-path>*/<entry-in-war>`
+/// reference (e.g. `jar:war:file:/x.war*/WEB-INF/lib/test.jar!/entry` — a jar
+/// packaged inside a WAR). Returns the nested jar's raw bytes read out of the
+/// enclosing WAR's zip central directory, or `None` if `jar_raw` isn't a
+/// `war:` reference (the plain on-disk-file case is handled separately by
+/// callers). Mirrors `UriUtil.warToJar`'s `*/` → `!/` translation, but reads
+/// the referenced entry's bytes (via the existing nested-jar cache) instead
+/// of just rewriting the URL string, since the entry lives inside another
+/// archive rather than directly on disk.
+fn war_nested_jar_bytes(jar_raw: &str) -> Option<Arc<Vec<u8>>> {
+    let rest = jar_raw.strip_prefix("war:")?.trim_start_matches("file:");
+    let mut wparts = rest.splitn(2, "*/");
+    let war_path_raw = wparts.next()?;
+    let inner_entry = wparts.next()?;
+    if inner_entry.is_empty() {
+        return None;
+    }
+    // `file:` URLs prefix a leading `/` before a Windows drive letter
+    // (`/C:/…`); try the trimmed form first, then the raw form for POSIX.
+    let trimmed = war_path_raw.trim_start_matches('/');
+    let war_disk = if std::path::Path::new(trimmed).exists() {
+        trimmed.to_string()
+    } else if std::path::Path::new(war_path_raw).exists() {
+        war_path_raw.to_string()
+    } else {
+        trimmed.to_string()
+    };
+    cached_nested_jar(&war_disk, inner_entry).ok()
+}
+
+/// Build a `java/util/jar/JarEntry` from an already-opened zip archive, or
+/// `Value::Object(None)` if `lookup` isn't present. Shared by the plain
+/// on-disk and WAR-nested-jar lookup paths in `jar_url_lookup_entry`.
+fn jar_entry_value_from_archive<R: std::io::Read + std::io::Seek>(
+    ctx: &mut dyn NativeContext,
+    archive: &mut zip::ZipArchive<R>,
+    lookup: &str,
+) -> Value {
+    let (name, size, csize, method) = match archive.by_name(lookup) {
+        Ok(entry) => {
+            let name = entry.name().to_string();
+            let size = entry.size() as i64;
+            let csize = entry.compressed_size() as i64;
+            #[allow(deprecated)]
+            let method = entry.compression().to_u16() as i32;
+            (name, size, csize, method)
+        }
+        Err(_) => return Value::Object(None),
+    };
+    let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
+    let name_s = ctx.create_string(&name);
+    ctx.set_field(je, 0, Value::Object(Some(name_s)));
+    ctx.set_field(je, 1, Value::Long(size));
+    ctx.set_field(je, 2, Value::Long(csize));
+    ctx.set_field(je, 3, Value::Int(method));
+    Value::Object(Some(je))
+}
+
 /// Parse a `jar:[file:]<path>!/<entry>` external form and return the entry's
 /// uncompressed size from the zip central directory, or `None` if the URL is
 /// not a resolvable jar-entry URL. Used by `JarURLConnection.getContentLength*`.
+///
+/// `<path>` is usually a plain on-disk jar/zip file, but Tomcat's `war:`
+/// nested-archive scheme (see `war_nested_jar_bytes`) produces
+/// `war:file:<war-path>*/<entry-in-war>` here instead — a jar packaged inside
+/// a WAR (e.g. `jar:war:file:/x.war*/WEB-INF/lib/test.jar!/META-INF/…`, from
+/// `WarURLConnection` wrapping the jar it points into). Handle that case by
+/// reading the nested jar's bytes out of the WAR first, then treating those
+/// bytes as the archive to look the entry up in.
 fn jar_url_entry_size(ext: &str) -> Option<i64> {
     let after = ext
         .strip_prefix("jar:file:")
@@ -843,6 +910,12 @@ fn jar_url_entry_size(ext: &str) -> Option<i64> {
     let entry_name = parts.next()?;
     if entry_name.is_empty() {
         return None;
+    }
+    if let Some(bytes) = war_nested_jar_bytes(jar_raw) {
+        let cursor = std::io::Cursor::new(bytes.as_slice());
+        let mut archive = zip::ZipArchive::new(cursor).ok()?;
+        let entry = archive.by_name(entry_name).ok()?;
+        return Some(entry.size() as i64);
     }
     // `file:` URLs prefix a leading `/` before a Windows drive letter
     // (`/C:/…`); try the trimmed form first, then the raw form for POSIX.
@@ -976,6 +1049,17 @@ fn jar_url_lookup_entry(ctx: &mut dyn NativeContext, ext: &str) -> Value {
         Some(e) if !e.is_empty() => e,
         _ => return Value::Object(None),
     };
+    // Tomcat `war:` nested-jar case (see `war_nested_jar_bytes`): the jar
+    // component is packaged inside a WAR rather than sitting directly on
+    // disk, so its bytes must come from the enclosing WAR's zip entry.
+    if let Some(bytes) = war_nested_jar_bytes(jar_raw) {
+        let cursor = std::io::Cursor::new(bytes.as_slice());
+        let mut archive = match zip::ZipArchive::new(cursor) {
+            Ok(a) => a,
+            Err(_) => return Value::Object(None),
+        };
+        return jar_entry_value_from_archive(ctx, &mut archive, entry_name);
+    }
     let trimmed = jar_raw.trim_start_matches('/');
     let disk = if std::path::Path::new(trimmed).exists() {
         trimmed.to_string()
@@ -995,24 +1079,7 @@ fn jar_url_lookup_entry(ctx: &mut dyn NativeContext, ext: &str) -> Value {
     // Extract the entry metadata into owned values, then drop the `archive`
     // borrow before doing any `ctx` allocation (mirrors p59_jar_collect_entries).
     let lookup = jmod_zip_entry_name(&disk, entry_name);
-    let (name, size, csize, method) = match archive.by_name(&lookup) {
-        Ok(entry) => {
-            let name = entry.name().to_string();
-            let size = entry.size() as i64;
-            let csize = entry.compressed_size() as i64;
-            #[allow(deprecated)]
-            let method = entry.compression().to_u16() as i32;
-            (name, size, csize, method)
-        }
-        Err(_) => return Value::Object(None),
-    };
-    let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
-    let name_s = ctx.create_string(&name);
-    ctx.set_field(je, 0, Value::Object(Some(name_s)));
-    ctx.set_field(je, 1, Value::Long(size));
-    ctx.set_field(je, 2, Value::Long(csize));
-    ctx.set_field(je, 3, Value::Int(method));
-    Value::Object(Some(je))
+    jar_entry_value_from_archive(ctx, &mut archive, &lookup)
 }
 
 /// Recover the originating `jar:…!/entry` URL from a synthetic
@@ -2938,7 +3005,7 @@ fn native_socket_input_stream_read_one(
 /// Returns the (possibly GC-relocated) `this` — callers that keep using the
 /// Socket afterward MUST use the returned value, not their original local.
 #[must_use]
-fn re1_init_socket_locks(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
+pub(crate) fn re1_init_socket_locks(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
     // GC-safety: `this` is a raw ObjectRef parameter, and `new_object` below
     // is a re-entrant, allocating call (it can trigger a GC). This is called
     // right after a fresh Socket allocation -- for a freshly-accepted Socket
@@ -2979,7 +3046,22 @@ fn re1_connect_socket(
     } else {
         TcpStream::connect(sa)
     }
-    .map_err(|e| ioex(format!("ConnectException: {host}:{port}: {e}")))?;
+    // BUGFIX [nb-net-phase-e]: throw the CONCRETE `java.net.*` exception types
+    // for connect failures, not a generic `IOException` whose message merely
+    // mentions the class name as a text prefix — real code catches these by
+    // type (`catch (ConnectException e)` / `catch (SocketTimeoutException e)`;
+    // a bare IOException escapes both).
+    .map_err(|e| match e.kind() {
+        std::io::ErrorKind::ConnectionRefused => RuntimeError::ConnectException {
+            message: format!("{host}:{port}: {e}"),
+        }
+        .into(),
+        std::io::ErrorKind::TimedOut => RuntimeError::SocketTimeoutException {
+            message: format!("{host}:{port}: {e}"),
+        }
+        .into(),
+        _ => ioex(format!("ConnectException: {host}:{port}: {e}")),
+    })?;
     let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
     let stream_id = s2_alloc_stream(stream);
     let pin_base = ctx.pin_native_root(this);
@@ -5329,6 +5411,28 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // hit the unsupported-scheme arm, leaving Felix's static
             // `DEFAULTS` field null and tripping a downstream NPE on
             // `DEFAULTS.isEmpty()`.
+            //
+            // Spring's in-memory compiler deliberately uses the same
+            // `resource:` spelling for URLs backed by an application-provided
+            // URLStreamHandler. Prefer that handler when present: generated
+            // annotation-processor outputs live only in its heap-resident
+            // DynamicResourceFileObject and cannot be found through the VM's
+            // static classpath resource index. Craton-synthesized resource
+            // URLs have no handler and continue through the existing lookup.
+            if let Some(conn) = url_custom_handler_connection(ctx, this)? {
+                match conn {
+                    Value::Object(Some(conn)) => {
+                        let stream = ctx.invoke_virtual(
+                            conn,
+                            "getInputStream",
+                            "()Ljava/io/InputStream;",
+                            &[],
+                        )?;
+                        return Ok(Some(stream.unwrap_or(Value::Object(None))));
+                    }
+                    _ => return Ok(Some(Value::Object(None))),
+                }
+            }
             let name = name.trim_start_matches('/');
             ctx.find_resource(name)
                 .ok_or_else(|| ioex(format!("URL.openStream: resource not found: {name}")))?
@@ -5389,18 +5493,34 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             eprintln!("[OSTR-DBG] URL.openStream bytes={}", bytes.len());
         }
         let body = new_java_byte_array(ctx, &bytes);
+        // Until `stream.buf` is published, `body` lives only in this native
+        // local.  The stream allocation is GC-capable, so keep the array in a
+        // remappable native root and reload it before storing the heap edge.
+        // This is especially visible for `jar:file:` resources: losing the
+        // mapping bytes makes Hibernate report an unparseable mapping document.
+        let body_pin = ctx.pin_native_root(body);
         let len = ctx.array_length(body) as i32;
         let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+        let body = ctx.read_native_pin(body_pin, body);
         ctx.set_field(stream, 0, Value::Object(Some(body))); // buf
         ctx.set_field(stream, 1, Value::Int(0)); // pos
         ctx.set_field(stream, 2, Value::Int(0)); // mark
         ctx.set_field(stream, 3, Value::Int(len)); // count
+        // The constructor dispatch can allocate as well.  Pin the newly
+        // allocated stream alongside its backing array, then return the
+        // post-GC stream address rather than the stale Rust local.
+        let stream_pin = ctx.pin_native_root(stream);
+        let stream = ctx.read_native_pin(stream_pin, stream);
+        let body = ctx.read_native_pin(body_pin, body);
         let _ = ctx.invoke(
             "java/io/ByteArrayInputStream",
             "<init>",
             "([B)V",
             &[Value::Object(Some(stream)), Value::Object(Some(body))],
         );
+        let stream = ctx.read_native_pin(stream_pin, stream);
+        ctx.unpin_native_roots(body_pin);
+        ctx.unpin_native_roots(stream_pin);
         Ok(Some(Value::Object(Some(stream))))
     });
 
@@ -8811,9 +8931,16 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         }
         let payload = java_byte_array_to_vec(ctx, data_arr, 0, len)?;
         let target = format!("{host}:{port}");
-        ctx.fd_table()
-            .udp_send(fd as u32, &payload, &target)
-            .map_err(|e| ioex(format!("UDP send: {e}")))?;
+        // Bracket the send in the GC-blocking protocol: it can park on a full
+        // local socket buffer, same rationale as MulticastSocket's send in
+        // native-io/src/net.rs — without this a cross-thread STW GC would
+        // wait for the syscall to return instead of the thread reaching a
+        // safepoint. No heap refs are read after the call, so a plain
+        // begin/end pair (no ref re-sync) suffices.
+        ctx.begin_blocking_region();
+        let send_result = ctx.fd_table().udp_send(fd as u32, &payload, &target);
+        ctx.end_blocking_region();
+        send_result.map_err(|e| ioex(format!("UDP send: {e}")))?;
         Ok(None)
     });
 
@@ -8843,10 +8970,31 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             ctx.fd_table()
                 .udp_set_read_timeout(fd as u32, d)
                 .map_err(|e| ioex(format!("UDP timeout: {e}")))?;
-            let (n, origin) = ctx
-                .fd_table()
-                .udp_recv(fd as u32, &mut buf)
-                .map_err(|e| ioex(format!("UDP recv: {e}")))?;
+            // GC-blocking audit: this recv parks in the OS for up to
+            // soTimeout — or indefinitely when no timeout is set (same hang
+            // mechanism documented on MulticastSocket's receive in
+            // native-io/src/net.rs, which this DatagramSocket-keyed
+            // registration duplicates for callers resolved via the
+            // DatagramSocket-declaring class). Without the blocking-region
+            // bracket, a cross-thread STW GC requested while this thread is
+            // parked in udp_recv can never be satisfied: the thread isn't in
+            // JIT code (can't be taken over) and isn't at a safepoint (can't
+            // cooperate), so `pending` never reaches 0 and the takeover loop
+            // spins until the external harness timeout. `pkt`/`data_arr` are
+            // re-synced afterward in case a moving GC ran while parked.
+            let mut blocked_refs = [Value::Object(Some(pkt)), Value::Object(Some(data_arr))];
+            ctx.begin_blocking_region();
+            let recv_result = ctx.fd_table().udp_recv(fd as u32, &mut buf);
+            ctx.end_blocking_region_refs(&mut blocked_refs);
+            let pkt = match blocked_refs[0] {
+                Value::Object(Some(o)) => o,
+                _ => pkt,
+            };
+            let data_arr = match blocked_refs[1] {
+                Value::Object(Some(o)) => o,
+                _ => data_arr,
+            };
+            let (n, origin) = recv_result.map_err(|e| ioex(format!("UDP recv: {e}")))?;
             copy_bytes_into_java_array(ctx, data_arr, 0, &buf[..n])?;
             ctx.set_field(pkt, DP_LENGTH, Value::Int(n as i32));
             if let Some((oh, op)) = origin.rsplit_once(':') {

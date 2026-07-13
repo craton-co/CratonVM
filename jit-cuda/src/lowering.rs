@@ -161,8 +161,10 @@ fn lower_method_with_pool_impl(
                     emitter.emit_loop_guard(&bound_reg, &li);
                 }
             }
-            // Body — walks until it hits the back-branch goto.
-            emitter.walk(li.body_start_pc, li.back_branch_pc + 5, Some(&li))?;
+            // Body — lower its forward CFG once.  The canonical back-edge
+            // is intentionally excluded: one CUDA thread owns one loop
+            // iteration, so re-emitting it would duplicate work.
+            emitter.walk_cfg(li.body_start_pc, li.back_branch_pc, &li)?;
             // Post-loop — anything from li.exit_pc on (returns).
             // Clear the hit_back_branch flag so the post-loop walk runs.
             emitter.clear_back_branch();
@@ -196,13 +198,9 @@ fn lower_method_with_pool_impl(
                 )));
             }
             emitter.emit_nested_loop_guard_and_decompose(&outer_bound, &inner_bound, &nl);
-            // Body — the inner loop's own body; walks until it hits the
-            // back-branch goto to the inner header.
-            emitter.walk(
-                nl.inner.body_start_pc,
-                nl.inner.back_branch_pc + 5,
-                Some(&nl.inner),
-            )?;
+            // Body — the inner loop's forward CFG.  As for a 1-D loop,
+            // the already-accounted-for canonical back-edge is excluded.
+            emitter.walk_cfg(nl.inner.body_start_pc, nl.inner.back_branch_pc, &nl.inner)?;
             // Post-loop — anything from the outer loop's exit_pc on.
             emitter.clear_back_branch();
             emitter.walk(nl.outer.exit_pc, bytes.len(), None)?;
@@ -580,7 +578,10 @@ mod tests {
             text.contains("cvt.rzi.f32.f32"),
             "missing truncate-toward-zero\n{text}"
         );
-        assert!(text.contains("neg.f32"), "missing quotient negation\n{text}");
+        assert!(
+            text.contains("neg.f32"),
+            "missing quotient negation\n{text}"
+        );
         assert!(
             text.contains("fma.rn.f32"),
             "missing single-rounding fma\n{text}"
@@ -613,7 +614,10 @@ mod tests {
             text.contains("cvt.rzi.f64.f64"),
             "missing truncate-toward-zero\n{text}"
         );
-        assert!(text.contains("neg.f64"), "missing quotient negation\n{text}");
+        assert!(
+            text.contains("neg.f64"),
+            "missing quotient negation\n{text}"
+        );
         assert!(
             text.contains("fma.rn.f64"),
             "missing single-rounding fma\n{text}"
@@ -1132,6 +1136,18 @@ mod tests {
         not(feature = "gpu-it"),
         ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
     )]
+    fn ptxas_round_trip_branching_loops() {
+        let m = lower_fixture("EligibleBranchingLoop", "absOrIncrement", "([I[I)V");
+        ptxas_round_trip(&m.render(), "branching_loop_merge");
+        let m = lower_fixture("EligibleBranchingLoop", "onlyNegatives", "([I[I)V");
+        ptxas_round_trip(&m.render(), "branching_loop_one_arm");
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-it"),
+        ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
+    )]
     fn ptxas_round_trip_frem() {
         let m = lower_fixture_with_pool_and_hint(
             "EligibleFrem",
@@ -1379,7 +1395,10 @@ mod tests {
             super::loop_recog::LoopShape::Counted(li) => {
                 assert_eq!(li.exit_op, 0xA2);
                 assert_eq!(li.iv_stride, 1);
-                assert_eq!(li.iv_start, 5, "start5Loop's start value must be recorded as 5");
+                assert_eq!(
+                    li.iv_start, 5,
+                    "start5Loop's start value must be recorded as 5"
+                );
             }
             other => panic!("expected Counted loop, got {other:?}"),
         }
@@ -1589,7 +1608,9 @@ mod tests {
         let method = load_method("NegativeStartLoop", "negativeStart", "([I)V");
         let sig = match analyze(&method) {
             OffloadVerdict::Eligible(s) => s,
-            v => panic!("expected NegativeStartLoop.negativeStart to be analyzer-eligible, got {v:?}"),
+            v => panic!(
+                "expected NegativeStartLoop.negativeStart to be analyzer-eligible, got {v:?}"
+            ),
         };
         let err = lower_method("NegativeStartLoop", &method, &sig, 7, 5)
             .expect_err("a negative constant start must still be rejected");
@@ -1829,6 +1850,49 @@ mod tests {
         expect_compare_fusion_eligible_but_not_lowerable("compareDoubles", "(DD)I");
     }
 
+    // ─── Loop-body control-flow graph lowering ─────────────────────────
+
+    #[test]
+    fn branching_loop_lowers_with_predicate_branches_and_local_merges() {
+        let m = lower_fixture("EligibleBranchingLoop", "absOrIncrement", "([I[I)V");
+        let text = m.render();
+        assert!(
+            text.contains("setp.ge.s32"),
+            "expected an if predicate:\n{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.trim_start().starts_with("@%p") && line.contains(" mov.s32"))
+                && text.lines().any(|line| {
+                    line.trim_start().starts_with("@!%p") && line.contains(" mov.s32")
+                }),
+            "expected predicated merge moves:\n{text}"
+        );
+        assert!(
+            text.contains("bra L_body_"),
+            "expected a real body label branch:\n{text}"
+        );
+        assert!(
+            text.matches("L_body_").count() >= 2,
+            "expected CFG labels:\n{text}"
+        );
+    }
+
+    #[test]
+    fn one_arm_branch_can_fall_through_to_the_loop_back_edge() {
+        let m = lower_fixture("EligibleBranchingLoop", "onlyNegatives", "([I[I)V");
+        let text = m.render();
+        assert!(
+            text.contains("setp.ge.s32"),
+            "expected branch predicate:\n{text}"
+        );
+        assert!(
+            text.contains("L_body_"),
+            "expected a branch target label:\n{text}"
+        );
+        assert!(!text.contains("non-canonical control flow"));
+    }
+
     // ─── AUDIT 2026-07-11: invokestatic intrinsic-table lowering ─────
     //
     // `EligibleMathKernel.java` mirrors `EligibleFrem.java`'s pattern
@@ -1936,8 +2000,14 @@ mod tests {
             crate::annotations::AdmissionHint::AllowIntrinsicCalls,
         );
         let text = m.render();
-        assert!(text.contains("setp.lt.s32"), "missing min predicate\n{text}");
-        assert!(text.contains("setp.gt.s32"), "missing max predicate\n{text}");
+        assert!(
+            text.contains("setp.lt.s32"),
+            "missing min predicate\n{text}"
+        );
+        assert!(
+            text.contains("setp.gt.s32"),
+            "missing max predicate\n{text}"
+        );
         assert!(
             text.matches("selp.s32").count() >= 2,
             "expected at least one selp.s32 per min/max\n{text}"
@@ -1979,8 +2049,14 @@ mod tests {
             text.contains("and.b32"),
             "missing max's AND-of-raw-bits signed-zero handling\n{text}"
         );
-        assert!(text.contains("setp.le.f32"), "missing min ordered compare\n{text}");
-        assert!(text.contains("setp.ge.f32"), "missing max ordered compare\n{text}");
+        assert!(
+            text.contains("setp.le.f32"),
+            "missing min ordered compare\n{text}"
+        );
+        assert!(
+            text.contains("setp.ge.f32"),
+            "missing max ordered compare\n{text}"
+        );
         // PTX's own min.f32/max.f32 do not implement Java's NaN/signed-zero
         // rules — pin that this lowering never regresses to using them.
         assert!(!text.contains("min.f32"));

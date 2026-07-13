@@ -1,3 +1,63 @@
+# 2026-07-13 current-dev residual update
+
+**Status: OPEN.** This remains a real CratonVM-only non-progress failure, but
+the current evidence does **not** establish the historical GC/STW-monitor-race
+attribution as its root cause. Keep the cross-reference as historical context;
+do not use it to close or otherwise classify this current residual.
+
+Validated on `origin/dev` at `acf9aaf7`, in isolated worktree
+`/data/victor-worktrees/cratonvm-es-ivfknn-complete-20260712-1540`, using
+binary
+`/data/data/cratonvm-targets/es-ivfknn-complete-20260712-1540/release/cratonvm-es-ivfknn-complete-20260712-1540`
+and the existing Elasticsearch fixture
+`/data/data/cratonvm-worktrees/20260708-191002-es-nonpassed-rerun/apps/elasticsearch`.
+The current `others.tsv` selection is runner start `2538` (not the historical
+start `549`):
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File apps/elasticsearch-suite-runner/run-elasticsearch-suite.ps1 -Category others -Jit on -Vm craton -ElasticsearchRoot "/data/data/cratonvm-worktrees/20260708-191002-es-nonpassed-rerun/apps/elasticsearch" -WorkDir "/data/victor-worktrees/cratonvm-es-ivfknn-complete-20260712-1540/apps/elasticsearch-suite-runner/.suite-es-ivfknn-complete-20260712-1540" -Exe /data/data/cratonvm-targets/es-ivfknn-complete-20260712-1540/release/cratonvm-es-ivfknn-complete-20260712-1540 -JdkHome /home/victor/jdk25 -TimeoutSec 90 -RunName ivfknn-current -ModeName craton-current -Start 2538 -Count 1
+```
+
+Results:
+
+- The same selection passes on HotSpot/JDK 25 in 13.5 seconds.
+- With Craton JIT enabled, the runner aborts after roughly 5--8 seconds with
+  `Test abandoned because suite timeout was reached`; the in-test message says
+  `>=580000 msec`. This is not the outer 90-second runner timeout. Narrow
+  `System.nanoTime` and `TimeUnit.MILLISECONDS.toNanos(580000)` probes return
+  correct values, so a generic timeout-clock or `TimeUnit` conversion fault is
+  not an adequate explanation.
+- With `--nojit`, the process consumes about one CPU continuously and fails to
+  produce a test result before a 90-second outer timeout. A 150-second run
+  behaved the same. This is genuine non-progress, not merely a slow test.
+
+A Craton watchdog dump during the no-JIT run places the active worker in the
+vector-query path:
+
+```
+testSlicesSparseWithFilter -> doTestSlicesSparse -> doTestSlices
+-> IndexSearcher.search/rewrite -> IVFKnnFloatVectorQuery.rewrite
+-> AbstractIVFKnnVectorQuery.rewrite -> TaskExecutor.invokeAll
+-> searchLeaf -> IVFKnnFloatSlicedVectorQuery.getLeafResults
+-> CodecReader.getSortedDocValues -> Lucene90DocValuesProducer.getSorted
+-> IndexInput.randomAccessSlice -> MockIndexInputWrapper.slice
+-> ByteBuffersIndexInput.slice
+```
+
+The suite coordinator is waiting in `ThreadLeakControl.join` while that worker
+does not advance. A local, uncommitted experiment which decoded raw compact
+`long` arguments for `ByteBuffersDataInput.seek(long)` and `slice(long,long)`
+also still timed out in no-JIT mode at 90 seconds; it was deliberately not
+merged because it did not fix the residual.
+
+The host disallows non-parent `gdb -p` attachment through Yama ptrace policy,
+so native thread-state confirmation remains unavailable without a permitted
+parent/debug launch. The next investigation should obtain that capture (or
+equivalent VM instrumentation) around the `TaskExecutor`/`ByteBuffersIndexInput`
+path, rather than treating the older GC-monitor finding as proven for this
+current run.
+
+---
 # ES HANG - server org.elasticsearch.search.vectors.DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests
 
 Status: OPEN

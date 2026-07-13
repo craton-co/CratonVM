@@ -1122,6 +1122,7 @@ pub fn build_trust_manager_state(keystore_id: i32) -> TrustManagerState {
                             None => continue,
                         }
                     }
+                    keystore::EntryKind::SecretKey { .. } => continue,
                 };
                 insert_anchor(&mut state, der);
             }
@@ -1140,6 +1141,7 @@ pub fn build_trust_manager_state(keystore_id: i32) -> TrustManagerState {
                         None => continue,
                     }
                 }
+                keystore::EntryKind::SecretKey { .. } => continue,
             };
             insert_anchor(&mut state, der);
         }

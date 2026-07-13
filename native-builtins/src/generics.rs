@@ -77,6 +77,20 @@ fn current_generic_decl() -> Value {
         .unwrap_or(Value::Object(None))
 }
 
+/// Resolve a symbolic signature class from the loader that owns the current
+/// generic declaration.  A global name lookup is insufficient once a forked
+/// test or generated class has defined another legitimate copy of the same
+/// binary name: its reflective `ParameterizedType` must contain raw classes
+/// from that declaration's own loader, otherwise generic resolvers compare
+/// incompatible class identities.
+fn class_id_in_generic_scope(ctx: &dyn NativeContext, name: &str) -> Option<cratonvm_types::ClassId> {
+    let scoped = GENERIC_DECL_SCOPE.with(|scope| scope.get()).and_then(|decl| {
+        ctx.class_id_from_mirror(decl)
+            .and_then(|near| ctx.class_id_by_name_near(name, near))
+    });
+    scoped.or_else(|| ctx.class_id_by_name(name))
+}
+
 fn reflective_type_variable_name(ctx: &mut dyn NativeContext, tv: ObjectRef) -> Option<String> {
     let cname = ctx
         .class_name_of_id(ctx.class_id_of_object(tv))
@@ -211,7 +225,7 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             // "Unable to determine source type <S> and target type <T>".
             // Real-JDK reifier likewise returns Class mirrors without forcing
             // initialization.
-            if let Some(cid) = ctx.class_id_by_name(name) {
+            if let Some(cid) = class_id_in_generic_scope(ctx, name) {
                 let mirror = ctx.get_class_mirror(cid);
                 Value::Object(Some(mirror))
             } else if let Ok(Some(v)) = ctx.load_class(name) {
@@ -243,7 +257,7 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             // owner is present (`type_args` empty, `owner` Some) — that still
             // reifies as a ParameterizedType on HotSpot, so build one here.
             let pt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/ParameterizedType", 3);
-            let raw_val = if let Some(cid) = ctx.class_id_by_name(name) {
+            let raw_val = if let Some(cid) = class_id_in_generic_scope(ctx, name) {
                 let m = ctx.get_class_mirror(cid);
                 Value::Object(Some(m))
             } else if let Ok(Some(v)) = ctx.load_class(name) {
@@ -257,6 +271,16 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             let args_arr = new_type_array(ctx, type_args.len());
             for (i, arg) in type_args.iter().enumerate() {
                 let val = type_arg_to_java(ctx, arg);
+                // ParameterizedType arguments are never null in the JDK
+                // reflection contract. An absent optional dependency is
+                // represented by its erased Object type instead.
+                let val = if matches!(val, Value::Object(None)) {
+                    ctx.class_id_by_name("java/lang/Object")
+                        .map(|id| Value::Object(Some(ctx.get_class_mirror(id))))
+                        .unwrap_or(val)
+                } else {
+                    val
+                };
                 ctx.set_array_element(args_arr, i, val);
             }
             ctx.set_field(pt, 1, Value::Object(Some(args_arr)));
@@ -376,7 +400,22 @@ fn new_type_array(ctx: &mut dyn NativeContext, len: usize) -> cratonvm_types::Ob
 /// Convert a TypeArg into a Type object.
 fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
     match arg {
-        TypeArg::Exact(sig) => type_sig_to_java(ctx, sig),
+        TypeArg::Exact(sig) => {
+            let value = type_sig_to_java(ctx, sig);
+            // A signature may mention an optional dependency absent from the
+            // active class path (Hibernate Validator's monetary validators
+            // are the concrete case). Reflection must never expose a null
+            // Type entry: callers dereference every argument. Erasure to
+            // Object is the conservative non-null representation when the
+            // referenced class cannot be resolved.
+            if matches!(value, Value::Object(None)) {
+                ctx.class_id_by_name("java/lang/Object")
+                    .map(|id| Value::Object(Some(ctx.get_class_mirror(id))))
+                    .unwrap_or(value)
+            } else {
+                value
+            }
+        }
         TypeArg::Extends(sig) => {
             // WildcardType: field 0 = upperBounds, field 1 = lowerBounds
             let wt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/WildcardType", 2);
@@ -488,9 +527,9 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
             owner,
         } if !type_args.is_empty() || owner.is_some() => {
             let slashed = name.replace('.', "/");
-            let raw = match ctx.class_id_by_name(&slashed).or_else(|| {
+            let raw = match class_id_in_generic_scope(ctx, &slashed).or_else(|| {
                 let _ = ctx.load_class(&slashed);
-                ctx.class_id_by_name(&slashed)
+                class_id_in_generic_scope(ctx, &slashed)
             }) {
                 Some(cid) => Value::Object(Some(ctx.get_class_mirror(cid))),
                 None => return type_sig_to_java(ctx, sig),
@@ -531,7 +570,16 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
 /// Build the REAL `Type` for a single `TypeArg` (used by [`typesig_to_real_type`]).
 fn typearg_to_real_type(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
     match arg {
-        TypeArg::Exact(sig) => typesig_to_real_type(ctx, sig),
+        TypeArg::Exact(sig) => {
+            let value = typesig_to_real_type(ctx, sig);
+            // Optional signature-only dependencies can be absent at runtime.
+            // Real reflective Type arrays must contain a non-null entry.
+            if matches!(value, Value::Object(None)) {
+                object_class_mirror(ctx)
+            } else {
+                value
+            }
+        }
         TypeArg::Extends(sig) => {
             let b = typesig_to_real_type(ctx, sig);
             real_wildcard_type(ctx, vec![b], vec![])

@@ -112,7 +112,7 @@ non-functional is closed: a curated `Math`/`StrictMath` table (`sqrt` on
 `double`, `abs`/`min`/`max` on `int`/`long`/`float`/`double`, `fma` on
 `float`/`double`) now resolves and lowers for real, narrower than TornadoVM's
 broader FP-intrinsic support (row 9) but no longer vaporware. See
-`docs/known-issues/gpu-offload-followups-20260711.md` and
+`docs/internal/gpu-offload-followups-20260711.md` and
 `docs/gpu/annotations.md` for the full detail.
 
 ---
@@ -141,5 +141,5 @@ broader FP-intrinsic support (row 9) but no longer vaporware. See
   [`docs/gpu/annotations.md`](./annotations.md),
   [`docs/gpu/async-api.md`](./async-api.md),
   [`docs/gpu/first-results.md`](./first-results.md),
-  [`docs/known-issues/gpu-offload-followups-20260711.md`](../known-issues/gpu-offload-followups-20260711.md),
+  [`docs/internal/gpu-offload-followups-20260711.md`](../internal/gpu-offload-followups-20260711.md),
   [`craton-gpu-java` README](https://github.com/craton-co/craton-gpu-java).

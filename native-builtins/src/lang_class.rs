@@ -209,7 +209,21 @@ fn array_descriptor_to_package_name(desc: &str) -> Option<String> {
 
 /// Last segment of a class's name after `/`, `.`, or `$` (the
 /// `Class.getSimpleName()` rule). Cached per `ClassId`.
-pub(crate) fn simple_class_name(class_id: ClassId, raw: &str) -> Arc<str> {
+///
+/// `is_real_inner` must be true only when this class actually has its own
+/// entry in its `InnerClasses` attribute (i.e. it's a genuine JVM member/
+/// local/anonymous class) — see the caller in `native_class_get_simple_name`.
+/// The `$`-strip only applies then. A top-level class whose *literal* binary
+/// name happens to contain `$` (dynamically-generated proxies from ByteBuddy/
+/// cglib/JDK `Proxy`, e.g. `org.easymock.mocks.InitialDirContext$$$EasyMock$1`)
+/// has no such attribute entry, so real `Class.getSimpleName()` returns the
+/// name unmodified after stripping only the package prefix — splitting on the
+/// last `$` regardless of real nested-class-ness previously made EasyMock's
+/// own `getSimpleName().contains("$$$EasyMock$")` mock-detection check see a
+/// truncated name (e.g. just `"1"`) and misreport `Not a mock` for every
+/// class-based mock (see jndirealmintegration-ldap-connection-npe residual /
+/// EasyMock investigation).
+pub(crate) fn simple_class_name(class_id: ClassId, raw: &str, is_real_inner: bool) -> Arc<str> {
     if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, class_id) {
         return arc;
     }
@@ -218,12 +232,28 @@ pub(crate) fn simple_class_name(class_id: ClassId, raw: &str) -> Arc<str> {
         return cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, simple);
     }
     let after_slash_or_dot = raw.rsplit(&['/', '.'][..]).next().unwrap_or(raw);
-    let after_dollar = after_slash_or_dot
-        .rsplit('$')
-        .next()
-        .unwrap_or(after_slash_or_dot);
-    let simple: Arc<str> = Arc::from(after_dollar);
+    let simple: Arc<str> = if is_real_inner {
+        Arc::from(
+            after_slash_or_dot
+                .rsplit('$')
+                .next()
+                .unwrap_or(after_slash_or_dot),
+        )
+    } else {
+        Arc::from(after_slash_or_dot)
+    };
     cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, simple)
+}
+
+/// Does `class_id` (named `class_name`) have its own entry in its
+/// `InnerClasses` attribute? True only for genuine JVM member/local/
+/// anonymous classes — a top-level class with literal `$` characters in its
+/// binary name (dynamically-generated proxies) has no such entry. Same
+/// lookup `native_class_get_simple_binary_name` uses.
+fn has_own_inner_classes_entry(ctx: &mut dyn NativeContext, class_id: ClassId, class_name: &str) -> bool {
+    ctx.inner_classes(class_id)
+        .iter()
+        .any(|(inner_class, _, _, _)| inner_class == class_name)
 }
 
 /// Canonical name: dotted form plus inner-class `$` в†’ `.` substitution.
@@ -1096,7 +1126,17 @@ pub(crate) fn t19_h10_alloc_byte_array_input_stream(
     for (i, &b) in bytes.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
     }
+    // `arr` is held only in this native's Rust local until it is installed in
+    // `stream.buf`.  Allocating the stream may itself initiate a collection;
+    // without a native pin, a non-moving sweep can reclaim the otherwise
+    // unreachable byte array (and a relocating collector can forward it while
+    // this raw local remains stale).  Resource parsing then observes an empty
+    // or invalid InputStream.  Keep the array rooted across that allocation
+    // and read the current address back before publishing the heap edge.
+    let arr_pin = ctx.pin_native_root(arr);
     let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     ctx.set_field(stream, 1, Value::Int(0));
     ctx.set_field(stream, 2, Value::Int(0));
@@ -1673,9 +1713,25 @@ pub(crate) fn native_class_for_name(
             dotted_name,
             loader_class_name_debug
         );
-        let invoke_args = [Value::Object(Some(loader)), Value::Object(Some(name_obj))];
+        // Spring's DynamicClassLoader deliberately delegates generated classes
+        // to its forked parent. In real-JDK mode the inherited ClassLoader
+        // bytecode can collapse that lookup to the flat global store before
+        // the parent's loader-local namespace participates. Invoke the parent
+        // directly for this known delegating loader so Class.forName observes
+        // the same class identity as the generated AOT code.
+        let lookup_loader = if loader_class_name_debug
+            == "org/springframework/core/test/tools/DynamicClassLoader"
+        {
+            match ctx.get_field_by_name(loader, "parent") {
+                Value::Object(Some(parent)) => parent,
+                _ => loader,
+            }
+        } else {
+            loader
+        };
+        let invoke_args = [Value::Object(Some(lookup_loader)), Value::Object(Some(name_obj))];
         match ctx.invoke_virtual(
-            loader,
+            lookup_loader,
             "loadClass",
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &invoke_args[1..],
@@ -2788,7 +2844,8 @@ pub(crate) fn native_class_get_simple_name(
             return Ok(Some(Value::Object(Some(result))));
         }
         if let Some(name) = ctx.class_name_of_id(class_id) {
-            let simple = simple_class_name(class_id, &name);
+            let is_real_inner = has_own_inner_classes_entry(ctx, class_id, &name);
+            let simple = simple_class_name(class_id, &name, is_real_inner);
             let result = ctx.create_string(&simple);
             return Ok(Some(Value::Object(Some(result))));
         }
@@ -4599,7 +4656,13 @@ fn field_set_raw(
     // Narrow or widen the incoming primitive into whatever the field
     // actually holds. This catches `Field.setInt(...)` on a reference field
     // and the like, producing IllegalArgumentException as per javadoc.
-    let coerced = coerce_arg_strict(ctx, new_value, &descriptor, "Field typed setter", Some(class_id))?;
+    let coerced = coerce_arg_strict(
+        ctx,
+        new_value,
+        &descriptor,
+        "Field typed setter",
+        Some(class_id),
+    )?;
 
     // WP2.1-field вЂ” volatile-aware write fences (no-op for non-volatile).
     volatile_store_fence_pre(modifiers);
@@ -6032,7 +6095,13 @@ pub(crate) fn native_method_invoke(
         // type mismatch (per java.lang.reflect.Method.invoke javadoc).
         for (i, pdesc) in param_descs.iter().enumerate() {
             let arg_val = raw_args[i];
-            match coerce_arg_strict(ctx, arg_val, pdesc, "Method.invoke argument", ctx.class_id_from_mirror(declaring_mirror)) {
+            match coerce_arg_strict(
+                ctx,
+                arg_val,
+                pdesc,
+                "Method.invoke argument",
+                ctx.class_id_from_mirror(declaring_mirror),
+            ) {
                 Ok(coerced) => invoke_args.push(coerced),
                 Err(e) => {
                     // JDK-faithful cause: HotSpot's reflective unboxing calls
@@ -7838,6 +7907,11 @@ pub(crate) fn native_constructor_new_instance(
             .into())
         }
     };
+    let args_array_early = match args.get(1) {
+        Some(Value::Object(Some(arr))) => Some(*arr),
+        _ => None,
+    };
+    let args_array_pin = args_array_early.map(|arr| (ctx.pin_native_root(arr), arr));
 
     // Serialization constructor: allocate the real target type.
     //
@@ -8045,10 +8119,8 @@ pub(crate) fn native_constructor_new_instance(
     let (param_descs, _) = parse_descriptor_param_and_return(&descriptor);
 
     // Extract arguments from Object[] (args[1])
-    let args_array = match args.get(1) {
-        Some(Value::Object(Some(arr))) => Some(*arr),
-        _ => None,
-    };
+    let args_array = args_array_pin
+        .map(|(pin, arr)| ctx.read_native_pin(pin, arr));
     let actual_arg_count = match args_array {
         Some(arr) => ctx.array_length(arr),
         None => 0,
@@ -8074,7 +8146,13 @@ pub(crate) fn native_constructor_new_instance(
         } else {
             Value::Object(None)
         };
-        let coerced = coerce_arg_strict(ctx, arg_val, pdesc, "Constructor.newInstance argument", declaring_cid)?;
+        let coerced = coerce_arg_strict(
+            ctx,
+            arg_val,
+            pdesc,
+            "Constructor.newInstance argument",
+            declaring_cid,
+        )?;
         init_args.push(coerced);
     }
 
@@ -9800,6 +9878,7 @@ fn make_type_not_present_exception(
     ctx: &mut dyn NativeContext,
     type_name: &str,
     cause: Option<ObjectRef>,
+    capture_trace: bool,
 ) -> Option<ObjectRef> {
     let cid = ctx
         .class_id_by_name("java/lang/TypeNotPresentException")
@@ -9809,16 +9888,106 @@ fn make_type_not_present_exception(
         })?;
     let nfields = ctx.class_num_total_fields(cid).max(4);
     let exc = ctx.alloc_object(cid, nfields);
+    // `exc` (and `cause`, when present) are raw `ObjectRef`s held across
+    // several re-entrant, potentially-allocating calls below (`create_string`,
+    // the `write_throwable_*` field writers). Under the moving collector any
+    // of those can trigger a GC that relocates `exc`/`cause`, leaving the
+    // Rust-local copy stale — it then reads back as whatever unrelated object
+    // now occupies that memory (observed as `gen_heap::get_field` "undersized
+    // object layout" errors on unrelated `String` objects, since this path is
+    // exercised far more often — once per unresolvable `@ConditionalOnClass`
+    // element — than the narrow classloader-isolation call site that
+    // originally used this helper). Pin both across the whole construction
+    // and re-fetch after every call that can allocate, per the documented
+    // `pin_native_root`/`read_native_pin` contract.
+    let pin = ctx.pin_native_root(exc);
+    let cause_pin = cause.map(|c| ctx.pin_native_root(c));
     // Mirror `new TypeNotPresentException(type, cause)`: message + cause set via
     // the layout-aware Throwable helpers (Throwable.<init> is shadowed, so the
     // real field initializers do not run otherwise).
     let msg = format!("Type {type_name} not present");
     let msg_obj = ctx.create_string(&msg);
+    let exc = ctx.read_native_pin(pin, exc);
+    let msg_pin = ctx.pin_native_root(msg_obj);
+    let msg_obj = ctx.read_native_pin(msg_pin, msg_obj);
     crate::lang_misc::write_throwable_detail_message(ctx, exc, Value::Object(Some(msg_obj)));
+    let exc = ctx.read_native_pin(pin, exc);
     if let Some(c) = cause {
+        let c = cause_pin
+            .map(|p| ctx.read_native_pin(p, c))
+            .unwrap_or(c);
         crate::lang_misc::write_throwable_cause(ctx, exc, Value::Object(Some(c)));
     }
-    crate::lang_misc::capture_throwable_trace(ctx, exc);
+    let exc = ctx.read_native_pin(pin, exc);
+    // `capture_throwable_trace` also walks/allocates; keep `exc` pinned
+    // through it too. Callers on a hot path (every unresolvable
+    // `@ConditionalOnClass`-style element, VM-wide) can skip it — Spring only
+    // ever checks `instanceof TypeNotPresentException` / reads the message on
+    // this sentinel, never its stack trace — to avoid the extra work, not for
+    // correctness (the actual corruption bug was the missing pins above).
+    if capture_trace {
+        crate::lang_misc::capture_throwable_trace(ctx, exc);
+    }
+    let exc = ctx.read_native_pin(pin, exc);
+    ctx.unpin_native_roots(pin);
+    Some(exc)
+}
+
+fn shared_unresolvable_class_sentinel_root() -> &'static Mutex<Option<usize>> {
+    static ROOT: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
+    ROOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Default (no `container_loader`) unresolvable-`Class`-element sentinel —
+/// the overwhelmingly common case (`@ConditionalOnClass`/`@ConditionalOnMissingClass`
+/// referencing an optional dependency absent from the classpath, with no
+/// classloader-isolation involved). Unlike [`make_type_not_present_exception`]
+/// (used only by the narrow, rarely-exercised classloader-isolation call
+/// site), this path fires once per unresolvable `Class`-typed element on
+/// EVERY annotated class VM-wide — allocating a fresh exception object each
+/// time turned a per-element loop that previously never allocated at all
+/// (an unresolvable class silently became `null`) into one that allocates
+/// routinely, which exposed a pre-existing GC-safety gap elsewhere in
+/// `create_annotation_proxy`'s array-construction loop (the array/element
+/// arrays it fills are held across the loop without being pinned; see
+/// `create_annotation_proxy`). Properly pinning the sentinel's OWN
+/// construction (as `make_type_not_present_exception` now does) did not
+/// fix that — the corruption persisted because the *other*, pre-existing
+/// unpinned arrays are what actually go stale once allocation starts
+/// happening inside that loop.
+///
+/// Sidestep the whole class of hazard instead of chasing it: build ONE
+/// generic `TypeNotPresentException` instance, ever, and permanently
+/// GC-root it (`add_global_root`/`resolve_global_root` — the same
+/// mechanism JNI global refs use), so this path allocates at most once per
+/// process instead of once per occurrence. After the first call it's a
+/// pure lookup — no allocation, so nothing downstream can be exposed to a
+/// GC that wasn't already possible before this fix existed. The message is
+/// intentionally generic (not per-class) since callers only ever check
+/// `instanceof TypeNotPresentException`; nothing here reads the message.
+fn shared_unresolvable_class_sentinel(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    {
+        let guard = shared_unresolvable_class_sentinel_root()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = *guard {
+            if let Some(obj) = ctx.resolve_global_root(handle) {
+                return Some(obj);
+            }
+        }
+    }
+    let mut guard = shared_unresolvable_class_sentinel_root()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // Re-check: another thread may have built it while we waited for the lock.
+    if let Some(handle) = *guard {
+        if let Some(obj) = ctx.resolve_global_root(handle) {
+            return Some(obj);
+        }
+    }
+    let exc = make_type_not_present_exception(ctx, "<annotation-referenced type>", None, true)?;
+    let handle = ctx.add_global_root(exc);
+    *guard = Some(handle);
     Some(exc)
 }
 
@@ -9988,15 +10157,28 @@ fn create_annotation_proxy(
 
     // Store element nameв†’value pairs as parallel arrays
     let n = all_elements.len();
-    let names_arr = ctx.new_ref_array(ClassId::new(0), n);
-    let values_arr = ctx.new_ref_array(ClassId::new(0), n);
+    let mut names_arr = ctx.new_ref_array(ClassId::new(0), n);
+    let names_pin = ctx.pin_native_root(names_arr);
+    let mut values_arr = ctx.new_ref_array(ClassId::new(0), n);
+    let values_pin = ctx.pin_native_root(values_arr);
+    // Both arrays are allocated once, then held across a loop whose body
+    // (`create_string`, `annotation_element_to_java_typed`) can itself
+    // allocate — under the moving collector either array can relocate
+    // mid-loop, leaving a stale Rust-local copy; pin both across the whole
+    // loop and re-fetch before every use, matching the documented
+    // `pin_native_root`/`read_native_pin` contract.
     for (i, (name, val, ret_desc)) in all_elements.iter().enumerate() {
         let name_str = ctx.create_string(name);
+        names_arr = ctx.read_native_pin(names_pin, names_arr);
         ctx.set_array_element(names_arr, i, Value::Object(Some(name_str)));
         let java_val =
             annotation_element_to_java_typed(ctx, val, ret_desc.as_deref(), container_loader);
+        values_arr = ctx.read_native_pin(values_pin, values_arr);
         ctx.set_array_element(values_arr, i, java_val);
     }
+    names_arr = ctx.read_native_pin(names_pin, names_arr);
+    values_arr = ctx.read_native_pin(values_pin, values_arr);
+    ctx.unpin_native_roots(names_pin);
     ctx.set_field(proxy, ANN_PROXY_ELEM_NAMES, Value::Object(Some(names_arr)));
     ctx.set_field(
         proxy,
@@ -10186,6 +10368,7 @@ pub(crate) fn annotation_element_to_java_typed(
                                 ctx,
                                 &owned.replace('/', "."),
                                 Some(cnfe),
+                                true,
                             ) {
                                 return Value::Object(Some(tnpe));
                             }
@@ -10214,10 +10397,35 @@ pub(crate) fn annotation_element_to_java_typed(
                 if let Ok(Some(val)) = load_res {
                     return val;
                 }
+                // Genuinely unresolvable (no container_loader took the CNFE
+                // branch above, e.g. plain app/bootstrap-loaded classes, which
+                // is the overwhelmingly common case for `@ConditionalOnClass`
+                // referencing an optional dependency). Mirror HotSpot's
+                // `AnnotationParser.parseClassValue`: a ClassNotFoundException
+                // here becomes a deferred `TypeNotPresentException` sentinel
+                // (thrown on member ACCESS by `annotation_proxy_dispatch_impl`),
+                // never a bare Java `null`. Handing back `null` let Spring's
+                // `TypeMappedAnnotation`/`MergedAnnotation` `classValuesAsString`
+                // conversion (`Class.getName()` on the null element) raise an
+                // unexpected `NullPointerException` that Spring's
+                // `TypeNotPresentException`-aware handling for exactly this
+                // optional-dependency pattern doesn't recognize — surfacing as
+                // `OnClassCondition.addAll`'s "NullPointerException cannot be
+                // cast to String[]" across every `@ConditionalOnClass`-gated
+                // autoconfiguration whose referenced class is absent.
+                if let Some(tnpe) = shared_unresolvable_class_sentinel(ctx) {
+                    if iae_trace_cls {
+                        eprintln!(
+                            "ANN-CLASS desc={desc} class={class_name} unresolved -> TypeNotPresentException (shared)"
+                        );
+                    }
+                    return Value::Object(Some(tnpe));
+                }
                 if iae_trace_cls {
                     eprintln!("ANN-CLASS desc={desc} class={class_name} RETURNING-NULL");
                 }
-                // Unloadable object class вЂ” preserve the existing null return.
+                // Could not even build the sentinel (e.g. TypeNotPresentException
+                // itself isn't loadable) вЂ” preserve the prior best-effort null.
                 return Value::Object(None);
             }
             // `annotation_desc_to_class_name` returned None: the descriptor is
@@ -10417,6 +10625,16 @@ pub(crate) fn annotation_element_to_java_typed(
                 })
                 .unwrap_or(cratonvm_types::ClassId::new(0));
             let arr = ctx.new_ref_array(comp_cid, elems.len());
+            // `arr` is allocated once, then held across a loop whose body
+            // (the recursive `annotation_element_to_java_typed` call below)
+            // can itself allocate — nested `String`/`Class`/nested-annotation
+            // elements always could, and an unresolvable `Class` element now
+            // can too (`shared_unresolvable_class_sentinel`, first call ever
+            // per process). Under the moving collector `arr` can relocate
+            // mid-loop, leaving this Rust-local copy stale; pin it across the
+            // whole loop and re-fetch on every iteration, matching the
+            // documented `pin_native_root`/`read_native_pin` contract.
+            let arr_pin = ctx.pin_native_root(arr);
             // Round 18: derive the per-element return-type descriptor from
             // the array descriptor (strip leading `[`) so primitive elements
             // box into the correct wrapper (Z/B/C/S в†’ Boolean/Byte/Char/Short
@@ -10424,6 +10642,32 @@ pub(crate) fn annotation_element_to_java_typed(
             let elem_desc: Option<String> = return_type_desc
                 .and_then(|rd| rd.strip_prefix('['))
                 .map(|s| s.to_string());
+            // `Class[]`-declared members (e.g. `@ConditionalOnClass`'s `value`)
+            // resolve each element independently; an unresolvable class yields
+            // a per-element `TypeNotPresentException` sentinel (see the
+            // `Class(desc)` arm above). HotSpot's own `AnnotationInvocationHandler
+            // .invoke` walks such a member's backing array and throws on the
+            // FIRST sentinel found for the WHOLE accessor call — it never hands
+            // the array itself back to the caller. Mirror that here at
+            // construction time (once per annotation instance) rather than on
+            // every subsequent access: collapse the whole member to the
+            // sentinel the moment one turns up, matching the existing scalar
+            // `Class`-member sentinel representation that
+            // `annotation_proxy_dispatch_impl` already knows how to throw.
+            // Without this, Spring's own `TypeNotPresentException`-aware
+            // attribute extraction (built specifically to catch this from a
+            // real `Method.invoke` and defer it for later `@ConditionalOnClass`
+            // handling) never sees it — it gets a plain array back, and a
+            // later `Class[]`→`String[]` conversion NPEs on the missing
+            // element instead.
+            let is_class_component = comp_name_owned == "java/lang/Class";
+            // Record only the INDEX of a sentinel hit, not the `Value` itself
+            // — a later iteration's allocation could relocate it, so re-read
+            // it fresh from the (freshly re-pinned) array after the loop
+            // instead of carrying a Rust-local copy across further
+            // allocating calls.
+            let mut sentinel_index: Option<usize> = None;
+            let mut arr = arr;
             for (i, elem) in elems.iter().enumerate() {
                 let v = annotation_element_to_java_typed(
                     ctx,
@@ -10431,7 +10675,32 @@ pub(crate) fn annotation_element_to_java_typed(
                     elem_desc.as_deref(),
                     container_loader,
                 );
+                arr = ctx.read_native_pin(arr_pin, arr);
+                if is_class_component && sentinel_index.is_none() {
+                    if let Value::Object(Some(o)) = v {
+                        if ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref()
+                            == Some("java/lang/TypeNotPresentException")
+                        {
+                            sentinel_index = Some(i);
+                        }
+                    }
+                }
+                // Always finish populating `arr` — matches the allocate-then-
+                // immediately-fill invariant every other caller of
+                // `new_ref_array` in this function relies on. An early return
+                // here left `arr` allocated but only partially filled (some
+                // trailing slots never touched by `set_array_element`) and
+                // unreferenced by anything, which triggered heap corruption
+                // (`gen_heap::get_field` "undersized object layout" errors on
+                // unrelated `String` objects) under GC — the array is
+                // discarded below when a sentinel was found, but only AFTER
+                // it's fully built and briefly reachable in the normal way.
                 ctx.set_array_element(arr, i, v);
+            }
+            arr = ctx.read_native_pin(arr_pin, arr);
+            ctx.unpin_native_roots(arr_pin);
+            if let Some(idx) = sentinel_index {
+                return ctx.get_array_element(arr, idx);
             }
             Value::Object(Some(arr))
         }
@@ -11727,6 +11996,7 @@ pub(crate) fn native_class_get_generic_interfaces(
         if let Some(class_sig) = crate::generics::parse_class_signature(&sig_str) {
             if !class_sig.interfaces.is_empty() {
                 let class_mirror = ctx.get_class_mirror(class_id);
+                let raw_interfaces = ctx.class_interfaces(class_id);
                 let arr = ctx.new_ref_array(ClassId::new(0), class_sig.interfaces.len());
                 for (i, iface) in class_sig.interfaces.iter().enumerate() {
                     // Type-variable uses in an interface type refer to THIS
@@ -11735,6 +12005,20 @@ pub(crate) fn native_class_get_generic_interfaces(
                         crate::generics::GenericDeclScope::new(Value::Object(Some(class_mirror)));
                     // SB-02b-#3: real ParameterizedTypeImpl for generic interfaces.
                     let val = crate::generics::typesig_to_real_type(ctx, iface);
+                    // A malformed or not-yet-resolvable generic argument must
+                    // not leave a null element in Type[]. Java reflection
+                    // degrades to the matching raw direct interface in this
+                    // situation; Hibernate Validator immediately dereferences
+                    // every returned Type while discovering ConstraintValidator
+                    // implementations.
+                    let val = if matches!(val, Value::Object(None)) {
+                        raw_interfaces
+                            .get(i)
+                            .map(|&id| Value::Object(Some(ctx.get_class_mirror(id))))
+                            .unwrap_or(Value::Object(None))
+                    } else {
+                        val
+                    };
                     ctx.set_array_element(arr, i, val);
                 }
                 return Ok(Some(Value::Object(Some(arr))));
@@ -13455,11 +13739,50 @@ pub(crate) fn native_class_get_class_loader(
 }
 
 pub(crate) fn native_class_as_subclass(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // Return this class
-    Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+    // `Class.asSubclass(clazz)` contract: return this Class object if it
+    // represents a subtype of `clazz`, otherwise throw ClassCastException.
+    // The previous implementation unconditionally returned `this`, which
+    // broke callers that USE the CCE for control flow — e.g. Lucene's
+    // `LuceneTestCase.newFSDirectory` relies on
+    // `CommandLineUtil.loadFSDirectoryClass(...)` throwing CCE for a
+    // non-FSDirectory `tests.directory` to fall back to a random
+    // FSDirectory; with the lenient version it proceeded to
+    // `getConstructor(Path.class, LockFactory.class)` on a directory class
+    // without that ctor and failed the test with an uncaught
+    // `NoSuchMethodException: <init>` (residual-doc item 5).
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    };
+    let target = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        // Null / missing target: keep the historic lenient return (the
+        // real JDK would NPE inside isAssignableFrom; some synthetic-mode
+        // callers pass no argument at all).
+        _ => return Ok(Some(Value::Object(Some(this)))),
+    };
+    let assignable = matches!(
+        native_class_is_assignable_from(
+            ctx,
+            &[Value::Object(Some(target)), Value::Object(Some(this))],
+        )?,
+        Some(Value::Int(v)) if v != 0
+    );
+    if assignable {
+        Ok(Some(Value::Object(Some(this))))
+    } else {
+        // HotSpot: `throw new ClassCastException(this.toString())`.
+        let name = mirror_class_name(ctx, this)
+            .unwrap_or_default()
+            .replace('/', ".");
+        Err(cratonvm_types::error::RuntimeError::ClassCastException {
+            message: format!("class {name}"),
+        }
+        .into())
+    }
 }
 
 pub(crate) fn native_class_descriptor_string(
@@ -14143,12 +14466,7 @@ pub(crate) fn native_type_variable_get_annotated_bounds(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let bounds = match ctx.invoke_virtual(
-        this,
-        "getBounds",
-        "()[Ljava/lang/reflect/Type;",
-        &[],
-    )? {
+    let bounds = match ctx.invoke_virtual(this, "getBounds", "()[Ljava/lang/reflect/Type;", &[])? {
         Some(Value::Object(Some(bounds))) => bounds,
         _ => {
             let empty = ctx.new_ref_array(ClassId::new(0), 0);
@@ -14673,7 +14991,15 @@ pub(crate) fn native_annotated_type_get_annotation(
     if let Some((arr, n)) = annotated_type_stashed_anns(ctx, this) {
         for i in 0..n {
             if let Value::Object(Some(proxy)) = ctx.get_array_element(arr, i) {
-                if let Value::Object(Some(tm)) = ctx.get_field(proxy, ANN_PROXY_TYPE_MIRROR) {
+                // Annotation instances are materialized as ordinary JDK dynamic
+                // proxies here. Do not assume the legacy synthetic
+                // `AnnotationProxy` field layout: reading slot 1 from a dynamic
+                // proxy is invalid and turns a valid type-use annotation into a
+                // false negative. The public Annotation contract supplies the
+                // precise type mirror for both representations.
+                if let Ok(Some(Value::Object(Some(tm)))) =
+                    ctx.invoke_virtual(proxy, "annotationType", "()Ljava/lang/Class;", &[])
+                {
                     if mirror_class_id(ctx, tm) == Some(want) {
                         return Ok(Some(Value::Object(Some(proxy))));
                     }
@@ -15720,6 +16046,20 @@ mod tests {
     fn class_get_simple_name_inner_class() {
         let mut ctx = mock_ctx();
         let cid = ctx.ensure_class_initialized("java/util/Map$Entry").unwrap();
+        // Real `Map$Entry` has its own `InnerClasses` attribute entry
+        // (outer=java/util/Map, inner_name=Entry) -- seed it so the mock
+        // matches what real class loading provides, since `getSimpleName()`
+        // now only strips the `$`-prefix for genuine member/local/anonymous
+        // classes (see `has_own_inner_classes_entry`).
+        ctx.set_inner_classes(
+            cid,
+            vec![(
+                "java/util/Map$Entry".to_string(),
+                "java/util/Map".to_string(),
+                "Entry".to_string(),
+                0,
+            )],
+        );
         let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "java/util/Map$Entry");
         let r = native_class_get_simple_name(&mut ctx, &[Value::Object(Some(mirror))]);
         let obj = match r.unwrap() {
@@ -15727,6 +16067,38 @@ mod tests {
             other => panic!("expected Object, got {other:?}"),
         };
         assert_eq!(ctx.read_string(obj).unwrap(), "Entry");
+    }
+
+    #[test]
+    fn class_get_simple_name_top_level_with_literal_dollar_not_split() {
+        // Dynamically-generated proxy classes (ByteBuddy/cglib/EasyMock) are
+        // genuine TOP-LEVEL classes whose literal binary name happens to
+        // contain `$` -- they have no `InnerClasses` attribute entry for
+        // themselves. Real `Class.getSimpleName()` must NOT split on `$` in
+        // this case (see jndirealmintegration-ldap-connection-npe residual:
+        // EasyMock's `isAClassMock` does
+        // `getSimpleName().contains("$$$EasyMock$")`, which silently broke
+        // when this returned just the trailing digit).
+        let mut ctx = mock_ctx();
+        let cid = ctx
+            .ensure_class_initialized("org/easymock/mocks/InitialDirContext$$$EasyMock$1")
+            .unwrap();
+        // No `set_inner_classes` call: default (empty) matches a real
+        // top-level class with no InnerClasses entry.
+        let mirror = make_class_mirror(
+            &mut ctx,
+            cid.as_u32(),
+            "org/easymock/mocks/InitialDirContext$$$EasyMock$1",
+        );
+        let r = native_class_get_simple_name(&mut ctx, &[Value::Object(Some(mirror))]);
+        let obj = match r.unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected Object, got {other:?}"),
+        };
+        assert_eq!(
+            ctx.read_string(obj).unwrap(),
+            "InitialDirContext$$$EasyMock$1"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -16192,11 +16564,24 @@ mod tests {
     fn coerce_arg_strict_reference_passes_through() {
         let mut ctx = mock_ctx();
         let obj = ctx.alloc_object(ClassId::new(0), 0);
-        let v = coerce_arg_strict(&ctx, Value::Object(Some(obj)), "Ljava/lang/Object;", "test", None)
-            .unwrap();
+        let v = coerce_arg_strict(
+            &ctx,
+            Value::Object(Some(obj)),
+            "Ljava/lang/Object;",
+            "test",
+            None,
+        )
+        .unwrap();
         assert_eq!(v, Value::Object(Some(obj)));
         // null is legal for a reference type.
-        let v = coerce_arg_strict(&ctx, Value::Object(None), "Ljava/lang/String;", "test", None).unwrap();
+        let v = coerce_arg_strict(
+            &ctx,
+            Value::Object(None),
+            "Ljava/lang/String;",
+            "test",
+            None,
+        )
+        .unwrap();
         assert_eq!(v, Value::Object(None));
     }
 
@@ -17194,6 +17579,11 @@ mod tests {
             let v = ctx.get_array_element(buf, i).as_int().unwrap_or(0);
             assert_eq!(v as u8, b, "byte {i} mismatch");
         }
+        assert_eq!(
+            ctx.native_pin_count_for_test(),
+            0,
+            "the resource-array pin must be released after stream publication"
+        );
     }
 
     // -----------------------------------------------------------------------

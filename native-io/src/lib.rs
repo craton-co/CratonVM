@@ -8190,23 +8190,6 @@ const DOS_FIELD_OUT: usize = 0;
 // Access `written` by NAME so the native and real bytecode agree on the slot.
 const DOS_WRITTEN_FIELD: &str = "written";
 
-#[derive(Default)]
-struct DisSideBuffer {
-    bytes: Vec<u8>,
-    pos: usize,
-}
-
-fn dis_side_buffers() -> &'static Mutex<HashMap<i32, DisSideBuffer>> {
-    static BUFS: OnceLock<Mutex<HashMap<i32, DisSideBuffer>>> = OnceLock::new();
-    BUFS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn dis_side_key(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
-    ctx.identity_hash_code(this)
-}
-
-const DIS_SIDE_BUFFER_SIZE: usize = 8192;
-
 fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -8287,27 +8270,19 @@ fn dis_read_one(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
 ) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
-    let key = dis_side_key(ctx, this);
-    {
-        let mut bufs = dis_side_buffers().lock();
-        if let Some(state) = bufs.get_mut(&key) {
-            if state.pos < state.bytes.len() {
-                let b = state.bytes[state.pos];
-                state.pos += 1;
-                if state.pos >= state.bytes.len() {
-                    bufs.remove(&key);
-                }
-                return Ok(b as i32);
-            }
-            bufs.remove(&key);
-        }
-    }
-
     let inner = match ctx.get_field(this, DIS_FIELD_IN) {
         Value::Object(Some(s)) => s,
         _ => return Ok(-1),
     };
-    let tmp = ctx.new_array(ArrayElementType::Byte, DIS_SIDE_BUFFER_SIZE);
+    // A DataInputStream does not own its wrapped stream; Java code may read
+    // that stream through another reference between typed reads. Prefetching
+    // 8 KiB here removed bytes from the Java stream and hid them in this Rust
+    // side buffer. ObjectInputStream does exactly that with its internal
+    // BlockDataInputStream, and javac's class-file readers also mix consumers.
+    // Read exactly the one byte requested by this helper so all consumers
+    // observe the same stream position.
+    let read_size = 1;
+    let tmp = ctx.new_array(ArrayElementType::Byte, read_size);
     let this_pin = ctx.pin_native_root(this);
     let tmp_pin = ctx.pin_native_root(tmp);
     let result = match ctx.invoke_virtual(
@@ -8317,7 +8292,7 @@ fn dis_read_one(
         &[
             Value::Object(Some(tmp)),
             Value::Int(0),
-            Value::Int(DIS_SIDE_BUFFER_SIZE as i32),
+            Value::Int(read_size as i32),
         ],
     ) {
         Ok(v) => v,
@@ -8329,6 +8304,32 @@ fn dis_read_one(
     let tmp = ctx.read_native_pin(tmp_pin, tmp);
     let n = match result {
         Some(Value::Int(v)) if v > 0 => v as usize,
+        Some(Value::Int(0)) => {
+            // InputStream implementations should not return zero for a
+            // non-empty request, but user streams sometimes do. Match
+            // DataInputStream's progress guarantee by falling back to the
+            // scalar read instead of turning zero progress into false EOF.
+            // Reload `this` after the virtual bulk call because it may have
+            // triggered a moving collection.
+            let this = ctx.read_native_pin(this_pin, this);
+            let inner = match ctx.get_field(this, DIS_FIELD_IN) {
+                Value::Object(Some(stream)) => stream,
+                _ => {
+                    ctx.unpin_native_roots(this_pin);
+                    return Ok(-1);
+                }
+            };
+            let scalar = match ctx.invoke_virtual(inner, "read", "()I", &[]) {
+                Ok(Some(Value::Int(value))) => value,
+                Ok(_) => -1,
+                Err(error) => {
+                    ctx.unpin_native_roots(this_pin);
+                    return Err(error);
+                }
+            };
+            ctx.unpin_native_roots(this_pin);
+            return Ok(scalar);
+        }
         _ => {
             ctx.unpin_native_roots(this_pin);
             return Ok(-1);
@@ -8337,13 +8338,7 @@ fn dis_read_one(
     let mut bytes = vec![0u8; n];
     ctx.read_byte_array_into(tmp, 0, &mut bytes);
     ctx.unpin_native_roots(this_pin);
-    let first = bytes[0];
-    if n > 1 {
-        dis_side_buffers()
-            .lock()
-            .insert(key, DisSideBuffer { bytes, pos: 1 });
-    }
-    Ok(first as i32)
+    Ok(bytes[0] as i32)
 }
 
 fn dis_read_exact(

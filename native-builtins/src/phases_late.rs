@@ -12,7 +12,10 @@ use cratonvm_types::error::{
 use cratonvm_types::ClassId;
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
-use crate::{alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
+use crate::{
+    alloc_concurrent_synthetic, jul_logger_handlers_get, jul_logger_handlers_set,
+    native_noop, native_noop_with_this, obj_arg,
+};
 use crate::{native_cf_then_accept, native_cf_then_apply};
 use crate::{
     BI_FIELD_SIGNUM, BI_FIELD_VALUE, CHARSET_FIELD_NAME, FUT_FIELD_DONE, FUT_FIELD_RESULT,
@@ -4929,6 +4932,7 @@ fn cm_lookup_registered(
     // relocate them (native stale-local family). One batch unpin at the end
     // covers every early return inside the closure.
     let this_pin = ctx.pin_native_root(this);
+    let cls_pin = ctx.pin_native_root(cls);
     let prefix_pin = pinned_object_value(ctx, prefix);
     let result = (|| {
         let impl_cls = match ctx.invoke(
@@ -4957,17 +4961,36 @@ fn cm_lookup_registered(
             _ => return None,
         };
         let prefix = read_pinned_object_value(ctx, prefix_pin, prefix);
-        match ctx.invoke_virtual(
+        let candidate = match ctx.invoke_virtual(
             inner,
             "get",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             &[prefix],
         ) {
-            Ok(Some(Value::Object(Some(o)))) => Some(Value::Object(Some(o))),
-            _ => None,
-        }
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => return None,
+        };
+        // A stale collection reference can leave a raw Object in the
+        // mappings table. Do not return it merely because the table has a
+        // value: the real SmallRye method performs Class.cast before returning.
+        let candidate_pin = ctx.pin_native_root(candidate);
+        let cls = ctx.read_native_pin(cls_pin, cls);
+        let candidate = ctx.read_native_pin(candidate_pin, candidate);
+        let valid = matches!(
+            ctx.invoke_virtual(
+                cls,
+                "isInstance",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(candidate))],
+            ),
+            Ok(Some(Value::Int(v))) if v != 0
+        );
+        let candidate = ctx.read_native_pin(candidate_pin, candidate);
+        ctx.unpin_native_roots(candidate_pin);
+        valid.then_some(Value::Object(Some(candidate)))
     })();
     ctx.unpin_native_roots(this_pin);
+    ctx.unpin_native_roots(cls_pin);
     result
 }
 
@@ -4998,6 +5021,65 @@ fn native_smallrye_get_config_mapping(
     if let Some(v) = cm_lookup_registered(ctx, this, cls, prefix) {
         ctx.unpin_native_roots(this_pin);
         return Ok(Some(v));
+    }
+
+    // SmallRye's keystore factory builds a short-lived config and immediately
+    // asks it for KeyStoreConfig. Unlike the main Quarkus build, that config
+    // has not populated its mappings registry yet. Register this legitimate
+    // mapping through SmallRye's own API before attempting the lower-level
+    // construction fallback; returning a fabricated interface object here
+    // degrades to java.lang.Object and fails the factory's cast.
+    let is_keystore_mapping = matches!(
+        crate::lang_class::mirror_class_name(ctx, cls).as_deref(),
+        Some("io/smallrye/config/source/keystore/KeyStoreConfig")
+    );
+    if is_keystore_mapping {
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let cls_cur = ctx.read_native_pin(cls_pin, cls);
+        let prefix_cur = read_pinned_object_value(ctx, prefix_pin, prefix);
+        if let Ok(Some(Value::Object(Some(config_class)))) = ctx.invoke(
+            "io/smallrye/config/ConfigMappings$ConfigClass",
+            "configClass",
+            "(Ljava/lang/Class;Ljava/lang/String;)Lio/smallrye/config/ConfigMappings$ConfigClass;",
+            &[Value::Object(Some(cls_cur)), prefix_cur],
+        ) {
+            let config_class_pin = ctx.pin_native_root(config_class);
+            if let Ok(Some(Value::Object(Some(mappings)))) =
+                ctx.new_object_initialized("java/util/HashSet", "()V", &[])
+            {
+                let mappings_pin = ctx.pin_native_root(mappings);
+                let config_class = ctx.read_native_pin(config_class_pin, config_class);
+                let mappings = ctx.read_native_pin(mappings_pin, mappings);
+                let _ = ctx.invoke_virtual(
+                    mappings,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(Some(config_class))],
+                );
+                let this_cur = ctx.read_native_pin(this_pin, this);
+                let mappings = ctx.read_native_pin(mappings_pin, mappings);
+                let registration = ctx
+                    .invoke(
+                        "io/smallrye/config/ConfigMappings",
+                        "registerConfigMappings",
+                        "(Lio/smallrye/config/SmallRyeConfig;Ljava/util/Set;)V",
+                        &[Value::Object(Some(this_cur)), Value::Object(Some(mappings))],
+                    );
+                if registration.is_ok() {
+                    let this_cur = ctx.read_native_pin(this_pin, this);
+                    let cls_cur = ctx.read_native_pin(cls_pin, cls);
+                    let prefix_cur = read_pinned_object_value(ctx, prefix_pin, prefix);
+                    if let Some(v) = cm_lookup_registered(ctx, this_cur, cls_cur, prefix_cur) {
+                        ctx.unpin_native_roots(config_class_pin);
+                        ctx.unpin_native_roots(mappings_pin);
+                        ctx.unpin_native_roots(this_pin);
+                        return Ok(Some(v));
+                    }
+                }
+                ctx.unpin_native_roots(mappings_pin);
+            }
+            ctx.unpin_native_roots(config_class_pin);
+        }
     }
 
     // Build the impl directly from the live config via a ConfigMappingContext.
@@ -7059,6 +7141,100 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
 
+    // `ConfigSourceContextConfigSource.getPropertyNames()` assumes its context
+    // iterator is String-only. A stale collection placeholder must never leak
+    // across that boundary: SmallRye uses this adapter while building nested
+    // keystore mappings, and its bytecode otherwise throws a CCE before it can
+    // validate the actual configured names. Preserve all genuine String names
+    // and ignore only invalid non-String entries.
+    r.register(
+        "io/smallrye/config/ConfigSourceContext$ConfigSourceContextConfigSource",
+        "getPropertyNames",
+        "()Ljava/util/Set;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let context = match ctx.get_field(this, 0) {
+                Value::Object(Some(o)) => o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let this_pin = ctx.pin_native_root(this);
+            let context_pin = ctx.pin_native_root(context);
+            let set = match ctx.new_object_initialized("java/util/HashSet", "()V", &[]) {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                _ => {
+                    ctx.unpin_native_roots(this_pin);
+                    ctx.unpin_native_roots(context_pin);
+                    return Ok(Some(Value::Object(None)));
+                }
+            };
+            let set_pin = ctx.pin_native_root(set);
+            let context = ctx.read_native_pin(context_pin, context);
+            let iterator = match ctx.invoke_virtual(context, "iterateNames", "()Ljava/util/Iterator;", &[]) {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                _ => {
+                    ctx.unpin_native_roots(this_pin);
+                    ctx.unpin_native_roots(context_pin);
+                    ctx.unpin_native_roots(set_pin);
+                    return Ok(Some(Value::Object(Some(set))));
+                }
+            };
+            let iterator_pin = ctx.pin_native_root(iterator);
+            loop {
+                let iterator = ctx.read_native_pin(iterator_pin, iterator);
+                let more = ctx.invoke_virtual(iterator, "hasNext", "()Z", &[])?;
+                if !matches!(more, Some(Value::Int(v)) if v != 0) {
+                    break;
+                }
+                let iterator = ctx.read_native_pin(iterator_pin, iterator);
+                let value = ctx.invoke_virtual(iterator, "next", "()Ljava/lang/Object;", &[])?;
+                if let Some(Value::Object(Some(value))) = value {
+                    if ctx.class_name_of_id(ctx.class_id_of_object(value)).as_deref() == Some("java/lang/String") {
+                        let value_pin = ctx.pin_native_root(value);
+                        let set = ctx.read_native_pin(set_pin, set);
+                        let value = ctx.read_native_pin(value_pin, value);
+                        let _ = ctx.invoke_virtual(set, "add", "(Ljava/lang/Object;)Z", &[Value::Object(Some(value))]);
+                        ctx.unpin_native_roots(value_pin);
+                    }
+                }
+            }
+            let set = ctx.read_native_pin(set_pin, set);
+            ctx.unpin_native_roots(this_pin);
+            ctx.unpin_native_roots(context_pin);
+            ctx.unpin_native_roots(iterator_pin);
+            ctx.unpin_native_roots(set_pin);
+            Ok(Some(Value::Object(Some(set))))
+        },
+    );
+
+    // Keycloak's legacy Config.Scope consumer calls this concrete one-argument
+    // method. Route it through the inherited two-argument lookup so config
+    // resolution follows the same path as the JDK implementation.
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/MicroProfileConfigProvider$MicroProfileScope",
+        "get",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let this_pin = ctx.pin_native_root(this);
+            let name_pin = ctx.pin_native_root(name);
+            let this_cur = ctx.read_native_pin(this_pin, this);
+            let name_cur = ctx.read_native_pin(name_pin, name);
+            let result = ctx.invoke_virtual(
+                this_cur,
+                "get",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                &[Value::Object(Some(name_cur)), Value::Object(None)],
+            );
+            ctx.unpin_native_roots(this_pin);
+            ctx.unpin_native_roots(name_pin);
+            result
+        },
+    );
+
     // --- smallrye-config KeyStoreConfigSourceFactory.getConfigSources ---
     // CratonVM divergence: In real Quarkus, the @ConfigMapping interface
     // io.smallrye.config.source.keystore.KeyStoreConfig is auto-registered with
@@ -7072,6 +7248,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // Iterable here is semantically equivalent to having no configured
     // keystores.  Short-circuit at getConfigSources so we never hit the
     // mapping lookup in getKeyStoreConfig.
+    #[cfg(any())]
     r.register(
         "io/smallrye/config/source/keystore/KeyStoreConfigSourceFactory",
         "getConfigSources",
@@ -8815,18 +8992,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     }
 
     r.register(
-        "org/keycloak/quarkus/runtime/configuration/PropertyMappingInterceptor",
-        "hasInferredValue",
-        "(Lorg/keycloak/quarkus/runtime/configuration/mappers/PropertyMapper;Lio/smallrye/config/ConfigSourceInterceptorContext;)Z",
-        native_keycloak_property_mapping_has_inferred_value,
-    );
-
-    r.register(
         "org/keycloak/quarkus/runtime/configuration/mappers/PropertyMapper",
         "getEnabledWhen",
         "()Ljava/util/Optional;",
         native_keycloak_property_mapper_get_enabled_when,
     );
+
     r.register(
         "org/keycloak/quarkus/runtime/configuration/mappers/PropertyMapper",
         "getRequiredWhen",
@@ -8895,12 +9066,6 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         native_keycloak_log_file_rotation_enabled,
     );
     r.register(
-        "org/keycloak/quarkus/runtime/configuration/mappers/LoggingPropertyMappers",
-        "isMdcActive",
-        "()Z",
-        native_keycloak_log_mdc_active,
-    );
-    r.register(
         "org/keycloak/quarkus/runtime/configuration/mappers/MetricsPropertyMappers",
         "metricsEnabled",
         "()Z",
@@ -8911,18 +9076,6 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "cacheSetToInfinispan",
         "()Z",
         native_keycloak_cache_set_to_infinispan,
-    );
-    r.register(
-        "org/keycloak/quarkus/runtime/configuration/mappers/TracingPropertyMappers",
-        "isTracingEnabled",
-        "()Z",
-        native_keycloak_tracing_enabled,
-    );
-    r.register(
-        "org/keycloak/quarkus/runtime/configuration/mappers/TracingPropertyMappers",
-        "isTracingAndEmbeddedInfinispanEnabled",
-        "()Z",
-        native_keycloak_tracing_infinispan_enabled,
     );
     r.register(
         "org/keycloak/quarkus/runtime/configuration/mappers/TelemetryPropertyMappers",
@@ -9350,8 +9503,35 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            let is_link = std::path::Path::new(&p).is_symlink();
+            let is_link = jrtfs_decode(&p)
+                .and_then(|(java_home, entry)| {
+                    jrt_image(&java_home).and_then(|image| {
+                        jrt_package_link_target(&image, &entry.strip_prefix("packages/")?)
+                    })
+                })
+                .is_some()
+                || std::path::Path::new(&p).is_symlink();
             Ok(Some(Value::Int(if is_link { 1 } else { 0 })))
+        },
+    );
+
+    r.register(
+        files,
+        "readSymbolicLink",
+        "(Ljava/nio/file/Path;)Ljava/nio/file/Path;",
+        |ctx, args| {
+            let path_obj = obj_arg(args, 0)?;
+            let p = p57_read_path(ctx, path_obj);
+            if let Some((java_home, entry)) = jrtfs_decode(&p) {
+                if let Some(target) = entry.strip_prefix("packages/").and_then(|rest| {
+                    jrt_image(&java_home).and_then(|image| jrt_package_link_target(&image, rest))
+                }) {
+                    let path =
+                        p57_alloc_path(ctx, &jrtfs_encode(&java_home, &format!("/{target}")));
+                    return Ok(Some(Value::Object(Some(path))));
+                }
+            }
+            Err(p57_no_such_file(ctx, &p))
         },
     );
 
@@ -11620,6 +11800,23 @@ fn p57_absolute_path_string(path: &str) -> String {
     }
 }
 
+/// Match java.io.File's lexical normalization for ordinary absolute paths.
+/// Preserve filesystem roots (and Windows drive roots) while removing an
+/// otherwise-significant trailing separator.
+fn p57_trim_file_trailing_separator(path: &str) -> String {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return if path.starts_with('\\') { "\\".to_string() } else { "/".to_string() };
+    }
+    if trimmed.len() == 2
+        && trimmed.as_bytes()[0].is_ascii_alphabetic()
+        && trimmed.as_bytes()[1] == b':'
+    {
+        return format!("{trimmed}/");
+    }
+    trimmed.to_string()
+}
+
 #[cfg(windows)]
 fn p57_windows_absolute_path_string(path: &str) -> String {
     let s = path.replace('\\', "/");
@@ -12715,30 +12912,50 @@ fn jrt_img_is_dir(img: &JrtImage, path: &str) -> bool {
     img.entries.get(idx).is_some_and(|e| e.starts_with(&prefix))
 }
 
+fn jrt_package_link_target(img: &JrtImage, rest: &str) -> Option<String> {
+    let (package, module) = rest.trim_matches('/').split_once('/')?;
+    if module.contains('/') {
+        return None;
+    }
+    img.package_modules
+        .get(&package.replace('.', "/"))?
+        .iter()
+        .any(|candidate| candidate == module)
+        .then(|| format!("modules/{module}"))
+}
+
+fn jrt_package_backing_entry(img: &JrtImage, rest: &str) -> Option<String> {
+    let mut parts = rest.trim_matches('/').split('/');
+    let package = parts.next()?;
+    let module = parts.next()?;
+    let target = jrt_package_link_target(img, &format!("{package}/{module}"))?;
+    let suffix = parts.collect::<Vec<_>>().join("/");
+    Some(if suffix.is_empty() {
+        target
+    } else {
+        format!("{target}/{suffix}")
+    })
+}
+
 fn jrt_package_path_kind(img: &JrtImage, rest: &str) -> JarFsKind {
     let rest = rest.trim_matches('/');
     if rest.is_empty() {
         return JarFsKind::Dir;
     }
-    if let Some((package, module)) = rest.rsplit_once('/') {
-        if img
-            .package_modules
-            .get(package)
-            .is_some_and(|modules| modules.iter().any(|m| m == module))
-        {
-            return JarFsKind::File;
-        }
-    }
-    let dir_prefix = format!("{rest}/");
-    if img.package_modules.contains_key(rest)
-        || img
-            .package_modules
-            .keys()
-            .any(|pkg| pkg.starts_with(&dir_prefix))
-    {
+    if img.package_modules.contains_key(&rest.replace('.', "/")) {
         JarFsKind::Dir
     } else {
-        JarFsKind::Absent
+        let Some(backing) = jrt_package_backing_entry(img, rest) else {
+            return JarFsKind::Absent;
+        };
+        let image_path = jrt_entry_to_image(&backing).expect("backing JRT package path is a module path");
+        if jrt_img_is_file(img, &image_path) {
+            JarFsKind::File
+        } else if jrt_img_is_dir(img, &image_path) {
+            JarFsKind::Dir
+        } else {
+            JarFsKind::Absent
+        }
     }
 }
 
@@ -12787,37 +13004,26 @@ fn jrtfs_list_dir_classified(java_home: &str, entry: &str) -> Vec<(String, bool)
     if e == "packages" {
         let mut seen = std::collections::BTreeMap::new();
         for package in img.package_modules.keys() {
-            let Some((head, rest)) = package.split_once('/') else {
-                seen.insert(format!("packages/{package}"), false);
-                continue;
-            };
-            seen.insert(format!("packages/{head}"), !rest.is_empty());
+            seen.insert(format!("packages/{}", package.replace('/', ".")), true);
         }
         return seen.into_iter().collect();
     }
     if let Some(rest) = e.strip_prefix("packages/") {
-        let mut seen: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
-        if let Some(modules) = img.package_modules.get(rest) {
-            for module in modules {
-                seen.insert(format!("packages/{rest}/{module}"), false);
-            }
+        if let Some(backing) = jrt_package_backing_entry(&img, rest) {
+            return jrtfs_list_dir_classified(java_home, &backing)
+                .into_iter()
+                .filter_map(|(child, is_dir)| {
+                    child.rsplit_once('/').map(|(_, name)| {
+                        (format!("packages/{rest}/{name}"), is_dir)
+                    })
+                })
+                .collect();
         }
-        let prefix = format!("{rest}/");
-        for package in img.package_modules.keys() {
-            let Some(tail) = package.strip_prefix(&prefix) else {
-                continue;
-            };
-            if tail.is_empty() {
-                continue;
-            }
-            let (child, is_dir) = match tail.split_once('/') {
-                Some((child, more)) => (child, !more.is_empty()),
-                None => (tail, false),
-            };
-            if !child.is_empty() {
-                let child_entry = format!("packages/{rest}/{child}");
-                let v = seen.entry(child_entry).or_insert(false);
-                *v = *v || is_dir;
+        let mut seen: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+        let package = rest.replace('.', "/");
+        if let Some(modules) = img.package_modules.get(&package) {
+            for module in modules {
+                seen.insert(format!("packages/{rest}/{module}"), true);
             }
         }
         return seen.into_iter().collect();
@@ -12874,6 +13080,99 @@ fn jrtfs_list_dir_classified(java_home: &str, entry: &str) -> Vec<(String, bool)
             seen.into_iter().collect()
         }
         None => Vec::new(),
+    }
+}
+
+/// Return the binary names of every class in a jrt module package.
+///
+/// `JavacFileManager.list` uses this view when compiling in-process.  Building
+/// it from the jimage directory index keeps javac's platform-class inventory
+/// complete instead of relying on a small hand-maintained class allowlist.
+pub(crate) fn jrtfs_list_class_binary_names(
+    java_home: &str,
+    module_name: &str,
+    package_name: &str,
+    recurse: bool,
+) -> Vec<String> {
+    let package_path = package_name.replace('.', "/");
+    let root = if package_path.is_empty() {
+        format!("modules/{module_name}")
+    } else {
+        format!("modules/{module_name}/{package_path}")
+    };
+    let module_prefix = format!("modules/{module_name}/");
+    let mut pending = vec![root];
+    let mut classes = Vec::new();
+
+    while let Some(dir) = pending.pop() {
+        for (child, is_dir) in jrtfs_list_dir_classified(java_home, &dir) {
+            if is_dir {
+                if recurse {
+                    pending.push(child);
+                }
+                continue;
+            }
+            let Some(relative) = child.strip_prefix(&module_prefix) else {
+                continue;
+            };
+            let Some(class_path) = relative.strip_suffix(".class") else {
+                continue;
+            };
+            classes.push(class_path.replace('/', "."));
+        }
+    }
+
+    classes.sort_unstable();
+    classes
+}
+
+#[cfg(test)]
+mod jrtfs_javac_listing_tests {
+    use super::jrtfs_list_class_binary_names;
+    use std::path::{Path, PathBuf};
+
+    fn test_java_home() -> Option<PathBuf> {
+        for key in ["CRATONVM_TEST_JDK", "CRATONVM_JAVA_HOME", "JAVA_HOME"] {
+            if let Some(home) = std::env::var_os(key).map(PathBuf::from) {
+                if home.join("lib/modules").is_file() {
+                    return Some(home);
+                }
+            }
+        }
+        for home in [
+            "/home/victor/jdk25",
+            "/usr/lib/jvm/java-21-openjdk-amd64",
+            "C:/Program Files/Java/jdk-25",
+        ] {
+            let path = Path::new(home);
+            if path.join("lib/modules").is_file() {
+                return Some(path.to_path_buf());
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn javac_platform_listing_uses_complete_jrt_package_inventory() {
+        let Some(java_home) = test_java_home() else {
+            eprintln!("JDK modules image unavailable; skipping jrt listing test");
+            return;
+        };
+        let java_home = java_home.to_string_lossy();
+        let direct =
+            jrtfs_list_class_binary_names(&java_home, "java.base", "java.lang", false);
+        assert!(direct.len() > 100, "java.lang listing was truncated: {direct:?}");
+        for required in ["java.lang.Object", "java.lang.Byte", "java.lang.Integer"] {
+            assert!(direct.iter().any(|name| name == required), "missing {required}");
+        }
+        let recursive =
+            jrtfs_list_class_binary_names(&java_home, "java.base", "java.lang", true);
+        assert!(
+            recursive
+                .iter()
+                .any(|name| name == "java.lang.annotation.Retention"),
+            "recursive listing omitted nested java.lang packages"
+        );
     }
 }
 
@@ -15682,6 +15981,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     .map(|cwd| cwd.join(&path).to_string_lossy().into_owned())
                     .unwrap_or(path)
             };
+            // java.io.File normalizes a trailing separator on ordinary paths
+            // (`new File("/tmp/").getAbsolutePath()` is `/tmp`). Keeping it
+            // made Keycloak persist kc.home.dir with a trailing slash while
+            // Path-based config resolution returned the normalized form.
+            let abs = p57_trim_file_trailing_separator(&abs);
             let s = ctx.create_string(&abs);
             Ok(Some(Value::Object(Some(s))))
         },
@@ -15690,13 +15994,14 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
         let p = std::path::Path::new(&path);
-        let abs = if p.is_absolute() {
-            path
-        } else {
-            std::env::current_dir()
-                .map(|cwd| cwd.join(&path).to_string_lossy().into_owned())
-                .unwrap_or(path)
-        };
+            let abs = if p.is_absolute() {
+                path
+            } else {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(&path).to_string_lossy().into_owned())
+                    .unwrap_or(path)
+            };
+        let abs = p57_trim_file_trailing_separator(&abs);
         Ok(Some(Value::Object(Some(file_alloc(ctx, &abs)))))
     });
     // Strip the Windows `\\?\` extended-length prefix that
@@ -18874,23 +19179,10 @@ fn drain_input_stream_per_byte(ctx: &mut dyn NativeContext, is_ref: ObjectRef, o
 pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // GZIPInputStream
-    let gi = "java/util/zip/GZIPInputStream";
-    r.register(gi, "<init>", "(Ljava/io/InputStream;)V", p58_gzip_in_init);
-    r.register(gi, "read", "()I", p58_gzip_in_read);
-    r.register(gi, "read", "([BII)I", p58_gzip_in_read_bytes);
-    r.register(gi, "available", "()I", p58_gzip_in_available);
-    r.register(gi, "close", "()V", |ctx, args| {
-        // Mark the stream as closed by clearing its decompressed data buffer.
-        let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > 0 {
-            ctx.set_field(this, 0, Value::Object(None));
-            if ctx.object_num_fields(this) > 1 {
-                ctx.set_field(this, 1, Value::Int(0));
-            }
-        }
-        Ok(None)
-    });
+    // Real-JDK GZIPInputStream must retain its bytecode implementation: it
+    // initializes and drives the zlib state through zip_real's private
+    // Inflater natives.  Synthetic-layout replacements here corrupt real JDK
+    // resource streams, so only the GZIPOutputStream bridge remains below.
 
     // GZIPOutputStream — accumulates data in field 0/1, compresses on finish
     let go = "java/util/zip/GZIPOutputStream";
@@ -19349,12 +19641,14 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
 fn p58_gzip_in_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let input_stream = args.get(1).copied().unwrap_or(Value::Object(None));
-    // Read all bytes from underlying stream eagerly.
-    // PERF: bulk-drain via read([B,I,I)I instead of a per-byte read()I loop.
-    let compressed = match input_stream {
-        Value::Object(Some(is)) => drain_input_stream_bulk(ctx, is),
-        _ => Vec::new(),
-    };
+    // Read all bytes from underlying stream eagerly.  Resource streams are
+    // frequently `ByteArrayInputStream`s backed by jar entries; use the scalar
+    // path here until the generic bulk virtual-dispatch path can preserve each
+    // compressed byte under all real-JDK stream subclasses.
+    let mut compressed = Vec::new();
+    if let Value::Object(Some(is)) = input_stream {
+        drain_input_stream_per_byte(ctx, is, &mut compressed);
+    }
     // Decompress with flate2 GzDecoder, bounded by the inflated-size cap so a
     // gzip bomb throws an IOException instead of exhausting the heap (finding 3).
     let decompressed = if !compressed.is_empty() {
@@ -25903,7 +26197,15 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
     );
     r.register(bfa, "isDirectory", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 3)))
+        // Coerce like `isRegularFile` below: an out-of-bounds/undersized-layout
+        // receiver makes `get_field` return `Value::Object(None)` (a dropped
+        // read), which must not leak out of a `()Z`-descriptor native as a
+        // reference value where the interpreter/JIT expects a boolean.
+        let is_dir = match ctx.get_field(this, 3) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(is_dir)))
     });
     r.register(bfa, "isRegularFile", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -28088,27 +28390,28 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let handler = args.get(1).copied().unwrap_or(Value::Object(None));
-            // The Phase 54 logger factory allocates field 2 specifically for
-            // handlers. This final Phase 61 override used to discard them,
-            // causing JULI AsyncFileHandler to receive no records at all.
-            if ctx.object_num_fields(this) > 2 {
-                let handlers = match ctx.get_field(this, 2) {
-                    Value::Object(Some(list)) => list,
-                    _ => {
-                        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-                        cratonvm_native_collections::native_al_init(
-                            ctx,
-                            &[Value::Object(Some(list))],
-                        )?;
-                        ctx.set_field(this, 2, Value::Object(Some(list)));
-                        list
-                    }
-                };
-                cratonvm_native_collections::native_al_add(
-                    ctx,
-                    &[Value::Object(Some(handlers)), handler],
-                )?;
-            }
+            // Handler list lives in a GC-safe side table keyed by identity
+            // hash, NOT a fixed field slot -- see jul_logger_handlers_get's
+            // doc comment. A real-JDK Logger's field 2 is `name` (a
+            // String), not a handlers ArrayList; reusing that slot threw
+            // NoSuchMethodError: java/lang/String.size()I from
+            // ClassLoaderLogManager.resetLoggers().
+            let handlers = match jul_logger_handlers_get(ctx, this) {
+                Some(list) => list,
+                None => {
+                    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                    cratonvm_native_collections::native_al_init(
+                        ctx,
+                        &[Value::Object(Some(list))],
+                    )?;
+                    jul_logger_handlers_set(ctx, this, list);
+                    list
+                }
+            };
+            cratonvm_native_collections::native_al_add(
+                ctx,
+                &[Value::Object(Some(handlers)), handler],
+            )?;
             Ok(None)
         },
     );
@@ -28124,14 +28427,12 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
         "()[Ljava/util/logging/Handler;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            // Logger field 2 = handlers ArrayList (added in Phase O).
-            if ctx.object_num_fields(this) > 2 {
-                if let Value::Object(Some(lst)) = ctx.get_field(this, 2) {
-                    return cratonvm_native_collections::native_al_to_array(
-                        ctx,
-                        &[Value::Object(Some(lst))],
-                    );
-                }
+            // See jul_logger_handlers_get: side table, not a field slot.
+            if let Some(lst) = jul_logger_handlers_get(ctx, this) {
+                return cratonvm_native_collections::native_al_to_array(
+                    ctx,
+                    &[Value::Object(Some(lst))],
+                );
             }
             // No handlers registered — return empty Handler[]
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
@@ -35614,7 +35915,10 @@ fn p98_walk_file_tree(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => return Ok(Some(path_val)),
     };
-    p98_walk_dir(ctx, &root_str, visitor, path_obj)?;
+    let skip_file_callbacks = ctx
+        .class_name_of_id(ctx.class_id_of_object(visitor))
+        .is_some_and(|name| name == "com/sun/tools/javac/file/JavacFileManager$ArchiveContainer$1");
+    p98_walk_dir(ctx, &root_str, visitor, path_obj, skip_file_callbacks)?;
     Ok(Some(path_val))
 }
 
@@ -35643,11 +35947,11 @@ fn p98_invoke_file_visitor(
     second_arg: Value,
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let args = [Value::Object(Some(path_obj)), second_arg];
-    let result = ctx.invoke_virtual(visitor, method_name, concrete_descriptor, &args);
+    let result = ctx.invoke_virtual(visitor, method_name, erased_descriptor, &args);
     let value = match result {
         Ok(value) => value,
-        Err(err) if p98_is_missing_visitor_method(&err, method_name, concrete_descriptor) => {
-            ctx.invoke_virtual(visitor, method_name, erased_descriptor, &args)?
+        Err(err) if p98_is_missing_visitor_method(&err, method_name, erased_descriptor) => {
+            ctx.invoke_virtual(visitor, method_name, concrete_descriptor, &args)?
         }
         Err(err) => return Err(err),
     };
@@ -35657,13 +35961,44 @@ fn p98_invoke_file_visitor(
     })
 }
 
+/// Build a real 5-field `BasicFileAttributes` (see `p59_files_read_attributes`
+/// for the canonical layout: creation=0, lastAccess=1, lastMod=2, isDir=3,
+/// size=4) for a `Files.walkFileTree` visitor callback.
+///
+/// `p98_walk_dir` used to hand every `preVisitDirectory`/`visitFile` callback
+/// a zero-field placeholder (`alloc_concurrent_synthetic(ctx, bfa, 0)`). Any
+/// real-bytecode `FileVisitor` that actually calls a `BasicFileAttributes`
+/// accessor on that placeholder (`isDirectory()`, `size()`, `creationTime()`,
+/// ...) hits the GC-guard's out-of-bounds-field-read path — silently dropped
+/// to a default rather than throwing, so the bug was invisible unless
+/// `CRATONVM_DBG_OOBFIELD`/`RUST_LOG=warn` was on. `isDirectory()` in
+/// particular (`register_p59_file_attributes`) returns the raw
+/// (out-of-bounds) `get_field` result verbatim for a `()Z`-descriptor method
+/// instead of coercing it to an `Int` — on this placeholder that silently
+/// returns `Value::Object(None)` where a boolean was expected, a type
+/// confusion that a defensively-coded caller (`isRegularFile`, which matches
+/// on `Value::Int` and falls back to `0`) tolerates but a naive caller
+/// (`isDirectory`) does not. Give every callback the real, correctly-shaped
+/// object instead of relying on the guard's fallback.
+fn p98_alloc_basic_file_attributes(ctx: &mut dyn NativeContext, is_dir: bool, size: i64) -> ObjectRef {
+    let bfa = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 5);
+    let ft = filetime_alloc(ctx, 0);
+    ctx.set_field(bfa, 0, Value::Object(Some(ft)));
+    ctx.set_field(bfa, 1, Value::Object(Some(ft)));
+    ctx.set_field(bfa, 2, Value::Object(Some(ft)));
+    ctx.set_field(bfa, 3, Value::Int(if is_dir { 1 } else { 0 }));
+    ctx.set_field(bfa, 4, Value::Long(if is_dir { 0 } else { size }));
+    bfa
+}
+
 fn p98_walk_dir(
     ctx: &mut dyn NativeContext,
     dir: &str,
     visitor: ObjectRef,
     dir_path_obj: ObjectRef,
+    skip_file_callbacks: bool,
 ) -> Result<bool, MethodCallFailed> {
-    let attrs = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 0);
+    let attrs = p98_alloc_basic_file_attributes(ctx, true, 0);
     // preVisitDirectory
     let pre = p98_invoke_file_visitor(
         ctx,
@@ -35694,15 +36029,12 @@ fn p98_walk_dir(
             let s = ctx.create_string(&es);
             ctx.set_field(epo, 0, Value::Object(Some(s)));
             if is_dir {
-                if !p98_walk_dir(ctx, &es, visitor, epo)? {
+                if !p98_walk_dir(ctx, &es, visitor, epo, skip_file_callbacks)? {
                     return Ok(false);
                 }
-            } else {
-                let fa = alloc_concurrent_synthetic(
-                    ctx,
-                    "java/nio/file/attribute/BasicFileAttributes",
-                    0,
-                );
+            } else if !skip_file_callbacks {
+                let size = jarfs_entry_size(&jar, &child).unwrap_or(0);
+                let fa = p98_alloc_basic_file_attributes(ctx, false, size);
                 let vr = p98_invoke_file_visitor(
                     ctx,
                     visitor,
@@ -35727,15 +36059,12 @@ fn p98_walk_dir(
             let s = ctx.create_string(&es);
             ctx.set_field(epo, 0, Value::Object(Some(s)));
             if is_dir {
-                if !p98_walk_dir(ctx, &es, visitor, epo)? {
+                if !p98_walk_dir(ctx, &es, visitor, epo, skip_file_callbacks)? {
                     return Ok(false);
                 }
-            } else {
-                let fa = alloc_concurrent_synthetic(
-                    ctx,
-                    "java/nio/file/attribute/BasicFileAttributes",
-                    0,
-                );
+            } else if !skip_file_callbacks {
+                let size = jrtfs_entry_size(&java_home, &child).unwrap_or(0);
+                let fa = p98_alloc_basic_file_attributes(ctx, false, size);
                 let vr = p98_invoke_file_visitor(
                     ctx,
                     visitor,
@@ -35760,15 +36089,12 @@ fn p98_walk_dir(
             let s = ctx.create_string(&es);
             ctx.set_field(epo, 0, Value::Object(Some(s)));
             if ep.is_dir() {
-                if !p98_walk_dir(ctx, &es, visitor, epo)? {
+                if !p98_walk_dir(ctx, &es, visitor, epo, skip_file_callbacks)? {
                     return Ok(false);
                 }
-            } else {
-                let fa = alloc_concurrent_synthetic(
-                    ctx,
-                    "java/nio/file/attribute/BasicFileAttributes",
-                    0,
-                );
+            } else if !skip_file_callbacks {
+                let size = entry.metadata().map(|m| m.len() as i64).unwrap_or(0);
+                let fa = p98_alloc_basic_file_attributes(ctx, false, size);
                 let vr = p98_invoke_file_visitor(
                     ctx,
                     visitor,
@@ -39112,89 +39438,30 @@ fn lucene_buffered_checksum_update_longs(
     Ok(None)
 }
 
-fn lucene_crc32_step(mut crc: u32, data: &[u8]) -> u32 {
-    for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            let mask = 0u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
-    }
-    crc
-}
-
-fn lucene_crc32_update_public(public_crc: u32, data: &[u8]) -> u32 {
-    !lucene_crc32_step(!public_crc, data)
-}
-
 fn lucene_buffered_checksum_index_input_get_checksum(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // Mirror the real Lucene bytecode exactly: `return digest.getValue();`.
+    //
+    // The previous implementation, whenever the input's read position was
+    // within 8 bytes of EOF, RE-READ the file and recomputed a CRC over
+    // `length - 8` bytes (a workaround for a since-fixed broken digest
+    // path, shaped around CodecUtil's footer idiom where getChecksum() is
+    // called at exactly length-8). That heuristic returned the WRONG value
+    // for every other caller shape — e.g. a caller that reads the entire
+    // file through openChecksumInput() got CRC(file[0..len-8]) instead of
+    // CRC(everything read), diverging from HotSpot on identical bytes
+    // (docs/internal/fixed-suite-bugs/s2-bytebuffer-natives-real-jdk-direct-buffer-gaps-FIXED.md
+    // item 4, ProbeNIOFS2: 170114997 vs 2329538857) — and silently re-read
+    // the whole file on every near-EOF getChecksum() call. The digest path
+    // (BufferedChecksum over java.util.zip.CRC32) is verified correct, so
+    // just return it.
     let this = obj_arg(args, 0)?;
-    let main = match ctx.get_field_by_name(this, "main") {
-        Value::Object(Some(main)) => main,
-        _ => return Ok(Some(Value::Long(0))),
-    };
-    let main_length = match ctx.invoke_virtual(main, "length", "()J", &[])? {
-        Some(Value::Long(v)) => v,
-        Some(Value::Int(v)) => v as i64,
-        _ => 0,
-    };
-    let main_position = match ctx.invoke_virtual(main, "getFilePointer", "()J", &[])? {
-        Some(Value::Long(v)) => v,
-        Some(Value::Int(v)) => v as i64,
-        _ => 0,
-    };
-    if main_length <= 8 || main_position < main_length - 8 {
-        return match ctx.get_field_by_name(this, "digest") {
-            Value::Object(Some(digest)) => ctx.invoke_virtual(digest, "getValue", "()J", &[]),
-            _ => Ok(Some(Value::Long(0))),
-        };
+    match ctx.get_field_by_name(this, "digest") {
+        Value::Object(Some(digest)) => ctx.invoke_virtual(digest, "getValue", "()J", &[]),
+        _ => Ok(Some(Value::Long(0))),
     }
-    let input0 =
-        match ctx.invoke_virtual(main, "clone", "()Lorg/apache/lucene/store/IndexInput;", &[])? {
-            Some(Value::Object(Some(clone))) => clone,
-            _ => main,
-        };
-    let input_pin = ctx.pin_native_root(input0);
-    let result: MethodCallResult = (|| {
-        let mut input = ctx.read_native_pin(input_pin, input0);
-        ctx.invoke_virtual(input, "seek", "(J)V", &[Value::Long(0)])?;
-        input = ctx.read_native_pin(input_pin, input);
-
-        let chunk_len = 8192usize;
-        let chunk = ctx.new_array(cratonvm_types::ArrayElementType::Byte, chunk_len);
-        let chunk_pin = ctx.pin_native_root(chunk);
-        let mut remaining = main_length - 8;
-        let mut crc = 0u32;
-        while remaining > 0 {
-            input = ctx.read_native_pin(input_pin, input);
-            let chunk = ctx.read_native_pin(chunk_pin, chunk);
-            let want = remaining.min(chunk_len as i64) as usize;
-            ctx.invoke_virtual(
-                input,
-                "readBytes",
-                "([BII)V",
-                &[
-                    Value::Object(Some(chunk)),
-                    Value::Int(0),
-                    Value::Int(want as i32),
-                ],
-            )?;
-            let chunk = ctx.read_native_pin(chunk_pin, chunk);
-            let mut bytes = vec![0u8; want];
-            let copied = ctx.read_byte_array_into(chunk, 0, &mut bytes);
-            if copied != want {
-                break;
-            }
-            crc = lucene_crc32_update_public(crc, &bytes);
-            remaining -= want as i64;
-        }
-        Ok(Some(Value::Long((crc as u64 & 0xffff_ffff) as i64)))
-    })();
-    ctx.unpin_native_roots(input_pin);
-    result
 }
 
 pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
@@ -63329,132 +63596,10 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // Deflater = 4-field (input=0, level=1, finished=2, bytesRead=3)
-    let dl = "java/util/zip/Deflater";
-    r.register(dl, "<init>", "()V", |ctx, args| {
-        p71_init_defl(ctx, args, -1)
-    });
-    r.register(dl, "<init>", "(I)V", |ctx, args| {
-        let lv = match args.get(1) {
-            Some(Value::Int(i)) => *i,
-            _ => -1,
-        };
-        p71_init_defl(ctx, args, lv)
-    });
-    r.register(dl, "setInput", "([B)V", |ctx, args| {
-        ctx.set_field(
-            obj_arg(args, 0)?,
-            0,
-            args.get(1).copied().unwrap_or(Value::Object(None)),
-        );
-        Ok(None)
-    });
-    r.register(dl, "setInput", "([BII)V", |ctx, args| {
-        ctx.set_field(
-            obj_arg(args, 0)?,
-            0,
-            args.get(1).copied().unwrap_or(Value::Object(None)),
-        );
-        Ok(None)
-    });
-    r.register(dl, "deflate", "([B)I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(dl, "deflate", "([BII)I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(dl, "finish", "()V", |ctx, args| {
-        ctx.set_field(obj_arg(args, 0)?, 2, Value::Int(1));
-        Ok(None)
-    });
-    r.register(dl, "finished", "()Z", |ctx, args| {
-        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 2)))
-    });
-    r.register(dl, "needsInput", "()Z", |ctx, args| {
-        let ni = matches!(ctx.get_field(obj_arg(args, 0)?, 0), Value::Object(None));
-        Ok(Some(Value::Int(if ni { 1 } else { 0 })))
-    });
-    r.register(dl, "getBytesRead", "()J", |ctx, args| {
-        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 3)))
-    });
-    r.register(dl, "getBytesWritten", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(0)))
-    });
-    r.register(dl, "end", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // Release all resources: clear input, mark finished, zero counters
-        ctx.set_field(this, 0, Value::Object(None));
-        ctx.set_field(this, 2, Value::Int(1)); // finished
-        ctx.set_field(this, 3, Value::Long(0));
-        Ok(None)
-    });
-    r.register(dl, "reset", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, Value::Object(None));
-        ctx.set_field(this, 2, Value::Int(0));
-        ctx.set_field(this, 3, Value::Long(0));
-        Ok(None)
-    });
-
-    // Inflater = 4-field (input=0, nowrap=1, finished=2, bytesRead=3)
-    let il = "java/util/zip/Inflater";
-    r.register(il, "<init>", "()V", |ctx, args| p71_init_infl(ctx, args, 0));
-    r.register(il, "<init>", "(Z)V", |ctx, args| {
-        let nw = match args.get(1) {
-            Some(Value::Int(i)) => *i,
-            _ => 0,
-        };
-        p71_init_infl(ctx, args, nw)
-    });
-    r.register(il, "setInput", "([B)V", |ctx, args| {
-        ctx.set_field(
-            obj_arg(args, 0)?,
-            0,
-            args.get(1).copied().unwrap_or(Value::Object(None)),
-        );
-        Ok(None)
-    });
-    r.register(il, "setInput", "([BII)V", |ctx, args| {
-        ctx.set_field(
-            obj_arg(args, 0)?,
-            0,
-            args.get(1).copied().unwrap_or(Value::Object(None)),
-        );
-        Ok(None)
-    });
-    r.register(il, "inflate", "([B)I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(il, "inflate", "([BII)I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(il, "finished", "()Z", |ctx, args| {
-        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 2)))
-    });
-    r.register(il, "needsInput", "()Z", |ctx, args| {
-        let ni = matches!(ctx.get_field(obj_arg(args, 0)?, 0), Value::Object(None));
-        Ok(Some(Value::Int(if ni { 1 } else { 0 })))
-    });
-    r.register(il, "getBytesRead", "()J", |ctx, args| {
-        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 3)))
-    });
-    r.register(il, "getBytesWritten", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(0)))
-    });
-    r.register(il, "end", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, Value::Object(None));
-        ctx.set_field(this, 2, Value::Int(1)); // finished
-        ctx.set_field(this, 3, Value::Long(0));
-        Ok(None)
-    });
-    r.register(il, "reset", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, Value::Object(None));
-        ctx.set_field(this, 2, Value::Int(0));
-        ctx.set_field(this, 3, Value::Long(0));
-        Ok(None)
-    });
+    // Do not override real-JDK Deflater/Inflater public constructors or methods.
+    // Their bytecode initializes `zsRef` through the private natives registered
+    // in zip_real; the old synthetic-layout stubs left it uninitialized and
+    // corrupted GZIPInputStream decompression.
 
     // ZipFile = 2-field (name=0, closed=1)
     let zf = "java/util/zip/ZipFile";

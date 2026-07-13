@@ -16,8 +16,8 @@ it, or extend the feature, read on.
 > tested, including integer/long reductions. See
 > [`../../README.md`](../../README.md)'s "GPU offload benchmarks"
 > section and [`../book/src/gpu/benchmarks.md`](../book/src/gpu/benchmarks.md)
-> for numbers. Open items are tracked in
-> [`../known-issues/gpu-offload-followups-20260711.md`](../known-issues/gpu-offload-followups-20260711.md).
+> for numbers. The completed hardware-validation follow-ups are recorded in
+> [`../internal/gpu-offload-followups-20260711.md`](../internal/gpu-offload-followups-20260711.md).
 
 ## Document map
 
@@ -31,9 +31,22 @@ it, or extend the feature, read on.
 | [`streams-events.md`](streams-events.md) | `Stream`, `Event`, async memcpy, `launch_on_stream`, per-buffer `last_write` ordering, stub op log for tests. |
 | [`async-api.md`](async-api.md) | `GpuExecutor`, `GpuFuture<T>`, `GpuArray<T>`, `GpuStream` for explicit async offload — including the current completion model and stream-affinity behavior. |
 | [`ci.md`](ci.md) | The self-hosted GPU CI workflow (`.github/workflows/gpu-selfhosted.yml`) and its checksum/latency gates (`bench-gpu/ci-gate.sh`). |
+| [`reductions.md`](reductions.md) | Proven integer/long reductions, PTX reduction syntax, and the intentional floating-point exclusion. |
+| [`jit-caller-gate.md`](jit-caller-gate.md) | Why eligible callers remain interpreted while GPU offload is active. |
+| [`async-completion-reaper.md`](async-completion-reaper.md) | Callback-driven finalization and the completion reaper. |
+| [`launch-work-sizing.md`](launch-work-sizing.md) | Runtime-sized grids for counted-loop kernels. |
+| [`occupancy-launch-config.md`](occupancy-launch-config.md) | Occupancy-selected CUDA block configuration. |
+| [`lowering-constants.md`](lowering-constants.md) | Numeric `ldc`/`ldc_w`/`ldc2_w` lowering. |
+| [`lowering-fp-remainder.md`](lowering-fp-remainder.md) | Opt-in floating-point remainder lowering. |
+| [`lowering-comparisons.md`](lowering-comparisons.md) | Bit-exact Java comparison opcodes. |
+| [`lowering-offset-loops.md`](lowering-offset-loops.md) | Canonical counted loops with non-zero starts. |
+| [`lowering-intrinsics.md`](lowering-intrinsics.md) | Curated `Math`/`StrictMath` intrinsic calls. |
+| [`lowering-nested-loops.md`](lowering-nested-loops.md) | Rectangular two-dimensional loop mapping. |
+| [`lowering-branches.md`](lowering-branches.md) | Basic-block and join-state lowering for loop-body branches. |
+| [`hardware-ci.md`](hardware-ci.md) | Self-hosted GPU CI scaffolding and enrollment status. |
 | [`../book/src/gpu/overview.md`](../book/src/gpu/overview.md) | User-facing book chapter: what can be offloaded, build modes, CLI flags. |
 | [`../book/src/gpu/benchmarks.md`](../book/src/gpu/benchmarks.md) | The 2026-07-11 RTX 2060 benchmark writeup (methodology + tables). |
-| [`../known-issues/gpu-offload-followups-20260711.md`](../known-issues/gpu-offload-followups-20260711.md) | Dated, itemized status of every open GPU follow-up (what's DONE, what's PARTIAL, what's still open). |
+| [`../internal/gpu-offload-followups-20260711.md`](../internal/gpu-offload-followups-20260711.md) | Dated, itemized completed GPU follow-up record. |
 
 ## At a glance
 
@@ -472,25 +485,19 @@ and a GC stress program (`GcStress`).
 
 ## Known follow-ups
 
-See [`../known-issues/gpu-offload-followups-20260711.md`](../known-issues/gpu-offload-followups-20260711.md)
-for the itemized, dated status of every open item. Summary as of
-2026-07-11 evening:
+See [`../internal/gpu-offload-followups-20260711.md`](../internal/gpu-offload-followups-20260711.md)
+for the itemized, dated completed record. Summary as of 2026-07-12:
 
 - **DONE**: reduction dispatch (int/long only — see "What the analyzer
   accepts"), the JIT-caller admission gate, the launch-config thread-
   floor/occupancy fix, `ldc`/`frem`/cmp/non-zero-loop-start/Math-
   intrinsics opcode coverage, `--print-gpu-decisions` visibility,
   self-hosted GPU CI scaffolding (runner enrollment still pending).
-- **PARTIAL**: async completion — `Event::query`/host-callback/
-  `poll_submission_status` make `isDone()` genuinely non-blocking, but
-  `get()` still only completes via a blocking `finalize_submission`;
-  there's no push model where a future completes with nobody polling.
-- **Still open**: float (`)F`/`)D`) reductions (GPU atomic-add reorders
-  summation vs. Java's sequential fp semantics — a deliberate
-  correctness/coverage tradeoff, not an oversight); general branches
-  and 2-D/nested loops inside a kernel body; `dup2_x1`/`dup2_x2`; the
-  external `craton-gpu-java` jar's Java-side bindings for the new
-  `GpuArray.allocate`/scalar-future surfaces.
+- **DONE**: asynchronous completion reaping, 2-D rectangular loops, and
+  acyclic `if`/`else` loop-body CFG lowering with join-state reconciliation.
+- **Intentional CPU fallback**: float (`)F`/`)D`) reductions (GPU atomic-add
+  reorders summation versus Java's sequential FP semantics), early exits, and
+  interior backward branches in a per-iteration kernel.
 
 ## File index (just the GPU-touching files)
 
@@ -567,7 +574,7 @@ bench-gpu/, bench-tornado/           Benchmark sources + TornadoVM twins; result
 
 docs/gpu/                            This directory.
 docs/book/src/gpu/                   User-facing book chapter + benchmarks page.
-docs/known-issues/gpu-offload-followups-20260711.md   Itemized open-work tracker.
+docs/internal/gpu-offload-followups-20260711.md       Itemized completed-work record.
 
 Cargo.toml                           cuda-bridge and jit-cuda as workspace members
 Cargo.lock                           Locked cudarc + bytemuck transitives

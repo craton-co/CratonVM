@@ -644,14 +644,12 @@ fn build_byte_array_input_stream(
     Ok(obj)
 }
 
-/// `ZipFile.entries()` / `JarFile.entries()` → `Enumeration<ZipEntry>`.
-/// Returns a synthetic `java.util.Enumeration` backed by a Rust Vec
-/// snapshot of the archive's entries.
-fn native_jarfile_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
+/// Build a `java.util.ArrayList` of synthetic `ZipEntry` objects for every
+/// entry in `this`'s archive. Shared by `entries()` (wrapped in an
+/// `Enumeration`) and `stream()` (wrapped in a `Stream`) — see the doc
+/// comment on `native_jarfile_stream` for why `stream()` needs its own
+/// native rather than falling through to real bytecode.
+fn build_zip_entry_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
     let handle = get_jar_handle(ctx, this);
     let entries: Vec<(String, i64, i64, i64, i64)> = {
         let mut table = jar_table().lock();
@@ -721,14 +719,62 @@ fn native_jarfile_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             &[Value::Object(Some(list)), Value::Object(Some(ze))],
         )?;
     }
+    Ok(Some(Value::Object(Some(list))))
+}
+
+/// `ZipFile.entries()` / `JarFile.entries()` → `Enumeration<ZipEntry>`.
+/// Returns a synthetic `java.util.Enumeration` backed by a Rust Vec
+/// snapshot of the archive's entries.
+fn native_jarfile_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let list = match build_zip_entry_list(ctx, this)? {
+        Some(Value::Object(Some(l))) => l,
+        _ => return Ok(Some(Value::Object(None))),
+    };
     // Collections.enumeration(list)
-    let en = ctx.invoke(
+    ctx.invoke(
         "java/util/Collections",
         "enumeration",
         "(Ljava/util/Collection;)Ljava/util/Enumeration;",
         &[Value::Object(Some(list))],
-    )?;
-    Ok(en)
+    )
+}
+
+/// `ZipFile.stream()` / `JarFile.stream()`.
+///
+/// BUG (found 2026-07-12): this method was NOT registered, so real JDK
+/// bytecode ran instead — and real `ZipFile.stream()` calls the private
+/// `ensureOpen()`, whose bytecode reads `this.res.zsrc` directly (not just
+/// a null-check on `res`). Our synthetic `<init>` natives
+/// (`native_jarfile_init_file`/`_string`/`_verify`) never run the real
+/// constructor, so the real `res` (`ZipFile$CleanableResource`) field is
+/// never populated and stays null — `getfield res.zsrc` on a null `res`
+/// throws `NullPointerException: Cannot read field "zsrc" because "this.res"
+/// is null`. Every OTHER public `ZipFile`/`JarFile` method that calls
+/// `ensureOpen()` (`getEntry`, `getInputStream`, `entries`, `close`,
+/// `getName`, `size`) is already registered here and so never reaches that
+/// real bytecode — `stream()` (and `getComment()`, see below) were the gap.
+/// Fix: register `stream()` too, reusing the same `ArrayList` this class
+/// already builds for `entries()`, wrapped via `ArrayList.stream()` instead
+/// of `Collections.enumeration(...)`.
+fn native_jarfile_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let list = match build_zip_entry_list(ctx, this)? {
+        Some(Value::Object(Some(l))) => l,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    ctx.invoke(
+        "java/util/ArrayList",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+        &[Value::Object(Some(list))],
+    )
 }
 
 /// `JarFile.getManifest()` → `java.util.jar.Manifest` loaded from
@@ -863,6 +909,30 @@ fn native_jarfile_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     Ok(Some(Value::Int(n)))
 }
 
+/// `ZipFile.getComment()` — the zip's central-directory comment, or `null`
+/// if none. Registered for the same reason `stream()` is (see
+/// `native_jarfile_stream`'s doc comment): real bytecode calls
+/// `ensureOpen()`, which NPEs on our never-populated `res` field.
+fn native_jarfile_get_comment(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let handle = get_jar_handle(ctx, this);
+    let comment = {
+        let table = jar_table().lock();
+        match table.get(&handle) {
+            Some(s) => s.archive.comment().to_vec(),
+            None => return Ok(Some(Value::Object(None))),
+        }
+    };
+    if comment.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let s = ctx.create_string(&String::from_utf8_lossy(&comment));
+    Ok(Some(Value::Object(Some(s))))
+}
+
 // Hold the unused-value-warning silencer for extract_string_arg.
 #[allow(dead_code)]
 fn _extract_string_arg_unused(_ctx: &dyn NativeContext, _v: Value) -> Option<String> {
@@ -916,6 +986,18 @@ pub fn register_jar_natives(r: &mut NativeMethodRegistry) {
             "entries",
             "()Ljava/util/Enumeration;",
             native_jarfile_entries,
+        );
+        r.register(
+            cls,
+            "stream",
+            "()Ljava/util/stream/Stream;",
+            native_jarfile_stream,
+        );
+        r.register(
+            cls,
+            "getComment",
+            "()Ljava/lang/String;",
+            native_jarfile_get_comment,
         );
         r.register(cls, "close", "()V", native_jarfile_close);
         r.register(
@@ -996,5 +1078,32 @@ mod tests {
         let mut out = Vec::new();
         c.read_to_end(&mut out).unwrap();
         assert_eq!(&out, data);
+    }
+
+    /// Regression coverage for `native_jarfile_get_comment`'s data source.
+    /// The zip's central-directory comment must round-trip through
+    /// `ZipArchive::comment()` exactly as written — this is the extraction
+    /// step `native_jarfile_get_comment` relies on before wrapping it as a
+    /// Java `String`.
+    #[test]
+    fn zip_comment_round_trips() {
+        let tmp = NamedTempFile::new().unwrap();
+        let file = tmp.reopen().unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        zw.set_comment("hello from a zip comment");
+        let opts = SimpleFileOptions::default();
+        zw.start_file("a.txt", opts).unwrap();
+        zw.write_all(b"x").unwrap();
+        zw.finish().unwrap();
+
+        let archive = zip::ZipArchive::new(File::open(tmp.path()).unwrap()).unwrap();
+        assert_eq!(archive.comment(), b"hello from a zip comment");
+    }
+
+    #[test]
+    fn zip_with_no_comment_has_empty_comment() {
+        let tmp = make_test_jar();
+        let archive = zip::ZipArchive::new(File::open(tmp.path()).unwrap()).unwrap();
+        assert!(archive.comment().is_empty());
     }
 }

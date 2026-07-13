@@ -49,9 +49,17 @@ the baseline VM could build.
 
 ## Validation
 
-All builds and probes ran on the Azure Linux host under `/data/data` with the
-task-specific release binary
-`cratonvm-hibstats-fixed2-20260712-001`.
+All builds and probes ran on the Azure Linux host under `/data/data`. The
+original focused validation used `cratonvm-hibstats-fixed2-20260712-001`.
+The first complete closure sweep rebuilt `dev` at `a6807594` as the unique
+release binary `cratonvm-hibstats-complete-currentdev-20260712-002`
+(SHA-256 `cefa2d5fad8841a1886710d83c9e3c8bdcfa02a009e0b7188fb951ea59c5c64f`).
+After `origin/dev` advanced, the closure branch was rebased onto `40c7e370`
+and rebuilt as `cratonvm-hibstats-complete-mergeddev-20260712-003`
+(SHA-256 `ded0269c8a7287461f9fcf53dc5bb7a09ff976aee0ccf2ecc3b0973010201c65`).
+After another runtime update, the branch was rebased onto `5806fde9` and
+rebuilt as `cratonvm-hibstats-complete-finaldev-20260712-004`
+(SHA-256 `c43e175d5458e7bdf02da19add4805cdf3b73d0142983c087c06a9c7477171f9`).
 
 | Probe/test | Before | After |
 |---|---:|---:|
@@ -69,14 +77,31 @@ cargo test --release -p cratonvm-native-builtins striped64_base_slot_tests --lib
 2 passed; 0 failed
 ```
 
-## Residual boundary
+## Complete closure sweep
 
-This archive closes the shared zero-counter defect, not every unrelated failure
-in every originally grouped class. On the fixed binary:
+The current-`dev` binary ran each class in a fresh VM process with a hard
+per-process timeout. The inventory included all 94 classes from the original
+cluster plus 21 statistics-adjacent candidates from the assertion-failure
+longtail, for 115 unique classes total. The entire inventory was repeated after
+each rebase onto newer `origin/dev` runtime changes; all three sweeps produced
+the same totals.
 
-- `cache.CacheRegionStatisticsTest` fails before statistics assertions because
-  `Dog` is not registered in its persistence unit.
-- `querycache.QueryCacheTest` and `mapping.naturalid.NaturalIdTest` reach their
-  per-class timeout without reproducing the zero-counter assertion.
+```text
+classes: 115 PASS, 0 FAIL, 0 TIMEOUT, 0 load errors
+tests:   418 found, 414 started, 414 passed, 0 failed, 0 aborted, 4 skipped
+```
 
-Those outcomes must remain separate from this resolved LongAdder family.
+All 94 original members and all 21 adjacent candidates were discovered. The
+four skips were test-declared conditions in otherwise successful classes, not
+runner or VM failures. The three residuals from the focused validation also
+closed on this current-head sweep:
+
+| Former residual | Current result |
+|---|---:|
+| `cache.CacheRegionStatisticsTest` | PASS (1/1) |
+| `querycache.QueryCacheTest` | PASS (8/8) |
+| `mapping.naturalid.NaturalIdTest` | PASS (6/6) |
+
+The standalone real-JDK probe reported `LongAdder` values `0 -> 1 -> 10`, and
+the inherited-slot Rust regression remained green (2/2). There is no remaining
+statistics-counter residual in this cluster or in its adjacent longtail set.

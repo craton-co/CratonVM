@@ -553,7 +553,14 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
         // Wait (bounded) for a taker to consume. If no taker arrives
         // within SQ_BLOCK_CAP, return anyway — same-thread tests drain
         // via `take` right after.
+        // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
+        // even though this wait is bounded (SQ_BLOCK_CAP, 2s), the thread
+        // stays counted in the STW barrier's `expected` for the whole
+        // window otherwise, needlessly delaying any GC pause requested
+        // meanwhile. `this`/`item` aren't touched again after this loop, so
+        // a plain begin/end pair (no ref re-sync) suffices.
         let deadline = Instant::now() + SQ_BLOCK_CAP;
+        ctx.begin_blocking_region();
         while state.has_item {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -562,6 +569,7 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
             let wait = remaining.min(SQ_POLL);
             slot.put_cv.wait_for(&mut state, wait);
         }
+        ctx.end_blocking_region();
         Ok(None)
     });
 
@@ -586,7 +594,7 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
 
     // take() — block until an item arrives.
     r.register(sq, "take", "()Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
+        let mut this = obj_arg(args, 0)?;
         let slot = get_or_create_slot(this);
         let mut state = slot.state.lock();
         // Fast path: item already available.
@@ -601,8 +609,14 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
                 }
             }
             // Block (bounded) waiting for a put/offer.
+            // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
+            // same bounded-but-uncounted gap as `put()` above — bracket the
+            // wait, and re-sync `this` afterward since it IS used again
+            // below (via `consume_item`), unlike `put()`.
             let deadline = Instant::now() + SQ_BLOCK_CAP;
             state.waiting_takers += 1;
+            let mut blocked_refs = [Value::Object(Some(this))];
+            ctx.begin_blocking_region();
             while !state.has_item {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -611,6 +625,11 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
                 let wait = remaining.min(SQ_POLL);
                 slot.take_cv.wait_for(&mut state, wait);
             }
+            ctx.end_blocking_region_refs(&mut blocked_refs);
+            this = match blocked_refs[0] {
+                Value::Object(Some(o)) => o,
+                _ => this,
+            };
             state.waiting_takers = state.waiting_takers.saturating_sub(1);
         }
         if state.has_item {
@@ -662,7 +681,7 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
         "poll",
         "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
+            let mut this = obj_arg(args, 0)?;
             let slot = get_or_create_slot(this);
             // Parse timeout — arg 1 is the count, arg 2 the TimeUnit
             // (enum ordinal in synthetic mode). Translate ordinal to nanos
@@ -694,8 +713,13 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
             let block_dur = Duration::from_nanos(nanos.max(0) as u64);
             let mut state = slot.state.lock();
             if !state.has_item && !block_dur.is_zero() {
+                // GC-blocking audit (STW takeover 5-class cluster,
+                // 2026-07-13) — see `take()`'s comment above for rationale;
+                // `this` is re-synced since `consume_item` uses it below.
                 let deadline = Instant::now() + block_dur.min(SQ_BLOCK_CAP);
                 state.waiting_takers += 1;
+                let mut blocked_refs = [Value::Object(Some(this))];
+                ctx.begin_blocking_region();
                 while !state.has_item {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
@@ -704,6 +728,11 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
                     let wait = remaining.min(SQ_POLL);
                     slot.take_cv.wait_for(&mut state, wait);
                 }
+                ctx.end_blocking_region_refs(&mut blocked_refs);
+                this = match blocked_refs[0] {
+                    Value::Object(Some(o)) => o,
+                    _ => this,
+                };
                 state.waiting_takers = state.waiting_takers.saturating_sub(1);
             }
             if state.has_item {

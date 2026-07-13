@@ -1591,7 +1591,13 @@ fn register_ssl_socket_factory(r: &mut NativeMethodRegistry) {
         "createSocket",
         "(Ljava/lang/String;I)Ljava/net/Socket;",
         |ctx, _args| {
+            // Seed socketLock/closeLock (see net_phase_e::re1_init_socket_locks
+            // doc comment) -- this bare allocation skips real `Socket.<init>`,
+            // and a real-bytecode `synchronized (socketLock)` method (e.g.
+            // `getImpl()`) would otherwise NPE. Same bug family as
+            // jndirealmintegration-ldap-connection-npe.md.
             let sock = alloc_concurrent_synthetic(ctx, "java/net/Socket", 2);
+            let sock = crate::net_phase_e::re1_init_socket_locks(ctx, sock);
             Ok(Some(Value::Object(Some(sock))))
         },
     );
@@ -1603,6 +1609,7 @@ fn register_ssl_socket_factory(r: &mut NativeMethodRegistry) {
         "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;",
         |ctx, _args| {
             let sock = alloc_concurrent_synthetic(ctx, "java/net/Socket", 2);
+            let sock = crate::net_phase_e::re1_init_socket_locks(ctx, sock);
             Ok(Some(Value::Object(Some(sock))))
         },
     );

@@ -481,6 +481,58 @@ fn mtroots_selfcheck(thread: &JvmThread, heap: &crate::memory::VmHeap, location:
 /// When the feature is disabled (`CRATONVM_XT_JIT_ROOT_SCAN=0`) or unsupported
 /// for the current heap, this is byte-for-byte the legacy `wait_for_all()` —
 /// zero behaviour change.
+///
+/// Perf/starvation fix (2026-07-13 — elinjsp-socket-read-timeout,
+/// stw-crossthread-jit-takeover-hang-cluster, wildfly-standalone-boot-stw-
+/// jit-takeover-hang): the per-round `take_over_pass` OS-level scan (Windows:
+/// a full `CreateToolhelp32Snapshot` plus per-peer `OpenThread`/
+/// `SuspendThread`/`GetThreadContext`/`ResumeThread`; Linux: a signal-and-wait
+/// per peer) is expensive, and suspending/resuming every peer thread —
+/// including the exact mutator this loop is waiting for — competes with that
+/// peer for scheduler time. Previously this ran unconditionally on every 1ms
+/// tick once the loop had spun even once (`rounds != 0`), regardless of
+/// whether anything was actually in JIT, for as long as the wait continued —
+/// a self-amplifying livelock where the longer the wait takes, the more it
+/// starves the very thread it is waiting for. Confirmed empirically: a
+/// single JSP-compile GC pause with exactly one pending (non-JIT,
+/// non-blocked) mutator took several minutes, logging hundreds of thousands
+/// of "0 newly taken over" scans, one per millisecond, before the mutator
+/// (itself just slow to reach its own next safepoint under the induced
+/// scheduling pressure) finally arrived.
+fn stw_takeover_should_scan(rounds: u32, jit_hint: bool) -> bool {
+    // Scan every round for the first FAST_SCAN_ROUNDS — preserves
+    // zero-added-latency behavior for the common case, where a genuinely
+    // in-JIT peer is taken over within single-digit milliseconds — then back
+    // off geometrically. A peer that enters JIT during the slow phase is
+    // still guaranteed to be found; it just carries up to one
+    // SLOW_SCAN_PERIOD/VERY_SLOW_SCAN_PERIOD round of added detection
+    // latency, negligible next to a stall already long enough to reach that
+    // phase, while cutting steady-state OS-call volume (and the
+    // peer-starvation feedback loop) by 1-2 orders of magnitude.
+    //
+    // Round 0 is deliberately left gated on the cheap `any_thread_in_jit()`
+    // hint alone (unchanged from before), so an ordinary, fully-cooperative
+    // GC pause that never needed a scan at all still does not pay for one.
+    // The hint is NOT used to gate rounds >= 1: that counter is a single
+    // process-global depth and cannot distinguish "a peer is in JIT" from "I
+    // am" — this function's caller is commonly reached via `maybe_gc` called
+    // from JIT-compiled code, so the initiator's own live JIT-entry guard can
+    // hold the hint permanently true regardless of any peer's actual state.
+    const FAST_SCAN_ROUNDS: u32 = 20;
+    const SLOW_SCAN_PERIOD: u32 = 20;
+    const VERY_SLOW_SCAN_ROUNDS: u32 = 500;
+    const VERY_SLOW_SCAN_PERIOD: u32 = 200;
+    if rounds == 0 {
+        jit_hint
+    } else if rounds < FAST_SCAN_ROUNDS {
+        true
+    } else if rounds < VERY_SLOW_SCAN_ROUNDS {
+        rounds % SLOW_SCAN_PERIOD == 0
+    } else {
+        rounds % VERY_SLOW_SCAN_PERIOD == 0
+    }
+}
+
 fn stw_take_over_and_wait(
     shared: &SharedVm,
     xt_roots: &mut Vec<ObjectRef>,
@@ -507,16 +559,17 @@ fn stw_take_over_and_wait(
     // arrive at the barrier. Keep looping until the barrier is satisfied.
     const WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
     const WARN_AFTER_ROUNDS: u32 = 64;
+    // See `stw_takeover_should_scan`'s doc for why the scan cadence backs off
+    // instead of running unconditionally on every round.
     let mut rounds = 0u32;
     let mut warned = false;
     loop {
         let tids_before = taken.tids.len();
-        // The global JIT-depth counter is a fast first-pass hint. Once a
-        // cooperative wait has actually timed out, perform a RIP-based scan
-        // even when the hint is false: a missed entry/exit bookkeeping
-        // transition must not become a permanent STW wait. The scan itself
-        // parks only peers whose RIP is inside a registered JIT range.
-        let newly = if rounds != 0 || crate::jit::conservative_roots::any_thread_in_jit() {
+        let should_scan = stw_takeover_should_scan(
+            rounds,
+            crate::jit::conservative_roots::any_thread_in_jit(),
+        );
+        let newly = if should_scan {
             xt::take_over_pass(&mut taken, &|a| shared.heap.is_object_address(a), xt_roots)
         } else {
             0
@@ -890,6 +943,21 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                         let (n, blocked, tids, blocked_tids) =
                             shared.thread_registry.alive_count_blocked_and_os_tids();
                         counted_os_tids = tids;
+                        // DIAGNOSTIC (2026-07-13, STW takeover 5-class cluster
+                        // investigation): print the EXACT identity set counted
+                        // as "expected" (alive AND NOT in_blocked_region) at
+                        // the instant this pause is requested, to disambiguate
+                        // whether a thread later seen parked was already
+                        // excluded at request time or genuinely raced in.
+                        if std::env::var_os("CRATONVM_DBG_STW_EXPECTED_IDS").is_some() {
+                            let expected_ids: Vec<u64> = shared
+                                .thread_registry
+                                .alive_thread_ids_excluding(&blocked_tids);
+                            eprintln!(
+                                "[stw-expected] initiator={} n={} blocked={} expected_ids={:?}",
+                                thread.thread_id.0, n, blocked, expected_ids
+                            );
+                        }
                         (
                             u32::try_from(n).unwrap_or(u32::MAX),
                             u32::try_from(blocked).unwrap_or(u32::MAX),
@@ -1173,6 +1241,13 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     // Round-5 fix (CRIT — UAF): drain this thread's per-thread SATB
     // buffer before initiating GC; see `maybe_gc` for the full rationale.
     shared.heap.flush_thread_satb();
+    // Real HotSpot's `System.gc()` triggers a FULL (old-gen-inclusive)
+    // collection by default — request one explicitly, since the collector's
+    // own Phase 5 otherwise only runs a major cycle when old gen crosses an
+    // occupancy threshold. See `gc_quiescence`'s doc comment for the full
+    // rationale (an already-promoted, genuinely-dead object is never swept by
+    // a `System.gc()` that only triggers a minor collection).
+    cratonvm_gc::gc_quiescence::request_major_gc();
     cratonvm_gc::gc_quiescence::begin_moving_young_coverage_cycle();
     update_root_snapshot(shared, thread);
     mtroots_set_gc_ctx(shared, thread, 1); // 1 = System.gc
@@ -1479,6 +1554,62 @@ fn process_references_after_gc(
             &is_marked,
             pointer_map,
         );
+        // Prune dead entries from the overlay-backed-collection side-tables
+        // (LinkedList / LinkedHashMap / TreeMap / TreeSet — `roots.rs` step 17
+        // / `native_collections::gc_scan_collection_overlay_roots`). This
+        // function existed but was never called from anywhere in the tree
+        // (confirmed: `gc_prune_dead_collection_overlays` had zero call
+        // sites) — a collection whose OWN object becomes genuinely
+        // unreachable left its registry entry (and every element it ever
+        // held) permanently behind, since nothing ever shrank these tables.
+        // Wiring this in is a real, independent, safe fix (verified: prunes
+        // ~1000/1470 stale entries per GC cycle in the Tomcat suite) with no
+        // change to rooting behavior — it only removes bookkeeping for
+        // collections `is_marked` already agrees are dead.
+        //
+        // NOTE: this does NOT fully close
+        // `docs/known-issues/tomcat-08-07/defaultinstancemanager-classunloading-count-mismatch.md`.
+        // `roots.rs` step 17 itself has a separate, deeper bug this session
+        // found but did not fix: `gc_scan_collection_overlay_roots` roots
+        // EVERY element of EVERY overlay-backed collection unconditionally,
+        // with no gate on whether the backing collection is reachable. A
+        // scratch `List<StackMapFrame>` the JDT compiler uses transiently
+        // during JSP compilation gets its elements force-rooted this way;
+        // forward-tracing from that illegitimate root walks back through the
+        // compiler's real field references into the evicted JSP's
+        // `JspServletWrapper` and its `ClassLoader`, keeping the whole
+        // cluster permanently, artificially reachable — confirmed via a
+        // root-membership closure check (21 direct hits, all contributed by
+        // step 17, not by any other root source). A full fix needs the same
+        // conditional-rooting + mark-time-propagation treatment this session
+        // gave `class_mirrors` (see `cratonvm_types::mirror_pin`), but scoped
+        // to every overlay table instead of just one cache — a materially
+        // larger, higher-risk change than fit in this session; left for a
+        // dedicated follow-up.
+        //
+        // Called here (not `update_all_roots`/gc.rs, where the existing
+        // remap call `gc_update_collection_overlay_refs` lives) for the same
+        // reason `reconcile_class_mirrors` is here and not there:
+        // `update_all_roots` early-returns when `pointer_map` is empty (the
+        // common case for the non-moving JIT-active sweep), so it would
+        // never run for that path. `is_marked` already handles PRE-GC
+        // addresses correctly for both the moving and non-moving cases
+        // (pointer_map lookup for moved survivors, `is_addr_live` for
+        // not-moved ones) — the same pattern `gc_reconcile_defining_loaders`
+        // above already relies on — so pruning here with pre-remap addresses
+        // is correct; the later `gc_update_collection_overlay_refs` remap
+        // pass in `update_all_roots` only touches whatever prune left behind.
+        cratonvm_native_collections::gc_prune_dead_collection_overlays(&is_marked);
+        // Companion reconciliation for the class-mirror cache — see
+        // `memory::gc::reconcile_class_mirrors` / `roots.rs` step 6. Same
+        // "before the no_refproc short-circuit" rationale: the cache must
+        // never hold a stale ObjectRef after a collection, independent of
+        // that diagnostic switch.
+        crate::memory::gc::reconcile_class_mirrors(shared, &is_marked);
+        // Rebuild the mirror_pin registry the GC marker consults (gen_heap.rs)
+        // from the now-pruned class_mirrors + just-remapped defining-loader
+        // side-table, so the marker sees current addresses next cycle.
+        crate::memory::gc::rebuild_mirror_pins(shared);
     }
 
     // bc math-ec 0x4 (CRATONVM_DBG_NO_REFPROC): subsystem-level exclusion
@@ -3023,18 +3154,19 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // conservative roots are extra MARK roots; nothing moves, so no
     // pin/pointer-map concerns.
     let mut counted_os_tids: Vec<u32> = Vec::new();
-    let initial_mark_done = shared
-        .gc_barrier
-        .request_stw_counted_with_live_blocked(thread.thread_id, || {
-            let (n, blocked, tids, blocked_tids) =
-                shared.thread_registry.alive_count_blocked_and_os_tids();
-            counted_os_tids = tids;
-            (
-                u32::try_from(n).unwrap_or(u32::MAX),
-                u32::try_from(blocked).unwrap_or(u32::MAX),
-                blocked_tids,
-            )
-        });
+    let initial_mark_done =
+        shared
+            .gc_barrier
+            .request_stw_counted_with_live_blocked(thread.thread_id, || {
+                let (n, blocked, tids, blocked_tids) =
+                    shared.thread_registry.alive_count_blocked_and_os_tids();
+                counted_os_tids = tids;
+                (
+                    u32::try_from(n).unwrap_or(u32::MAX),
+                    u32::try_from(blocked).unwrap_or(u32::MAX),
+                    blocked_tids,
+                )
+            });
     if !initial_mark_done {
         return; // Another STW was in progress
     }
@@ -3092,21 +3224,24 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // Phase 1 above (a never-polling in-JIT peer must not stall the remark
     // nor be covered only by its stale deposit snapshot).
     let mut counted_os_tids: Vec<u32> = Vec::new();
-    let remark_done = shared.gc_barrier.request_stw_counted_with_live_blocked(thread.thread_id, || {
-        // Finding 1(a): remark pauses use the identity census too, so blocked
-        // threads are excluded BY IDENTITY and their wake-time arrivals cannot
-        // satisfy this pause's quota (`arrive_and_wait_auto`). The anonymous
-        // `threads_blocked` subtraction this replaces excluded the same
-        // population without recording who it excluded.
-        let (n, blocked, tids, blocked_tids) =
-            shared.thread_registry.alive_count_blocked_and_os_tids();
-        counted_os_tids = tids;
-        (
-            u32::try_from(n).unwrap_or(u32::MAX),
-            u32::try_from(blocked).unwrap_or(u32::MAX),
-            blocked_tids,
-        )
-    });
+    let remark_done =
+        shared
+            .gc_barrier
+            .request_stw_counted_with_live_blocked(thread.thread_id, || {
+                // Finding 1(a): remark pauses use the identity census too, so blocked
+                // threads are excluded BY IDENTITY and their wake-time arrivals cannot
+                // satisfy this pause's quota (`arrive_and_wait_auto`). The anonymous
+                // `threads_blocked` subtraction this replaces excluded the same
+                // population without recording who it excluded.
+                let (n, blocked, tids, blocked_tids) =
+                    shared.thread_registry.alive_count_blocked_and_os_tids();
+                counted_os_tids = tids;
+                (
+                    u32::try_from(n).unwrap_or(u32::MAX),
+                    u32::try_from(blocked).unwrap_or(u32::MAX),
+                    blocked_tids,
+                )
+            });
     if remark_done {
         let mut xt_roots: Vec<ObjectRef> = Vec::new();
         let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
@@ -3196,18 +3331,19 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
     // roots are extra MARK roots; nothing moves, so no pin/pointer-map
     // concerns.
     let mut counted_os_tids: Vec<u32> = Vec::new();
-    let initial_mark_done = shared
-        .gc_barrier
-        .request_stw_counted_with_live_blocked(thread.thread_id, || {
-            let (n, blocked, tids, blocked_tids) =
-                shared.thread_registry.alive_count_blocked_and_os_tids();
-            counted_os_tids = tids;
-            (
-                u32::try_from(n).unwrap_or(u32::MAX),
-                u32::try_from(blocked).unwrap_or(u32::MAX),
-                blocked_tids,
-            )
-        });
+    let initial_mark_done =
+        shared
+            .gc_barrier
+            .request_stw_counted_with_live_blocked(thread.thread_id, || {
+                let (n, blocked, tids, blocked_tids) =
+                    shared.thread_registry.alive_count_blocked_and_os_tids();
+                counted_os_tids = tids;
+                (
+                    u32::try_from(n).unwrap_or(u32::MAX),
+                    u32::try_from(blocked).unwrap_or(u32::MAX),
+                    blocked_tids,
+                )
+            });
     if !initial_mark_done {
         return; // Another STW in progress
     }
@@ -3301,21 +3437,23 @@ fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread) {
     // frozen-TLAB-tail publication (consumed by the region walkers' skip
     // checks) is load-bearing here too.
     let mut counted_os_tids: Vec<u32> = Vec::new();
-    let done = shared.gc_barrier.request_stw_counted_with_live_blocked(thread.thread_id, || {
-        // Finding 1(a): remark pauses use the identity census too, so blocked
-        // threads are excluded BY IDENTITY and their wake-time arrivals cannot
-        // satisfy this pause's quota (`arrive_and_wait_auto`). The anonymous
-        // `threads_blocked` subtraction this replaces excluded the same
-        // population without recording who it excluded.
-        let (n, blocked, tids, blocked_tids) =
-            shared.thread_registry.alive_count_blocked_and_os_tids();
-        counted_os_tids = tids;
-        (
-            u32::try_from(n).unwrap_or(u32::MAX),
-            u32::try_from(blocked).unwrap_or(u32::MAX),
-            blocked_tids,
-        )
-    });
+    let done = shared
+        .gc_barrier
+        .request_stw_counted_with_live_blocked(thread.thread_id, || {
+            // Finding 1(a): remark pauses use the identity census too, so blocked
+            // threads are excluded BY IDENTITY and their wake-time arrivals cannot
+            // satisfy this pause's quota (`arrive_and_wait_auto`). The anonymous
+            // `threads_blocked` subtraction this replaces excluded the same
+            // population without recording who it excluded.
+            let (n, blocked, tids, blocked_tids) =
+                shared.thread_registry.alive_count_blocked_and_os_tids();
+            counted_os_tids = tids;
+            (
+                u32::try_from(n).unwrap_or(u32::MAX),
+                u32::try_from(blocked).unwrap_or(u32::MAX),
+                blocked_tids,
+            )
+        });
     if done {
         let mut xt_roots: Vec<ObjectRef> = Vec::new();
         let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
@@ -3387,6 +3525,18 @@ fn g1_remark_process_references(
     shared: &SharedVm,
     is_marked: &dyn Fn(usize) -> bool,
 ) -> Vec<usize> {
+    // Companion reconciliation for the class-mirror cache (see
+    // `memory::gc::reconcile_class_mirrors` / `roots.rs` step 6). `roots.rs`
+    // step 6 only stops unconditionally rooting a user-defined class's mirror
+    // when the Generational collector's non-moving marker is active — NOT
+    // under G1 (no mirror_pin propagation wired into `g1.rs` yet) — so under
+    // G1 every mirror stays rooted and this call is a no-op (`is_marked`
+    // always true, nothing pruned). Kept here anyway, unconditionally, so
+    // this stays correct for free if G1 ever gains the same treatment. Done
+    // before the `no_refproc` short-circuit, same rationale as the post-GC
+    // path.
+    crate::memory::gc::reconcile_class_mirrors(shared, is_marked);
+
     // Same subsystem-level exclusion switch as the post-GC path.
     if no_refproc() {
         return Vec::new();
@@ -11667,23 +11817,7 @@ fn execute_instruction(
     instruction: &Instruction,
     saved_pc: usize,
 ) -> Result<InstructionResult, MethodCallFailed> {
-    // ALV5th GC investigation (temp probe, CRATONVM_DBG_DESCTRACE): trace
-    // EVERY instruction executed while inside org/junit/runner/Description's
-    // addChild, unconditionally, before any opcode-specific logic runs (or
-    // can throw). Removes all assumptions about which opcode/branch fires.
-    if std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some() {
-        let cn = thread.frames[frame_idx].class_name();
-        let mn = thread.frames[frame_idx].method_name();
-        if cn == "org/junit/runner/Description" && mn == "addChild" {
-            eprintln!(
-                "[desctrace-instr] pc={} saved_pc={} instr={:?} stack_len={}",
-                thread.frames[frame_idx].pc,
-                saved_pc,
-                instruction,
-                thread.frames[frame_idx].stack.len(),
-            );
-        }
-    }
+    hotpath_counts::bump(&hotpath_counts::TOTAL_INSTRUCTIONS);
     match instruction {
         // -- Constants (T10.9.D direct CompactValue push) --
         Instruction::Nop => {}
@@ -12882,26 +13016,6 @@ fn execute_instruction(
             }
         }
         Instruction::Getfield(index) => {
-            // ALV5th GC investigation (temp probe, CRATONVM_DBG_DESCTRACE):
-            // dump the RAW (undecoded) operand-stack top the instant Getfield
-            // begins, for addChild specifically, before any pop/resolve call
-            // that could itself throw or transform the value. This bypasses
-            // every downstream assumption about which error path fires.
-            if std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some() {
-                let cn = thread.frames[frame_idx].class_name();
-                let mn = thread.frames[frame_idx].method_name();
-                if cn == "org/junit/runner/Description" && mn == "addChild" {
-                    let cv = thread.frames[frame_idx].stack.peek_compact();
-                    let v = thread.frames[frame_idx].stack.peek();
-                    eprintln!(
-                        "[desctrace-entry] Getfield in addChild pc={} stack_top raw_bits=0x{:x} tag={:?} decoded={:?}",
-                        thread.frames[frame_idx].pc,
-                        cv.raw_bits(),
-                        cv.tag(),
-                        v,
-                    );
-                }
-            }
             let current_class_id = thread.frames[frame_idx].class_id;
             // Perf: `resolve_field_name` takes a class_manager RwLock and
             // allocates a `String` — but the name is only needed for the
@@ -13132,24 +13246,6 @@ fn execute_instruction(
             } else {
                 shared.heap.get_field(obj_ref, field.field_index)
             };
-            // ALV5th GC investigation (temp probe, CRATONVM_DBG_DESCTRACE):
-            // trace every GET of fChildren, especially ones that observe
-            // null (the crash symptom), with the receiver's identity hash.
-            if std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some() {
-                let field_name = resolve_field_name(shared, current_class_id, *index);
-                if field_name.as_deref() == Some("fChildren") {
-                    eprintln!(
-                        "[desctrace-get] fChildren obj=0x{:x} ihash={} value_is_null={} in {}.{}{} pc={}",
-                        obj_ref.as_ptr() as usize,
-                        shared.heap.identity_hash_code(obj_ref),
-                        matches!(value, Value::Object(None)),
-                        thread.frames[frame_idx].class_name(),
-                        thread.frames[frame_idx].method_name(),
-                        thread.frames[frame_idx].method_descriptor(),
-                        thread.frames[frame_idx].pc,
-                    );
-                }
-            }
             // K2 (T10.9.E) — J/D direct-CompactValue fast path.
             //
             // For long/double fields, build the CompactValue with the exact
@@ -13412,26 +13508,6 @@ fn execute_instruction(
                 &field,
             ) {
                 field = retargeted;
-            }
-            // ALV5th GC investigation (temp probe, CRATONVM_DBG_DESCTRACE):
-            // trace every PUT of fChildren, recording the receiver's identity
-            // hash (stable across relocation) so it can be cross-referenced
-            // against [desctrace-fwd] relocation events and [desctrace-get]
-            // read events.
-            if std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some() {
-                let field_name = resolve_field_name(shared, current_class_id, *index);
-                if field_name.as_deref() == Some("fChildren") {
-                    eprintln!(
-                        "[desctrace-put] fChildren obj=0x{:x} ihash={} value_is_null={} in {}.{}{} pc={}",
-                        obj_ref.as_ptr() as usize,
-                        shared.heap.identity_hash_code(obj_ref),
-                        matches!(value, Value::Object(None)),
-                        thread.frames[frame_idx].class_name(),
-                        thread.frames[frame_idx].method_name(),
-                        thread.frames[frame_idx].method_descriptor(),
-                        thread.frames[frame_idx].pc,
-                    );
-                }
             }
             // Perf: ALL of the per-putfield diagnostic blocks below are gated
             // behind a SINGLE cached "any field diagnostic enabled" branch, so
@@ -14943,6 +15019,13 @@ fn lambda_proxy_satisfies(
         if &*target_name == "java/io/Serializable" {
             return true;
         }
+        // A lambda proxy is defined for precisely this functional-interface
+        // name. Its synthetic VM-only ClassId has no ClassStore hierarchy, and
+        // a global reload can select a different loader's mirror during forked
+        // test execution. The call-site metadata is authoritative here.
+        if iface_name.as_ref() == target_name {
+            return true;
+        }
         let load_result = shared.load_class_concurrent(&iface_name);
         if let Ok(iface_id) = load_result {
             return shared
@@ -14977,18 +15060,24 @@ fn loader_aware_name_assignable(
     if &*obj_class.name == target_class_name && &*target_class.name == target_class_name {
         return true;
     }
-    if !target_class.is_interface() {
-        return false;
-    }
-
     let mut queue: Vec<ClassId> = Vec::new();
     let mut current = Some(obj_class_id);
     while let Some(cid) = current {
         let Some(class) = cm.class_store.get(cid) else {
             break;
         };
+        // The resolved target can be a same-named class mirror from a
+        // different loader, not only an interface. Compare the structural
+        // superclass chain by binary name before relying on ClassId identity.
+        if &*class.name == target_class_name {
+            return true;
+        }
         queue.extend_from_slice(&class.interfaces);
         current = class.superclass;
+    }
+
+    if !target_class.is_interface() {
+        return false;
     }
 
     let mut seen: Vec<ClassId> = Vec::new();
@@ -15263,8 +15352,31 @@ pub(crate) fn aastore_element_assignable(
     // The element class must exist in the hierarchy; if not, fail open.
     {
         let cm = shared.class_manager.read();
-        if cm.get_class(value_class_id).is_none() {
+        let Some(value_class) = cm.get_class(value_class_id) else {
             return true;
+        };
+        // `array_descriptor_of` preserves only the component *name*, not its
+        // defining-loader ClassId. When a forked loader owns a same-named copy,
+        // the global lookup above can resolve the app copy and make a valid
+        // `ChildSegment[] <- ChildSegment` store look incompatible. The
+        // component identity is ambiguous here, so preserve this predicate's
+        // documented fail-open posture rather than manufacture a false ASE.
+        if &*value_class.name == comp_name && value_class_id != comp_id {
+            return true;
+        }
+        // The array header provides only a component name. With split class
+        // loaders, the stored value can be a subclass whose recorded
+        // superclass edge points to another same-named mirror. Walk that
+        // structural chain by name before treating the store as invalid.
+        let mut current = Some(value_class_id);
+        while let Some(id) = current {
+            let Some(class) = cm.get_class(id) else {
+                break;
+            };
+            if &*class.name == comp_name {
+                return true;
+            }
+            current = class.superclass;
         }
         // Component is an INTERFACE → fail open. Proving a value implements an
         // interface is unreliable in this VM (dynamic proxies, annotation
@@ -16057,6 +16169,7 @@ fn lookup_loader_initiated(
     referencing_class_id: ClassId,
     name: &str,
 ) -> Option<ClassId> {
+    hotpath_counts::bump(&hotpath_counts::LOOKUP_LOADER_INITIATED_CALLS);
     if !should_use_loader_initiated_resolution(shared, referencing_class_id) {
         return None;
     }
@@ -16444,6 +16557,7 @@ fn retarget_instance_field_to_receiver(
     receiver_class_id: ClassId,
     field: &ResolvedField,
 ) -> Option<ResolvedField> {
+    hotpath_counts::bump(&hotpath_counts::RETARGET_FIELD_CALLS);
     if field.is_static
         || receiver_class_id == ClassId::new(0)
         || receiver_class_id == field.declaring_class_id
@@ -17197,6 +17311,18 @@ fn execute_invoke_kind(
     let (method_class_name, method_name, method_descriptor, num_params) =
         resolve_method_ref(shared, current_class_id, cp_index)?;
 
+    if crate::runtime::env_cache::dbg_hang_sample() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CALL_COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n % 200_000 == 0 {
+            eprintln!(
+                "[HANG_SAMPLE_V1] call#{n} {}.{}{}",
+                &*method_class_name, &*method_name, &*method_descriptor
+            );
+        }
+    }
+
     // KAFKA-DEFAULT-RESCUE: snapshot the CP-resolved class id (if loaded)
     // before any downstream code can move `method_class_name`. The default-
     // method rescue at the NSME emit site in `invoke_on_class_shared_inner`
@@ -17270,6 +17396,18 @@ fn execute_invoke_kind(
         args.push(coerce_invoke_arg_for_descriptor(pd, v));
     }
 
+    // Apply the same forwarding read barrier used by getfield to every
+    // reference copied from the operand stack. A moving collection can leave
+    // an old from-space address in a frame slot; once the invoke pops that
+    // slot it is no longer visible to the frame-root remapper. Dispatch then
+    // dereferences the stale receiver (or a stale object argument) while
+    // resolving/invoking the callee. Refresh while the forwarding header is
+    // still available, before any class lookup or native call can touch it.
+    for value in &mut args {
+        if let Value::Object(Some(obj)) = value {
+            *obj = shared.heap.load_and_forward(*obj);
+        }
+    }
     // GC-stale `java.lang.Thread`-mirror receiver recovery.
     //
     // A moving / promoting young GC can relocate a thread's
@@ -18741,6 +18879,18 @@ fn lambda_arg_provably_not_instance(shared: &SharedVm, obj_ref: ObjectRef, desc_
         return false;
     }
     let obj_class_id = shared.heap.class_id_of(obj_ref);
+    // Lambda proxies use VM-only synthetic class IDs which intentionally do not
+    // have ClassStore metadata.  Without a real class graph we cannot prove a
+    // mismatch against the erased bridge parameter, so preserve this helper's
+    // fail-open contract and let the normal lambda dispatch validate it.
+    if shared
+        .class_manager
+        .read()
+        .get_class(obj_class_id)
+        .is_none()
+    {
+        return false;
+    }
     let (target_cid, is_sub, target_is_interface) = {
         let cm = shared.class_manager.read();
         match cm.get_loaded_class_id(target) {
@@ -18755,7 +18905,24 @@ fn lambda_arg_provably_not_instance(shared: &SharedVm, obj_ref: ObjectRef, desc_
             ),
         }
     };
+    // The lambda bridge descriptor carries a binary name only.  In a forked
+    // class-loader run the loader-blind lookup above may select the app copy
+    // of that name even though the value (and the bridge that owns it) use a
+    // child-defined copy.  Consult the value's exact defining namespace before
+    // calling the mismatch proven; this is the same identity rule used by the
+    // loader-aware checkcast path.  Restrict it to user loaders so ordinary
+    // bootstrap/application delegation remains unchanged.
+    let loader_scoped_is_sub = if crate::runtime::env_cache::loader_aware_resolution() {
+        let cm = shared.class_manager.read();
+        cm.get_loader_id(obj_class_id)
+            .filter(|loader| matches!(loader, cratonvm_types::ClassLoaderId::UserDefined(_)))
+            .and_then(|loader| cm.class_defined_by_loader_exact(target, loader))
+            .is_some_and(|scoped_target| cm.is_subclass_of(obj_class_id, scoped_target))
+    } else {
+        false
+    };
     if is_sub
+        || loader_scoped_is_sub
         || lambda_proxy_satisfies(shared, obj_class_id, target_cid)
         || synthetic_implements(shared, obj_class_id, target)
         || proxy_instance_satisfies_target(shared, obj_ref, target)
@@ -19070,6 +19237,7 @@ pub(crate) fn lambda_args_sam_compatible(
             }
         };
         if base
+            || loader_aware_name_assignable(shared, arg_cid, target_cid, target)
             || lambda_proxy_satisfies(shared, arg_cid, target_cid)
             || synthetic_implements(shared, arg_cid, target)
             || proxy_instance_satisfies_target(shared, arg, target)
@@ -19297,12 +19465,6 @@ fn try_invoke_cached_lambda_impl(
             ) else {
                 return Ok(None);
             };
-            if method.is_static() || method.is_synchronized() || method.is_native() {
-                return Ok(None);
-            }
-            let Some(code_attr) = method.code() else {
-                return Ok(None);
-            };
             let Some(class) = store.get(declaring_id) else {
                 return Ok(None);
             };
@@ -19314,6 +19476,12 @@ fn try_invoke_cached_lambda_impl(
             {
                 return Ok(None);
             }
+            if method.is_static() || method.is_synchronized() || method.is_native() {
+                return Ok(None);
+            }
+            let Some(code_attr) = method.code() else {
+                return Ok(None);
+            };
             let c = Arc::new(CachedBytecodeMethod {
                 declaring_class_id: declaring_id,
                 class_name: Arc::clone(&class.name),
@@ -20427,6 +20595,45 @@ pub(crate) fn is_typeuse_annotation_native_override(
         ),
         _ => false,
     }
+}
+
+/// java.lang.Class methods whose registered natives operate on CratonVM's
+/// class-mirror and annotation side tables. Ordinary bytecode invokes already
+/// prefer these registrations, but bound virtual method references dispatch
+/// through invoke_on_class_shared, whose concrete-bytecode precedence needs
+/// an explicit shared gate.
+pub(crate) fn is_class_mirror_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/lang/Class"
+        && matches!(
+            (method_name, descriptor),
+            ("getName", "()Ljava/lang/String;")
+                | ("getAnnotations", "()[Ljava/lang/annotation/Annotation;")
+                | (
+                    "getDeclaredAnnotations",
+                    "()[Ljava/lang/annotation/Annotation;"
+                )
+                | (
+                    "getAnnotation",
+                    "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"
+                )
+                | (
+                    "getDeclaredAnnotation",
+                    "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"
+                )
+                | ("isAnnotationPresent", "(Ljava/lang/Class;)Z")
+                | (
+                    "getAnnotationsByType",
+                    "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;"
+                )
+                | (
+                    "getDeclaredAnnotationsByType",
+                    "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;"
+                )
+        )
 }
 
 pub(crate) fn is_reflection_access_native_override(
@@ -22194,11 +22401,47 @@ pub(crate) fn is_reflection_factory_serialization_native_override(
     )
 }
 
+/// Temporary call-count instrumentation for the silent-hang-no-signature-
+/// cluster throughput residual (2026-07-13). Tallies invocations of several
+/// suspected interpreter dispatch hot-path functions, reported periodically
+/// via `CRATONVM_DBG_HOTPATH_COUNTS=1` — independent of wall-clock timing,
+/// so it stays valid signal even on a heavily contended/noisy host.
+pub(crate) mod hotpath_counts {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static FORCE_NATIVE_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static RESOLVE_METHOD_REF_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static LOOKUP_LOADER_INITIATED_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static RETARGET_FIELD_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static TOTAL_INSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn bump(counter: &AtomicU64) {
+        if !crate::runtime::env_cache::dbg_hotpath_counts() {
+            return;
+        }
+        let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() || n % 1_000_000 == 0 {
+            eprintln!(
+                "[hotpath-counts] force_native={} resolve_method_ref={} \
+                 lookup_loader_initiated={} retarget_field={} total_instr={}",
+                FORCE_NATIVE_CALLS.load(Ordering::Relaxed),
+                RESOLVE_METHOD_REF_CALLS.load(Ordering::Relaxed),
+                LOOKUP_LOADER_INITIATED_CALLS.load(Ordering::Relaxed),
+                RETARGET_FIELD_CALLS.load(Ordering::Relaxed),
+                TOTAL_INSTRUCTIONS.load(Ordering::Relaxed),
+            );
+        }
+    }
+}
+
 fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
+    hotpath_counts::bump(&hotpath_counts::FORCE_NATIVE_CALLS);
+    if is_class_mirror_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
     // Base64 encoders are represented by VM-side synthetic state.  The real
     // JDK bytecode instead reads its private object layout, which is not
     // populated for those synthetic instances and silently falls back to the
@@ -22214,6 +22457,38 @@ fn force_native_over_real_jdk_bytecode(
     if class_name == "java/lang/Object"
         && method_name == "clone"
         && method_descriptor == "()Ljava/lang/Object;"
+    {
+        return true;
+    }
+
+    // Class loading is implemented by CratonVM's native bridge so that its
+    // per-loader namespaces and parent-first delegation remain visible in
+    // real-JDK mode. The JDK methods are concrete bytecode, so force the
+    // bridge for inherited base calls (including invokespecial super calls
+    // from custom loaders); direct subclass overrides remain selected by
+    // their own declaring class.
+    if class_name == "java/lang/ClassLoader"
+        && method_name == "loadClass"
+        && matches!(
+            method_descriptor,
+            "(Ljava/lang/String;)Ljava/lang/Class;"
+                | "(Ljava/lang/String;Z)Ljava/lang/Class;"
+        )
+    {
+        return true;
+    }
+
+    // The slow invoke path already forces these generic Class metadata
+    // methods to their native Signature-attribute implementation. Keep the
+    // warmed virtual-call cache in sync; otherwise a hot call bypasses the
+    // override and re-enters the incomplete real-JDK reifier path.
+    if class_name == "java/lang/Class"
+        && matches!(
+            (method_name, method_descriptor),
+            ("getTypeParameters", "()[Ljava/lang/reflect/TypeVariable;")
+                | ("getGenericInterfaces", "()[Ljava/lang/reflect/Type;")
+                | ("getGenericSuperclass", "()Ljava/lang/reflect/Type;")
+        )
     {
         return true;
     }
@@ -22387,16 +22662,22 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
-    if class_name == "java/io/BufferedInputStream"
+    if class_name == "java/io/FilterInputStream"
+        && matches!(
+            (method_name, method_descriptor),
+            ("<init>", "(Ljava/io/InputStream;)V") | ("skip", "(J)J")
+        )
+    {
+        return true;
+    }
+
+    if class_name == "java/io/ByteArrayInputStream"
         && matches!(
             (method_name, method_descriptor),
             ("read", "()I")
                 | ("read", "([BII)I")
-                | ("skip", "(J)J")
                 | ("available", "()I")
-                | ("mark", "(I)V")
-                | ("reset", "()V")
-                | ("markSupported", "()Z")
+                | ("skip", "(J)J")
                 | ("close", "()V")
         )
     {
@@ -24006,7 +24287,7 @@ fn surefire_lazy_launcher_discover_native(
 /// Synthetic stubs are fallback implementations for fake or incomplete JDK
 /// classes. When the real class bytecode is loaded and explicitly protected,
 /// dispatch must prefer that bytecode over the approximate stub.
-fn synthetic_stub_should_yield_to_real_bytecode(
+pub(crate) fn synthetic_stub_should_yield_to_real_bytecode(
     shared: &SharedVm,
     class_name: &str,
     method_name: &str,
@@ -24020,7 +24301,37 @@ fn synthetic_stub_should_yield_to_real_bytecode(
         return false;
     }
 
-    let real_protected_stub = crate::runtime::env_cache::real_bytecode_selector()
+    if !real_protected_stub_class(class_name) {
+        return false;
+    }
+
+    let cm = shared.class_manager.read();
+    cm.get_loaded_class_id(class_name)
+        .and_then(|cid| {
+            cm.get_class(cid).and_then(|cls| {
+                if cls.is_synthetic_stub {
+                    None
+                } else {
+                    crate::classloading::find_method_recursive(
+                        cid,
+                        method_name,
+                        descriptor,
+                        &cm.class_store,
+                    )
+                    .map(|(m, _)| !m.is_native() && m.code().is_some())
+                }
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// The class allowlist for [`synthetic_stub_should_yield_to_real_bytecode`]
+/// (and `populate_invoke_cache`'s inline copy of the same predicate, which
+/// cannot call the full helper while holding the class-manager read lock):
+/// classes whose SyntheticStub natives exist only for stub-phase bootstraps
+/// and must yield to loaded real bytecode.
+pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
+    crate::runtime::env_cache::real_bytecode_selector()
         .prefers_real(class_name)
         || matches!(
             class_name,
@@ -24050,29 +24361,7 @@ fn synthetic_stub_should_yield_to_real_bytecode(
                 | "java/lang/ref/Cleaner"
                 | "java/lang/ref/Cleaner$Cleanable"
                 | "java/lang/management/ManagementFactory"
-        );
-    if !real_protected_stub {
-        return false;
-    }
-
-    let cm = shared.class_manager.read();
-    cm.get_loaded_class_id(class_name)
-        .and_then(|cid| {
-            cm.get_class(cid).and_then(|cls| {
-                if cls.is_synthetic_stub {
-                    None
-                } else {
-                    crate::classloading::find_method_recursive(
-                        cid,
-                        method_name,
-                        descriptor,
-                        &cm.class_store,
-                    )
-                    .map(|(m, _)| !m.is_native() && m.code().is_some())
-                }
-            })
-        })
-        .unwrap_or(false)
+        )
 }
 
 /// Stackless invoke: resolve a method and either call native (Handled) or push
@@ -25242,9 +25531,29 @@ fn populate_invoke_cache(
     // bytecode body, the cached Native entry must invalidate.  Look up
     // the class_id here rather than synthesizing a never-stale gate so
     // even native-resolved entries participate in JEP 109 invalidation.
+    //
+    // SyntheticStub yield: a stub-tagged native on a real-protected class
+    // whose real bytecode is loaded must NOT be cached (and especially not
+    // promoted to the cross-thread cache) — the stub body exists only for
+    // stub-phase bootstraps. Without this, a call site whose first
+    // resolution goes through this population path permanently pins the
+    // stub even though the slow-path dispatch sites correctly yield
+    // (observed 2026-07-13 with the since-removed OutputStreamWriter stub
+    // surface: `HttpServlet$NoBodyPrintWriter.resetBuffer`'s
+    // `new OutputStreamWriter` kept minting encoders with a null `se`
+    // while the sibling constructor call site ran the real ctor).
+    // Fall through to the bytecode resolution below instead.
     if let Some(callback) = shared
         .native_methods
         .find(&class_name, &method_name, &descriptor)
+        .filter(|_| {
+            !synthetic_stub_should_yield_to_real_bytecode(
+                shared,
+                &class_name,
+                &method_name,
+                &descriptor,
+            )
+        })
     {
         let cm = shared.class_manager.read();
         let gate = match cm.get_loaded_class_id(&class_name) {
@@ -25347,26 +25656,43 @@ fn populate_invoke_cache(
     // restored by the `cd396a04` "Merge branch 'main' into dev" merge).
     {
         let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
-        if let Some(callback) =
-            shared
-                .native_methods
-                .find(declaring_name, &method_name, &descriptor)
-        {
-            let gate = RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
-            drop(cm);
-            let target = CachedInvokeTarget::Native {
-                callback,
-                // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
-                num_params: num_params as u16,
-                gate,
-            };
-            shared
-                .shared_resolution
-                .insert_promoted_invoke(promoted_key, target.clone());
-            thread
-                .invoke_cache
-                .put(caller_class_id, cp_index, is_special, target);
-            return;
+        // Inline SyntheticStub yield (the full helper re-acquires the
+        // class-manager read lock, which is already held here): a stub-tagged
+        // native on a real-protected declaring class whose resolved method is
+        // real bytecode yields — do not cache the stub. `method`/`declaring_id`
+        // are the already-resolved real method/class from
+        // `find_method_recursive` above.
+        let stub_yields = shared
+            .native_methods
+            .kind_of(declaring_name, &method_name, &descriptor)
+            == Some(cratonvm_native_api::NativeKind::SyntheticStub)
+            && real_protected_stub_class(declaring_name)
+            && store.get(declaring_id).is_some_and(|c| !c.is_synthetic_stub)
+            && !method.is_native()
+            && method.code().is_some();
+        if !stub_yields {
+            if let Some(callback) =
+                shared
+                    .native_methods
+                    .find(declaring_name, &method_name, &descriptor)
+            {
+                let gate =
+                    RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
+                drop(cm);
+                let target = CachedInvokeTarget::Native {
+                    callback,
+                    // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
+                    num_params: num_params as u16,
+                    gate,
+                };
+                shared
+                    .shared_resolution
+                    .insert_promoted_invoke(promoted_key, target.clone());
+                thread
+                    .invoke_cache
+                    .put(caller_class_id, cp_index, is_special, target);
+                return;
+            }
         }
     }
 
@@ -30561,20 +30887,6 @@ fn execute_jit_call_decoded(
     // block in `execute_jit_call` for the full rationale.
     let deopt_signaled = sig.deopt;
 
-    // ALV5th GC investigation (temp probe, CRATONVM_DBG_DESCTRACE): identify
-    // exactly which JIT-compiled callee raised the pending-NPE signal, and
-    // dump its receiver/args raw pointers, before the signal is converted
-    // into a message-less Java NullPointerException.
-    if sig.npe && std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some() {
-        eprintln!(
-            "[desctrace-jitnpe] JIT callee {}.{}{} raised pending NPE — args_slice={:?} jit_args_raw={:?}",
-            cached.class_name,
-            cached.method_name,
-            cached.method_descriptor,
-            args_slice,
-            &jit_args[..np],
-        );
-    }
     // Drain pending NPE / AIOOBE set by void-return store helpers (same as
     // execute_jit_call) — route through the JIT'd method's exception table.
     if sig.npe {
@@ -30920,6 +31232,16 @@ fn execute_invokevirtual_vtable_fast(
     // All-zero header = stale pointer from zeroed GC memory — fall back
     // to the slow path which has detailed recovery logic.
     if receiver_class_id == ClassId::new(0) {
+        return Ok(CachedCallResult::CacheMiss);
+    }
+
+    // Synthetic lambda proxies implement their SAM through
+    // `try_lambda_dispatch`, not a vtable body.
+    if shared
+        .lambda_proxies
+        .read()
+        .contains_key(&receiver_class_id)
+    {
         return Ok(CachedCallResult::CacheMiss);
     }
 
@@ -31656,6 +31978,17 @@ fn execute_invokevirtual_cached(
                     if actual_class_id != receiver_class_id {
                         return Ok(CachedCallResult::CacheMiss);
                     }
+                    // Lambda proxy classes have no bytecode implementation of
+                    // their functional-interface method. They must reach the
+                    // slow path, which dispatches their SAM method handle.
+                    if !is_special
+                        && shared
+                            .lambda_proxies
+                            .read()
+                            .contains_key(&actual_class_id)
+                    {
+                        return Ok(CachedCallResult::CacheMiss);
+                    }
                     // WP2.7 — AnnotationProxy methods (incl. Object.equals/hashCode/
                     // toString from Object) must dispatch through the spec-compliant
                     // interception in `execute_invoke`, not Object's bytecode.
@@ -31947,6 +32280,16 @@ fn execute_invokevirtual_cached(
                         );
                     }
                     if actual_class_id != receiver_class_id {
+                        return Ok(CachedCallResult::CacheMiss);
+                    }
+                    // Lambda proxies require the slow `try_lambda_dispatch`
+                    // route instead of a cached interface target.
+                    if !is_special
+                        && shared
+                            .lambda_proxies
+                            .read()
+                            .contains_key(&actual_class_id)
+                    {
                         return Ok(CachedCallResult::CacheMiss);
                     }
                     // WP2.7 — same escape hatch as in the bytecode branch:
@@ -32900,6 +33243,7 @@ fn resolve_method_ref(
     current_class_id: ClassId,
     cp_index: u16,
 ) -> Result<(Arc<str>, Arc<str>, Arc<str>, usize), MethodCallFailed> {
+    hotpath_counts::bump(&hotpath_counts::RESOLVE_METHOD_REF_CALLS);
     // Check cache first — Arc::clone is a cheap refcount bump, not an allocation.
     if let Some(cached) = shared
         .resolution_cache
@@ -33647,6 +33991,53 @@ fn dump_imse_holdcount_state(shared: &SharedVm, thread: &JvmThread, exc: ObjectR
 mod tests {
     use super::*;
 
+    /// Perf/starvation fix (2026-07-13) — `stw_takeover_should_scan` must scan
+    /// every round through the fast window (catching a genuinely in-JIT peer
+    /// with no added latency), then only periodically once a stall has
+    /// already run long — never falling back to the old "scan literally every
+    /// round forever" behavior that starved the very peer it was waiting for.
+    #[test]
+    fn stw_takeover_scan_cadence_backs_off() {
+        // Round 0: gated on the hint alone, exactly like before this fix.
+        assert!(!stw_takeover_should_scan(0, false));
+        assert!(stw_takeover_should_scan(0, true));
+
+        // Fast window (rounds 1..20): always scan regardless of the hint —
+        // unchanged latency for the common near-immediate takeover case.
+        for r in 1..20u32 {
+            assert!(
+                stw_takeover_should_scan(r, false),
+                "round {r} should still scan every tick in the fast window"
+            );
+        }
+
+        // Slow window (rounds 20..500): only every 20th round.
+        assert!(stw_takeover_should_scan(20, false));
+        assert!(!stw_takeover_should_scan(21, false));
+        assert!(!stw_takeover_should_scan(39, false));
+        assert!(stw_takeover_should_scan(40, false));
+        assert!(!stw_takeover_should_scan(499, false));
+
+        // Very-slow window (rounds >= 500): only every 200th round (aligned
+        // to multiples of 200, not to 500 itself) — this is the regime a
+        // multi-minute-or-permanent stall (the WildFly parallel-extension-add
+        // hang, the 5-class Tomcat hang cluster) lives in, where the old code
+        // was doing a full OS-level suspend-scan of every peer thread on
+        // literally every 1ms tick.
+        assert!(!stw_takeover_should_scan(500, false));
+        assert!(!stw_takeover_should_scan(599, false));
+        assert!(stw_takeover_should_scan(600, false));
+        assert!(!stw_takeover_should_scan(601, false));
+        assert!(stw_takeover_should_scan(800, false));
+
+        // The hint must NOT override the backoff once rounds >= 1: it cannot
+        // distinguish a peer actually being in JIT from the initiator's own
+        // live JIT-entry guard (this function is commonly reached via
+        // `maybe_gc` called from JIT-compiled code).
+        assert!(!stw_takeover_should_scan(21, true));
+        assert!(!stw_takeover_should_scan(501, true));
+    }
+
     /// Young-GC live-reclaim ROOT FIX regression (RRWL/ThreadLocalMap$Entry
     /// IMSE/hang family, 2026-07-07): the pre-GC watch publication must
     /// include the REFERENCE OBJECTS' own addresses, not just their
@@ -33740,6 +34131,93 @@ mod tests {
             "await",
             "()V"
         ));
+    }
+
+    #[test]
+    fn class_mirror_force_native_covers_bound_method_reference_surface() {
+        let class = "java/lang/Class";
+        for (name, descriptor) in [
+            ("getName", "()Ljava/lang/String;"),
+            ("getAnnotations", "()[Ljava/lang/annotation/Annotation;"),
+            (
+                "getDeclaredAnnotations",
+                "()[Ljava/lang/annotation/Annotation;",
+            ),
+            (
+                "getAnnotation",
+                "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+            ),
+            (
+                "getDeclaredAnnotation",
+                "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+            ),
+            ("isAnnotationPresent", "(Ljava/lang/Class;)Z"),
+            (
+                "getAnnotationsByType",
+                "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;",
+            ),
+            (
+                "getDeclaredAnnotationsByType",
+                "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;",
+            ),
+        ] {
+            assert!(is_class_mirror_native_override(class, name, descriptor));
+            assert!(force_native_over_real_jdk_bytecode(class, name, descriptor));
+        }
+        assert!(!is_class_mirror_native_override(
+            class,
+            "getMethods",
+            "()[Ljava/lang/reflect/Method;"
+        ));
+    }
+
+    #[test]
+    fn buffered_input_stream_force_native_covers_constructors_and_io_surface() {
+        let buffered = "java/io/BufferedInputStream";
+        for (name, descriptor) in [
+            ("<init>", "(Ljava/io/InputStream;)V"),
+            ("<init>", "(Ljava/io/InputStream;I)V"),
+            ("read", "()I"),
+            ("read", "([BII)I"),
+            ("skip", "(J)J"),
+            ("available", "()I"),
+            ("mark", "(I)V"),
+            ("reset", "()V"),
+            ("markSupported", "()Z"),
+            ("close", "()V"),
+        ] {
+            assert!(
+                force_native_over_real_jdk_bytecode(buffered, name, descriptor),
+                "BufferedInputStream.{name}{descriptor} must use its registered native"
+            );
+        }
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/io/FilterInputStream",
+            "skip",
+            "(J)J"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/io/FilterInputStream",
+            "<init>",
+            "(Ljava/io/InputStream;)V"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/io/ByteArrayInputStream",
+            "skip",
+            "(J)J"
+        ));
+        for (name, descriptor) in [
+            ("read", "()I"),
+            ("read", "([BII)I"),
+            ("available", "()I"),
+            ("close", "()V"),
+        ] {
+            assert!(force_native_over_real_jdk_bytecode(
+                "java/io/ByteArrayInputStream",
+                name,
+                descriptor
+            ));
+        }
     }
 
     #[test]

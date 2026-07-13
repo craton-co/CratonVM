@@ -8,7 +8,7 @@ After the O(n²) algorithmic bugs in `String.substring` and the (dead-in-real-mo
 legacy `Matcher` bridge were fixed (see
 [`substring-large-parent-quadratic-allocation-FIXED.md`](substring-large-parent-quadratic-allocation-FIXED.md)
 and
-[`../../known-issues/matcher-native-full-input-redecode-quadratic.md`](../../known-issues/matcher-native-full-input-redecode-quadratic.md)),
+[`matcher-native-full-input-redecode-quadratic-FIXED.md`](matcher-native-full-input-redecode-quadratic-FIXED.md)),
 the README's `String/Regex (10K)` QuickBench kernel still showed a **37.6x**
 constant-factor gap vs HotSpot (11 ms JDK / 414 ms CratonVM). That gap is the
 interpreted `java.util.regex` engine itself: `CRATONVM_NATIVE_STRING_REGEX`

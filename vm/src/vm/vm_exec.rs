@@ -726,14 +726,30 @@ fn safe_native_call_impl(
             &format!("{des}  ->NATIVE {callee}"),
         );
     }
-    // Pin object arguments for the duration of the native: they have been
+    // Object arguments have just left the GC-visible operand stack. Refresh
+    // forwarded addresses before pinning them: pinning a stale from-space
+    // pointer preserves the bug rather than rooting the evacuated object.
+    // This is the native-call counterpart to the interpreter getfield read
+    // barrier and covers invokevirtual, invokeinterface, invokestatic, and
+    // every re-entrant native dispatch through this common choke point.
+    //
+    // No VM allocation or safepoint can occur between extracting the stack
+    // values and this barrier, so the forwarding header is still readable.
+    let mut forwarded_args = args.to_vec();
+    for value in &mut forwarded_args {
+        if let Value::Object(Some(obj)) = value {
+            *obj = shared.heap.load_and_forward(*obj);
+        }
+    }
+    let args = forwarded_args.as_slice();
     // popped from the operand stack into this Rust slice and are otherwise
+    // Pin object arguments for the duration of the native: they have been
     // invisible to `collect_roots` / frame scanning during a safepoint GC.
     let pin_base = thread.native_pin_roots.len();
-    // Retain a root index for every argument. The former four-element inline
-    // buffer could be selected before a re-entrant native path exposed a
-    // longer argument slice, leading to a bounds panic while remapping roots
-    // at the next safepoint.
+    // Retain a root index for every argument. Native calls are not restricted
+    // to the former four-element inline buffer: a re-entrant call with a
+    // longer slice (for example Set.of during Surefire bootstrap) must remain
+    // remappable at a safepoint without an out-of-bounds access.
     let mut arg_root_indices = Vec::with_capacity(args.len());
     for a in args {
         let before = thread.native_pin_roots.len();
@@ -976,8 +992,11 @@ fn safe_native_call_impl(
                         )
                     })
                     .unwrap_or_default();
+                let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
+                    .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
                 tracing::error!(
-                    "Native method panic caught: {} (native invoked from {})",
+                    "Native method panic caught in {}: {} (native invoked from {})",
+                    callee,
                     msg,
                     top
                 );
@@ -4028,6 +4047,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn read_string(&self, obj: ObjectRef) -> Option<String> {
         let class_id = self.shared.heap.class_id_of(obj);
+        // Reference arrays carry their component class ID; a String[] is not
+        // a String.
+        if self.shared.heap.kind_of(obj) != ObjectKind::Object {
+            return None;
+        }
         // Guard by class identity BEFORE the structural reader. `read_java_string`
         // below duck-types a String from the char[]/byte[] in field 0, but a
         // CratonVM synthetic `StringBuilder`/`StringBuffer` is *also* char[]-backed
@@ -6445,6 +6469,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // emits its current frames — no per-park snapshot cost needed.
         {
             let blk = self.shared.gc_barrier.enter_blocked();
+            // DIAGNOSTIC (2026-07-13, STW takeover 5-class cluster
+            // investigation): correlate against [stw-expected]'s identity
+            // list to see whether this thread's park() call landed before
+            // or after the pause was requested, and whether pre_stw-gated
+            // arrival actually fires.
+            if std::env::var_os("CRATONVM_DBG_STW_EXPECTED_IDS").is_some() {
+                eprintln!(
+                    "[stw-park] tid={} pre_stw={}",
+                    self.thread.thread_id.0, blk.pre_stw
+                );
+            }
             if blk.pre_stw {
                 // GCAUDIT-0711-FIX (finding 1a): `_auto` — the deposit above
                 // already raised `in_blocked_region` before this check.
@@ -6552,7 +6587,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             receiver = recovered;
             receiver_class_id = self.shared.heap.class_id_of(receiver);
         }
-
         // Check if the receiver is a lambda proxy.
         let call_site = {
             let proxies = self.shared.lambda_proxies.read();
@@ -7019,6 +7053,64 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     return Ok(Some(unboxed));
                 }
                 return Ok(None);
+            }
+
+            // `Class.forName(name, ..., loader)` invokes `loadClass(String)`
+            // through this NativeContext path.  For a subclass that merely
+            // inherits ClassLoader's implementation, virtual resolution must
+            // execute CratonVM's base ClassLoader native (which performs
+            // parent-first delegation and loader-local lookup), not the
+            // real-JDK bytecode/global-resolution fallback. Preserve genuine
+            // subclass overrides by checking the method's actual declarer.
+            //
+            // Spring's `DynamicClassLoader` is such an inheriting subclass;
+            // its generated classes deliberately live in the forked parent.
+            // The normal receiver resolver can retain the inherited JDK body
+            // before the base native gate sees it, collapsing this lookup to
+            // the global same-named class. Route this known inheriting loader
+            // directly through the base native to preserve parent-first
+            // fork-loader identity.
+            if method_name == "loadClass"
+                && descriptor == "(Ljava/lang/String;)Ljava/lang/Class;"
+                && class_name == "org/springframework/core/test/tools/DynamicClassLoader"
+            {
+                let mut full_args = Vec::with_capacity(1 + args.len());
+                full_args.push(Value::Object(Some(receiver)));
+                full_args.extend_from_slice(args);
+                return self.invoke_or_native(
+                    "java/lang/ClassLoader",
+                    method_name,
+                    descriptor,
+                    &full_args,
+                );
+            }
+            if method_name == "loadClass"
+                && descriptor == "(Ljava/lang/String;)Ljava/lang/Class;"
+                && resolved_from_receiver
+            {
+                let use_base_loader_native = {
+                    let cm = self.shared.class_manager.read();
+                    cm.get_class(receiver_class_id)
+                        .map(|receiver_class| {
+                            receiver_class.name.as_ref() == "java/lang/ClassLoader"
+                                || !receiver_class.methods.iter().any(|method| {
+                                    method.name.as_ref() == method_name
+                                        && method.descriptor.as_ref() == descriptor
+                                })
+                        })
+                        .unwrap_or(false)
+                };
+                if use_base_loader_native {
+                    let mut full_args = Vec::with_capacity(1 + args.len());
+                    full_args.push(Value::Object(Some(receiver)));
+                    full_args.extend_from_slice(args);
+                    return self.invoke_or_native(
+                        "java/lang/ClassLoader",
+                        method_name,
+                        descriptor,
+                        &full_args,
+                    );
+                }
             }
 
             // Prepend receiver to args.
@@ -8763,6 +8855,29 @@ pub fn invoke_or_native(
         return Ok(None);
     }
 
+    // In real-JDK mode ClassLoader's registered bridge can be tagged as a
+    // synthetic stub and therefore lose to the JDK bytecode selector. That
+    // bytecode uses the flat global class store and breaks child/fork-loader
+    // identity. The bridge is the authoritative implementation for these two
+    // base overloads, so invoke it directly once dispatch has selected
+    // `java/lang/ClassLoader`; subclass overrides remain outside this branch.
+    if effective_class == "java/lang/ClassLoader"
+        && method_name == "loadClass"
+        && matches!(
+            descriptor,
+            "(Ljava/lang/String;)Ljava/lang/Class;"
+                | "(Ljava/lang/String;Z)Ljava/lang/Class;"
+        )
+    {
+        if let Some(callback) = shared
+            .native_methods
+            .find("java/lang/ClassLoader", method_name, descriptor)
+        {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|v| coerce_native_return(v, descriptor));
+        }
+    }
+
     // peaceful-sammet — primitive-return functional-interface bridge.
     //
     // Spring/Eureka call `ToIntFunction.apply(Object)Object` on a receiver
@@ -9286,12 +9401,26 @@ pub fn invoke_special_shared(
     args: &[Value],
 ) -> MethodCallResult {
     // Native override always wins -- same priority order as invoke_or_native.
+    // EXCEPT for SyntheticStub-tagged natives on real-protected classes with
+    // loaded bytecode: invokespecial is how constructors and super-calls
+    // arrive, and running a stub <init> here while the method surface yields
+    // to real bytecode leaves the object half-initialized (observed
+    // 2026-07-13 with the since-removed OutputStreamWriter stub surface:
+    // the stub ctor never built the real StreamEncoder, so the real
+    // OSW.flush() bytecode NPE'd on `this.se`).
     if let Some(callback) = shared
         .native_methods
         .find(class_name, method_name, descriptor)
     {
-        return safe_native_call(shared, thread, callback, args)
-            .map(|v| coerce_native_return(v, descriptor));
+        if !crate::runtime::interpreter::synthetic_stub_should_yield_to_real_bytecode(
+            shared,
+            class_name,
+            method_name,
+            descriptor,
+        ) {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|v| coerce_native_return(v, descriptor));
+        }
     }
 
     // GC-safety: pin object args across class load + <clinit> and re-read the
@@ -10511,11 +10640,23 @@ fn adapt_array_contains(shared: &SharedVm, arr_val: Option<Value>, target_name: 
             Ok(Value::Object(Some(o))) => o,
             _ => continue,
         };
-        // Enum constant: slot 0 = name String (java.lang.Enum layout).
-        if let Value::Object(Some(name_obj)) = shared.heap.get_field(elem, 0) {
-            if let Some(s) = super::read_java_string(&shared.heap, name_obj) {
-                if s == target_name {
-                    return true;
+        // Resolve Enum.name through the actual hierarchy. In real-JDK mode
+        // subclasses may have fields before their inherited Enum fields, so
+        // assuming slot 0 causes CLASS_TO_STRING to be silently skipped.
+        let name_index = {
+            let cm = shared.class_manager.read();
+            resolve_field_index_in_hierarchy(
+                shared.heap.class_id_of(elem),
+                "name",
+                &cm.class_store,
+            )
+        };
+        if let Some(name_index) = name_index {
+            if let Value::Object(Some(name_obj)) = shared.heap.get_field(elem, name_index) {
+                if let Some(s) = super::read_java_string(&shared.heap, name_obj) {
+                    if s == target_name {
+                        return true;
+                    }
                 }
             }
         }
@@ -11891,6 +12032,21 @@ fn invoke_on_class_shared_inner(
                     // (e.g. ByteArrayInputStream created by getResourceAsStream).
                     let check_override = method.is_abstract()
                         || class_name == "java/io/ByteArrayInputStream"
+                        // Jandex constructs a real-JDK BufferedInputStream around
+                        // a resource stream.  Its registered native methods use
+                        // the inherited `in` field, so its constructor must use
+                        // the matching native layout initialization as well.
+                        || (class_name == "java/io/BufferedInputStream"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("<init>", "(Ljava/io/InputStream;)V")
+                                    | ("<init>", "(Ljava/io/InputStream;I)V")
+                            ))
+                        || (class_name == "java/io/FilterInputStream"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("<init>", "(Ljava/io/InputStream;)V") | ("skip", "(J)J")
+                            ))
                         // `java.util.Base64` and its Encoder/Decoder methods
                         // are concrete JDK bytecode.  CratonVM supplies the
                         // complete family as native intrinsics so they can
@@ -11942,6 +12098,27 @@ fn invoke_on_class_shared_inner(
                             && (method_name == "getTypeParameters"
                                 || method_name == "getGenericInterfaces"
                                 || method_name == "getGenericSuperclass"))
+                        // Lambda method references are dispatched through
+                        // `invoke_on_class_shared`, which normally permits a
+                        // concrete JDK method body to win over a registered
+                        // native.  That is invalid for Class mirrors: the
+                        // real JDK bodies read the host layout, while Craton
+                        // mirrors keep their metadata VM-side.  In particular
+                        // `SomeClass::getDeclaredAnnotations` returned an
+                        // empty array (and `SomeClass::getName` an internal
+                        // slash-separated name) although direct invokevirtual
+                        // calls correctly used the overrides.  Hibernate
+                        // Models constructs its annotation supplier with that
+                        // method-reference form, silently dropping every
+                        // mapped entity.  Keep these Class mirror accessors
+                        // native regardless of whether their JDK declaration
+                        // is concrete or ACC_NATIVE.
+                        || (class_name == "java/lang/Class"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("getName", "()Ljava/lang/String;")
+                                    | ("getDeclaredAnnotations", "()[Ljava/lang/annotation/Annotation;")
+                            ))
                         // Spring generic metadata: Method/Constructor/Field generic
                         // accessors are concrete JDK bytecode methods, but their
                         // sun.reflect.generics repository path is incomplete under
@@ -13468,17 +13645,10 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/util/concurrent/LinkedBlockingDeque"
                             && method_name == "clear"
                             && descriptor == "()V")
-                        || (class_name == "java/io/BufferedInputStream"
+                        || (class_name == "java/io/FilterInputStream"
                             && matches!(
                                 (method_name, descriptor),
-                                ("read", "()I")
-                                    | ("read", "([BII)I")
-                                    | ("skip", "(J)J")
-                                    | ("available", "()I")
-                                    | ("mark", "(I)V")
-                                    | ("reset", "()V")
-                                    | ("markSupported", "()Z")
-                                    | ("close", "()V")
+                                ("<init>", "(Ljava/io/InputStream;)V") | ("skip", "(J)J")
                             ))
                         || (matches!(class_name, "java/lang/Iterable" | "java/util/Collection" | "java/util/Set" | "java/util/EnumSet")
                             && method_name == "iterator"
@@ -14081,6 +14251,11 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
+                        || crate::runtime::interpreter::is_class_mirror_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
                         || crate::runtime::interpreter::is_awt_imageio_native_override(
                             class_name,
                             method_name,
@@ -14181,6 +14356,9 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
+                        || (class_name == "org/keycloak/quarkus/runtime/configuration/MicroProfileConfigProvider$MicroProfileScope"
+                            && method_name == "get"
+                            && descriptor == "(Ljava/lang/String;)Ljava/lang/String;")
                         || crate::runtime::interpreter::is_file_channel_impl_open_native_override(
                             class_name,
                             method_name,
@@ -14200,7 +14378,19 @@ fn invoke_on_class_shared_inner(
                             class_name,
                             method_name,
                             descriptor,
-                        );
+                        )
+                        // `ClassLoader.loadClass` is backed by concrete JDK bytecode,
+                        // but CratonVM supplies the actual loader-aware implementation
+                        // as a native.  Let that native win when an inherited base
+                        // method is selected; direct subclass overrides still resolve
+                        // on their own declaring class and continue to run normally.
+                        || (class_name == "java/lang/ClassLoader"
+                            && method_name == "loadClass"
+                            && matches!(
+                                descriptor,
+                                "(Ljava/lang/String;)Ljava/lang/Class;"
+                                    | "(Ljava/lang/String;Z)Ljava/lang/Class;"
+                            ));
                     if check_override
                         && shared
                             .native_methods
@@ -15514,6 +15704,17 @@ fn invoke_on_class_shared_inner(
             && !force_ffm_group_layout_interface_native
             && !force_ffm_memory_layout_interface_native
         {
+            None
+        } else if crate::runtime::interpreter::synthetic_stub_should_yield_to_real_bytecode(
+            shared,
+            &class_name_for_override,
+            method_name,
+            descriptor,
+        ) {
+            // SyntheticStub-tagged native on a real-protected class whose real
+            // bytecode is loaded: the stub body exists only for stub-phase
+            // bootstraps — run the bytecode (same yield the other dispatch
+            // sites apply; without it this re-check kept serving the stub).
             None
         } else {
             shared

@@ -77,7 +77,7 @@ String/Regex's O(n²)-shaped scaling (18.8x at 1K entries → 238.8x at 10K in t
 original profiling) was a `Matcher` native find()/group() path and a
 substring-from-large-parent allocation path, both quadratic-allocation bugs, not
 interpreter overhead — see
-[`docs/known-issues/matcher-native-full-input-redecode-quadratic.md`](docs/known-issues/matcher-native-full-input-redecode-quadratic.md)
+[`docs/internal/fixed-suite-bugs/matcher-native-full-input-redecode-quadratic-FIXED.md`](docs/internal/fixed-suite-bugs/matcher-native-full-input-redecode-quadratic-FIXED.md)
 and
 [`docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`](docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md)
 (merged `a87901e6`). That landed the algorithmic (O(n²)→O(n)) fix and left a
@@ -489,7 +489,7 @@ and the cold-start 4-way in [gpu-comparison-20260711.md](bench-gpu/results/gpu-c
 (includes N = 2²⁸ / 269M elements: 579 ms on GPU vs 30.8 s CratonVM CPU).
 Benchmark sources live in `bench-gpu/` (+ `bench-tornado/` for the TornadoVM twins). Numbers were taken on a
 machine with background load; treat CPU baselines as ±25%. Open GPU work is
-tracked in [docs/known-issues/gpu-offload-followups-20260711.md](docs/known-issues/gpu-offload-followups-20260711.md).
+recorded in [docs/internal/gpu-offload-followups-20260711.md](docs/internal/gpu-offload-followups-20260711.md).
 
 ### Update 2026-07-11 (evening)
 
@@ -500,7 +500,7 @@ literals outside `sipush` range, and any float/double/long literal), a JIT-calle
 admission gate that keeps offload-eligible callers interpreted so OSR can no
 longer silently degrade offload back to CPU, and a curated `Math`/`StrictMath`
 intrinsics table (`sqrt`/`abs`/`min`/`max`/`fma`) under `ALLOW_INTRINSIC_CALLS`.
-Full detail in [docs/known-issues/gpu-offload-followups-20260711.md](docs/known-issues/gpu-offload-followups-20260711.md)
+Full detail in [docs/internal/gpu-offload-followups-20260711.md](docs/internal/gpu-offload-followups-20260711.md)
 and [docs/gpu/annotations.md](docs/gpu/annotations.md).
 
 **Reduction dispatch** (`bench-gpu/GpuDotBench.java`, `sum += (long) a[i] * b[i]`

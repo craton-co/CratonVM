@@ -335,6 +335,14 @@ fn should_skip_jit_internal(
     allow_packages: &[&str],
     skip_init_check: bool,
 ) -> Option<SkipReason> {
+    // ES812 postings JIT residual (2026-07-13): indexedBinarySearch can
+    // invoke a lambda apply method through the wrong receiver after an
+    // aggressive java/util promotion. Interpret this dispatcher until the
+    // invokeinterface PIC invalidation handles changing lambda receivers.
+    if class_name == "java/util/Collections" && method_name == "indexedBinarySearch" {
+        return Some(SkipReason::JavaUtilCollection);
+    }
+
     // Bisection hook (development only): `CRATONVM_JIT_BISECT_SKIP` is a
     // comma-separated list of `Class.method` entries (slash-separated
     // class names, e.g. `java/util/Locale.hashCode`). Any listed method
@@ -589,6 +597,19 @@ fn should_skip_jit_internal(
         // `CRATONVM_JIT_ALLOW_PACKAGES=org/hamcrest/`.
         if class_name.starts_with("org/hamcrest/")
             && !package_allowed("org/hamcrest/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
+        // WILDFLY-CONTROLLER-JIT.1 (2026-07-13): the optimized
+        // invokespecial path skipped AbstractOperationContext.<init> while
+        // constructing OperationContextImpl. Its controllerOperations list
+        // remained null and parallel EJB boot failed; the same standalone boot
+        // reaches past that point with CRATONVM_DISABLE_JIT=1. Keep controller
+        // bytecode interpreted until the special-call backend is corrected.
+        // Liftable with CRATONVM_JIT_ALLOW_PACKAGES=org/jboss/as/controller/.
+        if class_name.starts_with("org/jboss/as/controller/")
+            && !package_allowed("org/jboss/as/controller/", allow_packages)
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
@@ -1313,6 +1334,17 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
+        // SPB-FLYWAY-HSQLDB.1: Flyway's HSQLDB integration runs this package
+        // through a dense add/update path. With JIT enabled it SIGSEGVs after
+        // CGLIB configuration enhancement; CRATONVM_JIT_DENY=org/hsqldb/
+        // consistently completes all test methods. Keep it interpreted until
+        // the lowering defect is isolated. Opt in for bisection with
+        // CRATONVM_JIT_ALLOW_PACKAGES=org/hsqldb/.
+        if class_name.starts_with("org/hsqldb/")
+            && !package_allowed("org/hsqldb/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
         // SPB.9b (Session 114) — companion blanket ban for the Spring
         // Boot loader + reactive web context, plus the Spring Beans
         // factory support layer. After SPB.9 pins the per-class logger

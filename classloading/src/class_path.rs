@@ -1245,6 +1245,18 @@ impl ClassPath {
         }
     }
 
+    /// Expand Java launcher classpath wildcards into their concrete JAR paths.
+    ///
+    /// This is also used when publishing `java.class.path`: HotSpot expands
+    /// `lib/*` before exposing that property, and in-process javac consumes the
+    /// property directly rather than consulting CratonVM's class loader.
+    pub fn expand_classpath_entries(paths: &[String]) -> Vec<String> {
+        paths
+            .iter()
+            .flat_map(|raw| Self::expand_classpath_wildcard(raw))
+            .collect()
+    }
+
     /// Expand a single classpath token, honouring Java's `dir/*` wildcard.
     ///
     /// HotSpot's `java -cp lib/*` expands to every JAR (`*.jar` / `*.JAR`)
@@ -5498,6 +5510,32 @@ Implementation-Version: 999.999\n";
         let pattern = format!("{}/*", dir.to_string_lossy());
         let cp = ClassPath::new(&[pattern]);
         assert_eq!(cp.entry_count(), 3, "wildcard should expand to 3 jars");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The launcher-facing expansion API must publish concrete paths too.
+    /// In-process javac reads `java.class.path` and cannot resolve a literal
+    /// `lib/*` token on its own.
+    #[test]
+    fn wildcard_publication_expands_to_concrete_sorted_jars() {
+        let dir = make_jar_dir(
+            "cratonvm_wildcard_property_publication",
+            &["z.jar", "a.jar", "m.jar"],
+        );
+        let pattern = format!("{}/*", dir.to_string_lossy());
+        let expanded = ClassPath::expand_classpath_entries(&[pattern]);
+        let names: Vec<_> = expanded
+            .iter()
+            .map(|path| {
+                Path::new(path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(names, ["a.jar", "m.jar", "z.jar"]);
+        assert!(expanded.iter().all(|path| !path.contains('*')));
         let _ = fs::remove_dir_all(&dir);
     }
 

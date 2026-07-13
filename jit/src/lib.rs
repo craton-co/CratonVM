@@ -4851,6 +4851,15 @@ fn hibernate_temporal_jit_deny_prefix(class_name: &str) -> Option<&'static str> 
     }
 }
 
+fn hsqldb_jit_deny_prefix(class_name: &str) -> Option<&'static str> {
+    const SLASH_PREFIX: &str = "org/hsqldb/";
+    const DOT_PREFIX: &str = "org.hsqldb.";
+    if class_name.starts_with(SLASH_PREFIX) {
+        Some(SLASH_PREFIX)
+    } else {
+        class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
+    }
+}
 fn jaxb_mapping_jit_deny_prefix(class_name: &str) -> Option<&'static str> {
     const SLASH_PREFIX: &str = "org/glassfish/jaxb/";
     const DOT_PREFIX: &str = "org.glassfish.jaxb.";
@@ -5133,6 +5142,15 @@ pub fn try_compile(
     // HIB-TEMPORAL.1 (2026-07-08): final fail-closed Hibernate guard. The VM
     // skip-list catches most eligibility paths, but tiered/background compile
     // can still reach this crate's final `try_compile` gate. The proven stable
+    // SPB-FLYWAY-HSQLDB.1: Keep the final admission gate aligned with the VM
+    // skip-list. The Flyway HSQLDB integration SIGSEGVs under JIT, while the
+    // package-level interpreted control completes the entire class. Background
+    // compilation can bypass VM eligibility checks, so fail closed here too.
+    if let Some(prefix) = hsqldb_jit_deny_prefix(&cached.class_name) {
+        if !jit_allow_package(prefix) {
+            return None;
+        }
+    }
     // control for the temporal residuals is exactly the same shape as
     // `CRATONVM_JIT_DENY=org/hibernate/`, so keep Hibernate bytecode interpreted
     // here too unless the package is explicitly allowed for bisection.
@@ -5143,6 +5161,16 @@ pub fn try_compile(
     }
 
     if let Some(prefix) = jaxb_mapping_jit_deny_prefix(&cached.class_name) {
+        if !jit_allow_package(prefix) {
+            return None;
+        }
+    }
+
+    // SPB-FLYWAY-HSQLDB.1: Keep the final admission gate aligned with the VM
+    // skip-list. The Flyway HSQLDB integration SIGSEGVs under JIT, while the
+    // package-level interpreted control completes the entire class. Background
+    // compilation can bypass VM eligibility checks, so fail closed here too.
+    if let Some(prefix) = hsqldb_jit_deny_prefix(&cached.class_name) {
         if !jit_allow_package(prefix) {
             return None;
         }
@@ -6127,7 +6155,27 @@ fn try_compile_inner(
     if !scan.ldc_ops.is_empty() {
         if let Some(resolver) = cp_ldc_resolver {
             for &(pc, cp_idx) in &scan.ldc_ops {
-                let val = resolver(cp_idx)?;
+                let val = match resolver(cp_idx) {
+                    Some(v) => v,
+                    None => {
+                        // RBC.7 — same permanent-bail class as RBC.4 (scan
+                        // reject) / RBC.6 (athrow+handler): this resolver's
+                        // `None` means the constant pool entry at `cp_idx` is
+                        // a String/Class/MethodHandle (not representable as
+                        // an immediate) — a property of the class file that
+                        // never changes, not a resolution-timing miss.
+                        // Without marking it, a hot method containing
+                        // `ldc "str"` re-ran the whole upgrade gauntlet
+                        // (skip-list + native-shadow walks + this scan) every
+                        // JIT_RETRY_STRIDE calls forever (same pathology RBC.4
+                        // fixed for scan rejects — observed as a silent,
+                        // diagnostic-free hang: TestResponsePerformance's
+                        // trivial `getRequestURI() { return "..."; }` bailed
+                        // on every one of ~1M hot-loop calls).
+                        *backend_attempted = true;
+                        return None;
+                    }
+                };
                 ldc_info.push((pc, val));
             }
         }
@@ -6140,7 +6188,16 @@ fn try_compile_inner(
     if !scan.ldc2w_ops.is_empty() {
         let resolver = cp_ldc2w_resolver?;
         for &(pc, cp_idx) in &scan.ldc2w_ops {
-            let (val, _is_double) = resolver(cp_idx)?;
+            let (val, _is_double) = match resolver(cp_idx) {
+                Some(v) => v,
+                None => {
+                    // RBC.7 twin: a non-Long/Double constant at this ldc2_w
+                    // index is likewise fixed by the bytecode — permanent
+                    // bail, not a transient miss. See the ldc arm above.
+                    *backend_attempted = true;
+                    return None;
+                }
+            };
             ldc2w_info.push((pc, val));
         }
     }
@@ -7490,6 +7547,18 @@ pub fn invokestatic_self_call_uses_tail_jump(code: &[u8], code_len: usize, pc: u
 // Tests
 // ---------------------------------------------------------------------------
 
+    #[test]
+    fn hsqldb_jit_deny_matches_slash_and_dot_names() {
+        assert_eq!(
+            hsqldb_jit_deny_prefix("org/hsqldb/map/BaseHashMap"),
+            Some("org/hsqldb/")
+        );
+        assert_eq!(
+            hsqldb_jit_deny_prefix("org.hsqldb.map.BaseHashMap"),
+            Some("org.hsqldb.")
+        );
+        assert_eq!(hsqldb_jit_deny_prefix("org/example/Foo"), None);
+    }
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7518,6 +7587,19 @@ mod tests {
             Some("org.glassfish.jaxb.")
         );
         assert_eq!(jaxb_mapping_jit_deny_prefix("org/glassfish/other/Foo"), None);
+    }
+
+    #[test]
+    fn hsqldb_jit_deny_matches_slash_and_dot_names() {
+        assert_eq!(
+            hsqldb_jit_deny_prefix("org/hsqldb/map/BaseHashMap"),
+            Some("org/hsqldb/")
+        );
+        assert_eq!(
+            hsqldb_jit_deny_prefix("org.hsqldb.map.BaseHashMap"),
+            Some("org.hsqldb.")
+        );
+        assert_eq!(hsqldb_jit_deny_prefix("org/example/Foo"), None);
     }
 
     #[test]
