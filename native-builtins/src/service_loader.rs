@@ -1110,6 +1110,50 @@ fn is_valid_provider_name(s: &str) -> bool {
 
 /// `ServiceLoader.iterator()` — scan META-INF/services and return an
 /// Iterator<Object> over instantiated providers.
+/// JDK `ServiceLoader` wraps a provider constructor failure in
+/// `ServiceConfigurationError` instead of silently omitting that provider.
+fn provider_construction_error(
+    ctx: &mut dyn NativeContext,
+    provider: &str,
+    failure: MethodCallFailed,
+) -> MethodCallFailed {
+    let cause = match failure {
+        MethodCallFailed::ExceptionThrown(cause) => cause,
+        other => return other,
+    };
+    // `Constructor.newInstance` correctly reports the provider's throw as an
+    // InvocationTargetException. ServiceLoader's contract exposes its target
+    // as the ServiceConfigurationError cause instead.
+    let original_cause_pin = ctx.pin_native_root(cause);
+    let unwrapped = ctx.invoke(
+        "java/lang/Throwable",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+        &[Value::Object(Some(cause))],
+    );
+    let cause = match unwrapped {
+        Ok(Some(Value::Object(Some(target)))) => target,
+        _ => ctx.read_native_pin(original_cause_pin, cause),
+    };
+    let cause_pin = ctx.pin_native_root(cause);
+    ctx.unpin_native_roots(original_cause_pin);
+    let message = ctx.create_string(&format!("Provider {provider} could not be instantiated"));
+    let message_pin = ctx.pin_native_root(message);
+    let cause = ctx.read_native_pin(cause_pin, cause);
+    let message = ctx.read_native_pin(message_pin, message);
+    let wrapped = ctx.new_object_initialized(
+        "java/util/ServiceConfigurationError",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+        &[Value::Object(Some(message)), Value::Object(Some(cause))],
+    );
+    ctx.unpin_native_roots(cause_pin);
+    ctx.unpin_native_roots(message_pin);
+    match wrapped {
+        Ok(Some(Value::Object(Some(error)))) => MethodCallFailed::ExceptionThrown(error),
+        _ => MethodCallFailed::ExceptionThrown(cause),
+    }
+}
+
 fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let sl = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -1257,15 +1301,15 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                  but this likely indicates a real bug, not a missing/malformed provider"
             );
         }
-        let inst = inst_result.ok().and_then(|v| v);
-        let inst = match inst {
-            Some(Value::Object(Some(o))) => o,
-            _ => {
+        let inst = match inst_result {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            Ok(_) => {
                 if diag {
                     eprintln!("[SL-DBG]   skip (newInstance returned null): {fqn}");
                 }
                 continue;
             }
+            Err(failure) => return Err(provider_construction_error(ctx, &fqn, failure)),
         };
         // Re-read the (possibly forwarded) list reference before mutating it.
         list = ctx.read_native_pin(list_pin, list);

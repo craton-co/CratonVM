@@ -6002,14 +6002,26 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     if is_tree_map_receiver(ctx, this) {
         return native_tm_entry_set(ctx, args);
     }
-    let entries = map_collect_entries(ctx, this);
+    // Both allocations below may run a moving young collection. Keep the
+    // source and newly created view rooted, then collect entries only after
+    // the view is fully wired; otherwise `set_field(set, ...)` can target the
+    // pre-move Set and leave entrySet().iterator() observing a null backing.
+    let this_pin = ctx.pin_native_root(this);
+    let entry_count = map_collect_entries(ctx, this).len();
     // Build a HashSet of Map.Entry objects, backed by a view backing that
     // remembers the source map so removing an entry through the set (or its
     // iterator) deletes the corresponding key from the source map.
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
-    let cap = std::cmp::max(entries.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
+    let set_pin = ctx.pin_native_root(set);
+    let cap = std::cmp::max(entry_count.next_power_of_two(), MAP_DEFAULT_CAPACITY);
+    let this = ctx.read_native_pin(this_pin, this);
     let backing_map = alloc_view_backing(ctx, this, VIEW_KIND_ENTRYSET, cap);
+    let backing_pin = ctx.pin_native_root(backing_map);
+    let set = ctx.read_native_pin(set_pin, set);
+    let backing_map = ctx.read_native_pin(backing_pin, backing_map);
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
+    let this = ctx.read_native_pin(this_pin, this);
+    let entries = map_collect_entries(ctx, this);
 
     // Each entry is a Map.Entry object with 2 fields: key and value.
     // Use `java/util/Map$Entry` instead of `HashMap$Entry`: in early
@@ -6044,6 +6056,10 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         set_map_size(ctx, backing_map, size + 1);
     }
 
+    let set = ctx.read_native_pin(set_pin, set);
+    ctx.unpin_native_roots(backing_pin);
+    ctx.unpin_native_roots(set_pin);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -7962,7 +7978,12 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             return native_al_iterator(ctx, args);
         }
     }
+    // Refreshing a live view allocates a replacement bucket array. Pin the
+    // HashSet before that allocation, otherwise the subsequent backing lookup
+    // can read the pre-move receiver and return a null iterator.
+    let this_pin = ctx.pin_native_root(this);
     resync_view_set(ctx, this);
+    let this = ctx.read_native_pin(this_pin, this);
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => {
@@ -7982,7 +8003,6 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // go stale and surface as null/stale iterator elements during WildFly MSC
     // state reporting.
     let len = collect_view_snapshot_ordered(ctx, backing).len();
-    let this_pin = ctx.pin_native_root(this);
     let backing_pin = ctx.pin_native_root(backing);
     let keys_arr = alloc_ref_array(ctx, len);
     let keys_arr_pin = ctx.pin_native_root(keys_arr);
@@ -8041,8 +8061,10 @@ fn native_hs_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         None => return Ok(Some(Value::Object(None))),
     };
     let len = collect_view_snapshot_ordered(ctx, backing).len();
+    let backing_pin = ctx.pin_native_root(backing);
     let arr = alloc_ref_array(ctx, len);
     let arr_pin = ctx.pin_native_root(arr);
+    let backing = ctx.read_native_pin(backing_pin, backing);
     let elems = collect_view_snapshot_ordered(ctx, backing);
     let arr = ctx.read_native_pin(arr_pin, arr);
     for (i, v) in elems.iter().enumerate().take(len) {
@@ -8053,6 +8075,7 @@ fn native_hs_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     ctx.set_field(spl, 0, Value::Object(Some(arr)));
     ctx.set_field(spl, 1, Value::Int(0));
     ctx.set_field(spl, 2, Value::Int(len as i32));
+    ctx.unpin_native_roots(backing_pin);
     ctx.unpin_native_roots(arr_pin);
     Ok(Some(Value::Object(Some(spl))))
 }
@@ -13179,8 +13202,31 @@ fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // produced an empty stream for `enumSet.stream()`. Use the generic helper,
     // whose ArrayList heuristics keep the fast path and whose iterator fallback
     // walks EnumSet/TreeSet/foreign collections.
+    // As for HashSet.stream(), never carry an unrooted Rust snapshot across
+    // stream/array allocation: a moving GC may forward every list element and
+    // turn the stale refs into unrelated Objects. This is particularly visible
+    // while SmallRye builds nested config mappings from ArrayList-backed source
+    // lists. Count before allocation, then re-snapshot from the pinned list.
+    let this_pin = ctx.pin_native_root(this);
+    let len = al_or_collection_elements(ctx, this).len();
+    let stream = alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS);
+    let stream_pin = ctx.pin_native_root(stream);
+    let arr = alloc_ref_array(ctx, len);
+    let arr_pin = ctx.pin_native_root(arr);
+    let this = ctx.read_native_pin(this_pin, this);
     let elements = al_or_collection_elements(ctx, this);
-    make_stream(ctx, &elements)
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    for (i, element) in elements.iter().enumerate().take(len) {
+        ctx.set_array_element(arr, i, *element);
+    }
+    let stream = ctx.read_native_pin(stream_pin, stream);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+    ctx.set_field(stream, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
+    ctx.unpin_native_roots(this_pin);
+    ctx.unpin_native_roots(stream_pin);
+    ctx.unpin_native_roots(arr_pin);
+    Ok(Some(Value::Object(Some(stream))))
 }
 
 fn native_hs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -13193,8 +13239,34 @@ fn native_hs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(m) => m,
         None => return make_stream(ctx, &[]),
     };
+    // `make_stream` allocates both the stream object and its backing array.
+    // Collecting object references before those allocations leaves a moving GC
+    // free to forward the backing map and every key, so the stale snapshot can
+    // later surface as unrelated `java.lang.Object` values. SmallRye's
+    // PropertyMappingInterceptor hits this through `LinkedHashSet.stream()`
+    // while enumerating config property names. Count first, allocate while the
+    // backing map is pinned, then collect the live keys and store them without
+    // another allocation.
+    let backing_pin = ctx.pin_native_root(backing);
+    let len = collect_view_snapshot_ordered(ctx, backing).len();
+    let stream = alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS);
+    let stream_pin = ctx.pin_native_root(stream);
+    let arr = alloc_ref_array(ctx, len);
+    let arr_pin = ctx.pin_native_root(arr);
+    let backing = ctx.read_native_pin(backing_pin, backing);
     let keys = collect_view_snapshot_ordered(ctx, backing);
-    make_stream(ctx, &keys)
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    for (i, key) in keys.iter().enumerate().take(len) {
+        ctx.set_array_element(arr, i, *key);
+    }
+    let stream = ctx.read_native_pin(stream_pin, stream);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+    ctx.set_field(stream, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
+    ctx.unpin_native_roots(backing_pin);
+    ctx.unpin_native_roots(stream_pin);
+    ctx.unpin_native_roots(arr_pin);
+    Ok(Some(Value::Object(Some(stream))))
 }
 
 // TreeSet.stream() — snapshot of sorted elements (also serves TreeMap.keySet()
@@ -13209,14 +13281,28 @@ fn native_ts_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
-    let (data_opt, size, _) = ts_state(ctx, this);
-    let elements: Vec<Value> = match data_opt {
-        Some(d) => (0..size as usize)
-            .map(|i| ctx.get_array_element(d, i))
-            .collect(),
-        None => Vec::new(),
-    };
-    make_stream(ctx, &elements)
+    let this_pin = ctx.pin_native_root(this);
+    let (_, size, _) = ts_state(ctx, this);
+    let stream = alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS);
+    let stream_pin = ctx.pin_native_root(stream);
+    let arr = alloc_ref_array(ctx, size as usize);
+    let arr_pin = ctx.pin_native_root(arr);
+    let this = ctx.read_native_pin(this_pin, this);
+    let (data_opt, live_size, _) = ts_state(ctx, this);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    if let Some(data) = data_opt {
+        for i in 0..(live_size as usize).min(size as usize) {
+            ctx.set_array_element(arr, i, ctx.get_array_element(data, i));
+        }
+    }
+    let stream = ctx.read_native_pin(stream_pin, stream);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+    ctx.set_field(stream, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
+    ctx.unpin_native_roots(this_pin);
+    ctx.unpin_native_roots(stream_pin);
+    ctx.unpin_native_roots(arr_pin);
+    Ok(Some(Value::Object(Some(stream))))
 }
 
 // -- Intermediate operations --

@@ -14183,6 +14183,9 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
+                        || (class_name == "org/keycloak/quarkus/runtime/configuration/MicroProfileConfigProvider$MicroProfileScope"
+                            && method_name == "get"
+                            && descriptor == "(Ljava/lang/String;)Ljava/lang/String;")
                         || crate::runtime::interpreter::is_file_channel_impl_open_native_override(
                             class_name,
                             method_name,

@@ -4929,6 +4929,7 @@ fn cm_lookup_registered(
     // relocate them (native stale-local family). One batch unpin at the end
     // covers every early return inside the closure.
     let this_pin = ctx.pin_native_root(this);
+    let cls_pin = ctx.pin_native_root(cls);
     let prefix_pin = pinned_object_value(ctx, prefix);
     let result = (|| {
         let impl_cls = match ctx.invoke(
@@ -4957,17 +4958,36 @@ fn cm_lookup_registered(
             _ => return None,
         };
         let prefix = read_pinned_object_value(ctx, prefix_pin, prefix);
-        match ctx.invoke_virtual(
+        let candidate = match ctx.invoke_virtual(
             inner,
             "get",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             &[prefix],
         ) {
-            Ok(Some(Value::Object(Some(o)))) => Some(Value::Object(Some(o))),
-            _ => None,
-        }
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => return None,
+        };
+        // A stale collection reference can leave a raw Object in the
+        // mappings table. Do not return it merely because the table has a
+        // value: the real SmallRye method performs Class.cast before returning.
+        let candidate_pin = ctx.pin_native_root(candidate);
+        let cls = ctx.read_native_pin(cls_pin, cls);
+        let candidate = ctx.read_native_pin(candidate_pin, candidate);
+        let valid = matches!(
+            ctx.invoke_virtual(
+                cls,
+                "isInstance",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(candidate))],
+            ),
+            Ok(Some(Value::Int(v))) if v != 0
+        );
+        let candidate = ctx.read_native_pin(candidate_pin, candidate);
+        ctx.unpin_native_roots(candidate_pin);
+        valid.then_some(Value::Object(Some(candidate)))
     })();
     ctx.unpin_native_roots(this_pin);
+    ctx.unpin_native_roots(cls_pin);
     result
 }
 
@@ -4998,6 +5018,65 @@ fn native_smallrye_get_config_mapping(
     if let Some(v) = cm_lookup_registered(ctx, this, cls, prefix) {
         ctx.unpin_native_roots(this_pin);
         return Ok(Some(v));
+    }
+
+    // SmallRye's keystore factory builds a short-lived config and immediately
+    // asks it for KeyStoreConfig. Unlike the main Quarkus build, that config
+    // has not populated its mappings registry yet. Register this legitimate
+    // mapping through SmallRye's own API before attempting the lower-level
+    // construction fallback; returning a fabricated interface object here
+    // degrades to java.lang.Object and fails the factory's cast.
+    let is_keystore_mapping = matches!(
+        crate::lang_class::mirror_class_name(ctx, cls).as_deref(),
+        Some("io/smallrye/config/source/keystore/KeyStoreConfig")
+    );
+    if is_keystore_mapping {
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let cls_cur = ctx.read_native_pin(cls_pin, cls);
+        let prefix_cur = read_pinned_object_value(ctx, prefix_pin, prefix);
+        if let Ok(Some(Value::Object(Some(config_class)))) = ctx.invoke(
+            "io/smallrye/config/ConfigMappings$ConfigClass",
+            "configClass",
+            "(Ljava/lang/Class;Ljava/lang/String;)Lio/smallrye/config/ConfigMappings$ConfigClass;",
+            &[Value::Object(Some(cls_cur)), prefix_cur],
+        ) {
+            let config_class_pin = ctx.pin_native_root(config_class);
+            if let Ok(Some(Value::Object(Some(mappings)))) =
+                ctx.new_object_initialized("java/util/HashSet", "()V", &[])
+            {
+                let mappings_pin = ctx.pin_native_root(mappings);
+                let config_class = ctx.read_native_pin(config_class_pin, config_class);
+                let mappings = ctx.read_native_pin(mappings_pin, mappings);
+                let _ = ctx.invoke_virtual(
+                    mappings,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(Some(config_class))],
+                );
+                let this_cur = ctx.read_native_pin(this_pin, this);
+                let mappings = ctx.read_native_pin(mappings_pin, mappings);
+                let registration = ctx
+                    .invoke(
+                        "io/smallrye/config/ConfigMappings",
+                        "registerConfigMappings",
+                        "(Lio/smallrye/config/SmallRyeConfig;Ljava/util/Set;)V",
+                        &[Value::Object(Some(this_cur)), Value::Object(Some(mappings))],
+                    );
+                if registration.is_ok() {
+                    let this_cur = ctx.read_native_pin(this_pin, this);
+                    let cls_cur = ctx.read_native_pin(cls_pin, cls);
+                    let prefix_cur = read_pinned_object_value(ctx, prefix_pin, prefix);
+                    if let Some(v) = cm_lookup_registered(ctx, this_cur, cls_cur, prefix_cur) {
+                        ctx.unpin_native_roots(config_class_pin);
+                        ctx.unpin_native_roots(mappings_pin);
+                        ctx.unpin_native_roots(this_pin);
+                        return Ok(Some(v));
+                    }
+                }
+                ctx.unpin_native_roots(mappings_pin);
+            }
+            ctx.unpin_native_roots(config_class_pin);
+        }
     }
 
     // Build the impl directly from the live config via a ConfigMappingContext.
@@ -7059,6 +7138,100 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
 
+    // `ConfigSourceContextConfigSource.getPropertyNames()` assumes its context
+    // iterator is String-only. A stale collection placeholder must never leak
+    // across that boundary: SmallRye uses this adapter while building nested
+    // keystore mappings, and its bytecode otherwise throws a CCE before it can
+    // validate the actual configured names. Preserve all genuine String names
+    // and ignore only invalid non-String entries.
+    r.register(
+        "io/smallrye/config/ConfigSourceContext$ConfigSourceContextConfigSource",
+        "getPropertyNames",
+        "()Ljava/util/Set;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let context = match ctx.get_field(this, 0) {
+                Value::Object(Some(o)) => o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let this_pin = ctx.pin_native_root(this);
+            let context_pin = ctx.pin_native_root(context);
+            let set = match ctx.new_object_initialized("java/util/HashSet", "()V", &[]) {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                _ => {
+                    ctx.unpin_native_roots(this_pin);
+                    ctx.unpin_native_roots(context_pin);
+                    return Ok(Some(Value::Object(None)));
+                }
+            };
+            let set_pin = ctx.pin_native_root(set);
+            let context = ctx.read_native_pin(context_pin, context);
+            let iterator = match ctx.invoke_virtual(context, "iterateNames", "()Ljava/util/Iterator;", &[]) {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                _ => {
+                    ctx.unpin_native_roots(this_pin);
+                    ctx.unpin_native_roots(context_pin);
+                    ctx.unpin_native_roots(set_pin);
+                    return Ok(Some(Value::Object(Some(set))));
+                }
+            };
+            let iterator_pin = ctx.pin_native_root(iterator);
+            loop {
+                let iterator = ctx.read_native_pin(iterator_pin, iterator);
+                let more = ctx.invoke_virtual(iterator, "hasNext", "()Z", &[])?;
+                if !matches!(more, Some(Value::Int(v)) if v != 0) {
+                    break;
+                }
+                let iterator = ctx.read_native_pin(iterator_pin, iterator);
+                let value = ctx.invoke_virtual(iterator, "next", "()Ljava/lang/Object;", &[])?;
+                if let Some(Value::Object(Some(value))) = value {
+                    if ctx.class_name_of_id(ctx.class_id_of_object(value)).as_deref() == Some("java/lang/String") {
+                        let value_pin = ctx.pin_native_root(value);
+                        let set = ctx.read_native_pin(set_pin, set);
+                        let value = ctx.read_native_pin(value_pin, value);
+                        let _ = ctx.invoke_virtual(set, "add", "(Ljava/lang/Object;)Z", &[Value::Object(Some(value))]);
+                        ctx.unpin_native_roots(value_pin);
+                    }
+                }
+            }
+            let set = ctx.read_native_pin(set_pin, set);
+            ctx.unpin_native_roots(this_pin);
+            ctx.unpin_native_roots(context_pin);
+            ctx.unpin_native_roots(iterator_pin);
+            ctx.unpin_native_roots(set_pin);
+            Ok(Some(Value::Object(Some(set))))
+        },
+    );
+
+    // Keycloak's legacy Config.Scope consumer calls this concrete one-argument
+    // method. Route it through the inherited two-argument lookup so config
+    // resolution follows the same path as the JDK implementation.
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/MicroProfileConfigProvider$MicroProfileScope",
+        "get",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let this_pin = ctx.pin_native_root(this);
+            let name_pin = ctx.pin_native_root(name);
+            let this_cur = ctx.read_native_pin(this_pin, this);
+            let name_cur = ctx.read_native_pin(name_pin, name);
+            let result = ctx.invoke_virtual(
+                this_cur,
+                "get",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                &[Value::Object(Some(name_cur)), Value::Object(None)],
+            );
+            ctx.unpin_native_roots(this_pin);
+            ctx.unpin_native_roots(name_pin);
+            result
+        },
+    );
+
     // --- smallrye-config KeyStoreConfigSourceFactory.getConfigSources ---
     // CratonVM divergence: In real Quarkus, the @ConfigMapping interface
     // io.smallrye.config.source.keystore.KeyStoreConfig is auto-registered with
@@ -7072,6 +7245,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // Iterable here is semantically equivalent to having no configured
     // keystores.  Short-circuit at getConfigSources so we never hit the
     // mapping lookup in getKeyStoreConfig.
+    #[cfg(any())]
     r.register(
         "io/smallrye/config/source/keystore/KeyStoreConfigSourceFactory",
         "getConfigSources",
@@ -8815,18 +8989,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     }
 
     r.register(
-        "org/keycloak/quarkus/runtime/configuration/PropertyMappingInterceptor",
-        "hasInferredValue",
-        "(Lorg/keycloak/quarkus/runtime/configuration/mappers/PropertyMapper;Lio/smallrye/config/ConfigSourceInterceptorContext;)Z",
-        native_keycloak_property_mapping_has_inferred_value,
-    );
-
-    r.register(
         "org/keycloak/quarkus/runtime/configuration/mappers/PropertyMapper",
         "getEnabledWhen",
         "()Ljava/util/Optional;",
         native_keycloak_property_mapper_get_enabled_when,
     );
+
     r.register(
         "org/keycloak/quarkus/runtime/configuration/mappers/PropertyMapper",
         "getRequiredWhen",
@@ -8895,12 +9063,6 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         native_keycloak_log_file_rotation_enabled,
     );
     r.register(
-        "org/keycloak/quarkus/runtime/configuration/mappers/LoggingPropertyMappers",
-        "isMdcActive",
-        "()Z",
-        native_keycloak_log_mdc_active,
-    );
-    r.register(
         "org/keycloak/quarkus/runtime/configuration/mappers/MetricsPropertyMappers",
         "metricsEnabled",
         "()Z",
@@ -8911,18 +9073,6 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "cacheSetToInfinispan",
         "()Z",
         native_keycloak_cache_set_to_infinispan,
-    );
-    r.register(
-        "org/keycloak/quarkus/runtime/configuration/mappers/TracingPropertyMappers",
-        "isTracingEnabled",
-        "()Z",
-        native_keycloak_tracing_enabled,
-    );
-    r.register(
-        "org/keycloak/quarkus/runtime/configuration/mappers/TracingPropertyMappers",
-        "isTracingAndEmbeddedInfinispanEnabled",
-        "()Z",
-        native_keycloak_tracing_infinispan_enabled,
     );
     r.register(
         "org/keycloak/quarkus/runtime/configuration/mappers/TelemetryPropertyMappers",
@@ -11618,6 +11768,23 @@ fn p57_absolute_path_string(path: &str) -> String {
                 .into_owned()
         }
     }
+}
+
+/// Match java.io.File's lexical normalization for ordinary absolute paths.
+/// Preserve filesystem roots (and Windows drive roots) while removing an
+/// otherwise-significant trailing separator.
+fn p57_trim_file_trailing_separator(path: &str) -> String {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return if path.starts_with('\\') { "\\".to_string() } else { "/".to_string() };
+    }
+    if trimmed.len() == 2
+        && trimmed.as_bytes()[0].is_ascii_alphabetic()
+        && trimmed.as_bytes()[1] == b':'
+    {
+        return format!("{trimmed}/");
+    }
+    trimmed.to_string()
 }
 
 #[cfg(windows)]
@@ -15682,6 +15849,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     .map(|cwd| cwd.join(&path).to_string_lossy().into_owned())
                     .unwrap_or(path)
             };
+            // java.io.File normalizes a trailing separator on ordinary paths
+            // (`new File("/tmp/").getAbsolutePath()` is `/tmp`). Keeping it
+            // made Keycloak persist kc.home.dir with a trailing slash while
+            // Path-based config resolution returned the normalized form.
+            let abs = p57_trim_file_trailing_separator(&abs);
             let s = ctx.create_string(&abs);
             Ok(Some(Value::Object(Some(s))))
         },
@@ -15690,13 +15862,14 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
         let p = std::path::Path::new(&path);
-        let abs = if p.is_absolute() {
-            path
-        } else {
-            std::env::current_dir()
-                .map(|cwd| cwd.join(&path).to_string_lossy().into_owned())
-                .unwrap_or(path)
-        };
+            let abs = if p.is_absolute() {
+                path
+            } else {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(&path).to_string_lossy().into_owned())
+                    .unwrap_or(path)
+            };
+        let abs = p57_trim_file_trailing_separator(&abs);
         Ok(Some(Value::Object(Some(file_alloc(ctx, &abs)))))
     });
     // Strip the Windows `\\?\` extended-length prefix that
