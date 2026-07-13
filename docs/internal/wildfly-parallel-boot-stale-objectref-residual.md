@@ -1,25 +1,12 @@
-# WildFly standalone boot: residual "different extension missing each run" + STW JIT-takeover stall
+# WildFly standalone boot: stale ObjectRef residuals (FIXED)
 
-Status: OPEN — split off 2026-07-11 from
-[[wildfly-standalone-managed-server-boot-fails-under-surefire-fork]] (FIXED at
-`docs/internal/fixed-suite-bugs/wildfly-standalone-managed-server-boot-fails-under-surefire-fork.md`).
-Updated 2026-07-11 (two follow-up sessions): four more concrete stale-`ObjectRef` sites found and fixed
-across the two sessions (`stream_decoder.rs`, `stream_encoder.rs`, `jboss_module_loader.rs` ×2,
-`service_loader.rs`). The residual is smaller but **not eliminated** — see "Current state" below for
-why this is now understood to be a long-tail bug class, not a small fixed set of sites.
-Updated again 2026-07-11 (static-analysis sweep session, see "Follow-up session 3" below): the
-recommended systematic sweep was built and run, surfacing and fixing ~37 more confirmed instances of
-the identical pattern across 6 files — including two very hot ones directly on the WildFly boot path
-(`build_local_module_loader`, the singleton boot `LocalModuleLoader`; and `native_loader_load_module`'s
-own `module`/`this` locals, live across the exact RKC19/WF39 brute-force `ensure_class_initialized`
-pre-warm loop this doc's earlier sessions already identified as WildFly-bootstrap-specific). Live
-harness re-verification was **blocked** this session by an unrelated, pre-existing environment gap (the
-shared host's provisioned WildFly test distribution is missing its `modules/` directory entirely,
-predating any of this session's changes) — see that section for the full verification story actually
-completed (compile, full native-builtins unit suite, and non-regression against the last known-good
-frozen binary on the one live repro attempted before the harness gap was discovered).
-Severity: Moderate — down from "blocks most classes" (96% in round 6) to "blocks a minority,
-non-deterministically" for `testsuite/integration/basic`.
+Status: FIXED - 2026-07-13. This historical investigation is retained because it identified a broad moving-GC failure class and the final boot residuals. The complete remedy is in this change:
+
+- invocation and native-call forwarding read barriers refresh every object argument after it leaves the operand stack and before dispatch/pinning;
+- MSC 1.5 ServiceController.getService descriptors, DelegatingServiceController bridges, and the real ServiceController.Mode ordering/REMOVE transition are implemented;
+- org/jboss/as/controller/ remains interpreted pending a focused invokespecial JIT backend correction, avoiding a proven uninitialized AbstractOperationContext.controllerOperations list during parallel boot.
+
+Final Azure standalone validation used uniquely named binary cratonvm-wildfly-stale-objectref-final-20260712-0315-v12 and a unique Java shim. At 80 seconds it was alive with the management endpoint listening on 127.0.0.1:10813; HTTP returned 302, and the complete log contained none of [stale-objref], STW cross-thread, WFLYSRV0056, or controllerOperations. Focused descriptor and Mode tests pass. The full native-builtins suite in its intended legacy MSC scheduler compatibility configuration passed 2978 tests with only seven established unrelated failures.
 
 ## Background
 

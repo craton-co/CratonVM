@@ -726,8 +726,24 @@ fn safe_native_call_impl(
             &format!("{des}  ->NATIVE {callee}"),
         );
     }
-    // Pin object arguments for the duration of the native: they have been
+    // Object arguments have just left the GC-visible operand stack. Refresh
+    // forwarded addresses before pinning them: pinning a stale from-space
+    // pointer preserves the bug rather than rooting the evacuated object.
+    // This is the native-call counterpart to the interpreter getfield read
+    // barrier and covers invokevirtual, invokeinterface, invokestatic, and
+    // every re-entrant native dispatch through this common choke point.
+    //
+    // No VM allocation or safepoint can occur between extracting the stack
+    // values and this barrier, so the forwarding header is still readable.
+    let mut forwarded_args = args.to_vec();
+    for value in &mut forwarded_args {
+        if let Value::Object(Some(obj)) = value {
+            *obj = shared.heap.load_and_forward(*obj);
+        }
+    }
+    let args = forwarded_args.as_slice();
     // popped from the operand stack into this Rust slice and are otherwise
+    // Pin object arguments for the duration of the native: they have been
     // invisible to `collect_roots` / frame scanning during a safepoint GC.
     let pin_base = thread.native_pin_roots.len();
     // Retain a root index for every argument. Native calls are not restricted
@@ -976,8 +992,11 @@ fn safe_native_call_impl(
                         )
                     })
                     .unwrap_or_default();
+                let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
+                    .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
                 tracing::error!(
-                    "Native method panic caught: {} (native invoked from {})",
+                    "Native method panic caught in {}: {} (native invoked from {})",
+                    callee,
                     msg,
                     top
                 );

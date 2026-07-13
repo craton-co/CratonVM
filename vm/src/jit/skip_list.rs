@@ -593,6 +593,19 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
+        // WILDFLY-CONTROLLER-JIT.1 (2026-07-13): the optimized
+        // invokespecial path skipped AbstractOperationContext.<init> while
+        // constructing OperationContextImpl. Its controllerOperations list
+        // remained null and parallel EJB boot failed; the same standalone boot
+        // reaches past that point with CRATONVM_DISABLE_JIT=1. Keep controller
+        // bytecode interpreted until the special-call backend is corrected.
+        // Liftable with CRATONVM_JIT_ALLOW_PACKAGES=org/jboss/as/controller/.
+        if class_name.starts_with("org/jboss/as/controller/")
+            && !package_allowed("org/jboss/as/controller/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
         // JSONSMART-PARSER.1 (2026-07-09) - Spring's JsonPathResultMatchersTests
         // now reach json-smart parsing after the EnumSet bridge fix. The
         // interpreter is correct (43/43), but the default JIT crashes inside
