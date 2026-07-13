@@ -43651,7 +43651,22 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         cf,
         "getInstance",
         "(Ljava/lang/String;)Ljava/security/cert/CertificateFactory;",
-        |ctx, _args| {
+        |ctx, args| {
+            // Real-JCA bring-up: prefer a genuine `CertificateFactory` wrapping
+            // a real provider SPI over the synthetic 1-field stub below — see
+            // `provider_chain::try_build_real_certificate_factory`'s doc
+            // comment for the root-cause story (real-bytecode-only methods
+            // like `generateCertPath` NPE on the synthetic stub's absent
+            // `certFacSpi`). Falls back to the stub when the algorithm can't
+            // be resolved (e.g. pure-synthetic mode, or an exotic type
+            // nothing seeds).
+            if crate::real_jca_mode() || crate::route_ec_to_real() || crate::route_dsa_to_real() {
+                if let Some(real_cf) =
+                    crate::jca::provider_chain::try_build_real_certificate_factory(ctx, args)
+                {
+                    return Ok(Some(Value::Object(Some(real_cf))));
+                }
+            }
             let obj = alloc_concurrent_synthetic(ctx, "java/security/cert/CertificateFactory", 1);
             ctx.set_field(obj, 0, Value::Object(None));
             Ok(Some(Value::Object(Some(obj))))

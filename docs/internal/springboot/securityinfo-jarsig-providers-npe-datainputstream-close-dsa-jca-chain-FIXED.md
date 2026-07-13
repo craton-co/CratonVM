@@ -1,15 +1,18 @@
-# `SecurityInfoTests`/`NestedJarFileTests`: `Providers.<clinit>` NPE + `DataInputStream.close()` no-op — FIXED (3 of 4 bugs); X.509 DER-parsing failure OPEN
+# `SecurityInfoTests`/`NestedJarFileTests`: `Providers.<clinit>` NPE + `DataInputStream.close()` no-op + DSA JCA-provider gaps — FIXED (6 of 7 bugs); nested PKCS7 timestamp-token ASN.1 parsing bug OPEN
 
-**Status:** 3 root causes FIXED (2 crypto/dispatch gaps genuinely fixed, plus general DSA
-`Signature` routing infrastructure added). A fourth, distinct, deeper bug in real X.509
-certificate DER parsing remains OPEN and blocks full test passage.
+**Status:** 6 root causes FIXED. A 7th, distinct, deeper bug in nested-PKCS7 (RFC 3161 timestamp
+token) attribute parsing remains OPEN and blocks full test passage.
 
 Investigated while following up on the `zip-filedatablock-bulk-bytebuffer-put-aioobe-FIXED.md`
 residuals list, which named `SecurityInfoTests`/`NestedJarFileTests` (signed-jar cases) as an
 unexplored cluster: jar-signature verification failing, plus a `bcprov-jdk18on-1.78.1.jar` file
 handle left open past test teardown.
 
-These turned out to be **four separate root causes**, not one:
+These turned out to be **seven separate root causes**, not one — what was originally logged as a
+single "bug 4: X.509 DER-parsing failure" in an earlier round of this investigation turned out,
+once actually root-caused, to be **three separate JCA-provider gaps**, all specific to DSA (bugs
+4–6 below); fixing those revealed an eighth-inning **new, genuinely distinct** bug (7) in nested
+PKCS7 timestamp-token verification that no earlier round of this investigation had reached:
 
 1. `sun.security.jca.Providers.<clinit>` no-op'd → `NullPointerException` in
    `Providers.startJarVerification()`/`stopJarVerification()` — **FIXED**.
@@ -18,11 +21,26 @@ These turned out to be **four separate root causes**, not one:
 3. CratonVM has no native DSA `Signature` sign/verify at all, and `sun.security.util
    .SignatureUtil.{initVerify,initSign}WithParam` were never reachable (dead native
    registrations) — **FIXED** (real-JDK-SPI routing added for DSA; `SignatureUtil` allowlisted
-   for native dispatch). Necessary but **not sufficient** — see bug 4.
-4. `sun.security.x509.X509CertInfo`/`sun.security.util.DerValue` fail to fully re-parse one of the
-   two real certificates embedded in the PKCS7 block (almost certainly the BouncyCastle leaf
-   cert's unusually large 2048-bit DSA key material) — **OPEN**, not root-caused to a fix (see
-   below). This is what actually still blocks `getWhenJarIsSigned`/`verifySignedJar` from passing.
+   for native dispatch).
+4. `KeyFactory.getInstance("DSA")` had no native support at all (`algo_idx("DSA")` unmapped) —
+   **FIXED** (routed to the real `sun.security.provider.DSAKeyFactory` SPI, mirroring the
+   existing RSA/EC pattern).
+5. `AlgorithmParameters.getInstance("DSA")` had no registered provider service, so
+   `AlgorithmId.decodeParams()` silently failed and `DSAPublicKey.getParams()` returned null —
+   **FIXED** (seeded the real `SUN` provider's `AlgorithmParameters.DSA →
+   sun.security.provider.DSAParameters` service entry).
+6. `CertificateFactory.getInstance(String)` (the 1-arg overload — the one virtually every real
+   caller uses) was intercepted by an old synthetic-stub native that never set the real
+   `certFacSpi` field, so any real-bytecode-only method not specifically re-implemented in that
+   native (`generateCertPath`, `generateCRL(s)`, `getCertPathEncodings`) NPE'd — **FIXED** (the
+   native now builds a genuine `CertificateFactory` wrapping a real provider SPI when the
+   real-JCA/EC/DSA routing path is active, falling back to the old synthetic stub otherwise).
+7. A real, JDK-independent-confirmed CratonVM bug in nested PKCS7 (RFC 3161 timestamp token)
+   attribute parsing: `sun.security.pkcs.SignerInfo.verify()`, when validating the *inner*
+   SignerInfo of an embedded timestamp token, fails to find a `contentType` authenticated
+   attribute that real HotSpot finds without issue on byte-identical input — **OPEN**, not
+   root-caused to a fix (see below). This is what actually still blocks
+   `getWhenJarIsSigned`/`verifySignedJar` from passing.
 
 ## Repro
 
@@ -49,8 +67,29 @@ investigated.
 After fix 3 (DSA routing + `SignatureUtil` allowlist): same 2/3 pass rate, same single
 `SecurityException` for `getWhenJarIsSigned`/`verifySignedJar` — bug 3 was real and necessary
 (confirmed via a from-scratch, Spring-Boot-independent repro) but the observed test failure has
-bug 4 further upstream in the same call chain, so fixing 3 alone doesn't move the test result.
-Left in because it's independently correct and needed once bug 4 is fixed.
+bugs 4–6 further upstream in the same call chain, so fixing 3 alone doesn't move the test result.
+Left in because it's independently correct and needed once 4–6 are fixed.
+
+After fix 4 (`KeyFactory` DSA routing): the `SecurityException` disappears — real progress — but a
+*new* failure appears: `InvalidKeyException: DSA public key lacks parameters` from
+`sun.security.provider.DSA.engineInitVerify`, one layer deeper in the same call chain
+(`X509Key.parse()`'s DSA public key now constructs successfully, but its `getParams()` still
+returns null). This is bug 5.
+
+After fix 5 (`AlgorithmParameters` DSA seeding): the `InvalidKeyException` disappears; a further
+*new* failure appears: `NullPointerException: Cannot invoke
+"CertificateFactorySpi.engineGenerateCertPath(List)" because "this.certFacSpi" is null` from
+`SignatureFileVerifier.getSigners()`. Real signature verification (DSA `Signature.verify()`)
+genuinely succeeded at this point — this NPE is in `CertPath` *construction*, after the crypto
+check already passed. This is bug 6.
+
+After fix 6 (`CertificateFactory` real-SPI construction): **no more exceptions at all** — jar
+verification runs to completion cleanly for the first time. But `SecurityInfoTests
+.getWhenJarIsSigned` still fails, now with a plain `AssertionError: Expecting actual not to be
+null` (`entry.getCertificates()`/`getCodeSigners()` return null for every `.class` entry). This is
+bug 7 — a **different subsystem** (nested PKCS7 ASN.1 attribute parsing, not JCA provider/SPI
+routing) that no earlier round of fixes had exposed, since bugs 1–6 all threw hard exceptions
+*before* code ever reached this deep.
 
 ## Bug 1 — `Providers.<clinit>` no-op breaks jar-signature verification (FIXED)
 
@@ -308,76 +347,224 @@ out of scope here, not blocking):
   resolves to the native (previously: zero native `Signature`/`SignatureUtil` calls fired beyond
   `getInstance`, for the entire test run).
 
-This fix is real and necessary, but the test still fails — see bug 4.
+This fix is real and necessary, but the test still fails — see bugs 4–7. (Note: what an earlier
+round of this investigation logged as "bug 4: X.509 DER-parsing failure, OPEN" was a
+misdiagnosis — the `ATHROW`-tracer catching the wrong exception in a chain of several. The real
+sequence, found by fixing forward one exception at a time, was bugs 4–6 below, all DSA-specific
+JCA-provider gaps, not DER-byte-level parsing at all.)
 
-## Bug 4 — real X.509 `DerValue`/`X509CertInfo` parsing fails on this cert (OPEN, not fixed)
+## Bug 4 — `KeyFactory.getInstance("DSA")` has no native support (FIXED)
+
+### Root cause
+
+`sun.security.x509.X509Key.parse()` (real bytecode, reached while re-parsing a real X.509 cert's
+`SubjectPublicKeyInfo` — this is the step the earlier misdiagnosed "bug 4" `ATHROW` trace actually
+caught mid-flight, one exception short of the real one) calls
+`KeyFactory.getInstance("DSA").generatePublic(x509KeySpec)`. `native-builtins/src/jca/key_factory
+.rs::algo_idx("DSA")` was unmapped (returned `-1`), so this fell through to the generic
+unrecognized-algorithm synthetic path and failed with `InvalidKeySpecException: cannot generate a
+usable Unknown public key` — not an `IOException`/DER-parsing failure at all, despite superficially
+looking like one three frames up the stack.
+
+### Fix
+
+`native-builtins/src/jca/key_factory.rs` — added `const ALGO_DSA: i32 = 11;`, mapped
+`"DSA" | "DSS"` to it in `algo_idx`/`algo_name`, and added a `drive_real_dsa_keyfactory` helper
+that drives the real `sun.security.provider.DSAKeyFactory` SPI (via the existing
+`drive_keyspec_spi` mechanism — CratonVM has no synthetic DSA key material to fall back to at all,
+unlike RSA/EC), gated on `route_dsa_to_real()` (the same flag bug 3 added). Wired into both
+`kf_generate_public` and `kf_generate_private`.
+
+### Verification
+
+A standalone `CertParseRepro.java` (reflective `X509CertInfo` construction from the leaf cert's
+raw TBSCertificate bytes, extracted via `openssl x509 -in ... -outform DER`) went from NPE/failure
+to printing the real, correctly-parsed `p`/`q`/`g`/`y` DSA public-key material. Re-running the
+actual suite: the `SecurityException` from bug 3's fix disappeared, replaced by the deeper
+`InvalidKeyException` of bug 5 — genuine forward progress, not a regression.
+
+## Bug 5 — `AlgorithmParameters.getInstance("DSA")` has no registered provider service (FIXED)
+
+### Root cause
+
+With bug 4 fixed, `sun.security.provider.DSA.engineInitVerify(PublicKey)` (real bytecode) started
+throwing `InvalidKeyException: DSA public key lacks parameters`. Traced via real JDK 25 source:
+`DSAPublicKey.getParams()` calls `algid.getParameters()`
+(`sun.security.x509.AlgorithmId.getParameters()` → `decodeParams()`), which calls
+`AlgorithmParameters.getInstance(algidName)` — with **no** provider service registered for
+`AlgorithmParameters.DSA` anywhere in `native-builtins/src/jca/provider_chain.rs`'s synthetic
+provider map, this throws `NoSuchAlgorithmException`, which `decodeParams()` **silently catches**
+(`algParams = null; return;` — by design, matching real JDK's tolerance for exotic/unsupported
+algorithm-parameter types), leaving `getParams()` returning null and the caller (`DSA
+.engineInitVerify`) throwing.
+
+### Fix
+
+`native-builtins/src/jca/provider_chain.rs` — added `seed_sun_dsa_services()`, registering
+`AlgorithmParameters.DSA → sun.security.provider.DSAParameters` (a real JDK 25 SPI class,
+confirmed pure Java/ASN.1 with no native methods and the implicit public no-arg ctor JCA requires,
+via `src.zip` source inspection) under the `SUN` provider, plus the `1.2.840.10040.4.1` (id-dsa)
+OID alias. Also extended the `GetInstance` bridge-registration gate (previously
+`real_jca_mode() || route_ec_to_real()`) to include `route_dsa_to_real()`, so the bridge natives
+that make this provider-map entry reachable are wired even if EC routing were ever independently
+disabled.
+
+### Verification
+
+`CertParseRepro` extended to print the parsed cert's `getPublicKey()`: went from a working key with
+null params to one whose `toString()` includes the real `p`/`q`/`g` DSA parameters (`"Sun DSA
+Public Key"` formatting). Re-running the suite: the `InvalidKeyException` disappeared, replaced by
+the deeper `NullPointerException` of bug 6.
+
+## Bug 6 — `CertificateFactory.getInstance(String)`'s synthetic stub never sets `certFacSpi` (FIXED)
+
+### Root cause
+
+With bugs 4–5 fixed, the failure moved to `NullPointerException: Cannot invoke
+"CertificateFactorySpi.engineGenerateCertPath(List)" because "this.certFacSpi" is null` from
+`sun.security.util.SignatureFileVerifier.getSigners()`'s `certificateFactory
+.generateCertPath(chain)` call — the *final* step of jar-signature verification, reached only
+after DSA `Signature.verify()` itself had already genuinely succeeded.
+
+`native-builtins/src/phases_late.rs::register_p68_security_cert` registers a native directly on
+`java/security/cert/CertificateFactory.getInstance(String)` (the **1-arg** overload — the one
+`SignatureFileVerifier`, and virtually every real caller, uses) that hands out a 1-field
+`alloc_concurrent_synthetic` stub object with no real `certFacSpi` field ever set. Since this is a
+**static** method, the registered native always wins unconditionally (no `check_override` gate
+applies to statics — see `reference_native_close_dispatch_precedence_over_inherited_bytecode`'s
+general finding). The stub's `generateCertificate`/`generateCertificates` methods were already
+natively intercepted with a real-`certFacSpi`-first-else-legacy-ad-hoc-parser fallback, so they
+worked regardless — but `generateCertPath`, `generateCRL(s)`, and `getCertPathEncodings` are
+**not** natively intercepted at all, so they always ran on real bytecode, which unconditionally
+needs the real `certFacSpi` field the synthetic stub never had. This bug therefore predates this
+session's DSA work entirely — it was simply never reached before, since bugs 1–5 always threw
+first.
+
+### Fix
+
+`native-builtins/src/jca/provider_chain.rs` — added `try_build_real_certificate_factory`, which
+resolves the algorithm against the existing provider service map (reusing `find_service_provider`/
+`build_jca_impl`/`resolve_or_make_provider`, the same primitives `getinstance_instance_search`
+already uses for the 2/3-arg `getInstance` overloads, which were never natively intercepted and
+already worked correctly) and constructs a genuine `CertificateFactory` via its real
+`(CertificateFactorySpi, Provider, String)` constructor.
+`native-builtins/src/phases_late.rs`'s `getInstance(String)` native now calls this first (gated on
+`real_jca_mode() || route_ec_to_real() || route_dsa_to_real()`) and only falls back to the old
+synthetic stub if it returns `None` (e.g. pure-synthetic mode, or an unresolvable algorithm).
+
+### Verification
+
+Re-ran the suite: the `certFacSpi` NPE disappeared entirely — jar verification now runs to
+completion with **no exceptions at all**, for the first time in this investigation. `cargo test -p
+cratonvm-native-builtins --lib`: 2976 passed, 6 failed — all 6 match the pre-existing baseline
+documented earlier in this doc (JCA Ed25519 dead-key test, 3× jspecify type-use annotations,
+ByteBuffer address test, xerces whitespace); confirmed by stashing this session's diff and
+re-running the single Ed25519 test in isolation, which fails identically without any of this
+session's changes.
+
+## Bug 7 — nested PKCS7 (RFC 3161 timestamp token) attribute parsing (OPEN, not fixed)
 
 ### What's confirmed
 
-With bugs 1–3 fixed, instrumenting every `ATHROW` bytecode (temporary, gated behind
-`CRATONVM_DSA_DBG`, removed before commit) during `getWhenJarIsSigned` showed the actual failure
-is **upstream of signature verification entirely** — in the certificate-issuer-name resolution
-`sun.security.pkcs.SignerInfo.verify()` does before it ever gets to `Signature.getInstance()`
-for the real check:
+With bugs 1–6 fixed, `SecurityInfoTests.getWhenJarIsSigned` fails differently again — no more
+exceptions, but a plain `AssertionError: Expecting actual not to be null`:
+`entry.getCertificates()`/`getCodeSigners()` return **null for every `.class` entry**, even though
+`content.hasJarSignatureFile()` is true and nothing throws anywhere visible to the test.
+
+Root-caused via a from-scratch, Spring-Boot-independent, reflective repro
+(`SigVerifyRepro.java`) that directly constructs a real `sun.security.util.SignatureFileVerifier`
+from the extracted `META-INF/{MANIFEST.MF,BC2048KE.SF,BC2048KE.DSA}` bytes and calls its
+package-private `process(...)` method, catching whatever it throws:
 
 ```
-ATHROW class=java/io/IOException
-  DerValue.<init> → DerValue.<init> → X509CertInfo.<init> →
-  PKCS7.populateCertIssuerNames → PKCS7.getCertificate → SignerInfo.getCertificate →
-  SignerInfo.verify → PKCS7.verify → SignatureFileVerifier.processImpl → ... → JarInputStream.read
-ATHROW class=java/security/cert/CertificateParsingException   (X509CertInfo.<init>'s own catch-and-rewrap of the IOException above)
-ATHROW class=java/lang/SecurityException                      (the final, observed "cannot verify signature block file")
+process() FAILED: java.security.SignatureException: Error verifying signature
+	at sun.security.pkcs.SignerInfo.verify(SignerInfo.java:473)
+	at sun.security.pkcs.PKCS7.verify(PKCS7.java:534)
+	at sun.security.pkcs.PKCS7.verify(PKCS7.java:551)
+	at sun.security.pkcs.SignerInfo.getTimestamp(SignerInfo.java:675)
+	at sun.security.util.SignatureFileVerifier.getSigners(SignatureFileVerifier.java:751)
+Caused by: java.io.IOException: No value found for attribute 1.2.840.113549.1.9.3
+	at sun.security.pkcs.PKCS9Attributes.getAttributeValue(PKCS9Attributes.java:278)
+	at sun.security.pkcs.SignerInfo.verify(SignerInfo.java:344)
 ```
 
-`PKCS7.getCertificate(serial, issuerName)` needs `certIssuerNames[i]` populated for every embedded
-cert (there are two: the RSA-signed CA "JCE Code Signing CA" and the DSA-keyed leaf "Legion of the
-Bouncy Castle Inc."). `populateCertIssuerNames()` re-parses each cert's TBSCertificate
-(`new X509CertInfo(cert.getTBSCertificate())`) to get a canonical `X500Name` for issuer comparison
-— and this re-parse throws `IOException` (from `sun.security.util.DerValue`, real bytecode) for
-(most likely) the DSA cert, given its unusually large key material (256-byte `p`, `q`/`g`/`y` all
-sizeable DER `INTEGER`s inside the `SubjectPublicKeyInfo`).
+`SignatureFileVerifier.getSigners()` (line 751: `signers.add(new CodeSigner(certChain,
+info.getTimestamp()));`) calls `SignerInfo.getTimestamp()` **unguarded** — unlike the *other*
+`getTimestamp()` call site inside `SignerInfo.verify(PKCS7, byte[])` (lines 311–323), which wraps
+it in its own `catch (Exception e) { /* signed but w/o a timestamp */ }` specifically so a broken
+timestamp token doesn't fail the primary signature. `getSigners()`'s call has no such guard, so any
+exception from `getTimestamp()` propagates all the way up through `processImpl()`/`process()`,
+caught only by `JarVerifier.processEntry()`'s broad, silent
+`catch (IOException | CertificateException | NoSuchAlgorithmException | SignatureException e) { //
+ignore and treat as unsigned }` — explaining why the test sees no exception at all, just silently
+missing certs.
 
-Real JDK code catches this internally (`populateCertIssuerNames`'s own `catch (Exception e) {
-// leave name as is }`) and falls back to `cert.getIssuerDN()` unconverted — **not fatal by
-design** on real JDK. Under CratonVM, this fallback apparently still doesn't produce a
-`certIssuerNames[i]` that `.equals()` the `X500Name` `SignerInfo` is searching for (likely a
-`Principal`-subtype mismatch once the canonical-form conversion silently fails), so
-`getCertificate()` returns `null` — even though a matching certificate genuinely exists in the
-block. This is consistent with an *earlier*, separate finding in the same investigation: a
-minimal `CertificateFactory.getInstance("X.509").generateCertificates(pkcs7Bytes)` call against
-the raw PKCS7 bytes returned **0 certificates** (a different, but likely related, X.509/PKCS7
-parsing gap).
+`getTimestamp()` parses the RFC 3161 timestamp token BC embedded as an unauthenticated attribute on
+the *outer* SignerInfo — itself another, nested PKCS7 `SignedData` structure — and verifies its
+*own inner* SignerInfo. That inner `SignerInfo.verify()` throws at line 344:
+`authenticatedAttributes.getAttributeValue(PKCS9Attribute.CONTENT_TYPE_OID)` (OID
+`1.2.840.113549.1.9.3`), meaning the inner SignerInfo's `PKCS9Attributes` — a `Hashtable
+<ObjectIdentifier, PKCS9Attribute>` — doesn't contain (or fails to look up) a `contentType`
+attribute that RFC 3161 timestamp tokens are required to carry (`id-ct-TSTInfo`).
+
+**Confirmed genuinely CratonVM-specific, not a jar/JDK-version quirk**: ran the *identical*
+`SigVerifyRepro.java`, unmodified, against the identical extracted bytes under real HotSpot JDK 25
+(`--add-opens java.base/sun.security.pkcs=ALL-UNNAMED --add-opens
+java.base/sun.security.util=ALL-UNNAMED`) — it succeeds completely, reporting 5369 signed entries,
+no exception.
+
+None of `sun.security.pkcs.PKCS7`, `sun.security.pkcs.SignerInfo`, or `sun.security.util
+.PKCS9Attributes` have ANY native registration anywhere in `native-builtins` (confirmed by
+exhaustive grep) — they run entirely on real bytecode both here and for the *outer* SignerInfo,
+which verifies fine. The divergence must therefore come from a lower-level ASN.1 primitive that
+behaves differently for this specific nested structure than it does for the outer one.
+
+### Leading hypothesis (not confirmed)
+
+`PKCS9Attributes` stores attributes in a `Hashtable<ObjectIdentifier, PKCS9Attribute>` and looks
+them up by a **separately-constructed** `ObjectIdentifier` (`PKCS9Attribute.CONTENT_TYPE_OID`, a
+different object instance than whatever the inner SignerInfo's parser constructed while decoding
+the attribute set). If `ObjectIdentifier.equals()`/`hashCode()` are inconsistent for an instance
+that's survived a moving-GC relocation since insertion — a bug pattern with substantial precedent
+in this codebase (see `reference_stale_ref_decode_hardening`,
+`reference_native_io_read_stale_objectref_pin_fix`, and others in the GC/moving-young-gen memory
+cluster) — a `Hashtable.get()` miss on a logically-present key would produce exactly this symptom.
+This is a hypothesis, not a confirmed diagnosis; the outer SignerInfo's `PKCS9Attributes` clearly
+works, so whatever's different is specific to something about the inner/nested parse (timing,
+object lifetime, or recursion depth into the same native primitives) — not a blanket
+`ObjectIdentifier` bug, or the outer attributes would fail too.
 
 ### Why not fixed here
 
-Root-causing the exact `DerValue`/`X509CertInfo` DER-parsing failure (which specific field —
-almost certainly something inside the DSA `SubjectPublicKeyInfo`'s large `INTEGER` encodings, but
-not confirmed to the byte) requires the same kind of `ATHROW`-message-level tracing this session
-already leaned on heavily, one level deeper, likely into whichever native backs `BigInteger`/DER
-`INTEGER` decoding for oversized values. This is a **distinct, self-contained investigation** from
-everything else in this doc — different subsystem (real X.509 cert parsing, not JCA `Signature`
-dispatch), different symptom class (a parsing exception three frames before any crypto call), and
-plausibly a bigger blast radius (any code that re-parses a cert with unusual key material via
-`new X509CertInfo(bytes)`, not just jar verification). Stopped here rather than open a fifth
-nested investigation in the same session.
+This is a **different subsystem** from bugs 1–6 (real ASN.1/DER attribute-set parsing depth, not
+JCA provider/SPI routing) and a different symptom class (silent data loss via a caught-and-ignored
+exception, not a hard failure) — confirming the exact native gap requires byte-level ASN.1
+inspection of the nested timestamp token's attribute SET, one level deeper than anything this
+session's tooling was built for. Stopped here rather than open an eighth nested investigation in
+the same session.
 
 ### Suggested starting points for a follow-up
 
-- Reproduce directly: `new sun.security.x509.X509CertInfo(leafCert.getTBSCertificate())`
-  (reflectively, `sun.security.x509`/`sun.security.pkcs` are not exported — needs
-  `--add-exports`/`--add-opens` or an in-package test class) against the extracted
-  `META-INF/BC2048KE.DSA` leaf certificate; get the exact `IOException` message (this session's
-  `ATHROW` tracer read `Throwable`'s message field by raw index and got `"<non-string>"` — use
-  `invoke_virtual(..., "getMessage", "()Ljava/lang/String;", ...)` instead, or `getMessage()` via
-  reflection in a plain Java repro, for a real message).
-- Extracted signature-block bytes for offline testing: `unzip -p bcprov-jdk18on-1.78.1.jar
-  META-INF/BC2048KE.DSA` (PKCS7 SignedData, DER) and `META-INF/BC2048KE.SF` (the signed manifest
-  digest file) — both straightforward to re-extract from
+- `SigVerifyRepro.java` (recipe below) is a complete, JDK-independent, Spring-Boot-independent
+  repro — no rebuild needed to iterate, since it hits real (unmodified) `sun.security.pkcs`/
+  `sun.security.util` bytecode directly via reflection. Re-extract the byte inputs and re-run it
+  under CratonVM after any candidate fix.
+- Extract the byte inputs: `unzip -p bcprov-jdk18on-1.78.1.jar META-INF/MANIFEST.MF
+  META-INF/BC2048KE.SF META-INF/BC2048KE.DSA` from
   `~/.gradle/caches/modules-2/files-2.1/org.bouncycastle/bcprov-jdk18on/1.78.1/*/bcprov-jdk18on-1.78.1.jar`.
-- Likely candidates for the actual native gap: `sun.security.util.DerInputStream`/`DerValue`'s
-  handling of `INTEGER`/`BIT STRING` DER elements over ~256 bytes (the DSA `p` parameter's size),
-  or `sun.security.x509.X509Key`/`AlgorithmId` parsing a DSA `SubjectPublicKeyInfo` specifically
-  (as opposed to RSA/EC, which are presumably well-exercised elsewhere).
+- The repro itself: reflectively construct `sun.security.util.ManifestDigester(byte[])`, then
+  `sun.security.util.SignatureFileVerifier(ArrayList, ManifestDigester, String, byte[])` (the
+  `.DSA` bytes), call its `setSignatureFile(byte[])` (the `.SF` bytes), then `process(Hashtable,
+  List, String)` — catch `InvocationTargetException`, print `getCause()`'s full chain.
+- To go one level deeper without modifying the repro's shape: reflectively call
+  `SignerInfo.getTsToken()` on the outer signer to get the raw nested `PKCS7`, then walk its
+  `ContentInfo`/`SignerInfo[]` and attribute `Hashtable` directly (via more reflection) to compare
+  the RAW attribute set actually parsed against what the DER bytes should decode to — this would
+  confirm or refute the `Hashtable`/`ObjectIdentifier` hypothesis above without guessing.
+- If the hypothesis holds, the fix is almost certainly in whatever native backs `ObjectIdentifier`
+  construction/equality/hashing during DER SET-OF decoding, or in ensuring GC-pinning discipline
+  around `Hashtable` insertion during nested/recursive ASN.1 parsing — not in
+  `sun.security.pkcs`/`sun.security.util` itself (all real bytecode, unmodifiable target).
 
 ## Files changed
 
@@ -388,12 +575,19 @@ nested investigation in the same session.
 - `native-builtins/src/classloader.rs` — `DataInputStream.close()` fixed for consistency (dead in
   practice); `BufferedInputStream.close()` investigated and left as documented-intentional no-op.
 - `native-builtins/src/phases_late.rs` — `InflaterInputStream.close()`/`ZipInputStream.close()`
-  fixed for `--synthetic-jdk` mode correctness (both confirmed dead code under real-JDK boot, kept
-  regardless — see "Dead ends" above).
+  fixed for `--synthetic-jdk` mode correctness (bug 2 fix, dead code under real-JDK boot, kept
+  regardless — see "Dead ends" above); `CertificateFactory.getInstance(String)` now prefers a real
+  `CertificateFactory` when available (bug 6 fix).
 - `native-builtins/src/jca/signature.rs` — DSA→real-SPI routing (bug 3 fix): `SIG_SHA1_DSA`
   constant, name/OID mappings, `dsa_real_spi_class`, wired into `sig_sign`/`sig_verify`.
 - `native-builtins/src/lib.rs` — `route_dsa_to_real()` (bug 3 fix, default-ON kill-switched flag).
 - `vm/src/vm/vm_exec.rs` — `sun/security/util/SignatureUtil` `check_override` allowlist entry
   (bug 3 fix, the piece that actually makes `sigutil_init_verify_key`/etc. reachable).
+- `native-builtins/src/jca/key_factory.rs` — `ALGO_DSA` constant, `drive_real_dsa_keyfactory`,
+  wired into `kf_generate_public`/`kf_generate_private` (bug 4 fix).
+- `native-builtins/src/jca/provider_chain.rs` — `seed_sun_dsa_services` (bug 5 fix);
+  `try_build_real_certificate_factory`, extended `ec_real` gate to include `route_dsa_to_real()`
+  (bug 6 fix).
 
-Bug 4 (X.509 DER-parsing) needs its own follow-up session — no code changed for it here.
+Bug 7 (nested PKCS7 timestamp-token attribute parsing) needs its own follow-up session — no code
+changed for it here.
