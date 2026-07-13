@@ -845,6 +845,20 @@ impl TieredCompilationManager {
         if state.queued_for_compilation
             || state.current_tier >= CompilationTier::C2
             || state.c2_bailout
+            // Same "give up after repeated failures" convention as
+            // `should_compile`/`request_c2_upgrade`: without this, a method
+            // whose OSR artifact compile keeps returning `published=false`
+            // (e.g. an uninlinable callee) has `current_tier` permanently
+            // stuck below C2 and `queued_for_compilation` cleared by
+            // `complete_task` after each failure — so the very next hot
+            // back-edge re-enqueues an OSR task, forever, with no
+            // diagnostic. This is the OSR-request twin of the plain
+            // background-compile bail-listing gap (see the `try_compile`
+            // ldc/ldc2_w fix): observed as a silent hang where the same
+            // method (`TestResponsePerformance.doHomebrew`) kept getting
+            // "bg-compile ... osr_bci=..." re-attempted every stride while
+            // never completing even one 1M-iteration measurement pass.
+            || state.tier_fail_count >= MAX_TIER_FAIL_RETRIES
         {
             return None;
         }

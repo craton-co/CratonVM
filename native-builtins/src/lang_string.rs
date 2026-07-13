@@ -1979,13 +1979,33 @@ pub(crate) fn native_sb_append_float(
 ///
 /// If the object is a Java String, reads it directly. Otherwise invokes
 /// `toString()` which will find overridden versions in user-defined classes.
+///
+/// A `toString()` override that legitimately returns Java `null` (legal —
+/// see `bug54241b` below) is coerced to the text `"null"` here, matching
+/// what every caller of this function needs: `StringBuilder.append(Object)`,
+/// string concatenation, etc. all ultimately go through
+/// `AbstractStringBuilder.append(String)`, which substitutes the text
+/// `"null"` for a null argument. `String.valueOf(Object)` is the ONE
+/// exception — its JDK contract for a non-null `obj` is exactly
+/// `obj.toString()`, preserving nullness rather than substituting text — so
+/// it must use [`invoke_to_string_opt`] directly instead of this wrapper.
 pub(crate) fn invoke_to_string(
     ctx: &mut dyn NativeContext,
     obj: cratonvm_types::ObjectRef,
 ) -> Result<String, cratonvm_types::error::MethodCallFailed> {
+    Ok(invoke_to_string_opt(ctx, obj)?.unwrap_or_else(|| "null".to_string()))
+}
+
+/// Like [`invoke_to_string`], but returns `Ok(None)` when `toString()`
+/// legitimately returns a Java `null` reference, instead of coercing it to
+/// the text `"null"`. Needed by `String.valueOf(Object)` — see its call site.
+fn invoke_to_string_opt(
+    ctx: &mut dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+) -> Result<Option<String>, cratonvm_types::error::MethodCallFailed> {
     // Fast path: if it's already a String object, just read it
     if let Some(s) = ctx.read_string(obj) {
-        return Ok(s);
+        return Ok(Some(s));
     }
 
     // Fast path for wrapper types: if the object has exactly 1 field and its
@@ -2037,17 +2057,17 @@ pub(crate) fn invoke_to_string(
                         // Integer
                         v.to_string()
                     };
-                    return Ok(formatted);
+                    return Ok(Some(formatted));
                 }
-                Value::Long(v) => return Ok(v.to_string()),
+                Value::Long(v) => return Ok(Some(v.to_string())),
                 // Use the Java-spec formatters (NOT raw `{}`), so a boxed Double/Float
                 // rendered via String.valueOf(Object) / StringBuilder.append(Object) /
                 // object string-concat matches `Double.toString` — incl. the
                 // 10^-3..10^7 scientific-notation threshold, "Infinity", and "-0.0".
                 // Raw `format!("{}")` dropped the ".0", printed "inf"/"-0", and never
                 // used E-notation (e.g. boxed 1e7 -> "10000000.0", -0.0 -> "-0").
-                Value::Float(v) => return Ok(format_float(v)),
-                Value::Double(v) => return Ok(format_double(v)),
+                Value::Float(v) => return Ok(Some(format_float(v))),
+                Value::Double(v) => return Ok(Some(format_double(v))),
                 _ => {} // Not a primitive wrapper
             }
         }
@@ -2056,9 +2076,14 @@ pub(crate) fn invoke_to_string(
     // Call obj.toString() via virtual dispatch; fall back on dispatch errors
     let result = ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[]);
     match result {
-        Ok(Some(Value::Object(Some(str_ref)))) => Ok(ctx
-            .read_string(str_ref)
-            .unwrap_or_else(|| "null".to_string())),
+        Ok(Some(Value::Object(Some(str_ref)))) => Ok(Some(
+            ctx.read_string(str_ref).unwrap_or_else(|| "null".to_string()),
+        )),
+        // toString() legitimately returned null (e.g. TestJspWriterImpl's
+        // bug54241b: an anonymous class whose toString() explicitly `return
+        // null;`) — this is NOT a dispatch failure, don't fall through to the
+        // ClassName@hash fallback below.
+        Ok(Some(Value::Object(None))) => Ok(None),
         Ok(_) | Err(_) => {
             // Honest fallback name: arrays render their JVMS array-class name
             // like HotSpot ([Ljava.lang.Class; / [I), not "Object".
@@ -2067,7 +2092,7 @@ pub(crate) fn invoke_to_string(
             } else {
                 "Object".to_string()
             };
-            Ok(format!("{}@{:x}", name, ctx.identity_hash_code(obj)))
+            Ok(Some(format!("{}@{:x}", name, ctx.identity_hash_code(obj))))
         }
     }
 }
@@ -3383,13 +3408,28 @@ pub(crate) fn native_string_value_of_object(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let text = match args.first() {
-        Some(Value::Object(Some(obj))) => invoke_to_string(ctx, *obj)?,
-        Some(Value::Object(None)) => "null".to_string(),
-        _ => "null".to_string(),
-    };
-    let result = ctx.create_string_uninterned(&text);
-    Ok(Some(Value::Object(Some(result))))
+    // JDK contract: `return (obj == null) ? "null" : obj.toString();` — for a
+    // non-null obj this returns EXACTLY whatever obj.toString() returns,
+    // including a legitimate Java null if toString() itself returns null
+    // (legal — e.g. TestJspWriterImpl's bug54241b, an anonymous class whose
+    // toString() explicitly `return null;`). That null must propagate as an
+    // actual null reference, NOT the text "null": JspWriterImpl.print(Object)
+    // is `write(String.valueOf(obj))`, and java.io.Writer's default
+    // write(String) legitimately throws NullPointerException on a real null
+    // (str.length()) but would silently write 4 chars for the text "null".
+    match args.first() {
+        Some(Value::Object(Some(obj))) => match invoke_to_string_opt(ctx, *obj)? {
+            Some(text) => {
+                let result = ctx.create_string_uninterned(&text);
+                Ok(Some(Value::Object(Some(result))))
+            }
+            None => Ok(Some(Value::Object(None))),
+        },
+        _ => {
+            let result = ctx.create_string_uninterned("null");
+            Ok(Some(Value::Object(Some(result))))
+        }
+    }
 }
 
 pub(crate) fn native_string_compare_to(

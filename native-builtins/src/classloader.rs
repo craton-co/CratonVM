@@ -60,6 +60,9 @@ pub fn reset_loader_singletons() {
         .clear();
     // HIB-CV-24: drop the GC marker's loader-pin mirror for the new VM.
     cratonvm_types::loader_pin::clear_loader_pins();
+    // Companion: drop the GC marker's mirror_pin registry for the new VM too
+    // (see `cratonvm_types::mirror_pin`).
+    cratonvm_types::mirror_pin::clear_mirror_pins();
 }
 
 /// GC root scan for the singleton built-in class loaders.
@@ -160,12 +163,20 @@ pub fn gc_reconcile_defining_loaders(
     is_marked: &dyn Fn(usize) -> bool,
     pointer_map: &std::collections::HashMap<usize, usize>,
 ) {
+    let dbg = std::env::var_os("CRATONVM_DBG_MIRRORPIN").is_some();
     let mut map = defining_loader_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     map.retain(|_class_id, obj_ref| {
         let old_addr = obj_ref.as_ptr() as usize;
-        if !is_marked(old_addr) {
+        let alive = is_marked(old_addr);
+        if dbg {
+            eprintln!(
+                "[DBG_MIRRORPIN] defining_loader_store cid={:?} loader_addr={:#x} is_marked={}",
+                _class_id, old_addr, alive
+            );
+        }
+        if !alive {
             // Loader unreachable and collected this cycle — drop the stale entry.
             // (No deref of `obj_ref`; the memory may already be freed/reused.)
             return false;
@@ -789,7 +800,14 @@ pub(crate) fn cl_bootstrap_scoped() -> bool {
 /// the now-stale side-table entry and remaps survivors. Opt-out
 /// `CRATONVM_LOADER_UNLOAD=0` restores the legacy behavior where every defining
 /// loader is strong-rooted forever (no class/loader unloading) as the safety net.
-pub(crate) fn loader_unload_enabled() -> bool {
+///
+/// `pub` (not `pub(crate)`): also consulted by `vm::memory::roots` /
+/// `vm::memory::gc` to gate rooting/reconciliation of the `SharedVm::class_mirrors`
+/// cache the same way — a `java.lang.Class` mirror's `classLoader` field is a
+/// real heap edge, so unconditionally rooting a user-defined class's mirror
+/// keeps its loader alive forever too, defeating this gate for any loader that
+/// ever had a class reflected on (`getClass()`, annotations, ...).
+pub fn loader_unload_enabled() -> bool {
     static GATE: OnceLock<bool> = OnceLock::new();
     *GATE.get_or_init(|| {
         std::env::var("CRATONVM_LOADER_UNLOAD")
