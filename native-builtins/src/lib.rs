@@ -24971,6 +24971,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljavax/tools/JavaFileManager$Location;Ljava/lang/String;Ljava/util/Set;Z)Ljava/lang/Iterable;",
         native_javac_file_manager_list,
     );
+    registry.register(
+        "com/sun/tools/javac/file/JavacFileManager$PathAndContainer",
+        "compareTo",
+        "(Ljava/lang/Object;)I",
+        native_javac_path_and_container_compare_to,
+    );
+    registry.register(
+        "com/sun/tools/javac/util/StringNameTable$NameImpl",
+        "hashCode",
+        "()I",
+        native_javac_string_name_hash_code,
+    );
 
     registry.register(
         "com/sun/tools/javac/file/RelativePath",
@@ -36403,6 +36415,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
+    crate::phases_late::register_p66_file_visitor(registry);
     // Restore the caller's category so later registrars keep their intended tag.
     registry.set_category(prev_category);
     let after = registry.len();
@@ -51741,63 +51754,40 @@ fn javac_platform_listing_classes(package_name: &str) -> &'static [&'static str]
     }
 }
 
-fn native_javac_file_manager_list(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_javac_file_manager_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let location = args.get(1).copied().unwrap_or(Value::Object(None));
-    let location_name = match location {
-        Value::Object(Some(location_obj)) => {
-            match ctx.invoke_virtual(location_obj, "getName", "()Ljava/lang/String;", &[])? {
-                Some(Value::Object(Some(name_obj))) => ctx.read_string(name_obj).unwrap_or_default(),
-                _ => String::new(),
-            }
-        }
-        _ => String::new(),
-    };
-    let package_name = match args.get(2) {
-        Some(Value::Object(Some(name_obj))) => ctx.read_string(*name_obj).unwrap_or_default(),
-        _ => String::new(),
-    };
-    if location_name == "CLASS_PATH"
-        && (package_name == "java"
-            || package_name.starts_with("java.")
-            || package_name == "com"
-            || package_name == "com.example"
-            || package_name.starts_with("com.example."))
-    {
-        return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
-    }
-    if location_name == "SYSTEM_MODULES[java.base]" {
-        let class_names = javac_platform_listing_classes(&package_name);
-        if !class_names.is_empty() {
-            let Some(kind_class) = javac_java_file_object_kind_class(ctx) else {
-                return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
-            };
-            let mut files = Vec::with_capacity(class_names.len());
-            for class_name in class_names {
-                if let Some(Value::Object(Some(file))) = javac_platform_class_file_object(
-                    ctx,
-                    this,
-                    location,
-                    kind_class,
-                    class_name,
-                )? {
-                    files.push(Value::Object(Some(file)));
-                }
-            }
-            return Ok(Some(Value::Object(Some(javac_array_list_from_values(
-                ctx, &files,
-            )))));
-        }
-    }
     ctx.invoke_virtual_bytecode_only(
         this,
         "list",
         "(Ljavax/tools/JavaFileManager$Location;Ljava/lang/String;Ljava/util/Set;Z)Ljava/lang/Iterable;",
         &args[1..],
     )
+}
+
+fn native_javac_path_and_container_compare_to(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let other = match args.get(1) {
+        Some(Value::Object(Some(value))) => *value,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let left = ctx.get_field_by_name(this, "index").as_int().unwrap_or(0);
+    let right = ctx.get_field_by_name(other, "index").as_int().unwrap_or(0);
+    Ok(Some(Value::Int(left.wrapping_sub(right))))
+}
+
+fn native_javac_string_name_hash_code(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let value = match ctx.get_field_by_name(this, "string") {
+        Value::Object(Some(value)) => ctx.read_string(value).unwrap_or_default(),
+        _ => String::new(),
+    };
+    Ok(Some(Value::Int(java_string_hash_code_ascii(&value))))
 }
 
 fn javac_relative_path_string(ctx: &mut dyn NativeContext, obj: ObjectRef) -> String {
