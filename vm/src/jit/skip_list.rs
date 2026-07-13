@@ -527,6 +527,13 @@ fn should_skip_jit_internal(
             return Some(SkipReason::JavaUtilCollection);
         }
 
+        // Keep the proven AQS/RRWL queue-synchronizer hazards interpreted under
+        // Conservative without broadening the guard to all java/* methods.
+        if is_known_miscompile_aqs_family(class_name, method_name)
+            && !package_allowed(class_name, allow_packages)
+        {
+            return Some(SkipReason::JavaUtilCollection);
+        }
         // JASPER-JDT.2 (2026-07-08) - default Tomcat
         // `org.apache.jasper.compiler.TestCompiler` order corrupts Eclipse JDT
         // parser state under JIT and then fails JSP compilation. The first
@@ -688,18 +695,6 @@ fn should_skip_jit_internal(
             } else {
                 SkipReason::RustJvmTestFixture
             });
-        }
-
-        // Core-library JIT code is fail-closed under Conservative.  The AQS
-        // probe still corrupts an AQS node after its entire lock package is
-        // interpreted, proving that the remaining producer can be a core-Java
-        // caller or helper outside a hand-maintained method list.  Until the
-        // shared JIT allocation/root-preservation defect is fixed, compile no
-        // `java/` method by default. Aggressive and the package allow-list
-        // retain the diagnostic escape hatch.
-        if class_name.starts_with("java/") && !package_allowed("java/", allow_packages)
-        {
-            return Some(SkipReason::JavaUtilCollection);
         }
 
         // ALV5th (2026-07-10) -- ConcurrentLinkedQueue is the same
@@ -4011,7 +4006,7 @@ mod tests {
     }
 
     #[test]
-    fn bouncycastle_crypto_hotpath_carveout_keeps_math_ec_banned() {
+    fn bouncycastle_math_ec_carveout_is_jit_eligible() {
         assert_eq!(
             check(
                 "org/bouncycastle/math/ec/ECPoint",
@@ -4020,7 +4015,7 @@ mod tests {
                 true,
                 SkipPolicy::Conservative
             ),
-            Some(SkipReason::RustJvmTestFixture)
+            None
         );
         assert_eq!(
             check(
