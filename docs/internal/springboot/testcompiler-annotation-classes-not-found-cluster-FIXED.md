@@ -85,8 +85,8 @@ issue because direct lookup and package enumeration exercise different paths.
 
 ## Root causes and fixes
 
-Two runtime defects were required to close the seven-class cluster and its
-downstream residuals:
+Four runtime defects and moving-GC residuals were required to close the
+seven-class cluster completely:
 
 1. CratonVM force-dispatches `JavacFileManager.list`. The original native used
    a small platform-class allowlist; the later full-JRT implementation still
@@ -107,14 +107,27 @@ downstream residuals:
    delegates to a non-JDK custom handler first when one is present, while URLs
    synthesized by CratonVM (which have no handler) retain the previous static
    lookup behavior.
+3. A current-`dev` rerun then exposed another moving-GC window in native
+   `Stream.collect`: materializing the lazy stream could move the tagged
+   `Collector` before CratonVM read its tag. A `Collectors.toSet()` collector
+   could therefore be mistaken for an `ArrayList` collector. The collector is
+   now pinned across stream materialization and refreshed before its tag and
+   fields are read.
+4. After the collector itself was protected, the materialized stream elements
+   were still raw references while the synthetic `HashSet`, backing map, and
+   buckets were allocated and populated. A `TypeElement` could move and the
+   processor would later observe an unrelated `java.lang.Object`. `make_set_of`
+   now pins every input element and each partially-built collection object,
+   refreshes them before use, and releases the complete pin window on both
+   success and error.
 
 ## Final verification (Azure, JDK 25, 2026-07-13)
 
 Unique final binary:
 
 ```text
-/data/victor-worktrees/cratonvm-spring-testcompiler-annotation-complete-20260713-06
-sha256 6e80e3a6425f543844d9b218a4699cd70ed615a9f4c9265fccb4f847c1bfaaae
+/data/victor-worktrees/cratonvm-spring-testcompiler-annotation-complete-20260713-10
+sha256 f14d72b9b341f9d27db06c1dea1ebf31b3b071c2a494ec1bf86f7e4e0a239062
 ```
 
 Focused runtime contracts all pass:
@@ -130,6 +143,10 @@ Focused runtime contracts all pass:
   `jrtfs_javac_listing_tests::javac_platform_listing_uses_complete_jrt_package_inventory`
   and
   `runtime::interpreter::tests::standard_location_force_native_covers_javac_regex_shortcut`.
+- The complete `cratonvm-native-collections` library suite passes (72 tests),
+  and three fresh `MethodBasedMetadataGenerationTests` VM processes pass
+  10/10 each (30/30 total), directly stressing the shifted collector/element
+  residuals.
 
 The clean Spring Boot 4.1.1-SNAPSHOT rerun used the module's Gradle-generated
 test runtime classpath, one VM process per class, and a 1500-second per-class
@@ -137,8 +154,11 @@ ceiling. All seven target classes pass: **94 tests started, 94 successful, 0
 failed, 0 aborted**. Logs are under:
 
 ```text
-/data/victor-worktrees/testcompiler-annotation-suite-20260713-02/
+/data/victor-worktrees/testcompiler-annotation-suite-20260713-05-final/
 ```
+
+The three-run focused stress logs are under
+`/data/victor-worktrees/testcompiler-annotation-elementpin-stress-20260713-10-final/`.
 
 ## Historical repro
 
