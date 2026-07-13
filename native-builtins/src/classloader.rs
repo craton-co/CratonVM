@@ -6649,7 +6649,33 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(avail(ctx, this))))
     });
 
-    r.register(dis, "close", "()V", |_ctx, _args| Ok(None));
+    // `DataInputStream` declares no bytecode of its own for `close()` (real
+    // JDK inherits `FilterInputStream.close()` → `in.close()`); registering
+    // a native directly on `DataInputStream` pre-empts that inherited real
+    // bytecode. This registration is normally DEAD in practice — real-JDK
+    // mode's boot sequence calls `native-io::register_io_natives` (which
+    // registers its own, now-fixed `DataInputStream.close` →
+    // `native_dis_close`) AFTER whatever calls this function, so that
+    // registration wins. Fixed here too for consistency / in case
+    // registration order ever changes; see `native-io/src/lib.rs`'s
+    // `native_dis_close` for the full root-cause writeup (a `FileDataBlock`
+    // handle leak in Spring Boot loader's
+    // `SecurityInfoTests`/`NestedJarFileTests`, root-caused via a minimal
+    // Spring-Boot-independent repro).
+    r.register(dis, "close", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let underlying = match ctx.get_field_by_name(this, "in") {
+            Value::Object(Some(u)) => Some(u),
+            _ => match ctx.get_field(this, 0) {
+                Value::Object(Some(u)) => Some(u),
+                _ => None,
+            },
+        };
+        if let Some(u) = underlying {
+            let _ = ctx.invoke_virtual(u, "close", "()V", &[]);
+        }
+        Ok(None)
+    });
 
     // -----------------------------------------------------------------------
     // java/io/BufferedInputStream — extends FilterInputStream
@@ -6760,6 +6786,16 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int(avail(ctx, this))))
     });
+    // Unlike `DataInputStream`, `BufferedInputStream` DOES declare its own
+    // `close()` in real JDK bytecode (`bufUpdater.compareAndSet(...) ...
+    // input.close()`) — it doesn't inherit from `FilterInputStream`, so the
+    // interpreter's dispatch correctly prefers that real bytecode over this
+    // registration regardless (this native is not reached in practice under
+    // real-JDK mode). Left as a no-op intentionally: `native-io`'s Wave2 H2
+    // fix explicitly relies on real BIS bytecode (`Unsafe
+    // .compareAndSetReference`-backed lazy `buf` allocation) and its comment
+    // there asks future changes NOT to add more layout-coupled natives for
+    // this class without a demonstrated regression.
     r.register(bis, "close", "()V", |_ctx, _args| Ok(None));
 
     // -----------------------------------------------------------------------

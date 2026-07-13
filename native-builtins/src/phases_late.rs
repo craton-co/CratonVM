@@ -19092,6 +19092,19 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     });
     r.register(zi, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // Propagate to the wrapped underlying InputStream (field 0), same
+        // as real `ZipInputStream.close()` → `InflaterInputStream.close()`
+        // → `FilterInputStream.close()` → `in.close()`. `<init>` eagerly
+        // drains `this` into in-memory byte arrays, so nothing here itself
+        // holds an OS handle open — but the underlying stream might (e.g. a
+        // caller-supplied `Closeable`-backed stream). This synthetic path
+        // only runs under `--synthetic-jdk` (real-JDK boot dispatches to the
+        // genuine `ZipInputStream`/`InflaterInputStream` bytecode instead,
+        // per `check_override` in vm_exec.rs) — kept correct for parity with
+        // that mode rather than leaving an unconditional no-op here.
+        if let Value::Object(Some(underlying)) = ctx.get_field(this, 0) {
+            let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
+        }
         ctx.set_field(this, 1, Value::Object(None));
         ctx.set_field(this, 2, Value::Object(None));
         Ok(None)
@@ -19255,11 +19268,48 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
+    // `InflaterInputStream.close()` — NOT a blanket no-op. Real bytecode is
+    // `if (!closed) { if (usesDefaultInflater) inf.end(); in.close(); closed
+    // = true; }`; mirror it via by-name field access (real-layout objects,
+    // not a synthetic fixed-slot convention).
+    //
+    // NOTE: empirically this native is NOT reached under real-JDK-boot mode
+    // (the default) for concrete subclasses like Spring Boot loader's
+    // `ZipInflaterInputStream` — the interpreter correctly prefers real
+    // `InflaterInputStream.close()` bytecode there (confirmed via a
+    // standalone repro: closing a 3-arg-constructed `InflaterInputStream`
+    // wrapping a tracing stream correctly reached the tracing stream's
+    // `close()` both with and without this native registered). The actual
+    // cause of the Spring Boot `SecurityInfoTests`/`NestedJarFileTests`
+    // file-handle leak was a DIFFERENT, more impactful bug — see the
+    // `DataInputStream`/`BufferedInputStream` `"close"` registrations in
+    // `native-builtins/src/classloader.rs`. This fix is kept regardless:
+    // it's still correct, and matters for `--synthetic-jdk` mode (no real
+    // bytecode to fall back to) or if dispatch precedence ever changes.
     r.register(
         "java/util/zip/InflaterInputStream",
         "close",
         "()V",
-        native_noop_with_this,
+        |ctx, args| {
+            eprintln!("[IIS_CLOSE_DBG] native InflaterInputStream.close invoked");
+            let this = obj_arg(args, 0)?;
+            if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
+                return Ok(None);
+            }
+            if matches!(
+                ctx.get_field_by_name(this, "usesDefaultInflater"),
+                Value::Int(1)
+            ) {
+                if let Value::Object(Some(inf)) = ctx.get_field_by_name(this, "inf") {
+                    let _ = ctx.invoke_virtual(inf, "end", "()V", &[]);
+                }
+            }
+            if let Value::Object(Some(underlying)) = ctx.get_field_by_name(this, "in") {
+                let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
+            }
+            ctx.set_field_by_name(this, "closed", Value::Int(1));
+            Ok(None)
+        },
     );
     r.register(
         "java/util/zip/DeflaterOutputStream",
