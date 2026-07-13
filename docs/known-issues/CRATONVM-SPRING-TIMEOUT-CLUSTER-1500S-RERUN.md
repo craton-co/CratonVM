@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN (12 genuinely hung, 10 slow-but-failing, 1 crash; 2 non-residual items removed). **2026-07-13 update**: 8 Bucket-1 + 3 Bucket-2 classes reconfirmed locally — one narrower bug fixed (`7ae137e4`), the hang itself still OPEN; see the 2026-07-13 section below. **2026-07-13 update #2**: `context.annotation.ImportSelectorTests`'s `StackOverflowError` root-caused — it is a Mockito `spy()` cross-hierarchy recursion, **unrelated to Spring's `ImportSelector` mechanism** (the original hypothesis below was wrong); still OPEN, see its own section. **2026-07-13 update #3**: both `web.service.registry.*` residuals (`ImportHttpServiceRegistrarTests`, `GroupsMetadataValueDelegateTests`) root-caused to `@CompileWithForkedClassLoader`'s custom-ClassLoader machinery interacting with Spring's AOT/test-compiler pipeline — two distinct defects, neither fixed; still OPEN, see dedicated section. **2026-07-13 update #4**: the 4 non-AOT, non-`ImportSelectorTests` Bucket-1 classes (`cache.jcache.JCacheEhCacheAnnotationTests`, `context.annotation.ComponentScanParserBeanDefinitionDefaultsTests`, `context.annotation.InitDestroyMethodLifecycleTests`, `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests`) **no longer hang** — reconfirmed clean on 2 independent runs each against a freshly-built `origin/dev` tip; see the dedicated section below. No new code was needed — all 4 were incidental beneficiaries of other unrelated fixes already on `dev`. |
+| **Status** | OPEN (12 genuinely hung, 10 slow-but-failing, 1 crash; 2 non-residual items removed). **2026-07-13 update**: 8 Bucket-1 + 3 Bucket-2 classes reconfirmed locally — one narrower bug fixed (`7ae137e4`), the hang itself still OPEN; see the 2026-07-13 section below. **2026-07-13 update #2**: `context.annotation.ImportSelectorTests`'s `StackOverflowError` root-caused — it is a Mockito `spy()` cross-hierarchy recursion, **unrelated to Spring's `ImportSelector` mechanism** (the original hypothesis below was wrong); still OPEN, see its own section. **2026-07-13 update #3**: both `web.service.registry.*` residuals (`ImportHttpServiceRegistrarTests`, `GroupsMetadataValueDelegateTests`) root-caused to `@CompileWithForkedClassLoader`'s custom-ClassLoader machinery interacting with Spring's AOT/test-compiler pipeline — two distinct defects, neither fixed; still OPEN, see dedicated section. **2026-07-13 update #4**: the 4 non-AOT, non-`ImportSelectorTests` Bucket-1 classes (`cache.jcache.JCacheEhCacheAnnotationTests`, `context.annotation.ComponentScanParserBeanDefinitionDefaultsTests`, `context.annotation.InitDestroyMethodLifecycleTests`, `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests`) **no longer hang** — reconfirmed clean on 2 independent runs each against a freshly-built `origin/dev` tip; see the dedicated section below. No new code was needed — all 4 were incidental beneficiaries of other unrelated fixes already on `dev`. **2026-07-13 update #5**: the "missing `ApiVersionStrategy` bean" `BeanCreationException` (2 classes: `CrossOriginAnnotationIntegrationTests`, `RequestMappingMessageConversionIntegrationTests`) **no longer reproduces** — confirmed fixed (likely a side effect of earlier JSpecify/reflection work), but both classes now fail a different way instead: a genuine **deadlock in `Semaphore.release()`'s internal monitor**, confirmed via a live `gdb` thread dump. Still OPEN, new root cause, see dedicated section. |
 | **Discovered** | 2026-07-11, following up on the 25 classes that hit TIMEOUT in the
 125-class scoped rerun (dev `9948295e`, standard 120s timeout — see
 [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](../internal/CRATONVM-SPRING-GENUINE-BUGLIST-125.md)). |
@@ -625,6 +625,133 @@ for this specific class (the effort instead went toward the
 `ImportHttpServiceRegistrarTests` repro above, which shares the
 `@CompileWithForkedClassLoader` machinery but fails at a different point).
 
+## 2026-07-13 local investigation #5 — Missing `ApiVersionStrategy` bean: RESOLVED; both classes now hit a different, new deadlock (still OPEN)
+
+Reproduced entirely on the Azure host (`20.83.144.174`, back up after a
+reboot), worktree `/data/data/cratonvm-apiversionstrategy-20260713`, dev tip
+`79773121` (fast-forwarded from this session's own `819ab93e` build tip —
+diffed the intervening commits; none touch annotation/reflection/CGLIB/
+monitor code, so the findings below hold at both tips), binary
+`cratonvm-apiversionstrategy.bin`.
+
+**The originally-documented bug no longer reproduces.** Three independent,
+increasingly faithful repros against the real `spring-webflux`/`spring-context`/
+`spring-beans` classes on this dev tip all **succeed**, matching HotSpot:
+1. A minimal `@Configuration` class with a `@Bean` method returning `null`
+   (typed `org.jspecify.annotations.Nullable`) consumed by a second `@Bean`
+   method's `@Qualifier(...) @Nullable` parameter — succeeds, `thing=null`.
+2. The same shape but with the `@Bean` methods declared on a **non-`@Configuration`
+   superclass** inherited by a `@Configuration(proxyBeanMethods = false)`
+   subclass (mirroring `WebFluxConfigurationSupport` → `DelegatingWebFluxConfiguration`
+   exactly, including a 2-parameter method where only the second parameter is
+   `@Nullable`) — succeeds.
+3. The literal real classes: `@Configuration @EnableWebFlux static class WebConfig {}`
+   (byte-for-byte what both failing test classes use), fetching
+   `RequestMappingHandlerMapping` and `RouterFunctionMapping` (both consumers
+   of the possibly-null `webFluxApiVersionStrategy` bean) from a real
+   `AnnotationConfigApplicationContext` — succeeds, both beans created, no
+   exception.
+
+Traced the actual mechanism while building these repros (for the next
+session, in case of a regression): `AbstractAutowireCapableBeanFactory`/
+`ConstructorResolver` resolve `@Bean` factory-method candidates via
+`ClassUtils.getUserClass(factoryClass)` (`ConstructorResolver.java:456`),
+which unwraps a CGLIB-enhanced `@Configuration` proxy back to the **original**
+class before reflecting for parameter annotations — so CratonVM's native
+CGLIB-enhancer shim (`native-builtins/src/cglib_enhancer.rs`, which
+deliberately leaves `@Bean` methods **with parameters** un-overridden per its
+own doc comment) is never in the annotation-resolution path here regardless.
+The actual gate is `DependencyDescriptor.isRequired()` →
+`Nullness.forMethodParameter()` → `Parameter.getAnnotatedType()`, which reads
+the real classfile's `RuntimeVisibleTypeAnnotations` — the exact API fixed by
+the 2026-07-01 JSpecify TYPE_USE reflection work
+(`docs/internal/spring/SC-jspecify-nullness-reflection.md`). That fix is what
+resolved this bug, just never reconfirmed against these 2 specific classes
+until now.
+
+**New finding: both classes now deadlock instead of throwing.** Reran both
+through the real `suite-run.sh` harness exactly as specified
+(`BATCH=1 BATCH_TO=600 ONE_TO=600 CRATONVM_DEFAULT_HEAP_MAX_MB=2048`): both
+hit the full double-timeout window (batch attempt + individual retry, 600s
+each) with `found=0/succ=0/fail=0` — no `BeanCreationException`, no crash.
+HotSpot baseline for `CrossOriginAnnotationIntegrationTests` (same argfile,
+real `java`): **68/68 pass in 3.6s total**. A dedicated single, longer
+(`timeout 1500`, `CRATONVM_DBG_HANG_SAMPLE=1`) attempt at the same class
+showed genuine forward progress at first — 9 distinct embedded-server
+(Tomcat/Jetty/Reactor-Netty/Undertow) start/stop cycles across the class's
+68 parameterized sub-tests over about 8 minutes, sampled method mix
+continuously varying (`ConcurrentReferenceHashMap`, `AttributeMethods`,
+`AnnotationTypeMappings`, `MergedAnnotation`, `AntPathMatcher` — Spring's
+annotation-introspection and handler-mapping machinery, not a tight loop) —
+but then **stopped making any progress at all**: the process's CPU time
+stopped advancing entirely (confirmed via repeated `ps -o time` samples 20s
+apart, byte-for-byte identical), i.e. a genuine hang, not just extreme
+slowness.
+
+**Root-caused via a live `gdb` thread dump** (`sudo gdb -p <pid> -batch -ex
+'thread apply all bt'`, all 13 threads): the single thread actually running
+Java (`main-vm`) is blocked in
+`vm/src/threading/monitor.rs`'s `MonitorTable::enter` → `entry_condvar.wait`,
+reached via `monitor_enter` (`vm/src/vm/vm_exec.rs:4671`) called from
+`sem_release_n_inner` (`native-builtins/src/lib.rs:59824`, backing
+`java.util.concurrent.Semaphore.release()`), itself reached from deep inside
+a `Stream.forEach`/`ArrayList.forEach`/`Optional.ifPresent` lambda chain
+(WebFlux/Reactor internals). **Every other one of the 13 threads is
+independently idle** — 8 Jetty `QueuedThreadPool` workers and 1 Reactor
+`boundedElastic` thread parked in `LockSupport.park`
+(`native_lock_support_park_nanos`) waiting for work, the JIT background
+compiler thread waiting on its `CompilationQueue` condvar, the JDK
+`Common-Cleaner` thread in a periodic `Thread.sleep` — **none hold any Java
+monitor**. Per `MonitorTable::enter`'s own logic
+(`vm/src/threading/monitor.rs:437-471`), the blocking thread only reaches the
+`wait()` loop when `state.owner` is `Some(other_thread_id)`; since no live
+thread holds it, `owner` must be a **stale entry left by a thread that has
+since exited without a matching `monitor_exit`** (a lock leak), not a live
+deadlock cycle between two running threads.
+
+**Leading, unconfirmed hypothesis** (not fixed this session — budget spent
+confirming the original bug's resolution and root-causing this new one):
+an unbalanced native `monitor_enter`/`monitor_exit` pair somewhere in the
+WebFlux/Reactor/Jetty call path this test exercises — most likely an early
+`return`/`?`-propagated error or panic-unwind between the two calls in some
+native shim (the project's own memory flags exactly this class of bug:
+"if-let mutex guard held across blocking else branch" — `audit \`if let .*
+.lock()\` in natives`), or a Rust-level analogue in one of the natives on
+this call path (`sem_release_n_inner`/`sem_acquire_blocking` themselves look
+correctly balanced on inspection — every path pairs `monitor_enter` with
+`monitor_exit` before returning — so the leak is more likely in a *different*
+native that also happens to lock the same Java object, or in whatever
+Reactor/Jetty code takes a `synchronized` block on it). Because the object
+is freshly allocated per test iteration (a new `AnnotationConfigApplicationContext`
++ new bean graph every one of the 68 sub-tests), this is also consistent with
+this project's well-documented "recycled object address/id" bug family (G1
+`pointer_map` recycled-destination ambiguity, the stale-`ObjectRef` static
+sweep) — a GC'd object's monitor-table entry surviving into a same-address
+freshly-allocated `Semaphore` (or whatever object backs this particular
+monitor) would produce exactly this symptom: permanently "owned" by a
+thread_id that no longer maps to any live thread.
+
+**Not fixed.** This is a different, unrelated bug from what this session was
+asked to investigate (explicitly out of scope: hangs) — flagging it because
+it is the actual, current blocker for both `CrossOriginAnnotationIntegrationTests`
+and `RequestMappingMessageConversionIntegrationTests` (which share the same
+`@EnableWebFlux`/`AbstractHttpHandlerIntegrationTests` harness and so very
+plausibly hit the identical deadlock). Next step for a future session:
+reproduce with `CRATONVM_DBG_MONENTER=1` (gates the wait-site-snapshot
+diagnostic already wired into `monitor_enter`, see
+`vm/src/threading/monitor.rs`'s `mon_enter_dump_enabled`) to capture the
+*leaking* thread's frame at the moment it last held this monitor, or audit
+every native that calls `ctx.monitor_enter`/`monitor_exit` on a `Semaphore`-
+or `Reactor`-adjacent object for an unbalanced early-return path.
+
+**Status of the 2 classes this session was assigned**: both `BeanCreationException`
+occurrences are gone (verified 3 ways above); both classes still fail to
+complete (TIMEOUT, confirmed via the real `suite-run.sh` harness at
+`BATCH_TO=600/ONE_TO=600`, and via a dedicated 1500s single-attempt probe)
+due to this newly-found, unrelated deadlock. No code fix landed this session
+— nothing needed fixing for the assigned bug, and the newly-found deadlock is
+a substantial, separate investigation of its own.
+
 ## Bucket 1 — Genuinely hung (12/25)
 
 Hit the full 1500s ceiling on **both** the batch attempt and the individual
@@ -798,13 +925,13 @@ rather than a coincidence:
 |---|---|--:|--:|---|
 | `orm.jpa.support.InjectionCodeGeneratorTests` | FAIL → **TIMEOUT as of 2026-07-13** | 206s | 3/10 | `CompilationException: Unable to compile source` → now hangs instead, see [2026-07-13 update](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open) |
 | `web.socket.messaging.StompWebSocketIntegrationTests` | FAIL | 169s | 0/16 | `ServletException` / `UnsatisfiedDependencyException` (no `MessageHandler` bean) |
-| `web.reactive.result.method.annotation.CrossOriginAnnotationIntegrationTests` | FAIL | 492s | 0/68 | `BeanCreationException`: no `ApiVersionStrategy` bean |
+| `web.reactive.result.method.annotation.CrossOriginAnnotationIntegrationTests` | FAIL → **TIMEOUT as of 2026-07-13** | 492s → 600s×2 (+1500s dedicated probe) | 0/68 → 0/0 | `BeanCreationException`: no `ApiVersionStrategy` bean → **bean bug fixed**, now deadlocks in `Semaphore.release()`'s monitor instead, see [2026-07-13 update #5](#2026-07-13-local-investigation-5--missing-apiversionstrategy-bean-resolved-both-classes-now-hit-a-different-new-deadlock-still-open) |
 | `web.servlet.mvc.method.annotation.ServletAnnotationControllerHandlerMethodTests` | FAIL | 445s | 211/241 | `AssertionFailedError` (mostly passing — a real partial failure) |
 | `beans.factory.aot.BeanDefinitionPropertiesCodeGeneratorTests` | FAIL → **TIMEOUT as of 2026-07-13** | 693s | 0/47 | `CompilationException: Unable to compile source` → now hangs instead, see [2026-07-13 update](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open) |
 | `beans.factory.aot.InstanceSupplierCodeGeneratorTests` | FAIL → **TIMEOUT as of 2026-07-13** | 730s | 4/26 | `CompilationException: Unable to compile source` → now hangs instead, see [2026-07-13 update](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open) |
 | `web.service.registry.ImportHttpServiceRegistrarTests` | FAIL, root-caused 2026-07-13 (still OPEN) | 763s (10s on the 2026-07-13 isolated rerun) | 3/5 | `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;` in `ConfigurationClassParser$SourceClass.getAnnotationAttributes` — see dedicated section below |
 | `web.service.registry.GroupsMetadataValueDelegateTests` | ABEND, root-caused 2026-07-13 (still OPEN) | 1039s (1306s on the 2026-07-13 rerun) | 0/8 | fatal VM error `class file error: class not found: .../GroupsMetadata__TestCode` — see dedicated section below |
-| `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` | FAIL | 1132s | 0/160 | `BeanCreationException`: no `ApiVersionStrategy` bean (same as `CrossOriginAnnotationIntegrationTests`) |
+| `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` | FAIL → **TIMEOUT as of 2026-07-13** | 1132s → 600s×2 | 0/160 → 0/0 | `BeanCreationException`: no `ApiVersionStrategy` bean (same as `CrossOriginAnnotationIntegrationTests`) → **bean bug fixed**, now TIMEOUTs the same way, see [2026-07-13 update #5](#2026-07-13-local-investigation-5--missing-apiversionstrategy-bean-resolved-both-classes-now-hit-a-different-new-deadlock-still-open) |
 | `context.annotation.ImportSelectorTests` | FAIL, root-caused 2026-07-13 (still OPEN) | 1456s (734s on the 2026-07-13 rebuild) | 4/9 | `StackOverflowError` — Mockito `spy()` recursion, not Spring; see dedicated section below |
 
 Notable sub-clusters within this bucket (candidates for shared root cause):
@@ -828,10 +955,14 @@ Notable sub-clusters within this bucket (candidates for shared root cause):
   two DIFFERENT specific defects. Neither fixed. See the dedicated section
   below.
 - **Missing `ApiVersionStrategy` bean** (2 classes: `CrossOriginAnnotationIntegrationTests`,
-  `RequestMappingMessageConversionIntegrationTests`) — both WebFlux, both fail
-  every parameterized variant (Jetty, Jetty Core, ...) with the identical
-  `BeanCreationException` chain; looks like a missing/unregistered default
-  bean rather than a per-test issue.
+  `RequestMappingMessageConversionIntegrationTests`) — **resolved as of
+  2026-07-13**: the `BeanCreationException` no longer reproduces (confirmed
+  3 ways against current dev). Both classes now TIMEOUT instead, due to an
+  unrelated, newly-found deadlock in `Semaphore.release()`'s internal
+  monitor — see the
+  [2026-07-13 update #5](#2026-07-13-local-investigation-5--missing-apiversionstrategy-bean-resolved-both-classes-now-hit-a-different-new-deadlock-still-open)
+  section above. Still OPEN, but for a different reason than originally
+  documented.
 - `ImportSelectorTests`'s `StackOverflowError` is unrelated to the above
   clusters. **Root-caused 2026-07-13** (see the dedicated section below):
   it is a Mockito `spy()` cross-class-hierarchy real-method recursion, not
