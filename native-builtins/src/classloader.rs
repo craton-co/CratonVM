@@ -4,7 +4,7 @@
 //! ClassLoader hierarchy, URLClassLoader, MethodHandles.Lookup, ProtectionDomain,
 //! and CodeSource native method implementations.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::service_loader::impl_jars_load_class;
@@ -54,6 +54,7 @@ pub fn reset_loader_singletons() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+    ANY_DEFINING_LOADER_REGISTERED.store(false, Ordering::Release);
     loader_namespace_id_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -238,6 +239,26 @@ fn defining_loader_store() -> &'static Mutex<std::collections::HashMap<u32, Obje
     INSTANCE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
+/// Perf (silent-hang-no-signature-cluster throughput residual, 2026-07-13):
+/// `defining_loader_for` sits behind `should_use_loader_initiated_resolution`,
+/// which the interpreter's `lookup_loader_initiated`/
+/// `retarget_instance_field_to_receiver` hot paths call on every non-fast-path
+/// invoke/getfield/putfield — confirmed via call-count instrumentation at
+/// 13-37% of ALL executed bytecode instructions in a Tomcat workload. This map
+/// is populated ONLY when a user-defined `ClassLoader` (ByteBuddy, cglib,
+/// Hibernate proxies, Groovy) defines a class — the overwhelming majority of
+/// classes (bootstrap/app-loader) never call `register_defining_loader`, so
+/// the map is empty for most workloads. A plain `bool` (not even relaxed-typed
+/// precision needed — false negatives are impossible, see below) lets
+/// `defining_loader_for` skip the `std::sync::Mutex` acquisition entirely in
+/// that case. Correctness: only ever transitions false→true (in
+/// `register_defining_loader`) or gets reset alongside the map itself (in
+/// `reset_loader_singletons`), so a `false` read here is always accurate at
+/// the instant it's read for a map that has never had an insert since the
+/// last reset — no ABA/staleness risk given the store never goes non-empty
+/// then empty except via the same reset that clears this flag.
+static ANY_DEFINING_LOADER_REGISTERED: AtomicBool = AtomicBool::new(false);
+
 /// Record the user-defined `ClassLoader` object that defined `class_id`, so
 /// `Class.getClassLoader()` returns the exact instance instead of the app-loader
 /// fallback.
@@ -246,6 +267,7 @@ pub fn register_defining_loader(class_id: u32, loader: ObjectRef) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(class_id, loader);
+    ANY_DEFINING_LOADER_REGISTERED.store(true, Ordering::Release);
     // HIB-CV-24: mirror into the loader-pin registry the GC marker consults so a
     // live instance of this class keeps its defining loader alive (the
     // instance→loader edge HotSpot gets for free via `Class.getClassLoader`).
@@ -254,6 +276,9 @@ pub fn register_defining_loader(class_id: u32, loader: ObjectRef) {
 
 /// Look up the user-defined `ClassLoader` object that defined `class_id`.
 pub fn defining_loader_for(class_id: u32) -> Option<ObjectRef> {
+    if !ANY_DEFINING_LOADER_REGISTERED.load(Ordering::Acquire) {
+        return None;
+    }
     defining_loader_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner())

@@ -11727,6 +11727,7 @@ fn execute_instruction(
     instruction: &Instruction,
     saved_pc: usize,
 ) -> Result<InstructionResult, MethodCallFailed> {
+    hotpath_counts::bump(&hotpath_counts::TOTAL_INSTRUCTIONS);
     match instruction {
         // -- Constants (T10.9.D direct CompactValue push) --
         Instruction::Nop => {}
@@ -16078,6 +16079,7 @@ fn lookup_loader_initiated(
     referencing_class_id: ClassId,
     name: &str,
 ) -> Option<ClassId> {
+    hotpath_counts::bump(&hotpath_counts::LOOKUP_LOADER_INITIATED_CALLS);
     if !should_use_loader_initiated_resolution(shared, referencing_class_id) {
         return None;
     }
@@ -16465,6 +16467,7 @@ fn retarget_instance_field_to_receiver(
     receiver_class_id: ClassId,
     field: &ResolvedField,
 ) -> Option<ResolvedField> {
+    hotpath_counts::bump(&hotpath_counts::RETARGET_FIELD_CALLS);
     if field.is_static
         || receiver_class_id == ClassId::new(0)
         || receiver_class_id == field.declaring_class_id
@@ -22296,11 +22299,44 @@ pub(crate) fn is_reflection_factory_serialization_native_override(
     )
 }
 
+/// Temporary call-count instrumentation for the silent-hang-no-signature-
+/// cluster throughput residual (2026-07-13). Tallies invocations of several
+/// suspected interpreter dispatch hot-path functions, reported periodically
+/// via `CRATONVM_DBG_HOTPATH_COUNTS=1` — independent of wall-clock timing,
+/// so it stays valid signal even on a heavily contended/noisy host.
+pub(crate) mod hotpath_counts {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static FORCE_NATIVE_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static RESOLVE_METHOD_REF_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static LOOKUP_LOADER_INITIATED_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static RETARGET_FIELD_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static TOTAL_INSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn bump(counter: &AtomicU64) {
+        if !crate::runtime::env_cache::dbg_hotpath_counts() {
+            return;
+        }
+        let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() || n % 1_000_000 == 0 {
+            eprintln!(
+                "[hotpath-counts] force_native={} resolve_method_ref={} \
+                 lookup_loader_initiated={} retarget_field={} total_instr={}",
+                FORCE_NATIVE_CALLS.load(Ordering::Relaxed),
+                RESOLVE_METHOD_REF_CALLS.load(Ordering::Relaxed),
+                LOOKUP_LOADER_INITIATED_CALLS.load(Ordering::Relaxed),
+                RETARGET_FIELD_CALLS.load(Ordering::Relaxed),
+                TOTAL_INSTRUCTIONS.load(Ordering::Relaxed),
+            );
+        }
+    }
+}
+
 fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
+    hotpath_counts::bump(&hotpath_counts::FORCE_NATIVE_CALLS);
     if is_class_mirror_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
@@ -33060,6 +33096,7 @@ fn resolve_method_ref(
     current_class_id: ClassId,
     cp_index: u16,
 ) -> Result<(Arc<str>, Arc<str>, Arc<str>, usize), MethodCallFailed> {
+    hotpath_counts::bump(&hotpath_counts::RESOLVE_METHOD_REF_CALLS);
     // Check cache first — Arc::clone is a cheap refcount bump, not an allocation.
     if let Some(cached) = shared
         .resolution_cache
