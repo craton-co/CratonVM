@@ -726,8 +726,24 @@ fn safe_native_call_impl(
             &format!("{des}  ->NATIVE {callee}"),
         );
     }
-    // Pin object arguments for the duration of the native: they have been
+    // Object arguments have just left the GC-visible operand stack. Refresh
+    // forwarded addresses before pinning them: pinning a stale from-space
+    // pointer preserves the bug rather than rooting the evacuated object.
+    // This is the native-call counterpart to the interpreter getfield read
+    // barrier and covers invokevirtual, invokeinterface, invokestatic, and
+    // every re-entrant native dispatch through this common choke point.
+    //
+    // No VM allocation or safepoint can occur between extracting the stack
+    // values and this barrier, so the forwarding header is still readable.
+    let mut forwarded_args = args.to_vec();
+    for value in &mut forwarded_args {
+        if let Value::Object(Some(obj)) = value {
+            *obj = shared.heap.load_and_forward(*obj);
+        }
+    }
+    let args = forwarded_args.as_slice();
     // popped from the operand stack into this Rust slice and are otherwise
+    // Pin object arguments for the duration of the native: they have been
     // invisible to `collect_roots` / frame scanning during a safepoint GC.
     let pin_base = thread.native_pin_roots.len();
     // Retain a root index for every argument. Native calls are not restricted
@@ -976,8 +992,11 @@ fn safe_native_call_impl(
                         )
                     })
                     .unwrap_or_default();
+                let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
+                    .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
                 tracing::error!(
-                    "Native method panic caught: {} (native invoked from {})",
+                    "Native method panic caught in {}: {} (native invoked from {})",
+                    callee,
                     msg,
                     top
                 );
@@ -11896,6 +11915,21 @@ fn invoke_on_class_shared_inner(
                     // (e.g. ByteArrayInputStream created by getResourceAsStream).
                     let check_override = method.is_abstract()
                         || class_name == "java/io/ByteArrayInputStream"
+                        // Jandex constructs a real-JDK BufferedInputStream around
+                        // a resource stream.  Its registered native methods use
+                        // the inherited `in` field, so its constructor must use
+                        // the matching native layout initialization as well.
+                        || (class_name == "java/io/BufferedInputStream"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("<init>", "(Ljava/io/InputStream;)V")
+                                    | ("<init>", "(Ljava/io/InputStream;I)V")
+                            ))
+                        || (class_name == "java/io/FilterInputStream"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("<init>", "(Ljava/io/InputStream;)V") | ("skip", "(J)J")
+                            ))
                         // `java.util.Base64` and its Encoder/Decoder methods
                         // are concrete JDK bytecode.  CratonVM supplies the
                         // complete family as native intrinsics so they can
@@ -13494,17 +13528,10 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/util/concurrent/LinkedBlockingDeque"
                             && method_name == "clear"
                             && descriptor == "()V")
-                        || (class_name == "java/io/BufferedInputStream"
+                        || (class_name == "java/io/FilterInputStream"
                             && matches!(
                                 (method_name, descriptor),
-                                ("read", "()I")
-                                    | ("read", "([BII)I")
-                                    | ("skip", "(J)J")
-                                    | ("available", "()I")
-                                    | ("mark", "(I)V")
-                                    | ("reset", "()V")
-                                    | ("markSupported", "()Z")
-                                    | ("close", "()V")
+                                ("<init>", "(Ljava/io/InputStream;)V") | ("skip", "(J)J")
                             ))
                         || (matches!(class_name, "java/lang/Iterable" | "java/util/Collection" | "java/util/Set" | "java/util/EnumSet")
                             && method_name == "iterator"
@@ -14079,6 +14106,11 @@ fn invoke_on_class_shared_inner(
                         // getTypeAnnotationBytes0 + unexposed ConstantPool. Shared
                         // source of truth with `force_native_over_real_jdk_bytecode`.
                         || crate::runtime::interpreter::is_typeuse_annotation_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_class_mirror_native_override(
                             class_name,
                             method_name,
                             descriptor,

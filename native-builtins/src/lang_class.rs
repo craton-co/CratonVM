@@ -1096,7 +1096,17 @@ pub(crate) fn t19_h10_alloc_byte_array_input_stream(
     for (i, &b) in bytes.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
     }
+    // `arr` is held only in this native's Rust local until it is installed in
+    // `stream.buf`.  Allocating the stream may itself initiate a collection;
+    // without a native pin, a non-moving sweep can reclaim the otherwise
+    // unreachable byte array (and a relocating collector can forward it while
+    // this raw local remains stale).  Resource parsing then observes an empty
+    // or invalid InputStream.  Keep the array rooted across that allocation
+    // and read the current address back before publishing the heap edge.
+    let arr_pin = ctx.pin_native_root(arr);
     let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     ctx.set_field(stream, 1, Value::Int(0));
     ctx.set_field(stream, 2, Value::Int(0));
@@ -17197,6 +17207,11 @@ mod tests {
             let v = ctx.get_array_element(buf, i).as_int().unwrap_or(0);
             assert_eq!(v as u8, b, "byte {i} mismatch");
         }
+        assert_eq!(
+            ctx.native_pin_count_for_test(),
+            0,
+            "the resource-array pin must be released after stream publication"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -9500,8 +9500,35 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            let is_link = std::path::Path::new(&p).is_symlink();
+            let is_link = jrtfs_decode(&p)
+                .and_then(|(java_home, entry)| {
+                    jrt_image(&java_home).and_then(|image| {
+                        jrt_package_link_target(&image, &entry.strip_prefix("packages/")?)
+                    })
+                })
+                .is_some()
+                || std::path::Path::new(&p).is_symlink();
             Ok(Some(Value::Int(if is_link { 1 } else { 0 })))
+        },
+    );
+
+    r.register(
+        files,
+        "readSymbolicLink",
+        "(Ljava/nio/file/Path;)Ljava/nio/file/Path;",
+        |ctx, args| {
+            let path_obj = obj_arg(args, 0)?;
+            let p = p57_read_path(ctx, path_obj);
+            if let Some((java_home, entry)) = jrtfs_decode(&p) {
+                if let Some(target) = entry.strip_prefix("packages/").and_then(|rest| {
+                    jrt_image(&java_home).and_then(|image| jrt_package_link_target(&image, rest))
+                }) {
+                    let path =
+                        p57_alloc_path(ctx, &jrtfs_encode(&java_home, &format!("/{target}")));
+                    return Ok(Some(Value::Object(Some(path))));
+                }
+            }
+            Err(p57_no_such_file(ctx, &p))
         },
     );
 
@@ -12882,30 +12909,50 @@ fn jrt_img_is_dir(img: &JrtImage, path: &str) -> bool {
     img.entries.get(idx).is_some_and(|e| e.starts_with(&prefix))
 }
 
+fn jrt_package_link_target(img: &JrtImage, rest: &str) -> Option<String> {
+    let (package, module) = rest.trim_matches('/').split_once('/')?;
+    if module.contains('/') {
+        return None;
+    }
+    img.package_modules
+        .get(&package.replace('.', "/"))?
+        .iter()
+        .any(|candidate| candidate == module)
+        .then(|| format!("modules/{module}"))
+}
+
+fn jrt_package_backing_entry(img: &JrtImage, rest: &str) -> Option<String> {
+    let mut parts = rest.trim_matches('/').split('/');
+    let package = parts.next()?;
+    let module = parts.next()?;
+    let target = jrt_package_link_target(img, &format!("{package}/{module}"))?;
+    let suffix = parts.collect::<Vec<_>>().join("/");
+    Some(if suffix.is_empty() {
+        target
+    } else {
+        format!("{target}/{suffix}")
+    })
+}
+
 fn jrt_package_path_kind(img: &JrtImage, rest: &str) -> JarFsKind {
     let rest = rest.trim_matches('/');
     if rest.is_empty() {
         return JarFsKind::Dir;
     }
-    if let Some((package, module)) = rest.rsplit_once('/') {
-        if img
-            .package_modules
-            .get(package)
-            .is_some_and(|modules| modules.iter().any(|m| m == module))
-        {
-            return JarFsKind::File;
-        }
-    }
-    let dir_prefix = format!("{rest}/");
-    if img.package_modules.contains_key(rest)
-        || img
-            .package_modules
-            .keys()
-            .any(|pkg| pkg.starts_with(&dir_prefix))
-    {
+    if img.package_modules.contains_key(&rest.replace('.', "/")) {
         JarFsKind::Dir
     } else {
-        JarFsKind::Absent
+        let Some(backing) = jrt_package_backing_entry(img, rest) else {
+            return JarFsKind::Absent;
+        };
+        let image_path = jrt_entry_to_image(&backing).expect("backing JRT package path is a module path");
+        if jrt_img_is_file(img, &image_path) {
+            JarFsKind::File
+        } else if jrt_img_is_dir(img, &image_path) {
+            JarFsKind::Dir
+        } else {
+            JarFsKind::Absent
+        }
     }
 }
 
@@ -12954,37 +13001,26 @@ fn jrtfs_list_dir_classified(java_home: &str, entry: &str) -> Vec<(String, bool)
     if e == "packages" {
         let mut seen = std::collections::BTreeMap::new();
         for package in img.package_modules.keys() {
-            let Some((head, rest)) = package.split_once('/') else {
-                seen.insert(format!("packages/{package}"), false);
-                continue;
-            };
-            seen.insert(format!("packages/{head}"), !rest.is_empty());
+            seen.insert(format!("packages/{}", package.replace('/', ".")), true);
         }
         return seen.into_iter().collect();
     }
     if let Some(rest) = e.strip_prefix("packages/") {
-        let mut seen: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
-        if let Some(modules) = img.package_modules.get(rest) {
-            for module in modules {
-                seen.insert(format!("packages/{rest}/{module}"), false);
-            }
+        if let Some(backing) = jrt_package_backing_entry(&img, rest) {
+            return jrtfs_list_dir_classified(java_home, &backing)
+                .into_iter()
+                .filter_map(|(child, is_dir)| {
+                    child.rsplit_once('/').map(|(_, name)| {
+                        (format!("packages/{rest}/{name}"), is_dir)
+                    })
+                })
+                .collect();
         }
-        let prefix = format!("{rest}/");
-        for package in img.package_modules.keys() {
-            let Some(tail) = package.strip_prefix(&prefix) else {
-                continue;
-            };
-            if tail.is_empty() {
-                continue;
-            }
-            let (child, is_dir) = match tail.split_once('/') {
-                Some((child, more)) => (child, !more.is_empty()),
-                None => (tail, false),
-            };
-            if !child.is_empty() {
-                let child_entry = format!("packages/{rest}/{child}");
-                let v = seen.entry(child_entry).or_insert(false);
-                *v = *v || is_dir;
+        let mut seen: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+        let package = rest.replace('.', "/");
+        if let Some(modules) = img.package_modules.get(&package) {
+            for module in modules {
+                seen.insert(format!("packages/{rest}/{module}"), true);
             }
         }
         return seen.into_iter().collect();
@@ -35830,7 +35866,10 @@ fn p98_walk_file_tree(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => return Ok(Some(path_val)),
     };
-    p98_walk_dir(ctx, &root_str, visitor, path_obj)?;
+    let skip_file_callbacks = ctx
+        .class_name_of_id(ctx.class_id_of_object(visitor))
+        .is_some_and(|name| name == "com/sun/tools/javac/file/JavacFileManager$ArchiveContainer$1");
+    p98_walk_dir(ctx, &root_str, visitor, path_obj, skip_file_callbacks)?;
     Ok(Some(path_val))
 }
 
@@ -35859,11 +35898,11 @@ fn p98_invoke_file_visitor(
     second_arg: Value,
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let args = [Value::Object(Some(path_obj)), second_arg];
-    let result = ctx.invoke_virtual(visitor, method_name, concrete_descriptor, &args);
+    let result = ctx.invoke_virtual(visitor, method_name, erased_descriptor, &args);
     let value = match result {
         Ok(value) => value,
-        Err(err) if p98_is_missing_visitor_method(&err, method_name, concrete_descriptor) => {
-            ctx.invoke_virtual(visitor, method_name, erased_descriptor, &args)?
+        Err(err) if p98_is_missing_visitor_method(&err, method_name, erased_descriptor) => {
+            ctx.invoke_virtual(visitor, method_name, concrete_descriptor, &args)?
         }
         Err(err) => return Err(err),
     };
@@ -35878,6 +35917,7 @@ fn p98_walk_dir(
     dir: &str,
     visitor: ObjectRef,
     dir_path_obj: ObjectRef,
+    skip_file_callbacks: bool,
 ) -> Result<bool, MethodCallFailed> {
     let attrs = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 0);
     // preVisitDirectory
@@ -35910,10 +35950,10 @@ fn p98_walk_dir(
             let s = ctx.create_string(&es);
             ctx.set_field(epo, 0, Value::Object(Some(s)));
             if is_dir {
-                if !p98_walk_dir(ctx, &es, visitor, epo)? {
+                if !p98_walk_dir(ctx, &es, visitor, epo, skip_file_callbacks)? {
                     return Ok(false);
                 }
-            } else {
+            } else if !skip_file_callbacks {
                 let fa = alloc_concurrent_synthetic(
                     ctx,
                     "java/nio/file/attribute/BasicFileAttributes",
@@ -35943,10 +35983,10 @@ fn p98_walk_dir(
             let s = ctx.create_string(&es);
             ctx.set_field(epo, 0, Value::Object(Some(s)));
             if is_dir {
-                if !p98_walk_dir(ctx, &es, visitor, epo)? {
+                if !p98_walk_dir(ctx, &es, visitor, epo, skip_file_callbacks)? {
                     return Ok(false);
                 }
-            } else {
+            } else if !skip_file_callbacks {
                 let fa = alloc_concurrent_synthetic(
                     ctx,
                     "java/nio/file/attribute/BasicFileAttributes",
@@ -35976,10 +36016,10 @@ fn p98_walk_dir(
             let s = ctx.create_string(&es);
             ctx.set_field(epo, 0, Value::Object(Some(s)));
             if ep.is_dir() {
-                if !p98_walk_dir(ctx, &es, visitor, epo)? {
+                if !p98_walk_dir(ctx, &es, visitor, epo, skip_file_callbacks)? {
                     return Ok(false);
                 }
-            } else {
+            } else if !skip_file_callbacks {
                 let fa = alloc_concurrent_synthetic(
                     ctx,
                     "java/nio/file/attribute/BasicFileAttributes",

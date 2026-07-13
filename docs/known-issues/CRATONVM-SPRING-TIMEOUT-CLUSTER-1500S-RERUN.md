@@ -5,7 +5,7 @@
 | **Status** | OPEN (12 genuinely hung, 12 slow-but-failing, 1 crash — none fixed) |
 | **Discovered** | 2026-07-11, following up on the 25 classes that hit TIMEOUT in the
 125-class scoped rerun (dev `9948295e`, standard 120s timeout — see
-[`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](CRATONVM-SPRING-GENUINE-BUGLIST-125.md)). |
+[`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](../internal/CRATONVM-SPRING-GENUINE-BUGLIST-125.md)). |
 
 ## Why this doc exists
 

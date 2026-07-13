@@ -890,8 +890,9 @@ fn dbg_fullstack_scan() -> bool {
 }
 
 /// A5 fix — scan this thread's native stack band `[lo, hi)` for any word that is
-/// an address inside a live JIT code range (`cratonvm_jit::lookup_jit_code_range`),
-/// i.e. a return address into compiled code. A hit proves a JIT method's frame
+/// an address strictly *inside* a live JIT code range
+/// (`cratonvm_jit::lookup_jit_code_range`), i.e. a return address into compiled
+/// code. A hit proves a JIT method's frame
 /// is on the stack even if it pushed no `JitEntryGuard`. Early-exits on the
 /// first hit. Bounded like [`scan_one_frame`] so a stale `hi` cannot run into
 /// unmapped pages.
@@ -916,8 +917,16 @@ fn native_stack_has_jit_frame(lo: usize, hi: usize) -> bool {
         while addr + 8 <= hi {
             // SAFETY: see the fast path below.
             let w = unsafe { (addr as *const usize).read() };
-            if cratonvm_jit::lookup_jit_code_range(w).is_some() {
-                return true;
+            if let Some(cm_ptr) = cratonvm_jit::lookup_jit_code_range(w) {
+                // A raw compiled-entry function pointer is routinely kept in
+                // Rust helper locals.  It is data, not a native return address,
+                // and treating it as a frame forces every precise moving-GC
+                // cycle into the conservative fallback.  A genuine return PC
+                // is always after the method entry instruction.
+                let cm = unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
+                if w != cm.entry_ptr() as usize {
+                    return true;
+                }
             }
             addr += 8;
         }
@@ -952,9 +961,11 @@ fn native_stack_has_jit_frame(lo: usize, hi: usize) -> bool {
             // `scan_one_frame`).
             let w = unsafe { (addr as *const usize).read() };
             if w >= env_lo && w < env_hi {
-                // Greatest range whose start <= w; it contains w iff w < its end.
+                // Greatest range whose start <= w; its start itself is a
+                // stored function pointer, while a native return PC is
+                // strictly inside the range.
                 let idx = ranges.partition_point(|&(s, _)| s <= w);
-                if idx > 0 && w < ranges[idx - 1].1 {
+                if idx > 0 && w > ranges[idx - 1].0 && w < ranges[idx - 1].1 {
                     return true;
                 }
             }
@@ -1102,7 +1113,13 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
     });
 
     #[cfg(any(target_os = "windows", target_os = "linux"))]
-    if cratonvm_jit::jit_code_range_count() > 0 {
+    // In precise moving-young mode every actual compiled transition is
+    // registered by JitEntryGuard and checked above.  A raw native-stack scan
+    // is not a frame walk: cached function pointers and JIT helper arguments
+    // are ordinary stack data that frequently point *inside* generated code.
+    // Treating them as return PCs fabricated an unregistered frame on nearly
+    // every root snapshot and permanently disabled precise reclamation.
+    if !moving_young_enabled() && cratonvm_jit::jit_code_range_count() > 0 {
         let cover_hi = JIT_ENTRY_CHAIN
             .with(|c| c.borrow().iter().map(|e| e.entry_sp).max())
             .unwrap_or(scanner_sp);
@@ -1377,7 +1394,12 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     {
         let code_ranges = cratonvm_jit::jit_code_range_count();
-        if code_ranges > 0 {
+        // See the matching precise-moving exemption in
+        // `refresh_moving_young_coverage_for_current_thread`: the raw-word
+        // probe is useful only for the conservative fallback and cannot
+        // distinguish a return address from an interior code pointer stored
+        // as data.
+        if !moving_young_enabled() && code_ranges > 0 {
             let cover_hi = JIT_ENTRY_CHAIN
                 .with(|c| c.borrow().iter().map(|e| e.entry_sp).max())
                 .unwrap_or(scanner_sp);
@@ -1585,13 +1607,14 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
             let Some(info) = entry.precise else { continue };
             dbg_precise += 1;
             let entry_sp = entry.entry_sp;
-            // OSR enters through a trampoline that jumps into the compiled
-            // body, so the OSR frame's return address points back to Rust
-            // rather than to a JIT child/parent pair. The parent-walk below
-            // therefore has no JIT return address it can use to resolve this
-            // boundary frame. Now that the trampoline records its exact RBP,
-            // remap the OSR frame directly with the CompiledMethod stored in
-            // the chain entry.
+            // The innermost frame's child is a Rust helper, so its return
+            // address cannot resolve this frame through the parent walk below.
+            // Remap it directly from the CompiledMethod registered at the
+            // interpreter-to-JIT boundary.  This is required for *every*
+            // moving collection, not just OSR: the active safepoint id and
+            // oop slots are addressed from the exact RBP recorded by the
+            // prologue, and leaving this boundary frame unpatched strands the
+            // current method's register/frame oops at pre-move addresses.
             if info.exact_rbp != 0
                 && info.exact_rbp & 0x7 == 0
                 && info.exact_rbp >= scanner_sp
@@ -1601,21 +1624,14 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
                 // and is kept alive by the JIT cache while the frame is active.
                 let boundary_cm: &cratonvm_jit::CompiledMethod =
                     unsafe { &*(info.compiled_method as *const cratonvm_jit::CompiledMethod) };
-                if boundary_cm.compiled_via_osr {
-                    // SAFETY: exact_rbp was range/alignment checked above; the
-                    // return address slot is the standard x64 `[rbp+8]`.
-                    let ret_addr = unsafe { ((info.exact_rbp + 8) as *const usize).read() };
-                    if cratonvm_jit::lookup_jit_code_range(ret_addr).is_none() {
-                        let (found, examined, n) =
-                            remap_one_jit_frame(info.exact_rbp, boundary_cm, pointer_map);
-                        dbg_frames += 1;
-                        dbg_slots.set(dbg_slots.get() + n);
-                        if found {
-                            dbg_maps_found.set(dbg_maps_found.get() + 1);
-                        }
-                        dbg_examined.set(dbg_examined.get() + examined);
-                    }
+                let (found, examined, n) =
+                    remap_one_jit_frame(info.exact_rbp, boundary_cm, pointer_map);
+                dbg_frames += 1;
+                dbg_slots.set(dbg_slots.get() + n);
+                if found {
+                    dbg_maps_found.set(dbg_maps_found.get() + 1);
                 }
+                dbg_examined.set(dbg_examined.get() + examined);
             }
             // Stage 5 — walk the JIT RBP chain from the innermost frame
             // (`info.frame_base`, the EXACT RBP recorded by the deepest
@@ -1631,10 +1647,9 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
             // caller) is walkable.
             //
             // `child_rbp`'s saved-rbp/return-address identify its PARENT, which
-            // is the frame we remap each step. The innermost frame itself is
-            // skipped: its child is a Rust helper (not in the JIT code
-            // registry) and its safepoint's live oops are conservatively
-            // pinned (so never relocated).
+            // is the frame we remap each step. The innermost frame was already
+            // remapped directly above because its child is a Rust helper rather
+            // than a JIT return address.
             //
             // Start from `exact_rbp` (the precise innermost RBP from the
             // prologue), NOT `frame_base` (the Rust-guard SP). Skip if it was
@@ -1822,7 +1837,12 @@ fn verify_precise_covers_conservative(
     cm: &cratonvm_jit::CompiledMethod,
     heap: &VmHeap,
 ) {
-    let slot_base = if cm.compiled_via_osr && info.exact_rbp != 0 {
+    // Oop-map offsets are emitted relative to the compiled frame's RBP, not
+    // the Rust caller's approximate stack pointer captured by the guard.  OSR
+    // used to be the sole consumer of `exact_rbp`; ordinary compiled entries
+    // need the identical addressing contract for precise marking and moving-GC
+    // root registration.
+    let slot_base = if info.exact_rbp != 0 {
         info.exact_rbp
     } else {
         info.frame_base
@@ -1891,7 +1911,10 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
         verify_precise_covers_conservative(info, cm, heap);
     }
 
-    let slot_base = if cm.compiled_via_osr && info.exact_rbp != 0 {
+    // Map offsets are relative to the compiled frame's RBP.  The guard's
+    // `frame_base` is only the conservative scan bound; it is not an oop-map
+    // base for ordinary interpreter-to-JIT entries.
+    let slot_base = if info.exact_rbp != 0 {
         info.exact_rbp
     } else {
         info.frame_base

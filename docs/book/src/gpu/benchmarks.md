@@ -133,4 +133,4 @@ Two honest caveats fall out of the tables above:
 exists specifically to skip offload below a work-size threshold for this
 reason, though the current estimate it uses is a fixed placeholder rather than
 the true runtime array length — see item 4 in
-[`docs/known-issues/gpu-offload-followups-20260711.md`](https://github.com/craton-co/cratonvm/blob/dev/docs/known-issues/gpu-offload-followups-20260711.md).
+[`docs/internal/gpu-offload-followups-20260711.md`](https://github.com/craton-co/cratonvm/blob/dev/docs/internal/gpu-offload-followups-20260711.md).

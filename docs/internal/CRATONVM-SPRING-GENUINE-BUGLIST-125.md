@@ -23,6 +23,26 @@ classloader-visibility symptoms (`MockitoException`, `CompilationException:
 Unable to compile source`, CGLIB-proxy `ABEND`s) — not individually
 root-caused.
 
+## Current status (2026-07-12)
+
+The AOT compiler investigation remains **open**. The real-JDK `javac` path
+now delegates `JavacFileManager.list` to the JDK implementation, uses the
+native `Files.walkFileTree` bridge for archive discovery, and correctly
+dispatches erased `FileVisitor` methods. JRT package links are also exposed as
+links to their backing module trees. These changes restored system-module and
+archive discovery sufficiently for a focused release run of
+`BeanDefinitionPropertiesCodeGeneratorTests#setAutowireCandidateWhenFalse` to
+pass (`found=1`, `succ=1`, `fail=0`).
+
+The full `BeanDefinitionPropertiesCodeGeneratorTests` and
+`BeanDefinitionMethodGeneratorTests` classes nevertheless remain CPU-bound at
+the file-manager boundary. A 600-second watchdog captured repeated traversal
+through `ClassFinder.fillIn`, `DynamicJavaFileManager.inferBinaryName`, and
+`PathFileObject.toBinaryName`; this is progress from the former hard hang, but
+not a complete class-level fix. `cargo check -p cratonvm-native-builtins`
+passes. The 11-class AOT TIMEOUT cluster therefore remains tracked below, and
+this document must stay in `docs/known-issues` rather than being archived.
+
 **65 classes newly fixed** between the first two runs, most notably:
 - The entire SpEL cluster (11 classes: `LiteralTests`, `OperatorTests`,
   `ParsingTests`, `SpelParserTests`, `ArrayConstructorTests`,

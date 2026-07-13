@@ -1365,7 +1365,7 @@ pub(crate) fn native_string_substring(
         }
     }
     let sub_text = String::from_utf16_lossy(&sub_utf16);
-    let result = ctx.create_string(&sub_text);
+    let result = ctx.create_string_uninterned(&sub_text);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -1379,7 +1379,7 @@ pub(crate) fn native_string_value_of_int(
         _ => 0,
     };
     let text = val.to_string();
-    let result = ctx.create_string(&text);
+    let result = ctx.create_string_uninterned(&text);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -2179,7 +2179,7 @@ pub(crate) fn native_sb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -
     let (buf, count) = sb_state(ctx, this);
     let buf = match buf {
         Some(b) => b,
-        None => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
+        None => return Ok(Some(Value::Object(Some(ctx.create_string_uninterned(""))))),
     };
     let count = count as usize;
     // Read chars and build Rust string
@@ -2998,7 +2998,7 @@ pub(crate) fn native_sb_substring(ctx: &mut dyn NativeContext, args: &[Value]) -
     let chars = sb_read_chars(ctx, this);
     let start = std::cmp::min(start, chars.len());
     let result = String::from_utf16_lossy(&chars[start..]);
-    let str_obj = ctx.create_string(&result);
+    let str_obj = ctx.create_string_uninterned(&result);
     Ok(Some(Value::Object(Some(str_obj))))
 }
 
@@ -3024,7 +3024,7 @@ pub(crate) fn native_sb_substring_range(
     let end = std::cmp::min(end, chars.len());
     let end = std::cmp::max(start, end);
     let result = String::from_utf16_lossy(&chars[start..end]);
-    let str_obj = ctx.create_string(&result);
+    let str_obj = ctx.create_string_uninterned(&result);
     Ok(Some(Value::Object(Some(str_obj))))
 }
 
@@ -3204,7 +3204,7 @@ pub(crate) fn native_string_trim(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     let text = ctx.read_string(this).unwrap_or_default();
     let trimmed = text.trim().to_string();
-    let result = ctx.create_string(&trimmed);
+    let result = ctx.create_string_uninterned(&trimmed);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -3236,7 +3236,7 @@ pub(crate) fn native_string_replace(
         }
         String::from_utf16_lossy(&out)
     });
-    let result = ctx.create_string(&text);
+    let result = ctx.create_string_uninterned(&text);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -3271,7 +3271,9 @@ pub(crate) fn native_string_replace_charseq(
     };
     let s = ctx.read_string(this).unwrap_or_default();
     let result = s.replace(&target, &replacement);
-    Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
+    Ok(Some(Value::Object(Some(
+        ctx.create_string_uninterned(&result),
+    ))))
 }
 
 pub(crate) fn native_string_to_lower_case(
@@ -3284,7 +3286,7 @@ pub(crate) fn native_string_to_lower_case(
     };
     let text = ctx.read_string(this).unwrap_or_default();
     let lower = text.to_lowercase();
-    let result = ctx.create_string(&lower);
+    let result = ctx.create_string_uninterned(&lower);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -3298,7 +3300,7 @@ pub(crate) fn native_string_to_upper_case(
     };
     let text = ctx.read_string(this).unwrap_or_default();
     let upper = text.to_uppercase();
-    let result = ctx.create_string(&upper);
+    let result = ctx.create_string_uninterned(&upper);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -3325,7 +3327,7 @@ pub(crate) fn native_string_value_of_long(
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    let result = ctx.create_string(&val.to_string());
+    let result = ctx.create_string_uninterned(&val.to_string());
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -3337,7 +3339,7 @@ pub(crate) fn native_string_value_of_boolean(
         Some(Value::Int(v)) => *v != 0,
         _ => false,
     };
-    let result = ctx.create_string(if val { "true" } else { "false" });
+    let result = ctx.create_string_uninterned(if val { "true" } else { "false" });
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -3349,7 +3351,7 @@ pub(crate) fn native_string_value_of_double(
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    let result = ctx.create_string(&format_double(val));
+    let result = ctx.create_string_uninterned(&format_double(val));
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -3361,7 +3363,7 @@ pub(crate) fn native_string_value_of_char(
         Some(Value::Int(v)) => char::from_u32(*v as u32).unwrap_or('\0'),
         _ => '\0',
     };
-    let result = ctx.create_string(&ch.to_string());
+    let result = ctx.create_string_uninterned(&ch.to_string());
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -3373,7 +3375,7 @@ pub(crate) fn native_string_value_of_float(
         Some(Value::Float(v)) => *v,
         _ => 0.0,
     };
-    let result = ctx.create_string(&format_float(val));
+    let result = ctx.create_string_uninterned(&format_float(val));
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -3386,7 +3388,7 @@ pub(crate) fn native_string_value_of_object(
         Some(Value::Object(None)) => "null".to_string(),
         _ => "null".to_string(),
     };
-    let result = ctx.create_string(&text);
+    let result = ctx.create_string_uninterned(&text);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -3536,7 +3538,7 @@ pub(crate) fn native_string_substring_one(
         }
     }
     let sub_text = String::from_utf16_lossy(&sub_utf16);
-    let result = ctx.create_string(&sub_text);
+    let result = ctx.create_string_uninterned(&sub_text);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -3578,7 +3580,7 @@ pub(crate) fn native_string_concat(
     let a = ctx.read_string(this).unwrap_or_default();
     let b = ctx.read_string(other).unwrap_or_default();
     let combined = format!("{a}{b}");
-    let result = ctx.create_string(&combined);
+    let result = ctx.create_string_uninterned(&combined);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -3623,7 +3625,7 @@ fn string_array_from_parts(ctx: &mut dyn NativeContext, parts: &[String]) -> Met
     };
     let arr = ctx.new_ref_array(string_class_id, parts.len());
     for (i, part) in parts.iter().enumerate() {
-        let str_ref = ctx.create_string(part);
+        let str_ref = ctx.create_string_uninterned(part);
         ctx.set_array_element(arr, i, Value::Object(Some(str_ref)));
     }
     Ok(Some(Value::Object(Some(arr))))
@@ -3814,7 +3816,7 @@ pub(crate) fn native_string_join(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     let arr = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
+        _ => return Ok(Some(Value::Object(Some(ctx.create_string_uninterned(""))))),
     };
     let len = ctx.array_length(arr);
     let mut parts = Vec::with_capacity(len);
@@ -3826,7 +3828,9 @@ pub(crate) fn native_string_join(ctx: &mut dyn NativeContext, args: &[Value]) ->
         }
     }
     let joined = parts.join(&delim);
-    Ok(Some(Value::Object(Some(ctx.create_string(&joined)))))
+    Ok(Some(Value::Object(Some(
+        ctx.create_string_uninterned(&joined),
+    ))))
 }
 
 pub(crate) fn native_string_join_iterable(
@@ -3839,11 +3843,11 @@ pub(crate) fn native_string_join_iterable(
     };
     let iterable = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
+        _ => return Ok(Some(Value::Object(Some(ctx.create_string_uninterned(""))))),
     };
     let iterator = match ctx.invoke_virtual(iterable, "iterator", "()Ljava/util/Iterator;", &[])? {
         Some(Value::Object(Some(obj))) => obj,
-        _ => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
+        _ => return Ok(Some(Value::Object(Some(ctx.create_string_uninterned(""))))),
     };
     let iterator_pin = ctx.pin_native_root(iterator);
     let mut parts = Vec::new();
@@ -3867,7 +3871,9 @@ pub(crate) fn native_string_join_iterable(
     }
     ctx.unpin_native_roots(iterator_pin);
     let joined = parts.join(&delim);
-    Ok(Some(Value::Object(Some(ctx.create_string(&joined)))))
+    Ok(Some(Value::Object(Some(
+        ctx.create_string_uninterned(&joined),
+    ))))
 }
 
 pub(crate) fn native_string_replace_all(
@@ -3892,7 +3898,9 @@ pub(crate) fn native_string_replace_all(
     } else {
         s.replace(&pattern, &replacement)
     };
-    Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
+    Ok(Some(Value::Object(Some(
+        ctx.create_string_uninterned(&result),
+    ))))
 }
 
 pub(crate) fn native_string_replace_first(
@@ -3917,7 +3925,9 @@ pub(crate) fn native_string_replace_first(
     } else {
         s.replacen(&pattern, &replacement, 1)
     };
-    Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
+    Ok(Some(Value::Object(Some(
+        ctx.create_string_uninterned(&result),
+    ))))
 }
 
 pub(crate) fn native_string_matches(
@@ -4104,7 +4114,9 @@ pub(crate) fn native_string_strip(ctx: &mut dyn NativeContext, args: &[Value]) -
         _ => return Ok(Some(Value::Object(None))),
     };
     let s = ctx.read_string(this).unwrap_or_default();
-    Ok(Some(Value::Object(Some(ctx.create_string(s.trim())))))
+    Ok(Some(Value::Object(Some(
+        ctx.create_string_uninterned(s.trim()),
+    ))))
 }
 
 pub(crate) fn native_string_strip_leading(
@@ -4116,7 +4128,9 @@ pub(crate) fn native_string_strip_leading(
         _ => return Ok(Some(Value::Object(None))),
     };
     let s = ctx.read_string(this).unwrap_or_default();
-    Ok(Some(Value::Object(Some(ctx.create_string(s.trim_start())))))
+    Ok(Some(Value::Object(Some(
+        ctx.create_string_uninterned(s.trim_start()),
+    ))))
 }
 
 pub(crate) fn native_string_strip_trailing(
@@ -4128,7 +4142,9 @@ pub(crate) fn native_string_strip_trailing(
         _ => return Ok(Some(Value::Object(None))),
     };
     let s = ctx.read_string(this).unwrap_or_default();
-    Ok(Some(Value::Object(Some(ctx.create_string(s.trim_end())))))
+    Ok(Some(Value::Object(Some(
+        ctx.create_string_uninterned(s.trim_end()),
+    ))))
 }
 
 pub(crate) fn native_string_copy_value_of(
@@ -4138,7 +4154,7 @@ pub(crate) fn native_string_copy_value_of(
     // Static method: args[0] = char[]
     let arr = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
+        _ => return Ok(Some(Value::Object(Some(ctx.create_string_uninterned(""))))),
     };
     let len = ctx.array_length(arr);
     let mut chars = Vec::with_capacity(len);
@@ -4150,7 +4166,7 @@ pub(crate) fn native_string_copy_value_of(
         }
     }
     let s: String = chars.into_iter().collect();
-    Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+    Ok(Some(Value::Object(Some(ctx.create_string_uninterned(&s)))))
 }
 
 // ---------------------------------------------------------------------------
@@ -4320,7 +4336,7 @@ pub(crate) fn native_string_lines(ctx: &mut dyn NativeContext, args: &[Value]) -
     let elements: Vec<Value> = lines
         .iter()
         .map(|line| {
-            let str_obj = ctx.create_string(line);
+            let str_obj = ctx.create_string_uninterned(line);
             Value::Object(Some(str_obj))
         })
         .collect();
@@ -4369,7 +4385,7 @@ pub(crate) fn native_string_indent(
         }
         result.push('\n');
     }
-    let str_obj = ctx.create_string(&result);
+    let str_obj = ctx.create_string_uninterned(&result);
     Ok(Some(Value::Object(Some(str_obj))))
 }
 
@@ -4585,7 +4601,7 @@ pub(crate) fn native_string_format(
         }
     }
 
-    let obj = ctx.create_string(&result);
+    let obj = ctx.create_string_uninterned(&result);
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -4934,7 +4950,7 @@ pub(crate) fn native_string_repeat(
     };
     let s = ctx.read_string(this).unwrap_or_default();
     let result = s.repeat(count);
-    let str_obj = ctx.create_string(&result);
+    let str_obj = ctx.create_string_uninterned(&result);
     Ok(Some(Value::Object(Some(str_obj))))
 }
 

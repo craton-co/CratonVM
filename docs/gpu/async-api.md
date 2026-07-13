@@ -417,7 +417,7 @@ from the by-design [Limitations](#limitations) below.
   `vm/src/runtime/offload.rs`) that finalizes the submission itself, off
   the mutator, while application code is doing something else entirely.
   This was formerly the last item in
-  `docs/known-issues/gpu-offload-followups-20260711.md`; that file's item
+  `docs/internal/gpu-offload-followups-20260711.md`; that file's item
   3 is now closed.
 - **Only `Void` results were surfaced until 2026-07-11 evening; scalar
   reduction results now reach Java too.** `SerializedResult`'s
@@ -455,7 +455,7 @@ from the by-design [Limitations](#limitations) below.
   never consulted again — offload silently stops, structurally, even
   though the 2026-07-11 fix keeps eligible interpreted call sites
   re-entering the hook correctly. See
-  `docs/known-issues/gpu-offload-followups-20260711.md` item 2.
+  `docs/internal/gpu-offload-followups-20260711.md` item 2.
 
 ## Limitations
 
@@ -509,7 +509,7 @@ from the by-design [Limitations](#limitations) below.
   to methods bearing this annotation.
 - [`README.md`](README.md) — top-level reference: build matrix
   (`gpu` vs `gpu-driver`), CLI surface, file index.
-- [`docs/known-issues/gpu-offload-followups-20260711.md`](../known-issues/gpu-offload-followups-20260711.md)
-  — open follow-ups from the first real-hardware validation pass,
+- [`docs/internal/gpu-offload-followups-20260711.md`](../internal/gpu-offload-followups-20260711.md)
+  — completed follow-ups from the first real-hardware validation pass,
   including the reduction void-return gate and the JIT-caller bypass
   referenced in [Current limitations](#current-limitations).

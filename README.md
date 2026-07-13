@@ -489,7 +489,7 @@ and the cold-start 4-way in [gpu-comparison-20260711.md](bench-gpu/results/gpu-c
 (includes N = 2²⁸ / 269M elements: 579 ms on GPU vs 30.8 s CratonVM CPU).
 Benchmark sources live in `bench-gpu/` (+ `bench-tornado/` for the TornadoVM twins). Numbers were taken on a
 machine with background load; treat CPU baselines as ±25%. Open GPU work is
-tracked in [docs/known-issues/gpu-offload-followups-20260711.md](docs/known-issues/gpu-offload-followups-20260711.md).
+recorded in [docs/internal/gpu-offload-followups-20260711.md](docs/internal/gpu-offload-followups-20260711.md).
 
 ### Update 2026-07-11 (evening)
 
@@ -500,7 +500,7 @@ literals outside `sipush` range, and any float/double/long literal), a JIT-calle
 admission gate that keeps offload-eligible callers interpreted so OSR can no
 longer silently degrade offload back to CPU, and a curated `Math`/`StrictMath`
 intrinsics table (`sqrt`/`abs`/`min`/`max`/`fma`) under `ALLOW_INTRINSIC_CALLS`.
-Full detail in [docs/known-issues/gpu-offload-followups-20260711.md](docs/known-issues/gpu-offload-followups-20260711.md)
+Full detail in [docs/internal/gpu-offload-followups-20260711.md](docs/internal/gpu-offload-followups-20260711.md)
 and [docs/gpu/annotations.md](docs/gpu/annotations.md).
 
 **Reduction dispatch** (`bench-gpu/GpuDotBench.java`, `sum += (long) a[i] * b[i]`
