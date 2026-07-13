@@ -6837,65 +6837,111 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                             .write()
                             .load_class(&lcs.impl_handle.class_name)?,
                     };
-                    super::ensure_class_initialized_shared(self.shared, self.thread, class_id)?;
-                    // Use `num_total_fields` (inherited + declared instance
-                    // fields), matching the `New` opcode and the sibling
-                    // NewInvokeSpecial path in `interpreter.rs`. `c.fields.len()`
-                    // is wrong here: it counts this class's declared fields
-                    // *including statics* while omitting inherited instance
-                    // fields, so a subclass constructor reference (e.g. JUnit5's
-                    // `DefaultClassDescriptor::new`, whose 2 fields are all
-                    // inherited from `AbstractAnnotatedDescriptorWrapper`)
-                    // under-allocates to 0 slots and trips the GC `get_field`
-                    // bounds guard on every inherited-field access.
-                    let num_fields = self
+                    // Array-constructor reference (`SomeType[]::new`) — see the
+                    // identical check in the sibling `interpreter.rs` path for
+                    // the full rationale. `load_class` resolves an array-shaped
+                    // impl class name to its synthesized array ClassId, but the
+                    // object-allocation + `<init>` dispatch below does not apply
+                    // to arrays (no fields, no constructor) and was silently
+                    // discarding the requested length, producing a corrupted
+                    // zero-field pseudo-object that fails a later checkcast to
+                    // the real array type.
+                    let array_info = self
                         .shared
                         .class_manager
                         .read()
                         .get_class(class_id)
-                        .map(|c| c.num_total_fields)
-                        .unwrap_or(0);
-                    let new_obj = match self.shared.heap.try_alloc_object(class_id, num_fields) {
-                        Some(obj) => obj,
-                        None => {
-                            self.thread.tlab.retire();
-                            crate::runtime::interpreter::maybe_gc_forced_pub(
+                        .and_then(|c| c.array_info.clone());
+                    if let Some(array_info) = array_info {
+                        let length = full_args
+                            .first()
+                            .and_then(Value::as_int)
+                            .ok_or_else(|| VmError::Internal {
+                                message: "array-constructor-reference: missing length arg"
+                                    .to_string(),
+                            })?;
+                        if length < 0 {
+                            Err(RuntimeError::NegativeArraySizeException { size: length }.into())
+                        } else {
+                            let length = length as usize;
+                            let arr = if array_info.array_dimension == 1 {
+                                match &*array_info.leaf_component_name {
+                                    "boolean" => self.new_array(ArrayElementType::Boolean, length),
+                                    "char" => self.new_array(ArrayElementType::Char, length),
+                                    "float" => self.new_array(ArrayElementType::Float, length),
+                                    "double" => self.new_array(ArrayElementType::Double, length),
+                                    "byte" => self.new_array(ArrayElementType::Byte, length),
+                                    "short" => self.new_array(ArrayElementType::Short, length),
+                                    "int" => self.new_array(ArrayElementType::Int, length),
+                                    "long" => self.new_array(ArrayElementType::Long, length),
+                                    _ => self.new_ref_array(array_info.component_class_id, length),
+                                }
+                            } else {
+                                self.new_ref_array(array_info.component_class_id, length)
+                            };
+                            Ok(Some(Value::Object(Some(arr))))
+                        }
+                    } else {
+                        super::ensure_class_initialized_shared(self.shared, self.thread, class_id)?;
+                        // Use `num_total_fields` (inherited + declared instance
+                        // fields), matching the `New` opcode and the sibling
+                        // NewInvokeSpecial path in `interpreter.rs`. `c.fields.len()`
+                        // is wrong here: it counts this class's declared fields
+                        // *including statics* while omitting inherited instance
+                        // fields, so a subclass constructor reference (e.g. JUnit5's
+                        // `DefaultClassDescriptor::new`, whose 2 fields are all
+                        // inherited from `AbstractAnnotatedDescriptorWrapper`)
+                        // under-allocates to 0 slots and trips the GC `get_field`
+                        // bounds guard on every inherited-field access.
+                        let num_fields = self
+                            .shared
+                            .class_manager
+                            .read()
+                            .get_class(class_id)
+                            .map(|c| c.num_total_fields)
+                            .unwrap_or(0);
+                        let new_obj = match self.shared.heap.try_alloc_object(class_id, num_fields) {
+                            Some(obj) => obj,
+                            None => {
+                                self.thread.tlab.retire();
+                                crate::runtime::interpreter::maybe_gc_forced_pub(
+                                    self.shared,
+                                    self.thread,
+                                );
+                                self.shared.heap.try_alloc_object(class_id, num_fields).ok_or_else(|| {
+                                    MethodCallFailed::InternalError(crate::error::VmError::Runtime(
+                                        crate::error::RuntimeError::OutOfMemoryError {
+                                            message: format!("Java heap space (MethodHandle newInvokeSpecial, {} fields)", num_fields),
+                                        },
+                                    ))
+                                })?
+                            }
+                        };
+                        let new_obj_pin = self.thread.native_pin_roots.len();
+                        self.thread.native_pin_roots.push(new_obj);
+                        let init_result = {
+                            let mut init_args = Vec::with_capacity(1 + full_args.len());
+                            init_args.push(Value::Object(Some(new_obj)));
+                            init_args.extend_from_slice(&full_args);
+                            invoke_on_class_shared(
                                 self.shared,
                                 self.thread,
-                            );
-                            self.shared.heap.try_alloc_object(class_id, num_fields).ok_or_else(|| {
-                                MethodCallFailed::InternalError(crate::error::VmError::Runtime(
-                                    crate::error::RuntimeError::OutOfMemoryError {
-                                        message: format!("Java heap space (MethodHandle newInvokeSpecial, {} fields)", num_fields),
-                                    },
-                                ))
-                            })?
-                        }
-                    };
-                    let new_obj_pin = self.thread.native_pin_roots.len();
-                    self.thread.native_pin_roots.push(new_obj);
-                    let init_result = {
-                        let mut init_args = Vec::with_capacity(1 + full_args.len());
-                        init_args.push(Value::Object(Some(new_obj)));
-                        init_args.extend_from_slice(&full_args);
-                        invoke_on_class_shared(
-                            self.shared,
-                            self.thread,
-                            class_id,
-                            &lcs.impl_handle.member_name,
-                            &lcs.impl_handle.descriptor,
-                            &init_args,
-                        )
-                    };
-                    let forwarded = self
-                        .thread
-                        .native_pin_roots
-                        .get(new_obj_pin)
-                        .copied()
-                        .unwrap_or(new_obj);
-                    self.thread.native_pin_roots.truncate(new_obj_pin);
-                    init_result?;
-                    Ok(Some(Value::Object(Some(forwarded))))
+                                class_id,
+                                &lcs.impl_handle.member_name,
+                                &lcs.impl_handle.descriptor,
+                                &init_args,
+                            )
+                        };
+                        let forwarded = self
+                            .thread
+                            .native_pin_roots
+                            .get(new_obj_pin)
+                            .copied()
+                            .unwrap_or(new_obj);
+                        self.thread.native_pin_roots.truncate(new_obj_pin);
+                        init_result?;
+                        Ok(Some(Value::Object(Some(forwarded))))
+                    }
                 }
                 _ => {
                     // GetField, GetStatic, PutField, PutStatic вЂ” very rare for
