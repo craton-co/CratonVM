@@ -8190,23 +8190,6 @@ const DOS_FIELD_OUT: usize = 0;
 // Access `written` by NAME so the native and real bytecode agree on the slot.
 const DOS_WRITTEN_FIELD: &str = "written";
 
-#[derive(Default)]
-struct DisSideBuffer {
-    bytes: Vec<u8>,
-    pos: usize,
-}
-
-fn dis_side_buffers() -> &'static Mutex<HashMap<i32, DisSideBuffer>> {
-    static BUFS: OnceLock<Mutex<HashMap<i32, DisSideBuffer>>> = OnceLock::new();
-    BUFS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn dis_side_key(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
-    ctx.identity_hash_code(this)
-}
-
-const DIS_SIDE_BUFFER_SIZE: usize = 8192;
-
 fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -8282,68 +8265,25 @@ fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
-/// Helper: read a single byte from the underlying stream of a DIS
+/// Helper: read a single byte from the underlying stream of a DIS.
+///
+/// Do not read ahead here. `DataInputStream` is used internally by
+/// `ObjectInputStream$BlockDataInputStream`, which alternates reads through its
+/// own cursor and its embedded `DataInputStream`. A native-side lookahead buffer
+/// advances the shared stream but leaves the bytes invisible to the block-data
+/// cursor, so custom `readObject` hooks see EOF at the end-block marker.
 fn dis_read_one(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
 ) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
-    let key = dis_side_key(ctx, this);
-    {
-        let mut bufs = dis_side_buffers().lock();
-        if let Some(state) = bufs.get_mut(&key) {
-            if state.pos < state.bytes.len() {
-                let b = state.bytes[state.pos];
-                state.pos += 1;
-                if state.pos >= state.bytes.len() {
-                    bufs.remove(&key);
-                }
-                return Ok(b as i32);
-            }
-            bufs.remove(&key);
-        }
-    }
-
     let inner = match ctx.get_field(this, DIS_FIELD_IN) {
         Value::Object(Some(s)) => s,
         _ => return Ok(-1),
     };
-    let tmp = ctx.new_array(ArrayElementType::Byte, DIS_SIDE_BUFFER_SIZE);
-    let this_pin = ctx.pin_native_root(this);
-    let tmp_pin = ctx.pin_native_root(tmp);
-    let result = match ctx.invoke_virtual(
-        inner,
-        "read",
-        "([BII)I",
-        &[
-            Value::Object(Some(tmp)),
-            Value::Int(0),
-            Value::Int(DIS_SIDE_BUFFER_SIZE as i32),
-        ],
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            ctx.unpin_native_roots(this_pin);
-            return Err(e);
-        }
-    };
-    let tmp = ctx.read_native_pin(tmp_pin, tmp);
-    let n = match result {
-        Some(Value::Int(v)) if v > 0 => v as usize,
-        _ => {
-            ctx.unpin_native_roots(this_pin);
-            return Ok(-1);
-        }
-    };
-    let mut bytes = vec![0u8; n];
-    ctx.read_byte_array_into(tmp, 0, &mut bytes);
-    ctx.unpin_native_roots(this_pin);
-    let first = bytes[0];
-    if n > 1 {
-        dis_side_buffers()
-            .lock()
-            .insert(key, DisSideBuffer { bytes, pos: 1 });
+    match ctx.invoke_virtual(inner, "read", "()I", &[])? {
+        Some(Value::Int(value)) => Ok(value),
+        _ => Ok(-1),
     }
-    Ok(first as i32)
 }
 
 fn dis_read_exact(
@@ -16969,6 +16909,23 @@ mod io_tests {
         assert!(r.find(dos, "<init>", "(Ljava/io/OutputStream;)V").is_some());
         assert!(r.find(dos, "writeInt", "(I)V").is_some());
         assert!(r.find(dos, "writeLong", "(J)V").is_some());
+    }
+
+    #[test]
+    fn data_input_single_byte_read_does_not_prefetch_from_shared_stream() {
+        let mut ctx = MockNativeContext::new();
+        let data_input = ctx.alloc_object(1);
+        let shared_stream = ctx.alloc_object(0);
+        ctx.set_field(data_input, DIS_FIELD_IN, Value::Object(Some(shared_stream)));
+        ctx.script("read", "()I", Ok(Some(Value::Int(0x77))));
+
+        let value = dis_read_one(&mut ctx, data_input).unwrap();
+
+        assert_eq!(value, 0x77);
+        let calls = ctx.recorded_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].method_name, "read");
+        assert_eq!(calls[0].descriptor, "()I");
     }
 
     #[test]

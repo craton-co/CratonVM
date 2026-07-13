@@ -7,30 +7,9 @@
 
 Catch-all doc for distinct exception types in the 453-class non-passed list
 that occurred too few times to warrant their own doc, grouped by shared
-exception type/theme.
-
-## EOFException — entity-manager serialization round-trip (4 classes)
-
-```
-jpa.ejb3configuration.EntityManagerFactorySerializationTest  :: java.io.EOFException
-jpa.ejb3configuration.EntityManagerSerializationTest          :: java.io.EOFException
-jpa.serialization.EntityManagerDeserializationTest            :: java.lang.RuntimeException: java.io.EOFException
-engine.spi.EntityEntryTest                                    :: java.io.EOFException
-```
-All 4 are serialization round-trip tests (`EntityManager`/`EntityManagerFactory`/
-`EntityEntry` → bytes → back). An `EOFException` during deserialize means the
-byte stream ran out before `ObjectInputStream` expected it to — consistent
-with a `writeObject`/`writeExternal` implementation that writes fewer bytes
-than its paired `readObject`/`readExternal` expects to consume (a
-length/field mismatch on the write side, or a `readObject` that expects
-optional data that wasn't written). **Likely related to** the separately
-documented [hib-connections-proxy-serializationexception-cluster.md](hib-connections-proxy-serializationexception-cluster.md)
-— both are Java-serialization-round-trip failures against CratonVM's real-
-JDK-mode object streams; worth investigating together, though the concrete
-exception shapes differ (`EOFException` here vs. `SerializationException`
-there, which usually means a different immediate cause even if the general
-area — CratonVM's `ObjectOutputStream`/`ObjectInputStream` support for
-Hibernate's runtime types — is shared).
+exception type/theme. The four serialization EOF residuals were fixed and
+retired with the related connection/proxy cluster; see
+[`hib-connections-proxy-serializationexception-cluster-FIXED.md`](../../internal/fixed-suite-bugs/hib-connections-proxy-serializationexception-cluster-FIXED.md).
 
 ## InvalidMappingException — hbm/orm XML mapping-document parse failures (3 classes)
 
