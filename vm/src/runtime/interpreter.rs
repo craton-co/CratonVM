@@ -20300,6 +20300,63 @@ pub(crate) fn try_lambda_dispatch(
                     .write()
                     .load_class(&call_site.impl_handle.class_name)?,
             };
+            // Array-constructor reference (`SomeType[]::new`, e.g. as an
+            // `IntFunction<SomeType[]>` — the mechanism behind
+            // `Collection.toArray(SomeType[]::new)` and any direct user code).
+            // `load_class` already resolves an array-shaped impl class name
+            // (e.g. "[Ljava/nio/ByteBuffer;") to its synthesized array
+            // ClassId (JVMS 5.3.3 — array classes are never loaded from a
+            // class file), but everything below this point assumes a
+            // REGULAR object: it allocates `num_total_fields` (0 for an
+            // array class) object slots and dispatches `<init>`, which does
+            // not exist for arrays. That produced a zero-field object
+            // wearing the array's ClassId — no length header, no element
+            // storage, and the requested length (the sole `IntFunction`
+            // argument) silently discarded — which a later `checkcast` to
+            // the real array type then rejects
+            // (`ClassCastException: ... cannot be cast to [Lyour/Type;`).
+            // Detect the array case up front and dispatch to real array
+            // allocation instead.
+            let array_info = shared
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .and_then(|c| c.array_info.clone());
+            if let Some(array_info) = array_info {
+                let length = full_args
+                    .first()
+                    .and_then(Value::as_int)
+                    .ok_or_else(|| VmError::Internal {
+                        message: "array-constructor-reference: missing length arg".to_string(),
+                    })?;
+                if length < 0 {
+                    return Err(RuntimeError::NegativeArraySizeException { size: length }.into());
+                }
+                let (element_type, component_class_id) = if array_info.array_dimension == 1 {
+                    match &*array_info.leaf_component_name {
+                        "boolean" => (ArrayElementType::Boolean, ClassId::new(0)),
+                        "char" => (ArrayElementType::Char, ClassId::new(0)),
+                        "float" => (ArrayElementType::Float, ClassId::new(0)),
+                        "double" => (ArrayElementType::Double, ClassId::new(0)),
+                        "byte" => (ArrayElementType::Byte, ClassId::new(0)),
+                        "short" => (ArrayElementType::Short, ClassId::new(0)),
+                        "int" => (ArrayElementType::Int, ClassId::new(0)),
+                        "long" => (ArrayElementType::Long, ClassId::new(0)),
+                        _ => (ArrayElementType::Reference, array_info.component_class_id),
+                    }
+                } else {
+                    (ArrayElementType::Reference, array_info.component_class_id)
+                };
+                let arr = gc_alloc_array(
+                    shared,
+                    thread,
+                    component_class_id,
+                    element_type,
+                    length as usize,
+                )?;
+                maybe_gc(shared, thread);
+                return Ok(Some(Some(Value::Object(Some(arr)))));
+            }
             ensure_class_initialized_shared(shared, thread, class_id)?;
             // Use `num_total_fields` (inherited + declared instance fields),
             // matching the `New` opcode. `c.fields.len()` is wrong here: it

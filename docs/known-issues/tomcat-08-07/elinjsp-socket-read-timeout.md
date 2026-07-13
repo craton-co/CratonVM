@@ -88,30 +88,62 @@ reproduced consistently across 2 back-to-back runs:
   that doc recommends merging the two docs and investigating server-side
   why Jasper/EL sometimes never produces a response.
 
-**New clue found this session, NOT yet in the hang-cluster doc:**
-re-reproduced `TestJspConfig` end-to-end against a fresh `dev`-tip build
-(`cratonvm-elinjsp-devmerged.exe`) with a `cdb` attach after ~150s stuck on
-`testServlet22NoEL` (a *different* test method than the hang-cluster doc's
-`testErrorOnELNotFound01` — that one actually PASSED in this run, which
-itself may indicate the underlying defect is intermittent/order-dependent,
-or this box's severe concurrent load — see below — makes different runs
-hit different methods). `main-vm`'s stack was NOT parked in
-`HttpURLConnection`/socket code this time; it was live inside:
-```
-cratonvm_native_io::dis_read_one
- <- dis_read_exact
- <- native_dis_read_unsigned_short
-```
-i.e. `DataInputStream.readUnsignedShort()` (or `.readChar()`, same native),
-which delegates via `ctx.invoke_virtual(inner, "read", "([BII)I", ...)` to
-whatever stream `inner` actually is — not resolved further this session.
-This is a genuinely different-looking stuck point than the previous
-session's `HttpURLConnection` finding for `testErrorOnELNotFound01`,
-consistent with "server never responds" being a JSP/EL-request-processing
-defect with more than one manifestation rather than a single stuck call
-site. Worth checking what `inner`'s concrete type is (a class-file reader?
-a JAR entry stream? something in Jasper's own compiled-JSP-class loading
-path?) as the next step.
+**Update 2026-07-13 (later the same day) — real O(n) performance bug found
+and fixed in `DataInputStream`/`RandomAccessFile`, but does NOT fully
+resolve the hang.** Followed up on the `dis_read_one` clue above (found by
+an earlier pass this session) with a matching-symbol `cdb` build and
+`--stack-dump-on-timeout`/`CRATONVM_ENABLE_NATIVE_RING` diagnostics. Found:
+
+- `native-io/src/lib.rs`'s `native_dis_read_bytes` (backs
+  `DataInputStream.read(byte[],int,int)`) and `dis_read_fully_impl` (backs
+  both `readFully` overloads) both looped `dis_read_one` — a full
+  array-alloc + `invoke_virtual` dispatch into the wrapped stream's
+  `read()` — **once per byte requested**, instead of issuing one bulk
+  `read(buf, off, len)` call (`dis_read_fully_impl`'s own doc comment
+  claimed it "tries bulk read on inner stream first, falls back to
+  byte-by-byte" — that bulk path did not actually exist in the code; the
+  comment was aspirational/stale). For a multi-KB/MB read — exactly what
+  reading a compiled JSP class file or JAR entry involves — this is
+  thousands of interpreter round-trips where real Java does 1-2 native
+  calls. `native_dis_skip_bytes` (`skipBytes`) had the identical pattern.
+  native-io/src/lib.rs's `native_raf_read_fully` (`RandomAccessFile.
+  readFully`) had a cheaper but analogous per-byte `fd_table().read_byte()`
+  loop instead of using the already-existing bulk `fd_table().read_bytes()`.
+- **All four fixed**: each now does genuine bulk reads (looping only on
+  actual short-reads/EOF, matching real `InputStream.read()`/`readFully()`
+  contract semantics exactly, just without the per-byte multiplier).
+  `dis_read_one` itself is unchanged and remains correct for its real
+  single/double-byte callers (`readByte`, `readUnsignedShort`, etc.) where
+  the per-call overhead is negligible.
+- **Confirmed via symbolicated `cdb`** that this was a genuine, actively-hit
+  bottleneck: multiple independent repro attempts caught `main-vm` (or an
+  `http-nio-*-exec-N` worker) live inside `dis_read_one` /
+  `native_dis_skip_bytes` / `ExpressionFactory.newInstance` (which itself
+  transitively reads class files via `DataInputStream` during classloading)
+  at the moment of the snapshot — not idle, not lock-blocked, genuinely
+  burning CPU in the anti-pattern.
+- **Ruled out "just slow"**: before finding this, ran `TestJspConfig` with
+  a 300s timeout (6x the normal 90s the suite runner uses) — it still did
+  not complete, ruling out "eventually finishes, just needs a longer
+  timeout" as the explanation on its own.
+- **Ruled out JIT-specific**: reproduces identically with
+  `CRATONVM_DISABLE_JIT=1`.
+- **Result after the fix: `TestJspConfig` (and the hang-cluster doc's other
+  3 residual classes) STILL HANG** at the suite runner's 90s timeout,
+  regression-checked with zero new regressions (60-class sample, same
+  26 PASS/1 FAIL/33 DoHead-cluster-HANG baseline as before, plus
+  `TestOrderInterceptor` still PASS). So this was a real bug — worth fixing
+  on its own merit, and it may well have shortened these hangs
+  significantly — but it's **not the sole or complete explanation**. Across
+  different repro attempts this session, `main-vm`/worker threads were
+  caught stuck in genuinely different-looking places (client `recv()` in
+  `HttpURLConnection`; `ExpressionFactory.newInstance`; the now-fixed
+  `DataInputStream` byte loop; and, in a couple of runs, actively executing
+  deep, seemingly-recursive JIT/interpreter frames with no obvious blocking
+  call at all) — consistent with either (a) more than one distinct slow/
+  looping code path compounding, or (b) one deeper defect (e.g. a genuine
+  infinite or unbounded-retry loop somewhere in classloading/EL setup) that
+  this session did not fully localize.
 
 **Confound to account for before trusting timing on this box:** this
 session independently hit (a) a severe, confirmed-active cryptominer
@@ -138,15 +170,22 @@ cd apps\tomcat-suite-runner
    [stw-crossthread-jit-takeover-hang-cluster.md](stw-crossthread-jit-takeover-hang-cluster.md)
    per that doc's own recommendation — both point at the same
    "Jasper/EL request sometimes never gets a server response" defect.
-2. Investigate from the server side: what is the `http-nio-*-exec-N`
-   worker thread actually doing (or not doing) for the specific hung/
-   never-responding request? The client-side view (this doc + the
-   hang-cluster doc) has now been dead-ended twice from two different
-   angles (`HttpURLConnection` socket read; `DataInputStream` native read)
-   without finding the server-side cause.
+2. The `DataInputStream`/`RandomAccessFile` O(n)-per-byte bug is now fixed,
+   but did not fully resolve the hang — don't re-chase that specific lead
+   again without new evidence. Next: get a clean, symbolicated,
+   `--stack-dump-on-timeout`-based capture of ALL threads' Java-level frame
+   traces (not just `main-vm`) on an idle host, and specifically watch for
+   whether the SAME code path (class name + method) keeps recurring across
+   several independent hang snapshots taken a few seconds apart on the
+   SAME run — that distinguishes "stuck in one place" (genuine infinite
+   loop/deadlock) from "just very slow, progressing through many different
+   places" (a chain of several slow-but-finite operations, in which case
+   look for more instances of this session's byte-by-byte anti-pattern —
+   grep for loops calling a single-unit native helper where a bulk
+   equivalent exists, the same signature that found the 3 fixes above).
 3. Re-run on an idle, unloaded host (no concurrent builds, miner
-   remediated) before drawing further conclusions — this session's
-   results, while internally consistent (3 clean confirmations of the
-   root-cause-#1 fix), were gathered under severe host contention that
-   makes any *new* timing-sensitive finding (like the `dis_read_one`
-   clue above) less trustworthy than the code-level fixes already merged.
+   remediated) before drawing further conclusions — this and the prior
+   session's results were gathered under confirmed, severe host contention
+   (cryptominer infection + 6-25 concurrent `cargo`/`rustc` processes from
+   other sessions throughout) that inflates any absolute timing number and
+   may itself explain part of why a 90s timeout isn't enough.
