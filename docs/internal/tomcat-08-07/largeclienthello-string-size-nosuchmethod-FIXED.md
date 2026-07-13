@@ -78,27 +78,40 @@ default and which unconditionally drops every native registered on
 `java/net/Socket`/`java/net/ServerSocket`, including the working
 `getSoTimeout`/`setSoTimeout` side-table natives — so real bytecode's
 `Socket.setSoTimeout()` → `getImpl().setOption(...)` runs instead). Unlike
-the deterministic Logger bug above, this one is **non-deterministic and
-timing-dependent**: reruns of `TestCancelledUpload` under identical
-conditions (only debug env vars added) produced three *different* failure
-signatures across runs — `NoSuchMethodError: java/lang/String.setOption`,
-`NullPointerException: Cannot enter synchronized block because
-"this.socketLock" is null` (a `final` field that should never be null
-post-construction), and `SocketException: Socket is closed`. A minimal
-isolated repro (`new Socket(host,port)` + `setSoTimeout` under
-`CRATONVM_REAL_NET_SOCKETS=1`, no Tomcat/JUnit harness) does **not**
-reproduce at all. This combination (deterministic-shape symptom, varying
-failure mode run-to-run, only under real GC/thread pressure) matches the
-codebase's existing, extensively-investigated **register-invisible JIT
-root / stale-reference-reuse** family (see
-`reference_gc_audit_stw_monitor_race_finding1`,
-`dohead-jit-heap-corruption-register-invisibility.md`'s "Layer 1" —
-real fix is precise oop maps / shadow stack, explicitly deferred there
-after multiple prior sessions' mitigation attempts proved insufficient),
-**not** a fixable-here vtable/dispatch bug. Left the two known-issues docs
-open; added cross-reference notes there pointing back to this refutation
-so a future session doesn't re-chase "shared root cause with the Logger
-bug" — the two are unrelated once the Logger fix is applied.
+the deterministic Logger bug above, this one initially looked
+non-deterministic/timing-dependent: reruns of `TestCancelledUpload` under
+identical conditions (only debug env vars added) produced different
+failure signatures across runs — `NoSuchMethodError:
+java/lang/String.setOption`, `NullPointerException: Cannot enter
+synchronized block because "this.socketLock" is null` (a `final` field
+that should never be null post-construction), and `SocketException: Socket
+is closed`. A minimal isolated repro (`new Socket(host,port)` +
+`setSoTimeout` under `CRATONVM_REAL_NET_SOCKETS=1`, no Tomcat/JUnit
+harness) does **not** reproduce at all, which this doc's investigation
+(mis-)read as pointing at the codebase's existing register-invisible-JIT
+root / stale-reference-reuse family.
+
+**Correction:** a concurrent 2026-07-13 session
+([[project_dohead_third_cause_socketfactory_synthetic_20260713]] in
+project memory) root-caused this **deterministically**, not a GC-timing
+race: commit `be6055605` (2026-07-09) added synthetic
+`javax/net/SocketFactory.createSocket` natives that fabricate a 5-slot
+synthetic-layout `Socket`; `CRATONVM_REAL_NET_SOCKETS=1` then drops every
+`java/net/Socket` native so *real* `Socket` bytecode consumes that
+synthetic object — a producer/consumer layout split-brain, reproducible
+with `--nojit`. Which of the three faces appears depends on the exact
+construction path (e.g. `useAsyncIO`), not GC timing; the isolated probe
+above doesn't reproduce it because `new Socket(host,port)` goes through
+`Socket`'s own real constructor directly, never through the buggy
+`SocketFactory.getDefault().createSocket(...)` producer path that
+`Http2TestBase` actually uses. Still a *different bug in a different
+class* from the Logger fix here (so the "shared root cause" hypothesis
+this doc set out to check is still refuted), but it **is** a fixable,
+already-diagnosed dispatch/layout bug, not the deep GC-precision family —
+don't cite this doc's "register-invisible-root" framing as the final word;
+see the other session's memory for the actual fix (prepared, not yet
+merged as of this note). Left the two known-issues docs open with
+corrected cross-reference notes.
 
 ## Verification
 
