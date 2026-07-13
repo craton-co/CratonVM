@@ -174,6 +174,52 @@ being invoked in `execute_invoke_kind`):
   `StringBuilder.append`). Clean negative result: JIT tier-up policy is not
   what's gating this hang.
 
+**HotSpot baseline (2026-07-13, same worktree, `run-suite.sh hotspot`, real
+`java.exe`, no CratonVM involved)** — how long does this actually take on a
+real JVM:
+
+| Class | HotSpot result | Elapsed |
+|---|---|--:|
+| `AutowiredAnnotationBeanRegistrationAotContributionTests` | OK 14/14 | 59.1s |
+| `BeanDefinitionMethodGeneratorTests` | OK 34/34 | 73.6s |
+| `ApplicationContextAotGeneratorTests` | OK 40/40 | 155.9s |
+
+All three pass cleanly and finish in under 3 minutes on HotSpot — including
+`ApplicationContextAotGeneratorTests`, the most expensive of the three
+(largest generated-code surface, most CGLIB/reflection-heavy fixtures).
+**This rules out "these are just inherently expensive AOT-codegen tests that
+happen to need close to 1500s."** They don't; HotSpot needs 1-3 minutes.
+CratonVM not finishing any of the 9 hung classes within a 1500s ceiling — 10x
+to 25x the *slowest* HotSpot baseline above, and 25x-1500x the *fastest* —
+is a severe gap, not a marginal one.
+
+**Characterization: leans toward a workload-specific disproportionate cost,
+not (only) a uniform interpreter/JIT throughput gap**, though this session's
+tooling can't fully separate the two. Reasoning: a "CratonVM is just N times
+slower at everything" story requires N to be roughly 20-25x (to explain
+`ApplicationContextAotGeneratorTests` alone needing >1500s against a 156s
+HotSpot baseline) up to 100x+ (for the 59s-73s baselines, or given that the
+9 hung classes never finish at all, not even slowly-but-boundedly within
+1500s). A uniform 20-100x interpreter gap of that magnitude, specifically
+and only for this kind of workload, would be a very unusual outlier relative
+to CratonVM's general performance posture elsewhere in the project (nothing
+else in project history shows a *general-purpose* interpreter/JIT gap in
+that range against HotSpot; JIT tier-up is confirmed active per above, and
+the `CRATONVM_DBG_HANG_SAMPLE` throughput — 20,000-55,000 real interpreted
+method calls/sec, sustained, not collapsing — is not itself abnormally slow
+for an interpreter loop). That combination (normal-looking per-call
+throughput, but the *total* task apparently needing on the order of
+100x-1000x+ HotSpot's wall time to finish, if it finishes at all) is more
+consistent with CratonVM doing **substantially more total work** for the
+same nominal compile than HotSpot does — i.e. some form of eager-vs-lazy
+discrepancy or a caching/completion-state gap inflating the effective
+symbol/class count touched — layered on top of, not instead of, ordinary
+interpreter overhead. This is not conclusively proven; it is this session's
+best-supported reading of the evidence gathered, and a real profiler could
+still overturn it (e.g. by showing the call graph really does only touch a
+small, bounded symbol set and the cost is genuinely per-call, in which case
+"broad perf gap" would be the better description after all).
+
 **Leading, unconfirmed hypothesis**: the sample's effective test classpath
 is unusually large for this kind of test (48 jars for `spring-beans`,
 including `kotlin-stdlib`, `kotlin-reflect`, `groovy`, `mockito`, `reactor`),
@@ -205,6 +251,61 @@ shared, actively-mutating main checkout this session was explicitly told
 never to touch) rather than the intended worktree. Running `discover` with
 `SPRING` pointed at the intended checkout regenerates it correctly; all
 final numbers quoted above are from the corrected, properly-isolated run.
+
+### Summary table — all 11 classes covered this session
+
+| Class | Status 2026-07-13 | Notes |
+|---|---|---|
+| `AutowiredAnnotationBeanRegistrationAotContributionTests` | **Still hangs** | HotSpot baseline: 59.1s, 14/14 OK |
+| `beans.factory.aot.BeanDefinitionMethodGeneratorTests` | **Still hangs** | HotSpot baseline: 73.6s, 34/34 OK |
+| `beans.factory.aot.BeanRegistrationsAotContributionTests` | **Still hangs** | not HotSpot-timed this session |
+| `context.annotation.CommonAnnotationBeanRegistrationAotContributionTests` | No longer hangs; FAIL 2/8 | new residual: `VerifyError` in `ReflectionTypeReference.<init>` (bytecode verifier, not filed yet) + an AOT codegen `IllegalArgumentException` (not filed yet) |
+| `context.annotation.ConfigurationClassPostProcessorAotContributionTests` | **Still hangs** | not HotSpot-timed this session |
+| `context.aot.ApplicationContextAotGeneratorTests` | **Still hangs** | HotSpot baseline: 155.9s, 40/40 OK |
+| `orm.jpa.support.PersistenceAnnotationBeanPostProcessorAotContributionTests` | No longer hangs; FAIL 2/8 | residual is the already-tracked Mockito self-attach gap (`bug-09`), not new |
+| `test.context.aot.TestContextAotGeneratorIntegrationTests` | **Still hangs** | not HotSpot-timed this session |
+| `orm.jpa.support.InjectionCodeGeneratorTests` | **Now hangs** (was FAIL/fast) | classpath gotcha fixed along the way (`spring-orm` jars weren't built) |
+| `beans.factory.aot.BeanDefinitionPropertiesCodeGeneratorTests` | **Now hangs** (was FAIL/fast) | |
+| `beans.factory.aot.InstanceSupplierCodeGeneratorTests` | **Now hangs** (was FAIL/fast) | |
+
+**Fixed and pushed to `dev`** (`7ae137e4`): `Files.walkFileTree`'s zero-field
+`BasicFileAttributes` placeholder — a real, standalone correctness/type-
+confusion bug, confirmed NOT the cause of the hang.
+
+**Ruled out for the 9-class hang**: deadlock; a tight 2-3-method infinite
+loop; the `BasicFileAttributes` bug above; `CRATONVM_DBG_STALE_OBJREF`
+(didn't fire); JIT instance-method tier-up policy (already default-ON,
+toggling it changes throughput ~20%, not the dominant factor); "these tests
+are just inherently this slow" (HotSpot finishes the 3 timed ones in
+59-156s).
+
+**Still open**: the hang/severe-slowdown itself. Best current
+characterization: likely a workload-specific disproportionate cost in
+javac's `ClassFinder`/`ClassReader`/`Scope`/`Symtab` symbol-completion
+machinery over this sample's unusually large 48-jar classpath (probably
+processing far more classes/symbols than HotSpot's lazy completion would
+for the identical compile), rather than a uniform interpreter/JIT throughput
+gap — but this session's tooling (no symbol-capable native profiler
+available on this Windows machine) couldn't conclusively distinguish that
+from "just a very large uniform slowdown for this specific code shape."
+
+**Diagnostics left in place for the next session** (both permanent, gated,
+default-off, negligible cost when unset):
+- `CRATONVM_DBG_HANG_SAMPLE=1` — periodically prints the method being
+  invoked in `execute_invoke_kind` (`vm/src/runtime/interpreter.rs`,
+  `vm/src/runtime/env_cache.rs::dbg_hang_sample`), every 200,000 calls. Cheap
+  way to see a hung process's last-known activity without a debugger.
+- `CRATONVM_DBG_OOBFIELD=<substr>` (pre-existing) — dumps a Rust backtrace
+  on every out-of-bounds field read whose class name contains `<substr>`;
+  used to pin the `BasicFileAttributes` bug precisely.
+- A proper next step would be a call-count-attributed sampling profiler
+  with matching symbols (this build's DWARF debug info isn't readable by
+  Windows' `wpr`/`wpa`; `perf`/`samply`-style tooling would need to be
+  brought in, or the investigation moved to a Linux host), or instrumenting
+  `ClassReader.readClassFile`/`ClassFinder.fillIn` call counts directly
+  (Rust-side, at the native javac-bridge boundary) to compare against a
+  HotSpot JFR/async-profiler trace of the same class for a true apples-to-
+  apples "how many classes actually get completed" count.
 
 ## Bucket 1 — Genuinely hung (12/25)
 
