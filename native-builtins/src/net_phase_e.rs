@@ -831,9 +831,76 @@ pub(crate) fn url_custom_handler_connection(
     Ok(Some(conn.unwrap_or(Value::Object(None))))
 }
 
+/// Resolve the jar-file component of a `jar:...!/entry` URL when that
+/// component is itself a Tomcat `war:file:<war-path>*/<entry-in-war>`
+/// reference (e.g. `jar:war:file:/x.war*/WEB-INF/lib/test.jar!/entry` — a jar
+/// packaged inside a WAR). Returns the nested jar's raw bytes read out of the
+/// enclosing WAR's zip central directory, or `None` if `jar_raw` isn't a
+/// `war:` reference (the plain on-disk-file case is handled separately by
+/// callers). Mirrors `UriUtil.warToJar`'s `*/` → `!/` translation, but reads
+/// the referenced entry's bytes (via the existing nested-jar cache) instead
+/// of just rewriting the URL string, since the entry lives inside another
+/// archive rather than directly on disk.
+fn war_nested_jar_bytes(jar_raw: &str) -> Option<Arc<Vec<u8>>> {
+    let rest = jar_raw.strip_prefix("war:")?.trim_start_matches("file:");
+    let mut wparts = rest.splitn(2, "*/");
+    let war_path_raw = wparts.next()?;
+    let inner_entry = wparts.next()?;
+    if inner_entry.is_empty() {
+        return None;
+    }
+    // `file:` URLs prefix a leading `/` before a Windows drive letter
+    // (`/C:/…`); try the trimmed form first, then the raw form for POSIX.
+    let trimmed = war_path_raw.trim_start_matches('/');
+    let war_disk = if std::path::Path::new(trimmed).exists() {
+        trimmed.to_string()
+    } else if std::path::Path::new(war_path_raw).exists() {
+        war_path_raw.to_string()
+    } else {
+        trimmed.to_string()
+    };
+    cached_nested_jar(&war_disk, inner_entry).ok()
+}
+
+/// Build a `java/util/jar/JarEntry` from an already-opened zip archive, or
+/// `Value::Object(None)` if `lookup` isn't present. Shared by the plain
+/// on-disk and WAR-nested-jar lookup paths in `jar_url_lookup_entry`.
+fn jar_entry_value_from_archive<R: std::io::Read + std::io::Seek>(
+    ctx: &mut dyn NativeContext,
+    archive: &mut zip::ZipArchive<R>,
+    lookup: &str,
+) -> Value {
+    let (name, size, csize, method) = match archive.by_name(lookup) {
+        Ok(entry) => {
+            let name = entry.name().to_string();
+            let size = entry.size() as i64;
+            let csize = entry.compressed_size() as i64;
+            #[allow(deprecated)]
+            let method = entry.compression().to_u16() as i32;
+            (name, size, csize, method)
+        }
+        Err(_) => return Value::Object(None),
+    };
+    let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
+    let name_s = ctx.create_string(&name);
+    ctx.set_field(je, 0, Value::Object(Some(name_s)));
+    ctx.set_field(je, 1, Value::Long(size));
+    ctx.set_field(je, 2, Value::Long(csize));
+    ctx.set_field(je, 3, Value::Int(method));
+    Value::Object(Some(je))
+}
+
 /// Parse a `jar:[file:]<path>!/<entry>` external form and return the entry's
 /// uncompressed size from the zip central directory, or `None` if the URL is
 /// not a resolvable jar-entry URL. Used by `JarURLConnection.getContentLength*`.
+///
+/// `<path>` is usually a plain on-disk jar/zip file, but Tomcat's `war:`
+/// nested-archive scheme (see `war_nested_jar_bytes`) produces
+/// `war:file:<war-path>*/<entry-in-war>` here instead — a jar packaged inside
+/// a WAR (e.g. `jar:war:file:/x.war*/WEB-INF/lib/test.jar!/META-INF/…`, from
+/// `WarURLConnection` wrapping the jar it points into). Handle that case by
+/// reading the nested jar's bytes out of the WAR first, then treating those
+/// bytes as the archive to look the entry up in.
 fn jar_url_entry_size(ext: &str) -> Option<i64> {
     let after = ext
         .strip_prefix("jar:file:")
@@ -843,6 +910,12 @@ fn jar_url_entry_size(ext: &str) -> Option<i64> {
     let entry_name = parts.next()?;
     if entry_name.is_empty() {
         return None;
+    }
+    if let Some(bytes) = war_nested_jar_bytes(jar_raw) {
+        let cursor = std::io::Cursor::new(bytes.as_slice());
+        let mut archive = zip::ZipArchive::new(cursor).ok()?;
+        let entry = archive.by_name(entry_name).ok()?;
+        return Some(entry.size() as i64);
     }
     // `file:` URLs prefix a leading `/` before a Windows drive letter
     // (`/C:/…`); try the trimmed form first, then the raw form for POSIX.
@@ -976,6 +1049,17 @@ fn jar_url_lookup_entry(ctx: &mut dyn NativeContext, ext: &str) -> Value {
         Some(e) if !e.is_empty() => e,
         _ => return Value::Object(None),
     };
+    // Tomcat `war:` nested-jar case (see `war_nested_jar_bytes`): the jar
+    // component is packaged inside a WAR rather than sitting directly on
+    // disk, so its bytes must come from the enclosing WAR's zip entry.
+    if let Some(bytes) = war_nested_jar_bytes(jar_raw) {
+        let cursor = std::io::Cursor::new(bytes.as_slice());
+        let mut archive = match zip::ZipArchive::new(cursor) {
+            Ok(a) => a,
+            Err(_) => return Value::Object(None),
+        };
+        return jar_entry_value_from_archive(ctx, &mut archive, entry_name);
+    }
     let trimmed = jar_raw.trim_start_matches('/');
     let disk = if std::path::Path::new(trimmed).exists() {
         trimmed.to_string()
@@ -995,24 +1079,7 @@ fn jar_url_lookup_entry(ctx: &mut dyn NativeContext, ext: &str) -> Value {
     // Extract the entry metadata into owned values, then drop the `archive`
     // borrow before doing any `ctx` allocation (mirrors p59_jar_collect_entries).
     let lookup = jmod_zip_entry_name(&disk, entry_name);
-    let (name, size, csize, method) = match archive.by_name(&lookup) {
-        Ok(entry) => {
-            let name = entry.name().to_string();
-            let size = entry.size() as i64;
-            let csize = entry.compressed_size() as i64;
-            #[allow(deprecated)]
-            let method = entry.compression().to_u16() as i32;
-            (name, size, csize, method)
-        }
-        Err(_) => return Value::Object(None),
-    };
-    let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
-    let name_s = ctx.create_string(&name);
-    ctx.set_field(je, 0, Value::Object(Some(name_s)));
-    ctx.set_field(je, 1, Value::Long(size));
-    ctx.set_field(je, 2, Value::Long(csize));
-    ctx.set_field(je, 3, Value::Int(method));
-    Value::Object(Some(je))
+    jar_entry_value_from_archive(ctx, &mut archive, &lookup)
 }
 
 /// Recover the originating `jar:…!/entry` URL from a synthetic
