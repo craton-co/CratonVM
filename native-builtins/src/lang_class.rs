@@ -4931,7 +4931,10 @@ pub(crate) fn native_class_get_declared_fields(
         .collect();
     // GC-safe: `create_field_object` allocates, so the array must be pinned
     // across the fill loop (see `build_mirror_array` вЂ” WildFly bug-06).
-    let arr = build_mirror_array(ctx, selected.len(), |ctx, i| {
+    let field_component = ctx
+        .class_id_by_name("java/lang/reflect/Field")
+        .unwrap_or_else(|| cratonvm_types::ClassId::new(0));
+    let arr = build_mirror_array_comp(ctx, field_component, selected.len(), |ctx, i| {
         create_field_object(ctx, selected[i])
     });
     Ok(Some(Value::Object(Some(arr))))

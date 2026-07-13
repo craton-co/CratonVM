@@ -32,7 +32,8 @@ use cratonvm_native_collections::identity_hash::obj_key;
 use cratonvm_native_collections::{
     __test_lhm_get, __test_lhm_set, __test_ll_get, __test_ll_set, __test_tm_fast_get_str,
     __test_tm_fast_put_str, __test_tm_get_slot, __test_tm_set_slot, __test_ts_get_slot,
-    __test_ts_set_slot, gc_scan_collection_overlay_roots, gc_update_collection_overlay_refs,
+    __test_ts_set_slot, gc_overlay_roots_for_collection, gc_scan_collection_overlay_roots,
+    gc_update_collection_overlay_refs,
 };
 use cratonvm_types::{ObjectRef, Value};
 use std::collections::HashMap;
@@ -217,6 +218,28 @@ fn fast_treemap_value_is_a_gc_root() {
         roots.iter().any(|r| r.as_ptr() == val.as_ptr()),
         "fast-mode TreeMap object value must be reported as a GC root — \
          otherwise a moving collector reclaims it as garbage (B1/V1 use-after-free)"
+    );
+}
+
+/// The non-moving Generational marker must follow a side-table edge only after
+/// its owning collection was marked. A different collection's overlay must not
+/// turn this value into a process-global root.
+#[test]
+fn overlay_roots_are_scoped_to_the_marked_collection_owner() {
+    let mut ctx = MockCtx::new();
+    let live_owner = ctx.alloc_object_simple(0);
+    let dead_owner = ctx.alloc_object_simple(0);
+    let live_value = ctx.alloc_object_simple(0);
+    let dead_value = ctx.alloc_object_simple(0);
+
+    __test_tm_fast_put_str(&ctx, live_owner, "live", Value::Object(Some(live_value)));
+    __test_tm_fast_put_str(&ctx, dead_owner, "dead", Value::Object(Some(dead_value)));
+
+    let roots = gc_overlay_roots_for_collection(live_owner.as_ptr() as usize);
+    assert!(roots.iter().any(|r| r.as_ptr() == live_value.as_ptr()));
+    assert!(
+        roots.iter().all(|r| r.as_ptr() != dead_value.as_ptr()),
+        "a different collection's overlay value must not be rooted"
     );
 }
 

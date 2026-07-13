@@ -177,6 +177,12 @@ const SIG_MLDSA_65: i32 = 17;
 const SIG_MLDSA_87: i32 = 18;
 const SIG_ED448: i32 = 19;
 const SIG_EDDSA: i32 = 20;
+// DSA with SHA-1 (the classic jarsigner default, `Signature.getInstance("DSA")`
+// / `"SHA1withDSA"`). CratonVM has no native DSA crypto (`crypto_impl` never
+// had a DSA path — `verify_dispatch`/`sign_dispatch` fall through to `_ =>
+// None`/`unwrap_or(false)`, so DSA verification always silently failed, no
+// exception). Routed to the real JDK SPI below, same as ECDSA/EdDSA/ML-DSA.
+const SIG_SHA1_DSA: i32 = 21;
 
 fn algo_idx(name: &str) -> i32 {
     let upper = name.to_ascii_uppercase();
@@ -200,7 +206,8 @@ fn algo_idx(name: &str) -> i32 {
         "ED25519" => SIG_ED25519,
         "ED448" => SIG_ED448,
         "EDDSA" => SIG_EDDSA,
-        "SHA256WITHDSA" => SIG_SHA256_DSA,
+        "SHA256WITHDSA" | "SHA-256WITHDSA" => SIG_SHA256_DSA,
+        "SHA1WITHDSA" | "SHA-1WITHDSA" | "DSA" | "DSS" => SIG_SHA1_DSA,
         // Post-quantum ML-DSA (FIPS 204). The umbrella "ML-DSA" name carries no
         // parameter set; the concrete SPI suffix is resolved from the init key's
         // `getAlgorithm()` (see `mldsa_spi_class`). The explicit param-set names
@@ -226,6 +233,9 @@ fn algo_idx(name: &str) -> i32 {
         "1.2.840.113549.1.1.13" => SIG_SHA512_RSA,
         // Ed25519:
         "1.3.101.112" => SIG_ED25519,
+        // id-dsa-with-sha1 / dsaWithSHA256:
+        "1.2.840.10040.4.3" => SIG_SHA1_DSA,
+        "2.16.840.1.101.3.4.3.2" => SIG_SHA256_DSA,
         _ => -1,
     }
 }
@@ -243,6 +253,7 @@ fn algo_name(idx: i32) -> &'static str {
         SIG_ED448 => "Ed448",
         SIG_EDDSA => "EdDSA",
         SIG_SHA256_DSA => "SHA256withDSA",
+        SIG_SHA1_DSA => "SHA1withDSA",
         SIG_PSS_SHA256 => "SHA256withRSAandMGF1",
         SIG_PSS_SHA384 => "SHA384withRSAandMGF1",
         SIG_PSS_SHA512 => "SHA512withRSAandMGF1",
@@ -470,6 +481,39 @@ fn eddsa_real_spi_class(alg: i32) -> Option<&'static str> {
         SIG_ED25519 => Some("sun/security/ec/ed/EdDSASignature$Ed25519"),
         SIG_ED448 => Some("sun/security/ec/ed/EdDSASignature$Ed448"),
         SIG_EDDSA => Some("sun/security/ec/ed/EdDSASignature"),
+        _ => None,
+    }
+}
+
+/// Real JDK `sun.security.provider.DSA$*` SPI class for a DSA algo index, or
+/// `None` when DSA routing is off or the algo is not DSA.
+///
+/// CratonVM has no native DSA sign/verify at all (unlike RSA/ECDSA, which
+/// have a fast synthetic Rust path with real-key routing layered on top) —
+/// `crypto_impl`'s `verify_dispatch`/`sign_dispatch` simply don't have a DSA
+/// arm, so `Signature.verify()` for any DSA algorithm silently returned
+/// `false` (`.unwrap_or(false)`) with no exception. Route directly to the
+/// real JDK 25 SUN-provider SPI instead, same mechanism as ECDSA/EdDSA/
+/// ML-DSA above — `sun.security.provider.DSA$SHA256withDSA`/`SHA1withDSA`
+/// are plain, dependency-free classes (construct + `engineInitVerify(key)` +
+/// `engineUpdate(buf)` + `engineVerify(sig)`), so there's no reason to
+/// hand-roll DSA modular-exponentiation crypto in Rust when the real
+/// implementation is already sitting in the boot classpath.
+///
+/// Found while root-causing `SecurityInfoTests.getWhenJarIsSigned`/
+/// `NestedJarFileTests.verifySignedJar`: `bcprov-jdk18on`'s real jarsigner
+/// signature uses a 2048-bit DSA key (`SHA256withDSA`) — the `.DSA` file
+/// extension is literal here, not just jarsigner's default naming.
+///
+/// Kill-switch `CRATONVM_SYNTHETIC_DSA=1` restores the legacy (always-false)
+/// behavior for debugging / regression bisecting.
+fn dsa_real_spi_class(alg: i32) -> Option<&'static str> {
+    if !crate::route_dsa_to_real() {
+        return None;
+    }
+    match alg {
+        SIG_SHA256_DSA => Some("sun/security/provider/DSA$SHA256withDSA"),
+        SIG_SHA1_DSA => Some("sun/security/provider/DSA$SHA1withDSA"),
         _ => None,
     }
 }
@@ -865,6 +909,10 @@ fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(spi_class) = eddsa_real_spi_class(alg) {
         return drive_real_signature_spi(ctx, this, spi_class, None);
     }
+    // DSA: drive the real sun.security.provider.DSA$* SPI (no native DSA crypto).
+    if let Some(spi_class) = dsa_real_spi_class(alg) {
+        return drive_real_signature_spi(ctx, this, spi_class, None);
+    }
     // ML-DSA: drive the real SUN ML_DSA_Impls$SIG* SPI (real lattice signature).
     if is_mldsa(alg) {
         return drive_real_mldsa(ctx, this, alg, None);
@@ -935,6 +983,14 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         return drive_real_signature_spi(ctx, this, spi_class, Some(provided));
     }
     if let Some(spi_class) = eddsa_real_spi_class(alg) {
+        let provided = match args.get(1) {
+            Some(Value::Object(Some(arr))) => read_byte_array_full(ctx, *arr),
+            _ => Vec::new(),
+        };
+        return drive_real_signature_spi(ctx, this, spi_class, Some(provided));
+    }
+    // DSA: drive the real sun.security.provider.DSA$* SPI (no native DSA crypto).
+    if let Some(spi_class) = dsa_real_spi_class(alg) {
         let provided = match args.get(1) {
             Some(Value::Object(Some(arr))) => read_byte_array_full(ctx, *arr),
             _ => Vec::new(),

@@ -76,6 +76,50 @@ retired `dohead1023-http2-index0-socketexception-likely-host-contention.md`
 analysis (that doc's host-contention theory was right for ITS 2/288
 flakes; the deterministic 152/288 cluster was the regressions above).
 
+**Full-family validation (2026-07-13, later the same day):** all **64**
+`TestHttpServletDoHeadInvalidWrite*` classes (suite indices 28–91, 18,432
+tests total) were swept on a current-`dev` binary (includes the fixes
+above plus the STW-takeover bracketing fix `945e44920` and the
+SyntheticStub dispatch-gate hardening `c73eeda7b`), real JDK, JIT on,
+1200s timeout, parallel 2:
+
+- **58/64 PASS clean (288/288); 6 classes at 287/288**, each with exactly
+  one failure at a random parameter index, in two shapes: 3× HTTP/2
+  mid-read disconnect (`IOException: End of input stream with [9] bytes
+  left`, the retired host-contention doc's environmental family) and
+  3× `LifecycleException: Protocol handler start failed` in test setUp —
+  root-caused during the solo re-runs to a sporadic
+  `IllegalThreadStateException` from `Thread.start()` on a freshly
+  constructed Tomcat endpoint worker (~1/5000 Tomcat boots, a CratonVM
+  Thread-state-tracking bug, NOT DoHead-specific and not port churn) —
+  filed as `docs/known-issues/tomcat-08-07/
+  threadpoolexecutor-prestart-illegalthreadstate-sporadic.md`. Solo
+  re-runs of the six classes otherwise PASS
+  (`apps/tomcat/.suite/results/dh3rerun/`).
+- **Zero occurrences across all 64 err logs** of: the AQS
+  ConditionNode/ConditionObject stale-receiver flood (Layer 1 — the
+  parkBlocker pin holds), any `Stale pointer` fallback, any walk-desync /
+  zero-span / overshoot / bad-forward containment event (Layer 2 — the
+  hardened sweep never even engaged its anomaly paths), any crash marker,
+  any `String.size()I` NSME (Logger fix holds), and any STW-takeover-wait
+  warning (the `945e44920` bracketing fix holds).
+- The only GC-adjacent events were 154 `mark_young: rejecting object with
+  implausible extent` lines (~2.4 per 288-test class) — the extent-clamp
+  (`8e64d9a5`) conservatively rejecting non-object conservative-scan
+  candidates, its designed retention-safe behavior, with no downstream
+  anomaly in any run.
+- Historical note on the earlier flake floor: an identical sweep hours
+  earlier on a pre-`945e44920` binary showed ~70% of classes with 1–2
+  `SocketTimeoutException: Read timed out` (300 s client timeout!)
+  failures plus one 1200 s HANG stuck at `STW cross-thread JIT takeover
+  is still waiting for cooperative mutators` — and the 07-12 baseline run
+  had 33 such timeouts across DoHead AND unrelated classes
+  (TestELInJsp, TestRewriteValve, TestHttp11Processor…). The takeover
+  bracketing fix eliminated all of them (sweep wall time dropped from a
+  projected 5+ h to 71.8 min on the same loaded box), identifying the
+  STW-takeover wedge — not host contention — as the dominant source of
+  that long-standing cross-suite read-timeout flake family.
+
 The original 2026-07-12 finding follows for the record: a fresh
 full-suite rerun on `dev` (commit `080e79256`, 2026-07-12, real JDK, JIT
 on, 1200s timeout) showed all ~19
