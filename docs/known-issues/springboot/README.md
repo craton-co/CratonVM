@@ -14,7 +14,7 @@ clustered.
 
 | Doc | Classes | Severity | Status |
 |---|---:|---|---|
-| [`onclasscondition-npe-cast-to-string-array-cluster.md`](onclasscondition-npe-cast-to-string-array-cluster.md) | 75 (348 occurrences) | CRITICAL | OPEN, precisely pinned to `OnClassCondition.addAll` |
+| [`onclasscondition-fix-blocked-by-heap-corruption.md`](onclasscondition-fix-blocked-by-heap-corruption.md) | 75 (348 occurrences) | CRITICAL | Fix verified correct, BLOCKED by an unrelated heap-corruption bug it exposes |
 | `DisposableBeanAdapter` "Invalid destruction signature" | 34 | HIGH | **RESOLVED 2026-07-12** — moved to [`../../internal/fixed-suite-bugs/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md`](../../internal/fixed-suite-bugs/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md); a direct probe against current dev found the destroy-method reflection path works fine, closing the cluster (no distinct residual identified) |
 | `sun.misc.Unsafe$MemoryAccessOption` NPE | 26 | HIGH | **FIXED/RETIRED 2026-07-12** — moved to [`../../internal/fixed-suite-bugs/spring-boot-unsafe-memoryaccessoption-npe-FIXED.md`](../../internal/fixed-suite-bugs/spring-boot-unsafe-memoryaccessoption-npe-FIXED.md); same bug independently found+fixed via a concurrent Keycloak investigation, canonical doc is `testsuite-model-unsafe-putorderedlong-memoryaccessoption-npe-FIXED.md` in the same directory |
 | `HttpClient.Builder` dead registration | 13 | HIGH | **RESOLVED 2026-07-12** — moved to [`../../internal/fixed-suite-bugs/springboot-httpclient-builder-dead-registration-abstractmethoderror-FIXED.md`](../../internal/fixed-suite-bugs/springboot-httpclient-builder-dead-registration-abstractmethoderror-FIXED.md); the active real-JDK registrar now covers every Java 17 fluent builder method |
@@ -28,7 +28,7 @@ Reran the original 150 HANG classes at 5x the timeout (see
 `apps/spring-boot-suite-runner/RESULTS-20260711.md` "HANG rerun" section):
 90 still hung, 51 turned FAIL, 7 PASS, 2 CRASH. Of the 51 FAILs: 7 are the
 the now-retired `TestCompiler` cluster above; ~16 more
-overlap with the `onclasscondition-npe-cast-to-string-array-cluster.md` and
+overlap with the `onclasscondition-fix-blocked-by-heap-corruption.md` and
 the two retired clusters (destroy-method resolution, `MemoryAccessOption`)
 above — those classes just needed more wall time to *reach* the
 already-known failure instead of timing out first. The remaining ~28 are a
