@@ -11173,20 +11173,52 @@ fn make_list_of_raw(ctx: &mut dyn NativeContext, elems: &[Value]) -> ObjectRef {
 
 /// Helper: create a HashSet from a slice of values.
 fn make_set_of(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult {
+    // Building the synthetic set allocates both its backing map and bucket
+    // array, and each native_map_put may run Java equality/hash code and move
+    // the heap. Keep every input element and partially-built object rooted,
+    // refreshing their addresses immediately before use. A raw stream element
+    // here previously became an unrelated java.lang.Object while collecting
+    // TypeElement values with Collectors.toSet().
+    let (elem_base, elem_handles) = pin_value_slice(ctx, elems);
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+    let set_pin = ctx.pin_native_root(set);
     let backing_map = alloc_backing_map(ctx);
+    let backing_map_pin = ctx.pin_native_root(backing_map);
     let cap = std::cmp::max(elems.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
     let buckets = alloc_ref_array(ctx, cap);
+    let buckets_pin = ctx.pin_native_root(buckets);
+    let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
+    let buckets = ctx.read_native_pin(buckets_pin, buckets);
     ctx.set_field(backing_map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
     set_map_size(ctx, backing_map, 0);
     ctx.set_field(backing_map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    let set = ctx.read_native_pin(set_pin, set);
+    let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
 
     let sentinel = Value::Int(1);
-    for elem in elems {
-        native_map_put(ctx, &[Value::Object(Some(backing_map)), *elem, sentinel])?;
+    for (index, elem) in elems.iter().enumerate() {
+        let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
+        let elem = read_pinned_elem(ctx, elem_handles[index], *elem);
+        if let Err(err) = native_map_put(
+            ctx,
+            &[Value::Object(Some(backing_map)), elem, sentinel],
+        ) {
+            ctx.unpin_native_roots(if elem_base == usize::MAX {
+                set_pin
+            } else {
+                elem_base
+            });
+            return Err(err);
+        }
     }
 
+    let set = ctx.read_native_pin(set_pin, set);
+    ctx.unpin_native_roots(if elem_base == usize::MAX {
+        set_pin
+    } else {
+        elem_base
+    });
     Ok(Some(Value::Object(Some(set))))
 }
 
