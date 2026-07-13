@@ -1,4 +1,4 @@
-# quarkus/runtime PicocliTest hang inside picocli ArgGroupSpec synopsis text building
+# quarkus/runtime PicocliTest hang — exponential-ish RelocateConfigSourceInterceptor fan-out under the JIT skip-list
 
 Status: open
 
@@ -7,108 +7,152 @@ Date observed: 2026-07-13, split out from
 speculatively grouped this with SmallRye Config resolution mismatches ("may share a root cause"). That hypothesis
 is refuted below — this is a separate, unrelated bug.
 
-## Summary
+## Summary (updated 2026-07-13, second investigation pass)
 
-`quarkus/runtime :: org.keycloak.quarkus.runtime.cli.PicocliTest` genuinely HANGS (does not merely run slowly) when
-run via the keycloak-suite-runner harness against a current `dev` build. Confirmed via two independent methods:
+`quarkus/runtime :: org.keycloak.quarkus.runtime.cli.PicocliTest` genuinely stalls for a very long time (confirmed
+NOT a classic infinite loop — see below) when run against a current `dev` build. The FIRST investigation pass
+(same day, earlier) captured a stack dump showing the hang inside picocli's own `ArgGroupSpec`/`ColorScheme`/`Text`
+CLI-help-synopsis-text building; a SECOND, deeper pass (using a custom timing-instrumented JUnit Platform runner,
+see "Repro" below) found this was a snapshot of an early/transient phase, not the actual steady-state hang location
+— the real hang is in **SmallRye Config's `RelocateConfigSourceInterceptor`**, and it is a genuine (if severe)
+**interpreter-throughput problem, not an infinite loop or correctness bug**.
 
-1. Two harness runs at different `-TimeoutSec` (180s and 300s) both cut off at the identical point in stderr
-   (`DEBUG [io.netty.util.NetUtil] Failed to get SOMAXCONN from sysctl and file \proc\sys\net\core\somaxconn.
-   Default: 200`), with zero further output either time — if it were merely slow, the 300s run should have printed
-   more before its cutoff than the 180s run did.
-2. A manually-launched process (bypassing the harness) showed **flat CPU time** across a 20s window (1.796875s of
-   CPU time both at the 20s and 40s checks) — the process was alive but making zero forward progress, not just
-   running slowly.
-3. CratonVM's own `--stack-dump-on-timeout` watchdog (armed at 35s, via a manually-constructed pathing jar with
-   `Main-Class: KcRunner` reusing the harness's own cached module classpath — the raw classpath is ~41KB, over
-   Windows' ~32K `CreateProcess` command-line limit, hence the pathing-jar workaround) produced a full thread dump
-   showing the single `main` thread 58 frames deep in:
+### Bisection: confirmed pre-existing, not a regression
 
-   ```
-   org.keycloak.quarkus.runtime.cli.PicocliTest.otelLogsHeaders
-   → PicocliTest.pseudoLaunch → NonRunningPicocli.launch → KeycloakMain.main
-   → Picocli.parseAndRun → Picocli.addCommandOptions → Picocli.addMappedOptionsToArgGroups
-   → picocli.CommandLine$Model$ArgGroupSpec$Builder.build()
-   → picocli.CommandLine$Model$ArgGroupSpec.<init>
-   → picocli.CommandLine$Model$ArgGroupSpec.synopsisUnit()
-   → picocli.CommandLine$Model$ArgGroupSpec.rawSynopsisUnitText()
-   → picocli.CommandLine$Model$ArgGroupSpec.concatOptionText()
-   → picocli.CommandLine$Help.concatOptionText()
-   → picocli.CommandLine$Help$ColorScheme.optionText()
-   → picocli.CommandLine$Help$ColorScheme.apply()
-   → picocli.CommandLine$Help$Ansi$Text.<init>()
-   → picocli.CommandLine$Help.defaultColorScheme()
-   → picocli.CommandLine$Help$ColorScheme$Builder.build()
-   → picocli.CommandLine$Help$ColorScheme.<init>()
-   ```
+Built a binary at `058e2b957` (the commit immediately before `10a561f21`, the SmallRye-config-resolution fix — see
+the sibling doc) and reran the identical repro: **still hangs** (300.9s wall, `HANG: 1`). The hang is NOT introduced
+by `10a561f21`'s native-override removals; it pre-dates that commit.
 
-   i.e. it's stuck constructing the ANSI-styled command-line help synopsis text for the `start-dev` command's
-   `ArgGroupSpec`s — this happens as a SIDE EFFECT of building the `CommandLine` spec via
-   `Picocli.addCommandOptions`, well BEFORE any SmallRye config-source or interceptor code is reached. This is the
-   VERY FIRST `pseudoLaunch(...)` call inside `PicocliTest.otelLogsHeaders()` (itself apparently one of the first
-   methods JUnit4's default method-sorter picks for this class).
+### Root cause: `RelocateConfigSourceInterceptor.getValue()` calls `context.proceed()` TWICE per invocation
+
+SmallRye Config 3.16.0's `RelocateConfigSourceInterceptor` (see
+`io/smallrye/config/RelocateConfigSourceInterceptor.java`):
+
+```java
+public ConfigValue getValue(final ConfigSourceInterceptorContext context, final String name) {
+    String map = getMapping().apply(name);
+    ConfigValue relocateValue = context.proceed(map);      // proceed #1 (relocated name)
+    if (name.equals(map)) { return relocateValue; }
+    ConfigValue configValue = context.proceed(name);        // proceed #2 (original name)
+    ...
+}
+```
+
+Every relocate interceptor calls `context.proceed()` twice against the SAME downstream chain (once for the
+relocated name, once for the original). Quarkus/Keycloak registers a chain of MULTIPLE stacked
+`RelocateConfigSourceInterceptor` instances (one per legacy-property-relocation source across the various
+extensions). Since each layer's `proceed()` call reaches the NEXT relocate interceptor (which itself calls
+`proceed()` twice more), a single property-value resolution against N stacked relocate interceptors costs up to
+`O(2^N)` total interceptor invocations — this is legitimate SmallRye behavior, not a bug, and is normally
+negligible because each individual call is nanoseconds under a JIT.
+
+A captured thread dump (via a custom timing-instrumented runner, `httpAccessLog`'s hang point) shows exactly this
+pattern repeating at depth 90-108 of a 109-frame stack:
+
+```
+RelocateConfigSourceInterceptor.getValue → SmallRyeConfigSourceInterceptorContext.proceed
+→ RelocateConfigSourceInterceptor.getValue → ...proceed → RelocateConfigSourceInterceptor.getValue → ...
+```
+
+### Confirmed NOT an infinite loop: JIT-allowing `io/smallrye/config/` measurably fixes individual test methods
+
+`picocli/`, `org/keycloak/`, and `io/smallrye/` are ALL forced onto CratonVM's interpreter under the default
+conservative JIT policy (`vm/src/jit/skip_list.rs`, KC26-PIC.1 ban, 2026-07-05). Running the SAME test sequence with
+`CRATONVM_JIT_ALLOW_PACKAGES=io/smallrye/config/,org/keycloak/quarkus/runtime/configuration/`:
+
+- `httpAccessLog` (the test that hung past 180s without the override) completed in **41.8s** with it.
+- The exponential `2^N` interceptor-chain cost is tractable under JIT (nanoseconds/call) but not under a pure
+  bytecode interpreter (each call carries full interpreter dispatch overhead), which is exactly the kind of
+  workload shape (many short-lived, low-iteration-count generated/lambda call sites) that amortizes JIT compilation
+  cost poorly — consistent with genuinely large-but-finite work, not a non-terminating loop.
+
+**However**, the test immediately AFTER `httpAccessLog` (`otelLogs`) STILL hangs past 180s even with the JIT-allow
+override — meaning either later tests exercise substantially more property-relocation fan-out than earlier ones
+(plausible — HTTP/telemetry/logging options are likely to have accumulated the most legacy-property relocations
+across Quarkus/Keycloak version history), or there is a still-unidentified accumulation/growth pattern across
+consecutive test invocations in the same process (not yet distinguished — see Next steps).
+
+### IMPORTANT CAVEAT: do not naively lift the `io/smallrye/`/`picocli/`/`org/keycloak/` JIT skip-list
+
+The skip-list ban this hang runs into was added 2026-07-05 for the OPPOSITE-looking reason: at that time, DEFAULT
+(unrestricted) JIT was empirically SLOWER for this same test class (265s timeout) than forcing these packages
+interpreted (`--nojit` completed in ~172s; `CRATONVM_JIT_DENY=org/keycloak/,picocli/,io/smallrye/` completed in
+~168s). This is not necessarily a contradiction — commit `10a561f21` (and likely others between 2026-07-05 and now)
+changed which native fast-paths short-circuit which bytecode paths, so the actual code being interpreted-vs-JIT'd
+today differs substantially from 2026-07-05's measurement. But it means the 2026-07-05 finding could easily still
+apply to OTHER tests/call-shapes in the same class even if it no longer applies to the specific
+`RelocateConfigSourceInterceptor` hot loop measured here. **Do not blanket-lift the skip-list ban without
+re-running the full `PicocliTest` class (and ideally the broader `quarkus/runtime` module) both with and without
+the override to confirm no regression** — the safer fix is almost certainly a narrow, targeted addition (either a
+carve-out in the skip-list scoped to just `RelocateConfigSourceInterceptor`/`SmallRyeConfigSourceInterceptorContext
+.proceed`, matching the existing `org/keycloak/models/credential/` carve-out pattern already in
+`skip_list.rs`, or a native fast-path for this specific hot method pair, matching the established pattern used by
+the 2026-07-05 fix itself).
 
 ## Why this is NOT the same root cause as the SmallRye config-resolution-mismatches doc
 
-- The stuck frame is 100% inside `picocli.*` internals building help-text synopsis strings — no
-  `io.smallrye.config.*` or `org.keycloak.quarkus.runtime.configuration.*` frame appears anywhere in the 58-frame
-  dump.
-- `picocli/` packages are deliberately excluded from CratonVM's JIT allow-list under the conservative default
-  policy (see `vm/src/jit/skip_list.rs`, `keycloak_picocli_smallrye_packages_skip_under_conservative` test) — so
-  this is running purely interpreted, which is consistent with either (a) genuinely slow O(n²)-or-worse interpreted
-  text-concatenation for a CLI with hundreds of options across many `ArgGroup`s, or (b) an actual infinite loop
-  somewhere in this text-building chain that real HotSpot's JIT would make appear instantaneous even if it were
-  doing wasted repeated work, but CratonVM's interpreter cannot outrun.
-- The already-landed SmallRye-config fix (`10a561f21`, see the sibling doc) does NOT touch anything in this call
-  chain — no picocli natives, no `ArgGroupSpec`/`ColorScheme`/`Text` code was changed.
-
-## Historical context
-
-A previous, apparently DIFFERENT hang in this same test class was fixed 2026-07-05 (see
-`docs/internal/fixed-suite-bugs/quarkus-runtime-picocli-post-compactvalue-hang.md`) — that hang's last-seen line
-before timeout was the `ExecutionExceptionHandler` `TlsUtils` WARN, i.e. it hung BEFORE even reaching Netty
-initialization, whereas this hang gets substantially further (through Netty init and into
-`KeycloakMain.main`/`Picocli.parseAndRun`) before getting stuck — this is not a regression of that same bug, since
-this hang point is strictly later in the startup sequence. It's plausible removing/changing some of the "native
-fast paths for Picocli and Keycloak configuration helpers" mentioned in that 2026-07-05 fix (as part of the
-2026-07-13 config-resolution fix, which removed `PropertyMappingInterceptor.hasInferredValue` and a few other
-native overrides) exposed this DIFFERENT, deeper hang that a removed fast-path was previously short-circuiting —
-but this has not been confirmed; it may equally be a pre-existing, never-exercised-until-now performance gap in
-picocli `ArgGroupSpec` synopsis building.
+The already-landed SmallRye-config fix (`10a561f21`, see the sibling doc) does not touch
+`RelocateConfigSourceInterceptor`, the JIT skip-list, or any picocli code — it fixed a different class of bug
+(stale/placeholder `Object` references leaking out of native collection/stream operations). This hang is a pure
+interpreter-throughput problem in a completely different subsystem (SmallRye's relocate-interceptor chain
+traversal), confirmed unrelated by the bisection above (hangs identically before and after `10a561f21`).
 
 ## Next steps
 
-1. Bisect whether this hang is NEW (introduced by commit `10a561f21`'s removal of
-   `PropertyMappingInterceptor.hasInferredValue`/`TracingPropertyMappers.isTracingEnabled`/etc. native overrides)
-   or pre-existing — build a binary at the commit immediately BEFORE `10a561f21` and rerun the same repro.
-2. If pre-existing: profile/trace `picocli.CommandLine$Model$ArgGroupSpec.rawSynopsisUnitText()`/`concatOptionText()`
-   for an actual infinite loop (e.g. a `Text` concatenation building an ever-growing structure without terminating)
-   vs. genuinely-large-but-finite interpreted work — the historical fix doc's approach (native fast paths for hot
-   picocli/Keycloak CLI helper methods) may need extending to cover whatever specific method(s) this deeper call
-   chain exercises that weren't covered before.
-3. Consider whether allow-listing just the specific `picocli.CommandLine$Help$*`/`ArgGroupSpec` classes for JIT
-   (via `CRATONVM_JIT_ALLOW_PACKAGES`) makes the hang complete in reasonable time — if so, this narrows the
-   diagnosis to "genuinely slow interpreted execution" rather than a true infinite loop, and the fix becomes a
-   targeted native fast path (matching the established pattern in this codebase) rather than a correctness bug fix.
+1. Determine whether the growing per-test cost (`httpAccessLog` 41.8s → `otelLogs` still >180s, both under the same
+   JIT-allow override) is (a) inherent to those specific tests' CLI options touching more legacy-relocated
+   properties, or (b) a genuine accumulation/leak across `PropertyMappers.reset()`/`Configuration.resetConfig()`
+   cycles. `Configuration.resetConfig()` itself looks clean (`config = null` + `KeycloakConfigSourceProvider.reload()`
+   — no obviously-growing collection), and `System.setProperties()`'s native implementation
+   (`native-builtins/src/lib.rs` ~line 27676) already does a correct full-replace (removes all old keys before
+   setting new ones, with an explicit comment noting this was fixed for exactly this
+   `AbstractConfigurationTest`/`System.setProperties(clone)` reset pattern) — so system-property accumulation is
+   ruled out. The `KeycloakConfigSourceProvider`/interceptor-chain construction itself has not yet been audited for
+   growth.
+2. Count how many `RelocateConfigSourceInterceptor` instances are actually stacked in Keycloak's real
+   `SmallRyeConfigBuilder` chain (add a one-off diagnostic print in `KeycloakConfigSourceProvider` or wherever the
+   chain is assembled) to get the real `N` and confirm the `2^N` fan-out theory quantitatively rather than just
+   from the stack-dump shape.
+3. Implement either: (a) a narrow JIT skip-list carve-out for `RelocateConfigSourceInterceptor`/
+   `SmallRyeConfigSourceInterceptorContext.proceed`, verified against the full `quarkus/runtime` module for
+   regressions, or (b) a native fast-path for the same hot pair, matching this codebase's established pattern for
+   this exact class of problem (see the 2026-07-05 fix's own "native fast paths for Picocli and Keycloak
+   configuration helpers").
 
 ## Repro
 
+Full class (via harness, ~41KB module classpath needs a pathing jar under Windows — see below):
 ```
 cd C:\craton\CratonVM
 $jdk = "C:\Program Files\Java\jdk-25"
 & .\apps\keycloak-suite-runner\run-keycloak-suite.ps1 -Vm craton -Jit on -TimeoutSec 300 -Parallel 1 -RunName repro-picocli-hang -ClassList <classlist with only quarkus/runtime org.keycloak.quarkus.runtime.cli.PicocliTest> -Exe <dev build> -JdkHome $jdk
 ```
 
-To get a clean stack dump (classpath is too long for a direct command line — build a pathing jar first, reusing
-the harness's own cached one at `apps\keycloak-suite-runner\.suite\pathing-jars\quarkus_runtime-*.jar` but with
-`Main-Class: KcRunner` in its manifest, then pass `--jar <pathing-jar> org.keycloak.quarkus.runtime.cli.PicocliTest`
-with `--stack-dump-on-timeout <N>` — the harness itself always passes `--stack-dump-on-timeout 0`, which DISABLES
-CratonVM's internal watchdog in favor of the harness's own external kill, so a stack dump requires a manual
-invocation like this).
+To see exactly which test is executing when the hang occurs (JUnit4's default test order isn't obvious from the
+outside), use a custom JUnit Platform runner with a `TestExecutionListener` that timestamps `executionStarted`/
+`executionFinished` per test to stderr — copy `apps/keycloak/kc-runner/KcRunner.java`'s `main()`, add the listener,
+compile into the SAME `kc-runner` directory (already on the harness's cached pathing-jar Class-Path), then build a
+NEW pathing jar reusing the harness's cached Class-Path but with `Main-Class: <YourRunner>` in its manifest instead
+of `KcRunner` (the raw classpath is too long for a direct command line on Windows — `CreateProcess`'s ~32,767
+character limit — hence the pathing-jar/manifest-`Class-Path` indirection; building one is cheap: extract
+`META-INF/MANIFEST.MF` from an existing cached jar under
+`apps\keycloak-suite-runner\.suite\pathing-jars\quarkus_runtime-*.jar`, `sed` the `Main-Class:` line, re-jar).
+
+To also get a clean stack dump when it hangs: the harness itself always passes `--stack-dump-on-timeout 0`, which
+DISABLES CratonVM's internal watchdog in favor of the harness's own external kill (no dump). Invoke the pathing jar
+manually instead with `--stack-dump-on-timeout <N>` for a real dump.
+
+To test the JIT-allow mitigation: set `$env:CRATONVM_JIT_ALLOW_PACKAGES =
+"io/smallrye/config/,org/keycloak/quarkus/runtime/configuration/"` before invoking (PowerShell env vars propagate
+to child `ProcessStartInfo`-launched processes by default, including through the harness script).
 
 ## Evidence
 
-`C:\craton\CratonVM\apps\keycloak-suite-runner\.suite\results\verify-picocli-retry-20260713\all-jit\logs\` (180s and
-300s hang cutoffs) and a manual stack-dump capture (not preserved as a file — 7.5MB, watchdog fired at 35s, single
-thread 58-frame trace as quoted above), 2026-07-13, local Windows-box build from worktree
-`C:\data\CratonVM-quarkusconfig-verify-20260713` at `dev` commit `10a561f21`.
+- First-pass stack dump (ArgGroupSpec/ColorScheme/Text, now understood to be a transient early phase, not the
+  steady-state hang): 2026-07-13, worktree `C:\data\CratonVM-quarkusconfig-verify-20260713` at commit `10a561f21`.
+- Bisection: worktree `C:\data\CratonVM-picocli-bisect-20260713`, branch `bisect/picocli-pre-10a561f21-20260713`,
+  commit `058e2b957`, run `verify-picocli-bisect-prefix-20260713` — HANG, 300.9s wall.
+- Timed-runner traces showing per-test elapsed times and the `RelocateConfigSourceInterceptor` recursive stack
+  dump: local captures `timedrun_utf8.log` / `timedrun_jitallow_utf8.log` (not preserved as repo files — see the
+  "Repro" section to regenerate), 2026-07-13, worktree `C:\data\CratonVM-quarkusconfig-verify-20260713` at `dev`
+  commit `10a561f21`.

@@ -90,20 +90,44 @@ whole chain is exactly what feeds `SmallRyeConfigSourceInterceptorContext.iterat
 stale/pre-GC-move `Object` reference instead of a re-pinned `String` under specific timing — but the exact
 allocation/pin gap was not isolated within this session's time budget.
 
-**Next steps for whoever picks this up**:
-1. Re-add the `CRATONVM_DBG_STREAM_MAP`-style instrumentation but widen the class-name filter (or drop it
-   entirely and log every `.map()`/`.filter()` call whose *input* element is exact class `java/lang/Object`) to
-   catch the actual corrupted call, since the narrower `keycloak`/`smallrye`/`picocli` substring filter used this
-   session never matched (the lambda's `class_name_of_id` may return a JVM-internal hidden-class name without a
-   readable package prefix).
-2. Audit `native-collections/src/lib.rs`'s `native_hs_stream`/`native_stream_filter`/`native_stream_map` GC-pinning
-   for a case where a `Set<T>.stream()` snapshot element is read AFTER a nested nativeーtoJava callback
-   (`ctx.invoke_virtual`) inside the SAME iteration allocates and moves the young generation, without a
-   pin/re-read cycle — `PropertyMappingInterceptor.hasInferredValue`'s `context.restart(key)` reentrant call is the
-   prime candidate for such a nested allocation trigger.
-3. Since it needs 72 prior tests' accumulated state to reproduce, isolate the *minimal* prior state by bisecting
-   which specific earlier `ConfigurationTest` method(s) are required before `testDatabaseProperties` for the race
-   to manifest, rather than assuming the full class is needed.
+**Update 2026-07-13, second investigation pass — ruled out the obvious native-collection GC-pinning sites; still
+unresolved**:
+
+1. **`native_hs_stream`/`native_stream_filter`/`native_stream_map`/`native_stream_flat_map` in
+   `native-collections/src/lib.rs` were individually code-reviewed line-by-line and all four already implement the
+   correct pin-then-re-read pattern.** `native_hs_stream` in particular has an EXISTING comment explicitly citing
+   this exact scenario ("SmallRye's `PropertyMappingInterceptor` hits this through `LinkedHashSet.stream()` while
+   enumerating config property names") — it counts first, allocates (which can move the backing map), re-reads the
+   backing map through its pin, THEN re-snapshots and writes into the freshly-allocated array. `native_stream_map`
+   and `native_stream_filter` pin every element individually via `pin_value_slice`/`read_pinned_elem` before each
+   `invoke_virtual` dispatch. `native_stream_flat_map` pins each inner-stream element via `pin_native_root` before
+   pushing to the `flat`/`flat_handles` accumulator, and the final `read_value_slice(ctx, &flat_handles, &flat)`
+   correctly re-reads every handled slot through its pin. None of these four show an obvious hole.
+2. **Widened the diagnostic instrumentation twice** (both reverted, not committed): first checking only `.map()`
+   results whose class was exact `java/lang/Object`, then broadening to log EVERY `.map()` call whose *lambda's*
+   declaring class name contains `keycloak`/`smallrye`/`picocli`. **Neither ever printed a single match**, including
+   in a passing run — meaning either (a) the actual corrupted call flows through a stream/collection native this
+   session didn't instrument (there are dozens in this file; `native_stream_sorted`/`native_stream_distinct`/
+   `native_al_stream`/`ConcurrentHashMap`-backed variants were not checked), or (b) the corruption happens via a
+   completely different mechanism (e.g. a plain `Set`/`Map`/`List` `.add()`/`.put()` storing a stale reference,
+   not a stream operation at all — `PropertyMappingInterceptor.iterateNames()`'s `mappersWithoutValues.remove
+   (mapper)` calls happen mid-`flatMap`, and the earlier-fixed `cm_lookup_registered`
+   (see the FIXED section above) shows this exact class of "stale ref left sitting in a collection, returned later
+   without a live-instance check" bug has occurred at least once already elsewhere in this codebase).
+3. **The instrumentation-changes-timing effect reproduced with a COMPLETELY DIFFERENT, pre-existing, zero-new-code
+   diagnostic**: enabling the existing `CRATONVM_DBG_HEAP_STALE=1` deep heap-walk verifier (`vm/src/memory/gc.rs`,
+   `verify_heap_object_fields`, runs after every GC) also made the failure disappear (1/1 pass, no STALE report) —
+   this independently confirms genuine GC-timing sensitivity (not an artifact of the specific instrumentation code
+   added), but the heap-walk verifier itself found nothing anomalous in the one run it was tried on, which is
+   inconclusive given it only takes one passing run to prove nothing.
+4. **Not yet tried**: instrumenting at a lower level than any specific stream op — e.g. a canary check inside
+   `pin_native_root`/`read_native_pin` themselves (the shared primitives underneath ALL the above natives) that
+   flags any read whose class-id changed unexpectedly between pin and read, with the check kept branch-only (no
+   string formatting/eprintln) in the non-anomalous path to minimize the timing perturbation that has masked every
+   diagnostic attempt so far. Also not yet tried: bisecting the *minimal* prior-test state needed (currently
+   assumed to need all ~72 prior `ConfigurationTest` methods; never confirmed that's actually necessary — a
+   standalone repro replaying just the CLI-args/system-property setup without the other 72 tests did NOT
+   reproduce, but a partial replay of, say, 10-20 specific prior tests was never tried).
 
 ## 2026-07-13 update correction: the PicocliTest hang is a SEPARATE, unrelated bug — do NOT treat as shared root cause
 

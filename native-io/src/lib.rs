@@ -8478,33 +8478,38 @@ fn native_dis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if len <= 0 {
         return Ok(Some(Value::Int(0)));
     }
-    let this_pin = ctx.pin_native_root(this);
-    let buf_pin = ctx.pin_native_root(buf);
-    let mut this = this;
-    let mut buf = buf;
-    let mut read = 0usize;
-    for i in 0..(len as usize) {
-        let b = match dis_read_one(ctx, this) {
-            Ok(v) => v,
-            Err(e) => {
-                ctx.unpin_native_roots(this_pin);
-                return Err(e);
-            }
-        };
-        this = ctx.read_native_pin(this_pin, this);
-        buf = ctx.read_native_pin(buf_pin, buf);
-        if b < 0 {
-            break;
-        }
-        ctx.set_array_element(buf, off as usize + i, Value::Int(b));
-        read += 1;
-    }
-    ctx.unpin_native_roots(this_pin);
-    if read == 0 {
-        Ok(Some(Value::Int(-1)))
-    } else {
-        Ok(Some(Value::Int(read as i32)))
-    }
+    // PERF FIX (2026-07-13, STW-takeover-cluster residual investigation):
+    // this used to loop `dis_read_one` (a full array-alloc +
+    // invoke_virtual dispatch) once per byte — O(len) interpreter round
+    // trips for a single bulk read() call. For a multi-KB/MB read (a
+    // compiled JSP class file, a JAR entry, ...) that's minutes of VM
+    // overhead where real Java does one native syscall, which manifested
+    // as an apparent permanent hang (confirmed NOT infinite — it just never
+    // finished within a 300s budget) in the STW-takeover-cluster residual
+    // investigation (see docs/known-issues/tomcat-08-07/
+    // stw-crossthread-jit-takeover-hang-cluster.md and
+    // elinjsp-socket-read-timeout.md). `DataInputStream.read(byte[],int,int)`
+    // in real JDK is a single delegating call to `in.read(b, off, len)` —
+    // it does not prefetch or over-read, so making exactly one call here
+    // for the exact requested length matches real semantics precisely
+    // while avoiding the per-byte multiplier. `dis_read_one` (unchanged)
+    // remains correct and cheap for the true single-byte callers
+    // (`readByte`/`readBoolean`/etc, `dis_read_exact` with len 1-8).
+    let inner = match ctx.get_field(this, DIS_FIELD_IN) {
+        Value::Object(Some(s)) => s,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let result = ctx.invoke_virtual(
+        inner,
+        "read",
+        "([BII)I",
+        &[Value::Object(Some(buf)), Value::Int(off), Value::Int(len)],
+    )?;
+    let n = match result {
+        Some(Value::Int(n)) => n,
+        _ => -1,
+    };
+    Ok(Some(Value::Int(n)))
 }
 
 fn native_dis_read_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8800,19 +8805,26 @@ fn eof_exception() -> MethodCallFailed {
     }))
 }
 
-/// Shared implementation for readFully.
+/// Shared implementation for readFully — bulk-reads on the inner stream,
+/// looping only on genuine short reads (a `read()` call returning fewer
+/// bytes than asked for — normal for e.g. a socket stream, and typically
+/// just 1-2 extra iterations for a buffered file/JAR stream). Throws
+/// EOFException if the stream ends before all requested bytes have been
+/// read, matching the Java specification.
 ///
-/// Despite its old doc comment's claim of "tries bulk read on inner stream
-/// first, falls back to byte-by-byte", this looped `dis_read_one` (one
-/// `invoke_virtual` per byte, via a 1-byte `read([BII)I` call) unconditionally
-/// — never actually bulk-reading. Found root-causing a real-world case:
-/// Spring Boot loader's `JarEntriesStream.assertSameContent()` calls
-/// `DataInputStream.readFully(byte[], off, len)` once per up-to-4KB chunk,
-/// once per non-directory jar entry — for a signed jar with ~5700 entries
-/// (bcprov-jdk18on), that's hundreds of thousands of single-byte native
-/// calls, taking minutes (confirmed via `--stack-dump-on-timeout`: identical
-/// pc across dumps, same "many fast calls in a loop" signature as the
-/// sibling `InputStream.readAllBytes`/`readNBytes` bug this fix mirrors).
+/// PERF FIX (2026-07-13): this used to loop `dis_read_one` byte-by-byte —
+/// O(len) interpreter-dispatch round trips for what real Java does as a
+/// handful of native `read()` calls. Independently root-caused twice the
+/// same day from two different angles: the STW-takeover-cluster residual
+/// investigation (docs/known-issues/tomcat-08-07/
+/// stw-crossthread-jit-takeover-hang-cluster.md — compiled JSP class
+/// files/JAR entries via Jasper's classloading path) and the jar-signature
+/// investigation (docs/internal/
+/// inputstream-readallbytes-readnbytes-readfully-byte-at-a-time-FIXED.md —
+/// Spring Boot loader's `JarEntriesStream.assertSameContent()`, once per
+/// up-to-4KB chunk per jar entry). Both turned a sub-millisecond real-JDK
+/// operation into minutes of VM overhead, confirmed NOT infinite — it just
+/// never finished within a 300s test-suite budget.
 ///
 /// Unlike `dis_read_one` (which deliberately reads only 1 byte at a time —
 /// see its own comment — to avoid silently prefetching bytes a *different*
@@ -8820,8 +8832,13 @@ fn eof_exception() -> MethodCallFailed {
 /// bulk-reading here is safe: `readFully(buf, off, len)` is itself a bulk
 /// request for exactly `len` bytes, so requesting up to the *remaining*
 /// unfulfilled portion of that same `len` via one `read([BII)I` call never
-/// reads a single byte past what the caller already asked for — it just
-/// stops asking one byte at a time for a bulk request.
+/// reads a single byte past what the caller already asked for.
+///
+/// `this`/`buf` are pinned and re-fetched via `read_native_pin` around each
+/// `invoke_virtual` call (which can trigger a moving GC) — a version of this
+/// fix landed concurrently on `dev` (`5a457f969`) without this pinning,
+/// leaving `inner`/`buf` referenced across the loop via stale `ObjectRef`s
+/// if a GC moves them mid-call; kept the pinned version here.
 fn dis_read_fully_impl(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -8902,22 +8919,65 @@ fn native_dis_skip_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if n <= 0 {
         return Ok(Some(Value::Int(0)));
     }
+    // PERF FIX (2026-07-13, STW-takeover-cluster residual investigation):
+    // same byte-by-byte-via-dis_read_one issue as native_dis_read_bytes/
+    // dis_read_fully_impl above — read-and-discard in bulk instead, capped
+    // at an 8 KiB scratch buffer per call so a huge `n` doesn't itself
+    // allocate a huge array.
+    //
+    // `inner` (fetched once before the loop) is pinned and re-fetched via
+    // `read_native_pin` each iteration — it's reused across multiple
+    // `invoke_virtual` calls, any of which can trigger a moving GC; the
+    // originally-landed version of this fix only pinned `scratch`, leaving
+    // `inner` referenced via a potentially-stale `ObjectRef` after the first
+    // GC-triggering call (see `dis_read_fully_impl`'s doc comment for the
+    // same class of gap in a sibling function).
+    const SKIP_CHUNK: i64 = 8192;
     let this_pin = ctx.pin_native_root(this);
-    let mut this = this;
+    let inner = match ctx.get_field(this, DIS_FIELD_IN) {
+        Value::Object(Some(s)) => s,
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(Value::Int(0)));
+        }
+    };
+    // `inner` gets its own pin handle (distinct from `this_pin`) — `pin_native_root`
+    // pins one object per call; `unpin_native_roots(this_pin)` below releases
+    // both, since pins are released from a handle onward.
+    let inner_pin = ctx.pin_native_root(inner);
+    let scratch = ctx.new_array(ArrayElementType::Byte, SKIP_CHUNK.min(n) as usize);
+    let scratch_pin = ctx.pin_native_root(scratch);
+    let mut scratch = scratch;
     let mut total_skipped = 0i64;
     while total_skipped < n {
-        let b = match dis_read_one(ctx, this) {
+        let inner_cur = ctx.read_native_pin(inner_pin, inner);
+        let want = (n - total_skipped).min(SKIP_CHUNK) as i32;
+        let scratch_cur = ctx.read_native_pin(scratch_pin, scratch);
+        let read = match ctx.invoke_virtual(
+            inner_cur,
+            "read",
+            "([BII)I",
+            &[
+                Value::Object(Some(scratch_cur)),
+                Value::Int(0),
+                Value::Int(want),
+            ],
+        ) {
             Ok(v) => v,
             Err(e) => {
                 ctx.unpin_native_roots(this_pin);
                 return Err(e);
             }
         };
-        this = ctx.read_native_pin(this_pin, this);
-        if b < 0 {
+        scratch = ctx.read_native_pin(scratch_pin, scratch);
+        let n_read = match read {
+            Some(Value::Int(v)) => v,
+            _ => -1,
+        };
+        if n_read < 0 {
             break;
         }
-        total_skipped += 1;
+        total_skipped += n_read as i64;
     }
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(total_skipped as i32)))
@@ -10817,9 +10877,27 @@ fn native_raf_read_fully(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(None),
     };
     let len = ctx.array_length(buf);
-    for i in 0..len {
-        let b = ctx.fd_table().read_byte(fd).unwrap_or(0);
-        ctx.set_array_element(buf, i, Value::Int(b));
+    // PERF FIX (2026-07-13, STW-takeover-cluster residual investigation):
+    // was one fd_table().read_byte() call per byte; bulk-read into a scratch
+    // buffer instead (same anti-pattern found and fixed in
+    // native_dis_read_bytes/dis_read_fully_impl above, though this one is
+    // native-to-native rather than native-to-bytecode so it's cheaper per
+    // iteration — still O(len) syscalls instead of O(len/chunk)).
+    let mut scratch = vec![0u8; len.min(65536)];
+    let mut filled = 0usize;
+    while filled < len {
+        let want = (len - filled).min(scratch.len());
+        let n = ctx
+            .fd_table()
+            .read_bytes(fd, &mut scratch[..want])
+            .unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        for (i, &b) in scratch[..n].iter().enumerate() {
+            ctx.set_array_element(buf, filled + i, Value::Int(b as i32));
+        }
+        filled += n;
     }
     Ok(None)
 }

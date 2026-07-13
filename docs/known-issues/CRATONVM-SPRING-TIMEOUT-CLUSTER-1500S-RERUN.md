@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN (12 genuinely hung, 10 slow-but-failing, 1 crash; 2 non-residual items removed). **2026-07-13 update**: 8 Bucket-1 + 3 Bucket-2 classes reconfirmed locally — one narrower bug fixed (`7ae137e4`), the hang itself still OPEN; see the 2026-07-13 section below. |
+| **Status** | OPEN (12 genuinely hung, 10 slow-but-failing, 1 crash; 2 non-residual items removed). **2026-07-13 update**: 8 Bucket-1 + 3 Bucket-2 classes reconfirmed locally — one narrower bug fixed (`7ae137e4`), the hang itself still OPEN; see the 2026-07-13 section below. **2026-07-13 update #2**: `context.annotation.ImportSelectorTests`'s `StackOverflowError` root-caused — it is a Mockito `spy()` cross-hierarchy recursion, **unrelated to Spring's `ImportSelector` mechanism** (the original hypothesis below was wrong); still OPEN, see its own section. |
 | **Discovered** | 2026-07-11, following up on the 25 classes that hit TIMEOUT in the
 125-class scoped rerun (dev `9948295e`, standard 120s timeout — see
 [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](../internal/CRATONVM-SPRING-GENUINE-BUGLIST-125.md)). |
@@ -307,6 +307,149 @@ default-off, negligible cost when unset):
   HotSpot JFR/async-profiler trace of the same class for a true apples-to-
   apples "how many classes actually get completed" count.
 
+## 2026-07-13 local investigation — `ImportSelectorTests` `StackOverflowError` root-caused to Mockito `spy()`, not Spring (still OPEN)
+
+Reproduced entirely locally (Azure host unreachable), worktree
+`cratonvm-wt-importselector-local-20260713`, dev tip `dbf7827c` (merged
+forward to `0b0d852d` after the investigation; the merged commits touch
+unrelated files, confirmed by diff — nothing Mockito/ThreadLocal/reflection-
+related landed in between), binary
+`cratonvm-importselector-local.exe`.
+
+**HotSpot baseline**: 9/9 pass, ~52s (`run-suite.sh hotspot`). Confirms this
+is entirely CratonVM-specific.
+
+**The original hypothesis in this doc was wrong.** This is *not* infinite
+recursion in Spring's `ImportSelector`/`ConfigurationClassParser` cycle
+detection — `ImportSelectorTests`'s own import graphs are shallow (2-3
+levels deep, by design in the test fixtures) and could never legitimately
+need anywhere near a stack-overflowing depth. The real signature: **of the
+9 test methods, the exact 4 that pass are the 4 that don't call
+`Mockito.spy(...)`, and the exact 5 that fail with `StackOverflowError` are
+the 5 that call `spy(new DefaultListableBeanFactory())` + `inOrder(...)`
+verification.** This is a Mockito `spy()` bug, confirmed to reproduce with
+**zero Spring context involved at all** — see
+[`docs/internal/repros/mockito-spy-hierarchy-recursion/`](../internal/repros/mockito-spy-hierarchy-recursion/)
+for the full repro kit and decompiled root-cause chain (`javap -p -c`
+against the real mockito-core 5.23.0 / byte-buddy 1.18.3 jars, not guessed
+from memory). Minimal repro (`SpyDLBFProbe.java` in that directory): create
+a real `DefaultListableBeanFactory`, `spy()` it, call
+`spy.registerSingleton("x", "y")` **once** — `StackOverflowError` in ~139s
+real time, with `--nojit` making no difference (rules out a JIT miscompile:
+same failure, same rough timing, interpreter-only).
+
+**Root cause chain** (see the repro kit's README for the full decompiled
+detail): `spy()` of a non-final class uses Mockito's **inline** mock maker,
+which retransforms (`Instrumentation.retransformClasses`) the bytecode of
+**every class in the hierarchy** in place (confirmed via
+`-Dnet.bytebuddy.dump=`: `DefaultListableBeanFactory`,
+`AbstractAutowireCapableBeanFactory`, `AbstractBeanFactory`,
+`FactoryBeanRegistrySupport`, `DefaultSingletonBeanRegistry`,
+`SimpleAliasRegistry` all get advice-woven bodies; the receiver's runtime
+class stays `DefaultListableBeanFactory`, no subclass is created). Every
+redefined method's entry checks
+`MockMethodDispatcher.get(identifier, this).isMocked(this)` before
+deciding whether to intercept. `isMocked()` delegates to
+`MockMethodAdvice$SelfCallInfo.checkSelfCall(Object)` — a
+`ThreadLocal<Object>`-based guard (`if (o == get()) { set(null); return
+false; } return true;`) whose entire purpose is recognizing "this is a
+reflective 'call the real method' invocation re-entering the same advised
+method" (unavoidable because `Lookup.unreflect()` on a public method always
+produces a virtually-dispatching handle, per JDK semantics) and letting it
+fall through to the unmodified original body instead of re-intercepting
+forever. **This guard does not appear to terminate the recursion on
+CratonVM.** The live `KRUN_STACK=1` stack trace shows an exact repeating
+~15-frame cycle bouncing between `DefaultListableBeanFactory
+.registerSingleton` (line 1491, the real body's own `super.
+registerSingleton(...)` call) and `DefaultSingletonBeanRegistry
+.registerSingleton` (line 142, its own advice entry), through
+`MockMethodDispatcher.handle` → `InstrumentationMemberAccessor.invoke` →
+back to `DefaultListableBeanFactory.registerSingleton`, forever.
+
+**Ruled out this session, each with a direct, targeted, decompiled-bytecode-
+informed empirical test** (not guesses — every one of these was verified to
+match HotSpot before testing CratonVM, then run on CratonVM):
+- **Not a JIT miscompile.** `--nojit` reproduces the identical
+  `StackOverflowError` in the same rough time (~116s vs ~139s with JIT) —
+  interpreter-level, not JIT-specific.
+- **Not broken reflection.** `Class.getMethod()`/`getDeclaringClass()`/
+  `getDeclaredMethods()` correctly identify that `DefaultListableBeanFactory`
+  overrides `DefaultSingletonBeanRegistry.registerSingleton`, byte-for-byte
+  matching HotSpot, **both before and after** the hierarchy has been
+  retransformed (`OverrideProbe.java`, `SpyDLBFProbe.java` STEP4 in the
+  repro kit).
+- **Not `MockMethodAdvice.isOverridden()` returning the wrong boolean.**
+  Called ByteBuddy's own `MethodGraph.Compiler` directly (the exact
+  algorithm `isOverridden()` uses) against the POST-RETRANSFORM
+  `spy.getClass()` — correctly resolves `registerSingleton`'s representative
+  to `DefaultListableBeanFactory`, both for the overridden
+  (`DefaultSingletonBeanRegistry`-declared) and non-overridden
+  (`DefaultListableBeanFactory`-declared) method objects, matching HotSpot
+  exactly (`SpyThenGraphProbe.java`).
+- **Not a generic stale-ThreadLocal-value-across-GC bug.** A standalone
+  simulation of the exact `replace()`/`checkSelfCall()` pattern — store an
+  object reference in a `ThreadLocal`, force two `System.gc()` cycles with
+  ~150MB of intervening garbage, then compare the stored value against a
+  fresh reference to the same logical object via `==` — works correctly on
+  CratonVM (`SelfCallProbe.java`), confirming `native_tl_get`/`native_tl_set`
+  (`native-builtins/src/phases_early.rs`, GC-safe via `add_global_root`/
+  `resolve_global_root`) are not the gap for this specific access pattern.
+
+**Separate, confirmed-real performance finding (not the cause of the
+recursion, but worth its own fix):** computing ByteBuddy's
+`MethodGraph.Compiler` for a class **freshly retransformed** by Mockito
+takes **~70 seconds** on CratonVM (`SpyThenGraphProbe.java`), vs. instant
+for the same computation against an un-retransformed class. This isn't
+what causes the infinite loop (the loop's own per-iteration cost is fast —
+total time-to-overflow, ~139s, is consistent with one ~70s cold
+`MethodGraph` compile plus ~69s of many fast recursive frames, not
+thousands of 70s computations), but it's a real, independently-reproducible
+slowdown specific to reflecting over post-redefinition classes.
+
+**Leading, unconfirmed hypothesis for the next session**:
+`MockMethodDispatcher.get(identifier, instance)` — the bootstrap-injected
+static bridge every redefined method's advice entry AND
+`SerializableRealMethodCall.invoke()` independently call to reach the ONE
+shared `MockMethodAdvice` instance (and hence its ONE `selfCallInfo`
+`ThreadLocal` object) — may not reliably resolve to the same object across
+all these call sites and all classes in the retransformed hierarchy on
+CratonVM. If two call sites see two different `MockMethodAdvice` instances
+(e.g. because of how CratonVM tracks the identity/static-state of a
+bootstrap-appended, dynamically-injected class), each would carry its own
+distinct `selfCallInfo`, and the ThreadLocal-based guard would never see a
+match between the "set" (in `SerializableRealMethodCall.invoke()`, right
+before the reflective call) and "check" (in the redefined method's advice
+entry, on re-entry) — cleanly explaining unconditional non-termination
+without requiring any single check to return a "wrong" answer in isolation.
+This was **not** directly confirmed this session — the next step is a
+targeted instrumentation of `MockMethodDispatcher.get()`'s resolution
+(e.g. printing `System.identityHashCode()` of the returned dispatcher from
+multiple call sites within one recursive chain, or a CratonVM-side trace of
+every `Class` object minted for the name
+`org.mockito.internal.creation.bytebuddy.inject.MockMethodDispatcher`),
+which needs a rebuild cycle this session didn't have budget for after the
+~62-minute initial release build plus the empirical work above.
+
+**Why this is unrelated to every other cluster in this doc**: none of the
+other TIMEOUT/hang clusters involve `Mockito.spy()` — they use plain
+`mock()` (already verified working end-to-end for creation, stubbing,
+`verify()`, per
+[`bug-09-mockito-inline-mockmaker-selfattach.md`](../internal/kafka-suite-bugs/bug-09-mockito-inline-mockmaker-selfattach.md)
+and
+[`spring-boot-groovy-indy-mockito-mock-dispatch.md`](../internal/spring/spring-boot-groovy-indy-mockito-mock-dispatch.md))
+or no Mockito at all. `spy()`'s `CALLS_REAL_METHODS` default answer is the
+first workload in this codebase's history to exercise Mockito's
+cross-hierarchy "call the real method, skip re-interception" path at
+all — `mock()`'s default answer never invokes real method bodies, so this
+exact path was never exercised by any of the prior, now-fixed Mockito work.
+
+**Still OPEN.** No fix attempted — the guard mechanism above is deep inside
+Mockito/ByteBuddy's own real, unmodified bytecode (not a CratonVM native to
+patch directly), and every specific hypothesis narrow enough to safely fix
+was empirically refuted this session. A confident fix needs the
+`MockMethodDispatcher.get()` identity instrumentation described above
+first.
+
 ## Bucket 1 — Genuinely hung (12/25)
 
 Hit the full 1500s ceiling on **both** the batch attempt and the individual
@@ -353,7 +496,7 @@ rather than a coincidence:
 | `web.service.registry.ImportHttpServiceRegistrarTests` | FAIL | 763s | 3/5 | `ArrayIndexOutOfBoundsException` / `DiscoveryIssueException` |
 | `web.service.registry.GroupsMetadataValueDelegateTests` | FAIL | 1039s | 1/8 | `ArrayIndexOutOfBoundsException` / `DiscoveryIssueException` |
 | `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` | FAIL | 1132s | 0/160 | `BeanCreationException`: no `ApiVersionStrategy` bean (same as `CrossOriginAnnotationIntegrationTests`) |
-| `context.annotation.ImportSelectorTests` | FAIL | 1456s | 4/9 | `StackOverflowError` |
+| `context.annotation.ImportSelectorTests` | FAIL, root-caused 2026-07-13 (still OPEN) | 1456s (734s on the 2026-07-13 rebuild) | 4/9 | `StackOverflowError` — Mockito `spy()` recursion, not Spring; see dedicated section below |
 
 Notable sub-clusters within this bucket (candidates for shared root cause):
 
@@ -386,8 +529,10 @@ Notable sub-clusters within this bucket (candidates for shared root cause):
   `BeanCreationException` chain; looks like a missing/unregistered default
   bean rather than a per-test issue.
 - `ImportSelectorTests`'s `StackOverflowError` is unrelated to the above
-  clusters — likely infinite recursion somewhere in import-selector
-  resolution, worth its own investigation.
+  clusters. **Root-caused 2026-07-13** (see the dedicated section below):
+  it is a Mockito `spy()` cross-class-hierarchy real-method recursion, not
+  Spring `ImportSelector`/`ConfigurationClassParser` recursion as originally
+  guessed — reproduces standalone with no Spring context involved at all.
 
 ## Bucket 3 — Immediate crash, not a hang (1/25)
 
