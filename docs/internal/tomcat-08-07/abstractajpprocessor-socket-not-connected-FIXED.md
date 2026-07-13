@@ -1,5 +1,23 @@
 # TestAbstractAjpProcessor — full-class AJP client socket failure (30/30)
 
+**Status: FIXED (2026-07-13, branch `fix/dohead-family-regressions-v2-20260713`).**
+Same root cause as the HTTP/2 cluster this doc already calls out below —
+see
+[`http2-testconnection-socket-closed-cluster-FIXED.md`](http2-testconnection-socket-closed-cluster-FIXED.md)
+for the full writeup (`javax/net/SocketFactory.createSocket` fabricating a
+synthetic-layout `java/net/Socket` under `CRATONVM_REAL_NET_SOCKETS=1`,
+which real `Socket` bytecode then misread). `SimpleAjpClient.connect()`
+goes through the exact same `SocketFactory.getDefault().createSocket(host,
+port)` call as `Http2TestBase`. Post-fix validation on the Windows suite
+runner: `TestAbstractAjpProcessor` went from 30/30 failing (`Socket is not
+connected`) to 2/30 failing — the 2 remaining are newly-VISIBLE,
+unrelated, genuine residuals (were masked by the whole-class failure), each
+tracked in its own doc:
+[`ajp-testsecret-secret-attribute-not-enforced.md`](../../known-issues/tomcat-08-07/ajp-testsecret-secret-attribute-not-enforced.md),
+[`ajp-testnoheaders-response-body-not-empty.md`](../../known-issues/tomcat-08-07/ajp-testnoheaders-response-body-not-empty.md).
+
+Original write-up follows for the record.
+
 **Status:** OPEN. **Severity:** high (whole class fails). **HotSpot:** PASS
 (fresh-verified).
 
