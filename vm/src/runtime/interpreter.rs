@@ -22429,24 +22429,6 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
-    if class_name == "java/io/BufferedInputStream"
-        && matches!(
-            (method_name, method_descriptor),
-            ("<init>", "(Ljava/io/InputStream;)V")
-                | ("<init>", "(Ljava/io/InputStream;I)V")
-                | ("read", "()I")
-                | ("read", "([BII)I")
-                | ("skip", "(J)J")
-                | ("available", "()I")
-                | ("mark", "(I)V")
-                | ("reset", "()V")
-                | ("markSupported", "()Z")
-                | ("close", "()V")
-        )
-    {
-        return true;
-    }
-
     if class_name == "java/io/FilterInputStream"
         && matches!(
             (method_name, method_descriptor),
