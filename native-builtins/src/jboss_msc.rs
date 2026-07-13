@@ -2528,9 +2528,29 @@ pub fn gc_update_msc_service_refs(pointer_map: &std::collections::HashMap<usize,
 // escape hatch; `CRATONVM_DBG_MSC` traces the install/start sequence.
 // ===========================================================================
 
+// Per-thread override for unit tests that exercise the simulated,
+// queue-based scheduler (`drain_tasks_locally`/`run_start_local`) directly.
+// That path is a legitimate, maintained mode (the `CRATONVM_MSC_REAL_START=0`
+// diagnostic escape hatch) but `msc_real_start_enabled` caches the env-var
+// read once, process-wide, in a `OnceLock` — the first `#[test]` thread to
+// call it wins for the rest of the test binary. Reading `set_var` per test
+// can't fix that race, so tests instead flip this thread-local, which
+// `msc_real_start_enabled` consults before falling back to the cached
+// process default.
+#[cfg(test)]
+thread_local! {
+    static TEST_FORCE_REAL_START: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// Cached check of the real-MSC mode. It is the production default; accept a
 /// conventional false value only as a diagnostic escape hatch.
 fn msc_real_start_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(forced) = TEST_FORCE_REAL_START.with(|c| c.get()) {
+            return forced;
+        }
+    }
     static F: OnceLock<bool> = OnceLock::new();
     *F.get_or_init(|| {
         !matches!(
@@ -4303,6 +4323,27 @@ mod tests {
         ServiceName::parse(s)
     }
 
+    /// RAII guard forcing `msc_real_start_enabled()` to `false` for the
+    /// current thread. Tests that drive scheduling via `drain_tasks_locally`
+    /// (the simulated, queue-based scheduler) need this: as of the
+    /// real-start-by-default change, `add_service`/`demand` only enqueue
+    /// `Task::Start` when real-start mode is off, and `drain_tasks_locally`
+    /// itself is the fake-completion path — a fresh `ServiceContainer::new()`
+    /// in these tests has no `drive_starts()` loop or worker pool to race
+    /// with, so simulated mode is safe and deterministic here.
+    struct SimulatedSchedulerMode;
+    impl SimulatedSchedulerMode {
+        fn on() -> Self {
+            TEST_FORCE_REAL_START.with(|c| c.set(Some(false)));
+            SimulatedSchedulerMode
+        }
+    }
+    impl Drop for SimulatedSchedulerMode {
+        fn drop(&mut self) {
+            TEST_FORCE_REAL_START.with(|c| c.set(None));
+        }
+    }
+
     #[test]
     fn t19_1_service_name_of_single_segment() {
         let n = ServiceName::of(["jboss"]);
@@ -4367,6 +4408,7 @@ mod tests {
 
     #[test]
     fn t19_1_service_state_transitions_new_to_up_when_started() {
+        let _mode = SimulatedSchedulerMode::on();
         let c = ServiceContainer::new();
         let n = name("t19_1_transition.x");
         c.add_service(n.clone(), vec![], Mode::Active, 1)
@@ -4378,6 +4420,7 @@ mod tests {
 
     #[test]
     fn t19_1_service_mode_on_demand_stays_down_until_dependent_needs_it() {
+        let _mode = SimulatedSchedulerMode::on();
         let c = ServiceContainer::new();
         let n = name("t19_1_ondemand.svc");
         c.add_service(n.clone(), vec![], Mode::OnDemand, 0)
@@ -4393,6 +4436,7 @@ mod tests {
 
     #[test]
     fn t19_1_service_dependency_transitive_start() {
+        let _mode = SimulatedSchedulerMode::on();
         let c = ServiceContainer::new();
         let a = name("t19_1_trans.a");
         let b = name("t19_1_trans.b");
@@ -4438,6 +4482,7 @@ mod tests {
 
     #[test]
     fn t19_1_service_container_shutdown_stops_all_in_reverse_dep_order() {
+        let _mode = SimulatedSchedulerMode::on();
         let c = ServiceContainer::new();
         let a = name("t19_1_shut.a");
         let b = name("t19_1_shut.b");
@@ -4540,6 +4585,7 @@ mod tests {
 
     #[test]
     fn t19_1_passive_mode_schedules_like_active() {
+        let _mode = SimulatedSchedulerMode::on();
         let c = ServiceContainer::new();
         let n = name("t19_1_passive.svc");
         c.add_service(n.clone(), vec![], Mode::Passive, 0).unwrap();
