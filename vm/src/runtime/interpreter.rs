@@ -481,6 +481,58 @@ fn mtroots_selfcheck(thread: &JvmThread, heap: &crate::memory::VmHeap, location:
 /// When the feature is disabled (`CRATONVM_XT_JIT_ROOT_SCAN=0`) or unsupported
 /// for the current heap, this is byte-for-byte the legacy `wait_for_all()` —
 /// zero behaviour change.
+///
+/// Perf/starvation fix (2026-07-13 — elinjsp-socket-read-timeout,
+/// stw-crossthread-jit-takeover-hang-cluster, wildfly-standalone-boot-stw-
+/// jit-takeover-hang): the per-round `take_over_pass` OS-level scan (Windows:
+/// a full `CreateToolhelp32Snapshot` plus per-peer `OpenThread`/
+/// `SuspendThread`/`GetThreadContext`/`ResumeThread`; Linux: a signal-and-wait
+/// per peer) is expensive, and suspending/resuming every peer thread —
+/// including the exact mutator this loop is waiting for — competes with that
+/// peer for scheduler time. Previously this ran unconditionally on every 1ms
+/// tick once the loop had spun even once (`rounds != 0`), regardless of
+/// whether anything was actually in JIT, for as long as the wait continued —
+/// a self-amplifying livelock where the longer the wait takes, the more it
+/// starves the very thread it is waiting for. Confirmed empirically: a
+/// single JSP-compile GC pause with exactly one pending (non-JIT,
+/// non-blocked) mutator took several minutes, logging hundreds of thousands
+/// of "0 newly taken over" scans, one per millisecond, before the mutator
+/// (itself just slow to reach its own next safepoint under the induced
+/// scheduling pressure) finally arrived.
+fn stw_takeover_should_scan(rounds: u32, jit_hint: bool) -> bool {
+    // Scan every round for the first FAST_SCAN_ROUNDS — preserves
+    // zero-added-latency behavior for the common case, where a genuinely
+    // in-JIT peer is taken over within single-digit milliseconds — then back
+    // off geometrically. A peer that enters JIT during the slow phase is
+    // still guaranteed to be found; it just carries up to one
+    // SLOW_SCAN_PERIOD/VERY_SLOW_SCAN_PERIOD round of added detection
+    // latency, negligible next to a stall already long enough to reach that
+    // phase, while cutting steady-state OS-call volume (and the
+    // peer-starvation feedback loop) by 1-2 orders of magnitude.
+    //
+    // Round 0 is deliberately left gated on the cheap `any_thread_in_jit()`
+    // hint alone (unchanged from before), so an ordinary, fully-cooperative
+    // GC pause that never needed a scan at all still does not pay for one.
+    // The hint is NOT used to gate rounds >= 1: that counter is a single
+    // process-global depth and cannot distinguish "a peer is in JIT" from "I
+    // am" — this function's caller is commonly reached via `maybe_gc` called
+    // from JIT-compiled code, so the initiator's own live JIT-entry guard can
+    // hold the hint permanently true regardless of any peer's actual state.
+    const FAST_SCAN_ROUNDS: u32 = 20;
+    const SLOW_SCAN_PERIOD: u32 = 20;
+    const VERY_SLOW_SCAN_ROUNDS: u32 = 500;
+    const VERY_SLOW_SCAN_PERIOD: u32 = 200;
+    if rounds == 0 {
+        jit_hint
+    } else if rounds < FAST_SCAN_ROUNDS {
+        true
+    } else if rounds < VERY_SLOW_SCAN_ROUNDS {
+        rounds % SLOW_SCAN_PERIOD == 0
+    } else {
+        rounds % VERY_SLOW_SCAN_PERIOD == 0
+    }
+}
+
 fn stw_take_over_and_wait(
     shared: &SharedVm,
     xt_roots: &mut Vec<ObjectRef>,
@@ -507,16 +559,17 @@ fn stw_take_over_and_wait(
     // arrive at the barrier. Keep looping until the barrier is satisfied.
     const WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
     const WARN_AFTER_ROUNDS: u32 = 64;
+    // See `stw_takeover_should_scan`'s doc for why the scan cadence backs off
+    // instead of running unconditionally on every round.
     let mut rounds = 0u32;
     let mut warned = false;
     loop {
         let tids_before = taken.tids.len();
-        // The global JIT-depth counter is a fast first-pass hint. Once a
-        // cooperative wait has actually timed out, perform a RIP-based scan
-        // even when the hint is false: a missed entry/exit bookkeeping
-        // transition must not become a permanent STW wait. The scan itself
-        // parks only peers whose RIP is inside a registered JIT range.
-        let newly = if rounds != 0 || crate::jit::conservative_roots::any_thread_in_jit() {
+        let should_scan = stw_takeover_should_scan(
+            rounds,
+            crate::jit::conservative_roots::any_thread_in_jit(),
+        );
+        let newly = if should_scan {
             xt::take_over_pass(&mut taken, &|a| shared.heap.is_object_address(a), xt_roots)
         } else {
             0
@@ -33753,6 +33806,53 @@ fn dump_imse_holdcount_state(shared: &SharedVm, thread: &JvmThread, exc: ObjectR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Perf/starvation fix (2026-07-13) — `stw_takeover_should_scan` must scan
+    /// every round through the fast window (catching a genuinely in-JIT peer
+    /// with no added latency), then only periodically once a stall has
+    /// already run long — never falling back to the old "scan literally every
+    /// round forever" behavior that starved the very peer it was waiting for.
+    #[test]
+    fn stw_takeover_scan_cadence_backs_off() {
+        // Round 0: gated on the hint alone, exactly like before this fix.
+        assert!(!stw_takeover_should_scan(0, false));
+        assert!(stw_takeover_should_scan(0, true));
+
+        // Fast window (rounds 1..20): always scan regardless of the hint —
+        // unchanged latency for the common near-immediate takeover case.
+        for r in 1..20u32 {
+            assert!(
+                stw_takeover_should_scan(r, false),
+                "round {r} should still scan every tick in the fast window"
+            );
+        }
+
+        // Slow window (rounds 20..500): only every 20th round.
+        assert!(stw_takeover_should_scan(20, false));
+        assert!(!stw_takeover_should_scan(21, false));
+        assert!(!stw_takeover_should_scan(39, false));
+        assert!(stw_takeover_should_scan(40, false));
+        assert!(!stw_takeover_should_scan(499, false));
+
+        // Very-slow window (rounds >= 500): only every 200th round (aligned
+        // to multiples of 200, not to 500 itself) — this is the regime a
+        // multi-minute-or-permanent stall (the WildFly parallel-extension-add
+        // hang, the 5-class Tomcat hang cluster) lives in, where the old code
+        // was doing a full OS-level suspend-scan of every peer thread on
+        // literally every 1ms tick.
+        assert!(!stw_takeover_should_scan(500, false));
+        assert!(!stw_takeover_should_scan(599, false));
+        assert!(stw_takeover_should_scan(600, false));
+        assert!(!stw_takeover_should_scan(601, false));
+        assert!(stw_takeover_should_scan(800, false));
+
+        // The hint must NOT override the backoff once rounds >= 1: it cannot
+        // distinguish a peer actually being in JIT from the initiator's own
+        // live JIT-entry guard (this function is commonly reached via
+        // `maybe_gc` called from JIT-compiled code).
+        assert!(!stw_takeover_should_scan(21, true));
+        assert!(!stw_takeover_should_scan(501, true));
+    }
 
     /// Young-GC live-reclaim ROOT FIX regression (RRWL/ThreadLocalMap$Entry
     /// IMSE/hang family, 2026-07-07): the pre-GC watch publication must

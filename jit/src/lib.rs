@@ -5166,6 +5166,16 @@ pub fn try_compile(
         }
     }
 
+    // SPB-FLYWAY-HSQLDB.1: Keep the final admission gate aligned with the VM
+    // skip-list. The Flyway HSQLDB integration SIGSEGVs under JIT, while the
+    // package-level interpreted control completes the entire class. Background
+    // compilation can bypass VM eligibility checks, so fail closed here too.
+    if let Some(prefix) = hsqldb_jit_deny_prefix(&cached.class_name) {
+        if !jit_allow_package(prefix) {
+            return None;
+        }
+    }
+
     // ES-JIT-DEOPT-GC.1: final fail-closed companion to the VM skip-list guard
     // for `org/yaml/snakeyaml/emitter/Emitter.emit`. Tiered/background compile
     // can reach this crate after the VM-side enqueue path has logged work; keep
@@ -7577,6 +7587,19 @@ mod tests {
             Some("org.glassfish.jaxb.")
         );
         assert_eq!(jaxb_mapping_jit_deny_prefix("org/glassfish/other/Foo"), None);
+    }
+
+    #[test]
+    fn hsqldb_jit_deny_matches_slash_and_dot_names() {
+        assert_eq!(
+            hsqldb_jit_deny_prefix("org/hsqldb/map/BaseHashMap"),
+            Some("org/hsqldb/")
+        );
+        assert_eq!(
+            hsqldb_jit_deny_prefix("org.hsqldb.map.BaseHashMap"),
+            Some("org.hsqldb.")
+        );
+        assert_eq!(hsqldb_jit_deny_prefix("org/example/Foo"), None);
     }
 
     #[test]
