@@ -51696,64 +51696,6 @@ fn javac_platform_class_file_object(
     )
 }
 
-fn javac_platform_listing_classes(package_name: &str) -> &'static [&'static str] {
-    match package_name {
-        "java.lang" => &[
-            "java.lang.Object",
-            "java.lang.String",
-            "java.lang.Class",
-            "java.lang.Throwable",
-            "java.lang.Exception",
-            "java.lang.RuntimeException",
-            "java.lang.Error",
-            "java.lang.System",
-            "java.lang.Boolean",
-            "java.lang.Integer",
-            "java.lang.Long",
-            "java.lang.Void",
-            "java.lang.Iterable",
-            "java.lang.Enum",
-            "java.lang.Override",
-        ],
-        "java.util" => &[
-            "java.util.Objects",
-            "java.util.List",
-            "java.util.Collection",
-            "java.util.Iterator",
-            "java.util.Map",
-            "java.util.Set",
-            "java.util.ArrayList",
-            "java.util.Collections",
-            "java.util.Arrays",
-            "java.util.Optional",
-        ],
-        "java.util.function" => &[
-            "java.util.function.Supplier",
-            "java.util.function.Function",
-            "java.util.function.Consumer",
-            "java.util.function.Predicate",
-        ],
-        "java.lang.invoke" => &[
-            "java.lang.invoke.MethodHandle",
-            "java.lang.invoke.MethodHandles",
-            "java.lang.invoke.MethodType",
-            "java.lang.invoke.LambdaMetafactory",
-        ],
-        "java.lang.annotation" => &[
-            "java.lang.annotation.Annotation",
-            "java.lang.annotation.Retention",
-            "java.lang.annotation.Target",
-        ],
-        "java.io" => &[
-            "java.io.Serializable",
-            "java.io.IOException",
-            "java.io.InputStream",
-            "java.io.OutputStream",
-        ],
-        _ => &[],
-    }
-}
-
 fn native_javac_file_manager_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     ctx.invoke_virtual_bytecode_only(

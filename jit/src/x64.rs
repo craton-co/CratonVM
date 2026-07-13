@@ -27251,6 +27251,7 @@ mod tests {
             throw_arithmetic: sentinel,
             invoke_dispatch: sentinel,
             invoke_virtual_mic: sentinel,
+            lambda_int_to_double: sentinel,
             write_barrier: sentinel,
             satb_pre_write_barrier: sentinel,
             uncommon_trap: sentinel,

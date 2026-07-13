@@ -13080,6 +13080,99 @@ fn jrtfs_list_dir_classified(java_home: &str, entry: &str) -> Vec<(String, bool)
     }
 }
 
+/// Return the binary names of every class in a jrt module package.
+///
+/// `JavacFileManager.list` uses this view when compiling in-process.  Building
+/// it from the jimage directory index keeps javac's platform-class inventory
+/// complete instead of relying on a small hand-maintained class allowlist.
+pub(crate) fn jrtfs_list_class_binary_names(
+    java_home: &str,
+    module_name: &str,
+    package_name: &str,
+    recurse: bool,
+) -> Vec<String> {
+    let package_path = package_name.replace('.', "/");
+    let root = if package_path.is_empty() {
+        format!("modules/{module_name}")
+    } else {
+        format!("modules/{module_name}/{package_path}")
+    };
+    let module_prefix = format!("modules/{module_name}/");
+    let mut pending = vec![root];
+    let mut classes = Vec::new();
+
+    while let Some(dir) = pending.pop() {
+        for (child, is_dir) in jrtfs_list_dir_classified(java_home, &dir) {
+            if is_dir {
+                if recurse {
+                    pending.push(child);
+                }
+                continue;
+            }
+            let Some(relative) = child.strip_prefix(&module_prefix) else {
+                continue;
+            };
+            let Some(class_path) = relative.strip_suffix(".class") else {
+                continue;
+            };
+            classes.push(class_path.replace('/', "."));
+        }
+    }
+
+    classes.sort_unstable();
+    classes
+}
+
+#[cfg(test)]
+mod jrtfs_javac_listing_tests {
+    use super::jrtfs_list_class_binary_names;
+    use std::path::{Path, PathBuf};
+
+    fn test_java_home() -> Option<PathBuf> {
+        for key in ["CRATONVM_TEST_JDK", "CRATONVM_JAVA_HOME", "JAVA_HOME"] {
+            if let Some(home) = std::env::var_os(key).map(PathBuf::from) {
+                if home.join("lib/modules").is_file() {
+                    return Some(home);
+                }
+            }
+        }
+        for home in [
+            "/home/victor/jdk25",
+            "/usr/lib/jvm/java-21-openjdk-amd64",
+            "C:/Program Files/Java/jdk-25",
+        ] {
+            let path = Path::new(home);
+            if path.join("lib/modules").is_file() {
+                return Some(path.to_path_buf());
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn javac_platform_listing_uses_complete_jrt_package_inventory() {
+        let Some(java_home) = test_java_home() else {
+            eprintln!("JDK modules image unavailable; skipping jrt listing test");
+            return;
+        };
+        let java_home = java_home.to_string_lossy();
+        let direct =
+            jrtfs_list_class_binary_names(&java_home, "java.base", "java.lang", false);
+        assert!(direct.len() > 100, "java.lang listing was truncated: {direct:?}");
+        for required in ["java.lang.Object", "java.lang.Byte", "java.lang.Integer"] {
+            assert!(direct.iter().any(|name| name == required), "missing {required}");
+        }
+        let recursive =
+            jrtfs_list_class_binary_names(&java_home, "java.base", "java.lang", true);
+        assert!(
+            recursive
+                .iter()
+                .any(|name| name == "java.lang.annotation.Retention"),
+            "recursive listing omitted nested java.lang packages"
+        );
+    }
+}
+
 fn jrtfs_entry_size(java_home: &str, entry: &str) -> std::io::Result<i64> {
     let img =
         jrt_image(java_home).ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;

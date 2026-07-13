@@ -1,4 +1,4 @@
-# GPU offload — open follow-ups after first real-hardware validation (2026-07-11)
+# GPU offload — completed follow-ups after first real-hardware validation (2026-07-11)
 
 **Context.** First systematic validation of the GPU offload stack on real hardware
 (RTX 2060, sm_75, CUDA driver 591.86, `--features gpu-driver` build of dev). The
@@ -14,18 +14,21 @@ closed items 1, 2, 4, 5, and 7 below, and made a real dent in item 6. Item 3
 see `README.md`'s "GPU offload benchmarks" section and `docs/gpu/COMPARISON.md`
 for the numbers this update is based on.
 
-**Update (2026-07-12).** Item 6's 2-D/rectangular-nested-loop gap is closed
-(`ptxas`-validated on the local RTX 2060 box's CUDA toolkit — see item 6 for
-the details and file references). Item 6's other remaining gap, general
-branches inside a loop body, is unchanged; see item 6 for why it's a
-substantially larger, higher-risk piece of work than everything closed so
-far and was deliberately left for its own follow-up.
+**Update (2026-07-12).** All code follow-ups in this report are closed. In
+particular, item 6 now lowers acyclic `if`/`else` control flow inside a counted
+loop body with explicit basic blocks, PTX labels, predicate branches, and
+per-block JVM-state merge registers. The implementation intentionally keeps
+early exits and interior backward edges on the CPU: they change the one-thread
+per-iteration work mapping rather than being ordinary branch joins. The
+fixture `EligibleBranchingLoop.java` covers both an `if`/`else` local merge and
+a one-arm branch; `ptxas_round_trip_branching_loops` is the hardware-assembler
+regression hook.
 
-Item 3 (async completion model) is also closed as of this update: the
-`cuLaunchHostFunc` host callback now drives a submission to
-`Completed`/`Failed` on its own via a background completion reaper, with no
-Java-side poll required — see item 3. That leaves general branches (item 6)
-as the only open item in this file.
+Item 3 (async completion model) is also closed: the `cuLaunchHostFunc` host
+callback now drives a submission to `Completed`/`Failed` via a background
+completion reaper, with no Java-side poll required. This report is retained
+under `docs/internal` as the completed record; self-hosted runner enrollment
+in item 7 is operational follow-up, not an unresolved code defect.
 
 ## 1. Reduction kernels never dispatch (void-return gate) — DONE
 
@@ -182,7 +185,7 @@ in `cuda-bridge/src/backend_cuda.rs`) instead of the fixed 256-thread
 changes in this update; landed together with the thread-floor fix in item 4
 above.
 
-## 6. Analyzer/lowering coverage gaps — MOSTLY DONE
+## 6. Analyzer/lowering coverage gaps — DONE
 
 Closed this update:
 
@@ -233,33 +236,22 @@ Closed this update:
   `ptxas` round-trip in `jit-cuda/src/lowering.rs`
   (`nested_loop_*`/`ptxas_round_trip_nested_loop`/`triangular_nested_loop_is_rejected`).
 
-Still open (unchanged from the original report):
+**General branches (closed 2026-07-12).** `Emitter::walk_cfg` discovers
+forward basic blocks in a counted-loop body, emits `L_body_<pc>` labels, and
+lowers `if*`/`if_icmp*`/`ifnull`/`ifnonnull` to `setp` plus predicated PTX
+branches. Each edge copies JVM locals and operand-stack values into the target
+block's canonical register set, providing explicit phi-style merge semantics
+without relying on a linear simulated stack. `goto`/`goto_w` are lowered as
+real forward PTX branches. Interior backward edges, branches that leave the
+body (`break`/`continue`), and returns in the body remain explicit CPU
+fallbacks because they require a different iteration-space model.
 
-- **General branches** (anything other than a compare-and-branch loop guard)
-  still reject — and this is now the last item in this file. Unlike the 2-D
-  loop work above, this is NOT a small extension of the existing recognizer:
-  the emitter (`jit-cuda/src/lowering/emit.rs`) has no basic-block/CFG
-  concept at all today — `Emitter::walk` emits one straight-line PTX `body`
-  string per bytecode range, and the simulated `OpStack`/`Locals` assume a
-  single linear pass with no join-point reconciliation. Supporting a real
-  `if`/`else` (or any other branch) inside the loop body needs (a)
-  basic-block discovery inside the loop body, (b) minting real PTX labels
-  and translating `if_icmp*`/`if*` into `setp` + `@pred bra` instead of the
-  two fixed, compiler-generated branches the emitter has today (the loop
-  guard and the bounds-check), and (c) a stack/register merge strategy at
-  block joins (either genuine SSA/phi handling, or — much cheaper, and
-  probably the right first cut — restricting admission to a narrow
-  `selp`-lowerable subset: `if`-without-`else` bodies that do a simple
-  predicated store, no early `return`/`break`, no nested `if`). Even that
-  restricted subset is a substantially larger, higher-risk change than
-  everything else in this file — it is the kind of change that can silently
-  miscompile if the block-splitting isn't exactly right, not just reject
-  too conservatively — so it was deliberately left for its own follow-up
-  rather than attempted alongside the 2-D loop work above. The relevant
-  rejection sites to relax, once that machinery exists, are
-  `jit-cuda/src/lowering/emit.rs`'s `0x99..=0xA4` (`if*`/`if_icmp*`) and
-  `0xA7 | 0xC8` (`goto`/`goto_w`) arms in `Emitter::emit_op`.
-- `)F`/`)D` reductions still stay on CPU by design — see item 1.
+`EligibleBranchingLoop.java` and the `branching_loop_*` lowering tests cover
+both `if`/`else` local joins and a one-arm branch that falls through to the
+canonical loop back-edge. `ptxas_round_trip_branching_loops` validates both
+generated PTX shapes when the CUDA integration feature is enabled.
+
+`)F`/`)D` reductions still stay on CPU by design — see item 1.
 
 ## 7. No hardware CI — SCAFFOLDING DONE, runner enrollment pending
 

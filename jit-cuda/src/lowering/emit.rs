@@ -23,6 +23,7 @@ use crate::emitter::{LoweringError, RegKind};
 use crate::lowering::loop_recog::{instr_size, CountedLoop, NestedLoop};
 use crate::signature::KernelSignature;
 use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 /// One slot of typed JVM state.
@@ -96,7 +97,7 @@ impl RegPool {
 }
 
 /// Simulated JVM operand stack of typed registers.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct OpStack(Vec<Reg>);
 
 impl OpStack {
@@ -118,8 +119,18 @@ impl OpStack {
 /// Per-local-slot register binding. JVM has up to `max_locals` slots,
 /// each addressed by index. Long/double take 2 slots but the emitter
 /// only stores into the low slot — the simulator ignores slot+1.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Locals(Vec<Option<Reg>>);
+
+/// JVM execution state at a basic-block entry.  A branch target owns one
+/// canonical register for every live local and operand-stack value; every
+/// predecessor copies its state into those registers before branching.  This
+/// is the small, explicit phi representation used by [`Emitter::walk_cfg`].
+#[derive(Clone)]
+struct BlockState {
+    stack: OpStack,
+    locals: Locals,
+}
 
 impl Locals {
     pub fn ensure(&mut self, idx: usize) {
@@ -374,7 +385,12 @@ impl<'a> Emitter<'a> {
         }
         let tid = self.tid_reg.clone().expect("emit_tid was called");
         let r = self.regs.fresh_reg(RegKind::S32);
-        writeln!(self.body, "    add.s32 {}, {}, {};", r.name, tid.name, start).unwrap();
+        writeln!(
+            self.body,
+            "    add.s32 {}, {}, {};",
+            r.name, tid.name, start
+        )
+        .unwrap();
         self.tid_reg = Some(r);
     }
 
@@ -610,6 +626,449 @@ impl<'a> Emitter<'a> {
             self.emit_op(op, pc, loop_info)?;
             pc += size;
         }
+        Ok(())
+    }
+
+    /// Lower the acyclic control-flow graph inside one counted-loop body.
+    ///
+    /// The surrounding counted loop is still executed once per CUDA thread,
+    /// so its canonical back-edge is deliberately outside `end`.  Interior
+    /// branches must be forward edges: admitting a second loop here would
+    /// change the work mapping and needs a separate iteration-space design.
+    /// Within that boundary this is a real CFG walk, not a pattern matcher:
+    /// it discovers basic blocks, emits PTX labels and predicate branches,
+    /// and reconciles JVM locals/operand-stack values at every join.
+    pub fn walk_cfg(
+        &mut self,
+        start: usize,
+        end: usize,
+        loop_info: &CountedLoop,
+    ) -> Result<(), LoweringError> {
+        let starts = self.cfg_block_starts(start, end, loop_info)?;
+        let starts: Vec<usize> = starts.into_iter().collect();
+        let mut entries = BTreeMap::<usize, BlockState>::new();
+        entries.insert(
+            start,
+            BlockState {
+                stack: self.stack.clone(),
+                locals: self.locals.clone(),
+            },
+        );
+
+        for (index, &block_start) in starts.iter().enumerate() {
+            let block_end = starts.get(index + 1).copied().unwrap_or(end);
+            let Some(entry) = entries.get(&block_start).cloned() else {
+                // Valid class files can retain unreachable bytecode.  It has
+                // no incoming edge in the admitted subgraph, so emitting it
+                // would manufacture an execution state the JVM never has.
+                continue;
+            };
+            self.stack = entry.stack;
+            self.locals = entry.locals;
+            if block_start != start {
+                writeln!(self.body, "L_body_{block_start}:").unwrap();
+            }
+
+            let mut pc = block_start;
+            let mut terminated = false;
+            while pc < block_end {
+                let op = self.bytes[pc];
+                let size = instr_size(self.bytes, pc)?;
+                if pc + size > self.bytes.len() || pc + size > end {
+                    return Err(LoweringError::UnsupportedNode(format!(
+                        "instruction at pc={pc} crosses a control-flow block boundary"
+                    )));
+                }
+                let next = pc + size;
+                match op {
+                    0x99..=0xA4 | 0xC6 | 0xC7 => {
+                        let target = self.branch_target(pc, op)?;
+                        let predicate = self.emit_branch_predicate(op)?;
+                        let state = BlockState {
+                            stack: self.stack.clone(),
+                            locals: self.locals.clone(),
+                        };
+                        self.copy_state_to_edge(
+                            &state,
+                            target,
+                            Some((&predicate.name, false)),
+                            &mut entries,
+                        )?;
+                        self.copy_state_to_edge(
+                            &state,
+                            next,
+                            Some((&predicate.name, true)),
+                            &mut entries,
+                        )?;
+                        writeln!(self.body, "    @{} bra L_body_{target};", predicate.name)
+                            .unwrap();
+                        terminated = true;
+                    }
+                    0xA7 | 0xC8 => {
+                        let target = self.branch_target(pc, op)?;
+                        if target == loop_info.header_pc {
+                            // The host-side loop guard already selected one
+                            // iteration per thread.  Do not emit the JVM
+                            // back-edge or this thread would repeat work.
+                            self.hit_back_branch = true;
+                        } else {
+                            let state = BlockState {
+                                stack: self.stack.clone(),
+                                locals: self.locals.clone(),
+                            };
+                            self.copy_state_to_edge(&state, target, None, &mut entries)?;
+                            writeln!(self.body, "    bra L_body_{target};").unwrap();
+                        }
+                        terminated = true;
+                    }
+                    0xAC..=0xB1 => {
+                        return Err(LoweringError::UnsupportedNode(format!(
+                            "return at pc={pc} inside a GPU loop body is an early exit; \
+                             per-iteration kernels only admit the post-loop return"
+                        )));
+                    }
+                    _ => self.emit_op(op, pc, Some(loop_info))?,
+                }
+                pc = next;
+                if terminated {
+                    if pc != block_end {
+                        return Err(LoweringError::UnsupportedNode(format!(
+                            "control transfer at pc={} is not the last instruction in its basic block",
+                            pc - size
+                        )));
+                    }
+                    break;
+                }
+            }
+            if !terminated && block_end < end {
+                let state = BlockState {
+                    stack: self.stack.clone(),
+                    locals: self.locals.clone(),
+                };
+                self.copy_state_to_edge(&state, block_end, None, &mut entries)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn cfg_block_starts(
+        &self,
+        start: usize,
+        end: usize,
+        loop_info: &CountedLoop,
+    ) -> Result<BTreeSet<usize>, LoweringError> {
+        let mut starts = BTreeSet::from([start]);
+        let mut pc = start;
+        while pc < end {
+            let op = self.bytes[pc];
+            let size = instr_size(self.bytes, pc)?;
+            let next = pc + size;
+            if next > end || next > self.bytes.len() {
+                return Err(LoweringError::UnsupportedNode(format!(
+                    "instruction at pc={pc} crosses the loop-body boundary"
+                )));
+            }
+            match op {
+                0x99..=0xA4 | 0xC6 | 0xC7 => {
+                    let target = self.branch_target(pc, op)?;
+                    self.validate_cfg_target(pc, target, start, end, loop_info)?;
+                    starts.insert(target);
+                    if next < end {
+                        starts.insert(next);
+                    }
+                }
+                0xA7 | 0xC8 => {
+                    let target = self.branch_target(pc, op)?;
+                    if target != loop_info.header_pc {
+                        self.validate_cfg_target(pc, target, start, end, loop_info)?;
+                        starts.insert(target);
+                    }
+                }
+                0xAC..=0xB1 => {
+                    return Err(LoweringError::UnsupportedNode(format!(
+                        "return at pc={pc} inside a GPU loop body is not supported"
+                    )));
+                }
+                _ => {}
+            }
+            pc = next;
+        }
+        Ok(starts)
+    }
+
+    fn validate_cfg_target(
+        &self,
+        source: usize,
+        target: usize,
+        start: usize,
+        end: usize,
+        _loop_info: &CountedLoop,
+    ) -> Result<(), LoweringError> {
+        if !(start..end).contains(&target) {
+            return Err(LoweringError::UnsupportedNode(format!(
+                "branch at pc={source} leaves the loop body (target {target}); \
+                 break/continue/early-exit control flow stays on the CPU"
+            )));
+        }
+        if !self.is_instruction_boundary(start, end, target)? {
+            return Err(LoweringError::UnsupportedNode(format!(
+                "branch at pc={source} targets byte {target}, which is not a JVM instruction boundary"
+            )));
+        }
+        if target <= source {
+            return Err(LoweringError::UnsupportedNode(format!(
+                "backward interior branch at pc={source} → {target} would form a nested loop; \
+                 only the canonical counted-loop back-edge is supported"
+            )));
+        }
+        Ok(())
+    }
+
+    fn is_instruction_boundary(
+        &self,
+        start: usize,
+        end: usize,
+        target: usize,
+    ) -> Result<bool, LoweringError> {
+        let mut pc = start;
+        while pc < end {
+            if pc == target {
+                return Ok(true);
+            }
+            pc += instr_size(self.bytes, pc)?;
+        }
+        Ok(false)
+    }
+
+    fn branch_target(&self, pc: usize, op: u8) -> Result<usize, LoweringError> {
+        let offset =
+            match op {
+                0xC8 => {
+                    i32::from_be_bytes([
+                        *self.bytes.get(pc + 1).ok_or_else(|| {
+                            LoweringError::UnsupportedNode("truncated goto_w".into())
+                        })?,
+                        *self.bytes.get(pc + 2).ok_or_else(|| {
+                            LoweringError::UnsupportedNode("truncated goto_w".into())
+                        })?,
+                        *self.bytes.get(pc + 3).ok_or_else(|| {
+                            LoweringError::UnsupportedNode("truncated goto_w".into())
+                        })?,
+                        *self.bytes.get(pc + 4).ok_or_else(|| {
+                            LoweringError::UnsupportedNode("truncated goto_w".into())
+                        })?,
+                    ]) as i64
+                }
+                _ => {
+                    i16::from_be_bytes([
+                        *self.bytes.get(pc + 1).ok_or_else(|| {
+                            LoweringError::UnsupportedNode("truncated branch".into())
+                        })?,
+                        *self.bytes.get(pc + 2).ok_or_else(|| {
+                            LoweringError::UnsupportedNode("truncated branch".into())
+                        })?,
+                    ]) as i64
+                }
+            };
+        let target = pc as i64 + offset;
+        if target < 0 || target as usize >= self.bytes.len() {
+            return Err(LoweringError::UnsupportedNode(format!(
+                "branch at pc={pc} has out-of-range target {target}"
+            )));
+        }
+        Ok(target as usize)
+    }
+
+    fn emit_branch_predicate(&mut self, op: u8) -> Result<Reg, LoweringError> {
+        let (mnemonic, lhs, rhs, kind) = match op {
+            0x99..=0x9E => {
+                let value = self.stack.pop()?;
+                if value.kind != RegKind::S32 {
+                    return Err(LoweringError::UnsupportedNode(format!(
+                        "if opcode 0x{op:02x} requires an int value, got {:?}",
+                        value.kind
+                    )));
+                }
+                let cmp = match op {
+                    0x99 => "eq",
+                    0x9A => "ne",
+                    0x9B => "lt",
+                    0x9C => "ge",
+                    0x9D => "gt",
+                    _ => "le",
+                };
+                (cmp, value.name, "0".to_string(), RegKind::S32)
+            }
+            0x9F..=0xA4 => {
+                let rhs = self.stack.pop()?;
+                let lhs = self.stack.pop()?;
+                if lhs.kind != RegKind::S32 || rhs.kind != RegKind::S32 {
+                    return Err(LoweringError::UnsupportedNode(format!(
+                        "if_icmp opcode 0x{op:02x} requires two int values"
+                    )));
+                }
+                let cmp = match op {
+                    0x9F => "eq",
+                    0xA0 => "ne",
+                    0xA1 => "lt",
+                    0xA2 => "ge",
+                    0xA3 => "gt",
+                    _ => "le",
+                };
+                (cmp, lhs.name, rhs.name, RegKind::S32)
+            }
+            0xC6 | 0xC7 => {
+                let value = self.stack.pop()?;
+                if value.kind != RegKind::U64 {
+                    return Err(LoweringError::UnsupportedNode(format!(
+                        "ifnull/ifnonnull at a non-reference value ({:?})",
+                        value.kind
+                    )));
+                }
+                (
+                    if op == 0xC6 { "eq" } else { "ne" },
+                    value.name,
+                    "0".to_string(),
+                    RegKind::U64,
+                )
+            }
+            _ => unreachable!("only conditional branches call emit_branch_predicate"),
+        };
+        let pred = self.regs.fresh_reg(RegKind::Pred);
+        let suffix = match kind {
+            RegKind::S32 => "s32",
+            RegKind::U64 => "u64",
+            _ => unreachable!(),
+        };
+        writeln!(
+            self.body,
+            "    setp.{mnemonic}.{suffix} {}, {}, {};",
+            pred.name, lhs, rhs
+        )
+        .unwrap();
+        Ok(pred)
+    }
+
+    fn copy_state_to_edge(
+        &mut self,
+        source: &BlockState,
+        target_pc: usize,
+        predicate: Option<(&str, bool)>,
+        entries: &mut BTreeMap<usize, BlockState>,
+    ) -> Result<(), LoweringError> {
+        if !entries.contains_key(&target_pc) {
+            entries.insert(target_pc, self.canonicalise_state(source));
+        }
+        let target = entries
+            .get(&target_pc)
+            .expect("state just inserted")
+            .clone();
+        self.copy_matching_state(source, &target, predicate, target_pc)
+    }
+
+    fn canonicalise_state(&mut self, source: &BlockState) -> BlockState {
+        let fresh = |r: &Reg, regs: &mut RegPool| Reg {
+            kind: r.kind,
+            // Array references are identified by the original parameter
+            // pointer register (`array_param_of` uses that identity to find
+            // its length/ABI slot).  A verifier-valid join can only merge
+            // compatible references, so keep that binding rather than
+            // inventing a phi register the array lowering cannot resolve.
+            name: if r.kind == RegKind::U64 {
+                r.name.clone()
+            } else {
+                regs.fresh(r.kind)
+            },
+            wide: r.wide,
+        };
+        BlockState {
+            stack: OpStack(
+                source
+                    .stack
+                    .0
+                    .iter()
+                    .map(|r| fresh(r, &mut self.regs))
+                    .collect(),
+            ),
+            locals: Locals(
+                source
+                    .locals
+                    .0
+                    .iter()
+                    .map(|r| r.as_ref().map(|r| fresh(r, &mut self.regs)))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn copy_matching_state(
+        &mut self,
+        source: &BlockState,
+        target: &BlockState,
+        predicate: Option<(&str, bool)>,
+        target_pc: usize,
+    ) -> Result<(), LoweringError> {
+        if source.stack.0.len() != target.stack.0.len() {
+            return Err(LoweringError::UnsupportedNode(format!(
+                "incompatible JVM state at control-flow join pc={target_pc}"
+            )));
+        }
+        for (from, to) in source.stack.0.iter().zip(&target.stack.0) {
+            self.copy_reg(from, to, predicate, target_pc)?;
+        }
+        let local_count = source.locals.0.len().max(target.locals.0.len());
+        for index in 0..local_count {
+            let from = source.locals.0.get(index).and_then(Option::as_ref);
+            let to = target.locals.0.get(index).and_then(Option::as_ref);
+            match (from, to) {
+                (None, None) => {}
+                (Some(from), Some(to)) => self.copy_reg(from, to, predicate, target_pc)?,
+                // A verifier-valid method cannot read a local that is only
+                // initialised on one predecessor.  If it is dead after this
+                // join, preserving neither binding is semantically exact;
+                // avoiding a needless rejection also handles javac's
+                // branch-local temporary slots.
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn copy_reg(
+        &mut self,
+        from: &Reg,
+        to: &Reg,
+        predicate: Option<(&str, bool)>,
+        target_pc: usize,
+    ) -> Result<(), LoweringError> {
+        if from.kind != to.kind || from.wide != to.wide {
+            return Err(LoweringError::UnsupportedNode(format!(
+                "incompatible register types at control-flow join pc={target_pc}"
+            )));
+        }
+        if from.name == to.name {
+            return Ok(());
+        }
+        let suffix = match from.kind {
+            RegKind::U32 => "u32",
+            RegKind::U64 => "u64",
+            RegKind::S32 => "s32",
+            RegKind::S64 => "s64",
+            RegKind::F32 => "f32",
+            RegKind::F64 => "f64",
+            RegKind::Pred => "pred",
+        };
+        let guard = match predicate {
+            Some((name, true)) => format!("@!{name} "),
+            Some((name, false)) => format!("@{name} "),
+            None => String::new(),
+        };
+        writeln!(
+            self.body,
+            "    {guard}mov.{suffix} {}, {};",
+            to.name, from.name
+        )
+        .unwrap();
         Ok(())
     }
 
@@ -1274,7 +1733,11 @@ impl<'a> Emitter<'a> {
         let a = self.stack.pop()?;
         let p = self.regs.fresh_reg(RegKind::Pred);
         let r = self.regs.fresh_reg(RegKind::S32);
-        let cmp = if want_min { "setp.lt.s32" } else { "setp.gt.s32" };
+        let cmp = if want_min {
+            "setp.lt.s32"
+        } else {
+            "setp.gt.s32"
+        };
         writeln!(self.body, "    {} {}, {}, {};", cmp, p.name, a.name, b.name).unwrap();
         writeln!(
             self.body,
@@ -1293,7 +1756,11 @@ impl<'a> Emitter<'a> {
         let a = self.stack.pop()?;
         let p = self.regs.fresh_reg(RegKind::Pred);
         let r = self.regs.fresh_reg(RegKind::S64);
-        let cmp = if want_min { "setp.lt.s64" } else { "setp.gt.s64" };
+        let cmp = if want_min {
+            "setp.lt.s64"
+        } else {
+            "setp.gt.s64"
+        };
         writeln!(self.body, "    {} {}, {}, {};", cmp, p.name, a.name, b.name).unwrap();
         writeln!(
             self.body,
@@ -1367,7 +1834,11 @@ impl<'a> Emitter<'a> {
             p_a_nan.name, a.name, a.name
         )
         .unwrap();
-        let ord_cmp = if want_min { "setp.le.f32" } else { "setp.ge.f32" };
+        let ord_cmp = if want_min {
+            "setp.le.f32"
+        } else {
+            "setp.ge.f32"
+        };
         writeln!(
             self.body,
             "    {} {}, {}, {};",
@@ -1456,7 +1927,11 @@ impl<'a> Emitter<'a> {
             p_a_nan.name, a.name, a.name
         )
         .unwrap();
-        let ord_cmp = if want_min { "setp.le.f64" } else { "setp.ge.f64" };
+        let ord_cmp = if want_min {
+            "setp.le.f64"
+        } else {
+            "setp.ge.f64"
+        };
         writeln!(
             self.body,
             "    {} {}, {}, {};",
@@ -1968,7 +2443,12 @@ impl<'a> Emitter<'a> {
         let abs_b = self.regs.fresh_reg(RegKind::F32);
         let p_inf_divisor = self.regs.fresh_reg(RegKind::Pred);
         let result = self.regs.fresh_reg(RegKind::F32);
-        writeln!(self.body, "    div.rn.f32 {}, {}, {};", t.name, a.name, b.name).unwrap();
+        writeln!(
+            self.body,
+            "    div.rn.f32 {}, {}, {};",
+            t.name, a.name, b.name
+        )
+        .unwrap();
         writeln!(
             self.body,
             "    cvt.rzi.f32.f32 {}, {};",
@@ -2017,7 +2497,12 @@ impl<'a> Emitter<'a> {
         let abs_b = self.regs.fresh_reg(RegKind::F64);
         let p_inf_divisor = self.regs.fresh_reg(RegKind::Pred);
         let result = self.regs.fresh_reg(RegKind::F64);
-        writeln!(self.body, "    div.rn.f64 {}, {}, {};", t.name, a.name, b.name).unwrap();
+        writeln!(
+            self.body,
+            "    div.rn.f64 {}, {}, {};",
+            t.name, a.name, b.name
+        )
+        .unwrap();
         writeln!(
             self.body,
             "    cvt.rzi.f64.f64 {}, {};",
