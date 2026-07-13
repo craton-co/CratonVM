@@ -97,6 +97,8 @@ pub enum EntryKind {
         /// X.509 cert DER.
         cert_der: Vec<u8>,
     },
+    /// Symmetric key material from a PKCS#12 SecretBag.
+    SecretKey { key_bytes: Vec<u8> },
 }
 
 /// One loaded keystore. The map keys are case-preserved aliases.
@@ -242,6 +244,7 @@ pub fn keystore_get_cert_der(id: i32, alias: &str) -> Option<Vec<u8>> {
     match &entry.kind {
         EntryKind::TrustedCert { cert_der } => Some(cert_der.clone()),
         EntryKind::PrivateKey { chain, .. } => chain.first().cloned(),
+        EntryKind::SecretKey { .. } => None,
     }
 }
 
@@ -315,6 +318,76 @@ fn bags_ber(pfx: &p12::PFX, password_str: &str) -> Result<Vec<p12::SafeBag>, yas
     Ok(result)
 }
 
+/// Decrypt the PBES2/PBKDF2/AES records emitted by current SunPKCS12 for
+/// `SecretKeyEntry` values. `p12` itself supports only legacy PKCS#12 PBE.
+fn decrypt_secret_pbes2(epki_der: &[u8], password: &[u8]) -> Option<Vec<u8>> {
+    let (salt, iterations, key_len, iv, ciphertext) = yasna::parse_ber(epki_der, |r| {
+        r.read_sequence(|r| {
+            let (salt, iterations, key_len, iv) = r.next().read_sequence(|r| {
+                let _pbes2_oid = r.next().read_oid()?;
+                r.next().read_sequence(|r| {
+                    let (salt, iterations, key_len) = r.next().read_sequence(|r| {
+                        let _pbkdf2_oid = r.next().read_oid()?;
+                        r.next().read_sequence(|r| {
+                            let salt = r.next().read_bytes()?;
+                            let iterations = r.next().read_u32()?;
+                            let key_len = r.next().read_u32()? as usize;
+                            r.read_optional(|r| {
+                                r.read_sequence(|r| {
+                                    let _prf_oid = r.next().read_oid()?;
+                                    r.read_optional(|r| r.read_null())?;
+                                    Ok(())
+                                })
+                            })?;
+                            Ok((salt, iterations, key_len))
+                        })
+                    })?;
+                    let iv = r.next().read_sequence(|r| {
+                        let _aes_oid = r.next().read_oid()?;
+                        r.next().read_bytes()
+                    })?;
+                    Ok((salt, iterations, key_len, iv))
+                })
+            })?;
+            let ciphertext = r.next().read_bytes()?;
+            Ok((salt, iterations, key_len, iv, ciphertext))
+        })
+    })
+    .ok()?;
+
+    let key = crate::phases_early::pbkdf2_derive_for(256, password, &salt, iterations, key_len);
+    use aes::cipher::block_padding::Pkcs7;
+    use aes::cipher::generic_array::GenericArray;
+    use aes::cipher::{BlockDecryptMut, KeyIvInit};
+    let mut out = vec![0u8; ciphertext.len()];
+    let written = match key.len() {
+        16 => cbc::Decryptor::<aes::Aes128>::new(
+            GenericArray::from_slice(&key),
+            GenericArray::from_slice(&iv),
+        )
+        .decrypt_padded_b2b_mut::<Pkcs7>(&ciphertext, &mut out)
+        .ok()?
+        .len(),
+        24 => cbc::Decryptor::<aes::Aes192>::new(
+            GenericArray::from_slice(&key),
+            GenericArray::from_slice(&iv),
+        )
+        .decrypt_padded_b2b_mut::<Pkcs7>(&ciphertext, &mut out)
+        .ok()?
+        .len(),
+        32 => cbc::Decryptor::<aes::Aes256>::new(
+            GenericArray::from_slice(&key),
+            GenericArray::from_slice(&iv),
+        )
+        .decrypt_padded_b2b_mut::<Pkcs7>(&ciphertext, &mut out)
+        .ok()?
+        .len(),
+        _ => return None,
+    };
+    out.truncate(written);
+    Some(out)
+}
+
 pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStoreError> {
     let pfx = p12::PFX::parse(bytes).map_err(|e| KeyStoreError::Pkcs12Parse(format!("{e:?}")))?;
 
@@ -349,6 +422,7 @@ pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyS
     let mut keys_by_local_id: HashMap<Vec<u8>, (Option<String>, Vec<u8>)> = HashMap::new();
     let mut certs_by_local_id: HashMap<Vec<u8>, Vec<(Option<String>, Vec<u8>)>> = HashMap::new();
     let mut orphan_certs: Vec<(Option<String>, Vec<u8>)> = Vec::new();
+    let mut secret_keys: Vec<(String, Vec<u8>)> = Vec::new();
 
     for bag in &bags {
         let friendly = bag.friendly_name();
@@ -373,12 +447,75 @@ pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyS
                         .push((friendly, der.clone()));
                 }
             }
-            // SDSI certs and other-bag-kinds: nothing standard to do; skip.
+            p12::SafeBagKind::OtherBagKind(other) => {
+                // SunPKCS12 stores `SecretKeyEntry` values as a SecretBag
+                // wrapping an EncryptedPrivateKeyInfo.  p12 0.6 exposes that
+                // bag as an opaque OtherBag, so decode its standard inner
+                // structure here and retain the encoded secret-key bytes.
+                // Some producers encode the encrypted record directly;
+                // SunPKCS12 retains the SecretBag sequence and wraps that
+                // record in the `[0]` OCTET STRING payload.
+                let epki_der = if yasna::parse_ber(
+                    &other.bag_value,
+                    p12::EncryptedPrivateKeyInfo::parse,
+                )
+                .is_ok()
+                {
+                    Some(other.bag_value.clone())
+                } else {
+                        yasna::parse_ber(&other.bag_value, |r| {
+                            r.read_sequence(|r| {
+                                let _secret_type = r.next().read_oid()?;
+                                r.next()
+                                    .read_tagged(yasna::Tag::context(0), |r| r.read_bytes())
+                            })
+                        })
+                        .ok()
+                };
+                let secret = epki_der
+                    .as_deref()
+                    .and_then(|epki_der| {
+                        let encrypted =
+                            yasna::parse_ber(epki_der, p12::EncryptedPrivateKeyInfo::parse).ok()?;
+                        let legacy = encrypted.decrypt(password.as_ref());
+                        let pbes2 = if legacy.is_none() {
+                            decrypt_secret_pbes2(epki_der, password.as_ref())
+                        } else {
+                            None
+                        };
+                        legacy.or(pbes2)
+                    })
+                    .and_then(|secret_info| {
+                        yasna::parse_ber(&secret_info, |r| {
+                        r.read_sequence(|r| {
+                            let _version = r.next().read_u8()?;
+                            let _algorithm = p12::AlgorithmIdentifier::parse(r.next())?;
+                            r.next().read_bytes()
+                        })
+                    })
+                    .ok()
+                });
+                if let Some(key_bytes) = secret {
+                    let alias = friendly.unwrap_or_else(|| hex_lower(&local_id));
+                    secret_keys.push((alias, key_bytes));
+                }
+            }
             _ => {}
         }
     }
 
     let mut entries: HashMap<String, KeyStoreEntry> = HashMap::new();
+
+    for (alias, key_bytes) in secret_keys {
+        entries.insert(
+            alias.clone(),
+            KeyStoreEntry {
+                alias,
+                creation_time_ms: 0,
+                kind: EntryKind::SecretKey { key_bytes },
+            },
+        );
+    }
 
     // Pair keys with their cert chains.
     for (local_id, (key_friendly, key_der)) in keys_by_local_id {
@@ -605,11 +742,21 @@ fn write_jks(store: &LoadedKeyStore, password: &[u8]) -> Vec<u8> {
     let mut body: Vec<u8> = Vec::new();
     body.extend_from_slice(&JKS_MAGIC.to_be_bytes());
     body.extend_from_slice(&2u32.to_be_bytes()); // version 2
-    body.extend_from_slice(&(store.entries.len() as u32).to_be_bytes());
+    // JKS has no compatible representation for SecretKeyEntry.  Keep the
+    // entry available in memory, but omit it from this legacy wire format.
+    // (PKCS#12 callers are still loaded from their original SecretBag.)
+    let mut aliases: Vec<&String> = store
+        .entries
+        .iter()
+        .filter_map(|(alias, entry)| match &entry.kind {
+            EntryKind::SecretKey { .. } => None,
+            _ => Some(alias),
+        })
+        .collect();
+    aliases.sort_unstable();
+    body.extend_from_slice(&(aliases.len() as u32).to_be_bytes());
 
     // Deterministic alias order for stable, reproducible output.
-    let mut aliases: Vec<&String> = store.entries.keys().collect();
-    aliases.sort_unstable();
     for alias in aliases {
         let entry = &store.entries[alias];
         let ab = alias.as_bytes();
@@ -639,6 +786,7 @@ fn write_jks(store: &LoadedKeyStore, password: &[u8]) -> Vec<u8> {
                     body.extend_from_slice(c);
                 }
             }
+            EntryKind::SecretKey { .. } => unreachable!("secret keys are filtered above"),
         }
     }
     let mac = jks_password_mac(password, &body);
@@ -1258,6 +1406,7 @@ fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
             EntryKind::TrustedCert { cert_der } => {
                 trust_anchor_ders.push(cert_der.clone());
             }
+            EntryKind::SecretKey { .. } => {}
         }
     }
 
@@ -1320,6 +1469,20 @@ fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         let composite = ((id as i64 & 0xFFFF_FFFF) << 32) | (alias_hash as i64 & 0xFFFF_FFFF);
         ctx.set_field(pk, 3, Value::Long(composite));
         Ok(Some(Value::Object(Some(pk))))
+    } else if let EntryKind::SecretKey { key_bytes } = &entry.kind {
+        // Return the concrete mirror rather than the `SecretKey` interface:
+        // SmallRye asks `Key.getEncoded()`, whose real interface method has no
+        // code body. `SecretKeySpec` has registered accessors and preserves
+        // the raw key bytes in field 0.
+        let key = alloc_concurrent_synthetic(ctx, "javax/crypto/spec/SecretKeySpec", 2);
+        let bytes = ctx.new_array(cratonvm_types::ArrayElementType::Byte, key_bytes.len());
+        for (i, byte) in key_bytes.iter().enumerate() {
+            ctx.set_array_element(bytes, i, Value::Int(*byte as i8 as i32));
+        }
+        ctx.set_field(key, 0, Value::Object(Some(bytes)));
+        let algorithm = ctx.create_string("RAW");
+        ctx.set_field(key, 1, Value::Object(Some(algorithm)));
+        Ok(Some(Value::Object(Some(key))))
     } else {
         Ok(Some(Value::Object(None)))
     }
@@ -1346,6 +1509,7 @@ fn engine_get_certificate(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             Some(d) => d.clone(),
             None => return Ok(Some(Value::Object(None))),
         },
+        EntryKind::SecretKey { .. } => return Ok(Some(Value::Object(None))),
     };
 
     Ok(Some(Value::Object(Some(make_x509_mirror(
@@ -1371,6 +1535,7 @@ fn engine_get_certificate_chain(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let chain = match &entry.kind {
         EntryKind::PrivateKey { chain, .. } => chain.clone(),
         EntryKind::TrustedCert { .. } => return Ok(Some(Value::Object(None))),
+        EntryKind::SecretKey { .. } => return Ok(Some(Value::Object(None))),
     };
 
     let cls_id = match ctx.ensure_class_initialized("java/security/cert/X509Certificate") {
@@ -1440,7 +1605,7 @@ fn engine_is_key_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         .and_then(|s| {
             s.entries
                 .get(&alias)
-                .map(|e| matches!(e.kind, EntryKind::PrivateKey { .. }))
+                .map(|e| matches!(e.kind, EntryKind::PrivateKey { .. } | EntryKind::SecretKey { .. }))
         })
         .unwrap_or(false);
     Ok(Some(Value::Int(if yes { 1 } else { 0 })))
