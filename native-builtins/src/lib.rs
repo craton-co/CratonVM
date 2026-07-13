@@ -51683,64 +51683,6 @@ fn javac_platform_class_file_object(
     )
 }
 
-fn javac_platform_listing_classes(package_name: &str) -> &'static [&'static str] {
-    match package_name {
-        "java.lang" => &[
-            "java.lang.Object",
-            "java.lang.String",
-            "java.lang.Class",
-            "java.lang.Throwable",
-            "java.lang.Exception",
-            "java.lang.RuntimeException",
-            "java.lang.Error",
-            "java.lang.System",
-            "java.lang.Boolean",
-            "java.lang.Integer",
-            "java.lang.Long",
-            "java.lang.Void",
-            "java.lang.Iterable",
-            "java.lang.Enum",
-            "java.lang.Override",
-        ],
-        "java.util" => &[
-            "java.util.Objects",
-            "java.util.List",
-            "java.util.Collection",
-            "java.util.Iterator",
-            "java.util.Map",
-            "java.util.Set",
-            "java.util.ArrayList",
-            "java.util.Collections",
-            "java.util.Arrays",
-            "java.util.Optional",
-        ],
-        "java.util.function" => &[
-            "java.util.function.Supplier",
-            "java.util.function.Function",
-            "java.util.function.Consumer",
-            "java.util.function.Predicate",
-        ],
-        "java.lang.invoke" => &[
-            "java.lang.invoke.MethodHandle",
-            "java.lang.invoke.MethodHandles",
-            "java.lang.invoke.MethodType",
-            "java.lang.invoke.LambdaMetafactory",
-        ],
-        "java.lang.annotation" => &[
-            "java.lang.annotation.Annotation",
-            "java.lang.annotation.Retention",
-            "java.lang.annotation.Target",
-        ],
-        "java.io" => &[
-            "java.io.Serializable",
-            "java.io.IOException",
-            "java.io.InputStream",
-            "java.io.OutputStream",
-        ],
-        _ => &[],
-    }
-}
-
 fn native_javac_file_manager_list(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -51769,14 +51711,26 @@ fn native_javac_file_manager_list(
     {
         return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
     }
-    if location_name == "SYSTEM_MODULES[java.base]" {
-        let class_names = javac_platform_listing_classes(&package_name);
-        if !class_names.is_empty() {
+    if let Some(module_name) = location_name
+        .strip_prefix("SYSTEM_MODULES[")
+        .and_then(|name| name.strip_suffix(']'))
+    {
+        if let Some(java_home) = ctx.get_system_property("java.home") {
+            let recurse = matches!(args.get(4), Some(Value::Int(v)) if *v != 0);
+            let class_names = phases_late::jrtfs_list_class_binary_names(
+                &java_home,
+                module_name,
+                &package_name,
+                recurse,
+            );
+            if class_names.is_empty() {
+                return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
+            }
             let Some(kind_class) = javac_java_file_object_kind_class(ctx) else {
                 return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
             };
             let mut files = Vec::with_capacity(class_names.len());
-            for class_name in class_names {
+            for class_name in &class_names {
                 if let Some(Value::Object(Some(file))) = javac_platform_class_file_object(
                     ctx,
                     this,

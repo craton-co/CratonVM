@@ -2472,7 +2472,11 @@ impl SharedVm {
             jar.to_string()
         } else if !config.classpath.is_empty() {
             let sep = if cfg!(windows) { ";" } else { ":" };
-            config.classpath.join(sep)
+            // The Java launcher expands `dir/*` before publishing this
+            // property. Keep it aligned with the already-expanded loader
+            // view so javax.tools/javac can discover wildcard JARs from its
+            // default classpath (notably H2's dynamic CREATE ALIAS compiler).
+            crate::classloading::ClassPath::expand_classpath_entries(&config.classpath).join(sep)
         } else {
             std::env::var("CLASSPATH").unwrap_or_default()
         };
