@@ -5439,10 +5439,9 @@ pub(crate) fn native_string_init_from_char_array(
     let arr = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: None,
-            }
-            .into())
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
         }
     };
     let len = ctx.array_length(arr);
@@ -5471,10 +5470,9 @@ pub(crate) fn native_string_init_from_char_array_range(
     let arr = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: None,
-            }
-            .into())
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
         }
     };
     let offset = match args.get(2) {
