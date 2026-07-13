@@ -151,6 +151,28 @@ being invoked in `execute_invoke_kind`):
 - Not the `BasicFileAttributes` bug above (fixed, confirmed insufficient).
 - Not caught by `CRATONVM_DBG_STALE_OBJREF` (the existing hard-panic
   stale-native-ObjectRef assertion) — it never fired during a 90s repro.
+- **Not a JIT instance-method invocation-tierup gap.** A plausible-sounding
+  lead: CratonVM's invocation-count tier-up historically only fired for
+  `execute_invokestatic_cached`, leaving short-loop *instance* hot methods
+  (exactly what `Scope`/`Name`/`ClassReader` accessors are) permanently
+  interpreted unless OSR or JIT-callee-inlining reached them. **This gap was
+  already closed and made default-ON weeks before this investigation**
+  (`CRATONVM_JIT_VIRTUAL_TIERUP`, commit `948df81c`, "make instance-method
+  invocation tier-up (B) default-ON"; the one JIT codegen bug that used to
+  block it, a `Matcher.search` virtual-dispatch-bail miscompile, was
+  root-caused and its skip-list ban *removed* the same day — see
+  `vm/src/jit/skip_list.rs` around the "bug-03 layer C" comment). It was
+  therefore already active in every reproduction above. Verified directly
+  anyway on `AutowiredAnnotationBeanRegistrationAotContributionTests`,
+  same machine load, same 90s window, `CRATONVM_DBG_HANG_SAMPLE` sampling:
+  explicit `CRATONVM_JIT_VIRTUAL_TIERUP=1` (= default) reached ~1.2M
+  interpreter calls before timing out; `=0` (disabled) reached ~1.0M — a
+  ~20% difference, not the 100x+ effect that would indicate this is the
+  dominant bottleneck, and both runs still hit the full TIMEOUT. Both traces
+  show the same hot-method mix (`Name.isEmpty`/`hashCode`,
+  `CharacterDataLatin1.getProperties`, `ClientCodeWrapper.isTrusted`,
+  `StringBuilder.append`). Clean negative result: JIT tier-up policy is not
+  what's gating this hang.
 
 **Leading, unconfirmed hypothesis**: the sample's effective test classpath
 is unusually large for this kind of test (48 jars for `spring-beans`,
