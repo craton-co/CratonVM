@@ -1554,6 +1554,52 @@ fn process_references_after_gc(
             &is_marked,
             pointer_map,
         );
+        // Prune dead entries from the overlay-backed-collection side-tables
+        // (LinkedList / LinkedHashMap / TreeMap / TreeSet — `roots.rs` step 17
+        // / `native_collections::gc_scan_collection_overlay_roots`). This
+        // function existed but was never called from anywhere in the tree
+        // (confirmed: `gc_prune_dead_collection_overlays` had zero call
+        // sites) — a collection whose OWN object becomes genuinely
+        // unreachable left its registry entry (and every element it ever
+        // held) permanently behind, since nothing ever shrank these tables.
+        // Wiring this in is a real, independent, safe fix (verified: prunes
+        // ~1000/1470 stale entries per GC cycle in the Tomcat suite) with no
+        // change to rooting behavior — it only removes bookkeeping for
+        // collections `is_marked` already agrees are dead.
+        //
+        // NOTE: this does NOT fully close
+        // `docs/known-issues/tomcat-08-07/defaultinstancemanager-classunloading-count-mismatch.md`.
+        // `roots.rs` step 17 itself has a separate, deeper bug this session
+        // found but did not fix: `gc_scan_collection_overlay_roots` roots
+        // EVERY element of EVERY overlay-backed collection unconditionally,
+        // with no gate on whether the backing collection is reachable. A
+        // scratch `List<StackMapFrame>` the JDT compiler uses transiently
+        // during JSP compilation gets its elements force-rooted this way;
+        // forward-tracing from that illegitimate root walks back through the
+        // compiler's real field references into the evicted JSP's
+        // `JspServletWrapper` and its `ClassLoader`, keeping the whole
+        // cluster permanently, artificially reachable — confirmed via a
+        // root-membership closure check (21 direct hits, all contributed by
+        // step 17, not by any other root source). A full fix needs the same
+        // conditional-rooting + mark-time-propagation treatment this session
+        // gave `class_mirrors` (see `cratonvm_types::mirror_pin`), but scoped
+        // to every overlay table instead of just one cache — a materially
+        // larger, higher-risk change than fit in this session; left for a
+        // dedicated follow-up.
+        //
+        // Called here (not `update_all_roots`/gc.rs, where the existing
+        // remap call `gc_update_collection_overlay_refs` lives) for the same
+        // reason `reconcile_class_mirrors` is here and not there:
+        // `update_all_roots` early-returns when `pointer_map` is empty (the
+        // common case for the non-moving JIT-active sweep), so it would
+        // never run for that path. `is_marked` already handles PRE-GC
+        // addresses correctly for both the moving and non-moving cases
+        // (pointer_map lookup for moved survivors, `is_addr_live` for
+        // not-moved ones) — the same pattern `gc_reconcile_defining_loaders`
+        // above already relies on — so pruning here with pre-remap addresses
+        // is correct; the later `gc_update_collection_overlay_refs` remap
+        // pass in `update_all_roots` only touches whatever prune left behind.
+        cratonvm_native_collections::gc_prune_dead_collection_overlays(&is_marked);
         // Companion reconciliation for the class-mirror cache — see
         // `memory::gc::reconcile_class_mirrors` / `roots.rs` step 6. Same
         // "before the no_refproc short-circuit" rationale: the cache must
