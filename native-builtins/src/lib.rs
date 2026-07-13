@@ -2324,6 +2324,52 @@ fn native_mapper_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         message_bytes_set_string_object(ctx, host_mb, default_host_name);
     }
     native_message_bytes_to_chars(ctx, &[Value::Object(Some(host_mb))])?;
+
+    // Match Mapper.map()'s Java contract for a null URI. CoyoteAdapter
+    // deliberately recycles decodedURI after an early protocol error, then
+    // calls Mapper.map() only to identify the Host for error reporting. The
+    // Java implementation sets MappingData.host and returns before context
+    // / wrapper mapping. Mapping the null URI as an empty CharChunk instead
+    // selects the ROOT context and can emit its welcome-file redirect,
+    // overwriting the original protocol status (e.g. AJP's 403 secret
+    // rejection) with 302.
+    if ctx.get_field_by_name(uri_mb, "type").as_int().unwrap_or(0) == 0 {
+        let host_chunk = match ctx.get_field_by_name(host_mb, "charC") {
+            Value::Object(Some(o)) => o,
+            _ => return Ok(None),
+        };
+        let hosts = match ctx.get_field_by_name(this, "hosts") {
+            Value::Object(Some(o)) => o,
+            _ => return Ok(None),
+        };
+        let Some((host_buff, host_start, host_end)) = char_chunk_parts(ctx, host_chunk) else {
+            return Ok(None);
+        };
+        let mut mapped_host =
+            mapper_exact_find_chunk_range(ctx, hosts, host_chunk, host_start, host_end, true);
+        if mapped_host.is_none() {
+            let dot = (host_start..host_end)
+                .find(|&pos| char_chunk_char_at(ctx, host_buff, pos) == b'.' as u16);
+            if let Some(dot_pos) = dot {
+                mapped_host =
+                    mapper_exact_find_chunk_range(ctx, hosts, host_chunk, dot_pos, host_end, true);
+            }
+        }
+        if mapped_host.is_none() {
+            mapped_host = match ctx.get_field_by_name(this, "defaultHost") {
+                Value::Object(Some(o)) => Some(o),
+                _ => None,
+            };
+        }
+        if let Some(mapped_host) = mapped_host {
+            let host_object = match ctx.get_field_by_name(mapped_host, "object") {
+                Value::Object(o) => o,
+                _ => None,
+            };
+            ctx.set_field_by_name(mapping_data, "host", Value::Object(host_object));
+        }
+        return Ok(None);
+    }
     native_message_bytes_to_chars(ctx, &[Value::Object(Some(uri_mb))])?;
 
     let host_chunk = match ctx.get_field_by_name(host_mb, "charC") {

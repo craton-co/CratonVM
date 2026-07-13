@@ -1039,18 +1039,18 @@ it under `docs/internal`.
   `javax/net/SocketFactory.getDefault().createSocket(...)` call as
   `Http2TestBase`. Doc moved to
   [`abstractajpprocessor-socket-not-connected-FIXED.md`](../internal/tomcat-08-07/abstractajpprocessor-socket-not-connected-FIXED.md).
-  Fixing the whole-class failure uncovered two narrower, genuine, still-OPEN
-  residuals (HotSpot passes both):
-  [`ajp-testsecret-secret-attribute-not-enforced.md`](tomcat-08-07/ajp-testsecret-secret-attribute-not-enforced.md),
+  The AJP secret residual is now fixed and retired; see
+  [`ajp-testsecret-secret-attribute-not-enforced-FIXED.md`](../internal/tomcat-08-07/ajp-testsecret-secret-attribute-not-enforced-FIXED.md).
+  The one independently tracked remaining residual is
   [`ajp-testnoheaders-response-body-not-empty.md`](tomcat-08-07/ajp-testnoheaders-response-body-not-empty.md).
 
 ## How many distinct bugs are here?
 
 After consolidation (full re-count 2026-06-18, kafka-bug-B/C status reconciled 2026-07-01),
 the ~30 docs map to **one root-cause family + ~16 distinct standalone bugs**, of which
-**11 are already FIXED on `dev`** (the prior 10 plus the Fork6/FJP A4 root-reclamation bug). Headline:
+**12 are already FIXED on `dev`** (the prior 11 plus the AJP secret-rejection fix). Headline:
 
-**~7 distinct OPEN defects + 1 latent** (was ~8 - Fork6/FJP A4 was fixed 2026-07-09), grouped as:
+**~6 distinct OPEN defects + 1 latent** (was ~7 after the AJP secret-rejection fix), grouped as:
 
 1. **Family A - GC root coverage under JIT** (one root cause, several manifestations). Open members:
    none from the Fork6/FJP lane; **A1/A2/A3/A4/A5 are FIXED**. **A2**
