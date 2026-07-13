@@ -52034,11 +52034,21 @@ fn native_javac_file_manager_list(ctx: &mut dyn NativeContext, args: &[Value]) -
                 let Some(kind_class) = javac_java_file_object_kind_class(ctx) else {
                     return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
                 };
+                let kind_class_pin = match kind_class {
+                    Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+                    _ => None,
+                };
                 let kinds = match kinds_pin {
                     Some((pin, fallback)) => {
                         Value::Object(Some(ctx.read_native_pin(pin, fallback)))
                     }
                     None => kinds,
+                };
+                let kind_class = match kind_class_pin {
+                    Some((pin, fallback)) => {
+                        Value::Object(Some(ctx.read_native_pin(pin, fallback)))
+                    }
+                    None => kind_class,
                 };
                 let accepts_classes = match kinds {
                     Value::Object(Some(kinds_obj)) => matches!(
@@ -52072,6 +52082,12 @@ fn native_javac_file_manager_list(ctx: &mut dyn NativeContext, args: &[Value]) -
                             Value::Object(Some(ctx.read_native_pin(pin, fallback)))
                         }
                         None => location,
+                    };
+                    let kind_class = match kind_class_pin {
+                        Some((pin, fallback)) => {
+                            Value::Object(Some(ctx.read_native_pin(pin, fallback)))
+                        }
+                        None => kind_class,
                     };
                     if let Some(Value::Object(Some(file))) = javac_platform_class_file_object(
                         ctx,
