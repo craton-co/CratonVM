@@ -72925,7 +72925,17 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         if let Some(addr) = rwl_parent_addr(ctx, this) {
+            // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
+            // rw_read_lock's internal contended wait is a raw
+            // parking_lot::Condvar::wait with NO GC-blocking-region bracket
+            // and no Java-heap touch inside — a thread contending for this
+            // lock while a writer holds it stays counted in the STW
+            // barrier's `expected` forever (not in JIT, never reaches a
+            // safepoint), livelocking any cross-thread STW pause requested
+            // while it waits.
+            ctx.begin_blocking_region();
             crate::stamped_lock::rw_read_lock(addr, ctx.thread_id());
+            ctx.end_blocking_region();
         }
         Ok(None)
     });
@@ -72975,7 +72985,10 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         if let Some(addr) = rwl_parent_addr(ctx, this) {
+            // GC-blocking audit — see the plain `lock()` registration above.
+            ctx.begin_blocking_region();
             crate::stamped_lock::rw_read_lock(addr, ctx.thread_id());
+            ctx.end_blocking_region();
         }
         Ok(None)
     });
@@ -72988,7 +73001,19 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         if let Some(addr) = rwl_parent_addr(ctx, this) {
+            // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
+            // rw_write_lock's internal contended wait is a raw
+            // parking_lot::Condvar::wait with NO GC-blocking-region bracket
+            // and no Java-heap touch inside — see the read-lock `lock()`
+            // registration above for the full rationale. Confirmed via
+            // symbolicated cdb stacks: TestOrderInterceptor's stuck
+            // ForkJoinPool worker threads were parked exactly here, not in
+            // LockSupport.park (which IS correctly bracketed) — this was the
+            // actual root cause of the STW takeover livelock, not a
+            // ForkJoinPool/AQS-specific issue.
+            ctx.begin_blocking_region();
             crate::stamped_lock::rw_write_lock(addr, ctx.thread_id());
+            ctx.end_blocking_region();
         }
         Ok(None)
     });
@@ -73035,7 +73060,10 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         if let Some(addr) = rwl_parent_addr(ctx, this) {
+            // GC-blocking audit — see the plain `lock()` registration above.
+            ctx.begin_blocking_region();
             crate::stamped_lock::rw_write_lock(addr, ctx.thread_id());
+            ctx.end_blocking_region();
         }
         Ok(None)
     });
@@ -73305,7 +73333,14 @@ fn native_stamped_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         None => return Ok(Some(Value::Long(0))),
     };
     let addr = stamped_addr_for_obj(ctx, obj);
+    // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
+    // stamped_write_lock's contended wait is a raw parking_lot::Condvar::wait
+    // with NO GC-blocking-region bracket — same missing-bracket bug as
+    // ReentrantReadWriteLock's rw_write_lock (see that registration's
+    // comment for the full rationale and how this was diagnosed).
+    ctx.begin_blocking_region();
     let stamp = crate::stamped_lock::stamped_write_lock(addr);
+    ctx.end_blocking_region();
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(stamp)))
 }
@@ -73316,7 +73351,10 @@ fn native_stamped_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         None => return Ok(Some(Value::Long(0))),
     };
     let addr = stamped_addr_for_obj(ctx, obj);
+    // GC-blocking audit — see `native_stamped_write_lock` above.
+    ctx.begin_blocking_region();
     let stamp = crate::stamped_lock::stamped_read_lock(addr);
+    ctx.end_blocking_region();
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(stamp)))
 }
@@ -73348,7 +73386,10 @@ fn native_stamped_write_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) -
         return Ok(None);
     };
     let addr = stamped_addr_for_obj(ctx, parent);
+    // GC-blocking audit — see `native_stamped_write_lock` above.
+    ctx.begin_blocking_region();
     crate::stamped_lock::stamped_write_lock(addr);
+    ctx.end_blocking_region();
     mirror_stamped_state(ctx, parent, addr);
     Ok(None)
 }
@@ -73389,7 +73430,10 @@ fn native_stamped_read_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) ->
         return Ok(None);
     };
     let addr = stamped_addr_for_obj(ctx, parent);
+    // GC-blocking audit — see `native_stamped_write_lock` above.
+    ctx.begin_blocking_region();
     crate::stamped_lock::stamped_read_lock(addr);
+    ctx.end_blocking_region();
     mirror_stamped_state(ctx, parent, addr);
     Ok(None)
 }
