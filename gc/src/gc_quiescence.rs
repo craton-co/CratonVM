@@ -268,6 +268,54 @@ pub fn force_non_moving_jit_roots() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Explicit System.gc() full-collection request
+// ---------------------------------------------------------------------------
+//
+// Real HotSpot's `System.gc()` triggers a FULL (young + old generation)
+// collection by default (`-XX:+DisableExplicitGC` opts out; CratonVM has no
+// equivalent knob yet, so the default must match it). Without this,
+// `GenerationalHeap::collect_garbage_inner`'s Phase 5 only runs `major_gc`
+// when old gen crosses an occupancy threshold (75% full) — an object already
+// promoted to old gen that has genuinely become garbage (e.g. a per-JSP
+// `ClassLoader` Tomcat/Jasper has dropped every reference to after evicting a
+// JSP) is NEVER swept by a `System.gc()` call that only triggers a minor
+// collection, because `VmHeap::is_addr_live` treats EVERY old-gen address as
+// live during a minor cycle (old gen isn't touched at all this pass) — the
+// collector simply never gets a chance to prove it dead. Symptom:
+// `TestDefaultInstanceManager.testClassUnloading`'s off-by-one (an unloaded
+// JSP's `Class`/`ClassLoader`, once promoted, survives forever unless old gen
+// happens to independently cross the occupancy threshold on its own).
+//
+// `force_gc_from_native` (`System.gc()`'s native impl) sets this before
+// invoking the collector; Phase 5 in `gen_heap.rs` consults it via
+// `take_major_gc_request` (check-and-clear — consumed exactly once per
+// collection, so a later UNRELATED allocation-triggered minor GC doesn't also
+// get forced into a major cycle it didn't ask for).
+
+thread_local! {
+    static MAJOR_GC_REQUESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Request that the next collection on this thread run a full (major) cycle
+/// regardless of old-gen occupancy. Set by `System.gc()`'s native
+/// implementation (`force_gc_from_native`).
+pub fn request_major_gc() {
+    MAJOR_GC_REQUESTED.with(|c| c.set(true));
+}
+
+/// Check-and-clear: consumed exactly once by the collector's Phase 5 check,
+/// regardless of which branch of that check ends up true — so the request
+/// never leaks into a later, unrelated collection.
+#[inline]
+pub fn take_major_gc_request() -> bool {
+    MAJOR_GC_REQUESTED.with(|c| {
+        let v = c.get();
+        c.set(false);
+        v
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Stage B (precise oop maps, B-K fix) — movable precise-JIT roots
 // ---------------------------------------------------------------------------
 //

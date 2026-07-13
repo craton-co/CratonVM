@@ -266,6 +266,17 @@ pub enum RuntimeError {
     #[error("SocketTimeoutException: {message}")]
     SocketTimeoutException { message: String },
 
+    /// `java.net.ConnectException` — a connection attempt was actively
+    /// refused (or otherwise failed to establish) by the remote host. A
+    /// subclass of `SocketException`/`IOException`; must be thrown as the
+    /// concrete type because real code catches it specifically (e.g. ES
+    /// `RestClientMultipleHostsIntegTests.testNodeSelector` does
+    /// `catch (ConnectException e)` around a request to a stopped host — a
+    /// bare IOException whose message merely mentions "ConnectException"
+    /// escapes that catch and fails the test).
+    #[error("ConnectException: {message}")]
+    ConnectException { message: String },
+
     #[error("FileNotFoundException: {path}")]
     FileNotFoundException { path: String },
 
