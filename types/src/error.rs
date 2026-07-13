@@ -307,6 +307,11 @@ pub enum RuntimeError {
     #[error("BufferOverflowException")]
     BufferOverflowException,
 
+    /// `java.nio.ReadOnlyBufferException` — a mutating operation (`put`,
+    /// `compact`, `array()`) was attempted on a read-only buffer.
+    #[error("ReadOnlyBufferException")]
+    ReadOnlyBufferException,
+
     #[error("InputMismatchException: {message}")]
     InputMismatchException { message: String },
 

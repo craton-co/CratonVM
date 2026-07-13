@@ -13468,11 +13468,50 @@ pub(crate) fn native_class_get_class_loader(
 }
 
 pub(crate) fn native_class_as_subclass(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // Return this class
-    Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+    // `Class.asSubclass(clazz)` contract: return this Class object if it
+    // represents a subtype of `clazz`, otherwise throw ClassCastException.
+    // The previous implementation unconditionally returned `this`, which
+    // broke callers that USE the CCE for control flow — e.g. Lucene's
+    // `LuceneTestCase.newFSDirectory` relies on
+    // `CommandLineUtil.loadFSDirectoryClass(...)` throwing CCE for a
+    // non-FSDirectory `tests.directory` to fall back to a random
+    // FSDirectory; with the lenient version it proceeded to
+    // `getConstructor(Path.class, LockFactory.class)` on a directory class
+    // without that ctor and failed the test with an uncaught
+    // `NoSuchMethodException: <init>` (residual-doc item 5).
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    };
+    let target = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        // Null / missing target: keep the historic lenient return (the
+        // real JDK would NPE inside isAssignableFrom; some synthetic-mode
+        // callers pass no argument at all).
+        _ => return Ok(Some(Value::Object(Some(this)))),
+    };
+    let assignable = matches!(
+        native_class_is_assignable_from(
+            ctx,
+            &[Value::Object(Some(target)), Value::Object(Some(this))],
+        )?,
+        Some(Value::Int(v)) if v != 0
+    );
+    if assignable {
+        Ok(Some(Value::Object(Some(this))))
+    } else {
+        // HotSpot: `throw new ClassCastException(this.toString())`.
+        let name = mirror_class_name(ctx, this)
+            .unwrap_or_default()
+            .replace('/', ".");
+        Err(cratonvm_types::error::RuntimeError::ClassCastException {
+            message: format!("class {name}"),
+        }
+        .into())
+    }
 }
 
 pub(crate) fn native_class_descriptor_string(
