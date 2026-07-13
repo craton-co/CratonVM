@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN (12 genuinely hung, 10 slow-but-failing, 1 crash; 2 non-residual items removed). **2026-07-13 update**: 8 Bucket-1 + 3 Bucket-2 classes reconfirmed locally — one narrower bug fixed (`7ae137e4`), the hang itself still OPEN; see the 2026-07-13 section below. **2026-07-13 update #2**: `context.annotation.ImportSelectorTests`'s `StackOverflowError` root-caused — it is a Mockito `spy()` cross-hierarchy recursion, **unrelated to Spring's `ImportSelector` mechanism** (the original hypothesis below was wrong); still OPEN, see its own section. |
+| **Status** | OPEN (12 genuinely hung, 10 slow-but-failing, 1 crash; 2 non-residual items removed). **2026-07-13 update**: 8 Bucket-1 + 3 Bucket-2 classes reconfirmed locally — one narrower bug fixed (`7ae137e4`), the hang itself still OPEN; see the 2026-07-13 section below. **2026-07-13 update #2**: `context.annotation.ImportSelectorTests`'s `StackOverflowError` root-caused — it is a Mockito `spy()` cross-hierarchy recursion, **unrelated to Spring's `ImportSelector` mechanism** (the original hypothesis below was wrong); still OPEN, see its own section. **2026-07-13 update #3**: the 4 non-AOT, non-`ImportSelectorTests` Bucket-1 classes (`cache.jcache.JCacheEhCacheAnnotationTests`, `context.annotation.ComponentScanParserBeanDefinitionDefaultsTests`, `context.annotation.InitDestroyMethodLifecycleTests`, `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests`) **no longer hang** — reconfirmed clean on 2 independent runs each against a freshly-built `origin/dev` tip; see the dedicated section below. No new code was needed — all 4 were incidental beneficiaries of other unrelated fixes already on `dev`. |
 | **Discovered** | 2026-07-11, following up on the 25 classes that hit TIMEOUT in the
 125-class scoped rerun (dev `9948295e`, standard 120s timeout — see
 [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](../internal/CRATONVM-SPRING-GENUINE-BUGLIST-125.md)). |
@@ -459,15 +459,15 @@ entry. These are real hangs, not slow tests:
 - `beans.factory.annotation.AutowiredAnnotationBeanRegistrationAotContributionTests` — reconfirmed hung 2026-07-13, see below
 - `beans.factory.aot.BeanDefinitionMethodGeneratorTests` — reconfirmed hung 2026-07-13, see below
 - `beans.factory.aot.BeanRegistrationsAotContributionTests` — reconfirmed hung 2026-07-13, see below
-- `cache.jcache.JCacheEhCacheAnnotationTests`
+- `cache.jcache.JCacheEhCacheAnnotationTests` — **no longer hangs** as of 2026-07-13 (later session), passes cleanly (67/68, 1 pre-existing `@Disabled`); see the dedicated section below
 - `context.annotation.CommonAnnotationBeanRegistrationAotContributionTests` — **no longer hangs** as of 2026-07-13, now completes with a distinct residual (`VerifyError` + AOT codegen limitation), see below
-- `context.annotation.ComponentScanParserBeanDefinitionDefaultsTests`
+- `context.annotation.ComponentScanParserBeanDefinitionDefaultsTests` — **no longer hangs** as of 2026-07-13 (later session), passes cleanly (12/12); see the dedicated section below
 - `context.annotation.ConfigurationClassPostProcessorAotContributionTests` — reconfirmed hung 2026-07-13, see below
-- `context.annotation.InitDestroyMethodLifecycleTests`
+- `context.annotation.InitDestroyMethodLifecycleTests` — **no longer hangs** as of 2026-07-13 (later session), passes cleanly (11/11, including its 2 AOT/`TestCompiler` methods); see the dedicated section below
 - `context.aot.ApplicationContextAotGeneratorTests` — reconfirmed hung 2026-07-13, see below
 - `orm.jpa.support.PersistenceAnnotationBeanPostProcessorAotContributionTests` — **no longer hangs** as of 2026-07-13, now completes with a distinct residual (Mockito self-attach, already tracked elsewhere), see below
 - `test.context.aot.TestContextAotGeneratorIntegrationTests` — reconfirmed hung 2026-07-13, see below
-- `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests`
+- `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests` — **no longer hangs** as of 2026-07-13 (later session), passes cleanly (10/10) but slowly (~7 minutes, ~45x HotSpot); see the dedicated section below
 
 9 of these 12 are AOT bean-registration/code-generation classes (same cluster
 flagged in the `-125` doc's "AOT bean-registration TIMEOUT cluster"). See
@@ -477,6 +477,140 @@ parallel.ParallelExecutionSpringExtensionTests`), confirmed to share one
 root cause with the Bucket 2 `CompilationException` classes below, and the
 hang itself remains OPEN (one narrower, unrelated bug was found and fixed
 along the way).
+
+## 2026-07-13 (later session) — 4 non-AOT Bucket-1 classes: all 4 no longer hang, no code change needed
+
+Assigned scope: the 4 Bucket-1 classes that are neither part of the AOT
+bean-registration cluster above nor `ImportSelectorTests` — `cache.jcache.
+JCacheEhCacheAnnotationTests`, `context.annotation.
+ComponentScanParserBeanDefinitionDefaultsTests`, `context.annotation.
+InitDestroyMethodLifecycleTests`, and `test.context.junit.jupiter.parallel.
+ParallelExecutionSpringExtensionTests`. These four don't share an obvious
+naming pattern and were investigated as four independent hypotheses.
+
+**Setup**: Azure host `20.83.144.174`, fresh worktree
+`/data/data/wt-standalone-hangs-20260713` (`git worktree add` off
+`origin/dev`, fetched fresh at session start — tip `819ab93e`), `apps/`
+copied from `wt-osr-other516-20260708-2131` with all 25
+`build/cratonvm-testcp.txt` files' stale absolute paths rewritten to point at
+the new worktree (the exact trap this doc's "Methodology note" above warns
+about — caught and fixed before running anything). `cargo build --release`
+clean build (~4.5 min), binary copied to `cratonvm-standalone-hangs.bin`.
+Same methodology as the original investigation: `suite-run.sh`,
+`BATCH=1 BATCH_TO=1500 ONE_TO=1500 CRATONVM_DEFAULT_HEAP_MAX_MB=2048`.
+
+**Result: none of the 4 reproduce as hangs any more.** Each was run in
+isolation first, then all 4 together in one consolidated rerun as a second,
+independent confirmation — both rounds agree closely (times in seconds,
+well under the 1500s ceiling both times):
+
+| Class | Run 1 | Run 2 (confirm) | Result |
+|---|--:|--:|---|
+| `context.annotation.InitDestroyMethodLifecycleTests` | 51s (11/11) | 48s (11/11) | OK, all 11 tests incl. the 2 `TestCompiler`/AOT ones |
+| `cache.jcache.JCacheEhCacheAnnotationTests` | 229s (67/68) | 215s (67/68) | OK, 67 succeed / 1 pre-existing `@Disabled` / 0 fail |
+| `context.annotation.ComponentScanParserBeanDefinitionDefaultsTests` | 251s (12/12) | 236s (12/12) | OK, all pass |
+| `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests` | 485s (10/10) | 416s (10/10) | OK, all pass — slow (~7 min) but not hung |
+
+No Rust code changes were made or needed for any of the 4 — `git status` in
+the worktree confirmed zero tracked-file diffs. All four appear to be
+incidental beneficiaries of *other* unrelated fixes that landed on `dev`
+between whenever the original 2026-07-11 hang data was gathered and this
+session's fetch (`819ab93e`), the same pattern already seen above for
+`CommonAnnotationBeanRegistrationAotContributionTests` and
+`PersistenceAnnotationBeanPostProcessorAotContributionTests`. Per-class
+detail:
+
+- **`JCacheEhCacheAnnotationTests`**: a live gdb backtrace (`sudo gdb -p
+  <pid> -batch -ex 'thread apply all bt'`) taken ~90s into the run caught
+  the main-vm thread inside `gc_prune_dead_collection_overlays` /
+  `remove_overlay_owner_key` (`native-collections/src/lib.rs`) during a
+  routine `maybe_gc()` pass — the collection-overlay side-table pruning
+  mechanism. `git log origin/dev --oneline` shows commit `acbea991`
+  ("fix(gc): propagate collection overlays from live owners", merged via
+  `75f11d95`) as an ancestor of this session's build tip. That fix (a
+  different session's work, already on `dev` before this session started)
+  is the most likely explanation: the test no longer needed the ~50+ minute
+  double-timeout window the original 2026-07-11 data recorded, and instead
+  completes normally in well under 4 minutes.
+- **`ComponentScanParserBeanDefinitionDefaultsTests`**: its two XML fixtures
+  (`defaultWithNoOverridesTests.xml`, `defaultLazyInitTrueTests.xml`) both
+  contain a real `<context:component-scan base-package="org.springframework.
+  context.annotation" .../>`, so this class does real classpath/directory
+  scanning via Spring's `ClassPathScanningCandidateComponentProvider`
+  (contrary to what its 12 individually-simple test bodies would suggest).
+  That scanning path depends on `Files.walkFileTree`/`BasicFileAttributes`
+  correctness for directory traversal — exactly the mechanism fixed for an
+  unrelated reason in commit `7ae137e4` ("Files.walkFileTree visitor
+  callbacks get a real BasicFileAttributes", landed 2026-07-13, also an
+  ancestor of this session's build tip), which specifically called out that
+  the previous zero-field placeholder made `isDirectory()` return a raw,
+  wrong `Value::Object(None)` for a `()Z`-descriptor method. A directory
+  walker silently getting `isDirectory()` wrong is exactly the kind of bug
+  that could make a classpath scan do drastically more (or repeated/
+  incorrect) work. Plausible root cause, not proven by a before/after diff
+  (the "before" binary wasn't rebuilt to confirm) — flagged as the leading
+  hypothesis rather than a certainty.
+- **`InitDestroyMethodLifecycleTests`**: only 2 of its 11 test methods use
+  the in-memory-javac `TestCompiler`/AOT pipeline (the same machinery as the
+  still-OPEN 9-class AOT hang cluster documented above); the other 9 are
+  plain bean-factory/lifecycle tests with no AOT involvement. A priori this
+  looked likely to inherit the AOT cluster's still-open hang. It did not:
+  the whole class, including both AOT methods, completes in well under a
+  minute. The likely explanation is scale, not a different mechanism — this
+  class's AOT-generated surface is a single small bean
+  (`CustomAnnotatedPrivateSameNameInitDestroyBean`/
+  `SubPackagePrivateInitDestroyBean`) compiled against `spring-context`'s
+  own test classpath, not the ~48-jar classpath (`kotlin-stdlib`,
+  `kotlin-reflect`, `groovy`, `mockito`, `reactor`, ...) that the AOT
+  cluster's own doc section above identifies as the likely disproportionate-
+  cost trigger. Consistent with, not contradicting, that cluster's "still
+  OPEN" status — this class's AOT workload was just never large enough to
+  hit it.
+- **`ParallelExecutionSpringExtensionTests`**: flagged going in as the class
+  most likely to expose a CratonVM-specific JUnit-parallel/`ForkJoinPool`
+  gap. It is genuinely slow — ~7 minutes for 10 outer `@RepeatedTest`
+  iterations × 1000 inner `@RepeatedTest` sub-tests
+  (`Constants.PARALLEL_EXECUTION_ENABLED_PROPERTY_NAME=true`,
+  `PARALLEL_CONFIG_DYNAMIC_FACTOR_PROPERTY_NAME=10`,
+  `PARALLEL_CONFIG_EXECUTOR_SERVICE_PROPERTY_NAME=WORKER_THREAD_POOL`) — but
+  it is not hung; it completes and passes both times, matching the ~513s
+  figure from the prior `2ba4aae9` ("Fix Spring JUnit parallel residual")
+  investigation on 2026-07-08 almost exactly. Live gdb snapshots (`thread
+  apply all bt`) confirmed real OS worker threads exist (`junit-5-worker-`,
+  `junit-6-worker-`, named per JUnit's own convention) doing genuine
+  interpreted/JIT work (one seen mid-`LockSupport.park()`, one mid first-
+  call JIT-eligibility classification in `jit_invoke_targets_native_shadow`/
+  `find_method_recursive`) — not deadlocked, not spinning in a tight loop.
+  `git log --all --oneline --grep=ForkJoin -i` and `--grep=parallel -i` were
+  searched per the task brief's suggestion; no dedicated native fast path
+  for `ForkJoinPool` itself was found (it runs as ordinary interpreted
+  bytecode over CratonVM's thread primitives), and the existing
+  ForkJoin-adjacent fixes on `dev` (`ae574d8f`/`c9da1f68`/`ebc4bb85`
+  "gcstress residual forkjoin fix", `743da7b1`/`ce258204` "Phaser/ForkJoinPool
+  hang" fix) address narrower, different mechanisms (GC-stress root
+  stability and a `CompletableFuture.runAsync` exception-swallowing hang,
+  respectively), not general worker-pool throughput. This class's ~45x
+  slowdown vs. HotSpot is a real, already-known, unresolved performance gap
+  (see `2ba4aae9`'s own history) — but at current dev tip it finishes inside
+  the 1500s ceiling with a comfortable margin (~3.6x on the faster of the
+  two runs), so it is reclassified out of Bucket 1 rather than treated as an
+  open hang. If a future session sees it exceed 1500s again, suspect either
+  host contention (this is a shared, busy machine) or an actual regression,
+  and re-open.
+
+**Why the original 2026-07-11 data showed `found=0/succ=0/fail=0` at the
+full ceiling for all 4**: not established with certainty for any of the
+four. The likely explanation for 3 of the 4 (`JCacheEhCacheAnnotationTests`,
+`ComponentScanParserBeanDefinitionDefaultsTests`,
+`InitDestroyMethodLifecycleTests` — all of which now finish in under 5
+minutes, nowhere near the 1500s ceiling even loaded) is a genuine bug fixed
+by later, unrelated `dev` work (`acbea991`/`7ae137e4` are the leading
+candidates, per-class above). `ParallelExecutionSpringExtensionTests` is the
+closest call — its ~7 minute runtime combined with a busier/more-contended
+host at the time of the original 25-class batch run could plausibly have
+pushed it over 1500s without any code-level hang at all; it may never have
+been a genuine infinite hang, just a very slow test caught by a shared,
+loaded host.
 
 ## Bucket 2 — Slow but completes (10 unresolved)
 
