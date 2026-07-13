@@ -3478,7 +3478,12 @@ thread_local! {
 unsafe fn jit_typecheck_resolve(
     vm: &SharedVm,
     obj_class_id: ClassId,
-    obj_ref: ObjectRef,
+    // GC-SAFETY (FMT-JIT-CCE): taken `&mut` so the slow path below can
+    // refresh the caller's copy after a GC-triggering class load — see the
+    // comment on that branch. Every read of `*obj_ref` in this function
+    // after that point observes the refreshed address; `jit_checkcast`'s
+    // caller reads it back too so its own return value isn't stale.
+    obj_ref: &mut ObjectRef,
     class_name: &str,
     // SBR-03: `checkcast` is lenient (preserve native `Object[]`→`T[]` casts),
     // `instanceof` is strict (a genuine `Object[]` is not an instance of `I[]`).
@@ -3499,8 +3504,8 @@ unsafe fn jit_typecheck_resolve(
     // the JIT'd lambda body because `checkcast [I` after the clone() return
     // hit the false branch below and zeroed the result. With this branch
     // in place, the cast succeeds and the array round-trips correctly.
-    if vm.heap.kind_of(obj_ref) == cratonvm_types::ObjectKind::Array {
-        if let Some(src_desc) = crate::runtime::interpreter::array_descriptor_of(vm, obj_ref) {
+    if vm.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array {
+        if let Some(src_desc) = crate::runtime::interpreter::array_descriptor_of(vm, *obj_ref) {
             let assignable = if lenient {
                 crate::runtime::interpreter::array_is_assignable_to(vm, &src_desc, class_name)
             } else {
@@ -3569,7 +3574,50 @@ unsafe fn jit_typecheck_resolve(
         // matching what HotSpot does for unresolvable targets in instanceof
         // (instanceof on an unresolvable target returns false; checkcast
         // would have been linked earlier and is a different failure mode).
-        if let Ok(target_class_id) = vm.load_class_concurrent(class_name) {
+        //
+        // GC-SAFETY (FMT-JIT-CCE): `load_class_concurrent` parses/defines the
+        // target class — allocating its `Class` mirror, constant-pool
+        // strings, and method/field metadata, and potentially running a
+        // user classloader's `loadClass`/`findClass` bytecode — any of which
+        // can trigger a moving GC that relocates `*obj_ref`. Unlike the
+        // interpreter's `Checkcast` handler (which pins the receiver in
+        // `thread.native_pin_roots` around this exact class-resolution call
+        // — see `runtime/interpreter.rs`), this JIT helper used to carry
+        // `obj_ref` across the call unpinned and unrefreshed, so a GC landing
+        // here left every later use of `*obj_ref` — the fallback checks
+        // below, and critically `jit_checkcast`'s own returned pointer —
+        // pointing at memory the collector had already reused. Observed live
+        // as `ClassCastException: java.lang.Object cannot be cast to
+        // org.jboss.as.controller.AttributeDefinition` (and other targets)
+        // during WildFly's highly concurrent `parallel-extension-add` boot
+        // step, where ~30 extension threads allocate/classload
+        // simultaneously and a target interface like `AttributeDefinition`
+        // is commonly resolved here for the first time under heavy GC
+        // pressure. Pin `*obj_ref` in the current thread's
+        // `native_pin_roots` (same mechanism, same pattern) across the call
+        // and refresh it from the pin afterward.
+        let current_thread = jit_get_current_thread();
+        // Explicit `&mut *current_thread` reborrows (rather than letting
+        // `.push()`/indexing implicitly autoref the raw pointer) — each is
+        // scoped to a single statement and dropped well before
+        // `load_class_concurrent` runs, so there's no borrow held across
+        // that call (which may itself reborrow the same TLS thread pointer,
+        // e.g. while running a classloader's bytecode).
+        let pin_idx = if !current_thread.is_null() {
+            let thread_ref: &mut JvmThread = &mut *current_thread;
+            let idx = thread_ref.native_pin_roots.len();
+            thread_ref.native_pin_roots.push(*obj_ref);
+            Some(idx)
+        } else {
+            None
+        };
+        let load_result = vm.load_class_concurrent(class_name);
+        if let Some(idx) = pin_idx {
+            let thread_ref: &mut JvmThread = &mut *current_thread;
+            *obj_ref = thread_ref.native_pin_roots[idx];
+            thread_ref.native_pin_roots.truncate(idx);
+        }
+        if let Ok(target_class_id) = load_result {
             JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
                 cache.set(Some((
                     cache_key.0,
@@ -3604,8 +3652,10 @@ unsafe fn jit_typecheck_resolve(
         return true;
     }
     // Instance-aware annotation-proxy admission (the proxy's real annotation
-    // type lives on the heap object, not its shared ClassId).
-    if crate::runtime::interpreter::annotation_proxy_satisfies_target(vm, obj_ref, class_name) {
+    // type lives on the heap object, not its shared ClassId). Reads
+    // `*obj_ref`, which by this point reflects the refresh above if the slow
+    // path ran.
+    if crate::runtime::interpreter::annotation_proxy_satisfies_target(vm, *obj_ref, class_name) {
         return true;
     }
 
@@ -3624,7 +3674,7 @@ unsafe fn jit_typecheck_resolve(
     // ScannerTest / PackagedEntityManagerTest / SimpleTests). Gating the strict
     // path on the element kind fixes it. The lenient (`checkcast`) leniency is
     // preserved unchanged (SBR-03 keeps native `Object[]`→`T[]` casts working).
-    if vm.heap.kind_of(obj_ref) == cratonvm_types::ObjectKind::Array {
+    if vm.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array {
         if class_name == "java/lang/Object"
             || class_name == "java/io/Serializable"
             || class_name == "java/lang/Cloneable"
@@ -3632,13 +3682,12 @@ unsafe fn jit_typecheck_resolve(
             return true;
         }
         if class_name == "[Ljava/lang/Object;"
-            && (lenient || vm.heap.element_type_of(obj_ref) == ArrayElementType::Reference)
+            && (lenient || vm.heap.element_type_of(*obj_ref) == ArrayElementType::Reference)
         {
             return true;
         }
     }
 
-    let _ = obj_ref;
     false
 }
 
@@ -3673,7 +3722,7 @@ pub unsafe extern "C" fn jit_checkcast(
     }
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
-    let obj_ref = match vm.heap.is_object_address(obj_ptr as usize) {
+    let mut obj_ref = match vm.heap.is_object_address(obj_ptr as usize) {
         Some(r) => r,
         None => return 0,
     };
@@ -3688,8 +3737,19 @@ pub unsafe extern "C" fn jit_checkcast(
     };
     let obj_class_id = vm.heap.class_id_of(obj_ref);
     // checkcast: lenient (SBR-03).
-    if jit_typecheck_resolve(vm, obj_class_id, obj_ref, class_name, true) {
-        obj_ptr
+    //
+    // GC-SAFETY (FMT-JIT-CCE): `jit_typecheck_resolve` can trigger a moving
+    // GC (via `load_class_concurrent` on a not-yet-loaded target) that
+    // relocates `obj_ref`; it refreshes our local `obj_ref` in place through
+    // the `&mut` when that happens. Return the (possibly refreshed)
+    // `obj_ref.as_ptr()` on success, NOT the original `obj_ptr` argument —
+    // returning the stale `obj_ptr` would hand the JIT-compiled caller a
+    // dangling pointer into memory the collector already reused, which is
+    // exactly what surfaced as `ClassCastException: java.lang.Object cannot
+    // be cast to org.jboss.as.controller.AttributeDefinition` (and other
+    // targets) during WildFly's concurrent `parallel-extension-add` boot.
+    if jit_typecheck_resolve(vm, obj_class_id, &mut obj_ref, class_name, true) {
+        obj_ref.as_ptr() as i64
     } else {
         0
     }
@@ -3740,7 +3800,7 @@ pub unsafe extern "C" fn jit_instanceof(
     // dereferencing it, degrading a dangling reference to "not an
     // instance" instead of crashing — the same fallback every other stale-
     // reference guard in this codebase uses.
-    let obj_ref = match vm.heap.is_object_address(obj_ptr as usize) {
+    let mut obj_ref = match vm.heap.is_object_address(obj_ptr as usize) {
         Some(r) => r,
         None => return 0,
     };
@@ -3754,8 +3814,13 @@ pub unsafe extern "C" fn jit_instanceof(
         Err(_) => return 0,
     };
     let obj_class_id = vm.heap.class_id_of(obj_ref);
-    // instanceof: strict (SBR-03).
-    if jit_typecheck_resolve(vm, obj_class_id, obj_ref, class_name, false) {
+    // instanceof: strict (SBR-03). `obj_ref` is passed `&mut` — see the
+    // GC-SAFETY comment in `jit_checkcast` — so any GC triggered by
+    // resolving a not-yet-loaded target class inside `jit_typecheck_resolve`
+    // doesn't leave the fallback checks in that function reading through a
+    // stale pointer. `instanceof` returns a bool, not a pointer, so there is
+    // no analogous stale-return-value fix needed here.
+    if jit_typecheck_resolve(vm, obj_class_id, &mut obj_ref, class_name, false) {
         1
     } else {
         0

@@ -39357,89 +39357,30 @@ fn lucene_buffered_checksum_update_longs(
     Ok(None)
 }
 
-fn lucene_crc32_step(mut crc: u32, data: &[u8]) -> u32 {
-    for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            let mask = 0u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
-    }
-    crc
-}
-
-fn lucene_crc32_update_public(public_crc: u32, data: &[u8]) -> u32 {
-    !lucene_crc32_step(!public_crc, data)
-}
-
 fn lucene_buffered_checksum_index_input_get_checksum(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // Mirror the real Lucene bytecode exactly: `return digest.getValue();`.
+    //
+    // The previous implementation, whenever the input's read position was
+    // within 8 bytes of EOF, RE-READ the file and recomputed a CRC over
+    // `length - 8` bytes (a workaround for a since-fixed broken digest
+    // path, shaped around CodecUtil's footer idiom where getChecksum() is
+    // called at exactly length-8). That heuristic returned the WRONG value
+    // for every other caller shape — e.g. a caller that reads the entire
+    // file through openChecksumInput() got CRC(file[0..len-8]) instead of
+    // CRC(everything read), diverging from HotSpot on identical bytes
+    // (docs/internal/fixed-suite-bugs/s2-bytebuffer-natives-real-jdk-direct-buffer-gaps-FIXED.md
+    // item 4, ProbeNIOFS2: 170114997 vs 2329538857) — and silently re-read
+    // the whole file on every near-EOF getChecksum() call. The digest path
+    // (BufferedChecksum over java.util.zip.CRC32) is verified correct, so
+    // just return it.
     let this = obj_arg(args, 0)?;
-    let main = match ctx.get_field_by_name(this, "main") {
-        Value::Object(Some(main)) => main,
-        _ => return Ok(Some(Value::Long(0))),
-    };
-    let main_length = match ctx.invoke_virtual(main, "length", "()J", &[])? {
-        Some(Value::Long(v)) => v,
-        Some(Value::Int(v)) => v as i64,
-        _ => 0,
-    };
-    let main_position = match ctx.invoke_virtual(main, "getFilePointer", "()J", &[])? {
-        Some(Value::Long(v)) => v,
-        Some(Value::Int(v)) => v as i64,
-        _ => 0,
-    };
-    if main_length <= 8 || main_position < main_length - 8 {
-        return match ctx.get_field_by_name(this, "digest") {
-            Value::Object(Some(digest)) => ctx.invoke_virtual(digest, "getValue", "()J", &[]),
-            _ => Ok(Some(Value::Long(0))),
-        };
+    match ctx.get_field_by_name(this, "digest") {
+        Value::Object(Some(digest)) => ctx.invoke_virtual(digest, "getValue", "()J", &[]),
+        _ => Ok(Some(Value::Long(0))),
     }
-    let input0 =
-        match ctx.invoke_virtual(main, "clone", "()Lorg/apache/lucene/store/IndexInput;", &[])? {
-            Some(Value::Object(Some(clone))) => clone,
-            _ => main,
-        };
-    let input_pin = ctx.pin_native_root(input0);
-    let result: MethodCallResult = (|| {
-        let mut input = ctx.read_native_pin(input_pin, input0);
-        ctx.invoke_virtual(input, "seek", "(J)V", &[Value::Long(0)])?;
-        input = ctx.read_native_pin(input_pin, input);
-
-        let chunk_len = 8192usize;
-        let chunk = ctx.new_array(cratonvm_types::ArrayElementType::Byte, chunk_len);
-        let chunk_pin = ctx.pin_native_root(chunk);
-        let mut remaining = main_length - 8;
-        let mut crc = 0u32;
-        while remaining > 0 {
-            input = ctx.read_native_pin(input_pin, input);
-            let chunk = ctx.read_native_pin(chunk_pin, chunk);
-            let want = remaining.min(chunk_len as i64) as usize;
-            ctx.invoke_virtual(
-                input,
-                "readBytes",
-                "([BII)V",
-                &[
-                    Value::Object(Some(chunk)),
-                    Value::Int(0),
-                    Value::Int(want as i32),
-                ],
-            )?;
-            let chunk = ctx.read_native_pin(chunk_pin, chunk);
-            let mut bytes = vec![0u8; want];
-            let copied = ctx.read_byte_array_into(chunk, 0, &mut bytes);
-            if copied != want {
-                break;
-            }
-            crc = lucene_crc32_update_public(crc, &bytes);
-            remaining -= want as i64;
-        }
-        Ok(Some(Value::Long((crc as u64 & 0xffff_ffff) as i64)))
-    })();
-    ctx.unpin_native_roots(input_pin);
-    result
 }
 
 pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {

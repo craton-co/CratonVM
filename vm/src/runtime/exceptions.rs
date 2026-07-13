@@ -1418,6 +1418,7 @@ pub fn throw_runtime_error(
         }
         RuntimeError::BufferUnderflowException => ("java/nio/BufferUnderflowException", None),
         RuntimeError::BufferOverflowException => ("java/nio/BufferOverflowException", None),
+        RuntimeError::ReadOnlyBufferException => ("java/nio/ReadOnlyBufferException", None),
         RuntimeError::InputMismatchException { message } => {
             ("java/util/InputMismatchException", Some(message.as_str()))
         }
