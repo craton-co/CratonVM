@@ -15672,6 +15672,13 @@ fn invoke_on_class_shared_inner(
                 method_name,
                 descriptor,
             );
+        let force_interface_default_native =
+            crate::runtime::interpreter::should_force_registered_native_over_bytecode(
+                shared,
+                &class_name_for_override,
+                method_name,
+                descriptor,
+            );
         let override_cb = if declaring_is_interface
             && !is_static
             && !force_ffm_value_layout_interface_native
@@ -15679,6 +15686,7 @@ fn invoke_on_class_shared_inner(
             && !force_ffm_symbol_lookup_interface_native
             && !force_ffm_group_layout_interface_native
             && !force_ffm_memory_layout_interface_native
+            && !force_interface_default_native
         {
             None
         } else if crate::runtime::interpreter::synthetic_stub_should_yield_to_real_bytecode(

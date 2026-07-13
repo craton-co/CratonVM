@@ -20575,6 +20575,12 @@ pub(crate) fn is_class_mirror_native_override(
                     "getDeclaredAnnotationsByType",
                     "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;"
                 )
+                | ("getDeclaredFields", "()[Ljava/lang/reflect/Field;")
+                | ("getDeclaredFields0", "(Z)[Ljava/lang/reflect/Field;")
+                | (
+                    "getDeclaredField",
+                    "(Ljava/lang/String;)Ljava/lang/reflect/Field;"
+                )
         )
 }
 
@@ -22382,6 +22388,42 @@ fn force_native_over_real_jdk_bytecode(
 ) -> bool {
     hotpath_counts::bump(&hotpath_counts::FORCE_NATIVE_CALLS);
     if is_class_mirror_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // The real Collections.emptyList() returns the class's pre-built static
+    // singleton. During the Brave bootstrap that slot can retain a polluted
+    // ArrayList, so use the registered constructor-backed empty-list native
+    // instead of exposing that stale shared state.
+    if class_name == "java/util/Collections"
+        && method_name == "emptyList"
+        && method_descriptor == "()Ljava/util/List;"
+    {
+        return true;
+    }
+    if class_name == "java/util/function/Predicate"
+        && matches!(
+            (method_name, method_descriptor),
+            ("and", "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;")
+                | ("or", "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;")
+                | ("negate", "()Ljava/util/function/Predicate;")
+                | ("not", "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;")
+        )
+    {
+        return true;
+    }
+    // The real DecimalFormatSymbols factories enter CLDR's locale bootstrap.
+    // During the early Spring/JUnit summary path that bootstrap can observe a
+    // stale Collections empty-list slot, producing a type-correct but wrong
+    // List element.  The registered locale native constructs the same DFS
+    // instance without that provider walk; force it over the concrete JDK
+    // bytecode on every interpreter dispatch path.
+    if class_name == "java/text/DecimalFormatSymbols"
+        && matches!(
+            (method_name, method_descriptor),
+            ("initialize", "(Ljava/util/Locale;)V")
+                | ("getInstance", "(Ljava/util/Locale;)Ljava/text/DecimalFormatSymbols;")
+        )
+    {
         return true;
     }
     // Base64 encoders are represented by VM-side synthetic state.  The real
@@ -24719,7 +24761,15 @@ fn try_stackless_invoke(
     // Reflection-metadata natives stay authoritative (see
     // `redefine_immune_reflection_native`) — a Mockito inline mock of
     // `java.lang.reflect.Method` must not disable annotation reflection.
-    if !(declaring_is_interface && !is_static)
+    let force_interface_default_native = declaring_is_interface
+        && !is_static
+        && should_force_registered_native_over_bytecode(
+            shared,
+            &class_name_arc,
+            method_name,
+            descriptor,
+        );
+    if (!(declaring_is_interface && !is_static) || force_interface_default_native)
         && (!native_shadow_suppressed_by_redefine(shared, &class_name_arc)
             || redefine_immune_forced_native(&class_name_arc, method_name, descriptor))
     {

@@ -37536,6 +37536,11 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // identity/return-this no-ops are available without the JIT/interpreter
     // having to resolve the override on the receiver's pipeline class.
     crate::streams::register_stream_overrides(registry);
+    // Predicate's compositional defaults are invokedynamic captures in the
+    // real JDK. Register the GC-visible bridge implementations in real-JDK
+    // mode as well so field-filter composition does not retain a stale capture
+    // receiver through JUnit cleanup.
+    crate::phases_late::register_phase56_function_extras(registry);
 
     // Spring XML namespace parsing: preserve validation and namespace-aware
     // parsing, but attach a VM-wide Xerces grammar pool so repeated
