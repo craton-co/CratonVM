@@ -32,7 +32,7 @@ correct JVM.
 - [hib-misc-singleton-failures.md](hib-misc-singleton-failures.md) — ~12 classes across several small independent clusters (`InvalidMappingException` XML-mapping parse, `SyntaxException` HQL boolean-negation, `SQLGrammarException` x2 including a possible in-process-javac regression, `UnknownNamedQueryException`, `CannotContainSubGraphException`, `FailureExpectedExtension$ExpectedFailureDidNotFail` — the latter is not a defect). The four serialization EOF residuals are fixed and archived with the related connection/proxy cluster.
 - [hib-generic-timeout-hang-longtail.md](hib-generic-timeout-hang-longtail.md) — 61 scattered HANG classes not in the two dedicated hang clusters. Likely a mix of genuine slowness and host-load artifacts; this session has repeatedly observed several of these flip between PASS/FAIL/HANG/CRASH across reruns — not individually triaged, needs a quiet-host recheck.
 - [hib-assertionfailederror-longtail-triage.md](hib-assertionfailederror-longtail-triage.md) — 110 scattered `AssertionFailedError`/`AssertionError` classes remaining after every other cluster was pulled out; catalogs visible sub-patterns (`InstantiationException` ×6, `sql.exec.*` ×9-11, likely-stats-cluster ×~15, generic-timeout ×13, `jpa.schemagen.*` ×4) but not individually root-caused.
-- [hib-notests-abstract-baseclass-list.md](hib-notests-abstract-baseclass-list.md) — 91 classes, NOT a bug (abstract base classes with 0 discoverable tests, matches HotSpot).
+- [hib-notests-abstract-baseclass-list.md](../../internal/hib-notests-abstract-baseclass-list.md) — 91 classes, NOT a bug (abstract base classes with 0 discoverable tests, matches HotSpot).
 
 ## Already tracked elsewhere (not re-documented here)
 
