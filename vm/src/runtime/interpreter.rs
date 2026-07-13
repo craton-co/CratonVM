@@ -943,6 +943,21 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                         let (n, blocked, tids, blocked_tids) =
                             shared.thread_registry.alive_count_blocked_and_os_tids();
                         counted_os_tids = tids;
+                        // DIAGNOSTIC (2026-07-13, STW takeover 5-class cluster
+                        // investigation): print the EXACT identity set counted
+                        // as "expected" (alive AND NOT in_blocked_region) at
+                        // the instant this pause is requested, to disambiguate
+                        // whether a thread later seen parked was already
+                        // excluded at request time or genuinely raced in.
+                        if std::env::var_os("CRATONVM_DBG_STW_EXPECTED_IDS").is_some() {
+                            let expected_ids: Vec<u64> = shared
+                                .thread_registry
+                                .alive_thread_ids_excluding(&blocked_tids);
+                            eprintln!(
+                                "[stw-expected] initiator={} n={} blocked={} expected_ids={:?}",
+                                thread.thread_id.0, n, blocked, expected_ids
+                            );
+                        }
                         (
                             u32::try_from(n).unwrap_or(u32::MAX),
                             u32::try_from(blocked).unwrap_or(u32::MAX),

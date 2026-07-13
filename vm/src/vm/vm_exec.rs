@@ -6469,6 +6469,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // emits its current frames — no per-park snapshot cost needed.
         {
             let blk = self.shared.gc_barrier.enter_blocked();
+            // DIAGNOSTIC (2026-07-13, STW takeover 5-class cluster
+            // investigation): correlate against [stw-expected]'s identity
+            // list to see whether this thread's park() call landed before
+            // or after the pause was requested, and whether pre_stw-gated
+            // arrival actually fires.
+            if std::env::var_os("CRATONVM_DBG_STW_EXPECTED_IDS").is_some() {
+                eprintln!(
+                    "[stw-park] tid={} pre_stw={}",
+                    self.thread.thread_id.0, blk.pre_stw
+                );
+            }
             if blk.pre_stw {
                 // GCAUDIT-0711-FIX (finding 1a): `_auto` — the deposit above
                 // already raised `in_blocked_region` before this check.
