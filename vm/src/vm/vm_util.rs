@@ -2219,7 +2219,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 "ARRAY_DOUBLE_BASE_OFFSET",
                 "ARRAY_OBJECT_BASE_OFFSET",
             ] {
-                n += set_static_by_name(name, Value::Long(16)) as i32;
+                n += set_static_by_name(name, Value::Int(16)) as i32;
             }
             for (name, scale) in [
                 ("ARRAY_BOOLEAN_INDEX_SCALE", 1),

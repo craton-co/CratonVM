@@ -1255,146 +1255,7 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(-1)))
         });
 
-        // -------------------------------------------------------------------------
-        // java.io.BufferedReader.<init>(Reader) / (Reader, int) — store reader at field 0
-        // -------------------------------------------------------------------------
-        r.register(
-            "java/io/BufferedReader",
-            "<init>",
-            "(Ljava/io/Reader;)V",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                let reader = args.get(1).copied().unwrap_or(Value::Object(None));
-                ctx.set_field(this, 0, reader);
-                Ok(None)
-            },
-        );
-        r.register(
-            "java/io/BufferedReader",
-            "<init>",
-            "(Ljava/io/Reader;I)V",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                let reader = args.get(1).copied().unwrap_or(Value::Object(None));
-                ctx.set_field(this, 0, reader);
-                Ok(None)
-            },
-        );
-
-        // -------------------------------------------------------------------------
-        // java.io.BufferedReader.readLine() → String
-        //
-        // The underlying InputStream is a synthetic ByteArrayInputStream with
-        // layout: field 0 = byte[] buf, field 1 = pos, field 2 = mark, field 3 = count.
-        // We read bytes from `pos..count` until we hit a line terminator
-        // (`\n`, `\r`, or `\r\n`), advance `pos` past it, and return the line
-        // as a UTF-8 String. Returns null at EOF.
-        // -------------------------------------------------------------------------
-        r.register(
-            "java/io/BufferedReader",
-            "readLine",
-            "()Ljava/lang/String;",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                let is = match r3_get_input_stream(ctx, this) {
-                    Some(s) => s,
-                    None => return Ok(Some(Value::Object(None))),
-                };
-                let buf_arr = match ctx.get_field(is, 0) {
-                    Value::Object(Some(arr)) => arr,
-                    _ => return Ok(Some(Value::Object(None))),
-                };
-                let mut pos = match ctx.get_field(is, 1) {
-                    Value::Int(i) => i as usize,
-                    _ => return Ok(Some(Value::Object(None))),
-                };
-                let count = match ctx.get_field(is, 3) {
-                    Value::Int(i) => i as usize,
-                    _ => ctx.array_length(buf_arr),
-                };
-                if pos >= count {
-                    // EOF — readLine returns null
-                    return Ok(Some(Value::Object(None)));
-                }
-                let mut bytes: Vec<u8> = Vec::new();
-                while pos < count {
-                    let b = match ctx.get_array_element(buf_arr, pos) {
-                        Value::Int(v) => (v as i8) as u8,
-                        _ => break,
-                    };
-                    pos += 1;
-                    if b == b'\n' {
-                        break;
-                    }
-                    if b == b'\r' {
-                        // Consume optional following \n (CRLF stays atomic)
-                        if pos < count {
-                            if let Value::Int(v) = ctx.get_array_element(buf_arr, pos) {
-                                if (v as i8) as u8 == b'\n' {
-                                    pos += 1;
-                                }
-                            }
-                        }
-                        break;
-                    }
-                    bytes.push(b);
-                }
-                ctx.set_field(is, 1, Value::Int(pos as i32));
-                let line = String::from_utf8_lossy(&bytes).into_owned();
-                let s = ctx.create_string(&line);
-                Ok(Some(Value::Object(Some(s))))
-            },
-        );
-
-        // -------------------------------------------------------------------------
-        // java.io.BufferedReader.lines() → Stream<String>
-        // -------------------------------------------------------------------------
-        r.register(
-            "java/io/BufferedReader",
-            "lines",
-            "()Ljava/util/stream/Stream;",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                let is = r3_get_input_stream(ctx, this);
-                let elems = match is {
-                    None => vec![],
-                    Some(is_ref) => {
-                        let lines_arr = match ctx.get_field(is_ref, 0) {
-                            Value::Object(Some(arr)) => arr,
-                            _ => {
-                                let s = p56_build_stream(ctx, vec![], "java/util/stream/Stream");
-                                return Ok(Some(Value::Object(Some(s))));
-                            }
-                        };
-                        let pos = match ctx.get_field(is_ref, 1) {
-                            Value::Int(i) => i as usize,
-                            _ => 0,
-                        };
-                        let len = ctx.array_length(lines_arr);
-                        let elems: Vec<Value> = (pos..len)
-                            .map(|i| ctx.get_array_element(lines_arr, i))
-                            .collect();
-                        // Advance position to end
-                        ctx.set_field(is_ref, 1, Value::Int(len as i32));
-                        elems
-                    }
-                };
-                let s = p56_build_stream(ctx, elems, "java/util/stream/Stream");
-                Ok(Some(Value::Object(Some(s))))
-            },
-        );
-
-        // -------------------------------------------------------------------------
-        // java.io.BufferedReader.close() — no-op
-        // java.io.Reader.close() — no-op
-        // -------------------------------------------------------------------------
-        r.register(
-            "java/io/BufferedReader",
-            "close",
-            "()V",
-            native_noop_with_this,
-        );
-        r.register("java/io/Reader", "close", "()V", native_noop_with_this);
+        // Real-JDK BufferedReader methods retain their bytecode implementation.
     } // end #[cfg(feature = "synthetic-jdk")] synthetic Reader-stack block
 }
 
@@ -3552,6 +3413,19 @@ s2_view_buf_fn!(s2_bb_as_short_buffer, "java/nio/ShortBuffer", 2);
 s2_view_buf_fn!(s2_bb_as_float_buffer, "java/nio/FloatBuffer", 4);
 s2_view_buf_fn!(s2_bb_as_double_buffer, "java/nio/DoubleBuffer", 8);
 
+/// Typed views encode their source byte offset as -(offset + 1) in the
+/// Buffer.address slot. That slot is a long on real JDK buffer layouts,
+/// while synthetic views use an int, so preserve both representations.
+#[inline]
+fn s2_typed_view_byte_start(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    let marker = match ctx.get_field(this, BB_MARK) {
+        Value::Int(v) => v,
+        Value::Long(v) => i32::try_from(v).unwrap_or(-1),
+        _ => -1,
+    };
+    if marker < 0 { -(marker + 1) } else { 0 }
+}
+
 /// `ByteBuffer.asCharBuffer()` — the view returned MUST have its backing
 /// store stored in the real-JDK `hb` field so JDK bytecode that reads
 /// `hb` (e.g. `CharBuffer.hasArray`, `CharBuffer.array`) sees a non-null
@@ -3630,79 +3504,18 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         "allocateDirect",
         "(I)Ljava/nio/ByteBuffer;",
         |ctx, args| {
-            // NEW-17: direct buffers back the array with REAL native memory and
-            // register a Cleaner action that frees the native allocation when
-            // the buffer becomes phantom-reachable.
-            let cap = args.first().and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-
-            // 1) Acquire native memory from the per-VM table.
-            let alloc_id = match ctx.allocate_native_memory(cap, 8) {
-                Some((id, _ptr)) => id,
-                None => {
-                    return Err(cratonvm_types::error::RuntimeError::OutOfMemoryError {
-                        message: "DirectByteBuffer.allocateDirect: native memory allocation failed"
-                            .into(),
-                    }
-                    .into());
+            let cap = args.first().and_then(|v| v.as_int()).unwrap_or(0);
+            if cap < 0 {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "capacity < 0".into(),
                 }
-            };
-
-            // 2) Allocate the buffer synthetic with 8 fields (the extra two
-            //    carry alloc_id + direct_flag). Use an empty byte[] for BB_ARRAY
-            //    so existing array-reading code paths see capacity 0 rather than
-            //    aliasing the native memory.
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, cap);
-            let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 8);
-            // Real-JDK named `mark` field (mirrors `bb_write_hb`) — deliberately
-            // NOT also written via the indexed BB_MARK fallback below. Real
-            // `Buffer`'s field order is `mark(0), position(1), limit(2),
-            // capacity(3), address(4)`, so index 4 — this file's synthetic-mode
-            // BB_MARK slot — aliases `address` (the actual native memory
-            // pointer) for a real-JDK `DirectByteBuffer`, NOT `mark`.
-            // Without this by-name write, `mark` starts at its generic
-            // zero-init default (`Value::Object(None)`, indistinguishable from
-            // "field doesn't exist"), so `s2_bb_get_mark`'s by-name-first probe
-            // misreads that as "no such field" on the FIRST `mark()` call and
-            // falls back to the indexed slot, silently overwriting `address`
-            // with the mark value — the next `put`/`get` then computes a
-            // garbage target address and SIGSEGVs (found chasing the
-            // ByteBuffer.mark()/reset() InvalidMarkException fix above through
-            // to a `ByteBuffer.allocateDirect` + `mark()` + `put()` repro).
-            // Skipping the indexed write here means a *genuinely* synthetic
-            // (non-real-JDK) ByteBuffer class would leave `mark` unusable —
-            // accepted: this whole module is real-JDK-mode-only in practice.
-            ctx.set_field_by_name(buf, "position", Value::Int(0));
-            ctx.set_field_by_name(buf, "limit", Value::Int(cap as i32));
-            ctx.set_field_by_name(buf, "capacity", Value::Int(cap as i32));
-            ctx.set_field_by_name(buf, "mark", Value::Int(-1));
-            // Synthetic-mode indexed fallback (array/order/native-id/direct-flag
-            // only — NOT mark, see above).
-            ctx.set_field(buf, BB_ARRAY, Value::Object(Some(arr)));
-            ctx.set_field(buf, BB_POS, Value::Int(0));
-            ctx.set_field(buf, BB_LIMIT, Value::Int(cap as i32));
-            ctx.set_field(buf, BB_CAP, Value::Int(cap as i32));
-            ctx.set_field(buf, BB_ORDER, Value::Int(0));
-            ctx.set_field(buf, BB_NATIVE_ID, Value::Long(alloc_id));
-            ctx.set_field(buf, BB_DIRECT_FLAG, Value::Int(1));
-
-            // 3) Allocate the deallocator (Runnable) synthetic carrying alloc_id.
-            let dealloc = alloc_concurrent_synthetic(ctx, DEALLOC_CLASS, 1);
-            ctx.set_field(dealloc, DEALLOC_ID, Value::Long(alloc_id));
-
-            // 4) Allocate a Cleanable, install the deallocator as its action,
-            //    and register it as a Cleaner-typed phantom of `buf` in the
-            //    ref processor. When `buf` is collected, the GC will queue this
-            //    cleanable into shared.cleaner_thread; the interpreter's
-            //    run_cleaner_actions then invokes deallocator.run()V → frees
-            //    the native memory.
-            let cleanable = alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner$Cleanable", 3);
-            ctx.set_field(cleanable, 0, Value::Object(Some(dealloc)));
-            ctx.set_field(cleanable, 1, Value::Int(0));
-            ctx.set_field(cleanable, 2, Value::Int(-1));
-            // 3 = REF_TYPE_CLEANER (see vm_exec::discover_reference)
-            ctx.discover_reference(3, cleanable, buf, None);
-
-            Ok(Some(Value::Object(Some(buf))))
+                .into());
+            }
+            ctx.new_object_initialized(
+                "java/nio/DirectByteBuffer",
+                "(I)V",
+                &[Value::Int(cap)],
+            )
         },
     );
     r.register(bb, "wrap", "([B)Ljava/nio/ByteBuffer;", |ctx, args| {
@@ -4269,6 +4082,15 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         r.register(bb, "position", ret, |ctx, args| {
             let this = obj_arg(args, 0)?;
             let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+            let limit = s2_bb_limit(ctx, this);
+            if v < 0 || v > limit {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("newPosition > limit: ({v} > {limit})"),
+                }.into());
+            }
+            if s2_bb_get_mark(ctx, this) > v {
+                s2_bb_set_mark(ctx, this, -1);
+            }
             ctx.set_field(this, BB_POS, Value::Int(v));
             Ok(Some(Value::Object(Some(this))))
         });
@@ -4280,6 +4102,19 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         r.register(bb, "limit", ret, |ctx, args| {
             let this = obj_arg(args, 0)?;
             let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+            let cap = s2_bb_cap(ctx, this);
+            if v < 0 || v > cap {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("newLimit > capacity: ({v} > {cap})"),
+                }.into());
+            }
+            let pos = s2_bb_pos(ctx, this);
+            if pos > v {
+                ctx.set_field(this, BB_POS, Value::Int(v));
+            }
+            if s2_bb_get_mark(ctx, this) > v {
+                s2_bb_set_mark(ctx, this, -1);
+            }
             ctx.set_field(this, BB_LIMIT, Value::Int(v));
             Ok(Some(Value::Object(Some(this))))
         });
@@ -4672,10 +4507,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 if pos >= s2_bb_limit(ctx, this) {
                     return Err(RuntimeError::BufferUnderflowException.into());
                 }
-                let bs = {
-                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
-                    if m < 0 { -(m + 1) } else { 0 }
-                };
+                let bs = s2_typed_view_byte_start(ctx, this);
                 let off = pos
                     .checked_mul($width)
                     .and_then(|b| bs.checked_add(b))
@@ -4687,10 +4519,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             fn $get_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
                 let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-                let bs = {
-                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
-                    if m < 0 { -(m + 1) } else { 0 }
-                };
+                let bs = s2_typed_view_byte_start(ctx, this);
                 let off = idx
                     .checked_mul($width)
                     .and_then(|b| bs.checked_add(b))
@@ -4705,10 +4534,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 if pos >= s2_bb_limit(ctx, this) {
                     return Err(RuntimeError::BufferOverflowException.into());
                 }
-                let bs = {
-                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
-                    if m < 0 { -(m + 1) } else { 0 }
-                };
+                let bs = s2_typed_view_byte_start(ctx, this);
                 let off = pos
                     .checked_mul($width)
                     .and_then(|b| bs.checked_add(b))
@@ -4721,10 +4547,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 let this = obj_arg(args, 0)?;
                 let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
                 let v = args.get(2).cloned().unwrap_or(Value::Int(0));
-                let bs = {
-                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
-                    if m < 0 { -(m + 1) } else { 0 }
-                };
+                let bs = s2_typed_view_byte_start(ctx, this);
                 let off = idx
                     .checked_mul($width)
                     .and_then(|b| bs.checked_add(b))
@@ -4743,10 +4566,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 let pos = s2_bb_pos(ctx, this);
                 let lim = s2_bb_limit(ctx, this);
                 let remaining = (lim - pos).max(0);
-                let bs = {
-                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
-                    if m < 0 { -(m + 1) } else { 0 }
-                };
+                let bs = s2_typed_view_byte_start(ctx, this);
                 let new_bs = pos
                     .checked_mul($width)
                     .and_then(|b| bs.checked_add(b))
@@ -4772,10 +4592,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                     }
                     .into());
                 }
-                let bs = {
-                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
-                    if m < 0 { -(m + 1) } else { 0 }
-                };
+                let bs = s2_typed_view_byte_start(ctx, this);
                 let new_bs = index
                     .checked_mul($width)
                     .and_then(|b| bs.checked_add(b))
@@ -4814,10 +4631,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 let pos = s2_bb_pos(ctx, this);
                 let lim = s2_bb_limit(ctx, this);
                 let cap = s2_bb_cap(ctx, this);
-                let bs = {
-                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
-                    if m < 0 { -(m + 1) } else { 0 }
-                };
+                let bs = s2_typed_view_byte_start(ctx, this);
                 let remaining = (lim - pos).max(0);
                 for i in 0..remaining {
                     let src_off = (pos + i)
@@ -4868,10 +4682,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 if pos.checked_add(len).map_or(true, |e| e > s2_bb_limit(ctx, this)) {
                     return Err(RuntimeError::BufferUnderflowException.into());
                 }
-                let bs = {
-                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
-                    if m < 0 { -(m + 1) } else { 0 }
-                };
+                let bs = s2_typed_view_byte_start(ctx, this);
                 for i in 0..len {
                     let src_off = (pos + i)
                         .checked_mul($width)
@@ -4901,10 +4712,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 if pos.checked_add(len).map_or(true, |e| e > s2_bb_limit(ctx, this)) {
                     return Err(RuntimeError::BufferOverflowException.into());
                 }
-                let bs = {
-                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
-                    if m < 0 { -(m + 1) } else { 0 }
-                };
+                let bs = s2_typed_view_byte_start(ctx, this);
                 for i in 0..len {
                     let v = ctx.get_array_element(src, (off + i) as usize);
                     let dst_off = (pos + i)

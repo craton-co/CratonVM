@@ -19176,23 +19176,10 @@ fn drain_input_stream_per_byte(ctx: &mut dyn NativeContext, is_ref: ObjectRef, o
 pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // GZIPInputStream
-    let gi = "java/util/zip/GZIPInputStream";
-    r.register(gi, "<init>", "(Ljava/io/InputStream;)V", p58_gzip_in_init);
-    r.register(gi, "read", "()I", p58_gzip_in_read);
-    r.register(gi, "read", "([BII)I", p58_gzip_in_read_bytes);
-    r.register(gi, "available", "()I", p58_gzip_in_available);
-    r.register(gi, "close", "()V", |ctx, args| {
-        // Mark the stream as closed by clearing its decompressed data buffer.
-        let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > 0 {
-            ctx.set_field(this, 0, Value::Object(None));
-            if ctx.object_num_fields(this) > 1 {
-                ctx.set_field(this, 1, Value::Int(0));
-            }
-        }
-        Ok(None)
-    });
+    // Real-JDK GZIPInputStream must retain its bytecode implementation: it
+    // initializes and drives the zlib state through zip_real's private
+    // Inflater natives.  Synthetic-layout replacements here corrupt real JDK
+    // resource streams, so only the GZIPOutputStream bridge remains below.
 
     // GZIPOutputStream — accumulates data in field 0/1, compresses on finish
     let go = "java/util/zip/GZIPOutputStream";
@@ -19601,12 +19588,14 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
 fn p58_gzip_in_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let input_stream = args.get(1).copied().unwrap_or(Value::Object(None));
-    // Read all bytes from underlying stream eagerly.
-    // PERF: bulk-drain via read([B,I,I)I instead of a per-byte read()I loop.
-    let compressed = match input_stream {
-        Value::Object(Some(is)) => drain_input_stream_bulk(ctx, is),
-        _ => Vec::new(),
-    };
+    // Read all bytes from underlying stream eagerly.  Resource streams are
+    // frequently `ByteArrayInputStream`s backed by jar entries; use the scalar
+    // path here until the generic bulk virtual-dispatch path can preserve each
+    // compressed byte under all real-JDK stream subclasses.
+    let mut compressed = Vec::new();
+    if let Value::Object(Some(is)) = input_stream {
+        drain_input_stream_per_byte(ctx, is, &mut compressed);
+    }
     // Decompress with flate2 GzDecoder, bounded by the inflated-size cap so a
     // gzip bomb throws an IOException instead of exhausting the heap (finding 3).
     let decompressed = if !compressed.is_empty() {
@@ -63570,132 +63559,10 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // Deflater = 4-field (input=0, level=1, finished=2, bytesRead=3)
-    let dl = "java/util/zip/Deflater";
-    r.register(dl, "<init>", "()V", |ctx, args| {
-        p71_init_defl(ctx, args, -1)
-    });
-    r.register(dl, "<init>", "(I)V", |ctx, args| {
-        let lv = match args.get(1) {
-            Some(Value::Int(i)) => *i,
-            _ => -1,
-        };
-        p71_init_defl(ctx, args, lv)
-    });
-    r.register(dl, "setInput", "([B)V", |ctx, args| {
-        ctx.set_field(
-            obj_arg(args, 0)?,
-            0,
-            args.get(1).copied().unwrap_or(Value::Object(None)),
-        );
-        Ok(None)
-    });
-    r.register(dl, "setInput", "([BII)V", |ctx, args| {
-        ctx.set_field(
-            obj_arg(args, 0)?,
-            0,
-            args.get(1).copied().unwrap_or(Value::Object(None)),
-        );
-        Ok(None)
-    });
-    r.register(dl, "deflate", "([B)I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(dl, "deflate", "([BII)I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(dl, "finish", "()V", |ctx, args| {
-        ctx.set_field(obj_arg(args, 0)?, 2, Value::Int(1));
-        Ok(None)
-    });
-    r.register(dl, "finished", "()Z", |ctx, args| {
-        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 2)))
-    });
-    r.register(dl, "needsInput", "()Z", |ctx, args| {
-        let ni = matches!(ctx.get_field(obj_arg(args, 0)?, 0), Value::Object(None));
-        Ok(Some(Value::Int(if ni { 1 } else { 0 })))
-    });
-    r.register(dl, "getBytesRead", "()J", |ctx, args| {
-        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 3)))
-    });
-    r.register(dl, "getBytesWritten", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(0)))
-    });
-    r.register(dl, "end", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // Release all resources: clear input, mark finished, zero counters
-        ctx.set_field(this, 0, Value::Object(None));
-        ctx.set_field(this, 2, Value::Int(1)); // finished
-        ctx.set_field(this, 3, Value::Long(0));
-        Ok(None)
-    });
-    r.register(dl, "reset", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, Value::Object(None));
-        ctx.set_field(this, 2, Value::Int(0));
-        ctx.set_field(this, 3, Value::Long(0));
-        Ok(None)
-    });
-
-    // Inflater = 4-field (input=0, nowrap=1, finished=2, bytesRead=3)
-    let il = "java/util/zip/Inflater";
-    r.register(il, "<init>", "()V", |ctx, args| p71_init_infl(ctx, args, 0));
-    r.register(il, "<init>", "(Z)V", |ctx, args| {
-        let nw = match args.get(1) {
-            Some(Value::Int(i)) => *i,
-            _ => 0,
-        };
-        p71_init_infl(ctx, args, nw)
-    });
-    r.register(il, "setInput", "([B)V", |ctx, args| {
-        ctx.set_field(
-            obj_arg(args, 0)?,
-            0,
-            args.get(1).copied().unwrap_or(Value::Object(None)),
-        );
-        Ok(None)
-    });
-    r.register(il, "setInput", "([BII)V", |ctx, args| {
-        ctx.set_field(
-            obj_arg(args, 0)?,
-            0,
-            args.get(1).copied().unwrap_or(Value::Object(None)),
-        );
-        Ok(None)
-    });
-    r.register(il, "inflate", "([B)I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(il, "inflate", "([BII)I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(il, "finished", "()Z", |ctx, args| {
-        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 2)))
-    });
-    r.register(il, "needsInput", "()Z", |ctx, args| {
-        let ni = matches!(ctx.get_field(obj_arg(args, 0)?, 0), Value::Object(None));
-        Ok(Some(Value::Int(if ni { 1 } else { 0 })))
-    });
-    r.register(il, "getBytesRead", "()J", |ctx, args| {
-        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 3)))
-    });
-    r.register(il, "getBytesWritten", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(0)))
-    });
-    r.register(il, "end", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, Value::Object(None));
-        ctx.set_field(this, 2, Value::Int(1)); // finished
-        ctx.set_field(this, 3, Value::Long(0));
-        Ok(None)
-    });
-    r.register(il, "reset", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, Value::Object(None));
-        ctx.set_field(this, 2, Value::Int(0));
-        ctx.set_field(this, 3, Value::Long(0));
-        Ok(None)
-    });
+    // Do not override real-JDK Deflater/Inflater public constructors or methods.
+    // Their bytecode initializes `zsRef` through the private natives registered
+    // in zip_real; the old synthetic-layout stubs left it uninitialized and
+    // corrupted GZIPInputStream decompression.
 
     // ZipFile = 2-field (name=0, closed=1)
     let zf = "java/util/zip/ZipFile";

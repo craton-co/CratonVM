@@ -335,6 +335,14 @@ fn should_skip_jit_internal(
     allow_packages: &[&str],
     skip_init_check: bool,
 ) -> Option<SkipReason> {
+    // ES812 postings JIT residual (2026-07-13): indexedBinarySearch can
+    // invoke a lambda apply method through the wrong receiver after an
+    // aggressive java/util promotion. Interpret this dispatcher until the
+    // invokeinterface PIC invalidation handles changing lambda receivers.
+    if class_name == "java/util/Collections" && method_name == "indexedBinarySearch" {
+        return Some(SkipReason::JavaUtilCollection);
+    }
+
     // Bisection hook (development only): `CRATONVM_JIT_BISECT_SKIP` is a
     // comma-separated list of `Class.method` entries (slash-separated
     // class names, e.g. `java/util/Locale.hashCode`). Any listed method
