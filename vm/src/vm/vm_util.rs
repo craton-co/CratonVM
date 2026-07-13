@@ -823,8 +823,21 @@ fn initialize_class_shared(
                     // merge в†’ Top false positive. See
                     // `classloading/src/verifier.rs` module docs for
                     // the JVMS В§4.10.2.5 background.
+                    // `define_class_with_options` has already performed Pass 3
+                    // using ClassManager's loader-aware hierarchy. This adapter
+                    // has only a name-indexed ClassStore, so repeating Pass 3 for
+                    // a user-defined loader can resolve a same-named app copy and
+                    // reject valid forked bytecode. Keep Pass 2 here, but trust the
+                    // authoritative define-time Pass 3 for such classes.
                     let bytecode = structural.and_then(|()| {
-                        crate::classloading::verifier::verify_class_bytecode(class, &hierarchy)
+                        if matches!(
+                            class.loader_id,
+                            cratonvm_types::ClassLoaderId::UserDefined(_)
+                        ) {
+                            Ok(())
+                        } else {
+                            crate::classloading::verifier::verify_class_bytecode(class, &hierarchy)
+                        }
                     });
                     if let Err(e) = bytecode {
                         drop(cm);

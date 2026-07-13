@@ -51615,88 +51615,6 @@ fn javac_array_list_from_values(ctx: &mut dyn NativeContext, values: &[Value]) -
     list
 }
 
-fn javac_java_file_object_kind_class(ctx: &mut dyn NativeContext) -> Option<Value> {
-    let class_id = ctx
-        .ensure_class_initialized("javax/tools/JavaFileObject$Kind")
-        .ok()?;
-    let slot = ctx.static_field_index_by_name(class_id, "CLASS")?;
-    Some(ctx.get_static_field(class_id, slot))
-}
-
-fn javac_platform_class_file_object(
-    ctx: &mut dyn NativeContext,
-    file_manager: ObjectRef,
-    location: Value,
-    kind_class: Value,
-    class_name: &str,
-) -> MethodCallResult {
-    let name = ctx.create_string(class_name);
-    ctx.invoke_virtual_bytecode_only(
-        file_manager,
-        "getJavaFileForInput",
-        "(Ljavax/tools/JavaFileManager$Location;Ljava/lang/String;Ljavax/tools/JavaFileObject$Kind;)Ljavax/tools/JavaFileObject;",
-        &[location, Value::Object(Some(name)), kind_class],
-    )
-}
-
-fn javac_platform_listing_classes(package_name: &str) -> &'static [&'static str] {
-    match package_name {
-        "java.lang" => &[
-            "java.lang.Object",
-            "java.lang.String",
-            "java.lang.Class",
-            "java.lang.Throwable",
-            "java.lang.Exception",
-            "java.lang.RuntimeException",
-            "java.lang.Error",
-            "java.lang.System",
-            "java.lang.Boolean",
-            "java.lang.Integer",
-            "java.lang.Long",
-            "java.lang.Void",
-            "java.lang.Iterable",
-            "java.lang.Enum",
-            "java.lang.Override",
-        ],
-        "java.util" => &[
-            "java.util.Objects",
-            "java.util.List",
-            "java.util.Collection",
-            "java.util.Iterator",
-            "java.util.Map",
-            "java.util.Set",
-            "java.util.ArrayList",
-            "java.util.Collections",
-            "java.util.Arrays",
-            "java.util.Optional",
-        ],
-        "java.util.function" => &[
-            "java.util.function.Supplier",
-            "java.util.function.Function",
-            "java.util.function.Consumer",
-            "java.util.function.Predicate",
-        ],
-        "java.lang.invoke" => &[
-            "java.lang.invoke.MethodHandle",
-            "java.lang.invoke.MethodHandles",
-            "java.lang.invoke.MethodType",
-            "java.lang.invoke.LambdaMetafactory",
-        ],
-        "java.lang.annotation" => &[
-            "java.lang.annotation.Annotation",
-            "java.lang.annotation.Retention",
-            "java.lang.annotation.Target",
-        ],
-        "java.io" => &[
-            "java.io.Serializable",
-            "java.io.IOException",
-            "java.io.InputStream",
-            "java.io.OutputStream",
-        ],
-        _ => &[],
-    }
-}
-
 fn native_javac_file_manager_list(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -51724,29 +51642,6 @@ fn native_javac_file_manager_list(
             || package_name.starts_with("com.example."))
     {
         return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
-    }
-    if location_name == "SYSTEM_MODULES[java.base]" {
-        let class_names = javac_platform_listing_classes(&package_name);
-        if !class_names.is_empty() {
-            let Some(kind_class) = javac_java_file_object_kind_class(ctx) else {
-                return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
-            };
-            let mut files = Vec::with_capacity(class_names.len());
-            for class_name in class_names {
-                if let Some(Value::Object(Some(file))) = javac_platform_class_file_object(
-                    ctx,
-                    this,
-                    location,
-                    kind_class,
-                    class_name,
-                )? {
-                    files.push(Value::Object(Some(file)));
-                }
-            }
-            return Ok(Some(Value::Object(Some(javac_array_list_from_values(
-                ctx, &files,
-            )))));
-        }
     }
     ctx.invoke_virtual_bytecode_only(
         this,
