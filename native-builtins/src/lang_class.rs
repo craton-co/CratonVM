@@ -209,7 +209,21 @@ fn array_descriptor_to_package_name(desc: &str) -> Option<String> {
 
 /// Last segment of a class's name after `/`, `.`, or `$` (the
 /// `Class.getSimpleName()` rule). Cached per `ClassId`.
-pub(crate) fn simple_class_name(class_id: ClassId, raw: &str) -> Arc<str> {
+///
+/// `is_real_inner` must be true only when this class actually has its own
+/// entry in its `InnerClasses` attribute (i.e. it's a genuine JVM member/
+/// local/anonymous class) — see the caller in `native_class_get_simple_name`.
+/// The `$`-strip only applies then. A top-level class whose *literal* binary
+/// name happens to contain `$` (dynamically-generated proxies from ByteBuddy/
+/// cglib/JDK `Proxy`, e.g. `org.easymock.mocks.InitialDirContext$$$EasyMock$1`)
+/// has no such attribute entry, so real `Class.getSimpleName()` returns the
+/// name unmodified after stripping only the package prefix — splitting on the
+/// last `$` regardless of real nested-class-ness previously made EasyMock's
+/// own `getSimpleName().contains("$$$EasyMock$")` mock-detection check see a
+/// truncated name (e.g. just `"1"`) and misreport `Not a mock` for every
+/// class-based mock (see jndirealmintegration-ldap-connection-npe residual /
+/// EasyMock investigation).
+pub(crate) fn simple_class_name(class_id: ClassId, raw: &str, is_real_inner: bool) -> Arc<str> {
     if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, class_id) {
         return arc;
     }
@@ -218,12 +232,28 @@ pub(crate) fn simple_class_name(class_id: ClassId, raw: &str) -> Arc<str> {
         return cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, simple);
     }
     let after_slash_or_dot = raw.rsplit(&['/', '.'][..]).next().unwrap_or(raw);
-    let after_dollar = after_slash_or_dot
-        .rsplit('$')
-        .next()
-        .unwrap_or(after_slash_or_dot);
-    let simple: Arc<str> = Arc::from(after_dollar);
+    let simple: Arc<str> = if is_real_inner {
+        Arc::from(
+            after_slash_or_dot
+                .rsplit('$')
+                .next()
+                .unwrap_or(after_slash_or_dot),
+        )
+    } else {
+        Arc::from(after_slash_or_dot)
+    };
     cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, simple)
+}
+
+/// Does `class_id` (named `class_name`) have its own entry in its
+/// `InnerClasses` attribute? True only for genuine JVM member/local/
+/// anonymous classes — a top-level class with literal `$` characters in its
+/// binary name (dynamically-generated proxies) has no such entry. Same
+/// lookup `native_class_get_simple_binary_name` uses.
+fn has_own_inner_classes_entry(ctx: &mut dyn NativeContext, class_id: ClassId, class_name: &str) -> bool {
+    ctx.inner_classes(class_id)
+        .iter()
+        .any(|(inner_class, _, _, _)| inner_class == class_name)
 }
 
 /// Canonical name: dotted form plus inner-class `$` в†’ `.` substitution.
@@ -2814,7 +2844,8 @@ pub(crate) fn native_class_get_simple_name(
             return Ok(Some(Value::Object(Some(result))));
         }
         if let Some(name) = ctx.class_name_of_id(class_id) {
-            let simple = simple_class_name(class_id, &name);
+            let is_real_inner = has_own_inner_classes_entry(ctx, class_id, &name);
+            let simple = simple_class_name(class_id, &name, is_real_inner);
             let result = ctx.create_string(&simple);
             return Ok(Some(Value::Object(Some(result))));
         }
@@ -16015,6 +16046,20 @@ mod tests {
     fn class_get_simple_name_inner_class() {
         let mut ctx = mock_ctx();
         let cid = ctx.ensure_class_initialized("java/util/Map$Entry").unwrap();
+        // Real `Map$Entry` has its own `InnerClasses` attribute entry
+        // (outer=java/util/Map, inner_name=Entry) -- seed it so the mock
+        // matches what real class loading provides, since `getSimpleName()`
+        // now only strips the `$`-prefix for genuine member/local/anonymous
+        // classes (see `has_own_inner_classes_entry`).
+        ctx.set_inner_classes(
+            cid,
+            vec![(
+                "java/util/Map$Entry".to_string(),
+                "java/util/Map".to_string(),
+                "Entry".to_string(),
+                0,
+            )],
+        );
         let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "java/util/Map$Entry");
         let r = native_class_get_simple_name(&mut ctx, &[Value::Object(Some(mirror))]);
         let obj = match r.unwrap() {
@@ -16022,6 +16067,38 @@ mod tests {
             other => panic!("expected Object, got {other:?}"),
         };
         assert_eq!(ctx.read_string(obj).unwrap(), "Entry");
+    }
+
+    #[test]
+    fn class_get_simple_name_top_level_with_literal_dollar_not_split() {
+        // Dynamically-generated proxy classes (ByteBuddy/cglib/EasyMock) are
+        // genuine TOP-LEVEL classes whose literal binary name happens to
+        // contain `$` -- they have no `InnerClasses` attribute entry for
+        // themselves. Real `Class.getSimpleName()` must NOT split on `$` in
+        // this case (see jndirealmintegration-ldap-connection-npe residual:
+        // EasyMock's `isAClassMock` does
+        // `getSimpleName().contains("$$$EasyMock$")`, which silently broke
+        // when this returned just the trailing digit).
+        let mut ctx = mock_ctx();
+        let cid = ctx
+            .ensure_class_initialized("org/easymock/mocks/InitialDirContext$$$EasyMock$1")
+            .unwrap();
+        // No `set_inner_classes` call: default (empty) matches a real
+        // top-level class with no InnerClasses entry.
+        let mirror = make_class_mirror(
+            &mut ctx,
+            cid.as_u32(),
+            "org/easymock/mocks/InitialDirContext$$$EasyMock$1",
+        );
+        let r = native_class_get_simple_name(&mut ctx, &[Value::Object(Some(mirror))]);
+        let obj = match r.unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected Object, got {other:?}"),
+        };
+        assert_eq!(
+            ctx.read_string(obj).unwrap(),
+            "InitialDirContext$$$EasyMock$1"
+        );
     }
 
     // -----------------------------------------------------------------------

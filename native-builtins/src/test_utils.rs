@@ -593,6 +593,15 @@ pub(crate) struct MockNativeContext {
     /// to simulate a class with a specific declared field list for
     /// `ObjectStreamClass` / reflection-driven code.
     pub(crate) declared_fields_override: UnsafeCell<HashMap<u32, Vec<FieldMetadata>>>,
+    /// Per-class overrides for `inner_classes` (the `InnerClasses` attribute
+    /// entries, as `(inner_class_name, outer_class_name, inner_name,
+    /// access_flags)`). Empty vec by default (mock has no class metadata);
+    /// tests simulating a real JVM member/local/anonymous class (e.g.
+    /// `java/util/Map$Entry`) populate this so `getSimpleName()`/
+    /// `getSimpleBinaryName0()` can tell it apart from a top-level class
+    /// whose literal binary name merely contains `$` (dynamically-generated
+    /// proxies).
+    pub(crate) inner_classes_override: UnsafeCell<HashMap<u32, Vec<(String, String, String, u16)>>>,
     /// WP0.2: per-class overrides for `declared_methods`.
     pub(crate) declared_methods_override: UnsafeCell<HashMap<u32, Vec<MethodMetadata>>>,
     /// WP0.2: per-class super-class override (consulted by
@@ -752,6 +761,7 @@ impl MockNativeContext {
             blocking_begin_count: 0,
             blocking_end_count: 0,
             declared_fields_override: UnsafeCell::new(HashMap::new()),
+            inner_classes_override: UnsafeCell::new(HashMap::new()),
             declared_methods_override: UnsafeCell::new(HashMap::new()),
             superclass_override: UnsafeCell::new(HashMap::new()),
             is_interface_override: UnsafeCell::new(HashMap::new()),
@@ -993,6 +1003,19 @@ impl MockNativeContext {
     pub(crate) fn set_declared_fields(&self, class_id: ClassId, fields: Vec<FieldMetadata>) {
         // SAFETY: single-threaded test code.
         unsafe { (*self.declared_fields_override.get()).insert(class_id.as_u32(), fields) };
+    }
+
+    /// Register `class_id`'s own `InnerClasses` attribute entries. Overrides
+    /// the default (empty) `inner_classes` return so tests can simulate a
+    /// genuine JVM member/local/anonymous class.
+    #[allow(dead_code)]
+    pub(crate) fn set_inner_classes(
+        &self,
+        class_id: ClassId,
+        entries: Vec<(String, String, String, u16)>,
+    ) {
+        // SAFETY: single-threaded test code.
+        unsafe { (*self.inner_classes_override.get()).insert(class_id.as_u32(), entries) };
     }
 
     /// WP0.2: push declared method metadata for `class_id`.  Overrides
@@ -1655,6 +1678,12 @@ impl NativeContext for MockNativeContext {
             *slot = false;
         }
         val
+    }
+
+    fn inner_classes(&self, class_id: ClassId) -> Vec<(String, String, String, u16)> {
+        // SAFETY: single-threaded test code.
+        let overrides = unsafe { &*self.inner_classes_override.get() };
+        overrides.get(&class_id.as_u32()).cloned().unwrap_or_default()
     }
 
     fn declared_fields(&self, class_id: ClassId) -> Vec<FieldMetadata> {
