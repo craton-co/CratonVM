@@ -870,35 +870,75 @@ detail:
   hit it.
 - **`ParallelExecutionSpringExtensionTests`**: flagged going in as the class
   most likely to expose a CratonVM-specific JUnit-parallel/`ForkJoinPool`
-  gap. It is genuinely slow — ~7 minutes for 10 outer `@RepeatedTest`
+  gap. It is genuinely slow — ~7–8 minutes for 10 outer `@RepeatedTest`
   iterations × 1000 inner `@RepeatedTest` sub-tests
   (`Constants.PARALLEL_EXECUTION_ENABLED_PROPERTY_NAME=true`,
   `PARALLEL_CONFIG_DYNAMIC_FACTOR_PROPERTY_NAME=10`,
   `PARALLEL_CONFIG_EXECUTOR_SERVICE_PROPERTY_NAME=WORKER_THREAD_POOL`) — but
-  it is not hung; it completes and passes both times, matching the ~513s
-  figure from the prior `2ba4aae9` ("Fix Spring JUnit parallel residual")
-  investigation on 2026-07-08 almost exactly. Live gdb snapshots (`thread
-  apply all bt`) confirmed real OS worker threads exist (`junit-5-worker-`,
-  `junit-6-worker-`, named per JUnit's own convention) doing genuine
-  interpreted/JIT work (one seen mid-`LockSupport.park()`, one mid first-
-  call JIT-eligibility classification in `jit_invoke_targets_native_shadow`/
-  `find_method_recursive`) — not deadlocked, not spinning in a tight loop.
+  it is not hung; it completes and passes on **3 independent runs**
+  (485s, 416s, 481s), matching the ~513s figure from the prior `2ba4aae9`
+  ("Fix Spring JUnit parallel residual") investigation on 2026-07-08 almost
+  exactly.
+
+  **Root cause of the slowdown, confirmed via 5 sequential live gdb
+  snapshots** (`thread apply all bt`, ~2–3s apart) during the 3rd run: real
+  OS worker threads genuinely exist and are created per JUnit's own naming
+  convention (`junit-1-worker-`, `junit-2-worker-`, ...), but **only one is
+  ever actively executing bytecode at any given snapshot** — the others
+  (including the `main-vm` orchestrator thread, consistently parked in
+  `native_lock_support_park`/`LockSupport.park()` across all 5 snapshots)
+  sit idle. The active worker's own OS thread identity changed between
+  snapshots (`junit-1-worker-` LWP 334411 in snapshot 1 was gone by
+  snapshot 2, replaced by a new `junit-2-worker-` LWP 335897 that stayed
+  active through snapshot 5) — i.e. exactly one thread does all the work at
+  a time, and a fresh thread periodically takes over, rather than N threads
+  genuinely running concurrently. This matches source: `java/util/concurrent/
+  ForkJoinTask`'s `fork()`/`join()`/`invoke()`/`get()` are globally
+  overridden in `native-builtins/src/phases_early.rs` (~line 7976) as a
+  **lazy, single-thread synchronous emulation** — `fork()` is a no-op that
+  just returns `this` (the task is never actually handed to another worker
+  or queued), and `join()`/`invoke()`/`get()` all run `compute()`
+  synchronously on the calling thread if not already done (comment in that
+  file: "Eager fork was overflowing the host stack on deeply-recursive
+  RecursiveTask probes" — a known, intentional trade-off from earlier work,
+  not something newly discovered here). JUnit's `ForkJoinPoolHierarchical
+  TestExecutorService` uses exactly this `RecursiveAction`-based fork/join
+  pattern for its parallel test executor (`ExclusiveTask`), so under this
+  emulation the "parallel" executor's recursive test-tree fan-out collapses
+  to ordinary sequential recursion on whichever single thread happens to be
+  driving it at the time — explaining the ~45x-vs-HotSpot slowdown (no
+  parallelism speedup despite the 10x dynamic worker-count factor) without
+  any deadlock or correctness break for this specific test's usage pattern.
+  Separately, `native-builtins/src/phases_late.rs` (~line 70837) gives
+  `ForkJoinPool.commonPool()`/`asyncCommonPool()` a synthetic proxy, but a
+  custom `new ForkJoinPool(...)` (as JUnit's `WORKER_THREAD_POOL` config
+  uses) has no dedicated native fast path and runs as ordinary interpreted
+  bytecode over CratonVM's thread primitives.
+
   `git log --all --oneline --grep=ForkJoin -i` and `--grep=parallel -i` were
-  searched per the task brief's suggestion; no dedicated native fast path
-  for `ForkJoinPool` itself was found (it runs as ordinary interpreted
-  bytecode over CratonVM's thread primitives), and the existing
-  ForkJoin-adjacent fixes on `dev` (`ae574d8f`/`c9da1f68`/`ebc4bb85`
-  "gcstress residual forkjoin fix", `743da7b1`/`ce258204` "Phaser/ForkJoinPool
-  hang" fix) address narrower, different mechanisms (GC-stress root
-  stability and a `CompletableFuture.runAsync` exception-swallowing hang,
-  respectively), not general worker-pool throughput. This class's ~45x
-  slowdown vs. HotSpot is a real, already-known, unresolved performance gap
-  (see `2ba4aae9`'s own history) — but at current dev tip it finishes inside
-  the 1500s ceiling with a comfortable margin (~3.6x on the faster of the
-  two runs), so it is reclassified out of Bucket 1 rather than treated as an
-  open hang. If a future session sees it exceed 1500s again, suspect either
-  host contention (this is a shared, busy machine) or an actual regression,
-  and re-open.
+  also searched per the task brief's suggestion; the existing ForkJoin-
+  adjacent fixes on `dev` (`ae574d8f`/`c9da1f68`/`ebc4bb85` "gcstress
+  residual forkjoin fix", `743da7b1`/`ce258204` "Phaser/ForkJoinPool hang"
+  fix) address narrower, different mechanisms (GC-stress root stability and
+  a `CompletableFuture.runAsync` exception-swallowing hang, respectively),
+  not general worker-pool throughput or the fork/join synchronous-emulation
+  behavior described above.
+
+  This class's ~45x slowdown vs. HotSpot is therefore a real,
+  well-understood (if still unresolved) performance gap — the fork/join
+  synchronous-emulation design already in the codebase, not a new bug — but
+  at current dev tip it finishes inside the 1500s ceiling with a comfortable
+  margin (~3x on all 3 runs), so it is reclassified out of Bucket 1 rather
+  than treated as an open hang. A future session wanting genuine JUnit
+  parallel-test speedup under CratonVM would need to make `ForkJoinTask.
+  fork()` actually dispatch to other pool worker threads instead of the
+  current no-op-fork/synchronous-join emulation — a larger undertaking
+  (the original eager-fork approach was reverted for stack-overflow reasons
+  on deep `RecursiveTask` recursion, so a real fix likely needs an explicit
+  work queue rather than reverting that change) that is out of scope here.
+  If a future session sees this class exceed 1500s, suspect either host
+  contention (this is a shared, busy machine) or an actual regression, and
+  re-open.
 
 **Why the original 2026-07-11 data showed `found=0/succ=0/fail=0` at the
 full ceiling for all 4**: not established with certainty for any of the
