@@ -38,8 +38,16 @@ normal optimized runtime. Every run completed with `failed=0`:
 | `cascade.circle.MultiPathCircleCascade*` | 6 | `found=9 started=9 ok=9` |
 | `bytecode.enhancement.cascade.circle.MultiPathCircleCascade*` | 6 | `found=18 started=18 ok=18` |
 
+An independent JIT-on current-`dev` rerun on 2026-07-12 reproduced those
+results: all 54 plain and 108 enhanced tests passed, with the slowest class
+finishing in 208 seconds (under the original 300-second timeout).
+
 The abstract enhanced base remains intentionally untested; it contains no
 concrete JUnit tests and was not part of the 12-class failure set.
+
+The same 12 concrete classes also completed on the JDK 25 HotSpot baseline
+with no failures, confirming that their circular-cascade behavior itself is
+valid and that the original timeout was CratonVM-specific.
 
 The JIT package guards have dedicated slash- and dot-name regression tests in
 both the VM enqueue-side skip list and the final compiler gate.
