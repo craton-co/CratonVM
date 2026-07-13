@@ -3,6 +3,37 @@
 Status: OPEN (residuals split out of
 `docs/internal/elasticsearch-suite/ES-FAIL-FAMILY-20260710-vector-codec-exception-cause-object-FIXED.md`)
 
+## 2026-07-13 focused real-JDK NIOFS finding
+
+The direct-buffer compatibility fixes are sufficient for the focused
+real-JDK direct-buffer probes (including a non-null `DirectBuffer.cleaner`,
+direct `FileChannel` I/O, `ByteBuffersDirectory` reflection + I/O, byte-order
+round trips, and the exact `ChecksumIndexInput.getChecksum()` value).  They
+also move the forced `NIOFSDirectory`
+`BaseIndexFileFormatTestCase.testMultiClose` repro past its former
+`DirectBuffer.cleaner().clean()` null-pointer failure.
+
+The same deterministic repro is **still open**: it now ends with
+`CorruptIndexException: misplaced codec footer (file truncated?)`, reporting
+`remaining=-30, expected=16, fp=2517`.  System-call tracing records only a
+2479-byte body write followed by an 8-byte write, while Lucene's logical
+output position expects a 2533-byte file: 46 bytes are lost before the final
+OS write, not by a later read-back or footer check.  Standalone direct
+`FileChannel` (including a 131071-byte stress probe), transfer, and
+`OutputStreamIndexOutput` alignment probes preserve their physical lengths,
+so this is not a generic direct-buffer allocation, cleaner, file-channel, or
+alignment failure.
+
+The remaining evidence points at the compound-file `copyBytes` path:
+`Lucene90CompoundFormat.writeCompoundFile` reports its logical file pointer
+after copying input through the force-dispatched ByteBuffer family, but the
+produced compound body is short.  In particular, the forced
+`ByteBuffer.get([BII)` / `put([BII)` dispatch reached by the input/output
+bulk-copy path remains the next narrow runtime boundary to instrument with
+the exact compound-file chunk sizes.  Do not retire this note until that
+copy-path pointer/physical-length divergence is eliminated and the exact
+`testMultiClose` command passes.
+
 Context: the s2 synthetic ByteBuffer native family
 (`native-builtins/src/servlet.rs`, sibling copy in `tests_extracted.rs`) is
 force-dispatched over real JDK bytecode for ~60 `java/nio/ByteBuffer`
