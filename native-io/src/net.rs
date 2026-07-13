@@ -662,17 +662,33 @@ fn net_accept_close_aware(
 }
 
 /// Convert a `std::io::Error` into the closest matching JDK IOException subtype.
-/// Because `RuntimeError` only has a generic `IOException` variant we encode the
-/// Java class name in the message prefix — the same convention used by
-/// `net_phase_e.rs` for `java.net.Socket` / `ServerSocket`.
+/// `ConnectException` and `SocketTimeoutException` have real typed `RuntimeError`
+/// variants and MUST be thrown as those concrete types — real code catches them
+/// specifically (e.g. ES `RestClientMultipleHostsIntegTests.testNodeSelector`
+/// does `catch (ConnectException e)` around a connect to a stopped host; a bare
+/// IOException whose message merely mentions the class name escapes that catch).
+/// The remaining kinds have no typed variant yet, so we fall back to the
+/// message-prefix convention also used by `net_phase_e.rs` for `java.net.Socket`
+/// / `ServerSocket`.
 fn net_err(ctx: &str, e: std::io::Error) -> MethodCallFailed {
+    match e.kind() {
+        ErrorKind::ConnectionRefused => {
+            return RuntimeError::ConnectException {
+                message: format!("{ctx}: {e}"),
+            }
+            .into();
+        }
+        ErrorKind::TimedOut | ErrorKind::WouldBlock => {
+            return RuntimeError::SocketTimeoutException {
+                message: format!("{ctx}: {e}"),
+            }
+            .into();
+        }
+        _ => {}
+    }
     let msg = match e.kind() {
-        ErrorKind::ConnectionRefused => format!("ConnectException: {ctx}: {e}"),
         ErrorKind::ConnectionReset => format!("SocketException: Connection reset: {ctx}: {e}"),
         ErrorKind::ConnectionAborted => format!("SocketException: Connection aborted: {ctx}: {e}"),
-        ErrorKind::TimedOut | ErrorKind::WouldBlock => {
-            format!("SocketTimeoutException: {ctx}: {e}")
-        }
         ErrorKind::AddrInUse => format!("BindException: Address already in use: {ctx}: {e}"),
         ErrorKind::AddrNotAvailable => {
             format!("BindException: Cannot assign requested address: {ctx}: {e}")

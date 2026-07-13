@@ -170,10 +170,93 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     }
 
     // 6. Class mirror cache — java.lang.Class objects
+    //
+    // A mirror's `classLoader` field is a real heap edge to its defining
+    // ClassLoader, so unconditionally rooting every mirror ever created here
+    // keeps that loader alive forever too — completely defeating
+    // `CRATONVM_LOADER_UNLOAD` (default ON, see `gc_scan_loader_singleton_roots`)
+    // for any class that ever had a mirror created (`getClass()`, reflection,
+    // annotation scanning — i.e. virtually every class). Symptom: a
+    // `WeakReference<Class<?>>` (e.g. Tomcat's `ManagedConcurrentWeakHashMap`
+    // used by `DefaultInstanceManager`'s annotation cache) never clears for an
+    // unloaded webapp class even after its ClassLoader is otherwise
+    // unreachable — `TestDefaultInstanceManager.testClassUnloading` count
+    // off-by-one.
+    //
+    // Built-in loaders (bootstrap/extension/application) are permanent for the
+    // process lifetime, so their classes' mirrors stay unconditionally rooted.
+    // Classes loaded by a user-defined `ClassLoader` are NOT unconditionally
+    // rooted here when the gate is on — otherwise this loop would defeat
+    // `defining_loader_store`'s own unloading the same way it defeated it
+    // before this fix. Such a mirror still stays alive whenever its DEFINING
+    // LOADER is independently reachable (built-in-loader liveness, another
+    // live reference to the loader, or a live instance of one of its OTHER
+    // classes via `loader_pin`) via the `cratonvm_types::mirror_pin`
+    // propagation the GC marker consults for exactly this — mirroring
+    // `loader_pin`'s instance→loader edge in the opposite direction, since
+    // CratonVM's synthetic `ClassLoader` model has no heap-traceable
+    // `ClassLoader.classes` bookkeeping to make plain reachability of the
+    // mirror alone sufficient. A mirror whose loader turns out unreachable
+    // this cycle is pruned post-GC by `memory::gc::reconcile_class_mirrors`.
+    //
+    // The mirror_pin propagation is only wired into the Generational
+    // collector's NON-MOVING marker (`gen_heap.rs`'s `mark_young` worklist
+    // loop + old-gen BFS, both keyed off a STABLE object address — see the
+    // mirror_pin call sites there) — the SAME collector
+    // `conservative_locals_enabled` above already keys off
+    // `gc_quiescence::is_active()` for an analogous reason. It is NOT wired
+    // into G1's or ZGC's own marker (a pre-existing gap shared with
+    // `loader_pin` itself, which also only instruments `gen_heap.rs`), nor
+    // into the Generational collector's MOVING young-gen Cheney-copy path,
+    // which relocates objects while scanning and would need the mirror_pin
+    // lookup keyed by each object's PRE-copy address (not implemented this
+    // pass — no test exercises it and it is a materially different,
+    // higher-risk change to the copying loop). So: only take mirrors out of
+    // the unconditional root set when BOTH the configured algorithm is
+    // Generational AND its non-moving marker is what will actually run this
+    // cycle. Under G1/ZGC or the moving path this falls back to the original
+    // (safe, if still-leaky) unconditional rooting.
+    //
+    // Classification note: whether to skip unconditional rooting MUST use a
+    // PERMANENT signal — `class_manager`'s `ClassLoaderId::UserDefined(_)`,
+    // set once when the class is registered and never cleared — NOT
+    // `defining_loader_for` (a mutable liveness side-table pruned by
+    // `gc_reconcile_defining_loaders` the moment a loader is confirmed dead).
+    // Using the mutable signal here is a trap that reintroduces this exact
+    // bug: the instant a user-defined class's own loader legitimately dies
+    // and its `defining_loader_store` entry is pruned, `defining_loader_for`
+    // starts returning `None` for it — indistinguishable from "always was a
+    // built-in class" — which would flip this loop to root it
+    // UNCONDITIONALLY forever from that point on (verified: this exact
+    // mistake measured `expected:8 actual:9`, i.e. no improvement at all,
+    // because the JSP-eviction test's whole point is a loader dying mid-run).
+    // `defining_loader_for` remains the right call for `mirror_pin`'s OWN
+    // bookkeeping below (rebuild_mirror_pins / gen_heap.rs) — there it
+    // legitimately means "does this class currently have a live pairing,"
+    // which is exactly what that machinery wants.
     {
         let class_mirrors = shared.class_mirrors.read();
-        for obj_ref in class_mirrors.values() {
-            roots.push(*obj_ref);
+        if cratonvm_native_builtins::classloader::loader_unload_enabled()
+            && shared.config.gc_algorithm == crate::config::GcAlgorithm::Generational
+            && cratonvm_gc::gc_quiescence::is_active()
+        {
+            let cm = shared.class_manager.read();
+            for (&class_id, obj_ref) in class_mirrors.iter() {
+                let is_user_defined = cm.get_class(class_id).is_some_and(|c| {
+                    matches!(
+                        c.loader_id,
+                        crate::classloading::ClassLoaderId::UserDefined(_)
+                    )
+                });
+                if is_user_defined {
+                    continue;
+                }
+                roots.push(*obj_ref);
+            }
+        } else {
+            for obj_ref in class_mirrors.values() {
+                roots.push(*obj_ref);
+            }
         }
     }
 

@@ -20,6 +20,14 @@ KCRUNNER_RESULT tests=7 failed=1 aborted=0 skipped=0 containersFailed=0
 The sibling `testEdDSAKeyBindingWithEd25519` in the same class now passes cleanly (confirming
 `eddsa-keyspec-to-publickey-invalidkeyspecexception` is genuinely fixed for Ed25519) — this is specific to Ed448.
 
+**Update 2026-07-13**: the identical `testEdDSAKeyBindingWithEd448` failure (same `ComparisonFailure`, same
+`SdJwtKeyBindingTest.testKeyBinding(SdJwtKeyBindingTest.java:192)` stack) also reproduces in
+`crypto/elytron :: org.keycloak.crypto.elytron.test.sdjwt.ElytronCryptoSdJwtKeyBindingTest` — confirmed via a
+fresh (non-stale-distribution) HotSpot comparison where both the `fips1402` and `elytron` variants of this test
+PASS cleanly under HotSpot but still fail identically under CratonVM. This confirms the bug is in the shared
+`SdJwtKeyBindingTest`/Ed448 signing-and-verification code path itself (exercised identically by both crypto
+provider variants), not specific to either provider.
+
 ## Notes
 
 - `ComparisonFailure` (no message body captured in the summary output) means an actual vs expected string/value
