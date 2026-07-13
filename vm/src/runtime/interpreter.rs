@@ -1226,6 +1226,13 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     // Round-5 fix (CRIT — UAF): drain this thread's per-thread SATB
     // buffer before initiating GC; see `maybe_gc` for the full rationale.
     shared.heap.flush_thread_satb();
+    // Real HotSpot's `System.gc()` triggers a FULL (old-gen-inclusive)
+    // collection by default — request one explicitly, since the collector's
+    // own Phase 5 otherwise only runs a major cycle when old gen crosses an
+    // occupancy threshold. See `gc_quiescence`'s doc comment for the full
+    // rationale (an already-promoted, genuinely-dead object is never swept by
+    // a `System.gc()` that only triggers a minor collection).
+    cratonvm_gc::gc_quiescence::request_major_gc();
     cratonvm_gc::gc_quiescence::begin_moving_young_coverage_cycle();
     update_root_snapshot(shared, thread);
     mtroots_set_gc_ctx(shared, thread, 1); // 1 = System.gc
@@ -1532,6 +1539,16 @@ fn process_references_after_gc(
             &is_marked,
             pointer_map,
         );
+        // Companion reconciliation for the class-mirror cache — see
+        // `memory::gc::reconcile_class_mirrors` / `roots.rs` step 6. Same
+        // "before the no_refproc short-circuit" rationale: the cache must
+        // never hold a stale ObjectRef after a collection, independent of
+        // that diagnostic switch.
+        crate::memory::gc::reconcile_class_mirrors(shared, &is_marked);
+        // Rebuild the mirror_pin registry the GC marker consults (gen_heap.rs)
+        // from the now-pruned class_mirrors + just-remapped defining-loader
+        // side-table, so the marker sees current addresses next cycle.
+        crate::memory::gc::rebuild_mirror_pins(shared);
     }
 
     // bc math-ec 0x4 (CRATONVM_DBG_NO_REFPROC): subsystem-level exclusion
@@ -3447,6 +3464,18 @@ fn g1_remark_process_references(
     shared: &SharedVm,
     is_marked: &dyn Fn(usize) -> bool,
 ) -> Vec<usize> {
+    // Companion reconciliation for the class-mirror cache (see
+    // `memory::gc::reconcile_class_mirrors` / `roots.rs` step 6). `roots.rs`
+    // step 6 only stops unconditionally rooting a user-defined class's mirror
+    // when the Generational collector's non-moving marker is active — NOT
+    // under G1 (no mirror_pin propagation wired into `g1.rs` yet) — so under
+    // G1 every mirror stays rooted and this call is a no-op (`is_marked`
+    // always true, nothing pruned). Kept here anyway, unconditionally, so
+    // this stays correct for free if G1 ever gains the same treatment. Done
+    // before the `no_refproc` short-circuit, same rationale as the post-GC
+    // path.
+    crate::memory::gc::reconcile_class_mirrors(shared, is_marked);
+
     // Same subsystem-level exclusion switch as the post-GC path.
     if no_refproc() {
         return Vec::new();

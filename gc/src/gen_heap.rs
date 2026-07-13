@@ -4061,10 +4061,27 @@ impl GenerationalHeap {
         // reliable within the next non-moving epoch, where A2's desync occurs).
         crate::a2dbg::clear();
 
-        // Phase 5: Check if old gen is getting full — trigger major GC (mark-compact)
-        let major_ran = if old_gen.used() >= old_gen.capacity() * 75 / 100 {
+        // Phase 5: Check if old gen is getting full — trigger major GC (mark-compact).
+        //
+        // `take_major_gc_request` is ALWAYS evaluated (not short-circuited by
+        // `||`) so an explicit `System.gc()` request is consumed exactly once
+        // per cycle even when the occupancy threshold was independently also
+        // crossed — otherwise the request would leak into and force a LATER,
+        // unrelated allocation-triggered minor GC into a major cycle it never
+        // asked for. See `gc_quiescence`'s doc comment for the full rationale.
+        let major_requested = crate::gc_quiescence::take_major_gc_request();
+        if std::env::var_os("CRATONVM_DBG_MIRRORPIN").is_some() {
+            eprintln!(
+                "[DBG_MIRRORPIN] Phase5 old_gen_used={} old_gen_cap={} major_requested={} will_run_major={}",
+                old_gen.used(),
+                old_gen.capacity(),
+                major_requested,
+                old_gen.used() >= old_gen.capacity() * 75 / 100 || major_requested
+            );
+        }
+        let major_ran = if old_gen.used() >= old_gen.capacity() * 75 / 100 || major_requested {
             tracing::debug!(
-                "Old gen at {}% — running major GC (mark-compact)",
+                "Old gen at {}% (or explicit System.gc() request) — running major GC (mark-compact)",
                 old_gen.used() * 100 / old_gen.capacity(),
             );
             let old_used_before = old_gen.used();
@@ -4677,6 +4694,22 @@ impl GenerationalHeap {
                     cratonvm_types::loader_pin::loader_pin_addr(header.class_id.as_u32())
                 {
                     mark_young(loader_addr as *mut u8, &mut worklist, &mut side_marks);
+                }
+            }
+            // Class-mirror liveness pin (mirror_pin, companion to loader_pin
+            // above — see `vm::memory::roots` step 6 and
+            // `cratonvm_types::mirror_pin`): this object is non-moving here,
+            // so `obj_ptr` is a stable key. If it IS itself a user-defined
+            // `ClassLoader` that has defined mirror-having classes, mark
+            // those mirrors alive too — the edge a real JDK's
+            // `ClassLoader.classes` field gives for free, which this VM's
+            // synthetic `ClassLoader` doesn't carry as a heap-traceable
+            // field.
+            if let Some(mirror_addrs) =
+                cratonvm_types::mirror_pin::mirrors_for_loader(obj_ptr as usize)
+            {
+                for mirror_addr in mirror_addrs {
+                    mark_young(mirror_addr as *mut u8, &mut worklist, &mut side_marks);
                 }
             }
         }
@@ -6502,6 +6535,31 @@ impl GenerationalHeap {
                         if h.gc_flags & GC_FLAG_MARKED == 0 {
                             h.gc_flags |= GC_FLAG_MARKED;
                             worklist.push(lp);
+                        }
+                    }
+                }
+            }
+            // Class-mirror liveness pin (mirror_pin, companion to loader_pin
+            // above — see `vm::memory::roots` step 6 and
+            // `cratonvm_types::mirror_pin`). Old gen doesn't move during this
+            // BFS (compaction happens after), so `obj_ptr` is a stable key.
+            // If this marked object IS itself a user-defined `ClassLoader`
+            // that defined mirror-having classes, mark those mirrors alive
+            // too — same "conservative, only ever marks MORE live" property
+            // as the loader_pin check above. Same young-gen exemption as
+            // loader_pin: a still-young mirror is already live as a major-GC
+            // root.
+            if let Some(mirror_addrs) =
+                cratonvm_types::mirror_pin::mirrors_for_loader(obj_ptr as usize)
+            {
+                for mirror_addr in mirror_addrs {
+                    let mp = mirror_addr as *mut u8;
+                    if old_gen.contains(mp) {
+                        // SAFETY: `mp` is within old gen (verified by `contains`).
+                        let h = unsafe { &mut *(mp as *mut ObjectHeader) };
+                        if h.gc_flags & GC_FLAG_MARKED == 0 {
+                            h.gc_flags |= GC_FLAG_MARKED;
+                            worklist.push(mp);
                         }
                     }
                 }
