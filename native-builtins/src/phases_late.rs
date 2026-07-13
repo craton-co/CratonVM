@@ -26144,7 +26144,15 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
     );
     r.register(bfa, "isDirectory", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 3)))
+        // Coerce like `isRegularFile` below: an out-of-bounds/undersized-layout
+        // receiver makes `get_field` return `Value::Object(None)` (a dropped
+        // read), which must not leak out of a `()Z`-descriptor native as a
+        // reference value where the interpreter/JIT expects a boolean.
+        let is_dir = match ctx.get_field(this, 3) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(is_dir)))
     });
     r.register(bfa, "isRegularFile", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -35901,6 +35909,36 @@ fn p98_invoke_file_visitor(
     })
 }
 
+/// Build a real 5-field `BasicFileAttributes` (see `p59_files_read_attributes`
+/// for the canonical layout: creation=0, lastAccess=1, lastMod=2, isDir=3,
+/// size=4) for a `Files.walkFileTree` visitor callback.
+///
+/// `p98_walk_dir` used to hand every `preVisitDirectory`/`visitFile` callback
+/// a zero-field placeholder (`alloc_concurrent_synthetic(ctx, bfa, 0)`). Any
+/// real-bytecode `FileVisitor` that actually calls a `BasicFileAttributes`
+/// accessor on that placeholder (`isDirectory()`, `size()`, `creationTime()`,
+/// ...) hits the GC-guard's out-of-bounds-field-read path — silently dropped
+/// to a default rather than throwing, so the bug was invisible unless
+/// `CRATONVM_DBG_OOBFIELD`/`RUST_LOG=warn` was on. `isDirectory()` in
+/// particular (`register_p59_file_attributes`) returns the raw
+/// (out-of-bounds) `get_field` result verbatim for a `()Z`-descriptor method
+/// instead of coercing it to an `Int` — on this placeholder that silently
+/// returns `Value::Object(None)` where a boolean was expected, a type
+/// confusion that a defensively-coded caller (`isRegularFile`, which matches
+/// on `Value::Int` and falls back to `0`) tolerates but a naive caller
+/// (`isDirectory`) does not. Give every callback the real, correctly-shaped
+/// object instead of relying on the guard's fallback.
+fn p98_alloc_basic_file_attributes(ctx: &mut dyn NativeContext, is_dir: bool, size: i64) -> ObjectRef {
+    let bfa = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 5);
+    let ft = filetime_alloc(ctx, 0);
+    ctx.set_field(bfa, 0, Value::Object(Some(ft)));
+    ctx.set_field(bfa, 1, Value::Object(Some(ft)));
+    ctx.set_field(bfa, 2, Value::Object(Some(ft)));
+    ctx.set_field(bfa, 3, Value::Int(if is_dir { 1 } else { 0 }));
+    ctx.set_field(bfa, 4, Value::Long(if is_dir { 0 } else { size }));
+    bfa
+}
+
 fn p98_walk_dir(
     ctx: &mut dyn NativeContext,
     dir: &str,
@@ -35908,7 +35946,7 @@ fn p98_walk_dir(
     dir_path_obj: ObjectRef,
     skip_file_callbacks: bool,
 ) -> Result<bool, MethodCallFailed> {
-    let attrs = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 0);
+    let attrs = p98_alloc_basic_file_attributes(ctx, true, 0);
     // preVisitDirectory
     let pre = p98_invoke_file_visitor(
         ctx,
@@ -35943,11 +35981,8 @@ fn p98_walk_dir(
                     return Ok(false);
                 }
             } else if !skip_file_callbacks {
-                let fa = alloc_concurrent_synthetic(
-                    ctx,
-                    "java/nio/file/attribute/BasicFileAttributes",
-                    0,
-                );
+                let size = jarfs_entry_size(&jar, &child).unwrap_or(0);
+                let fa = p98_alloc_basic_file_attributes(ctx, false, size);
                 let vr = p98_invoke_file_visitor(
                     ctx,
                     visitor,
@@ -35976,11 +36011,8 @@ fn p98_walk_dir(
                     return Ok(false);
                 }
             } else if !skip_file_callbacks {
-                let fa = alloc_concurrent_synthetic(
-                    ctx,
-                    "java/nio/file/attribute/BasicFileAttributes",
-                    0,
-                );
+                let size = jrtfs_entry_size(&java_home, &child).unwrap_or(0);
+                let fa = p98_alloc_basic_file_attributes(ctx, false, size);
                 let vr = p98_invoke_file_visitor(
                     ctx,
                     visitor,
@@ -36009,11 +36041,8 @@ fn p98_walk_dir(
                     return Ok(false);
                 }
             } else if !skip_file_callbacks {
-                let fa = alloc_concurrent_synthetic(
-                    ctx,
-                    "java/nio/file/attribute/BasicFileAttributes",
-                    0,
-                );
+                let size = entry.metadata().map(|m| m.len() as i64).unwrap_or(0);
+                let fa = p98_alloc_basic_file_attributes(ctx, false, size);
                 let vr = p98_invoke_file_visitor(
                     ctx,
                     visitor,

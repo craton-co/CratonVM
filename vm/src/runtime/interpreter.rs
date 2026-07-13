@@ -17240,6 +17240,18 @@ fn execute_invoke_kind(
     let (method_class_name, method_name, method_descriptor, num_params) =
         resolve_method_ref(shared, current_class_id, cp_index)?;
 
+    if crate::runtime::env_cache::dbg_hang_sample() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CALL_COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n % 200_000 == 0 {
+            eprintln!(
+                "[HANG_SAMPLE_V1] call#{n} {}.{}{}",
+                &*method_class_name, &*method_name, &*method_descriptor
+            );
+        }
+    }
+
     // KAFKA-DEFAULT-RESCUE: snapshot the CP-resolved class id (if loaded)
     // before any downstream code can move `method_class_name`. The default-
     // method rescue at the NSME emit site in `invoke_on_class_shared_inner`
