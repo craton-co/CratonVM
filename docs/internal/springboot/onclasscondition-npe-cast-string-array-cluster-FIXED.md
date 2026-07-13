@@ -1,14 +1,19 @@
-# `OnClassCondition.addAll` NPE-cast-to-`String[]` cluster: root cause found, fix verified correct, but BLOCKED from merging by a newly-exposed heap-corruption bug
+# `OnClassCondition.addAll` NPE-cast-to-`String[]` cluster — FIXED and merged
 
-**Status: OPEN (blocked). The original 75-class/348-occurrence
-`ClassCastException` cluster (formerly tracked as
-`onclasscondition-npe-cast-to-string-array-cluster.md`, now retired to
-`docs/internal/` — this doc supersedes it) is fully root-caused and a fix is
-verified to eliminate every occurrence. That fix cannot ship: applying it
-makes 3 Spring Boot test classes crash/hang with a heap-corruption defect
-that does not reproduce on the unmodified baseline. The corruption's root
-cause is NOT understood. Do not merge
-`fix/onclasscondition-npe-array-alias-20260712` until it is.**
+**Status: FIXED (2026-07-13), merged to `dev`.** The 75-class/348-occurrence
+`ClassCastException` cluster is root-caused and fixed, verified against all
+75/75 originally-affected classes with zero residual. The fix initially
+appeared to expose a separate, unrelated heap-corruption bug in 3 classes —
+that turned out to be a **red herring**: the corruption was a pre-existing
+bug (`NativeContextImpl::read_string` misidentifying a `String[]` array as a
+`java/lang/String` by class ID alone), independently found and fixed on
+`dev` the same day for an unrelated symptom (Flyway/CGLIB SIGSEGV, commit
+`e7e3bb91f`). This fix's new annotation-array-construction code path just
+exercised that same latent bug far more often than the narrow path that
+originally found it. Cherry-picking `e7e3bb91f` eliminated the corruption
+entirely — see "Resolution" below. The investigation trail (5 failed
+GC-pinning attempts, a `--nojit` bisection) is kept below for anyone who
+hits a similar heap-corruption-shaped mystery in the future.
 
 ## The original bug — ROOT-CAUSED, FIX CONFIRMED CORRECT
 
@@ -143,7 +148,51 @@ root piece (go back to allocating a fresh, `pin_native_root`-protected
 sentinel every time, accepting the perf cost) and see whether the corruption
 changes character or disappears.
 
-## Repro
+## Resolution (2026-07-13)
+
+While retiring this doc, the sibling doc
+`docs/internal/flyway-cglib-heap-corruption-sigsegv-crash-FIXED.md` was
+noticed — independently landed on `dev` (commit `e7e3bb91f`) the same day,
+for a completely different symptom (`FlywayAutoConfigurationTests` SIGSEGV
+via CGLIB), but with the **identical corruption signature**: `num_slots=0,
+class_id=ClassId(6), class_name=java/lang/String, real_field_count=Some(4)`,
+from the **same code path** (`annotation_element_to_java_typed` →
+`create_annotation_proxy`). Root cause there: `NativeContextImpl::read_string`
+identified a String purely by class ID, but CratonVM reference arrays store
+their **component** class ID in that same header slot — so a one-element
+`String[]` (as `create_annotation_proxy` builds for `getDeclaredAnnotations()`
+internals) was wrongly accepted as itself being a `java/lang/String`, and the
+structural string reader then read an array element as if it were an object
+field, producing the exact `num_slots=0`/malformed-String corruption
+signature seen in all 5 fix variants above. `read_string` now requires
+`ObjectKind::Object` before checking String identity, rejecting arrays
+outright.
+
+This fix's own annotation code just called into this area of
+`create_annotation_proxy` far more often than the original Flyway/CGLIB path
+ever did (once per unresolvable-`@ConditionalOnClass`-element, VM-wide,
+versus a narrow CGLIB-specific trigger) — which is exactly why 5 different
+GC-pinning fixes aimed at the WRONG mechanism (allocation staleness in
+*this* fix's own new objects) never touched it: the actual corruption source
+was a pre-existing bug in a completely different function
+(`read_string`), just being hit far more frequently.
+
+Cherry-picked `e7e3bb91f` into `fix/onclasscondition-npe-array-alias-20260712`.
+**Verified**: the 3 previously-crashing classes — `JdbcSessionAutoConfigurationTests`,
+`SecurityAutoConfigurationTests` (both now clean, no corruption, `FAIL` for
+genuinely unrelated pre-existing reasons) and `BraveAutoConfigurationTests`
+(corruption gone, but see the separate small residual doc
+`brave-baggagefields-classcast-summary-printing.md`) — plus a full 75-class
+re-run: **zero** occurrences of the dangerous corruption signature anywhere,
+**zero** residual `ClassCastException`s from the original bug. The remaining
+scattered "corrupt Value cell" (HIB-CV-32) guard hits in a handful of other
+classes are confirmed pre-existing on unmodified `origin/dev` too (same
+counts, same classes) — unrelated, already-tracked, non-fatal noise, not a
+regression from this work.
+
+Merged to `dev`.
+
+## Repro (historical — for the corruption investigation, now resolved)
 
 ```powershell
 # Original ClassCastException cluster (fixed — verify with the fix binary):
