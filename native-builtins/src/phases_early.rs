@@ -578,11 +578,11 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     // --- Collections.emptyList/emptyMap/emptySet ---
     let cu = "java/util/Collections";
     r.register(cu, "emptyList", "()Ljava/util/List;", |ctx, _args| {
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-        ctx.set_field(list, 0, Value::Object(Some(arr)));
-        ctx.set_field(list, 1, Value::Int(0));
-        Ok(Some(Value::Object(Some(list))))
+        // Do not hand-assemble ArrayList's internal fields, and do not return
+        // a native-side allocation across a potential collection. `List.of()`
+        // is the JDK-owned empty immutable list construction and keeps its
+        // result live through the ordinary VM invocation path.
+        ctx.invoke("java/util/List", "of", "()Ljava/util/List;", &[])
     });
     r.register(cu, "emptyMap", "()Ljava/util/Map;", |ctx, _args| {
         let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);

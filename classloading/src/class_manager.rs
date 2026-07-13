@@ -5915,8 +5915,19 @@ impl ClassManager {
             class.annotations = annotations;
             class.signature = signature;
             class.is_synthetic_stub = false;
-            // Reset state to Loaded so verification + init can run
+            // Reset *both* initialization representations so verification and
+            // the real `<clinit>` run after a stub-to-bytecode upgrade.  The
+            // dispatch fast path reads `init_state` before inspecting
+            // `ClassState`; leaving the stub's Initialized value there makes
+            // it return early even though this real class has never executed
+            // its initializer.  That leaked stale static slots through
+            // `Collections.emptyList()` during Spring Boot bootstrap.
             class.state = ClassState::Loaded;
+            class.initializing_thread = None;
+            class.init_state.store(
+                CLASS_INIT_UNINITIALIZED,
+                std::sync::atomic::Ordering::Release,
+            );
 
             // Compute has_finalizer
             class.has_finalizer = class.declares_finalize();
@@ -12306,6 +12317,35 @@ mod tests {
         let child = mgr.class_store.get(child_id).unwrap();
         assert_eq!(child.first_field_index, 2);
         assert_eq!(child.num_total_fields, 3);
+    }
+
+    #[test]
+    fn synthetic_upgrade_resets_embedded_initialization_fast_path() {
+        let mut manager = ClassManager::new(&[], &[], &[]);
+        let class_id = manager.ensure_synthetic_class("Foo", 0);
+        manager.set_class_init_state(class_id, CLASS_INIT_INITIALIZED);
+
+        manager
+            .upgrade_synthetic_class(
+                class_id,
+                "Foo",
+                include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class"),
+                ClassLoaderId::Bootstrap,
+            )
+            .expect("upgrade synthetic Foo stub to real fixture");
+
+        let class = manager
+            .class_store
+            .get(class_id)
+            .expect("upgraded class remains registered");
+        assert!(!class.is_synthetic_stub);
+        assert_eq!(class.state, ClassState::Loaded);
+        assert_eq!(class.initializing_thread, None);
+        assert_eq!(
+            class.init_state.load(std::sync::atomic::Ordering::Acquire),
+            CLASS_INIT_UNINITIALIZED,
+            "a real class upgraded from an initialized stub must not skip its real <clinit>"
+        );
     }
 
     #[test]
