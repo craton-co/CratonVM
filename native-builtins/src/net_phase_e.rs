@@ -3046,7 +3046,22 @@ fn re1_connect_socket(
     } else {
         TcpStream::connect(sa)
     }
-    .map_err(|e| ioex(format!("ConnectException: {host}:{port}: {e}")))?;
+    // BUGFIX [nb-net-phase-e]: throw the CONCRETE `java.net.*` exception types
+    // for connect failures, not a generic `IOException` whose message merely
+    // mentions the class name as a text prefix — real code catches these by
+    // type (`catch (ConnectException e)` / `catch (SocketTimeoutException e)`;
+    // a bare IOException escapes both).
+    .map_err(|e| match e.kind() {
+        std::io::ErrorKind::ConnectionRefused => RuntimeError::ConnectException {
+            message: format!("{host}:{port}: {e}"),
+        }
+        .into(),
+        std::io::ErrorKind::TimedOut => RuntimeError::SocketTimeoutException {
+            message: format!("{host}:{port}: {e}"),
+        }
+        .into(),
+        _ => ioex(format!("ConnectException: {host}:{port}: {e}")),
+    })?;
     let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
     let stream_id = s2_alloc_stream(stream);
     let pin_base = ctx.pin_native_root(this);
