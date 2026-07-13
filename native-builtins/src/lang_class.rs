@@ -10176,6 +10176,32 @@ fn create_annotation_proxy(
         ctx.set_array_element(names_arr, i, Value::Object(Some(name_str)));
         let java_val =
             annotation_element_to_java_typed(ctx, val, ret_desc.as_deref(), container_loader);
+        if std::env::var("CRATONVM_IAE_TRACE2").is_ok() {
+            let desc = match &java_val {
+                Value::Object(Some(o)) => {
+                    let cid = ctx.class_id_of_object(*o);
+                    let is_arr = ctx.heap_kind_of(*o) == cratonvm_types::ObjectKind::Array;
+                    let len = if is_arr {
+                        ctx.array_length(*o) as i64
+                    } else {
+                        -1
+                    };
+                    format!(
+                        "Object(cid={} name={:?} is_array={} len={})",
+                        cid.as_u32(),
+                        ctx.class_name_of_id(cid),
+                        is_arr,
+                        len
+                    )
+                }
+                Value::Object(None) => "Object(null)".to_string(),
+                other => format!("{other:?}"),
+            };
+            eprintln!(
+                "ANN-ELEM holder={} name={} value={}",
+                ann.type_descriptor, name, desc
+            );
+        }
         values_arr = ctx.read_native_pin(values_pin, values_arr);
         ctx.set_array_element(values_arr, i, java_val);
     }
@@ -11495,9 +11521,14 @@ pub(crate) fn native_method_get_annotations(
     let annotations = ctx.method_annotations(class_id, &method_name, &method_desc);
     if std::env::var("CRATONVM_ANN_TRACE").is_ok() {
         let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
-        if cn.contains("SpringBootApplication") || cn.contains("EnableAutoConfiguration") {
+        if cn.contains("SpringBootApplication")
+            || cn.contains("EnableAutoConfiguration")
+            || cn.ends_with("/Import")
+            || cn.contains("ImportHttpServices")
+        {
             eprintln!(
-                "[MGA] {}.{}{} -> {} method-anns",
+                "[MGA] class_id={} {}.{}{} -> {} method-anns",
+                class_id.as_u32(),
                 cn,
                 method_name,
                 method_desc,
@@ -11575,9 +11606,13 @@ pub(crate) fn native_method_get_annotation(
     let annotations = ctx.method_annotations(class_id, &method_name, &method_desc);
     if std::env::var("CRATONVM_ANN_TRACE").is_ok() {
         let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
-        if cn.contains("SpringBootApplication") {
+        if cn.contains("SpringBootApplication")
+            || cn.ends_with("/Import")
+            || cn.contains("ImportHttpServices")
+        {
             eprintln!(
-                "[GMA] {}.{}{} target={} -> {} method-anns",
+                "[GMA] class_id={} {}.{}{} target={} -> {} method-anns",
+                class_id.as_u32(),
                 cn,
                 method_name,
                 method_desc,

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN (12 genuinely hung, 10 slow-but-failing, 1 crash; 2 non-residual items removed). **2026-07-13 update**: 8 Bucket-1 + 3 Bucket-2 classes reconfirmed locally — one narrower bug fixed (`7ae137e4`), the hang itself still OPEN; see the 2026-07-13 section below. **2026-07-13 update #2**: `context.annotation.ImportSelectorTests`'s `StackOverflowError` root-caused — it is a Mockito `spy()` cross-hierarchy recursion, **unrelated to Spring's `ImportSelector` mechanism** (the original hypothesis below was wrong); still OPEN, see its own section. **2026-07-13 update #3**: the 4 non-AOT, non-`ImportSelectorTests` Bucket-1 classes (`cache.jcache.JCacheEhCacheAnnotationTests`, `context.annotation.ComponentScanParserBeanDefinitionDefaultsTests`, `context.annotation.InitDestroyMethodLifecycleTests`, `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests`) **no longer hang** — reconfirmed clean on 2 independent runs each against a freshly-built `origin/dev` tip; see the dedicated section below. No new code was needed — all 4 were incidental beneficiaries of other unrelated fixes already on `dev`. |
+| **Status** | OPEN (12 genuinely hung, 10 slow-but-failing, 1 crash; 2 non-residual items removed). **2026-07-13 update**: 8 Bucket-1 + 3 Bucket-2 classes reconfirmed locally — one narrower bug fixed (`7ae137e4`), the hang itself still OPEN; see the 2026-07-13 section below. **2026-07-13 update #2**: `context.annotation.ImportSelectorTests`'s `StackOverflowError` root-caused — it is a Mockito `spy()` cross-hierarchy recursion, **unrelated to Spring's `ImportSelector` mechanism** (the original hypothesis below was wrong); still OPEN, see its own section. **2026-07-13 update #3**: both `web.service.registry.*` residuals (`ImportHttpServiceRegistrarTests`, `GroupsMetadataValueDelegateTests`) root-caused to `@CompileWithForkedClassLoader`'s custom-ClassLoader machinery interacting with Spring's AOT/test-compiler pipeline — two distinct defects, neither fixed; still OPEN, see dedicated section. **2026-07-13 update #4**: the 4 non-AOT, non-`ImportSelectorTests` Bucket-1 classes (`cache.jcache.JCacheEhCacheAnnotationTests`, `context.annotation.ComponentScanParserBeanDefinitionDefaultsTests`, `context.annotation.InitDestroyMethodLifecycleTests`, `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests`) **no longer hang** — reconfirmed clean on 2 independent runs each against a freshly-built `origin/dev` tip; see the dedicated section below. No new code was needed — all 4 were incidental beneficiaries of other unrelated fixes already on `dev`. |
 | **Discovered** | 2026-07-11, following up on the 25 classes that hit TIMEOUT in the
 125-class scoped rerun (dev `9948295e`, standard 120s timeout — see
 [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](../internal/CRATONVM-SPRING-GENUINE-BUGLIST-125.md)). |
@@ -450,6 +450,181 @@ was empirically refuted this session. A confident fix needs the
 `MockMethodDispatcher.get()` identity instrumentation described above
 first.
 
+## 2026-07-13 local investigation — `web.service.registry.*` residuals (both root-caused, neither fixed — still OPEN)
+
+Reproduced entirely locally, worktree
+`cratonvm-wt-webserviceregistry-local-20260713`, dev tip `edca766e` (merged
+forward from `dbf7827c`), binary `cratonvm-websvcreg-local.exe`. Diagnostics
+added this session (commit `b34679e5`, kept in place): `CRATONVM_IAE_TRACE2`
+(per-element resolved-value dump in `create_annotation_proxy`) and a
+widened `CRATONVM_ANN_TRACE` gate covering `Import`/`ImportHttpServices`.
+
+### `ImportHttpServiceRegistrarTests` — `ClassCastException`, root-caused, not fixed
+
+**Confirmed 3/5 pass, 2/5 fail** (`basicListingWithAot`, `basicScanWithAot`
+fail; `basicListing`, `basicScan`, `clientType` pass). The passing 3 call
+`registrar.registerHttpServices()` directly and never touch
+`ConfigurationClassParser`. The failing 2 go through
+`ApplicationContextAotGenerator.processAheadOfTime` →
+`ConfigurationClassParser.collectImports` →
+`SourceClass.getAnnotationAttributes(Import.class.getName(), "value")`
+(`ConfigurationClassParser.java:577`, then `:1119`'s
+`(String[]) annotationAttributes.get(attribute)` cast), which throws
+`ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;`.
+
+**Both failing tests are `@CompileWithForkedClassLoader`.** Confirmed via
+the live stack trace that the failure happens on the SECOND, forked-loader
+re-execution (`CompileWithForkedClassLoaderExtension.intercept` took the
+`invocation.proceed()` branch, meaning `testClass.getClassLoader()` was
+already the forked `CompileWithForkedClassLoaderClassLoader` at the point
+of failure) — i.e. the test class, its nested config class, and (per
+`ClassLoader.loadClass`'s default parent-first delegation crossing into
+`findClass`) `ImportHttpServices`/`Import` themselves all get freshly
+re-defined under that loader.
+
+**Built a fast (~2s), reliable, 1:1-faithful repro** — no need to run the
+full 5-test class or wait on the suite runner to iterate:
+- `Repro7` (`org.springframework.core.test.tools.Repro7`, same package as
+  the real `CompileWithForkedClassLoaderClassLoader` to access its
+  package-private constructor) creates a fresh forked loader, reloads
+  `Repro7Body` through it, and invokes `Repro7Body.run()` reflectively —
+  exactly mirroring `CompileWithForkedClassLoaderExtension.runTest`'s own
+  `Launcher`+`selectMethod`+reflective-invoke shape (a driver that keeps
+  Spring classes on the ORIGINAL loader, like an earlier attempt of mine,
+  reproduces a DIFFERENT, unrelated split-package error even on real
+  HotSpot — the whole test body must be reloaded and invoked together for
+  a faithful repro).
+- `Repro7Body.run()` (`org.springframework.web.service.registry.Repro7Body`)
+  registers a `@ImportHttpServices`-annotated nested config class and calls
+  `ApplicationContextAotGenerator.processAheadOfTime` — reproduces the
+  IDENTICAL `ClassCastException` at the identical stack trace, 100% of the
+  time.
+- **Verified correct on real HotSpot** (both the driver+body pair and every
+  intermediate simplification along the way).
+
+**Ruled out, with direct empirical evidence** (not guesses):
+- **Not the array/scalar attribute-value construction.** `CRATONVM_IAE_TRACE2`
+  confirms `Import`'s `value` element is built as a proper `Class[]` of
+  length 1 (`Object(cid=12 name="java/lang/Class" is_array=true len=1)`) at
+  proxy-construction time, every time it's constructed.
+- **Not `method_annotations()` mis-scoping.** `Import.value()` and
+  `ImportHttpServices.value()` share the exact same name AND descriptor
+  (`()[Ljava/lang/Class;`), raising the hypothesis that a method-annotation
+  lookup keyed insufficiently (e.g. by name only) could leak
+  `ImportHttpServices.value()`'s own `@AliasFor("types")` onto
+  `Import.value()` (which has no annotations on it in real Spring source).
+  The widened `CRATONVM_ANN_TRACE` trace directly refutes this:
+  `ctx.method_annotations(class_id=<Import's own cid>, "value", ...)`
+  consistently and correctly returns 0 annotations, every single time it's
+  queried across the whole run.
+- **Not JIT-specific.** `--nojit` reproduces the identical exception,
+  identical stack trace.
+- **Not a heap-size/GC-timing race in the simple sense.** Reproduces 100%
+  of the time regardless of `--Xmx` (tested default and `2g`) — this is a
+  deterministic defect given this exact workload shape, not a rare
+  collection-timing coincidence.
+- **Isolating just the classloader-fork + annotation-read step is NOT
+  sufficient to reproduce it.** A narrower repro (`Repro6`) that reloads
+  the config class and `ImportHttpServices` through a fresh forked loader
+  and then directly calls `AnnotationUtils.validateAnnotation` +
+  `AnnotationMetadata.introspect(...).getAnnotationAttributes(Import...)`
+  — WITHOUT the full `ApplicationContextAotGenerator` pipeline — passes
+  cleanly, correctly returning `{value=[ImportHttpServiceRegistrar]}` as a
+  `String[]`. The bug needs BOTH the forked-loader reload AND the fuller
+  AOT/bean-registration processing pipeline to manifest; the annotation
+  metadata API in isolation is fine.
+
+**Leading, unconfirmed hypothesis**: Spring's own `AttributeMethods.cache`
+and `AnnotationTypeMappings.cache` (`org.springframework.core.annotation`)
+are both `ConcurrentReferenceHashMap`s, whose default reference type is
+`SOFT` for both keys and values — i.e. Spring's own per-annotation-type
+metadata (including cached/mirrored attribute values resolved once during
+`AnnotationTypeMapping` construction) is held behind `SoftReference`s. This
+is exactly the shape of construct that would surface a latent bug in how
+CratonVM's GC updates (or fails to update) a `Reference`'s `referent`
+pointer versus how it decides which soft/weak referents survive a
+collection — a stale/wrong-address referent read back after a GC event
+would manifest as exactly this symptom (a resurrected, wrong-typed object —
+here a bare `java.lang.Class` — where a `Class[]` used to be). This was
+**not directly confirmed** — it requires either instrumenting
+`gc/src/reference.rs`'s soft-reference processing/relocation path directly,
+or a decompiled-bytecode-level trace of
+`AnnotationTypeMapping`/`AttributeMethods`'s own caching (in the style of
+this session's `ImportSelectorTests` Mockito investigation, see the section
+above) to see exactly which cached value gets read back wrong and from
+where. Neither was completed this session — each further experiment here
+costs a ~20-30 minute release rebuild (this build uses `lto="fat"`,
+`codegen-units=1`) plus test time, and this session's budget for this
+cluster ran out at the hypothesis stage.
+
+**Not fixed.** Repro kit (`Repro.java`/`Repro2.java`/.../`Repro7.java`,
+`Repro7Body.java`, all under `org.springframework.{core.test.tools,web.service.registry}`)
+was left in the session scratchpad, not committed (throwaway harness code,
+not part of the CratonVM source tree) — regenerate from this doc's
+description if picked up again; each file is small and the progression
+from `Repro2` (fails to reproduce) through `Repro7` (reproduces) is
+instructive for why the forked-loader+full-pipeline combination is
+necessary.
+
+### `GroupsMetadataValueDelegateTests` — fatal `class not found`, root-caused, not fixed
+
+**Confirmed still ABEND**, identical symptom to the pre-existing entry:
+`[cratonvm] main-vm run() returned Err: Error in thread "main" class file
+error: class not found: org/springframework/web/service/registry/GroupsMetadata__TestCode`.
+This is a **hard, uncatchable VM-level fatal error** (not a normal Java
+`ClassNotFoundException` that JUnit could report as a test failure) — the
+whole process aborts (`rc=1`), hence `ABEND` rather than `FAIL`.
+
+**Confirmed NOT fixed by the 2026-07-13 `TestCompiler`/`JavacFileManager.list`
+GC-safety fix** (commit `10831b7b`/`a02322e4`, already in this session's
+history) — despite that fix targeting the exact same in-memory-`javac` +
+`DynamicClassLoader` pipeline this test also uses, and despite having
+fixed a 7-class cluster with a similarly-shaped symptom. Re-verified on a
+binary built from dev tip `edca766e` (well after that fix landed): byte-
+for-byte identical crash, same class name, same message.
+
+**Leading, unconfirmed hypothesis, narrowed via code reading (not yet
+empirically instrumented — each attempt costs ~22 minutes via the real
+suite runner, on top of the ~20-30 minute rebuild)**:
+`GroupsMetadataValueDelegateTests` is itself `@CompileWithForkedClassLoader`
+at the class level. `DynamicClassLoader`'s constructor
+(`org.springframework.core.test.tools.DynamicClassLoader`) special-cases
+exactly this situation: when its `parent` is a
+`CompileWithForkedClassLoaderClassLoader`, it does NOT define freshly-
+compiled classes (like `GroupsMetadata__TestCode`) on itself — it
+reflectively invokes the parent's package-private `defineDynamicClass(name,
+bytes, off, len)`, which calls `super.defineClass(...)` — i.e. the new class
+is defined on the PARENT forked loader, not on the `DynamicClassLoader`
+instance. Later, `Compiled.getInstance(Object.class, generatedClass.getName()
+.reflectionName())` calls `this.classLoader.loadClass(className)` where
+`this.classLoader` IS the `DynamicClassLoader` (the child), relying on
+ordinary `ClassLoader.loadClass` parent-delegation to find the class on the
+parent that actually defined it. This is structurally the same "does a
+user-defined loader correctly report/find a class it (or a linked sibling)
+defined" shape as the already-fixed `SC-custom-classloader-ignored.md` bug
+family, but for a NEW specific pattern (reflectively-invoked
+`defineClass` on a DIFFERENT loader instance than the one later asked to
+`loadClass` it) that doesn't appear to be covered by that fix. The fact that
+the failure is a hard VM-level "class file error" rather than a normal,
+catchable `ClassNotFoundException` additionally suggests the actual failing
+resolution may not even be going through the Java-level
+`loadClass`/`findClass` override machinery at all, but some lower-level
+internal symbol resolution CratonVM performs directly against its global
+class table during bytecode execution (e.g. resolving a constant-pool
+reference to `GroupsMetadata__TestCode` from inside
+`ReflectionUtils.findMethod`/`Method.invoke` in
+`Compiled`/`getGeneratedCodeReturnValue`) — this needs direct confirmation.
+
+**Not fixed.** Next step: a targeted, minimal repro of exactly this
+pattern (a `TestCompiler.forSystem()` compile under a real, minimal
+`@CompileWithForkedClassLoader`-shaped two-loader setup, generating one
+throwaway class and loading it back via the child `DynamicClassLoader`)
+would let this be iterated in seconds rather than the ~22-minute real-suite
+cost — this session ran out of budget before building that narrower repro
+for this specific class (the effort instead went toward the
+`ImportHttpServiceRegistrarTests` repro above, which shares the
+`@CompileWithForkedClassLoader` machinery but fails at a different point).
+
 ## Bucket 1 — Genuinely hung (12/25)
 
 Hit the full 1500s ceiling on **both** the batch attempt and the individual
@@ -627,8 +802,8 @@ rather than a coincidence:
 | `web.servlet.mvc.method.annotation.ServletAnnotationControllerHandlerMethodTests` | FAIL | 445s | 211/241 | `AssertionFailedError` (mostly passing — a real partial failure) |
 | `beans.factory.aot.BeanDefinitionPropertiesCodeGeneratorTests` | FAIL → **TIMEOUT as of 2026-07-13** | 693s | 0/47 | `CompilationException: Unable to compile source` → now hangs instead, see [2026-07-13 update](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open) |
 | `beans.factory.aot.InstanceSupplierCodeGeneratorTests` | FAIL → **TIMEOUT as of 2026-07-13** | 730s | 4/26 | `CompilationException: Unable to compile source` → now hangs instead, see [2026-07-13 update](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open) |
-| `web.service.registry.ImportHttpServiceRegistrarTests` | FAIL | 763s | 3/5 | `ArrayIndexOutOfBoundsException` / `DiscoveryIssueException` |
-| `web.service.registry.GroupsMetadataValueDelegateTests` | FAIL | 1039s | 1/8 | `ArrayIndexOutOfBoundsException` / `DiscoveryIssueException` |
+| `web.service.registry.ImportHttpServiceRegistrarTests` | FAIL, root-caused 2026-07-13 (still OPEN) | 763s (10s on the 2026-07-13 isolated rerun) | 3/5 | `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;` in `ConfigurationClassParser$SourceClass.getAnnotationAttributes` — see dedicated section below |
+| `web.service.registry.GroupsMetadataValueDelegateTests` | ABEND, root-caused 2026-07-13 (still OPEN) | 1039s (1306s on the 2026-07-13 rerun) | 0/8 | fatal VM error `class file error: class not found: .../GroupsMetadata__TestCode` — see dedicated section below |
 | `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` | FAIL | 1132s | 0/160 | `BeanCreationException`: no `ApiVersionStrategy` bean (same as `CrossOriginAnnotationIntegrationTests`) |
 | `context.annotation.ImportSelectorTests` | FAIL, root-caused 2026-07-13 (still OPEN) | 1456s (734s on the 2026-07-13 rebuild) | 4/9 | `StackOverflowError` — Mockito `spy()` recursion, not Spring; see dedicated section below |
 
@@ -647,16 +822,11 @@ Notable sub-clusters within this bucket (candidates for shared root cause):
   [2026-07-13 local investigation](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open)
   section above — still OPEN.
 - **`web.service.registry.*` residuals** (2 classes: `ImportHttpServiceRegistrarTests`,
-  `GroupsMetadataValueDelegateTests`) — the original JUnit-discovery signature
-  is no longer the common failure. An isolated rerun of
-  `ImportHttpServiceRegistrarTests` now reaches Spring parsing and fails with
-  `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;`
-  from `ConfigurationClassParser$SourceClass.getAnnotationAttributes`.
-  This points to incomplete `Class[]`-to-`String[]` annotation-map adaptation.
-  The current isolated probe for `GroupsMetadataValueDelegateTests` instead
-  stops before JUnit with a missing generated helper,
-  `GroupsMetadata__TestCode`; it needs a generated-test-aware probe before a
-  VM root cause can be assigned.
+  `GroupsMetadataValueDelegateTests`) — both now root-caused to the same
+  general area (`@CompileWithForkedClassLoader`'s custom-ClassLoader
+  machinery interacting with Spring's AOT/test-compiler pipeline), but with
+  two DIFFERENT specific defects. Neither fixed. See the dedicated section
+  below.
 - **Missing `ApiVersionStrategy` bean** (2 classes: `CrossOriginAnnotationIntegrationTests`,
   `RequestMappingMessageConversionIntegrationTests`) — both WebFlux, both fail
   every parameterized variant (Jetty, Jetty Core, ...) with the identical
