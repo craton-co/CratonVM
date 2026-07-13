@@ -1,3 +1,12 @@
+> **RETIRED 2026-07-13 — superseded by
+> [`docs/known-issues/springboot/onclasscondition-fix-blocked-by-heap-corruption.md`](../../known-issues/springboot/onclasscondition-fix-blocked-by-heap-corruption.md).**
+> The root cause documented below was found and a fix was verified to
+> eliminate all 75/75 occurrences. The fix is NOT merged — it exposes a
+> separate, unrelated heap-corruption bug in 3 test classes that isn't yet
+> understood. See the successor doc for the full picture (fix + blocker).
+> Kept here for historical reference only, per this repo's
+> known-issues-must-not-contain-addressed-bugs convention.
+
 # `OnClassCondition.addAll`: a `NullPointerException` object is handed back where a `String[]` annotation attribute is expected — 75 classes, 348 occurrences (the largest single cluster in the run)
 
 **Status: OPEN, precisely characterized (exact Spring call site pinned).

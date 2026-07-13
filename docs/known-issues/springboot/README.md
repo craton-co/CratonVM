@@ -12,7 +12,7 @@ clustered.
 
 | Doc | Classes | Severity | Status |
 |---|---:|---|---|
-| [`onclasscondition-npe-cast-to-string-array-cluster.md`](onclasscondition-npe-cast-to-string-array-cluster.md) | 75 (348 occurrences) | CRITICAL | OPEN, precisely pinned to `OnClassCondition.addAll` |
+| [`onclasscondition-fix-blocked-by-heap-corruption.md`](onclasscondition-fix-blocked-by-heap-corruption.md) | 75 (348 occurrences) | CRITICAL | Fix verified correct, BLOCKED by an unrelated heap-corruption bug it exposes |
 | [`disposablebeanadapter-invalid-destruction-signature-cluster.md`](disposablebeanadapter-invalid-destruction-signature-cluster.md) | 34 | HIGH | OPEN, Spring call site pinned |
 | [`unsafe-memoryaccessoption-npe-cluster.md`](unsafe-memoryaccessoption-npe-cluster.md) | 26 | HIGH | OPEN, likely same family as an already-fixed bug |
 | [`httpclient-builder-dead-registration-abstractmethoderror.md`](httpclient-builder-dead-registration-abstractmethoderror.md) | 13 | HIGH | OPEN, fully root-caused (dead `synthetic-jdk` registration) |
