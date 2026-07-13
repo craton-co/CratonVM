@@ -5495,11 +5495,27 @@ fn native_is_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 }
 
 /// InputStream.readAllBytes() → byte[] (Java 9+)
+///
+/// Was a one-`invoke_virtual`-per-byte loop through the single-byte
+/// `read()I` overload — correct but catastrophically slow for any stream
+/// with more than a few KB of content (each byte pays a full virtual
+/// dispatch). Found root-causing a real-world case: `JarInputStream
+/// .checkManifest()`'s `readAllBytes()` on a signed jar with a ~769KB
+/// `MANIFEST.MF` (bcprov-jdk18on) took 18-70+ seconds (and, under shared-host
+/// CPU contention, blew past a 300s test-suite timeout, surfacing as an
+/// apparent hang even though the thread was making genuine — just glacial —
+/// progress; confirmed via `--stack-dump-on-timeout`, which sampled the
+/// identical `read()I` pc across dumps because the loop resets to the same
+/// bytecode entry point on every one of the ~769,000 single-byte calls).
+/// Rewritten to bulk-read via the virtual `read([BII)I` overload (16KB
+/// chunks, same pattern as `native_is_transfer_to` below) — real
+/// `ZipInputStream`/`InflaterInputStream`/etc. already implement that
+/// overload efficiently (native inflate), so this just stops bypassing it.
 fn native_is_read_all_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
+            let arr = ctx.new_array(ArrayElementType::Byte, 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
@@ -5508,32 +5524,55 @@ fn native_is_read_all_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         .unwrap_or_default();
     // Same Mockito inherited-helper guard as native_bais_read_bytes.
     if cls_name.contains("$MockitoMock$") {
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
+        let arr = ctx.new_array(ArrayElementType::Byte, 0);
         return Ok(Some(Value::Object(Some(arr))));
     }
 
-    let mut bytes: Vec<i32> = Vec::new();
+    let this_pin = ctx.pin_native_root(this);
+    const CHUNK: usize = 16 * 1024;
+    let chunk_buf = ctx.new_array(ArrayElementType::Byte, CHUNK);
+    let chunk_pin = ctx.pin_native_root(chunk_buf);
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut scratch = vec![0u8; CHUNK];
     loop {
-        let b = ctx.invoke_virtual(this, "read", "()I", &[])?;
-        match b {
-            Some(Value::Int(-1)) | None => break,
-            Some(Value::Int(v)) => bytes.push(v & 0xFF),
-            _ => break,
-        }
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let chunk_cur = ctx.read_native_pin(chunk_pin, chunk_buf);
+        let n = match ctx.invoke_virtual(
+            this_cur,
+            "read",
+            "([BII)I",
+            &[
+                Value::Object(Some(chunk_cur)),
+                Value::Int(0),
+                Value::Int(CHUNK as i32),
+            ],
+        ) {
+            Ok(Some(Value::Int(n))) if n > 0 => n as usize,
+            Ok(_) => break,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
+        let chunk_cur = ctx.read_native_pin(chunk_pin, chunk_buf);
+        let copied = ctx.read_byte_array_into(chunk_cur, 0, &mut scratch[..n]);
+        bytes.extend_from_slice(&scratch[..copied]);
     }
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
-    for (i, &b) in bytes.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Int(b));
-    }
+    ctx.unpin_native_roots(this_pin);
+    let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+    ctx.write_byte_array_from(arr, 0, &bytes);
     Ok(Some(Value::Object(Some(arr))))
 }
 
 /// InputStream.readNBytes(int n) → byte[] (Java 11+) — reads exactly n bytes (or EOF)
+///
+/// Same one-byte-per-`invoke_virtual` slowness as `native_is_read_all_bytes`
+/// (see its doc comment) — rewritten to the same bulk-`read([BII)I` pattern.
 fn native_is_read_n_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
+            let arr = ctx.new_array(ArrayElementType::Byte, 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
@@ -5541,23 +5580,50 @@ fn native_is_read_n_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Int(v)) => (*v).max(0) as usize,
         _ => 0,
     };
-    let mut bytes: Vec<i32> = Vec::with_capacity(n);
-    for _ in 0..n {
-        let b = ctx.invoke_virtual(this, "read", "()I", &[])?;
-        match b {
-            Some(Value::Int(-1)) | None => break,
-            Some(Value::Int(v)) => bytes.push(v & 0xFF),
-            _ => break,
-        }
+
+    let this_pin = ctx.pin_native_root(this);
+    const CHUNK: usize = 16 * 1024;
+    let chunk_len = n.min(CHUNK).max(1);
+    let chunk_buf = ctx.new_array(ArrayElementType::Byte, chunk_len);
+    let chunk_pin = ctx.pin_native_root(chunk_buf);
+    let mut bytes: Vec<u8> = Vec::with_capacity(n);
+    let mut scratch = vec![0u8; chunk_len];
+    while bytes.len() < n {
+        let want = (n - bytes.len()).min(chunk_len);
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let chunk_cur = ctx.read_native_pin(chunk_pin, chunk_buf);
+        let read = match ctx.invoke_virtual(
+            this_cur,
+            "read",
+            "([BII)I",
+            &[
+                Value::Object(Some(chunk_cur)),
+                Value::Int(0),
+                Value::Int(want as i32),
+            ],
+        ) {
+            Ok(Some(Value::Int(r))) if r > 0 => r as usize,
+            Ok(_) => break,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
+        let chunk_cur = ctx.read_native_pin(chunk_pin, chunk_buf);
+        let copied = ctx.read_byte_array_into(chunk_cur, 0, &mut scratch[..read]);
+        bytes.extend_from_slice(&scratch[..copied]);
     }
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
-    for (i, &b) in bytes.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Int(b));
-    }
+    ctx.unpin_native_roots(this_pin);
+    let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+    ctx.write_byte_array_from(arr, 0, &bytes);
     Ok(Some(Value::Object(Some(arr))))
 }
 
 /// InputStream.readNBytes(byte[] buf, int off, int len) → int (Java 11+)
+///
+/// Same one-byte-per-`invoke_virtual` slowness as `native_is_read_all_bytes`
+/// — rewritten to bulk-read directly into the caller's own `buf` (no extra
+/// copy needed since the destination is already a real array).
 fn native_is_read_n_bytes_buf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -5575,18 +5641,33 @@ fn native_is_read_n_bytes_buf(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Int(v)) => (*v).max(0) as usize,
         _ => 0,
     };
+
+    let this_pin = ctx.pin_native_root(this);
+    let buf_pin = ctx.pin_native_root(buf);
     let mut count = 0usize;
-    for i in 0..len {
-        let b = ctx.invoke_virtual(this, "read", "()I", &[])?;
-        match b {
-            Some(Value::Int(-1)) | None => break,
-            Some(Value::Int(v)) => {
-                ctx.set_array_element(buf, off + i, Value::Int(v & 0xFF));
-                count += 1;
+    while count < len {
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let buf_cur = ctx.read_native_pin(buf_pin, buf);
+        let read = match ctx.invoke_virtual(
+            this_cur,
+            "read",
+            "([BII)I",
+            &[
+                Value::Object(Some(buf_cur)),
+                Value::Int((off + count) as i32),
+                Value::Int((len - count) as i32),
+            ],
+        ) {
+            Ok(Some(Value::Int(r))) if r > 0 => r as usize,
+            Ok(_) => break,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
             }
-            _ => break,
-        }
+        };
+        count += read;
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(count as i32)))
 }
 
@@ -8719,9 +8800,28 @@ fn eof_exception() -> MethodCallFailed {
     }))
 }
 
-/// Shared implementation for readFully — tries bulk read on inner stream first,
-/// falls back to byte-by-byte.  Throws EOFException if the stream ends before
-/// all requested bytes have been read, matching the Java specification.
+/// Shared implementation for readFully.
+///
+/// Despite its old doc comment's claim of "tries bulk read on inner stream
+/// first, falls back to byte-by-byte", this looped `dis_read_one` (one
+/// `invoke_virtual` per byte, via a 1-byte `read([BII)I` call) unconditionally
+/// — never actually bulk-reading. Found root-causing a real-world case:
+/// Spring Boot loader's `JarEntriesStream.assertSameContent()` calls
+/// `DataInputStream.readFully(byte[], off, len)` once per up-to-4KB chunk,
+/// once per non-directory jar entry — for a signed jar with ~5700 entries
+/// (bcprov-jdk18on), that's hundreds of thousands of single-byte native
+/// calls, taking minutes (confirmed via `--stack-dump-on-timeout`: identical
+/// pc across dumps, same "many fast calls in a loop" signature as the
+/// sibling `InputStream.readAllBytes`/`readNBytes` bug this fix mirrors).
+///
+/// Unlike `dis_read_one` (which deliberately reads only 1 byte at a time —
+/// see its own comment — to avoid silently prefetching bytes a *different*
+/// concurrent reader of the same shared underlying stream might need),
+/// bulk-reading here is safe: `readFully(buf, off, len)` is itself a bulk
+/// request for exactly `len` bytes, so requesting up to the *remaining*
+/// unfulfilled portion of that same `len` via one `read([BII)I` call never
+/// reads a single byte past what the caller already asked for — it just
+/// stops asking one byte at a time for a bulk request.
 fn dis_read_fully_impl(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -8731,23 +8831,60 @@ fn dis_read_fully_impl(
 ) -> MethodCallResult {
     let this_pin = ctx.pin_native_root(this);
     let buf_pin = ctx.pin_native_root(buf);
-    let mut this = this;
-    let mut buf = buf;
-    for i in 0..len {
-        let b = match dis_read_one(ctx, this) {
-            Ok(v) => v,
+    let mut total = 0usize;
+    while total < len {
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let inner = match ctx.get_field(this_cur, DIS_FIELD_IN) {
+            Value::Object(Some(s)) => s,
+            _ => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(eof_exception());
+            }
+        };
+        let buf_cur = ctx.read_native_pin(buf_pin, buf);
+        let n = match ctx.invoke_virtual(
+            inner,
+            "read",
+            "([BII)I",
+            &[
+                Value::Object(Some(buf_cur)),
+                Value::Int((off + total) as i32),
+                Value::Int((len - total) as i32),
+            ],
+        ) {
+            Ok(Some(Value::Int(n))) if n > 0 => n as usize,
+            Ok(Some(Value::Int(0))) => {
+                // Non-compliant streams sometimes return 0 for a non-empty
+                // request instead of blocking — same edge case `dis_read_one`
+                // guards against. Fall back to one scalar byte rather than
+                // treating no-progress-this-call as EOF.
+                let this_cur = ctx.read_native_pin(this_pin, this);
+                match dis_read_one(ctx, this_cur) {
+                    Ok(b) if b >= 0 => {
+                        let buf_cur = ctx.read_native_pin(buf_pin, buf);
+                        ctx.set_array_element(buf_cur, off + total, Value::Int(b));
+                        1
+                    }
+                    Ok(_) => {
+                        ctx.unpin_native_roots(this_pin);
+                        return Err(eof_exception());
+                    }
+                    Err(e) => {
+                        ctx.unpin_native_roots(this_pin);
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(_) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(eof_exception());
+            }
             Err(e) => {
                 ctx.unpin_native_roots(this_pin);
                 return Err(e);
             }
         };
-        this = ctx.read_native_pin(this_pin, this);
-        buf = ctx.read_native_pin(buf_pin, buf);
-        if b < 0 {
-            ctx.unpin_native_roots(this_pin);
-            return Err(eof_exception());
-        }
-        ctx.set_array_element(buf, off + i, Value::Int(b));
+        total += n;
     }
     ctx.unpin_native_roots(this_pin);
     Ok(None)
