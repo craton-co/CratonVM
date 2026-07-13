@@ -755,10 +755,52 @@ fn should_skip_jit_internal(
         // JIT-eligible under the safe Conservative default. Without this
         // carve-out this later, broader ban silently re-skip-lists them,
         // regressing that earlier decision.
+        //
+        // Carve-out: `io/smallrye/config/` + `org/keycloak/quarkus/runtime/
+        // configuration/` (2026-07-13, KC26-PIC.2). `PicocliTest` was found
+        // to genuinely HANG (not just run slowly) well past this ban's
+        // original 265s watchdog window: `SmallRyeConfig`'s
+        // `RelocateConfigSourceInterceptor.getValue()` calls
+        // `context.proceed()` TWICE per invocation (once for the relocated
+        // name, once for the original — legitimate SmallRye semantics), and
+        // Quarkus/Keycloak stack N `RelocateConfigSourceInterceptor`
+        // instances (one per legacy-property-relocation source), so a
+        // single property lookup costs up to O(2^N) total interceptor
+        // invocations. That fan-out is negligible under a JIT (nanoseconds/
+        // call) but not under a pure bytecode interpreter, where every call
+        // pays full dispatch overhead — this reproduced as `httpAccessLog`
+        // (and later tests) never completing within a 180s watchdog.
+        // Allowing JIT for just these packages took `httpAccessLog` from a
+        // >180s hang to 41.8s; bisected the underlying interceptor fan-out
+        // itself as pre-existing (reproduces identically at `058e2b957`,
+        // immediately before the unrelated KC26-CFG.1 config-resolution fix
+        // in `10a561f21`) — not a regression from that commit's
+        // native-override removals. `org/keycloak/quarkus/runtime/cli/`
+        // (Picocli.java's own `validateConfig`/`validateProperty` orchestration,
+        // which loops over every registered CLI option calling into the
+        // now-carved-out config/interceptor code once per option) was added
+        // after a later test (`duplicatedCliOptions`) hung inside THAT loop
+        // specifically rather than inside the interceptor chain itself —
+        // the loop's own per-option interpreted overhead was the remaining
+        // bottleneck once the interceptor calls themselves got fast.
+        // Deliberately narrower than lifting the whole ban: `picocli/`
+        // itself remains interpreted, since this ban's own history
+        // (KC26-PIC.1 above) found unrestricted JIT for ALL THREE packages
+        // was empirically SLOWER for this same test class in 2026-07-05 —
+        // that finding may or may not still hold given how much bytecode
+        // this ban's own native-fast-path history has changed since, but
+        // there is no evidence either way for `picocli/` specifically, so
+        // it stays banned. See
+        // docs/known-issues/keycloak/quarkus-runtime-picocli-arggroupspec-synopsis-hang-20260713.md
+        // for the full investigation.
+        let smallrye_relocate_carveout = class_name.starts_with("io/smallrye/config/")
+            || class_name.starts_with("org/keycloak/quarkus/runtime/configuration/")
+            || class_name.starts_with("org/keycloak/quarkus/runtime/cli/");
         if (class_name.starts_with("org/keycloak/")
             || class_name.starts_with("picocli/")
             || class_name.starts_with("io/smallrye/"))
             && !class_name.starts_with("org/keycloak/models/credential/")
+            && !smallrye_relocate_carveout
             && !package_allowed(class_name, allow_packages)
         {
             return Some(SkipReason::RustJvmTestFixture);
@@ -3307,9 +3349,16 @@ mod tests {
     #[test]
     fn keycloak_picocli_smallrye_packages_skip_under_conservative() {
         for (class_name, allow) in [
-            ("org/keycloak/quarkus/runtime/cli/Picocli", "org/keycloak/"),
+            // `org/keycloak/quarkus/runtime/cli/` itself now has a targeted
+            // carve-out (KC26-PIC.2, below) — exercise a sibling
+            // org/keycloak/ package here to keep covering the general
+            // (non-carved-out) ban.
+            ("org/keycloak/models/RealmModel", "org/keycloak/"),
             ("picocli/CommandLine", "picocli/"),
-            ("io/smallrye/config/SmallRyeConfig", "io/smallrye/"),
+            // `io/smallrye/config/` itself now has a targeted carve-out
+            // (KC26-PIC.2, below) — exercise a sibling io.smallrye package
+            // here to keep covering the general (non-carved-out) ban.
+            ("io/smallrye/mutiny/Uni", "io/smallrye/"),
         ] {
             assert_eq!(
                 check(class_name, "example", false, true, SkipPolicy::Conservative),
@@ -3332,6 +3381,43 @@ mod tests {
                 ),
                 None,
                 "allow-package entry must lift {class_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn kc26_pic2_smallrye_relocate_carveout_lifted_under_conservative() {
+        // KC26-PIC.2: these packages are carved OUT of the KC26-PIC.1 ban
+        // (RelocateConfigSourceInterceptor exponential fan-out is tractable
+        // under JIT, catastrophic under the interpreter; Picocli.java's own
+        // validateConfig/validateProperty loop over every CLI option was a
+        // secondary bottleneck once the interceptor calls got fast) and so
+        // must be JIT-eligible even under the default Conservative policy.
+        for class_name in [
+            "io/smallrye/config/SmallRyeConfig",
+            "io/smallrye/config/RelocateConfigSourceInterceptor",
+            "org/keycloak/quarkus/runtime/configuration/PropertyMappingInterceptor",
+            "org/keycloak/quarkus/runtime/configuration/NestedPropertyMappingInterceptor",
+            "org/keycloak/quarkus/runtime/cli/Picocli",
+            "org/keycloak/quarkus/runtime/cli/command/AbstractCommand",
+        ] {
+            assert_eq!(
+                check(class_name, "example", false, true, SkipPolicy::Conservative),
+                None,
+                "{class_name} must be carved out of the ban under the conservative policy"
+            );
+        }
+        // The rest of org/keycloak/ (outside .../configuration/ and .../cli/)
+        // and all of picocli/ must remain banned — the carve-out is
+        // deliberately narrow.
+        for class_name in [
+            "org/keycloak/models/RealmModel",
+            "picocli/CommandLine",
+        ] {
+            assert_eq!(
+                check(class_name, "example", false, true, SkipPolicy::Conservative),
+                Some(SkipReason::RustJvmTestFixture),
+                "{class_name} must remain interpreted — the KC26-PIC.2 carve-out must not widen to this package"
             );
         }
     }

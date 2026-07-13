@@ -1,6 +1,12 @@
 # quarkus/runtime PicocliTest hang — exponential-ish RelocateConfigSourceInterceptor fan-out under the JIT skip-list
 
-Status: open
+Status: PARTIALLY FIXED (2026-07-13, third pass) — a targeted JIT skip-list carve-out (KC26-PIC.2) landed that
+substantially reduces the hang's severity (individual affected tests 5-10x faster; the class gets roughly twice as
+far before stalling: 55/107 tests complete vs ~20-36/107 before, depending on which earlier partial carve-out is
+compared). **The full `PicocliTest` class STILL does not complete** even with the fix, and even with the ENTIRE
+original 2026-07-05 ban fully lifted (`CRATONVM_JIT_ALLOW_PACKAGES=org/keycloak/,picocli/,io/smallrye/`, 400s
+timeout) — so this is a real, verified, safe improvement, not a full resolution. See "Fix landed" below for what
+shipped and "Next steps" for what remains.
 
 Date observed: 2026-07-13, split out from
 `docs/internal/fixed-suite-bugs/keycloak-quarkus-runtime-config-resolution-mismatches.md`, whose 2026-07-13 update
@@ -97,27 +103,62 @@ The already-landed SmallRye-config fix (`10a561f21`, see the sibling doc) does n
 interpreter-throughput problem in a completely different subsystem (SmallRye's relocate-interceptor chain
 traversal), confirmed unrelated by the bisection above (hangs identically before and after `10a561f21`).
 
+## Fix landed (2026-07-13, third pass): KC26-PIC.2 JIT skip-list carve-out
+
+`vm/src/jit/skip_list.rs`'s KC26-PIC.1 ban (`org/keycloak/`, `picocli/`, `io/smallrye/` forced interpreted under
+the Conservative policy) now has a narrow carve-out for:
+- `io/smallrye/config/` (the SmallRye interceptor chain itself — `RelocateConfigSourceInterceptor`,
+  `SmallRyeConfigSourceInterceptorContext`, `ExpressionConfigSourceInterceptor`, etc.)
+- `org/keycloak/quarkus/runtime/configuration/` (Keycloak's own `PropertyMappingInterceptor`/
+  `NestedPropertyMappingInterceptor`/`PropertyMapper` layer, which is interleaved into the same recursive
+  `proceed()` chain)
+- `org/keycloak/quarkus/runtime/cli/` (`Picocli.java`'s own `validateConfig`/`validateProperty` orchestration loop,
+  which iterates once per registered CLI option and was a SECOND bottleneck once the interceptor calls themselves
+  got fast)
+
+`picocli/` itself (picocli's own library code — `CommandLine`, `ArgGroupSpec`, `Help`, etc.) and the REST of
+`org/keycloak/` (models, services, everything outside `.../configuration/` and `.../cli/`) remain interpreted —
+this is a deliberately narrow carve-out, not a lift of the whole ban.
+
+**Verified**:
+- Zero regressions: `DatasourcesConfigurationTest` (33/33), `TracingConfigurationTest` (13/13),
+  `IgnoredArtifactsTest` (15/15), `ConfigurationTest` (73/73) all still PASS cleanly with the carve-out
+  (`verify-regression-relocatefix-20260713`).
+- Two new unit tests added to `skip_list.rs`: `kc26_pic2_smallrye_relocate_carveout_lifted_under_conservative`
+  (asserts the carved-out classes ARE JIT-eligible, and that `picocli/`/the rest of `org/keycloak/` are NOT) and an
+  updated `keycloak_picocli_smallrye_packages_skip_under_conservative` (swapped its `org/keycloak/`/`io/smallrye/`
+  example classes to ones OUTSIDE the new carve-out, to keep covering the general ban).
+- Iteratively widened against real stack dumps: started with just `io/smallrye/config/` +
+  `.../configuration/` (`httpAccessLog`: >180s → 41.8s single-test; full class: hung at test ~20 → test 36/107),
+  then added `.../cli/` after a fresh dump showed the NEXT bottleneck was `Picocli.validateProperty`'s per-option
+  loop rather than the interceptor chain itself (full class: 36/107 → 55/107 before stalling).
+
+**NOT fully fixed**: the full `PicocliTest` class (107 tests) still does not complete within a 300-400s window even
+with this carve-out, AND — critically — even with the ENTIRE original ban fully lifted via
+`CRATONVM_JIT_ALLOW_PACKAGES=org/keycloak/,picocli/,io/smallrye/` (i.e. `picocli/` JIT-eligible too), it STILL hangs
+past 400s (`verify-picocli-fullallow-20260713`). This means the remaining bottleneck, for at least one test's
+specific CLI options, is not solvable by JIT-eligibility alone — either the fan-out for that specific property's
+relocation chain is large enough that even JIT-speed `2^N` calls don't finish in reasonable time, or there's a
+genuinely different (possibly still-unidentified accumulation) issue for later tests. This is real, verified
+partial progress, not a complete fix — treat the class as still HANG-prone in full-suite runs.
+
 ## Next steps
 
-1. Determine whether the growing per-test cost (`httpAccessLog` 41.8s → `otelLogs` still >180s, both under the same
-   JIT-allow override) is (a) inherent to those specific tests' CLI options touching more legacy-relocated
-   properties, or (b) a genuine accumulation/leak across `PropertyMappers.reset()`/`Configuration.resetConfig()`
-   cycles. `Configuration.resetConfig()` itself looks clean (`config = null` + `KeycloakConfigSourceProvider.reload()`
-   — no obviously-growing collection), and `System.setProperties()`'s native implementation
-   (`native-builtins/src/lib.rs` ~line 27676) already does a correct full-replace (removes all old keys before
-   setting new ones, with an explicit comment noting this was fixed for exactly this
-   `AbstractConfigurationTest`/`System.setProperties(clone)` reset pattern) — so system-property accumulation is
-   ruled out. The `KeycloakConfigSourceProvider`/interceptor-chain construction itself has not yet been audited for
-   growth.
+1. Get a fresh stack dump for wherever the class stalls now (`wildcardLevelFromParent` at last check, but this may
+   shift as the fix evolves) using the TimedKcRunner technique in "Repro" below, to see if it's still the same
+   `RelocateConfigSourceInterceptor` pattern (now just needing a deeper/larger-N case) or something new.
 2. Count how many `RelocateConfigSourceInterceptor` instances are actually stacked in Keycloak's real
    `SmallRyeConfigBuilder` chain (add a one-off diagnostic print in `KeycloakConfigSourceProvider` or wherever the
-   chain is assembled) to get the real `N` and confirm the `2^N` fan-out theory quantitatively rather than just
-   from the stack-dump shape.
-3. Implement either: (a) a narrow JIT skip-list carve-out for `RelocateConfigSourceInterceptor`/
-   `SmallRyeConfigSourceInterceptorContext.proceed`, verified against the full `quarkus/runtime` module for
-   regressions, or (b) a native fast-path for the same hot pair, matching this codebase's established pattern for
-   this exact class of problem (see the 2026-07-05 fix's own "native fast paths for Picocli and Keycloak
-   configuration helpers").
+   chain is assembled) to get the real `N` and confirm/refute the `2^N` fan-out theory quantitatively — if `N` is
+   large enough (30-40+) even JIT-speed calls could genuinely take minutes, which would mean the real fix has to
+   reduce the FAN-OUT itself (e.g. memoizing `RelocateConfigSourceInterceptor.getValue()` per name within a single
+   property resolution, since SmallRye's own semantics don't obviously require re-doing the full downstream
+   traversal twice when `map == name` is common) rather than just making the interpreter faster.
+3. Consider whether a native fast-path for `RelocateConfigSourceInterceptor.getValue()`/
+   `SmallRyeConfigSourceInterceptorContext.proceed()` (bypassing bytecode entirely for this specific hot pair,
+   matching the established pattern from the 2026-07-05 fix) would help further where the JIT-eligibility carve-out
+   alone doesn't — a native implementation could also add memoization within a single top-level resolution that
+   Java-level `proceed()` semantics can't easily add without changing SmallRye's own source.
 
 ## Repro
 
