@@ -51,7 +51,7 @@ Known-issue docs added or updated from this investigation:
 - `ES-FAIL-FAMILY-20260709-restclient-singlehost-timeout.md`
 - `ES-CRASH-FAMILY-20260709-currentdev-fail-probe-rc139.md`
 - `ES-HANG-20260709-currentdev-nojit-es812-postings.md`
-- `ES-HANG-20260709-currentdev-nojit-float-random-binary-doc-values-range-query.md`
+- `../internal/ES-HANG-20260709-currentdev-nojit-float-random-binary-doc-values-range-query-FIXED.md`
 - `ES-HANG-20260709-currentdev-nojit-ivfknn-float-sliced-vector-query.md`
 
 Interpretation:

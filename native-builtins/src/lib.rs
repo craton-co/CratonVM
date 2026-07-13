@@ -37049,10 +37049,20 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
                 Value::Object(Some(o)) => o,
                 _ => return Ok(Some(Value::Object(Some(this)))),
             };
-            let existing = ctx.read_string(sb).unwrap_or_default();
-            let combined = format!("{}{}", existing, formatted_str);
-            let new_str = ctx.create_string(&combined);
-            ctx.set_field(this, 0, Value::Object(Some(new_str)));
+            if let Some(existing) = ctx.read_string(sb) {
+                let combined = format!("{}{}", existing, formatted_str);
+                let new_str = ctx.create_string(&combined);
+                ctx.set_field(this, 0, Value::Object(Some(new_str)));
+            } else {
+                // Preserve a caller-supplied Appendable.
+                let text = ctx.create_string(&formatted_str);
+                let _ = ctx.invoke_virtual(
+                    sb,
+                    "append",
+                    "(Ljava/lang/CharSequence;)Ljava/lang/Appendable;",
+                    &[Value::Object(Some(text))],
+                )?;
+            }
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -37093,6 +37103,11 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
             _ => return Ok(None),
         };
         if let Value::Object(Some(target)) = ctx.get_field(this, 0) {
+            // StringBuilder implements Appendable but not Flushable. Avoid
+            // inventing a StringBuilder.flush() call for the in-memory sink.
+            if ctx.read_string(target).is_none() {
+                return Ok(None);
+            }
             let _ = ctx.invoke_virtual(target, "flush", "()V", &[]);
         }
         Ok(None)
@@ -69327,6 +69342,10 @@ fn transition_real_executor_to_shutdown(
     // below. SHUTDOWN is run-state 0, so retain only the worker-count bits.
     let shutdown = current & 0x1fff_ffff;
     let _ = ctx.invoke_virtual(ctl, "set", "(I)V", &[Value::Int(shutdown)]);
+    // A graceful ThreadPoolExecutor shutdown must wake idle workers so they
+    // observe SHUTDOWN and leave getTask().  Merely updating ctl leaks every
+    // worker blocked in LinkedBlockingQueue.take().
+    let _ = interrupt_executor_workers(ctx, executor);
     Ok(None)
 }
 
