@@ -164,11 +164,22 @@ pub fn stamped_write_lock(ctx: &mut dyn NativeContext, addr: usize) -> i64 {
     let slot = stamped_slot(addr);
     let mut state = slot.state.lock();
     if state.write_held() || state.readers > 0 {
+        // LOCK-ORDER FIX (2026-07-13): begin_blocking_region/
+        // end_blocking_region must NOT run while holding `state` -- see the
+        // module-level note on this file's lock-ordering discipline. Drop
+        // the raw guard around both calls (each can synchronously block
+        // for an entire in-flight STW pause via `arrive_and_wait_auto`/
+        // `mark_blocked_region_leave`); only the actual `cv.wait` loop
+        // needs the guard, and it manages its own atomic release/reacquire.
+        drop(state);
         ctx.begin_blocking_region();
+        state = slot.state.lock();
         while state.write_held() || state.readers > 0 {
             slot.cv.wait(&mut state);
         }
+        drop(state);
         ctx.end_blocking_region();
+        state = slot.state.lock();
     }
     state.stamp |= 1; // set write bit
     state.stamp
@@ -197,11 +208,17 @@ pub fn stamped_read_lock(ctx: &mut dyn NativeContext, addr: usize) -> i64 {
     let slot = stamped_slot(addr);
     let mut state = slot.state.lock();
     if state.write_held() {
+        // LOCK-ORDER FIX (2026-07-13): see `stamped_write_lock` -- do not
+        // hold `state` across begin_blocking_region/end_blocking_region.
+        drop(state);
         ctx.begin_blocking_region();
+        state = slot.state.lock();
         while state.write_held() {
             slot.cv.wait(&mut state);
         }
+        drop(state);
         ctx.end_blocking_region();
+        state = slot.state.lock();
     }
     state.readers += 1;
     state.stamp
@@ -499,11 +516,17 @@ pub fn rw_read_lock(ctx: &mut dyn NativeContext, parent_addr: usize, tid: u64) {
     let slot = rw_slot(parent_addr, false);
     let mut state = slot.state.lock();
     if !reader_can_proceed(&state, tid) {
+        // LOCK-ORDER FIX (2026-07-13): see `rw_write_lock` -- do not hold
+        // `state` across begin_blocking_region/end_blocking_region.
+        drop(state);
         ctx.begin_blocking_region();
+        state = slot.state.lock();
         while !reader_can_proceed(&state, tid) {
             slot.cv.wait(&mut state);
         }
+        drop(state);
         ctx.end_blocking_region();
+        state = slot.state.lock();
     }
     *state.read_holds.entry(tid).or_insert(0) += 1;
     state.total_readers += 1;
@@ -586,11 +609,35 @@ pub fn rw_write_lock(ctx: &mut dyn NativeContext, parent_addr: usize, tid: u64) 
     // win the race (recheck and increment again before waiting).
     state.waiting_writers += 1;
     if state.writer_thread.is_some() || state.total_readers > 0 {
+        // LOCK-ORDER FIX (2026-07-13, second-session live-gdb capture,
+        // silent-hang regression): begin_blocking_region/end_blocking_region
+        // must NOT run while holding `state`. `begin_blocking_region`'s
+        // `GcBarrier::arrive_and_wait_auto` (and `end_blocking_region`'s
+        // `mark_blocked_region_leave`) can block SYNCHRONOUSLY until an
+        // in-flight STW pause fully completes -- potentially for the
+        // pause's whole duration. Holding `state` (this lock's own raw
+        // parking_lot mutex) across that call means the ACTUAL write-lock
+        // holder -- or any other waiter -- can never acquire `state` to
+        // release/re-check, while the STW pause may itself be waiting for
+        // THAT thread to arrive: pause waits for holder, holder waits for
+        // `state`, this waiter holds `state` waiting for the pause. Caught
+        // live: 18 threads piled up in this exact `cv.wait` below with
+        // zero progress and no STW warning ever printed (the arrived
+        // waiter's own wait for `gc_complete` isn't reflected in the
+        // initiator's `rounds`/`pending` diagnostic), reproducing in
+        // 8-11/15 isolated WildFly boot attempts after the original
+        // T19.H1 fix landed -- a regression worse than the hang it closed.
+        // Fix: drop the guard around both calls; only the actual `cv.wait`
+        // loop needs it, and manages its own atomic release/reacquire.
+        drop(state);
         ctx.begin_blocking_region();
+        state = slot.state.lock();
         while state.writer_thread.is_some() || state.total_readers > 0 {
             slot.cv.wait(&mut state);
         }
+        drop(state);
         ctx.end_blocking_region();
+        state = slot.state.lock();
     }
     state.waiting_writers -= 1;
     state.writer_thread = Some(tid);
