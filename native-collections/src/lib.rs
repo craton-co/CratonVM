@@ -15213,8 +15213,23 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let elements = stream_elements_mut(ctx, this)?;
-    let tag = match collector_tag_of(ctx, Value::Object(Some(collector))) {
+    // Materializing a real/lazy stream may invoke Java bytecode and trigger a
+    // moving collection. Keep the Collector live and refresh its address before
+    // reading our synthetic tag; otherwise a moved `toSet()` collector can be
+    // mistaken for whichever object later occupies its old address (observed as
+    // tag 1 / ArrayList returned where the caller requires Set).
+    let collector_pin = ctx.pin_native_root(collector);
+    let elements = match stream_elements_mut(ctx, this) {
+        Ok(elements) => elements,
+        Err(err) => {
+            ctx.unpin_native_roots(collector_pin);
+            return Err(err);
+        }
+    };
+    let collector = ctx.read_native_pin(collector_pin, collector);
+    let tag = collector_tag_of(ctx, Value::Object(Some(collector)));
+    ctx.unpin_native_roots(collector_pin);
+    let tag = match tag {
         Some(t) => t,
         // Not one of our `make_collector` tagged fast-path collectors -
         // a real JDK/Guava `Collector`. Honour the standard contract
