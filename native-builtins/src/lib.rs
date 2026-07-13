@@ -8291,6 +8291,25 @@ pub fn route_ec_to_real() -> bool {
     *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SYNTHETIC_EC").is_none())
 }
 
+/// Route DSA `Signature` sign/verify to the real JDK 25 `sun.security
+/// .provider.DSA$*` SPIs. Default ON — unlike EC/RSA, there is no synthetic
+/// DSA crypto in `crypto_impl` to fall back to at all (`verify_dispatch`/
+/// `sign_dispatch` never had a DSA arm), so this isn't an optimization vs. a
+/// slower-but-working synthetic path the way `route_ec_to_real` is — without
+/// it, every DSA signature verification silently returns `false` with no
+/// exception. `sun.security.provider.DSA$SHA256withDSA`/`SHA1withDSA` are
+/// plain, dependency-free SPI classes (construct + `engineInitVerify(key)` +
+/// `engineUpdate` + `engineVerify`), so real routing is strictly correct
+/// with no keygen/provider-bring-up cost to justify a synthetic shortcut.
+///
+/// Kill-switch `CRATONVM_SYNTHETIC_DSA=1` restores the legacy (always-false)
+/// behavior for debugging / regression bisecting.
+pub fn route_dsa_to_real() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SYNTHETIC_DSA").is_none())
+}
+
 /// Route the post-quantum families (ML-DSA via the SUN provider, ML-KEM via
 /// SunJCE) to the real JDK 25 SPIs instead of the synthetic stubs. Default ON,
 /// same rationale as [`route_ec_to_real`]: the synthetic `KeyPairGenerator` /

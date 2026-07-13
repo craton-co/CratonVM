@@ -13736,6 +13736,30 @@ fn invoke_on_class_shared_inner(
                                 | "verify"
                                 | "getAlgorithm"
                             ))
+                        // SigProbe: `sun.security.util.SignatureUtil
+                        // .{initVerify,initSign}WithParam` — real bytecode
+                        // indirects through `SharedSecrets
+                        // .getJavaSecuritySignatureAccess()`, populated only by
+                        // `Signature.<clinit>` (no-op'd — see
+                        // `jca/key_factory.rs`'s `Signature.<clinit>`
+                        // registration), so the accessor is null and real
+                        // bytecode NPEs ("Cannot invoke initVerify on null").
+                        // `native-builtins/src/jca/signature.rs`'s
+                        // `sigutil_init_verify_key`/`sigutil_init_verify_cert`/
+                        // `sigutil_init_sign` exist specifically to bypass
+                        // this — but without an allowlist entry here,
+                        // `SignatureUtil` (a real, loadable class with real
+                        // bytecode for these static methods) never actually
+                        // reached them: `has_own_bytecode` was true, so real
+                        // bytecode always won and the natives were dead code.
+                        // Found while root-causing real PKCS7/DSA jar-signature
+                        // verification (`sun.security.pkcs.SignerInfo.verify()`
+                        // calls `SignatureUtil.initVerifyWithParam` directly).
+                        || (class_name == "sun/security/util/SignatureUtil"
+                            && matches!(
+                                method_name,
+                                "initVerifyWithParam" | "initSignWithParam"
+                            ))
                         // SigProbe: `java.security.KeyFactory.getInstance` /
                         // `generatePublic` / `generatePrivate` — natives in
                         // `native-builtins/src/jca/key_factory.rs`.
