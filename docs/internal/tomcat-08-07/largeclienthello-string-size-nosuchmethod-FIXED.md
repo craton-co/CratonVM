@@ -108,10 +108,18 @@ above doesn't reproduce it because `new Socket(host,port)` goes through
 class* from the Logger fix here (so the "shared root cause" hypothesis
 this doc set out to check is still refuted), but it **is** a fixable,
 already-diagnosed dispatch/layout bug, not the deep GC-precision family —
-don't cite this doc's "register-invisible-root" framing as the final word;
-see the other session's memory for the actual fix (prepared, not yet
-merged as of this note). Left the two known-issues docs open with
-corrected cross-reference notes.
+don't cite this doc's "register-invisible-root" framing as the final word.
+
+**Update:** the SocketFactory fix (and a separate StreamEncoder eager-flush
+regression re-fix) landed the same day via
+`project_dohead_socket_streamencoder_logger_20260713` (project memory),
+merged `dev` `7e04cfe9c`. Both `dohead-jit-heap-corruption-register-invisibility.md`
+and `http2-testconnection-socket-closed-cluster.md` are now retired to
+`docs/internal/` as well (`-FIXED` suffix); a new residual doc
+`largeclienthello-session-resumption-handshake-abort.md` tracks the
+`SSLHandshakeException` failure this doc's own "Verification" section
+flagged as out-of-scope. The whole three-doc cluster this doc originally
+speculated about is closed.
 
 ## Verification
 
