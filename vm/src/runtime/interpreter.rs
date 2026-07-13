@@ -1226,6 +1226,13 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     // Round-5 fix (CRIT — UAF): drain this thread's per-thread SATB
     // buffer before initiating GC; see `maybe_gc` for the full rationale.
     shared.heap.flush_thread_satb();
+    // Real HotSpot's `System.gc()` triggers a FULL (old-gen-inclusive)
+    // collection by default — request one explicitly, since the collector's
+    // own Phase 5 otherwise only runs a major cycle when old gen crosses an
+    // occupancy threshold. See `gc_quiescence`'s doc comment for the full
+    // rationale (an already-promoted, genuinely-dead object is never swept by
+    // a `System.gc()` that only triggers a minor collection).
+    cratonvm_gc::gc_quiescence::request_major_gc();
     cratonvm_gc::gc_quiescence::begin_moving_young_coverage_cycle();
     update_root_snapshot(shared, thread);
     mtroots_set_gc_ctx(shared, thread, 1); // 1 = System.gc
@@ -1532,6 +1539,16 @@ fn process_references_after_gc(
             &is_marked,
             pointer_map,
         );
+        // Companion reconciliation for the class-mirror cache — see
+        // `memory::gc::reconcile_class_mirrors` / `roots.rs` step 6. Same
+        // "before the no_refproc short-circuit" rationale: the cache must
+        // never hold a stale ObjectRef after a collection, independent of
+        // that diagnostic switch.
+        crate::memory::gc::reconcile_class_mirrors(shared, &is_marked);
+        // Rebuild the mirror_pin registry the GC marker consults (gen_heap.rs)
+        // from the now-pruned class_mirrors + just-remapped defining-loader
+        // side-table, so the marker sees current addresses next cycle.
+        crate::memory::gc::rebuild_mirror_pins(shared);
     }
 
     // bc math-ec 0x4 (CRATONVM_DBG_NO_REFPROC): subsystem-level exclusion
@@ -3447,6 +3464,18 @@ fn g1_remark_process_references(
     shared: &SharedVm,
     is_marked: &dyn Fn(usize) -> bool,
 ) -> Vec<usize> {
+    // Companion reconciliation for the class-mirror cache (see
+    // `memory::gc::reconcile_class_mirrors` / `roots.rs` step 6). `roots.rs`
+    // step 6 only stops unconditionally rooting a user-defined class's mirror
+    // when the Generational collector's non-moving marker is active — NOT
+    // under G1 (no mirror_pin propagation wired into `g1.rs` yet) — so under
+    // G1 every mirror stays rooted and this call is a no-op (`is_marked`
+    // always true, nothing pruned). Kept here anyway, unconditionally, so
+    // this stays correct for free if G1 ever gains the same treatment. Done
+    // before the `no_refproc` short-circuit, same rationale as the post-GC
+    // path.
+    crate::memory::gc::reconcile_class_mirrors(shared, is_marked);
+
     // Same subsystem-level exclusion switch as the post-GC path.
     if no_refproc() {
         return Vec::new();
@@ -24185,7 +24214,7 @@ fn surefire_lazy_launcher_discover_native(
 /// Synthetic stubs are fallback implementations for fake or incomplete JDK
 /// classes. When the real class bytecode is loaded and explicitly protected,
 /// dispatch must prefer that bytecode over the approximate stub.
-fn synthetic_stub_should_yield_to_real_bytecode(
+pub(crate) fn synthetic_stub_should_yield_to_real_bytecode(
     shared: &SharedVm,
     class_name: &str,
     method_name: &str,
@@ -24199,7 +24228,37 @@ fn synthetic_stub_should_yield_to_real_bytecode(
         return false;
     }
 
-    let real_protected_stub = crate::runtime::env_cache::real_bytecode_selector()
+    if !real_protected_stub_class(class_name) {
+        return false;
+    }
+
+    let cm = shared.class_manager.read();
+    cm.get_loaded_class_id(class_name)
+        .and_then(|cid| {
+            cm.get_class(cid).and_then(|cls| {
+                if cls.is_synthetic_stub {
+                    None
+                } else {
+                    crate::classloading::find_method_recursive(
+                        cid,
+                        method_name,
+                        descriptor,
+                        &cm.class_store,
+                    )
+                    .map(|(m, _)| !m.is_native() && m.code().is_some())
+                }
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// The class allowlist for [`synthetic_stub_should_yield_to_real_bytecode`]
+/// (and `populate_invoke_cache`'s inline copy of the same predicate, which
+/// cannot call the full helper while holding the class-manager read lock):
+/// classes whose SyntheticStub natives exist only for stub-phase bootstraps
+/// and must yield to loaded real bytecode.
+pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
+    crate::runtime::env_cache::real_bytecode_selector()
         .prefers_real(class_name)
         || matches!(
             class_name,
@@ -24229,29 +24288,7 @@ fn synthetic_stub_should_yield_to_real_bytecode(
                 | "java/lang/ref/Cleaner"
                 | "java/lang/ref/Cleaner$Cleanable"
                 | "java/lang/management/ManagementFactory"
-        );
-    if !real_protected_stub {
-        return false;
-    }
-
-    let cm = shared.class_manager.read();
-    cm.get_loaded_class_id(class_name)
-        .and_then(|cid| {
-            cm.get_class(cid).and_then(|cls| {
-                if cls.is_synthetic_stub {
-                    None
-                } else {
-                    crate::classloading::find_method_recursive(
-                        cid,
-                        method_name,
-                        descriptor,
-                        &cm.class_store,
-                    )
-                    .map(|(m, _)| !m.is_native() && m.code().is_some())
-                }
-            })
-        })
-        .unwrap_or(false)
+        )
 }
 
 /// Stackless invoke: resolve a method and either call native (Handled) or push
@@ -25421,9 +25458,29 @@ fn populate_invoke_cache(
     // bytecode body, the cached Native entry must invalidate.  Look up
     // the class_id here rather than synthesizing a never-stale gate so
     // even native-resolved entries participate in JEP 109 invalidation.
+    //
+    // SyntheticStub yield: a stub-tagged native on a real-protected class
+    // whose real bytecode is loaded must NOT be cached (and especially not
+    // promoted to the cross-thread cache) — the stub body exists only for
+    // stub-phase bootstraps. Without this, a call site whose first
+    // resolution goes through this population path permanently pins the
+    // stub even though the slow-path dispatch sites correctly yield
+    // (observed 2026-07-13 with the since-removed OutputStreamWriter stub
+    // surface: `HttpServlet$NoBodyPrintWriter.resetBuffer`'s
+    // `new OutputStreamWriter` kept minting encoders with a null `se`
+    // while the sibling constructor call site ran the real ctor).
+    // Fall through to the bytecode resolution below instead.
     if let Some(callback) = shared
         .native_methods
         .find(&class_name, &method_name, &descriptor)
+        .filter(|_| {
+            !synthetic_stub_should_yield_to_real_bytecode(
+                shared,
+                &class_name,
+                &method_name,
+                &descriptor,
+            )
+        })
     {
         let cm = shared.class_manager.read();
         let gate = match cm.get_loaded_class_id(&class_name) {
@@ -25526,26 +25583,43 @@ fn populate_invoke_cache(
     // restored by the `cd396a04` "Merge branch 'main' into dev" merge).
     {
         let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
-        if let Some(callback) =
-            shared
-                .native_methods
-                .find(declaring_name, &method_name, &descriptor)
-        {
-            let gate = RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
-            drop(cm);
-            let target = CachedInvokeTarget::Native {
-                callback,
-                // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
-                num_params: num_params as u16,
-                gate,
-            };
-            shared
-                .shared_resolution
-                .insert_promoted_invoke(promoted_key, target.clone());
-            thread
-                .invoke_cache
-                .put(caller_class_id, cp_index, is_special, target);
-            return;
+        // Inline SyntheticStub yield (the full helper re-acquires the
+        // class-manager read lock, which is already held here): a stub-tagged
+        // native on a real-protected declaring class whose resolved method is
+        // real bytecode yields — do not cache the stub. `method`/`declaring_id`
+        // are the already-resolved real method/class from
+        // `find_method_recursive` above.
+        let stub_yields = shared
+            .native_methods
+            .kind_of(declaring_name, &method_name, &descriptor)
+            == Some(cratonvm_native_api::NativeKind::SyntheticStub)
+            && real_protected_stub_class(declaring_name)
+            && store.get(declaring_id).is_some_and(|c| !c.is_synthetic_stub)
+            && !method.is_native()
+            && method.code().is_some();
+        if !stub_yields {
+            if let Some(callback) =
+                shared
+                    .native_methods
+                    .find(declaring_name, &method_name, &descriptor)
+            {
+                let gate =
+                    RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
+                drop(cm);
+                let target = CachedInvokeTarget::Native {
+                    callback,
+                    // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
+                    num_params: num_params as u16,
+                    gate,
+                };
+                shared
+                    .shared_resolution
+                    .insert_promoted_invoke(promoted_key, target.clone());
+                thread
+                    .invoke_cache
+                    .put(caller_class_id, cp_index, is_special, target);
+                return;
+            }
         }
     }
 

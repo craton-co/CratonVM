@@ -5,6 +5,26 @@ symptoms across `quarkus/runtime`'s configuration test suite
 
 Date observed: 2026-07-11 (refresh rerun against non-passed-before classes, branch fix/keycloak-nonpassed-rerun-v2-20260710)
 
+**Update 2026-07-13**: confirmed still genuinely open via a fresh (non-stale-distribution) HotSpot comparison —
+HotSpot cleanly passes both of the following, CratonVM still fails them:
+- `quarkus/runtime :: DatasourcesConfigurationTest::testMysqlTLSOptions` now additionally shows
+  `java.lang.NoSuchMethodError: java/lang/Object.proceed(Ljava/lang/String;)Lio/smallrye/config/ConfigValue;`
+  thrown from `SmallRyeConfig$SmallRyeConfigSourceInterceptorContext.proceed` — the receiver is reported as
+  plain `java/lang/Object` rather than the real interceptor-context type, suggesting a wrong/erased receiver
+  type on a dynamically-chained interceptor object, distinct from the value-mismatch symptoms already described
+  above.
+- `quarkus/runtime :: PicocliTest` still fails 27/107 methods (`errorSpiBuildtimeChanged`,
+  `buildOptionChangedWithOptimized`, `spiAmbiguousSpiAutoBuild`, and 24 others) with plain JUnit `AssertionError`s
+  from `PicocliTest.build()` — same rough failure count as previously observed in
+  `docs/internal/fixed-suite-bugs/quarkus-runtime-picocli-post-compactvalue-hang.md` ("106 tests, failed 28"),
+  which explicitly deferred root-causing these as "later behavioral assertions ... not root-caused here". Given
+  both classes exercise SmallRye Config resolution/interceptor chains, these may share a root cause with this
+  doc's config-resolution-mismatch findings.
+- Evidence: `apps/keycloak-suite-runner/.suite/results/nonpassed-before-refresh2-shard1/all-jit/logs/quarkus_runtime.org.keycloak.quarkus.runtime.configuration.DatasourcesConfigurationTest.{out,err}.log` and
+  `.../quarkus_runtime.org.keycloak.quarkus.runtime.cli.PicocliTest.{out,err}.log`; fresh HotSpot PASS in
+  `apps/keycloak-suite-runner/.suite/results/hotspot-refresh-v2-shard1/hotspot-jit/results.tsv` (both classes in
+  the 162-class `timeout-affected.tsv` sample, branch `fix/keycloak-nonpassed-rerun-v2-20260710`).
+
 ## Summary
 
 Several `quarkus/runtime :: configuration.*` test classes fail with config-value or config-property-enumeration

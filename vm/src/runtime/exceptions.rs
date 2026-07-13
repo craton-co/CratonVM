@@ -1377,6 +1377,9 @@ pub fn throw_runtime_error(
         RuntimeError::SocketTimeoutException { message } => {
             ("java/net/SocketTimeoutException", Some(message.as_str()))
         }
+        RuntimeError::ConnectException { message } => {
+            ("java/net/ConnectException", Some(message.as_str()))
+        }
         RuntimeError::FileNotFoundException { path } => {
             ("java/io/FileNotFoundException", Some(path.as_str()))
         }
