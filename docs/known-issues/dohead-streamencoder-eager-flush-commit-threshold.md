@@ -1,5 +1,15 @@
 # Tomcat `TestHttpServletDoHead*` (legacy HEAD) — StreamEncoder eager-flush broke the byte-count commit threshold (FIXED)
 
+**Note (2026-07-13):** restored from `docs/internal/fixed-suite-bugs/`
+alongside `dohead-jit-heap-corruption-register-invisibility.md`. This
+specific fix (commit `1773d3df2`) is confirmed merged to `dev` and remains
+accurate — the byte-count commit-threshold bug it describes is genuinely
+fixed. It's back in `known-issues` only for continuity: the class this doc
+validated (`TestHttpServletDoHeadInvalidWrite1024ValidWrite512`) still
+fails today, but via an unrelated, newly-found issue (`Socket`/HTTP2
+test-connection handling — see the main doc) that this fix neither causes
+nor addresses.
+
 Status: **FIXED** on branch `dev` (this fix). Root cause is entirely in
 `native-io/src/stream_encoder.rs` (CratonVM's real-mode shim for
 `sun.nio.cs.StreamEncoder`) — no Tomcat/Servlet-API source was touched.
