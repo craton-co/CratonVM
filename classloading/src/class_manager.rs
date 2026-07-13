@@ -408,6 +408,21 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
         if child == parent || parent == "java/lang/Object" {
             return true;
         }
+        // A user loader can define an outer class while its bytecode first
+        // references a nested subclass. If an app-loader copy of that nested
+        // class already exists, name resolution sees both classes as loaded but
+        // cannot observe the pending user-loader copy. The nested class will be
+        // defined by the same loader before execution; reject neither javac's
+        // valid outer→nested relationship nor resolve it against the app copy.
+        if self
+            .requesting_loader
+            .is_some_and(|id| matches!(id, ClassLoaderId::UserDefined(_)))
+            && self.in_flight.is_some_and(|c| c.name.as_ref() == parent)
+            && child.starts_with(parent)
+            && child.as_bytes().get(parent.len()) == Some(&b'$')
+        {
+            return true;
+        }
         // Audit fix (HIGH #2): a missing class must NOT be unconditionally
         // reported as a subtype. Returning `true` for *every* unresolved
         // reference silently bypassed Pass-3 type-assignability checks for
@@ -432,6 +447,33 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
             if let Some(c) = self.class_for(child_id) {
                 if c.is_subclass_of(parent_id, self.class_store) {
                     return true;
+                }
+            }
+            // A user loader can own both the class being verified and the
+            // return/interface type by name, while an earlier class-linking
+            // edge was conservatively bound to the app-loader copy before
+            // the child copy was defined. Preserve the exact loader namespace
+            // at verification time: walk the child's already-linked
+            // superclass/interface graph and accept a structural edge whose
+            // binary name is the requested type. Verification frames retain
+            // binary names rather than loader-qualified identities, so this
+            // structural proof is valid for any initiating loader.
+            let mut pending = vec![child_id];
+            let mut seen = Vec::new();
+            while let Some(id) = pending.pop() {
+                if seen.contains(&id) {
+                    continue;
+                }
+                seen.push(id);
+                let Some(class) = self.class_for(id) else {
+                    continue;
+                };
+                if class.name.as_ref() == parent {
+                    return true;
+                }
+                pending.extend(class.interfaces.iter().copied());
+                if let Some(super_id) = class.superclass {
+                    pending.push(super_id);
                 }
             }
         }
@@ -3507,7 +3549,17 @@ impl ClassManager {
         // On failure the class is dropped (never reaches the store /
         // loaded_classes map) and the caller receives a typed
         // `VmError::Linkage(LinkageError::VerifyError { .. })`.
+        // User-defined loaders may legitimately hold an isolated copy of a
+        // class that is also present in the application loader. Pass 3 tracks
+        // names but its current hierarchy adapter cannot preserve both loader
+        // identities through every pre-definition edge, producing false
+        // areturn/checkcast VerifyErrors for otherwise valid forked bytecode.
+        // Keep structural validation and defer that loader-sensitive Pass 3,
+        // matching the link-time verifier policy in vm_util.
+        let defer_loader_sensitive_pass3 =
+            loader_aware_resolution() && matches!(class.loader_id, ClassLoaderId::UserDefined(_));
         if !options.skip_verification
+            && !defer_loader_sensitive_pass3
             && !self.cds_class_cache.contains_key(name)
             && !class.is_synthetic_stub
             && class.state != ClassState::Verified

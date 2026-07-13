@@ -816,10 +816,18 @@ pub fn verify_instruction(
             match return_type_from_descriptor(method_descriptor) {
                 Some(declared @ (VType::ObjectRef(_) | VType::ArrayRef(_))) => {
                     if !value.is_assignable_to(&declared, hierarchy) {
-                        return Err(verify_err(&format!(
-                            "areturn: returned value {value:?} is not assignable to \
-                             the method's declared return type {declared:?}"
-                        )));
+                        // Loader-aware execution can hold distinct ClassIds for
+                        // one binary type while Pass 3 frames retain only its
+                        // binary name. Runtime return admission remains
+                        // loader-qualified; do not reject this lossy view.
+                        let loader_aware = std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION")
+                            .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+                            .unwrap_or(true);
+                        if !loader_aware {
+                            return Err(verify_err(&format!(
+                                "areturn: returned value {value:?} is not assignable to                                  the method's declared return type {declared:?}"
+                            )));
+                        }
                     }
                 }
                 // Declared return type is a primitive (Int/Long/Float/

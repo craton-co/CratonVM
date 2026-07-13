@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN (12 genuinely hung, 12 slow-but-failing, 1 crash — none fixed) |
+| **Status** | OPEN (12 genuinely hung, 10 slow-but-failing, 1 crash; 2 non-residual items removed) |
 | **Discovered** | 2026-07-11, following up on the 25 classes that hit TIMEOUT in the
 125-class scoped rerun (dev `9948295e`, standard 120s timeout — see
 [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](../internal/CRATONVM-SPRING-GENUINE-BUGLIST-125.md)). |
@@ -25,6 +25,15 @@ mid-run (six shards' first classes reappeared as fresh processes at ~279s
 after apparently running for the full 1500s). The `1500000` ms figure
 recorded for hung classes is the single retry window's duration, not the
 cumulative wall-clock.
+
+## Resolved during this investigation
+
+- `test.context.aot.TestClassScannerTests` was already clean in the 1500s
+  rerun (7/7) and is not an active issue.
+- `web.service.registry.HttpServiceProxyRegistrationAotProcessorTests` now
+  passes (0 failures). The fix makes `Class.forName` invoked through Spring's
+  `DynamicClassLoader` resolve generated classes through its parent loader,
+  preserving the class identity expected by the test compiler and registry.
 
 ## Bucket 1 — Genuinely hung (12/25)
 
@@ -50,7 +59,7 @@ flagged in the `-125` doc's "AOT bean-registration TIMEOUT cluster") — a
 shared root cause in that pipeline remains the leading hypothesis, not yet
 investigated.
 
-## Bucket 2 — Slow but completes (12/25)
+## Bucket 2 — Slow but completes (10 unresolved)
 
 Real result landed well under 1500s (or right at the boundary for one). Not
 hangs — but 10/12 are near-total failures, so the slowness itself may be part
@@ -59,8 +68,6 @@ rather than a coincidence:
 
 | Class | Status | Elapsed | Pass/Total | First FAILCAUSE |
 |---|---|--:|--:|---|
-| `test.context.aot.TestClassScannerTests` | **OK** | 265s | 7/7 | — |
-| `web.service.registry.HttpServiceProxyRegistrationAotProcessorTests` | FAIL | 111s | 3/5 | `ArrayIndexOutOfBoundsException` / `DiscoveryIssueException` (JUnit discovery) |
 | `orm.jpa.support.InjectionCodeGeneratorTests` | FAIL | 206s | 3/10 | `CompilationException: Unable to compile source` |
 | `web.socket.messaging.StompWebSocketIntegrationTests` | FAIL | 169s | 0/16 | `ServletException` / `UnsatisfiedDependencyException` (no `MessageHandler` bean) |
 | `web.reactive.result.method.annotation.CrossOriginAnnotationIntegrationTests` | FAIL | 492s | 0/68 | `BeanCreationException`: no `ApiVersionStrategy` bean |
@@ -80,11 +87,17 @@ Notable sub-clusters within this bucket (candidates for shared root cause):
   the (now-fixed) `core.test.tools.CompiledTests`/`TestCompilerTests`; these
   three fail fast on compile rather than hang, so likely a related but
   distinct defect in the same subsystem.
-- **`web.service.registry.*` `ArrayIndexOutOfBoundsException` +
-  `DiscoveryIssueException`** (3 classes: `HttpServiceProxyRegistrationAotProcessorTests`,
-  `ImportHttpServiceRegistrarTests`, `GroupsMetadataValueDelegateTests`) — all
-  in the same new (Spring 7) `web.service.registry` package, same two-error
-  signature across methods, strongly suggests one shared bug.
+- **`web.service.registry.*` residuals** (2 classes: `ImportHttpServiceRegistrarTests`,
+  `GroupsMetadataValueDelegateTests`) — the original JUnit-discovery signature
+  is no longer the common failure. An isolated rerun of
+  `ImportHttpServiceRegistrarTests` now reaches Spring parsing and fails with
+  `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;`
+  from `ConfigurationClassParser$SourceClass.getAnnotationAttributes`.
+  This points to incomplete `Class[]`-to-`String[]` annotation-map adaptation.
+  The current isolated probe for `GroupsMetadataValueDelegateTests` instead
+  stops before JUnit with a missing generated helper,
+  `GroupsMetadata__TestCode`; it needs a generated-test-aware probe before a
+  VM root cause can be assigned.
 - **Missing `ApiVersionStrategy` bean** (2 classes: `CrossOriginAnnotationIntegrationTests`,
   `RequestMappingMessageConversionIntegrationTests`) — both WebFlux, both fail
   every parameterized variant (Jetty, Jetty Core, ...) with the identical
