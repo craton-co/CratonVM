@@ -1683,9 +1683,25 @@ pub(crate) fn native_class_for_name(
             dotted_name,
             loader_class_name_debug
         );
-        let invoke_args = [Value::Object(Some(loader)), Value::Object(Some(name_obj))];
+        // Spring's DynamicClassLoader deliberately delegates generated classes
+        // to its forked parent. In real-JDK mode the inherited ClassLoader
+        // bytecode can collapse that lookup to the flat global store before
+        // the parent's loader-local namespace participates. Invoke the parent
+        // directly for this known delegating loader so Class.forName observes
+        // the same class identity as the generated AOT code.
+        let lookup_loader = if loader_class_name_debug
+            == "org/springframework/core/test/tools/DynamicClassLoader"
+        {
+            match ctx.get_field_by_name(loader, "parent") {
+                Value::Object(Some(parent)) => parent,
+                _ => loader,
+            }
+        } else {
+            loader
+        };
+        let invoke_args = [Value::Object(Some(lookup_loader)), Value::Object(Some(name_obj))];
         match ctx.invoke_virtual(
-            loader,
+            lookup_loader,
             "loadClass",
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &invoke_args[1..],
@@ -4609,7 +4625,13 @@ fn field_set_raw(
     // Narrow or widen the incoming primitive into whatever the field
     // actually holds. This catches `Field.setInt(...)` on a reference field
     // and the like, producing IllegalArgumentException as per javadoc.
-    let coerced = coerce_arg_strict(ctx, new_value, &descriptor, "Field typed setter", Some(class_id))?;
+    let coerced = coerce_arg_strict(
+        ctx,
+        new_value,
+        &descriptor,
+        "Field typed setter",
+        Some(class_id),
+    )?;
 
     // WP2.1-field вЂ” volatile-aware write fences (no-op for non-volatile).
     volatile_store_fence_pre(modifiers);
@@ -6042,7 +6064,13 @@ pub(crate) fn native_method_invoke(
         // type mismatch (per java.lang.reflect.Method.invoke javadoc).
         for (i, pdesc) in param_descs.iter().enumerate() {
             let arg_val = raw_args[i];
-            match coerce_arg_strict(ctx, arg_val, pdesc, "Method.invoke argument", ctx.class_id_from_mirror(declaring_mirror)) {
+            match coerce_arg_strict(
+                ctx,
+                arg_val,
+                pdesc,
+                "Method.invoke argument",
+                ctx.class_id_from_mirror(declaring_mirror),
+            ) {
                 Ok(coerced) => invoke_args.push(coerced),
                 Err(e) => {
                     // JDK-faithful cause: HotSpot's reflective unboxing calls
@@ -8087,7 +8115,13 @@ pub(crate) fn native_constructor_new_instance(
         } else {
             Value::Object(None)
         };
-        let coerced = coerce_arg_strict(ctx, arg_val, pdesc, "Constructor.newInstance argument", declaring_cid)?;
+        let coerced = coerce_arg_strict(
+            ctx,
+            arg_val,
+            pdesc,
+            "Constructor.newInstance argument",
+            declaring_cid,
+        )?;
         init_args.push(coerced);
     }
 
@@ -11740,6 +11774,7 @@ pub(crate) fn native_class_get_generic_interfaces(
         if let Some(class_sig) = crate::generics::parse_class_signature(&sig_str) {
             if !class_sig.interfaces.is_empty() {
                 let class_mirror = ctx.get_class_mirror(class_id);
+                let raw_interfaces = ctx.class_interfaces(class_id);
                 let arr = ctx.new_ref_array(ClassId::new(0), class_sig.interfaces.len());
                 for (i, iface) in class_sig.interfaces.iter().enumerate() {
                     // Type-variable uses in an interface type refer to THIS
@@ -11748,6 +11783,20 @@ pub(crate) fn native_class_get_generic_interfaces(
                         crate::generics::GenericDeclScope::new(Value::Object(Some(class_mirror)));
                     // SB-02b-#3: real ParameterizedTypeImpl for generic interfaces.
                     let val = crate::generics::typesig_to_real_type(ctx, iface);
+                    // A malformed or not-yet-resolvable generic argument must
+                    // not leave a null element in Type[]. Java reflection
+                    // degrades to the matching raw direct interface in this
+                    // situation; Hibernate Validator immediately dereferences
+                    // every returned Type while discovering ConstraintValidator
+                    // implementations.
+                    let val = if matches!(val, Value::Object(None)) {
+                        raw_interfaces
+                            .get(i)
+                            .map(|&id| Value::Object(Some(ctx.get_class_mirror(id))))
+                            .unwrap_or(Value::Object(None))
+                    } else {
+                        val
+                    };
                     ctx.set_array_element(arr, i, val);
                 }
                 return Ok(Some(Value::Object(Some(arr))));
@@ -14156,12 +14205,7 @@ pub(crate) fn native_type_variable_get_annotated_bounds(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let bounds = match ctx.invoke_virtual(
-        this,
-        "getBounds",
-        "()[Ljava/lang/reflect/Type;",
-        &[],
-    )? {
+    let bounds = match ctx.invoke_virtual(this, "getBounds", "()[Ljava/lang/reflect/Type;", &[])? {
         Some(Value::Object(Some(bounds))) => bounds,
         _ => {
             let empty = ctx.new_ref_array(ClassId::new(0), 0);
@@ -14686,7 +14730,15 @@ pub(crate) fn native_annotated_type_get_annotation(
     if let Some((arr, n)) = annotated_type_stashed_anns(ctx, this) {
         for i in 0..n {
             if let Value::Object(Some(proxy)) = ctx.get_array_element(arr, i) {
-                if let Value::Object(Some(tm)) = ctx.get_field(proxy, ANN_PROXY_TYPE_MIRROR) {
+                // Annotation instances are materialized as ordinary JDK dynamic
+                // proxies here. Do not assume the legacy synthetic
+                // `AnnotationProxy` field layout: reading slot 1 from a dynamic
+                // proxy is invalid and turns a valid type-use annotation into a
+                // false negative. The public Annotation contract supplies the
+                // precise type mirror for both representations.
+                if let Ok(Some(Value::Object(Some(tm)))) =
+                    ctx.invoke_virtual(proxy, "annotationType", "()Ljava/lang/Class;", &[])
+                {
                     if mirror_class_id(ctx, tm) == Some(want) {
                         return Ok(Some(Value::Object(Some(proxy))));
                     }
@@ -16205,11 +16257,24 @@ mod tests {
     fn coerce_arg_strict_reference_passes_through() {
         let mut ctx = mock_ctx();
         let obj = ctx.alloc_object(ClassId::new(0), 0);
-        let v = coerce_arg_strict(&ctx, Value::Object(Some(obj)), "Ljava/lang/Object;", "test", None)
-            .unwrap();
+        let v = coerce_arg_strict(
+            &ctx,
+            Value::Object(Some(obj)),
+            "Ljava/lang/Object;",
+            "test",
+            None,
+        )
+        .unwrap();
         assert_eq!(v, Value::Object(Some(obj)));
         // null is legal for a reference type.
-        let v = coerce_arg_strict(&ctx, Value::Object(None), "Ljava/lang/String;", "test", None).unwrap();
+        let v = coerce_arg_strict(
+            &ctx,
+            Value::Object(None),
+            "Ljava/lang/String;",
+            "test",
+            None,
+        )
+        .unwrap();
         assert_eq!(v, Value::Object(None));
     }
 

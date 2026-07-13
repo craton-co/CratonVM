@@ -931,13 +931,21 @@ fn cl_real_load_class_base(
     // app classes under the child loader, diverging from HotSpot). Built-in
     // loaders and bootstrap class names also keep the fast global path. Opt-out:
     // `CRATONVM_CL_BOOTSTRAP_SCOPED=0`.
-    let parent_is_null = matches!(
-        ctx.get_field_by_name(this, "parent"),
-        Value::Object(None) | Value::Int(0) | Value::Long(0)
-    );
+    let parent = match ctx.get_field_by_name(this, "parent") {
+        Value::Object(Some(parent)) => Some(parent),
+        Value::Object(None) | Value::Int(0) | Value::Long(0) => None,
+        _ => None,
+    };
+    let parent_is_null = parent.is_none();
+    // The platform loader can load JDK modules but not application/test
+    // classes. Do not let the flat global class store impersonate an app parent.
+    let parent_is_platform = parent.is_some_and(|parent| {
+        ctx.class_name_of_id(ctx.class_id_of_object(parent))
+            .is_some_and(|name| name == "jdk/internal/loader/ClassLoaders$PlatformClassLoader")
+    });
     let overrides_find_class = crate::classloader::receiver_overrides_find_class(ctx, this);
     let defer_to_find_class = overrides_find_class
-        && parent_is_null
+        && (parent_is_null || parent_is_platform)
         && crate::classloader::cl_bootstrap_scoped()
         && !crate::classloader::is_bootstrap_class_name(&internal);
 

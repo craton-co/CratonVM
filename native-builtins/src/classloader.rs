@@ -1114,6 +1114,23 @@ pub(crate) fn find_loaded_class_for_loader(
             return Some(ctx.get_class_mirror(cid));
         }
     }
+    // Real-JDK ClassLoader layouts do not reliably expose the synthetic
+    // namespace id used by the class manager. `defineClass` also records the
+    // exact defining loader object per ClassId; consult that authoritative
+    // relation so a parent fork loader can recover its own already-defined
+    // class before delegating to a global same-named copy.
+    let defined_here: Vec<u32> = defining_loader_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(|(&cid, loader)| (loader.as_ptr() == this.as_ptr()).then_some(cid))
+        .collect();
+    for cid in defined_here {
+        let cid = cratonvm_types::ClassId::new(cid);
+        if ctx.class_name_of_id(cid).as_deref() == Some(internal_name) {
+            return Some(ctx.get_class_mirror(cid));
+        }
+    }
     // 2. A globally-known class THIS loader is the defining loader of.
     if let Some(cid) = ctx.class_id_by_name(internal_name) {
         if let Some(def) = defining_loader_for(cid.as_u32()) {
@@ -1246,7 +1263,6 @@ fn cl_load_class_base_delegation(
 ) -> MethodCallResult {
     let dotted = ctx.read_string(name_obj).unwrap_or_default();
     let internal = dotted.replace('.', "/");
-
     // HIB-CV-24 / SBR-14 -- honor a supplied child/isolated `ClassLoader`.
     //
     // CratonVM stands in for `ClassLoader.loadClass` with this native (it keeps no
@@ -1266,11 +1282,29 @@ fn cl_load_class_base_delegation(
     // classpath). Opt-out: `CRATONVM_CL_BOOTSTRAP_SCOPED=0`.
     let parent = classloader_parent(ctx, this);
     let parent_is_null = parent.is_none();
+    // The platform loader has the same visibility as bootstrap for application
+    // classes: it can load JDK modules, never a test/application class.  In
+    // real-JDK mode its Java fields cannot carry CratonVM's synthetic loader
+    // type marker, so the old `parent_type` fallback below mistook it for the
+    // app loader and leaked a global app class before a child `findClass` got
+    // a chance to define its own copy.  Compare the singleton identity instead
+    // of inspecting real JDK object fields.
+    let parent_is_platform = parent.is_some_and(|candidate| {
+        // The JDK can manufacture another PlatformClassLoader object before
+        // our native singleton is observed, so identity is a fast path only;
+        // the object's actual runtime class is the authoritative fallback.
+        ctx.class_name_of_id(ctx.class_id_of_object(candidate))
+            .is_some_and(|name| name == "jdk/internal/loader/ClassLoaders$PlatformClassLoader")
+            || platform_loader_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some_and(|platform| platform.as_ptr() == candidate.as_ptr())
+    });
+    let receiver_has_find_class_override = receiver_overrides_find_class(ctx, this);
     let defer_to_find_class = cl_bootstrap_scoped()
-        && parent_is_null
+        && (parent_is_null || parent_is_platform)
         && !is_bootstrap_class_name(&internal)
-        && receiver_overrides_find_class(ctx, this);
-
+        && receiver_has_find_class_override;
     // JVM spec §5.3.2 — parent-first delegation:
     // 1. Check if this loader already loaded the class (findLoadedClass)
     let loader_type = match ctx.get_field(this, CL_LOADER_TYPE) {
@@ -1278,7 +1312,29 @@ fn cl_load_class_base_delegation(
         _ => LOADER_APP,
     };
 
-    // For custom loaders, check own namespace first
+    // A user-defined loader must always return a class it has already
+    // defined before delegating to its parent. In real-JDK mode the
+    // synthetic loader-type slot is unavailable, so the legacy branch below
+    // can misclassify it as an application loader and skip this check; that
+    // leaks a same-named global class through a forked parent loader.
+    if is_user_defined_loader(ctx, this) {
+        if let Some(mirror) = find_loaded_class_for_loader(ctx, this, &internal) {
+            return Ok(Some(Value::Object(Some(mirror))));
+        }
+        // The read-only lookup above intentionally avoids allocating a
+        // namespace.  A real-JDK ClassLoader may not expose the synthetic
+        // id field even though `defineClass` has already registered classes
+        // through `loader_namespace_id`; ask that same authoritative mapping
+        // before falling through to the parent/global store.
+        let loader_id = loader_namespace_id(ctx, this);
+        if let Some(cid) = ctx.class_id_by_name_and_loader(&internal, loader_id) {
+            if let Some(mirror) = cid_visible_mirror(ctx, this, cid) {
+                return Ok(Some(Value::Object(Some(mirror))));
+            }
+        }
+    }
+
+    // For synthetic-mode custom loaders, check own namespace first.
     if loader_type == LOADER_CUSTOM {
         let loader_id = match ctx.get_field(this, CL_LOADER_ID) {
             Value::Int(v) if v > 0 => Some(v as u32),
@@ -1314,6 +1370,26 @@ fn cl_load_class_base_delegation(
                 if let Some(mirror) = cid_visible_mirror(ctx, this, cid) {
                     return Ok(Some(Value::Object(Some(mirror))));
                 }
+            }
+        }
+        // A user-defined parent has its own delegation and `findClass`
+        // behavior. In real-JDK mode its internal loader-type fields are not
+        // available to this native, so treating it like a built-in parent and
+        // consulting the flat global store first can return an unrelated
+        // same-named application class. Invoke the parent's actual loadClass
+        // before any global fallback, exactly as parent-first delegation
+        // requires (notably DynamicClassLoader -> forked test loader).
+        if is_user_defined_loader(ctx, parent) {
+            match ctx.invoke_virtual(
+                parent,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[Value::Object(Some(name_obj))],
+            ) {
+                Ok(Some(Value::Object(Some(mirror)))) => {
+                    return Ok(Some(Value::Object(Some(mirror))));
+                }
+                _ => {}
             }
         }
         // For built-in parent loaders (bootstrap/platform/app), use standard delegation
@@ -1368,7 +1444,9 @@ fn cl_load_class_base_delegation(
             &[Value::Object(Some(name_obj))],
         );
         match result {
-            Ok(Some(Value::Object(Some(_)))) => return result,
+            Ok(Some(Value::Object(Some(_)))) => {
+                return result
+            },
             // findClass threw (ClassNotFoundException) or returned null — fall through.
             _ => {}
         }
