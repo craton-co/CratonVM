@@ -1445,9 +1445,18 @@ fn perform(
     // directly instead of opening a second one.
     if let Some(stream_id) = established_https_stream_id {
         let mut stream = RustlsIdStream(stream_id);
-        stream.write_all(&req).map_err(|e| format!("write: {e}"))?;
-        stream.flush().map_err(|e| format!("flush: {e}"))?;
-        return read_response(&mut stream, head);
+        // Same blocking-region gap as the plain-HTTP branch below: a real OS
+        // write+read over an already-established connection, no Java-heap
+        // touch in this closure, so a plain begin/end bracket (no ref
+        // re-sync needed) is enough to keep it out of the STW mutator count.
+        ctx.begin_blocking_region();
+        let result = (|| -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
+            stream.write_all(&req).map_err(|e| format!("write: {e}"))?;
+            stream.flush().map_err(|e| format!("flush: {e}"))?;
+            read_response(&mut stream, head)
+        })();
+        ctx.end_blocking_region();
+        return result;
     }
     let addr = format!("{}:{}", parsed.host, parsed.port);
     let mut last_err: Option<String> = None;
@@ -1633,11 +1642,23 @@ fn perform(
         outcome
     } else {
         let mut s = tcp;
+        // Plain-HTTP request write + response read is a real blocking OS
+        // recv() with no Java-heap interaction anywhere in the closure
+        // (`read_response` is generic over `Read`, takes no `ctx`) — bracket
+        // it like the TCP connect above, unlike the HTTPS branch which uses
+        // `set_active_native_context` instead for its own documented reason.
+        // Without this, a cross-thread STW pause requested while this thread
+        // is parked in `read_response` can never be satisfied: the thread is
+        // neither in JIT code (can't be forcibly taken over) nor at a
+        // safepoint (can't cooperate), so the takeover loop in
+        // `stw_take_over_and_wait` spins until the external harness timeout.
+        ctx.begin_blocking_region();
         let result = (|| -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
             s.write_all(&req).map_err(|e| format!("write: {e}"))?;
             s.flush().map_err(|e| format!("flush: {e}"))?;
             read_response(&mut s, head)
         })();
+        ctx.end_blocking_region();
         result
     }
 }

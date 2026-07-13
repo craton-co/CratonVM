@@ -481,6 +481,58 @@ fn mtroots_selfcheck(thread: &JvmThread, heap: &crate::memory::VmHeap, location:
 /// When the feature is disabled (`CRATONVM_XT_JIT_ROOT_SCAN=0`) or unsupported
 /// for the current heap, this is byte-for-byte the legacy `wait_for_all()` —
 /// zero behaviour change.
+///
+/// Perf/starvation fix (2026-07-13 — elinjsp-socket-read-timeout,
+/// stw-crossthread-jit-takeover-hang-cluster, wildfly-standalone-boot-stw-
+/// jit-takeover-hang): the per-round `take_over_pass` OS-level scan (Windows:
+/// a full `CreateToolhelp32Snapshot` plus per-peer `OpenThread`/
+/// `SuspendThread`/`GetThreadContext`/`ResumeThread`; Linux: a signal-and-wait
+/// per peer) is expensive, and suspending/resuming every peer thread —
+/// including the exact mutator this loop is waiting for — competes with that
+/// peer for scheduler time. Previously this ran unconditionally on every 1ms
+/// tick once the loop had spun even once (`rounds != 0`), regardless of
+/// whether anything was actually in JIT, for as long as the wait continued —
+/// a self-amplifying livelock where the longer the wait takes, the more it
+/// starves the very thread it is waiting for. Confirmed empirically: a
+/// single JSP-compile GC pause with exactly one pending (non-JIT,
+/// non-blocked) mutator took several minutes, logging hundreds of thousands
+/// of "0 newly taken over" scans, one per millisecond, before the mutator
+/// (itself just slow to reach its own next safepoint under the induced
+/// scheduling pressure) finally arrived.
+fn stw_takeover_should_scan(rounds: u32, jit_hint: bool) -> bool {
+    // Scan every round for the first FAST_SCAN_ROUNDS — preserves
+    // zero-added-latency behavior for the common case, where a genuinely
+    // in-JIT peer is taken over within single-digit milliseconds — then back
+    // off geometrically. A peer that enters JIT during the slow phase is
+    // still guaranteed to be found; it just carries up to one
+    // SLOW_SCAN_PERIOD/VERY_SLOW_SCAN_PERIOD round of added detection
+    // latency, negligible next to a stall already long enough to reach that
+    // phase, while cutting steady-state OS-call volume (and the
+    // peer-starvation feedback loop) by 1-2 orders of magnitude.
+    //
+    // Round 0 is deliberately left gated on the cheap `any_thread_in_jit()`
+    // hint alone (unchanged from before), so an ordinary, fully-cooperative
+    // GC pause that never needed a scan at all still does not pay for one.
+    // The hint is NOT used to gate rounds >= 1: that counter is a single
+    // process-global depth and cannot distinguish "a peer is in JIT" from "I
+    // am" — this function's caller is commonly reached via `maybe_gc` called
+    // from JIT-compiled code, so the initiator's own live JIT-entry guard can
+    // hold the hint permanently true regardless of any peer's actual state.
+    const FAST_SCAN_ROUNDS: u32 = 20;
+    const SLOW_SCAN_PERIOD: u32 = 20;
+    const VERY_SLOW_SCAN_ROUNDS: u32 = 500;
+    const VERY_SLOW_SCAN_PERIOD: u32 = 200;
+    if rounds == 0 {
+        jit_hint
+    } else if rounds < FAST_SCAN_ROUNDS {
+        true
+    } else if rounds < VERY_SLOW_SCAN_ROUNDS {
+        rounds % SLOW_SCAN_PERIOD == 0
+    } else {
+        rounds % VERY_SLOW_SCAN_PERIOD == 0
+    }
+}
+
 fn stw_take_over_and_wait(
     shared: &SharedVm,
     xt_roots: &mut Vec<ObjectRef>,
@@ -507,16 +559,17 @@ fn stw_take_over_and_wait(
     // arrive at the barrier. Keep looping until the barrier is satisfied.
     const WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
     const WARN_AFTER_ROUNDS: u32 = 64;
+    // See `stw_takeover_should_scan`'s doc for why the scan cadence backs off
+    // instead of running unconditionally on every round.
     let mut rounds = 0u32;
     let mut warned = false;
     loop {
         let tids_before = taken.tids.len();
-        // The global JIT-depth counter is a fast first-pass hint. Once a
-        // cooperative wait has actually timed out, perform a RIP-based scan
-        // even when the hint is false: a missed entry/exit bookkeeping
-        // transition must not become a permanent STW wait. The scan itself
-        // parks only peers whose RIP is inside a registered JIT range.
-        let newly = if rounds != 0 || crate::jit::conservative_roots::any_thread_in_jit() {
+        let should_scan = stw_takeover_should_scan(
+            rounds,
+            crate::jit::conservative_roots::any_thread_in_jit(),
+        );
+        let newly = if should_scan {
             xt::take_over_pass(&mut taken, &|a| shared.heap.is_object_address(a), xt_roots)
         } else {
             0
@@ -11674,23 +11727,6 @@ fn execute_instruction(
     instruction: &Instruction,
     saved_pc: usize,
 ) -> Result<InstructionResult, MethodCallFailed> {
-    // ALV5th GC investigation (temp probe, CRATONVM_DBG_DESCTRACE): trace
-    // EVERY instruction executed while inside org/junit/runner/Description's
-    // addChild, unconditionally, before any opcode-specific logic runs (or
-    // can throw). Removes all assumptions about which opcode/branch fires.
-    if std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some() {
-        let cn = thread.frames[frame_idx].class_name();
-        let mn = thread.frames[frame_idx].method_name();
-        if cn == "org/junit/runner/Description" && mn == "addChild" {
-            eprintln!(
-                "[desctrace-instr] pc={} saved_pc={} instr={:?} stack_len={}",
-                thread.frames[frame_idx].pc,
-                saved_pc,
-                instruction,
-                thread.frames[frame_idx].stack.len(),
-            );
-        }
-    }
     match instruction {
         // -- Constants (T10.9.D direct CompactValue push) --
         Instruction::Nop => {}
@@ -12889,26 +12925,6 @@ fn execute_instruction(
             }
         }
         Instruction::Getfield(index) => {
-            // ALV5th GC investigation (temp probe, CRATONVM_DBG_DESCTRACE):
-            // dump the RAW (undecoded) operand-stack top the instant Getfield
-            // begins, for addChild specifically, before any pop/resolve call
-            // that could itself throw or transform the value. This bypasses
-            // every downstream assumption about which error path fires.
-            if std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some() {
-                let cn = thread.frames[frame_idx].class_name();
-                let mn = thread.frames[frame_idx].method_name();
-                if cn == "org/junit/runner/Description" && mn == "addChild" {
-                    let cv = thread.frames[frame_idx].stack.peek_compact();
-                    let v = thread.frames[frame_idx].stack.peek();
-                    eprintln!(
-                        "[desctrace-entry] Getfield in addChild pc={} stack_top raw_bits=0x{:x} tag={:?} decoded={:?}",
-                        thread.frames[frame_idx].pc,
-                        cv.raw_bits(),
-                        cv.tag(),
-                        v,
-                    );
-                }
-            }
             let current_class_id = thread.frames[frame_idx].class_id;
             // Perf: `resolve_field_name` takes a class_manager RwLock and
             // allocates a `String` — but the name is only needed for the
@@ -13139,24 +13155,6 @@ fn execute_instruction(
             } else {
                 shared.heap.get_field(obj_ref, field.field_index)
             };
-            // ALV5th GC investigation (temp probe, CRATONVM_DBG_DESCTRACE):
-            // trace every GET of fChildren, especially ones that observe
-            // null (the crash symptom), with the receiver's identity hash.
-            if std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some() {
-                let field_name = resolve_field_name(shared, current_class_id, *index);
-                if field_name.as_deref() == Some("fChildren") {
-                    eprintln!(
-                        "[desctrace-get] fChildren obj=0x{:x} ihash={} value_is_null={} in {}.{}{} pc={}",
-                        obj_ref.as_ptr() as usize,
-                        shared.heap.identity_hash_code(obj_ref),
-                        matches!(value, Value::Object(None)),
-                        thread.frames[frame_idx].class_name(),
-                        thread.frames[frame_idx].method_name(),
-                        thread.frames[frame_idx].method_descriptor(),
-                        thread.frames[frame_idx].pc,
-                    );
-                }
-            }
             // K2 (T10.9.E) — J/D direct-CompactValue fast path.
             //
             // For long/double fields, build the CompactValue with the exact
@@ -13419,26 +13417,6 @@ fn execute_instruction(
                 &field,
             ) {
                 field = retargeted;
-            }
-            // ALV5th GC investigation (temp probe, CRATONVM_DBG_DESCTRACE):
-            // trace every PUT of fChildren, recording the receiver's identity
-            // hash (stable across relocation) so it can be cross-referenced
-            // against [desctrace-fwd] relocation events and [desctrace-get]
-            // read events.
-            if std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some() {
-                let field_name = resolve_field_name(shared, current_class_id, *index);
-                if field_name.as_deref() == Some("fChildren") {
-                    eprintln!(
-                        "[desctrace-put] fChildren obj=0x{:x} ihash={} value_is_null={} in {}.{}{} pc={}",
-                        obj_ref.as_ptr() as usize,
-                        shared.heap.identity_hash_code(obj_ref),
-                        matches!(value, Value::Object(None)),
-                        thread.frames[frame_idx].class_name(),
-                        thread.frames[frame_idx].method_name(),
-                        thread.frames[frame_idx].method_descriptor(),
-                        thread.frames[frame_idx].pc,
-                    );
-                }
             }
             // Perf: ALL of the per-putfield diagnostic blocks below are gated
             // behind a SINGLE cached "any field diagnostic enabled" branch, so
@@ -30726,20 +30704,6 @@ fn execute_jit_call_decoded(
     // block in `execute_jit_call` for the full rationale.
     let deopt_signaled = sig.deopt;
 
-    // ALV5th GC investigation (temp probe, CRATONVM_DBG_DESCTRACE): identify
-    // exactly which JIT-compiled callee raised the pending-NPE signal, and
-    // dump its receiver/args raw pointers, before the signal is converted
-    // into a message-less Java NullPointerException.
-    if sig.npe && std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some() {
-        eprintln!(
-            "[desctrace-jitnpe] JIT callee {}.{}{} raised pending NPE — args_slice={:?} jit_args_raw={:?}",
-            cached.class_name,
-            cached.method_name,
-            cached.method_descriptor,
-            args_slice,
-            &jit_args[..np],
-        );
-    }
     // Drain pending NPE / AIOOBE set by void-return store helpers (same as
     // execute_jit_call) — route through the JIT'd method's exception table.
     if sig.npe {
@@ -33842,6 +33806,53 @@ fn dump_imse_holdcount_state(shared: &SharedVm, thread: &JvmThread, exc: ObjectR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Perf/starvation fix (2026-07-13) — `stw_takeover_should_scan` must scan
+    /// every round through the fast window (catching a genuinely in-JIT peer
+    /// with no added latency), then only periodically once a stall has
+    /// already run long — never falling back to the old "scan literally every
+    /// round forever" behavior that starved the very peer it was waiting for.
+    #[test]
+    fn stw_takeover_scan_cadence_backs_off() {
+        // Round 0: gated on the hint alone, exactly like before this fix.
+        assert!(!stw_takeover_should_scan(0, false));
+        assert!(stw_takeover_should_scan(0, true));
+
+        // Fast window (rounds 1..20): always scan regardless of the hint —
+        // unchanged latency for the common near-immediate takeover case.
+        for r in 1..20u32 {
+            assert!(
+                stw_takeover_should_scan(r, false),
+                "round {r} should still scan every tick in the fast window"
+            );
+        }
+
+        // Slow window (rounds 20..500): only every 20th round.
+        assert!(stw_takeover_should_scan(20, false));
+        assert!(!stw_takeover_should_scan(21, false));
+        assert!(!stw_takeover_should_scan(39, false));
+        assert!(stw_takeover_should_scan(40, false));
+        assert!(!stw_takeover_should_scan(499, false));
+
+        // Very-slow window (rounds >= 500): only every 200th round (aligned
+        // to multiples of 200, not to 500 itself) — this is the regime a
+        // multi-minute-or-permanent stall (the WildFly parallel-extension-add
+        // hang, the 5-class Tomcat hang cluster) lives in, where the old code
+        // was doing a full OS-level suspend-scan of every peer thread on
+        // literally every 1ms tick.
+        assert!(!stw_takeover_should_scan(500, false));
+        assert!(!stw_takeover_should_scan(599, false));
+        assert!(stw_takeover_should_scan(600, false));
+        assert!(!stw_takeover_should_scan(601, false));
+        assert!(stw_takeover_should_scan(800, false));
+
+        // The hint must NOT override the backoff once rounds >= 1: it cannot
+        // distinguish a peer actually being in JIT from the initiator's own
+        // live JIT-entry guard (this function is commonly reached via
+        // `maybe_gc` called from JIT-compiled code).
+        assert!(!stw_takeover_should_scan(21, true));
+        assert!(!stw_takeover_should_scan(501, true));
+    }
 
     /// Young-GC live-reclaim ROOT FIX regression (RRWL/ThreadLocalMap$Entry
     /// IMSE/hang family, 2026-07-07): the pre-GC watch publication must

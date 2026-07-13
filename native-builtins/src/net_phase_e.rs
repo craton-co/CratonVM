@@ -8931,9 +8931,16 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         }
         let payload = java_byte_array_to_vec(ctx, data_arr, 0, len)?;
         let target = format!("{host}:{port}");
-        ctx.fd_table()
-            .udp_send(fd as u32, &payload, &target)
-            .map_err(|e| ioex(format!("UDP send: {e}")))?;
+        // Bracket the send in the GC-blocking protocol: it can park on a full
+        // local socket buffer, same rationale as MulticastSocket's send in
+        // native-io/src/net.rs — without this a cross-thread STW GC would
+        // wait for the syscall to return instead of the thread reaching a
+        // safepoint. No heap refs are read after the call, so a plain
+        // begin/end pair (no ref re-sync) suffices.
+        ctx.begin_blocking_region();
+        let send_result = ctx.fd_table().udp_send(fd as u32, &payload, &target);
+        ctx.end_blocking_region();
+        send_result.map_err(|e| ioex(format!("UDP send: {e}")))?;
         Ok(None)
     });
 
@@ -8963,10 +8970,31 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             ctx.fd_table()
                 .udp_set_read_timeout(fd as u32, d)
                 .map_err(|e| ioex(format!("UDP timeout: {e}")))?;
-            let (n, origin) = ctx
-                .fd_table()
-                .udp_recv(fd as u32, &mut buf)
-                .map_err(|e| ioex(format!("UDP recv: {e}")))?;
+            // GC-blocking audit: this recv parks in the OS for up to
+            // soTimeout — or indefinitely when no timeout is set (same hang
+            // mechanism documented on MulticastSocket's receive in
+            // native-io/src/net.rs, which this DatagramSocket-keyed
+            // registration duplicates for callers resolved via the
+            // DatagramSocket-declaring class). Without the blocking-region
+            // bracket, a cross-thread STW GC requested while this thread is
+            // parked in udp_recv can never be satisfied: the thread isn't in
+            // JIT code (can't be taken over) and isn't at a safepoint (can't
+            // cooperate), so `pending` never reaches 0 and the takeover loop
+            // spins until the external harness timeout. `pkt`/`data_arr` are
+            // re-synced afterward in case a moving GC ran while parked.
+            let mut blocked_refs = [Value::Object(Some(pkt)), Value::Object(Some(data_arr))];
+            ctx.begin_blocking_region();
+            let recv_result = ctx.fd_table().udp_recv(fd as u32, &mut buf);
+            ctx.end_blocking_region_refs(&mut blocked_refs);
+            let pkt = match blocked_refs[0] {
+                Value::Object(Some(o)) => o,
+                _ => pkt,
+            };
+            let data_arr = match blocked_refs[1] {
+                Value::Object(Some(o)) => o,
+                _ => data_arr,
+            };
+            let (n, origin) = recv_result.map_err(|e| ioex(format!("UDP recv: {e}")))?;
             copy_bytes_into_java_array(ctx, data_arr, 0, &buf[..n])?;
             ctx.set_field(pkt, DP_LENGTH, Value::Int(n as i32));
             if let Some((oh, op)) = origin.rsplit_once(':') {

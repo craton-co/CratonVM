@@ -12,7 +12,10 @@ use cratonvm_types::error::{
 use cratonvm_types::ClassId;
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
-use crate::{alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
+use crate::{
+    alloc_concurrent_synthetic, jul_logger_handlers_get, jul_logger_handlers_set,
+    native_noop, native_noop_with_this, obj_arg,
+};
 use crate::{native_cf_then_accept, native_cf_then_apply};
 use crate::{
     BI_FIELD_SIGNUM, BI_FIELD_VALUE, CHARSET_FIELD_NAME, FUT_FIELD_DONE, FUT_FIELD_RESULT,
@@ -28329,27 +28332,28 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let handler = args.get(1).copied().unwrap_or(Value::Object(None));
-            // The Phase 54 logger factory allocates field 2 specifically for
-            // handlers. This final Phase 61 override used to discard them,
-            // causing JULI AsyncFileHandler to receive no records at all.
-            if ctx.object_num_fields(this) > 2 {
-                let handlers = match ctx.get_field(this, 2) {
-                    Value::Object(Some(list)) => list,
-                    _ => {
-                        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-                        cratonvm_native_collections::native_al_init(
-                            ctx,
-                            &[Value::Object(Some(list))],
-                        )?;
-                        ctx.set_field(this, 2, Value::Object(Some(list)));
-                        list
-                    }
-                };
-                cratonvm_native_collections::native_al_add(
-                    ctx,
-                    &[Value::Object(Some(handlers)), handler],
-                )?;
-            }
+            // Handler list lives in a GC-safe side table keyed by identity
+            // hash, NOT a fixed field slot -- see jul_logger_handlers_get's
+            // doc comment. A real-JDK Logger's field 2 is `name` (a
+            // String), not a handlers ArrayList; reusing that slot threw
+            // NoSuchMethodError: java/lang/String.size()I from
+            // ClassLoaderLogManager.resetLoggers().
+            let handlers = match jul_logger_handlers_get(ctx, this) {
+                Some(list) => list,
+                None => {
+                    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                    cratonvm_native_collections::native_al_init(
+                        ctx,
+                        &[Value::Object(Some(list))],
+                    )?;
+                    jul_logger_handlers_set(ctx, this, list);
+                    list
+                }
+            };
+            cratonvm_native_collections::native_al_add(
+                ctx,
+                &[Value::Object(Some(handlers)), handler],
+            )?;
             Ok(None)
         },
     );
@@ -28365,14 +28369,12 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
         "()[Ljava/util/logging/Handler;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            // Logger field 2 = handlers ArrayList (added in Phase O).
-            if ctx.object_num_fields(this) > 2 {
-                if let Value::Object(Some(lst)) = ctx.get_field(this, 2) {
-                    return cratonvm_native_collections::native_al_to_array(
-                        ctx,
-                        &[Value::Object(Some(lst))],
-                    );
-                }
+            // See jul_logger_handlers_get: side table, not a field slot.
+            if let Some(lst) = jul_logger_handlers_get(ctx, this) {
+                return cratonvm_native_collections::native_al_to_array(
+                    ctx,
+                    &[Value::Object(Some(lst))],
+                );
             }
             // No handlers registered — return empty Handler[]
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
