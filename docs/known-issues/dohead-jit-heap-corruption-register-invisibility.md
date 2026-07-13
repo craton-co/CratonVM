@@ -1,4 +1,61 @@
-# Tomcat `TestHttpServletDoHead*` — JIT-only young-gen heap corruption / SIGSEGV (FIX LANDED)
+# Tomcat `TestHttpServletDoHead*` — JIT-only young-gen heap corruption / SIGSEGV
+
+**Status (2026-07-13): RESTORED to known-issues.** This doc was previously
+retired to `docs/internal` under a `-FIXED` filename because its two
+documented root causes were genuinely fixed and merged to `dev`:
+
+- **Root cause #1** (young from-space walk-desync / GC corruption, "FATAL
+  LAYER" below) — commit `928cc5b3`, confirmed present in current `dev`
+  history (`git merge-base --is-ancestor 928cc5b3 origin/dev` succeeds).
+- **Root cause #2** (`StreamEncoder` eager-flush breaking the commit
+  threshold) — commit `1773d3df2` ("fix: buffer StreamEncoder writes to
+  match real HotSpot flush granularity"), also confirmed present in `dev`.
+  See `dohead-streamencoder-eager-flush-commit-threshold.md` (also restored
+  from `docs/internal/fixed-suite-bugs/`).
+
+**However, the whole DoHead family still does not pass today.** A fresh
+full-suite rerun on `dev` (commit `080e79256`, 2026-07-12, real JDK, JIT on,
+1200s timeout) shows all ~19
+`jakarta.servlet.http.TestHttpServletDoHeadInvalidWrite*` classes still
+FAIL or HANG — none PASS. Spot-checking
+`TestHttpServletDoHeadInvalidWrite1024ValidWrite512` (the exact class the
+StreamEncoder fix validated as `OK (288 tests)` at the time) now shows
+**152 of 288 failures**, and the failure signatures are **neither of the
+two documented root causes**:
+
+```
+java.lang.NullPointerException: Cannot enter synchronized block because "this.socketLock" is null
+	at java.net.Socket.getImpl(Socket.java:493)
+	at java.net.Socket.setSoTimeout(Socket.java:1278)
+	at org.apache.coyote.http2.Http2TestBase.openClientConnection(Http2TestBase.java:700)
+
+java.net.SocketException: Socket is closed
+	at java.net.SocketException.<init>(SocketException.java:47)
+	at java.net.Socket.setSoTimeout(Socket.java:1275)
+
+java.lang.NoSuchMethodError: java/lang/String.setOption(ILjava/lang/Object;)V
+	at java.net.Socket.setSoTimeout(Socket.java:1278)
+```
+
+The same `socketLock`-NPE / `Socket is closed` pair shows up consistently
+across other DoHead siblings too
+(`TestHttpServletDoHeadInvalidWrite1023ValidWrite0`,
+`TestHttpServletDoHeadInvalidWrite0ValidWrite1023`, spot-checked). This is
+**not** the same thing as the existing tentative
+`dohead1023-http2-index0-socketexception-likely-host-contention.md` doc
+(`docs/internal/`) — that doc saw only 2/288 flaky failures in one class
+and explicitly couldn't reproduce them reliably, hypothesizing shared-host
+CPU contention. What's described here is much larger in scope (152/288,
+consistent across multiple sibling classes) and includes a **deterministic,
+non-timing-sensitive** signature (`NoSuchMethodError:
+java/lang/String.setOption(ILjava/lang/Object;)V` — `Socket.setSoTimeout`
+dispatching into a `String` method surface looks like a native-call/vtable
+resolution bug, not a flaky timing artifact). Likely a genuine, currently
+open, undocumented third root cause in `Socket`/HTTP2 test-connection
+handling — worth its own investigation before assuming it's the same
+low-confidence host-contention theory.
+
+## Original write-up follows (root causes #1 and #2, both now fixed on dev)
 
 **Note (2026-07-06):** at a long-enough timeout (1200s) that the crash/hang
 this doc describes doesn't mask it, `TestHttpServletDoHeadInvalidWrite1024ValidWrite512`
