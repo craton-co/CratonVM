@@ -3023,18 +3023,19 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // conservative roots are extra MARK roots; nothing moves, so no
     // pin/pointer-map concerns.
     let mut counted_os_tids: Vec<u32> = Vec::new();
-    let initial_mark_done = shared
-        .gc_barrier
-        .request_stw_counted_with_live_blocked(thread.thread_id, || {
-            let (n, blocked, tids, blocked_tids) =
-                shared.thread_registry.alive_count_blocked_and_os_tids();
-            counted_os_tids = tids;
-            (
-                u32::try_from(n).unwrap_or(u32::MAX),
-                u32::try_from(blocked).unwrap_or(u32::MAX),
-                blocked_tids,
-            )
-        });
+    let initial_mark_done =
+        shared
+            .gc_barrier
+            .request_stw_counted_with_live_blocked(thread.thread_id, || {
+                let (n, blocked, tids, blocked_tids) =
+                    shared.thread_registry.alive_count_blocked_and_os_tids();
+                counted_os_tids = tids;
+                (
+                    u32::try_from(n).unwrap_or(u32::MAX),
+                    u32::try_from(blocked).unwrap_or(u32::MAX),
+                    blocked_tids,
+                )
+            });
     if !initial_mark_done {
         return; // Another STW was in progress
     }
@@ -3092,21 +3093,24 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // Phase 1 above (a never-polling in-JIT peer must not stall the remark
     // nor be covered only by its stale deposit snapshot).
     let mut counted_os_tids: Vec<u32> = Vec::new();
-    let remark_done = shared.gc_barrier.request_stw_counted_with_live_blocked(thread.thread_id, || {
-        // Finding 1(a): remark pauses use the identity census too, so blocked
-        // threads are excluded BY IDENTITY and their wake-time arrivals cannot
-        // satisfy this pause's quota (`arrive_and_wait_auto`). The anonymous
-        // `threads_blocked` subtraction this replaces excluded the same
-        // population without recording who it excluded.
-        let (n, blocked, tids, blocked_tids) =
-            shared.thread_registry.alive_count_blocked_and_os_tids();
-        counted_os_tids = tids;
-        (
-            u32::try_from(n).unwrap_or(u32::MAX),
-            u32::try_from(blocked).unwrap_or(u32::MAX),
-            blocked_tids,
-        )
-    });
+    let remark_done =
+        shared
+            .gc_barrier
+            .request_stw_counted_with_live_blocked(thread.thread_id, || {
+                // Finding 1(a): remark pauses use the identity census too, so blocked
+                // threads are excluded BY IDENTITY and their wake-time arrivals cannot
+                // satisfy this pause's quota (`arrive_and_wait_auto`). The anonymous
+                // `threads_blocked` subtraction this replaces excluded the same
+                // population without recording who it excluded.
+                let (n, blocked, tids, blocked_tids) =
+                    shared.thread_registry.alive_count_blocked_and_os_tids();
+                counted_os_tids = tids;
+                (
+                    u32::try_from(n).unwrap_or(u32::MAX),
+                    u32::try_from(blocked).unwrap_or(u32::MAX),
+                    blocked_tids,
+                )
+            });
     if remark_done {
         let mut xt_roots: Vec<ObjectRef> = Vec::new();
         let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
@@ -3196,18 +3200,19 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
     // roots are extra MARK roots; nothing moves, so no pin/pointer-map
     // concerns.
     let mut counted_os_tids: Vec<u32> = Vec::new();
-    let initial_mark_done = shared
-        .gc_barrier
-        .request_stw_counted_with_live_blocked(thread.thread_id, || {
-            let (n, blocked, tids, blocked_tids) =
-                shared.thread_registry.alive_count_blocked_and_os_tids();
-            counted_os_tids = tids;
-            (
-                u32::try_from(n).unwrap_or(u32::MAX),
-                u32::try_from(blocked).unwrap_or(u32::MAX),
-                blocked_tids,
-            )
-        });
+    let initial_mark_done =
+        shared
+            .gc_barrier
+            .request_stw_counted_with_live_blocked(thread.thread_id, || {
+                let (n, blocked, tids, blocked_tids) =
+                    shared.thread_registry.alive_count_blocked_and_os_tids();
+                counted_os_tids = tids;
+                (
+                    u32::try_from(n).unwrap_or(u32::MAX),
+                    u32::try_from(blocked).unwrap_or(u32::MAX),
+                    blocked_tids,
+                )
+            });
     if !initial_mark_done {
         return; // Another STW in progress
     }
@@ -3301,21 +3306,23 @@ fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread) {
     // frozen-TLAB-tail publication (consumed by the region walkers' skip
     // checks) is load-bearing here too.
     let mut counted_os_tids: Vec<u32> = Vec::new();
-    let done = shared.gc_barrier.request_stw_counted_with_live_blocked(thread.thread_id, || {
-        // Finding 1(a): remark pauses use the identity census too, so blocked
-        // threads are excluded BY IDENTITY and their wake-time arrivals cannot
-        // satisfy this pause's quota (`arrive_and_wait_auto`). The anonymous
-        // `threads_blocked` subtraction this replaces excluded the same
-        // population without recording who it excluded.
-        let (n, blocked, tids, blocked_tids) =
-            shared.thread_registry.alive_count_blocked_and_os_tids();
-        counted_os_tids = tids;
-        (
-            u32::try_from(n).unwrap_or(u32::MAX),
-            u32::try_from(blocked).unwrap_or(u32::MAX),
-            blocked_tids,
-        )
-    });
+    let done = shared
+        .gc_barrier
+        .request_stw_counted_with_live_blocked(thread.thread_id, || {
+            // Finding 1(a): remark pauses use the identity census too, so blocked
+            // threads are excluded BY IDENTITY and their wake-time arrivals cannot
+            // satisfy this pause's quota (`arrive_and_wait_auto`). The anonymous
+            // `threads_blocked` subtraction this replaces excluded the same
+            // population without recording who it excluded.
+            let (n, blocked, tids, blocked_tids) =
+                shared.thread_registry.alive_count_blocked_and_os_tids();
+            counted_os_tids = tids;
+            (
+                u32::try_from(n).unwrap_or(u32::MAX),
+                u32::try_from(blocked).unwrap_or(u32::MAX),
+                blocked_tids,
+            )
+        });
     if done {
         let mut xt_roots: Vec<ObjectRef> = Vec::new();
         let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
@@ -14943,6 +14950,13 @@ fn lambda_proxy_satisfies(
         if &*target_name == "java/io/Serializable" {
             return true;
         }
+        // A lambda proxy is defined for precisely this functional-interface
+        // name. Its synthetic VM-only ClassId has no ClassStore hierarchy, and
+        // a global reload can select a different loader's mirror during forked
+        // test execution. The call-site metadata is authoritative here.
+        if iface_name.as_ref() == target_name {
+            return true;
+        }
         let load_result = shared.load_class_concurrent(&iface_name);
         if let Ok(iface_id) = load_result {
             return shared
@@ -14977,18 +14991,24 @@ fn loader_aware_name_assignable(
     if &*obj_class.name == target_class_name && &*target_class.name == target_class_name {
         return true;
     }
-    if !target_class.is_interface() {
-        return false;
-    }
-
     let mut queue: Vec<ClassId> = Vec::new();
     let mut current = Some(obj_class_id);
     while let Some(cid) = current {
         let Some(class) = cm.class_store.get(cid) else {
             break;
         };
+        // The resolved target can be a same-named class mirror from a
+        // different loader, not only an interface. Compare the structural
+        // superclass chain by binary name before relying on ClassId identity.
+        if &*class.name == target_class_name {
+            return true;
+        }
         queue.extend_from_slice(&class.interfaces);
         current = class.superclass;
+    }
+
+    if !target_class.is_interface() {
+        return false;
     }
 
     let mut seen: Vec<ClassId> = Vec::new();
@@ -15263,8 +15283,31 @@ pub(crate) fn aastore_element_assignable(
     // The element class must exist in the hierarchy; if not, fail open.
     {
         let cm = shared.class_manager.read();
-        if cm.get_class(value_class_id).is_none() {
+        let Some(value_class) = cm.get_class(value_class_id) else {
             return true;
+        };
+        // `array_descriptor_of` preserves only the component *name*, not its
+        // defining-loader ClassId. When a forked loader owns a same-named copy,
+        // the global lookup above can resolve the app copy and make a valid
+        // `ChildSegment[] <- ChildSegment` store look incompatible. The
+        // component identity is ambiguous here, so preserve this predicate's
+        // documented fail-open posture rather than manufacture a false ASE.
+        if &*value_class.name == comp_name && value_class_id != comp_id {
+            return true;
+        }
+        // The array header provides only a component name. With split class
+        // loaders, the stored value can be a subclass whose recorded
+        // superclass edge points to another same-named mirror. Walk that
+        // structural chain by name before treating the store as invalid.
+        let mut current = Some(value_class_id);
+        while let Some(id) = current {
+            let Some(class) = cm.get_class(id) else {
+                break;
+            };
+            if &*class.name == comp_name {
+                return true;
+            }
+            current = class.superclass;
         }
         // Component is an INTERFACE → fail open. Proving a value implements an
         // interface is unreliable in this VM (dynamic proxies, annotation
@@ -18753,6 +18796,18 @@ fn lambda_arg_provably_not_instance(shared: &SharedVm, obj_ref: ObjectRef, desc_
         return false;
     }
     let obj_class_id = shared.heap.class_id_of(obj_ref);
+    // Lambda proxies use VM-only synthetic class IDs which intentionally do not
+    // have ClassStore metadata.  Without a real class graph we cannot prove a
+    // mismatch against the erased bridge parameter, so preserve this helper's
+    // fail-open contract and let the normal lambda dispatch validate it.
+    if shared
+        .class_manager
+        .read()
+        .get_class(obj_class_id)
+        .is_none()
+    {
+        return false;
+    }
     let (target_cid, is_sub, target_is_interface) = {
         let cm = shared.class_manager.read();
         match cm.get_loaded_class_id(target) {
@@ -18767,7 +18822,24 @@ fn lambda_arg_provably_not_instance(shared: &SharedVm, obj_ref: ObjectRef, desc_
             ),
         }
     };
+    // The lambda bridge descriptor carries a binary name only.  In a forked
+    // class-loader run the loader-blind lookup above may select the app copy
+    // of that name even though the value (and the bridge that owns it) use a
+    // child-defined copy.  Consult the value's exact defining namespace before
+    // calling the mismatch proven; this is the same identity rule used by the
+    // loader-aware checkcast path.  Restrict it to user loaders so ordinary
+    // bootstrap/application delegation remains unchanged.
+    let loader_scoped_is_sub = if crate::runtime::env_cache::loader_aware_resolution() {
+        let cm = shared.class_manager.read();
+        cm.get_loader_id(obj_class_id)
+            .filter(|loader| matches!(loader, cratonvm_types::ClassLoaderId::UserDefined(_)))
+            .and_then(|loader| cm.class_defined_by_loader_exact(target, loader))
+            .is_some_and(|scoped_target| cm.is_subclass_of(obj_class_id, scoped_target))
+    } else {
+        false
+    };
     if is_sub
+        || loader_scoped_is_sub
         || lambda_proxy_satisfies(shared, obj_class_id, target_cid)
         || synthetic_implements(shared, obj_class_id, target)
         || proxy_instance_satisfies_target(shared, obj_ref, target)
@@ -19082,6 +19154,7 @@ pub(crate) fn lambda_args_sam_compatible(
             }
         };
         if base
+            || loader_aware_name_assignable(shared, arg_cid, target_cid, target)
             || lambda_proxy_satisfies(shared, arg_cid, target_cid)
             || synthetic_implements(shared, arg_cid, target)
             || proxy_instance_satisfies_target(shared, arg, target)
@@ -22268,6 +22341,38 @@ fn force_native_over_real_jdk_bytecode(
     if class_name == "java/lang/Object"
         && method_name == "clone"
         && method_descriptor == "()Ljava/lang/Object;"
+    {
+        return true;
+    }
+
+    // Class loading is implemented by CratonVM's native bridge so that its
+    // per-loader namespaces and parent-first delegation remain visible in
+    // real-JDK mode. The JDK methods are concrete bytecode, so force the
+    // bridge for inherited base calls (including invokespecial super calls
+    // from custom loaders); direct subclass overrides remain selected by
+    // their own declaring class.
+    if class_name == "java/lang/ClassLoader"
+        && method_name == "loadClass"
+        && matches!(
+            method_descriptor,
+            "(Ljava/lang/String;)Ljava/lang/Class;"
+                | "(Ljava/lang/String;Z)Ljava/lang/Class;"
+        )
+    {
+        return true;
+    }
+
+    // The slow invoke path already forces these generic Class metadata
+    // methods to their native Signature-attribute implementation. Keep the
+    // warmed virtual-call cache in sync; otherwise a hot call bypasses the
+    // override and re-enters the incomplete real-JDK reifier path.
+    if class_name == "java/lang/Class"
+        && matches!(
+            (method_name, method_descriptor),
+            ("getTypeParameters", "()[Ljava/lang/reflect/TypeVariable;")
+                | ("getGenericInterfaces", "()[Ljava/lang/reflect/Type;")
+                | ("getGenericSuperclass", "()Ljava/lang/reflect/Type;")
+        )
     {
         return true;
     }
@@ -30983,6 +31088,16 @@ fn execute_invokevirtual_vtable_fast(
         return Ok(CachedCallResult::CacheMiss);
     }
 
+    // Synthetic lambda proxies implement their SAM through
+    // `try_lambda_dispatch`, not a vtable body.
+    if shared
+        .lambda_proxies
+        .read()
+        .contains_key(&receiver_class_id)
+    {
+        return Ok(CachedCallResult::CacheMiss);
+    }
+
     if resolved_private_invokevirtual_target(
         shared,
         caller_class_id,
@@ -31716,6 +31831,17 @@ fn execute_invokevirtual_cached(
                     if actual_class_id != receiver_class_id {
                         return Ok(CachedCallResult::CacheMiss);
                     }
+                    // Lambda proxy classes have no bytecode implementation of
+                    // their functional-interface method. They must reach the
+                    // slow path, which dispatches their SAM method handle.
+                    if !is_special
+                        && shared
+                            .lambda_proxies
+                            .read()
+                            .contains_key(&actual_class_id)
+                    {
+                        return Ok(CachedCallResult::CacheMiss);
+                    }
                     // WP2.7 — AnnotationProxy methods (incl. Object.equals/hashCode/
                     // toString from Object) must dispatch through the spec-compliant
                     // interception in `execute_invoke`, not Object's bytecode.
@@ -32007,6 +32133,16 @@ fn execute_invokevirtual_cached(
                         );
                     }
                     if actual_class_id != receiver_class_id {
+                        return Ok(CachedCallResult::CacheMiss);
+                    }
+                    // Lambda proxies require the slow `try_lambda_dispatch`
+                    // route instead of a cached interface target.
+                    if !is_special
+                        && shared
+                            .lambda_proxies
+                            .read()
+                            .contains_key(&actual_class_id)
+                    {
                         return Ok(CachedCallResult::CacheMiss);
                     }
                     // WP2.7 — same escape hatch as in the bytecode branch:
