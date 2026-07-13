@@ -1686,6 +1686,26 @@ impl VmHeap {
         }
         out
     }
+
+    /// TEMPORARY diagnostic (is_live_young_survivor false-positive
+    /// investigation): scan every live object in the heap for one whose
+    /// `class_id` matches `target_class_id`, returning its address. Used to
+    /// tell apart "a live instance of the evicted class genuinely still
+    /// exists somewhere (loader_pin correctly keeps its loader alive)" from
+    /// "nothing legitimate justifies the loader being marked alive." Must be
+    /// called during a GC safepoint (same contract as `walk_objects`).
+    pub fn find_instances_of_class(&self, target_class_id: u32) -> Vec<usize> {
+        let mut out = Vec::new();
+        for (obj_ptr, _size) in self.walk_objects() {
+            // SAFETY: `walk_objects` yields the start of each live object, so
+            // `obj_ptr` targets a valid, fully-initialized `ObjectHeader`.
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            if header.class_id.as_u32() == target_class_id {
+                out.push(obj_ptr as usize);
+            }
+        }
+        out
+    }
 }
 
 // ─── Phase 6 #1: GPU/GC coordination tests ───────────────────────────
