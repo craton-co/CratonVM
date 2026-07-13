@@ -16,6 +16,71 @@ use crate::types::ObjectRef;
 #[cfg(test)]
 use crate::types::Value;
 
+/// Post-GC reconciliation of the class-mirror cache (companion to
+/// `roots.rs` step 6, which stops unconditionally rooting a user-defined
+/// class's `java.lang.Class` mirror once `CRATONVM_LOADER_UNLOAD` is on —
+/// see that comment for the full rationale). A mirror that did not survive
+/// this collection must be dropped from `SharedVm::class_mirrors` /
+/// `class_mirrors_reverse` here, BEFORE `update_all_roots`' own step 6/14
+/// remap runs over the map — otherwise the cache would keep a stale
+/// `ObjectRef` pointing at memory the collector already reclaimed or moved,
+/// and the next `getClass()` on that class id would hand back a dangling
+/// reference instead of lazily recreating the mirror.
+///
+/// `is_marked(addr)` MUST be the same survivor predicate reference
+/// processing uses this cycle (mirrors `gc_reconcile_defining_loaders`),
+/// so a mirror is pruned exactly when a weak/phantom reference to it would
+/// be cleared. Safe to call unconditionally (including with
+/// `CRATONVM_LOADER_UNLOAD=0`): every entry is still rooted in that mode, so
+/// `is_marked` is always true and nothing is pruned.
+pub fn reconcile_class_mirrors(shared: &crate::vm::SharedVm, is_marked: &dyn Fn(usize) -> bool) {
+    let dbg = std::env::var_os("CRATONVM_DBG_MIRRORPIN").is_some();
+    let mut mirrors = shared.class_mirrors.write();
+    if dbg {
+        let cm = shared.class_manager.read();
+        for (&class_id, obj_ref) in mirrors.iter() {
+            let name = cm
+                .get_class(class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_default();
+            let addr = obj_ref.as_ptr() as usize;
+            eprintln!(
+                "[DBG_MIRRORPIN] reconcile class={:?} cid={:?} mirror_addr={:#x} is_marked={}",
+                name,
+                class_id,
+                addr,
+                is_marked(addr)
+            );
+        }
+    }
+    mirrors.retain(|_class_id, obj_ref| is_marked(obj_ref.as_ptr() as usize));
+}
+
+/// Rebuild `cratonvm_types::mirror_pin`'s (loader address -> defined mirror
+/// addresses) registry from the authoritative, just-pruned `class_mirrors`
+/// cache and the defining-loader side-table, so the GC marker's mirror_pin
+/// checks (`gen_heap.rs`, see `vm::memory::roots` step 6) see current
+/// addresses on the next collection.
+///
+/// Call this AFTER `reconcile_class_mirrors` and
+/// `gc_reconcile_defining_loaders` have both run this cycle. Cheap to call
+/// unconditionally: bounded by `class_mirrors.len()`, each entry a single
+/// `defining_loader_for` hash lookup that returns `None` (skipped) for every
+/// built-in-loader class — the overwhelmingly common case.
+pub fn rebuild_mirror_pins(shared: &crate::vm::SharedVm) {
+    let class_mirrors = shared.class_mirrors.read();
+    let mut entries: Vec<(usize, usize)> = Vec::new();
+    for (&class_id, mirror_ref) in class_mirrors.iter() {
+        if let Some(loader) =
+            cratonvm_native_builtins::classloader::defining_loader_for(class_id.as_u32())
+        {
+            entries.push((loader.as_ptr() as usize, mirror_ref.as_ptr() as usize));
+        }
+    }
+    drop(class_mirrors);
+    cratonvm_types::mirror_pin::replace_mirror_pins(&entries);
+}
+
 /// Update all root locations in the VM state after a GC collection.
 ///
 /// Scans thread frames (locals + operand stacks), static fields, class locks,

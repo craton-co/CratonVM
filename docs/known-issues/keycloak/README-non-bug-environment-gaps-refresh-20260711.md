@@ -24,9 +24,16 @@ java.lang.RuntimeException: Failed to resolve artifact: org.keycloak.testframewo
   ... Caused by: io.quarkus.bootstrap.resolver.maven.BootstrapMavenException: Failed to load current project at .../tests/base/pom.xml
 ```
 
-**Confirmed NOT a CratonVM bug** — reproduces identically under real HotSpot (see
-`docs/internal/keycloak-tests-base-remote-providers-artifact-resolution-NOT-A-BUG.md`, triaged 2026-07-07). A
-Maven/Quarkus-bootstrap reactor-resolution gap in this checkout/environment, not a VM defect.
+**RETRACTED 2026-07-13 — this IS a CratonVM bug, not an environment gap.** The 2026-07-07 "NOT A BUG" triage
+(`docs/internal/keycloak-tests-base-remote-providers-artifact-resolution-NOT-A-BUG.md`) was based on a HotSpot
+comparison run against a since-discovered-**stale** `keycloak-999.0.0-SNAPSHOT.zip` distribution artifact
+(weeks old), under which HotSpot itself failed to boot the test server for unrelated reasons. After rebuilding
+the distribution fresh and re-running under real HotSpot (solo/sequential, avoiding a shared-extraction-directory
+race), HotSpot cleanly PASSES the large majority of these classes, while CratonVM still fails every one of them
+with an identical, narrower root cause: CratonVM's file I/O drops/corrupts the `?` character in the `<?xml ...?>`
+declaration when Quarkus's embedded Maven resolver reads `tests/base/pom.xml` in-process, breaking POM parsing.
+See `docs/known-issues/keycloak/pom-xml-declaration-char-corruption-breaks-quarkus-maven-bootstrap.md` for the
+full writeup, evidence, and retraction details.
 
 ## 3. FIPS-mode `Assume.assumeTrue` skip pattern — 10 `crypto/fips1402` classes
 

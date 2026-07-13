@@ -785,6 +785,44 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
         .class_mirrors_reverse
         .write()
         .insert(mirror, class_id);
+
+    // Class-mirror liveness pin (companion to HIB-CV-24's `loader_pin`, see
+    // `cratonvm_types::mirror_pin`): if this class was defined by a
+    // user-defined `ClassLoader`, record (loader_addr, mirror_addr) so the GC
+    // marker keeps this mirror alive whenever that loader is independently
+    // reachable — mirroring the `ClassLoader.classes` edge a real JDK gets
+    // for free, which CratonVM's synthetic `ClassLoader` model doesn't
+    // maintain. Without this, `roots.rs` step 6 (which stops unconditionally
+    // rooting a user-defined class's mirror) would let a STILL-LOADED class's
+    // mirror die simply because nothing happens to hold a fresh `Class<?>`
+    // reference to it (e.g. Tomcat/Jasper's shared JSP base classes, whose
+    // `Class<?>` is normally only touched transiently during annotation
+    // scanning). Built-in-loader classes need no entry: their mirrors stay
+    // unconditionally rooted directly.
+    if let Some(loader) =
+        cratonvm_native_builtins::classloader::defining_loader_for(class_id.as_u32())
+    {
+        if std::env::var_os("CRATONVM_DBG_MIRRORPIN").is_some() {
+            let name = shared
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_default();
+            eprintln!(
+                "[DBG_MIRRORPIN] add_mirror_pin class={:?} cid={:?} mirror={:?} loader_addr={:#x}",
+                name,
+                class_id,
+                mirror.as_ptr(),
+                loader.as_ptr() as usize
+            );
+        }
+        cratonvm_types::mirror_pin::add_mirror_pin(
+            loader.as_ptr() as usize,
+            mirror.as_ptr() as usize,
+        );
+    }
+
     mirror
 }
 
