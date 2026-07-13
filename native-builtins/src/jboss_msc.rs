@@ -704,6 +704,25 @@ impl ServiceContainer {
     /// Drain the task queue by running every pending `Start` task
     /// synchronously.  Useful for tests that want deterministic
     /// completion without spawning worker threads.
+    ///
+    /// Under `msc_real_start_enabled()` (the production default since
+    /// `0cac9cc80`), `add_service`/`demand`/`schedule_dependents_of`
+    /// deliberately leave `task_queue` empty — that queue is also drained by
+    /// the always-running `worker_loop` background threads on
+    /// `global_container()`, and letting them race the real `drive_starts()`
+    /// loop (which invokes actual Java `start()`) was Bug 15: a worker would
+    /// bookkeeping-only fake-complete a service the real loop hadn't started
+    /// yet. So once the queue empties, fall back to the same scan-based
+    /// selection `drive_starts()` uses (`take_ready_start`/`finish_start`)
+    /// instead of just returning early — this is what makes the method work
+    /// under both real-start settings rather than silently doing nothing
+    /// under the default. It's safe here specifically because this fallback
+    /// never invokes real Java code (no `NativeContext` available to a plain
+    /// `&self` method), and every production caller picks *either*
+    /// `drive_starts` *or* `drain_tasks_locally` for a given real-start
+    /// setting — see `native_service_controller_set_mode` — so this never
+    /// runs concurrently with a real `drive_starts()` driving the same
+    /// container.
     pub fn drain_tasks_locally(&self) {
         loop {
             let task = {
@@ -711,7 +730,10 @@ impl ServiceContainer {
                 state.task_queue.pop_front()
             };
             match task {
-                Some(Task::Start(id)) => self.run_start_local(id),
+                Some(Task::Start(id)) => {
+                    self.run_start_local(id);
+                    continue;
+                }
                 Some(Task::Stop(id)) => {
                     let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(name) = state.by_id.get(&id).cloned() {
@@ -719,7 +741,12 @@ impl ServiceContainer {
                             c.state = ServiceState::Down;
                         }
                     }
+                    continue;
                 }
+                None => {}
+            }
+            match self.take_ready_start() {
+                Some(id) => self.finish_start(id),
                 None => break,
             }
         }
@@ -1375,10 +1402,24 @@ fn native_service_container_add_service(
     ctx.set_field(ctrl_obj, SC_FIELD_VALUE, Value::Object(None));
     ctx.set_field(ctrl_obj, SC_FIELD_ID, Value::Long(id as i64));
 
-    // Run the task queue locally so the mirror's state reflects the
-    // transition before we return.  When real Java `start()` callbacks
-    // are wired in T19.2 this will shift onto the worker threads.
-    container.drain_tasks_locally();
+    // Drive the service to completion before returning, same as
+    // `native_service_controller_set_mode`'s Active/Passive branch: under
+    // `msc_real_start_enabled()` (the default since `0cac9cc80`) only
+    // `drive_starts` invokes the real Java `start()` callback, so this
+    // legacy 2-arg `addService` must route through it too instead of always
+    // calling `drain_tasks_locally` — that unconditional call predates the
+    // real-start default and, left as-is, would silently bookkeeping-fake
+    // the service straight to `Up` without ever running its `start()`.
+    if msc_real_start_enabled() {
+        let was_driving = DRIVING.with(|d| d.replace(true));
+        if !was_driving {
+            let res = drive_starts(ctx, &container);
+            DRIVING.with(|d| d.set(false));
+            res?;
+        }
+    } else {
+        container.drain_tasks_locally();
+    }
     reflect_controller(ctx, ctrl_obj, &container, id);
 
     Ok(Some(Value::Object(Some(ctrl_obj))))
@@ -2528,29 +2569,9 @@ pub fn gc_update_msc_service_refs(pointer_map: &std::collections::HashMap<usize,
 // escape hatch; `CRATONVM_DBG_MSC` traces the install/start sequence.
 // ===========================================================================
 
-// Per-thread override for unit tests that exercise the simulated,
-// queue-based scheduler (`drain_tasks_locally`/`run_start_local`) directly.
-// That path is a legitimate, maintained mode (the `CRATONVM_MSC_REAL_START=0`
-// diagnostic escape hatch) but `msc_real_start_enabled` caches the env-var
-// read once, process-wide, in a `OnceLock` — the first `#[test]` thread to
-// call it wins for the rest of the test binary. Reading `set_var` per test
-// can't fix that race, so tests instead flip this thread-local, which
-// `msc_real_start_enabled` consults before falling back to the cached
-// process default.
-#[cfg(test)]
-thread_local! {
-    static TEST_FORCE_REAL_START: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 /// Cached check of the real-MSC mode. It is the production default; accept a
 /// conventional false value only as a diagnostic escape hatch.
 fn msc_real_start_enabled() -> bool {
-    #[cfg(test)]
-    {
-        if let Some(forced) = TEST_FORCE_REAL_START.with(|c| c.get()) {
-            return forced;
-        }
-    }
     static F: OnceLock<bool> = OnceLock::new();
     *F.get_or_init(|| {
         !matches!(
@@ -4323,27 +4344,6 @@ mod tests {
         ServiceName::parse(s)
     }
 
-    /// RAII guard forcing `msc_real_start_enabled()` to `false` for the
-    /// current thread. Tests that drive scheduling via `drain_tasks_locally`
-    /// (the simulated, queue-based scheduler) need this: as of the
-    /// real-start-by-default change, `add_service`/`demand` only enqueue
-    /// `Task::Start` when real-start mode is off, and `drain_tasks_locally`
-    /// itself is the fake-completion path — a fresh `ServiceContainer::new()`
-    /// in these tests has no `drive_starts()` loop or worker pool to race
-    /// with, so simulated mode is safe and deterministic here.
-    struct SimulatedSchedulerMode;
-    impl SimulatedSchedulerMode {
-        fn on() -> Self {
-            TEST_FORCE_REAL_START.with(|c| c.set(Some(false)));
-            SimulatedSchedulerMode
-        }
-    }
-    impl Drop for SimulatedSchedulerMode {
-        fn drop(&mut self) {
-            TEST_FORCE_REAL_START.with(|c| c.set(None));
-        }
-    }
-
     #[test]
     fn t19_1_service_name_of_single_segment() {
         let n = ServiceName::of(["jboss"]);
@@ -4408,7 +4408,6 @@ mod tests {
 
     #[test]
     fn t19_1_service_state_transitions_new_to_up_when_started() {
-        let _mode = SimulatedSchedulerMode::on();
         let c = ServiceContainer::new();
         let n = name("t19_1_transition.x");
         c.add_service(n.clone(), vec![], Mode::Active, 1)
@@ -4420,7 +4419,6 @@ mod tests {
 
     #[test]
     fn t19_1_service_mode_on_demand_stays_down_until_dependent_needs_it() {
-        let _mode = SimulatedSchedulerMode::on();
         let c = ServiceContainer::new();
         let n = name("t19_1_ondemand.svc");
         c.add_service(n.clone(), vec![], Mode::OnDemand, 0)
@@ -4436,7 +4434,6 @@ mod tests {
 
     #[test]
     fn t19_1_service_dependency_transitive_start() {
-        let _mode = SimulatedSchedulerMode::on();
         let c = ServiceContainer::new();
         let a = name("t19_1_trans.a");
         let b = name("t19_1_trans.b");
@@ -4482,7 +4479,6 @@ mod tests {
 
     #[test]
     fn t19_1_service_container_shutdown_stops_all_in_reverse_dep_order() {
-        let _mode = SimulatedSchedulerMode::on();
         let c = ServiceContainer::new();
         let a = name("t19_1_shut.a");
         let b = name("t19_1_shut.b");
@@ -4585,7 +4581,6 @@ mod tests {
 
     #[test]
     fn t19_1_passive_mode_schedules_like_active() {
-        let _mode = SimulatedSchedulerMode::on();
         let c = ServiceContainer::new();
         let n = name("t19_1_passive.svc");
         c.add_service(n.clone(), vec![], Mode::Passive, 0).unwrap();
