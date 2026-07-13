@@ -30,6 +30,28 @@ completion reaper, with no Java-side poll required. This report is retained
 under `docs/internal` as the completed record; self-hosted runner enrollment
 in item 7 is operational follow-up, not an unresolved code defect.
 
+## Feature documentation
+
+The durable feature documentation derived from this report lives under
+`docs/gpu/`:
+
+- [Integer and long reductions](../gpu/reductions.md)
+- [JIT caller gate](../gpu/jit-caller-gate.md)
+- [Callback-driven async completion](../gpu/async-completion-reaper.md)
+- [Runtime launch work sizing](../gpu/launch-work-sizing.md)
+- [Occupancy-tuned launch configuration](../gpu/occupancy-launch-config.md)
+- [Numeric constant-pool lowering](../gpu/lowering-constants.md)
+- [Floating-point remainder lowering](../gpu/lowering-fp-remainder.md)
+- [Comparison opcode lowering](../gpu/lowering-comparisons.md)
+- [Non-zero-start counted loops](../gpu/lowering-offset-loops.md)
+- [Curated Math/StrictMath intrinsics](../gpu/lowering-intrinsics.md)
+- [Rectangular two-dimensional loops](../gpu/lowering-nested-loops.md)
+- [Acyclic loop-body branch lowering](../gpu/lowering-branches.md)
+- [Self-hosted GPU CI scaffolding](../gpu/hardware-ci.md)
+
+This file remains the dated validation narrative and benchmark snapshot; the
+feature documents above are the maintained technical entry points.
+
 ## 1. Reduction kernels never dispatch (void-return gate) — DONE
 
 `try_dispatch` used to only launch kernels for methods whose descriptor ends in
