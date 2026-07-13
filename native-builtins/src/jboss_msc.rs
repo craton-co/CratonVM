@@ -277,6 +277,8 @@ impl ServiceState {
 /// `ServiceController.Mode` — controls automatic startup behaviour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
+    /// Permanently remove the controller and notify removal listeners.
+    Remove,
     /// Start as soon as dependencies are `Up`.
     Active,
     /// Start only when a dependent requires the value.
@@ -293,15 +295,17 @@ pub enum Mode {
 impl Mode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Mode::Active => "ACTIVE",
-            Mode::OnDemand => "ON_DEMAND",
-            Mode::Passive => "PASSIVE",
-            Mode::Lazy => "LAZY",
+            Mode::Remove => "REMOVE",
             Mode::Never => "NEVER",
+            Mode::OnDemand => "ON_DEMAND",
+            Mode::Lazy => "LAZY",
+            Mode::Passive => "PASSIVE",
+            Mode::Active => "ACTIVE",
         }
     }
     pub fn parse(s: &str) -> Mode {
         match s {
+            "REMOVE" => Mode::Remove,
             "ACTIVE" => Mode::Active,
             "ON_DEMAND" => Mode::OnDemand,
             "PASSIVE" => Mode::Passive,
@@ -312,11 +316,12 @@ impl Mode {
     }
     pub fn ordinal(self) -> i32 {
         match self {
-            Mode::Active => 0,
-            Mode::OnDemand => 1,
-            Mode::Passive => 2,
+            Mode::Remove => 0,
+            Mode::Never => 1,
+            Mode::OnDemand => 2,
             Mode::Lazy => 3,
-            Mode::Never => 4,
+            Mode::Passive => 4,
+            Mode::Active => 5,
         }
     }
 }
@@ -1385,16 +1390,14 @@ fn native_service_controller_set_mode(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let new_mode = match args.get(1).copied() {
-        Some(Value::Object(Some(s))) => {
-            let txt = ctx.read_string(s).unwrap_or_default();
-            Mode::parse(&txt)
-        }
+        Some(Value::Object(Some(mode))) => read_mode_by_name(ctx, Some(mode)),
         Some(Value::Int(i)) => match i {
-            0 => Mode::Active,
-            1 => Mode::OnDemand,
-            2 => Mode::Passive,
+            0 => Mode::Remove,
+            1 => Mode::Never,
+            2 => Mode::OnDemand,
             3 => Mode::Lazy,
-            4 => Mode::Never,
+            4 => Mode::Passive,
+            5 => Mode::Active,
             _ => Mode::Active,
         },
         _ => Mode::Active,
@@ -1411,6 +1414,29 @@ fn native_service_controller_set_mode(
                 c.mode = new_mode;
             }
         }
+    }
+    if matches!(new_mode, Mode::Remove) {
+        let removed = {
+            let mut state = container.inner.lock().unwrap_or_else(|e| e.into_inner());
+            match state.by_id.get(&id).cloned() {
+                Some(name) => match state.services.get_mut(&name) {
+                    Some(controller) => {
+                        controller.state = ServiceState::Removed;
+                        controller.async_pending = false;
+                        state.in_flight.remove(&id);
+                        true
+                    }
+                    None => false,
+                },
+                None => false,
+            }
+        };
+        ctx.set_field(this, SC_FIELD_MODE, Value::Int(new_mode.ordinal()));
+        ctx.set_field(this, SC_FIELD_STATE, Value::Int(ServiceState::Removed.ordinal()));
+        if removed {
+            fire_lifecycle_event_all(ctx, id, "REMOVED");
+        }
+        return Ok(None);
     }
     if matches!(new_mode, Mode::OnDemand | Mode::Lazy) {
         // No auto-start; leave as Down until demanded.
@@ -3640,7 +3666,7 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         r.register(
             cls,
             "getService",
-            "()Lorg/jboss/msc/Service;",
+            "()Lorg/jboss/msc/service/Service;",
             native_service_controller_get_service,
         );
         r.register(
@@ -4020,7 +4046,7 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         r.register(
             ctrl,
             "getService",
-            "()Lorg/jboss/msc/Service;",
+            "()Lorg/jboss/msc/service/Service;",
             native_service_controller_get_service,
         );
         r.register(
@@ -4037,7 +4063,7 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         r.register(
             ctrl_impl,
             "getService",
-            "()Lorg/jboss/msc/Service;",
+            "()Lorg/jboss/msc/service/Service;",
             native_service_controller_get_service,
         );
         r.register(
@@ -4083,6 +4109,31 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
     r.alias_class(
         "org/jboss/msc/service/ServiceController",
         "org/jboss/msc/service/ServiceControllerImpl",
+    );
+
+    // DelegatingServiceController is another concrete wrapper selected at
+    // dispatch sites such as the datasource parallel boot task. Its inherited
+    // ServiceController methods have no Code attribute, so it needs the same
+    // complete bridge as ServiceControllerImpl.
+    r.alias_class(
+        "org/jboss/msc/service/ServiceController",
+        "org/jboss/msc/service/DelegatingServiceController",
+    );
+    // DelegatingServiceController resolves these interface declarations under
+    // its own class key, so register them explicitly as well as aliasing the
+    // complete bridge above.
+    let delegating_controller = "org/jboss/msc/service/DelegatingServiceController";
+    r.register(
+        delegating_controller,
+        "getService",
+        "()Lorg/jboss/msc/service/Service;",
+        native_service_controller_get_service,
+    );
+    r.register(
+        delegating_controller,
+        "getName",
+        "()Lorg/jboss/msc/service/ServiceName;",
+        native_service_controller_get_name,
     );
 
     let _ = CTX_NUM_SLOTS; // silence unused constant when debug builds elide.
@@ -4226,6 +4277,23 @@ fn native_construct_message_logger(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_controller_get_service_uses_msc_1_5_descriptor() {
+        let mut registry = NativeMethodRegistry::new();
+        register_jboss_msc_natives(&mut registry);
+        let descriptor = "()Lorg/jboss/msc/service/Service;";
+        for class in [
+            "org/jboss/msc/service/ServiceController",
+            "org/jboss/msc/service/ServiceControllerImpl",
+            "org/jboss/msc/service/DelegatingServiceController",
+        ] {
+            assert!(
+                registry.find(class, "getService", descriptor).is_some(),
+                "{class}.getService must use the descriptor from jboss-msc 1.5"
+            );
+        }
+    }
 
     // Helper: reset the intern table between tests so each run is
     // deterministic.  The global container can't be reset (it's bound
@@ -4464,6 +4532,9 @@ mod tests {
         assert_eq!(ServiceState::Failed.as_str(), "FAILED");
         assert_eq!(Mode::parse("ACTIVE"), Mode::Active);
         assert_eq!(Mode::parse("ON_DEMAND"), Mode::OnDemand);
+        assert_eq!(Mode::parse("REMOVE"), Mode::Remove);
+        assert_eq!(Mode::Remove.ordinal(), 0);
+        assert_eq!(Mode::Active.ordinal(), 5);
         assert_eq!(Mode::parse("garbage"), Mode::Active);
     }
 

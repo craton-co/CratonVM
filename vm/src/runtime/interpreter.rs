@@ -17270,6 +17270,18 @@ fn execute_invoke_kind(
         args.push(coerce_invoke_arg_for_descriptor(pd, v));
     }
 
+    // Apply the same forwarding read barrier used by getfield to every
+    // reference copied from the operand stack. A moving collection can leave
+    // an old from-space address in a frame slot; once the invoke pops that
+    // slot it is no longer visible to the frame-root remapper. Dispatch then
+    // dereferences the stale receiver (or a stale object argument) while
+    // resolving/invoking the callee. Refresh while the forwarding header is
+    // still available, before any class lookup or native call can touch it.
+    for value in &mut args {
+        if let Value::Object(Some(obj)) = value {
+            *obj = shared.heap.load_and_forward(*obj);
+        }
+    }
     // GC-stale `java.lang.Thread`-mirror receiver recovery.
     //
     // A moving / promoting young GC can relocate a thread's
