@@ -31,6 +31,19 @@ it, or extend the feature, read on.
 | [`streams-events.md`](streams-events.md) | `Stream`, `Event`, async memcpy, `launch_on_stream`, per-buffer `last_write` ordering, stub op log for tests. |
 | [`async-api.md`](async-api.md) | `GpuExecutor`, `GpuFuture<T>`, `GpuArray<T>`, `GpuStream` for explicit async offload — including the current completion model and stream-affinity behavior. |
 | [`ci.md`](ci.md) | The self-hosted GPU CI workflow (`.github/workflows/gpu-selfhosted.yml`) and its checksum/latency gates (`bench-gpu/ci-gate.sh`). |
+| [`reductions.md`](reductions.md) | Proven integer/long reductions, PTX reduction syntax, and the intentional floating-point exclusion. |
+| [`jit-caller-gate.md`](jit-caller-gate.md) | Why eligible callers remain interpreted while GPU offload is active. |
+| [`async-completion-reaper.md`](async-completion-reaper.md) | Callback-driven finalization and the completion reaper. |
+| [`launch-work-sizing.md`](launch-work-sizing.md) | Runtime-sized grids for counted-loop kernels. |
+| [`occupancy-launch-config.md`](occupancy-launch-config.md) | Occupancy-selected CUDA block configuration. |
+| [`lowering-constants.md`](lowering-constants.md) | Numeric `ldc`/`ldc_w`/`ldc2_w` lowering. |
+| [`lowering-fp-remainder.md`](lowering-fp-remainder.md) | Opt-in floating-point remainder lowering. |
+| [`lowering-comparisons.md`](lowering-comparisons.md) | Bit-exact Java comparison opcodes. |
+| [`lowering-offset-loops.md`](lowering-offset-loops.md) | Canonical counted loops with non-zero starts. |
+| [`lowering-intrinsics.md`](lowering-intrinsics.md) | Curated `Math`/`StrictMath` intrinsic calls. |
+| [`lowering-nested-loops.md`](lowering-nested-loops.md) | Rectangular two-dimensional loop mapping. |
+| [`lowering-branches.md`](lowering-branches.md) | Basic-block and join-state lowering for loop-body branches. |
+| [`hardware-ci.md`](hardware-ci.md) | Self-hosted GPU CI scaffolding and enrollment status. |
 | [`../book/src/gpu/overview.md`](../book/src/gpu/overview.md) | User-facing book chapter: what can be offloaded, build modes, CLI flags. |
 | [`../book/src/gpu/benchmarks.md`](../book/src/gpu/benchmarks.md) | The 2026-07-11 RTX 2060 benchmark writeup (methodology + tables). |
 | [`../internal/gpu-offload-followups-20260711.md`](../internal/gpu-offload-followups-20260711.md) | Dated, itemized completed GPU follow-up record. |
