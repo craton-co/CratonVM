@@ -2575,7 +2575,7 @@ fn s2_bb_is_read_only(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
 /// (`order() == ByteOrder.LITTLE_ENDIAN`) and `toString()` behave exactly
 /// like HotSpot. Falls back to a 1-slot synthetic (field 0 = order int)
 /// only when the real class/statics are unavailable (synthetic-jdk mode).
-fn s2_byte_order_object(ctx: &mut dyn NativeContext, ord: i32) -> ObjectRef {
+pub(crate) fn s2_byte_order_object(ctx: &mut dyn NativeContext, ord: i32) -> ObjectRef {
     let cid = ctx
         .ensure_class_initialized("java/nio/ByteOrder")
         .ok()

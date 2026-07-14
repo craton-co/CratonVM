@@ -14637,7 +14637,26 @@ fn invoke_on_class_shared_inner(
                     // wrapper class name, not on the interface. Without this, dispatch on
                     // an Enumeration$Impl receiver to Iterator.hasNext() resolves to the
                     // abstract method and fails with "no Code attribute".
-                    if !native && method.is_abstract() && class_id != declaring_id {
+                    //
+                    // Deliberately NOT gated on `!native`: `check_override` above may
+                    // already have matched a *generic* native registered directly on the
+                    // abstract method's declaring interface (e.g. a fallback
+                    // `java/util/Map$Entry.getKey` that reads field slot 0), which is
+                    // less specific than a native registered on the receiver's own
+                    // concrete wrapper class. Without re-checking here, that generic
+                    // interface-level match wins unconditionally and is never displaced
+                    // by a more specific wrapper-class override reachable only through
+                    // this block — this was the root cause of
+                    // `structured-logging-map-entry-getkey-lambda-dispatch-precedence`:
+                    // `Map.Entry::getKey`/`getValue` invoked as method references over a
+                    // synthetic `cratonvm/internal/UnmodifiableMapEntry` receiver
+                    // resolved to the generic `Map$Entry` native (reading the wrapper's
+                    // own backing-entry field directly) instead of
+                    // `UnmodifiableMapEntry`'s own correctly-delegating native, returning
+                    // the whole wrapped entry instead of the key/value. A match on the
+                    // receiver's own class is always at least as specific as one found
+                    // via the abstract declaring class, so prefer it whenever it exists.
+                    if method.is_abstract() && class_id != declaring_id {
                         let recv_name = store.get(class_id).map(|c| &*c.name).unwrap_or("");
                         if !recv_name.is_empty()
                             && shared

@@ -29830,7 +29830,33 @@ fn cb_read_hb(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<ObjectRef> {
     }
 }
 
+/// Plain CharBuffer/HeapCharBuffer/StringCharBuffer instances have no
+/// independent byte-order concept of their own (real `HeapCharBuffer.order()`
+/// just returns the platform's native order); this mirrors the same
+/// convention already used by `ByteOrder.nativeOrder()`
+/// (`servlet.rs::register_s2_byteorder`) — 0 = BIG_ENDIAN, 1 = LITTLE_ENDIAN.
+///
+/// Note: `ByteBuffer.asCharBuffer()` (`servlet.rs::s2_bb_as_char_buffer`)
+/// allocates its returned view under this same plain `java/nio/CharBuffer`
+/// class name (not one of the `ByteBufferAsCharBuffer{B,L,RB,RL}` subclasses)
+/// and separately stashes the source ByteBuffer's order in an indexed slot —
+/// that slot is not read here, so an `asCharBuffer()` view built over a
+/// non-native-order source ByteBuffer will report native order rather than
+/// the source's actual order from this native. That's a narrower, pre-existing
+/// gap in `s2_bb_as_char_buffer`'s view-class choice, independent of the
+/// AbstractMethodError this registration fixes (real HeapCharBuffer/wrap/
+/// allocate paths, which is what the affected Spring Boot classes exercise).
+#[inline]
+fn cb_native_order(_ctx: &dyn NativeContext, _buf: ObjectRef) -> i32 {
+    if cfg!(target_endian = "big") {
+        0
+    } else {
+        1
+    }
+}
+
 pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
+    use crate::servlet::s2_byte_order_object;
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cb = "java/nio/CharBuffer";
@@ -29939,6 +29965,40 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         )))
     });
     r.register(cb, "isDirect", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+    // order()Ljava/nio/ByteOrder; — abstract on CharBuffer, like isReadOnly/
+    // isDirect above; every concrete leaf subclass overrides it in real
+    // OpenJDK. CratonVM never registered a native anywhere in the CharBuffer
+    // hierarchy, so any first-use call (real-JDK bytecode resolves the
+    // abstract declaration with no override) throws
+    // "AbstractMethodError: java/nio/CharBuffer.order()Ljava/nio/ByteOrder;
+    // has no Code attribute" — hit by ICU4X's `UCharacterProperty.<clinit>`
+    // reading Unicode property data via `CharBuffer.get(int[])`, which
+    // transitively poisons `java.net.IDN.<clinit>` (the first caller to ever
+    // exercise this path) for the rest of the process. Plain `CharBuffer`/
+    // `HeapCharBuffer`/`StringCharBuffer` report the platform's native byte
+    // order, matching real `HeapCharBuffer.order()`; the four
+    // `ByteBufferAsCharBuffer{B,L,RB,RL}` view classes encode their
+    // endianness in the class-name suffix (B/RB = big, L/RL = little),
+    // matching real JDK's per-view-class `order()` overrides.
+    r.register(cb, "order", "()Ljava/nio/ByteOrder;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let ord = cb_native_order(ctx, this);
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, ord)))))
+    });
+    fn cb_order_big(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        use crate::servlet::s2_byte_order_object;
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, 0)))))
+    }
+    fn cb_order_little(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        use crate::servlet::s2_byte_order_object;
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, 1)))))
+    }
+    for subclass in ["java/nio/ByteBufferAsCharBufferB", "java/nio/ByteBufferAsCharBufferRB"] {
+        r.register(subclass, "order", "()Ljava/nio/ByteOrder;", cb_order_big);
+    }
+    for subclass in ["java/nio/ByteBufferAsCharBufferL", "java/nio/ByteBufferAsCharBufferRL"] {
+        r.register(subclass, "order", "()Ljava/nio/ByteOrder;", cb_order_little);
+    }
     r.register(cb, "arrayOffset", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         match ctx.get_field_by_name(this, "offset") {
