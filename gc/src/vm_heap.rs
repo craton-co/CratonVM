@@ -712,11 +712,21 @@ impl VmHeap {
 
     /// Descriptor-aware set.
     pub fn set_field_as(&self, obj: ObjectRef, index: usize, value: Value, desc_byte: u8) {
+        // Like `set_field`, descriptor-aware stores use the collector's
+        // inherent barrier path. Close the debug SATB triad sentinel here;
+        // otherwise an interpreter/JIT pre-barrier followed by putfield via
+        // this typed entry point leaves it armed until the next store.
+        #[cfg(debug_assertions)]
+        clear_pending_pre_barrier();
         dispatch!(self, set_field_as(obj, index, value, desc_byte))
     }
 
     /// Volatile descriptor-aware set.
     pub fn set_field_volatile_as(&self, obj: ObjectRef, index: usize, value: Value, desc_byte: u8) {
+        // Same inherent-barrier path and debug-triad closure as
+        // `set_field_as` above.
+        #[cfg(debug_assertions)]
+        clear_pending_pre_barrier();
         dispatch!(self, set_field_volatile_as(obj, index, value, desc_byte))
     }
 

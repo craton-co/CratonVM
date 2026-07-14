@@ -1,4 +1,4 @@
-# CratonVM Spring suite — genuine bug list (updated, dev `9948295e`)
+# CratonVM Spring suite — genuine bug list (AOT revalidated on dev `1c035eef`)
 
 Baseline: fresh HotSpot run over 516 non-passed classes with corrected
 classpath (spring-websocket/oxm/jms/orm/core-test jars were missing before —
@@ -23,7 +23,25 @@ classloader-visibility symptoms (`MockitoException`, `CompilationException:
 Unable to compile source`, CGLIB-proxy `ABEND`s) — not individually
 root-caused.
 
-## Current status (2026-07-12)
+## Current status (2026-07-14)
+
+This issue remains **open** and belongs in `docs/known-issues`. The final
+merged-dev AOT validation used
+`cratonvm-aot-final-merged-dev-20260714-release.exe`
+(SHA-256 `A94B4CCB0CCA098459FE2C79B4AEF4BCC16D9801DC157F5AB1D6393FF1955B26`)
+against the exact 11 original cluster classes, one class per VM, with both
+batch and recovery watchdogs set to 600 seconds. It ran for 12,219 seconds:
+
+- 10 classes timed out in both the batch and isolated recovery executions
+  (`found=0/succ=0/fail=0`, 600,000 ms each).
+- `PersistenceAnnotationBeanPostProcessorAotContributionTests` completed in
+  6,579 ms, but all 8 methods failed with
+  `NoClassDefFoundError: org/springframework/orm/jpa/support/PersistenceAnnotationBeanPostProcessor`.
+
+Consequently, none of the 11 cluster entries was removed as fixed. The
+intermediate fixes listed below are retained because they removed concrete
+verifier/file-manager defects, but they did not resolve the class-level AOT
+cluster.
 
 The AOT compiler investigation remains **open**. The real-JDK `javac` path
 now delegates `JavacFileManager.list` to the JDK implementation, uses the
@@ -187,8 +205,9 @@ Reconfirmed via a fresh scoped rerun of exactly this 125-class list on dev
 Patterns observed in the dev-`9948295e` reconfirmation run that weren't
 called out before — grouped for future investigation, not yet root-caused:
 
-**AOT bean-registration TIMEOUT cluster (11 classes)** — all hit the exact
-120000ms ceiling with `found=0/succ=0/fail=0` (hard hang, not a slow test):
+**AOT bean-registration residual cluster (11 classes, final validation
+2026-07-14)** — 10 of these hit the exact 600000ms ceiling in both batch and
+isolated recovery with `found=0/succ=0/fail=0`:
 `beans.factory.annotation.AutowiredAnnotationBeanRegistrationAotContributionTests`,
 `beans.factory.aot.BeanDefinitionMethodGeneratorTests`,
 `beans.factory.aot.BeanDefinitionPropertiesCodeGeneratorTests`,
@@ -197,13 +216,16 @@ called out before — grouped for future investigation, not yet root-caused:
 `context.annotation.CommonAnnotationBeanRegistrationAotContributionTests`,
 `context.annotation.ConfigurationClassPostProcessorAotContributionTests`,
 `context.aot.ApplicationContextAotGeneratorTests`,
-`orm.jpa.support.PersistenceAnnotationBeanPostProcessorAotContributionTests`,
 `test.context.aot.TestClassScannerTests`,
-`test.context.aot.TestContextAotGeneratorIntegrationTests`. All exercise
-Spring's AOT code-generation path (same machinery `CompiledTests` used —
-in-memory javac compilation of generated sources); likely one shared root
-cause in that pipeline, separate from the classloader-visibility fix that
-resolved `CompiledTests` itself.
+`test.context.aot.TestContextAotGeneratorIntegrationTests`.
+`orm.jpa.support.PersistenceAnnotationBeanPostProcessorAotContributionTests`
+is the remaining eleventh member but is now a fast 8/8 FAIL caused by the
+missing `PersistenceAnnotationBeanPostProcessor` definition rather than a
+timeout. The timeouts still exercise Spring's generated-source/AOT pipeline;
+the final traces reach generated Java source, CGLIB enhancement, Hibernate
+validation, and Spring Test scanning before stalling. This is no longer
+consistent with the earlier direct-superclass verifier error, which is fixed,
+but remains an unresolved shared AOT execution defect.
 
 **Groovy scripting cluster (8 classes)** — `scripting.groovy.GroovyAspectTests`,
 `scripting.groovy.GroovyAspectIntegrationTests`,
@@ -273,7 +295,7 @@ cause with that cluster.
 ### `beans.factory.aot.BeanDefinitionPropertyValueCodeGeneratorDelegatesTests` — LOADERR
 - java.lang.OutOfMemoryError: Java heap space (new_object class_id 483 fields 5)
 
-### `beans.factory.aot.BeanRegistrationsAotContributionTests` — ABEND
+### `beans.factory.aot.BeanRegistrationsAotContributionTests` — TIMEOUT
     == org.springframework.beans.factory.aot.BeanRegistrationsAotContributionTests ABEND rc=139 ==
     [2m2026-07-09T08:03:51.506175Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: UnsafeConstants populated (5/5)
     [2m2026-07-09T08:04:08.921592Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: File separator/pathSeparator populated (4/4)
@@ -505,7 +527,9 @@ cause with that cluster.
 ### `orm.jpa.support.InjectionCodeGeneratorTests` — TIMEOUT
 - (hard timeout at 120s, no stack captured)
 
-### `orm.jpa.support.PersistenceAnnotationBeanPostProcessorAotContributionTests` — TIMEOUT
+### `orm.jpa.support.PersistenceAnnotationBeanPostProcessorAotContributionTests` — FAIL
+- Final AOT validation (2026-07-14): 8/8 methods failed in 6,579 ms with
+  `NoClassDefFoundError: org/springframework/orm/jpa/support/PersistenceAnnotationBeanPostProcessor`.
 - (hard timeout at 120s, no stack captured)
 
 ### `orm.jpa.support.PersistenceInjectionTests` — FAIL

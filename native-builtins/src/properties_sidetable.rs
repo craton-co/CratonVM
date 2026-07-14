@@ -2605,6 +2605,31 @@ fn native_properties_store_writer(ctx: &mut dyn NativeContext, args: &[Value]) -
 }
 
 pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
+    // FIX (2026-07-14, java.home/Locale bootstrap regression): every native
+    // in this function is a permanent, correctness-critical BRIDGE, not an
+    // approximation that real bytecode can substitute for. `System.
+    // getProperties()` (see its registration in lib.rs) hands back a
+    // "lightweight synthetic Properties object" whose inherited Hashtable/
+    // ConcurrentHashMap backing is deliberately never populated — real JDK
+    // 25 `Properties`/`Hashtable` bytecode dereferences a `map` field that is
+    // permanently null on this object, so EVERY one of these overrides
+    // (getProperty, get, put, size, keySet, forEach, ...) is the only thing
+    // that makes the synthetic object behave like a real Map at all. Without
+    // an explicit category, each of this function's ~3 call sites registers
+    // under whatever `current_category` happens to be ambient there — bridge
+    // in some, but (found 2026-07-14) `SyntheticStub` in real-JDK mode's own
+    // `register_properties_sidetable` call sites in `vm/src/vm/vm_init.rs`.
+    // Once commit `d8092acb` started actually enforcing
+    // `set_drop_synthetic_stubs(true)` in real-JDK mode, EVERY registration
+    // below was silently dropped, falling through to real bytecode's
+    // null-`map` NPEs/no-ops for read paths that don't throw — including
+    // `Properties.getProperty("java.home")` for the specific `Properties`
+    // instance `jdk.internal.util.StaticProperty`'s bootstrap path reads,
+    // which surfaced as `InternalError: null property: java.home` from
+    // `java.util.Locale.<clinit>` (any real-JDK-mode program touching
+    // `Locale` early). Explicitly pin `Bridge` here so this function's
+    // behavior no longer depends on the caller's ambient category.
+    registry.with_category(cratonvm_native_api::NativeKind::Bridge, |registry| {
     registry.register(
         "java/util/Properties",
         "equals",
@@ -2829,6 +2854,7 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/Map;)V",
         native_properties_put_all,
     );
+    });
 }
 
 /// Native `Properties.putAll(Map)` — side-table-aware copy.

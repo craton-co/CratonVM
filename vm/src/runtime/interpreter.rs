@@ -22770,6 +22770,27 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    // File-attribute values are carried by a private five-slot synthetic
+    // object, not by the real JDK's zero-field interface or platform-private
+    // attribute layouts. Interface call sites must therefore dispatch to the
+    // registered bridge before any receiver-class bytecode is selected.
+    if class_name == "java/nio/file/attribute/BasicFileAttributes"
+        && matches!(
+            (method_name, method_descriptor),
+            ("creationTime", "()Ljava/nio/file/attribute/FileTime;")
+                | ("lastAccessTime", "()Ljava/nio/file/attribute/FileTime;")
+                | ("lastModifiedTime", "()Ljava/nio/file/attribute/FileTime;")
+                | ("isDirectory", "()Z")
+                | ("isRegularFile", "()Z")
+                | ("isSymbolicLink", "()Z")
+                | ("isOther", "()Z")
+                | ("size", "()J")
+                | ("fileKey", "()Ljava/lang/Object;")
+        )
+    {
+        return true;
+    }
+
     // Class loading is implemented by CratonVM's native bridge so that its
     // per-loader namespaces and parent-first delegation remain visible in
     // real-JDK mode. The JDK methods are concrete bytecode, so force the
@@ -23595,6 +23616,10 @@ fn force_native_over_real_jdk_bytecode(
                     "list",
                     "(Ljavax/tools/JavaFileManager$Location;Ljava/lang/String;Ljava/util/Set;Z)Ljava/lang/Iterable;"
                 )
+                | (
+                    "inferBinaryName",
+                    "(Ljavax/tools/JavaFileManager$Location;Ljavax/tools/JavaFileObject;)Ljava/lang/String;"
+                )
         )
     {
         return true;
@@ -23608,6 +23633,23 @@ fn force_native_over_real_jdk_bytecode(
                 | ("compareTo", "(Lcom/sun/tools/javac/file/RelativePath;)I")
                 | ("getPath", "()Ljava/lang/String;")
         )
+    {
+        return true;
+    }
+
+    if matches!(
+        class_name,
+        "com/sun/tools/javac/util/Name"
+            | "com/sun/tools/javac/util/SharedNameTable$NameImpl"
+            | "com/sun/tools/javac/util/StringNameTable$NameImpl"
+    ) && method_name == "equals" && method_descriptor == "(Ljava/lang/Object;)Z"
+    {
+        return true;
+    }
+
+    if class_name == "org/springframework/core/test/tools/CompileWithForkedClassLoaderExtension"
+        && method_name == "isUsingForkedClassPathLoader"
+        && method_descriptor == "(Lorg/junit/jupiter/api/extension/ExtensionContext;)Z"
     {
         return true;
     }
@@ -34840,7 +34882,7 @@ mod tests {
             "list",
             "(Ljavax/tools/JavaFileManager$Location;Ljava/lang/String;Ljava/util/Set;Z)Ljava/lang/Iterable;"
         ));
-        assert!(!force_native_over_real_jdk_bytecode(
+        assert!(force_native_over_real_jdk_bytecode(
             "com/sun/tools/javac/file/JavacFileManager",
             "inferBinaryName",
             "(Ljavax/tools/JavaFileManager$Location;Ljavax/tools/JavaFileObject;)Ljava/lang/String;"
