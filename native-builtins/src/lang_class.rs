@@ -6276,7 +6276,26 @@ pub(crate) fn native_method_invoke(
             }
         }
     } else {
-        match ctx.invoke(&class_name, &method_name, &descriptor, &invoke_args) {
+        // Use the Method object's OWN already-resolved declaring ClassId
+        // when available, instead of re-resolving `class_name` by name.
+        // Name-based resolution goes through the loader-blind global lookup,
+        // which is unsound (reports "not found") once 2+ different
+        // user-defined loaders each register their own distinct class under
+        // this identical simple name — an ordinary occurrence for harnesses
+        // that mint a fresh ClassLoader + identically-named generated class
+        // per invocation (Spring's TestCompiler/@CompileWithForkedClassLoader
+        // — see `invoke_by_class_id_shared`'s doc comment). This matters most
+        // for STATIC methods (never virtually dispatched, always reaching
+        // this branch), which is exactly the reflective-invoke shape
+        // Method.invoke() takes right after successfully loading the
+        // generated class via a specific ClassLoader.
+        let dispatch_result = match mirror_class_id(ctx, declaring_mirror) {
+            Some(cid) => {
+                ctx.invoke_by_class_id(cid, &class_name, &method_name, &descriptor, &invoke_args)
+            }
+            None => ctx.invoke(&class_name, &method_name, &descriptor, &invoke_args),
+        };
+        match dispatch_result {
             Ok(v) => v,
             Err(failure) => {
                 return Err(wrap_as_invocation_target_exception(ctx, failure));

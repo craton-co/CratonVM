@@ -670,6 +670,40 @@ pub trait NativeContext {
         args: &[Value],
     ) -> MethodCallResult;
 
+    /// Invoke a method on an ALREADY-RESOLVED declaring class, bypassing
+    /// name-based class resolution entirely.
+    ///
+    /// `Method.invoke()` (reflection) on a static method already has an
+    /// unambiguous declaring `ClassId` in hand (from the `Method` object's
+    /// own `clazz` mirror) — it must not re-resolve the class by NAME, which
+    /// goes through the loader-blind global lookup (`load_class`/
+    /// `get_loaded_class_id`). That lookup deliberately returns "not found"
+    /// (not a guess) whenever 2+ *different* user-defined loaders each
+    /// register their own distinct class under the identical simple name —
+    /// an intentional, documented anti-ambiguity guard (see
+    /// `ClassManager::get_loaded_class_id`), but it means ANY name-based
+    /// re-resolution after the fact is unsound the moment a second same-named
+    /// class from a different loader exists anywhere in the process — a
+    /// completely ordinary pattern for repeatedly-invoked test/codegen
+    /// harnesses that mint a fresh ClassLoader + identically-named generated
+    /// class each time (e.g. Spring's `TestCompiler`/
+    /// `@CompileWithForkedClassLoader`, which produced the exact
+    /// `GroupsMetadataValueDelegateTests` "class file error: class not
+    /// found" VM abort this fixes). Default implementation falls back to the
+    /// name-based [`Self::invoke`] for callers/mocks that have no ClassId
+    /// fast path; the real VM overrides this to skip re-resolution.
+    fn invoke_by_class_id(
+        &mut self,
+        class_id: ClassId,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let _ = class_id;
+        self.invoke(class_name, method_name, descriptor, args)
+    }
+
     /// Get the identity hash code of an ObjectRef.
     fn identity_hash_code(&self, obj: ObjectRef) -> i32;
 
