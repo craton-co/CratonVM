@@ -14591,6 +14591,11 @@ pub(crate) fn native_type_variable_get_annotated_bounds(
 /// BASE_LOCATION by real-JDK code) and `allOnSameTargetTypeAnnotations` with an
 /// empty array so `getTypeAnnotations()` never returns null either.
 fn annotated_type_fill_bookkeeping(ctx: &mut dyn NativeContext, obj: ObjectRef) {
+    // GC-SAFETY: `ensure_class_initialized` (via `base_loc`'s computation)
+    // and `new_ref_array` below can each trigger a moving GC; `obj` (the
+    // caller-supplied AnnotatedType instance) is used both before and
+    // after both. Pin up front and re-read before each use.
+    let obj_pin = ctx.pin_native_root(obj);
     let base_loc = ctx
         .ensure_class_initialized("sun/reflect/annotation/TypeAnnotation$LocationInfo")
         .ok()
@@ -14599,13 +14604,16 @@ fn annotated_type_fill_bookkeeping(ctx: &mut dyn NativeContext, obj: ObjectRef) 
                 .map(|idx| ctx.get_static_field(cid, idx))
         })
         .unwrap_or(Value::Object(None));
+    let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field_by_name(obj, "location", base_loc);
     let empty_ta = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+    let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field_by_name(
         obj,
         "allOnSameTargetTypeAnnotations",
         Value::Object(Some(empty_ta)),
     );
+    ctx.unpin_native_roots(obj_pin);
 }
 
 /// Which real-JDK `sun.reflect.annotation.AnnotatedTypeFactory` impl class
@@ -14674,6 +14682,15 @@ fn make_annotated_type(
     // `annotated_type_impl_class_name`); fall back to the interface name
     // (synthetic-mode placeholder) if the impl class can't be loaded.
     let impl_name = annotated_type_impl_class_name(ctx, backing_type);
+    // GC-SAFETY: `ensure_class_initialized`, `alloc_object`,
+    // `new_ref_array`, and (in the `else` branch) `annotated_type_fill_
+    // bookkeeping`'s own internal allocations can each trigger a moving
+    // GC; `backing_type` (the caller-supplied Type mirror) and `obj` (the
+    // freshly-allocated AnnotatedType, also the return value) are each
+    // used again after one of these. Pin `backing_type` up front and
+    // `obj` as soon as it's allocated, and re-read both before each
+    // subsequent use.
+    let backing_pin = ctx.pin_native_root(backing_type);
     let cid = ctx
         .ensure_class_initialized(impl_name)
         .or_else(|_| ctx.ensure_class_initialized("java/lang/reflect/AnnotatedType"))
@@ -14682,9 +14699,12 @@ fn make_annotated_type(
     let layout_fields = ctx.class_num_total_fields(cid);
     let num_fields = if layout_fields >= 2 { layout_fields } else { 2 };
     let obj = ctx.alloc_object(cid, num_fields);
+    let obj_pin = ctx.pin_native_root(obj);
 
     // empty Annotation[] for `annotations`
     let empty_anns = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+    let backing_type = ctx.read_native_pin(backing_pin, backing_type);
+    let obj = ctx.read_native_pin(obj_pin, obj);
 
     ctx.set_field_by_name(obj, "type", Value::Object(Some(backing_type)));
     ctx.set_field_by_name(obj, "annotations", Value::Object(Some(empty_anns)));
@@ -14694,6 +14714,8 @@ fn make_annotated_type(
     } else {
         annotated_type_fill_bookkeeping(ctx, obj);
     }
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(backing_pin);
     obj
 }
 
@@ -14709,9 +14731,19 @@ fn make_annotated_type_with_anns(
     backing_type: ObjectRef,
     anns: &[cratonvm_native_api::AnnotationData],
 ) -> ObjectRef {
+    // GC-SAFETY: `build_annotation_array`, `ensure_class_initialized`,
+    // `alloc_object`, and (in the `else` branch) `annotated_type_fill_
+    // bookkeeping`'s own internal allocations can each trigger a moving
+    // GC. `backing_type` (the caller-supplied Type mirror) is used again
+    // after several of these, and `ann_arr`/`obj` (also the return value)
+    // are each used again after later ones. Pin everything as it's
+    // produced and re-read before each subsequent use.
+    let backing_pin = ctx.pin_native_root(backing_type);
     // Build the proxy array first (it allocates) before we allocate the
     // AnnotatedType object, mirroring the GC-ordering used elsewhere.
     let ann_arr = build_annotation_array(ctx, anns);
+    let ann_pin = ctx.pin_native_root(ann_arr);
+    let backing_type = ctx.read_native_pin(backing_pin, backing_type);
 
     // Select the real-JDK impl class matching the backing Type's kind (see
     // `annotated_type_impl_class_name`); fall back to the interface name
@@ -14725,6 +14757,10 @@ fn make_annotated_type_with_anns(
     let layout_fields = ctx.class_num_total_fields(cid);
     let num_fields = if layout_fields >= 2 { layout_fields } else { 2 };
     let obj = ctx.alloc_object(cid, num_fields);
+    let obj_pin = ctx.pin_native_root(obj);
+    let backing_type = ctx.read_native_pin(backing_pin, backing_type);
+    let ann_arr = ctx.read_native_pin(ann_pin, ann_arr);
+    let obj = ctx.read_native_pin(obj_pin, obj);
 
     ctx.set_field_by_name(obj, "type", Value::Object(Some(backing_type)));
     ctx.set_field_by_name(obj, "annotations", Value::Object(Some(ann_arr)));
@@ -14734,6 +14770,8 @@ fn make_annotated_type_with_anns(
     } else {
         annotated_type_fill_bookkeeping(ctx, obj);
     }
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(backing_pin);
     obj
 }
 
@@ -15258,8 +15296,34 @@ pub(crate) fn populate_protection_domain_fields(
     codesource: Value,
     classloader: Value,
 ) {
+    // GC-SAFETY: `build_empty_permissions`/`new_array` below can each
+    // trigger a moving GC; `pd` (the receiver) and the caller-supplied
+    // `codesource`/`classloader` are all used again afterward. Pin
+    // everything up front and re-read before use.
+    let pd_pin = ctx.pin_native_root(pd);
+    let cs_obj = match codesource {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    };
+    let cs_pin = cs_obj.map(|o| ctx.pin_native_root(o));
+    let cl_obj = match classloader {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    };
+    let cl_pin = cl_obj.map(|o| ctx.pin_native_root(o));
+
     let perms = build_empty_permissions(ctx);
     let principals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+
+    let pd = ctx.read_native_pin(pd_pin, pd);
+    let codesource = match (cs_obj, cs_pin) {
+        (Some(o), Some(p)) => Value::Object(Some(ctx.read_native_pin(p, o))),
+        _ => codesource,
+    };
+    let classloader = match (cl_obj, cl_pin) {
+        (Some(o), Some(p)) => Value::Object(Some(ctx.read_native_pin(p, o))),
+        _ => classloader,
+    };
     let perms_v = Value::Object(Some(perms));
     let principals_v = Value::Object(Some(principals));
 
@@ -15273,6 +15337,7 @@ pub(crate) fn populate_protection_domain_fields(
     ctx.set_field_by_name(pd, "permissions", perms_v);
     ctx.set_field_by_name(pd, "classloader", classloader);
     ctx.set_field_by_name(pd, "principals", principals_v);
+    ctx.unpin_native_roots(pd_pin);
 }
 
 /// `java/lang/Class.getClassFileVersion0()I`
@@ -15401,10 +15466,22 @@ pub(crate) fn native_class_get_protection_domain0(
     // Do **not** call `url_parse` here: our 6-field `URL_FIELD_FULL` index
     // collides with `authority`, corrupting `URL.toString()` / `toURI()` for
     // Spring Boot's launcher.
+    //
+    // GC-SAFETY: this whole tail allocates a long chain of objects
+    // (url_obj -> path_obj/proto_obj/host_obj -> cs -> location_str ->
+    // cert arrays -> pd) and reuses several of them well after later
+    // allocations in the same chain -- pin each as it's produced and
+    // re-read immediately before every subsequent use.
     let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 13);
+    let url_pin = ctx.pin_native_root(url_obj);
     let path_obj = ctx.create_string(&path);
+    let path_pin = ctx.pin_native_root(path_obj);
     let proto_obj = ctx.create_string("file");
+    let proto_pin = ctx.pin_native_root(proto_obj);
     let host_obj = ctx.create_string("");
+    let url_obj = ctx.read_native_pin(url_pin, url_obj);
+    let path_obj = ctx.read_native_pin(path_pin, path_obj);
+    let proto_obj = ctx.read_native_pin(proto_pin, proto_obj);
     ctx.set_field(url_obj, 0, Value::Object(Some(proto_obj)));
     ctx.set_field(url_obj, 1, Value::Object(Some(host_obj)));
     ctx.set_field(url_obj, 2, Value::Int(-1));
@@ -15416,6 +15493,8 @@ pub(crate) fn native_class_get_protection_domain0(
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let cs_num_fields = ctx.class_num_total_fields(cs_cid).max(2);
     let cs = ctx.alloc_object(cs_cid, cs_num_fields);
+    let cs_pin = ctx.pin_native_root(cs);
+    let url_obj = ctx.read_native_pin(url_pin, url_obj);
     // Slot-based writes cover the synthetic layout; name-based writes
     // cover the real-JDK-loaded layout. At least one lands on the right
     // slot for each mode.
@@ -15425,6 +15504,8 @@ pub(crate) fn native_class_get_protection_domain0(
     // callers and the T19.N1 test read). Populate it with the real code base
     // URL (`location_url`) instead of leaving it empty / a bare URL object.
     let location_str = ctx.create_string(&location_url);
+    let cs = ctx.read_native_pin(cs_pin, cs);
+    let url_obj = ctx.read_native_pin(url_pin, url_obj);
     ctx.set_field(cs, 0, Value::Object(Some(location_str)));
     // Real-JDK `CodeSource.location` is typed `java.net.URL`; the name-based
     // write targets that layout with the constructed URL object.
@@ -15434,16 +15515,21 @@ pub(crate) fn native_class_get_protection_domain0(
     let certs = ctx.class_code_source_certs(class_id);
     if !certs.is_empty() {
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, certs.len());
+        let arr_pin = ctx.pin_native_root(arr);
         for (i, cert) in certs.iter().enumerate() {
             let cert_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, cert.len());
             for (j, &b) in cert.iter().enumerate() {
                 ctx.set_array_element(cert_arr, j, Value::Int(b as i8 as i32));
             }
+            let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_array_element(arr, i, Value::Object(Some(cert_arr)));
         }
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let cs = ctx.read_native_pin(cs_pin, cs);
         ctx.set_field(cs, 1, Value::Object(Some(arr)));
         ctx.set_field_by_name(cs, "certs", Value::Object(Some(arr)));
     }
+    let cs = ctx.read_native_pin(cs_pin, cs);
 
     // Build ProtectionDomain(codesource=cs, permissions=<empty>,
     // classloader=<defining loader>, principals=empty).  SBR-13: populate the
@@ -15455,12 +15541,17 @@ pub(crate) fn native_class_get_protection_domain0(
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let pd_num_fields = ctx.class_num_total_fields(pd_cid).max(4);
     let pd = ctx.alloc_object(pd_cid, pd_num_fields);
+    let pd_pin = ctx.pin_native_root(pd);
+    let cs = ctx.read_native_pin(cs_pin, cs);
     // Resolve the class's defining loader exactly like `Class.getClassLoader()`
     // (bootstrap в†’ null, app classpath в†’ the singleton AppClassLoader).
     let classloader = native_class_get_class_loader(ctx, args)
         .ok()
         .flatten()
         .unwrap_or(Value::Object(None));
+    let pd = ctx.read_native_pin(pd_pin, pd);
+    let cs = ctx.read_native_pin(cs_pin, cs);
+    ctx.unpin_native_roots(url_pin);
     populate_protection_domain_fields(ctx, pd, Value::Object(Some(cs)), classloader);
 
     Ok(Some(Value::Object(Some(pd))))
