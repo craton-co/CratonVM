@@ -4,6 +4,21 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-14 Spring Boot `crashfail-20260714` rerun; 9 new bug clusters filed under `springboot/`
+
+Full-suite rerun after the 7 clusters from 07-11/07-13 were fixed (see
+[`springboot/README.md`](springboot/README.md) for the full table). While the
+8-shard run was still in progress, triaged the CRASH set (8 fatal
+process-aborts) and the clearest FAIL log-signature clusters, dispatching 8
+parallel investigation agents. Two crashes have precise, high-confidence root
+causes with concrete fix directions:
+
+- [`springboot/charbuffer-order-missing-native-idn-clinit-cluster.md`](springboot/charbuffer-order-missing-native-idn-clinit-cluster.md) — `CharBuffer.order()` has no native registration; poisons `java.net.IDN`'s `<clinit>` for the rest of the process on first use (6 FAIL classes + 1 fatal CRASH).
+- [`springboot/structured-logging-map-entry-getkey-lambda-dispatch-precedence.md`](springboot/structured-logging-map-entry-getkey-lambda-dispatch-precedence.md) — `Map.Entry::getKey`/`getValue` method references over a synthetic wrapper entry resolve to the wrong native override (interface-level generic beats the wrapper's own delegating native); confirmed with a standalone repro (5 classes).
+- [`springboot/applicationcontextrunnertests-lazy-cglib-classnotfound-crash.md`](springboot/applicationcontextrunnertests-lazy-cglib-classnotfound-crash.md) — Spring's `@Lazy`-injection CGLIB proxy naming (`$$SpringCGLIB$$`) isn't recognized as a recoverable classloading miss, so an expected `ClassNotFoundException` escapes as an internal error and aborts the whole process (3 fatal CRASH classes; likely affects `@Lazy` injection broadly, not just these 3).
+
+The remaining six are OPEN with strong, evidence-backed hypotheses not yet confirmed by live bisection: `logback-loggercontext-listenerlist-final-field-corruption.md` (a `final` field going null — heap/GC corruption, not construction), `jit-dispatch-depth-guard-shallow-stackoverflow-cluster.md`, `comparable-classcast-lambda-proxy-unknown-class.md`, `collectionbindertests-classcast-testdescriptor-crash.md`, `jsonvaluewritertests-nesting-depth-guard-stack-overflow.md` (a genuine native `EXCEPTION_STACK_OVERFLOW`, not a caught Java one), and `reactor-nettyhttpclient-httpclientsecure-null-provider-crash.md`. None overlap with previously-retired clusters.
+
 ## 2026-07-13 WildFly `AttributeAccess` CCE confirmed as register-invisible-JIT-root family; NEW "Family 1" stale-ObjectRef residual found alongside it
 
 - 🔴 NEW: [`wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`](wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md)
