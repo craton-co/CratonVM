@@ -53814,6 +53814,55 @@ fn matcher_realjdk_cache() -> &'static Mutex<std::collections::HashMap<i32, Matc
     CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
+fn matcher_realjdk_group_slice<'a>(
+    utf8: &'a str,
+    utf16_to_byte: &[u32],
+    start: i32,
+    end: i32,
+) -> Option<&'a str> {
+    let start = usize::try_from(start).ok()?;
+    let end = usize::try_from(end).ok()?;
+    if start > end || end >= utf16_to_byte.len() {
+        return None;
+    }
+    let is_scalar_boundary = |offset: usize| {
+        offset == 0
+            || offset + 1 == utf16_to_byte.len()
+            || utf16_to_byte[offset] != utf16_to_byte[offset - 1]
+    };
+    if !is_scalar_boundary(start) || !is_scalar_boundary(end) {
+        return None;
+    }
+    let start_byte = utf16_to_byte[start] as usize;
+    let end_byte = utf16_to_byte[end] as usize;
+    utf8.get(start_byte..end_byte)
+}
+
+/// Materialize a group directly from the decoded String cached by the native
+/// find path. Returns `None` when the Matcher was populated by bytecode, its
+/// text changed, or a boundary falls inside a surrogate pair.
+fn matcher_realjdk_cached_group_string(
+    ctx: &mut dyn NativeContext,
+    matcher: ObjectRef,
+    text: ObjectRef,
+    start: i32,
+    end: i32,
+) -> Option<ObjectRef> {
+    let matcher_identity = ctx.identity_hash_code(matcher);
+    let text_identity = ctx.identity_hash_code(text);
+    let (utf8, utf16_to_byte) = {
+        let guard = matcher_realjdk_cache().lock().ok()?;
+        let entry = guard.get(&matcher_identity)?;
+        if entry.text_identity != text_identity {
+            return None;
+        }
+        (entry.utf8.clone(), entry.utf16_to_byte.clone())
+    };
+
+    let text = matcher_realjdk_group_slice(&utf8, &utf16_to_byte, start, end)?;
+    Some(ctx.create_string_uninterned(text))
+}
+
 /// Build both offset tables in one O(n) pass over `s`.
 fn matcher_realjdk_build_offset_tables(s: &str) -> (Vec<u32>, Vec<u32>) {
     let mut byte_to_utf16 = vec![0u32; s.len() + 1];
@@ -54305,9 +54354,22 @@ fn matcher_realjdk_group_in_bounds(
 #[cfg(test)]
 mod matcher_realjdk_layout_tests {
     use super::{
-        compile_java_regex, matcher_realjdk_capture_layout_valid,
-        matcher_realjdk_group_index_in_bounds, matcher_realjdk_native_callback,
+        compile_java_regex, matcher_realjdk_build_offset_tables,
+        matcher_realjdk_capture_layout_valid, matcher_realjdk_group_index_in_bounds,
+        matcher_realjdk_group_slice, matcher_realjdk_native_callback,
     };
+
+    #[test]
+    fn cached_group_slice_preserves_utf16_boundaries() {
+        let text = "x😀value12,y";
+        let (_, utf16_to_byte) = matcher_realjdk_build_offset_tables(text);
+        assert_eq!(
+            matcher_realjdk_group_slice(text, &utf16_to_byte, 3, 10),
+            Some("value12")
+        );
+        assert_eq!(matcher_realjdk_group_slice(text, &utf16_to_byte, 2, 10), None);
+        assert_eq!(matcher_realjdk_group_slice(text, &utf16_to_byte, 1, 2), None);
+    }
 
     #[test]
     fn jit_dispatch_resolver_covers_only_real_layout_matcher_intrinsics() {
@@ -54565,6 +54627,11 @@ fn native_matcher_group_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value])
             )
         }
     };
+    if let Some(group_string) =
+        matcher_realjdk_cached_group_string(ctx, this, text_obj, start, end)
+    {
+        return Ok(Some(Value::Object(Some(group_string))));
+    }
     // The real-layout find fast path only caches an actual `String` input.
     // Call the same registered substring native directly for that common case
     // instead of re-entering generic virtual dispatch for every captured group.
