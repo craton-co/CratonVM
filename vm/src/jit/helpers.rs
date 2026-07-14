@@ -819,10 +819,56 @@ unsafe fn try_call_compiled_entry_inner(
                 let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
                 f(vm_ptr, args_slice[0], args_slice[1], args_slice[2])
             }
-            // TODO(round-6-wave-2): extend register-table coverage or
-            // emit stack-arg setup so 4+-arg with-ctx callees stay on
-            // the JIT fast-path. Until then return None so the caller
-            // bails to the interpreter (correct semantics, slower).
+            4 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    vm_ptr,
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                )
+            }
+            5 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    vm_ptr,
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                )
+            }
+            6 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    vm_ptr,
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                    args_slice[5],
+                )
+            }
+            7 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    vm_ptr,
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                    args_slice[5],
+                    args_slice[6],
+                )
+            }
             _ => return None,
         })
     } else {
@@ -857,7 +903,56 @@ unsafe fn try_call_compiled_entry_inner(
                 let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
                 f(args_slice[0], args_slice[1], args_slice[2], args_slice[3])
             }
-            // TODO(round-6-wave-2): see with-ctx branch above.
+            5 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                )
+            }
+            6 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                    args_slice[5],
+                )
+            }
+            7 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                    args_slice[5],
+                    args_slice[6],
+                )
+            }
+            8 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                    args_slice[5],
+                    args_slice[6],
+                    args_slice[7],
+                )
+            }
             _ => return None,
         })
     }
@@ -3530,12 +3625,12 @@ unsafe fn jit_typecheck_resolve(
         class_name.len(),
     );
     let cached_target = JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
-        cache.get().and_then(|(cached_vm, cached_ptr, cached_len, raw)| {
-            (cached_vm == cache_key.0
-                && cached_ptr == cache_key.1
-                && cached_len == cache_key.2)
-                .then(|| ClassId::new(raw))
-        })
+        cache
+            .get()
+            .and_then(|(cached_vm, cached_ptr, cached_len, raw)| {
+                (cached_vm == cache_key.0 && cached_ptr == cache_key.1 && cached_len == cache_key.2)
+                    .then(|| ClassId::new(raw))
+            })
     });
     let target_class_id_opt = if cached_target.is_some() {
         cached_target
@@ -3543,7 +3638,12 @@ unsafe fn jit_typecheck_resolve(
         let resolved = vm.class_manager.read().find_class_by_name(class_name);
         if let Some(target) = resolved {
             JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
-                cache.set(Some((cache_key.0, cache_key.1, cache_key.2, target.as_u32())))
+                cache.set(Some((
+                    cache_key.0,
+                    cache_key.1,
+                    cache_key.2,
+                    target.as_u32(),
+                )))
             });
         }
         resolved
@@ -6308,6 +6408,36 @@ mod tests {
             try_call_compiled_entry_reentrant(add_ctx_arg as *const () as usize, true, 5, &[7])
         };
         assert_eq!(result, Some(12));
+    }
+
+    #[test]
+    fn compiled_entry_reentrant_wrapper_preserves_stack_arg_abi() {
+        unsafe extern "C" fn sum_five(a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
+            a + b + c + d + e
+        }
+        unsafe extern "C" fn sum_ctx_four(ctx: i64, a: i64, b: i64, c: i64, d: i64) -> i64 {
+            ctx + a + b + c + d
+        }
+        // SAFETY: both functions use the C ABI selected by the helper, including
+        // the first stack-passed parameter on Windows.
+        let no_ctx = unsafe {
+            try_call_compiled_entry_reentrant(
+                sum_five as *const () as usize,
+                false,
+                0,
+                &[1, 2, 3, 4, 5],
+            )
+        };
+        let with_ctx = unsafe {
+            try_call_compiled_entry_reentrant(
+                sum_ctx_four as *const () as usize,
+                true,
+                10,
+                &[1, 2, 3, 4],
+            )
+        };
+        assert_eq!(no_ctx, Some(15));
+        assert_eq!(with_ctx, Some(20));
     }
 
     #[test]

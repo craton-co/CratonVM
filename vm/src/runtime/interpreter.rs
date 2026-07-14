@@ -565,10 +565,8 @@ fn stw_take_over_and_wait(
     let mut warned = false;
     loop {
         let tids_before = taken.tids.len();
-        let should_scan = stw_takeover_should_scan(
-            rounds,
-            crate::jit::conservative_roots::any_thread_in_jit(),
-        );
+        let should_scan =
+            stw_takeover_should_scan(rounds, crate::jit::conservative_roots::any_thread_in_jit());
         let newly = if should_scan {
             xt::take_over_pass(&mut taken, &|a| shared.heap.is_object_address(a), xt_roots)
         } else {
@@ -20323,12 +20321,13 @@ pub(crate) fn try_lambda_dispatch(
                 .get_class(class_id)
                 .and_then(|c| c.array_info.clone());
             if let Some(array_info) = array_info {
-                let length = full_args
-                    .first()
-                    .and_then(Value::as_int)
-                    .ok_or_else(|| VmError::Internal {
-                        message: "array-constructor-reference: missing length arg".to_string(),
-                    })?;
+                let length =
+                    full_args
+                        .first()
+                        .and_then(Value::as_int)
+                        .ok_or_else(|| VmError::Internal {
+                            message: "array-constructor-reference: missing length arg".to_string(),
+                        })?;
                 if length < 0 {
                     return Err(RuntimeError::NegativeArraySizeException { size: length }.into());
                 }
@@ -21424,6 +21423,9 @@ pub(crate) fn is_h2_parser_native_override(
     method_name: &str,
     descriptor: &str,
 ) -> bool {
+    if class_name == "org/h2/util/Utils" {
+        return (method_name, descriptor) == ("getResource", "(Ljava/lang/String;)[B");
+    }
     if class_name == "org/h2/constraint/ConstraintReferential" {
         return (method_name, descriptor)
             == ("checkExistingData", "(Lorg/h2/engine/SessionLocal;)V");
@@ -22518,10 +22520,17 @@ fn force_native_over_real_jdk_bytecode(
     if class_name == "java/util/function/Predicate"
         && matches!(
             (method_name, method_descriptor),
-            ("and", "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;")
-                | ("or", "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;")
-                | ("negate", "()Ljava/util/function/Predicate;")
-                | ("not", "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;")
+            (
+                "and",
+                "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;"
+            ) | (
+                "or",
+                "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;"
+            ) | ("negate", "()Ljava/util/function/Predicate;")
+                | (
+                    "not",
+                    "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;"
+                )
         )
     {
         return true;
@@ -22536,7 +22545,10 @@ fn force_native_over_real_jdk_bytecode(
         && matches!(
             (method_name, method_descriptor),
             ("initialize", "(Ljava/util/Locale;)V")
-                | ("getInstance", "(Ljava/util/Locale;)Ljava/text/DecimalFormatSymbols;")
+                | (
+                    "getInstance",
+                    "(Ljava/util/Locale;)Ljava/text/DecimalFormatSymbols;"
+                )
         )
     {
         return true;
@@ -22570,8 +22582,7 @@ fn force_native_over_real_jdk_bytecode(
         && method_name == "loadClass"
         && matches!(
             method_descriptor,
-            "(Ljava/lang/String;)Ljava/lang/Class;"
-                | "(Ljava/lang/String;Z)Ljava/lang/Class;"
+            "(Ljava/lang/String;)Ljava/lang/Class;" | "(Ljava/lang/String;Z)Ljava/lang/Class;"
         )
     {
         return true;
@@ -24430,8 +24441,7 @@ pub(crate) fn synthetic_stub_should_yield_to_real_bytecode(
 /// classes whose SyntheticStub natives exist only for stub-phase bootstraps
 /// and must yield to loaded real bytecode.
 pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
-    crate::runtime::env_cache::real_bytecode_selector()
-        .prefers_real(class_name)
+    crate::runtime::env_cache::real_bytecode_selector().prefers_real(class_name)
         || matches!(
             class_name,
             "java/util/concurrent/locks/ReentrantLock"
@@ -25774,7 +25784,9 @@ fn populate_invoke_cache(
             .kind_of(declaring_name, &method_name, &descriptor)
             == Some(cratonvm_native_api::NativeKind::SyntheticStub)
             && real_protected_stub_class(declaring_name)
-            && store.get(declaring_id).is_some_and(|c| !c.is_synthetic_stub)
+            && store
+                .get(declaring_id)
+                .is_some_and(|c| !c.is_synthetic_stub)
             && !method.is_native()
             && method.code().is_some();
         if !stub_yields {
@@ -30371,16 +30383,13 @@ fn execute_jit_call(
     // chain calls into a 5+-arg JIT'd method on Windows and panics with
     // "index out of bounds: the len is 4 but the index is 4" at the
     // pop-into-`jit_args` loop below.
-    #[cfg(target_os = "windows")]
-    const JIT_ABI_REG_SLOTS: usize = 4;
-    #[cfg(not(target_os = "windows"))]
-    const JIT_ABI_REG_SLOTS: usize = 6;
+    const JIT_ABI_MAX_JAVA_ARGS: usize = 8;
     let np = num_params as usize; // Widening: parameter count conversion
-    let max_java_params = JIT_ABI_REG_SLOTS - if needs_heap { 1 } else { 0 };
+    let max_java_params = JIT_ABI_MAX_JAVA_ARGS - if needs_heap { 1 } else { 0 };
     if np > max_java_params {
         return Ok(CachedCallResult::CacheMiss);
     }
-    let mut jit_args = [0i64; JIT_ABI_REG_SLOTS];
+    let mut jit_args = [0i64; JIT_ABI_MAX_JAVA_ARGS];
     // The JIT calling convention expects raw primitive bits with no NaN-box
     // tag (Int → sign-extended i64, Long → raw i64, Float → zero-extended u32
     // bits, Double → raw f64 bits, Object → pointer). Decode each arg slot by
@@ -30402,8 +30411,8 @@ fn execute_jit_call(
     // Save the raw popped slots (bit-exact + long mark) so the i64::MIN deopt
     // arm below can restore them before the slow path re-pops the args. See
     // that arm for the underflow this prevents.
-    let mut saved_args: [(CompactValue, bool); JIT_ABI_REG_SLOTS] =
-        [(CompactValue::zero(), false); JIT_ABI_REG_SLOTS];
+    let mut saved_args: [(CompactValue, bool); JIT_ABI_MAX_JAVA_ARGS] =
+        [(CompactValue::zero(), false); JIT_ABI_MAX_JAVA_ARGS];
     for i in (0..np).rev() {
         let (cv, is_long) = thread.frames[frame_idx]
             .stack
@@ -30889,12 +30898,9 @@ fn execute_jit_call_decoded(
     cached: &Arc<CachedBytecodeMethod>,
     args_slice: &[Value],
 ) -> Result<Option<CachedCallResult>, MethodCallFailed> {
-    #[cfg(target_os = "windows")]
-    const JIT_ABI_REG_SLOTS: usize = 4;
-    #[cfg(not(target_os = "windows"))]
-    const JIT_ABI_REG_SLOTS: usize = 6;
+    const JIT_ABI_MAX_JAVA_ARGS: usize = 8;
     let np = num_params as usize; // Widening: parameter count conversion
-    let max_java_params = JIT_ABI_REG_SLOTS - if needs_heap { 1 } else { 0 };
+    let max_java_params = JIT_ABI_MAX_JAVA_ARGS - if needs_heap { 1 } else { 0 };
     // Too many args for the register-only JIT ABI, or a mismatch between the
     // decoded args and the declared count → interpreter fallback (Ok(None)).
     if np > max_java_params || args_slice.len() != np {
@@ -30903,7 +30909,7 @@ fn execute_jit_call_decoded(
     // Decode each Java arg to its raw JIT-ABI bit pattern (Int → sign-extended
     // i64, Long → raw i64, Float/Double → zero-/raw-bits, Object → pointer).
     // `args_slice` is already descriptor-decoded by the caller (receiver = arg 0).
-    let mut jit_args = [0i64; JIT_ABI_REG_SLOTS];
+    let mut jit_args = [0i64; JIT_ABI_MAX_JAVA_ARGS];
     for (i, v) in args_slice.iter().enumerate().take(np) {
         jit_args[i] = match v {
             Value::Int(x) => *x as i64, // Cast: JIT ABI -- i64 register convention
@@ -32088,12 +32094,7 @@ fn execute_invokevirtual_cached(
                     // Lambda proxy classes have no bytecode implementation of
                     // their functional-interface method. They must reach the
                     // slow path, which dispatches their SAM method handle.
-                    if !is_special
-                        && shared
-                            .lambda_proxies
-                            .read()
-                            .contains_key(&actual_class_id)
-                    {
+                    if !is_special && shared.lambda_proxies.read().contains_key(&actual_class_id) {
                         return Ok(CachedCallResult::CacheMiss);
                     }
                     // WP2.7 — AnnotationProxy methods (incl. Object.equals/hashCode/
@@ -32391,12 +32392,7 @@ fn execute_invokevirtual_cached(
                     }
                     // Lambda proxies require the slow `try_lambda_dispatch`
                     // route instead of a cached interface target.
-                    if !is_special
-                        && shared
-                            .lambda_proxies
-                            .read()
-                            .contains_key(&actual_class_id)
-                    {
+                    if !is_special && shared.lambda_proxies.read().contains_key(&actual_class_id) {
                         return Ok(CachedCallResult::CacheMiss);
                     }
                     // WP2.7 — same escape hatch as in the bytecode branch:

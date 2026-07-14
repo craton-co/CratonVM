@@ -6884,8 +6884,13 @@ fn analyze_bounds_elimination(
         let iv_start_nonneg = find_iv_nonneg_start(code, code_len, induction_var);
 
         // Step 4: Find safe array accesses (statically proven)
-        let loop_safe =
-            find_safe_array_accesses(&bounds, modified, &operands, bound_from_array, iv_start_nonneg);
+        let loop_safe = find_safe_array_accesses(
+            &bounds,
+            modified,
+            &operands,
+            bound_from_array,
+            iv_start_nonneg,
+        );
         safe_pcs.extend(&loop_safe);
 
         // Step 5: Speculative BCE — for counted loops with IV from 0..N step 1,
@@ -17102,9 +17107,9 @@ impl Compiler {
                     let null_patch = self.buf.pos();
                     self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
                     self.deopt_stubs.push((null_patch, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
-                    // Bounds guard: MOV R10D, [RAX + ARRAY_LENGTH_OFFSET];
-                    // CMP ECX, R10D; JAE deopt — unsigned, so a negative
-                    // index is caught as huge (same as emit_bounds_check).
+                                                                // Bounds guard: MOV R10D, [RAX + ARRAY_LENGTH_OFFSET];
+                                                                // CMP ECX, R10D; JAE deopt — unsigned, so a negative
+                                                                // index is caught as huge (same as emit_bounds_check).
                     self.buf
                         .emit(&[0x44, 0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // Cast: x86-64 register encoding
                     self.buf.emit(&[0x41, 0x3B, 0xCA]);
@@ -17112,7 +17117,7 @@ impl Compiler {
                     let bounds_patch = self.buf.pos();
                     self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
                     self.deopt_stubs.push((bounds_patch, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
-                    // Inline aaload: MOV RAX, [RAX + RCX*8 + HEADER_SIZE]
+                                                                  // Inline aaload: MOV RAX, [RAX + RCX*8 + HEADER_SIZE]
                     self.emit_ref_aload_regs();
                     // Store hoisted value in dedicated spill slot
                     self.emit_store_local(hoist_offset, RAX);
@@ -25083,7 +25088,8 @@ impl Compiler {
                         // atomically.  Keep the optimization available for
                         // focused validation, but require an explicit opt-in
                         // until its moving-GC contract is proved.
-                        let can_inline = std::env::var_os("CRATONVM_JIT_ENABLE_INLINE_NEW").is_some()
+                        let can_inline = std::env::var_os("CRATONVM_JIT_ENABLE_INLINE_NEW")
+                            .is_some()
                             && self.helpers.get_current_thread != 0
                             && self.helpers.tlab_post_init != 0
                             && self.helpers.new_object != 0
@@ -26275,8 +26281,7 @@ pub fn compile_with_param_slots(
     // the debug gate true to its documentation.)
     let simd_covered = |header: usize, arr_local: usize, bound_local: usize, iv_local: usize| {
         !no_bce
-            && ((find_bound_arraylength_provenance(code, code_len, bound_local)
-                == Some(arr_local)
+            && ((find_bound_arraylength_provenance(code, code_len, bound_local) == Some(arr_local)
                 && find_iv_nonneg_start(code, code_len, iv_local))
                 || speculative_bce_guards.iter().any(|g| {
                     g.loop_header == header
@@ -27333,6 +27338,75 @@ mod tests {
                 .windows(expected.len())
                 .any(|w| w == expected.as_slice()),
             "compiled prologue should contain MOV EAX, [RSP-4096]"
+        );
+    }
+
+    #[test]
+    fn compiled_entry_accepts_stack_passed_java_arguments() {
+        // `iload 4; ireturn`: on Windows the fifth no-context argument is
+        // stack-passed, while the fourth argument of a context method is
+        // stack-passed because the hidden context consumes RCX.
+        let fifth_arg = [0x15, 0x04, 0xac];
+        let no_context = compile(
+            &fifth_arg,
+            fifth_arg.len(),
+            5,
+            5,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+        .expect("five-argument method should compile");
+        // SAFETY: `no_context` was compiled from the valid method above.
+        assert_eq!(unsafe { no_context.try_call(&[1, 2, 3, 4, 55]) }, Ok(55));
+
+        let fourth_arg = [0x1d, 0xac];
+        let with_context = compile(
+            &fourth_arg,
+            fourth_arg.len(),
+            4,
+            4,
+            true,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+        .expect("four-argument context method should compile");
+        // SAFETY: `with_context` was compiled from the valid method above.
+        assert_eq!(
+            unsafe { with_context.try_call_with_context(0, &[1, 2, 3, 44]) },
+            Ok(44)
         );
     }
 
@@ -32600,13 +32674,23 @@ mod tests {
 
         // All three accesses end up elided (a statically, b/out behind guards)...
         for pc in [18usize, 22, 24] {
-            assert!(safe_pcs.contains(&pc), "access at pc={pc} elided, got {safe_pcs:?}");
+            assert!(
+                safe_pcs.contains(&pc),
+                "access at pc={pc} elided, got {safe_pcs:?}"
+            );
         }
         // ...but `b` (local 1) and `out` (local 2) each need their own guard,
         // and `a` (local 0) — statically proven — must have none.
         let mut guarded: Vec<(usize, usize, usize, Vec<usize>)> = guards
             .iter()
-            .map(|g| (g.array_local, g.bound_local, g.iv_local, g.covered_pcs.clone()))
+            .map(|g| {
+                (
+                    g.array_local,
+                    g.bound_local,
+                    g.iv_local,
+                    g.covered_pcs.clone(),
+                )
+            })
             .collect();
         guarded.sort();
         assert_eq!(
@@ -32641,7 +32725,10 @@ mod tests {
         assert_eq!(find_bound_arraylength_provenance(&code, code_len, 2), None);
 
         let (safe_pcs, guards) = analyze_bounds_elimination(&code, code_len, &loops);
-        assert!(safe_pcs.contains(&7), "elided behind a guard, got {safe_pcs:?}");
+        assert!(
+            safe_pcs.contains(&7),
+            "elided behind a guard, got {safe_pcs:?}"
+        );
         assert_eq!(guards.len(), 1, "exactly one speculative guard");
         assert_eq!(
             (
@@ -32684,7 +32771,10 @@ mod tests {
         let loops = detect_loops(&code, code_len);
         assert_eq!(loops[0], (6, 18));
 
-        assert_eq!(find_bound_arraylength_provenance(&code, code_len, 1), Some(0));
+        assert_eq!(
+            find_bound_arraylength_provenance(&code, code_len, 1),
+            Some(0)
+        );
         assert!(
             !find_iv_nonneg_start(&code, code_len, 2),
             "bipush -5 start must not prove a non-negative IV"
@@ -32711,7 +32801,10 @@ mod tests {
             0x1b, 0x04, 0x60, 0x3c, // n = n + 1
             0xb1,
         ];
-        assert_eq!(find_bound_arraylength_provenance(&code, code.len(), 1), None);
+        assert_eq!(
+            find_bound_arraylength_provenance(&code, code.len(), 1),
+            None
+        );
     }
 
     #[test]
