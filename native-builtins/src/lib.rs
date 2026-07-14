@@ -54414,6 +54414,37 @@ fn native_matcher_group_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value])
             )
         }
     };
+    // The comment above ("groups[] would still be all -1") only holds for
+    // callers that reach `groups[]` via THIS fast path's own `find()`/
+    // `find(int)` (which does bail early for non-String text — see
+    // `matcher_realjdk_cached`). `Matcher.matches()`/`lookingAt()` are NOT
+    // natively intercepted at all, so they run as real interpreted bytecode
+    // against ANY `CharSequence` (correctly — that's all the `CharSequence`
+    // contract promises) and populate `groups[]` just fine. A subsequent
+    // `matcher.group(int)` call then DOES reach here with valid `start`/`end`
+    // even though `text` is a non-String `CharSequence` (e.g. Spring's
+    // `AntPathMatcher$AntPathStringMatcher$MaxAttemptsCharSequence`, which
+    // implements only `subSequence`/`charAt`/`length`/`isEmpty` — no
+    // `substring`). Calling `.substring(int,int)` unconditionally then threw
+    // a spurious `NoSuchMethodError` instead of returning the matched text.
+    // Real JDK's `Matcher.group(int)` never calls `.substring()` either — it
+    // calls `getSubSequence(start,end).toString()`, `subSequence` being the
+    // one method every `CharSequence` actually guarantees. Keep the fast,
+    // allocation-light `substring` shortcut for genuine `String` text (the
+    // overwhelming common case) and bail to real bytecode for anything else,
+    // instead of assuming the receiver has a `substring` method it never
+    // promised to have.
+    let text_cid = ctx.class_id_of_object(text_obj);
+    let text_cname = ctx.class_name_of_id(text_cid);
+    if text_cname.as_deref() != Some("java/lang/String") {
+        return matcher_realjdk_bail(
+            ctx,
+            this,
+            "group",
+            "(I)Ljava/lang/String;",
+            &[Value::Int(group)],
+        );
+    }
     ctx.invoke_virtual(
         text_obj,
         "substring",
