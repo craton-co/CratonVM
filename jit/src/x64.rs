@@ -25494,6 +25494,7 @@ impl Compiler {
                             // the `new_info` doc in `jit/src/lib.rs`),
                             // so the conservative default `(true,true)`
                             // keeps the helper call in place for now.
+                            let skip_helper = !has_prim_init && !has_finalizer;
                             self.emit_inline_tlab_new(class_id_raw, num_fields, skip_helper);
                         } else {
                             // Slow path: full helper-call dispatch. Used when
