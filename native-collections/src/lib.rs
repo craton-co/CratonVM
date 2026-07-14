@@ -3437,12 +3437,23 @@ fn native_al_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let size = size as usize;
     let mut hash: i32 = 1;
     if let Some(d) = data {
+        // GC-safety: `element_hash_code` can invoke an element's real
+        // `hashCode()` (Java bytecode), which can trigger a moving GC. The
+        // backing array `d` is read again on every loop iteration; pin it
+        // once up front and re-read from the pin before each use. Confirmed
+        // live via CRATONVM_DBG_STALE_OBJREF during WildFly
+        // parallel-extension-add (same "Family 1" pattern as
+        // native_hashmap_get_exact's `map_keys_equal` fix -- see
+        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md).
+        let d_pin = ctx.pin_native_root(d);
         for i in 0..size {
-            let val = ctx.get_array_element(d, i);
+            let d_cur = ctx.read_native_pin(d_pin, d);
+            let val = ctx.get_array_element(d_cur, i);
             // List.hashCode contract: 31*acc + e.hashCode() (0 for null).
             let elem_hash = element_hash_code(ctx, &val);
             hash = hash.wrapping_mul(31).wrapping_add(elem_hash);
         }
+        ctx.unpin_native_roots(d_pin);
     }
     Ok(Some(Value::Int(hash)))
 }
@@ -5521,6 +5532,21 @@ fn native_map_put_evict_pinned(
         node_val = next;
     }
 
+    // GC-safety: the chain-walk loop above can call `map_keys_equal`
+    // (arbitrary Java `equals()`) an arbitrary number of times, each a
+    // moving-GC risk. The loop already refreshes `node`/`node_key`/
+    // `tail_node` after each such call, but NOT the enclosing `this` --
+    // confirmed live via CRATONVM_DBG_STALE_OBJREF during WildFly
+    // parallel-extension-add (`set_field` inside `set_map_size`, reached
+    // from here, panicked on a stale `this` even after `this` was
+    // "refreshed" from a `this_pin` seeded below with an already-stale
+    // value). `put_pin_base` is the caller-provided pin for `this` and
+    // stays valid for this whole function's lifetime, so re-read through
+    // it here -- before it is used to seed the new `this_pin` below -- to
+    // guarantee `this` is current regardless of how many GCs the walk
+    // triggered. See docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    this = ctx.read_native_pin(put_pin_base, this);
+
     // Key not found — append at the TAIL of the chain. This matches HotSpot
     // HashMap.putVal (JDK 8+), which links the new node after the last bin
     // entry rather than prepending it. Tail-append makes within-bucket
@@ -5572,6 +5598,15 @@ fn native_map_put_evict_pinned(
         // Empty bucket: the new node becomes the chain head.
         None => ctx.set_array_element(buckets, idx, Value::Object(Some(new_node))),
     }
+    // GC-safety: the reference-typed `set_field`/`set_array_element` writes
+    // just above can each trigger a write-barrier remembered-set allocation
+    // (and therefore a moving young GC) when linking a young `new_node` into
+    // an old-generation chain/bucket array -- confirmed live via
+    // CRATONVM_DBG_STALE_OBJREF (`this` read stale inside `set_map_size`,
+    // reached from `resync_view_set`'s per-key `native_map_put` loop during
+    // WildFly parallel-extension-add). Re-read `this` from its pin
+    // immediately before this last use.
+    let this = ctx.read_native_pin(this_pin, this);
     set_map_size(ctx, this, size + 1);
     ctx.unpin_native_roots(this_pin);
 
@@ -5607,16 +5642,50 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     }
     let this = materialize_hm_int_fast(ctx, this)?;
 
-    let (key_ref, hash, is_null_key) = match key_val {
-        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k)?, false),
-        Value::Object(None) => (None, 0, true),
-        _ => return Ok(Some(Value::Object(None))),
+    // GC-safety: `map_hash_key`/`map_keys_equal` dispatch arbitrary Java code
+    // (hashCode()/equals()), which can trigger a moving GC. Pin the raw
+    // receiver/key up front and re-read them after every such call, matching
+    // `native_map_put_evict_pinned`'s established pattern. Caught live via
+    // CRATONVM_DBG_STALE_OBJREF during WildFly parallel-extension-add: the
+    // bucket-chain `node` local (and the search key reused across every
+    // comparison) were captured before `map_keys_equal`'s `equals()`
+    // dispatch and then reused afterward unpinned, both in the eventual
+    // `get_node_value(ctx, node)` match branch and in this loop's
+    // `ctx.get_field(node, NODE_FIELD_NEXT)` tail — reached from real
+    // ConcurrentHashMap.computeIfPresent (whose segment storage walks this
+    // same plain-HashMap bucket code) via
+    // native_chm_compute_if_present -> native_map_compute_if_present ->
+    // native_map_get -> native_hashmap_get_exact. See
+    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key_val);
+    let key_for_hash = read_pinned_elem(ctx, key_pin, key_val);
+    let (hash, is_null_key) = match key_for_hash {
+        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false),
+        Value::Object(None) => (0, true),
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(Value::Object(None)));
+        }
+    };
+    let this = ctx.read_native_pin(this_pin, this);
+    let key_val = read_pinned_elem(ctx, key_pin, key_val);
+    let key_ref = match key_val {
+        Value::Object(Some(k)) => Some(k),
+        Value::Object(None) if is_null_key => None,
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(Value::Object(None)));
+        }
     };
 
     let (buckets, _, cap) = map_state(ctx, this);
     let buckets = match buckets {
         Some(b) => b,
-        None => return Ok(Some(Value::Object(None))),
+        None => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(Value::Object(None)));
+        }
     };
 
     let idx = map_bucket_index(hash, cap);
@@ -5631,13 +5700,14 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // call forever with no way to recover or diagnose.
     const CHAIN_WALK_LIMIT: usize = 4096;
     let mut walk_count: usize = 0;
-    while let Value::Object(Some(node)) = node_val {
+    while let Value::Object(Some(mut node)) = node_val {
         walk_count += 1;
         if walk_count > CHAIN_WALK_LIMIT {
             eprintln!(
                 "[HM-GET-GUARD] aborting chain walk at {} nodes (suspected cycle); map={:?} idx={} cap={}",
                 walk_count, this, idx, cap
             );
+            ctx.unpin_native_roots(this_pin);
             return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                 message: "hashmap chain exceeded safety cap; possible corruption".to_string(),
             }
@@ -5647,11 +5717,29 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         if is_null_key {
             if matches!(node_key_field, Value::Object(None)) {
                 let value = get_node_value(ctx, node);
+                ctx.unpin_native_roots(this_pin);
                 return Ok(Some(value));
             }
         } else if let Value::Object(Some(node_key)) = node_key_field {
-            if map_keys_equal(ctx, node_key, key_ref.unwrap())? {
+            // `map_keys_equal` invokes the key's real `equals(Object)` (Java
+            // bytecode), which can trigger a moving GC -- refresh both
+            // `node` and the search key from their pins before any further
+            // use, and again immediately after the call before dereferencing
+            // `node` again.
+            let node_pin = ctx.pin_native_root(node);
+            let node_key_pin = ctx.pin_native_root(node_key);
+            let node_key = ctx.read_native_pin(node_key_pin, node_key);
+            let key_cur = match read_pinned_elem(ctx, key_pin, key_val) {
+                Value::Object(Some(k)) => k,
+                _ => key_ref.unwrap(),
+            };
+            let eq = map_keys_equal(ctx, node_key, key_cur)?;
+            node = ctx.read_native_pin(node_pin, node);
+            ctx.unpin_native_roots(node_key_pin);
+            ctx.unpin_native_roots(node_pin);
+            if eq {
                 let value = get_node_value(ctx, node);
+                ctx.unpin_native_roots(this_pin);
                 return Ok(Some(value));
             }
         }
@@ -5661,6 +5749,10 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // Diagnostic: enum-keyed HashMap miss — prime suspect for Keycloak's
     // `Profile.isFeatureEnabled` NPE. Dump every node's enum identity.
     if dbg_kcbool() {
+        let key_ref = match read_pinned_elem(ctx, key_pin, key_val) {
+            Value::Object(Some(k)) => Some(k),
+            _ => key_ref,
+        };
         if let Some(k) = key_ref {
             if enum_key_identity(ctx, k).is_some() {
                 let mut node_keys: Vec<ObjectRef> = Vec::new();
@@ -5683,6 +5775,7 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         }
     }
 
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(None)))
 }
 
@@ -5871,20 +5964,45 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     }
 
+    // GC-safety: same "Family 1" stale-ObjectRef pattern fixed in
+    // `native_hashmap_get_exact` (see its comment for the live
+    // CRATONVM_DBG_STALE_OBJREF capture this mirrors) -- `map_hash_key`/
+    // `map_keys_equal` dispatch arbitrary Java code (hashCode()/equals()),
+    // which can trigger a moving GC. Pin `this` and the search key up front
+    // and re-read them (plus the bucket-chain `node`) after every such call.
+    let this_pin = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key_val);
     this = materialize_hm_int_fast(ctx, this)?;
+    let this = ctx.read_native_pin(this_pin, this);
     let key_val = read_pinned_elem(ctx, key_pin, key_val);
 
-    let (key_ref, hash, is_null_key) = match key_val {
-        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k)?, false),
-        Value::Object(None) => (None, 0, true),
-        _ => return Ok(Some(Value::Int(0))),
+    let key_for_hash = key_val;
+    let (hash, is_null_key) = match key_for_hash {
+        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false),
+        Value::Object(None) => (0, true),
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(Value::Int(0)));
+        }
+    };
+    let this = ctx.read_native_pin(this_pin, this);
+    let key_val = read_pinned_elem(ctx, key_pin, key_val);
+    let key_ref = match key_val {
+        Value::Object(Some(k)) => Some(k),
+        Value::Object(None) if is_null_key => None,
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(Value::Int(0)));
+        }
     };
 
     let (buckets, _, cap) = map_state(ctx, this);
     let buckets = match buckets {
         Some(b) => b,
-        None => return Ok(Some(Value::Int(0))),
+        None => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(Value::Int(0)));
+        }
     };
 
     let idx = map_bucket_index(hash, cap);
@@ -5893,13 +6011,14 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // Chain-walk cycle guard: mirrors native_map_put's CHAIN_WALK_LIMIT.
     const CHAIN_WALK_LIMIT: usize = 4096;
     let mut walk_count: usize = 0;
-    while let Value::Object(Some(node)) = node_val {
+    while let Value::Object(Some(mut node)) = node_val {
         walk_count += 1;
         if walk_count > CHAIN_WALK_LIMIT {
             eprintln!(
                 "[HM-CONTAINSKEY-GUARD] aborting chain walk at {} nodes (suspected cycle); map={:?} idx={} cap={}",
                 walk_count, this, idx, cap
             );
+            ctx.unpin_native_roots(this_pin);
             return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                 message: "hashmap chain exceeded safety cap; possible corruption".to_string(),
             }
@@ -5908,17 +6027,33 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         let node_key_field = get_node_key(ctx, node);
         if is_null_key {
             if matches!(node_key_field, Value::Object(None)) {
+                ctx.unpin_native_roots(this_pin);
                 return Ok(Some(Value::Int(1)));
             }
         } else if let Value::Object(Some(node_key)) = node_key_field {
-            if map_keys_equal(ctx, node_key, key_ref.unwrap())? {
+            // `map_keys_equal` invokes the key's real `equals(Object)` (Java
+            // bytecode), which can trigger a moving GC -- refresh `node` and
+            // the search key from their pins before and after the call.
+            let node_pin = ctx.pin_native_root(node);
+            let node_key_pin = ctx.pin_native_root(node_key);
+            let node_key = ctx.read_native_pin(node_key_pin, node_key);
+            let key_cur = match read_pinned_elem(ctx, key_pin, key_val) {
+                Value::Object(Some(k)) => k,
+                _ => key_ref.unwrap(),
+            };
+            let eq = map_keys_equal(ctx, node_key, key_cur)?;
+            node = ctx.read_native_pin(node_pin, node);
+            ctx.unpin_native_roots(node_key_pin);
+            ctx.unpin_native_roots(node_pin);
+            if eq {
+                ctx.unpin_native_roots(this_pin);
                 return Ok(Some(Value::Int(1)));
             }
         }
         node_val = ctx.get_field(node, NODE_FIELD_NEXT);
     }
 
-    ctx.unpin_native_roots(key_pin);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(0)))
 }
 
@@ -22781,10 +22916,18 @@ fn lhm_init_with_cap(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) {
     // so that the GC-stable key is established at init time — see
     // `identity_hash::seed`.
     ih_seed(ctx, this);
+    // GC-safety: `alloc_bucket_table` below allocates the bucket array and
+    // can trigger a moving GC; `this` is reused across every `lhm_set` call
+    // that follows, unpinned otherwise. Confirmed live via
+    // CRATONVM_DBG_STALE_OBJREF during WildFly parallel-extension-add (same
+    // "Family 1" pattern as native_hashmap_get_exact's fix -- see
+    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md).
+    let this_pin = ctx.pin_native_root(this);
     // Cap the eager bucket-table allocation to what the heap can hold (see
     // `alloc_bucket_table`); `cap` is rebound to the actual table length so
     // `__capacity`/`threshold` stay consistent and the map grows on demand.
     let (buckets, cap) = alloc_bucket_table(ctx, cap);
+    let this = ctx.read_native_pin(this_pin, this);
     lhm_set(
         ctx,
         this,
@@ -22814,6 +22957,7 @@ fn lhm_init_with_cap(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) {
     // values when the HashMap.clone bytecode walks them.
     try_set_jdk_map_field(ctx, this, "loadFactor", Value::Float(0.75_f32));
     try_set_jdk_map_field(ctx, this, "threshold", Value::Int((cap as i32 * 3) / 4));
+    ctx.unpin_native_roots(this_pin);
 }
 
 fn native_lhm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
