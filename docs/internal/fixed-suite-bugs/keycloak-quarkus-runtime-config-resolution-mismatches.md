@@ -1,8 +1,12 @@
 # quarkus/runtime: SmallRye/Quarkus Config resolution mismatches — wrong values, missing property names, host-environment leakage
 
-Status: FIXED (3 of 4 original symptoms) as of dev commit `10a561f21` ("fix keycloak quarkus config resolution",
-2026-07-13). One narrower residual remains OPEN — see "Residual" section below — tracked inline here rather than
-in a separate known-issues doc because it is a direct descendant of item 4 below, not a new symptom.
+Status: FIXED (4 of 4 original symptoms, including the item-4 residual below). Items 1-3 fixed as of dev commit
+`10a561f21` ("fix keycloak quarkus config resolution", 2026-07-13). The item-4 residual (intermittent
+`ConfigurationTest::testDatabaseProperties` `ClassCastException`, see "Residual" section below, now retitled
+"Residual — CLOSED") stopped reproducing sometime between the 2026-07-13 second investigation pass (dev commit
+`10a561f21`) and dev commit `edca766e5` (2026-07-13, same day) — see the 2026-07-13 third investigation pass at the
+bottom of the Residual section for full evidence. No source fix was needed/landed in the third pass itself; this
+update is a re-verification + doc closure only.
 
 Date observed: 2026-07-11 (refresh rerun against non-passed-before classes, branch fix/keycloak-nonpassed-rerun-v2-20260710)
 
@@ -50,7 +54,11 @@ Results (`.suite\results\verify-quarkus-config-20260713\all-jit\`):
 Items 1, 2, and 3 are confirmed FIXED. Item 4 is narrowed and downgraded from "value doesn't resolve" to a
 narrower, intermittent residual described below.
 
-## Residual (OPEN): `ConfigurationTest::testDatabaseProperties` intermittent `ClassCastException`
+## Residual — CLOSED (no longer reproduces as of dev `edca766e5`): `ConfigurationTest::testDatabaseProperties` intermittent `ClassCastException`
+
+**2026-07-13, third investigation pass — see bottom of this section for the closure evidence.** The
+history below (both the original report and the "second investigation pass") is preserved as-is for context; skip to
+"Update 2026-07-13, third investigation pass" at the end of this section for the current status.
 
 **Symptom**: `java.lang.ClassCastException: java.lang.Object cannot be cast to java.lang.String` thrown from
 `io.smallrye.config.SmallRyeConfig$ConfigSources$PropertyNames.latest(SmallRyeConfig.java:1163)` — a `checkcast
@@ -128,6 +136,72 @@ unresolved**:
    assumed to need all ~72 prior `ConfigurationTest` methods; never confirmed that's actually necessary — a
    standalone repro replaying just the CLI-args/system-property setup without the other 72 tests did NOT
    reproduce, but a partial replay of, say, 10-20 specific prior tests was never tried).
+
+**Update 2026-07-13, third investigation pass — bug no longer reproduces; CLOSING as fixed by dev drift, no source
+change from this pass**:
+
+Worktree `C:\data\CratonVM-configtest-race-canary-20260713`, branch `fix/configtest-race-canary-20260713`, branched
+from `origin/dev` at commit `edca766e5` ("Merge branch 'fix/picocli-relocate-interceptor-jit-carveout-20260713' into
+dev"). `apps/keycloak` is gitignored and not present in a fresh worktree; ran via
+`-KeycloakRoot C:\craton\CratonVM\apps\keycloak` (the main checkout's copy) since building a fresh one was
+unnecessary for this investigation — noted as a possible (low-probability, see below) confound since it means test
+classes loaded off a different physical directory than in the original investigation.
+
+1. **Prepared, but never needed, the not-yet-tried canary from item 4 above** (a `class_id_of_object`-based
+   pin/read mismatch check local to `native_stream_filter`/`native_stream_map`/`native_stream_flat_map` in
+   `native-collections/src/lib.rs` — kept local to each call rather than threaded through the shared
+   `native_pin_roots` vector itself, to avoid false positives from the ~100 call sites elsewhere that push/truncate
+   that vector directly without going through `pin_native_root`/`unpin_native_roots`). Never merged — see below for
+   why.
+2. **Before running the canary, re-confirmed the baseline still fails at the previously-established rate — it did
+   not.** A clean release build of unmodified `dev` HEAD (`edca766e5`, binary preserved as
+   `target/release/cratonvm-baseline.exe`) ran `ConfigurationTest` alone 8 times back-to-back
+   (`-Vm craton -Jit on -TimeoutSec 180 -Parallel 1`, run names `baseline-confirm-run{1..8}-20260713`): **8/8 PASS**,
+   0 failures, 0 `ClassCastException` in any `.out`/`.err` log. This already contradicts the ~80%-fail/~20%-pass
+   baseline established in the second investigation pass (dev `10a561f21`) enough to warrant checking `git log`
+   before assuming the environment was just lucky (see `reference_check_recent_commits_before_fresh_investigation`
+   in the shared memory index) — 156 commits landed on `dev` between `10a561f21` and `edca766e5`.
+3. **Found two commits directly touching the exact suspect code** (`native-collections/src/lib.rs` stream/collector
+   pinning), landed the SAME DAY as the second investigation pass but evidently after it: `903a38fc1`
+   ("pin-stream-collector-before-materialization", fixes a stale-collector-across-GC bug in
+   `native_stream_collect`) and `3eb4b6a68` ("fix(streams): pin set elements during collection", fixes an
+   unpinned-elements-during-`make_set_of` bug) — both real fixes for unrelated Hibernate/annotation-processing
+   `Collectors.toSet()` corruption, not written with this Keycloak bug in mind, but touching the same
+   pin/read-through-handle machinery this doc's second pass was auditing.
+4. **Isolation test: surgically reverted just those two commits** (`git revert --no-commit 3eb4b6a68 903a38fc1`,
+   clean auto-merge, everything else left at `edca766e5` HEAD) and rebuilt (binary preserved as
+   `target/release/cratonvm-prefix-revert.exe`). Ran the same 8-rep protocol
+   (`prefixrevert-run{1..8}-20260713`): **also 8/8 PASS**, 0 failures, 0 `ClassCastException`. This refutes the
+   hypothesis that those two specific commits are what fixed (or incidentally masked) the race — reverting them
+   made no observable difference. **16/16 total PASS across both binary variants** — at the previously-established
+   ~20% pass rate, 16/16 has probability roughly (0.2)^16 ≈ 6.5e-12 by chance, so this is not sampling noise; the
+   race genuinely does not reproduce under this build/environment any more, for a reason other than those two
+   commits (most plausibly some other change among the 156 intervening commits — several touch GC/root-scanning
+   correctness in this window, e.g. `945e44920` "bracket 5 missing GC-blocking-region locks", `acbea991e`
+   "propagate collection overlays from live owners", `ccd51c3a3` "stop class_mirrors from unconditionally rooting" —
+   none specifically investigated further since the bug is gone either way).
+5. **Sibling classes reverified with the unmodified HEAD binary**: `DatasourcesConfigurationTest` (PASS, 34.5s, 33
+   tests), `TracingConfigurationTest` (PASS, 7.9s, 13 tests), `IgnoredArtifactsTest` (PASS, 7.2s, 15 tests) — run
+   `sibling-verify-20260713`. No regression.
+6. **Caveat / residual uncertainty**: this session ran with `-KeycloakRoot` pointing at a different worktree's
+   `apps/keycloak` copy (cross-directory classpath/jar I/O) rather than a local copy, and per-run wall time was
+   noisier than the original investigation's (65s-155s vs. a steady ~84s) — plausibly first-run disk-cache warmup,
+   since times settled to 65-95s by run 3 onward with no correlated pass/fail difference. Given the established
+   "any added overhead masks this race" pattern from the second pass, a systematically slower environment is the
+   one thing that could produce a false "fixed" reading here. However, 16/16 clean passes across two different
+   binaries, with per-run times spanning a 2x range and no failures at either extreme, makes "still racy but masked
+   by this session's environment" a much weaker explanation than "genuinely no longer reproduces." If it resurfaces,
+   the prepared canary (design in this update, not committed — recreate from this description: per-call
+   `Vec<Option<ClassId>>` recorded via `class_id_of_object` right after `pin_value_slice`, compared via
+   `class_id_of_object` right after each `read_pinned_elem`, atomic-gated single-shot `eprintln!` on mismatch) is
+   the next concrete step, along with the never-tried prior-test bisection from item 4 of the second pass.
+7. **No source or config change from this pass landed on `dev`** — this update is documentation-only, reflecting a
+   fix that arrived incidentally via unrelated commits (or via some other unidentified change) between the second
+   and third investigation passes.
+8. Evidence: `C:\data\CratonVM-configtest-race-canary-20260713\apps\keycloak-suite-runner\.suite\results\{baseline-confirm-run1..8,prefixrevert-run1..8,sibling-verify}-20260713\all-jit\` (`results.tsv` + `logs/`), same worktree,
+   branch `fix/configtest-race-canary-20260713`, HEAD `edca766e5` (unreverted) / isolation-test binary built from
+   HEAD with `3eb4b6a68`+`903a38fc1` reverted (not committed, build-only revert, `git revert --abort` afterward to
+   restore a clean tree).
 
 ## 2026-07-13 update correction: the PicocliTest hang is a SEPARATE, unrelated bug — do NOT treat as shared root cause
 
