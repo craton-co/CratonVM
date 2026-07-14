@@ -25459,18 +25459,17 @@ impl Compiler {
                         // is smaller, so a legacy fit implies a compact fit.
                         // `emit_inline_tlab_new` computes the real compact size +
                         // writes array_length/GC_FLAG_COMPACT inline.
-                        // The pure inline path publishes a complete canonical
-                        // header before advancing the TLAB cursor and cannot
-                        // call into GC. Enable that safe subset by default.
-                        // Body clearing makes int-family typed zeroes safe in
-                        // the pure inline path. Sites requiring non-zero Value
-                        // tags (long/float/double) or finalizer registration
-                        // retain the helper path unless explicitly opted in.
-                        let skip_helper = !has_prim_init && !has_finalizer;
-                        let can_inline = std::env::var_os("CRATONVM_JIT_DISABLE_INLINE_NEW")
-                            .is_none()
-                            && (skip_helper
-                                || std::env::var_os("CRATONVM_JIT_ENABLE_INLINE_NEW").is_some())
+                        // Inline TLAB allocation is not yet safe with the
+                        // precise moving young collector: under Hibernate's
+                        // repeated SessionFactory bootstrap it can leave the
+                        // heap walker at an invalid object boundary
+                        // (kind=Object with array payload metadata), whereas
+                        // the helper path initializes the canonical header
+                        // atomically.  Keep the optimization available for
+                        // focused validation, but require an explicit opt-in
+                        // until its moving-GC contract is proved.
+                        let can_inline = std::env::var_os("CRATONVM_JIT_ENABLE_INLINE_NEW")
+                            .is_some()
                             && self.helpers.get_current_thread != 0
                             && self.helpers.tlab_post_init != 0
                             && self.helpers.new_object != 0
@@ -27784,6 +27783,75 @@ mod tests {
                 .windows(expected.len())
                 .any(|w| w == expected.as_slice()),
             "compiled prologue should contain MOV EAX, [RSP-4096]"
+        );
+    }
+
+    #[test]
+    fn compiled_entry_accepts_stack_passed_java_arguments() {
+        // `iload 4; ireturn`: on Windows the fifth no-context argument is
+        // stack-passed, while the fourth argument of a context method is
+        // stack-passed because the hidden context consumes RCX.
+        let fifth_arg = [0x15, 0x04, 0xac];
+        let no_context = compile(
+            &fifth_arg,
+            fifth_arg.len(),
+            5,
+            5,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+        .expect("five-argument method should compile");
+        // SAFETY: `no_context` was compiled from the valid method above.
+        assert_eq!(unsafe { no_context.try_call(&[1, 2, 3, 4, 55]) }, Ok(55));
+
+        let fourth_arg = [0x1d, 0xac];
+        let with_context = compile(
+            &fourth_arg,
+            fourth_arg.len(),
+            4,
+            4,
+            true,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+        .expect("four-argument context method should compile");
+        // SAFETY: `with_context` was compiled from the valid method above.
+        assert_eq!(
+            unsafe { with_context.try_call_with_context(0, &[1, 2, 3, 44]) },
+            Ok(44)
         );
     }
 

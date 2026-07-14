@@ -1131,6 +1131,14 @@ pub trait NativeContext {
         self.create_string(text)
     }
 
+    /// Create a dynamic String at a native-call safepoint when the caller has
+    /// no unpinned Java references.  The VM implementation may collect before
+    /// allocating; the default keeps mock contexts and legacy implementations
+    /// on the ordinary uninterned path.
+    fn create_string_uninterned_gc_safe(&mut self, text: &str) -> ObjectRef {
+        self.create_string_uninterned(text)
+    }
+
     /// Populate an *already-allocated* `java/lang/String` object's backing
     /// fields directly from raw UTF-16 code `units`, using the same
     /// Latin1-fits-in-a-byte bulk scan + little-endian compact-string layout
