@@ -4,6 +4,18 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-14 Stream/ArrayList heap corruption under extreme small-heap GC pressure — found by accident, NOT root-caused
+
+Found while verifying dev commit `671c8df3` (Stream/Comparator `ObjectRef` pin fix). A 24-thread
+stress repro (`ArrayList<P>` build + `stream().map().flatMap().collect(toUnmodifiableList())` +
+`stream().map().filter().findFirst()`, 3000 iterations/thread) under `-Xmx32m` segfaults on the
+unfixed binary (GC header-corruption warnings, `CRATONVM_DBG_STALE_OBJREF` did not cleanly fire) and,
+even with `671c8df3`'s fix applied, occasionally returns a silently-wrong (too-short) collected list
+instead of crashing. Both binaries pass clean at `-Xmx512m` — heap-pressure/GC-timing dependent, not a
+deterministic logic bug, and **not** something `671c8df3` was expected to fix. See
+[`stream-arraylist-gc-pressure-heap-corruption.md`](stream-arraylist-gc-pressure-heap-corruption.md)
+for the full repro, symptoms, and suggested next steps. Not yet root-caused or fixed.
+
 ## 2026-07-14 (cont'd) String.getBytes() + Locale bootstrap regressions FIXED; new HttpExchange URI bug found
 
 - FIXED (moved to `docs/internal/`): [`string-getbytes-empty-real-jdk-mode-FIXED.md`](../internal/string-getbytes-empty-real-jdk-mode-FIXED.md) -- same failure class as the `java.util.Properties` fix (`f62d2073`): `register_real_charset_natives` (`native-builtins/src/charset.rs`) never set its own registry category, so its real-JDK-mode call sites inherited the default `SyntheticStub` and got silently dropped by `d8092acb`'s hardening. Fixed by wrapping the whole function body in `with_category(Bridge, ...)`. This was also the true root cause of the `com.sun.net.httpserver.HttpServer` "always empty body" symptom noted in the URLClassLoader fix above.
