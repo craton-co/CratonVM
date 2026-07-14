@@ -3024,8 +3024,14 @@ fn synthetic_class_mirror(ctx: &mut dyn NativeContext, name: &str) -> cratonvm_t
         }
     };
     let mirror = ctx.alloc_object(class_class_id, num_fields);
-    ctx.set_field(mirror, 0, Value::Object(None));
+    // GC-safety: `create_string` below can trigger a collection that
+    // relocates `mirror`; pin it and re-read the forwarded reference before
+    // the `set_field` calls that populate it (mirrors `create_field_object`).
+    let mirror_pin = ctx.pin_native_root(mirror);
     let name_str = ctx.create_string(name);
+    let mirror = ctx.read_native_pin(mirror_pin, mirror);
+    ctx.unpin_native_roots(mirror_pin);
+    ctx.set_field(mirror, 0, Value::Object(None));
     ctx.set_field(mirror, 1, Value::Object(Some(name_str)));
     ctx.set_field(mirror, 12, Value::Int(0)); // classRedefinedCount
     mirror
@@ -3479,7 +3485,13 @@ pub(crate) fn illegal_arg_exc_null_to_primitive(
         Ok(Some(Value::Object(Some(obj)))) => obj,
         _ => return illegal_arg_exc(msg),
     };
+    // GC-safety: `create_string` below can trigger a collection that
+    // relocates `npe`; pin it and re-read the forwarded reference before it
+    // is embedded as the IAE's cause.
+    let npe_pin = ctx.pin_native_root(npe);
     let msg_obj = ctx.create_string(&msg);
+    let npe = ctx.read_native_pin(npe_pin, npe);
+    ctx.unpin_native_roots(npe_pin);
     match ctx.new_object_initialized(
         "java/lang/IllegalArgumentException",
         "(Ljava/lang/String;Ljava/lang/Throwable;)V",
@@ -3545,17 +3557,30 @@ pub(crate) fn wrap_as_invocation_target_exception(
     // list does not model JDK 7+ `InvocationTargetException(Throwable)`.
     let target_class = "java/lang/reflect/InvocationTargetException";
     if ctx.is_class_synthetic_stub(target_class) {
+        // GC-safety: `new_object` can trigger a collection that relocates
+        // `original` (materialized well before this point); pin it before
+        // allocating `wrapper`.
+        let original_pin = ctx.pin_native_root(original);
         let new_result = ctx.new_object(target_class);
+        let original = ctx.read_native_pin(original_pin, original);
         let wrapper = match new_result {
             Ok(Some(Value::Object(Some(obj)))) => obj,
             _ => return MethodCallFailed::ExceptionThrown(original),
         };
+        // `invoke_special` runs a real Java `<init>` body, which can itself
+        // allocate; pin `wrapper` too (the earlier `original_pin` handle
+        // still covers it once released together below) and re-read both
+        // forwarded references before their next use.
+        let wrapper_pin = ctx.pin_native_root(wrapper);
         let _ = ctx.invoke_special(
             "java/lang/ReflectiveOperationException",
             "<init>",
             "()V",
             &[Value::Object(Some(wrapper))],
         );
+        let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
+        let original = ctx.read_native_pin(original_pin, original);
+        ctx.unpin_native_roots(original_pin);
         let _ = ctx.set_field_by_name(wrapper, "target", Value::Object(Some(original)));
         return MethodCallFailed::ExceptionThrown(wrapper);
     }
@@ -3563,19 +3588,33 @@ pub(crate) fn wrap_as_invocation_target_exception(
     // Attempt to allocate and initialise
     // `java.lang.reflect.InvocationTargetException(Throwable)`. If any step
     // fails, fall back to the original exception rather than masking it.
+    //
+    // GC-safety: `new_object` below can relocate `original`; pin it first
+    // and re-read the forwarded reference before it's used as the `invoke`
+    // argument / fallback return value.
+    let original_pin = ctx.pin_native_root(original);
     let new_result = ctx.new_object(target_class);
+    let original = ctx.read_native_pin(original_pin, original);
     let wrapper = match new_result {
         Ok(Some(Value::Object(Some(obj)))) => obj,
         _ => return MethodCallFailed::ExceptionThrown(original),
     };
 
     // Preferred path: InvocationTargetException(Throwable target).
+    // GC-safety: `invoke` runs the exception's real Java `<init>`, which can
+    // itself allocate; pin `wrapper` across it too and re-read both
+    // forwarded references before their next use (both are read again in
+    // the `match` below).
+    let wrapper_pin = ctx.pin_native_root(wrapper);
     let init_result = ctx.invoke(
         target_class,
         "<init>",
         "(Ljava/lang/Throwable;)V",
         &[Value::Object(Some(wrapper)), Value::Object(Some(original))],
     );
+    let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
+    let original = ctx.read_native_pin(original_pin, original);
+    ctx.unpin_native_roots(original_pin);
     match init_result {
         Ok(_) => MethodCallFailed::ExceptionThrown(wrapper),
         // If the two-arg constructor is unavailable, fall back to the
@@ -10239,7 +10278,11 @@ fn create_annotation_proxy(
     // Real annotations: hand back a real `$ProxyN` proxy that wraps
     // this AnnotationProxy as its InvocationHandler (so `getClass()` is a
     // `$ProxyN`). Falls back to the bare AnnotationProxy when generation fails.
-    if real_annotations_enabled() {
+    // A real proxy needs the VM-owned loader and generated-class namespace.
+    // The lightweight native unit-test context deliberately does not model
+    // that global state, so retain the valid AnnotationProxy representation
+    // there instead of reusing a loader ObjectRef from another mock VM.
+    if ctx.supports_real_proxy_generation() && real_annotations_enabled() {
         if let Some(ann_cid) = ann_class_id_opt {
             if let Some(real) = wrap_annotation_in_real_proxy(ctx, ann_cid, proxy) {
                 return real;

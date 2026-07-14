@@ -847,6 +847,11 @@ fn http_string_hash_code(bytes: &[u8]) -> i32 {
 
 fn native_http_string_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // `this` must survive the `create_string` call in the `string_obj` match
+    // below (a GC-triggering allocation), and both `this` and `string_obj`
+    // must survive the `new_array` allocation further down before either is
+    // read again for the `set_field*` calls.
+    let this_pin = ctx.pin_native_root(this);
     let text_arg = args.get(1).copied().unwrap_or(Value::Object(None));
     let text = match text_arg {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
@@ -856,6 +861,7 @@ fn native_http_string_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Value::Object(Some(s)) if ctx.read_string(s).is_some() => s,
         _ => ctx.create_string(&text),
     };
+    let string_obj_pin = ctx.pin_native_root(string_obj);
 
     if class_has_field(ctx, CLS_HTTP_STRING, "bytes") {
         let bytes = text.as_bytes();
@@ -863,14 +869,19 @@ fn native_http_string_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         for (i, b) in bytes.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
         }
+        let this = ctx.read_native_pin(this_pin, this);
+        let string_obj = ctx.read_native_pin(string_obj_pin, string_obj);
         ctx.set_field_by_name(this, "bytes", Value::Object(Some(arr)));
         ctx.set_field_by_name(this, "hashCode", Value::Int(http_string_hash_code(bytes)));
         ctx.set_field_by_name(this, "orderInt", Value::Int(0));
         ctx.set_field_by_name(this, "string", Value::Object(Some(string_obj)));
     } else {
+        let this = ctx.read_native_pin(this_pin, this);
+        let string_obj = ctx.read_native_pin(string_obj_pin, string_obj);
         ctx.set_field(this, HS_FIELD_BYTES, Value::Object(Some(string_obj)));
         ctx.set_field_by_name(this, "string", Value::Object(Some(string_obj)));
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -1027,8 +1038,14 @@ fn exchange_header_map_or_create(
         match ctx.get_field(this, synthetic_slot) {
             Value::Object(Some(map)) => Ok(Some(Value::Object(Some(map)))),
             _ => {
+                // Mirror the real-layout branch above: `this` must survive
+                // the GC-triggering `alloc_header_map_for_exchange` call
+                // before being read again for `set_field`.
+                let this_pin = ctx.pin_native_root(this);
                 let map = alloc_header_map_for_exchange(ctx)?;
+                let this = ctx.read_native_pin(this_pin, this);
                 ctx.set_field(this, synthetic_slot, Value::Object(Some(map)));
+                ctx.unpin_native_roots(this_pin);
                 Ok(Some(Value::Object(Some(map))))
             }
         }
@@ -1129,16 +1146,24 @@ fn real_exchange_force_empty_response_body(
     else {
         return Ok(None);
     };
+    // `headers` and `name_text`/`name` all need to survive the two
+    // `create_string` calls and the `new_object_initialized` call below
+    // before being read again for the final `native_header_map_put`.
+    let headers_pin = ctx.pin_native_root(headers);
     let name_text = ctx.create_string("Content-Length");
+    let name_text_pin = ctx.pin_native_root(name_text);
     let name = match ctx.new_object_initialized(
         CLS_HTTP_STRING,
         "(Ljava/lang/String;)V",
         &[Value::Object(Some(name_text))],
     )? {
         Some(Value::Object(Some(o))) => o,
-        _ => name_text,
+        _ => ctx.read_native_pin(name_text_pin, name_text),
     };
+    let name_pin = ctx.pin_native_root(name);
     let zero = ctx.create_string("0");
+    let headers = ctx.read_native_pin(headers_pin, headers);
+    let name = ctx.read_native_pin(name_pin, name);
     let _ = native_header_map_put(
         ctx,
         &[
@@ -1147,6 +1172,7 @@ fn real_exchange_force_empty_response_body(
             Value::Object(Some(zero)),
         ],
     )?;
+    ctx.unpin_native_roots(headers_pin);
     Ok(None)
 }
 

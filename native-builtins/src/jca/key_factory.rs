@@ -1558,13 +1558,20 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // InvalidKeySpecException despite working key-pair generation.
     if let Some(Value::Object(Some(spec))) = args.get(1) {
         if eddsa_keyfactory_spi_class(algo).is_some() {
-            return drive_real_eddsa_keyfactory(
+            match drive_real_eddsa_keyfactory(
                 ctx,
                 algo,
                 *spec,
                 "engineGeneratePublic",
                 "Ljava/security/PublicKey;",
-            );
+            ) {
+                Ok(Some(key)) => return Ok(Some(key)),
+                // A context that cannot execute the real SPI must not turn
+                // that absence into a null/dead public key. Fall through to
+                // the declared InvalidKeySpecException below.
+                Ok(None) => {}
+                Err(err) => return Err(err),
+            }
         }
     }
     // DSA: drive the real sun.security.provider.DSAKeyFactory SPI (no

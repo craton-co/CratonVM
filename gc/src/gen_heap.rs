@@ -632,6 +632,22 @@ pub struct GenerationalHeap {
     /// `AtomicBool` so the flag can be read/written without going
     /// through the per-arena mutex.
     force_promote_all: std::sync::atomic::AtomicBool,
+    /// Young-exhaustion signal from the *native* allocation wrappers
+    /// (`ctx.alloc_object` / `alloc_array` / the `*_full` fallible twins),
+    /// which must stay GC-free mid-callback (their callers hold unrooted
+    /// local `ObjectRef`s) and therefore spill into old gen when young
+    /// cannot satisfy an allocation. Set on every such spill; consumed at
+    /// the next native-call boundary (`safe_native_call` in the VM), where
+    /// every argument is pinned and remappable, to run the same
+    /// orchestrated GC the interpreter's `gc_alloc_*` slow path would.
+    /// Without this, a workload whose allocations all happen inside
+    /// natives (e.g. a JIT'd `HashMap<Integer,Integer>` put loop — boxing
+    /// and node allocations are both native) never initiates ANY
+    /// collection: young fills once with mostly-dead wrappers, every
+    /// subsequent allocation spills, old gen fills, and
+    /// [`alloc_young_initialized`] hard-aborts a process whose heap is
+    /// almost entirely garbage.
+    young_spill_pressure: std::sync::atomic::AtomicBool,
     /// BUG-03 — absolute `(cursor, end)` reserved-tail regions of TLABs
     /// belonging to peer threads that the cross-thread STW JIT root scan
     /// forcibly stopped while they were executing JIT code. Such a peer never
@@ -718,6 +734,7 @@ impl GenerationalHeap {
             numa_num_nodes,
             stats: HeapStats::default(),
             force_promote_all: std::sync::atomic::AtomicBool::new(false),
+            young_spill_pressure: std::sync::atomic::AtomicBool::new(false),
             jit_tlab_skip_regions: Mutex::new(Vec::new()),
         };
         // Publish the initial region bounds so the lock-free
@@ -901,6 +918,10 @@ impl GenerationalHeap {
         let ptr = match self.try_alloc_young_initialized(total_size, &init) {
             Some(p) => p,
             None => {
+                // Young exhausted: flag it so the next native-call boundary
+                // runs a GC (this method itself must stay GC-free — see the
+                // `young_spill_pressure` field doc).
+                self.note_young_spill_pressure();
                 if let Some(obj) = self.try_alloc_object_old(class_id, num_fields) {
                     return obj;
                 }
@@ -957,6 +978,9 @@ impl GenerationalHeap {
         let ptr = match self.try_alloc_young_initialized(total_size, &init) {
             Some(p) => p,
             None => {
+                // Young exhausted: flag for the boundary GC (see the
+                // `young_spill_pressure` field doc).
+                self.note_young_spill_pressure();
                 if let Some(obj) = self.try_alloc_object_old(class_id, num_fields) {
                     return Some(obj);
                 }
@@ -1115,6 +1139,9 @@ impl GenerationalHeap {
         let ptr = match self.try_alloc_young_initialized(total_size, &init) {
             Some(p) => p,
             None => {
+                // Young exhausted: flag for the boundary GC (see the
+                // `young_spill_pressure` field doc).
+                self.note_young_spill_pressure();
                 if let Some(obj) =
                     self.try_alloc_array_humongous(class_id, element_type, length_u32)
                 {
@@ -1184,6 +1211,9 @@ impl GenerationalHeap {
         let ptr = match self.try_alloc_young_initialized(total_size, &init) {
             Some(p) => p,
             None => {
+                // Young exhausted: flag for the boundary GC (see the
+                // `young_spill_pressure` field doc).
+                self.note_young_spill_pressure();
                 if let Some(obj) =
                     self.try_alloc_array_humongous(class_id, element_type, length_u32)
                 {
@@ -1450,6 +1480,11 @@ impl GenerationalHeap {
         num_fields: usize,
         count: usize,
     ) -> Vec<ObjectRef> {
+        // This batch refill only runs once young can no longer supply a TLAB
+        // (see `NativeContextImpl::alloc_object`), i.e. on a young-exhaustion
+        // spill: arm the boundary-GC pressure flag (advisability-gated; one
+        // extra old-gen lock per 2048-object batch, not per allocation).
+        self.note_young_spill_pressure();
         let Some((total_size, array_len, compact_flag)) = plan_object_alloc(class_id, num_fields)
         else {
             return Vec::new();
@@ -2769,6 +2804,50 @@ impl GenerationalHeap {
 
     // ----- GC ----------------------------------------------------------------
 
+    /// Record that a native-wrapper allocation had to spill into old gen
+    /// because young was exhausted. See the `young_spill_pressure` field doc.
+    ///
+    /// The pressure flag (and therefore the boundary GC) is only armed once
+    /// old-gen headroom drops below the worst-case promotion demand — the
+    /// entire young semi (a boundary GC may need to evacuate ALL of young's
+    /// live set into old) plus a young/8 margin. While old gen has more room
+    /// than that, spilling is both safe and much cheaper than a full mark
+    /// cycle (HashMapOnly 30M at -Xmx16g: 13.5s spilling vs 32.8s collecting
+    /// on first exhaustion), so we stay on the spill path. Past the bound,
+    /// waiting longer risks promotion failure (old too full to drain young)
+    /// → the both-gens-full abort this machinery exists to avoid.
+    ///
+    /// Takes the old-gen lock — call this only from allocation SLOW paths
+    /// (the spill arms / batch refill), never per-object.
+    pub fn note_young_spill_pressure(&self) {
+        let young_semi = self.young_semi_capacity();
+        let advisable = {
+            let og = self.old_gen.lock();
+            og.used() + young_semi + young_semi / 8 >= og.capacity()
+        };
+        if advisable {
+            self.young_spill_pressure
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Native-wrapper young-exhaustion signal (see `young_spill_pressure`
+    /// field doc). One relaxed load — cheap enough for a per-native-call
+    /// check on the dispatch hot path.
+    #[inline]
+    pub fn young_spill_pressure(&self) -> bool {
+        self.young_spill_pressure
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Clear the native-wrapper young-exhaustion signal (after the
+    /// boundary GC ran, or after deciding the flag was stale).
+    #[inline]
+    pub fn clear_young_spill_pressure(&self) {
+        self.young_spill_pressure
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Returns true when the young generation should be collected.
     pub fn needs_gc(&self) -> bool {
         let from = self.young_from.lock();
@@ -2803,6 +2882,23 @@ impl GenerationalHeap {
     /// Total bytes currently allocated across young and old generations.
     pub fn allocated_bytes(&self) -> usize {
         self.young_from.lock().used() + self.old_gen.lock().used()
+    }
+
+    /// Live-bytes estimate for GC-productivity accounting: like
+    /// [`allocated_bytes`], but young counts `used - free_list_bytes`
+    /// instead of the raw bump cursor. The non-moving young sweep reclaims
+    /// dead objects into the from-space free list WITHOUT retreating the
+    /// cursor, so the raw `used()` stays pinned at its high-water mark
+    /// forever after young first fills — measured that way, every sweep
+    /// looks like it freed 0 bytes and the GC-overhead limit falsely
+    /// declares a perfectly-productive collector "thrashing" (then stops
+    /// collecting, wedging the heap into the old-gen-spill → abort path).
+    /// Same live metric `needs_gc` already uses for its trigger.
+    pub fn live_bytes_estimate(&self) -> usize {
+        let from = self.young_from.lock();
+        let young_live = from.used().saturating_sub(from.free_list_bytes());
+        drop(from);
+        young_live + self.old_gen.lock().used()
     }
 
     /// DBG (bc math-ec `0x4`): scan the young from-space for the FIRST object
@@ -3160,6 +3256,22 @@ impl GenerationalHeap {
             // `.expect(...)` panicked (monitor.rs registry/mark-word desync).
             // Re-key the registry here, identically to the moving path.
             monitors.remap_after_gc(&result.0.pointer_map);
+            // DBG (CRATONVM_DBG_YOUNGSTATE): post-collection young/old arena
+            // state — the bimodal-bt18 discriminator (is young allocatable
+            // after this sweep, and from which structure?).
+            if std::env::var_os("CRATONVM_DBG_YOUNGSTATE").is_some() {
+                let from = self.young_from.lock();
+                let og = self.old_gen.lock();
+                eprintln!(
+                    "[youngstate] post-sweep used={}/{} free_list={} largest_free={} old={}/{}",
+                    from.used(),
+                    from.capacity(),
+                    from.free_list_bytes(),
+                    from.largest_free_block(),
+                    og.used(),
+                    og.capacity(),
+                );
+            }
             return result;
         }
 
@@ -4900,6 +5012,16 @@ impl GenerationalHeap {
             // stretches are handled by pass 3a's conservative rewrite.
             let mut evacuated: Vec<*mut u8> = Vec::new();
             let mut fwd_installs: Vec<(usize, *mut u8)> = Vec::new();
+            // Deferred survivor age bumps (applied with the forwarding
+            // installs below, under the same anchor-verified discipline).
+            // The unconditional side-marking hardening removed every
+            // mark-time header write — which silently stopped survivor
+            // aging, and with it this whole pass (no object could ever
+            // reach PROMOTION_AGE, so a fully-live young could never drain
+            // to old gen and the heap wedged into the old-gen-spill → abort
+            // path). Aging now happens here, where the walk grid validates
+            // each header before any write lands on it.
+            let mut age_bumps: Vec<usize> = Vec::new();
             {
                 // PERF: reuse the once-computed sorted free-block snapshot.
                 let mut free_iter = sweep_free_blocks.iter().peekable();
@@ -4909,15 +5031,19 @@ impl GenerationalHeap {
                 // Candidate counts at the last trustworthy anchor.
                 let mut fwd_wm = 0usize;
                 let mut evac_wm = 0usize;
+                let mut age_wm = 0usize;
                 // Drop candidates collected since the last anchor (suspect
                 // stretch): remove them from evac_map, orphan their copies.
                 fn unwind_evac(
                     fwd_installs: &mut Vec<(usize, *mut u8)>,
                     evacuated: &mut Vec<*mut u8>,
                     evac_map: &mut HashMap<usize, usize>,
+                    age_bumps: &mut Vec<usize>,
                     fwd_wm: usize,
                     evac_wm: usize,
+                    age_wm: usize,
                 ) {
+                    age_bumps.truncate(age_wm);
                     if fwd_installs.len() > fwd_wm {
                         let n = SWEEP_PROMOTION_ABORT_HITS.fetch_add(1, Ordering::Relaxed);
                         if n < 8 {
@@ -4945,13 +5071,16 @@ impl GenerationalHeap {
                                 &mut fwd_installs,
                                 &mut evacuated,
                                 &mut evac_map,
+                                &mut age_bumps,
                                 fwd_wm,
                                 evac_wm,
+                                age_wm,
                             );
                         }
                         if resynced {
                             fwd_wm = fwd_installs.len();
                             evac_wm = evacuated.len();
+                            age_wm = age_bumps.len();
                             continue;
                         }
                     }
@@ -4999,8 +5128,10 @@ impl GenerationalHeap {
                             &mut fwd_installs,
                             &mut evacuated,
                             &mut evac_map,
+                            &mut age_bumps,
                             fwd_wm,
                             evac_wm,
+                            age_wm,
                         );
                         if resync_to_next_free_block(&mut cursor, &mut free_iter) {
                             continue;
@@ -5017,8 +5148,10 @@ impl GenerationalHeap {
                                 &mut fwd_installs,
                                 &mut evacuated,
                                 &mut evac_map,
+                                &mut age_bumps,
                                 fwd_wm,
                                 evac_wm,
+                                age_wm,
                             );
                             cursor = foff;
                             continue;
@@ -5033,8 +5166,26 @@ impl GenerationalHeap {
                     // gen. Short-lived survivors stay in young and are reclaimed
                     // normally; only the genuinely long-lived set (the
                     // persistent tree) ages out and promotes.
+                    // Survivor liveness comes from EITHER mark channel: the
+                    // legacy header mark, or the side-mark set. Since the
+                    // unconditional side-marking hardening, the marker never
+                    // header-writes, so `side_marks` is the only live channel
+                    // — requiring the header mark alone made this whole pass
+                    // inert (nothing evacuated, nothing aged; a fully-live
+                    // young then wedged the heap into the old-gen-spill →
+                    // abort path that the native-alloc boundary GC exists to
+                    // relieve).
                     let aged = header.gc_age + 1 >= PROMOTION_AGE;
-                    if header.gc_flags & GC_FLAG_MARKED != 0 && aged && !pinned.contains(&addr) {
+                    let header_marked = header.gc_flags & GC_FLAG_MARKED != 0;
+                    let marked = header_marked || side_marks.contains(&addr);
+                    if marked && !aged && !header_marked {
+                        // Deferred, anchor-verified age bump — applied with
+                        // the forwarding installs below. Header-marked
+                        // survivors are excluded: the main sweep still ages
+                        // those in place.
+                        age_bumps.push(addr);
+                    }
+                    if marked && aged && !pinned.contains(&addr) {
                         match old_gen.alloc(total_size, 8) {
                             Some(dst) => {
                                 // gcstress face-1 hunt (no-op unless gated):
@@ -5085,6 +5236,16 @@ impl GenerationalHeap {
                                 fwd_installs.push((addr, dst));
                                 evac_map.insert(addr, dst as usize);
                                 evacuated.push(dst);
+                                // Promotion accounting (mirrors the moving
+                                // collector's `forward_object`): powers the
+                                // GC-overhead productivity metric — a
+                                // promotion-only cycle conserves live bytes
+                                // but very much did useful work (it drained
+                                // young), and must not count as "thrashing".
+                                self.stats
+                                    .bytes_promoted
+                                    .fetch_add(total_size as u64, Ordering::Relaxed);
+                                self.stats.objects_promoted.fetch_add(1, Ordering::Relaxed);
                             }
                             None => old_full = true,
                         }
@@ -5105,6 +5266,21 @@ impl GenerationalHeap {
                         .write(dst);
                 }
             }
+            // Age the not-yet-tenurable survivors — same anchor-verified
+            // deferral contract as the forwarding installs above. This is the
+            // aging the marker's unconditional side-marking removed (it never
+            // header-writes); without it no survivor can ever reach
+            // PROMOTION_AGE and this pass stays permanently inert.
+            for &src_addr in &age_bumps {
+                // SAFETY: `src_addr` is a live young object header on an
+                // anchor-verified stretch (identical contract to the
+                // forwarding-pointer install above); bumping its age byte is
+                // the write the walk deferred.
+                unsafe {
+                    let h = &mut *(src_addr as *mut ObjectHeader);
+                    h.gc_age = h.gc_age.saturating_add(1);
+                }
+            }
 
             // DBG (CRATONVM_SP_STATS): per-GC pin/evac counts, printed
             // unconditionally (even when nothing evacuated) so we can confirm
@@ -5113,9 +5289,10 @@ impl GenerationalHeap {
             // coalescing below.
             if std::env::var_os("CRATONVM_SP_STATS").is_some() {
                 eprintln!(
-                    "[sp-stats] gc: pinned={} evac={}",
+                    "[sp-stats] gc: pinned={} evac={} aged={}",
                     pinned.len(),
                     evac_map.len(),
+                    age_bumps.len(),
                 );
             }
 
@@ -7155,6 +7332,19 @@ impl GenerationalHeap {
         self.young_from.lock().has_free_block_at_least(size)
     }
 
+    /// DBG: one-shot young-arena state snapshot `(used, capacity,
+    /// free_list_bytes, largest_free_block)` — diagnostics only (full
+    /// free-list scans under the lock).
+    pub fn young_arena_diag(&self) -> (usize, usize, usize, usize) {
+        let from = self.young_from.lock();
+        (
+            from.used(),
+            from.capacity(),
+            from.free_list_bytes(),
+            from.largest_free_block(),
+        )
+    }
+
     /// Carve out a TLAB-sized chunk from the young from-space.
     ///
     /// Returns `Some((ptr, size))` on success, where `ptr` is the start of
@@ -7180,11 +7370,40 @@ impl GenerationalHeap {
             return None; // Not enough for a useful TLAB
         }
         let actual_size = requested_size.min(available);
-        let ptr = from.alloc(actual_size, 8)?;
-        // Zero the TLAB region
-        // SAFETY: `ptr` was just allocated from the arena with `actual_size` bytes; zeroing is within bounds.
-        unsafe { std::ptr::write_bytes(ptr, 0, actual_size) };
-        Some((ptr, actual_size))
+        if let Some(ptr) = from.alloc(actual_size, 8) {
+            // Zero the TLAB region
+            // SAFETY: `ptr` was just allocated from the arena with `actual_size` bytes; zeroing is within bounds.
+            unsafe { std::ptr::write_bytes(ptr, 0, actual_size) };
+            return Some((ptr, actual_size));
+        }
+        // Fragmentation fallback (the bimodal-bt18 wedge): no single span fits
+        // `actual_size`, but a smaller one can still make a useful TLAB.
+        // Steady-state refills carve exact `requested_size` chunks out of the
+        // sweep's coalesced spans; the split leftovers converge on blocks a
+        // few bytes SHORT of the adaptive sizer's request (observed: a ~2 GiB
+        // free list made entirely of 131056-byte blocks vs. a 131072-byte
+        // request). Without this fallback the refill gate then fails on every
+        // allocation while tiny object allocations keep succeeding off the
+        // remnants — so the young collection (whose coalescer would heal the
+        // fragmentation) is never triggered either, and the entire rest of
+        // the run crawls through the per-object slow path (bt18: 1.9s → 4.5s
+        // on a ~50% coin flip of whether the post-sweep workload outlasted
+        // the recycled spans). Serving the largest available block (capped at
+        // the request, floored at a useful TLAB size) keeps the remnants
+        // flowing through the bump fast path instead; the cost — one
+        // O(free-list) largest-block scan — is paid once per served TLAB,
+        // not per object.
+        let largest = from.largest_free_block();
+        let floor = crate::tlab::min_tlab_size().max(256);
+        if largest >= floor {
+            let take = largest.min(actual_size);
+            if let Some(ptr) = from.alloc(take, 8) {
+                // SAFETY: `ptr` was just allocated from the arena with `take` bytes; zeroing is within bounds.
+                unsafe { std::ptr::write_bytes(ptr, 0, take) };
+                return Some((ptr, take));
+            }
+        }
+        None
     }
 
     /// Allocate bytes in the young from-space and initialize the object before
@@ -9320,6 +9539,56 @@ mod tests {
         assert!(
             !roots2.contains(&(old_ptr as usize)),
             "an old object no longer young-referenced must not be re-reported",
+        );
+    }
+
+    /// `young_spill_pressure` — the native-wrapper young-exhaustion signal —
+    /// must start clear, stay clear while old gen has ample spill headroom
+    /// (spilling is cheaper than collecting), arm once old-gen headroom
+    /// drops below the worst-case promotion demand (one young semi + young/8
+    /// margin), and re-arm after `clear` while the exhaustion persists. (The
+    /// VM consumes this flag at the `safe_native_call` boundary to run the
+    /// GC the panicking native allocation wrappers cannot run themselves —
+    /// the fix for the HashMapOnly "young gen exhausted" hard abort.)
+    #[test]
+    fn young_spill_sets_pressure_flag_for_boundary_gc() {
+        let heap = small_gen_heap();
+        assert!(
+            !heap.young_spill_pressure(),
+            "fresh heap must not report young spill pressure"
+        );
+
+        // Fill the 4 KiB young semi (≈73 x 56-byte objects), then keep
+        // spilling into the 8 KiB old gen. The advisability gate arms the
+        // flag once old_used >= old_cap - young_semi - young_semi/8 =
+        // 8192 - 4096 - 512 = 3584 bytes (≈64 spilled objects) — well
+        // before old gen fills, so the both-gens-full abort is unreachable.
+        let mut armed_at = None;
+        for i in 0..220 {
+            let _ = heap.alloc_object(ClassId::new(1), 1);
+            if heap.young_spill_pressure() {
+                armed_at = Some(i);
+                break;
+            }
+        }
+        let armed_at = armed_at.expect("sustained young spill must arm the pressure flag");
+        assert!(
+            armed_at > 70,
+            "the flag must NOT arm while old gen still has more headroom \
+             than a full young semi (armed after only {armed_at} allocations)"
+        );
+
+        heap.clear_young_spill_pressure();
+        assert!(!heap.young_spill_pressure());
+
+        // Young is still exhausted and old-gen headroom is still below the
+        // promotion-demand bound: the very next spilling allocation must
+        // re-arm the flag (fallible array path this time).
+        let arr = heap.try_alloc_array_full(ClassId::new(0), ArrayElementType::Int, 4);
+        assert!(arr.is_some(), "old gen must still have room for the array");
+        assert!(
+            heap.young_spill_pressure(),
+            "a post-clear spill must re-arm the flag"
         );
     }
 

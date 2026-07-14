@@ -48,7 +48,7 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 | Matrix 1280x1280                    | 2,085 ms      | 5,583 ms          | 2.68x         |
 | **QuickBench TOTAL**                | **8,330 ms**  | **19,491 ms**     | **2.34x**     |
 | HashMap (1M put/get, isolated)      | 42 ms         | 264 ms            | 6.29x         |
-| String/Regex (1M, isolated)         | 146 ms        | 4,785 ms          | 32.8x         |
+| String/Regex (1M, isolated)         | 144 ms        | 3,468 ms          | 24.1x         |
 | Binary Trees (depth=18, isolated)   | 382 ms        | 4,916 ms          | 12.9x         |
 
 *Arithmetic/Fibonacci/Sieve/Matrix/TOTAL and HashMap remeasured 2026-07-14 on the
@@ -117,13 +117,14 @@ bit-identical to HotSpot's backtracking-engine bookkeeping — verified against 
 parity battery to have zero effect on `find`/`group`/`start`/`end` correctness).
 `CRATONVM_NATIVE_MATCHER_FIND=0` reverts to real JDK bytecode as the safety net.
 
-The table above now uses a freshly verified **32.8x** at 1M entries (146 ms JDK /
-4,785 ms CratonVM, median of nine alternating-order paired runs,
+The table above now uses a freshly verified **24.1x** at 1M entries (144 ms JDK /
+3,468 ms CratonVM, median of nine alternating-order paired runs,
 `bench/StringRegexOnly.java` standalone, `CRATONVM_NATIVE_MATCHER_FIND` at its default).
-Every run returned checksum `500000500000`. The earlier 100K measurement was 58 ms
-JDK / 476 ms CratonVM (**8.21x**); at 1M, CratonVM time scales almost exactly 10x while
-HotSpot scales only 2.5x, exposing a larger remaining steady-state throughput gap after
-startup and tiering costs are amortized.
+Every run returned checksum `500000500000`. This steady-state follow-up reduces the
+previous 1M CratonVM median from 4,785 ms to 3,468 ms (**27.5%**) and its ratio from
+32.8x to 24.1x. The earlier 100K measurement was 58 ms JDK / 476 ms CratonVM
+(**8.21x**); the 1M row still exposes the remaining throughput gap after startup and
+tiering costs are amortized.
 
 The residual was not generic native-dispatch tax. The fast path compared Rust's
 semantic capture count with `Matcher.groups.length / 2`; the real runtime layout can
@@ -134,6 +135,14 @@ real bytecode. The guard now compares against `Pattern.capturingGroupCount` and 
 the extra slots never make invalid groups legal. See
 [`docs/internal/performance/string-regex-overallocated-groups-fastpath-20260714.md`](docs/internal/performance/string-regex-overallocated-groups-fastpath-20260714.md)
 for the implementation, raw measurements, artifact hash, and semantic validation.
+
+The 1M follow-up removes fixed work that remained on every successful match: capture
+ranges are written without an intermediate allocation; decoded text, compiled regex,
+semantic capture count, and scalar Matcher state are reused behind exact object/layout
+and `modCount` guards; captured ASCII strings use a bulk compact-String allocator; and
+StringBuilder input construction uses one checked bulk char-array write per append.
+The complete raw paired sample set, retained artifact hash, and parity coverage are
+recorded in the same performance note.
 
 HashMap's slowdown was a *different* shape of bug — flat across sizes (not O(n²)), and
 cdb stack-sampling showed it was NOT allocation/GC-bound (only ~9% of sampled stacks in
