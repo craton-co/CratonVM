@@ -4749,6 +4749,26 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // holds raw `Value` copies (its args slice) that are neither rooted
         // nor remappable across a GC-blocked wait; block as an EXPECTED
         // mutator instead (a concurrent STW waits for us).
+        //
+        // STW-TAKEOVER-FIX (2026-07-13) follow-up: this reasoning IS the
+        // root cause of the WildFly `parallel-extension-add` STW-barrier
+        // deadlock (see
+        // `docs/internal/fixed-suite-bugs/wildfly-standalone-boot-stw-jit-takeover-hang.md`)
+        // for the one call site proven live via gdb to hit it
+        // (`CountDownLatch`'s polling loop). An earlier version of this fix
+        // switched THIS method wholesale to `monitor_enter_blocking`, but a
+        // full audit of every native caller of `monitor_enter` (~80 sites:
+        // Semaphore/Phaser/Exchanger/blocking-queue/ConcurrentHashMap/
+        // ReentrantLock/Condition/BouncyCastle-random/etc.) found the
+        // overwhelming majority keep using the SAME `obj`/`this` afterward
+        // without any pin-and-refresh — switching all of them to a
+        // GC-pausable wait at once would trade one hang for a batch of new,
+        // unaudited stale-`ObjectRef`-across-GC bugs (this codebase's most
+        // recurring defect class, see
+        // `docs/internal/wildfly-parallel-boot-stale-objectref-residual.md`).
+        // `monitor_enter` therefore stays on this original, non-GC-blocked
+        // path for everyone; `monitor_enter_gc_safe` (below) is the narrow,
+        // opt-in escape hatch for the one call site with live evidence.
         self.shared.monitors.enter(obj, self.thread.thread_id);
         if dbg_mon_dump {
             crate::vm::vm_init::clear_wait_site_snapshot();
@@ -4760,6 +4780,27 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             self.thread.pin_count = self.thread.pin_count.saturating_add(1);
             self.thread.pin_reason = "Monitor";
         }
+    }
+
+    fn monitor_enter_gc_safe(&mut self, obj: ObjectRef) -> ObjectRef {
+        // STW-TAKEOVER-FIX (2026-07-13): the narrow, opt-in counterpart to
+        // `monitor_enter` above — see its doc comment and
+        // `NativeContext::monitor_enter_gc_safe`'s trait doc for the full
+        // story. Delegates to the already-established, bytecode-tested
+        // `monitor_enter_blocking` (deposit root snapshot, retire TLAB,
+        // `GcBarrier::enter_blocked`/`arrive_and_wait_auto`, `block_enter`,
+        // `mark_blocked_region_leave`/`check_post_block_gc`, pin+remap the
+        // object across the wait) and returns the current, possibly-
+        // relocated reference — callers MUST use it for anything after this
+        // call. The fast (uncontended) path is unaffected:
+        // `monitor_enter_blocking` returns immediately, zero barrier
+        // interaction, when `enter_or_contend` acquires without contention.
+        let fixed = monitor_enter_blocking(self.shared, self.thread, obj);
+        if matches!(self.thread.kind, crate::threading::ThreadKind::Virtual) {
+            self.thread.pin_count = self.thread.pin_count.saturating_add(1);
+            self.thread.pin_reason = "Monitor";
+        }
+        fixed
     }
 
     fn monitor_exit(&mut self, obj: ObjectRef) {
