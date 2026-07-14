@@ -44245,7 +44245,12 @@ fn native_uuid_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         (lsb >> 48) & 0xFFFF,
         lsb & 0xFFFF_FFFF_FFFF
     );
-    let str_obj = ctx.create_string(&s);
+    // UUID text is dynamically produced.  Interning every distinct value keeps
+    // the entire monotonicity-test output alive and turns normal allocation
+    // pressure into repeated intern-table stalls.  The receiver is pinned by
+    // safe_native_call and its fields have already been read above, so this
+    // native can safely request collection before the transient allocation.
+    let str_obj = ctx.create_string_uninterned_gc_safe(&s);
     Ok(Some(Value::Object(Some(str_obj))))
 }
 

@@ -787,12 +787,45 @@ fn safe_native_call_impl(
     let native_pin_base = thread.native_pin_roots.len();
 
     let mut remapped_args = None;
-    if shared
+    let stw_pending = shared
         .gc_barrier
         .stw_requested
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
+        .load(std::sync::atomic::Ordering::Acquire);
+    if stw_pending {
         crate::runtime::interpreter::safepoint_check(shared, thread);
+    }
+    // Native-alloc young-pressure relief: when a native allocation wrapper
+    // had to spill into old gen because young was exhausted (the wrappers —
+    // `ctx.alloc_object`, `new_array`, … — must stay GC-free mid-callback,
+    // since their callers hold unrooted local `ObjectRef`s), run the same
+    // orchestrated GC the interpreter's `gc_alloc_*` slow path would, HERE:
+    // the one point on the native dispatch path where every argument is
+    // pinned in `native_pin_roots` and remapped below, exactly like the
+    // peer-STW `safepoint_check` above (so this adds no new hazard class for
+    // callers). Without this, a workload whose allocations all happen inside
+    // natives (e.g. a JIT'd HashMap<Integer,Integer> put loop: boxing + node
+    // allocs are both native) never initiates ANY collection — young fills
+    // once with mostly-dead wrappers, old gen absorbs every later allocation,
+    // and `gen_heap::alloc_young_initialized` hard-aborts a process whose
+    // heap is almost entirely garbage (HashMapOnly 30M at default -Xmx).
+    // Gated on the heap's own occupancy trigger (`needs_gc`, live-metric) +
+    // the GC-overhead limit so an all-live young cannot thrash boundary GCs;
+    // the flag check itself is one relaxed load on the hot path.
+    let mut pressure_gc = false;
+    if shared.heap.young_spill_pressure() {
+        if !crate::runtime::interpreter::gc_overhead_limit_exceeded(shared)
+            && shared.heap.needs_gc()
+        {
+            // `maybe_gc_forced` retires this thread's TLAB itself.
+            crate::runtime::interpreter::maybe_gc_forced_pub(shared, thread);
+            pressure_gc = true;
+        }
+        // Clear even when the gates said no: the flag was stale (another
+        // thread's GC already relieved young) or the heap is genuinely full
+        // of live data (overhead limit) — the next spill re-sets it.
+        shared.heap.clear_young_spill_pressure();
+    }
+    if stw_pending || pressure_gc {
         let mut fresh = args.to_vec();
         for (idx, root_idx) in arg_root_indices.iter().enumerate() {
             let Some(root_idx) = root_idx else {
@@ -4071,6 +4104,31 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         super::create_java_string_uninterned(self.shared, text)
     }
 
+    fn create_string_uninterned_gc_safe(&mut self, text: &str) -> ObjectRef {
+        // Native callers opt into this only after pinning every live Java
+        // reference.  Native string construction uses two no-GC allocations
+        // (the String plus its backing byte[]); if young is fragmented, the
+        // generic fallible allocator would otherwise spill both into old gen
+        // without crossing `needs_gc()`.  Request a normal young collection
+        // before that spill, leaving old-gen collection policy unchanged.
+        const STRING_ALLOCATION_HEADROOM: usize = 256;
+        if !self
+            .shared
+            .heap
+            .young_bump_headroom(STRING_ALLOCATION_HEADROOM)
+            && !self
+                .shared
+                .heap
+                .young_has_free_block(STRING_ALLOCATION_HEADROOM)
+        {
+            self.shared
+                .gc_requested
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::runtime::interpreter::maybe_gc(self.shared, self.thread);
+        }
+        super::create_java_string_uninterned(self.shared, text)
+    }
+
     fn init_string_from_units(&mut self, this: ObjectRef, units: &[u16]) -> bool {
         super::populate_java_string_fields(self.shared, this, units)
     }
@@ -4362,7 +4420,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // callback: `tlab_alloc_object` only bumps/refills young space and
         // returns `None` when it cannot. The existing `heap.alloc_object`
         // fallback retains the previous spill/OOM behavior and native rooting
-        // contract.
+        // contract. Instead of collecting here, a TLAB failure flags
+        // `young_spill_pressure` so the NEXT `safe_native_call` boundary —
+        // where every argument is pinned and remappable — runs the
+        // orchestrated GC this method cannot (see `safe_native_call_impl`).
         use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
         let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
         if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
@@ -4375,6 +4436,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             ) {
                 return obj;
             }
+            // Young could not supply another TLAB chunk: every allocation
+            // below lands in old gen. The old-batch refill / heap spill arms
+            // below signal the native-call boundary GC (`note_young_spill_
+            // pressure` — advisability-gated, needs the old-gen lock those
+            // slow paths already pay for; calling it here would add an
+            // old-gen lock acquisition per allocation in spill mode).
         }
         // Once young space cannot provide another TLAB, amortize the
         // non-moving old-generation lock and free-list work across a chunk of

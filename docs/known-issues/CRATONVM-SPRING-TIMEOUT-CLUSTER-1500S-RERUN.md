@@ -964,7 +964,7 @@ rather than a coincidence:
 | Class | Status | Elapsed | Pass/Total | First FAILCAUSE |
 |---|---|--:|--:|---|
 | `orm.jpa.support.InjectionCodeGeneratorTests` | FAIL → **TIMEOUT as of 2026-07-13** | 206s | 3/10 | `CompilationException: Unable to compile source` → now hangs instead, see [2026-07-13 update](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open) |
-| `web.socket.messaging.StompWebSocketIntegrationTests` | FAIL | 169s | 0/16 | `ServletException` / `UnsatisfiedDependencyException` (no `MessageHandler` bean) |
+| `web.socket.messaging.StompWebSocketIntegrationTests` | FAIL -> **TIMEOUT as of 2026-07-14** | 169s -> 600s+ (2x) | 0/16 -> 0/0 | `ServletException`/`UnsatisfiedDependencyException` (no `MessageHandler` bean) -> **bean/startup bug no longer reproduces**, now hangs instead, see 2026-07-14 update below |
 | `web.reactive.result.method.annotation.CrossOriginAnnotationIntegrationTests` | FAIL → **TIMEOUT as of 2026-07-13** | 492s → 600s×2 (+1500s dedicated probe) | 0/68 → 0/0 | `BeanCreationException`: no `ApiVersionStrategy` bean → **bean bug fixed**, now deadlocks in `Semaphore.release()`'s monitor instead, see [2026-07-13 update #5](#2026-07-13-local-investigation-5--missing-apiversionstrategy-bean-resolved-both-classes-now-hit-a-different-new-deadlock-still-open) |
 | `web.servlet.mvc.method.annotation.ServletAnnotationControllerHandlerMethodTests` | **FIXED 2026-07-14** | 445s -> 149s | 211/241 -> **241/241** | Two native bugs, both fixed (`cd90774e`, `72a9ad40`): `PrintWriter.write(String)` bypassed subclass `write(String,int,int)` overrides (broke Spring test fixture auto-flush); `Matcher.group(int)` assumed cached text was always `java.lang.String`, threw spurious `NoSuchMethodError` on a general `CharSequence` (e.g. `AntPathMatcher`'s `MaxAttemptsCharSequence`) |
 | `beans.factory.aot.BeanDefinitionPropertiesCodeGeneratorTests` | FAIL → **TIMEOUT as of 2026-07-13** | 693s | 0/47 | `CompilationException: Unable to compile source` → now hangs instead, see [2026-07-13 update](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open) |
@@ -1008,6 +1008,68 @@ Notable sub-clusters within this bucket (candidates for shared root cause):
   it is a Mockito `spy()` cross-class-hierarchy real-method recursion, not
   Spring `ImportSelector`/`ConfigurationClassParser` recursion as originally
   guessed — reproduces standalone with no Spring context involved at all.
+
+## 2026-07-14 local investigation — StompWebSocketIntegrationTests: one real bug fixed, class still doesn't pass (a different, deeper hang) — OPEN
+
+Worktree `cratonvm-stompws-20260713` on the Azure host, branch
+`fix/stompws-cluster-20260713`, merged to `origin/dev` (commit `0bb89ebf`,
+plus a doc-only follow-up).
+
+**What was fixed and verified real:** `SocketChannel.read`/`write`/`accept`
+(plain blocking mode) and `AsynchronousSocketChannel`'s underlying
+blocking-recv-faked-as-async read/write natives
+(`native-builtins/src/phases_late.rs`) had **zero `begin_blocking_region`/
+`end_blocking_region` bracket** around the genuinely-blocking OS `recv()`/
+`send()`/`accept()` syscall. A thread parked in one of these can never reach
+a JIT-takeover safepoint on its own, so a concurrent STW pause that expects
+every mutator to cooperate waits forever (`pending=1 taken=0`) — this is the
+same "STW cross-thread JIT takeover" bug class documented in
+[`docs/known-issues/tomcat-08-07/stw-crossthread-jit-takeover-hang-cluster.md`](tomcat-08-07/stw-crossthread-jit-takeover-hang-cluster.md),
+applied here to a different subsystem (raw socket I/O rather than locks/
+`IoFuture`). `origin/dev` already had an independent, concurrently-landed
+fix for the *async*-channel half of this (same root cause, found via a
+different investigation) but without ObjectRef-relocation tracking across
+the blocking window; the merge kept this session's more complete
+`end_blocking_region_refs`-based version. This fix is real, confirmed via
+live gdb (thread genuinely parked in `tcp_read`/`recv()` with no
+`begin_blocking_region` before the fix), and is independently valuable
+(protects any future test that hits these exact native call sites during a
+concurrent GC pause) even though — see below — it doesn't make this specific
+class pass.
+
+**Why the class still doesn't pass:** the original `ServletException`/
+`UnsatisfiedDependencyException` ("no `MessageHandler` bean") failure no
+longer reproduces at all — likely fixed as an incidental side effect of
+other AOT/annotation-processing work that landed on `dev` this week, the
+same pattern seen with the `ApiVersionStrategy` bean cluster below. With
+that gone, the test gets much further: it actually opens a STOMP connection
+and starts exchanging messages, then hits a **genuine, different hang** —
+confirmed via a live gdb `thread apply all bt` on a stuck 2026-07-14 rerun
+(binary `cratonvm-stompws-final.bin`, both a 600s batch attempt and the
+600s individual crash-recovery retry timed out identically):
+
+- `main-vm` (the test's own thread) is parked in a plain
+  `LockSupport.park()` (`native_lock_support_park`), reached via a
+  reflective `Method.invoke` call chain — consistent with a test-framework
+  timeout/await helper (e.g. a `CountDownLatch.await(timeout)` or
+  `CompletableFuture.get(timeout)` wrapper) waiting on a result that never
+  arrives.
+- A `SimpleAsyncTaskExecutor`-spawned thread is correctly parked inside
+  `tcp_read()`/`recv()` — **with the STW-cooperation fix above already
+  covering this exact call site** (`phases_late.rs` line ~38221, the
+  `AsynchronousSocketChannel` async-channel read path) — genuinely blocked
+  waiting for incoming socket data that never arrives, not spinning or
+  deadlocked at the VM level.
+
+This is **not** the STW-takeover bug: `begin_blocking_region` is correctly
+in effect (verified by inspecting the frame — the fix from this session is
+active on the exact code path caught mid-hang), so a concurrent STW pause
+would NOT wait on this thread. The test is stuck because **no STOMP message
+ever arrives** on that socket — a functional gap somewhere in message
+routing/broker delivery, not a VM-level concurrency bug. Root cause not yet
+found; needs tracing on the server (broker) side to see whether it's
+sending the expected frame at all, or a client-side subscription/session
+bug. Left as the open item for a future session.
 
 ## Bucket 3 — Immediate crash, not a hang (0/25 — FIXED 2026-07-13)
 

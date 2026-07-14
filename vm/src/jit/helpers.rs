@@ -819,10 +819,56 @@ unsafe fn try_call_compiled_entry_inner(
                 let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
                 f(vm_ptr, args_slice[0], args_slice[1], args_slice[2])
             }
-            // TODO(round-6-wave-2): extend register-table coverage or
-            // emit stack-arg setup so 4+-arg with-ctx callees stay on
-            // the JIT fast-path. Until then return None so the caller
-            // bails to the interpreter (correct semantics, slower).
+            4 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    vm_ptr,
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                )
+            }
+            5 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    vm_ptr,
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                )
+            }
+            6 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    vm_ptr,
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                    args_slice[5],
+                )
+            }
+            7 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    vm_ptr,
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                    args_slice[5],
+                    args_slice[6],
+                )
+            }
             _ => return None,
         })
     } else {
@@ -857,7 +903,56 @@ unsafe fn try_call_compiled_entry_inner(
                 let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
                 f(args_slice[0], args_slice[1], args_slice[2], args_slice[3])
             }
-            // TODO(round-6-wave-2): see with-ctx branch above.
+            5 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                )
+            }
+            6 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                    args_slice[5],
+                )
+            }
+            7 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                    args_slice[5],
+                    args_slice[6],
+                )
+            }
+            8 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                    args_slice[5],
+                    args_slice[6],
+                    args_slice[7],
+                )
+            }
             _ => return None,
         })
     }
@@ -5257,6 +5352,22 @@ fn call_integer_native_raw(
                     .map(|(_, raw)| ClassId::new(raw))
             });
             if let Some(class_id) = cached_class {
+                // Young-pressure relief for this cached fast path, which
+                // deliberately bypasses the `safe_native_call` boundary (and
+                // its young-pressure GC hook): the only argument here is a
+                // primitive `i32`, so initiating the orchestrated GC is
+                // exactly as safe as `jit_new_object`'s slow-path GC — no raw
+                // object pointers are held across it. Without this, a
+                // boxing-dominated compiled loop keeps spilling wrappers into
+                // old gen until `alloc_young_initialized` hard-aborts.
+                if vm.heap.young_spill_pressure() {
+                    if !crate::runtime::interpreter::gc_overhead_limit_exceeded(vm)
+                        && vm.heap.needs_gc()
+                    {
+                        crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+                    }
+                    vm.heap.clear_young_spill_pressure();
+                }
                 use cratonvm_native_api::NativeContext as _;
                 let mut ctx = crate::vm::NativeContextImpl { shared: vm, thread };
                 let object = ctx.alloc_object(class_id, 1);
@@ -6563,6 +6674,36 @@ mod tests {
             try_call_compiled_entry_reentrant(add_ctx_arg as *const () as usize, true, 5, &[7])
         };
         assert_eq!(result, Some(12));
+    }
+
+    #[test]
+    fn compiled_entry_reentrant_wrapper_preserves_stack_arg_abi() {
+        unsafe extern "C" fn sum_five(a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
+            a + b + c + d + e
+        }
+        unsafe extern "C" fn sum_ctx_four(ctx: i64, a: i64, b: i64, c: i64, d: i64) -> i64 {
+            ctx + a + b + c + d
+        }
+        // SAFETY: both functions use the C ABI selected by the helper, including
+        // the first stack-passed parameter on Windows.
+        let no_ctx = unsafe {
+            try_call_compiled_entry_reentrant(
+                sum_five as *const () as usize,
+                false,
+                0,
+                &[1, 2, 3, 4, 5],
+            )
+        };
+        let with_ctx = unsafe {
+            try_call_compiled_entry_reentrant(
+                sum_ctx_four as *const () as usize,
+                true,
+                10,
+                &[1, 2, 3, 4],
+            )
+        };
+        assert_eq!(no_ctx, Some(15));
+        assert_eq!(with_ctx, Some(20));
     }
 
     #[test]
