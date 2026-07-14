@@ -1181,7 +1181,13 @@ impl<'a> Parser<'a> {
                         // literal `$` without triggering ${...}
                         // substitution.  Useful for legacy paths that
                         // contain a stray dollar sign.
-                        Some('$') => out.push('$'),
+                        // Preserve the escape until substitution has scanned
+                        // the completed string. Otherwise `\${USER}` becomes
+                        // `${USER}` here and is mistakenly expanded below.
+                        Some('$') => {
+                            out.push('\\');
+                            out.push('$');
+                        }
                         Some(other) => out.push(other),
                         None => return Err(self.err("unterminated escape")),
                     }
@@ -1223,7 +1229,19 @@ impl<'a> Parser<'a> {
         let bytes = raw.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
-            if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'$' {
+                // `parse_string` preserves `\$` solely as a substitution
+                // escape marker. Consume it here and publish the literal.
+                out.push('$');
+                i += 2;
+            } else if bytes[i] == b'\\' {
+                // A backslash that did not escape a dollar is ordinary
+                // policy text. Handle it separately so the copy run below
+                // cannot consume the escape marker before this branch sees
+                // it on the next iteration.
+                out.push('\\');
+                i += 1;
+            } else if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
                 // Find the matching `}` — search byte-wise because
                 // `}` is ASCII and cannot appear inside a UTF-8
                 // continuation byte (those have the high bit set).
@@ -1261,7 +1279,7 @@ impl<'a> Parser<'a> {
                 // We stop at any `$` so the next iteration can
                 // examine it for `${` substitution.
                 let run_start = i;
-                while i < bytes.len() && bytes[i] != b'$' {
+                while i < bytes.len() && bytes[i] != b'$' && bytes[i] != b'\\' {
                     // Step by the UTF-8 char width to keep ASCII /
                     // non-ASCII distinction intact.  `from_utf8`
                     // verified the slice on entry so this is safe.

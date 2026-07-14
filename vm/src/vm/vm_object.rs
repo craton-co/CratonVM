@@ -112,6 +112,21 @@ pub fn try_create_java_string_from_units(shared: &SharedVm, units: &[u16]) -> Op
 /// Allocate and populate a fresh `java/lang/String` object for `text`.
 /// Performs no pool lookup or insertion — callers decide pooling policy.
 fn alloc_java_string_object(shared: &SharedVm, text: &str) -> ObjectRef {
+    if shared
+        .compact_strings
+        .load(std::sync::atomic::Ordering::Relaxed)
+        && text.is_ascii()
+    {
+        return try_alloc_java_string_object_from_ascii(shared, text.as_bytes()).unwrap_or_else(
+            || {
+                eprintln!(
+                    "FATAL: heap exhausted allocating java/lang/String ({} units)",
+                    text.len()
+                );
+                std::process::abort();
+            },
+        );
+    }
     let units: Vec<u16> = text.encode_utf16().collect();
     alloc_java_string_object_from_units(shared, &units)
 }
@@ -134,14 +149,9 @@ fn alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> Obje
     })
 }
 
-/// Fallible twin of [`alloc_java_string_object_from_units`]: returns `None`
-/// instead of aborting when the heap is too full to allocate the `String`
-/// object or its backing array. Used by exception materialization so a
-/// `java.lang.OutOfMemoryError` can be surfaced (or the pre-allocated singleton
-/// thrown) on a 100%-full heap rather than the VM hard-aborting. Goes through
-/// the fallible-with-old-gen heap paths (`try_alloc_object_full` /
-/// `try_alloc_array_full`).
-fn try_alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> Option<ObjectRef> {
+/// Resolve the loaded String class and its instance-field count. The field
+/// count is cached; the ordinary fast path uses only a class-manager read lock.
+fn java_string_allocation_layout(shared: &SharedVm) -> (ClassId, usize) {
     // Load java/lang/String class and resolve field count (cached after first call).
     // The field count is cached in an AtomicUsize to avoid lock contention:
     // once resolved, subsequent calls skip the class_manager *write* lock entirely.
@@ -172,7 +182,7 @@ fn try_alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> 
     } else {
         None
     };
-    let (string_class_id, field_count) = match resolved {
+    match resolved {
         Some(pair) => pair,
         None => {
             // Slow path: first resolution (or read-probe miss). Take the write
@@ -205,7 +215,63 @@ fn try_alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> 
             };
             (id, count)
         }
-    };
+    }
+}
+
+/// Compact-String fast path for the overwhelmingly common ASCII dynamic
+/// result (regex groups, numeric formatting, short substrings). It avoids the
+/// temporary UTF-16 Vec and writes the byte[] payload with one bulk copy.
+fn try_alloc_java_string_object_from_ascii(shared: &SharedVm, ascii: &[u8]) -> Option<ObjectRef> {
+    debug_assert!(ascii.is_ascii());
+    debug_assert!(shared
+        .compact_strings
+        .load(std::sync::atomic::Ordering::Relaxed));
+    let (string_class_id, field_count) = java_string_allocation_layout(shared);
+    let str_obj = shared
+        .heap
+        .try_alloc_object_full(string_class_id, field_count)?;
+    let byte_array =
+        shared
+            .heap
+            .try_alloc_array_full(ClassId::new(0), ArrayElementType::Byte, ascii.len())?;
+    if !ascii.is_empty() {
+        match shared.heap.array_data_ptr(byte_array) {
+            Some(base) => unsafe {
+                cratonvm_gc::heap::cell_watch_check(
+                    base as usize,
+                    ascii.len(),
+                    "try_alloc_java_string_object_from_ascii",
+                    &byte_array.as_ptr(),
+                );
+                std::ptr::copy_nonoverlapping(ascii.as_ptr(), base, ascii.len());
+            },
+            None => {
+                for (i, &byte) in ascii.iter().enumerate() {
+                    if shared
+                        .heap
+                        .set_array_element(byte_array, i, Value::Int(byte as i32))
+                        .is_err()
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    shared
+        .heap
+        .set_field(str_obj, 0, Value::Object(Some(byte_array)));
+    shared.heap.set_field(str_obj, 1, Value::Int(CODER_LATIN1));
+    shared.heap.set_field(str_obj, 2, Value::Int(0));
+    shared.heap.set_field(str_obj, 3, Value::Int(0));
+    Some(str_obj)
+}
+
+/// Fallible twin of [`alloc_java_string_object_from_units`]: returns `None`
+/// instead of aborting when the heap is too full to allocate the `String`
+/// object or its backing array.
+fn try_alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> Option<ObjectRef> {
+    let (string_class_id, field_count) = java_string_allocation_layout(shared);
     let str_obj = shared
         .heap
         .try_alloc_object_full(string_class_id, field_count)?;
@@ -1564,6 +1630,29 @@ mod tests {
         let obj1 = create_java_string(&shared, "same");
         let obj2 = create_java_string(&shared, "same");
         assert_eq!(obj1.as_ptr(), obj2.as_ptr());
+    }
+
+    #[test]
+    fn compact_ascii_uninterned_strings_are_fresh_and_roundtrip() {
+        let shared = test_shared();
+        shared
+            .compact_strings
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        shared
+            .cached_string_num_fields
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+
+        let obj1 = create_java_string_uninterned(&shared, "5888890");
+        let obj2 = create_java_string_uninterned(&shared, "5888890");
+        assert_ne!(obj1.as_ptr(), obj2.as_ptr());
+        assert_eq!(
+            read_java_string(&shared.heap, obj1),
+            Some("5888890".to_string())
+        );
+        assert_eq!(
+            read_java_string(&shared.heap, obj2),
+            Some("5888890".to_string())
+        );
     }
 
     /// Build a `byte[]` payload directly and decode it via

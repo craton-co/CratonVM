@@ -1061,14 +1061,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
     // GC-overhead accounting: live set BEFORE the collection (post-TLAB-retire),
     // so `note_gc_productivity` can compute how much this forced GC actually
     // freed (`before - after`). See `note_gc_productivity` / `gc_overhead_limit_exceeded`.
-    // Free-list-aware metric: the non-moving young sweep reclaims into the
-    // from-space free list without retreating the bump cursor, so the raw
-    // `allocated_bytes` reads "freed 0" for a perfectly-productive sweep and
-    // the overhead limit falsely latches (then no GC ever runs again).
-    // Promoted bytes count as productivity too — a promotion-only cycle
-    // conserves live bytes but drained young for new allocation.
-    let before_live = shared.heap.live_bytes_estimate();
-    let before_promoted = shared.heap.bytes_promoted_total();
+    let before_live = shared.heap.allocated_bytes();
     // Round-5 fix (CRIT — UAF): see comment in `maybe_gc`. The forced
     // path is also an initiator path; drain its per-thread SATB buffer
     // before scanning roots.
@@ -1095,7 +1088,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
         shared
             .gc_cycle_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        note_gc_productivity(shared, before_live, before_promoted);
+        note_gc_productivity(shared, before_live);
     } else {
         let mut counted_os_tids: Vec<u32> = Vec::new();
         let should_initiate_gc = {
@@ -1153,7 +1146,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             shared
                 .gc_cycle_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            note_gc_productivity(shared, before_live, before_promoted);
+            note_gc_productivity(shared, before_live);
         } else {
             safepoint_check(shared, thread);
         }
@@ -1177,30 +1170,17 @@ const GC_OVERHEAD_LIMIT_CYCLES: u32 = 8;
 /// generational heap: in a retained-allocation death-spiral the young semi-space
 /// is emptied every cycle (so total *fullness* sits near young/total ≈ 50% and
 /// never looks exhausted), yet the GC frees ~nothing net because every survivor
-/// is promoted into an already-full old generation. Promoted bytes DO count
-/// toward productivity (they re-enable young allocation, which is the point of
-/// the collection) — but the 2%-of-capacity threshold still catches the
-/// death-spiral: a wedged, ~full old generation cannot absorb 2% of total heap
-/// capacity per cycle, so its sliver-promotions stay "unproductive" and the
-/// streak still trips the overhead limit. A healthy young→old drain moves far
-/// more than 2% and resets it.
+/// is promoted into an already-full old generation. `before - after` captures
+/// exactly that — promotion is not freeing, so it does not reset the streak.
 /// Forced GCs only happen on genuine allocation failure (young full *and*
 /// promotion blocked), so this never fires during ordinary young-GC churn.
-fn note_gc_productivity(shared: &SharedVm, before_live: usize, before_promoted: u64) {
+fn note_gc_productivity(shared: &SharedVm, before_live: usize) {
     let cap = shared.heap.heap_capacity();
     if cap == 0 {
         return;
     }
-    // Free-list-aware live metric (see the capture site in `maybe_gc_forced`):
-    // the non-moving sweep reclaims into the young free list without moving
-    // the bump cursor, so `allocated_bytes` would read a fully-productive
-    // sweep as "freed 0" and falsely latch the overhead limit.
-    let after_live = shared.heap.live_bytes_estimate();
-    let promoted = shared
-        .heap
-        .bytes_promoted_total()
-        .saturating_sub(before_promoted) as usize;
-    let freed = before_live.saturating_sub(after_live).saturating_add(promoted);
+    let after_live = shared.heap.allocated_bytes();
+    let freed = before_live.saturating_sub(after_live);
     // unproductive: freed < 2% of capacity
     // Cast: numeric/representation conversion
     let unproductive = (freed as u128) * 100 < (cap as u128) * 2;
@@ -1217,7 +1197,7 @@ fn note_gc_productivity(shared: &SharedVm, before_live: usize, before_promoted: 
     };
     if std::env::var_os("CRATONVM_DBG_GC_OVERHEAD").is_some() {
         eprintln!(
-            "[GC_OVERHEAD] before={before_live} after={after_live} promoted={promoted} freed={freed} cap={cap} unproductive={unproductive} streak={streak}"
+            "[GC_OVERHEAD] before={before_live} after={after_live} freed={freed} cap={cap} unproductive={unproductive} streak={streak}"
         );
     }
 }
@@ -2046,6 +2026,53 @@ pub(crate) fn tlab_alloc_object_guarded_refill(
     tlab_alloc_object_inner(thread, shared, class_id, num_fields, total_size, true)
 }
 
+/// DBG (CRATONVM_DBG_TLABMISS): gate-failure state dump — the live young
+/// arena facts at the moment the guarded-refill young-room gate said no.
+/// Sampled every 2^20 failures (plus the first).
+fn dbg_refill_fail_state(shared: &SharedVm, requested: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_TLABMISS").is_some()) {
+        return;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n & 0xFFFFF == 1 {
+        let (used, cap, fl, largest) = shared.heap.young_arena_diag();
+        eprintln!(
+            "[gatefail] n={n} requested={requested} used={used}/{cap} free_list={fl} largest_free={largest} headroom={} has_free={}",
+            shared.heap.young_bump_headroom(requested),
+            shared.heap.young_has_free_block(requested),
+        );
+    }
+}
+
+/// DBG (CRATONVM_DBG_TLABMISS): which step of the guarded TLAB refill fails
+/// and with what request size. stage: 0=young-room gate, 1=refill_tlab
+/// returned None. Prints every 2^20 events per stage.
+#[inline]
+fn dbg_refill_fail(stage: usize, requested: usize) {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_TLABMISS").is_some()) {
+        return;
+    }
+    static COUNTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    static LAST_REQ: AtomicUsize = AtomicUsize::new(0);
+    LAST_REQ.store(requested, Ordering::Relaxed);
+    let n = COUNTS[stage].fetch_add(1, Ordering::Relaxed) + 1;
+    if n & 0xFFFFF == 1 {
+        eprintln!(
+            "[refillfail] gate={} refill_none={} last_requested={}",
+            COUNTS[0].load(Ordering::Relaxed),
+            COUNTS[1].load(Ordering::Relaxed),
+            requested,
+        );
+    }
+}
+
 #[inline(always)]
 fn tlab_alloc_object_inner(
     thread: &mut JvmThread,
@@ -2103,10 +2130,21 @@ fn tlab_alloc_object_inner(
     // check, then the amortized-O(1) reclaimed-span probe. Otherwise bail to
     // the caller's non-TLAB fallback (old-gen spill). See the wrapper doc
     // for the failure modes this gate was shaped by.
+    // Fragmentation-tolerant free-block probe: any reclaimed span that can
+    // hold a minimum-sized TLAB is worth refilling from — `refill_tlab`'s
+    // fragmentation fallback serves the largest available block capped at
+    // `requested` (see the wedge note there). Probing for the FULL
+    // `requested` size wedged this gate shut on a free list made entirely of
+    // just-under-`requested` split remnants (the bimodal-bt18 4.5s mode:
+    // ~2 GiB of 131056-byte blocks vs a 131072-byte request, every
+    // allocation crawling through the per-object slow path while the young
+    // collection that would re-coalesce them never triggered).
+    let free_block_floor = cratonvm_gc::tlab::min_tlab_size().max(256).min(requested);
     if refill_needs_young_room
         && !shared.heap.young_bump_headroom(requested)
-        && !shared.heap.young_has_free_block(requested)
+        && !shared.heap.young_has_free_block(free_block_floor)
     {
+        dbg_refill_fail_state(shared, requested);
         return None;
     }
 
@@ -2133,6 +2171,9 @@ fn tlab_alloc_object_inner(
     thread.tlab.retire();
 
     let refill = shared.heap.refill_tlab(requested);
+    if refill.is_none() {
+        dbg_refill_fail(1, requested);
+    }
     if let Some((buf, size)) = refill {
         shared.tlab_refill_count.fetch_add(1, Ordering::Relaxed);
         // SAFETY: buf and size were just returned by the arena allocator and the memory is zeroed.
@@ -8724,6 +8765,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let tdigest_kernel = frame.class_name() == "org/elasticsearch/tdigest/Dist"
                         && matches!(frame.method_name(), "quantile" | "cdf")
                         && frame.method_descriptor() == "(DILjava/util/function/Function;)D";
+                    // SAFETY: `code_ptr` addresses this frame's bytecode and the
+                    // preceding length check proves every inspected offset is in bounds.
                     if tdigest_kernel
                         && saved_pc + 14 <= code_len
                         && unsafe { *code_ptr.add(saved_pc + 3) } == 0xb9
@@ -10309,6 +10352,8 @@ pub(crate) fn build_deopt_frame_inner(
     for m in &rframe.monitors {
         match &m.object {
             FrameValue::Object(addr) => {
+                // SAFETY: materialization produced this raw oop and the frame is
+                // pinned before any allocation or GC can make the address stale.
                 let obj = unsafe { ObjectRef::from_raw(*addr as usize as *mut u8) };
                 thread.native_pin_roots.push(obj);
                 monitor_depths.push(m.lock_depth);
@@ -19607,6 +19652,8 @@ fn try_invoke_cached_lambda_impl(
                             crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(
                                 &*compiled,
                             );
+                        // SAFETY: the compiled entry's ABI and optional context
+                        // are selected from its own verified metadata above.
                         unsafe {
                             if compiled.needs_context() {
                                 compiled.try_call_with_context(vm_ptr, &jit_args)
@@ -20611,20 +20658,23 @@ pub(crate) fn try_lambda_dispatch(
     }
 }
 
-/// Invoke a cached native callback with [`safe_native_call`] (pins jobject
-/// args / return values across safepoint GC) and push any result.
 #[inline]
-fn invoke_cached_native_callback(
+fn invoke_cached_native_callback_impl(
     shared: &SharedVm,
     thread: &mut JvmThread,
     frame_idx: usize,
     callback: cratonvm_native_api::NativeCallback,
     args: &[Value],
     method_descriptor: &str,
+    objects_prevalidated: bool,
 ) -> Result<(), MethodCallFailed> {
     // Widening: small integer index -> usize (non-negative, fits in pointer width)
     let _ring_idx = cratonvm_native_api::native_ring::record_enter(callback as usize);
-    let result = crate::vm::safe_native_call(shared, thread, callback, args);
+    let result = if objects_prevalidated {
+        crate::vm::safe_native_call_prevalidated_objects(shared, thread, callback, args)
+    } else {
+        crate::vm::safe_native_call(shared, thread, callback, args)
+    };
     cratonvm_native_api::native_ring::record_exit(_ring_idx);
     let result = result?;
     if let Some(value) = result {
@@ -20646,6 +20696,48 @@ fn invoke_cached_native_callback(
         }
     }
     Ok(())
+}
+
+/// Invoke a cached native callback with [`safe_native_call`] (pins jobject
+/// args / return values across safepoint GC) and push any result.
+#[inline]
+fn invoke_cached_native_callback(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    callback: cratonvm_native_api::NativeCallback,
+    args: &[Value],
+    method_descriptor: &str,
+) -> Result<(), MethodCallFailed> {
+    invoke_cached_native_callback_impl(
+        shared,
+        thread,
+        frame_idx,
+        callback,
+        args,
+        method_descriptor,
+        false,
+    )
+}
+
+#[inline]
+fn invoke_cached_native_callback_prevalidated(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    callback: cratonvm_native_api::NativeCallback,
+    args: &[Value],
+    method_descriptor: &str,
+) -> Result<(), MethodCallFailed> {
+    invoke_cached_native_callback_impl(
+        shared,
+        thread,
+        frame_idx,
+        callback,
+        args,
+        method_descriptor,
+        true,
+    )
 }
 
 /// Registered Rust natives that must win over real-JDK bytecode on the same
@@ -32591,6 +32683,32 @@ fn execute_invokevirtual_cached(
                     if actual_class_id != receiver_class_id {
                         return Ok(CachedCallResult::CacheMiss);
                     }
+                    // The callback identity proves this cache entry is one of
+                    // the eight real-layout Matcher leaves. The receiver was
+                    // just checked against the cache's monomorphic class guard,
+                    // so it cannot be a lambda/annotation proxy and its sole
+                    // object argument is already heap-validated. Skip those two
+                    // generic proxy locks and the duplicate heap-membership
+                    // search while retaining ordinary native pinning, return,
+                    // and exception handling.
+                    if cratonvm_native_builtins::is_matcher_realjdk_native_callback(callback) {
+                        let (args, method_descriptor) = pop_coerced_invoke_args_virtual(
+                            shared,
+                            caller_class_id,
+                            cp_index,
+                            frame_idx,
+                            thread,
+                        )?;
+                        invoke_cached_native_callback_prevalidated(
+                            shared,
+                            thread,
+                            frame_idx,
+                            callback,
+                            &args,
+                            &method_descriptor,
+                        )?;
+                        return Ok(CachedCallResult::Handled);
+                    }
                     // Lambda proxies require the slow `try_lambda_dispatch`
                     // route instead of a cached interface target.
                     if !is_special && shared.lambda_proxies.read().contains_key(&actual_class_id) {
@@ -34476,7 +34594,7 @@ mod tests {
     }
 
     #[test]
-    fn buffered_input_stream_force_native_covers_constructors_and_io_surface() {
+    fn buffered_input_stream_real_jdk_uses_its_own_bytecode() {
         let buffered = "java/io/BufferedInputStream";
         for (name, descriptor) in [
             ("<init>", "(Ljava/io/InputStream;)V"),
@@ -34491,8 +34609,8 @@ mod tests {
             ("close", "()V"),
         ] {
             assert!(
-                force_native_over_real_jdk_bytecode(buffered, name, descriptor),
-                "BufferedInputStream.{name}{descriptor} must use its registered native"
+                !force_native_over_real_jdk_bytecode(buffered, name, descriptor),
+                "BufferedInputStream.{name}{descriptor} must keep its real-JDK bytecode"
             );
         }
         assert!(force_native_over_real_jdk_bytecode(

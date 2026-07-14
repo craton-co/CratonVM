@@ -2066,6 +2066,33 @@ fn dbg_jit_alloc_filter() -> Option<u32> {
 // class_id_raw and num_fields must match the class metadata resolved at compile time.
 // The returned i64 is a raw heap pointer to the newly allocated object.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+/// DBG (CRATONVM_DBG_TLABMISS): count why `jit_new_object` fell past the
+/// TLAB arm — the bimodal-bt18 discriminator. reason: 0=oversized,
+/// 1=guarded-refill returned None, 2=JIT_THREAD TLS null. Prints a running
+/// breakdown every 2^20 misses.
+#[inline]
+fn dbg_tlabmiss(reason: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_TLABMISS").is_some()) {
+        return;
+    }
+    static COUNTS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    let n = COUNTS[reason].fetch_add(1, Ordering::Relaxed) + 1;
+    let total = COUNTS[0].load(Ordering::Relaxed)
+        + COUNTS[1].load(Ordering::Relaxed)
+        + COUNTS[2].load(Ordering::Relaxed);
+    if total & 0xFFFFF == 0 || (n == 1 && reason == 2) {
+        eprintln!(
+            "[tlabmiss] oversized={} refill_none={} jit_thread_null={}",
+            COUNTS[0].load(Ordering::Relaxed),
+            COUNTS[1].load(Ordering::Relaxed),
+            COUNTS[2].load(Ordering::Relaxed),
+        );
+    }
+}
+
 pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fields: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -2139,7 +2166,12 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
                 }
                 return obj_ref.as_ptr() as i64;
             }
+            dbg_tlabmiss(1); // guarded refill returned None
+        } else {
+            dbg_tlabmiss(2); // JIT_THREAD TLS pointer is null
         }
+    } else {
+        dbg_tlabmiss(0); // oversized for TLAB
     }
     // Fallible young → old-gen alloc (preserves alloc_object's old-gen spill);
     // on exhaustion surface a catchable OutOfMemoryError instead of the hard
@@ -2834,6 +2866,8 @@ pub unsafe extern "C" fn jit_arraylength(array_ptr: i64) -> i64 {
 /// # Safety
 /// `obj_ptr` must be non-null and point at a valid object header.
 #[inline]
+// SAFETY: callers validate that `obj_ptr` names a live object before using
+// the compact-layout metadata derived from its header.
 unsafe fn jit_compact_field_slot(obj_ptr: i64, field_index: i64) -> Option<(usize, bool)> {
     if field_index < 0 {
         return None;
@@ -2855,6 +2889,8 @@ unsafe fn jit_compact_field_slot(obj_ptr: i64, field_index: i64) -> Option<(usiz
 /// `obj_ptr` must be non-null, point at a valid object header, and `field_index`
 /// must be within the object's slot count (callers bounds-check first).
 #[inline]
+// SAFETY: callers bounds-check `field_index`, so the returned address remains
+// within the live object's allocated field storage.
 unsafe fn jit_field_cell_ptr(obj_ptr: i64, field_index: i64) -> *mut u8 {
     let off = match jit_compact_field_slot(obj_ptr, field_index) {
         Some((o, _)) => o,
@@ -4016,6 +4052,13 @@ struct DispatchCache {
 struct NativeDispatchCache {
     receiver_class_id: u32,
     callback: cratonvm_native_api::NativeCallback,
+    kind: ObjectNativeKind,
+}
+
+#[derive(Clone, Copy)]
+enum ObjectNativeKind {
+    HashMap,
+    Matcher,
 }
 
 #[derive(Clone, Copy)]
@@ -4039,7 +4082,7 @@ thread_local! {
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
     static DISPATCH_COUNTER: std::cell::RefCell<rustc_hash::FxHashMap<usize, u32>>
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
-    static HASHMAP_NATIVE_DISPATCH_CACHE:
+    static OBJECT_NATIVE_DISPATCH_CACHE:
         std::cell::RefCell<rustc_hash::FxHashMap<usize, NativeDispatchCache>>
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
     static INTEGER_NATIVE_DISPATCH_CACHE:
@@ -4048,6 +4091,10 @@ thread_local! {
     /// Real `java/lang/Integer` class discovered from the first ordinary
     /// `valueOf` result in each VM. A new VM pointer invalidates the entry.
     static INTEGER_WRAPPER_CLASS_CACHE: std::cell::Cell<Option<(usize, u32)>> =
+        const { std::cell::Cell::new(None) };
+    /// Exact real-JDK `java/util/regex/Matcher` class id, discovered once per
+    /// VM for the virtual-MIC native fast path.
+    static MATCHER_CLASS_CACHE: std::cell::Cell<Option<(usize, u32)>> =
         const { std::cell::Cell::new(None) };
     // Virtual/interface call sites are keyed by their JIT metadata pointer AND
     // the receiver's actual class id. A static CP owner is not sound here:
@@ -4507,15 +4554,16 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     };
 
     let info_key = info_ptr as usize;
-    // Cached HashMap-native fast path — the FIRST per-callsite probe. The
+    // Cached exact-receiver native fast path — the FIRST per-callsite probe. The
     // resolution/insertion slow path stays further down (after the compile
     // probes); this early block only serves sites the cache has already
-    // resolved. Rationale: `HashMap.put/get` are registered natives with no
+    // resolved. Rationale: `HashMap.put/get` and the real-layout Matcher
+    // operations are registered natives with no
     // bytecode, so neither the Integer cache below nor the virtual-dispatch
     // machinery can ever serve them — yet every map call paid those probes
     // first. Probing the map cache first costs the (now direct-called on
     // x64, hence rarely dispatched) Integer sites one extra hash lookup and
-    // saves one on every map operation. The receiver class-id equality
+    // saves one on every cached native operation. The receiver class-id equality
     // check preserves the exact-receiver guard; the `any_class_redefined`
     // gate matches the resolution site below. Runs ahead of the recursion
     // depth guard like the Integer block: the cached callbacks are native
@@ -4525,20 +4573,15 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         && !crate::classloading::any_class_redefined()
     {
         let cached =
-            HASHMAP_NATIVE_DISPATCH_CACHE.with(|cache| cache.borrow().get(&info_key).copied());
+            OBJECT_NATIVE_DISPATCH_CACHE.with(|cache| cache.borrow().get(&info_key).copied());
         if let Some(entry) = cached {
             let receiver_raw = args_slice[0] as u64;
             if receiver_raw != 0 && (receiver_raw & 0x7) == 0 && receiver_raw < (1u64 << 48) {
                 if let Some(receiver) = vm.heap.is_object_address(receiver_raw as usize) {
                     if vm.heap.class_id_of(receiver).as_u32() == entry.receiver_class_id {
                         if let Some((thread, _guard)) = jit_thread_mut() {
-                            if let Some(result) = call_hashmap_native_raw(
-                                vm,
-                                thread,
-                                info,
-                                receiver,
-                                args_slice,
-                                entry.callback,
+                            if let Some(result) = call_object_native_raw(
+                                vm, thread, info, receiver, args_slice, entry,
                             ) {
                                 return result;
                             }
@@ -4853,19 +4896,24 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     };
 
     // Registered natives cannot populate DISPATCH_CACHE because they have no
-    // compiled entry pointer. Cache the callback and exact receiver ClassId for
-    // the hot monomorphic HashMap put/get sites instead of repeating virtual
-    // resolution and a failed compile probe on every iteration.
+    // compiled entry pointer. Cache the callback, decoder kind, and exact
+    // receiver ClassId for the hot monomorphic HashMap and Matcher sites
+    // instead of repeating virtual resolution and a failed compile probe on
+    // every iteration.
+    let object_native_kind = hashmap_native_arg_count(info)
+        .map(|_| ObjectNativeKind::HashMap)
+        .or_else(|| matcher_native_arg_count(info).map(|_| ObjectNativeKind::Matcher));
     if matches!(info.invoke_kind, 0 | 2)
         && !crate::classloading::any_class_redefined()
-        && hashmap_native_arg_count(info).is_some()
+        && object_native_kind.is_some()
         && !args_slice.is_empty()
     {
+        let kind = object_native_kind.expect("checked above");
         let receiver_raw = args_slice[0] as u64;
         if receiver_raw != 0 && (receiver_raw & 0x7) == 0 && receiver_raw < (1u64 << 48) {
             if let Some(receiver) = vm.heap.is_object_address(receiver_raw as usize) {
                 let receiver_class_id = vm.heap.class_id_of(receiver).as_u32();
-                let cached = HASHMAP_NATIVE_DISPATCH_CACHE.with(|cache| {
+                let cached = OBJECT_NATIVE_DISPATCH_CACHE.with(|cache| {
                     cache
                         .borrow()
                         .get(&info_key)
@@ -4873,36 +4921,40 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                         .filter(|entry| entry.receiver_class_id == receiver_class_id)
                 });
                 if let Some(entry) = cached {
-                    if let Some(result) = call_hashmap_native_raw(
-                        vm,
-                        thread,
-                        info,
-                        receiver,
-                        args_slice,
-                        entry.callback,
-                    ) {
+                    if let Some(result) =
+                        call_object_native_raw(vm, thread, info, receiver, args_slice, entry)
+                    {
                         return result;
                     }
                 } else {
-                    let is_exact_hashmap = {
+                    let expected_class = match kind {
+                        ObjectNativeKind::HashMap => "java/util/HashMap",
+                        ObjectNativeKind::Matcher => "java/util/regex/Matcher",
+                    };
+                    let is_exact_receiver = {
                         let classes = vm.class_manager.read();
                         classes
                             .get_class(ClassId::new(receiver_class_id))
-                            .map(|class| class.name.as_ref() == "java/util/HashMap")
+                            .map(|class| class.name.as_ref() == expected_class)
                             .unwrap_or(false)
                     };
-                    if is_exact_hashmap {
-                        if let Some(callback) = hashmap_native_callback(info) {
+                    if is_exact_receiver {
+                        let callback = match kind {
+                            ObjectNativeKind::HashMap => hashmap_native_callback(info),
+                            ObjectNativeKind::Matcher => matcher_native_callback(info),
+                        };
+                        if let Some(callback) = callback {
                             let entry = NativeDispatchCache {
                                 receiver_class_id,
                                 callback,
+                                kind,
                             };
-                            HASHMAP_NATIVE_DISPATCH_CACHE.with(|cache| {
+                            OBJECT_NATIVE_DISPATCH_CACHE.with(|cache| {
                                 cache.borrow_mut().insert(info_key, entry);
                             });
-                            if let Some(result) = call_hashmap_native_raw(
-                                vm, thread, info, receiver, args_slice, callback,
-                            ) {
+                            if let Some(result) =
+                                call_object_native_raw(vm, thread, info, receiver, args_slice, entry)
+                            {
                                 return result;
                             }
                         }
@@ -5452,6 +5504,68 @@ fn hashmap_native_callback(info: &JitInvokeInfo) -> Option<cratonvm_native_api::
     }
 }
 
+#[inline]
+fn matcher_native_arg_count(info: &JitInvokeInfo) -> Option<usize> {
+    match (info.method_name, info.descriptor) {
+        ("find", "()Z")
+        | ("start", "()I")
+        | ("end", "()I")
+        | ("group", "()Ljava/lang/String;") => Some(1),
+        ("find", "(I)Z")
+        | ("start", "(I)I")
+        | ("end", "(I)I")
+        | ("group", "(I)Ljava/lang/String;") => Some(2),
+        _ => None,
+    }
+}
+
+#[inline]
+fn matcher_native_callback(info: &JitInvokeInfo) -> Option<cratonvm_native_api::NativeCallback> {
+    if !crate::runtime::env_cache::native_matcher_find() {
+        return None;
+    }
+    cratonvm_native_builtins::matcher_realjdk_native_callback(info.method_name, info.descriptor)
+}
+
+#[inline]
+fn is_exact_matcher_class(vm: &SharedVm, class_id: ClassId) -> bool {
+    let vm_key = vm as *const SharedVm as usize;
+    let raw_class_id = class_id.as_u32();
+    if MATCHER_CLASS_CACHE.with(|cache| cache.get() == Some((vm_key, raw_class_id))) {
+        return true;
+    }
+
+    let is_exact = vm
+        .class_manager
+        .read()
+        .get_class(class_id)
+        .map(|class| class.name.as_ref() == "java/util/regex/Matcher")
+        .unwrap_or(false);
+    if is_exact {
+        MATCHER_CLASS_CACHE.with(|cache| cache.set(Some((vm_key, raw_class_id))));
+    }
+    is_exact
+}
+
+#[inline]
+fn call_object_native_raw(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+    receiver_ref: ObjectRef,
+    args_slice: &[i64],
+    entry: NativeDispatchCache,
+) -> Option<i64> {
+    match entry.kind {
+        ObjectNativeKind::HashMap => {
+            call_hashmap_native_raw(vm, thread, info, receiver_ref, args_slice, entry.callback)
+        }
+        ObjectNativeKind::Matcher => {
+            call_matcher_native_raw(vm, thread, info, receiver_ref, args_slice, entry.callback)
+        }
+    }
+}
+
 /// Invoke a cached HashMap bridge directly from raw JIT argument slots.
 #[inline]
 fn call_hashmap_native_raw(
@@ -5479,6 +5593,47 @@ fn call_hashmap_native_raw(
         }
         let object = vm.heap.is_object_address(bits as usize)?;
         values[index + 1] = Value::Object(Some(object));
+    }
+
+    let result = match crate::vm::safe_native_call_prevalidated_objects(
+        vm,
+        thread,
+        callback,
+        &values[..expected_len],
+    ) {
+        Ok(value) => value,
+        Err(error) => return Some(handle_jit_dispatch_error(vm, thread, error, info)),
+    };
+    Some(match result {
+        Some(Value::Int(value)) => value as i64,
+        Some(Value::Long(value)) => value,
+        Some(Value::Float(value)) => value.to_bits() as i64,
+        Some(Value::Double(value)) => value.to_bits() as i64,
+        Some(Value::Object(Some(object))) => object.as_ptr() as i64,
+        Some(Value::Object(None)) | None => 0,
+        _ => 0,
+    })
+}
+
+/// Invoke a cached real-layout Matcher native from raw JIT argument slots.
+#[inline]
+fn call_matcher_native_raw(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+    receiver_ref: ObjectRef,
+    args_slice: &[i64],
+    callback: cratonvm_native_api::NativeCallback,
+) -> Option<i64> {
+    let expected_len = matcher_native_arg_count(info)?;
+    if args_slice.len() != expected_len {
+        return None;
+    }
+
+    let mut values = [Value::Object(None); 2];
+    values[0] = Value::Object(Some(receiver_ref));
+    if expected_len == 2 {
+        values[1] = Value::Int(args_slice[1] as i32);
     }
 
     let result = match crate::vm::safe_native_call_prevalidated_objects(
@@ -5591,6 +5746,8 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
     }
 }
 
+// SAFETY: the JIT invoke metadata and the validated proxy receiver originate
+// from the active interpreted frame; callers fall back to interpretation on a miss.
 unsafe fn try_fast_lambda_int_to_double_apply(
     vm: &SharedVm,
     thread: &mut JvmThread,
@@ -5833,6 +5990,30 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
 
     let receiver_class_id = vm.heap.class_id_of(receiver_ref);
     let receiver_cid = receiver_class_id.as_u32();
+
+    // Real-layout Matcher methods are registered natives, so they can never
+    // publish a compiled entry into the ordinary MIC/PIC. Without this leaf
+    // path every `find`/`start`/`end`/`group` hit decodes a heap-allocated
+    // `Vec<Value>`, retries a compile probe, and performs generic virtual/native
+    // resolution. Guarding the exact receiver class preserves subclass
+    // overrides; the feature gate in `matcher_native_callback` preserves the
+    // native opt-out, and class redefinition keeps using the generic resolver.
+    if !crate::classloading::any_class_redefined() {
+        if let Some(callback) = matcher_native_callback(info) {
+            if is_exact_matcher_class(vm, receiver_class_id) {
+                if let Some(result) = call_matcher_native_raw(
+                    vm,
+                    thread,
+                    info,
+                    receiver_ref,
+                    args_slice,
+                    callback,
+                ) {
+                    return result;
+                }
+            }
+        }
+    }
 
     // AnnotationProxy receiver: synthetic class with no bytecode methods, so the
     // cache-miss path below would resolve on it, fail the compile-probe, and
