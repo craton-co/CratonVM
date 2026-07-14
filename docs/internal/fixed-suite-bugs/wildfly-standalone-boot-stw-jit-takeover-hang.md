@@ -1,5 +1,13 @@
 # WildFly standalone boot hangs forever in CratonVM's STW cross-thread JIT-takeover during parallel-extension-add
 
+Status: **RESOLVED** (2026-07-14) — see "Final resolution" at the bottom. The specific bug this doc
+documents (the `STW cross-thread JIT takeover ... rounds=64 pending=N taken=0` warning followed by a
+permanent hang) is fixed: 0 occurrences across 50+ verification attempts post-fix, versus ~80-90%
+before. Moved to `docs/internal/fixed-suite-bugs/` accordingly; see the bottom section for what remains
+genuinely open (separate, already-tracked bugs, not sub-parts of this one).
+
+Original filing (2026-07-13), preserved for history:
+
 Status: OPEN — new, found 2026-07-13 while root-causing
 [[wildfly-standalone-managed-server-boot-fails-under-surefire-fork]] after the
 `ProcessBuilder.environment()` fix (`d22a5e73`) landed and changed but did not resolve that bug.
@@ -277,3 +285,126 @@ targeting the TIMEOUT_NO_WARN stall (not the now-fixed STW-warning cases), or a 
 diagnostic approach (e.g. periodic `/proc/<pid>/stack` or `perf record` sampling across the whole stall
 window rather than a single point-in-time `bt`, since the earlier live-attach attempts for the
 STW-warning cases don't apply — there's no log line to poll for here).
+
+## Final resolution 2026-07-14 (third session): TIMEOUT_NO_WARN was a measurement artifact — CLOSING
+
+The prior addendum's `TIMEOUT_NO_WARN` residual — the thing keeping this doc open after both real
+deadlocks were fixed — turned out to be a **false alarm caused by an under-informative repro-loop
+methodology**, not a third bug. A CPU-activity-aware repro loop was built specifically to settle this:
+after an initial 45s grace budget, it samples `/proc/<pid>/stat` `utime+stime` every 2s and only
+classifies a slow run as `GENUINE_STALL` if CPU ticks stay **completely flat across 5 consecutive
+samples** (10s of zero progress) — gdb-attaching immediately when that happens, poll-and-pounce style.
+Anything still burning CPU when the hard 150s budget is hit is `SLOW_ACTIVE` instead: still working,
+just slower than the old blind timeout allowed for.
+
+15-run result on an idle host (post the CDL fix + `945e4302`/`945e4492`'s rwlock fix, both already on
+`dev`):
+
+```text
+OK: 1   STW_HANG: 0   CCE_CRASH: 6   GENUINE_STALL: 0   SLOW_ACTIVE: 7   SEGV: 1
+```
+
+**Zero genuine stalls.** Every run the earlier `TIMEOUT_NO_WARN` bucket would have caught was actively
+consuming CPU the whole time (`SLOW_ACTIVE`) — WildFly's later-stage *sequential* per-subsystem
+extension init (after `parallel-extension-add` itself completes) is just legitimately slow under
+CratonVM's interpreter on a host shared by 15+ other concurrent sessions, not stuck. The prior sessions'
+`TIMEOUT_NO_WARN` numbers were an artifact of fixed, too-short timeouts (20-45s) with no CPU-activity
+check to distinguish "still working" from "wedged" — exactly the trap the very first version of this
+doc's own "Confirmed as a genuine permanent hang, not slowness" section warned about, re-encountered by
+later sessions using a less careful method.
+
+The other two buckets are separate, independently-tracked bugs, not part of this one:
+
+- `CCE_CRASH` (6/15, 40%) — `ClassCastException: Object cannot be cast to
+  org.jboss.as.controller.AttributeDefinition`, this run's instance triggered by
+  `org.wildfly.extension.io.IOExtension` rather than the originally-filed `org.jboss.as.remoting`. The
+  *original* site of this exact signature was root-caused and fixed
+  (`fix(jit): pin checkcast/instanceof receiver across GC-triggering class load`, `70154861`,
+  [[wildfly-remoting-classcastexception-parallel-extension-add]], moved to
+  `docs/internal/fixed-suite-bugs/`) — that fix IS present in the binary used for this batch
+  (confirmed via `git merge-base --is-ancestor`), so this is a **recurrence of the same bug class at a
+  different, not-yet-covered call site**, exactly the "long-tail" pattern
+  `docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md` already documents. Tracked
+  there / in `wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md` if that doc
+  exists — not re-diagnosed here.
+- `SEGV` (1/15) — consistent with the same stale-`ObjectRef`-across-GC defect family; not attributed to
+  a specific site in this session, flagged for whoever next works the stale-ObjectRef residual doc.
+
+### Fix summary (three independent mechanisms, all now on `dev`)
+
+The one diagnostic signature this doc tracks (`STW cross-thread JIT takeover ... rounds=64 pending=N
+taken=0` then permanent silence) had **two distinct root causes**, both native blocking primitives that
+never registered with the GC barrier's blocked-region bookkeeping (unlike `NativeContextImpl::park`,
+used for `LockSupport.park`/`Object.wait`) — so a thread genuinely waiting on one stayed counted in the
+STW barrier's `expected` set forever:
+
+1. **`ReentrantReadWriteLock`/`StampedLock`** (`native-builtins/src/stamped_lock.rs` — `rw_write_lock`/
+   `rw_read_lock`/`stamped_write_lock`/`stamped_read_lock`) — blocked on a raw `parking_lot::Condvar`
+   with zero GC-barrier bracket. Root-caused independently by two sessions the same day: this doc's own
+   investigation (live-gdb caught two threads permanently parked here during WildFly's
+   `parallel-extension-add`, the lock held by `ConcreteResourceRegistration`'s shared registry lock)
+   and, separately, a Tomcat/`TestOrderInterceptor` investigation
+   (`docs/known-issues/tomcat-08-07/stw-crossthread-jit-takeover-hang-cluster.md`) that found the exact
+   same missing bracket via a Windows `cdb` stack (Tribes' internal executor). The Tomcat-side fix
+   landed first (`fix(gc): bracket 5 missing GC-blocking-region locks — the real STW takeover root
+   cause`, `945e4492`, merged `dev`) — call-site-level `ctx.begin_blocking_region()`/
+   `end_blocking_region()` wraps around each `lock()` registration in `native-builtins/src/lib.rs`, no
+   function-signature change to `stamped_lock.rs` itself. It ALSO covers two more blocking primitives
+   this doc's own investigation never got to: `native-builtins/src/xnio_async.rs`'s `native_iof_await`
+   family (XNIO `IoFuture`, heavily used by Undertow/WildFly) and
+   `native-builtins/src/concurrent_extras.rs`'s `SynchronousQueue` put/take/poll. This doc's own
+   first-attempt fix (commit `87fbb718`, function-signature change + internal restructuring) was
+   **dropped as redundant** once `945e4492` was confirmed already on `dev` and structurally simpler
+   (no lock-ordering hazard to manage — see next point).
+2. **`CountDownLatch`** (`native-builtins/src/lib.rs` — `native_cdl_await`/`native_cdl_await_timeout`/
+   `native_cdl_count_down`) — `NativeContextImpl::monitor_enter` called `self.shared.monitors.enter()`
+   directly instead of the established `monitor_enter_blocking()` contended-path helper. Live-gdb
+   caught the lone holdout parked in `Monitor::block_enter`'s condvar wait while every other worker was
+   correctly (GC-blocked) parked in `Object.wait()` inside the same handshake-latch polling loop. Fixed
+   narrowly: a first attempt (`87fbb718`) applied `monitor_enter_blocking` to ALL ~80 `monitor_enter`
+   call sites and was reverted after an audit found most of them keep using the same `ObjectRef`
+   afterward with no pin-and-refresh (would have traded this hang for a batch of new
+   stale-`ObjectRef`-across-GC bugs — this codebase's most recurring defect class). The final fix adds
+   a narrow, opt-in `NativeContext::monitor_enter_gc_safe` used ONLY by the 3 live-gdb-confirmed CDL
+   call sites (`native-api/src/registry.rs`, `vm/src/vm/vm_exec.rs`); `monitor_enter` itself is
+   untouched for every other caller. Merged `dev` as `fix(gc): close CountDownLatch monitor_enter
+   STW-barrier deadlock` (`41b06719`).
+
+A **third, self-inflicted bug was also found and fixed during this doc's own investigation**, worth
+flagging since it's an easy mistake to repeat: an early revision of the `stamped_lock.rs` fix called
+`ctx.begin_blocking_region()`/`end_blocking_region()` **while still holding the lock's own raw
+`parking_lot::MutexGuard`**. Since both calls can block synchronously for an entire in-flight STW pause,
+holding that guard across them let a WAITER (not even the lock holder) block the actual holder from
+ever reacquiring the state mutex to release/re-check — a new 3-way deadlock, live-gdb-captured as 18
+threads piled up with zero progress and **no STW warning ever printed** (an already-arrived waiter's own
+wait for pause-completion isn't reflected in the initiator's `rounds`/`pending` diagnostic — this is
+exactly what a naive `begin_blocking_region`/`end_blocking_region` bracket placed carelessly around
+existing lock code can produce, a hazard worth checking for in any future fix of this shape). Superseded
+by `945e4492`'s call-site-wrap approach, which structurally avoids the issue (both calls happen entirely
+outside any lock acquisition).
+
+### Verification tally (all post-fix, no genuine hangs in any batch)
+
+- This session (own): 4 isolated runs (livecap1-4) — 0 STW_HANG, then a 5-run CPU-census batch — 0
+  STW_HANG, then the 15-run CPU-aware batch above — 0 STW_HANG, 0 GENUINE_STALL.
+- An independent concurrent session's own 13-run verification loop (same combined-fix binary): 0
+  STW_HANG.
+- Unit tests: `cargo test -p cratonvm-native-builtins -p cratonvm-vm stamped` — 46/46 passing (43 +
+  3), including the multi-threaded contention tests (`rw_concurrent_readers_no_serialization`,
+  `stamped_no_lost_wakeup_under_contention`, `rw_writer_blocks_on_readers_and_releases`) — no
+  regression from any of the fixes above.
+- 0 STW hangs across 50+ total isolated attempts post-fix, versus ~80-90% before (the original doc's
+  "Scale" section).
+
+### Related
+
+[[wildfly-remoting-classcastexception-parallel-extension-add]] — FIXED (`70154861`), moved to
+`docs/internal/fixed-suite-bugs/`; the `CCE_CRASH` bucket above is a recurrence of the same bug class at
+a new site, not this exact bug reopened.
+`docs/known-issues/tomcat-08-07/stw-crossthread-jit-takeover-hang-cluster.md` — the sibling
+investigation that found and fixed the `ReentrantReadWriteLock`/`StampedLock`/XNIO/`SynchronousQueue`
+cluster (`945e4492`) via a completely different repro (Tomcat `TestOrderInterceptor`), independently
+confirming the same root-cause class this doc found for `ReentrantReadWriteLock`/`StampedLock`.
+`docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md` — tracks the `CCE_CRASH`/`SEGV`
+long-tail family still causing WildFly boot failures; genuinely open, not closed by anything in this
+doc.
