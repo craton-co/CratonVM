@@ -732,7 +732,7 @@ fn pin_frozen_peer_roots_for_g1(
     }
 }
 
-fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
+pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // First, check if another thread requested STW — if so, participate
     safepoint_check(shared, thread);
 

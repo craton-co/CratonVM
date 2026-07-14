@@ -4041,6 +4041,31 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         super::create_java_string_uninterned(self.shared, text)
     }
 
+    fn create_string_uninterned_gc_safe(&mut self, text: &str) -> ObjectRef {
+        // Native callers opt into this only after pinning every live Java
+        // reference.  Native string construction uses two no-GC allocations
+        // (the String plus its backing byte[]); if young is fragmented, the
+        // generic fallible allocator would otherwise spill both into old gen
+        // without crossing `needs_gc()`.  Request a normal young collection
+        // before that spill, leaving old-gen collection policy unchanged.
+        const STRING_ALLOCATION_HEADROOM: usize = 256;
+        if !self
+            .shared
+            .heap
+            .young_bump_headroom(STRING_ALLOCATION_HEADROOM)
+            && !self
+                .shared
+                .heap
+                .young_has_free_block(STRING_ALLOCATION_HEADROOM)
+        {
+            self.shared
+                .gc_requested
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::runtime::interpreter::maybe_gc(self.shared, self.thread);
+        }
+        super::create_java_string_uninterned(self.shared, text)
+    }
+
     fn init_string_from_units(&mut self, this: ObjectRef, units: &[u16]) -> bool {
         super::populate_java_string_fields(self.shared, this, units)
     }
