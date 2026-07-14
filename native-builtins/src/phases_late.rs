@@ -38144,11 +38144,17 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             let bb = obj_arg(args, 1)?;
             // DF07: decode the destination buffer via the real-or-synthetic
             // accessor (a real HeapByteBuffer's array is `hb`, not slot 0).
+            // GC-blocking audit — see the matching comment on the sibling
+            // `write` registration below for the full rationale (found via
+            // the same STW-takeover-cluster residual investigation).
             let bytes_read = if fd_id >= 0 {
                 match aio_bb_region(ctx, bb) {
                     Some((arr, off, remaining)) if remaining > 0 => {
                         let mut tmp = vec![0u8; remaining];
-                        match ctx.fd_table().tcp_read(fd_id as u32, &mut tmp) {
+                        ctx.begin_blocking_region();
+                        let read_result = ctx.fd_table().tcp_read(fd_id as u32, &mut tmp);
+                        ctx.end_blocking_region();
+                        match read_result {
                             Ok(0) => -1,
                             Ok(n) => {
                                 ctx.write_byte_array_from(arr, off, &tmp[..n]);
@@ -38176,12 +38182,40 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             let fd_id = ctx.get_field(this, 2).as_int().unwrap_or(-1);
             let bb = obj_arg(args, 1)?;
             // DF07: source the bytes via the real-or-synthetic accessor (see read).
+            //
+            // GC-blocking audit (STW takeover 5-class cluster residual,
+            // 2026-07-13, Azure host follow-up): `tcp_write` is a raw
+            // blocking `send()` with NO GC-blocking-region bracket — found
+            // via gdb on a hung TestWsWebSocketContainerTimeoutClient (the
+            // test deliberately never drains the peer socket to force a
+            // write timeout, so this send() parks in the OS indefinitely
+            // once the send buffer fills). Bracketing it fixes the
+            // STW-takeover hang (this thread was counted in `expected`
+            // forever, `taken=0`, matching the doc's signature exactly).
+            //
+            // NOTE this does NOT fix the deeper issue that this Future-
+            // returning overload is synchronous (blocks the calling thread
+            // until the write completes or errors) rather than genuinely
+            // async like the sibling CompletionHandler-based overload in
+            // native-io/src/async_socket.rs's aio_asc_write (which
+            // dispatches to a worker pool via Job::Write and returns
+            // immediately with a real pending Future). A caller doing
+            // `write(bb).get(timeout, unit)` to detect a write timeout will
+            // still block inside this native call itself rather than inside
+            // `Future.get`, so the write always "succeeds" eventually (once
+            // the peer reads or the connection resets) instead of the
+            // caller's own timeout ever firing — a separate, out-of-scope-
+            // for-this-fix architectural gap. Filed as a residual; see
+            // docs/known-issues/tomcat-08-07/stw-crossthread-jit-takeover-hang-cluster.md.
             let bytes_written = if fd_id >= 0 {
                 match aio_bb_region(ctx, bb) {
                     Some((arr, off, remaining)) if remaining > 0 => {
                         let mut data = vec![0u8; remaining];
                         ctx.read_byte_array_into(arr, off, &mut data);
-                        match ctx.fd_table().tcp_write(fd_id as u32, &data) {
+                        ctx.begin_blocking_region();
+                        let write_result = ctx.fd_table().tcp_write(fd_id as u32, &data);
+                        ctx.end_blocking_region();
+                        match write_result {
                             Ok(n) => {
                                 aio_bb_advance(ctx, bb, n as i32);
                                 n as i32
