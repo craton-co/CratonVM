@@ -1450,8 +1450,7 @@ impl GenerationalHeap {
         num_fields: usize,
         count: usize,
     ) -> Vec<ObjectRef> {
-        let Some((total_size, array_len, compact_flag)) =
-            plan_object_alloc(class_id, num_fields)
+        let Some((total_size, array_len, compact_flag)) = plan_object_alloc(class_id, num_fields)
         else {
             return Vec::new();
         };
@@ -1520,7 +1519,10 @@ impl GenerationalHeap {
             let fwd_ptr = header.forwarding_address();
             let (fwd_class_id, fwd_kind) = if !fwd_ptr.is_null() {
                 let fwd_header = unsafe { &*(fwd_ptr as *const ObjectHeader) };
-                (fwd_header.class_id.as_u32(), format!("{:?}", fwd_header.kind))
+                (
+                    fwd_header.class_id.as_u32(),
+                    format!("{:?}", fwd_header.kind),
+                )
             } else {
                 (u32::MAX, "<null-forward>".to_string())
             };
@@ -4336,6 +4338,20 @@ impl GenerationalHeap {
         roots: &[ObjectRef],
         finalizer_addrs: &[usize],
     ) -> (GcResult, Vec<usize>) {
+        let phase_diag = std::env::var_os("CRATONVM_DBG_GCPHASE").is_some();
+        let phase_start = std::time::Instant::now();
+        let mut phase_last = phase_start;
+        let mut report_phase = |name: &str| {
+            if phase_diag {
+                let now = std::time::Instant::now();
+                eprintln!(
+                    "[gcphase] {name}: phase={}ms total={}ms",
+                    now.duration_since(phase_last).as_millis(),
+                    now.duration_since(phase_start).as_millis(),
+                );
+                phase_last = now;
+            }
+        };
         if watchref_dbg() {
             eprintln!("[watchref] sweep_young_non_moving ENTRY (non-moving path taken)");
         }
@@ -4758,6 +4774,7 @@ impl GenerationalHeap {
         // ABSOLUTE addresses.
         let mut side_sorted: Vec<usize> = side_marks.iter().copied().collect();
         side_sorted.sort_unstable();
+        report_phase("mark");
 
         // ----- Selective promotion -----------------------------------------
         //
@@ -4811,7 +4828,13 @@ impl GenerationalHeap {
         // pointer. Retention for one cycle is always safe; the flag is
         // per-cycle so ordinary (single-threaded / cooperative) collections
         // keep the bt18-critical drain.
-        let selective_on = std::env::var_os("CRATONVM_NO_SELECTIVE_PROMOTE").is_none()
+        // No object can satisfy `gc_age + 1 >= PROMOTION_AGE` until it has
+        // survived `PROMOTION_AGE - 1` prior minor collections. Skip the two
+        // guaranteed-no-op full-arena promotion walks at heap startup.
+        let promotion_age_reachable = self.stats.minor_gc_count.load(Ordering::Relaxed)
+            >= u64::from(PROMOTION_AGE.saturating_sub(1));
+        let selective_on = promotion_age_reachable
+            && std::env::var_os("CRATONVM_NO_SELECTIVE_PROMOTE").is_none()
             && !crate::gc_quiescence::moving_young_coverage_incomplete();
         if selective_on {
             let is_y = |a: usize| -> bool { a >= from_base && a < from_end && (a & 0x7) == 0 };
@@ -5387,6 +5410,8 @@ impl GenerationalHeap {
             }
         }
 
+        report_phase("selective-promotion");
+
         // ----- Diagnostic: inbound-edge search (CRATONVM_DBG_SWEEP_EDGES) --
         //
         // Marking is complete; nothing has been zeroed yet. This answers the
@@ -5597,6 +5622,8 @@ impl GenerationalHeap {
             );
         }
 
+        report_phase("optional-edge-diagnostics");
+
         // ----- Sweep phase ------------------------------------------------
         //
         // Walk the from-space linearly, skipping holes already on the free
@@ -5628,14 +5655,19 @@ impl GenerationalHeap {
                 }
             }
         }
-        // (offset, size, class_id, kind_byte) of every span the walk decided
-        // to reclaim. DoHead walk-desync hardening (2026-07-02): zeroing and
+        // (offset, size, class_id, kind_byte, object_count) of spans the walk
+        // decided to reclaim. Adjacent dead objects are collapsed by default;
+        // forensic gates retain one record per object. DoHead walk-desync
+        // hardening (2026-07-02): zeroing and
         // free-list publication are DEFERRED to the publication loop after the
         // walk, so that a later-detected grid anomaly (free-block overshoot /
         // implausible header) can UNWIND the suspect entries collected since
         // the last trustworthy anchor (`dead_watermark`) instead of having
         // already zeroed what may be a live object's interior.
-        let mut dead_regions: Vec<(usize, usize, u32, u8)> = Vec::new();
+        let retain_dead_objects = sweep_zero_enabled()
+            || crate::a2dbg::enabled()
+            || std::env::var_os("CRATONVM_DBG_SWEEP_CENSUS").is_some();
+        let mut dead_regions: Vec<(usize, usize, u32, u8, usize)> = Vec::new();
         let mut bytes_swept: usize = 0;
         let mut objects_swept: usize = 0;
         // Index into `dead_regions` at the last trustworthy walk anchor
@@ -5652,18 +5684,20 @@ impl GenerationalHeap {
         // whose headers were never written; the walk must retain them
         // without touching gc_flags/gc_age.
         let mut side_iter = side_sorted.iter().peekable();
-        // Debug diag: keep a short ring buffer of (offset, size, class_id, kind,
-        // num_slots, array_length) for the last 6 objects walked. When the
-        // implausible-header break fires we dump it so we can pin down which
-        // PRIOR object had an undersized/oversized header that mis-aligned the
-        // walker into a payload region. Cheap (a Vec push per object) and only
-        // logged once per sweep on the abort path.
-        let mut walked: Vec<(usize, usize, u32, ObjectKind, u32, u32)> = Vec::new();
+        // Debug diag: retain per-object walk history only under the explicit A2
+        // forensic gate. The old default path retained every object (and a
+        // later bounded-ring attempt still updated a deque per object), adding
+        // gigabytes of metadata traffic across bintrees18's ~19M-node sweep.
+        let retain_full_walk = std::env::var_os("CRATONVM_DBG_A2").is_some();
+        let mut walked_count = 0usize;
+        let mut walked: std::collections::VecDeque<(usize, usize, u32, ObjectKind, u32, u32)> =
+            std::collections::VecDeque::new();
         // A2 probe (CRATONVM_DBG_A2): parallel to `walked`, the element_type byte
         // and the raw first 8 header bytes AS THE WALKER READ THEM (so a desync
         // dump shows the actual walk-time header, not an unreliable post-zeroing
         // re-read). Indexed in lockstep with `walked`.
-        let mut walked_ext: Vec<(u8, u64)> = Vec::new();
+        let mut walked_ext: std::collections::VecDeque<(u8, u64)> =
+            std::collections::VecDeque::new();
         while cursor < used {
             // Skip known free blocks ROBUSTLY. The free list (`existing_free`) is
             // sorted ascending and the walk advances `cursor` monotonically, so we
@@ -5811,7 +5845,7 @@ impl GenerationalHeap {
                 );
                 tracing::warn!(
                     "  total walked={} objects, used={} from_base={:#x}",
-                    walked.len(),
+                    walked_count,
                     used,
                     from_base,
                 );
@@ -5863,7 +5897,7 @@ impl GenerationalHeap {
                 if std::env::var_os("CRATONVM_DBG_A2").is_some()
                     && A2_PROBE_HITS.fetch_add(1, Ordering::Relaxed) < 4
                 {
-                    if let Some(&(loff, lsz, lcid, lkind, lns, lal)) = walked.last() {
+                    if let Some(&(loff, lsz, lcid, lkind, lns, lal)) = walked.back() {
                         // SAFETY: loff < used, header mapped.
                         let lhdr = unsafe { &*((from_base + loff) as *const ObjectHeader) };
                         eprintln!(
@@ -5921,12 +5955,12 @@ impl GenerationalHeap {
                             cursor, from_base + cursor,
                         ),
                     }
-                    if let Some(&(loff, lsz, _, _, _, _)) = walked.last() {
+                    if let Some(&(loff, lsz, _, _, _, _)) = walked.back() {
                         // Walk-time header AS THE WALKER READ IT (element_type byte
                         // + raw first 8 bytes). This is the decisive value: if it
                         // shows a 4-byte element_type for a byte[], the header is
                         // corrupt at walk time (vs an allocator/walker formula bug).
-                        if let Some(&(wet, w0)) = walked_ext.last() {
+                        if let Some(&(wet, w0)) = walked_ext.back() {
                             eprintln!(
                                 "[A2] WALK-TIME prior@{} element_type_byte={} raw_word0={:#018x} (b0=class_id_lo b4=kind b5=element_type)",
                                 loff, wet, w0,
@@ -6037,18 +6071,21 @@ impl GenerationalHeap {
                 }
             }
 
-            walked.push((
-                cursor,
-                total_size,
-                header.class_id.as_u32(),
-                header.kind,
-                header.num_slots,
-                header.array_length,
-            ));
-            // SAFETY: obj_ptr is the mapped header start; reading 8 bytes is in bounds.
-            walked_ext.push((header.element_type as u8, unsafe {
-                *(obj_ptr as *const u64)
-            }));
+            walked_count += 1;
+            if retain_full_walk {
+                walked.push_back((
+                    cursor,
+                    total_size,
+                    header.class_id.as_u32(),
+                    header.kind,
+                    header.num_slots,
+                    header.array_length,
+                ));
+                // SAFETY: obj_ptr is the mapped header start; reading 8 bytes is in bounds.
+                walked_ext.push_back((header.element_type as u8, unsafe {
+                    *(obj_ptr as *const u64)
+                }));
+            }
 
             let side_marked_survivor = if !header.is_forwarded() {
                 // xt-hardening (2026-07-03): side-marked survivor check
@@ -6100,12 +6137,38 @@ impl GenerationalHeap {
                         );
                     }
                 } else {
-                    dead_regions.push((
-                        cursor,
-                        total_size,
-                        header.class_id.as_u32(),
-                        header.kind as u8,
-                    ));
+                    if !retain_dead_objects {
+                        if let Some(last) = dead_regions.last_mut() {
+                            if last.0 + last.1 == cursor {
+                                last.1 += total_size;
+                                last.4 += 1;
+                            } else {
+                                dead_regions.push((
+                                    cursor,
+                                    total_size,
+                                    header.class_id.as_u32(),
+                                    header.kind as u8,
+                                    1,
+                                ));
+                            }
+                        } else {
+                            dead_regions.push((
+                                cursor,
+                                total_size,
+                                header.class_id.as_u32(),
+                                header.kind as u8,
+                                1,
+                            ));
+                        }
+                    } else {
+                        dead_regions.push((
+                            cursor,
+                            total_size,
+                            header.class_id.as_u32(),
+                            header.kind as u8,
+                            1,
+                        ));
+                    }
                 }
             } else if side_marked_survivor {
                 // Side-marked survivor: pure retention, no header writes.
@@ -6167,15 +6230,43 @@ impl GenerationalHeap {
                 // inside the hole) and free-list publication are deferred to
                 // the publication loop below, so a grid anomaly detected
                 // later in the walk can still unwind this decision.
-                dead_regions.push((
-                    cursor,
-                    total_size,
-                    header.class_id.as_u32(),
-                    header.kind as u8,
-                ));
+                if !retain_dead_objects {
+                    if let Some(last) = dead_regions.last_mut() {
+                        if last.0 + last.1 == cursor {
+                            last.1 += total_size;
+                            last.4 += 1;
+                        } else {
+                            dead_regions.push((
+                                cursor,
+                                total_size,
+                                header.class_id.as_u32(),
+                                header.kind as u8,
+                                1,
+                            ));
+                        }
+                    } else {
+                        dead_regions.push((
+                            cursor,
+                            total_size,
+                            header.class_id.as_u32(),
+                            header.kind as u8,
+                            1,
+                        ));
+                    }
+                } else {
+                    dead_regions.push((
+                        cursor,
+                        total_size,
+                        header.class_id.as_u32(),
+                        header.kind as u8,
+                        1,
+                    ));
+                }
             }
             cursor += total_size;
         }
+
+        report_phase("sweep-walk");
 
         // Publish reclaimed regions to the arena's free list FIRST. Subsequent
         // `try_alloc_young_initialized` calls will satisfy allocations from
@@ -6204,7 +6295,7 @@ impl GenerationalHeap {
         // Either way it is the direct source of the overlapping free blocks the
         // coalescer then has to merge.
         if std::env::var_os("CRATONVM_DBG_A2").is_some() {
-            for &(doff, dsz, _, _) in &dead_regions {
+            for &(doff, dsz, _, _, _) in &dead_regions {
                 for &(foff, fsz) in &existing_free {
                     if doff < foff + fsz && foff < doff + dsz {
                         let n = A2_FL_OVERLAP_HITS.load(Ordering::Relaxed);
@@ -6220,24 +6311,48 @@ impl GenerationalHeap {
                 }
             }
         }
+        // Coalesce the newly-dead spans while they are still in walk order.
+        // Publishing every object-sized hole first and sorting the arena free
+        // list afterward made a bintrees18 collection allocate, sort, and merge
+        // millions of entries even though nearly all of them are adjacent.
+        // Keep `dead_regions` intact for the per-object diagnostics below, but
+        // zero and publish only maximal contiguous spans.
+        let mut reclaimed_regions: Vec<(usize, usize)> = Vec::new();
+        reclaimed_regions.reserve(dead_regions.len().min(1024));
+        for &(off, sz, _, _, _) in &dead_regions {
+            if let Some(last) = reclaimed_regions.last_mut() {
+                let last_end = last.0 + last.1;
+                if off <= last_end {
+                    last.1 = last_end.max(off + sz) - last.0;
+                    continue;
+                }
+            }
+            reclaimed_regions.push((off, sz));
+        }
+
         // DoHead walk-desync hardening (2026-07-02): zeroing was deferred from
         // the walk's disposition arms to here so that anomaly-triggered
         // unwinding (dead_regions.truncate above) never has to un-zero.
         // Everything surviving in `dead_regions` was collected on a verified
         // stretch of the walk grid. Zero each span (so a later conservative
         // root scan cannot resurrect a stale header inside the hole) and
-        // publish it to the free list.
-        for &(off, sz, class_id, kind_byte) in &dead_regions {
+        // publish it to the free list. Per-object forensic records remain
+        // available without forcing per-object arena publication.
+        for &(off, sz, class_id, kind_byte, object_count) in &dead_regions {
             let obj_addr = from_base + off;
             record_swept(obj_addr, class_id, kind_byte, sweep_zero_cycle);
-            // SAFETY: `[off, off+sz)` lies within the live from-space region
-            // (validated by the walk before the span was collected).
-            unsafe { std::ptr::write_bytes(obj_addr as *mut u8, 0, sz) };
             crate::a2dbg::record_free(obj_addr);
             bytes_swept += sz;
-            objects_swept += 1;
+            objects_swept += object_count;
+        }
+        for &(off, sz) in &reclaimed_regions {
+            let obj_addr = from_base + off;
+            // SAFETY: this is the union of adjacent/overlapping spans that the
+            // verified walk collected, all within the live from-space region.
+            unsafe { std::ptr::write_bytes(obj_addr as *mut u8, 0, sz) };
             young_from.add_free_block(off, sz);
         }
+        report_phase("zero-and-publish");
 
         // DBG (CRATONVM_DBG_SWEEP_CENSUS): per-cycle census of what this sweep
         // reclaimed, by class. A continuously-live workload class (e.g. the
@@ -6247,9 +6362,9 @@ impl GenerationalHeap {
         if std::env::var_os("CRATONVM_DBG_SWEEP_CENSUS").is_some() && !dead_regions.is_empty() {
             let mut counts: std::collections::HashMap<u32, (usize, usize)> =
                 std::collections::HashMap::new();
-            for &(off, sz, class_id, _kind) in &dead_regions {
+            for &(off, sz, class_id, _kind, object_count) in &dead_regions {
                 let e = counts.entry(class_id).or_insert((0, from_base + off));
-                e.0 += 1;
+                e.0 += object_count;
                 let _ = sz;
             }
             let mut v: Vec<(u32, usize, usize)> =
@@ -6275,7 +6390,7 @@ impl GenerationalHeap {
             // victim. The mark said "unreachable"; if a live holder still
             // points at the victim, this names the EXACT edge the mark missed
             // — the decisive datum for the live-reclaim investigation.
-            for &(doff, _dsz, dcid, _dk) in dead_regions.iter().take(6) {
+            for &(doff, _dsz, dcid, _dk, _) in dead_regions.iter().take(6) {
                 let victim = from_base + doff;
                 let vname = crate::gc::resolve_class_info(dcid)
                     .map(|(n, _)| n)
@@ -6406,6 +6521,7 @@ impl GenerationalHeap {
                 }
             }
         }
+        report_phase("arena-coalesce");
 
         // Defence-in-depth: unconditionally clear `GC_FLAG_MARKED` on every
         // object header in the from-space. The survivor branch above already
@@ -6419,6 +6535,7 @@ impl GenerationalHeap {
         // after the `while` loop. Now hole-aware: the dead spans are on the
         // free list (published above), so the re-walk skips them.
         clear_all_mark_bits_in_arena(&mut young_from);
+        report_phase("clear-marks");
 
         let live_bytes = bytes_before.saturating_sub(bytes_swept);
         tracing::debug!(

@@ -565,10 +565,8 @@ fn stw_take_over_and_wait(
     let mut warned = false;
     loop {
         let tids_before = taken.tids.len();
-        let should_scan = stw_takeover_should_scan(
-            rounds,
-            crate::jit::conservative_roots::any_thread_in_jit(),
-        );
+        let should_scan =
+            stw_takeover_should_scan(rounds, crate::jit::conservative_roots::any_thread_in_jit());
         let newly = if should_scan {
             xt::take_over_pass(&mut taken, &|a| shared.heap.is_object_address(a), xt_roots)
         } else {
@@ -4922,6 +4920,58 @@ pub fn execute(
                                 ));
                                 continue;
                             }
+                            // `Integer.valueOf(I)` thin direct call — statically
+                            // bound NATIVE callee, so the eager callee compile can
+                            // never succeed and the generic dispatch round trip is
+                            // pure fixed overhead on the hottest autoboxing path.
+                            // Parity with the recognition in `jit::try_compile`;
+                            // see `jit::helpers::jit_integer_value_of_direct`.
+                            if invoke_kind == 3
+                                && target_class == "java/lang/Integer"
+                                && method_name_ref == "valueOf"
+                                && descriptor_ref == "(I)Ljava/lang/Integer;"
+                            {
+                                // VM crate: take the helper's address directly —
+                                // no registration-order dependency (the atomic in
+                                // the jit crate is only for `jit::try_compile`,
+                                // which cannot name VM symbols).
+                                let entry = crate::jit::helpers::jit_integer_value_of_direct
+                                    as *const () as usize;
+                                direct_calls_early.push((
+                                    pc,
+                                    crate::jit::JitDirectCall {
+                                        entry,
+                                        needs_context: true,
+                                        num_params: 1,
+                                        return_type: b'L',
+                                        guard_class_id: 0,
+                                    },
+                                ));
+                                continue;
+                            }
+                            // `Integer.intValue()` thin direct call — `Integer`
+                            // is `final`, so a site declared against it is
+                            // statically monomorphic (guard-free); the helper
+                            // handles the null-receiver NPE itself.
+                            if invoke_kind == 0
+                                && target_class == "java/lang/Integer"
+                                && method_name_ref == "intValue"
+                                && descriptor_ref == "()I"
+                            {
+                                let entry = crate::jit::helpers::jit_integer_int_value_direct
+                                    as *const () as usize;
+                                direct_calls_early.push((
+                                    pc,
+                                    crate::jit::JitDirectCall {
+                                        entry,
+                                        needs_context: true,
+                                        num_params: 0,
+                                        return_type: b'I',
+                                        guard_class_id: 0,
+                                    },
+                                ));
+                                continue;
+                            }
                             // Defer trivial `<init>()V` sites for after-lock
                             // elidability resolution (see the block + pending
                             // list comments above).
@@ -5031,7 +5081,8 @@ pub fn execute(
                     // Resolve new/anewarray info (Phase 39: correct ClassId + field count for JIT new)
                     // Only resolve for non-synthetic classes (real JDK bytecode) to avoid
                     // expensive class loading cascades during JIT of synthetic code.
-                    // Tuple: (pc, class_id, num_fields, has_primitive_init, has_finalizer).
+                    // Tuple: (pc, class_id, num_fields,
+                    // has_nonzero_tag_primitive_init, has_finalizer).
                     // The last two are conservative true/true here so the JIT goes through
                     // the post-init helper — matches pre-CRIT-2 behavior. A follow-up should
                     // extract the real flags from class metadata to enable the skip path.
@@ -6354,7 +6405,7 @@ pub(crate) fn try_osr_with_backoff(
         let reusable = {
             let jc = shared.jit_cache.read();
             matches!(
-                jc.get(&cn, &mn, &md),
+                jc.get_osr(&cn, &mn, &md),
                 Some(c) if c.compiled_via_osr && c.can_osr_enter(entry_pc)
             )
         };
@@ -6364,11 +6415,20 @@ pub(crate) fn try_osr_with_backoff(
             // than spin. A subsequent hot back-edge finds the published
             // artifact and falls through to the reuse-enter below.
             let key = crate::jit::tiered::MethodKey::new(cn, mn, md);
-            if !crate::jit::tiered::is_osr_denied(&key) {
-                ensure_bg_compiler_started(shared);
-                let _ = shared.tiered_manager.request_osr(&key, entry_pc as u32);
+            if crate::jit::tiered::is_osr_denied(&key) {
+                thread.frames[*frame_idx].record_osr_rejection(entry_pc);
+                return OsrBackoffOutcome::Skip;
             }
-            thread.frames[*frame_idx].record_osr_rejection(entry_pc);
+            ensure_bg_compiler_started(shared);
+            let _ = shared.tiered_manager.request_osr(&key, entry_pc as u32);
+            // Waiting for an off-thread compile is not a failed OSR attempt.
+            // The old attempt counter reached its permanent cap within a few
+            // thousand interpreted iterations, usually before the worker had
+            // published, so the frame never probed the completed artifact.
+            // Restart the stride instead: this polls at most once per threshold
+            // while the task is queued. A real compile failure marks the method
+            // OSR-denied below and returns to the bounded rejection schedule.
+            thread.frames[*frame_idx].record_osr_background_pending();
             return OsrBackoffOutcome::Skip;
         }
         // `reusable`: fall through to `try_osr`, which reuses the published
@@ -20323,12 +20383,13 @@ pub(crate) fn try_lambda_dispatch(
                 .get_class(class_id)
                 .and_then(|c| c.array_info.clone());
             if let Some(array_info) = array_info {
-                let length = full_args
-                    .first()
-                    .and_then(Value::as_int)
-                    .ok_or_else(|| VmError::Internal {
-                        message: "array-constructor-reference: missing length arg".to_string(),
-                    })?;
+                let length =
+                    full_args
+                        .first()
+                        .and_then(Value::as_int)
+                        .ok_or_else(|| VmError::Internal {
+                            message: "array-constructor-reference: missing length arg".to_string(),
+                        })?;
                 if length < 0 {
                     return Err(RuntimeError::NegativeArraySizeException { size: length }.into());
                 }
@@ -22518,10 +22579,17 @@ fn force_native_over_real_jdk_bytecode(
     if class_name == "java/util/function/Predicate"
         && matches!(
             (method_name, method_descriptor),
-            ("and", "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;")
-                | ("or", "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;")
-                | ("negate", "()Ljava/util/function/Predicate;")
-                | ("not", "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;")
+            (
+                "and",
+                "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;"
+            ) | (
+                "or",
+                "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;"
+            ) | ("negate", "()Ljava/util/function/Predicate;")
+                | (
+                    "not",
+                    "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;"
+                )
         )
     {
         return true;
@@ -22536,7 +22604,10 @@ fn force_native_over_real_jdk_bytecode(
         && matches!(
             (method_name, method_descriptor),
             ("initialize", "(Ljava/util/Locale;)V")
-                | ("getInstance", "(Ljava/util/Locale;)Ljava/text/DecimalFormatSymbols;")
+                | (
+                    "getInstance",
+                    "(Ljava/util/Locale;)Ljava/text/DecimalFormatSymbols;"
+                )
         )
     {
         return true;
@@ -22570,8 +22641,7 @@ fn force_native_over_real_jdk_bytecode(
         && method_name == "loadClass"
         && matches!(
             method_descriptor,
-            "(Ljava/lang/String;)Ljava/lang/Class;"
-                | "(Ljava/lang/String;Z)Ljava/lang/Class;"
+            "(Ljava/lang/String;)Ljava/lang/Class;" | "(Ljava/lang/String;Z)Ljava/lang/Class;"
         )
     {
         return true;
@@ -24430,8 +24500,7 @@ pub(crate) fn synthetic_stub_should_yield_to_real_bytecode(
 /// classes whose SyntheticStub natives exist only for stub-phase bootstraps
 /// and must yield to loaded real bytecode.
 pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
-    crate::runtime::env_cache::real_bytecode_selector()
-        .prefers_real(class_name)
+    crate::runtime::env_cache::real_bytecode_selector().prefers_real(class_name)
         || matches!(
             class_name,
             "java/util/concurrent/locks/ReentrantLock"
@@ -25774,7 +25843,9 @@ fn populate_invoke_cache(
             .kind_of(declaring_name, &method_name, &descriptor)
             == Some(cratonvm_native_api::NativeKind::SyntheticStub)
             && real_protected_stub_class(declaring_name)
-            && store.get(declaring_id).is_some_and(|c| !c.is_synthetic_stub)
+            && store
+                .get(declaring_id)
+                .is_some_and(|c| !c.is_synthetic_stub)
             && !method.is_native()
             && method.code().is_some();
         if !stub_yields {
@@ -26506,7 +26577,7 @@ fn compile_osr_artifact(
     // here (or no cached artifact) recompile exactly as before.
     let cached_osr = {
         let jit_cache = shared.jit_cache.read();
-        jit_cache.get(&class_name_arc, &method_name_arc, &descriptor_arc)
+        jit_cache.get_osr(&class_name_arc, &method_name_arc, &descriptor_arc)
     };
     // Only reuse artifacts the OSR path itself produced: those carry the
     // eager invokestatic callee wiring (direct calls). A first-call/upgrade
@@ -26760,6 +26831,62 @@ fn compile_osr_artifact(
                                 needs_context: false,
                                 num_params: 1,
                                 return_type: b'D',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                    // `Integer.valueOf(I)` thin direct call — statically bound
+                    // NATIVE callee, so the eager callee compile below can never
+                    // succeed and the generic dispatch round trip is pure fixed
+                    // overhead on the hottest autoboxing path. Parity with the
+                    // recognition in `jit::try_compile`; see
+                    // `jit::helpers::jit_integer_value_of_direct`. This OSR-tier
+                    // site matters most: a single-invocation harness method
+                    // (e.g. a benchmark main loop) runs its entire life inside
+                    // the OSR body.
+                    if invoke_kind == 3
+                        && target_class == "java/lang/Integer"
+                        && mn == "valueOf"
+                        && desc == "(I)Ljava/lang/Integer;"
+                    {
+                        // VM crate: take the helper's address directly — no
+                        // registration-order dependency. (This OSR path calls
+                        // `build_helpers` — which registers the jit-crate
+                        // atomic — only AFTER this construction block, so the
+                        // first OSR compile in a process would read 0 there.)
+                        let entry = crate::jit::helpers::jit_integer_value_of_direct
+                            as *const () as usize;
+                        direct_calls2.push((
+                            pc,
+                            crate::jit::JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 1,
+                                return_type: b'L',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                    // `Integer.intValue()` thin direct call — `Integer` is
+                    // `final`, so a site declared against it is statically
+                    // monomorphic (guard-free); the helper handles the
+                    // null-receiver NPE itself.
+                    if invoke_kind == 0
+                        && target_class == "java/lang/Integer"
+                        && mn == "intValue"
+                        && desc == "()I"
+                    {
+                        let entry = crate::jit::helpers::jit_integer_int_value_direct
+                            as *const () as usize;
+                        direct_calls2.push((
+                            pc,
+                            crate::jit::JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 0,
+                                return_type: b'I',
                                 guard_class_id: 0,
                             },
                         ));
@@ -27170,13 +27297,13 @@ fn compile_osr_artifact(
                 &mut cm,
             );
             let mut jit_cache = shared.jit_cache.write();
-            jit_cache.put(
+            jit_cache.put_osr(
                 class_name_arc.clone(),
                 method_name_arc.clone(),
                 descriptor_arc.clone(),
                 cm,
             );
-            jit_cache.get(&class_name_arc, &method_name_arc, &descriptor_arc)
+            jit_cache.get_osr(&class_name_arc, &method_name_arc, &descriptor_arc)
         })()
     };
 
@@ -27618,13 +27745,14 @@ fn try_osr(
 
 /// CRIT-2 — shared body for the JIT `cp_new_resolver` closures: resolve a
 /// `new`/`anewarray` CP index in `holder_cid`'s constant pool to
-/// `(class_id, num_fields, has_primitive_init, has_finalizer)`.
+/// `(class_id, num_fields, has_nonzero_tag_primitive_init, has_finalizer)`.
 ///
 /// The two flags feed the inline-TLAB `new` fast path, which skips the
 /// `jit_post_tlab_init` helper call when BOTH are false — i.e. no
-/// primitive-typed instance field anywhere in the hierarchy (the typed-zero
-/// defaults would be a no-op on the TLAB-zeroed region) and no finalizer to
-/// register. `has_primitive_init` mirrors the hierarchy walk in
+/// long/float/double instance field anywhere in the hierarchy (the JIT now
+/// explicitly clears the body, so int/byte/char/short/boolean are already the
+/// correct all-zero `Value::Int(0)`) and no finalizer to register.
+/// `has_nonzero_tag_primitive_init` mirrors the hierarchy walk in
 /// `crate::jit::helpers::jit_init_primitive_fields`; `has_finalizer` mirrors
 /// the single-class read in `jit_post_tlab_init`. Unresolvable metadata
 /// reports `(true, true)` so the helper call stays in place.
@@ -27650,11 +27778,7 @@ fn resolve_jit_new_site(
             break;
         };
         if c.fields.iter().any(|f| {
-            !f.is_static()
-                && matches!(
-                    f.descriptor.as_bytes().first(),
-                    Some(b'I' | b'B' | b'C' | b'S' | b'Z' | b'J' | b'F' | b'D')
-                )
+            !f.is_static() && matches!(f.descriptor.as_bytes().first(), Some(b'J' | b'F' | b'D'))
         }) {
             has_prim_init = true;
             break;
@@ -28239,7 +28363,7 @@ fn try_jit_upgrade_with_gate(
         }
     };
     // new/anewarray resolver: maps CP index of `new`/`anewarray` to
-    // (class_id_raw, num_fields, has_primitive_init, has_finalizer).
+    // (class_id_raw, num_fields, has_nonzero_tag_primitive_init, has_finalizer).
     let new_resolver = |cp_idx: u16| -> Option<(u32, usize, bool, bool)> {
         let cm = shared.class_manager.read();
         resolve_jit_new_site(&cm, class_id, cp_idx)
@@ -29696,6 +29820,64 @@ fn fetch_osr_compile_inputs(
     Some((class_id, padded, max_locals))
 }
 
+/// Admit the narrow scalar self-recursion shape directly to the optimizing IR
+/// backend on its first background compilation. Compiling it as C1 first is
+/// counterproductive: once a recursive C1 frame is entered, its direct calls
+/// remain in that slower body for the entire subtree even if C2 is published
+/// concurrently. Every call target is resolved here and must be this exact
+/// static `(I)I` method; all remaining structural checks live in the JIT crate.
+fn promote_scalar_selfrec_to_ir(shared: &SharedVm, key: &crate::jit::tiered::MethodKey) -> bool {
+    let Some((class_id, padded, _)) =
+        fetch_osr_compile_inputs(shared, &key.class_name, &key.method_name, &key.descriptor)
+    else {
+        return false;
+    };
+    let code_len = padded.len().saturating_sub(2);
+    if !cratonvm_jit::scalar_selfrec_ir_would_engage(&padded, code_len, &key.descriptor) {
+        return false;
+    }
+    let Some(scan) = crate::jit::x64::jit_scan(&padded, code_len, &key.descriptor) else {
+        return false;
+    };
+    let cm = shared.class_manager.read();
+    let Some(class) = cm.get_class(class_id) else {
+        return false;
+    };
+    let is_static = class
+        .methods
+        .iter()
+        .find(|m| &*m.name == &*key.method_name && &*m.descriptor == &*key.descriptor)
+        .map(|m| m.is_static())
+        .unwrap_or(false);
+    if !is_static {
+        return false;
+    }
+    scan.invoke_ops.iter().all(|(_, cp_idx, opcode)| {
+        if *opcode != 0xb8 {
+            return false;
+        }
+        let Some(ConstantPoolEntry::MethodReference {
+            class_index,
+            name_and_type_index,
+            ..
+        }) = class.constant_pool.get(*cp_idx)
+        else {
+            return false;
+        };
+        let Some(target_class) = class.constant_pool.get_class_name(*class_index) else {
+            return false;
+        };
+        let Some((target_name, target_desc)) =
+            class.constant_pool.get_name_and_type(*name_and_type_index)
+        else {
+            return false;
+        };
+        target_class == &*key.class_name
+            && target_name == &*key.method_name
+            && target_desc == &*key.descriptor
+    })
+}
+
 fn background_compile_task(
     weak_vm: &std::sync::Weak<SharedVm>,
     task: &crate::jit::tiered::CompilationTask,
@@ -29716,7 +29898,8 @@ fn background_compile_task(
     if task.osr_bci.is_some() && crate::jit::tiered::is_osr_denied(&task.method_key) {
         return fail(0);
     }
-    let optimized = crate::jit::tiered::tier_uses_optimized_backend(task.target_tier);
+    let optimized = crate::jit::tiered::tier_uses_optimized_backend(task.target_tier)
+        || (task.osr_bci.is_none() && promote_scalar_selfrec_to_ir(&shared, &task.method_key));
     if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
             "[cratonvm-jitc] bg-compile {}.{}{} tier={:?} optimized={}{}",
@@ -29760,6 +29943,13 @@ fn background_compile_task(
         } else {
             false
         };
+        if !published {
+            // The compile inputs and policy are stable for the life of this
+            // loaded method. Prevent a failed background artifact from being
+            // re-enqueued forever now that pending work no longer consumes the
+            // frame's permanent-rejection budget.
+            crate::jit::tiered::mark_osr_denied(task.method_key.clone());
+        }
         return CompileOutcome {
             // Widening: smaller integer -> 64-bit (zero/sign-extended).
             compile_time_ms: start.elapsed().as_millis() as u64,
@@ -32088,12 +32278,7 @@ fn execute_invokevirtual_cached(
                     // Lambda proxy classes have no bytecode implementation of
                     // their functional-interface method. They must reach the
                     // slow path, which dispatches their SAM method handle.
-                    if !is_special
-                        && shared
-                            .lambda_proxies
-                            .read()
-                            .contains_key(&actual_class_id)
-                    {
+                    if !is_special && shared.lambda_proxies.read().contains_key(&actual_class_id) {
                         return Ok(CachedCallResult::CacheMiss);
                     }
                     // WP2.7 — AnnotationProxy methods (incl. Object.equals/hashCode/
@@ -32391,12 +32576,7 @@ fn execute_invokevirtual_cached(
                     }
                     // Lambda proxies require the slow `try_lambda_dispatch`
                     // route instead of a cached interface target.
-                    if !is_special
-                        && shared
-                            .lambda_proxies
-                            .read()
-                            .contains_key(&actual_class_id)
-                    {
+                    if !is_special && shared.lambda_proxies.read().contains_key(&actual_class_id) {
                         return Ok(CachedCallResult::CacheMiss);
                     }
                     // WP2.7 — same escape hatch as in the bytecode branch:

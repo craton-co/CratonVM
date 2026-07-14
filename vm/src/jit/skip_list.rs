@@ -1377,8 +1377,7 @@ fn should_skip_jit_internal(
         // consistently completes all test methods. Keep it interpreted until
         // the lowering defect is isolated. Opt in for bisection with
         // CRATONVM_JIT_ALLOW_PACKAGES=org/hsqldb/.
-        if class_name.starts_with("org/hsqldb/")
-            && !package_allowed("org/hsqldb/", allow_packages)
+        if class_name.starts_with("org/hsqldb/") && !package_allowed("org/hsqldb/", allow_packages)
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
@@ -2702,14 +2701,23 @@ fn is_known_miscompile_clq_family(class_name: &str, method_name: &str) -> bool {
         (class_name, method_name),
         ("java/util/concurrent/ConcurrentLinkedQueue", "add")
             | ("java/util/concurrent/ConcurrentLinkedQueue", "offer")
-            | ("java/util/concurrent/ConcurrentLinkedQueue", "tryCasSuccessor")
+            | (
+                "java/util/concurrent/ConcurrentLinkedQueue",
+                "tryCasSuccessor"
+            )
             | ("java/util/concurrent/ConcurrentLinkedQueue", "updateHead")
             | ("java/util/concurrent/ConcurrentLinkedQueue", "succ")
             | ("java/util/concurrent/ConcurrentLinkedQueue", "poll")
-            | ("java/util/concurrent/ConcurrentLinkedQueue", "skipDeadNodes")
+            | (
+                "java/util/concurrent/ConcurrentLinkedQueue",
+                "skipDeadNodes"
+            )
             | ("java/util/concurrent/ConcurrentLinkedQueue", "<init>")
             | ("java/util/concurrent/ConcurrentLinkedQueue$Node", "<init>")
-            | ("java/util/concurrent/ConcurrentLinkedQueue$Node", "appendRelaxed")
+            | (
+                "java/util/concurrent/ConcurrentLinkedQueue$Node",
+                "appendRelaxed"
+            )
             | ("java/util/concurrent/ConcurrentLinkedQueue$Node", "casItem")
     )
 }
@@ -3405,10 +3413,7 @@ mod tests {
         // The rest of org/keycloak/ (outside .../configuration/ and .../cli/)
         // and all of picocli/ must remain banned — the carve-out is
         // deliberately narrow.
-        for class_name in [
-            "org/keycloak/models/RealmModel",
-            "picocli/CommandLine",
-        ] {
+        for class_name in ["org/keycloak/models/RealmModel", "picocli/CommandLine"] {
             assert_eq!(
                 check(class_name, "example", false, true, SkipPolicy::Conservative),
                 Some(SkipReason::RustJvmTestFixture),

@@ -464,6 +464,12 @@ impl ExecutableBuffer {
         self.ptr
     }
 
+    /// Size of the private executable allocation backing this method.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Get the emitted bytes as a slice.
     pub fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
@@ -2475,6 +2481,36 @@ pub fn c2_upgrade_would_engage(
         || (ir_emit_fp && fp_in_body(code, code_len))
 }
 
+/// Structural half of the early optimized-tier admission for the common
+/// `static int f(int)` self-recursion shape. The VM performs the constant-pool
+/// identity check separately; this function deliberately accepts only scalar,
+/// allocation-free bytecode whose calls are all `invokestatic`.
+pub fn scalar_selfrec_ir_would_engage(code: &[u8], code_len: usize, descriptor: &str) -> bool {
+    if descriptor != "(I)I" {
+        return false;
+    }
+    let Some(scan) = x64::jit_scan(code, code_len, descriptor) else {
+        return false;
+    };
+    if scan.invoke_ops.is_empty()
+        || scan.invoke_ops.iter().any(|(_, _, opcode)| *opcode != 0xb8)
+        || !scan.multianewarray_ops.is_empty()
+        || !scan.field_ops.is_empty()
+        || !scan.typecheck_ops.is_empty()
+        || !scan.static_field_ops.is_empty()
+        || !scan.new_ops.is_empty()
+        || !scan.anewarray_ops.is_empty()
+        || !scan.indy_ops.is_empty()
+        || scan.has_newarray
+        || scan.has_athrow
+    {
+        return false;
+    }
+    ir::ir_compatible(&scan)
+        && !method_uses_category2(code, code_len, descriptor)
+        && !method_uses_fp(code, code_len, descriptor)
+}
+
 /// Resolved metadata for a method eligible for inlining at a specific call site.
 #[derive(Clone)]
 pub struct InlineSite {
@@ -2997,6 +3033,44 @@ mod math_intrinsic_aliases {
         JitIntrinsic::MathUnsignedMultiplyHigh.as_entry();
 }
 pub use math_intrinsic_aliases::*;
+
+/// Process-global pointer to the VM-side
+/// `jit_integer_value_of_direct(vm_ptr, value) -> i64` thin helper,
+/// registered once at VM init (`build_helpers`). Avoids a
+/// `JitRuntimeHelpers` ABI change (same pattern as
+/// `x64::ARM_SAVEBASE_WATCH_FN`). `0` = not wired → the recognition below
+/// is skipped and `Integer.valueOf` sites use the generic dispatch helper.
+///
+/// Why: `invokestatic Integer.valueOf(I)` is statically bound and its
+/// callee is a registered native, so the generic `jit_invoke_dispatch`
+/// round trip (info decode, per-call thread-local cache probes, argument
+/// buffer build, safe-native-call wrapper) is pure fixed overhead on one
+/// of the hottest autoboxing paths (three `valueOf` calls per
+/// `HashMap<Integer,Integer>` put+get pair). A direct `CALL` to the thin
+/// helper keeps the exact allocation, `-128..=127` identity-cache, and
+/// pending-return rooting semantics while skipping the dispatch machinery.
+pub static INTEGER_VALUE_OF_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the `Integer.valueOf` thin direct-call helper (called once from
+/// the VM's `build_helpers`).
+pub fn set_integer_value_of_direct_fn(addr: usize) {
+    INTEGER_VALUE_OF_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `Integer.intValue()` sibling of [`INTEGER_VALUE_OF_DIRECT_FN`].
+/// `java/lang/Integer` is `final`, so an `invokevirtual` site whose
+/// constant-pool class is exactly `Integer` is statically monomorphic and
+/// can take the plain (guard-free) virtual direct-call path; the thin
+/// helper handles the null-receiver NPE itself.
+pub static INTEGER_INT_VALUE_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the `Integer.intValue` thin direct-call helper (called once from
+/// the VM's `build_helpers`).
+pub fn set_integer_int_value_direct_fn(addr: usize) {
+    INTEGER_INT_VALUE_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Resolve a method invocation to a JIT call-site intrinsic, if one applies.
 ///
@@ -4131,6 +4205,11 @@ fn compute_jit_key_hash(class: &str, method: &str, desc: &str) -> u64 {
 /// concurrency invariants that need their own test battery.
 pub struct JitCache {
     methods: FxHashMap<u64, (JitKey, Arc<CompiledMethod>)>,
+    /// OSR bodies are keyed separately from method-entry bodies. An OSR
+    /// artifact and a later C1/C2 publication for the same Java method must
+    /// coexist: replacing the OSR body otherwise leaves the hot back-edge
+    /// permanently interpreting while it waits for an OSR-only cache entry.
+    osr_methods: FxHashMap<u64, (JitKey, Arc<CompiledMethod>)>,
     /// Evicted compiled methods whose code ranges remain executable and
     /// registered for precise GC frame walks.
     ///
@@ -4147,6 +4226,7 @@ impl JitCache {
     pub fn new() -> Self {
         Self {
             methods: FxHashMap::default(),
+            osr_methods: FxHashMap::default(),
             retired_methods: Vec::new(),
             string_arena: Vec::new(),
             invoke_info_arena: Vec::new(),
@@ -4191,6 +4271,25 @@ impl JitCache {
     ) -> Option<Arc<CompiledMethod>> {
         let h = compute_jit_key_hash(class_name, method_name, descriptor);
         let (key, method) = self.methods.get(&h)?;
+        if &*key.class_name == class_name
+            && &*key.method_name == method_name
+            && &*key.descriptor == descriptor
+        {
+            Some(method.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Look up the independently published OSR body for a method.
+    pub fn get_osr(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Option<Arc<CompiledMethod>> {
+        let h = compute_jit_key_hash(class_name, method_name, descriptor);
+        let (key, method) = self.osr_methods.get(&h)?;
         if &*key.class_name == class_name
             && &*key.method_name == method_name
             && &*key.descriptor == descriptor
@@ -4257,12 +4356,51 @@ impl JitCache {
         self.methods.insert(h, (key, arc));
     }
 
+    /// Publish an OSR body without superseding the method-entry body.
+    pub fn put_osr(
+        &mut self,
+        class_name: Arc<str>,
+        method_name: Arc<str>,
+        descriptor: Arc<str>,
+        compiled: CompiledMethod,
+    ) {
+        debug_assert!(compiled.compiled_via_osr);
+        let h = compute_jit_key_hash(&class_name, &method_name, &descriptor);
+        let key = JitKey {
+            class_name,
+            method_name,
+            descriptor,
+        };
+        if let Some((_old_key, old_cm)) = self.osr_methods.remove(&h) {
+            self.retire_evicted_method(old_cm);
+        }
+        let arc = Arc::new(compiled);
+        if crate::x64::precise_jit_maps_enabled() || xt_jit_root_scan_enabled() {
+            register_jit_code_range(
+                arc.entry_ptr() as usize,
+                arc.code_len(),
+                Arc::as_ptr(&arc) as usize,
+            );
+        }
+        if jit_names_enabled() {
+            register_jit_method_name(
+                arc.entry_ptr() as usize,
+                arc.code_len(),
+                format!(
+                    "{}.{}{} [osr]",
+                    key.class_name, key.method_name, key.descriptor
+                ),
+            );
+        }
+        self.osr_methods.insert(h, (key, arc));
+    }
+
     pub fn len(&self) -> usize {
-        self.methods.len()
+        self.methods.len() + self.osr_methods.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.methods.is_empty()
+        self.methods.is_empty() && self.osr_methods.is_empty()
     }
 
     /// Remove a compiled method from the cache (for invalidation).
@@ -4282,6 +4420,16 @@ impl JitCache {
                 // stale direct-call targets.
                 let cm = cm.clone();
                 self.methods.remove(&h);
+                self.retire_evicted_method(cm);
+            }
+        }
+        if let Some((key, cm)) = self.osr_methods.get(&h) {
+            if &*key.class_name == class_name
+                && &*key.method_name == method_name
+                && &*key.descriptor == descriptor
+            {
+                let cm = cm.clone();
+                self.osr_methods.remove(&h);
                 self.retire_evicted_method(cm);
             }
         }
@@ -4307,9 +4455,24 @@ impl JitCache {
             })
             .map(|(h, _)| *h)
             .collect();
-        let count = hashes_to_remove.len();
+        let osr_hashes_to_remove: Vec<u64> = self
+            .osr_methods
+            .iter()
+            .filter(|(_, (_key, cm))| {
+                cm.inlined_methods
+                    .iter()
+                    .any(|(cls, _, _)| cls == changed_class)
+            })
+            .map(|(h, _)| *h)
+            .collect();
+        let count = hashes_to_remove.len() + osr_hashes_to_remove.len();
         for h in hashes_to_remove {
             if let Some((_key, cm)) = self.methods.remove(&h) {
+                self.retire_evicted_method(cm);
+            }
+        }
+        for h in osr_hashes_to_remove {
+            if let Some((_key, cm)) = self.osr_methods.remove(&h) {
                 self.retire_evicted_method(cm);
             }
         }
@@ -4330,9 +4493,25 @@ impl JitCache {
             })
             .map(|(h, _)| *h)
             .collect();
-        let count = hashes_to_remove.len();
+        let osr_hashes_to_remove: Vec<u64> = self
+            .osr_methods
+            .iter()
+            .filter(|(_, (_key, compiled))| {
+                compiled
+                    .inlined_methods
+                    .iter()
+                    .any(|(cn, _, _)| cn == class_name)
+            })
+            .map(|(h, _)| *h)
+            .collect();
+        let count = hashes_to_remove.len() + osr_hashes_to_remove.len();
         for h in hashes_to_remove {
             if let Some((_key, cm)) = self.methods.remove(&h) {
+                self.retire_evicted_method(cm);
+            }
+        }
+        for h in osr_hashes_to_remove {
+            if let Some((_key, cm)) = self.osr_methods.remove(&h) {
                 self.retire_evicted_method(cm);
             }
         }
@@ -4346,9 +4525,13 @@ impl JitCache {
     /// but conservative; normal mode retires evicted methods so retained code
     /// ranges still have valid GC metadata.
     pub fn clear_all(&mut self) -> usize {
-        let count = self.methods.len();
+        let count = self.methods.len() + self.osr_methods.len();
         let methods = std::mem::take(&mut self.methods);
         for (_h, (_key, cm)) in methods {
+            self.retire_evicted_method(cm);
+        }
+        let osr_methods = std::mem::take(&mut self.osr_methods);
+        for (_h, (_key, cm)) in osr_methods {
             self.retire_evicted_method(cm);
         }
         count
@@ -4363,7 +4546,12 @@ impl Default for JitCache {
 
 impl std::fmt::Debug for JitCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "JitCache({} methods)", self.methods.len())
+        write!(
+            f,
+            "JitCache({} methods, {} osr methods)",
+            self.methods.len(),
+            self.osr_methods.len()
+        )
     }
 }
 
@@ -5033,7 +5221,7 @@ pub fn try_compile(
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
-    // CRIT-2 — returns (class_id, num_fields, has_primitive_init,
+    // CRIT-2 — returns (class_id, num_fields, has_nonzero_tag_primitive_init,
     // has_finalizer). The two flags feed the inline-TLAB `new` fast path;
     // resolvers that cannot compute them must return `(_, _, true, true)`
     // so the post-init helper call stays in place.
@@ -5355,7 +5543,7 @@ fn try_compile_inner(
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
-    // (class_id, num_fields, has_primitive_init, has_finalizer) — see `try_compile`.
+    // (class_id, num_fields, has_nonzero_tag_primitive_init, has_finalizer) — see `try_compile`.
     cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
     cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<i64>>,
     cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<(i64, bool)>>, // inc 35: (bits, is_double)
@@ -5708,11 +5896,12 @@ fn try_compile_inner(
                     let mut info_map = std::collections::HashMap::new();
                     let mut all_emittable = true;
                     // Follow-up to the fib44 fix: when
-                    // `CRATONVM_JIT_IR_SELFREC_DIRECT` is on, a self-recursive
-                    // wide-return call stays on the IR path but is emitted as a
-                    // DIRECT self-call (invoke_kind 4) instead of bailing to
-                    // single-pass — see the gate below and `ir_lower`'s Op::Call.
-                    // Default-off (experimental): default behaviour is the bail.
+                    // `CRATONVM_JIT_IR_SELFREC_DIRECT` is on, an eligible
+                    // self-recursive static call is emitted as a DIRECT self-call
+                    // (invoke_kind 4) instead of paying `jit_invoke_dispatch` on
+                    // every recursion — see the gate below and `ir_lower`'s Op::Call.
+                    // Default-on when the native-stack guard helper is wired;
+                    // the env flag remains an opt-out for diagnosis.
                     let selfrec_direct = selfrec_direct_enabled();
                     for &(pc, cp_idx, opcode) in &scan.invoke_ops {
                         // Admit `invokestatic` (under `ir_emit_calls`), resolved
@@ -5770,13 +5959,22 @@ fn try_compile_inner(
                         // return is wide, mark the body non-emittable so it bails. The
                         // intended unblock — CROSS-method wide-return calls (e.g.
                         // `Pack.bigEndianToLong`) — is non-self-recursive and unaffected.
-                        let is_self_recursive_wide = matches!(ret, b'J' | b'D' | b'F')
+                        let is_self_recursive = is_static
                             && cn.as_str() == &*cached.class_name
                             && mn.as_str() == &*cached.method_name
                             && desc.as_str() == &*cached.method_descriptor;
+                        let is_self_recursive_wide =
+                            is_self_recursive && matches!(ret, b'J' | b'D' | b'F');
+                        // Integer and reference self-recursion has the same direct-call
+                        // ABI as the already-supported wide-return path. Void calls have
+                        // no result slot for `emit_self_recursive_call` to fill.
+                        let is_self_recursive_direct = selfrec_direct
+                            && helpers.self_call_stack_guard != 0
+                            && is_self_recursive
+                            && ret != b'V';
                         if is_self_recursive_wide && !selfrec_direct {
-                            // Default: bail the whole method to single-pass (fast
-                            // direct self-call). The `selfrec_direct` opt-in keeps
+                            // Opt-out: bail the whole method to single-pass (fast
+                            // direct self-call). The direct path keeps
                             // it on the IR path with a direct self-call instead
                             // (invoke_kind 4 below).
                             all_emittable = false;
@@ -5793,10 +5991,9 @@ fn try_compile_inner(
                         // static call-site signature it resolves against).
                         let has_receiver = !is_static;
                         let num_args = desc_args + if has_receiver { 1 } else { 0 };
-                        let invoke_kind: u8 = if is_self_recursive_wide {
-                            // 4 = self-recursive static DIRECT call (only reachable
-                            // when `selfrec_direct` is on — else the gate above
-                            // already broke out). `ir_lower` emits a direct `CALL`
+                        let invoke_kind: u8 = if is_self_recursive_direct {
+                            // 4 = guarded self-recursive static DIRECT call.
+                            // `ir_lower` emits a direct `CALL`
                             // to this method's own entry instead of routing through
                             // `jit_invoke_dispatch`. Never seen by the dispatch
                             // helper (the direct path never calls it).
@@ -6118,9 +6315,8 @@ fn try_compile_inner(
 
     // CRIT-2 — new_info tuple shape:
     //   (pc, class_id_raw, num_fields,
-    //    has_primitive_init,    // class has primitive-typed fields that
-    //                           // need typed-zero defaults applied by
-    //                           // `jit_init_primitive_fields`
+    //    has_nonzero_tag_primitive_init, // class has long/float/double fields
+    //                                    // whose typed-zero Value tag is nonzero
     //    has_finalizer)         // class overrides `finalize()` and must
     //                           // be registered with the finalizer queue
     //
@@ -6303,6 +6499,35 @@ fn try_compile_inner(
                 }
 
                 if !planned_inline {
+                    // `Integer.valueOf(I)` thin direct call (see
+                    // `INTEGER_VALUE_OF_DIRECT_FN`): statically bound, native
+                    // callee — the eager callee-compile attempt below can
+                    // never succeed for it, and the generic dispatch fallback
+                    // pays the full helper round trip per call. `needs_context`
+                    // routes vm_ptr as arg 0; the helper preserves the
+                    // identity-cache and pending-return rooting contracts.
+                    if invoke_kind == 3
+                        && class_name == "java/lang/Integer"
+                        && method_name == "valueOf"
+                        && descriptor == "(I)Ljava/lang/Integer;"
+                    {
+                        let entry = INTEGER_VALUE_OF_DIRECT_FN
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        if entry != 0 {
+                            needs_heap = true;
+                            direct_calls.push((
+                                pc,
+                                JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params: 1,
+                                    return_type: b'L',
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
                     if let Some(compiler) = callee_compiler.as_ref() {
                         if let Some((entry, callee_needs_ctx)) =
                             compiler(&class_name, &method_name, &descriptor)
@@ -6418,6 +6643,33 @@ fn try_compile_inner(
             // `guard_class_id` stays 0 and the CRC32 codegen bails the site
             // to normal dispatch (0 is never a real class id).
             if !is_recursive_call && (invoke_kind == 0 || invoke_kind == 2) {
+                // `Integer.intValue()` thin direct call (see
+                // `INTEGER_INT_VALUE_DIRECT_FN`): `Integer` is `final`, so a
+                // site declared against it is statically monomorphic — the
+                // plain guard-free virtual direct-call path is sound, and
+                // the helper handles the null-receiver NPE itself.
+                if invoke_kind == 0
+                    && class_name == "java/lang/Integer"
+                    && method_name == "intValue"
+                    && descriptor == "()I"
+                {
+                    let entry =
+                        INTEGER_INT_VALUE_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
+                    if entry != 0 {
+                        needs_heap = true;
+                        direct_calls.push((
+                            pc,
+                            JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 0,
+                                return_type: b'I',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                }
                 // First the layout-independent instance intrinsics.
                 if let Some((entry, num_params, ret)) =
                     try_resolve_intrinsic(&class_name, &method_name, &descriptor)
@@ -6709,6 +6961,14 @@ fn try_compile_inner(
     );
 
     x64::set_pending_verified_max_stack(cached.max_stack as usize);
+    // Pure-kernel GPR local homes: this is the METHOD-ENTRY compile path
+    // (OSR artifacts go through the interpreter's `compile_osr_artifact`,
+    // which never sets this), so request the kernel register homes. The
+    // backend engages them only for call/field/alloc/typecheck-free bodies
+    // with no speculative-BCE guards, keeps reference locals frame-homed,
+    // and publishes the body without OSR entry points — see
+    // `x64::kernel_reg_locals_enabled` for the safety argument.
+    x64::set_kernel_reg_homes_request(true);
     let mut compiled = x64::compile_with_param_slots(
         code,
         code_len,
@@ -7288,17 +7548,21 @@ pub fn __set_selfrec_direct_override(v: Option<bool>) {
     SELFREC_DIRECT_TEST_OVERRIDE.with(|c| c.set(v));
 }
 
-/// fib44-fix follow-up: is the self-recursive wide-return DIRECT-call path on?
-/// When on, a self-recursive `J`/`D`/`F` call stays on the IR path emitted as a
-/// direct `CALL` to the method's own entry (invoke_kind 4 in the eligibility
-/// loop, lowered in `ir_lower`) instead of bailing to single-pass. Default-OFF
-/// (experimental): the env var `CRATONVM_JIT_IR_SELFREC_DIRECT` opts in; a
-/// thread-local override takes precedence for tests.
+/// Whether guarded IR self-recursion uses a direct call to the method's own
+/// entry. Default-on now that the IR lowering has the same native-stack floor
+/// guard as single-pass. `CRATONVM_JIT_IR_SELFREC_DIRECT=0` opts out for
+/// diagnosis; a thread-local override takes precedence for tests.
 fn selfrec_direct_enabled() -> bool {
     if let Some(v) = SELFREC_DIRECT_TEST_OVERRIDE.with(|c| c.get()) {
         return v;
     }
-    std::env::var_os("CRATONVM_JIT_IR_SELFREC_DIRECT").is_some()
+    match std::env::var("CRATONVM_JIT_IR_SELFREC_DIRECT") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    }
 }
 
 /// Gap B (inc 22): classify a static-call descriptor for the `Op::Call` slice.
@@ -7547,18 +7811,18 @@ pub fn invokestatic_self_call_uses_tail_jump(code: &[u8], code_len: usize, pc: u
 // Tests
 // ---------------------------------------------------------------------------
 
-    #[test]
-    fn hsqldb_jit_deny_matches_slash_and_dot_names() {
-        assert_eq!(
-            hsqldb_jit_deny_prefix("org/hsqldb/map/BaseHashMap"),
-            Some("org/hsqldb/")
-        );
-        assert_eq!(
-            hsqldb_jit_deny_prefix("org.hsqldb.map.BaseHashMap"),
-            Some("org.hsqldb.")
-        );
-        assert_eq!(hsqldb_jit_deny_prefix("org/example/Foo"), None);
-    }
+#[test]
+fn hsqldb_jit_deny_matches_slash_and_dot_names() {
+    assert_eq!(
+        hsqldb_jit_deny_prefix("org/hsqldb/map/BaseHashMap"),
+        Some("org/hsqldb/")
+    );
+    assert_eq!(
+        hsqldb_jit_deny_prefix("org.hsqldb.map.BaseHashMap"),
+        Some("org.hsqldb.")
+    );
+    assert_eq!(hsqldb_jit_deny_prefix("org/example/Foo"), None);
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7586,7 +7850,10 @@ mod tests {
             jaxb_mapping_jit_deny_prefix("org.glassfish.jaxb.runtime.v2.ContextFactory"),
             Some("org.glassfish.jaxb.")
         );
-        assert_eq!(jaxb_mapping_jit_deny_prefix("org/glassfish/other/Foo"), None);
+        assert_eq!(
+            jaxb_mapping_jit_deny_prefix("org/glassfish/other/Foo"),
+            None
+        );
     }
 
     #[test]
@@ -9696,6 +9963,20 @@ mod tests {
     // ── JitCache tests ──────────────────────────────────────────────
 
     #[test]
+    fn test_scalar_selfrec_ir_structural_admission() {
+        let fib = [
+            0x1a, 0x04, 0xa3, 0x00, 0x05, // iload_0; iconst_1; if_icmpgt
+            0x1a, 0xac, // iload_0; ireturn
+            0x1a, 0x04, 0x64, 0xb8, 0x00, 0x02, // fib(n - 1)
+            0x1a, 0x05, 0x64, 0xb8, 0x00, 0x02, // fib(n - 2)
+            0x60, 0xac, // iadd; ireturn
+        ];
+        assert!(scalar_selfrec_ir_would_engage(&fib, fib.len(), "(I)I"));
+        assert!(!scalar_selfrec_ir_would_engage(&fib, fib.len(), "(I)J"));
+        assert!(!scalar_selfrec_ir_would_engage(&[0x1a, 0xac], 2, "(I)I"));
+    }
+
+    #[test]
     fn test_jit_cache_new_is_empty() {
         let cache = JitCache::new();
         assert!(cache.is_empty());
@@ -9719,6 +10000,54 @@ mod tests {
 
         let result = cache.get(&class, &method, &desc);
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_jit_cache_osr_and_method_entry_bodies_coexist() {
+        let mut cache = JitCache::new();
+        let class: Arc<str> = Arc::from("LoopClass");
+        let method: Arc<str> = Arc::from("hotLoop");
+        let desc: Arc<str> = Arc::from("(I)I");
+
+        let mut entry_buf = ExecutableBuffer::new(64).expect("alloc failed");
+        entry_buf.emit(&[0xC3]);
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            CompiledMethod::new(entry_buf),
+        );
+
+        let mut osr_buf = ExecutableBuffer::new(64).expect("alloc failed");
+        osr_buf.emit(&[0xC3]);
+        let mut osr = CompiledMethod::new(osr_buf);
+        osr.compiled_via_osr = true;
+        cache.put_osr(class.clone(), method.clone(), desc.clone(), osr);
+
+        let entry = cache.get(&class, &method, &desc).expect("entry body");
+        let osr = cache.get_osr(&class, &method, &desc).expect("osr body");
+        assert_ne!(entry.entry_ptr(), osr.entry_ptr());
+        assert!(!entry.compiled_via_osr);
+        assert!(osr.compiled_via_osr);
+        assert_eq!(cache.len(), 2);
+
+        let osr_entry = osr.entry_ptr();
+        let mut c2_buf = ExecutableBuffer::new(64).expect("alloc failed");
+        c2_buf.emit(&[0xC3]);
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            CompiledMethod::new(c2_buf),
+        );
+        assert_eq!(
+            cache
+                .get_osr(&class, &method, &desc)
+                .expect("osr survives method-entry supersede")
+                .entry_ptr(),
+            osr_entry
+        );
+        assert_eq!(cache.len(), 2);
     }
 
     #[test]

@@ -8427,25 +8427,84 @@ fn dis_read_exact(
     this: ObjectRef,
     len: usize,
 ) -> Result<Vec<u8>, MethodCallFailed> {
-    let this_pin = ctx.pin_native_root(this);
-    let mut this = this;
-    let mut out = Vec::with_capacity(len);
-    for _ in 0..len {
-        let b = match dis_read_one(ctx, this) {
-            Ok(v) => v,
+    // PERF FIX (2026-07-13, STW-takeover-cluster residual investigation,
+    // Azure host follow-up): this used to loop `dis_read_one` (a full
+    // array-alloc + invoke_virtual dispatch) once per byte. It's the shared
+    // helper behind readByte/readShort/readUnsignedShort/readChar AND
+    // (found via multi-snapshot gdb on the Azure host, confirmed the same
+    // stuck frame 3 snapshots in a row 5s apart) `readUTF` — which calls it
+    // with `len` up to 65535 (the modified-UTF-8 payload length), and
+    // `readUTF` is exactly how class-file/JSP-compile constant-pool string
+    // entries get decoded, so this was the dominant cost in the
+    // TestJspConfig/TestELInterpreterTagSetters/TestEnvEntry/
+    // TestWsWebSocketContainerTimeoutClient hang residual left after the
+    // native_dis_read_bytes/dis_read_fully_impl/native_dis_skip_bytes fixes
+    // (see docs/known-issues/tomcat-08-07/elinjsp-socket-read-timeout.md).
+    // Bulk-read instead, preserving the same zero-progress-guard fallback
+    // `dis_read_one` had (a stream returning 0 for a non-empty request is a
+    // contract violation but tolerated here via a scalar `read()` retry).
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let inner = match ctx.get_field(this, DIS_FIELD_IN) {
+        Value::Object(Some(s)) => s,
+        _ => return Err(eof_exception()),
+    };
+    let buf = ctx.new_array(ArrayElementType::Byte, len);
+    let buf_pin = ctx.pin_native_root(buf);
+    let mut buf = buf;
+    let mut total = 0usize;
+    while total < len {
+        let remaining = (len - total) as i32;
+        let n = match ctx.invoke_virtual(
+            inner,
+            "read",
+            "([BII)I",
+            &[
+                Value::Object(Some(buf)),
+                Value::Int(total as i32),
+                Value::Int(remaining),
+            ],
+        ) {
+            Ok(Some(Value::Int(n))) => n,
+            Ok(_) => -1,
             Err(e) => {
-                ctx.unpin_native_roots(this_pin);
+                ctx.unpin_native_roots(buf_pin);
                 return Err(e);
             }
         };
-        this = ctx.read_native_pin(this_pin, this);
-        if b < 0 {
-            ctx.unpin_native_roots(this_pin);
+        buf = ctx.read_native_pin(buf_pin, buf);
+        if n == 0 {
+            // Contract-violating zero-progress read: fall back to a scalar
+            // single-byte read so a misbehaving stream still makes forward
+            // progress instead of spinning forever on remaining==0 never
+            // being satisfied.
+            let scalar = match ctx.invoke_virtual(inner, "read", "()I", &[]) {
+                Ok(Some(Value::Int(v))) if v >= 0 => v,
+                Ok(_) => -1,
+                Err(e) => {
+                    ctx.unpin_native_roots(buf_pin);
+                    return Err(e);
+                }
+            };
+            if scalar < 0 {
+                ctx.unpin_native_roots(buf_pin);
+                return Err(eof_exception());
+            }
+            buf = ctx.read_native_pin(buf_pin, buf);
+            ctx.set_array_element(buf, total, Value::Int(scalar));
+            total += 1;
+            continue;
+        }
+        if n < 0 {
+            ctx.unpin_native_roots(buf_pin);
             return Err(eof_exception());
         }
-        out.push(b as u8);
+        total += n as usize;
     }
-    ctx.unpin_native_roots(this_pin);
+    let mut out = vec![0u8; len];
+    ctx.read_byte_array_into(buf, 0, &mut out);
+    ctx.unpin_native_roots(buf_pin);
     Ok(out)
 }
 

@@ -499,18 +499,37 @@ impl CompilerCore {
     /// as "done" for that tier, so `should_compile` would never recommend it
     /// again, and nothing was ever inserted into `jit_cache` for the
     /// interpreter's fast-path lookup to find.
+    ///
+    /// `osr` marks a back-edge OSR task. A successful OSR publish goes into
+    /// the SEPARATE OSR artifact cache — the method-entry cache is still
+    /// empty — so it must NOT advance `current_tier`: `should_compile` reads
+    /// `current_tier` as "method-entry compiled through this tier" and
+    /// returns `None` at C2, which starved the method-entry compile of any
+    /// loop-heavy method whose OSR body published first (the invocation
+    /// counter kept firing but every recommendation was refused, so each
+    /// fresh call re-entered the interpreter and re-OSR'd forever — observed
+    /// as QuickBench `sieve` never retiring its per-call interpreter warmup
+    /// across 20,000 invocations). This is the mirror image of the
+    /// `request_osr` decoupling introduced with the independent OSR cache:
+    /// OSR requests are not suppressed by method-entry C2, and method-entry
+    /// tiering must not be suppressed by an OSR artifact. Queue flags and
+    /// fail counters still clear/advance normally so both pipelines share
+    /// the single in-flight slot.
     fn complete_task(
         &self,
         key: &MethodKey,
         tier: CompilationTier,
         compile_time_ms: u64,
         success: bool,
+        osr: bool,
     ) {
         {
             let mut methods = self.methods.lock();
             if let Some(state) = methods.get_mut(key) {
                 if success {
-                    state.current_tier = tier;
+                    if !osr {
+                        state.current_tier = tier;
+                    }
                     state.tier_fail_count = 0;
                 } else {
                     state.tier_fail_count = state.tier_fail_count.saturating_add(1);
@@ -824,7 +843,8 @@ impl TieredCompilationManager {
     /// the throttle, so calling `on_backedge` per iteration just to reach the
     /// count threshold would both pay a lock per back-edge and double-count.
     /// It is idempotent: a no-op (returns `None`) if the method is already
-    /// queued, already at/above C2, or has bailed out of C2. The enqueued task
+    /// queued or has bailed out of C2. Method-entry C2 does not suppress this
+    /// request because OSR bodies live in an independent cache. The enqueued task
     /// carries `osr_bci` so the background worker compiles an OSR-enterable
     /// artifact; the mutator enters it once published. (Threshold tuning of
     /// when a loop counts as "hot enough" is Step 6.)
@@ -843,7 +863,6 @@ impl TieredCompilationManager {
             return None;
         }
         if state.queued_for_compilation
-            || state.current_tier >= CompilationTier::C2
             || state.c2_bailout
             // Same "give up after repeated failures" convention as
             // `should_compile`/`request_c2_upgrade`: without this, a method
@@ -981,7 +1000,7 @@ impl TieredCompilationManager {
         tier: CompilationTier,
         compile_time_ms: u64,
     ) {
-        self.core.complete_task(key, tier, compile_time_ms, true);
+        self.core.complete_task(key, tier, compile_time_ms, true, false);
     }
 
     // ── Deoptimization ───────────────────────────────────────────────────
@@ -1203,6 +1222,7 @@ impl TieredCompilationManager {
                 task.target_tier,
                 outcome.compile_time_ms,
                 outcome.published,
+                task.osr_bci.is_some(),
             );
             // C1→C2 supersede: a freshly-published C1-family body whose
             // method the VM judged IR-eligible gets a Low-priority C2
@@ -1455,19 +1475,18 @@ mod tests {
     }
 
     #[test]
-    fn step5_request_osr_skips_when_already_c2_or_bailed() {
+    fn step5_request_osr_is_independent_of_method_entry_c2_but_honors_bailout() {
         clear_osr_deny_list_for_test();
-        // Already at C2 → nothing to OSR-compile. `compilation_complete` /
-        // `on_c2_bailout` use `get_mut` (no-op on an unseen method), so the
-        // method must first be registered via `on_method_invocation`.
+        // A method-entry C2 body does not provide an OSR entry and therefore
+        // must not suppress the separately cached OSR artifact.
         let mgr = TieredCompilationManager::with_default_policy();
         let key = test_key();
         mgr.on_method_invocation(&key);
         mgr.compilation_complete(&key, CompilationTier::C2, 1);
-        assert!(
-            mgr.request_osr(&key, 7).is_none(),
-            "C2 method: no OSR enqueue"
-        );
+        let task = mgr
+            .request_osr(&key, 7)
+            .expect("method-entry C2 must still allow an OSR artifact");
+        assert_eq!(task.osr_bci, Some(7));
 
         // C2-bailed method → no OSR enqueue.
         let mgr2 = TieredCompilationManager::with_default_policy();
@@ -1740,7 +1759,7 @@ mod tests {
         let mgr = TieredCompilationManager::with_default_policy();
         let key = test_key();
         mgr.on_method_invocation(&key); // create state
-        mgr.core.complete_task(&key, CompilationTier::C1, 10, false);
+        mgr.core.complete_task(&key, CompilationTier::C1, 10, false, false);
         assert_eq!(
             mgr.current_tier(&key),
             CompilationTier::Interpreter,
@@ -1768,7 +1787,7 @@ mod tests {
         // leave the method eligible for another attempt (queued_for_compilation
         // reset, current_tier untouched).
         for i in 0..(MAX_TIER_FAIL_RETRIES - 1) {
-            mgr.core.complete_task(&key, CompilationTier::C1, 1, false);
+            mgr.core.complete_task(&key, CompilationTier::C1, 1, false, false);
             assert_eq!(
                 mgr.on_method_invocation(&key),
                 Some(CompilationTier::C1),
@@ -1777,7 +1796,7 @@ mod tests {
         }
         // One more failure reaches MAX_TIER_FAIL_RETRIES — should_compile
         // must now give up permanently.
-        mgr.core.complete_task(&key, CompilationTier::C1, 1, false);
+        mgr.core.complete_task(&key, CompilationTier::C1, 1, false, false);
         assert_eq!(
             mgr.on_method_invocation(&key),
             None,
@@ -1795,14 +1814,55 @@ mod tests {
         let mgr = TieredCompilationManager::new(policy);
         let key = test_key();
         mgr.on_method_invocation(&key);
-        mgr.core.complete_task(&key, CompilationTier::C1, 1, false);
-        mgr.core.complete_task(&key, CompilationTier::C1, 5, true);
+        mgr.core.complete_task(&key, CompilationTier::C1, 1, false, false);
+        mgr.core.complete_task(&key, CompilationTier::C1, 5, true, false);
         assert_eq!(mgr.current_tier(&key), CompilationTier::C1);
         let methods = mgr.core.methods.lock();
         assert_eq!(
             methods[&key].tier_fail_count, 0,
             "a later success should reset the fail streak"
         );
+    }
+
+    // Regression coverage for the OSR-starves-method-entry bug: a successful
+    // OSR compile publishes into the SEPARATE OSR artifact cache, so it must
+    // not stamp `current_tier = C2` — that made `should_compile` refuse every
+    // later method-entry recommendation while the method-entry cache was
+    // still empty, so each fresh invocation of a loop-heavy method (e.g.
+    // QuickBench sieve) re-entered the interpreter and re-OSR'd forever.
+    #[test]
+    fn osr_completion_does_not_suppress_method_entry_tiering() {
+        let policy = CompilationPolicy {
+            c1_threshold: 1,
+            ..CompilationPolicy::default()
+        };
+        let mgr = TieredCompilationManager::new(policy);
+        let key = test_key();
+
+        // A hot back-edge enqueues an OSR task (target tier C2) before the
+        // invocation counter has recommended anything.
+        let task = mgr.request_osr(&key, 42).expect("OSR task should enqueue");
+        assert_eq!(task.osr_bci, Some(42));
+        // The worker completes it successfully — artifact goes to the OSR
+        // cache, `osr = true`.
+        mgr.core
+            .complete_task(&key, task.target_tier, 3, true, true);
+        assert_eq!(
+            mgr.current_tier(&key),
+            CompilationTier::Interpreter,
+            "an OSR publish must not advance the method-entry tier"
+        );
+        // The invocation counter must still be able to recommend the
+        // method-entry compile.
+        assert_eq!(
+            mgr.on_method_invocation(&key),
+            Some(CompilationTier::C1),
+            "method-entry compilation must still be recommended after an OSR publish"
+        );
+        // And a successful method-entry completion advances the tier as usual.
+        mgr.core
+            .complete_task(&key, CompilationTier::C1, 2, true, false);
+        assert_eq!(mgr.current_tier(&key), CompilationTier::C1);
     }
 
     // ── Deoptimization ───────────────────────────────────────────────────

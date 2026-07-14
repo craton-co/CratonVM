@@ -156,6 +156,8 @@ struct Lowerer<'a> {
     /// `Long.MIN_VALUE` return (see `lower_call`'s sentinel sequence). 0 if no
     /// calls / not wired (int/ref/void sites never consult it).
     dispatch_threw: usize,
+    /// Catchable native-stack overflow guard for direct self-recursion.
+    self_call_stack_guard: usize,
     /// IR FP tier (Slice A) — address of the `jit_frem` / `jit_drem` runtime
     /// helpers (`extern "C" fn(f32,f32)->f32` / `fn(f64,f64)->f64`). Baked into
     /// an `Op::Rem` Float/Double site as `MOV RAX,imm64 ; CALL RAX` with the two
@@ -281,6 +283,7 @@ impl<'a> Lowerer<'a> {
             invoke_dispatch: helpers.invoke_dispatch,
             lambda_int_to_double: helpers.lambda_int_to_double,
             dispatch_threw: helpers.dispatch_threw,
+            self_call_stack_guard: helpers.self_call_stack_guard,
             frem: helpers.jit_frem,
             drem: helpers.jit_drem,
             getfield: helpers.getfield,
@@ -818,9 +821,9 @@ impl<'a> Lowerer<'a> {
     /// fib44-fix follow-up: emit a self-recursive call as a DIRECT `CALL` to this
     /// method's own entry (code offset 0), instead of the generic
     /// `jit_invoke_dispatch` helper. Only reached for an `Op::Call` whose
-    /// `JitInvokeInfo.invoke_kind == 4` (the eligibility loop sets that only when
-    /// `CRATONVM_JIT_IR_SELFREC_DIRECT` is on for a self-recursive wide-return
-    /// call). `inputs` is the call node's `inputs` (`[ctrl, mem, args…]`), `slot`
+    /// `JitInvokeInfo.invoke_kind == 4` (the eligibility loop sets that when
+    /// `CRATONVM_JIT_IR_SELFREC_DIRECT` is on for a supported self-recursive
+    /// static call). `inputs` is the call node's `inputs` (`[ctrl, mem, args…]`), `slot`
     /// its result slot, `num_args` its Java arg count.
     ///
     /// SAFETY of a direct call vs. the C-ABI dispatch helper: the IR method is
@@ -828,6 +831,38 @@ impl<'a> Lowerer<'a> {
     /// preserves the platform callee-saved registers — a self-call is just a call
     /// to that same ABI-compliant function.
     fn emit_self_recursive_call(&mut self, inputs: &[NodeId], slot: i32, num_args: usize) {
+        // Preserve Java's catchable StackOverflowError semantics without a
+        // helper call in every recursive frame. Sample once whenever the next
+        // frame can cross a 64 KiB native-stack boundary. The runtime guard's
+        // floor reserves 1 MiB, so even a check delayed by one full stride still
+        // leaves at least 960 KiB for exception construction and unwinding.
+        //
+        //   low = RSP & 0xffff
+        //   if low > frame_size + call/prologue bytes: skip helper
+        self.buf.emit(&[0x48, 0x89, 0xE0]); // MOV RAX, RSP
+        self.buf.emit_byte(0x25); // AND EAX, imm32
+        self.buf.emit(&0xffffu32.to_le_bytes());
+        self.buf.emit_byte(0x3D); // CMP EAX, imm32
+        let next_frame_span = (self.frame_size as u32).saturating_add(16).min(0xffff);
+        self.buf.emit(&next_frame_span.to_le_bytes());
+        self.buf.emit(&[0x0F, 0x87]); // JA .guard_ok
+        let fast_skip_patch = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+        if self.self_call_stack_guard != 0 {
+            self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
+            self.emit_mov_reg_imm64(RAX, self.self_call_stack_guard as u64);
+            self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+            self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+            self.buf.emit(&[0x0F, 0x85]); // JNE shared bail stub
+            let patch = self.buf.pos();
+            self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+            self.call_exc_patches.push(patch);
+        }
+        let rel = self.buf.pos() as i32 - (fast_skip_patch as i32 + 4);
+        self.buf
+            .try_patch_i32(fast_skip_patch, rel)
+            .expect("ir_lower self-call stack-sample patch in-bounds");
+
         // Marshal args into this method's OWN entry ABI — IDENTICAL to the
         // register list `emit_prologue` reads incoming args from: abi[0] = the
         // hidden VM context pointer, abi[1 + i] = Java arg i. Each source is a
@@ -848,11 +883,11 @@ impl<'a> Lowerer<'a> {
         let patch = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
         self.self_call_patches.push(patch);
-        // Exception/deopt sentinel — identical to the dispatch path's wide-return
-        // branch. A self-recursive direct callee is always J/D/F here, so a legit
-        // result whose bits == `i64::MIN` (e.g. Long.MIN_VALUE) must be KEPT, not
-        // misread as the deopt sentinel: on `RAX == i64::MIN` peek the out-of-band
-        // signal via `dispatch_threw` and bail only when one is pending.
+        // Exception/deopt sentinel — identical to the dispatch path's return
+        // check. Integer/reference results cannot equal the full-width sentinel;
+        // wide returns can legitimately carry those bits (for example
+        // Long.MIN_VALUE), so on `RAX == i64::MIN` peek the out-of-band signal
+        // via `dispatch_threw` and bail only when one is pending.
         self.emit_mov_reg_imm64(R10, i64::MIN as u64);
         self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
         self.buf.emit(&[0x0F, 0x85]); // JNE .keep

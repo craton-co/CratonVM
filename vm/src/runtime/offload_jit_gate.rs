@@ -480,7 +480,7 @@ mod tests {
         code.extend_from_slice(&1i32.to_be_bytes()); // high = 1
         code.extend_from_slice(&0xb8b8b8b8u32.to_be_bytes()); // jump entry 0 (garbage, looks like invokestatic bytes)
         code.extend_from_slice(&0xb8b8b8b8u32.to_be_bytes()); // jump entry 1 (garbage)
-        // Now a real invokestatic #99.
+                                                              // Now a real invokestatic #99.
         code.extend_from_slice(&[0xb8, 0x00, 0x63]);
         assert_eq!(scan_invokestatic_cp_indices(&code), vec![99]);
     }
@@ -539,9 +539,9 @@ mod tests {
         ConstantPool::new(vec![
             ConstantPoolEntry::Tombstone, // 0 (unused)
             ConstantPoolEntry::Utf8(std::sync::Arc::from("com/example/Kernel")), // 1
-            ConstantPoolEntry::ClassReference { name_index: 1 },                // 2
-            ConstantPoolEntry::Utf8(std::sync::Arc::from("vectorAdd")),         // 3
-            ConstantPoolEntry::Utf8(std::sync::Arc::from("([I[I[I)V")),         // 4
+            ConstantPoolEntry::ClassReference { name_index: 1 }, // 2
+            ConstantPoolEntry::Utf8(std::sync::Arc::from("vectorAdd")), // 3
+            ConstantPoolEntry::Utf8(std::sync::Arc::from("([I[I[I)V")), // 4
             ConstantPoolEntry::NameAndType {
                 name_index: 3,
                 descriptor_index: 4,
@@ -562,21 +562,14 @@ mod tests {
     fn resolve_method_reference() {
         let cp = sample_cp();
         let resolved = resolve_method_ref(&cp, 6).expect("MethodReference must resolve");
-        assert_eq!(
-            resolved,
-            ("com/example/Kernel", "vectorAdd", "([I[I[I)V")
-        );
+        assert_eq!(resolved, ("com/example/Kernel", "vectorAdd", "([I[I[I)V"));
     }
 
     #[test]
     fn resolve_interface_method_reference() {
         let cp = sample_cp();
-        let resolved =
-            resolve_method_ref(&cp, 7).expect("InterfaceMethodReference must resolve");
-        assert_eq!(
-            resolved,
-            ("com/example/Kernel", "vectorAdd", "([I[I[I)V")
-        );
+        let resolved = resolve_method_ref(&cp, 7).expect("InterfaceMethodReference must resolve");
+        assert_eq!(resolved, ("com/example/Kernel", "vectorAdd", "([I[I[I)V"));
     }
 
     #[test]

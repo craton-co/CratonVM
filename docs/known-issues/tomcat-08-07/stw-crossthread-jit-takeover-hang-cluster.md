@@ -1,11 +1,17 @@
 # STW cross-thread JIT takeover — stuck waiting for cooperative mutators (5-class hang cluster)
 
 **Status:** RESOLVED for the actual STW-takeover mechanism (root-caused and
-fixed, 2026-07-13, see below) — validated via `TestOrderInterceptor`, which
-now PASSES cleanly (was 100% hang before). **4 of the original 5 classes
-still hang, but for an unrelated reason** — see "Residual: 4 classes still
-hang, but NOT an STW-takeover bug" at the bottom; that part needs its own
-follow-up, likely merged with `elinjsp-socket-read-timeout.md`.
+fixed, 2026-07-13). **4 of the original 5 classes are now effectively
+resolved as of 2026-07-13/14** (see "Update 2026-07-13/14 (Azure Linux
+host)" below): `TestOrderInterceptor` and `TestELInterpreterTagSetters`
+PASS/complete; `TestJspConfig`/`TestEnvEntry` make genuine unbounded-but-
+finite progress (no longer stuck, no STW involvement — likely just need a
+longer suite timeout for their large test-method counts).
+`TestWsWebSocketContainerTimeoutClient` has its STW-visibility bug fixed
+but needs a separate, deeper architectural fix (make
+`AsynchronousSocketChannel.write`'s `Future`-returning overload genuinely
+async) to actually pass — see that update section for the concrete next
+step.
 
 **HotSpot:** PASS on all 5 (fresh-verified, 2026-07-12).
 
@@ -119,6 +125,102 @@ fix) against a 60-class sample (`-Category all -Start 1 -Count 60`) with
 1 pre-existing unrelated `TestBeanSupport` FAIL, 33 HANG in the
 already-documented, unrelated `TestHttpServletDoHead*` cluster (see
 `reference_tomcat_dohead_gc_safepoint_deadlock` and siblings).
+
+## Update 2026-07-13/14 (Azure Linux host) — 3 of 4 classes now resolved, 1 partially
+
+Continued on the Azure Linux host (`victor@20.83.144.174`, worktree
+`/data/wt-datastream-residual-20260713`, branch
+`fix/datastream-residual-20260713`, main worktree `/data/data/cratonvm`).
+Also cleaned up ~113G of >48h-stale scratch under `/data/data` (preserving
+dirty worktrees and shared infra) — unrelated housekeeping, noted here only
+because it freed enough disk to build comfortably.
+
+**Found via multi-snapshot `gdb`** (3 attaches, 5s apart, on a hung
+`TestJspConfig`): all 3 snapshots landed inside `dis_read_one`/
+`dis_read_exact`, reached via `native_dis_read_utf`
+(`DataInputStream.readUTF()`) — called with `len` up to 65535 (the
+modified-UTF-8 payload length). **`dis_read_exact` itself — the shared
+helper behind `readByte`/`readShort`/`readUnsignedShort`/`readChar` AND
+`readUTF` — still had the byte-by-byte anti-pattern**; the earlier fixes in
+this doc only touched its *callers* that had their own dedicated loops
+(`native_dis_read_bytes`, `dis_read_fully_impl`, `native_dis_skip_bytes`),
+not this shared helper. `readUTF` is exactly how class-file/JSP
+constant-pool string entries decode, so this was the dominant remaining
+cost. **Fixed**: `dis_read_exact` now bulk-reads via one `invoke_virtual`
+call (looping only on genuine short-reads), same pattern as the other
+fixes, preserving `dis_read_one`'s zero-progress-guard fallback.
+
+**A concurrent session found the identical bug class independently** in
+`InputStream.readAllBytes`/`readNBytes` (`native_is_read_all_bytes`/
+`native_is_read_n_bytes`/`native_is_read_n_bytes_buf`) via a completely
+different investigation (a 769KB-manifest signed-jar `SecurityInfoTests`
+timeout), landing `8492687f4` on `dev` first — see
+`docs/internal/inputstream-readallbytes-readnbytes-readfully-byte-at-a-time-FIXED.md`.
+**That session also found a real GC-safety bug in this doc's own earlier
+`dis_read_fully_impl`/`native_dis_skip_bytes` fixes**: neither pinned the
+`inner`/`buf` `ObjectRef`s reused across multiple `invoke_virtual` calls in
+their loops, so a moving GC mid-loop could leave later iterations
+referencing stale/relocated objects. Merged `8492687f4` into this branch,
+keeping their corrected (pinned) versions.
+
+**Result after `dis_read_exact` fix, verified on Linux:**
+- `TestOrderInterceptor` — still PASSES (no regression).
+- `TestELInterpreterTagSetters` — **now completes** (48 tests, 4 failures —
+  `AbstractMethodError: ELInterpreter.interpreterCall has no Code
+  attribute`, a real but separate, pre-existing bug, not a hang).
+- `TestJspConfig` / `TestEnvEntry` — **no longer stuck**: both make steady,
+  continuous forward progress through their (many) test methods at every
+  timeout tested (90s/180s/300s each got further: e.g. `TestJspConfig`
+  reached `testServlet23NoEL` → `24` → `25` as the timeout budget grew).
+  Neither ever printed another `[stw-request]`/STW-takeover warning after
+  the fix. This looks like inherent per-test-method embedded-Tomcat
+  start/stop overhead across a large test count exceeding a 300s budget,
+  not a defect — would need either a longer suite timeout or further
+  Tomcat-lifecycle profiling to speed up, which is out of scope for "STW
+  takeover hangs."
+- `TestWsWebSocketContainerTimeoutClient` — **STW-visibility bug found and
+  fixed, but the test still cannot complete for a separate reason.**
+  `gdb` on a hung repro found `main-vm` (the test's own thread) blocked in
+  a raw `send()` syscall (`native-api/src/fd_table.rs` `tcp_write`), called
+  synchronously and unbracketed from
+  `native-builtins/src/phases_late.rs`'s `AsynchronousSocketChannel.
+  write(ByteBuffer):Future<Void>` registration (`register_p67_async_channels`).
+  The test deliberately never drains the peer socket (`BlockingPojo`) to
+  force a write timeout, so this `send()` parks in the OS indefinitely once
+  the send buffer fills — exactly the doc's `taken=0`/never-decreasing-
+  `pending` signature. **Fixed the STW-visibility gap** (bracketed this
+  call plus the sibling `read` registration, both previously unbracketed)
+  — confirmed the STW warning no longer needs to fire for this path.
+  **However this does NOT make the test pass**: this `Future`-returning
+  `write` overload is a *second, separate, synchronous* implementation of
+  `AsynchronousSocketChannel` alongside the properly-async
+  `CompletionHandler`-based one in `native-io/src/async_socket.rs`'s
+  `aio_asc_write` (which correctly dispatches to a worker-pool `Job::Write`
+  and returns immediately with a real pending `Future`). Because the
+  `Future`-returning overload blocks the *caller* until the write
+  completes/errors instead of returning a pending `Future`, a caller doing
+  `write(bb).get(timeout, unit)` to detect a write timeout blocks inside
+  this native call itself, never reaching `Future.get` — so the write
+  always eventually "succeeds" (once the peer reads or the connection
+  resets) rather than the caller's own timeout ever firing. **This is a
+  distinct, deeper architectural gap** (make the `Future`-returning
+  overload genuinely async, reusing the same worker-pool/pending-`Future`
+  machinery as the `CompletionHandler` overload) — out of scope for "missing
+  GC-blocking bracket," filed here as the next concrete step for whoever
+  continues this specific class.
+
+**Net result: 3 of the original 4 residual classes are effectively
+resolved** (pass, or make genuine unbounded-but-finite progress with no
+STW involvement); **1 has its STW-hang symptom fixed but needs a follow-up
+architectural fix** (synchronous-vs-async `AsynchronousSocketChannel.write`)
+to actually pass.
+
+Regression-checked (27-class sample, `jakarta.el.*`/`jakarta.servlet.*`
+prefix of `all-tests.txt`, Linux): 25 PASS, 2 FAIL — both pre-existing and
+unrelated to this fix (`TestBeanSupport`, already-known; `TestCompositeELResolver`,
+a Linux-harness-only `WebResourceSet` staging gap in this particular
+pre-staged `/data/data/apps/tomcat` copy, confirmed by its own exception
+message, nothing to do with `DataInputStream`).
 
 ## Residual: 4 classes still hang, but NOT an STW-takeover bug
 
