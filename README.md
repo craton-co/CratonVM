@@ -48,7 +48,7 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 | Matrix 1280x1280                    | 2,099 ms      | 5,909 ms          | 2.82x         |
 | **QuickBench TOTAL**                | **9,398 ms**  | **31,064 ms**     | **3.31x**     |
 | HashMap (1M put/get, isolated)      | 51.1 ms       | 409.6 ms          | 8.01x         |
-| String/Regex (10K, isolated)        | 8 ms          | 153 ms            | 19.1x         |
+| String/Regex (100K, isolated)       | 58 ms         | 476 ms            | 8.21x         |
 | Binary Trees (depth=18, isolated)   | 382 ms        | 4,916 ms          | 12.9x         |
 
 *Arithmetic/Fibonacci/Sieve/Matrix measured 2026-07-13 on the Azure Linux benchmark
@@ -57,10 +57,11 @@ processes against Temurin JDK 25.0.3 C2 and a CratonVM release candidate with de
 settings. Checksums matched on every run. The OSR scheduling and guarded scalar
 self-recursion changes behind these results are documented in
 [`docs/internal/performance/quickbench-half-gap-3rows-20260713.md`](docs/internal/performance/quickbench-half-gap-3rows-20260713.md).
-HashMap, String/Regex, and Binary Trees retain their prior isolated snapshots and are
-each measured as a **separate, isolated, freshly-launched process** (not part of the
-combined run above,
-median/mean of several rounds, checksums identical every round) — mixing any of them
+String/Regex was freshly remeasured on 2026-07-14 as the median of nine
+alternating-order paired runs pinned to logical CPU 14; HashMap and Binary Trees retain
+their prior isolated snapshots. All three are measured as **separate, isolated,
+freshly-launched processes** (not part of the combined run above, median/mean of
+several rounds, checksums identical every round) — mixing any of them
 into the combined run inflates its ratio via accumulated GC/heap pressure from the
 preceding kernels in the same process, so each is kept isolated for a representative
 number (same rationale `bench/BenchSuite` already used for Binary Trees; HashMap and
@@ -106,18 +107,22 @@ bit-identical to HotSpot's backtracking-engine bookkeeping — verified against 
 parity battery to have zero effect on `find`/`group`/`start`/`end` correctness).
 `CRATONVM_NATIVE_MATCHER_FIND=0` reverts to real JDK bytecode as the safety net.
 
-The table above uses a freshly-verified **19.1x** (8 ms JDK / 153 ms CratonVM, best of
-5, `bench/StringRegexOnly.java` standalone, `CRATONVM_NATIVE_MATCHER_FIND` at its new
-default) — down from 37.6x, though not yet at the 5-7x range the other constant-factor
-rows sit in. The residual is believed to be the same fixed per-native-call VM dispatch
-tax the HashMap section below documents (each `find`/`group`/`start`/`end` call is a
-separate native dispatch, each paying that tax) rather than anything specific to
-regex — the HashMap section below describes two rounds of fixes already landed for
-exactly that class of overhead (357x isolated → 29.6x), so applying the same
-root-publication/dispatch-residual technique to `Matcher`'s natives is a promising,
-not-yet-attempted follow-up here, rather than a hypothetical one. Like the String/Regex
-row above it, an isolated re-measurement not yet re-run through the exact combined-suite
-harness.
+The table above now uses a freshly verified **8.21x** at 100K entries (58 ms JDK /
+476 ms CratonVM, median of nine alternating-order paired runs,
+`bench/StringRegexOnly.java` standalone, `CRATONVM_NATIVE_MATCHER_FIND` at its default).
+Every run returned checksum `5000050000`. Before the fix, the same fresh 100K harness
+measured 59 ms JDK / 2,065 ms CratonVM (**35.0x**), so the fix removes 77% of CratonVM
+latency and 79% of the ratio gap to parity.
+
+The residual was not generic native-dispatch tax. The fast path compared Rust's
+semantic capture count with `Matcher.groups.length / 2`; the real runtime layout can
+overallocate that backing array to ten capture pairs even when the pattern has only
+one explicit group. That capacity/semantic-count mismatch made every `find()` bail to
+real bytecode. The guard now compares against `Pattern.capturingGroupCount` and treats
+`groups[]` only as a capacity bound; indexed accessors use the same semantic count so
+the extra slots never make invalid groups legal. See
+[`docs/internal/performance/string-regex-overallocated-groups-fastpath-20260714.md`](docs/internal/performance/string-regex-overallocated-groups-fastpath-20260714.md)
+for the implementation, raw measurements, artifact hash, and semantic validation.
 
 HashMap's slowdown was a *different* shape of bug — flat across sizes (not O(n²)), and
 cdb stack-sampling showed it was NOT allocation/GC-bound (only ~9% of sampled stacks in
