@@ -4,6 +4,17 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-14 (cont'd) String.getBytes() + Locale bootstrap regressions FIXED; new HttpExchange URI bug found
+
+- FIXED (moved to `docs/internal/`): [`string-getbytes-empty-real-jdk-mode-FIXED.md`](../internal/string-getbytes-empty-real-jdk-mode-FIXED.md) -- same failure class as the `java.util.Properties` fix (`f62d2073`): `register_real_charset_natives` (`native-builtins/src/charset.rs`) never set its own registry category, so its real-JDK-mode call sites inherited the default `SyntheticStub` and got silently dropped by `d8092acb`'s hardening. Fixed by wrapping the whole function body in `with_category(Bridge, ...)`. This was also the true root cause of the `com.sun.net.httpserver.HttpServer` "always empty body" symptom noted in the URLClassLoader fix above.
+- FIXED (moved to `docs/internal/`, found already fixed on `dev` by a concurrent session): [`locale-real-jdk-bootstrap-noclassdeffounderror-FIXED.md`](../internal/locale-real-jdk-bootstrap-noclassdeffounderror-FIXED.md) -- same root mechanism, fixed via `f62d2073`'s `java.util.Properties` bridge-pinning (the `Locale`/`BaseLocale`/`StaticProperty` chain bottoms out in the same `System.getProperties()` read that fix restored).
+- 🔴 NEW: [`httpserver-exchange-requesturi-getpath-empty.md`](httpserver-exchange-requesturi-getpath-empty.md) -- `HttpExchange.getRequestURI()` returns a `URI` whose `toString()`/`getPath()` are empty (a plain directly-constructed `URI` works fine, so this is specific to how the exchange's request URI gets built during request parsing). Now the last confirmed blocker for running Keycloak's `TestClassServerTest` end-to-end via the real `com.sun.net.httpserver.HttpServer` (its handler routes on the request path). Not yet investigated.
+
+## 2026-07-14 TestClassServerTest URLClassLoader isolation FIXED; severe new String.getBytes() regression found
+
+- FIXED (moved to `docs/internal/`): [`keycloak-testclassserver-invalidpackage-classnotfound-FIXED.md`](../internal/keycloak-testclassserver-invalidpackage-classnotfound-FIXED.md) -- root cause was the same underlying defect as `spring-boot-probe-sweep/SBR-14-urlclassloader-parent-null-bypassed.md`: a null-parent `URLClassLoader` never consulted its own URL/HTTP classpath at all, resolving through CratonVM's flat global class store instead (breaking isolation AND making `testInvalidPackage`'s expected `ClassNotFoundException` never fire). Fixed in `native-builtins/src/classloader.rs`/`classloader_real.rs` (defer-to-`findClass` gate now covers bare `URLClassLoader`, not just subclasses) plus a genuine HTTP(S) fetch path added for URLClassLoader entries (`http_client.rs`). Verified via an isolated A/B repro against a real external HTTP server; the literal upstream test still can't run end-to-end due to the new bug below.
+- 🔴 NEW, severe: [`string-getbytes-empty-real-jdk-mode.md`](string-getbytes-empty-real-jdk-mode.md) -- `String.getBytes()` (all overloads) returns an empty byte array in real-JDK mode, confirmed pre-existing (present on unmodified `dev` HEAD, not introduced by the fix above). Suspected fallout from the same-day commit `d8092acb`'s new synthetic-native-stub-dropping hardening silently dropping a genuine bridge native that was never re-categorized. Broad blast radius suspected (anything doing String-to-bytes: I/O, hashing, HTTP bodies) -- likely under-detected because failures land on higher-layer symptoms. Not yet fixed.
+
 ## 2026-07-14 Spring Boot `crashfail-20260714` rerun; 9 new bug clusters filed under `springboot/`
 
 Full-suite rerun after the 7 clusters from 07-11/07-13 were fixed (see
@@ -134,7 +145,7 @@ bean-registration TIMEOUT cluster (all hard-hang at the 120s ceiling), an
 WebFlux reactive FAIL/EMPTY cluster, and 6 ABEND crashes with `found=0`
 (crash before test discovery, distinct from the mid-run HIB-CV-32 crash
 shape). See
-[`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](../internal/CRATONVM-SPRING-GENUINE-BUGLIST-125.md)
+[`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](CRATONVM-SPRING-GENUINE-BUGLIST-125.md)
 for full detail.
 
 ## 2026-07-11 `HashMap` native-dispatch overhead вЂ” FIXED/RETIRED
@@ -623,7 +634,7 @@ surfaced three distinct, layered issues:
 
 ## 2026-07-09 Spring suite genuine-bug list, updated (125, down from 159)
 
-- [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](../internal/CRATONVM-SPRING-GENUINE-BUGLIST-125.md) вЂ” full per-test-method detail for 125 CratonVM-unique Spring failures (HotSpot passes, CratonVM doesn't), cross-referenced against a clean HotSpot baseline with the classpath-dump gap fixed (spring-websocket/oxm/jms/orm/core-test jars were never built вЂ” `./gradlew jar testFixturesJar testClasses` fixed it). Down from 159 two dev commits ago: 65 newly fixed (entire SpEL cluster + spring-jms module), 31 "newly broken" are **not** new regressions вЂ” root-caused to the already-tracked HIB-CV-32 batch/load-dependent heap-corruption family (25/31 SIGSEGV, one test confirmed passing standalone but ABEND under full-suite load).
+- [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](CRATONVM-SPRING-GENUINE-BUGLIST-125.md) вЂ” full per-test-method detail for 125 CratonVM-unique Spring failures (HotSpot passes, CratonVM doesn't), cross-referenced against a clean HotSpot baseline with the classpath-dump gap fixed (spring-websocket/oxm/jms/orm/core-test jars were never built вЂ” `./gradlew jar testFixturesJar testClasses` fixed it). Down from 159 two dev commits ago: 65 newly fixed (entire SpEL cluster + spring-jms module), 31 "newly broken" are **not** new regressions вЂ” root-caused to the already-tracked HIB-CV-32 batch/load-dependent heap-corruption family (25/31 SIGSEGV, one test confirmed passing standalone but ABEND under full-suite load).
 
 ## 2026-07-09 BC-java `asn1-regression` X9Test SIGSEGV retired
 

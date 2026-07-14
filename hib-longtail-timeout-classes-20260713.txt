@@ -1,0 +1,14 @@
+org.hibernate.orm.test.annotations.fetchprofile.FetchProfileTest
+org.hibernate.orm.test.batch.BatchTest
+org.hibernate.orm.test.id.uuid.rfc9562.UUidV6V7GeneratorTest
+org.hibernate.orm.test.insertordering.InsertOrderingRCATest
+org.hibernate.orm.test.jpa.CompositeIdRowValueTest
+org.hibernate.orm.test.jpa.cascade.DeleteOrphanTest
+org.hibernate.orm.test.jpa.compliance.ModulusTest
+org.hibernate.orm.test.jpa.criteria.TreatDisjunctionTest
+org.hibernate.orm.test.jpa.criteria.valuehandlingmode.inline.EqualityComparisonTest
+org.hibernate.orm.test.jpa.criteria.valuehandlingmode.inline.NonPkAssociationEqualityPredicateTest
+org.hibernate.orm.test.jpa.emops.MergeNullCollectionTest
+org.hibernate.orm.test.jpa.exception.ExceptionTest
+org.hibernate.orm.test.jpa.integrationprovider.IntegrationProviderSettingByClassUsingPropertiesTest
+org.hibernate.orm.test.function.json.JsonArrayUnnestTest

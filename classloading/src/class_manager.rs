@@ -2675,6 +2675,14 @@ impl ClassManager {
     /// 2. Ask bootstrap → extension → application to find the class
     /// 3. Parse, recursively load superclass/interfaces, and register
     pub fn load_class(&mut self, name: &str) -> Result<ClassId, VmError> {
+        if std::env::var_os("CRATONVM_DBG_LOADCLASS").is_some() && name.contains("GroupsMetadata")
+        {
+            let bt = std::backtrace::Backtrace::force_capture();
+            eprintln!(
+                "[DBG_LOADCLASS] load_class({name}) already_loaded={:?}\n{bt}",
+                self.get_loaded_class_id(name)
+            );
+        }
         // RKC16N.3: Reference- and primitive-array classes (`[X`) are
         // *synthesised* by the bootstrap loader directly from the
         // resolved component class — JVMS §5.3.3 explicitly says no

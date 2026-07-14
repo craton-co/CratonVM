@@ -6556,12 +6556,22 @@ pub(crate) fn native_record_support_deserialization_ctr(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // GC-SAFETY: `desc` is used again below (stored into the new
+    // MethodHandle's MH_BOUND slot) after `ctx.invoke_virtual` (Java
+    // dispatch) and `alloc_method_handle`'s own internal allocations,
+    // either of which can trigger a moving GC. Pin it up front and re-read
+    // before the final use.
+    let desc_pin = ctx.pin_native_root(desc);
     let cls_mirror = match ctx.invoke_virtual(desc, "forClass", "()Ljava/lang/Class;", &[])? {
         Some(Value::Object(Some(m))) => m,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            ctx.unpin_native_roots(desc_pin);
+            return Ok(Some(Value::Object(None)));
+        }
     };
     let cls_name = crate::lang_class::mirror_class_name(ctx, cls_mirror).unwrap_or_default();
     if cls_name.is_empty() {
+        ctx.unpin_native_roots(desc_pin);
         return Ok(Some(Value::Object(None)));
     }
     let mh = alloc_method_handle(
@@ -6571,7 +6581,9 @@ pub(crate) fn native_record_support_deserialization_ctr(
         "([B[Ljava/lang/Object;)Ljava/lang/Object;",
         MH_KIND_RECORD_DESER,
     );
+    let desc = ctx.read_native_pin(desc_pin, desc);
     ctx.set_field(mh, MH_BOUND, Value::Object(Some(desc)));
+    ctx.unpin_native_roots(desc_pin);
     Ok(Some(Value::Object(Some(mh))))
 }
 

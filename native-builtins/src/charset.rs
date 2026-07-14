@@ -918,6 +918,20 @@ fn arg_obj(args: &[Value], i: usize) -> Result<ObjectRef, cratonvm_types::error:
 /// previously-stubbed ones.  The registry dedups on (class, name,
 /// descriptor) so re-registering is idempotent.
 pub fn register_real_charset_natives(registry: &mut NativeMethodRegistry) {
+    // Same failure class as the java.util.Properties side-table regression
+    // fixed in f62d2073: this function never set its own category, so it
+    // silently inherited whatever ambient category was active at each of
+    // its real-JDK-mode call sites (vm_init.rs) -- which is the registry's
+    // default, SyntheticStub. Once d8092acb enabled
+    // set_drop_synthetic_stubs(true) for real-JDK mode, every native
+    // registered here (String.getBytes()/(Charset)/(String), the
+    // CharsetEncoder/CharsetDecoder bridges) was silently dropped, falling
+    // through to real String.getBytes() bytecode's CharsetEncoder.encode
+    // path -- which reads zero chars against CratonVM's synthetic Buffer
+    // overlay (see the getBytes()[B comment below) and returns an empty
+    // array. These are genuine required bridges, not droppable
+    // approximations -- pin them regardless of ambient/call-site state.
+    registry.with_category(cratonvm_native_api::NativeKind::Bridge, |registry| {
     let enc = "java/nio/charset/CharsetEncoder";
     registry.register(
         enc,
@@ -1007,6 +1021,7 @@ pub fn register_real_charset_natives(registry: &mut NativeMethodRegistry) {
             ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
         Ok(Some(Value::Object(Some(arr))))
+    });
     });
 }
 
