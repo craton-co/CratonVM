@@ -305,6 +305,14 @@ pub enum GpuFutureResult {
 /// The `Vm` struct implements this trait. Using a trait here avoids circular
 /// module dependencies between `native` and `vm`.
 pub trait NativeContext {
+    /// Whether this context can construct and dispatch real generated proxy
+    /// classes. Lightweight unit-test contexts intentionally return `false`:
+    /// they model native object state but do not own a VM-wide class-loader and
+    /// proxy-class namespace.
+    fn supports_real_proxy_generation(&self) -> bool {
+        true
+    }
+
     /// Load a class by name. Returns the ClassId.
     fn load_class(&mut self, name: &str) -> MethodCallResult;
 
