@@ -72351,18 +72351,38 @@ pub(crate) fn locale_populate(
     // it lazily). `BaseLocale.equals` compares the four Strings, so using
     // interned Strings (the default for `create_string`) keeps its
     // identity (`==`) comparisons correct across separately-built Locales.
-    if let Ok(base_cid) = ctx.ensure_class_initialized("sun/util/locale/BaseLocale") {
-        let nfields = ctx.class_num_total_fields(base_cid).max(5);
-        let base = ctx.alloc_object(base_cid, nfields);
-        let lang_s = ctx.create_string(lang);
-        let script_s = ctx.create_string("");
-        let region_s = ctx.create_string(country);
-        let variant_s = ctx.create_string(variant);
-        ctx.set_field_by_name(base, "language", Value::Object(Some(lang_s)));
-        ctx.set_field_by_name(base, "script", Value::Object(Some(script_s)));
-        ctx.set_field_by_name(base, "region", Value::Object(Some(region_s)));
-        ctx.set_field_by_name(base, "variant", Value::Object(Some(variant_s)));
-        ctx.set_field_by_name(loc, "baseLocale", Value::Object(Some(base)));
+    match ctx.ensure_class_initialized("sun/util/locale/BaseLocale") {
+        Ok(base_cid) => {
+            let nfields = ctx.class_num_total_fields(base_cid).max(5);
+            let base = ctx.alloc_object(base_cid, nfields);
+            let lang_s = ctx.create_string(lang);
+            let script_s = ctx.create_string("");
+            let region_s = ctx.create_string(country);
+            let variant_s = ctx.create_string(variant);
+            ctx.set_field_by_name(base, "language", Value::Object(Some(lang_s)));
+            ctx.set_field_by_name(base, "script", Value::Object(Some(script_s)));
+            ctx.set_field_by_name(base, "region", Value::Object(Some(region_s)));
+            ctx.set_field_by_name(base, "variant", Value::Object(Some(variant_s)));
+            ctx.set_field_by_name(loc, "baseLocale", Value::Object(Some(base)));
+        }
+        Err(e) => {
+            // KNOWN GAP (2026-07-14): if `sun/util/locale/BaseLocale`'s own
+            // `<clinit>` is touched too early in boot (before
+            // `jdk/internal/misc/VM`'s saved-properties snapshot has
+            // `java.home` populated), it fails with
+            // `InternalError("null property: java.home")` and is
+            // permanently marked `InitializationError` (JVMS §5.5) — every
+            // later attempt (including this one) gets a cached
+            // `NoClassDefFoundError` instead of a fresh error. `baseLocale`
+            // is left null; any real-bytecode `Locale` method not natively
+            // overridden here (`toString`, `equals`, `hashCode`, …) then
+            // NPEs on `this.baseLocale`. See docs/known-issues/vm/
+            // locale-real-jdk-bootstrap-noclassdeffounderror.md.
+            tracing::warn!(
+                "locale_populate: could not initialize sun.util.locale.BaseLocale ({e:?}) — \
+                 baseLocale left null on this Locale"
+            );
+        }
     }
     // `localeExtensions` is intentionally left null (the "no extensions"
     // shape that real-JDK `Locale.equals`/`hashCode` expect).
