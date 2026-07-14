@@ -18951,6 +18951,16 @@ pub fn comparator_compare(
                     return compare_with_key_function(ctx, comparator, a, b);
                 }
                 Some("java/util/function/ToIntFunction") => {
+                    // Family-1 stale-ObjectRef fix (2026-07-13, follow-up):
+                    // the first `applyAsInt` call can run arbitrary
+                    // interpreted bytecode and trigger a moving GC. Not just
+                    // `comparator` (the key-extractor lambda) but also `b`
+                    // (the second element, computed AFTER that hazard) must
+                    // be re-read — `a`/`b` are raw `ObjectRef`-carrying
+                    // `Value`s just like `comparator`. See
+                    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+                    let comparator_pin = ctx.pin_native_root(comparator);
+                    let b_pin = pin_value(ctx, b);
                     let ia = comparing_key_as_i64(
                         ctx,
                         comparator,
@@ -18958,6 +18968,8 @@ pub fn comparator_compare(
                         "(Ljava/lang/Object;)I",
                         a,
                     )?;
+                    let comparator = ctx.read_native_pin(comparator_pin, comparator);
+                    let b = read_pinned_elem(ctx, b_pin, b);
                     let ib = comparing_key_as_i64(
                         ctx,
                         comparator,
@@ -18965,9 +18977,13 @@ pub fn comparator_compare(
                         "(Ljava/lang/Object;)I",
                         b,
                     )?;
+                    ctx.unpin_native_roots(comparator_pin);
                     return Ok(Some(Value::Int(ia.cmp(&ib) as i32)));
                 }
                 Some("java/util/function/ToLongFunction") => {
+                    // Family-1 stale-ObjectRef fix: same as ToIntFunction above.
+                    let comparator_pin = ctx.pin_native_root(comparator);
+                    let b_pin = pin_value(ctx, b);
                     let ia = comparing_key_as_i64(
                         ctx,
                         comparator,
@@ -18975,6 +18991,8 @@ pub fn comparator_compare(
                         "(Ljava/lang/Object;)J",
                         a,
                     )?;
+                    let comparator = ctx.read_native_pin(comparator_pin, comparator);
+                    let b = read_pinned_elem(ctx, b_pin, b);
                     let ib = comparing_key_as_i64(
                         ctx,
                         comparator,
@@ -18982,11 +19000,18 @@ pub fn comparator_compare(
                         "(Ljava/lang/Object;)J",
                         b,
                     )?;
+                    ctx.unpin_native_roots(comparator_pin);
                     return Ok(Some(Value::Int(ia.cmp(&ib) as i32)));
                 }
                 Some("java/util/function/ToDoubleFunction") => {
+                    // Family-1 stale-ObjectRef fix: same as ToIntFunction above.
+                    let comparator_pin = ctx.pin_native_root(comparator);
+                    let b_pin = pin_value(ctx, b);
                     let da = comparing_key_as_f64(ctx, comparator, a)?;
+                    let comparator = ctx.read_native_pin(comparator_pin, comparator);
+                    let b = read_pinned_elem(ctx, b_pin, b);
                     let db = comparing_key_as_f64(ctx, comparator, b)?;
+                    ctx.unpin_native_roots(comparator_pin);
                     return Ok(Some(Value::Int(double_compare(da, db))));
                 }
                 _ => {}
@@ -19007,17 +19032,29 @@ pub fn comparator_compare(
             // comparator) threw `NoSuchMethodError: Function.compare`, which
             // unwound through the JUnit MethodHandle interceptor chain and tripped
             // "InvocationInterceptors called invocation multiple times".
+            // Family-1 stale-ObjectRef fix: `comparator` is reused in the
+            // `compare_with_key_function` fallback below if the first call
+            // fails; root it across the attempt in case the failing call
+            // still executed enough bytecode to trigger a moving GC.
+            let comparator_pin = ctx.pin_native_root(comparator);
             return match ctx.invoke_virtual(
                 comparator,
                 "compare",
                 "(Ljava/lang/Object;Ljava/lang/Object;)I",
                 &[a, b],
             ) {
-                Ok(v) => Ok(v),
-                Err(compare_err) => match compare_with_key_function(ctx, comparator, a, b) {
-                    Ok(v) => Ok(v),
-                    Err(_) => Err(compare_err),
-                },
+                Ok(v) => {
+                    ctx.unpin_native_roots(comparator_pin);
+                    Ok(v)
+                }
+                Err(compare_err) => {
+                    let comparator = ctx.read_native_pin(comparator_pin, comparator);
+                    ctx.unpin_native_roots(comparator_pin);
+                    match compare_with_key_function(ctx, comparator, a, b) {
+                        Ok(v) => Ok(v),
+                        Err(_) => Err(compare_err),
+                    }
+                }
             };
         }
     };
@@ -19036,6 +19073,14 @@ pub fn comparator_compare(
                 Value::Object(Some(r)) => r,
                 _ => return Ok(Some(Value::Int(0))),
             };
+            // Family-1 stale-ObjectRef fix (2026-07-13, follow-up): the
+            // first `apply` call can run arbitrary interpreted bytecode
+            // (the key extractor) and trigger a moving GC; `key_fn` AND
+            // `b` (the second element, used AFTER that hazard) are both
+            // raw `ObjectRef`-carrying `Value`s that must be re-read. See
+            // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+            let key_fn_pin = ctx.pin_native_root(key_fn);
+            let b_pin = pin_value(ctx, b);
             let ka = ctx
                 .invoke_virtual(
                     key_fn,
@@ -19044,6 +19089,8 @@ pub fn comparator_compare(
                     &[a],
                 )?
                 .unwrap_or(Value::Object(None));
+            let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
+            let b = read_pinned_elem(ctx, b_pin, b);
             let kb = ctx
                 .invoke_virtual(
                     key_fn,
@@ -19052,6 +19099,7 @@ pub fn comparator_compare(
                     &[b],
                 )?
                 .unwrap_or(Value::Object(None));
+            ctx.unpin_native_roots(key_fn_pin);
             natural_compare(ctx, &ka, &kb)
         }
         CMP_TAG_REVERSED => {
@@ -19070,7 +19118,25 @@ pub fn comparator_compare(
                 Value::Object(Some(r)) => r,
                 _ => return Ok(Some(Value::Int(0))),
             };
+            // Family-1 stale-ObjectRef fix (2026-07-13, follow-up): the
+            // recursive `comparator_compare` call for `primary` can invoke
+            // a real user Comparator/lambda, triggering a moving GC. Not
+            // just `comparator` (used again below for CMP_FIELD_ARG2) but
+            // also `a`/`b` — reused for the SECOND recursive call below —
+            // must be re-read. This was the actual root cause of the
+            // residual panics that survived the owner/data/comparator-only
+            // fix (class_id 1295/1299 traces via `Comparator.lambda$
+            // thenComparing$...` and `ResourceAttributesXMLContentReader
+            // .<init>`). See
+            // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+            let comparator_pin = ctx.pin_native_root(comparator);
+            let a_pin = pin_value(ctx, a);
+            let b_pin = pin_value(ctx, b);
             let result = comparator_compare(ctx, primary, a, b)?;
+            let comparator = ctx.read_native_pin(comparator_pin, comparator);
+            let a = read_pinned_elem(ctx, a_pin, a);
+            let b = read_pinned_elem(ctx, b_pin, b);
+            ctx.unpin_native_roots(comparator_pin);
             match result {
                 Some(Value::Int(0)) => {
                     let secondary = match ctx.get_field(comparator, CMP_FIELD_ARG2) {
@@ -19087,8 +19153,15 @@ pub fn comparator_compare(
                 Value::Object(Some(r)) => r,
                 _ => return Ok(Some(Value::Int(0))),
             };
+            // Family-1 stale-ObjectRef fix: `key_fn` AND `b` (used after the
+            // first GC-triggering `applyAsInt` call) both need re-reading.
+            let key_fn_pin = ctx.pin_native_root(key_fn);
+            let b_pin = pin_value(ctx, b);
             let ia = comparing_key_as_i64(ctx, key_fn, "applyAsInt", "(Ljava/lang/Object;)I", a)?;
+            let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
+            let b = read_pinned_elem(ctx, b_pin, b);
             let ib = comparing_key_as_i64(ctx, key_fn, "applyAsInt", "(Ljava/lang/Object;)I", b)?;
+            ctx.unpin_native_roots(key_fn_pin);
             Ok(Some(Value::Int(ia.cmp(&ib) as i32)))
         }
         CMP_TAG_COMPARING_LONG => {
@@ -19096,8 +19169,15 @@ pub fn comparator_compare(
                 Value::Object(Some(r)) => r,
                 _ => return Ok(Some(Value::Int(0))),
             };
+            // Family-1 stale-ObjectRef fix: `key_fn` AND `b` reused across
+            // two GC-triggering `applyAsLong` calls.
+            let key_fn_pin = ctx.pin_native_root(key_fn);
+            let b_pin = pin_value(ctx, b);
             let ia = comparing_key_as_i64(ctx, key_fn, "applyAsLong", "(Ljava/lang/Object;)J", a)?;
+            let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
+            let b = read_pinned_elem(ctx, b_pin, b);
             let ib = comparing_key_as_i64(ctx, key_fn, "applyAsLong", "(Ljava/lang/Object;)J", b)?;
+            ctx.unpin_native_roots(key_fn_pin);
             Ok(Some(Value::Int(ia.cmp(&ib) as i32)))
         }
         CMP_TAG_COMPARING_DOUBLE => {
@@ -19105,8 +19185,15 @@ pub fn comparator_compare(
                 Value::Object(Some(r)) => r,
                 _ => return Ok(Some(Value::Int(0))),
             };
+            // Family-1 stale-ObjectRef fix: `key_fn` AND `b` reused across
+            // two GC-triggering `applyAsDouble` calls.
+            let key_fn_pin = ctx.pin_native_root(key_fn);
+            let b_pin = pin_value(ctx, b);
             let da = comparing_key_as_f64(ctx, key_fn, a)?;
+            let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
+            let b = read_pinned_elem(ctx, b_pin, b);
             let db = comparing_key_as_f64(ctx, key_fn, b)?;
+            ctx.unpin_native_roots(key_fn_pin);
             // Match java.lang.Double.compare ordering (NaN greatest, -0.0 < 0.0).
             Ok(Some(Value::Int(double_compare(da, db))))
         }
@@ -19120,6 +19207,13 @@ fn compare_with_key_function(
     a: Value,
     b: Value,
 ) -> MethodCallResult {
+    // Family-1 stale-ObjectRef fix (2026-07-13, follow-up): the first
+    // `apply` call can run arbitrary interpreted bytecode and trigger a
+    // moving GC; `key_fn` AND `b` (used after that hazard) both need
+    // re-reading. See
+    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    let key_fn_pin = ctx.pin_native_root(key_fn);
+    let b_pin = pin_value(ctx, b);
     let ka = ctx
         .invoke_virtual(
             key_fn,
@@ -19128,6 +19222,8 @@ fn compare_with_key_function(
             &[a],
         )?
         .unwrap_or(Value::Object(None));
+    let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
+    let b = read_pinned_elem(ctx, b_pin, b);
     let kb = ctx
         .invoke_virtual(
             key_fn,
@@ -19136,6 +19232,7 @@ fn compare_with_key_function(
             &[b],
         )?
         .unwrap_or(Value::Object(None));
+    ctx.unpin_native_roots(key_fn_pin);
     natural_compare(ctx, &ka, &kb)
 }
 
@@ -26958,13 +27055,56 @@ fn tree_compare(
 
 // ----- TreeMap binary search -----
 // Returns Ok(index) if key found at that entry index, Err(insert_pos) if not found.
+/// Family-1 stale-ObjectRef fix (2026-07-13): `tree_compare` below can
+/// dispatch to an arbitrary user-supplied `Comparator` (`thenComparing`
+/// chains, key-extractor lambdas, a real-bytecode `compare()` override) —
+/// a full interpreted call that can allocate and trigger a moving GC. Both
+/// `owner` (the TreeMap/TreeSet object, needed by callers for side-table
+/// lookups keyed off its address) and `data` (the backing `Object[]` slots
+/// array, read again on every loop iteration) are raw `ObjectRef`s that
+/// must be re-read after every comparator invocation, not just once at
+/// entry — hence pinning both here and returning their current values
+/// alongside the search result, so callers never reuse a pre-search copy.
+/// See docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
 fn tm_binary_search(
     ctx: &mut dyn NativeContext,
+    owner: ObjectRef,
     data: ObjectRef,
     size: i32,
     comparator: &Value,
     key: &Value,
-) -> Result<Result<usize, usize>, cratonvm_types::error::MethodCallFailed> {
+) -> Result<
+    (Result<usize, usize>, ObjectRef, ObjectRef, Value),
+    cratonvm_types::error::MethodCallFailed,
+> {
+    let owner_pin = ctx.pin_native_root(owner);
+    let data_pin = ctx.pin_native_root(data);
+    let mut owner = owner;
+    let mut data = data;
+    // Family-1 stale-ObjectRef fix (2026-07-13 follow-up): `comparator`
+    // itself — not just `owner`/`data` — is dereferenced by every
+    // `tree_compare` call below (`comparator_compare` reads its fields
+    // immediately). Across 2+ loop iterations, an earlier comparison's
+    // GC-triggering dispatch can relocate the comparator object, so it
+    // must be pinned and re-read exactly like `owner`/`data`.
+    let mut comparator = *comparator;
+    let comparator_pin = match comparator {
+        Value::Object(Some(r)) => Some(ctx.pin_native_root(r)),
+        _ => None,
+    };
+    // Family-1 stale-ObjectRef fix (second follow-up): `key` — the searched
+    // key, compared on EVERY loop iteration — is exactly as much at risk as
+    // `comparator`/`owner`/`data`: a comparator dispatch on one iteration
+    // can relocate it before the next iteration's `tree_compare` call
+    // dereferences it again. Refreshed and returned to the caller too,
+    // since some callers (`native_tm_put`/`native_tm_put_if_absent`) reuse
+    // the searched key after this function returns (to store it into the
+    // array on a miss). This — plus the sibling `a`/`b` reuse inside
+    // `comparator_compare`'s own dispatch arms — was the actual root cause
+    // of the residual panics that survived the owner/data/comparator-only
+    // fix. See docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    let mut key = *key;
+    let key_pin = pin_value(ctx, key);
     let mut low: usize = 0;
     let mut high = size as usize;
     while low < high {
@@ -26973,26 +27113,60 @@ fn tm_binary_search(
         // Match TreeMap.put/get semantics: compare the searched key with the
         // current node key. Non-antisymmetric comparators rely on this
         // orientation, including Liquibase's pipeline-order tie comparator.
-        let cmp = tree_compare(ctx, comparator, *key, mid_key)?;
+        let cmp = match tree_compare(ctx, &comparator, key, mid_key) {
+            Ok(c) => c,
+            Err(e) => {
+                ctx.unpin_native_roots(owner_pin);
+                return Err(e);
+            }
+        };
+        owner = ctx.read_native_pin(owner_pin, owner);
+        data = ctx.read_native_pin(data_pin, data);
+        if let (Value::Object(Some(r)), Some(pin)) = (comparator, comparator_pin) {
+            comparator = Value::Object(Some(ctx.read_native_pin(pin, r)));
+        }
+        key = read_pinned_elem(ctx, key_pin, key);
         if cmp > 0 {
             low = mid + 1;
         } else if cmp < 0 {
             high = mid;
         } else {
-            return Ok(Ok(mid));
+            ctx.unpin_native_roots(owner_pin);
+            return Ok((Ok(mid), owner, data, key));
         }
     }
-    Ok(Err(low))
+    ctx.unpin_native_roots(owner_pin);
+    Ok((Err(low), owner, data, key))
 }
 
 // ----- TreeSet binary search -----
+/// See `tm_binary_search`'s doc comment — identical Family-1 fix, applied to
+/// TreeSet's backing array.
 fn ts_binary_search(
     ctx: &mut dyn NativeContext,
+    owner: ObjectRef,
     data: ObjectRef,
     size: i32,
     comparator: &Value,
     key: &Value,
-) -> Result<Result<usize, usize>, cratonvm_types::error::MethodCallFailed> {
+) -> Result<
+    (Result<usize, usize>, ObjectRef, ObjectRef, Value),
+    cratonvm_types::error::MethodCallFailed,
+> {
+    let owner_pin = ctx.pin_native_root(owner);
+    let data_pin = ctx.pin_native_root(data);
+    let mut owner = owner;
+    let mut data = data;
+    // Family-1 stale-ObjectRef fix: same as `tm_binary_search` above —
+    // `comparator` AND `key` (the searched element) must be pinned/
+    // refreshed across loop iterations too, not just `owner`/`data`.
+    let mut comparator = *comparator;
+    let comparator_pin = match comparator {
+        Value::Object(Some(r)) => Some(ctx.pin_native_root(r)),
+        _ => None,
+    };
+    let mut key = *key;
+    let key_pin = pin_value(ctx, key);
     let mut low: usize = 0;
     let mut high = size as usize;
     while low < high {
@@ -27000,16 +27174,30 @@ fn ts_binary_search(
         let mid_elem = ctx.get_array_element(data, mid);
         // Keep TreeSet aligned with TreeMap's backing-key behavior:
         // compare(new_element, existing_element), not the reverse.
-        let cmp = tree_compare(ctx, comparator, *key, mid_elem)?;
+        let cmp = match tree_compare(ctx, &comparator, key, mid_elem) {
+            Ok(c) => c,
+            Err(e) => {
+                ctx.unpin_native_roots(owner_pin);
+                return Err(e);
+            }
+        };
+        owner = ctx.read_native_pin(owner_pin, owner);
+        data = ctx.read_native_pin(data_pin, data);
+        if let (Value::Object(Some(r)), Some(pin)) = (comparator, comparator_pin) {
+            comparator = Value::Object(Some(ctx.read_native_pin(pin, r)));
+        }
+        key = read_pinned_elem(ctx, key_pin, key);
         if cmp > 0 {
             low = mid + 1;
         } else if cmp < 0 {
             high = mid;
         } else {
-            return Ok(Ok(mid));
+            ctx.unpin_native_roots(owner_pin);
+            return Ok((Ok(mid), owner, data, key));
         }
     }
-    Ok(Err(low))
+    ctx.unpin_native_roots(owner_pin);
+    Ok((Err(low), owner, data, key))
 }
 
 // Read TreeMap state
@@ -27039,12 +27227,21 @@ fn tm_ensure_capacity(
         return data;
     }
     let new_cap = (arr_len * 2).max(needed);
+    // Family-1 stale-ObjectRef fix: `alloc_ref_array` allocates, which can
+    // trigger a moving GC that relocates `this`/`data` while they sit in bare
+    // Rust locals across the call — pin both and refresh before using them
+    // again (copy loop reads `data`; `tm_set_slot` writes through `this`).
+    let this_pin = ctx.pin_native_root(this);
+    let data_pin = ctx.pin_native_root(data);
     let new_arr = alloc_ref_array(ctx, new_cap);
+    let this = ctx.read_native_pin(this_pin, this);
+    let data = ctx.read_native_pin(data_pin, data);
     for i in 0..(size as usize * 2) {
         let v = ctx.get_array_element(data, i);
         ctx.set_array_element(new_arr, i, v);
     }
     tm_set_slot(ctx, this, TM_FIELD_DATA, Value::Object(Some(new_arr)));
+    ctx.unpin_native_roots(this_pin);
     new_arr
 }
 
@@ -27108,12 +27305,20 @@ fn ts_ensure_capacity(
         return data;
     }
     let new_cap = (arr_len * 2).max(needed);
+    // Family-1 stale-ObjectRef fix: same hazard as `tm_ensure_capacity` —
+    // `alloc_ref_array` can trigger a moving GC that relocates `this`/`data`
+    // while they sit in bare Rust locals across the call.
+    let this_pin = ctx.pin_native_root(this);
+    let data_pin = ctx.pin_native_root(data);
     let new_arr = alloc_ref_array(ctx, new_cap);
+    let this = ctx.read_native_pin(this_pin, this);
+    let data = ctx.read_native_pin(data_pin, data);
     for i in 0..(size as usize) {
         let v = ctx.get_array_element(data, i);
         ctx.set_array_element(new_arr, i, v);
     }
     ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(new_arr)));
+    ctx.unpin_native_roots(this_pin);
     new_arr
 }
 
@@ -27224,7 +27429,12 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             buf
         }
     };
-    let search = tm_binary_search(ctx, data, size, &comparator, &key)?;
+    // Family-1 stale-ObjectRef fix: `tm_binary_search` invokes the user
+    // Comparator, which can trigger a moving GC — use its refreshed
+    // `this`/`data`/`key` (shadowed here) instead of the pre-search copies
+    // above; `key`'s own staleness (not just `this`/`data`) was the actual
+    // root cause of the residual panics that survived the earlier fix.
+    let (search, mut this, data, key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
     match search {
         Ok(idx) => {
             // Key exists — replace value, return old
@@ -27275,7 +27485,10 @@ fn native_tm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(d) => d,
         None => return Ok(Some(Value::Object(None))),
     };
-    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+    // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed `data`
+    // (the Comparator invocation inside it can trigger a moving GC).
+    let (tm_search_result, _this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    match tm_search_result {
         Ok(idx) => Ok(Some(ctx.get_array_element(data, idx * 2 + 1))),
         Err(_) => Ok(Some(Value::Object(None))),
     }
@@ -27304,7 +27517,11 @@ fn native_tm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(d) => d,
         None => return Ok(Some(Value::Object(None))),
     };
-    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+    // Family-1 stale-ObjectRef fix: `this` is used again below
+    // (tm_set_slot) after the Comparator-invoking search, so use the
+    // refreshed copy tm_binary_search returns (`key` isn't reused here).
+    let (search, this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    match search {
         Ok(idx) => {
             let old_val = ctx.get_array_element(data, idx * 2 + 1);
             tm_remove_at(ctx, data, size, idx);
@@ -27334,7 +27551,7 @@ fn native_tm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(d) => d,
         None => return Ok(Some(Value::Int(0))),
     };
-    let found = tm_binary_search(ctx, data, size, &comparator, &key)?.is_ok();
+    let found = tm_binary_search(ctx, this, data, size, &comparator, &key)?.0.is_ok();
     Ok(Some(Value::Int(i32::from(found))))
 }
 
@@ -27524,7 +27741,10 @@ fn native_tm_ceiling_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(d) => d,
         None => return Ok(Some(Value::Object(None))),
     };
-    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+    // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed `data`
+    // (the Comparator invocation inside it can trigger a moving GC).
+    let (tm_search_result, _this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    match tm_search_result {
         Ok(idx) => Ok(Some(ctx.get_array_element(data, idx * 2))),
         Err(pos) => {
             if pos < size as usize {
@@ -27561,7 +27781,10 @@ fn native_tm_floor_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(d) => d,
         None => return Ok(Some(Value::Object(None))),
     };
-    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+    // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed `data`
+    // (the Comparator invocation inside it can trigger a moving GC).
+    let (tm_search_result, _this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    match tm_search_result {
         Ok(idx) => Ok(Some(ctx.get_array_element(data, idx * 2))),
         Err(pos) => {
             if pos > 0 {
@@ -27601,7 +27824,10 @@ fn native_tm_higher_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(d) => d,
         None => return Ok(Some(Value::Object(None))),
     };
-    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+    // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed `data`
+    // (the Comparator invocation inside it can trigger a moving GC).
+    let (tm_search_result, _this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    match tm_search_result {
         Ok(idx) => {
             let next = idx + 1;
             if next < size as usize {
@@ -27648,7 +27874,10 @@ fn native_tm_lower_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(d) => d,
         None => return Ok(Some(Value::Object(None))),
     };
-    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+    // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed `data`
+    // (the Comparator invocation inside it can trigger a moving GC).
+    let (tm_search_result, _this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    match tm_search_result {
         Ok(idx) => {
             if idx > 0 {
                 Ok(Some(ctx.get_array_element(data, (idx - 1) * 2)))
@@ -27719,7 +27948,10 @@ fn native_tm_ceiling_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(d) => d,
         None => return Ok(Some(Value::Object(None))),
     };
-    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+    // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed `data`
+    // (the Comparator invocation inside it can trigger a moving GC).
+    let (tm_search_result, _this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    match tm_search_result {
         Ok(idx) => Ok(Some(tm_array_entry(ctx, data, idx))),
         Err(pos) => {
             if pos < size as usize {
@@ -27759,7 +27991,10 @@ fn native_tm_floor_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(d) => d,
         None => return Ok(Some(Value::Object(None))),
     };
-    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+    // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed `data`
+    // (the Comparator invocation inside it can trigger a moving GC).
+    let (tm_search_result, _this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    match tm_search_result {
         Ok(idx) => Ok(Some(tm_array_entry(ctx, data, idx))),
         Err(pos) => {
             if pos > 0 {
@@ -27802,7 +28037,10 @@ fn native_tm_higher_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(d) => d,
         None => return Ok(Some(Value::Object(None))),
     };
-    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+    // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed `data`
+    // (the Comparator invocation inside it can trigger a moving GC).
+    let (tm_search_result, _this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    match tm_search_result {
         Ok(idx) => {
             let next = idx + 1;
             if next < size as usize {
@@ -27852,7 +28090,10 @@ fn native_tm_lower_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(d) => d,
         None => return Ok(Some(Value::Object(None))),
     };
-    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+    // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed `data`
+    // (the Comparator invocation inside it can trigger a moving GC).
+    let (tm_search_result, _this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    match tm_search_result {
         Ok(idx) => {
             if idx > 0 {
                 Ok(Some(tm_array_entry(ctx, data, idx - 1)))
@@ -28154,7 +28395,10 @@ fn native_tm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(d) => d,
         None => return Ok(Some(default)),
     };
-    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+    // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed `data`
+    // (the Comparator invocation inside it can trigger a moving GC).
+    let (tm_search_result, _this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    match tm_search_result {
         Ok(idx) => Ok(Some(ctx.get_array_element(data, idx * 2 + 1))),
         Err(_) => Ok(Some(default)),
     }
@@ -28203,14 +28447,26 @@ fn native_tm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             buf
         }
     };
-    let search = tm_binary_search(ctx, data, size, &comparator, &key)?;
+    // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed
+    // `this`/`data`/`key` (shadowed) rather than the pre-search copies —
+    // `key` is reused below (tm_insert_at) on a miss, and its own
+    // staleness (not just `this`/`data`) was the actual root cause of the
+    // residual panics that survived the earlier fix. `value` is pinned
+    // separately across `tm_ensure_capacity` since it isn't threaded
+    // through the search.
+    let (search, this, data, key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
     match search {
         Ok(idx) => {
             let existing = ctx.get_array_element(data, idx * 2 + 1);
             Ok(Some(existing))
         }
         Err(pos) => {
+            let key_pin = pin_value(ctx, key);
+            let value_pin = pin_value(ctx, value);
             let data = tm_ensure_capacity(ctx, this, size, data);
+            let key = read_pinned_elem(ctx, key_pin, key);
+            let value = read_pinned_elem(ctx, value_pin, value);
+            ctx.unpin_native_roots(key_pin.min(value_pin));
             tm_insert_at(ctx, data, size, pos, key, value);
             tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(size + 1));
             Ok(Some(Value::Object(None)))
@@ -28239,9 +28495,29 @@ fn native_tm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // Elasticsearch `Settings.Builder.put(Settings)` failure (its builder map is
     // a TreeMap, so `output.map.putAll(settingsMap)` lands here).
     let pairs = collect_entries_any(ctx, source);
-    for (k, v) in pairs {
-        native_tm_put(ctx, &[Value::Object(Some(this)), k, v])?;
+    // Family-1 stale-ObjectRef fix: each `native_tm_put` call below can run a
+    // user Comparator/lambda and trigger a moving GC. `this` was a bare local
+    // reused across every iteration, and `pairs` (keys/values collected
+    // up front) sat entirely unpinned in a Rust `Vec` across the whole loop —
+    // any GC triggered by an early iteration would leave `this` and every
+    // not-yet-consumed key/value stale for later iterations. Pin all of them
+    // before the loop starts and refresh on every iteration.
+    let keys: Vec<Value> = pairs.iter().map(|(k, _)| *k).collect();
+    let vals: Vec<Value> = pairs.iter().map(|(_, v)| *v).collect();
+    // `this_pin` is pushed first, so it is the earliest (lowest) handle in
+    // this function's pin scope; unpinning from it unwinds everything pushed
+    // afterward (the key/value slices) too — no need to track their bases
+    // separately.
+    let this_pin = ctx.pin_native_root(this);
+    let (_, key_pins) = pin_value_slice(ctx, &keys);
+    let (_, val_pins) = pin_value_slice(ctx, &vals);
+    for i in 0..pairs.len() {
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pins[i], keys[i]);
+        let val = read_pinned_elem(ctx, val_pins[i], vals[i]);
+        native_tm_put(ctx, &[Value::Object(Some(this_cur)), key, val])?;
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -28283,21 +28559,45 @@ fn native_tm_head_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let to_key = args.get(1).copied().unwrap_or(Value::Object(None));
     let (data_opt, size, comparator) = tm_state(ctx, this);
-    let result = alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS);
+    let mut result = alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS);
     let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
     tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
     tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
     tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
     if let Some(data) = data_opt {
+        // Family-1 stale-ObjectRef fix: `tree_compare` (user Comparator
+        // dispatch) and `native_tm_put` (comparator dispatch + possible
+        // array growth) can both run arbitrary interpreted bytecode and
+        // trigger a moving GC. `data`/`result`/`comparator`/`to_key` were
+        // bare locals reused across every iteration without being
+        // refreshed — pin them up front and re-read after each
+        // GC-triggering call. See
+        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+        let data_pin = ctx.pin_native_root(data);
+        let result_pin = ctx.pin_native_root(result);
+        let mut data = data;
+        let mut comparator = comparator;
+        let comparator_pin = pin_value(ctx, comparator);
+        let mut to_key = to_key;
+        let to_key_pin = pin_value(ctx, to_key);
         for i in 0..(size as usize) {
             let k = ctx.get_array_element(data, i * 2);
             let cmp = tree_compare(ctx, &comparator, k, to_key)?;
+            data = ctx.read_native_pin(data_pin, data);
+            result = ctx.read_native_pin(result_pin, result);
+            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+            to_key = read_pinned_elem(ctx, to_key_pin, to_key);
             if cmp >= 0 {
                 break;
             }
             let v = ctx.get_array_element(data, i * 2 + 1);
             native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
+            data = ctx.read_native_pin(data_pin, data);
+            result = ctx.read_native_pin(result_pin, result);
+            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+            to_key = read_pinned_elem(ctx, to_key_pin, to_key);
         }
+        ctx.unpin_native_roots(data_pin);
     }
     Ok(Some(Value::Object(Some(result))))
 }
@@ -28310,20 +28610,38 @@ fn native_tm_tail_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let from_key = args.get(1).copied().unwrap_or(Value::Object(None));
     let (data_opt, size, comparator) = tm_state(ctx, this);
-    let result = alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS);
+    let mut result = alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS);
     let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
     tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
     tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
     tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
     if let Some(data) = data_opt {
+        // Family-1 stale-ObjectRef fix: same hazard as `native_tm_head_map`
+        // — `tree_compare`/`native_tm_put` can trigger a moving GC.
+        let data_pin = ctx.pin_native_root(data);
+        let result_pin = ctx.pin_native_root(result);
+        let mut data = data;
+        let mut comparator = comparator;
+        let comparator_pin = pin_value(ctx, comparator);
+        let mut from_key = from_key;
+        let from_key_pin = pin_value(ctx, from_key);
         for i in 0..(size as usize) {
             let k = ctx.get_array_element(data, i * 2);
             let cmp = tree_compare(ctx, &comparator, k, from_key)?;
+            data = ctx.read_native_pin(data_pin, data);
+            result = ctx.read_native_pin(result_pin, result);
+            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+            from_key = read_pinned_elem(ctx, from_key_pin, from_key);
             if cmp >= 0 {
                 let v = ctx.get_array_element(data, i * 2 + 1);
                 native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
+                data = ctx.read_native_pin(data_pin, data);
+                result = ctx.read_native_pin(result_pin, result);
+                comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+                from_key = read_pinned_elem(ctx, from_key_pin, from_key);
             }
         }
+        ctx.unpin_native_roots(data_pin);
     }
     Ok(Some(Value::Object(Some(result))))
 }
@@ -28337,25 +28655,51 @@ fn native_tm_sub_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let from_key = args.get(1).copied().unwrap_or(Value::Object(None));
     let to_key = args.get(2).copied().unwrap_or(Value::Object(None));
     let (data_opt, size, comparator) = tm_state(ctx, this);
-    let result = alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS);
+    let mut result = alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS);
     let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
     tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
     tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
     tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
     if let Some(data) = data_opt {
+        // Family-1 stale-ObjectRef fix: same hazard as `native_tm_head_map`.
+        let data_pin = ctx.pin_native_root(data);
+        let result_pin = ctx.pin_native_root(result);
+        let mut data = data;
+        let mut comparator = comparator;
+        let comparator_pin = pin_value(ctx, comparator);
+        let mut from_key = from_key;
+        let from_key_pin = pin_value(ctx, from_key);
+        let mut to_key = to_key;
+        let to_key_pin = pin_value(ctx, to_key);
         for i in 0..(size as usize) {
             let k = ctx.get_array_element(data, i * 2);
             let cmp_lo = tree_compare(ctx, &comparator, k, from_key)?;
+            data = ctx.read_native_pin(data_pin, data);
+            result = ctx.read_native_pin(result_pin, result);
+            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+            from_key = read_pinned_elem(ctx, from_key_pin, from_key);
+            to_key = read_pinned_elem(ctx, to_key_pin, to_key);
             if cmp_lo < 0 {
                 continue;
             }
             let cmp_hi = tree_compare(ctx, &comparator, k, to_key)?;
+            data = ctx.read_native_pin(data_pin, data);
+            result = ctx.read_native_pin(result_pin, result);
+            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+            from_key = read_pinned_elem(ctx, from_key_pin, from_key);
+            to_key = read_pinned_elem(ctx, to_key_pin, to_key);
             if cmp_hi >= 0 {
                 break;
             }
             let v = ctx.get_array_element(data, i * 2 + 1);
             native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
+            data = ctx.read_native_pin(data_pin, data);
+            result = ctx.read_native_pin(result_pin, result);
+            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+            from_key = read_pinned_elem(ctx, from_key_pin, from_key);
+            to_key = read_pinned_elem(ctx, to_key_pin, to_key);
         }
+        ctx.unpin_native_roots(data_pin);
     }
     Ok(Some(Value::Object(Some(result))))
 }
@@ -28567,9 +28911,17 @@ fn native_ts_init_collection(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // is still drained via its real `toArray()` — otherwise `new TreeSet<>(
     // someView)` comes out empty (mirrors `native_hs_add_all`).
     let elems = collect_collection_elements_or_real(ctx, source);
-    for e in elems {
-        native_ts_add(ctx, &[Value::Object(Some(this)), e])?;
+    // Family-1 stale-ObjectRef fix: same hazard as `native_ts_add_all` —
+    // each `native_ts_add` call can trigger a moving GC, so `this` and the
+    // up-front-collected `elems` must be pinned across the whole loop.
+    let this_pin = ctx.pin_native_root(this);
+    let (_, elem_pins) = pin_value_slice(ctx, &elems);
+    for i in 0..elems.len() {
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let e = read_pinned_elem(ctx, elem_pins[i], elems[i]);
+        native_ts_add(ctx, &[Value::Object(Some(this_cur)), e])?;
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -28588,11 +28940,18 @@ fn native_ts_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             buf
         }
     };
-    let search = ts_binary_search(ctx, data, size, &comparator, &elem)?;
+    // Family-1 stale-ObjectRef fix: use ts_binary_search's refreshed
+    // `this`/`data`/`elem` (the Comparator invocation inside it can trigger
+    // a moving GC) rather than the pre-search copies above — `elem` is
+    // reused below (ts_insert_at) on a miss.
+    let (search, this, data, elem) = ts_binary_search(ctx, this, data, size, &comparator, &elem)?;
     match search {
         Ok(_) => Ok(Some(Value::Int(0))), // already present
         Err(pos) => {
+            let elem_pin = pin_value(ctx, elem);
             let data = ts_ensure_capacity(ctx, this, size, data);
+            let elem = read_pinned_elem(ctx, elem_pin, elem);
+            ctx.unpin_native_roots(elem_pin);
             ts_insert_at(ctx, data, size, pos, elem);
             ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(size + 1));
             Ok(Some(Value::Int(1)))
@@ -28611,7 +28970,11 @@ fn native_ts_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(d) => d,
         None => return Ok(Some(Value::Int(0))),
     };
-    match ts_binary_search(ctx, data, size, &comparator, &elem)? {
+    // Family-1 stale-ObjectRef fix: `this` AND `elem` are used again below
+    // (ts_set_slot, ts_view_source, source_map_remove) after the
+    // Comparator-invoking search.
+    let (search, this, data, elem) = ts_binary_search(ctx, this, data, size, &comparator, &elem)?;
+    match search {
         Ok(idx) => {
             ts_remove_at(ctx, data, size, idx);
             ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(size - 1));
@@ -28636,7 +28999,7 @@ fn native_ts_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(d) => d,
         None => return Ok(Some(Value::Int(0))),
     };
-    let found = ts_binary_search(ctx, data, size, &comparator, &elem)?.is_ok();
+    let found = ts_binary_search(ctx, this, data, size, &comparator, &elem)?.0.is_ok();
     Ok(Some(Value::Int(i32::from(found))))
 }
 
@@ -28864,7 +29227,10 @@ fn native_ts_ceiling(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(d) => d,
         None => return Ok(Some(Value::Object(None))),
     };
-    match ts_binary_search(ctx, data, size, &comparator, &elem)? {
+    // Family-1 stale-ObjectRef fix: use ts_binary_search's refreshed `data`
+    // (the Comparator invocation inside it can trigger a moving GC).
+    let (ts_search_result, _this, data, _elem) = ts_binary_search(ctx, this, data, size, &comparator, &elem)?;
+    match ts_search_result {
         Ok(idx) => Ok(Some(ctx.get_array_element(data, idx))),
         Err(pos) => {
             if pos < size as usize {
@@ -28887,7 +29253,10 @@ fn native_ts_floor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(d) => d,
         None => return Ok(Some(Value::Object(None))),
     };
-    match ts_binary_search(ctx, data, size, &comparator, &elem)? {
+    // Family-1 stale-ObjectRef fix: use ts_binary_search's refreshed `data`
+    // (the Comparator invocation inside it can trigger a moving GC).
+    let (ts_search_result, _this, data, _elem) = ts_binary_search(ctx, this, data, size, &comparator, &elem)?;
+    match ts_search_result {
         Ok(idx) => Ok(Some(ctx.get_array_element(data, idx))),
         Err(pos) => {
             if pos > 0 {
@@ -28910,7 +29279,10 @@ fn native_ts_higher(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(d) => d,
         None => return Ok(Some(Value::Object(None))),
     };
-    match ts_binary_search(ctx, data, size, &comparator, &elem)? {
+    // Family-1 stale-ObjectRef fix: use ts_binary_search's refreshed `data`
+    // (the Comparator invocation inside it can trigger a moving GC).
+    let (ts_search_result, _this, data, _elem) = ts_binary_search(ctx, this, data, size, &comparator, &elem)?;
+    match ts_search_result {
         Ok(idx) => {
             let next = idx + 1;
             if next < size as usize {
@@ -28940,7 +29312,10 @@ fn native_ts_lower(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(d) => d,
         None => return Ok(Some(Value::Object(None))),
     };
-    match ts_binary_search(ctx, data, size, &comparator, &elem)? {
+    // Family-1 stale-ObjectRef fix: use ts_binary_search's refreshed `data`
+    // (the Comparator invocation inside it can trigger a moving GC).
+    let (ts_search_result, _this, data, _elem) = ts_binary_search(ctx, this, data, size, &comparator, &elem)?;
+    match ts_search_result {
         Ok(idx) => {
             if idx > 0 {
                 Ok(Some(ctx.get_array_element(data, idx - 1)))
@@ -29025,7 +29400,11 @@ fn native_ts_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // path (binary search + side-table size update).
     let (data_opt, size, comparator) = ts_state(ctx, owner);
     if let Some(data) = data_opt {
-        if let Ok(idx) = ts_binary_search(ctx, data, size, &comparator, &last)? {
+        // Family-1 stale-ObjectRef fix: `owner`/`data` are used again below
+        // (ts_remove_at, ts_set_slot) after the Comparator-invoking search
+        // (`last` isn't reused here so its refreshed copy is discarded).
+        let (search, owner, data, _last) = ts_binary_search(ctx, owner, data, size, &comparator, &last)?;
+        if let Ok(idx) = search {
             ts_remove_at(ctx, data, size, idx);
             ts_set_slot(ctx, owner, TS_FIELD_SIZE, Value::Int(size - 1));
         }
@@ -29127,20 +29506,39 @@ fn native_ts_head_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let to_elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let (data_opt, size, comparator) = ts_state(ctx, this);
-    let result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
+    let mut result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
     ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
     ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, comparator);
     if let Some(data) = data_opt {
+        // Family-1 stale-ObjectRef fix: `tree_compare`/`native_ts_add` can
+        // run a user Comparator/lambda and trigger a moving GC. See
+        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+        let data_pin = ctx.pin_native_root(data);
+        let result_pin = ctx.pin_native_root(result);
+        let mut data = data;
+        let mut comparator = comparator;
+        let comparator_pin = pin_value(ctx, comparator);
+        let mut to_elem = to_elem;
+        let to_elem_pin = pin_value(ctx, to_elem);
         for i in 0..(size as usize) {
             let e = ctx.get_array_element(data, i);
             let cmp = tree_compare(ctx, &comparator, e, to_elem)?;
+            data = ctx.read_native_pin(data_pin, data);
+            result = ctx.read_native_pin(result_pin, result);
+            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+            to_elem = read_pinned_elem(ctx, to_elem_pin, to_elem);
             if cmp >= 0 {
                 break;
             }
             native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
+            data = ctx.read_native_pin(data_pin, data);
+            result = ctx.read_native_pin(result_pin, result);
+            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+            to_elem = read_pinned_elem(ctx, to_elem_pin, to_elem);
         }
+        ctx.unpin_native_roots(data_pin);
     }
     Ok(Some(Value::Object(Some(result))))
 }
@@ -29152,19 +29550,36 @@ fn native_ts_tail_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let from_elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let (data_opt, size, comparator) = ts_state(ctx, this);
-    let result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
+    let mut result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
     ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
     ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, comparator);
     if let Some(data) = data_opt {
+        // Family-1 stale-ObjectRef fix: same hazard as `native_ts_head_set`.
+        let data_pin = ctx.pin_native_root(data);
+        let result_pin = ctx.pin_native_root(result);
+        let mut data = data;
+        let mut comparator = comparator;
+        let comparator_pin = pin_value(ctx, comparator);
+        let mut from_elem = from_elem;
+        let from_elem_pin = pin_value(ctx, from_elem);
         for i in 0..(size as usize) {
             let e = ctx.get_array_element(data, i);
             let cmp = tree_compare(ctx, &comparator, e, from_elem)?;
+            data = ctx.read_native_pin(data_pin, data);
+            result = ctx.read_native_pin(result_pin, result);
+            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+            from_elem = read_pinned_elem(ctx, from_elem_pin, from_elem);
             if cmp >= 0 {
                 native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
+                data = ctx.read_native_pin(data_pin, data);
+                result = ctx.read_native_pin(result_pin, result);
+                comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+                from_elem = read_pinned_elem(ctx, from_elem_pin, from_elem);
             }
         }
+        ctx.unpin_native_roots(data_pin);
     }
     Ok(Some(Value::Object(Some(result))))
 }
@@ -29177,24 +29592,50 @@ fn native_ts_sub_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let from_elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let to_elem = args.get(2).copied().unwrap_or(Value::Object(None));
     let (data_opt, size, comparator) = ts_state(ctx, this);
-    let result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
+    let mut result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
     ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
     ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, comparator);
     if let Some(data) = data_opt {
+        // Family-1 stale-ObjectRef fix: same hazard as `native_ts_head_set`.
+        let data_pin = ctx.pin_native_root(data);
+        let result_pin = ctx.pin_native_root(result);
+        let mut data = data;
+        let mut comparator = comparator;
+        let comparator_pin = pin_value(ctx, comparator);
+        let mut from_elem = from_elem;
+        let from_elem_pin = pin_value(ctx, from_elem);
+        let mut to_elem = to_elem;
+        let to_elem_pin = pin_value(ctx, to_elem);
         for i in 0..(size as usize) {
             let e = ctx.get_array_element(data, i);
             let cmp_lo = tree_compare(ctx, &comparator, e, from_elem)?;
+            data = ctx.read_native_pin(data_pin, data);
+            result = ctx.read_native_pin(result_pin, result);
+            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+            from_elem = read_pinned_elem(ctx, from_elem_pin, from_elem);
+            to_elem = read_pinned_elem(ctx, to_elem_pin, to_elem);
             if cmp_lo < 0 {
                 continue;
             }
             let cmp_hi = tree_compare(ctx, &comparator, e, to_elem)?;
+            data = ctx.read_native_pin(data_pin, data);
+            result = ctx.read_native_pin(result_pin, result);
+            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+            from_elem = read_pinned_elem(ctx, from_elem_pin, from_elem);
+            to_elem = read_pinned_elem(ctx, to_elem_pin, to_elem);
             if cmp_hi >= 0 {
                 break;
             }
             native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
+            data = ctx.read_native_pin(data_pin, data);
+            result = ctx.read_native_pin(result_pin, result);
+            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+            from_elem = read_pinned_elem(ctx, from_elem_pin, from_elem);
+            to_elem = read_pinned_elem(ctx, to_elem_pin, to_elem);
         }
+        ctx.unpin_native_roots(data_pin);
     }
     Ok(Some(Value::Object(Some(result))))
 }
@@ -29220,20 +29661,37 @@ fn native_ts_tail_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let from_elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let inclusive = arg_bool(args, 2);
     let (data_opt, size, comparator) = ts_state(ctx, this);
-    let result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
+    let mut result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
     ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
     ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, comparator);
     if let Some(data) = data_opt {
+        // Family-1 stale-ObjectRef fix: same hazard as `native_ts_head_set`.
+        let data_pin = ctx.pin_native_root(data);
+        let result_pin = ctx.pin_native_root(result);
+        let mut data = data;
+        let mut comparator = comparator;
+        let comparator_pin = pin_value(ctx, comparator);
+        let mut from_elem = from_elem;
+        let from_elem_pin = pin_value(ctx, from_elem);
         for i in 0..(size as usize) {
             let e = ctx.get_array_element(data, i);
             let cmp = tree_compare(ctx, &comparator, e, from_elem)?;
+            data = ctx.read_native_pin(data_pin, data);
+            result = ctx.read_native_pin(result_pin, result);
+            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+            from_elem = read_pinned_elem(ctx, from_elem_pin, from_elem);
             let keep = if inclusive { cmp >= 0 } else { cmp > 0 };
             if keep {
                 native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
+                data = ctx.read_native_pin(data_pin, data);
+                result = ctx.read_native_pin(result_pin, result);
+                comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+                from_elem = read_pinned_elem(ctx, from_elem_pin, from_elem);
             }
         }
+        ctx.unpin_native_roots(data_pin);
     }
     Ok(Some(Value::Object(Some(result))))
 }
@@ -29246,22 +29704,39 @@ fn native_ts_head_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let to_elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let inclusive = arg_bool(args, 2);
     let (data_opt, size, comparator) = ts_state(ctx, this);
-    let result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
+    let mut result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
     ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
     ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, comparator);
     if let Some(data) = data_opt {
+        // Family-1 stale-ObjectRef fix: same hazard as `native_ts_head_set`.
+        let data_pin = ctx.pin_native_root(data);
+        let result_pin = ctx.pin_native_root(result);
+        let mut data = data;
+        let mut comparator = comparator;
+        let comparator_pin = pin_value(ctx, comparator);
+        let mut to_elem = to_elem;
+        let to_elem_pin = pin_value(ctx, to_elem);
         for i in 0..(size as usize) {
             let e = ctx.get_array_element(data, i);
             let cmp = tree_compare(ctx, &comparator, e, to_elem)?;
+            data = ctx.read_native_pin(data_pin, data);
+            result = ctx.read_native_pin(result_pin, result);
+            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+            to_elem = read_pinned_elem(ctx, to_elem_pin, to_elem);
             // Ascending order: once we pass the upper bound, stop.
             let stop = if inclusive { cmp > 0 } else { cmp >= 0 };
             if stop {
                 break;
             }
             native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
+            data = ctx.read_native_pin(data_pin, data);
+            result = ctx.read_native_pin(result_pin, result);
+            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+            to_elem = read_pinned_elem(ctx, to_elem_pin, to_elem);
         }
+        ctx.unpin_native_roots(data_pin);
     }
     Ok(Some(Value::Object(Some(result))))
 }
@@ -29276,15 +29751,30 @@ fn native_ts_sub_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let to_elem = args.get(3).copied().unwrap_or(Value::Object(None));
     let to_inclusive = arg_bool(args, 4);
     let (data_opt, size, comparator) = ts_state(ctx, this);
-    let result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
+    let mut result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
     ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
     ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, comparator);
     if let Some(data) = data_opt {
+        // Family-1 stale-ObjectRef fix: same hazard as `native_ts_head_set`.
+        let data_pin = ctx.pin_native_root(data);
+        let result_pin = ctx.pin_native_root(result);
+        let mut data = data;
+        let mut comparator = comparator;
+        let comparator_pin = pin_value(ctx, comparator);
+        let mut from_elem = from_elem;
+        let from_elem_pin = pin_value(ctx, from_elem);
+        let mut to_elem = to_elem;
+        let to_elem_pin = pin_value(ctx, to_elem);
         for i in 0..(size as usize) {
             let e = ctx.get_array_element(data, i);
             let cmp_lo = tree_compare(ctx, &comparator, e, from_elem)?;
+            data = ctx.read_native_pin(data_pin, data);
+            result = ctx.read_native_pin(result_pin, result);
+            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+            from_elem = read_pinned_elem(ctx, from_elem_pin, from_elem);
+            to_elem = read_pinned_elem(ctx, to_elem_pin, to_elem);
             let below = if from_inclusive {
                 cmp_lo < 0
             } else {
@@ -29294,6 +29784,11 @@ fn native_ts_sub_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
                 continue;
             }
             let cmp_hi = tree_compare(ctx, &comparator, e, to_elem)?;
+            data = ctx.read_native_pin(data_pin, data);
+            result = ctx.read_native_pin(result_pin, result);
+            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+            from_elem = read_pinned_elem(ctx, from_elem_pin, from_elem);
+            to_elem = read_pinned_elem(ctx, to_elem_pin, to_elem);
             let above = if to_inclusive {
                 cmp_hi > 0
             } else {
@@ -29303,7 +29798,13 @@ fn native_ts_sub_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
                 break;
             }
             native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
+            data = ctx.read_native_pin(data_pin, data);
+            result = ctx.read_native_pin(result_pin, result);
+            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+            from_elem = read_pinned_elem(ctx, from_elem_pin, from_elem);
+            to_elem = read_pinned_elem(ctx, to_elem_pin, to_elem);
         }
+        ctx.unpin_native_roots(data_pin);
     }
     Ok(Some(Value::Object(Some(result))))
 }
@@ -29323,13 +29824,27 @@ fn native_ts_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // real `toArray()`. Without this, `TreeSet.addAll(map.keySet())` was a
     // silent no-op (MimeType.compareTo's case-sensitive parameter check).
     let elems = collect_collection_elements_or_real(ctx, source);
+    // Family-1 stale-ObjectRef fix: this is the exact hazard behind the
+    // WildFly `XMLSequence$DefaultXMLSequence.collectNames` boot panics
+    // (class_id 128) — `TreeSet.addAll` on a set built with a real
+    // (non-synthetic) user Comparator. Each `native_ts_add` call below can
+    // run that Comparator/lambda and trigger a moving GC. `this` was a bare
+    // local reused across every iteration, and `elems` (collected up front)
+    // sat entirely unpinned in a Rust `Vec` across the whole loop — pin both
+    // before the loop starts and refresh on every iteration. See
+    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    let this_pin = ctx.pin_native_root(this);
+    let (_, elem_pins) = pin_value_slice(ctx, &elems);
     let mut changed = false;
-    for e in elems {
-        let result = native_ts_add(ctx, &[Value::Object(Some(this)), e])?;
+    for i in 0..elems.len() {
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let e = read_pinned_elem(ctx, elem_pins[i], elems[i]);
+        let result = native_ts_add(ctx, &[Value::Object(Some(this_cur)), e])?;
         if result == Some(Value::Int(1)) {
             changed = true;
         }
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(i32::from(changed))))
 }
 

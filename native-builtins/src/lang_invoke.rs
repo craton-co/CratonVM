@@ -3292,6 +3292,14 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
                             .to_string(),
                     }
                 })?;
+            // Family-1 stale-ObjectRef fix (2026-07-13): same defect as the
+            // sibling registration in classloader.rs::lk_ensure_initialized
+            // (whichever registration order wins in a given context reaches
+            // this exact bug) — `ctx.initialize_class` can run `<clinit>`
+            // and trigger a moving GC, so `target_class` must be rooted
+            // across the call and re-read before reuse. See
+            // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+            let target_class_pin = ctx.pin_native_root(target_class);
             ctx.initialize_class(class_id).map_err(|message| {
                 cratonvm_types::error::MethodCallFailed::InternalError(
                     cratonvm_types::error::VmError::Internal {
@@ -3299,6 +3307,8 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
                     },
                 )
             })?;
+            let target_class = ctx.read_native_pin(target_class_pin, target_class);
+            ctx.unpin_native_roots(target_class_pin);
             Ok(Some(Value::Object(Some(target_class))))
         },
     );
