@@ -13941,6 +13941,40 @@ impl Compiler {
         let stack_checkpoint = self.stack.clone();
         let oop_marks_checkpoint = self.stack_oop_marks.clone();
         let spill_checkpoint = self.next_spill_offset;
+        // groovyjarjarasm-asm-handler-getexceptiontablesize-sigsegv-20260713:
+        // the buffer/stack/oop-marks/spill rollback above is NOT the full set
+        // of speculative side effects `try_emit_inline_body` can produce. Any
+        // bytecode instruction it simulates (e.g. an inlined `invoke*` via
+        // `emit_post_invoke_exception_check`) can also push a **patch-site
+        // offset** -- a raw `usize` into `self.buf` -- onto one of these
+        // deferred patch-list fields. Those offsets are only meaningful while
+        // they point at the placeholder bytes (`0F 84 00 00 00 00` etc.) that
+        // were live when they were recorded. A bail rewinds `self.buf` past
+        // them (via `rewind_to` above) and the fall-through normal-call path
+        // then emits *different* code over that same buffer range -- but
+        // without this snapshot/truncate, the stale offset(s) from the
+        // abandoned attempt survive in the Vec and get blindly patched later
+        // (`emit_exception_check_stub` / `emit_deopt_stubs` / `patch_branches`
+        // / `patch_self_calls`, all of which run once at the very end of
+        // `compile_bytecode` over the FINAL, already-reused buffer), corrupting
+        // whatever real instruction now lives at that stale offset. Root-caused
+        // via a live trace on `groovyjarjarasm.asm.Handler.getExceptionTableSize`
+        // (pulled in by Groovy's ASM-based class generation under
+        // `GroovyScriptFactoryTests`): a stale `exception_check_stubs` entry
+        // from a rewound inline attempt got patched into the middle of the
+        // *kept* method's precise-maps safepoint-id store, scribbling a bogus
+        // immediate byte and a corrupt REX prefix into otherwise-valid JIT
+        // code -- an immediate SIGSEGV the instant the (very hot, called
+        // thousands of times) method next ran, well before any test
+        // discovery. Snapshot every such deferred patch-list field here and
+        // truncate back on bail, mirroring the buffer/stack rollback above.
+        let exception_check_stubs_checkpoint = self.exception_check_stubs.len();
+        let deopt_stubs_checkpoint = self.deopt_stubs.len();
+        let forward_patches_checkpoint = self.forward_patches.len();
+        let jump_table_patches_checkpoint = self.jump_table_patches.len();
+        let self_call_patches_checkpoint = self.self_call_patches.len();
+        let bounds_check_stubs_checkpoint = self.bounds_check_stubs.len();
+        let null_check_store_stubs_checkpoint = self.null_check_store_stubs.len();
         if self.try_emit_inline_body(pc) {
             true
         } else {
@@ -13951,6 +13985,17 @@ impl Compiler {
             self.stack = stack_checkpoint;
             self.stack_oop_marks = oop_marks_checkpoint;
             self.next_spill_offset = spill_checkpoint;
+            self.exception_check_stubs
+                .truncate(exception_check_stubs_checkpoint);
+            self.deopt_stubs.truncate(deopt_stubs_checkpoint);
+            self.forward_patches.truncate(forward_patches_checkpoint);
+            self.jump_table_patches
+                .truncate(jump_table_patches_checkpoint);
+            self.self_call_patches.truncate(self_call_patches_checkpoint);
+            self.bounds_check_stubs
+                .truncate(bounds_check_stubs_checkpoint);
+            self.null_check_store_stubs
+                .truncate(null_check_store_stubs_checkpoint);
             false
         }
     }
