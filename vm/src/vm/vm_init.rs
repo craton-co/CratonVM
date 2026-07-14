@@ -1330,6 +1330,11 @@ impl SharedVm {
                 // Tell the registry to drop StringJoiner registrations so the real,
                 // self-contained bytecode runs instead.
                 native_methods.set_drop_real_layout_synthetic(true);
+                // Do not let approximations shadow the real JDK bytecode.
+                // Real-JDK mode may retain only actual VM bridges and
+                // semantics-preserving intrinsics; the synthetic surface is
+                // available exclusively to synthetic-JDK mode.
+                native_methods.set_drop_synthetic_stubs(true);
                 register_essential_natives(&mut native_methods);
                 // Register concurrent natives (ReentrantLock, etc.) needed by real JDK classes
                 // like LinkedBlockingQueue which use ReentrantLock for synchronization
@@ -1723,6 +1728,7 @@ impl SharedVm {
             // BEFORE any `register_*` pass here. (The synthetic-jdk-feature build
             // sets the same flag in its real-JDK arm above.)
             native_methods.set_drop_real_layout_synthetic(true);
+            native_methods.set_drop_synthetic_stubs(true);
             register_essential_natives(&mut native_methods);
             // cratonvm-cli default features omit `synthetic-jdk`; the rich
             // registration block only lives under `cfg(feature = "synthetic-jdk")`
@@ -6077,9 +6083,27 @@ mod tests {
     fn ensure_system_streams_creates_objects() {
         let shared = SharedVm::new(VmConfig::default());
         let (out, err) = shared.ensure_system_streams();
-        // Should have fd_id 1 for stdout, 2 for stderr
-        assert_eq!(shared.heap.get_field(out, 0), Value::Int(1));
-        assert_eq!(shared.heap.get_field(err, 0), Value::Int(2));
+        let out_header = shared.heap.get_header(out);
+        let err_header = shared.heap.get_header(err);
+        assert_ne!(out.as_ptr(), err.as_ptr());
+        assert_eq!(out_header.class_id, err_header.class_id);
+        assert!(out_header.num_slots >= 1);
+        assert!(err_header.num_slots >= 1);
+
+        // Synthetic PrintStream uses slot 0 as its stdout/stderr descriptor.
+        // In the real JDK, that slot is FilterOutputStream.out (a reference),
+        // and the streams are identified by object identity instead. Writing
+        // an integer there would box it and corrupt the real stream graph.
+        let slot0_is_ref = cratonvm_gc::class_layout(out_header.class_id.as_u32())
+            .and_then(|layout| layout.field_is_ref(0))
+            .unwrap_or(false);
+        if slot0_is_ref {
+            assert!(!matches!(shared.heap.get_field(out, 0), Value::Int(1)));
+            assert!(!matches!(shared.heap.get_field(err, 0), Value::Int(2)));
+        } else {
+            assert_eq!(shared.heap.get_field(out, 0), Value::Int(1));
+            assert_eq!(shared.heap.get_field(err, 0), Value::Int(2));
+        }
     }
 
     #[test]
@@ -6444,17 +6468,15 @@ mod tests {
         let mut config = VmConfig::default();
         config.use_synthetic_jdk = false;
         let shared = SharedVm::new(config);
-        // Essential-only mode should stay well below full `register_builtins`
-        // synthetic coverage. The ceiling is a soft guard that rises as the
-        // real-JDK native bundle grows (currently ~8800, up from ~6200 after
-        // the unmodifiable-collection-view bootstrap added a proportional
-        // slice of `List`/`Set`/`Map`/etc. natives, see `d3474b3e`/
-        // `c2d68883`); synthetic-jdk builds still register thousands more on
-        // top of this baseline.
-        assert!(
-            shared.native_methods.len() < 9500,
-            "Real JDK mode should have < 9500 natives, got {}",
-            shared.native_methods.len()
+        let synthetic_stubs = shared
+            .native_methods
+            .dump_registrations()
+            .iter()
+            .filter(|(_, _, _, kind)| *kind == cratonvm_native_api::NativeKind::SyntheticStub)
+            .count();
+        assert_eq!(
+            synthetic_stubs, 0,
+            "real-JDK mode must not register synthetic overrides"
         );
     }
 

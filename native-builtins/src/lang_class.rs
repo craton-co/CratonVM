@@ -10220,7 +10220,11 @@ fn create_annotation_proxy(
     // Real annotations: hand back a real `$ProxyN` proxy that wraps
     // this AnnotationProxy as its InvocationHandler (so `getClass()` is a
     // `$ProxyN`). Falls back to the bare AnnotationProxy when generation fails.
-    if real_annotations_enabled() {
+    // A real proxy needs the VM-owned loader and generated-class namespace.
+    // The lightweight native unit-test context deliberately does not model
+    // that global state, so retain the valid AnnotationProxy representation
+    // there instead of reusing a loader ObjectRef from another mock VM.
+    if ctx.supports_real_proxy_generation() && real_annotations_enabled() {
         if let Some(ann_cid) = ann_class_id_opt {
             if let Some(real) = wrap_annotation_in_real_proxy(ctx, ann_cid, proxy) {
                 return real;
