@@ -26124,7 +26124,8 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/file/attribute/FileTime;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 0)))
+            let millis = basic_file_attributes_time_millis(ctx, this, "creation");
+            Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
         },
     );
     r.register(
@@ -26133,7 +26134,8 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/file/attribute/FileTime;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 1)))
+            let millis = basic_file_attributes_time_millis(ctx, this, "access");
+            Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
         },
     );
     r.register(
@@ -26142,20 +26144,17 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/file/attribute/FileTime;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 2)))
+            let millis = basic_file_attributes_time_millis(ctx, this, "modified");
+            Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
         },
     );
     r.register(bfa, "isDirectory", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 3)))
+        Ok(Some(Value::Int(i32::from(basic_file_attributes_is_dir(ctx, this)))))
     });
     r.register(bfa, "isRegularFile", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let is_dir = match ctx.get_field(this, 3) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        Ok(Some(Value::Int(if is_dir == 0 { 1 } else { 0 })))
+        Ok(Some(Value::Int(i32::from(!basic_file_attributes_is_dir(ctx, this)))))
     });
     r.register(bfa, "isSymbolicLink", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
@@ -26163,7 +26162,7 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
     r.register(bfa, "isOther", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
     r.register(bfa, "size", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 4)))
+        Ok(Some(Value::Long(basic_file_attributes_size(ctx, this))))
     });
     // `fileKey()` returns an object that uniquely identifies the file, or
     // `null` if a file key is not available. The JDK Windows file system
@@ -26315,6 +26314,105 @@ fn filetime_read_millis(ctx: &dyn NativeContext, ft: ObjectRef) -> i64 {
     }
 }
 
+/// Allocate a real platform `BasicFileAttributes` implementation.
+///
+/// Callers perform a JVM `checkcast BasicFileAttributes`, so the carrier must
+/// actually implement that interface. The native bridge stores its canonical
+/// values in named platform fields and force-dispatches the interface methods;
+/// it never relies on the implementation's bytecode layout.
+fn basic_file_attributes_alloc(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let class_name = if cfg!(windows) {
+        "sun/nio/fs/WindowsFileAttributes"
+    } else {
+        "sun/nio/fs/UnixFileAttributes"
+    };
+    if let Ok(class_id) = ctx.ensure_class_initialized(class_name) {
+        let fields = ctx.class_num_total_fields(class_id);
+        if ctx.class_name_of_id(class_id).as_deref() == Some(class_name) && fields > 0 {
+            return ctx.alloc_object(class_id, fields);
+        }
+    }
+    // Only reached by a synthetic-JDK configuration, where the interface is
+    // modelled as a concrete helper with a five-field layout.
+    alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 5)
+}
+
+fn basic_file_attributes_is_windows(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(attrs)).as_deref()
+        == Some("sun/nio/fs/WindowsFileAttributes")
+}
+
+fn basic_file_attributes_time_millis(
+    ctx: &dyn NativeContext,
+    attrs: ObjectRef,
+    which: &str,
+) -> i64 {
+    let field = if basic_file_attributes_is_windows(ctx, attrs) {
+        match which {
+            "creation" => "creationTime",
+            "access" => "lastAccessTime",
+            _ => "lastWriteTime",
+        }
+    } else {
+        match which {
+            "creation" => "st_birthtime",
+            "access" => "st_atime",
+            _ => "st_mtime",
+        }
+    };
+    match ctx.get_field_by_name(attrs, field) {
+        Value::Long(v) => v,
+        _ => 0,
+    }
+}
+
+fn basic_file_attributes_is_dir(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {
+    if basic_file_attributes_is_windows(ctx, attrs) {
+        return matches!(ctx.get_field_by_name(attrs, "fileAttrs"), Value::Int(v) if v & 0x10 != 0);
+    }
+    matches!(ctx.get_field_by_name(attrs, "st_mode"), Value::Int(v) if v & 0o170000 == 0o040000)
+}
+
+fn basic_file_attributes_size(ctx: &dyn NativeContext, attrs: ObjectRef) -> i64 {
+    let field = if basic_file_attributes_is_windows(ctx, attrs) {
+        "size"
+    } else {
+        "st_size"
+    };
+    match ctx.get_field_by_name(attrs, field) {
+        Value::Long(v) => v,
+        _ => 0,
+    }
+}
+
+fn basic_file_attributes_store(
+    ctx: &mut dyn NativeContext,
+    attrs: ObjectRef,
+    is_dir: bool,
+    size: i64,
+    creation_millis: i64,
+    access_millis: i64,
+    modified_millis: i64,
+) {
+    if basic_file_attributes_is_windows(ctx, attrs) {
+        ctx.set_field_by_name(attrs, "fileAttrs", Value::Int(if is_dir { 0x10 } else { 0 }));
+        ctx.set_field_by_name(attrs, "creationTime", Value::Long(creation_millis));
+        ctx.set_field_by_name(attrs, "lastAccessTime", Value::Long(access_millis));
+        ctx.set_field_by_name(attrs, "lastWriteTime", Value::Long(modified_millis));
+        ctx.set_field_by_name(attrs, "size", Value::Long(size));
+    } else {
+        ctx.set_field_by_name(
+            attrs,
+            "st_mode",
+            Value::Int(if is_dir { 0o040000 } else { 0o100000 }),
+        );
+        ctx.set_field_by_name(attrs, "st_birthtime", Value::Long(creation_millis));
+        ctx.set_field_by_name(attrs, "st_atime", Value::Long(access_millis));
+        ctx.set_field_by_name(attrs, "st_mtime", Value::Long(modified_millis));
+        ctx.set_field_by_name(attrs, "st_size", Value::Long(size));
+    }
+}
+
 /// Extract path string from a Path argument (field 0 = String)
 fn extract_path_string(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> String {
     let raw = match arg {
@@ -26371,11 +26469,7 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // sentinel string ENOENTs, which made the walker treat every mounted-jar
     // root as a zero-length regular file (JUnit5 jar scanning found nothing).
     if let Some((jar, entry)) = jarfs_decode(&path_str) {
-        let bfa = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 5);
-        let ft = filetime_alloc(ctx, 0);
-        ctx.set_field(bfa, 0, Value::Object(Some(ft)));
-        ctx.set_field(bfa, 1, Value::Object(Some(ft)));
-        ctx.set_field(bfa, 2, Value::Object(Some(ft)));
+        let bfa = basic_file_attributes_alloc(ctx);
         let (is_dir, size) = match jarfs_classify(&jar, &entry) {
             JarFsKind::Dir => (1, 0i64),
             JarFsKind::File => (0, jarfs_entry_size(&jar, &entry).unwrap_or(0)),
@@ -26389,19 +26483,14 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 .into());
             }
         };
-        ctx.set_field(bfa, 3, Value::Int(is_dir));
-        ctx.set_field(bfa, 4, Value::Long(size));
+        basic_file_attributes_store(ctx, bfa, is_dir != 0, size, 0, 0, 0);
         return Ok(Some(Value::Object(Some(bfa))));
     }
 
     // jrt-FS (runtime image) path — attributes come from the jimage, not the
     // host filesystem. javac's platform-class indexing walks `/modules/...`.
     if let Some((java_home, entry)) = jrtfs_decode(&path_str) {
-        let bfa = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 5);
-        let ft = filetime_alloc(ctx, 0);
-        ctx.set_field(bfa, 0, Value::Object(Some(ft)));
-        ctx.set_field(bfa, 1, Value::Object(Some(ft)));
-        ctx.set_field(bfa, 2, Value::Object(Some(ft)));
+        let bfa = basic_file_attributes_alloc(ctx);
         let (is_dir, size) = match jrtfs_classify(&java_home, &entry) {
             JarFsKind::Dir => (1, 0i64),
             JarFsKind::File => (0, jrtfs_entry_size(&java_home, &entry).unwrap_or(0)),
@@ -26412,8 +26501,7 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 .into());
             }
         };
-        ctx.set_field(bfa, 3, Value::Int(is_dir));
-        ctx.set_field(bfa, 4, Value::Long(size));
+        basic_file_attributes_store(ctx, bfa, is_dir != 0, size, 0, 0, 0);
         return Ok(Some(Value::Object(Some(bfa))));
     }
 
@@ -26427,27 +26515,25 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         std::fs::metadata(&path_str)
     };
 
-    let bfa = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 5);
+    let bfa = basic_file_attributes_alloc(ctx);
 
     match meta_result {
         Ok(meta) => {
             // Creation time
             let creation_millis = meta.created().ok().map(system_time_to_millis).unwrap_or(0);
-            let ft_create = filetime_alloc(ctx, creation_millis);
-
             // Last access time
             let access_millis = meta.accessed().ok().map(system_time_to_millis).unwrap_or(0);
-            let ft_access = filetime_alloc(ctx, access_millis);
-
             // Last modified time
             let mod_millis = meta.modified().ok().map(system_time_to_millis).unwrap_or(0);
-            let ft_mod = filetime_alloc(ctx, mod_millis);
-
-            ctx.set_field(bfa, 0, Value::Object(Some(ft_create)));
-            ctx.set_field(bfa, 1, Value::Object(Some(ft_access)));
-            ctx.set_field(bfa, 2, Value::Object(Some(ft_mod)));
-            ctx.set_field(bfa, 3, Value::Int(if meta.is_dir() { 1 } else { 0 }));
-            ctx.set_field(bfa, 4, Value::Long(meta.len() as i64));
+            basic_file_attributes_store(
+                ctx,
+                bfa,
+                meta.is_dir(),
+                meta.len() as i64,
+                creation_millis,
+                access_millis,
+                mod_millis,
+            );
         }
         // NIO contract: `Files.readAttributes` must raise `IOException`
         // (`NoSuchFileException` when the path is missing) — silently
@@ -35903,6 +35989,21 @@ fn p98_invoke_file_visitor(
     })
 }
 
+/// Build the canonical five-field BasicFileAttributes layout for a
+/// Files.walkFileTree callback: creation=0, lastAccess=1, lastModified=2,
+/// isDirectory=3, size=4. Callers of FileVisitor legitimately inspect these
+/// attributes while javac discovers archive entries, so zero-field placeholders
+/// leak invalid return values from the BasicFileAttributes bridge.
+fn p98_alloc_basic_file_attributes(
+    ctx: &mut dyn NativeContext,
+    is_dir: bool,
+    size: i64,
+) -> ObjectRef {
+    let attrs = basic_file_attributes_alloc(ctx);
+    basic_file_attributes_store(ctx, attrs, is_dir, size, 0, 0, 0);
+    attrs
+}
+
 fn p98_walk_dir(
     ctx: &mut dyn NativeContext,
     dir: &str,
@@ -35910,7 +36011,7 @@ fn p98_walk_dir(
     dir_path_obj: ObjectRef,
     skip_file_callbacks: bool,
 ) -> Result<bool, MethodCallFailed> {
-    let attrs = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 0);
+    let attrs = p98_alloc_basic_file_attributes(ctx, true, 0);
     // preVisitDirectory
     let pre = p98_invoke_file_visitor(
         ctx,
@@ -35945,10 +36046,10 @@ fn p98_walk_dir(
                     return Ok(false);
                 }
             } else if !skip_file_callbacks {
-                let fa = alloc_concurrent_synthetic(
+                let fa = p98_alloc_basic_file_attributes(
                     ctx,
-                    "java/nio/file/attribute/BasicFileAttributes",
-                    0,
+                    false,
+                    jarfs_entry_size(&jar, &child).unwrap_or(0),
                 );
                 let vr = p98_invoke_file_visitor(
                     ctx,
@@ -35978,10 +36079,10 @@ fn p98_walk_dir(
                     return Ok(false);
                 }
             } else if !skip_file_callbacks {
-                let fa = alloc_concurrent_synthetic(
+                let fa = p98_alloc_basic_file_attributes(
                     ctx,
-                    "java/nio/file/attribute/BasicFileAttributes",
-                    0,
+                    false,
+                    jrtfs_entry_size(&java_home, &child).unwrap_or(0),
                 );
                 let vr = p98_invoke_file_visitor(
                     ctx,
@@ -36011,10 +36112,10 @@ fn p98_walk_dir(
                     return Ok(false);
                 }
             } else if !skip_file_callbacks {
-                let fa = alloc_concurrent_synthetic(
+                let fa = p98_alloc_basic_file_attributes(
                     ctx,
-                    "java/nio/file/attribute/BasicFileAttributes",
-                    0,
+                    false,
+                    entry.metadata().map(|metadata| metadata.len() as i64).unwrap_or(0),
                 );
                 let vr = p98_invoke_file_visitor(
                     ctx,
