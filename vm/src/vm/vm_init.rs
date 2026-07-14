@@ -1330,11 +1330,29 @@ impl SharedVm {
                 // Tell the registry to drop StringJoiner registrations so the real,
                 // self-contained bytecode runs instead.
                 native_methods.set_drop_real_layout_synthetic(true);
-                // Do not let approximations shadow the real JDK bytecode.
-                // Real-JDK mode may retain only actual VM bridges and
-                // semantics-preserving intrinsics; the synthetic surface is
-                // available exclusively to synthetic-JDK mode.
-                native_methods.set_drop_synthetic_stubs(true);
+                // NOTE: unconditionally dropping ALL SyntheticStub-tagged
+                // natives in real-JDK mode was tried (dev d8092acb,
+                // 2026-07-14) and reverted the same day: several register_*
+                // clusters that are tagged SyntheticStub are actually needed
+                // as permanent bridges in BOTH modes (no working real-bytecode
+                // fallback exists), not just as fake-JDK approximations.
+                // Confirmed regressions: the entire java.lang.management/JMX
+                // native surface (native-builtins/src/jmx.rs -- WildFly's
+                // very first ManagementFactory.getPlatformMBeanServer() call
+                // NPEs deep inside real javax.management bytecode,
+                // ObjectName._ca_array null, with the stub dropped) and
+                // java.util.function.Function$Identity (a VM-internal
+                // synthetic stand-in for the real lambda-based
+                // Function.identity(), which has no real bytecode to fall
+                // back to at all -- UnsatisfiedLinkError). The
+                // `drop_synthetic_stubs` field's own doc comment already
+                // documented the safe, original design: opt-in only, via
+                // `CRATONVM_NO_STUBS`, "because some apps currently limp on
+                // these fakes and dropping them surfaces real gaps as clear
+                // errors." Leave it opt-in; do not force it on here. See
+                // docs/known-issues/wildfly-standalone-boot-stw-jit-takeover-hang.md's
+                // 2026-07-14 addendum for the WildFly-boot regression this
+                // caused and how it was found (git bisect).
                 register_essential_natives(&mut native_methods);
                 // Register concurrent natives (ReentrantLock, etc.) needed by real JDK classes
                 // like LinkedBlockingQueue which use ReentrantLock for synchronization
@@ -1728,7 +1746,11 @@ impl SharedVm {
             // BEFORE any `register_*` pass here. (The synthetic-jdk-feature build
             // sets the same flag in its real-JDK arm above.)
             native_methods.set_drop_real_layout_synthetic(true);
-            native_methods.set_drop_synthetic_stubs(true);
+            // set_drop_synthetic_stubs(true) intentionally NOT called here.
+            // See the matching real-JDK arm above for why (dev d8092acb
+            // regression + revert, 2026-07-14): several SyntheticStub-tagged
+            // register_* clusters (JMX, Function$Identity) are permanent
+            // bridges needed in real mode too, not fake-JDK-only shadows.
             register_essential_natives(&mut native_methods);
             // cratonvm-cli default features omit `synthetic-jdk`; the rich
             // registration block only lives under `cfg(feature = "synthetic-jdk")`
@@ -6465,18 +6487,62 @@ mod tests {
 
     #[test]
     fn real_jdk_mode_registers_fewer_natives() {
-        let mut config = VmConfig::default();
-        config.use_synthetic_jdk = false;
-        let shared = SharedVm::new(config);
-        let synthetic_stubs = shared
-            .native_methods
+        // NOTE: this test previously asserted `synthetic_stubs == 0` for
+        // real-JDK mode, backed by `set_drop_synthetic_stubs(true)` forced
+        // on unconditionally in `vm_init.rs`'s real-JDK arms (dev d8092acb,
+        // 2026-07-14). That default was reverted the same day: several
+        // SyntheticStub-tagged register_* clusters (the whole
+        // java.lang.management/JMX native surface, java.util.function.
+        // Function$Identity) are permanent bridges needed in BOTH modes --
+        // no working real-bytecode fallback exists for them yet -- and
+        // dropping them broke WildFly boot immediately (ObjectName NPE /
+        // UnsatisfiedLinkError). `drop_synthetic_stubs` is opt-in only
+        // again (`CRATONVM_NO_STUBS`), matching its own field doc. This
+        // test now checks the weaker, still-true invariant: real-JDK mode
+        // registers meaningfully fewer natives than synthetic-JDK mode
+        // (fewer collection/layout fallbacks needed once real bytecode
+        // handles those classes directly).
+        let mut real_config = VmConfig::default();
+        real_config.use_synthetic_jdk = false;
+        let real_shared = SharedVm::new(real_config);
+        let real_count = real_shared.native_methods.dump_registrations().len();
+
+        let mut synthetic_config = VmConfig::default();
+        synthetic_config.use_synthetic_jdk = true;
+        let synthetic_shared = SharedVm::new(synthetic_config);
+        let synthetic_count = synthetic_shared.native_methods.dump_registrations().len();
+
+        assert!(
+            real_count <= synthetic_count,
+            "real-JDK mode ({real_count}) should not register MORE natives              than synthetic-JDK mode ({synthetic_count})"
+        );
+    }
+
+    #[test]
+    fn drop_synthetic_stubs_mechanism_still_works_when_opted_in() {
+        // The `CRATONVM_NO_STUBS` / `set_drop_synthetic_stubs(true)` opt-in
+        // mechanism itself (native-api/src/registry.rs) is unit-tested here
+        // directly, decoupled from whether any particular boot mode enables
+        // it by default (see `real_jdk_mode_registers_fewer_natives` above
+        // for why real-JDK mode does not, as of 2026-07-14).
+        let mut r = cratonvm_native_api::NativeMethodRegistry::new();
+        r.set_drop_synthetic_stubs(true);
+        r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+        r.register("Test", "stub", "()V", |_ctx, _args| Ok(None));
+        r.set_category(cratonvm_native_api::NativeKind::Bridge);
+        r.register("Test", "bridge", "()V", |_ctx, _args| Ok(None));
+        let kinds: Vec<_> = r
             .dump_registrations()
             .iter()
-            .filter(|(_, _, _, kind)| *kind == cratonvm_native_api::NativeKind::SyntheticStub)
-            .count();
-        assert_eq!(
-            synthetic_stubs, 0,
-            "real-JDK mode must not register synthetic overrides"
+            .map(|(_, m, _, k)| (m.to_string(), *k))
+            .collect();
+        assert!(
+            !kinds.iter().any(|(m, _)| m == "stub"),
+            "SyntheticStub registration should have been dropped"
+        );
+        assert!(
+            kinds.iter().any(|(m, _)| m == "bridge"),
+            "Bridge registration should survive drop_synthetic_stubs"
         );
     }
 

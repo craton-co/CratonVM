@@ -21031,7 +21031,7 @@ fn ll_real_field(name: &str) -> Option<&'static str> {
 
 fn ll_get(ctx: &dyn NativeContext, this: ObjectRef, name: &'static str) -> Value {
     {
-        let ov = ll_overlay().lock().unwrap();
+        let ov = ll_overlay().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(v) = ov
             .get(&widened_obj_key(ctx, this))
             .and_then(|m| m.get(name))
@@ -22445,7 +22445,7 @@ fn lhm_overlay_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
 }
 fn lhm_get(ctx: &dyn NativeContext, this: ObjectRef, name: &str, _fallback: usize) -> Value {
     {
-        let m = lhm_overlay().lock().unwrap();
+        let m = lhm_overlay().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(v) = m
             .get(&lhm_overlay_key(ctx, this))
             .and_then(|inner| inner.get(name))
@@ -22480,7 +22480,7 @@ fn lhm_set(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback: 
         .unwrap()
         .insert(this.as_ptr() as usize, key);
     {
-        let mut m = lhm_overlay().lock().unwrap();
+        let mut m = lhm_overlay().lock().unwrap_or_else(|e| e.into_inner());
         m.entry(key).or_default().insert(name.to_string(), v);
     }
     // Mirror the structural pointers to the REAL JDK heap fields so that
@@ -22523,7 +22523,7 @@ fn lhm_set(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback: 
 /// the clone produces an empty overlay — acceptable because pre-rekey
 /// the same call leaked the entry entirely on every GC move.
 pub fn clone_lhm_overlay(src: ObjectRef, dst: ObjectRef) {
-    let cache = lhm_ptr_cache().lock().unwrap();
+    let cache = lhm_ptr_cache().lock().unwrap_or_else(|e| e.into_inner());
     let src_key = match cache.get(&(src.as_ptr() as usize)) {
         Some(k) => *k,
         None => return,
@@ -22538,7 +22538,7 @@ pub fn clone_lhm_overlay(src: ObjectRef, dst: ObjectRef) {
         None => dst.as_ptr() as usize,
     };
     drop(cache);
-    let mut m = lhm_overlay().lock().unwrap();
+    let mut m = lhm_overlay().lock().unwrap_or_else(|e| e.into_inner());
     let src_state = m.get(&src_key).cloned();
     if let Some(s) = src_state {
         m.insert(dst_key, s);
@@ -22552,7 +22552,7 @@ pub fn clone_lhm_overlay(src: ObjectRef, dst: ObjectRef) {
 pub fn clone_lhm_overlay_ctx(ctx: &dyn NativeContext, src: ObjectRef, dst: ObjectRef) {
     let src_key = lhm_overlay_key(ctx, src);
     let dst_key = lhm_overlay_key(ctx, dst);
-    let mut m = lhm_overlay().lock().unwrap();
+    let mut m = lhm_overlay().lock().unwrap_or_else(|e| e.into_inner());
     let src_state = m.get(&src_key).cloned();
     if let Some(s) = src_state {
         m.insert(dst_key, s);
@@ -22717,26 +22717,64 @@ fn lhm_find_node(
         Some(b) => b,
         None => return Ok(None),
     };
-    let (hash, is_null) = match key {
-        Value::Object(Some(k)) => (map_hash_key(ctx, *k)?, false),
+    // GC-safety: `map_hash_key`/`map_keys_equal` dispatch arbitrary Java
+    // code (hashCode()/equals()), which can trigger a moving GC. Pin the
+    // raw buckets-array/key up front and re-read them after every such
+    // call, matching `native_hashmap_get_exact`'s established pattern.
+    // Caught live via CRATONVM_DBG_STALE_OBJREF during WildFly
+    // parallel-extension-add (root cause of the TIMEOUT_NO_WARN silent-stall
+    // symptom -- see "Investigation update 2026-07-14" in
+    // docs/known-issues/wildfly-standalone-boot-stw-jit-takeover-hang.md):
+    // `buckets` was captured before `map_hash_key`'s `hashCode()` dispatch,
+    // and the bucket-chain `node` local was captured before
+    // `map_keys_equal`'s `equals()` dispatch, both then reused unpinned --
+    // reached from real `CapabilityRegistration`/registry code via
+    // `lhm_get`/`lhm_state`. See
+    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    let buckets_pin = ctx.pin_native_root(buckets);
+    let key_pin = pin_value(ctx, *key);
+    let key_for_hash = read_pinned_elem(ctx, key_pin, *key);
+    let (hash, is_null) = match key_for_hash {
+        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false),
         Value::Object(None) => (0, true),
-        _ => return Ok(None),
+        _ => {
+            ctx.unpin_native_roots(buckets_pin);
+            return Ok(None);
+        }
     };
+    let buckets = ctx.read_native_pin(buckets_pin, buckets);
     let idx = map_bucket_index(hash, cap);
     let mut node_val = ctx.get_array_element(buckets, idx);
-    while let Value::Object(Some(node)) = node_val {
+    while let Value::Object(Some(mut node)) = node_val {
         let node_key = ctx.get_field(node, LHM_NODE_KEY);
         if is_null {
             if matches!(node_key, Value::Object(None)) {
+                ctx.unpin_native_roots(buckets_pin);
                 return Ok(Some(node));
             }
-        } else if let (Value::Object(Some(nk)), Value::Object(Some(k))) = (node_key, key) {
-            if map_keys_equal(ctx, nk, *k)? {
+        } else if let Value::Object(Some(nk)) = node_key {
+            let key_cur = match read_pinned_elem(ctx, key_pin, *key) {
+                Value::Object(Some(k)) => k,
+                _ => {
+                    ctx.unpin_native_roots(buckets_pin);
+                    return Ok(None);
+                }
+            };
+            let node_pin = ctx.pin_native_root(node);
+            let nk_pin = ctx.pin_native_root(nk);
+            let nk = ctx.read_native_pin(nk_pin, nk);
+            let eq = map_keys_equal(ctx, nk, key_cur)?;
+            node = ctx.read_native_pin(node_pin, node);
+            ctx.unpin_native_roots(nk_pin);
+            ctx.unpin_native_roots(node_pin);
+            if eq {
+                ctx.unpin_native_roots(buckets_pin);
                 return Ok(Some(node));
             }
         }
         node_val = ctx.get_field(node, LHM_NODE_NEXT);
     }
+    ctx.unpin_native_roots(buckets_pin);
     Ok(None)
 }
 
@@ -23129,11 +23167,30 @@ fn native_lhm_put_evict(
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
 
+    // GC-safety (TIMEOUT_NO_WARN investigation, 2026-07-14): `this` is read
+    // again below across map_hash_key/lhm_resize/lhm_find_node, each of
+    // which can dispatch real Java hashCode()/equals() bytecode and trigger
+    // a moving GC. Pin here and re-read before each subsequent use --
+    // confirmed live via CRATONVM_DBG_STALE_OBJREF (panicked inside
+    // lhm_state, reached from here, on a stale `this`). See
+    // docs/known-issues/wildfly-standalone-boot-stw-jit-takeover-hang.md.
+    let this_pin_early = ctx.pin_native_root(this);
+
     let hash = match key_val {
-        Value::Object(Some(k)) => map_hash_key(ctx, k)?,
+        Value::Object(Some(k)) => match map_hash_key(ctx, k) {
+            Ok(h) => h,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin_early);
+                return Err(e);
+            }
+        },
         Value::Object(None) => 0,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            ctx.unpin_native_roots(this_pin_early);
+            return Ok(Some(Value::Object(None)));
+        }
     };
+    let this = ctx.read_native_pin(this_pin_early, this);
 
     // Check for resize. Also initialize table when buckets is None
     // (e.g. `org/springframework/core/annotation/AnnotationAttributes`
@@ -23148,9 +23205,18 @@ fn native_lhm_put_evict(
     if initial_buckets.is_none() || size + 1 > (cap * 3) / 4 {
         lhm_resize(ctx, this);
     }
+    let this = ctx.read_native_pin(this_pin_early, this);
 
     // Check for existing key
-    if let Some(node) = lhm_find_node(ctx, this, &key_val)? {
+    let found = match lhm_find_node(ctx, this, &key_val) {
+        Ok(f) => f,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin_early);
+            return Err(e);
+        }
+    };
+    let this = ctx.read_native_pin(this_pin_early, this);
+    if let Some(node) = found {
         let old = ctx.get_field(node, LHM_NODE_VALUE);
         ctx.set_field(node, LHM_NODE_VALUE, value);
         // Access-order semantics: re-inserting a value for an existing key
@@ -23160,6 +23226,7 @@ fn native_lhm_put_evict(
         if lhm_is_access_order(ctx, this) {
             lhm_move_to_tail(ctx, this, node);
         }
+        ctx.unpin_native_roots(this_pin_early);
         return Ok(Some(old));
     }
 
@@ -23167,9 +23234,13 @@ fn native_lhm_put_evict(
     let (buckets, size, cap) = lhm_state(ctx, this);
     let buckets = match buckets {
         Some(b) => b,
-        None => return Ok(Some(Value::Object(None))),
+        None => {
+            ctx.unpin_native_roots(this_pin_early);
+            return Ok(Some(Value::Object(None)));
+        }
     };
     let idx = map_bucket_index(hash, cap);
+    ctx.unpin_native_roots(this_pin_early);
 
     // gcstress residual face-1 fix — `lhm_alloc_node` allocates and can
     // trigger a moving young GC that relocates `this` and `buckets` (bare
