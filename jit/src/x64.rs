@@ -2674,6 +2674,77 @@ pub fn callee_saved_gpr_local_homes_enabled() -> bool {
     })
 }
 
+/// Pure-kernel callee-saved-GPR local homes (default **ON**, opt out with
+/// `CRATONVM_JIT_KERNEL_REG_LOCALS=0`).
+///
+/// A narrow, provably-safe subset of the gated allocator above: NON-REFERENCE
+/// locals of a **pure kernel** method-entry body get callee-saved register
+/// homes. "Pure kernel" means the method has no invokes of any kind (no
+/// invoke_info/direct_calls/MIC/PIC/indy sites), no field or static-field
+/// ops, no allocation, no typechecks, no inline sites, and no speculative
+/// BCE guards — i.e. nothing but arithmetic, array element access, and
+/// branches (the QuickBench sieve/matrix shape). Under those constraints the
+/// documented miscompile family ("live Java values kept exclusively in
+/// callee-saved GPRs across calls/OSR transitions") is structurally
+/// unreachable:
+///  * no calls → no value survives a call in a register;
+///  * reference locals are excluded (see `regalloc::find_reference_locals`),
+///    so GC root scanning and every deopt/exception path that reads locals
+///    from frame slots is unaffected;
+///  * the body is published WITHOUT OSR entry points (`osr_pc_to_native`
+///    left empty), so no OSR transition can enter it mid-loop — the
+///    separately-compiled OSR artifact keeps memory-homed locals;
+///  * the remaining implicit-exception paths (AIOOBE/NPE stubs) return the
+///    deopt sentinel and re-execute the whole call in the interpreter from
+///    the original arguments, never reading JIT frame local slots.
+///
+/// Requested per-compile by `try_compile` (method-entry only) via
+/// [`set_kernel_reg_homes_request`]; OSR compiles (`compile_osr_artifact`)
+/// and the legacy [`compile`] test wrapper never set it.
+pub fn kernel_reg_locals_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("CRATONVM_JIT_KERNEL_REG_LOCALS")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
+thread_local! {
+    /// Per-compile request flag for the pure-kernel GPR local homes (see
+    /// [`kernel_reg_locals_enabled`]). Set by the method-entry compile path
+    /// immediately before calling [`compile_with_param_slots`]; consumed
+    /// (taken) at its entry so it can never leak into a later compile on the
+    /// same thread.
+    static KERNEL_REG_HOMES_REQUEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Request pure-kernel GPR local homes for the NEXT `compile_with_param_slots`
+/// call on this thread (method-entry compiles only — never OSR).
+pub fn set_kernel_reg_homes_request(on: bool) {
+    KERNEL_REG_HOMES_REQUEST.with(|c| c.set(on));
+}
+
+thread_local! {
+    /// Internal handshake between `compile_with_param_slots` (which decides
+    /// whether the pure-kernel GPR local homes engage) and `Compiler::new`
+    /// (which owns the legacy env-flag gate that would otherwise zero the
+    /// register assignments). Set strictly around the `Compiler::new` call.
+    static KERNEL_REG_HOMES_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Adjacent store→load reload elision (default **ON**, opt out with
+/// `CRATONVM_JIT_NO_SLOT_MIRROR=1`). See `Compiler::slot_mirror`.
+fn slot_mirror_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_NO_SLOT_MIRROR").is_none())
+}
+
 fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
     let mut targets = vec![false; code_len];
     let mut pc = 0usize;
@@ -7471,6 +7542,31 @@ struct Compiler {
     /// `emit_oop_map_for_safepoint` can look up the local-oop mask without
     /// threading `pc` through every safepoint call site.
     cur_bc_pc: usize,
+    /// Adjacent store→load reload elision: `(frame_offset, gpr, buf_pos)`
+    /// recorded by `emit_store_local`/`emit_load_local` — "register `gpr`
+    /// holds the exact value of `[rbp - frame_offset]`, and the buffer stood
+    /// at `buf_pos` right after that instruction". Consulted by
+    /// `emit_load_local`, which substitutes a reg-reg move (or nothing) for
+    /// the reload **only when `buf_pos == self.buf.pos()`** — i.e. nothing
+    /// whatsoever has been emitted in between, so no instruction can have
+    /// clobbered the register and no code path can have joined in between
+    /// (any join at a bytecode boundary is additionally severed by the
+    /// explicit invalidation at branch-target PCs in the main loop, and
+    /// speculative-inline emission suppresses the mechanism entirely — its
+    /// mini-emitter replays CALLEE bytecode whose internal joins this
+    /// position rule cannot see). The STORE itself is never elided, so frame
+    /// slots always hold canonical values for GC scans, OSR entries, deopt
+    /// re-execution, and the interpreter.
+    ///
+    /// This kills the dominant cost of the template backend's operand-stack
+    /// round-trips (`mov [rbp-X],rax; mov rax,[rbp-X]`) — on store-forwarding
+    /// latency inside loop-carried dependency chains it was worth ~25-40% on
+    /// pure-int array kernels (QuickBench sieve). Opt out with
+    /// `CRATONVM_JIT_NO_SLOT_MIRROR=1`.
+    slot_mirror: Option<(i32, u8, usize)>,
+    /// `true` while `try_emit_inline` replays callee bytecode (see
+    /// `slot_mirror`): suppresses both recording and consumption.
+    slot_mirror_suppressed: bool,
     /// Stage 3 — whether the moving-safe precise-stack-map machinery is on
     /// (gate `CRATONVM_PRECISE_JIT_MAPS`). Gates the prologue frame-record
     /// call and the per-safepoint id store. Off → byte-identical default path.
@@ -8256,7 +8352,8 @@ impl Compiler {
         let raw_local_assignments = alloc_result.assignments;
         let raw_used_callee_saved = alloc_result.used_callee_saved;
         let raw_local_assignments_len = raw_local_assignments.len();
-        let gpr_local_homes_enabled = callee_saved_gpr_local_homes_enabled();
+        let gpr_local_homes_enabled = callee_saved_gpr_local_homes_enabled()
+            || KERNEL_REG_HOMES_ACTIVE.with(|c| c.get());
         let local_assignments = if gpr_local_homes_enabled {
             raw_local_assignments
         } else {
@@ -8458,6 +8555,8 @@ impl Compiler {
             uses_long_float_double: false,
             local_oop_reached: Vec::new(),
             cur_bc_pc: 0,
+            slot_mirror: None,
+            slot_mirror_suppressed: false,
             precise_maps,
             inline_rbp_tls_disp,
             verify_inline_frame_record,
@@ -10599,10 +10698,31 @@ impl Compiler {
     }
 
     /// MOV reg, [rbp - offset]
+    ///
+    /// Reload elision (see the `slot_mirror` field doc): when the immediately
+    /// preceding instruction was a store/load of the SAME slot — nothing
+    /// emitted since, verified by exact buffer-position equality — substitute
+    /// a register-register move (or nothing) for the memory reload. The
+    /// mirror is refreshed to the destination register so back-to-back
+    /// consumers keep chaining.
     fn emit_load_local(&mut self, reg: u8, offset: i32) {
+        if !self.slot_mirror_suppressed {
+            if let Some((moff, mreg, mpos)) = self.slot_mirror {
+                if moff == offset && mpos == self.buf.pos() && slot_mirror_enabled() {
+                    self.emit_mov_reg_reg(reg, mreg); // no-op when reg == mreg
+                    self.slot_mirror = Some((offset, reg, self.buf.pos()));
+                    return;
+                }
+            }
+        }
         self.rex_w_r(reg);
         self.buf.emit_byte(0x8B); // MOV r64, r/m64
         self.modrm_rbp_disp(reg, offset);
+        if !self.slot_mirror_suppressed {
+            // A completed load is itself a valid mirror source: `reg` now
+            // holds `[rbp - offset]` with nothing emitted after it.
+            self.slot_mirror = Some((offset, reg, self.buf.pos()));
+        }
     }
 
     /// MOV reg, [rbp + positive_disp] — load a stack-passed argument from
@@ -10636,6 +10756,12 @@ impl Compiler {
         self.rex_w_r(reg);
         self.buf.emit_byte(0x89); // MOV r/m64, r64
         self.modrm_rbp_disp(reg, offset);
+        if !self.slot_mirror_suppressed {
+            // Record the store for the adjacent-reload elision (see
+            // `slot_mirror`): the STORE always stays in the stream; only an
+            // immediately-following reload of the same slot may be elided.
+            self.slot_mirror = Some((offset, reg, self.buf.pos()));
+        }
     }
 
     // ── CMOV helpers (round-8 perf, round-7 jit #7) ──────────────────
@@ -13981,7 +14107,20 @@ impl Compiler {
         let self_call_patches_checkpoint = self.self_call_patches.len();
         let bounds_check_stubs_checkpoint = self.bounds_check_stubs.len();
         let null_check_store_stubs_checkpoint = self.null_check_store_stubs.len();
-        if self.try_emit_inline_body(pc) {
+        // Reload-elision mirror: the inline mini-emitter replays CALLEE
+        // bytecode whose internal joins the position rule cannot see (the
+        // main loop's branch-target invalidation covers only OUTER-method
+        // pcs). Suppress the mechanism for the duration and drop any live
+        // mirror on both entry and exit; a bail additionally rewinds the
+        // buffer, which would otherwise let a stale recorded position
+        // "validate" against different, re-emitted code.
+        let mirror_suppressed_checkpoint = self.slot_mirror_suppressed;
+        self.slot_mirror = None;
+        self.slot_mirror_suppressed = true;
+        let inline_ok = self.try_emit_inline_body(pc);
+        self.slot_mirror_suppressed = mirror_suppressed_checkpoint;
+        self.slot_mirror = None;
+        if inline_ok {
             true
         } else {
             // Discard every speculative side effect of the abandoned
@@ -16891,6 +17030,14 @@ impl Compiler {
             // mask for this instruction without threading `pc` through every
             // safepoint call site.
             self.cur_bc_pc = pc;
+            // Reload-elision mirror (see `slot_mirror`): a branch-target PC is
+            // a control-flow join — a path jumping here did NOT execute the
+            // instruction the mirror describes, so the register/slot pairing
+            // must not survive across it. (This is the only zero-emitted-bytes
+            // join the buffer-position rule cannot catch.)
+            if branch_targets[pc] {
+                self.slot_mirror = None;
+            }
             // DCE: if we're in dead code and this PC isn't a branch target, skip it
             if dead {
                 if branch_targets[pc] {
@@ -25870,6 +26017,9 @@ pub fn compile_with_param_slots(
     indy_info: Vec<(usize, usize, u8)>,
 ) -> Option<CompiledMethod> {
     let verified_max_stack = PENDING_VERIFIED_MAX_STACK.with(|c| c.borrow_mut().take());
+    // Consume the pure-kernel GPR local-homes request FIRST so an early bail
+    // below can never leak it into an unrelated later compile on this thread.
+    let kernel_reg_homes_requested = KERNEL_REG_HOMES_REQUEST.with(|c| c.take());
 
     // Estimate buffer size: extra for invoke dispatch calls (~40 bytes each).
     // This is a heuristic only — see the `buf.overflowed()` bailout below for
@@ -26137,6 +26287,50 @@ pub fn compile_with_param_slots(
     let alloc_result =
         super::regalloc::allocate_registers(code, code_len, max_locals, num_params, &loops);
 
+    // Pure-kernel GPR local homes (see `kernel_reg_locals_enabled` for the
+    // full safety argument). Consume the per-compile request (set only by the
+    // method-entry compile path) so it can never leak into a later compile,
+    // then engage only for the pure-kernel shape: no calls of any kind, no
+    // field/static ops, no allocation, no typechecks, no inline sites, and no
+    // speculative BCE guards (those deopt with frame-stashed state). Reference
+    // locals are masked back to frame homes, so GC visibility is unchanged.
+    let kernel_reg_homes = kernel_reg_homes_requested
+        && kernel_reg_locals_enabled()
+        && !callee_saved_gpr_local_homes_enabled()
+        && invoke_info.is_empty()
+        && direct_calls.is_empty()
+        && mic_slots.is_empty()
+        && pic_slots.is_empty()
+        && indy_info.is_empty()
+        && field_info.is_empty()
+        && static_field_info.is_empty()
+        && new_info.is_empty()
+        && anewarray_info.is_empty()
+        && multianewarray_info.is_empty()
+        && typecheck_info.is_empty()
+        && compact_field_info.is_empty()
+        && inline_sites.is_empty()
+        && speculative_bce_guards.is_empty();
+    let alloc_result = if kernel_reg_homes {
+        let mut ar = alloc_result;
+        let ref_mask =
+            super::regalloc::find_reference_locals(code, code_len, max_locals) | param_oop_mask;
+        for (i, assignment) in ar.assignments.iter_mut().enumerate() {
+            if i >= 64 || (ref_mask >> i) & 1 == 1 {
+                *assignment = None;
+            }
+        }
+        // Recompute the save/restore set from the surviving assignments so
+        // the prologue/epilogue and frame sizing stay consistent.
+        let mut used: Vec<u8> = ar.assignments.iter().flatten().copied().collect();
+        used.sort_unstable();
+        used.dedup();
+        ar.used_callee_saved = used;
+        ar
+    } else {
+        alloc_result
+    };
+
     // Precise escape re-analysis. `jit_scan` produced `non_escaping_new`
     // with a conservative empty shape map (it has no CP resolver). Now
     // that `invoke_info` carries every invokespecial's resolved
@@ -26248,6 +26442,7 @@ pub fn compile_with_param_slots(
             found
         };
 
+    KERNEL_REG_HOMES_ACTIVE.with(|c| c.set(kernel_reg_homes));
     let mut compiler = Compiler::new(
         method_key.to_string(),
         buf,
@@ -26267,6 +26462,7 @@ pub fn compile_with_param_slots(
         cache_jit_thread_for_inline_new,
         reserve_stack_floor,
     );
+    KERNEL_REG_HOMES_ACTIVE.with(|c| c.set(false));
     compiler.param_jvm_slots = param_jvm_slots.to_vec();
     compiler.param_slot_span = param_slot_span;
     compiler.method_key = method_key.to_string();
@@ -26636,7 +26832,20 @@ pub fn compile_with_param_slots(
     // back-edges skip it) while `osr_entry_native[header]` points *before* it
     // (so a cold OSR entry runs the hoist initialisation). For every other PC
     // the two are identical.
-    cm.osr_pc_to_native = Some(compiler.osr_entry_native);
+    //
+    // Pure-kernel GPR local homes: publish NO OSR entries for such a body.
+    // Its non-reference locals live exclusively in callee-saved registers,
+    // and the OSR trampoline's frame-seeded entry contract is exactly the
+    // "OSR transition" the kernel-homes safety argument excludes. The OSR
+    // pipeline compiles its own separate, memory-homed artifact
+    // (`compile_osr_artifact` never requests kernel homes), so loop-hot
+    // methods still get OSR service.
+    cm.osr_pc_to_native = if kernel_reg_homes {
+        // Same length, every entry -1: `can_osr_enter` refuses every pc.
+        Some(vec![-1; compiler.osr_entry_native.len()])
+    } else {
+        Some(compiler.osr_entry_native)
+    };
     cm.osr_num_locals = compiler.num_locals;
     cm.osr_num_reg_locals = compiler.num_reg_locals;
 
