@@ -10584,9 +10584,16 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     );
     r.register(hex, "getRequestURI", "()Ljava/net/URI;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let s = ctx.get_field(this, 1);
-        let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 6);
-        ctx.set_field(uri, 0, s);
+        // The exchange stores the request target as a String. Do not place it
+        // in a guessed URI field slot: in the real JDK layout slot 0 is the
+        // scheme, not the full external form, which made toString()/getPath()
+        // observe an empty URI. `make_uri` writes the canonical URI fields by
+        // name and therefore works for both synthetic and real-JDK layouts.
+        let raw = match ctx.get_field(this, 1) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let uri = make_uri(ctx, &raw);
         Ok(Some(Value::Object(Some(uri))))
     });
     // Request/response headers are stored on the exchange as REAL
