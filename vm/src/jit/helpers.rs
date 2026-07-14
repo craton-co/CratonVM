@@ -2173,33 +2173,51 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     } else {
         dbg_tlabmiss(0); // oversized for TLAB
     }
-    // Fallible young → old-gen alloc (preserves alloc_object's old-gen spill);
-    // on exhaustion surface a catchable OutOfMemoryError instead of the hard
-    // abort in alloc_young. The `new` codegen's emit_post_alloc_oom_check bails
-    // on the 0/null sentinel and routes the OOME through the method's exception
-    // table (matching the interpreter's gc_alloc_object).
+    // Fallible young → old-gen alloc (preserves alloc_object's old-gen spill).
+    // A successful young-space probe above does not guarantee this allocation
+    // will succeed: the TLAB refill may need a larger contiguous span than the
+    // object itself, so it can fall through to an already-full old generation.
+    // In that case force one orchestrated collection and retry before reporting
+    // OOM.  This is essential for the JIT-active non-moving collector: its
+    // in-place old sweep runs during that collection and can reclaim dead
+    // promoted objects without relocating conservative JIT roots.
     let obj_ref = match heap.try_alloc_object_full(class_id, num_fields as usize) {
         Some(o) => o,
         None => {
-            // G1 last-ditch full cycle + one retry (see jit_newarray).
-            if !jit_g1_last_ditch_full_cycle(vm) {
+            if let Some((thread, _guard)) = jit_thread_mut() {
+                thread.tlab.retire();
+                crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+            }
+            if !crate::runtime::interpreter::gc_overhead_limit_exceeded(vm) {
+                if let Some(obj_ref) = heap.try_alloc_object_full(class_id, num_fields as usize) {
+                    obj_ref
+                } else if !jit_g1_last_ditch_full_cycle(vm) {
+                    return jit_alloc_oom(
+                        vm,
+                        &format!(
+                            "Java heap space (new_object class_id {class_id_raw} fields {num_fields})"
+                        ),
+                    );
+                } else {
+                    match heap.try_alloc_object_full(class_id, num_fields as usize) {
+                        Some(o) => o,
+                        None => {
+                            return jit_alloc_oom(
+                                vm,
+                                &format!(
+                                    "Java heap space (new_object class_id {class_id_raw} fields {num_fields})"
+                                ),
+                            )
+                        }
+                    }
+                }
+            } else {
                 return jit_alloc_oom(
                     vm,
                     &format!(
                         "Java heap space (new_object class_id {class_id_raw} fields {num_fields})"
                     ),
                 );
-            }
-            match heap.try_alloc_object_full(class_id, num_fields as usize) {
-                Some(o) => o,
-                None => {
-                    return jit_alloc_oom(
-                        vm,
-                        &format!(
-                        "Java heap space (new_object class_id {class_id_raw} fields {num_fields})"
-                    ),
-                    )
-                }
             }
         }
     };

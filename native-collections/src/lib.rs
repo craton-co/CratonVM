@@ -10446,6 +10446,21 @@ fn sort_with_comparator(
     // The comparison is fallible: a comparator that throws propagates the
     // error out and short-circuits the sort. A non-Int return is treated as
     // 0 ("equal"), preserving the previous insertion-sort semantics.
+    //
+    // GC-SAFETY (Family-1 stale-ObjectRef fix, follow-up to the TreeMap/TreeSet
+    // comparator_compare fix): `merge_sort_fallible` dispatches the caller's
+    // (possibly `thenComparing`-chained) Comparator via `comparator_compare`
+    // up to O(n log n) times, and each dispatch can invoke a user lambda and
+    // trigger a moving GC. `data` and `comparator` were already pinned/
+    // refreshed here, but the `list` parameter itself was held raw across the
+    // WHOLE sort and dereferenced only at the very end by
+    // `values_view_source(ctx, list)` (which reads `list`'s class via
+    // `al_state`/`unwrap_unmod`/`class_id_of_object`) -- pin it too. Confirmed
+    // via a targeted repro (concurrent `ArrayList.sort(Comparator
+    // .comparingInt(f).thenComparing(g))` under GC pressure) as the actual
+    // root cause of the `Comparator.lambda$thenComparing$...` (class_id 6)
+    // panics surviving the TreeMap/TreeSet fix.
+    let list_pin = ctx.pin_native_root(list);
     let data_pin = ctx.pin_native_root(data);
     let cmp_pin = ctx.pin_native_root(comparator);
     let (_, elem_handles) = pin_value_slice(ctx, &elems);
@@ -10470,7 +10485,7 @@ fn sort_with_comparator(
         }
     });
     if let Err(e) = sort_result {
-        ctx.unpin_native_roots(data_pin);
+        ctx.unpin_native_roots(list_pin);
         return Err(e);
     }
 
@@ -10484,7 +10499,8 @@ fn sort_with_comparator(
         let val = read_pinned_elem(ctx, elem_handles[i], elems[i]);
         ctx.set_array_element(data, out, val);
     }
-    ctx.unpin_native_roots(data_pin);
+    let list = ctx.read_native_pin(list_pin, list);
+    ctx.unpin_native_roots(list_pin);
     // Detach from `Map.values()` live-view semantics. Real `Map.values()`'s
     // return type doesn't implement `List` (no `.sort()` possible on it at
     // all on HotSpot) — reaching this native means whatever called
@@ -12438,11 +12454,35 @@ fn stream_apply_chain_full(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
 ) -> Result<Vec<Value>, MethodCallFailed> {
+    // GC-SAFETY: the pull loop below re-invokes the chain's user lambdas
+    // (map/flatMap/filter/peek) once per emitted element via `stream_pull` ->
+    // `stream_process_chain` -> `invoke_deferred_stream_lambda`, and each
+    // dispatch can allocate and trigger a moving GC. Earlier iterations'
+    // results were being accumulated into `out` as bare `Value`s with no pin,
+    // so a LATER element's lambda call could relocate an EARLIER element
+    // already sitting in `out`, leaving it stale by the time a downstream
+    // terminal (e.g. `collect(toUnmodifiableList())`'s `make_list_of`) reads
+    // it back. Pin every emitted value immediately and rebuild `out` from
+    // those pins once the whole pull completes. Observed as class_id 64/65
+    // panics inside Xerces' `DefaultXMLSequence` ctor's `particles.stream()
+    // .map(...).flatMap(...).collect(Collectors.toUnmodifiableList())`
+    // pipeline.
     let mut out = Vec::new();
-    stream_pull(ctx, this, |_c, v| {
+    let mut handles: Vec<usize> = Vec::new();
+    let mut base = usize::MAX;
+    stream_pull(ctx, this, |c, v| {
+        let h = pin_value(c, v);
+        if base == usize::MAX {
+            base = h;
+        }
+        handles.push(h);
         out.push(v);
         Ok(PullStep::Continue)
     })?;
+    let out = read_value_slice(ctx, &handles, &out);
+    if base != usize::MAX {
+        ctx.unpin_native_roots(base);
+    }
     Ok(out)
 }
 
@@ -14278,9 +14318,26 @@ fn native_stream_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             found = Some(v);
             Ok(PullStep::Stop)
         })?;
+        // GC-SAFETY: `alloc_synthetic` below allocates the Optional wrapper and
+        // can trigger a moving GC; `found` is a bare `Value` captured from the
+        // pull closure with no pin. Pin it first and refresh after, matching
+        // the eager branch a few lines below.
+        let found_pin = match found {
+            Some(Value::Object(Some(o))) => Some(ctx.pin_native_root(o)),
+            _ => None,
+        };
         let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
         if let Some(fv) = found {
+            let fv = match (fv, found_pin) {
+                (Value::Object(Some(o)), Some(pin)) => {
+                    Value::Object(Some(ctx.read_native_pin(pin, o)))
+                }
+                _ => fv,
+            };
             ctx.set_field(opt, OPT_FIELD_VALUE, fv);
+        }
+        if let Some(pin) = found_pin {
+            ctx.unpin_native_roots(pin);
         }
         return Ok(Some(Value::Object(Some(opt))));
     }
@@ -19837,8 +19894,17 @@ fn make_comparing(ctx: &mut dyn NativeContext, args: &[Value], tag: i32) -> Meth
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // GC-SAFETY (Family-1 stale-ObjectRef fix, follow-up to the TreeMap/TreeSet
+    // comparator_compare fix): `make_comparator` allocates the tagged synthetic
+    // Comparator$Native object (via `alloc_synthetic` -> `ensure_class_initialized`
+    // + the allocation itself), either of which can run a `<clinit>` and trigger a
+    // moving GC. `key_fn` is a raw ObjectRef held across that call and reused
+    // afterward in `set_field` -- pin it first and refresh before the write.
+    let key_fn_pin = ctx.pin_native_root(key_fn);
     let cmp = make_comparator(ctx, tag);
+    let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
     ctx.set_field(cmp, CMP_FIELD_ARG1, Value::Object(Some(key_fn)));
+    ctx.unpin_native_roots(key_fn_pin);
     Ok(Some(Value::Object(Some(cmp))))
 }
 
@@ -19872,8 +19938,13 @@ fn native_comparator_reversed(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // GC-SAFETY: same `make_comparator` allocation hazard as `make_comparing`
+    // above -- pin `this` across it and refresh before the write-back.
+    let this_pin = ctx.pin_native_root(this);
     let cmp = make_comparator(ctx, CMP_TAG_REVERSED);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(cmp, CMP_FIELD_ARG1, Value::Object(Some(this)));
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(cmp))))
 }
 
@@ -19897,17 +19968,36 @@ fn make_then_comparing(
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // GC-SAFETY (Family-1 stale-ObjectRef fix, follow-up to the TreeMap/TreeSet
+    // comparator_compare fix -- this residual survived that fix because it's a
+    // DIFFERENT native entry point: comparator *construction*, not comparator
+    // *dispatch*). Building a `thenComparing*` comparator can allocate TWICE
+    // (the inner key-extractor comparator when `inner_tag` is `Some`, then the
+    // outer THEN_COMPARING comparator always) via `make_comparator` ->
+    // `alloc_synthetic` -> `ensure_class_initialized` + the allocation itself,
+    // either of which can run a `<clinit>` and trigger a moving GC. `this` and
+    // `arg1` are raw ObjectRefs read from `args` before either allocation and
+    // then written into fields afterward -- pin both up front, refresh right
+    // before each write. Observed as `Comparator.lambda$thenComparing$...`
+    // (class_id 6) panics surviving the TreeMap/TreeSet fix.
+    let this_pin = ctx.pin_native_root(this);
+    let arg1_pin = ctx.pin_native_root(arg1);
     let secondary = match inner_tag {
         None => arg1,
         Some(key_tag) => {
             let inner = make_comparator(ctx, key_tag);
+            let arg1 = ctx.read_native_pin(arg1_pin, arg1);
             ctx.set_field(inner, CMP_FIELD_ARG1, Value::Object(Some(arg1)));
             inner
         }
     };
+    let secondary_pin = ctx.pin_native_root(secondary);
     let cmp = make_comparator(ctx, CMP_TAG_THEN_COMPARING);
+    let this = ctx.read_native_pin(this_pin, this);
+    let secondary = ctx.read_native_pin(secondary_pin, secondary);
     ctx.set_field(cmp, CMP_FIELD_ARG1, Value::Object(Some(this)));
     ctx.set_field(cmp, CMP_FIELD_ARG2, Value::Object(Some(secondary)));
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(cmp))))
 }
 
