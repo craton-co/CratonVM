@@ -242,3 +242,38 @@ the diff itself.
    entirely that merely correlates with these commits.
 4. Only merge once a CLEAN-host repro loop shows a clear, reproducible improvement over the 7/15 baseline
    OK rate — not just STW_HANG=0, since TIMEOUT_NO_WARN is arguably just as bad a boot outcome.
+
+## Investigation update 2026-07-14: CDL deadlock fix merged; doc STAYS OPEN (TIMEOUT_NO_WARN residual)
+
+The CountDownLatch `monitor_enter` deadlock described above (root-caused via live gdb, previously pushed
+to `origin/fix/wildfly-stw-jit-takeover-20260713` but held back pending an `~80`-call-site audit) is now
+merged: `fix(gc): close CountDownLatch monitor_enter STW-barrier deadlock` (`native-api/src/registry.rs`,
+`native-builtins/src/lib.rs`, `vm/Cargo.toml`, `vm/src/vm/vm_exec.rs` — new opt-in
+`NativeContext::monitor_enter_gc_safe`, used only by the 3 live-gdb-confirmed CDL call sites; the other
+~80 `monitor_enter` callers are untouched, deliberately, per the audit in the prior addendum). The earlier
+broader `stamped_lock.rs` fix from that same branch was **dropped as redundant** — `dev` had already
+independently gained an equivalent (and structurally simpler — call-site-level blocking-region wrap, no
+lock-ordering hazard to manage) fix for `ReentrantReadWriteLock`/`StampedLock` via a different session's
+"5-class cluster" fix (`945e4492`, already on `dev` before this branch was rebased). Verified: isolated
+`cargo test -p cratonvm-vm --lib host_native_excludes_idle_thread_from_stw` passes; the full suite's other
+handful of failures (native-count-threshold drift, unrelated flaky tests) reproduce identically on an
+unmodified checkout — not a regression from this change. Merged to `dev` (`41b06719`), build-verified
+clean post-push.
+
+**This does NOT close the doc.** Two independent deadlock mechanisms behind the original "STW cross-thread
+JIT takeover ... taken=0" warning are now fixed (rwlock/StampedLock via `945e4492`, CountDownLatch via
+this fix) — `STW_HANG` (the case where that exact warning fires and then nothing) is meaningfully
+reduced. But a **third, larger-magnitude, and still-unexplained** failure mode dominates: `TIMEOUT_NO_WARN`
+— the boot process silently stalls earlier (mid sequential-extension-init, no STW warning ever printed) at
+a rate that stayed high (roughly 40-70% of attempts across several sampling rounds) even during a
+genuinely idle host window (freshly rebooted, `uptime` load 0.00/0.00/0.00, single user) — ruling out
+"it's just host contention" as a full explanation. This is NOT yet root-caused. See the prior addendum's
+"How to apply / next steps" section (poll the boot log for it going quiet, not for the STW warning, since
+this stall never prints one) — that guidance stands unchanged and is the correct starting point for
+whoever picks this up next. Given the volume of independent verification already invested here across
+two sessions (isolated-repro bisection across 4+ binaries, live-gdb captures, a genuinely idle-host
+sample) without pinning it down, this likely needs either a dedicated live-gdb session specifically
+targeting the TIMEOUT_NO_WARN stall (not the now-fixed STW-warning cases), or a completely different
+diagnostic approach (e.g. periodic `/proc/<pid>/stack` or `perf record` sampling across the whole stall
+window rather than a single point-in-time `bt`, since the earlier live-attach attempts for the
+STW-warning cases don't apply — there's no log line to poll for here).
