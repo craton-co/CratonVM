@@ -541,3 +541,5 @@ combined) rather than starting over — the false-positive fixes from this sessi
 whatever script version comes next. Prioritize `servlet.rs` and `wildfly_naming.rs`/`wildfly_security.rs`
 next (smaller, WildFly-boot-relevant, realistic to finish in one session) before attempting the three giant
 Phase-N files.
+
+**Addendum**: servlet.rs (14 functions, full pass) and spring_startup_bootstrap.rs (19 functions, full pass) were both fully triaged and fixed same-day by a sub-agent of this sweep session — commit 2d609591 (merged on top of e3d5fbb4/139e2644). Both files are now COMPLETE, not partial ("still-untriaged" list above should drop them). cargo test -p cratonvm-native-builtins --lib: 2983 passed / 7 failed, identical pre-existing baseline.
