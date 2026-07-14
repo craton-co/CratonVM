@@ -53721,26 +53721,6 @@ fn pattern_realjdk_field_indices(ctx: &mut dyn NativeContext) -> Option<PatternF
     })
 }
 
-/// Return the semantic capture count stored by the real JDK Pattern. This
-/// includes group zero. Some supported JDK Matcher layouts overallocate the
-/// backing `groups[]` array (for example, ten capture pairs for a one-group
-/// pattern), so array length is a capacity check, not the group count.
-fn matcher_realjdk_java_capture_count(
-    ctx: &mut dyn NativeContext,
-    matcher: ObjectRef,
-    idx: MatcherFieldIndices,
-    pattern_idx: PatternFieldIndices,
-) -> Option<usize> {
-    let pattern = match ctx.get_field(matcher, idx.parent_pattern) {
-        Value::Object(Some(pattern)) => pattern,
-        _ => return None,
-    };
-    let count = ctx
-        .get_field(pattern, pattern_idx.capturing_group_count)
-        .as_int()?;
-    (count > 0).then_some(count as usize)
-}
-
 fn matcher_realjdk_capture_layout_valid(
     rust_capture_count: usize,
     java_capture_count: usize,
@@ -53753,15 +53733,10 @@ fn matcher_realjdk_capture_layout_valid(
 
 fn matcher_realjdk_capture_layout_ok(
     ctx: &mut dyn NativeContext,
-    matcher: ObjectRef,
-    idx: MatcherFieldIndices,
-    pattern_idx: PatternFieldIndices,
-    re: &JavaRegex,
+    capture_count: usize,
     groups: ObjectRef,
 ) -> bool {
-    matcher_realjdk_java_capture_count(ctx, matcher, idx, pattern_idx).is_some_and(|count| {
-        matcher_realjdk_capture_layout_valid(re.captures_len(), count, ctx.array_length(groups))
-    })
+    ctx.array_length(groups) >= capture_count.saturating_mul(2)
 }
 
 /// One matcher's decoded input text plus the UTF-8-byte <-> UTF-16-code-unit
@@ -53788,6 +53763,10 @@ struct MatcherRealCache {
     /// `usePattern(Pattern)` swapping the compiled pattern invalidates this
     /// entry too.
     pattern_identity: i32,
+    /// The semantic capture count, validated against the compiled Rust regex
+    /// on cache construction. The exact Pattern object is part of the cache
+    /// key, so steady-state find calls only need to recheck groups[] capacity.
+    capture_count: usize,
     utf8: std::sync::Arc<str>,
     /// `byte_to_utf16[byte_offset] == utf16 code-unit offset at that byte`.
     /// Length `utf8.len() + 1` (entries at non-char-boundary byte offsets
@@ -53995,6 +53974,13 @@ fn matcher_realjdk_cached(
         .as_int()
         .unwrap_or(0);
     let re = compile_java_regex(&pattern_text, flags).ok()?;
+    let capture_count = ctx
+        .get_field(pattern_obj, pattern_idx.capturing_group_count)
+        .as_int()
+        .and_then(|count| (count > 0).then_some(count as usize))?;
+    if re.captures_len() != capture_count {
+        return None;
+    }
 
     let (byte_to_utf16, utf16_to_byte) = matcher_realjdk_build_offset_tables(&decoded);
     let utf8: std::sync::Arc<str> = std::sync::Arc::from(decoded.into_boxed_str());
@@ -54004,6 +53990,7 @@ fn matcher_realjdk_cached(
     let entry = std::sync::Arc::new(MatcherRealCache {
         text_identity,
         pattern_identity,
+        capture_count,
         utf8,
         byte_to_utf16,
         utf16_to_byte,
@@ -54243,7 +54230,7 @@ fn native_matcher_find_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     };
     // Group-count safety net, checked BEFORE any field mutation below. The
     // Pattern field is the semantic count; groups[] may be overallocated.
-    if !matcher_realjdk_capture_layout_ok(ctx, this, idx, pattern_idx, &cached.re, groups_obj) {
+    if !matcher_realjdk_capture_layout_ok(ctx, cached.capture_count, groups_obj) {
         return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]);
     }
 
@@ -54341,7 +54328,7 @@ fn native_matcher_find_at_realjdk(
     };
     // Group-count safety net — checked before any field mutation below. The
     // Pattern field is the semantic count; groups[] may be overallocated.
-    if !matcher_realjdk_capture_layout_ok(ctx, this, idx, pattern_idx, &cached.re, groups_obj) {
+    if !matcher_realjdk_capture_layout_ok(ctx, cached.capture_count, groups_obj) {
         return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]);
     }
 
@@ -54415,8 +54402,27 @@ fn matcher_realjdk_group_in_bounds(
     let Some(pattern_idx) = pattern_realjdk_field_indices(ctx) else {
         return false;
     };
-    let Some(capture_count) = matcher_realjdk_java_capture_count(ctx, matcher, idx, pattern_idx)
-    else {
+    let pattern = match ctx.get_field(matcher, idx.parent_pattern) {
+        Value::Object(Some(pattern)) => pattern,
+        _ => return false,
+    };
+    let matcher_raw = matcher.as_ptr() as usize;
+    let pattern_raw = pattern.as_ptr() as usize;
+    let cached_count = MATCHER_REAL_LAST_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|(cached_matcher, _, cached_pattern, _)| {
+                *cached_matcher == matcher_raw && *cached_pattern == pattern_raw
+            })
+            .map(|(_, _, _, entry)| entry.capture_count)
+    });
+    let capture_count = cached_count.or_else(|| {
+        ctx.get_field(pattern, pattern_idx.capturing_group_count)
+            .as_int()
+            .and_then(|count| (count > 0).then_some(count as usize))
+    });
+    let Some(capture_count) = capture_count else {
         return false;
     };
     matcher_realjdk_group_index_in_bounds(group, capture_count, ctx.array_length(groups_obj))
