@@ -146,3 +146,22 @@ the process — no retry, no later successful attempt, regardless of how quickly
   produces a different `RuntimeException: No provider factories exists for provider
   JpaConnectionProvider`), this is unavoidable for any `testsuite/model` class on this
   checkout — not a Liquibase-specific quirk, a general real-JDK Locale bug.
+
+---
+
+## FIXED 2026-07-14
+
+Fixed as a side effect of commit `f62d2073` ("pin `java.util.Properties`
+side-table bridges to `NativeKind::Bridge`") — the exact chain this doc's
+root-cause section traced (`Locale.<clinit>` → `BaseLocale.<clinit>` →
+`StaticProperty.<clinit>` → `StaticProperty.getProperty("java.home")`) bottoms
+out in `System.getProperties()`'s side-table read, which is what that commit
+restored. Not a boot-ordering hoist after all (the "reorder `SharedVm::new()`"
+next-step above turned out not to be necessary) — the actual defect was the
+same silently-dropped-`SyntheticStub` pattern as the `String.getBytes()`
+bug (see
+[`string-getbytes-empty-real-jdk-mode-FIXED.md`](string-getbytes-empty-real-jdk-mode-FIXED.md),
+now also `docs/internal/`), just reached via a different call chain.
+
+Verified: `Locale.getDefault()` and `Locale.US` both correctly print `en_US`
+(previously: `Object.toString()` fallback / `NoClassDefFoundError`).

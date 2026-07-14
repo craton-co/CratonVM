@@ -2,7 +2,7 @@
 
 Status: open — **severe**, broad blast radius suspected; root cause narrowed to a likely mechanism, not yet fixed
 
-Date observed: 2026-07-14, while verifying [`test-classserver-invalidpackage-classnotfound-not-thrown.md`](keycloak/test-classserver-invalidpackage-classnotfound-not-thrown.md) (now moved to `docs/internal/` as FIXED) on the Azure Linux build host.
+Date observed: 2026-07-14, while verifying [`keycloak-testclassserver-invalidpackage-classnotfound-FIXED.md`](keycloak-testclassserver-invalidpackage-classnotfound-FIXED.md) (now moved to `docs/internal/` as FIXED) on the Azure Linux build host.
 
 ## Summary
 
@@ -152,3 +152,63 @@ built from unmodified `dev` HEAD (`cratonvm-baseline-20260714`) and one with
 this session's unrelated classloader fix applied
 (`cratonvm-urlclfix-20260714`) — identical `0 / 0 / 0` result on both,
 confirming the bug is pre-existing and branch-independent.
+
+---
+
+## FIXED 2026-07-14
+
+**Root cause confirmed**: identical failure pattern to the same-day
+`java.util.Properties` regression (commit `f62d2073`, "pin java.util.Properties
+side-table bridges to `NativeKind::Bridge`"). `register_real_charset_natives`
+(`native-builtins/src/charset.rs:920`) — which registers all three modern
+`String.getBytes` overloads (`()[B`, `(Charset)[B`, `(String)[B`) plus the
+`CharsetEncoder`/`CharsetDecoder` bridge natives — never set its own registry
+category. Both of its real-JDK-mode call sites (`vm/src/vm/vm_init.rs:1556`,
+`:2125`) sit outside any `Bridge`/`Intrinsic` scope, so its registrations
+inherited the registry's default category, `SyntheticStub`. Commit `d8092acb`
+("fix-tests-real-jdk-contracts") made real-JDK mode silently DROP every
+`SyntheticStub` registration (`set_drop_synthetic_stubs(true)`), which is
+correct for genuine approximations but wrongly caught these — the file's own
+comments (lines 984-997) already documented that real `String.getBytes()`
+bytecode's `CharsetEncoder.encode` path reads zero chars against CratonVM's
+synthetic `Buffer` field-layout overlay, which is exactly what these natives
+exist to work around. With the natives dropped, every `getBytes()` call
+silently fell through to that broken real-bytecode path and returned an empty
+array — confirmed via the `CRATONVM_DBG_DROPPED_STUBS=1` diagnostic (added by
+the Properties fix) listing `java/lang/String.getBytes()[B]`,
+`.getBytes(Ljava/nio/charset/Charset;)[B`, and `.getBytes(Ljava/lang/String;)[B`
+all as dropped stubs.
+
+**Fix**: wrapped `register_real_charset_natives`'s entire body in
+`registry.with_category(NativeKind::Bridge, |registry| { ... })`, mirroring
+`f62d2073`'s fix to `register_properties_sidetable` — the same class of bug,
+same fix shape, different function.
+
+**Verified**: `"hello".getBytes()` / `.getBytes(UTF_8)` / `.getBytes("UTF-8")`
+all correctly return 5 (was 0 on both an unmodified-dev-HEAD baseline and a
+binary built immediately before this fix). Confirmed this was indeed the true
+root cause of the `com.sun.net.httpserver.HttpServer` "always `Content-Length:
+0`" symptom noted in
+[`keycloak-testclassserver-invalidpackage-classnotfound-FIXED.md`](keycloak-testclassserver-invalidpackage-classnotfound-FIXED.md)'s
+residual note — a live server/curl round trip now correctly returns real
+bytes with a matching `Content-Length`. Regression-checked `new
+String(bytes, charset)` (byte→String, the inverse direction),
+`Charset.encode(String)`/`Charset.decode(ByteBuffer)` (the
+`CharsetEncoder`/`CharsetDecoder` bridges this same fix also restores) — all
+correct.
+
+**Bonus finding**: this session also confirmed (not this session's own fix —
+already landed via `f62d2073`, which the Properties bug's own chain runs
+through) that
+[`locale-real-jdk-bootstrap-noclassdeffounderror-FIXED.md`](locale-real-jdk-bootstrap-noclassdeffounderror-FIXED.md)
+is ALSO fixed — `Locale.getDefault()`/`Locale.US` now both correctly print
+`en_US` instead of throwing. Moved to `docs/internal/` alongside this doc.
+
+**Residual — NOT fixed, new finding**: `com.sun.net.httpserver.HttpExchange
+.getRequestURI()` returns a `URI` object whose `toString()`/`getPath()` are
+empty strings, even though a directly-constructed `new URI(...)` works
+correctly — see
+[`httpserver-exchange-requesturi-getpath-empty.md`](../known-issues/httpserver-exchange-requesturi-getpath-empty.md).
+This still blocks the literal upstream Keycloak `TestClassServerTest` end to
+end, since `TestClassServer`'s handler routes on
+`httpExchange.getRequestURI().getPath()`.
