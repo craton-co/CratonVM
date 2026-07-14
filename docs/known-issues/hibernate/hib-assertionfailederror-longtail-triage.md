@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🟡 UNCLASSIFIED — catalog only. The 21 statistics-related candidates were removed after a complete current-`dev` pass; the rest need individual triage. HotSpot confirmation pending for the remaining entries. |
+| **Status** | 🟡 PARTIALLY RESOLVED — the current Azure checkpoint closes the UUID timeout mechanism and validates the full `sql.exec.*` and `InstantiationException` clusters. The remaining catalog still needs its own current-binary rerun. |
 | **Discovered** | 2026-07-11 full 4548-class suite audit, `dev` post `44f16ee2`+. |
 
 After pulling out every cluster with a clear shared signature elsewhere in
@@ -12,13 +12,49 @@ members of the resolved
 [statistics-counter cluster](../../internal/fixed-suite-bugs/hibernate-statistics-longadder-counters-zero-FIXED.md)
 and all 21 statistics-adjacent candidates from this catalog. Those candidates
 are no longer open entries, leaving **about 89 classes** here. Given the scale,
-this doc catalogs the remaining classes with visible sub-patterns rather than
-individually root-causing each one.
+this doc cataloged the remaining classes with visible sub-patterns rather than
+individually root-causing each one. The 2026-07-14 checkpoint below supersedes
+the affected historical cluster entries; do not use the original approximate
+class count as a current failure count.
+
+## 2026-07-14 Azure checkpoint — current status
+
+The dedicated Azure worktree was built as
+`cvhib-longtail-overlayfix-20260714-azure-012`. Three runtime fixes were
+committed and pushed on the dedicated branch before this checkpoint:
+
+- H2 native-path and JIT argument-handling corrections;
+- GC-safe, non-interned transient UUID strings; and
+- direct removal of a reclaimed collection-overlay key from its known owner.
+
+The last change removes the quadratic GC cleanup that the debugger captured in
+`native_collections::remove_overlay_owner_key` while AssertJ compared UUIDs.
+The pathological 300,000-comparison reproducer completed in 12.7 seconds
+(rather than stalling around 280,000 comparisons). Both real
+`UUidV6V7GeneratorTest` methods passed under `--nojit`: v6 in 71.967s and v7
+in 72.406s.
+
+The following historical catalog entries now have a complete current-binary
+pass and are not open residuals:
+
+- all 11 `sql.exec.*` classes listed below: 61 tests passed;
+- all six `InstantiationException` candidates listed below: 12 tests passed;
+- `annotations.fetchprofile.FetchProfileTest`: 7 tests passed in 28.261s.
+
+`sql.exec.EmbeddedIdEntityTest` specifically passed all six methods. Its
+historical Hibernate Models annotation-supplier diagnosis no longer reproduces
+on this runtime path, so it must not be used as the current root-cause theory.
+
+The timeout batch was intentionally stopped during `batch.BatchTest` at the
+user-requested checkpoint. The remaining timeout, schema-generation, and
+one-off entries have not been reclassified by this checkpoint; this note stays
+under `docs/known-issues` until those residuals are handled.
 
 ## Visible sub-patterns worth investigating first
 
-**`InstantiationException: Could not instantiate entity` (6 classes)** —
-likely the constructor-invocation sibling of the
+**`InstantiationException: Could not instantiate entity` (6 classes, resolved
+in the 2026-07-14 Azure checkpoint)** — originally suspected to be the
+constructor-invocation sibling of the
 [PropertyAccessException setter cluster](hib-bytecode-enhancement-propertyaccessexception-setter-cluster.md):
 ```
 annotations.cid.EmbeddedIdLazyOneToOneCriteriaQueryTest
@@ -29,8 +65,8 @@ bytecode.enhancement.merge.CompositeMergeTest
 bytecode.enhancement.refresh.RefreshTest
 ```
 
-**`sql.exec.*` bare `AssertionError` (9 classes)** — a tight package
-cluster, likely SQL-AST execution-path assertions with a shared cause:
+**`sql.exec.*` bare `AssertionError` (11 classes, resolved in the 2026-07-14
+Azure checkpoint)** — historical tight package cluster:
 ```
 sql.exec.EmbeddedIdEntityTest
 sql.exec.EntityWithEmbeddedIdTest

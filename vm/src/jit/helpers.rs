@@ -819,10 +819,56 @@ unsafe fn try_call_compiled_entry_inner(
                 let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
                 f(vm_ptr, args_slice[0], args_slice[1], args_slice[2])
             }
-            // TODO(round-6-wave-2): extend register-table coverage or
-            // emit stack-arg setup so 4+-arg with-ctx callees stay on
-            // the JIT fast-path. Until then return None so the caller
-            // bails to the interpreter (correct semantics, slower).
+            4 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    vm_ptr,
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                )
+            }
+            5 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    vm_ptr,
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                )
+            }
+            6 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    vm_ptr,
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                    args_slice[5],
+                )
+            }
+            7 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    vm_ptr,
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                    args_slice[5],
+                    args_slice[6],
+                )
+            }
             _ => return None,
         })
     } else {
@@ -857,7 +903,56 @@ unsafe fn try_call_compiled_entry_inner(
                 let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
                 f(args_slice[0], args_slice[1], args_slice[2], args_slice[3])
             }
-            // TODO(round-6-wave-2): see with-ctx branch above.
+            5 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                )
+            }
+            6 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                    args_slice[5],
+                )
+            }
+            7 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                    args_slice[5],
+                    args_slice[6],
+                )
+            }
+            8 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                    args_slice[5],
+                    args_slice[6],
+                    args_slice[7],
+                )
+            }
             _ => return None,
         })
     }
@@ -3530,12 +3625,12 @@ unsafe fn jit_typecheck_resolve(
         class_name.len(),
     );
     let cached_target = JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
-        cache.get().and_then(|(cached_vm, cached_ptr, cached_len, raw)| {
-            (cached_vm == cache_key.0
-                && cached_ptr == cache_key.1
-                && cached_len == cache_key.2)
-                .then(|| ClassId::new(raw))
-        })
+        cache
+            .get()
+            .and_then(|(cached_vm, cached_ptr, cached_len, raw)| {
+                (cached_vm == cache_key.0 && cached_ptr == cache_key.1 && cached_len == cache_key.2)
+                    .then(|| ClassId::new(raw))
+            })
     });
     let target_class_id_opt = if cached_target.is_some() {
         cached_target
@@ -3543,7 +3638,12 @@ unsafe fn jit_typecheck_resolve(
         let resolved = vm.class_manager.read().find_class_by_name(class_name);
         if let Some(target) = resolved {
             JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
-                cache.set(Some((cache_key.0, cache_key.1, cache_key.2, target.as_u32())))
+                cache.set(Some((
+                    cache_key.0,
+                    cache_key.1,
+                    cache_key.2,
+                    target.as_u32(),
+                )))
             });
         }
         resolved
@@ -4407,6 +4507,47 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     };
 
     let info_key = info_ptr as usize;
+    // Cached HashMap-native fast path — the FIRST per-callsite probe. The
+    // resolution/insertion slow path stays further down (after the compile
+    // probes); this early block only serves sites the cache has already
+    // resolved. Rationale: `HashMap.put/get` are registered natives with no
+    // bytecode, so neither the Integer cache below nor the virtual-dispatch
+    // machinery can ever serve them — yet every map call paid those probes
+    // first. Probing the map cache first costs the (now direct-called on
+    // x64, hence rarely dispatched) Integer sites one extra hash lookup and
+    // saves one on every map operation. The receiver class-id equality
+    // check preserves the exact-receiver guard; the `any_class_redefined`
+    // gate matches the resolution site below. Runs ahead of the recursion
+    // depth guard like the Integer block: the cached callbacks are native
+    // leaves that never re-enter JIT code.
+    if matches!(info.invoke_kind, 0 | 2)
+        && !args_slice.is_empty()
+        && !crate::classloading::any_class_redefined()
+    {
+        let cached =
+            HASHMAP_NATIVE_DISPATCH_CACHE.with(|cache| cache.borrow().get(&info_key).copied());
+        if let Some(entry) = cached {
+            let receiver_raw = args_slice[0] as u64;
+            if receiver_raw != 0 && (receiver_raw & 0x7) == 0 && receiver_raw < (1u64 << 48) {
+                if let Some(receiver) = vm.heap.is_object_address(receiver_raw as usize) {
+                    if vm.heap.class_id_of(receiver).as_u32() == entry.receiver_class_id {
+                        if let Some((thread, _guard)) = jit_thread_mut() {
+                            if let Some(result) = call_hashmap_native_raw(
+                                vm,
+                                thread,
+                                info,
+                                receiver,
+                                args_slice,
+                                entry.callback,
+                            ) {
+                                return result;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     if !crate::classloading::any_class_redefined() {
         let cached =
             INTEGER_NATIVE_DISPATCH_CACHE.with(|cache| cache.borrow().get(&info_key).copied());
@@ -4452,48 +4593,6 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         Ok(g) => g,
         Err(sentinel) => return sentinel,
     };
-
-    // Cached HashMap-native fast path, checked BEFORE the virtual-dispatch
-    // machinery below. The resolution/insertion slow path stays further down
-    // (after the compile probes); this early block only serves sites the
-    // cache has already resolved. Rationale: `HashMap.put/get` are registered
-    // natives with no bytecode, so for these sites the virtual-dispatch fast
-    // path below can never install a compiled entry — yet every call still
-    // paid its full probe cost (`virtual_dispatch_target_for_receiver` +
-    // `get_loaded_class_id` + `mic_callee_has_exception_table`: three
-    // class-manager read locks and a recursive method walk) before falling
-    // through to the HashMap cache on the slow path. On the 1M put/get probe
-    // that wasted work was ~12% of total runtime. The receiver class-id
-    // equality check preserves the exact-receiver guard, and the
-    // `any_class_redefined` gate matches the resolution site below.
-    if matches!(info.invoke_kind, 0 | 2)
-        && !args_slice.is_empty()
-        && !crate::classloading::any_class_redefined()
-    {
-        let cached =
-            HASHMAP_NATIVE_DISPATCH_CACHE.with(|cache| cache.borrow().get(&info_key).copied());
-        if let Some(entry) = cached {
-            let receiver_raw = args_slice[0] as u64;
-            if receiver_raw != 0 && (receiver_raw & 0x7) == 0 && receiver_raw < (1u64 << 48) {
-                if let Some(receiver) = vm.heap.is_object_address(receiver_raw as usize) {
-                    if vm.heap.class_id_of(receiver).as_u32() == entry.receiver_class_id {
-                        if let Some((thread, _guard)) = jit_thread_mut() {
-                            if let Some(result) = call_hashmap_native_raw(
-                                vm,
-                                thread,
-                                info,
-                                receiver,
-                                args_slice,
-                                entry.callback,
-                            ) {
-                                return result;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     // Fast path: check thread-local dispatch cache for a previously-compiled callee.
     // This avoids the JIT cache lock on every call.
@@ -5073,16 +5172,71 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
         });
         if let Some(class_id) = cached_class {
             if let Some((thread, _guard)) = jit_thread_mut() {
-                use cratonvm_native_api::NativeContext as _;
-                let mut ctx = crate::vm::NativeContextImpl { shared: vm, thread };
-                let object = ctx.alloc_object(class_id, 1);
+                // Direct TLAB bump — the SAME allocation function
+                // `NativeContextImpl::alloc_object`'s TLAB arm uses (full
+                // header init, fresh identity hash), minus that method's
+                // per-call clamp-cache scan, alloc-pool probes and context
+                // plumbing. The slot count is the class's real declared
+                // field count, resolved once per (vm, class) below — so the
+                // undersized-layout clamp is honored, not skipped. TLAB
+                // exhaustion (or an oversized layout) falls back to the full
+                // allocator with its old-gen spill/batch behavior.
+                thread_local! {
+                    // (vm_key, class_id, slots) — invalidated implicitly by
+                    // the enclosing `any_class_redefined` gate (field counts
+                    // only change through redefinition).
+                    static INTEGER_ALLOC_SLOTS: std::cell::Cell<Option<(usize, u32, u32)>> =
+                        const { std::cell::Cell::new(None) };
+                }
+                let slots = INTEGER_ALLOC_SLOTS.with(|cache| {
+                    if let Some((vk, cid, slots)) = cache.get() {
+                        if vk == vm_key && cid == class_id.as_u32() {
+                            return slots as usize;
+                        }
+                    }
+                    let resolved = vm
+                        .class_manager
+                        .read()
+                        .get_class(class_id)
+                        .map(|c| c.num_total_fields.max(1))
+                        .unwrap_or(1);
+                    // Cast: field counts are far below u32::MAX.
+                    cache.set(Some((vm_key, class_id.as_u32(), resolved as u32)));
+                    resolved
+                });
+                use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+                let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+                let tlab_object = if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
+                    crate::runtime::interpreter::tlab_alloc_object(
+                        thread,
+                        vm,
+                        class_id,
+                        slots,
+                        requested_size,
+                    )
+                } else {
+                    None
+                };
+                let object = match tlab_object {
+                    Some(object) => object,
+                    None => {
+                        use cratonvm_native_api::NativeContext as _;
+                        // Reborrow: `thread` is used again after this arm for
+                        // the pending-return publication.
+                        let mut ctx = crate::vm::NativeContextImpl {
+                            shared: vm,
+                            thread: &mut *thread,
+                        };
+                        ctx.alloc_object(class_id, 1)
+                    }
+                };
                 // Direct descriptor-typed write: `Integer.value` is declared
                 // `int` (field 0, descriptor `I`) — skip `ctx.set_field`'s
                 // per-call `class_id_of` + descriptor resolution and hand the
                 // heap the same normalized store it would have produced.
                 vm.heap.set_field_as(object, 0, Value::Int(value), b'I');
                 // Object-return handoff root (see `call_integer_native_raw`).
-                ctx.thread.native_pending_return = Some(object);
+                thread.native_pending_return = Some(object);
                 return object.as_ptr() as i64;
             }
         }
@@ -5198,6 +5352,22 @@ fn call_integer_native_raw(
                     .map(|(_, raw)| ClassId::new(raw))
             });
             if let Some(class_id) = cached_class {
+                // Young-pressure relief for this cached fast path, which
+                // deliberately bypasses the `safe_native_call` boundary (and
+                // its young-pressure GC hook): the only argument here is a
+                // primitive `i32`, so initiating the orchestrated GC is
+                // exactly as safe as `jit_new_object`'s slow-path GC — no raw
+                // object pointers are held across it. Without this, a
+                // boxing-dominated compiled loop keeps spilling wrappers into
+                // old gen until `alloc_young_initialized` hard-aborts.
+                if vm.heap.young_spill_pressure() {
+                    if !crate::runtime::interpreter::gc_overhead_limit_exceeded(vm)
+                        && vm.heap.needs_gc()
+                    {
+                        crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+                    }
+                    vm.heap.clear_young_spill_pressure();
+                }
                 use cratonvm_native_api::NativeContext as _;
                 let mut ctx = crate::vm::NativeContextImpl { shared: vm, thread };
                 let object = ctx.alloc_object(class_id, 1);
@@ -6504,6 +6674,36 @@ mod tests {
             try_call_compiled_entry_reentrant(add_ctx_arg as *const () as usize, true, 5, &[7])
         };
         assert_eq!(result, Some(12));
+    }
+
+    #[test]
+    fn compiled_entry_reentrant_wrapper_preserves_stack_arg_abi() {
+        unsafe extern "C" fn sum_five(a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
+            a + b + c + d + e
+        }
+        unsafe extern "C" fn sum_ctx_four(ctx: i64, a: i64, b: i64, c: i64, d: i64) -> i64 {
+            ctx + a + b + c + d
+        }
+        // SAFETY: both functions use the C ABI selected by the helper, including
+        // the first stack-passed parameter on Windows.
+        let no_ctx = unsafe {
+            try_call_compiled_entry_reentrant(
+                sum_five as *const () as usize,
+                false,
+                0,
+                &[1, 2, 3, 4, 5],
+            )
+        };
+        let with_ctx = unsafe {
+            try_call_compiled_entry_reentrant(
+                sum_ctx_four as *const () as usize,
+                true,
+                10,
+                &[1, 2, 3, 4],
+            )
+        };
+        assert_eq!(no_ctx, Some(15));
+        assert_eq!(with_ctx, Some(20));
     }
 
     #[test]

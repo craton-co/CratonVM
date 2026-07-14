@@ -464,20 +464,17 @@ cached_is_set!(jit_main_inline, "CRATONVM_JIT_MAIN_INLINE");
 // until the worker publishes, at which point the `jit_cache` fast-path flips the
 // call site to `Jit`. Step-5 OSR likewise compiles off-thread when on.
 //
-// **DEFAULT-ON as of wire-tiered-manager Step 7** ("retire the single
-// fixed-threshold inline path"): the fixed-threshold invocation path
-// (`try_jit_upgrade_with_gate`) no longer compiles synchronously on the mutator
-// by default. The eager *first-call* single-pass compile (`fn execute`) remains
-// as the quick first tier; this gate governs the invocation-counted re-tiering
-// and OSR. Opt-out — `CRATONVM_BG_COMPILE=0` (or `false`) restores the historical
-// inline path (the safety net while the off-thread pipeline soaks on the
-// gauntlet). See `docs/feature-designs/wire-tiered-manager.md` (Step 7).
+// Default-off while the off-thread compiler continues to soak.  Short, very
+// hot queries can finish before a background-produced body is published; H2's
+// lateral-unnest plan then spends its full timeout in the interpreter.  The
+// historical inline tier-up produces usable code on the mutator at the hot
+// threshold. Set `CRATONVM_BG_COMPILE=1` to opt into background compilation.
 #[inline]
 pub fn bg_compile() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| match std::env::var("CRATONVM_BG_COMPILE") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
+        Err(_) => false,
     })
 }
 // wire-tiered-manager Step 4 (PGO handoff C1 → C2): opt-in profile collection.

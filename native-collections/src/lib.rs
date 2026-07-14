@@ -154,14 +154,26 @@ fn register_overlay_owner_key(owner_addr: usize, key: usize) -> usize {
     key
 }
 
-fn remove_overlay_owner_key(key: usize) {
+/// Remove one packed overlay key from its recorded collection owner.
+///
+/// Callers already know the owner address from the object-key registry.  Using
+/// it directly keeps cleanup proportional to that collection's own keys;
+/// scanning every live owner for every reclaimed key turns a large minor GC
+/// into quadratic work under short-lived collection churn.
+fn remove_overlay_owner_key(owner_addr: usize, key: usize) {
     let mut index = overlay_owner_keys()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    index.retain(|_, keys| {
-        keys.retain(|registered| *registered != key);
-        !keys.is_empty()
-    });
+    let remove_owner = index
+        .get_mut(&owner_addr)
+        .map(|keys| {
+            keys.retain(|registered| *registered != key);
+            keys.is_empty()
+        })
+        .unwrap_or(false);
+    if remove_owner {
+        index.remove(&owner_addr);
+    }
 }
 
 /// Select the registry shard for an identity hash. Mixes with the 64-bit
@@ -189,7 +201,7 @@ fn obj_key_shard_for(hash: u32) -> &'static ObjKeyShard {
 /// than the historical prune block, which omitted the TreeMap/TreeSet tables.
 /// Locks are poison-recovered (`into_inner`) so a panic elsewhere can never
 /// leave stale state stranded and re-aliasable.
-fn clear_overlay_entries_for_key(key: usize) {
+fn clear_overlay_entries_for_key(key: usize, owner_addr: usize) {
     hm_int_fast_table()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -228,7 +240,7 @@ fn clear_overlay_entries_for_key(key: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|_ptr, packed| *packed != key);
-    remove_overlay_owner_key(key);
+    remove_overlay_owner_key(owner_addr, key);
 }
 
 /// Next never-recycled generation for a hash bucket: one past the maximum
@@ -289,6 +301,7 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
         }
         // Different-class recycle: re-key + clear the stale overlay state.
         let stale_key = pack_obj_key(hash, slots[0].generation);
+        let stale_owner = slots[0].last_ptr;
         let generation = next_generation(slots);
         slots[0].last_ptr = ptr;
         slots[0].generation = generation;
@@ -298,7 +311,7 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
         // the reverse, so dropping it first keeps the lock order one-directional
         // and cannot deadlock against a concurrent side-table op.
         drop(reg);
-        clear_overlay_entries_for_key(stale_key);
+        clear_overlay_entries_for_key(stale_key, stale_owner);
         return register_overlay_owner_key(ptr, pack_obj_key(hash, generation));
     }
 
@@ -27031,7 +27044,7 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
     // of all shards is the whole registry); runs under GC so per-shard locking is
     // uncontended. Preserves the original early-return: if NO shard yielded a
     // dead key, skip the overlay-cleanup pass entirely.
-    let mut dead_keys: Vec<usize> = Vec::new();
+    let mut dead_keys: Vec<(usize, usize)> = Vec::new();
     for shard in obj_key_shards().iter() {
         if let Ok(mut reg) = shard.lock() {
             for (&hash, slots) in reg.iter() {
@@ -27040,7 +27053,7 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
                     // it as live (defensive — never prune what we can't classify).
                     let live = slot.last_ptr == 0 || is_live(slot.last_ptr);
                     if !live {
-                        dead_keys.push(pack_obj_key(hash, slot.generation));
+                        dead_keys.push((pack_obj_key(hash, slot.generation), slot.last_ptr));
                     }
                 }
             }
@@ -27065,7 +27078,7 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
         let mut hm = hm_int_fast_table()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for k in &dead_keys {
+        for (k, _) in &dead_keys {
             hm.remove(k);
         }
     }
@@ -27083,37 +27096,37 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
     //    count independent of the number of dead keys.
     {
         let mut lhm = lhm_overlay().lock().unwrap_or_else(|e| e.into_inner());
-        for k in &dead_keys {
+        for (k, _) in &dead_keys {
             lhm.remove(k);
         }
     }
     {
         let mut hb = lhm_heap_backed().lock().unwrap_or_else(|e| e.into_inner());
-        for k in &dead_keys {
+        for (k, _) in &dead_keys {
             hb.remove(k);
         }
     }
     {
         let mut ll = ll_overlay().lock().unwrap_or_else(|e| e.into_inner());
-        for k in &dead_keys {
+        for (k, _) in &dead_keys {
             ll.remove(k);
         }
     }
     {
         let mut tm = tm_array_table().lock().unwrap_or_else(|e| e.into_inner());
-        for k in &dead_keys {
+        for (k, _) in &dead_keys {
             tm.remove(k);
         }
     }
     {
         let mut tmf = tm_fast_table().lock().unwrap_or_else(|e| e.into_inner());
-        for k in &dead_keys {
+        for (k, _) in &dead_keys {
             tmf.remove(k);
         }
     }
     {
         let mut ts = ts_array_table().lock().unwrap_or_else(|e| e.into_inner());
-        for k in &dead_keys {
+        for (k, _) in &dead_keys {
             ts.remove(k);
         }
     }
@@ -27123,7 +27136,7 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
         let mut cmps = cslm_comparator_table()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for k in &dead_keys {
+        for (k, _) in &dead_keys {
             cmps.remove(k);
         }
     }
@@ -27132,11 +27145,12 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
     // is now a dead packed key.
     {
         let mut cache = lhm_ptr_cache().lock().unwrap_or_else(|e| e.into_inner());
-        let dead: std::collections::HashSet<usize> = dead_keys.iter().copied().collect();
+        let dead: std::collections::HashSet<usize> =
+            dead_keys.iter().map(|(key, _)| *key).collect();
         cache.retain(|_ptr, packed| !dead.contains(packed));
     }
-    for key in dead_keys {
-        remove_overlay_owner_key(key);
+    for (key, owner_addr) in dead_keys {
+        remove_overlay_owner_key(owner_addr, key);
     }
 }
 

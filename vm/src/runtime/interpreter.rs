@@ -565,10 +565,8 @@ fn stw_take_over_and_wait(
     let mut warned = false;
     loop {
         let tids_before = taken.tids.len();
-        let should_scan = stw_takeover_should_scan(
-            rounds,
-            crate::jit::conservative_roots::any_thread_in_jit(),
-        );
+        let should_scan =
+            stw_takeover_should_scan(rounds, crate::jit::conservative_roots::any_thread_in_jit());
         let newly = if should_scan {
             xt::take_over_pass(&mut taken, &|a| shared.heap.is_object_address(a), xt_roots)
         } else {
@@ -734,7 +732,7 @@ fn pin_frozen_peer_roots_for_g1(
     }
 }
 
-fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
+pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // First, check if another thread requested STW — if so, participate
     safepoint_check(shared, thread);
 
@@ -1063,7 +1061,14 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
     // GC-overhead accounting: live set BEFORE the collection (post-TLAB-retire),
     // so `note_gc_productivity` can compute how much this forced GC actually
     // freed (`before - after`). See `note_gc_productivity` / `gc_overhead_limit_exceeded`.
-    let before_live = shared.heap.allocated_bytes();
+    // Free-list-aware metric: the non-moving young sweep reclaims into the
+    // from-space free list without retreating the bump cursor, so the raw
+    // `allocated_bytes` reads "freed 0" for a perfectly-productive sweep and
+    // the overhead limit falsely latches (then no GC ever runs again).
+    // Promoted bytes count as productivity too — a promotion-only cycle
+    // conserves live bytes but drained young for new allocation.
+    let before_live = shared.heap.live_bytes_estimate();
+    let before_promoted = shared.heap.bytes_promoted_total();
     // Round-5 fix (CRIT — UAF): see comment in `maybe_gc`. The forced
     // path is also an initiator path; drain its per-thread SATB buffer
     // before scanning roots.
@@ -1090,7 +1095,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
         shared
             .gc_cycle_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        note_gc_productivity(shared, before_live);
+        note_gc_productivity(shared, before_live, before_promoted);
     } else {
         let mut counted_os_tids: Vec<u32> = Vec::new();
         let should_initiate_gc = {
@@ -1148,7 +1153,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             shared
                 .gc_cycle_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            note_gc_productivity(shared, before_live);
+            note_gc_productivity(shared, before_live, before_promoted);
         } else {
             safepoint_check(shared, thread);
         }
@@ -1172,17 +1177,30 @@ const GC_OVERHEAD_LIMIT_CYCLES: u32 = 8;
 /// generational heap: in a retained-allocation death-spiral the young semi-space
 /// is emptied every cycle (so total *fullness* sits near young/total ≈ 50% and
 /// never looks exhausted), yet the GC frees ~nothing net because every survivor
-/// is promoted into an already-full old generation. `before - after` captures
-/// exactly that — promotion is not freeing, so it does not reset the streak.
+/// is promoted into an already-full old generation. Promoted bytes DO count
+/// toward productivity (they re-enable young allocation, which is the point of
+/// the collection) — but the 2%-of-capacity threshold still catches the
+/// death-spiral: a wedged, ~full old generation cannot absorb 2% of total heap
+/// capacity per cycle, so its sliver-promotions stay "unproductive" and the
+/// streak still trips the overhead limit. A healthy young→old drain moves far
+/// more than 2% and resets it.
 /// Forced GCs only happen on genuine allocation failure (young full *and*
 /// promotion blocked), so this never fires during ordinary young-GC churn.
-fn note_gc_productivity(shared: &SharedVm, before_live: usize) {
+fn note_gc_productivity(shared: &SharedVm, before_live: usize, before_promoted: u64) {
     let cap = shared.heap.heap_capacity();
     if cap == 0 {
         return;
     }
-    let after_live = shared.heap.allocated_bytes();
-    let freed = before_live.saturating_sub(after_live);
+    // Free-list-aware live metric (see the capture site in `maybe_gc_forced`):
+    // the non-moving sweep reclaims into the young free list without moving
+    // the bump cursor, so `allocated_bytes` would read a fully-productive
+    // sweep as "freed 0" and falsely latch the overhead limit.
+    let after_live = shared.heap.live_bytes_estimate();
+    let promoted = shared
+        .heap
+        .bytes_promoted_total()
+        .saturating_sub(before_promoted) as usize;
+    let freed = before_live.saturating_sub(after_live).saturating_add(promoted);
     // unproductive: freed < 2% of capacity
     // Cast: numeric/representation conversion
     let unproductive = (freed as u128) * 100 < (cap as u128) * 2;
@@ -1199,7 +1217,7 @@ fn note_gc_productivity(shared: &SharedVm, before_live: usize) {
     };
     if std::env::var_os("CRATONVM_DBG_GC_OVERHEAD").is_some() {
         eprintln!(
-            "[GC_OVERHEAD] before={before_live} after={after_live} freed={freed} cap={cap} unproductive={unproductive} streak={streak}"
+            "[GC_OVERHEAD] before={before_live} after={after_live} promoted={promoted} freed={freed} cap={cap} unproductive={unproductive} streak={streak}"
         );
     }
 }
@@ -5083,7 +5101,8 @@ pub fn execute(
                     // Resolve new/anewarray info (Phase 39: correct ClassId + field count for JIT new)
                     // Only resolve for non-synthetic classes (real JDK bytecode) to avoid
                     // expensive class loading cascades during JIT of synthetic code.
-                    // Tuple: (pc, class_id, num_fields, has_primitive_init, has_finalizer).
+                    // Tuple: (pc, class_id, num_fields,
+                    // has_nonzero_tag_primitive_init, has_finalizer).
                     // The last two are conservative true/true here so the JIT goes through
                     // the post-init helper — matches pre-CRIT-2 behavior. A follow-up should
                     // extract the real flags from class metadata to enable the skip path.
@@ -20384,12 +20403,13 @@ pub(crate) fn try_lambda_dispatch(
                 .get_class(class_id)
                 .and_then(|c| c.array_info.clone());
             if let Some(array_info) = array_info {
-                let length = full_args
-                    .first()
-                    .and_then(Value::as_int)
-                    .ok_or_else(|| VmError::Internal {
-                        message: "array-constructor-reference: missing length arg".to_string(),
-                    })?;
+                let length =
+                    full_args
+                        .first()
+                        .and_then(Value::as_int)
+                        .ok_or_else(|| VmError::Internal {
+                            message: "array-constructor-reference: missing length arg".to_string(),
+                        })?;
                 if length < 0 {
                     return Err(RuntimeError::NegativeArraySizeException { size: length }.into());
                 }
@@ -21485,6 +21505,9 @@ pub(crate) fn is_h2_parser_native_override(
     method_name: &str,
     descriptor: &str,
 ) -> bool {
+    if class_name == "org/h2/util/Utils" {
+        return (method_name, descriptor) == ("getResource", "(Ljava/lang/String;)[B");
+    }
     if class_name == "org/h2/constraint/ConstraintReferential" {
         return (method_name, descriptor)
             == ("checkExistingData", "(Lorg/h2/engine/SessionLocal;)V");
@@ -22579,10 +22602,17 @@ fn force_native_over_real_jdk_bytecode(
     if class_name == "java/util/function/Predicate"
         && matches!(
             (method_name, method_descriptor),
-            ("and", "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;")
-                | ("or", "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;")
-                | ("negate", "()Ljava/util/function/Predicate;")
-                | ("not", "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;")
+            (
+                "and",
+                "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;"
+            ) | (
+                "or",
+                "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;"
+            ) | ("negate", "()Ljava/util/function/Predicate;")
+                | (
+                    "not",
+                    "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;"
+                )
         )
     {
         return true;
@@ -22597,7 +22627,10 @@ fn force_native_over_real_jdk_bytecode(
         && matches!(
             (method_name, method_descriptor),
             ("initialize", "(Ljava/util/Locale;)V")
-                | ("getInstance", "(Ljava/util/Locale;)Ljava/text/DecimalFormatSymbols;")
+                | (
+                    "getInstance",
+                    "(Ljava/util/Locale;)Ljava/text/DecimalFormatSymbols;"
+                )
         )
     {
         return true;
@@ -22631,8 +22664,7 @@ fn force_native_over_real_jdk_bytecode(
         && method_name == "loadClass"
         && matches!(
             method_descriptor,
-            "(Ljava/lang/String;)Ljava/lang/Class;"
-                | "(Ljava/lang/String;Z)Ljava/lang/Class;"
+            "(Ljava/lang/String;)Ljava/lang/Class;" | "(Ljava/lang/String;Z)Ljava/lang/Class;"
         )
     {
         return true;
@@ -24491,8 +24523,7 @@ pub(crate) fn synthetic_stub_should_yield_to_real_bytecode(
 /// classes whose SyntheticStub natives exist only for stub-phase bootstraps
 /// and must yield to loaded real bytecode.
 pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
-    crate::runtime::env_cache::real_bytecode_selector()
-        .prefers_real(class_name)
+    crate::runtime::env_cache::real_bytecode_selector().prefers_real(class_name)
         || matches!(
             class_name,
             "java/util/concurrent/locks/ReentrantLock"
@@ -25835,7 +25866,9 @@ fn populate_invoke_cache(
             .kind_of(declaring_name, &method_name, &descriptor)
             == Some(cratonvm_native_api::NativeKind::SyntheticStub)
             && real_protected_stub_class(declaring_name)
-            && store.get(declaring_id).is_some_and(|c| !c.is_synthetic_stub)
+            && store
+                .get(declaring_id)
+                .is_some_and(|c| !c.is_synthetic_stub)
             && !method.is_native()
             && method.code().is_some();
         if !stub_yields {
@@ -27735,13 +27768,14 @@ fn try_osr(
 
 /// CRIT-2 — shared body for the JIT `cp_new_resolver` closures: resolve a
 /// `new`/`anewarray` CP index in `holder_cid`'s constant pool to
-/// `(class_id, num_fields, has_primitive_init, has_finalizer)`.
+/// `(class_id, num_fields, has_nonzero_tag_primitive_init, has_finalizer)`.
 ///
 /// The two flags feed the inline-TLAB `new` fast path, which skips the
 /// `jit_post_tlab_init` helper call when BOTH are false — i.e. no
-/// primitive-typed instance field anywhere in the hierarchy (the typed-zero
-/// defaults would be a no-op on the TLAB-zeroed region) and no finalizer to
-/// register. `has_primitive_init` mirrors the hierarchy walk in
+/// long/float/double instance field anywhere in the hierarchy (the JIT now
+/// explicitly clears the body, so int/byte/char/short/boolean are already the
+/// correct all-zero `Value::Int(0)`) and no finalizer to register.
+/// `has_nonzero_tag_primitive_init` mirrors the hierarchy walk in
 /// `crate::jit::helpers::jit_init_primitive_fields`; `has_finalizer` mirrors
 /// the single-class read in `jit_post_tlab_init`. Unresolvable metadata
 /// reports `(true, true)` so the helper call stays in place.
@@ -27767,11 +27801,7 @@ fn resolve_jit_new_site(
             break;
         };
         if c.fields.iter().any(|f| {
-            !f.is_static()
-                && matches!(
-                    f.descriptor.as_bytes().first(),
-                    Some(b'I' | b'B' | b'C' | b'S' | b'Z' | b'J' | b'F' | b'D')
-                )
+            !f.is_static() && matches!(f.descriptor.as_bytes().first(), Some(b'J' | b'F' | b'D'))
         }) {
             has_prim_init = true;
             break;
@@ -28356,7 +28386,7 @@ fn try_jit_upgrade_with_gate(
         }
     };
     // new/anewarray resolver: maps CP index of `new`/`anewarray` to
-    // (class_id_raw, num_fields, has_primitive_init, has_finalizer).
+    // (class_id_raw, num_fields, has_nonzero_tag_primitive_init, has_finalizer).
     let new_resolver = |cp_idx: u16| -> Option<(u32, usize, bool, bool)> {
         let cm = shared.class_manager.read();
         resolve_jit_new_site(&cm, class_id, cp_idx)
@@ -30554,16 +30584,13 @@ fn execute_jit_call(
     // chain calls into a 5+-arg JIT'd method on Windows and panics with
     // "index out of bounds: the len is 4 but the index is 4" at the
     // pop-into-`jit_args` loop below.
-    #[cfg(target_os = "windows")]
-    const JIT_ABI_REG_SLOTS: usize = 4;
-    #[cfg(not(target_os = "windows"))]
-    const JIT_ABI_REG_SLOTS: usize = 6;
+    const JIT_ABI_MAX_JAVA_ARGS: usize = 8;
     let np = num_params as usize; // Widening: parameter count conversion
-    let max_java_params = JIT_ABI_REG_SLOTS - if needs_heap { 1 } else { 0 };
+    let max_java_params = JIT_ABI_MAX_JAVA_ARGS - if needs_heap { 1 } else { 0 };
     if np > max_java_params {
         return Ok(CachedCallResult::CacheMiss);
     }
-    let mut jit_args = [0i64; JIT_ABI_REG_SLOTS];
+    let mut jit_args = [0i64; JIT_ABI_MAX_JAVA_ARGS];
     // The JIT calling convention expects raw primitive bits with no NaN-box
     // tag (Int → sign-extended i64, Long → raw i64, Float → zero-extended u32
     // bits, Double → raw f64 bits, Object → pointer). Decode each arg slot by
@@ -30585,8 +30612,8 @@ fn execute_jit_call(
     // Save the raw popped slots (bit-exact + long mark) so the i64::MIN deopt
     // arm below can restore them before the slow path re-pops the args. See
     // that arm for the underflow this prevents.
-    let mut saved_args: [(CompactValue, bool); JIT_ABI_REG_SLOTS] =
-        [(CompactValue::zero(), false); JIT_ABI_REG_SLOTS];
+    let mut saved_args: [(CompactValue, bool); JIT_ABI_MAX_JAVA_ARGS] =
+        [(CompactValue::zero(), false); JIT_ABI_MAX_JAVA_ARGS];
     for i in (0..np).rev() {
         let (cv, is_long) = thread.frames[frame_idx]
             .stack
@@ -31072,12 +31099,9 @@ fn execute_jit_call_decoded(
     cached: &Arc<CachedBytecodeMethod>,
     args_slice: &[Value],
 ) -> Result<Option<CachedCallResult>, MethodCallFailed> {
-    #[cfg(target_os = "windows")]
-    const JIT_ABI_REG_SLOTS: usize = 4;
-    #[cfg(not(target_os = "windows"))]
-    const JIT_ABI_REG_SLOTS: usize = 6;
+    const JIT_ABI_MAX_JAVA_ARGS: usize = 8;
     let np = num_params as usize; // Widening: parameter count conversion
-    let max_java_params = JIT_ABI_REG_SLOTS - if needs_heap { 1 } else { 0 };
+    let max_java_params = JIT_ABI_MAX_JAVA_ARGS - if needs_heap { 1 } else { 0 };
     // Too many args for the register-only JIT ABI, or a mismatch between the
     // decoded args and the declared count → interpreter fallback (Ok(None)).
     if np > max_java_params || args_slice.len() != np {
@@ -31086,7 +31110,7 @@ fn execute_jit_call_decoded(
     // Decode each Java arg to its raw JIT-ABI bit pattern (Int → sign-extended
     // i64, Long → raw i64, Float/Double → zero-/raw-bits, Object → pointer).
     // `args_slice` is already descriptor-decoded by the caller (receiver = arg 0).
-    let mut jit_args = [0i64; JIT_ABI_REG_SLOTS];
+    let mut jit_args = [0i64; JIT_ABI_MAX_JAVA_ARGS];
     for (i, v) in args_slice.iter().enumerate().take(np) {
         jit_args[i] = match v {
             Value::Int(x) => *x as i64, // Cast: JIT ABI -- i64 register convention
@@ -32271,12 +32295,7 @@ fn execute_invokevirtual_cached(
                     // Lambda proxy classes have no bytecode implementation of
                     // their functional-interface method. They must reach the
                     // slow path, which dispatches their SAM method handle.
-                    if !is_special
-                        && shared
-                            .lambda_proxies
-                            .read()
-                            .contains_key(&actual_class_id)
-                    {
+                    if !is_special && shared.lambda_proxies.read().contains_key(&actual_class_id) {
                         return Ok(CachedCallResult::CacheMiss);
                     }
                     // WP2.7 — AnnotationProxy methods (incl. Object.equals/hashCode/
@@ -32574,12 +32593,7 @@ fn execute_invokevirtual_cached(
                     }
                     // Lambda proxies require the slow `try_lambda_dispatch`
                     // route instead of a cached interface target.
-                    if !is_special
-                        && shared
-                            .lambda_proxies
-                            .read()
-                            .contains_key(&actual_class_id)
-                    {
+                    if !is_special && shared.lambda_proxies.read().contains_key(&actual_class_id) {
                         return Ok(CachedCallResult::CacheMiss);
                     }
                     // WP2.7 — same escape hatch as in the bytecode branch:
