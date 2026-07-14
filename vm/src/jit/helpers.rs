@@ -3961,6 +3961,10 @@ thread_local! {
     /// `valueOf` result in each VM. A new VM pointer invalidates the entry.
     static INTEGER_WRAPPER_CLASS_CACHE: std::cell::Cell<Option<(usize, u32)>> =
         const { std::cell::Cell::new(None) };
+    /// Exact real-JDK `java/util/regex/Matcher` class id, discovered once per
+    /// VM for the virtual-MIC native fast path.
+    static MATCHER_CLASS_CACHE: std::cell::Cell<Option<(usize, u32)>> =
+        const { std::cell::Cell::new(None) };
     // Virtual/interface call sites are keyed by their JIT metadata pointer AND
     // the receiver's actual class id. A static CP owner is not sound here:
     // an interface method may resolve to a receiver override.
@@ -5377,6 +5381,26 @@ fn matcher_native_callback(info: &JitInvokeInfo) -> Option<cratonvm_native_api::
 }
 
 #[inline]
+fn is_exact_matcher_class(vm: &SharedVm, class_id: ClassId) -> bool {
+    let vm_key = vm as *const SharedVm as usize;
+    let raw_class_id = class_id.as_u32();
+    if MATCHER_CLASS_CACHE.with(|cache| cache.get() == Some((vm_key, raw_class_id))) {
+        return true;
+    }
+
+    let is_exact = vm
+        .class_manager
+        .read()
+        .get_class(class_id)
+        .map(|class| class.name.as_ref() == "java/util/regex/Matcher")
+        .unwrap_or(false);
+    if is_exact {
+        MATCHER_CLASS_CACHE.with(|cache| cache.set(Some((vm_key, raw_class_id))));
+    }
+    is_exact
+}
+
+#[inline]
 fn call_object_native_raw(
     vm: &SharedVm,
     thread: &mut JvmThread,
@@ -5817,6 +5841,30 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
 
     let receiver_class_id = vm.heap.class_id_of(receiver_ref);
     let receiver_cid = receiver_class_id.as_u32();
+
+    // Real-layout Matcher methods are registered natives, so they can never
+    // publish a compiled entry into the ordinary MIC/PIC. Without this leaf
+    // path every `find`/`start`/`end`/`group` hit decodes a heap-allocated
+    // `Vec<Value>`, retries a compile probe, and performs generic virtual/native
+    // resolution. Guarding the exact receiver class preserves subclass
+    // overrides; the feature gate in `matcher_native_callback` preserves the
+    // native opt-out, and class redefinition keeps using the generic resolver.
+    if !crate::classloading::any_class_redefined() {
+        if let Some(callback) = matcher_native_callback(info) {
+            if is_exact_matcher_class(vm, receiver_class_id) {
+                if let Some(result) = call_matcher_native_raw(
+                    vm,
+                    thread,
+                    info,
+                    receiver_ref,
+                    args_slice,
+                    callback,
+                ) {
+                    return result;
+                }
+            }
+        }
+    }
 
     // AnnotationProxy receiver: synthetic class with no bytecode methods, so the
     // cache-miss path below would resolve on it, fail the compile-probe, and
