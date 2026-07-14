@@ -204,11 +204,4 @@ through) that
 is ALSO fixed — `Locale.getDefault()`/`Locale.US` now both correctly print
 `en_US` instead of throwing. Moved to `docs/internal/` alongside this doc.
 
-**Residual — NOT fixed, new finding**: `com.sun.net.httpserver.HttpExchange
-.getRequestURI()` returns a `URI` object whose `toString()`/`getPath()` are
-empty strings, even though a directly-constructed `new URI(...)` works
-correctly — see
-[`httpserver-exchange-requesturi-getpath-empty.md`](../known-issues/httpserver-exchange-requesturi-getpath-empty.md).
-This still blocks the literal upstream Keycloak `TestClassServerTest` end to
-end, since `TestClassServer`'s handler routes on
-`httpExchange.getRequestURI().getPath()`.
+**Follow-up resolved 2026-07-14**: the co-discovered [`HttpExchange.getRequestURI()` URI-layout bug](httpserver-exchange-requesturi-getpath-empty-FIXED.md) is now fixed too. Its getter had written the request target into a guessed synthetic URI slot instead of the real JDK URI fields. A live handler probe now preserves the full request target, decoded/raw paths, and query, so Keycloak's `TestClassServer` path-routing expression `httpExchange.getRequestURI().getPath()` is no longer blocked by either same-day HTTP defect.

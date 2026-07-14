@@ -4,11 +4,11 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
-## 2026-07-14 (cont'd) String.getBytes() + Locale bootstrap regressions FIXED; new HttpExchange URI bug found
+## 2026-07-14 (cont'd) String.getBytes(), Locale bootstrap, and HttpExchange URI regressions FIXED
 
 - FIXED (moved to `docs/internal/`): [`string-getbytes-empty-real-jdk-mode-FIXED.md`](../internal/string-getbytes-empty-real-jdk-mode-FIXED.md) -- same failure class as the `java.util.Properties` fix (`f62d2073`): `register_real_charset_natives` (`native-builtins/src/charset.rs`) never set its own registry category, so its real-JDK-mode call sites inherited the default `SyntheticStub` and got silently dropped by `d8092acb`'s hardening. Fixed by wrapping the whole function body in `with_category(Bridge, ...)`. This was also the true root cause of the `com.sun.net.httpserver.HttpServer` "always empty body" symptom noted in the URLClassLoader fix above.
 - FIXED (moved to `docs/internal/`, found already fixed on `dev` by a concurrent session): [`locale-real-jdk-bootstrap-noclassdeffounderror-FIXED.md`](../internal/locale-real-jdk-bootstrap-noclassdeffounderror-FIXED.md) -- same root mechanism, fixed via `f62d2073`'s `java.util.Properties` bridge-pinning (the `Locale`/`BaseLocale`/`StaticProperty` chain bottoms out in the same `System.getProperties()` read that fix restored).
-- 🔴 NEW: [`httpserver-exchange-requesturi-getpath-empty.md`](httpserver-exchange-requesturi-getpath-empty.md) -- `HttpExchange.getRequestURI()` returns a `URI` whose `toString()`/`getPath()` are empty (a plain directly-constructed `URI` works fine, so this is specific to how the exchange's request URI gets built during request parsing). Now the last confirmed blocker for running Keycloak's `TestClassServerTest` end-to-end via the real `com.sun.net.httpserver.HttpServer` (its handler routes on the request path). Not yet investigated.
+- FIXED (moved to `docs/internal/`): [`httpserver-exchange-requesturi-getpath-empty-FIXED.md`](../internal/httpserver-exchange-requesturi-getpath-empty-FIXED.md) -- `HttpExchange.getRequestURI()` was writing the request target into a guessed synthetic `URI` slot (real-JDK slot 0 is `scheme`), leaving `toString()`/`getPath()` empty. It now uses the shared field-name-safe URI constructor; a live server probe verified the full target, decoded/raw path, and query.
 
 ## 2026-07-14 TestClassServerTest URLClassLoader isolation FIXED; severe new String.getBytes() regression found
 
