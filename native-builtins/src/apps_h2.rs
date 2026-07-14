@@ -30,7 +30,8 @@
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use cratonvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
+use std::io::{Cursor, Read};
 
 const H2_ROOT_REFERENCE: &str = "org/h2/mvstore/RootReference";
 const H2_TRANSACTION: &str = "org/h2/mvstore/tx/Transaction";
@@ -138,6 +139,39 @@ pub fn register_h2_parser_fastpaths(registry: &mut NativeMethodRegistry) {
     registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
 
     registry.register("org/h2/command/ParserBase", "read", "()V", h2_parser_read);
+    // H2 packages parser resources in `org/h2/util/data.zip`. Its ordinary
+    // ZipInputStream scan is disproportionately expensive during Hibernate
+    // bootstrap, so resolve the requested entry directly from the archive.
+    registry.register(
+        "org/h2/util/Utils",
+        "getResource",
+        "(Ljava/lang/String;)[B",
+        h2_utils_get_resource,
+    );
+    registry.register(
+        "org/h2/expression/condition/Comparison",
+        "compare",
+        "(Lorg/h2/engine/SessionLocal;Lorg/h2/value/Value;Lorg/h2/value/Value;I)Lorg/h2/value/Value;",
+        h2_comparison_compare,
+    );
+    registry.register(
+        "org/h2/expression/condition/ConditionAndOr",
+        "getValue",
+        "(Lorg/h2/engine/SessionLocal;)Lorg/h2/value/Value;",
+        h2_condition_and_or_get_value,
+    );
+    registry.register(
+        "org/h2/expression/function/CoalesceFunction",
+        "getValue",
+        "(Lorg/h2/engine/SessionLocal;)Lorg/h2/value/Value;",
+        h2_coalesce_function_get_value,
+    );
+    registry.register(
+        "org/h2/expression/function/CardinalityExpression",
+        "getValue",
+        "(Lorg/h2/engine/SessionLocal;)Lorg/h2/value/Value;",
+        h2_cardinality_expression_get_value,
+    );
     registry.register(
         "org/h2/command/ParserBase",
         "setTokenIndex",
@@ -403,6 +437,560 @@ fn h2_session_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(Some(Value::Int(h2_int_field(ctx, this, "serialId"))))
 }
 
+fn h2_static_object(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    field: &str,
+) -> Option<ObjectRef> {
+    let class_id = ctx
+        .ensure_class_initialized(class_name)
+        .ok()
+        .or_else(|| ctx.class_id_by_name(class_name))?;
+    let field_index = ctx.static_field_index_by_name(class_id, field)?;
+    match ctx.get_static_field(class_id, field_index) {
+        Value::Object(Some(value)) => Some(value),
+        _ => None,
+    }
+}
+
+fn h2_static_value(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    field: &str,
+) -> Result<Value, MethodCallFailed> {
+    h2_static_object(ctx, class_name, field)
+        .map(|value| Value::Object(Some(value)))
+        .ok_or_else(|| {
+            RuntimeError::IllegalStateException {
+                message: format!("missing H2 static field {class_name}.{field}"),
+            }
+            .into()
+        })
+}
+
+fn h2_value_result(value: Option<Value>, label: &str) -> Result<Value, MethodCallFailed> {
+    match value {
+        Some(Value::Object(Some(value))) => Ok(Value::Object(Some(value))),
+        Some(Value::Object(None)) => Ok(Value::Object(None)),
+        _ => Err(RuntimeError::IllegalStateException {
+            message: format!("{label} returned a non-reference value"),
+        }
+        .into()),
+    }
+}
+
+fn h2_internal_error(ctx: &mut dyn NativeContext, message: String) -> MethodCallFailed {
+    let message = ctx.create_string(&message);
+    match ctx.invoke(
+        "org/h2/message/DbException",
+        "getInternalError",
+        "(Ljava/lang/String;)Ljava/lang/RuntimeException;",
+        &[Value::Object(Some(message))],
+    ) {
+        Ok(Some(Value::Object(Some(exception)))) => MethodCallFailed::ExceptionThrown(exception),
+        Ok(_) => RuntimeError::IllegalStateException {
+            message: "H2 DbException.getInternalError returned null".to_string(),
+        }
+        .into(),
+        Err(error) => error,
+    }
+}
+
+fn h2_comparison_compare(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let session = h2_object_arg(args, 0, "Comparison.compare session is null")?;
+    let left = h2_object_arg(args, 1, "Comparison.compare left is null")?;
+    let right = h2_object_arg(args, 2, "Comparison.compare right is null")?;
+    let compare_type = h2_int_arg(args, 3, "Comparison.compare type is invalid")?;
+    let result = match compare_type {
+        0 | 1 | 2 | 3 | 4 | 5 => {
+            let comparison = match ctx.invoke_virtual(
+                session,
+                "compareWithNull",
+                "(Lorg/h2/value/Value;Lorg/h2/value/Value;Z)I",
+                &[
+                    Value::Object(Some(left)),
+                    Value::Object(Some(right)),
+                    Value::Int(i32::from(compare_type <= 1)),
+                ],
+            )? {
+                Some(Value::Int(value)) => value,
+                Some(Value::Long(value)) => value as i32,
+                _ => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "SessionLocal.compareWithNull returned a non-int value"
+                            .to_string(),
+                    }
+                    .into())
+                }
+            };
+            if comparison == i32::MIN {
+                h2_static_value(ctx, "org/h2/value/ValueNull", "INSTANCE")?
+            } else {
+                let matches = match compare_type {
+                    0 => comparison == 0,
+                    1 => comparison != 0,
+                    2 => comparison < 0,
+                    3 => comparison > 0,
+                    4 => comparison <= 0,
+                    5 => comparison >= 0,
+                    _ => unreachable!(),
+                };
+                h2_static_value(
+                    ctx,
+                    "org/h2/value/ValueBoolean",
+                    if matches { "TRUE" } else { "FALSE" },
+                )?
+            }
+        }
+        6 | 7 => {
+            let equal = matches!(
+                ctx.invoke_virtual(
+                    session,
+                    "areEqual",
+                    "(Lorg/h2/value/Value;Lorg/h2/value/Value;)Z",
+                    &[Value::Object(Some(left)), Value::Object(Some(right))],
+                )?,
+                Some(Value::Int(value)) if value != 0
+            );
+            let value = if compare_type == 6 { equal } else { !equal };
+            h2_value_result(
+                ctx.invoke(
+                    "org/h2/value/ValueBoolean",
+                    "get",
+                    "(Z)Lorg/h2/value/ValueBoolean;",
+                    &[Value::Int(i32::from(value))],
+                )?,
+                "ValueBoolean.get",
+            )?
+        }
+        8 => {
+            let null = h2_static_object(ctx, "org/h2/value/ValueNull", "INSTANCE");
+            if null == Some(left) || null == Some(right) {
+                h2_static_value(ctx, "org/h2/value/ValueNull", "INSTANCE")?
+            } else {
+                let left_geometry = h2_value_result(
+                    ctx.invoke_virtual(
+                        left,
+                        "convertToGeometry",
+                        "(Lorg/h2/value/ExtTypeInfoGeometry;)Lorg/h2/value/ValueGeometry;",
+                        &[Value::Object(None)],
+                    )?,
+                    "Value.convertToGeometry",
+                )?;
+                let left_geometry =
+                    h2_object_arg(&[left_geometry], 0, "geometry conversion returned null")?;
+                let right_geometry = h2_value_result(
+                    ctx.invoke_virtual(
+                        right,
+                        "convertToGeometry",
+                        "(Lorg/h2/value/ExtTypeInfoGeometry;)Lorg/h2/value/ValueGeometry;",
+                        &[Value::Object(None)],
+                    )?,
+                    "Value.convertToGeometry",
+                )?;
+                let intersects = matches!(
+                    ctx.invoke_virtual(
+                        left_geometry,
+                        "intersectsBoundingBox",
+                        "(Lorg/h2/value/ValueGeometry;)Z",
+                        &[right_geometry],
+                    )?,
+                    Some(Value::Int(value)) if value != 0
+                );
+                h2_value_result(
+                    ctx.invoke(
+                        "org/h2/value/ValueBoolean",
+                        "get",
+                        "(Z)Lorg/h2/value/ValueBoolean;",
+                        &[Value::Int(i32::from(intersects))],
+                    )?,
+                    "ValueBoolean.get",
+                )?
+            }
+        }
+        _ => return Err(h2_internal_error(ctx, compare_type.to_string())),
+    };
+    Ok(Some(result))
+}
+
+fn h2_condition_and_or_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = h2_object_arg(args, 0, "ConditionAndOr receiver is null")?;
+    let session = h2_object_arg(args, 1, "ConditionAndOr session is null")?;
+    let left =
+        h2_object_field(ctx, this, "left").ok_or_else(|| RuntimeError::NullPointerException {
+            message: Some("ConditionAndOr.left".to_string()),
+        })?;
+    let left_value = h2_value_result(
+        ctx.invoke_virtual(
+            left,
+            "getValue",
+            "(Lorg/h2/engine/SessionLocal;)Lorg/h2/value/Value;",
+            &[Value::Object(Some(session))],
+        )?,
+        "ConditionAndOr.left.getValue",
+    )?;
+    let left_value_ref = h2_object_arg(
+        &[left_value.clone()],
+        0,
+        "ConditionAndOr left value is null",
+    )?;
+    let and_or_type = h2_int_field(ctx, this, "andOrType");
+    let test_method = match and_or_type {
+        0 => "isFalse",
+        1 => "isTrue",
+        _ => return Err(h2_internal_error(ctx, and_or_type.to_string())),
+    };
+    let left_matches = matches!(
+        ctx.invoke_virtual(left_value_ref, test_method, "()Z", &[])?,
+        Some(Value::Int(value)) if value != 0
+    );
+    let boolean_field = if and_or_type == 0 { "FALSE" } else { "TRUE" };
+    if left_matches {
+        return Ok(Some(h2_static_value(
+            ctx,
+            "org/h2/value/ValueBoolean",
+            boolean_field,
+        )?));
+    }
+    let right =
+        h2_object_field(ctx, this, "right").ok_or_else(|| RuntimeError::NullPointerException {
+            message: Some("ConditionAndOr.right".to_string()),
+        })?;
+    let right_value = h2_value_result(
+        ctx.invoke_virtual(
+            right,
+            "getValue",
+            "(Lorg/h2/engine/SessionLocal;)Lorg/h2/value/Value;",
+            &[Value::Object(Some(session))],
+        )?,
+        "ConditionAndOr.right.getValue",
+    )?;
+    let right_value_ref = h2_object_arg(
+        &[right_value.clone()],
+        0,
+        "ConditionAndOr right value is null",
+    )?;
+    if matches!(
+        ctx.invoke_virtual(right_value_ref, test_method, "()Z", &[])?,
+        Some(Value::Int(value)) if value != 0
+    ) {
+        return Ok(Some(h2_static_value(
+            ctx,
+            "org/h2/value/ValueBoolean",
+            boolean_field,
+        )?));
+    }
+    let null = h2_static_object(ctx, "org/h2/value/ValueNull", "INSTANCE");
+    if null == Some(left_value_ref) || null == Some(right_value_ref) {
+        Ok(Some(h2_static_value(
+            ctx,
+            "org/h2/value/ValueNull",
+            "INSTANCE",
+        )?))
+    } else {
+        let field = if and_or_type == 0 { "TRUE" } else { "FALSE" };
+        Ok(Some(h2_static_value(
+            ctx,
+            "org/h2/value/ValueBoolean",
+            field,
+        )?))
+    }
+}
+
+fn h2_coalesce_function_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = h2_object_arg(args, 0, "CoalesceFunction receiver is null")?;
+    let session = h2_object_arg(args, 1, "CoalesceFunction session is null")?;
+    match h2_int_field(ctx, this, "function") {
+        0 => {}
+        1 | 2 => {
+            return ctx.invoke_special(
+                "org/h2/expression/function/CoalesceFunction",
+                "greatestOrLeast",
+                "(Lorg/h2/engine/SessionLocal;)Lorg/h2/value/Value;",
+                &[Value::Object(Some(this)), Value::Object(Some(session))],
+            )
+        }
+        function => return Err(h2_internal_error(ctx, function.to_string())),
+    }
+    let args_array =
+        h2_object_field(ctx, this, "args").ok_or_else(|| RuntimeError::NullPointerException {
+            message: Some("CoalesceFunction.args".to_string()),
+        })?;
+    let null = h2_static_object(ctx, "org/h2/value/ValueNull", "INSTANCE");
+    let value_type =
+        h2_object_field(ctx, this, "type").ok_or_else(|| RuntimeError::NullPointerException {
+            message: Some("CoalesceFunction.type".to_string()),
+        })?;
+    for index in 0..ctx.array_length(args_array) {
+        let expression = match ctx.get_array_element(args_array, index) {
+            Value::Object(Some(value)) => value,
+            _ => continue,
+        };
+        let value = h2_value_result(
+            ctx.invoke_virtual(
+                expression,
+                "getValue",
+                "(Lorg/h2/engine/SessionLocal;)Lorg/h2/value/Value;",
+                &[Value::Object(Some(session))],
+            )?,
+            "CoalesceFunction expression.getValue",
+        )?;
+        let value_ref = h2_object_arg(&[value.clone()], 0, "CoalesceFunction value is null")?;
+        if null != Some(value_ref) {
+            return Ok(Some(h2_value_result(
+                ctx.invoke_virtual(
+                    value_ref,
+                    "convertTo",
+                    "(Lorg/h2/value/TypeInfo;Lorg/h2/engine/CastDataProvider;)Lorg/h2/value/Value;",
+                    &[
+                        Value::Object(Some(value_type)),
+                        Value::Object(Some(session)),
+                    ],
+                )?,
+                "Value.convertTo",
+            )?));
+        }
+    }
+    Ok(Some(h2_static_value(
+        ctx,
+        "org/h2/value/ValueNull",
+        "INSTANCE",
+    )?))
+}
+
+fn h2_invalid_array_value(ctx: &mut dyn NativeContext, value: ObjectRef) -> MethodCallFailed {
+    let trace_sql = match ctx.invoke_virtual(value, "getTraceSQL", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(value)))) => value,
+        Ok(_) => return h2_internal_error(ctx, "Value.getTraceSQL returned null".to_string()),
+        Err(error) => return error,
+    };
+    let array = ctx.create_string("array");
+    match ctx.invoke(
+        "org/h2/message/DbException",
+        "getInvalidValueException",
+        "(Ljava/lang/String;Ljava/lang/Object;)Lorg/h2/message/DbException;",
+        &[Value::Object(Some(array)), Value::Object(Some(trace_sql))],
+    ) {
+        Ok(Some(Value::Object(Some(exception)))) => MethodCallFailed::ExceptionThrown(exception),
+        Ok(_) => h2_internal_error(
+            ctx,
+            "DbException.getInvalidValueException returned null".to_string(),
+        ),
+        Err(error) => error,
+    }
+}
+
+fn h2_cardinality_expression_get_value(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = h2_object_arg(args, 0, "CardinalityExpression receiver is null")?;
+    let session = h2_object_arg(args, 1, "CardinalityExpression session is null")?;
+    let arg =
+        h2_object_field(ctx, this, "arg").ok_or_else(|| RuntimeError::NullPointerException {
+            message: Some("CardinalityExpression.arg".to_string()),
+        })?;
+    let null = h2_static_object(ctx, "org/h2/value/ValueNull", "INSTANCE");
+
+    let count = if h2_int_field(ctx, this, "max") != 0 {
+        let type_info = h2_object_arg(
+            &[h2_value_result(
+                ctx.invoke_virtual(arg, "getType", "()Lorg/h2/value/TypeInfo;", &[])?,
+                "CardinalityExpression.arg.getType",
+            )?],
+            0,
+            "CardinalityExpression type is null",
+        )?;
+        let value_type = match ctx.invoke_virtual(type_info, "getValueType", "()I", &[])? {
+            Some(Value::Int(value)) => value,
+            _ => {
+                return Err(h2_internal_error(
+                    ctx,
+                    "TypeInfo.getValueType result".to_string(),
+                ))
+            }
+        };
+        if value_type != 40 {
+            let value = h2_object_arg(
+                &[h2_value_result(
+                    ctx.invoke_virtual(
+                        arg,
+                        "getValue",
+                        "(Lorg/h2/engine/SessionLocal;)Lorg/h2/value/Value;",
+                        &[Value::Object(Some(session))],
+                    )?,
+                    "CardinalityExpression.arg.getValue",
+                )?],
+                0,
+                "CardinalityExpression value is null",
+            )?;
+            return Err(h2_invalid_array_value(ctx, value));
+        }
+        let precision = match ctx.invoke_virtual(type_info, "getPrecision", "()J", &[])? {
+            Some(Value::Long(value)) => value,
+            _ => {
+                return Err(h2_internal_error(
+                    ctx,
+                    "TypeInfo.getPrecision result".to_string(),
+                ))
+            }
+        };
+        match ctx.invoke(
+            "org/h2/util/MathUtils",
+            "convertLongToInt",
+            "(J)I",
+            &[Value::Long(precision)],
+        )? {
+            Some(Value::Int(value)) => value,
+            _ => {
+                return Err(h2_internal_error(
+                    ctx,
+                    "MathUtils.convertLongToInt result".to_string(),
+                ))
+            }
+        }
+    } else {
+        let value = h2_object_arg(
+            &[h2_value_result(
+                ctx.invoke_virtual(
+                    arg,
+                    "getValue",
+                    "(Lorg/h2/engine/SessionLocal;)Lorg/h2/value/Value;",
+                    &[Value::Object(Some(session))],
+                )?,
+                "CardinalityExpression.arg.getValue",
+            )?],
+            0,
+            "CardinalityExpression value is null",
+        )?;
+        if null == Some(value) {
+            return Ok(Some(h2_static_value(
+                ctx,
+                "org/h2/value/ValueNull",
+                "INSTANCE",
+            )?));
+        }
+        let value_type = match ctx.invoke_virtual(value, "getValueType", "()I", &[])? {
+            Some(Value::Int(value)) => value,
+            _ => {
+                return Err(h2_internal_error(
+                    ctx,
+                    "Value.getValueType result".to_string(),
+                ))
+            }
+        };
+        match value_type {
+            38 => {
+                let json = h2_object_arg(
+                    &[h2_value_result(
+                        ctx.invoke_virtual(
+                            value,
+                            "convertToAnyJson",
+                            "()Lorg/h2/value/ValueJson;",
+                            &[],
+                        )?,
+                        "Value.convertToAnyJson",
+                    )?],
+                    0,
+                    "Value.convertToAnyJson returned null",
+                )?;
+                let decomposition = h2_object_arg(
+                    &[h2_value_result(
+                        ctx.invoke_virtual(
+                            json,
+                            "getDecomposition",
+                            "()Lorg/h2/util/json/JSONValue;",
+                            &[],
+                        )?,
+                        "ValueJson.getDecomposition",
+                    )?],
+                    0,
+                    "ValueJson.getDecomposition returned null",
+                )?;
+                let is_json_array = ctx
+                    .class_id_by_name("org/h2/util/json/JSONArray")
+                    .is_some_and(|json_array| {
+                        let decomposition_class = ctx.class_id_of_object(decomposition);
+                        decomposition_class == json_array
+                            || ctx.is_subclass(decomposition_class, json_array)
+                    });
+                if !is_json_array {
+                    return Ok(Some(h2_static_value(
+                        ctx,
+                        "org/h2/value/ValueNull",
+                        "INSTANCE",
+                    )?));
+                }
+                match ctx.invoke_virtual(decomposition, "length", "()I", &[])? {
+                    Some(Value::Int(value)) => value,
+                    _ => {
+                        return Err(h2_internal_error(
+                            ctx,
+                            "JSONArray.length result".to_string(),
+                        ))
+                    }
+                }
+            }
+            40 => {
+                let list = h2_object_arg(
+                    &[h2_value_result(
+                        ctx.invoke_virtual(value, "getList", "()[Lorg/h2/value/Value;", &[])?,
+                        "ValueArray.getList",
+                    )?],
+                    0,
+                    "ValueArray.getList returned null",
+                )?;
+                ctx.array_length(list) as i32
+            }
+            _ => return Err(h2_invalid_array_value(ctx, value)),
+        }
+    };
+    Ok(Some(h2_value_result(
+        ctx.invoke(
+            "org/h2/value/ValueInteger",
+            "get",
+            "(I)Lorg/h2/value/ValueInteger;",
+            &[Value::Int(count)],
+        )?,
+        "ValueInteger.get",
+    )?))
+}
+
+fn h2_utils_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let resource_name = match args.first() {
+        Some(Value::Object(Some(name))) => ctx.read_string(*name).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let resource_name = resource_name.trim_start_matches('/');
+    if resource_name.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+
+    // Match H2's lookup order: data.zip is authoritative when present; direct
+    // class resources are only its fallback when the archive is absent.
+    let bytes = match ctx.find_resource("org/h2/util/data.zip") {
+        Some(data_zip) => (|| {
+            let mut archive = zip::ZipArchive::new(Cursor::new(data_zip)).ok()?;
+            let mut entry = archive.by_name(resource_name).ok()?;
+            let mut bytes = Vec::with_capacity(usize::try_from(entry.size()).ok()?);
+            entry.read_to_end(&mut bytes).ok()?;
+            Some(bytes)
+        })(),
+        None => ctx.find_resource(resource_name),
+    };
+    let Some(bytes) = bytes else {
+        return Ok(Some(Value::Object(None)));
+    };
+
+    let array = ctx.new_array(ArrayElementType::Byte, bytes.len());
+    if !ctx.write_byte_array_from(array, 0, &bytes) {
+        for (index, byte) in bytes.iter().enumerate() {
+            ctx.set_array_element(array, index, Value::Int(*byte as i8 as i32));
+        }
+    }
+    Ok(Some(Value::Object(Some(array))))
+}
+
 fn h2_transaction_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = h2_object_arg(args, 0, "Transaction.<init> receiver is null")?;
     let store = h2_optional_object_arg(args, 1);
@@ -632,8 +1220,10 @@ fn h2_long_data_type_binary_search(
     Ok(Some(Value::Int(low ^ -1)))
 }
 
-
-fn h2_session_prepare_local_no_cache(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn h2_session_prepare_local_no_cache(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -1384,6 +1974,9 @@ mod tests {
     fn h2_long_data_type_binary_search_is_registered() {
         let mut registry = NativeMethodRegistry::new();
         register_h2_parser_fastpaths(&mut registry);
+        assert!(registry
+            .find("org/h2/util/Utils", "getResource", "(Ljava/lang/String;)[B")
+            .is_some());
         assert!(registry
             .find(
                 "org/h2/mvstore/type/LongDataType",

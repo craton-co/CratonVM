@@ -48,7 +48,7 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 | Matrix 1280x1280                    | 2,085 ms      | 5,583 ms          | 2.68x         |
 | **QuickBench TOTAL**                | **8,330 ms**  | **19,491 ms**     | **2.34x**     |
 | HashMap (1M put/get, isolated)      | 42 ms         | 264 ms            | 6.29x         |
-| String/Regex (100K, isolated)       | 58 ms         | 476 ms            | 8.21x         |
+| String/Regex (1M, isolated)         | 146 ms        | 4,785 ms          | 32.8x         |
 | Binary Trees (depth=18, isolated)   | 382 ms        | 4,916 ms          | 12.9x         |
 
 *Arithmetic/Fibonacci/Sieve/Matrix/TOTAL and HashMap remeasured 2026-07-14 on the
@@ -67,9 +67,9 @@ median was 2,486 ms (JDK-side bimodality, not a CratonVM change). The earlier OS
 scheduling and guarded scalar self-recursion work behind the first four rows is
 documented in
 [`docs/internal/performance/quickbench-half-gap-3rows-20260713.md`](docs/internal/performance/quickbench-half-gap-3rows-20260713.md).
-String/Regex was freshly remeasured on 2026-07-14 as the median of nine
-alternating-order paired runs pinned to logical CPU 14; Binary Trees retains
-its prior isolated snapshot. All three are measured as **separate, isolated,
+String/Regex was freshly remeasured at 1M entries on 2026-07-14 as the median
+of nine alternating-order paired runs pinned to logical CPU 14; Binary Trees
+retains its prior isolated snapshot. All three are measured as **separate, isolated,
 freshly-launched processes** (not part of the combined run above, median/mean of
 several rounds, checksums identical every round) — mixing any of them
 into the combined run inflates its ratio via accumulated GC/heap pressure from the
@@ -117,12 +117,13 @@ bit-identical to HotSpot's backtracking-engine bookkeeping — verified against 
 parity battery to have zero effect on `find`/`group`/`start`/`end` correctness).
 `CRATONVM_NATIVE_MATCHER_FIND=0` reverts to real JDK bytecode as the safety net.
 
-The table above now uses a freshly verified **8.21x** at 100K entries (58 ms JDK /
-476 ms CratonVM, median of nine alternating-order paired runs,
+The table above now uses a freshly verified **32.8x** at 1M entries (146 ms JDK /
+4,785 ms CratonVM, median of nine alternating-order paired runs,
 `bench/StringRegexOnly.java` standalone, `CRATONVM_NATIVE_MATCHER_FIND` at its default).
-Every run returned checksum `5000050000`. Before the fix, the same fresh 100K harness
-measured 59 ms JDK / 2,065 ms CratonVM (**35.0x**), so the fix removes 77% of CratonVM
-latency and 79% of the ratio gap to parity.
+Every run returned checksum `500000500000`. The earlier 100K measurement was 58 ms
+JDK / 476 ms CratonVM (**8.21x**); at 1M, CratonVM time scales almost exactly 10x while
+HotSpot scales only 2.5x, exposing a larger remaining steady-state throughput gap after
+startup and tiering costs are amortized.
 
 The residual was not generic native-dispatch tax. The fast path compared Rust's
 semantic capture count with `Matcher.groups.length / 2`; the real runtime layout can

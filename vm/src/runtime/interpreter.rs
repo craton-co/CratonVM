@@ -732,7 +732,7 @@ fn pin_frozen_peer_roots_for_g1(
     }
 }
 
-fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
+pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // First, check if another thread requested STW — if so, participate
     safepoint_check(shared, thread);
 
@@ -21505,6 +21505,9 @@ pub(crate) fn is_h2_parser_native_override(
     method_name: &str,
     descriptor: &str,
 ) -> bool {
+    if class_name == "org/h2/util/Utils" {
+        return (method_name, descriptor) == ("getResource", "(Ljava/lang/String;)[B");
+    }
     if class_name == "org/h2/constraint/ConstraintReferential" {
         return (method_name, descriptor)
             == ("checkExistingData", "(Lorg/h2/engine/SessionLocal;)V");
@@ -30581,16 +30584,13 @@ fn execute_jit_call(
     // chain calls into a 5+-arg JIT'd method on Windows and panics with
     // "index out of bounds: the len is 4 but the index is 4" at the
     // pop-into-`jit_args` loop below.
-    #[cfg(target_os = "windows")]
-    const JIT_ABI_REG_SLOTS: usize = 4;
-    #[cfg(not(target_os = "windows"))]
-    const JIT_ABI_REG_SLOTS: usize = 6;
+    const JIT_ABI_MAX_JAVA_ARGS: usize = 8;
     let np = num_params as usize; // Widening: parameter count conversion
-    let max_java_params = JIT_ABI_REG_SLOTS - if needs_heap { 1 } else { 0 };
+    let max_java_params = JIT_ABI_MAX_JAVA_ARGS - if needs_heap { 1 } else { 0 };
     if np > max_java_params {
         return Ok(CachedCallResult::CacheMiss);
     }
-    let mut jit_args = [0i64; JIT_ABI_REG_SLOTS];
+    let mut jit_args = [0i64; JIT_ABI_MAX_JAVA_ARGS];
     // The JIT calling convention expects raw primitive bits with no NaN-box
     // tag (Int → sign-extended i64, Long → raw i64, Float → zero-extended u32
     // bits, Double → raw f64 bits, Object → pointer). Decode each arg slot by
@@ -30612,8 +30612,8 @@ fn execute_jit_call(
     // Save the raw popped slots (bit-exact + long mark) so the i64::MIN deopt
     // arm below can restore them before the slow path re-pops the args. See
     // that arm for the underflow this prevents.
-    let mut saved_args: [(CompactValue, bool); JIT_ABI_REG_SLOTS] =
-        [(CompactValue::zero(), false); JIT_ABI_REG_SLOTS];
+    let mut saved_args: [(CompactValue, bool); JIT_ABI_MAX_JAVA_ARGS] =
+        [(CompactValue::zero(), false); JIT_ABI_MAX_JAVA_ARGS];
     for i in (0..np).rev() {
         let (cv, is_long) = thread.frames[frame_idx]
             .stack
@@ -31099,12 +31099,9 @@ fn execute_jit_call_decoded(
     cached: &Arc<CachedBytecodeMethod>,
     args_slice: &[Value],
 ) -> Result<Option<CachedCallResult>, MethodCallFailed> {
-    #[cfg(target_os = "windows")]
-    const JIT_ABI_REG_SLOTS: usize = 4;
-    #[cfg(not(target_os = "windows"))]
-    const JIT_ABI_REG_SLOTS: usize = 6;
+    const JIT_ABI_MAX_JAVA_ARGS: usize = 8;
     let np = num_params as usize; // Widening: parameter count conversion
-    let max_java_params = JIT_ABI_REG_SLOTS - if needs_heap { 1 } else { 0 };
+    let max_java_params = JIT_ABI_MAX_JAVA_ARGS - if needs_heap { 1 } else { 0 };
     // Too many args for the register-only JIT ABI, or a mismatch between the
     // decoded args and the declared count → interpreter fallback (Ok(None)).
     if np > max_java_params || args_slice.len() != np {
@@ -31113,7 +31110,7 @@ fn execute_jit_call_decoded(
     // Decode each Java arg to its raw JIT-ABI bit pattern (Int → sign-extended
     // i64, Long → raw i64, Float/Double → zero-/raw-bits, Object → pointer).
     // `args_slice` is already descriptor-decoded by the caller (receiver = arg 0).
-    let mut jit_args = [0i64; JIT_ABI_REG_SLOTS];
+    let mut jit_args = [0i64; JIT_ABI_MAX_JAVA_ARGS];
     for (i, v) in args_slice.iter().enumerate().take(np) {
         jit_args[i] = match v {
             Value::Int(x) => *x as i64, // Cast: JIT ABI -- i64 register convention
