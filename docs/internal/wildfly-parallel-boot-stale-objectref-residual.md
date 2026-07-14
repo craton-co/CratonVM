@@ -805,3 +805,42 @@ enough time to actually get through a meaningful fraction rather than another pa
 (`fix/stream-thencompar-stale-objref-20260714`) landed its own separate stale-ObjectRef fixes in the same
 file family — confirms this bug class is being actively hunted from multiple angles concurrently on this
 project right now. Always fetch + shadow-check before finalizing a fix in this area.
+
+## Follow-up session 6 (2026-07-14): poisoning-cascade amplifier fixed; lambda_arg_provably_not_instance flagged unfixed
+
+Working the TIMEOUT_NO_WARN angle (`docs/known-issues/wildfly-standalone-boot-stw-jit-takeover-hang.md`'s
+2026-07-14 fourth-session addendum has the full account) rather than a fresh static/log-mining sweep.
+Two findings worth recording here specifically:
+
+1. **Poisoning-cascade amplifier, fixed.** `native-collections/src/lib.rs`'s overlay-table global
+   `Mutex` accessors (`lhm_overlay()`/`lhm_ptr_cache()`/`ll_overlay()`) still used naive
+   `.lock().unwrap()` at 6 call sites reachable from ordinary `get`/`put`/`remove` operations (as opposed
+   to the GC's own root-scan pass, hardened back in June by `eb13200b`). Since a `std::sync::Mutex`
+   poisons permanently once any thread panics while holding it, a single (still-open, long-tail) Family-1
+   panic on ANY thread can permanently poison one of these locks, after which every subsequent
+   LinkedHashMap/LinkedList operation on every thread for the rest of the process panics too. Live-captured
+   directly: one `CRATONVM_DBG_STALE_OBJREF` panic followed immediately by 5 more `PoisonError` panics on
+   unrelated worker threads. Applied this file's own established `.lock().unwrap_or_else(|e|
+   e.into_inner())` idiom (already used 8 other places in this file) to the remaining 6 sites. This does
+   NOT close any specific Family-1 site -- it limits the blast radius of whichever ones remain open.
+
+2. **`lambda_arg_provably_not_instance` (`vm/src/runtime/interpreter.rs:19024`), NOT fixed.** The single
+   largest `CRATONVM_DBG_STALE_OBJREF` contributor in a 20-run diagnostic sample taken after the JMX
+   regression fix and before `2d45ef40` landed (8/20, via `native_stream_for_each`/
+   `native_stream_all_match`/`invoke_deferred_stream_lambda`, all panicking on the exact same
+   `shared.heap.class_id_of(obj_ref)` line -- the FIRST dereference of `obj_ref` inside the function).
+   Traced the pin chain up through `coerce_lambda_args`/`checkcast_lambda_instantiated_args`: `obj_ref` is
+   read fresh from `thread.native_pin_roots[h]` immediately before the call with no intervening
+   GC-triggering step, yet still panics on first use. Either this function's stated "no GC, no stale
+   `obj_ref`" invariant (only consults already-loaded classes) is violated by one of its own helpers
+   (`lambda_proxy_satisfies`/`synthetic_implements`/`proxy_instance_satisfies_target`/
+   `annotation_proxy_satisfies_target`), or the corruption predates entry into `coerce_lambda_args`
+   entirely (something upstream hands it an already-stale `args` element). Not fixed here: the function's
+   signature (`shared: &SharedVm`, no mutable `NativeContext`/pin access) does not obviously support this
+   file's established pin/re-read idiom without a larger refactor, and a rushed fix without live-gdb
+   confirmation risked being wrong. Flagged as the best next lead for whoever picks this up -- likely the
+   fastest remaining win given its outsized share of the diagnostic sample.
+
+Verified: `cargo test -p cratonvm-native-collections --lib` 72/72, `-p cratonvm-vm --lib` 2217/0/111
+ignored, `-p cratonvm-native-builtins --lib` 2994/0/6 ignored -- all identical to baseline. Merged `dev`
+(`6a0eedd8`/`cfd80297`, pushed as `ab423500`).
