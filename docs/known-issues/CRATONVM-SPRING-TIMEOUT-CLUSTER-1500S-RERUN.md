@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN (12 genuinely hung, 10 slow-but-failing, 0 crash — 1 FIXED; 2 non-residual items removed). **2026-07-13 update**: 8 Bucket-1 + 3 Bucket-2 classes reconfirmed locally — one narrower bug fixed (`7ae137e4`), the hang itself still OPEN; see the 2026-07-13 section below. **2026-07-13 update #2**: `context.annotation.ImportSelectorTests`'s `StackOverflowError` root-caused — it is a Mockito `spy()` cross-hierarchy recursion, **unrelated to Spring's `ImportSelector` mechanism** (the original hypothesis below was wrong); still OPEN, see its own section. **2026-07-13 update #3**: both `web.service.registry.*` residuals (`ImportHttpServiceRegistrarTests`, `GroupsMetadataValueDelegateTests`) root-caused to `@CompileWithForkedClassLoader`'s custom-ClassLoader machinery interacting with Spring's AOT/test-compiler pipeline — two distinct defects, neither fixed; still OPEN, see dedicated section. **2026-07-13 update #4**: the 4 non-AOT, non-`ImportSelectorTests` Bucket-1 classes (`cache.jcache.JCacheEhCacheAnnotationTests`, `context.annotation.ComponentScanParserBeanDefinitionDefaultsTests`, `context.annotation.InitDestroyMethodLifecycleTests`, `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests`) **no longer hang** — reconfirmed clean on 2 independent runs each against a freshly-built `origin/dev` tip; see the dedicated section below. No new code was needed — all 4 were incidental beneficiaries of other unrelated fixes already on `dev`. **2026-07-13 update #5**: the "missing `ApiVersionStrategy` bean" `BeanCreationException` (2 classes: `CrossOriginAnnotationIntegrationTests`, `RequestMappingMessageConversionIntegrationTests`) **no longer reproduces** — confirmed fixed (likely a side effect of earlier JSpecify/reflection work), but both classes now fail a different way instead: a genuine **deadlock in `Semaphore.release()`'s internal monitor**, confirmed via a live `gdb` thread dump. Still OPEN, new root cause, see dedicated section. **2026-07-13 update #6**: Bucket 3's `scripting.groovy.GroovyScriptFactoryTests` SIGSEGV **FIXED** (`2724ea5b`, pushed to `dev`) — root cause was a JIT codegen bug (stale deferred patch-list offsets surviving a rewound speculative-inline attempt, corrupting a later safepoint-id store in a hot, frequently-recompiled method); see dedicated section below. **2026-07-14 update**: the update #5 `Semaphore.release()` deadlock is now **FIXED** (`b6fffebf`/`9ca83d62`, pushed) — both classes run to completion instead of TIMEOUT. A second, unrelated bug underneath it (`Objects.toString(Object[, String])` never virtually dispatching, causing a malformed HTTP `Host` header via Apache HttpComponents5) is root-caused and fixed locally (`7b1d6ff3`, not yet pushed). Full end-to-end reverification of both classes is currently blocked by a **third, severe, unrelated regression** bisected with certainty to commit `d8092acb` (`InternalError: null property: java.home` from any early `Locale` use in real-JDK mode) — a dedicated follow-up task has been filed given its severity. See the 2026-07-14 section below. |
+| **Status** | OPEN (12 genuinely hung, 10 slow-but-failing, 0 crash — 1 FIXED; 2 non-residual items removed). **2026-07-13 update**: 8 Bucket-1 + 3 Bucket-2 classes reconfirmed locally — one narrower bug fixed (`7ae137e4`), the hang itself still OPEN; see the 2026-07-13 section below. **2026-07-13 update #2**: `context.annotation.ImportSelectorTests`'s `StackOverflowError` root-caused — it is a Mockito `spy()` cross-hierarchy recursion, **unrelated to Spring's `ImportSelector` mechanism** (the original hypothesis below was wrong); still OPEN, see its own section. **2026-07-13 update #3**: both `web.service.registry.*` residuals (`ImportHttpServiceRegistrarTests`, `GroupsMetadataValueDelegateTests`) root-caused to `@CompileWithForkedClassLoader`'s custom-ClassLoader machinery interacting with Spring's AOT/test-compiler pipeline — two distinct defects, neither fixed; still OPEN, see dedicated section. **2026-07-13 update #4**: the 4 non-AOT, non-`ImportSelectorTests` Bucket-1 classes (`cache.jcache.JCacheEhCacheAnnotationTests`, `context.annotation.ComponentScanParserBeanDefinitionDefaultsTests`, `context.annotation.InitDestroyMethodLifecycleTests`, `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests`) **no longer hang** — reconfirmed clean on 2 independent runs each against a freshly-built `origin/dev` tip; see the dedicated section below. No new code was needed — all 4 were incidental beneficiaries of other unrelated fixes already on `dev`. **2026-07-13 update #5**: the "missing `ApiVersionStrategy` bean" `BeanCreationException` (2 classes: `CrossOriginAnnotationIntegrationTests`, `RequestMappingMessageConversionIntegrationTests`) **no longer reproduces** — confirmed fixed (likely a side effect of earlier JSpecify/reflection work), but both classes now fail a different way instead: a genuine **deadlock in `Semaphore.release()`'s internal monitor**, confirmed via a live `gdb` thread dump. Still OPEN, new root cause, see dedicated section. **2026-07-13 update #6**: Bucket 3's `scripting.groovy.GroovyScriptFactoryTests` SIGSEGV **FIXED** (`2724ea5b`, pushed to `dev`) — root cause was a JIT codegen bug (stale deferred patch-list offsets surviving a rewound speculative-inline attempt, corrupting a later safepoint-id store in a hot, frequently-recompiled method); see dedicated section below. **2026-07-14 update**: the update #5 `Semaphore.release()` deadlock is now **FIXED** (`b6fffebf`/`9ca83d62`, pushed) — both classes run to completion instead of TIMEOUT. A second, unrelated bug underneath it (`Objects.toString(Object[, String])` never virtually dispatching, causing a malformed HTTP `Host` header via Apache HttpComponents5) is root-caused and fixed locally (`7b1d6ff3`, not yet pushed). Full end-to-end reverification of both classes is currently blocked by a **third, severe, unrelated regression** bisected with certainty to commit `d8092acb` (`InternalError: null property: java.home` from any early `Locale` use in real-JDK mode) — a dedicated follow-up task has been filed given its severity. See the 2026-07-14 section below. **2026-07-14 update #2 (urgent)**: the `java.home` regression is now **root-caused precisely and FIXED** (`f62d2073`, pushed) — a whole-function category-tagging bug in `register_properties_sidetable` (`java.util.Properties`' native bridges silently dropped in real-JDK mode). A second instance of the identical bug family (`CopyOnWriteArrayList`'s mutators, causing `"this.lock is null"` NPEs) was found and **also fixed** (`68c44f62`, pushed). Both target classes still do not fully pass — clearing these two blockers revealed (at least) two further, distinct, unrelated, NOT-yet-investigated issues (one per remaining backend: Jetty `NoClassDefFoundError`, Tomcat `LifecycleException`). See the new 2026-07-14 follow-up #2 section below. |
 | **Discovered** | 2026-07-11, following up on the 25 classes that hit TIMEOUT in the
 125-class scoped rerun (dev `9948295e`, standard 120s timeout — see
 [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](../internal/CRATONVM-SPRING-GENUINE-BUGLIST-125.md)). |
@@ -914,6 +914,163 @@ attempt to clean up `/home/victor`'s large shared caches
 binaries, all of which are shared across concurrent sessions on this host
 and unsafe to delete unilaterally. This may be silently affecting other
 concurrent sessions' builds too.
+
+## 2026-07-14 follow-up #2 — java.home regression ROOT-CAUSED and FIXED (urgent, host-wide impact); a second instance of the same bug family also fixed; two more distinct issues surfaced, not yet investigated
+
+Escalated to highest priority: the finding #3 regression from the section
+above (`InternalError: null property: java.home`, bisected to commit
+`d8092acb`) was confirmed independently reproducing on `origin/dev` and
+flagged as plausibly affecting **every other concurrent session on this
+host currently exercising real-JDK mode** — any of them touching
+`java.util.Locale` early would hit this crash silently.
+
+### Root cause, confirmed precisely
+
+The original hypothesis (a duplicate/conflicting `VM.getSavedProperty`
+registration) was **investigated and refuted** — tracing the actual
+registration order showed the broken `phases_early.rs` stub for that
+method is only reachable via `register_synthetic_overrides`, which real-JDK
+mode never calls; the correct `lib.rs` implementation (tagged `Bridge`) is
+the only one ever registered there.
+
+Root-caused instead via a new permanent, gated diagnostic
+(`CRATONVM_DBG_DROPPED_STUBS=1`, `native-api/src/registry.rs`, ~3 lines,
+zero cost when unset) that lists every registration
+`set_drop_synthetic_stubs` silently drops. Running it against the bare
+`LocaleRepro.java` one-liner immediately showed the actual mechanism:
+**every native backing `java.util.Properties`** (`getProperty`, `get`,
+`put`, `size`, `keySet`, `forEach`, `putAll`, ~24 methods total) was being
+dropped. `System.getProperties()` (`native-builtins/src/lib.rs`)
+deliberately hands back a "lightweight synthetic Properties object" whose
+inherited `Hashtable`/`ConcurrentHashMap` backing is **never populated** —
+real JDK 25 `Properties`/`Hashtable` bytecode dereferences a `map` field
+that stays permanently null on this object, so these overrides are the
+*only* thing that makes it behave like a `Map` at all (this is explicitly
+documented in the existing code comment right above the
+`System.getProperties()` registration). `register_properties_sidetable`
+(`native-builtins/src/properties_sidetable.rs`) registered its entire
+~24-method surface with no explicit category of its own, inheriting
+whatever was ambient at each of its ~3 call sites — `Bridge` in some,
+`SyntheticStub` in real-JDK mode's own call sites in `vm/src/vm/vm_init.rs`.
+Once `d8092acb` made `set_drop_synthetic_stubs(true)` actually take effect
+in real-JDK mode, the entire synthetic `Properties` object lost every
+override that made it functional — including the `getProperty` lookup
+`jdk.internal.util.StaticProperty`'s bootstrap path depends on for
+`"java.home"`.
+
+**Fix** (commit `f62d2073`, pushed): wrap `register_properties_sidetable`'s
+whole body in `registry.with_category(NativeKind::Bridge, |registry| {
+...})`, so its registrations no longer depend on the caller's ambient
+category. Does **not** touch or revert `d8092acb`'s actual intended
+behavior (`set_drop_synthetic_stubs` itself stays in effect for genuine
+synthetic approximations, e.g. `ByteBuffer.allocate`/`allocateDirect` and
+`CodingErrorAction`, confirmed still correctly falling through to real
+bytecode — see spot-check below) or any of `d8092acb`'s 8 other,
+unrelated fixes (JIT safety guard, EdDSA key factory, security-policy
+escape handling, etc.).
+
+**Verified**:
+- `LocaleRepro.java` (`"X".toLowerCase(Locale.ROOT)`): now prints
+  `RESULT lower=[localhost]` / `OVERALL SUCCESS` instead of crashing.
+- `SpotCheck.java`: `ByteBuffer.allocate`/`allocateDirect` (confirming
+  `d8092acb`'s own fix is untouched), a plain `new Properties()` instance,
+  and both `System.getProperties().getProperty("java.home")` and
+  `System.getProperty("java.home")` all match HotSpot.
+- `SemCorrectness.java`, `URIAuthorityRepro.java`, `HttpClient5HostRepro.java`
+  (this session's earlier fixes): all still pass — no interaction between
+  the three fixes. `HttpClient5HostRepro` now captures the **correct** Host
+  header (`localhost:<port>`) end-to-end through real Apache httpclient5,
+  confirming the `Objects.toString` fix's real-world effect is intact.
+- Real suite runner: `CrossOriginAnnotationIntegrationTests` no longer
+  shows the `java.home` `LOADERR` (was crashing in ~5-8ms before any test
+  loaded); it now runs all 68 sub-tests to completion in ~213s (down from
+  ~372s pre-fix — the java.home/Properties bug was itself adding overhead
+  throughout, not just at startup).
+
+### Second instance of the same bug family, found and fixed
+
+With `java.home` fixed, both target classes progressed further but then
+failed **every** sub-test on **all 4 backends** uniformly with
+`java.lang.NullPointerException: Cannot enter synchronized block because
+"this.lock" is null`.
+
+Same root-cause shape: `register_concurrent_natives`'s
+`CopyOnWriteArrayList` registration block (`native-builtins/src/lib.rs`,
+~line 57046 — `add`, `set`, `remove`, `clear`, `addIfAbsent`, etc.) also
+inherited its ambient category instead of declaring one, and was also
+`SyntheticStub` in real-JDK mode (confirmed via
+`CRATONVM_DBG_DROPPED_STUBS` during a live
+`CrossOriginAnnotationIntegrationTests` run). `CopyOnWriteArrayList.
+<init>()V` is deliberately left unregistered so real bytecode constructs
+`this.lock` correctly (a prior, already-correct fix, per the comment
+already in this file) — but real JDK's own `add`/`set`/`remove`/`clear`
+bytecode does `getfield lock; monitorenter` (confirmed via `javap -p -c`
+against the real class), and these mutator natives exist specifically to
+bypass that bytecode, not approximate it. Once dropped, every mutating
+call on a real `CopyOnWriteArrayList` (used constantly by Spring's own
+`BeanPostProcessor`/listener lists during `ApplicationContext` refresh —
+both target classes refresh a context 68 and 160 times respectively) fell
+through to bytecode requiring a lock object.
+
+**Fix** (commit `68c44f62`, pushed): same `with_category(Bridge)` wrap,
+scoped to just the COWAL registration block (the other classes registered
+earlier in the same function — `ReentrantLock`, `Condition`, etc. — were
+left untouched; no evidence found that they share the problem, and the
+fix should stay as narrow as the evidence supports).
+
+**Verified**: rerunning `CrossOriginAnnotationIntegrationTests` shows the
+`"this.lock is null"` NPE is completely gone from all 4 backends.
+
+### Two (at least) further, distinct, NOT-yet-investigated issues remain
+
+With both fixes applied, `CrossOriginAnnotationIntegrationTests` still
+fails all 68 sub-tests (258s), now with a **different FAILCAUSE per
+backend** (no longer uniform — a good sign that each backend now fails on
+its own, unrelated issue rather than one shared blocker):
+
+| Backend | FAILCAUSE |
+|---|---|
+| Jetty | `NoClassDefFoundError: org/eclipse/jetty/http/MimeTypes$Mutable` (+ `ExceptionInInitializerError`) |
+| Jetty Core | `NoClassDefFoundError: org/eclipse/jetty/http/MimeTypes$Mutable` |
+| Reactor Netty | `IllegalStateException: failed to create a child event loop` (unchanged since the original 2026-07-13 investigation — see the section above; not caused by anything fixed today) |
+| Tomcat | `IllegalStateException: org.apache.catalina.LifecycleException: Failed to initialize component [StandardServer[-1]]` |
+
+None of these were investigated this session — flagging them here rather
+than guessing. Given the `NoClassDefFoundError`/`LifecycleException`
+shapes, it is plausible (not confirmed) that at least one of these is
+*also* a `SyntheticStub`-drop casualty of the same `d8092acb` family
+(worth checking with `CRATONVM_DBG_DROPPED_STUBS` first before assuming a
+new, unrelated bug) — but this was not verified. `RequestMappingMessageConversionIntegrationTests`
+was not rerun against the COWAL fix specifically (only against the
+java.home fix alone, where it showed the same `"this.lock is null"` NPE
+as `CrossOriginAnnotationIntegrationTests`, so the COWAL fix should apply
+equally there, but this was not directly reconfirmed).
+
+### Status
+
+The two bugs this session was explicitly, urgently asked to confirm and
+fix (the `java.home`/`Locale` regression and its root cause) are **fixed,
+verified, and pushed** (`f62d2073`). A closely related second instance
+(`CopyOnWriteArrayList`) was also found, fixed, and pushed (`68c44f62`).
+**Both target classes still do not fully pass** — each of the 4
+parameterized backends now fails on what looks like its own distinct,
+unrelated issue, none investigated yet. This is a legitimately deep stack
+of independent pre-existing bugs being uncovered one layer at a time as
+each blocker is cleared, consistent with the pattern already documented
+elsewhere in this doc (e.g. the AOT hang cluster, the original
+`ApiVersionStrategy` investigation itself). Recommend a fresh, dedicated
+session per remaining backend-specific failure rather than continuing
+serially in this one.
+
+**Unrelated but urgent operational note**: the Azure host's root
+filesystem (`/`, distinct from `/data`) is now at **100% capacity, 0
+bytes free** (was ~70MB free earlier this session) — `scp`/`cc`/anything
+that writes to `/tmp` will fail outright for any concurrent session on
+this host until this is addressed. Did not attempt to clean up
+`/home/victor`'s large shared caches or other sessions' preserved
+binaries (unsafe to delete unilaterally without coordination) — flagging
+for whoever has host-level access/context to free space or move `/tmp` to
+the `/data` volume (177G+ free there throughout this session).
 
 ## Bucket 1 — Genuinely hung (12/25)
 
