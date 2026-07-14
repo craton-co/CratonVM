@@ -53713,6 +53713,7 @@ fn matcher_realjdk_field_indices(ctx: &mut dyn NativeContext) -> Option<MatcherF
 struct PatternFieldIndices {
     pattern: usize,
     flags: usize,
+    capturing_group_count: usize,
 }
 
 fn pattern_realjdk_field_indices(ctx: &mut dyn NativeContext) -> Option<PatternFieldIndices> {
@@ -53723,7 +53724,51 @@ fn pattern_realjdk_field_indices(ctx: &mut dyn NativeContext) -> Option<PatternF
         Some(PatternFieldIndices {
             pattern: ctx.resolve_field_index(CLASS, f::PATTERN)?,
             flags: ctx.resolve_field_index(CLASS, f::FLAGS)?,
+            capturing_group_count: ctx.resolve_field_index(CLASS, f::CAPTURING_GROUP_COUNT)?,
         })
+    })
+}
+
+/// Return the semantic capture count stored by the real JDK Pattern. This
+/// includes group zero. Some supported JDK Matcher layouts overallocate the
+/// backing `groups[]` array (for example, ten capture pairs for a one-group
+/// pattern), so array length is a capacity check, not the group count.
+fn matcher_realjdk_java_capture_count(
+    ctx: &mut dyn NativeContext,
+    matcher: ObjectRef,
+    idx: MatcherFieldIndices,
+    pattern_idx: PatternFieldIndices,
+) -> Option<usize> {
+    let pattern = match ctx.get_field(matcher, idx.parent_pattern) {
+        Value::Object(Some(pattern)) => pattern,
+        _ => return None,
+    };
+    let count = ctx
+        .get_field(pattern, pattern_idx.capturing_group_count)
+        .as_int()?;
+    (count > 0).then_some(count as usize)
+}
+
+fn matcher_realjdk_capture_layout_valid(
+    rust_capture_count: usize,
+    java_capture_count: usize,
+    groups_len: usize,
+) -> bool {
+    java_capture_count > 0
+        && rust_capture_count == java_capture_count
+        && groups_len >= java_capture_count.saturating_mul(2)
+}
+
+fn matcher_realjdk_capture_layout_ok(
+    ctx: &mut dyn NativeContext,
+    matcher: ObjectRef,
+    idx: MatcherFieldIndices,
+    pattern_idx: PatternFieldIndices,
+    re: &JavaRegex,
+    groups: ObjectRef,
+) -> bool {
+    matcher_realjdk_java_capture_count(ctx, matcher, idx, pattern_idx).is_some_and(|count| {
+        matcher_realjdk_capture_layout_valid(re.captures_len(), count, ctx.array_length(groups))
     })
 }
 
@@ -53941,8 +53986,8 @@ fn matcher_realjdk_search(
     // it here instead would mean bailing to real bytecode after already
     // having overwritten `first`/`oldLast` above, corrupting the state the
     // bytecode fallback itself depends on). Trust the caller: by the time
-    // we're here, `re.captures_len() == groups_obj.length / 2` is already
-    // established, so every `caps.len()` below is guaranteed to match.
+    // we're here, Rust's capture count matches Pattern.capturingGroupCount and
+    // `groups_obj` has enough capacity, so every write below is in bounds.
     let caps = re.captures_at(region_slice, search_from_byte);
     let matched = match caps {
         Some(caps) => {
@@ -54064,10 +54109,9 @@ fn native_matcher_find_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Value::Object(Some(g)) => g,
         _ => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
     };
-    // Group-count safety net, checked BEFORE any field mutation below (see
-    // the comment in `matcher_realjdk_search` for why bailing after
-    // mutating `first`/`oldLast` would corrupt the fallback's own state).
-    if re.captures_len() != ctx.array_length(groups_obj) / 2 {
+    // Group-count safety net, checked BEFORE any field mutation below. The
+    // Pattern field is the semantic count; groups[] may be overallocated.
+    if !matcher_realjdk_capture_layout_ok(ctx, this, idx, pattern_idx, &re, groups_obj) {
         return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]);
     }
 
@@ -54164,9 +54208,9 @@ fn native_matcher_find_at_realjdk(
         Value::Object(Some(g)) => g,
         _ => return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]),
     };
-    // Group-count safety net — checked before any field mutation below; see
-    // the comment in `matcher_realjdk_search`.
-    if re.captures_len() != ctx.array_length(groups_obj) / 2 {
+    // Group-count safety net — checked before any field mutation below. The
+    // Pattern field is the semantic count; groups[] may be overallocated.
+    if !matcher_realjdk_capture_layout_ok(ctx, this, idx, pattern_idx, &re, groups_obj) {
         return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]);
     }
 
@@ -54216,11 +54260,57 @@ fn native_matcher_find_at_realjdk(
 /// (not a subclass CratonVM has a dedicated `RuntimeError` variant for) on an
 /// invalid index — the caller bails to real bytecode for that rare case so
 /// it throws the exact right exception, rather than fabricating one here.
-/// Returns `true` when `group` is in bounds (`0..=groupCount()`, where
-/// `groupCount() == groups_obj.length/2 - 1`).
-fn matcher_realjdk_group_in_bounds(ctx: &mut dyn NativeContext, groups_obj: ObjectRef, group: i32) -> bool {
-    let group_count = (ctx.array_length(groups_obj) / 2) as i32 - 1;
-    group >= 0 && group <= group_count
+/// Returns `true` when `group` is in bounds (`0..=groupCount()`). Pattern's
+/// semantic capture count is authoritative because groups[] may be larger.
+fn matcher_realjdk_group_index_in_bounds(
+    group: i32,
+    capture_count: usize,
+    groups_len: usize,
+) -> bool {
+    if group < 0 {
+        return false;
+    }
+    let group = group as usize;
+    group < capture_count && group.saturating_mul(2).saturating_add(1) < groups_len
+}
+
+fn matcher_realjdk_group_in_bounds(
+    ctx: &mut dyn NativeContext,
+    matcher: ObjectRef,
+    idx: MatcherFieldIndices,
+    groups_obj: ObjectRef,
+    group: i32,
+) -> bool {
+    let Some(pattern_idx) = pattern_realjdk_field_indices(ctx) else {
+        return false;
+    };
+    let Some(capture_count) = matcher_realjdk_java_capture_count(ctx, matcher, idx, pattern_idx)
+    else {
+        return false;
+    };
+    matcher_realjdk_group_index_in_bounds(group, capture_count, ctx.array_length(groups_obj))
+}
+
+#[cfg(test)]
+mod matcher_realjdk_layout_tests {
+    use super::{matcher_realjdk_capture_layout_valid, matcher_realjdk_group_index_in_bounds};
+
+    #[test]
+    fn overallocated_groups_array_is_capacity_not_capture_count() {
+        assert!(matcher_realjdk_capture_layout_valid(2, 2, 20));
+        assert!(matcher_realjdk_group_index_in_bounds(1, 2, 20));
+        assert!(!matcher_realjdk_group_index_in_bounds(2, 2, 20));
+    }
+
+    #[test]
+    fn layout_rejects_semantic_count_mismatch_or_short_capacity() {
+        assert!(!matcher_realjdk_capture_layout_valid(3, 2, 20));
+        assert!(!matcher_realjdk_capture_layout_valid(2, 3, 20));
+        assert!(!matcher_realjdk_capture_layout_valid(2, 2, 3));
+        assert!(!matcher_realjdk_capture_layout_valid(0, 0, 0));
+        assert!(!matcher_realjdk_group_index_in_bounds(-1, 2, 20));
+        assert!(!matcher_realjdk_group_index_in_bounds(1, 2, 3));
+    }
 }
 
 fn native_matcher_start_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -54289,7 +54379,7 @@ fn native_matcher_start_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value])
         Value::Object(Some(g)) => g,
         _ => return matcher_realjdk_bail(ctx, this, "start", "(I)I", &[Value::Int(group)]),
     };
-    if !matcher_realjdk_group_in_bounds(ctx, groups_obj, group) {
+    if !matcher_realjdk_group_in_bounds(ctx, this, idx, groups_obj, group) {
         return matcher_realjdk_bail(ctx, this, "start", "(I)I", &[Value::Int(group)]);
     }
     Ok(Some(ctx.get_array_element(groups_obj, 2 * group as usize)))
@@ -54319,7 +54409,7 @@ fn native_matcher_end_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -
         Value::Object(Some(g)) => g,
         _ => return matcher_realjdk_bail(ctx, this, "end", "(I)I", &[Value::Int(group)]),
     };
-    if !matcher_realjdk_group_in_bounds(ctx, groups_obj, group) {
+    if !matcher_realjdk_group_in_bounds(ctx, this, idx, groups_obj, group) {
         return matcher_realjdk_bail(ctx, this, "end", "(I)I", &[Value::Int(group)]);
     }
     Ok(Some(ctx.get_array_element(groups_obj, 2 * group as usize + 1)))
@@ -54377,7 +54467,7 @@ fn native_matcher_group_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value])
             )
         }
     };
-    if !matcher_realjdk_group_in_bounds(ctx, groups_obj, group) {
+    if !matcher_realjdk_group_in_bounds(ctx, this, idx, groups_obj, group) {
         return matcher_realjdk_bail(
             ctx,
             this,
