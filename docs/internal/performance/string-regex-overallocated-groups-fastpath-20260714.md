@@ -2,9 +2,10 @@
 
 ## Status
 
-Fixed on topic commit `471dd417` (`codex/perf-string-regex-20260713-001`), based on
-current `origin/dev`. The change restores the existing real-JDK `Matcher` native fast
-path for runtime layouts that overallocate the `groups[]` backing array.
+Fixed on topic commit `471dd417` (`codex/perf-string-regex-20260713-001`) and merged
+to `dev` by `71f1516e`. The change restores the existing real-JDK `Matcher` native
+fast path for runtime layouts that overallocate the `groups[]` backing array. The 1M
+README remeasurement below used later current-dev commit `331b279e`.
 
 ## Symptom and root cause
 
@@ -68,7 +69,37 @@ SHA-256 38582cda6f3a4bea58137d162b26fe1aac356ed42e10fc13581e8215653e6b97
 The artifact was built in the unique target directory
 `/data/data/cratonvm-perf-string-regex-target-20260714-471dd417`.
 
-## Fresh 100K benchmark
+The current-dev 1M remeasurement used this separate unique artifact:
+
+```text
+/data/cratonvm-perf-string-regex-artifacts-20260713/
+  cratonvm-string-regex-1m-331b279e-20260714-001.bin
+SHA-256 805ddffd3b9edcc5d9a3030c13f989e6392a87ec3ffb1398f88faebb3a71b74e
+```
+
+It was built in
+`/data/data/cratonvm-perf-string-regex-1m-target-20260714-331b279e`, with compiler
+temporaries redirected to `/data` because the host's shared `/tmp` filesystem was full.
+
+## Fresh 1M benchmark (README row)
+
+Method: Azure Linux benchmark host, logical CPU 14 via `taskset`, freshly launched
+process per sample, alternating CratonVM/HotSpot order, nine paired rounds. HotSpot was
+Temurin JDK 25.0.3 C2. Harness source SHA-256:
+`76e3ae6010061db3da1b366c9e0a4a598d9487e3bf99c9132bdbb1f27bb66fde`.
+Every sample returned checksum `500000500000`.
+
+```text
+CratonVM: 4841, 4792, 4839, 4784, 4763, 4779, 4785, 4806, 4782 ms
+HotSpot:   145,  149,  142,  146,  149,  146,  143,  146,  142 ms
+Median:  4785 ms CratonVM / 146 ms HotSpot = 32.8x
+```
+
+Compared with the earlier 100K result below, CratonVM time scales almost exactly 10x
+while HotSpot time scales 2.5x. The larger 1M ratio therefore exposes the remaining
+steady-state throughput gap after process startup and tiering costs are amortized.
+
+## Historical fresh 100K benchmark
 
 Method: Azure Linux benchmark host, logical CPU 14 via `taskset`, freshly launched
 process per sample, alternating CratonVM/HotSpot order, nine paired rounds. HotSpot was
@@ -91,4 +122,3 @@ Ratio: 35.0x
 ```
 
 The fix reduces CratonVM latency by 77.0% and reduces the ratio gap to parity by 78.8%.
-
