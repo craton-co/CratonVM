@@ -1374,6 +1374,24 @@ pub struct G1Collector {
     /// concurrent mutator's cached entry.
     rset_cache_epoch: AtomicU64,
 
+    /// Process-unique identity of this collector instance, minted from a
+    /// global monotonic counter in [`G1Collector::new`].
+    ///
+    /// `post_write_barrier_rset`'s TLS cache must key its cached `*const
+    /// G1Region` to the collector instance that produced it. Using the
+    /// collector's own address (`self as *const Self`) for that is unsound:
+    /// a later collector can be constructed at the SAME address as a dropped
+    /// one (stack slot reuse across calls, or allocator block reuse), and if
+    /// its `rset_cache_epoch` history happens to line up too — trivially
+    /// true for two identically-driven collectors, e.g. unit tests running
+    /// the same scenario twice — the fast path revalidates a dangling
+    /// pointer into the dropped collector's freed `regions` storage and
+    /// writes through it (observed as intermittent 0xC0000374 heap
+    /// corruption in parallel `cargo test -p cratonvm-gc` runs). A minted id
+    /// is never reused within the process, so a cache entry can only ever
+    /// match the instance that created it.
+    instance_id: u64,
+
     /// Address-to-region lookup table for O(log R) `region_for_ptr` queries.
     ///
     /// Each entry is `(base_addr, region_idx)`, sorted ascending by
@@ -1415,6 +1433,11 @@ pub struct G1Collector {
 // in the mark bitmap are heap-managed and only accessed during STW pauses.
 unsafe impl Send for G1Collector {}
 unsafe impl Sync for G1Collector {}
+
+/// Monotonic source of process-unique [`G1Collector::instance_id`] values.
+/// Starts at 1 so 0 can serve as a never-assigned sentinel in debugging.
+/// Wraparound after 2^64 collectors is not a practical concern.
+static NEXT_G1_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 impl G1Collector {
     /// Create a new G1 collector with the given configuration.
@@ -1494,6 +1517,7 @@ impl G1Collector {
             kept_unresolved_any: AtomicBool::new(false),
             // SECURITY FIX (V7a): start the RSet TLS-cache epoch at 0.
             rset_cache_epoch: AtomicU64::new(0),
+            instance_id: NEXT_G1_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             region_lookup,
             arena_base,
             arena_end,
@@ -6284,9 +6308,14 @@ impl G1Collector {
     /// captured under one lock acquisition remains valid for later
     /// dereference even after the lock is released, as long as the
     /// collector itself is still alive. The cached pointer is keyed by
-    /// both region index AND collector identity (the `*const Self`)
-    /// so a stale cache from a previous collector instance never
-    /// resurrects a dangling pointer.
+    /// both region index AND collector identity so a stale cache from a
+    /// previous collector instance never resurrects a dangling pointer.
+    /// Identity is the minted [`Self::instance_id`], NOT the collector's
+    /// address: `self as *const Self` ABAs when a later collector is
+    /// constructed at a dropped one's address (stack-slot or allocator
+    /// block reuse) with a matching epoch history, which let this fast
+    /// path write through a pointer into the dropped collector's freed
+    /// regions storage (intermittent 0xC0000374 under parallel gc tests).
     pub fn post_write_barrier_rset(&self, src_obj: ObjectRef, stored_ref: ObjectRef) {
         let src_addr = src_obj.as_ptr() as usize;
         let dst_addr = stored_ref.as_ptr() as usize;
@@ -6302,7 +6331,7 @@ impl G1Collector {
             _ => return,
         };
 
-        let collector_id = self as *const Self as usize;
+        let collector_id = self.instance_id;
 
         // SECURITY FIX (V7a): snapshot the current reclassification epoch.
         // Pairs (`Acquire`) with the `Release` bump performed under the
@@ -6311,11 +6340,11 @@ impl G1Collector {
         let cur_epoch = self.rset_cache_epoch.load(Ordering::Acquire);
 
         thread_local! {
-            // SECURITY FIX (V7a): now (collector_id, region_idx,
+            // SECURITY FIX (V7a): now (collector instance_id, region_idx,
             // *const G1Region, epoch). `Cell` is sufficient — the
             // pointer is `Copy` and never escapes the with() block other
             // than as a deref-then-call.
-            static LAST_RSET_TARGET: std::cell::Cell<Option<(usize, usize, *const G1Region, u64)>>
+            static LAST_RSET_TARGET: std::cell::Cell<Option<(u64, usize, *const G1Region, u64)>>
                 = const { std::cell::Cell::new(None) };
         }
 
