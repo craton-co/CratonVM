@@ -2834,6 +2834,8 @@ pub unsafe extern "C" fn jit_arraylength(array_ptr: i64) -> i64 {
 /// # Safety
 /// `obj_ptr` must be non-null and point at a valid object header.
 #[inline]
+// SAFETY: callers validate that `obj_ptr` names a live object before using
+// the compact-layout metadata derived from its header.
 unsafe fn jit_compact_field_slot(obj_ptr: i64, field_index: i64) -> Option<(usize, bool)> {
     if field_index < 0 {
         return None;
@@ -2855,6 +2857,8 @@ unsafe fn jit_compact_field_slot(obj_ptr: i64, field_index: i64) -> Option<(usiz
 /// `obj_ptr` must be non-null, point at a valid object header, and `field_index`
 /// must be within the object's slot count (callers bounds-check first).
 #[inline]
+// SAFETY: callers bounds-check `field_index`, so the returned address remains
+// within the live object's allocated field storage.
 unsafe fn jit_field_cell_ptr(obj_ptr: i64, field_index: i64) -> *mut u8 {
     let off = match jit_compact_field_slot(obj_ptr, field_index) {
         Some((o, _)) => o,
@@ -5591,6 +5595,8 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
     }
 }
 
+// SAFETY: the JIT invoke metadata and the validated proxy receiver originate
+// from the active interpreted frame; callers fall back to interpretation on a miss.
 unsafe fn try_fast_lambda_int_to_double_apply(
     vm: &SharedVm,
     thread: &mut JvmThread,

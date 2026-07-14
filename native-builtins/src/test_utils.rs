@@ -1156,6 +1156,10 @@ impl MockNativeContext {
 }
 
 impl NativeContext for MockNativeContext {
+    fn supports_real_proxy_generation(&self) -> bool {
+        false
+    }
+
     fn load_class(&mut self, _name: &str) -> MethodCallResult {
         Ok(None)
     }
