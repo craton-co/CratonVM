@@ -13376,6 +13376,53 @@ fn native_ts_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
 // -- Intermediate operations --
 
+/// Diagnostic-only tripwire for the pin/read-through-handle path shared by
+/// `native_stream_filter`/`native_stream_map`/`native_stream_flat_map`. Snapshots
+/// each input element's class id right after `pin_value_slice` and compares it
+/// against the class id read back via `read_pinned_elem` immediately before the
+/// element is dispatched to Java bytecode. A mismatch would mean a stale or
+/// incorrectly-forwarded native root slipped through a moving-GC window — the
+/// exact failure shape suspected (never confirmed) behind the intermittent
+/// `ConfigurationTest::testDatabaseProperties` `ClassCastException`, see
+/// docs/internal/fixed-suite-bugs/keycloak-quarkus-runtime-config-resolution-mismatches.md
+/// ("Residual" section). That race stopped reproducing before this canary could
+/// be validated against it; kept as a near-zero-overhead tripwire (one class-id
+/// comparison per element; no allocation/formatting unless it actually fires,
+/// and it reports only once per process) in case it ever resurfaces.
+static STREAM_PIN_CANARY_FIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn stream_pin_canary_snapshot(ctx: &dyn NativeContext, vals: &[Value]) -> Vec<Option<ClassId>> {
+    vals.iter()
+        .map(|v| match v {
+            Value::Object(Some(o)) => Some(ctx.class_id_of_object(*o)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[inline]
+fn stream_pin_canary_check(
+    ctx: &dyn NativeContext,
+    site: &'static str,
+    index: usize,
+    before: Option<ClassId>,
+    after: Value,
+) {
+    if let (Some(before), Value::Object(Some(o))) = (before, after) {
+        let after_cid = ctx.class_id_of_object(o);
+        if after_cid != before
+            && !STREAM_PIN_CANARY_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!(
+                "[CRATONVM_STREAM_PIN_CANARY] {site}: element {index} class id changed \
+                 {before:?} -> {after_cid:?} across pin/read (stale-ref race?)"
+            );
+        }
+    }
+}
+
 fn native_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
@@ -13403,11 +13450,13 @@ fn native_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // and rebuild the kept list by re-reading from the pins at the end.
     let pred_pin = ctx.pin_native_root(predicate);
     let (_, ehandles) = pin_value_slice(ctx, &elements);
+    let elem_cids = stream_pin_canary_snapshot(ctx, &elements);
     let mut kept_idx: Vec<usize> = Vec::new();
     let mut err = None;
     for i in 0..elements.len() {
         let p = ctx.read_native_pin(pred_pin, predicate);
         let e = read_pinned_elem(ctx, ehandles[i], elements[i]);
+        stream_pin_canary_check(ctx, "native_stream_filter", i, elem_cids[i], e);
         match ctx.invoke_virtual(p, "test", "(Ljava/lang/Object;)Z", &[e]) {
             Ok(r) => {
                 if matches!(r, Some(Value::Int(v)) if v != 0) {
@@ -13422,7 +13471,11 @@ fn native_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     }
     let kept: Vec<Value> = kept_idx
         .iter()
-        .map(|&i| read_pinned_elem(ctx, ehandles[i], elements[i]))
+        .map(|&i| {
+            let e = read_pinned_elem(ctx, ehandles[i], elements[i]);
+            stream_pin_canary_check(ctx, "native_stream_filter:rebuild", i, elem_cids[i], e);
+            e
+        })
         .collect();
     ctx.unpin_native_roots(pred_pin);
     if let Some(e) = err {
@@ -13453,12 +13506,14 @@ fn native_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // every result as it is produced, then rebuild `mapped` from those pins.
     let fn_pin = ctx.pin_native_root(function);
     let (_, ehandles) = pin_value_slice(ctx, &elements);
+    let elem_cids = stream_pin_canary_snapshot(ctx, &elements);
     let mut mapped = Vec::with_capacity(elements.len());
     let mut result_handles: Vec<usize> = Vec::with_capacity(elements.len());
     let mut err = None;
     for i in 0..elements.len() {
         let f = ctx.read_native_pin(fn_pin, function);
         let e = read_pinned_elem(ctx, ehandles[i], elements[i]);
+        stream_pin_canary_check(ctx, "native_stream_map", i, elem_cids[i], e);
         match ctx.invoke_virtual(f, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;", &[e]) {
             Ok(r) => {
                 let v = r.unwrap_or(Value::Object(None));
@@ -13500,11 +13555,13 @@ fn native_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let elements = stream_elements_mut(ctx, this)?;
     let fn_pin = ctx.pin_native_root(function);
     let (_, elem_handles) = pin_value_slice(ctx, &elements);
+    let elem_cids = stream_pin_canary_snapshot(ctx, &elements);
     let mut flat = Vec::new();
     let mut flat_handles = Vec::new();
     for i in 0..elements.len() {
         let function = ctx.read_native_pin(fn_pin, function);
         let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+        stream_pin_canary_check(ctx, "native_stream_flat_map", i, elem_cids[i], elem);
         let result = match ctx.invoke_virtual(
             function,
             "apply",

@@ -6,7 +6,9 @@ Status: FIXED (4 of 4 original symptoms, including the item-4 residual below). I
 "Residual — CLOSED") stopped reproducing sometime between the 2026-07-13 second investigation pass (dev commit
 `10a561f21`) and dev commit `edca766e5` (2026-07-13, same day) — see the 2026-07-13 third investigation pass at the
 bottom of the Residual section for full evidence. No source fix was needed/landed in the third pass itself; this
-update is a re-verification + doc closure only.
+update is a re-verification + doc closure only. A fourth pass later landed a standing (never-fired, unvalidated
+against a live repro) class-id canary tripwire in the three suspect stream natives on explicit user request — see
+"Update 2026-07-13, fourth pass" at the end of the Residual section.
 
 Date observed: 2026-07-11 (refresh rerun against non-passed-before classes, branch fix/keycloak-nonpassed-rerun-v2-20260710)
 
@@ -147,12 +149,13 @@ dev"). `apps/keycloak` is gitignored and not present in a fresh worktree; ran vi
 unnecessary for this investigation — noted as a possible (low-probability, see below) confound since it means test
 classes loaded off a different physical directory than in the original investigation.
 
-1. **Prepared, but never needed, the not-yet-tried canary from item 4 above** (a `class_id_of_object`-based
+1. **Prepared, but never needed at the time, the not-yet-tried canary from item 4 above** (a `class_id_of_object`-based
    pin/read mismatch check local to `native_stream_filter`/`native_stream_map`/`native_stream_flat_map` in
    `native-collections/src/lib.rs` — kept local to each call rather than threaded through the shared
    `native_pin_roots` vector itself, to avoid false positives from the ~100 call sites elsewhere that push/truncate
-   that vector directly without going through `pin_native_root`/`unpin_native_roots`). Never merged — see below for
-   why.
+   that vector directly without going through `pin_native_root`/`unpin_native_roots`). Not merged in this pass — see
+   below for why — but landed afterward on user request as a standing tripwire; see "Fourth pass" at the end of this
+   section.
 2. **Before running the canary, re-confirmed the baseline still fails at the previously-established rate — it did
    not.** A clean release build of unmodified `dev` HEAD (`edca766e5`, binary preserved as
    `target/release/cratonvm-baseline.exe`) ran `ConfigurationTest` alone 8 times back-to-back
@@ -202,6 +205,41 @@ classes loaded off a different physical directory than in the original investiga
    branch `fix/configtest-race-canary-20260713`, HEAD `edca766e5` (unreverted) / isolation-test binary built from
    HEAD with `3eb4b6a68`+`903a38fc1` reverted (not committed, build-only revert, `git revert --abort` afterward to
    restore a clean tree).
+
+**Update 2026-07-13, fourth pass — landed the prepared canary anyway, on explicit user request, as a standing
+tripwire (not a fix, and not validated against a live repro since none remains)**:
+
+The user asked for the canary described in item 6 above to be implemented regardless of the bug no longer
+reproducing, as a low-cost tripwire in case the race ever resurfaces. Implemented in worktree
+`C:\data\CratonVM-configtest-canary-impl-20260713`, branch `fix/configtest-race-canary-impl-20260713`, branched from
+`origin/dev` at `ff6d45d6f` (the third-pass closure commit above).
+
+- Added two small helpers, `stream_pin_canary_snapshot`/`stream_pin_canary_check`, and a single
+  `STREAM_PIN_CANARY_FIRED: AtomicBool`, directly above `native_stream_filter` in
+  `native-collections/src/lib.rs`. Exactly matches the design sketched in item 6: a `Vec<Option<ClassId>>` snapshot
+  taken via `ctx.class_id_of_object` right after each of the three functions' `pin_value_slice` call, compared via
+  `ctx.class_id_of_object` again at every `read_pinned_elem` call site for the **input** elements (not the
+  freshly-produced output objects in `native_stream_map`/`native_stream_flat_map`, which are pinned individually via
+  `pin_native_root` rather than through the snapshot-then-compare pattern, matching the original design's stated
+  scope). On a class-id mismatch: a single `eprintln!` gated by an atomic compare-and-swap so it fires at most once
+  per process, naming the call site and element index. The non-anomalous path costs one extra `class_id_of_object`
+  call (a cheap header read) per element per call site — no allocation, no formatting, no branching beyond the
+  comparison itself, in keeping with the original design's goal of not perturbing GC timing enough to mask a future
+  recurrence.
+- Deliberately did NOT touch the shared `pin_native_root`/`read_native_pin`/`native_pin_roots` machinery in
+  `vm/src/vm/vm_exec.rs` itself, and did NOT extend the canary to the dozens of other native collection/stream
+  call sites — scope is exactly the three functions named in the original design, nothing broader.
+- **Verification** (the only kind possible here — there is no live repro left to validate detection against):
+  clean release build; all three previously-verified sibling classes plus `ConfigurationTest` itself re-run once
+  more against the new binary — `DatasourcesConfigurationTest` (33/33 PASS), `TracingConfigurationTest` (13/13
+  PASS), `IgnoredArtifactsTest` (15/15 PASS), `ConfigurationTest` (73/73 PASS, 119s) — zero regressions, and the
+  canary's `eprintln!` never appeared in any `.err.log` (expected, since the race it watches for is gone). Also ran
+  `cargo test --release -p cratonvm-native-collections`: all 6 tests + doctests pass.
+- Evidence: `C:\data\CratonVM-configtest-canary-impl-20260713\apps\keycloak-suite-runner\.suite\results\sibling-canary-verify-20260713\all-jit\`.
+- If this canary ever fires in a real run, the `eprintln!` output (site name, element index, before/after
+  `ClassId`) is the starting point — cross-reference against whatever native stream/collection call preceded it in
+  the same test to identify the actual stale-reference source, something every prior pass in this doc failed to
+  pinpoint directly.
 
 ## 2026-07-13 update correction: the PicocliTest hang is a SEPARATE, unrelated bug — do NOT treat as shared root cause
 
