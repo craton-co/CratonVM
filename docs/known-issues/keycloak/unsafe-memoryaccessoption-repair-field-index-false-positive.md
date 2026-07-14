@@ -1,18 +1,17 @@
-# `sun.misc.Unsafe.MEMORY_ACCESS_OPTION` repair still fails for real Keycloak/Infinispan integration — the "already_initialized" check likely has a field-index bug, causing a false-positive skip
+# `sun.misc.Unsafe.MEMORY_ACCESS_OPTION` repair still fails for real Keycloak/Infinispan integration — field-index hypothesis REFUTED; real cause is `MemoryAccessOption` never being loaded
 
-Status: open — the fix in `docs/internal/fixed-suite-bugs/testsuite-model-unsafe-putorderedlong-memoryaccessoption-npe-FIXED.md`
-(marked fixed 2026-07-12) does **not** actually resolve this in the real Keycloak/Infinispan test suite; its own
-validation notes admit the suite-level check was skipped ("Azure host does not currently contain compiled
-`testsuite/model` `UserModelTest` artifacts... so the final suite-level check was unavailable"). Reopening with
-direct evidence from an actual Keycloak run.
+Status: partially fixed (2026-07-14) — `already_initialized`'s false-positive risk is
+hardened, but the actual failure mode observed via a real repro this session is a
+**different** bug than originally hypothesized, and remains open. Full real-Keycloak
+verification is separately blocked by
+[docs/known-issues/vm/locale-real-jdk-bootstrap-noclassdeffounderror.md](../vm/locale-real-jdk-bootstrap-noclassdeffounderror.md).
 
-Date observed: 2026-07-13 (second refresh rerun against non-passed-before classes, branch fix/keycloak-nonpassed-rerun-v2-20260710)
+Date observed: 2026-07-13 (original), reinvestigated 2026-07-14 with a real, isolated,
+falsifiable repro (see below) on the Azure build host.
 
-## Summary
+## Original summary (2026-07-13, still accurate)
 
-36 `testsuite/model` classes still fail with the **exact same** `NullPointerException` this fix was supposed to
-resolve:
-
+36 `testsuite/model` classes failed with:
 ```
 => java.lang.ExceptionInInitializerError
  Caused by: org.infinispan.commons.CacheConfigurationException: Unable to construct a GlobalComponentRegistry!
@@ -20,98 +19,159 @@ resolve:
  Caused by: java.lang.IllegalStateException: failed to create a child event loop
  Caused by: java.lang.NullPointerException: Cannot invoke "sun.misc.Unsafe$MemoryAccessOption.ordinal()"
 ```
-
-Crucially, the fix's own diagnostic log line confirms it ran and explicitly chose **not** to repair:
-
+with the repair's own log line confirming it ran and chose not to repair:
 ```
 Post-clinit fixup: sun.misc.Unsafe MEMORY_ACCESS_OPTION policy=ALLOW repaired=false
 ```
 
-(from this exact class's `.err.log`, moments before the same NPE fires downstream)
+## 2026-07-14 reinvestigation: the field-index hypothesis is REFUTED
 
-## Root cause hypothesis — a field-index computation bug in the repair's own "is it already initialized" check
+The original doc hypothesized that `already_initialized`'s manual static-field-index
+recomputation (`vm/src/vm/vm_util.rs` ~line 2280) diverged from the indexing convention
+`get_static_shared`/`resolve_field_ref` actually use, causing a false-positive
+"already initialized" read that forces `repaired=false`.
 
-`vm/src/vm/vm_util.rs` (~line 2265-2285):
+**This is not the bug.** Careful comparison (this session) of `already_initialized`'s
+static-field counting loop against BOTH `resolve_field_ref` (`vm/src/runtime/
+interpreter.rs`) and `set_static_by_name`'s own documented convention (same file, ~line
+2155, which has an explicit comment warning about exactly this class of bug from an
+earlier, unrelated BigDecimal incident) shows all three use the **identical**
+convention: count only static fields, in `class.fields` declaration order, break on the
+first name match without incrementing for the match itself. No divergence exists.
 
-```rust
-let unsafe_option_slot = {
-    let cm = shared.class_manager.read();
-    cm.get_class(class_id).and_then(|unsafe_class| {
-        let mut static_idx = 0usize;
-        for field in &unsafe_class.fields {
-            if field.is_static() {
-                if &*field.name == "MEMORY_ACCESS_OPTION" {
-                    return Some(static_idx);
-                }
-                static_idx += 1;
-            }
-        }
-        None
-    })
-};
-let already_initialized = unsafe_option_slot.is_some_and(|static_idx| {
-    matches!(
-        super::vm_object::get_static_shared(shared, class_id, static_idx),
-        Value::Object(Some(_))
-    )
-});
-// ...
-let repaired = if already_initialized {
-    false   // <-- skips repair entirely if this check is a false positive
-} else if let Some((enum_class_id, static_idx)) = enum_slot {
-    // ... actually performs the repair
-};
+## Real root cause (evidence-based, 2026-07-14)
+
+An isolated, minimal, falsifiable repro (a standalone Java program doing
+reflection-based `Unsafe.putOrderedLong`, matching the ORIGINAL fix's own validation
+probe from `docs/internal/fixed-suite-bugs/
+testsuite-model-unsafe-putorderedlong-memoryaccessoption-npe-FIXED.md`) **reproduces
+`repaired=false` and the exact NPE, on the current dev tip**, with debug tracing added
+to pin down exactly why:
+```
+Post-clinit fixup: sun.misc.Unsafe MEMORY_ACCESS_OPTION repair could not resolve
+enum_slot (unsafe_option_slot=Some(25) enum_class_id=None policy_field=ALLOW) —
+repair skipped
 ```
 
-The `already_initialized` check independently recomputes `MEMORY_ACCESS_OPTION`'s static-field index by manually
-counting static fields in declaration order (`static_idx += 1` for each static field encountered). If this
-manual count doesn't match the indexing convention `get_static_shared`/`set_static_by_name` actually use elsewhere
-in the VM (e.g. if it should also count inherited/interface static fields, or if `unsafe_class.fields` orders
-fields differently than however `class_id`'s static slot table was built), this check would read the **wrong
-slot** — and if that wrong slot happens to already hold *some* non-null object (entirely unrelated to
-`MEMORY_ACCESS_OPTION`), `already_initialized` reports `true`, `repaired` is forced to `false`, and the actual
-`MEMORY_ACCESS_OPTION` field is left null, exactly reproducing the original bug — with the fix's own log line
-(`repaired=false`) as the tell.
+`enum_class_id=None` — `sun/misc/Unsafe$MemoryAccessOption` (the nested enum whose
+`ALLOW`/`WARN`/`DEBUG`/`DENY` constants the repair copies from) **was never loaded** at
+the point the repair runs. `already_initialized` correctly read `Value::Int(0)`
+(genuinely uninitialized, not a false positive) — the repair falls through to the
+`enum_slot` branch, which needs `cm.find_class_by_name("sun/misc/Unsafe$MemoryAccessOption")`
+to succeed, and it can't: **`find_class_by_name` is lookup-only and never triggers
+class loading.** In this minimal repro nothing else in the program had touched
+`MemoryAccessOption` yet — even though real `Unsafe.<clinit>` bytecode is documented
+(this repair's own comments) to call `MemoryAccessOption.value()` as part of its own
+execution, which should load it as a side effect. Why that reference doesn't
+consistently load the enum class in every execution path is unresolved — plausibly
+`Unsafe.<clinit>`'s real bytecode doesn't always reach that statement (e.g. an early
+branch on the configured policy), or loads it via a path this investigation didn't
+trace far enough to find.
 
-This is consistent with why the fix's isolated validation probes (`vm/src/vm/vm_util.rs`'s own comment thread and
-the FIXED doc's "Reflection-based `Unsafe.putOrderedLong` probe" / "real Netty `NioEventLoopGroup(1)` probe")
-passed — those probes likely trigger `sun/misc/Unsafe`'s `<clinit>` via a simpler, more direct path where the
-field-index computation happens to line up correctly, while the full Keycloak/Infinispan bootstrap path
-(reached through many more layers of classloading/JIT/whatever else runs first) exercises a `unsafe_class.fields`
-ordering or a static-field layout where the computed index diverges from the real one.
+### Fix attempted and reverted: eager force-load deadlocks
+
+The natural fix — force-load and force-initialize `sun/misc/Unsafe$MemoryAccessOption`
+via `shared.load_class_concurrent(...)` + `ensure_class_initialized_shared(...)` when
+`find_class_by_name` returns `None` — was implemented, and **deadlocked** (confirmed:
+process hung indefinitely, `ps aux` showed 0% CPU, genuinely blocked not spinning).
+Root cause: `post_clinit_fixup` (where this repair lives) runs from *inside*
+`initialize_class_shared` for `sun/misc/Unsafe` itself, **before** that call's
+`InitCleanupGuard`/`finalize_init` releases its claim on the class (see the
+"success-path" call site comments in `vm_util.rs` ~line 1169). Recursively driving
+another class's *full* initialization from within this window is unsafe — this needs a
+non-recursive fix (e.g. deferring the eager load until after `finalize_init`, via a
+follow-up task/queue, rather than calling it synchronously from inside the fixup).
+**Reverted** rather than shipped with a deadlock risk.
+
+## What was actually shipped (2026-07-14, safe, verified)
+
+`vm/src/vm/vm_util.rs`'s `already_initialized` check now verifies the slot actually
+holds an instance of `MemoryAccessOption` (via `shared.heap.class_id_of(obj) ==
+enum_class_id`) rather than trusting "slot is non-null" alone — per the original doc's
+own suggested next-step #3. This is a genuine, low-risk correctness hardening
+(confirmed via `cargo build --release`, no deadlock, no behavior change on the isolated
+repro since it wasn't the false-positive case) but does **not** resolve the
+`enum_class_id=None` failure mode found this session. Verified: on both dev-tip
+(baseline) and this fix, the isolated Unsafe probe produces the identical
+`repaired=false` + NPE — the fix is safe but not (yet) sufficient.
 
 ## Next steps
 
-1. Compare `unsafe_class.fields`' static-field enumeration (used by this repair check) against however
-   `get_static_shared`/`set_static_by_name`'s actual slot-indexing scheme is built elsewhere (likely in
-   `class_manager.rs` or wherever static field slots are assigned at class-loading time) — look for a mismatch in
-   what counts as a "static field" for indexing purposes (e.g. synthetic fields, fields from a different
-   classfile version, or field declaration order differences between however this class gets loaded in the
-   isolated probe vs the real Keycloak run).
-2. Add a debug assertion or log dumping what `already_initialized`'s read actually sees at that slot (the class
-   name/type of whatever object is there) when it returns `true` — this would immediately confirm or refute the
-   field-index-mismatch hypothesis by showing whether the "already non-null" object is genuinely a
-   `MemoryAccessOption` enum constant or something else entirely.
-3. Consider a more robust check: rather than trusting a manually-recomputed index, verify the *type* of whatever
-   object occupies the slot (confirm it `instanceof sun.misc.Unsafe$MemoryAccessOption`) before treating it as
-   "already initialized" — this would be robust to any indexing discrepancy.
-4. Re-verify against all 36 currently-failing `testsuite/model` classes (not just isolated probes) before
-   re-closing this doc.
+1. Implement the eager-load fix for `enum_class_id=None` **without** the recursion
+   hazard — e.g. have `initialize_class_shared` (or its caller) perform a
+   *post*-`finalize_init` pass for `sun/misc/Unsafe` specifically that ensures
+   `MemoryAccessOption` is loaded+initialized, or restructure `post_clinit_fixup`'s
+   `sun/misc/Unsafe` arm to only *read* (never trigger loading of) `enum_class_id`
+   and instead schedule the repair to run again (idempotently — the fixup already
+   only overwrites when `!already_initialized`) the next time ANYTHING touches
+   `sun/misc/Unsafe` post-boot, by which point `MemoryAccessOption` is far more likely
+   to have been loaded via some other path.
+2. Alternatively (more invasive, likely more correct): find out why real
+   `Unsafe.<clinit>` bytecode doesn't reliably load `MemoryAccessOption` as a side
+   effect in the first place, and fix that instead of working around it in the repair.
+3. Re-verify against the real `testsuite/model` classes once
+   [the java.util.Locale bootstrap bug](../vm/locale-real-jdk-bootstrap-noclassdeffounderror.md)
+   is fixed — that bug independently blocks every `testsuite/model` class from
+   completing far enough to reach this code path (confirmed this session: the Locale
+   bug fires earlier in boot, during `Liquibase`'s provider-factory init, before
+   Netty/Infinispan's event-loop construction is ever reached).
 
 ## Repro
 
+Isolated (no Keycloak needed) — this is the fastest way to iterate on this specific bug:
+```java
+import java.lang.reflect.Field;
+import sun.misc.Unsafe;
+
+public class UnsafeProbe {
+    static long value;
+    public static void main(String[] args) throws Exception {
+        Field f = Unsafe.class.getDeclaredField("theUnsafe");
+        f.setAccessible(true);
+        Unsafe unsafe = (Unsafe) f.get(null);
+        Field optField = Unsafe.class.getDeclaredField("MEMORY_ACCESS_OPTION");
+        optField.setAccessible(true);
+        System.out.println("MEMORY_ACCESS_CONFIGURED_OPTION=" + optField.get(null));
+        Field valueField = UnsafeProbe.class.getDeclaredField("value");
+        long offset = unsafe.objectFieldOffset(valueField);
+        unsafe.putOrderedLong(new UnsafeProbe(), offset, 42L);  // NPEs here pre-fix
+        System.out.println("UNSAFE_PUT_ORDERED_LONG_OK memoryAccess=allow");
+    }
+}
 ```
-cd C:\craton\CratonVM-keycloak-nonpassed-v2-20260710
-$jdk = '"C:\Program Files\Java\jdk-25"'
-powershell -NoProfile -ExecutionPolicy Bypass -File apps\keycloak-suite-runner\run-keycloak-suite.ps1 -Vm craton -Jit on -TimeoutSec 60 -Parallel 1 -RunName repro-unsafe-memoryaccess-repair-gap -ClassList <(printf 'module\tclass\ntestsuite/model\torg.keycloak.testsuite.model.authz.ConcurrentAuthzTest\n') -KeycloakRoot apps\keycloak -Exe target\release\cratonvm-nonpassed-v2-refresh2-20260712.exe -JdkHome $jdk
+Run: `cratonvm --java-home <realjdk25> -cp . UnsafeProbe`. Expect (pre-fix, and still on
+dev tip after the 2026-07-14 partial fix):
 ```
-Check the `.err.log` for `Post-clinit fixup: sun.misc.Unsafe MEMORY_ACCESS_OPTION policy=... repaired=...` — expect
-`repaired=false` followed shortly by the same `NullPointerException: ...MemoryAccessOption.ordinal()`.
+Post-clinit fixup: sun.misc.Unsafe MEMORY_ACCESS_OPTION policy=ALLOW repaired=false
+MEMORY_ACCESS_CONFIGURED_OPTION=null
+...NullPointerException: Cannot invoke "sun.misc.Unsafe$MemoryAccessOption.ordinal()"
+```
+
+Full real-Keycloak repro (currently blocked by the separate Locale bug before reaching
+this code path — see that doc for the harness setup, host, and exact commands):
+```
+cd /data/data/wt-keycloak-memaccess-fieldindex-20260714  (Azure host victor@20.83.144.174)
+apps/keycloak/kc-runner/KcRunner org.keycloak.testsuite.model.authz.ConcurrentAuthzTest
+  (via cratonvm --java-home /home/victor/jdk25
+   -Dkeycloak.model.parameters=Infinispan,Jpa -Djava.util.logging.manager=org.jboss.logmanager.LogManager
+   -Dkeycloak.connectionsJpa.default.driver=org.h2.Driver -Dkeycloak.connectionsJpa.default.database=keycloak
+   -Dkeycloak.connectionsJpa.default.user=sa -Dkeycloak.connectionsJpa.default.password=
+   -Dkeycloak.connectionsJpa.default.url=jdbc:h2:mem:test;DB_CLOSE_DELAY=-1
+   -cp <testsuite/model target/classes:target/test-classes:resolved-deps:kc-runner> KcRunner <class>)
+```
 
 ## Evidence
 
-36 classes across
-`C:\craton\CratonVM-keycloak-nonpassed-v2-20260710\apps\keycloak-suite-runner\.suite\results\nonpassed-before-refresh2-shard{1,2,3,4}\all-jit\logs\testsuite_model.*.{out,err}.log`,
-2026-07-13 rerun with a binary built from `dev` post the 2026-07-12 fix merge. Fix source (with the suspected
-bug): `vm/src/vm/vm_util.rs` lines ~2265-2285. Original (incomplete) fix doc:
-`docs/internal/fixed-suite-bugs/testsuite-model-unsafe-putorderedlong-memoryaccessoption-npe-FIXED.md`.
+- Isolated probe run on both baseline (dev-tip `6addc1e0`) and the 2026-07-14 fix,
+  Azure host `/data/data/wt-keycloak-memaccess-fieldindex-20260714`, binaries
+  `target/release/cratonvm-memaccess-baseline-20260714` /
+  `cratonvm-memaccess-fieldindex-fix3-20260714` — identical `repaired=false` + NPE on
+  both, confirming the shipped fix doesn't regress anything and doesn't (yet) resolve
+  this failure mode.
+- Debug-instrumented build (`cratonvm-memaccess-fieldindex-fix-debug-20260714`,
+  reverted before final commit) directly confirmed `enum_class_id=None` at the moment
+  of failure.
+- Original (incomplete) fix doc:
+  `docs/internal/fixed-suite-bugs/testsuite-model-unsafe-putorderedlong-memoryaccessoption-npe-FIXED.md`.
+  Fix source: `vm/src/vm/vm_util.rs` `post_clinit_fixup`'s `"sun/misc/Unsafe"` arm
+  (~line 2254).
