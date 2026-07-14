@@ -1821,13 +1821,34 @@ fn al_ensure_capacity(
         std::cmp::max(old_cap.saturating_add(growth), min_cap),
         AL_MAX_CAPACITY,
     );
+
+    // GC-SAFETY: `alloc_ref_array` below is a real allocation and can trigger
+    // a moving GC, which may relocate `this` (the ArrayList receiver) and the
+    // OLD backing array. Neither was pinned here before, so `al_set_data`'s
+    // `ctx.set_field(this, ...)` could write through a STALE handle -- either
+    // corrupting whatever now occupies that address (observed as GC header
+    // corruption / segfaults) or silently landing on a reused-but-harmless
+    // slot, in which case the real (moved) ArrayList's `data`/`size` fields
+    // never get updated and the list looks permanently empty to callers like
+    // `stream()`. Every caller of this function hits the exact same hazard on
+    // `this` after the call returns (`al_set_size` etc.), so this is `add`/
+    // `add(int,Object)`/`addAll`'s shared, hottest allocation site. See
+    // docs/known-issues/stream-arraylist-gc-pressure-heap-corruption.md.
+    let this_pin = ctx.pin_native_root(this);
+    let old_buf_pin = data.map(|d| ctx.pin_native_root(d)).unwrap_or(usize::MAX);
     let new_buf = alloc_ref_array(ctx, new_cap);
+    let this = ctx.read_native_pin(this_pin, this);
 
     // Copy old content. Prefer the bulk intrinsic so the VM can use
     // `copy_nonoverlapping` on the underlying storage; fall back to the
     // per-element loop only when the override declines (default trait impl
     // also returns `true`, so the loop is unreachable when bulk succeeds).
     if let Some(old_buf) = data {
+        let old_buf = if old_buf_pin != usize::MAX {
+            ctx.read_native_pin(old_buf_pin, old_buf)
+        } else {
+            old_buf
+        };
         let copy_len = std::cmp::min(old_cap, new_cap);
         if !ctx.bulk_array_copy(old_buf, 0, new_buf, 0, copy_len) {
             for i in 0..copy_len {
@@ -1838,6 +1859,7 @@ fn al_ensure_capacity(
     }
 
     al_set_data(ctx, this, new_buf);
+    ctx.unpin_native_roots(this_pin);
     Ok(new_buf)
 }
 
@@ -2203,9 +2225,18 @@ pub fn native_al_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let (_, size) = al_state(ctx, this);
     let size = size as usize;
+    // GC-SAFETY: `al_ensure_capacity` allocates (and can GC) internally on a
+    // grow. Pin `this` (used again below in `al_set_size`) and `elem` across
+    // it -- see the GC-SAFETY note on `al_ensure_capacity` itself.
+    let this_pin = ctx.pin_native_root(this);
+    let elem_pin = pin_value(ctx, elem);
+    let this = ctx.read_native_pin(this_pin, this);
     let buf = al_ensure_capacity(ctx, this, size + 1)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    let elem = read_pinned_elem(ctx, elem_pin, elem);
     ctx.set_array_element(buf, size, elem);
     al_set_size(ctx, this, (size + 1) as i32);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(1))) // returns true
 }
 
@@ -2229,7 +2260,15 @@ pub fn native_al_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         );
     }
     let index = index as usize;
+    // GC-SAFETY: same hazard as `native_al_add` -- `al_ensure_capacity` can
+    // allocate/GC internally, and both `this` (used again in `al_set_size`)
+    // and `elem` are live across it.
+    let this_pin = ctx.pin_native_root(this);
+    let elem_pin = pin_value(ctx, elem);
+    let this = ctx.read_native_pin(this_pin, this);
     let buf = al_ensure_capacity(ctx, this, size + 1)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    let elem = read_pinned_elem(ctx, elem_pin, elem);
     // Shift elements right
     for i in (index..size).rev() {
         let val = ctx.get_array_element(buf, i);
@@ -2237,6 +2276,7 @@ pub fn native_al_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     }
     ctx.set_array_element(buf, index, elem);
     al_set_size(ctx, this, (size + 1) as i32);
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -2824,7 +2864,16 @@ fn native_al_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if let (Some(other_data), true) = (other_data, other_size > 0) {
         let (_, my_size) = al_state(ctx, this);
         let my_size = my_size as usize;
+        // GC-SAFETY: same `al_ensure_capacity` allocation hazard as
+        // `native_al_add` -- `this` (used again in `al_set_size`) and
+        // `other_data` (the source array, read again below) are both live
+        // across it.
+        let this_pin = ctx.pin_native_root(this);
+        let other_data_pin = ctx.pin_native_root(other_data);
+        let this = ctx.read_native_pin(this_pin, this);
         let buf = al_ensure_capacity(ctx, this, my_size + other_size)?;
+        let this = ctx.read_native_pin(this_pin, this);
+        let other_data = ctx.read_native_pin(other_data_pin, other_data);
         if !ctx.bulk_array_copy(other_data, 0, buf, my_size, other_size) {
             for i in 0..other_size {
                 let val = ctx.get_array_element(other_data, i);
@@ -2832,6 +2881,7 @@ fn native_al_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             }
         }
         al_set_size(ctx, this, (my_size + other_size) as i32);
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Int(1)));
     }
     // General path: the source is NOT a plain ArrayList — it may be a
@@ -2855,11 +2905,20 @@ fn native_al_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     }
     let (_, my_size) = al_state(ctx, this);
     let my_size = my_size as usize;
+    // GC-SAFETY: same `al_ensure_capacity` allocation hazard -- `this` (used
+    // again in `al_set_size`) and every object-typed element of `elems`
+    // (written into `buf` below) are live across it.
+    let this_pin = ctx.pin_native_root(this);
+    let (_, elems_handles) = pin_value_slice(ctx, &elems);
+    let this = ctx.read_native_pin(this_pin, this);
     let buf = al_ensure_capacity(ctx, this, my_size + elems.len())?;
+    let this = ctx.read_native_pin(this_pin, this);
+    let elems = read_value_slice(ctx, &elems_handles, &elems);
     for (i, val) in elems.iter().enumerate() {
         ctx.set_array_element(buf, my_size + i, *val);
     }
     al_set_size(ctx, this, (my_size + elems.len()) as i32);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(1)))
 }
 
