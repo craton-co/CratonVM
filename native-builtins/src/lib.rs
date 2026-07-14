@@ -53822,7 +53822,7 @@ thread_local! {
     /// on this Java thread is the overwhelmingly common case. The global map
     /// remains the cross-thread/cold fallback.
     static MATCHER_REAL_LAST_CACHE:
-        std::cell::RefCell<Option<(i32, i32, i32, std::sync::Arc<MatcherRealCache>)>> =
+        std::cell::RefCell<Option<(usize, usize, usize, std::sync::Arc<MatcherRealCache>)>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -53860,25 +53860,29 @@ fn matcher_realjdk_cached_group_string(
     start: i32,
     end: i32,
 ) -> Option<ObjectRef> {
-    let matcher_identity = ctx.identity_hash_code(matcher);
-    let text_identity = ctx.identity_hash_code(text);
-    let entry = MATCHER_REAL_LAST_CACHE
-        .with(|cache| {
-            cache
-                .borrow()
-                .as_ref()
-                .filter(|(matcher_id, text_id, _, _)| {
-                    *matcher_id == matcher_identity && *text_id == text_identity
-                })
-                .map(|(_, _, _, entry)| entry.clone())
-        })
-        .or_else(|| {
+    let matcher_raw = matcher.as_ptr() as usize;
+    let text_raw = text.as_ptr() as usize;
+    let last = MATCHER_REAL_LAST_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|(cached_matcher, cached_text, _, _)| {
+                *cached_matcher == matcher_raw && *cached_text == text_raw
+            })
+            .map(|(_, _, _, entry)| entry.clone())
+    });
+    let entry = match last {
+        Some(entry) => Some(entry),
+        None => {
+            let matcher_identity = ctx.identity_hash_code(matcher);
+            let text_identity = ctx.identity_hash_code(text);
             let guard = matcher_realjdk_cache().lock().ok()?;
             guard
                 .get(&matcher_identity)
                 .filter(|entry| entry.text_identity == text_identity)
                 .cloned()
-        })?;
+        }
+    }?;
 
     let text = matcher_realjdk_group_slice(&entry.utf8, &entry.utf16_to_byte, start, end)?;
     Some(ctx.create_string_uninterned(text))
@@ -53927,24 +53931,30 @@ fn matcher_realjdk_cached(
         Value::Object(Some(p)) => p,
         _ => return None,
     };
-    let text_identity = ctx.identity_hash_code(text_obj);
-    let pattern_identity = ctx.identity_hash_code(pattern_obj);
-    let matcher_identity = ctx.identity_hash_code(matcher);
-
+    let matcher_raw = matcher.as_ptr() as usize;
+    let text_raw = text_obj.as_ptr() as usize;
+    let pattern_raw = pattern_obj.as_ptr() as usize;
     let last = MATCHER_REAL_LAST_CACHE.with(|cache| {
         cache
             .borrow()
             .as_ref()
-            .filter(|(matcher_id, text_id, pattern_id, _)| {
-                *matcher_id == matcher_identity
-                    && *text_id == text_identity
-                    && *pattern_id == pattern_identity
+            .filter(|(cached_matcher, cached_text, cached_pattern, _)| {
+                *cached_matcher == matcher_raw
+                    && *cached_text == text_raw
+                    && *cached_pattern == pattern_raw
             })
             .map(|(_, _, _, entry)| entry.clone())
     });
     if last.is_some() {
         return last;
     }
+
+    // Raw references change when a moving collector forwards any member of
+    // the triple, producing a safe TLS miss. Stable identity hashes retain the
+    // cross-GC/global lookup semantics on that cold refresh path.
+    let text_identity = ctx.identity_hash_code(text_obj);
+    let pattern_identity = ctx.identity_hash_code(pattern_obj);
+    let matcher_identity = ctx.identity_hash_code(matcher);
 
     if let Ok(guard) = matcher_realjdk_cache().lock() {
         if let Some(entry) = guard.get(&matcher_identity) {
@@ -53953,9 +53963,9 @@ fn matcher_realjdk_cached(
                 let entry = entry.clone();
                 MATCHER_REAL_LAST_CACHE.with(|cache| {
                     cache.borrow_mut().replace((
-                        matcher_identity,
-                        text_identity,
-                        pattern_identity,
+                        matcher_raw,
+                        text_raw,
+                        pattern_raw,
                         entry.clone(),
                     ));
                 });
@@ -54004,9 +54014,9 @@ fn matcher_realjdk_cached(
     }
     MATCHER_REAL_LAST_CACHE.with(|cache| {
         cache.borrow_mut().replace((
-            matcher_identity,
-            text_identity,
-            pattern_identity,
+            matcher_raw,
+            text_raw,
+            pattern_raw,
             entry.clone(),
         ));
     });
