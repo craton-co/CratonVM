@@ -16,7 +16,7 @@ use crate::{alloc_concurrent_synthetic, compile_java_regex, native_noop_with_thi
 // SAFETY/RATIONALE: each thread gets its own `RefCell<Vec<u16>>`. Native
 // method handlers are called synchronously on the executing thread, never
 // re-entrantly with overlapping borrows on the same scratch buffer (each
-// call clears + fills, then releases the borrow before returning).
+// call clears + fills + clones, then releases the borrow before returning).
 // We expose helpers (`with_string_chars_scratch`, `with_two_string_chars_scratches`)
 // that hand out exclusive borrows; callers must NOT call back into other
 // `read_string_chars*` helpers while holding one. The two-buffer helper is
@@ -33,8 +33,6 @@ thread_local! {
         std::cell::RefCell::new(Vec::with_capacity(64));
     static STRING_CHARS_SCRATCH_B: std::cell::RefCell<Vec<u16>> =
         std::cell::RefCell::new(Vec::with_capacity(64));
-    static STRING_BYTES_SCRATCH: std::cell::RefCell<Vec<u8>> =
-        std::cell::RefCell::new(Vec::with_capacity(128));
 }
 
 /// Decode a String object's backing `value` array into a `Vec<u16>` of
@@ -42,7 +40,7 @@ thread_local! {
 ///   * legacy `char[]` value (one u16 per element);
 ///   * JDK 9+ compact `byte[]` value, LATIN-1 coder (one byte per char,
 ///     zero-extended);
-///   * JDK 9+ compact `byte[]` value, UTF-16 coder (two little-endian bytes
+///   * JDK 9+ compact `byte[]` value, UTF-16 coder (two big-endian bytes
 ///     per char).
 ///
 /// This is the single source of truth for "String object -> Vec<u16>".
@@ -81,28 +79,38 @@ fn decode_string_chars(
     // Compact `byte[]` value. `coder` lives in field index 1: 1 = UTF-16,
     // 0 = LATIN-1.
     let is_utf16 = matches!(ctx.get_field(obj, 1), Value::Int(1));
-    STRING_BYTES_SCRATCH.with(|cell| {
-        let mut bytes = cell.borrow_mut();
-        bytes.resize(raw_len, 0);
-        let written = ctx.read_byte_array_into(arr, 0, &mut bytes);
-        bytes.truncate(written);
-        if is_utf16 {
-            // Two bytes per char, little-endian (low byte first) — matches
-            // StringUTF16.isBigEndian()==false on x86/ARM and the byte order
-            // written by create_java_string. Ignore an impossible trailing
-            // odd byte just as the previous `raw_len / 2` loop did.
-            dst.reserve(bytes.len() / 2);
-            dst.extend(
-                bytes
-                    .chunks_exact(2)
-                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]])),
-            );
-        } else {
-            // LATIN-1: each byte zero-extended, after one bulk heap read.
-            dst.reserve(bytes.len());
-            dst.extend(bytes.iter().map(|&byte| byte as u16));
+    if is_utf16 {
+        // Two bytes per char, little-endian (low byte first) — matches
+        // StringUTF16.isBigEndian()==false on x86/ARM and the byte order
+        // written by create_java_string. `raw_len` is 2 * char_count.
+        let char_count = raw_len / 2;
+        if dst.capacity() < char_count {
+            dst.reserve(char_count - dst.capacity());
         }
-    });
+        for c in 0..char_count {
+            let lo = match ctx.get_array_element(arr, c * 2) {
+                Value::Int(v) => (v as u8) as u16,
+                _ => 0,
+            };
+            let hi = match ctx.get_array_element(arr, c * 2 + 1) {
+                Value::Int(v) => (v as u8) as u16,
+                _ => 0,
+            };
+            dst.push((hi << 8) | lo);
+        }
+    } else {
+        // LATIN-1: one byte per char, zero-extended.
+        if dst.capacity() < raw_len {
+            dst.reserve(raw_len - dst.capacity());
+        }
+        for i in 0..raw_len {
+            let ch = match ctx.get_array_element(arr, i) {
+                Value::Int(v) => (v & 0xff) as u16,
+                _ => 0,
+            };
+            dst.push(ch);
+        }
+    }
 }
 
 /// Fill the given `Vec<u16>` with the characters of the String object's
@@ -1682,16 +1690,12 @@ pub(crate) fn native_sb_append_string(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    match args.get(1) {
-        Some(Value::Object(Some(string))) => {
-            STRING_CHARS_SCRATCH_A.with(|cell| {
-                let mut chars = cell.borrow_mut();
-                fill_string_chars(ctx, *string, &mut chars);
-                sb_append_chars(ctx, this, &chars);
-            });
-        }
-        _ => sb_append_str(ctx, this, "null"),
-    }
+    let text = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_else(|| "null".to_string()),
+        Some(Value::Object(None)) => "null".to_string(),
+        _ => "null".to_string(),
+    };
+    sb_append_str(ctx, this, &text);
     Ok(Some(Value::Object(Some(this))))
 }
 
