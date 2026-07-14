@@ -152,6 +152,46 @@ fn register_object_name(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/lang/String;",
         native_object_name_get_key_property,
     );
+    // RKC-ObjectName-01: `getCanonicalKeyPropertyListString` and the
+    // `is*Pattern` family are real, un-intercepted-until-now `ObjectName`
+    // methods that `com.sun.jmx.mbeanserver.Repository`/`JmxMBeanServer`
+    // call on every `addMBean`/`queryNames` dispatch as soon as real JDK
+    // bytecode constructs a genuine `JmxMBeanServer` (see
+    // `native-api/src/registry.rs`'s `drop_synthetic_stubs` and
+    // `vm/src/vm/vm_init.rs`). The real bytecode for these methods reads
+    // private fields (`_ca_array`, `_compressed_storage`, ...) that this
+    // synthetic 1-field `ObjectName` model never populates (construction is
+    // always native-Bridge-shortcut, see `object_name_new`/`object_name_set_text`
+    // above) -- `_ca_array` in particular is a reference field, so an
+    // out-of-bounds read of it yields `null`, and real bytecode's
+    // `_ca_array.length` then NPEs. Implement these against the same
+    // canonical-string text model the rest of this file already uses
+    // (`object_name_parts`, `getDomain`, `getKeyProperty`) instead.
+    r.register(
+        cls,
+        "getCanonicalKeyPropertyListString",
+        "()Ljava/lang/String;",
+        native_object_name_get_canonical_key_property_list_string,
+    );
+    r.register(cls, "isPattern", "()Z", native_object_name_is_pattern);
+    r.register(
+        cls,
+        "isDomainPattern",
+        "()Z",
+        native_object_name_is_domain_pattern,
+    );
+    r.register(
+        cls,
+        "isPropertyPattern",
+        "()Z",
+        native_object_name_is_property_pattern,
+    );
+    r.register(
+        cls,
+        "isPropertyListPattern",
+        "()Z",
+        native_object_name_is_property_list_pattern,
+    );
     r.register(
         cls,
         "apply",
@@ -415,6 +455,91 @@ fn object_name_parts(text: &str) -> (String, Vec<(String, String)>, bool) {
         }
     }
     (domain.to_string(), props, is_pattern)
+}
+
+/// `ObjectName.getCanonicalKeyPropertyListString()`: the canonical
+/// (domain-and-pattern-suffix-stripped) key-property-list portion of the
+/// name, e.g. `"type=MBeanServerDelegate"` for
+/// `"JMImplementation:type=MBeanServerDelegate"`. Mirrors real JDK's
+/// `_canonicalName.substring(domainLength + 1, len)` but derived from the
+/// synthetic text model (field 0) instead of the real private fields.
+fn native_object_name_get_canonical_key_property_list_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let text = object_name_text(ctx, this);
+    let props_str = text.split_once(':').map(|(_, p)| p).unwrap_or("");
+    let props_str = props_str.strip_suffix(",*").unwrap_or(props_str);
+    let props_str = if props_str == "*" { "" } else { props_str };
+    let s = ctx.create_string(props_str);
+    Ok(Some(Value::Object(Some(s))))
+}
+
+fn native_object_name_is_domain_pattern(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let text = object_name_text(ctx, this);
+    let (domain, _, _) = object_name_parts(&text);
+    Ok(Some(Value::Int(
+        (domain.contains('*') || domain.contains('?')) as i32,
+    )))
+}
+
+fn native_object_name_is_property_list_pattern(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let text = object_name_text(ctx, this);
+    let (_, _, is_plist_pattern) = object_name_parts(&text);
+    Ok(Some(Value::Int(is_plist_pattern as i32)))
+}
+
+fn native_object_name_is_property_pattern(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let text = object_name_text(ctx, this);
+    let (_, props, is_plist_pattern) = object_name_parts(&text);
+    let value_pattern = props
+        .iter()
+        .any(|(_, v)| v.contains('*') || v.contains('?'));
+    Ok(Some(Value::Int((is_plist_pattern || value_pattern) as i32)))
+}
+
+/// `ObjectName.isPattern()`: true iff the domain contains a wildcard or the
+/// name is a property pattern (property-list pattern, e.g. `"d:k=v,*"`, or a
+/// property-value pattern, e.g. `"d:k=*"`).
+fn native_object_name_is_pattern(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let text = object_name_text(ctx, this);
+    let (domain, props, is_plist_pattern) = object_name_parts(&text);
+    let domain_pattern = domain.contains('*') || domain.contains('?');
+    let value_pattern = props
+        .iter()
+        .any(|(_, v)| v.contains('*') || v.contains('?'));
+    Ok(Some(Value::Int(
+        (domain_pattern || is_plist_pattern || value_pattern) as i32,
+    )))
 }
 
 fn native_object_name_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4135,6 +4260,105 @@ mod jmx_tests {
         );
         // Null name -> empty key, no panic.
         assert_eq!(object_name_key(&mut ctx, None), "");
+    }
+
+    #[test]
+    fn test_object_name_new_natives_are_registered_bridge() {
+        // RKC-ObjectName-01 regression test: getCanonicalKeyPropertyListString
+        // and the is*Pattern family must be registered (previously they fell
+        // through to real bytecode, which NPEs on the synthetic 1-field
+        // ObjectName's never-populated `_ca_array`/`_compressed_storage`).
+        let mut r = NativeMethodRegistry::new();
+        register_jmx_natives(&mut r);
+        let cls = "javax/management/ObjectName";
+        assert!(r
+            .find(cls, "getCanonicalKeyPropertyListString", "()Ljava/lang/String;")
+            .is_some());
+        assert!(r.find(cls, "isPattern", "()Z").is_some());
+        assert!(r.find(cls, "isDomainPattern", "()Z").is_some());
+        assert!(r.find(cls, "isPropertyPattern", "()Z").is_some());
+        assert!(r.find(cls, "isPropertyListPattern", "()Z").is_some());
+    }
+
+    #[test]
+    fn test_object_name_get_canonical_key_property_list_string() {
+        let mut ctx = crate::test_utils::mock_ctx();
+        let name = object_name_new(
+            &mut ctx,
+            "JMImplementation:type=MBeanServerDelegate".to_string(),
+        );
+        let result = native_object_name_get_canonical_key_property_list_string(
+            &mut ctx,
+            &[Value::Object(Some(name))],
+        )
+        .unwrap()
+        .unwrap();
+        let s = match result {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap(),
+            other => panic!("expected a String, got {other:?}"),
+        };
+        assert_eq!(s, "type=MBeanServerDelegate");
+
+        // Domain-only pattern ("d:*") has no key properties.
+        let pattern_name = object_name_new(&mut ctx, "java.lang:*".to_string());
+        let result = native_object_name_get_canonical_key_property_list_string(
+            &mut ctx,
+            &[Value::Object(Some(pattern_name))],
+        )
+        .unwrap()
+        .unwrap();
+        let s = match result {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap(),
+            other => panic!("expected a String, got {other:?}"),
+        };
+        assert_eq!(s, "");
+
+        // Property-list pattern ("d:k=v,*") strips the trailing ",*".
+        let plist_pattern = object_name_new(&mut ctx, "d:k=v,*".to_string());
+        let result = native_object_name_get_canonical_key_property_list_string(
+            &mut ctx,
+            &[Value::Object(Some(plist_pattern))],
+        )
+        .unwrap()
+        .unwrap();
+        let s = match result {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap(),
+            other => panic!("expected a String, got {other:?}"),
+        };
+        assert_eq!(s, "k=v");
+    }
+
+    #[test]
+    fn test_object_name_is_pattern_family() {
+        let mut ctx = crate::test_utils::mock_ctx();
+
+        let concrete = object_name_new(
+            &mut ctx,
+            "JMImplementation:type=MBeanServerDelegate".to_string(),
+        );
+        let is_pattern = |ctx: &mut dyn NativeContext, f: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult, obj: ObjectRef| {
+            matches!(f(ctx, &[Value::Object(Some(obj))]).unwrap().unwrap(), Value::Int(1))
+        };
+        assert!(!is_pattern(&mut ctx, native_object_name_is_pattern, concrete));
+        assert!(!is_pattern(&mut ctx, native_object_name_is_domain_pattern, concrete));
+        assert!(!is_pattern(&mut ctx, native_object_name_is_property_pattern, concrete));
+        assert!(!is_pattern(&mut ctx, native_object_name_is_property_list_pattern, concrete));
+
+        let domain_pattern = object_name_new(&mut ctx, "java.*:type=Memory".to_string());
+        assert!(is_pattern(&mut ctx, native_object_name_is_pattern, domain_pattern));
+        assert!(is_pattern(&mut ctx, native_object_name_is_domain_pattern, domain_pattern));
+        assert!(!is_pattern(&mut ctx, native_object_name_is_property_list_pattern, domain_pattern));
+
+        let plist_pattern = object_name_new(&mut ctx, "d:k=v,*".to_string());
+        assert!(is_pattern(&mut ctx, native_object_name_is_pattern, plist_pattern));
+        assert!(is_pattern(&mut ctx, native_object_name_is_property_pattern, plist_pattern));
+        assert!(is_pattern(&mut ctx, native_object_name_is_property_list_pattern, plist_pattern));
+        assert!(!is_pattern(&mut ctx, native_object_name_is_domain_pattern, plist_pattern));
+
+        let value_pattern = object_name_new(&mut ctx, "d:k=*".to_string());
+        assert!(is_pattern(&mut ctx, native_object_name_is_pattern, value_pattern));
+        assert!(is_pattern(&mut ctx, native_object_name_is_property_pattern, value_pattern));
+        assert!(!is_pattern(&mut ctx, native_object_name_is_property_list_pattern, value_pattern));
     }
 
     #[test]
