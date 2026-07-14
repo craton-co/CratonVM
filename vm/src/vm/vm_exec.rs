@@ -541,7 +541,10 @@ fn object_class_id(shared: &SharedVm) -> Option<ClassId> {
     if let Some(id) = OBJECT_CLASS_ID.get() {
         return Some(*id);
     }
-    let resolved = shared.class_manager.read().find_class_by_name("java/lang/Object")?;
+    let resolved = shared
+        .class_manager
+        .read()
+        .find_class_by_name("java/lang/Object")?;
     let _ = OBJECT_CLASS_ID.set(resolved); // races are harmless; loser just re-resolves next time
     Some(resolved)
 }
@@ -1384,9 +1387,8 @@ fn resolve_field_descriptor_byte_cached(
     {
         let cache = shared.field_descriptor_cache.read();
         if let Some(&b) = cache.get(&(class_id, slot_index)) {
-            FIELD_DESCRIPTOR_LAST.with(|last| {
-                last.set(Some((vm_key, class_id.as_u32(), slot_index, b)))
-            });
+            FIELD_DESCRIPTOR_LAST
+                .with(|last| last.set(Some((vm_key, class_id.as_u32(), slot_index, b))));
             return if b == 0 { None } else { Some(b) };
         }
     }
@@ -1520,18 +1522,16 @@ fn resolve_field_descriptor_byte_cached(
                 .field_descriptor_cache
                 .write()
                 .insert((class_id, slot_index), b);
-            FIELD_DESCRIPTOR_LAST.with(|last| {
-                last.set(Some((vm_key, class_id.as_u32(), slot_index, b)))
-            });
+            FIELD_DESCRIPTOR_LAST
+                .with(|last| last.set(Some((vm_key, class_id.as_u32(), slot_index, b))));
         }
         None if cacheable => {
             shared
                 .field_descriptor_cache
                 .write()
                 .insert((class_id, slot_index), 0u8);
-            FIELD_DESCRIPTOR_LAST.with(|last| {
-                last.set(Some((vm_key, class_id.as_u32(), slot_index, 0u8)))
-            });
+            FIELD_DESCRIPTOR_LAST
+                .with(|last| last.set(Some((vm_key, class_id.as_u32(), slot_index, 0u8))));
         }
         None => {}
     }
@@ -2986,7 +2986,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
         #[cfg(not(feature = "gpu-offload"))]
         {
-            let _ = (class_name, method_name, descriptor, java_args, stream_handle);
+            let _ = (
+                class_name,
+                method_name,
+                descriptor,
+                java_args,
+                stream_handle,
+            );
             None
         }
     }
@@ -3037,7 +3043,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     /// `gpu_future_status` now uses — so a caller that already observed
     /// `isDone() == true` gets the result with no wait, and a caller
     /// that hasn't gets `None` rather than an implicit block.
-    fn gpu_future_take_result(&self, handle: u64) -> Option<cratonvm_native_api::registry::GpuFutureResult> {
+    fn gpu_future_take_result(
+        &self,
+        handle: u64,
+    ) -> Option<cratonvm_native_api::registry::GpuFutureResult> {
         #[cfg(feature = "gpu-offload")]
         {
             use crate::runtime::offload::{PollOutcome, SerializedResult, SubmissionStatus};
@@ -6853,12 +6862,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         .get_class(class_id)
                         .and_then(|c| c.array_info.clone());
                     if let Some(array_info) = array_info {
-                        let length = full_args
-                            .first()
-                            .and_then(Value::as_int)
-                            .ok_or_else(|| VmError::Internal {
-                                message: "array-constructor-reference: missing length arg"
-                                    .to_string(),
+                        let length =
+                            full_args.first().and_then(Value::as_int).ok_or_else(|| {
+                                VmError::Internal {
+                                    message: "array-constructor-reference: missing length arg"
+                                        .to_string(),
+                                }
                             })?;
                         if length < 0 {
                             Err(RuntimeError::NegativeArraySizeException { size: length }.into())
@@ -6900,7 +6909,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                             .get_class(class_id)
                             .map(|c| c.num_total_fields)
                             .unwrap_or(0);
-                        let new_obj = match self.shared.heap.try_alloc_object(class_id, num_fields) {
+                        let new_obj = match self.shared.heap.try_alloc_object(class_id, num_fields)
+                        {
                             Some(obj) => obj,
                             None => {
                                 self.thread.tlab.retire();
@@ -8911,13 +8921,13 @@ pub fn invoke_or_native(
         && method_name == "loadClass"
         && matches!(
             descriptor,
-            "(Ljava/lang/String;)Ljava/lang/Class;"
-                | "(Ljava/lang/String;Z)Ljava/lang/Class;"
+            "(Ljava/lang/String;)Ljava/lang/Class;" | "(Ljava/lang/String;Z)Ljava/lang/Class;"
         )
     {
-        if let Some(callback) = shared
-            .native_methods
-            .find("java/lang/ClassLoader", method_name, descriptor)
+        if let Some(callback) =
+            shared
+                .native_methods
+                .find("java/lang/ClassLoader", method_name, descriptor)
         {
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
@@ -10691,11 +10701,7 @@ fn adapt_array_contains(shared: &SharedVm, arr_val: Option<Value>, target_name: 
         // assuming slot 0 causes CLASS_TO_STRING to be silently skipped.
         let name_index = {
             let cm = shared.class_manager.read();
-            resolve_field_index_in_hierarchy(
-                shared.heap.class_id_of(elem),
-                "name",
-                &cm.class_store,
-            )
+            resolve_field_index_in_hierarchy(shared.heap.class_id_of(elem), "name", &cm.class_store)
         };
         if let Some(name_index) = name_index {
             if let Value::Object(Some(name_obj)) = shared.heap.get_field(elem, name_index) {

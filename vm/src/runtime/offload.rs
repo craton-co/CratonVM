@@ -281,11 +281,8 @@ impl OffloadCache {
         // Pool-aware analysis so `ldc`/`ldc_w`/`ldc2_w` of primitive
         // constants (Integer/Float/Long/Double CP entries) are admitted;
         // without the pool the analyzer must reject every ldc.
-        let verdict = analyzer::analyze_with_annotations_and_pool(
-            method,
-            &method_annotations,
-            constant_pool,
-        );
+        let verdict =
+            analyzer::analyze_with_annotations_and_pool(method, &method_annotations, constant_pool);
         if self.print_decisions {
             tracing::info!(
                 "gpu offload: {}.{}{} -> {:?}",
@@ -1137,7 +1134,10 @@ mod tests {
 
         finalize_enqueued_handle(&weak_vm, handle);
 
-        assert!(matches!(&*sub.status.lock(), SubmissionStatus::Completed { .. }));
+        assert!(matches!(
+            &*sub.status.lock(),
+            SubmissionStatus::Completed { .. }
+        ));
         release_submission(handle);
     }
 
@@ -1228,18 +1228,15 @@ mod tests {
         // resolvable, terminally-`Failed` submission handle.
         let shared = crate::vm::SharedVm::new(VmConfig::default());
         let h1 = dispatch_method_from_native(&shared, "NoSuchClass", "m", "()V", &[]);
-        let h2 = dispatch_method_from_native_on_stream(
-            &shared,
-            "NoSuchClass",
-            "m",
-            "()V",
-            &[],
-            None,
-        );
+        let h2 =
+            dispatch_method_from_native_on_stream(&shared, "NoSuchClass", "m", "()V", &[], None);
         assert!(h1 > 0 && h2 > 0 && h1 != h2);
         for h in [h1, h2] {
             let sub = lookup_submission(h).expect("handle must resolve to a submission");
-            assert!(matches!(&*sub.status.lock(), SubmissionStatus::Failed { .. }));
+            assert!(matches!(
+                &*sub.status.lock(),
+                SubmissionStatus::Failed { .. }
+            ));
             release_submission(h);
         }
     }
@@ -1266,7 +1263,10 @@ mod tests {
         );
         assert!(handle > 0);
         let sub = lookup_submission(handle).expect("handle must resolve to a submission");
-        assert!(matches!(&*sub.status.lock(), SubmissionStatus::Failed { .. }));
+        assert!(matches!(
+            &*sub.status.lock(),
+            SubmissionStatus::Failed { .. }
+        ));
         release_submission(handle);
     }
 }
@@ -3083,10 +3083,7 @@ pub enum PollOutcome {
 /// dropped immediately rather than left to leak GC-critical count
 /// forever with no future finalize call able to reach it.
 #[cfg(feature = "gpu-offload")]
-pub fn poll_submission_status(
-    shared: &crate::vm::SharedVm,
-    handle: u64,
-) -> Option<PollOutcome> {
+pub fn poll_submission_status(shared: &crate::vm::SharedVm, handle: u64) -> Option<PollOutcome> {
     let submission = lookup_submission(handle)?;
 
     // Already terminal — no need to touch the event or the driver.
