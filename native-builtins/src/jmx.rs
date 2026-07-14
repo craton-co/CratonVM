@@ -489,16 +489,31 @@ fn native_object_name_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Int(hash)))
 }
 
-/// Fake-JDK fallback for `ManagementFactory.getPlatformMBeanServer()`.
+/// Synthetic `ManagementFactory.getPlatformMBeanServer()` used in BOTH
+/// real- and fake-JDK modes.
 ///
-/// Real-JDK mode must normally run the JDK bytecode for this method so it can
-/// construct a concrete `JmxMBeanServer`. This native is tagged as a
-/// SyntheticStub and the dispatcher protects the real bytecode path; it only
-/// exists for fake-JDK launches where `ManagementFactory` itself is a synthetic
-/// stub and the method would otherwise be missing.
+/// UPDATED 2026-07-14: this was previously tagged SyntheticStub on the
+/// theory that real-JDK mode should "normally run the JDK bytecode for
+/// this method" and only fall back to this stub for fake-JDK launches.
+/// That theory was never actually exercised until `set_drop_synthetic_stubs`
+/// started defaulting on for real-JDK mode (dev d8092acb) and this
+/// registration got dropped for the first time: real bytecode for
+/// `getPlatformMBeanServer()` -> `MBeanServerFactory.createMBeanServer()`
+/// -> `new JmxMBeanServer(...)` -> ... -> `Repository.addMBean` ->
+/// `ObjectName.getCanonicalKeyPropertyListString()` NPEs on a null
+/// `_ca_array` deep inside real `com.sun.jmx.mbeanserver.*` bytecode that
+/// this VM has apparently never successfully interpreted end-to-end before.
+/// That's a real, deep, uninvestigated interpreter/real-mode gap -- not
+/// something to chase here. Tag as Bridge (registered in both modes,
+/// intercepting the real bytecode path entirely) so boot doesn't depend on
+/// that untested path succeeding, matching this file's established
+/// register_mbean_server/register_management_factory precedent ("its own
+/// comment: `register_mbean_server` ... `register_management_factory` ...
+/// deliberately called unconditionally by `register_jmx_natives` in BOTH
+/// real- and synthetic-JDK registration branches").
 pub fn register_management_factory_platform_server_stub(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(
         "java/lang/management/ManagementFactory",
         "getPlatformMBeanServer",
@@ -1001,7 +1016,7 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 fn register_jmx_connector_factory(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(
         "javax/management/remote/JMXConnectorFactory",
         "newJMXConnector",
@@ -1239,7 +1254,7 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
 /// `ManagementFactoryHelper`, so this is intentionally minimal.
 pub fn register_class_loading_impl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/ClassLoadingImpl";
 
     // setVerboseClass(Z)V — accept and ignore (synthetic verbose flag is
@@ -1265,7 +1280,7 @@ pub fn register_class_loading_impl(r: &mut NativeMethodRegistry) {
 /// `VMManagementImpl.isGcNotificationSupported` returns `false`).
 pub fn register_garbage_collector_impl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/GarbageCollectorImpl";
 
     // getCollectionCount — REAL: cumulative GC count from the VM's own
@@ -1330,7 +1345,7 @@ pub fn register_garbage_collector_impl(r: &mut NativeMethodRegistry) {
 /// `ManagementFactoryHelper` doesn't filter the bean out.)
 pub fn register_memory_manager_impl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/MemoryManagerImpl";
 
     r.register(
@@ -1371,7 +1386,7 @@ pub fn register_memory_manager_impl(r: &mut NativeMethodRegistry) {
 /// regardless of field-layout drift.
 pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/MemoryPoolImpl";
 
     r.register(
@@ -1508,7 +1523,7 @@ pub fn alloc_garbage_collector_impl(ctx: &mut dyn NativeContext, name: &str) -> 
 /// via the OperatingSystemMXBean alloc above, not from this class.)
 pub fn register_operating_system_impl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/OperatingSystemImpl";
 
     let neg_one_long: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
@@ -1596,7 +1611,7 @@ pub fn register_hotspot_diagnostic(r: &mut NativeMethodRegistry) {
     // OpenJDK's HotSpotDiagnostic class is in `sun.management` (the public
     // facade lives in `com.sun.management.HotSpotDiagnosticMXBean`).
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/HotSpotDiagnostic";
 
     // dumpHeap0(String, Z)V — heap dumping is a major separate effort;
@@ -1629,7 +1644,7 @@ pub fn register_hotspot_diagnostic(r: &mut NativeMethodRegistry) {
 /// queries return zero / empty.
 pub fn register_flag_impl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/Flag";
 
     r.register(cls, "getInternalFlagCount", "()I", |_ctx, _args| {
@@ -1719,7 +1734,7 @@ pub fn register_flag_impl(r: &mut NativeMethodRegistry) {
 
 fn register_management_factory(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/ManagementFactory";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -2698,7 +2713,7 @@ fn alloc_compilation_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
 
 fn register_compilation_mxbean(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/CompilationMXBean";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -3162,7 +3177,7 @@ fn mbs_lookup_bean_at(ctx: &dyn NativeContext, server: ObjectRef, i: usize) -> O
 
 pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "javax/management/MBeanServer";
     r.register(cls, "<init>", "()V", |ctx, args| {
         // Initialise the registry on a freshly-constructed synthetic server
