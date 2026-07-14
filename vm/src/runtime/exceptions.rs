@@ -1377,6 +1377,9 @@ pub fn throw_runtime_error(
         RuntimeError::SocketTimeoutException { message } => {
             ("java/net/SocketTimeoutException", Some(message.as_str()))
         }
+        RuntimeError::ConnectException { message } => {
+            ("java/net/ConnectException", Some(message.as_str()))
+        }
         RuntimeError::FileNotFoundException { path } => {
             ("java/io/FileNotFoundException", Some(path.as_str()))
         }
@@ -1418,6 +1421,7 @@ pub fn throw_runtime_error(
         }
         RuntimeError::BufferUnderflowException => ("java/nio/BufferUnderflowException", None),
         RuntimeError::BufferOverflowException => ("java/nio/BufferOverflowException", None),
+        RuntimeError::ReadOnlyBufferException => ("java/nio/ReadOnlyBufferException", None),
         RuntimeError::InputMismatchException { message } => {
             ("java/util/InputMismatchException", Some(message.as_str()))
         }

@@ -1255,146 +1255,7 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(-1)))
         });
 
-        // -------------------------------------------------------------------------
-        // java.io.BufferedReader.<init>(Reader) / (Reader, int) — store reader at field 0
-        // -------------------------------------------------------------------------
-        r.register(
-            "java/io/BufferedReader",
-            "<init>",
-            "(Ljava/io/Reader;)V",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                let reader = args.get(1).copied().unwrap_or(Value::Object(None));
-                ctx.set_field(this, 0, reader);
-                Ok(None)
-            },
-        );
-        r.register(
-            "java/io/BufferedReader",
-            "<init>",
-            "(Ljava/io/Reader;I)V",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                let reader = args.get(1).copied().unwrap_or(Value::Object(None));
-                ctx.set_field(this, 0, reader);
-                Ok(None)
-            },
-        );
-
-        // -------------------------------------------------------------------------
-        // java.io.BufferedReader.readLine() → String
-        //
-        // The underlying InputStream is a synthetic ByteArrayInputStream with
-        // layout: field 0 = byte[] buf, field 1 = pos, field 2 = mark, field 3 = count.
-        // We read bytes from `pos..count` until we hit a line terminator
-        // (`\n`, `\r`, or `\r\n`), advance `pos` past it, and return the line
-        // as a UTF-8 String. Returns null at EOF.
-        // -------------------------------------------------------------------------
-        r.register(
-            "java/io/BufferedReader",
-            "readLine",
-            "()Ljava/lang/String;",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                let is = match r3_get_input_stream(ctx, this) {
-                    Some(s) => s,
-                    None => return Ok(Some(Value::Object(None))),
-                };
-                let buf_arr = match ctx.get_field(is, 0) {
-                    Value::Object(Some(arr)) => arr,
-                    _ => return Ok(Some(Value::Object(None))),
-                };
-                let mut pos = match ctx.get_field(is, 1) {
-                    Value::Int(i) => i as usize,
-                    _ => return Ok(Some(Value::Object(None))),
-                };
-                let count = match ctx.get_field(is, 3) {
-                    Value::Int(i) => i as usize,
-                    _ => ctx.array_length(buf_arr),
-                };
-                if pos >= count {
-                    // EOF — readLine returns null
-                    return Ok(Some(Value::Object(None)));
-                }
-                let mut bytes: Vec<u8> = Vec::new();
-                while pos < count {
-                    let b = match ctx.get_array_element(buf_arr, pos) {
-                        Value::Int(v) => (v as i8) as u8,
-                        _ => break,
-                    };
-                    pos += 1;
-                    if b == b'\n' {
-                        break;
-                    }
-                    if b == b'\r' {
-                        // Consume optional following \n (CRLF stays atomic)
-                        if pos < count {
-                            if let Value::Int(v) = ctx.get_array_element(buf_arr, pos) {
-                                if (v as i8) as u8 == b'\n' {
-                                    pos += 1;
-                                }
-                            }
-                        }
-                        break;
-                    }
-                    bytes.push(b);
-                }
-                ctx.set_field(is, 1, Value::Int(pos as i32));
-                let line = String::from_utf8_lossy(&bytes).into_owned();
-                let s = ctx.create_string(&line);
-                Ok(Some(Value::Object(Some(s))))
-            },
-        );
-
-        // -------------------------------------------------------------------------
-        // java.io.BufferedReader.lines() → Stream<String>
-        // -------------------------------------------------------------------------
-        r.register(
-            "java/io/BufferedReader",
-            "lines",
-            "()Ljava/util/stream/Stream;",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                let is = r3_get_input_stream(ctx, this);
-                let elems = match is {
-                    None => vec![],
-                    Some(is_ref) => {
-                        let lines_arr = match ctx.get_field(is_ref, 0) {
-                            Value::Object(Some(arr)) => arr,
-                            _ => {
-                                let s = p56_build_stream(ctx, vec![], "java/util/stream/Stream");
-                                return Ok(Some(Value::Object(Some(s))));
-                            }
-                        };
-                        let pos = match ctx.get_field(is_ref, 1) {
-                            Value::Int(i) => i as usize,
-                            _ => 0,
-                        };
-                        let len = ctx.array_length(lines_arr);
-                        let elems: Vec<Value> = (pos..len)
-                            .map(|i| ctx.get_array_element(lines_arr, i))
-                            .collect();
-                        // Advance position to end
-                        ctx.set_field(is_ref, 1, Value::Int(len as i32));
-                        elems
-                    }
-                };
-                let s = p56_build_stream(ctx, elems, "java/util/stream/Stream");
-                Ok(Some(Value::Object(Some(s))))
-            },
-        );
-
-        // -------------------------------------------------------------------------
-        // java.io.BufferedReader.close() — no-op
-        // java.io.Reader.close() — no-op
-        // -------------------------------------------------------------------------
-        r.register(
-            "java/io/BufferedReader",
-            "close",
-            "()V",
-            native_noop_with_this,
-        );
-        r.register("java/io/Reader", "close", "()V", native_noop_with_this);
+        // Real-JDK BufferedReader methods retain their bytecode implementation.
     } // end #[cfg(feature = "synthetic-jdk")] synthetic Reader-stack block
 }
 
@@ -2610,14 +2471,126 @@ fn s2_bb_arr(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<ObjectRef> {
 /// name-first/slot-4-fallback resolution as native-io's
 /// `directbuffer_address`. `None` for heap buffers and storage-less
 /// synthetics.
+///
+/// Heap buffers ALSO carry a non-zero `address` (`bb_write_hb` seeds
+/// ARRAY_BYTE_BASE_OFFSET + offset, i.e. 16+, mirroring the real
+/// HeapByteBuffer ctor) — that is an array-relative offset, not a process
+/// pointer, so the presence of a heap array must always win over the
+/// address field. Guard here so callers can consult this helper directly
+/// without repeating the array check.
 fn s2_bb_direct_addr(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<i64> {
+    if s2_bb_arr(ctx, buf).is_some() {
+        return None;
+    }
     match ctx.get_field_by_name(buf, "address") {
-        Value::Long(v) if v != 0 => Some(v),
+        Value::Long(v) if v > 0 => Some(v),
         _ => match ctx.get_field(buf, 4) {
-            Value::Long(v) if v != 0 => Some(v),
+            Value::Long(v) if v > 0 => Some(v),
             _ => None,
         },
     }
+}
+
+/// Array-base offset of a heap buffer — the real-JDK `ByteBuffer.offset`
+/// field (element index of logical byte 0 inside `hb`). 0 for fresh
+/// allocations/wraps and for layouts with no `offset` field to resolve
+/// (typed views, bare synthetics). Non-zero only for aliasing views made
+/// by `slice()`/`slice(int,int)` below, mirroring real HeapByteBuffer.
+#[inline]
+fn s2_bb_heap_base(ctx: &dyn NativeContext, buf: ObjectRef) -> usize {
+    match ctx.get_field_by_name(buf, "offset") {
+        Value::Int(v) if v > 0 => v as usize,
+        _ => 0,
+    }
+}
+
+/// Resolved backing storage of an s2-managed buffer: a heap array plus the
+/// buffer's array-base offset, OR a direct native address. This is the
+/// single storage-view helper the residual doc
+/// (docs/internal/fixed-suite-bugs/s2-bytebuffer-natives-real-jdk-direct-buffer-gaps-FIXED.md)
+/// called for: every method that used to read `s2_bb_arr` only — and
+/// silently produced empty/zero results on a DIRECT receiver — goes
+/// through here instead.
+enum S2BbStorage {
+    Heap { arr: ObjectRef, base: usize },
+    Direct { addr: i64 },
+}
+
+fn s2_bb_storage(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<S2BbStorage> {
+    if let Some(arr) = s2_bb_arr(ctx, buf) {
+        let base = s2_bb_heap_base(ctx, buf);
+        return Some(S2BbStorage::Heap { arr, base });
+    }
+    s2_bb_direct_addr(ctx, buf).map(|addr| S2BbStorage::Direct { addr })
+}
+
+/// Read `len` bytes starting at logical byte index `from` (position-space,
+/// i.e. NOT including the heap array-base offset) from either storage kind.
+/// `None` when the buffer is storage-less or a direct native read fails.
+fn s2_bb_read_window(
+    ctx: &dyn NativeContext,
+    buf: ObjectRef,
+    from: i32,
+    len: usize,
+) -> Option<Vec<u8>> {
+    if from < 0 {
+        return None;
+    }
+    match s2_bb_storage(ctx, buf)? {
+        S2BbStorage::Heap { arr, base } => {
+            let start = base.checked_add(from as usize)?;
+            let end = start.checked_add(len)?;
+            if end > ctx.array_length(arr) {
+                return None;
+            }
+            Some(
+                (start..end)
+                    .map(|i| ctx.get_array_element(arr, i).as_int().unwrap_or(0) as u8)
+                    .collect(),
+            )
+        }
+        S2BbStorage::Direct { addr } => {
+            let mut bytes = vec![0u8; len];
+            if ctx.copy_from_native_memory(addr.saturating_add(from as i64), &mut bytes) {
+                Some(bytes)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// True when the buffer's real-JDK `isReadOnly` flag is set (layouts with
+/// no such field — bare synthetics, typed views — always report writable,
+/// matching this family's historic behaviour).
+#[inline]
+fn s2_bb_is_read_only(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
+    matches!(ctx.get_field_by_name(buf, "isReadOnly"), Value::Int(v) if v != 0)
+}
+
+/// The canonical `java.nio.ByteOrder` object for `ord` (0=BIG_ENDIAN,
+/// 1=LITTLE_ENDIAN). Prefers the REAL class statics — ensuring the class
+/// is initialized first, since callers like `buffer.order()` can run
+/// before any Java-side `ByteOrder` access — so identity comparisons
+/// (`order() == ByteOrder.LITTLE_ENDIAN`) and `toString()` behave exactly
+/// like HotSpot. Falls back to a 1-slot synthetic (field 0 = order int)
+/// only when the real class/statics are unavailable (synthetic-jdk mode).
+fn s2_byte_order_object(ctx: &mut dyn NativeContext, ord: i32) -> ObjectRef {
+    let cid = ctx
+        .ensure_class_initialized("java/nio/ByteOrder")
+        .ok()
+        .or_else(|| ctx.class_id_by_name("java/nio/ByteOrder"));
+    if let Some(cid) = cid {
+        let field = if ord == 1 { "LITTLE_ENDIAN" } else { "BIG_ENDIAN" };
+        if let Some(idx) = ctx.static_field_index_by_name(cid, field) {
+            if let Value::Object(Some(o)) = ctx.get_static_field(cid, idx) {
+                return o;
+            }
+        }
+    }
+    let bo = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
+    ctx.set_field(bo, 0, Value::Int(ord));
+    bo
 }
 
 /// Write a buffer's `position`. Buffers with a heap array keep this
@@ -2643,7 +2616,7 @@ fn s2_bb_get_byte(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i8 {
         return 0;
     }
     if let Some(arr) = s2_bb_arr(ctx, buf) {
-        let i = idx as usize;
+        let i = s2_bb_heap_base(ctx, buf).saturating_add(idx as usize);
         if i >= ctx.array_length(arr) {
             return 0;
         }
@@ -2679,7 +2652,7 @@ fn s2_bb_put_byte(ctx: &mut dyn NativeContext, buf: ObjectRef, idx: i32, b: i8) 
         return;
     }
     if let Some(arr) = s2_bb_arr(ctx, buf) {
-        let i = idx as usize;
+        let i = s2_bb_heap_base(ctx, buf).saturating_add(idx as usize);
         if i >= ctx.array_length(arr) {
             return;
         }
@@ -2694,16 +2667,12 @@ fn s2_bb_put_byte(ctx: &mut dyn NativeContext, buf: ObjectRef, idx: i32, b: i8) 
 }
 
 /// Remaining bytes (pos..limit) as Vec<u8> without advancing position.
+/// Storage-aware: heap (honouring the array-base offset) and direct
+/// buffers both work; storage-less synthetics stay an empty Vec.
 fn s2_bb_remaining_bytes(ctx: &dyn NativeContext, buf: ObjectRef) -> Vec<u8> {
-    let pos = s2_bb_pos(ctx, buf) as usize;
-    let lim = s2_bb_limit(ctx, buf) as usize;
-    if let Some(arr) = s2_bb_arr(ctx, buf) {
-        (pos..lim)
-            .map(|i| ctx.get_array_element(arr, i).as_int().unwrap_or(0) as u8)
-            .collect()
-    } else {
-        vec![]
-    }
+    let pos = s2_bb_pos(ctx, buf).max(0);
+    let lim = s2_bb_limit(ctx, buf).max(pos);
+    s2_bb_read_window(ctx, buf, pos, (lim - pos) as usize).unwrap_or_default()
 }
 
 /// B8: compute `idx + off` for a multi-byte ByteBuffer access without
@@ -3533,11 +3502,26 @@ macro_rules! s2_view_buf_fn {
             // declares no `hb` field of its own, so `s2_bb_arr`'s by-name
             // lookup already falls straight through to the same indexed
             // slot 0 that a raw `ctx.get_field` reads.)
-            ctx.set_field(vb, BB_SEGMENT_SLOT, Value::Object(s2_bb_arr(ctx, this)));
+            if let Some(arr) = s2_bb_arr(ctx, this) {
+                ctx.set_field(vb, BB_SEGMENT_SLOT, Value::Object(Some(arr)));
+                // Byte-start marker: the view's element 0 lives at source
+                // byte `pos` — PLUS the source's own array-base offset
+                // (non-zero when the source is an aliasing `slice()`),
+                // since the view's byte accessors resolve against the
+                // shared array with the VIEW's own (absent → 0) offset.
+                let bs = s2_bb_heap_base(ctx, this) as i32 + pos;
+                ctx.set_field(vb, BB_MARK, Value::Int(-(bs + 1)));
+            } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
+                // DIRECT source (residual-doc item 3): keep a real native
+                // address — folded to the source's current position — in
+                // the view's `address` slot. The byte accessors reach it
+                // via `s2_bb_direct_addr`, and `s2_typed_view_byte_start`
+                // reads a positive address slot as byte-start 0.
+                ctx.set_field_by_name(vb, "address", Value::Long(addr.saturating_add(pos as i64)));
+            }
             ctx.set_field(vb, BB_POS, Value::Int(0));
             ctx.set_field(vb, BB_LIMIT, Value::Int(rem));
             ctx.set_field(vb, BB_CAP, Value::Int(rem));
-            ctx.set_field(vb, BB_MARK, Value::Int(-(pos + 1)));
             // Propagate the source buffer's order via the layout-aware
             // accessors (the source may be real-layout: order in `bigEndian`).
             let ord = s2_bb_order(ctx, this);
@@ -3551,6 +3535,19 @@ s2_view_buf_fn!(s2_bb_as_long_buffer, "java/nio/LongBuffer", 8);
 s2_view_buf_fn!(s2_bb_as_short_buffer, "java/nio/ShortBuffer", 2);
 s2_view_buf_fn!(s2_bb_as_float_buffer, "java/nio/FloatBuffer", 4);
 s2_view_buf_fn!(s2_bb_as_double_buffer, "java/nio/DoubleBuffer", 8);
+
+/// Typed views encode their source byte offset as -(offset + 1) in the
+/// Buffer.address slot. That slot is a long on real JDK buffer layouts,
+/// while synthetic views use an int, so preserve both representations.
+#[inline]
+fn s2_typed_view_byte_start(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    let marker = match ctx.get_field(this, BB_MARK) {
+        Value::Int(v) => v,
+        Value::Long(v) => i32::try_from(v).unwrap_or(-1),
+        _ => -1,
+    };
+    if marker < 0 { -(marker + 1) } else { 0 }
+}
 
 /// `ByteBuffer.asCharBuffer()` — the view returned MUST have its backing
 /// store stored in the real-JDK `hb` field so JDK bytecode that reads
@@ -3576,25 +3573,18 @@ fn s2_bb_as_char_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let rem_chars = rem_bytes / 2;
     // Transcode bytes → chars using the source ByteBuffer's byte order.
     let chars_arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, rem_chars);
-    if let Some(src) = s2_bb_arr(ctx, this) {
-        for i in 0..rem_chars {
-            let hi = ctx
-                .get_array_element(src, pos + 2 * i)
-                .as_int()
-                .unwrap_or(0)
-                & 0xFF;
-            let lo = ctx
-                .get_array_element(src, pos + 2 * i + 1)
-                .as_int()
-                .unwrap_or(0)
-                & 0xFF;
-            let ch = if order == 1 {
-                (lo << 8) | hi
-            } else {
-                (hi << 8) | lo
-            };
-            ctx.set_array_element(chars_arr, i, Value::Int(ch));
-        }
+    // Storage-aware byte reads (heap incl. array-base offset, or direct) —
+    // the previous `s2_bb_arr`-only loop silently produced an all-zero
+    // char[] for direct sources (residual-doc item 3).
+    for i in 0..rem_chars {
+        let hi = s2_bb_get_byte(ctx, this, (pos + 2 * i) as i32) as i32 & 0xFF;
+        let lo = s2_bb_get_byte(ctx, this, (pos + 2 * i + 1) as i32) as i32 & 0xFF;
+        let ch = if order == 1 {
+            (lo << 8) | hi
+        } else {
+            (hi << 8) | lo
+        };
+        ctx.set_array_element(chars_arr, i, Value::Int(ch));
     }
     let vb = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 6);
     // Write to BOTH indexed slot 0 (synthetic-mode layout used by our
@@ -3617,6 +3607,73 @@ fn s2_bb_as_char_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(Some(Value::Object(Some(vb))))
 }
 
+/// Build an ALIASING heap ByteBuffer view (used by `slice`/`slice(II)`/
+/// `duplicate`/`asReadOnlyBuffer`): shares `arr` with the source and
+/// records the view's array-base `offset`, exactly like real-JDK
+/// HeapByteBuffer views. `address` mirrors the real ctor's
+/// ARRAY_BYTE_BASE_OFFSET + offset seeding (see `bb_write_hb`).
+#[allow(clippy::too_many_arguments)]
+fn s2_bb_new_heap_view(
+    ctx: &mut dyn NativeContext,
+    arr: ObjectRef,
+    offset: usize,
+    pos: i32,
+    lim: i32,
+    cap: i32,
+    mark: i32,
+    read_only: bool,
+    ord: i32,
+) -> ObjectRef {
+    let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+    ctx.set_field_by_name(buf, "hb", Value::Object(Some(arr)));
+    ctx.set_field_by_name(buf, "offset", Value::Int(offset as i32));
+    ctx.set_field_by_name(buf, "isReadOnly", Value::Int(read_only as i32));
+    ctx.set_field_by_name(buf, "position", Value::Int(pos));
+    ctx.set_field_by_name(buf, "limit", Value::Int(lim));
+    ctx.set_field_by_name(buf, "capacity", Value::Int(cap));
+    ctx.set_field_by_name(buf, "mark", Value::Int(mark));
+    ctx.set_field_by_name(buf, "address", Value::Long(16i64.saturating_add(offset as i64)));
+    if s2_bb_synthetic_layout(ctx, buf) {
+        // Bare-synthetic layout: no `offset` field exists, so aliasing at a
+        // non-zero base is not representable — the callers below keep the
+        // legacy copying behaviour for that mode instead of reaching here.
+        ctx.set_field(buf, BB_ARRAY, Value::Object(Some(arr)));
+        ctx.set_field(buf, BB_POS, Value::Int(pos));
+        ctx.set_field(buf, BB_LIMIT, Value::Int(lim));
+        ctx.set_field(buf, BB_CAP, Value::Int(cap));
+        ctx.set_field(buf, BB_MARK, Value::Int(mark));
+    }
+    s2_bb_set_order(ctx, buf, ord);
+    buf
+}
+
+/// Build an ALIASING direct ByteBuffer view over native memory at `addr`
+/// (already advanced to the view's byte 0). The object is stamped with the
+/// abstract `java/nio/ByteBuffer` class — every accessor reaches the
+/// storage through `s2_bb_direct_addr`, closing residual-doc item 3's
+/// "slices/duplicates of a direct buffer come back empty" gap.
+#[allow(clippy::too_many_arguments)]
+fn s2_bb_new_direct_view(
+    ctx: &mut dyn NativeContext,
+    addr: i64,
+    pos: i32,
+    lim: i32,
+    cap: i32,
+    mark: i32,
+    read_only: bool,
+    ord: i32,
+) -> ObjectRef {
+    let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+    ctx.set_field_by_name(buf, "isReadOnly", Value::Int(read_only as i32));
+    ctx.set_field_by_name(buf, "position", Value::Int(pos));
+    ctx.set_field_by_name(buf, "limit", Value::Int(lim));
+    ctx.set_field_by_name(buf, "capacity", Value::Int(cap));
+    ctx.set_field_by_name(buf, "mark", Value::Int(mark));
+    ctx.set_field_by_name(buf, "address", Value::Long(addr));
+    s2_bb_set_order(ctx, buf, ord);
+    buf
+}
+
 fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     use cratonvm_types::ArrayElementType;
     let bb = "java/nio/ByteBuffer";
@@ -3630,79 +3687,18 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         "allocateDirect",
         "(I)Ljava/nio/ByteBuffer;",
         |ctx, args| {
-            // NEW-17: direct buffers back the array with REAL native memory and
-            // register a Cleaner action that frees the native allocation when
-            // the buffer becomes phantom-reachable.
-            let cap = args.first().and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-
-            // 1) Acquire native memory from the per-VM table.
-            let alloc_id = match ctx.allocate_native_memory(cap, 8) {
-                Some((id, _ptr)) => id,
-                None => {
-                    return Err(cratonvm_types::error::RuntimeError::OutOfMemoryError {
-                        message: "DirectByteBuffer.allocateDirect: native memory allocation failed"
-                            .into(),
-                    }
-                    .into());
+            let cap = args.first().and_then(|v| v.as_int()).unwrap_or(0);
+            if cap < 0 {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "capacity < 0".into(),
                 }
-            };
-
-            // 2) Allocate the buffer synthetic with 8 fields (the extra two
-            //    carry alloc_id + direct_flag). Use an empty byte[] for BB_ARRAY
-            //    so existing array-reading code paths see capacity 0 rather than
-            //    aliasing the native memory.
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, cap);
-            let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 8);
-            // Real-JDK named `mark` field (mirrors `bb_write_hb`) — deliberately
-            // NOT also written via the indexed BB_MARK fallback below. Real
-            // `Buffer`'s field order is `mark(0), position(1), limit(2),
-            // capacity(3), address(4)`, so index 4 — this file's synthetic-mode
-            // BB_MARK slot — aliases `address` (the actual native memory
-            // pointer) for a real-JDK `DirectByteBuffer`, NOT `mark`.
-            // Without this by-name write, `mark` starts at its generic
-            // zero-init default (`Value::Object(None)`, indistinguishable from
-            // "field doesn't exist"), so `s2_bb_get_mark`'s by-name-first probe
-            // misreads that as "no such field" on the FIRST `mark()` call and
-            // falls back to the indexed slot, silently overwriting `address`
-            // with the mark value — the next `put`/`get` then computes a
-            // garbage target address and SIGSEGVs (found chasing the
-            // ByteBuffer.mark()/reset() InvalidMarkException fix above through
-            // to a `ByteBuffer.allocateDirect` + `mark()` + `put()` repro).
-            // Skipping the indexed write here means a *genuinely* synthetic
-            // (non-real-JDK) ByteBuffer class would leave `mark` unusable —
-            // accepted: this whole module is real-JDK-mode-only in practice.
-            ctx.set_field_by_name(buf, "position", Value::Int(0));
-            ctx.set_field_by_name(buf, "limit", Value::Int(cap as i32));
-            ctx.set_field_by_name(buf, "capacity", Value::Int(cap as i32));
-            ctx.set_field_by_name(buf, "mark", Value::Int(-1));
-            // Synthetic-mode indexed fallback (array/order/native-id/direct-flag
-            // only — NOT mark, see above).
-            ctx.set_field(buf, BB_ARRAY, Value::Object(Some(arr)));
-            ctx.set_field(buf, BB_POS, Value::Int(0));
-            ctx.set_field(buf, BB_LIMIT, Value::Int(cap as i32));
-            ctx.set_field(buf, BB_CAP, Value::Int(cap as i32));
-            ctx.set_field(buf, BB_ORDER, Value::Int(0));
-            ctx.set_field(buf, BB_NATIVE_ID, Value::Long(alloc_id));
-            ctx.set_field(buf, BB_DIRECT_FLAG, Value::Int(1));
-
-            // 3) Allocate the deallocator (Runnable) synthetic carrying alloc_id.
-            let dealloc = alloc_concurrent_synthetic(ctx, DEALLOC_CLASS, 1);
-            ctx.set_field(dealloc, DEALLOC_ID, Value::Long(alloc_id));
-
-            // 4) Allocate a Cleanable, install the deallocator as its action,
-            //    and register it as a Cleaner-typed phantom of `buf` in the
-            //    ref processor. When `buf` is collected, the GC will queue this
-            //    cleanable into shared.cleaner_thread; the interpreter's
-            //    run_cleaner_actions then invokes deallocator.run()V → frees
-            //    the native memory.
-            let cleanable = alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner$Cleanable", 3);
-            ctx.set_field(cleanable, 0, Value::Object(Some(dealloc)));
-            ctx.set_field(cleanable, 1, Value::Int(0));
-            ctx.set_field(cleanable, 2, Value::Int(-1));
-            // 3 = REF_TYPE_CLEANER (see vm_exec::discover_reference)
-            ctx.discover_reference(3, cleanable, buf, None);
-
-            Ok(Some(Value::Object(Some(buf))))
+                .into());
+            }
+            ctx.new_object_initialized(
+                "java/nio/DirectByteBuffer",
+                "(I)V",
+                &[Value::Int(cap)],
+            )
         },
     );
     r.register(bb, "wrap", "([B)Ljava/nio/ByteBuffer;", |ctx, args| {
@@ -3785,8 +3781,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         // byte[], so this exact path is how Lucene's footer/checksum bytes
         // came back as zero (ES-FAIL-FAMILY-20260709).
         if let Some(arr) = s2_bb_arr(ctx, this) {
+            let base = s2_bb_heap_base(ctx, this);
             for i in 0..len as usize {
-                let b = ctx.get_array_element(arr, pos as usize + i);
+                let b = ctx.get_array_element(arr, base + pos as usize + i);
                 ctx.set_array_element(dst, off + i, b);
             }
         } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
@@ -3818,8 +3815,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             return Err(RuntimeError::BufferUnderflowException.into());
         }
         if let Some(arr) = s2_bb_arr(ctx, this) {
+            let base = s2_bb_heap_base(ctx, this);
             for i in 0..len as usize {
-                let b = ctx.get_array_element(arr, pos as usize + i);
+                let b = ctx.get_array_element(arr, base + pos as usize + i);
                 ctx.set_array_element(dst, i, b);
             }
         } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
@@ -3843,6 +3841,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     // put
     r.register(bb, "put", "(B)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if s2_bb_is_read_only(ctx, this) {
+            return Err(RuntimeError::ReadOnlyBufferException.into());
+        }
         let b = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as i8;
         let pos = s2_bb_pos(ctx, this);
         if pos >= s2_bb_limit(ctx, this) {
@@ -3854,6 +3855,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     });
     r.register(bb, "put", "(IB)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if s2_bb_is_read_only(ctx, this) {
+            return Err(RuntimeError::ReadOnlyBufferException.into());
+        }
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let b = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as i8;
         s2_bb_put_byte(ctx, this, idx, b);
@@ -3861,6 +3865,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     });
     r.register(bb, "put", "([BII)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if s2_bb_is_read_only(ctx, this) {
+            return Err(RuntimeError::ReadOnlyBufferException.into());
+        }
         let src = obj_arg(args, 1)?;
         // BUG [nb-servlet]: symmetric to get([BII). `off`/`len` were raw i32 with
         // no negativity check and `off` cast to usize before validation. A negative
@@ -3892,9 +3899,10 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         // Mirrors put(Ljava/nio/ByteBuffer;)'s direct-buffer fix — see
         // get([BII)'s comment above for the matching read-side rationale.
         if let Some(arr) = s2_bb_arr(ctx, this) {
+            let base = s2_bb_heap_base(ctx, this);
             for i in 0..len as usize {
                 let b = ctx.get_array_element(src, off + i);
-                ctx.set_array_element(arr, pos as usize + i, b);
+                ctx.set_array_element(arr, base + pos as usize + i, b);
             }
         } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
             let mut bytes = vec![0u8; len as usize];
@@ -3915,6 +3923,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     });
     r.register(bb, "put", "([B)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if s2_bb_is_read_only(ctx, this) {
+            return Err(RuntimeError::ReadOnlyBufferException.into());
+        }
         let src = obj_arg(args, 1)?;
         let len = ctx.array_length(src) as i32;
         let pos = s2_bb_pos(ctx, this);
@@ -3922,9 +3933,10 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             return Err(RuntimeError::BufferOverflowException.into());
         }
         if let Some(arr) = s2_bb_arr(ctx, this) {
+            let base = s2_bb_heap_base(ctx, this);
             for i in 0..len as usize {
                 let b = ctx.get_array_element(src, i);
-                ctx.set_array_element(arr, pos as usize + i, b);
+                ctx.set_array_element(arr, base + pos as usize + i, b);
             }
         } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
             let mut bytes = vec![0u8; len as usize];
@@ -3949,6 +3961,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/ByteBuffer;)Ljava/nio/ByteBuffer;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            if s2_bb_is_read_only(ctx, this) {
+                return Err(RuntimeError::ReadOnlyBufferException.into());
+            }
             let src = obj_arg(args, 1)?;
             let src_pos = s2_bb_pos(ctx, src);
             let src_lim = s2_bb_limit(ctx, src);
@@ -3970,9 +3985,10 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             // ES-FAIL-FAMILY-20260710-vector-codec-exception-cause-object).
             let mut bytes = vec![0u8; n];
             if let Some(src_arr) = s2_bb_arr(ctx, src) {
+                let src_base = s2_bb_heap_base(ctx, src);
                 for (i, b) in bytes.iter_mut().enumerate() {
                     *b = ctx
-                        .get_array_element(src_arr, src_pos as usize + i)
+                        .get_array_element(src_arr, src_base + src_pos as usize + i)
                         .as_int()
                         .unwrap_or(0) as u8;
                 }
@@ -3989,8 +4005,13 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Object(Some(this))));
             }
             if let Some(dst_arr) = s2_bb_arr(ctx, this) {
+                let dst_base = s2_bb_heap_base(ctx, this);
                 for (i, b) in bytes.iter().enumerate() {
-                    ctx.set_array_element(dst_arr, pos as usize + i, Value::Int(*b as i8 as i32));
+                    ctx.set_array_element(
+                        dst_arr,
+                        dst_base + pos as usize + i,
+                        Value::Int(*b as i8 as i32),
+                    );
                 }
             } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
                 if !ctx.copy_to_native_memory(addr.saturating_add(pos as i64), &bytes) {
@@ -4026,6 +4047,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     });
     r.register(bb, "putShort", "(S)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if s2_bb_is_read_only(ctx, this) {
+            return Err(RuntimeError::ReadOnlyBufferException.into());
+        }
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as i16;
         let pos = s2_bb_pos(ctx, this);
         if pos + 2 > s2_bb_limit(ctx, this) {
@@ -4037,6 +4061,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     });
     r.register(bb, "putShort", "(IS)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if s2_bb_is_read_only(ctx, this) {
+            return Err(RuntimeError::ReadOnlyBufferException.into());
+        }
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let v = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as i16;
         s2_bb_write2(ctx, this, idx, v);
@@ -4061,6 +4088,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     });
     r.register(bb, "putChar", "(C)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if s2_bb_is_read_only(ctx, this) {
+            return Err(RuntimeError::ReadOnlyBufferException.into());
+        }
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as i16;
         let pos = s2_bb_pos(ctx, this);
         if pos + 2 > s2_bb_limit(ctx, this) {
@@ -4072,6 +4102,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     });
     r.register(bb, "putChar", "(IC)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if s2_bb_is_read_only(ctx, this) {
+            return Err(RuntimeError::ReadOnlyBufferException.into());
+        }
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let v = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as i16;
         s2_bb_write2(ctx, this, idx, v);
@@ -4096,6 +4129,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     });
     r.register(bb, "putInt", "(I)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if s2_bb_is_read_only(ctx, this) {
+            return Err(RuntimeError::ReadOnlyBufferException.into());
+        }
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let pos = s2_bb_pos(ctx, this);
         if pos + 4 > s2_bb_limit(ctx, this) {
@@ -4107,6 +4143,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     });
     r.register(bb, "putInt", "(II)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if s2_bb_is_read_only(ctx, this) {
+            return Err(RuntimeError::ReadOnlyBufferException.into());
+        }
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let v = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
         s2_bb_write4(ctx, this, idx, v);
@@ -4131,6 +4170,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     });
     r.register(bb, "putLong", "(J)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if s2_bb_is_read_only(ctx, this) {
+            return Err(RuntimeError::ReadOnlyBufferException.into());
+        }
         let v = match args.get(1) {
             Some(Value::Long(l)) => *l,
             Some(Value::Int(i)) => *i as i64,
@@ -4146,6 +4188,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     });
     r.register(bb, "putLong", "(IJ)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if s2_bb_is_read_only(ctx, this) {
+            return Err(RuntimeError::ReadOnlyBufferException.into());
+        }
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let v = match args.get(2) {
             Some(Value::Long(l)) => *l,
@@ -4176,6 +4221,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     });
     r.register(bb, "putFloat", "(F)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if s2_bb_is_read_only(ctx, this) {
+            return Err(RuntimeError::ReadOnlyBufferException.into());
+        }
         let v = match args.get(1) {
             Some(Value::Float(f)) => *f,
             Some(Value::Int(i)) => f32::from_bits(*i as u32),
@@ -4203,6 +4251,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     });
     r.register(bb, "putDouble", "(D)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if s2_bb_is_read_only(ctx, this) {
+            return Err(RuntimeError::ReadOnlyBufferException.into());
+        }
         let v = match args.get(1) {
             Some(Value::Double(d)) => *d,
             _ => 0.0,
@@ -4269,6 +4320,15 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         r.register(bb, "position", ret, |ctx, args| {
             let this = obj_arg(args, 0)?;
             let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+            let limit = s2_bb_limit(ctx, this);
+            if v < 0 || v > limit {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("newPosition > limit: ({v} > {limit})"),
+                }.into());
+            }
+            if s2_bb_get_mark(ctx, this) > v {
+                s2_bb_set_mark(ctx, this, -1);
+            }
             ctx.set_field(this, BB_POS, Value::Int(v));
             Ok(Some(Value::Object(Some(this))))
         });
@@ -4280,6 +4340,19 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         r.register(bb, "limit", ret, |ctx, args| {
             let this = obj_arg(args, 0)?;
             let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+            let cap = s2_bb_cap(ctx, this);
+            if v < 0 || v > cap {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("newLimit > capacity: ({v} > {cap})"),
+                }.into());
+            }
+            let pos = s2_bb_pos(ctx, this);
+            if pos > v {
+                ctx.set_field(this, BB_POS, Value::Int(v));
+            }
+            if s2_bb_get_mark(ctx, this) > v {
+                s2_bb_set_mark(ctx, this, -1);
+            }
             ctx.set_field(this, BB_LIMIT, Value::Int(v));
             Ok(Some(Value::Object(Some(this))))
         });
@@ -4305,14 +4378,27 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     });
     r.register(bb, "compact", "()Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let pos = s2_bb_pos(ctx, this) as usize;
-        let lim = s2_bb_limit(ctx, this) as usize;
+        if s2_bb_is_read_only(ctx, this) {
+            return Err(RuntimeError::ReadOnlyBufferException.into());
+        }
+        let pos = s2_bb_pos(ctx, this).max(0);
+        let lim = s2_bb_limit(ctx, this).max(pos);
         let cap = s2_bb_cap(ctx, this);
-        let n = lim.saturating_sub(pos);
-        if let Some(arr) = s2_bb_arr(ctx, this) {
-            for i in 0..n {
-                let b = ctx.get_array_element(arr, pos + i);
-                ctx.set_array_element(arr, i, b);
+        let n = (lim - pos) as usize;
+        // Storage-aware move (residual-doc item 3: direct receivers were a
+        // silent no-op). Reading the window first makes the overlapping
+        // move safe for both storage kinds.
+        if let Some(bytes) = s2_bb_read_window(ctx, this, pos, n) {
+            match s2_bb_storage(ctx, this) {
+                Some(S2BbStorage::Heap { arr, base }) => {
+                    for (i, b) in bytes.iter().enumerate() {
+                        ctx.set_array_element(arr, base + i, Value::Int(*b as i8 as i32));
+                    }
+                }
+                Some(S2BbStorage::Direct { addr }) => {
+                    let _ = ctx.copy_to_native_memory(addr, &bytes);
+                }
+                None => {}
             }
         }
         ctx.set_field(this, BB_POS, Value::Int(n as i32));
@@ -4321,47 +4407,61 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(this))))
     });
 
-    // array / hasArray / isDirect / isReadOnly / arrayOffset
+    // array / hasArray / isDirect / isReadOnly / arrayOffset — all
+    // storage/flag-aware now (previously hardcoded heap-and-writable, so a
+    // direct or read-only receiver answered wrong on every one of these).
     r.register(bb, "array", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Object(s2_bb_arr(ctx, this))))
+        match s2_bb_arr(ctx, this) {
+            Some(arr) => {
+                if s2_bb_is_read_only(ctx, this) {
+                    return Err(RuntimeError::ReadOnlyBufferException.into());
+                }
+                Ok(Some(Value::Object(Some(arr))))
+            }
+            None if s2_bb_direct_addr(ctx, this).is_some() => {
+                Err(RuntimeError::UnsupportedOperationException {
+                    message: "direct buffer has no backing array".to_string(),
+                }
+                .into())
+            }
+            // Storage-less synthetic: keep the historic benign null.
+            None => Ok(Some(Value::Object(None))),
+        }
     });
-    r.register(bb, "arrayOffset", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(bb, "arrayOffset", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(s2_bb_heap_base(ctx, this) as i32)))
     });
     r.register(bb, "hasArray", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(if s2_bb_arr(ctx, this).is_some() {
-            1
-        } else {
-            0
-        })))
+        let has = s2_bb_arr(ctx, this).is_some() && !s2_bb_is_read_only(ctx, this);
+        Ok(Some(Value::Int(has as i32)))
     });
-    r.register(bb, "isDirect", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
-    r.register(bb, "isReadOnly", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(bb, "isDirect", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(
+            s2_bb_direct_addr(ctx, this).is_some() as i32,
+        )))
+    });
+    r.register(bb, "isReadOnly", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(s2_bb_is_read_only(ctx, this) as i32)))
     });
 
     // order
     r.register(bb, "order", "()Ljava/nio/ByteOrder;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let ord = s2_bb_order(ctx, this);
-        // Prefer the REAL ByteOrder statics: JDK and library bytecode
-        // compares the result with `==` against `ByteOrder.LITTLE_ENDIAN`
-        // (e.g. Lucene's `assert buffer.order() == LITTLE_ENDIAN`), and a
-        // synthetic stand-in also corrupts its `name` field in real-JDK
-        // mode (slot 0 is the name String there, not an order int).
-        if let Some(cid) = ctx.class_id_by_name("java/nio/ByteOrder") {
-            let field = if ord == 1 { "LITTLE_ENDIAN" } else { "BIG_ENDIAN" };
-            if let Some(idx) = ctx.static_field_index_by_name(cid, field) {
-                if let Value::Object(Some(o)) = ctx.get_static_field(cid, idx) {
-                    return Ok(Some(Value::Object(Some(o))));
-                }
-            }
-        }
-        let bo = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
-        ctx.set_field(bo, 0, Value::Int(ord));
-        Ok(Some(Value::Object(Some(bo))))
+        // Canonical (real-static) ByteOrder object: JDK and library
+        // bytecode compares the result with `==` against
+        // `ByteOrder.LITTLE_ENDIAN` (e.g. Lucene's `assert buffer.order()
+        // == LITTLE_ENDIAN`). The helper also ensures the class is
+        // INITIALIZED first — the previous lookup silently fell back to a
+        // fresh synthetic (printing as BIG_ENDIAN, failing identity
+        // comparisons) when `order()` ran before any Java-side ByteOrder
+        // access had triggered <clinit> (residual-doc item 6).
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, ord)))))
     });
     r.register(
         bb,
@@ -4392,53 +4492,160 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // slice / duplicate / asReadOnlyBuffer
+    // slice / slice(II) / duplicate / asReadOnlyBuffer — ALIASING views.
+    //
+    // The previous implementations copied the remaining bytes into a fresh
+    // heap array (slice) or dropped the storage entirely for a DIRECT
+    // source (all four) — residual-doc items 2/3: writes through a slice
+    // never reached the parent, and every view over a direct buffer came
+    // back empty/zero. Views now share the parent's storage exactly like
+    // real-JDK buffers: heap views record an array-base `offset` (honoured
+    // by every accessor via `s2_bb_heap_base`), direct views record the
+    // advanced native `address`. The bare-synthetic 6-slot layout has no
+    // `offset` field to carry a base, so it keeps the legacy copying
+    // behaviour (data-correct, aliasing not representable).
     r.register(bb, "slice", "()Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let pos = s2_bb_pos(ctx, this) as usize;
-        let lim = s2_bb_limit(ctx, this) as usize;
-        let rem = lim.saturating_sub(pos);
-        let new_arr = ctx.new_array(ArrayElementType::Byte, rem);
-        if let Some(src) = s2_bb_arr(ctx, this) {
-            for i in 0..rem {
-                let b = ctx.get_array_element(src, pos + i);
-                ctx.set_array_element(new_arr, i, b);
-            }
-        }
-        let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
-        bb_write_hb(ctx, buf, new_arr, rem as i32);
-        ctx.set_field_by_name(buf, "isReadOnly", Value::Int(0));
-        // Propagate the source buffer's order via the layout-aware
-        // accessors (the source may be real-layout: order in `bigEndian`).
+        let pos = s2_bb_pos(ctx, this).max(0);
+        let lim = s2_bb_limit(ctx, this).max(pos);
+        let rem = lim - pos;
+        let ro = s2_bb_is_read_only(ctx, this);
         let ord = s2_bb_order(ctx, this);
-        s2_bb_set_order(ctx, buf, ord);
+        if s2_bb_synthetic_layout(ctx, this) {
+            let new_arr = ctx.new_array(ArrayElementType::Byte, rem as usize);
+            if let Some(src) = s2_bb_arr(ctx, this) {
+                for i in 0..rem as usize {
+                    let b = ctx.get_array_element(src, pos as usize + i);
+                    ctx.set_array_element(new_arr, i, b);
+                }
+            }
+            let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+            bb_write_hb(ctx, buf, new_arr, rem);
+            s2_bb_set_order(ctx, buf, ord);
+            return Ok(Some(Value::Object(Some(buf))));
+        }
+        let buf = match s2_bb_storage(ctx, this) {
+            Some(S2BbStorage::Heap { arr, base }) => s2_bb_new_heap_view(
+                ctx,
+                arr,
+                base + pos as usize,
+                0,
+                rem,
+                rem,
+                -1,
+                ro,
+                ord,
+            ),
+            Some(S2BbStorage::Direct { addr }) => s2_bb_new_direct_view(
+                ctx,
+                addr.saturating_add(pos as i64),
+                0,
+                rem,
+                rem,
+                -1,
+                ro,
+                ord,
+            ),
+            // Storage-less synthetic: keep the historic empty-copy result.
+            None => {
+                let new_arr = ctx.new_array(ArrayElementType::Byte, rem as usize);
+                let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+                bb_write_hb(ctx, buf, new_arr, rem);
+                buf
+            }
+        };
+        Ok(Some(Value::Object(Some(buf))))
+    });
+    // JDK 13+ `slice(int index, int length)` — absolute-indexed aliasing
+    // view, independent of position/limit. Abstract on the real class, so
+    // an s2-stamped receiver needs this registration to avoid
+    // AbstractMethodError (same pattern as the typed-buffer views).
+    r.register(bb, "slice", "(II)Ljava/nio/ByteBuffer;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let index = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        let length = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        let lim = s2_bb_limit(ctx, this);
+        if index < 0 || length < 0 || index.checked_add(length).map_or(true, |e| e > lim) {
+            return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                index: index.saturating_add(length),
+            }
+            .into());
+        }
+        let ro = s2_bb_is_read_only(ctx, this);
+        let ord = s2_bb_order(ctx, this);
+        let buf = match s2_bb_storage(ctx, this) {
+            Some(S2BbStorage::Heap { arr, base }) if !s2_bb_synthetic_layout(ctx, this) => {
+                s2_bb_new_heap_view(
+                    ctx,
+                    arr,
+                    base + index as usize,
+                    0,
+                    length,
+                    length,
+                    -1,
+                    ro,
+                    ord,
+                )
+            }
+            Some(S2BbStorage::Direct { addr }) => s2_bb_new_direct_view(
+                ctx,
+                addr.saturating_add(index as i64),
+                0,
+                length,
+                length,
+                -1,
+                ro,
+                ord,
+            ),
+            _ => {
+                // Bare-synthetic / storage-less: copying fallback.
+                let new_arr = ctx.new_array(ArrayElementType::Byte, length as usize);
+                if let Some(src) = s2_bb_arr(ctx, this) {
+                    for i in 0..length as usize {
+                        let b = ctx.get_array_element(src, index as usize + i);
+                        ctx.set_array_element(new_arr, i, b);
+                    }
+                }
+                let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+                bb_write_hb(ctx, buf, new_arr, length);
+                s2_bb_set_order(ctx, buf, ord);
+                buf
+            }
+        };
         Ok(Some(Value::Object(Some(buf))))
     });
     r.register(bb, "duplicate", "()Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
-        // Rebuild the duplicate from semantic accessors instead of blindly
-        // copying slots 0..5: on a real-JDK-shaped buffer slot 0 is `mark`,
-        // so a raw copy clobbers BB_ARRAY with Int(-1) and downstream code
-        // reports "ByteBuffer missing backing array".
-        if let Some(src_arr) = s2_bb_arr(ctx, this) {
-            let cap = s2_bb_cap(ctx, this);
-            bb_write_hb(ctx, buf, src_arr, cap);
-            let pos = s2_bb_pos(ctx, this);
-            let lim = s2_bb_limit(ctx, this);
-            let mark = ctx
-                .get_field_by_name(this, "mark")
-                .as_int()
-                .or_else(|| ctx.get_field(this, BB_MARK).as_int())
-                .unwrap_or(-1);
-            ctx.set_field_by_name(buf, "position", Value::Int(pos));
-            ctx.set_field_by_name(buf, "limit", Value::Int(lim));
-            ctx.set_field_by_name(buf, "mark", Value::Int(mark));
-            ctx.set_field(buf, BB_POS, Value::Int(pos));
-            ctx.set_field(buf, BB_LIMIT, Value::Int(lim));
-            ctx.set_field(buf, BB_MARK, Value::Int(mark));
-        }
-        ctx.set_field(buf, BB_ORDER, Value::Int(s2_bb_order(ctx, this)));
+        let pos = s2_bb_pos(ctx, this);
+        let lim = s2_bb_limit(ctx, this);
+        let cap = s2_bb_cap(ctx, this);
+        let mark = s2_bb_get_mark(ctx, this);
+        let ro = s2_bb_is_read_only(ctx, this);
+        let ord = s2_bb_order(ctx, this);
+        let buf = match s2_bb_storage(ctx, this) {
+            Some(S2BbStorage::Heap { arr, base }) if !s2_bb_synthetic_layout(ctx, this) => {
+                s2_bb_new_heap_view(ctx, arr, base, pos, lim, cap, mark, ro, ord)
+            }
+            Some(S2BbStorage::Direct { addr }) => {
+                s2_bb_new_direct_view(ctx, addr, pos, lim, cap, mark, ro, ord)
+            }
+            _ => {
+                // Bare-synthetic / storage-less: legacy shared-array
+                // rebuild (aliases the array, no offset support needed).
+                let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+                if let Some(src_arr) = s2_bb_arr(ctx, this) {
+                    bb_write_hb(ctx, buf, src_arr, cap);
+                    ctx.set_field_by_name(buf, "position", Value::Int(pos));
+                    ctx.set_field_by_name(buf, "limit", Value::Int(lim));
+                    ctx.set_field_by_name(buf, "mark", Value::Int(mark));
+                    ctx.set_field(buf, BB_POS, Value::Int(pos));
+                    ctx.set_field(buf, BB_LIMIT, Value::Int(lim));
+                    ctx.set_field(buf, BB_MARK, Value::Int(mark));
+                }
+                ctx.set_field(buf, BB_ORDER, Value::Int(ord));
+                buf
+            }
+        };
         Ok(Some(Value::Object(Some(buf))))
     });
     r.register(
@@ -4447,26 +4654,34 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/ByteBuffer;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
-            if let Some(src_arr) = s2_bb_arr(ctx, this) {
-                let cap = s2_bb_cap(ctx, this);
-                bb_write_hb(ctx, buf, src_arr, cap);
-                let pos = s2_bb_pos(ctx, this);
-                let lim = s2_bb_limit(ctx, this);
-                let mark = ctx
-                    .get_field_by_name(this, "mark")
-                    .as_int()
-                    .or_else(|| ctx.get_field(this, BB_MARK).as_int())
-                    .unwrap_or(-1);
-                ctx.set_field_by_name(buf, "position", Value::Int(pos));
-                ctx.set_field_by_name(buf, "limit", Value::Int(lim));
-                ctx.set_field_by_name(buf, "mark", Value::Int(mark));
-                ctx.set_field_by_name(buf, "isReadOnly", Value::Int(1));
-                ctx.set_field(buf, BB_POS, Value::Int(pos));
-                ctx.set_field(buf, BB_LIMIT, Value::Int(lim));
-                ctx.set_field(buf, BB_MARK, Value::Int(mark));
-            }
-            ctx.set_field(buf, BB_ORDER, Value::Int(s2_bb_order(ctx, this)));
+            let pos = s2_bb_pos(ctx, this);
+            let lim = s2_bb_limit(ctx, this);
+            let cap = s2_bb_cap(ctx, this);
+            let mark = s2_bb_get_mark(ctx, this);
+            let ord = s2_bb_order(ctx, this);
+            let buf = match s2_bb_storage(ctx, this) {
+                Some(S2BbStorage::Heap { arr, base }) if !s2_bb_synthetic_layout(ctx, this) => {
+                    s2_bb_new_heap_view(ctx, arr, base, pos, lim, cap, mark, true, ord)
+                }
+                Some(S2BbStorage::Direct { addr }) => {
+                    s2_bb_new_direct_view(ctx, addr, pos, lim, cap, mark, true, ord)
+                }
+                _ => {
+                    let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+                    if let Some(src_arr) = s2_bb_arr(ctx, this) {
+                        bb_write_hb(ctx, buf, src_arr, cap);
+                        ctx.set_field_by_name(buf, "position", Value::Int(pos));
+                        ctx.set_field_by_name(buf, "limit", Value::Int(lim));
+                        ctx.set_field_by_name(buf, "mark", Value::Int(mark));
+                        ctx.set_field_by_name(buf, "isReadOnly", Value::Int(1));
+                        ctx.set_field(buf, BB_POS, Value::Int(pos));
+                        ctx.set_field(buf, BB_LIMIT, Value::Int(lim));
+                        ctx.set_field(buf, BB_MARK, Value::Int(mark));
+                    }
+                    ctx.set_field(buf, BB_ORDER, Value::Int(ord));
+                    buf
+                }
+            };
             Ok(Some(Value::Object(Some(buf))))
         },
     );
@@ -4672,10 +4887,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 if pos >= s2_bb_limit(ctx, this) {
                     return Err(RuntimeError::BufferUnderflowException.into());
                 }
-                let bs = {
-                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
-                    if m < 0 { -(m + 1) } else { 0 }
-                };
+                let bs = s2_typed_view_byte_start(ctx, this);
                 let off = pos
                     .checked_mul($width)
                     .and_then(|b| bs.checked_add(b))
@@ -4687,10 +4899,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             fn $get_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
                 let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-                let bs = {
-                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
-                    if m < 0 { -(m + 1) } else { 0 }
-                };
+                let bs = s2_typed_view_byte_start(ctx, this);
                 let off = idx
                     .checked_mul($width)
                     .and_then(|b| bs.checked_add(b))
@@ -4705,10 +4914,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 if pos >= s2_bb_limit(ctx, this) {
                     return Err(RuntimeError::BufferOverflowException.into());
                 }
-                let bs = {
-                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
-                    if m < 0 { -(m + 1) } else { 0 }
-                };
+                let bs = s2_typed_view_byte_start(ctx, this);
                 let off = pos
                     .checked_mul($width)
                     .and_then(|b| bs.checked_add(b))
@@ -4721,10 +4927,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 let this = obj_arg(args, 0)?;
                 let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
                 let v = args.get(2).cloned().unwrap_or(Value::Int(0));
-                let bs = {
-                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
-                    if m < 0 { -(m + 1) } else { 0 }
-                };
+                let bs = s2_typed_view_byte_start(ctx, this);
                 let off = idx
                     .checked_mul($width)
                     .and_then(|b| bs.checked_add(b))
@@ -4734,29 +4937,40 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             }
             fn $order(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
-                let obj = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
-                ctx.set_field(obj, 0, Value::Int(s2_bb_order(ctx, this)));
-                Ok(Some(Value::Object(Some(obj))))
+                // Return the canonical (real-static) ByteOrder object — a
+                // fresh synthetic here broke identity comparisons
+                // (`view.order() == ByteOrder.LITTLE_ENDIAN`) and printed
+                // as BIG_ENDIAN regardless of value in real-JDK mode
+                // (residual-doc item 6).
+                let ord = s2_bb_order(ctx, this);
+                Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, ord)))))
             }
             fn $slice(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
                 let pos = s2_bb_pos(ctx, this);
                 let lim = s2_bb_limit(ctx, this);
                 let remaining = (lim - pos).max(0);
-                let bs = {
-                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
-                    if m < 0 { -(m + 1) } else { 0 }
-                };
+                let bs = s2_typed_view_byte_start(ctx, this);
                 let new_bs = pos
                     .checked_mul($width)
                     .and_then(|b| bs.checked_add(b))
                     .unwrap_or(bs);
                 let vb = alloc_concurrent_synthetic(ctx, $cls, 6);
-                ctx.set_field(vb, BB_SEGMENT_SLOT, Value::Object(s2_bb_arr(ctx, this)));
+                if let Some(arr) = s2_bb_arr(ctx, this) {
+                    ctx.set_field(vb, BB_SEGMENT_SLOT, Value::Object(Some(arr)));
+                    ctx.set_field(vb, BB_MARK, Value::Int(-(new_bs + 1)));
+                } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
+                    // DIRECT view: alias the native storage at the sliced
+                    // element position (residual-doc item 3).
+                    ctx.set_field_by_name(
+                        vb,
+                        "address",
+                        Value::Long(addr.saturating_add((new_bs as i64).max(0))),
+                    );
+                }
                 ctx.set_field(vb, BB_POS, Value::Int(0));
                 ctx.set_field(vb, BB_LIMIT, Value::Int(remaining));
                 ctx.set_field(vb, BB_CAP, Value::Int(remaining));
-                ctx.set_field(vb, BB_MARK, Value::Int(-(new_bs + 1)));
                 let ord = s2_bb_order(ctx, this);
                 s2_bb_set_order(ctx, vb, ord);
                 Ok(Some(Value::Object(Some(vb))))
@@ -4772,20 +4986,25 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                     }
                     .into());
                 }
-                let bs = {
-                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
-                    if m < 0 { -(m + 1) } else { 0 }
-                };
+                let bs = s2_typed_view_byte_start(ctx, this);
                 let new_bs = index
                     .checked_mul($width)
                     .and_then(|b| bs.checked_add(b))
                     .unwrap_or(bs);
                 let vb = alloc_concurrent_synthetic(ctx, $cls, 6);
-                ctx.set_field(vb, BB_SEGMENT_SLOT, Value::Object(s2_bb_arr(ctx, this)));
+                if let Some(arr) = s2_bb_arr(ctx, this) {
+                    ctx.set_field(vb, BB_SEGMENT_SLOT, Value::Object(Some(arr)));
+                    ctx.set_field(vb, BB_MARK, Value::Int(-(new_bs + 1)));
+                } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
+                    ctx.set_field_by_name(
+                        vb,
+                        "address",
+                        Value::Long(addr.saturating_add((new_bs as i64).max(0))),
+                    );
+                }
                 ctx.set_field(vb, BB_POS, Value::Int(0));
                 ctx.set_field(vb, BB_LIMIT, Value::Int(length));
                 ctx.set_field(vb, BB_CAP, Value::Int(length));
-                ctx.set_field(vb, BB_MARK, Value::Int(-(new_bs + 1)));
                 let ord = s2_bb_order(ctx, this);
                 s2_bb_set_order(ctx, vb, ord);
                 Ok(Some(Value::Object(Some(vb))))
@@ -4797,11 +5016,16 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 let cap = s2_bb_cap(ctx, this);
                 let bs_field = ctx.get_field(this, BB_MARK);
                 let vb = alloc_concurrent_synthetic(ctx, $cls, 6);
-                ctx.set_field(vb, BB_SEGMENT_SLOT, Value::Object(s2_bb_arr(ctx, this)));
+                if let Some(arr) = s2_bb_arr(ctx, this) {
+                    ctx.set_field(vb, BB_SEGMENT_SLOT, Value::Object(Some(arr)));
+                    ctx.set_field(vb, BB_MARK, bs_field);
+                } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
+                    // DIRECT duplicate: same native storage, same window.
+                    ctx.set_field_by_name(vb, "address", Value::Long(addr));
+                }
                 ctx.set_field(vb, BB_POS, Value::Int(pos));
                 ctx.set_field(vb, BB_LIMIT, Value::Int(lim));
                 ctx.set_field(vb, BB_CAP, Value::Int(cap));
-                ctx.set_field(vb, BB_MARK, bs_field);
                 let ord = s2_bb_order(ctx, this);
                 s2_bb_set_order(ctx, vb, ord);
                 Ok(Some(Value::Object(Some(vb))))
@@ -4814,10 +5038,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 let pos = s2_bb_pos(ctx, this);
                 let lim = s2_bb_limit(ctx, this);
                 let cap = s2_bb_cap(ctx, this);
-                let bs = {
-                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
-                    if m < 0 { -(m + 1) } else { 0 }
-                };
+                let bs = s2_typed_view_byte_start(ctx, this);
                 let remaining = (lim - pos).max(0);
                 for i in 0..remaining {
                     let src_off = (pos + i)
@@ -4868,10 +5089,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 if pos.checked_add(len).map_or(true, |e| e > s2_bb_limit(ctx, this)) {
                     return Err(RuntimeError::BufferUnderflowException.into());
                 }
-                let bs = {
-                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
-                    if m < 0 { -(m + 1) } else { 0 }
-                };
+                let bs = s2_typed_view_byte_start(ctx, this);
                 for i in 0..len {
                     let src_off = (pos + i)
                         .checked_mul($width)
@@ -4901,10 +5119,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 if pos.checked_add(len).map_or(true, |e| e > s2_bb_limit(ctx, this)) {
                     return Err(RuntimeError::BufferOverflowException.into());
                 }
-                let bs = {
-                    let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
-                    if m < 0 { -(m + 1) } else { 0 }
-                };
+                let bs = s2_typed_view_byte_start(ctx, this);
                 for i in 0..len {
                     let v = ctx.get_array_element(src, (off + i) as usize);
                     let dst_off = (pos + i)
@@ -5035,6 +5250,11 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(db, "put", "([DII)Ljava/nio/DoubleBuffer;", s2_db_put_bulk);
 
     // equals / hashCode / compareTo / toString
+    // equals / hashCode / compareTo — storage-aware (residual-doc item 2:
+    // these were heap-array-only, so ANY direct buffer — including a
+    // genuine real-JDK DirectByteBuffer receiver, since `ByteBuffer.equals`
+    // resolves on the abstract class and is force-dispatched — compared as
+    // empty/zero and mixed heap/direct comparisons always failed).
     r.register(bb, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let other = match args.get(1) {
@@ -5044,38 +5264,34 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         if this == other {
             return Ok(Some(Value::Int(1)));
         }
-        let pa = s2_bb_pos(ctx, this) as usize;
-        let la = s2_bb_limit(ctx, this) as usize;
-        let pb = s2_bb_pos(ctx, other) as usize;
-        let lb = s2_bb_limit(ctx, other) as usize;
-        let na = la.saturating_sub(pa);
-        if na != lb.saturating_sub(pb) {
+        let pa = s2_bb_pos(ctx, this).max(0);
+        let la = s2_bb_limit(ctx, this).max(pa);
+        let pb = s2_bb_pos(ctx, other).max(0);
+        let lb = s2_bb_limit(ctx, other).max(pb);
+        let na = (la - pa) as usize;
+        if na != (lb - pb) as usize {
             return Ok(Some(Value::Int(0)));
         }
-        let aa = match s2_bb_arr(ctx, this) {
-            Some(a) => a,
-            None => return Ok(Some(Value::Int(0))),
-        };
-        let ab = match s2_bb_arr(ctx, other) {
-            Some(a) => a,
-            None => return Ok(Some(Value::Int(0))),
-        };
-        for i in 0..na {
-            if ctx.get_array_element(aa, pa + i) != ctx.get_array_element(ab, pb + i) {
-                return Ok(Some(Value::Int(0)));
-            }
+        let wa = s2_bb_read_window(ctx, this, pa, na);
+        let wb = s2_bb_read_window(ctx, other, pb, na);
+        match (wa, wb) {
+            (Some(a), Some(b)) => Ok(Some(Value::Int((a == b) as i32))),
+            _ => Ok(Some(Value::Int(0))),
         }
-        Ok(Some(Value::Int(1)))
     });
     r.register(bb, "hashCode", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let pos = s2_bb_pos(ctx, this).max(0);
+        let lim = s2_bb_limit(ctx, this).max(pos);
+        let n = (lim - pos) as usize;
         let mut h: i32 = 1;
-        let pos = s2_bb_pos(ctx, this) as usize;
-        let lim = s2_bb_limit(ctx, this) as usize;
-        if let Some(arr) = s2_bb_arr(ctx, this) {
-            for i in pos..lim {
-                let b = ctx.get_array_element(arr, i).as_int().unwrap_or(0) as i8 as i32;
-                h = h.wrapping_mul(31).wrapping_add(b);
+        if let Some(w) = s2_bb_read_window(ctx, this, pos, n) {
+            // Real-JDK `Buffer.hashCode` iterates BACKWARD
+            // (`for (int i = limit() - 1; i >= position(); i--)`) — the
+            // previous forward loop produced a different value than
+            // HotSpot for every buffer with 2+ remaining bytes.
+            for b in w.iter().rev() {
+                h = h.wrapping_mul(31).wrapping_add(*b as i8 as i32);
             }
         }
         Ok(Some(Value::Int(h)))
@@ -5083,24 +5299,24 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(bb, "compareTo", "(Ljava/nio/ByteBuffer;)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let other = obj_arg(args, 1)?;
-        let pa = s2_bb_pos(ctx, this) as usize;
-        let la = s2_bb_limit(ctx, this) as usize;
-        let pb = s2_bb_pos(ctx, other) as usize;
-        let lb = s2_bb_limit(ctx, other) as usize;
-        let na = la.saturating_sub(pa);
-        let nb = lb.saturating_sub(pb);
+        let pa = s2_bb_pos(ctx, this).max(0);
+        let la = s2_bb_limit(ctx, this).max(pa);
+        let pb = s2_bb_pos(ctx, other).max(0);
+        let lb = s2_bb_limit(ctx, other).max(pb);
+        let na = (la - pa) as usize;
+        let nb = (lb - pb) as usize;
         let n = na.min(nb);
-        let aa = match s2_bb_arr(ctx, this) {
-            Some(a) => a,
+        let wa = match s2_bb_read_window(ctx, this, pa, n) {
+            Some(w) => w,
             None => return Ok(Some(Value::Int(0))),
         };
-        let ab = match s2_bb_arr(ctx, other) {
-            Some(a) => a,
+        let wb = match s2_bb_read_window(ctx, other, pb, n) {
+            Some(w) => w,
             None => return Ok(Some(Value::Int(0))),
         };
         for i in 0..n {
-            let va = ctx.get_array_element(aa, pa + i).as_int().unwrap_or(0);
-            let vb = ctx.get_array_element(ab, pb + i).as_int().unwrap_or(0);
+            let va = wa[i] as i8 as i32;
+            let vb = wb[i] as i8 as i32;
             if va != vb {
                 return Ok(Some(Value::Int(va - vb)));
             }
@@ -5144,24 +5360,45 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
 
 fn register_s2_byteorder(r: &mut NativeMethodRegistry) {
     let bo = "java/nio/ByteOrder";
+    // The factory/static natives return the CANONICAL objects (real class
+    // statics when available) — the previous fresh-synthetic-per-call
+    // objects broke identity comparisons (`nativeOrder() ==
+    // ByteOrder.LITTLE_ENDIAN` was always false) and, in real-JDK mode,
+    // wrote an order Int into the real 1-field layout's `name` String slot
+    // (residual-doc item 6).
     r.register(bo, "nativeOrder", "()Ljava/nio/ByteOrder;", |ctx, _| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
-        ctx.set_field(obj, 0, Value::Int(1)); // x86/ARM64 = LITTLE_ENDIAN
-        Ok(Some(Value::Object(Some(obj))))
+        let ord = if cfg!(target_endian = "big") { 0 } else { 1 };
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, ord)))))
     });
     r.register(bo, "BIG_ENDIAN", "Ljava/nio/ByteOrder;", |ctx, _| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
-        ctx.set_field(obj, 0, Value::Int(0));
-        Ok(Some(Value::Object(Some(obj))))
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, 0)))))
     });
     r.register(bo, "LITTLE_ENDIAN", "Ljava/nio/ByteOrder;", |ctx, _| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
-        ctx.set_field(obj, 0, Value::Int(1));
-        Ok(Some(Value::Object(Some(obj))))
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, 1)))))
     });
+    // Layout-aware decode shared by toString/equals: real ByteOrder keeps
+    // its `name` String at field 0; the synthetic stand-in keeps an order
+    // Int there. The previous int-only reads decoded EVERY real constant
+    // as 0 — so `LITTLE_ENDIAN.toString()` printed "BIG_ENDIAN".
+    fn s2_byte_order_ord(ctx: &dyn NativeContext, obj: ObjectRef) -> i32 {
+        match ctx.get_field(obj, 0) {
+            Value::Int(v) => v,
+            Value::Object(Some(name)) => {
+                match ctx.read_string(name).as_deref() {
+                    Some("LITTLE_ENDIAN") => 1,
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        }
+    }
     r.register(bo, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let name = if ctx.get_field(this, 0).as_int().unwrap_or(0) == 1 {
+        // Real layout: return the name String itself.
+        if let Value::Object(Some(name)) = ctx.get_field(this, 0) {
+            return Ok(Some(Value::Object(Some(name))));
+        }
+        let name = if s2_byte_order_ord(ctx, this) == 1 {
             "LITTLE_ENDIAN"
         } else {
             "BIG_ENDIAN"
@@ -5175,8 +5412,11 @@ fn register_s2_byteorder(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let a = ctx.get_field(this, 0).as_int().unwrap_or(0);
-        let b = ctx.get_field(other, 0).as_int().unwrap_or(0);
+        if this == other {
+            return Ok(Some(Value::Int(1)));
+        }
+        let a = s2_byte_order_ord(ctx, this);
+        let b = s2_byte_order_ord(ctx, other);
         Ok(Some(Value::Int(if a == b { 1 } else { 0 })))
     });
 }

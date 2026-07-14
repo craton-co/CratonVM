@@ -464,20 +464,17 @@ cached_is_set!(jit_main_inline, "CRATONVM_JIT_MAIN_INLINE");
 // until the worker publishes, at which point the `jit_cache` fast-path flips the
 // call site to `Jit`. Step-5 OSR likewise compiles off-thread when on.
 //
-// **DEFAULT-ON as of wire-tiered-manager Step 7** ("retire the single
-// fixed-threshold inline path"): the fixed-threshold invocation path
-// (`try_jit_upgrade_with_gate`) no longer compiles synchronously on the mutator
-// by default. The eager *first-call* single-pass compile (`fn execute`) remains
-// as the quick first tier; this gate governs the invocation-counted re-tiering
-// and OSR. Opt-out — `CRATONVM_BG_COMPILE=0` (or `false`) restores the historical
-// inline path (the safety net while the off-thread pipeline soaks on the
-// gauntlet). See `docs/feature-designs/wire-tiered-manager.md` (Step 7).
+// Default-off while the off-thread compiler continues to soak.  Short, very
+// hot queries can finish before a background-produced body is published; H2's
+// lateral-unnest plan then spends its full timeout in the interpreter.  The
+// historical inline tier-up produces usable code on the mutator at the hot
+// threshold. Set `CRATONVM_BG_COMPILE=1` to opt into background compilation.
 #[inline]
 pub fn bg_compile() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| match std::env::var("CRATONVM_BG_COMPILE") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
+        Err(_) => false,
     })
 }
 // wire-tiered-manager Step 4 (PGO handoff C1 → C2): opt-in profile collection.
@@ -647,12 +644,26 @@ cached_is_set!(dbg_jetty2, "CRATONVM_DBG_JETTY2");
 // environment on every dispatch.
 cached_is_set!(dbg_vdisp, "CRATONVM_DBG_VDISP");
 cached_is_set!(dbg_ccsprobe, "CRATONVM_DBG_CCSPROBE");
+// `CRATONVM_DBG_HANG_SAMPLE` -- temporary diagnostic for the AOT
+// bean-registration hang investigation (2026-07-13). Periodically samples
+// the method being invoked in `execute_invoke_kind` (every Nth call) so a
+// hung process's last-known activity can be inspected from stderr without a
+// native debugger. Not perf-sensitive: gated behind a cached env lookup and
+// only actually prints once every 200,000 calls.
+cached_is_set!(dbg_hang_sample, "CRATONVM_DBG_HANG_SAMPLE");
 cached_is_set!(dbg_pbstart, "CRATONVM_DBG_PBSTART");
 cached_is_set!(dbg_bblp, "CRATONVM_DBG_BBLP");
 cached_is_set!(dbg_jitc, "CRATONVM_DBG_JITC");
 cached_is_set!(dbg_unpark_miss, "CRATONVM_DBG_UNPARK_MISS");
 cached_is_set!(dbg_jit_ldc, "CRATONVM_DBG_JIT_LDC");
 cached_is_set!(trace_unimplemented, "CRATONVM_TRACE_UNIMPLEMENTED");
+/// `CRATONVM_DBG_HOTPATH_COUNTS` — temporary call-count instrumentation for
+/// the silent-hang-no-signature-cluster throughput residual investigation
+/// (2026-07-13). Tallies invocations of several suspected interpreter
+/// dispatch hot-path functions and periodically reports counts, independent
+/// of wall-clock timing (robust to host contention noise). See
+/// `interpreter::hotpath_counts`.
+cached_is_set!(dbg_hotpath_counts, "CRATONVM_DBG_HOTPATH_COUNTS");
 
 // ── Flags read via `env::var(...).is_ok()` ──────────────────────────────
 

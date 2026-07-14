@@ -513,10 +513,106 @@ fn buffered_input_stream_input(ctx: &dyn NativeContext, this: ObjectRef) -> Opti
 fn buffered_input_stream_init(ctx: &mut dyn NativeContext, this: ObjectRef, input: Value) {
     ctx.set_field_by_name(this, "in", input);
     ctx.set_field(this, 0, input);
+    // Native reads delegate directly to `in`, but inherited real-JDK methods
+    // such as FilterInputStream.skip can still enter BufferedInputStream.skip.
+    // Keep the real layout in a valid empty-buffer state so ensureOpen() does
+    // not interpret this freshly constructed stream as closed.
+    let buffer = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 8192);
+    ctx.set_field_by_name(this, "buf", Value::Object(Some(buffer)));
+    ctx.set_field_by_name(this, "count", Value::Int(0));
+    ctx.set_field_by_name(this, "pos", Value::Int(0));
+    ctx.set_field_by_name(this, "markpos", Value::Int(-1));
+    ctx.set_field_by_name(this, "marklimit", Value::Int(0));
     buffered_input_stream_marks()
         .lock()
         .unwrap()
         .remove(&ctx.identity_hash_code(this));
+}
+
+fn byte_array_input_stream_skip(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    requested: i64,
+) -> i64 {
+    if requested <= 0 {
+        return 0;
+    }
+    let pos = ctx
+        .get_field_by_name(this, "pos")
+        .as_int()
+        .unwrap_or(0)
+        .max(0) as i64;
+    let count = ctx
+        .get_field_by_name(this, "count")
+        .as_int()
+        .unwrap_or(0)
+        .max(0) as i64;
+    let skipped = requested.min(count.saturating_sub(pos));
+    ctx.set_field_by_name(this, "pos", Value::Int((pos + skipped) as i32));
+    skipped
+}
+
+fn buffered_input_stream_skip(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    requested: i64,
+) -> Result<i64, MethodCallFailed> {
+    if requested <= 0 {
+        return Ok(0);
+    }
+    let mut skipped = 0i64;
+    while skipped < requested && buffered_input_stream_read_one(ctx, this)? >= 0 {
+        skipped += 1;
+    }
+    Ok(skipped)
+}
+
+fn filter_input_stream_skip(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    requested: i64,
+) -> Result<i64, MethodCallFailed> {
+    if requested <= 0 {
+        return Ok(0);
+    }
+    // Match InputStream.skip's bounded discard buffer instead of issuing one
+    // virtual read per byte. Besides avoiding quadratic class-file scanning,
+    // invoking read([BII) on the receiver preserves FilterInputStream's virtual
+    // delegation semantics for DataInputStream and other subclasses.
+    let capacity = requested.min(2048) as usize;
+    let buffer = ctx.new_array(cratonvm_types::ArrayElementType::Byte, capacity);
+    let buffer_pin = ctx.pin_native_root(buffer);
+    let this_pin = ctx.pin_native_root(this);
+    let mut skipped = 0i64;
+    while skipped < requested {
+        let current_this = ctx.read_native_pin(this_pin, this);
+        let current_buffer = ctx.read_native_pin(buffer_pin, buffer);
+        let chunk = (requested - skipped).min(capacity as i64) as i32;
+        let result = ctx.invoke_virtual(
+            current_this,
+            "read",
+            "([BII)I",
+            &[
+                Value::Object(Some(current_buffer)),
+                Value::Int(0),
+                Value::Int(chunk),
+            ],
+        );
+        let read = match result {
+            Ok(Some(Value::Int(read))) => read,
+            Ok(_) => -1,
+            Err(error) => {
+                ctx.unpin_native_roots(buffer_pin);
+                return Err(error);
+            }
+        };
+        if read <= 0 {
+            break;
+        }
+        skipped += read as i64;
+    }
+    ctx.unpin_native_roots(buffer_pin);
+    Ok(skipped)
 }
 
 fn buffered_input_stream_record_byte(ctx: &dyn NativeContext, this: ObjectRef, byte: u8) {
@@ -547,6 +643,15 @@ fn buffered_input_stream_replay_byte(ctx: &dyn NativeContext, this: ObjectRef) -
     } else {
         None
     }
+}
+
+fn buffered_input_stream_can_delegate_bulk(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let key = ctx.identity_hash_code(this);
+    buffered_input_stream_marks()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .is_none_or(|state| !state.mark_active)
 }
 
 fn buffered_input_stream_read_one(
@@ -2219,6 +2324,52 @@ fn native_mapper_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         message_bytes_set_string_object(ctx, host_mb, default_host_name);
     }
     native_message_bytes_to_chars(ctx, &[Value::Object(Some(host_mb))])?;
+
+    // Match Mapper.map()'s Java contract for a null URI. CoyoteAdapter
+    // deliberately recycles decodedURI after an early protocol error, then
+    // calls Mapper.map() only to identify the Host for error reporting. The
+    // Java implementation sets MappingData.host and returns before context
+    // / wrapper mapping. Mapping the null URI as an empty CharChunk instead
+    // selects the ROOT context and can emit its welcome-file redirect,
+    // overwriting the original protocol status (e.g. AJP's 403 secret
+    // rejection) with 302.
+    if ctx.get_field_by_name(uri_mb, "type").as_int().unwrap_or(0) == 0 {
+        let host_chunk = match ctx.get_field_by_name(host_mb, "charC") {
+            Value::Object(Some(o)) => o,
+            _ => return Ok(None),
+        };
+        let hosts = match ctx.get_field_by_name(this, "hosts") {
+            Value::Object(Some(o)) => o,
+            _ => return Ok(None),
+        };
+        let Some((host_buff, host_start, host_end)) = char_chunk_parts(ctx, host_chunk) else {
+            return Ok(None);
+        };
+        let mut mapped_host =
+            mapper_exact_find_chunk_range(ctx, hosts, host_chunk, host_start, host_end, true);
+        if mapped_host.is_none() {
+            let dot = (host_start..host_end)
+                .find(|&pos| char_chunk_char_at(ctx, host_buff, pos) == b'.' as u16);
+            if let Some(dot_pos) = dot {
+                mapped_host =
+                    mapper_exact_find_chunk_range(ctx, hosts, host_chunk, dot_pos, host_end, true);
+            }
+        }
+        if mapped_host.is_none() {
+            mapped_host = match ctx.get_field_by_name(this, "defaultHost") {
+                Value::Object(Some(o)) => Some(o),
+                _ => None,
+            };
+        }
+        if let Some(mapped_host) = mapped_host {
+            let host_object = match ctx.get_field_by_name(mapped_host, "object") {
+                Value::Object(o) => o,
+                _ => None,
+            };
+            ctx.set_field_by_name(mapping_data, "host", Value::Object(host_object));
+        }
+        return Ok(None);
+    }
     native_message_bytes_to_chars(ctx, &[Value::Object(Some(uri_mb))])?;
 
     let host_chunk = match ctx.get_field_by_name(host_mb, "charC") {
@@ -8324,6 +8475,25 @@ pub fn route_ec_to_real() -> bool {
     *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SYNTHETIC_EC").is_none())
 }
 
+/// Route DSA `Signature` sign/verify to the real JDK 25 `sun.security
+/// .provider.DSA$*` SPIs. Default ON — unlike EC/RSA, there is no synthetic
+/// DSA crypto in `crypto_impl` to fall back to at all (`verify_dispatch`/
+/// `sign_dispatch` never had a DSA arm), so this isn't an optimization vs. a
+/// slower-but-working synthetic path the way `route_ec_to_real` is — without
+/// it, every DSA signature verification silently returns `false` with no
+/// exception. `sun.security.provider.DSA$SHA256withDSA`/`SHA1withDSA` are
+/// plain, dependency-free SPI classes (construct + `engineInitVerify(key)` +
+/// `engineUpdate` + `engineVerify`), so real routing is strictly correct
+/// with no keygen/provider-bring-up cost to justify a synthetic shortcut.
+///
+/// Kill-switch `CRATONVM_SYNTHETIC_DSA=1` restores the legacy (always-false)
+/// behavior for debugging / regression bisecting.
+pub fn route_dsa_to_real() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SYNTHETIC_DSA").is_none())
+}
+
 /// Route the post-quantum families (ML-DSA via the SUN provider, ML-KEM via
 /// SunJCE) to the real JDK 25 SPIs instead of the synthetic stubs. Default ON,
 /// same rationale as [`route_ec_to_real`]: the synthetic `KeyPairGenerator` /
@@ -9161,6 +9331,56 @@ fn jul_logger_config_is_real(ctx: &mut dyn NativeContext, obj: ObjectRef) -> boo
     ctx.class_name_of_id(ctx.class_id_of_object(obj))
         .map(|n| n == "java/util/logging/Logger$ConfigurationData")
         .unwrap_or(false)
+}
+
+/// GC-safe side table for `java.util.logging.Logger`'s handler list, keyed by
+/// `identity_hash_code` (same pattern as `net_phase_e.rs`'s `ss_side_table` /
+/// `stream_owner_table`). `addHandler`/`removeHandler`/`getHandlers` are
+/// fully native-overridden (never fall through to real bytecode), so they
+/// don't need to live in any particular instance field slot -- and MUST NOT,
+/// because real-JDK 25's `Logger` has no `handlers` instance field at all
+/// (handlers moved inside `Logger$ConfigurationData`, referenced from slot 0
+/// / `config`) and slot 2 is actually `name` (a `String`). The old code
+/// stored/read the handler `ArrayList` at raw field slot 2, which on a
+/// real-bytecode-constructed `Logger` collided with `name`:
+/// `ctx.invoke_virtual(nameString, "size", "()I", ...)` then threw
+/// `NoSuchMethodError: java/lang/String.size()I` (surfaced from
+/// `org.apache.juli.ClassLoaderLogManager.resetLoggers`, which calls
+/// `logger.getHandlers()` during webapp/classloader shutdown -- see
+/// docs/known-issues/tomcat-08-07/largeclienthello-string-size-nosuchmethod.md).
+/// Keying by identity hash and holding the list as a global GC root
+/// sidesteps field layout entirely -- correct for both real and synthetic
+/// loggers, and immune to future real-JDK field-order changes.
+fn jul_logger_handlers_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, usize>>
+{
+    static T: OnceLock<std::sync::Mutex<std::collections::HashMap<i32, usize>>> = OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub(crate) fn jul_logger_handlers_get(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+) -> Option<ObjectRef> {
+    let key = ctx.identity_hash_code(logger);
+    let handle = *jul_logger_handlers_table().lock().unwrap().get(&key)?;
+    ctx.resolve_global_root(handle)
+}
+
+pub(crate) fn jul_logger_handlers_set(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+    list: ObjectRef,
+) {
+    let handle = ctx.add_global_root(list);
+    let key = ctx.identity_hash_code(logger);
+    jul_logger_handlers_table().lock().unwrap().insert(key, handle);
+}
+
+pub(crate) fn jul_logger_handlers_clear(ctx: &mut dyn NativeContext, logger: ObjectRef) {
+    let key = ctx.identity_hash_code(logger);
+    if let Some(handle) = jul_logger_handlers_table().lock().unwrap().remove(&key) {
+        ctx.remove_global_root(handle);
+    }
 }
 
 const ANTLR_PC: &str = "org/antlr/v4/runtime/atn/PredictionContext";
@@ -10332,30 +10552,57 @@ fn antlr_double_key_map_put_value(
 ) -> MethodCallResult {
     let data = antlr_double_key_map_data_or_create(ctx, map)?;
     let inner_value = antlr_map_get(ctx, data, key1)?;
-    let (inner, previous) = match inner_value {
+    let previous = match inner_value {
         Some(Value::Object(Some(inner))) => {
-            let previous = antlr_map_get(ctx, inner, key2)?;
-            (inner, previous.unwrap_or(Value::Object(None)))
+            antlr_map_put(ctx, inner, key2, value)?.unwrap_or(Value::Object(None))
         }
         _ => {
-            let data_pin = ctx.pin_native_root(data);
-            if let Value::Object(Some(key)) = key1 {
-                ctx.pin_native_root(key);
-            }
-            if let Value::Object(Some(key)) = key2 {
-                ctx.pin_native_root(key);
-            }
-            if let Value::Object(Some(value)) = value {
-                ctx.pin_native_root(value);
-            }
-            let inner = antlr_new_linked_hash_map(ctx)?;
-            let data = ctx.read_native_pin(data_pin, data);
-            ctx.unpin_native_roots(data_pin);
-            antlr_map_put(ctx, data, key1, Value::Object(Some(inner)))?;
-            (inner, Value::Object(None))
+            // Creating the inner map can allocate and move all four objects. Keep
+            // them rooted as one scoped group, then release that group after the
+            // new map is linked from `data`. Previously the three argument pins
+            // were discarded without an unpin, permanently retaining every ANTLR
+            // merge-cache entry and its prediction-context graph.
+            let pins = ctx.pin_native_root(data);
+            let key1_pin = match key1 {
+                Value::Object(Some(key)) => Some((ctx.pin_native_root(key), key)),
+                _ => None,
+            };
+            let key2_pin = match key2 {
+                Value::Object(Some(key)) => Some((ctx.pin_native_root(key), key)),
+                _ => None,
+            };
+            let value_pin = match value {
+                Value::Object(Some(value)) => Some((ctx.pin_native_root(value), value)),
+                _ => None,
+            };
+            let created = (|| {
+                let inner = antlr_new_linked_hash_map(ctx)?;
+                let data = ctx.read_native_pin(pins, data);
+                let key1 = match key1_pin {
+                    Some((pin, fallback)) => {
+                        Value::Object(Some(ctx.read_native_pin(pin, fallback)))
+                    }
+                    None => key1,
+                };
+                let key2 = match key2_pin {
+                    Some((pin, fallback)) => {
+                        Value::Object(Some(ctx.read_native_pin(pin, fallback)))
+                    }
+                    None => key2,
+                };
+                let value = match value_pin {
+                    Some((pin, fallback)) => {
+                        Value::Object(Some(ctx.read_native_pin(pin, fallback)))
+                    }
+                    None => value,
+                };
+                antlr_map_put(ctx, data, key1, Value::Object(Some(inner)))?;
+                antlr_map_put(ctx, inner, key2, value)
+            })();
+            ctx.unpin_native_roots(pins);
+            created?.unwrap_or(Value::Object(None))
         }
     };
-    antlr_map_put(ctx, inner, key2, value)?;
     Ok(Some(previous))
 }
 
@@ -18046,6 +18293,33 @@ mod antlr_prediction_context_tests {
     }
 
     #[test]
+    fn antlr_double_key_map_insert_releases_temporary_native_pins() {
+        let mut ctx = mock_ctx();
+        let map = ctx.fresh_object_ref();
+        let data = alloc_concurrent_synthetic(&mut ctx, "java/util/HashMap", 3);
+        cratonvm_native_collections::native_map_init(&mut ctx, &[Value::Object(Some(data))])
+            .unwrap();
+        ctx.set_field(map, 0, Value::Object(Some(data)));
+        let key1 = ctx.fresh_object_ref();
+        let key2 = ctx.fresh_object_ref();
+        let value = ctx.fresh_object_ref();
+
+        assert_eq!(ctx.native_pin_count_for_test(), 0);
+        assert_eq!(
+            antlr_double_key_map_put_value(
+                &mut ctx,
+                map,
+                Value::Object(Some(key1)),
+                Value::Object(Some(key2)),
+                Value::Object(Some(value)),
+            )
+            .unwrap(),
+            Some(Value::Object(None))
+        );
+        assert_eq!(ctx.native_pin_count_for_test(), 0);
+    }
+
+    #[test]
     fn antlr_atn_state_accessors_read_arraylist_transitions() {
         let mut ctx = mock_ctx();
         let atn_state_class = ctx.ensure_class_initialized(ANTLR_ATN_STATE).unwrap();
@@ -24971,6 +25245,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljavax/tools/JavaFileManager$Location;Ljava/lang/String;Ljava/util/Set;Z)Ljava/lang/Iterable;",
         native_javac_file_manager_list,
     );
+    registry.register(
+        "com/sun/tools/javac/file/JavacFileManager$PathAndContainer",
+        "compareTo",
+        "(Ljava/lang/Object;)I",
+        native_javac_path_and_container_compare_to,
+    );
+    registry.register(
+        "com/sun/tools/javac/util/StringNameTable$NameImpl",
+        "hashCode",
+        "()I",
+        native_javac_string_name_hash_code,
+    );
 
     registry.register(
         "com/sun/tools/javac/file/RelativePath",
@@ -25987,140 +26273,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             "Ljava/util/jar/Attributes$Name;",
             |ctx, _args| native_attrs_name_constant(ctx, "Main-Class"),
         );
-        registry.register(
-            "java/io/BufferedReader",
-            "<init>",
-            "(Ljava/io/Reader;)V",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                let reader = args.get(1).copied().unwrap_or(Value::Object(None));
-                ctx.set_field(this, 0, reader);
-                Ok(None)
-            },
-        );
-        registry.register(
-            "java/io/BufferedReader",
-            "<init>",
-            "(Ljava/io/Reader;I)V",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                let reader = args.get(1).copied().unwrap_or(Value::Object(None));
-                ctx.set_field(this, 0, reader);
-                Ok(None)
-            },
-        );
-        registry.register("java/io/BufferedReader", "read", "()I", |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let reader = match ctx.get_field(this, 0) {
-                Value::Object(Some(reader)) => reader,
-                _ => return Ok(Some(Value::Int(-1))),
-            };
-            let result = ctx.invoke_virtual(reader, "read", "()I", &[])?;
-            Ok(result.or(Some(Value::Int(-1))))
-        });
-        registry.register("java/io/BufferedReader", "read", "([CII)I", |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let chars = match args.get(1) {
-                Some(Value::Object(Some(chars))) => *chars,
-                _ => return Ok(Some(Value::Int(-1))),
-            };
-            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-            if len == 0 {
-                return Ok(Some(Value::Int(0)));
-            }
-            let out_len = ctx.array_length(chars);
-            if off > out_len || off.saturating_add(len) > out_len {
-                return Ok(Some(Value::Int(-1)));
-            }
-            let reader = match ctx.get_field(this, 0) {
-                Value::Object(Some(reader)) => reader,
-                _ => return Ok(Some(Value::Int(-1))),
-            };
-            let result = ctx.invoke_virtual(
-                reader,
-                "read",
-                "([CII)I",
-                &[
-                    Value::Object(Some(chars)),
-                    Value::Int(off as i32),
-                    Value::Int(len as i32),
-                ],
-            )?;
-            Ok(result.or(Some(Value::Int(-1))))
-        });
-        registry.register(
-            "java/io/BufferedReader",
-            "readLine",
-            "()Ljava/lang/String;",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                let reader = match ctx.get_field(this, 0) {
-                    Value::Object(Some(reader)) => reader,
-                    _ => return Ok(Some(Value::Object(None))),
-                };
-                let one = ctx.new_array(cratonvm_types::ArrayElementType::Char, 1);
-                let mut out = String::new();
-                let mut saw_any = false;
-                let key = ctx.identity_hash_code(this);
-                loop {
-                    // Take the pending char in its own statement: an `if let`
-                    // scrutinee's temporaries (the MutexGuard!) live through
-                    // the ENTIRE if/else in edition 2021, and the else branch
-                    // below does a BLOCKING `read` through invoke_virtual —
-                    // holding this global mutex across that park starved every
-                    // other reader (Process Controller stderr-drain thread →
-                    // child stderr never relayed → child blocks on full pipe).
-                    let pending = r3_br_pending_chars().lock().remove(&key);
-                    let ch = if let Some(ch) = pending {
-                        ch
-                    } else {
-                        let n = match ctx.invoke_virtual(
-                            reader,
-                            "read",
-                            "([CII)I",
-                            &[Value::Object(Some(one)), Value::Int(0), Value::Int(1)],
-                        )? {
-                            Some(Value::Int(n)) => n,
-                            _ => -1,
-                        };
-                        if n <= 0 {
-                            break;
-                        }
-                        ctx.get_array_element(one, 0).as_int().unwrap_or(0)
-                    };
-                    saw_any = true;
-                    if ch == b'\n' as i32 {
-                        break;
-                    }
-                    if ch == b'\r' as i32 {
-                        let n = match ctx.invoke_virtual(
-                            reader,
-                            "read",
-                            "([CII)I",
-                            &[Value::Object(Some(one)), Value::Int(0), Value::Int(1)],
-                        )? {
-                            Some(Value::Int(n)) => n,
-                            _ => -1,
-                        };
-                        if n > 0 {
-                            let next = ctx.get_array_element(one, 0).as_int().unwrap_or(0);
-                            if next != b'\n' as i32 {
-                                r3_br_pending_chars().lock().insert(key, next);
-                            }
-                        }
-                        break;
-                    }
-                    if let Some(c) = char::from_u32(ch as u32) {
-                        out.push(c);
-                    }
-                }
-                if !saw_any && out.is_empty() {
-                    return Ok(Some(Value::Object(None)));
-                }
-                Ok(Some(Value::Object(Some(ctx.create_string(&out)))))
-            },
-        );
+        // Real-JDK BufferedReader owns its internal Reader/buffer fields.
     } // end #[cfg(feature = "synthetic-jdk")] synthetic Reader ctor shadows
       // Also wire the full R3 bundle in essential mode so readLine/lines/close
       // are available during early Maven/Surefire bootstrap.
@@ -26624,60 +26777,104 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         },
     );
     registry.register(
+        "java/io/FilterInputStream",
+        "skip",
+        "(J)J",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(object))) => *object,
+                _ => return Ok(Some(Value::Long(0))),
+            };
+            let requested = args.get(1).and_then(|value| value.as_long()).unwrap_or(0);
+            Ok(Some(Value::Long(filter_input_stream_skip(
+                ctx, this, requested,
+            )?)))
+        },
+    );
+    registry.register(
         "java/io/FilterOutputStream",
         "write",
         "([B)V",
         native_output_stream_write_all,
     );
-    for descriptor in [
-        "(Ljava/io/OutputStream;)V",
-        "(Ljava/io/OutputStream;Ljava/nio/charset/Charset;)V",
-        "(Ljava/io/OutputStream;Ljava/lang/String;)V",
-    ] {
+    // Synthetic-JDK builds only. In real-JDK mode this OutputStreamWriter
+    // surface (added 2026-07-09 by the WildFly process-controller bootstrap
+    // batch, b448f2039) shadowed the real OSW bytecode at every dispatch
+    // site (WP0.1 native-override-priority) and REGRESSED the StreamEncoder
+    // commit-threshold fix (1773d3df2, docs/known-issues/
+    // dohead-streamencoder-eager-flush-commit-threshold.md):
+    // `write_bytes_from_output_stream_writer` encodes every `write()` call
+    // straight to the wrapped stream — one underlying `write([BII)` per
+    // Writer call instead of real StreamEncoder's 512-byte batches — which
+    // broke `NoBodyOutputStream.checkCommit`'s byte-count commit threshold
+    // again (Tomcat `TestHttpServletDoHead*`: the 8 useLegacy+useWriter+FULL
+    // params fail `expected:<2> but was:<3>` / GET has content-length while
+    // HEAD goes chunked). It also encodes with `String::into_bytes()` — i.e.
+    // hard-coded UTF-8, ignoring the writer's charset — and its `<init>`
+    // native writes the OutputStream into raw slot 0 (real layout:
+    // `Writer.writeBuffer`) while never creating the `se` StreamEncoder the
+    // real bytecode needs, breaking the CharsetEncoder-ctor delegation
+    // workaround above too. Real-JDK mode runs the real OSW bytecode →
+    // `sun.nio.cs.StreamEncoder` shim (native-io/src/stream_encoder.rs),
+    // which was validated byte-for-byte against HotSpot's flush granularity.
+    // Same gating precedent as the BufferedInputStream block below.
+    if cfg!(feature = "synthetic-jdk") {
+        for descriptor in [
+            "(Ljava/io/OutputStream;)V",
+            "(Ljava/io/OutputStream;Ljava/nio/charset/Charset;)V",
+            "(Ljava/io/OutputStream;Ljava/lang/String;)V",
+        ] {
+            registry.register(
+                "java/io/OutputStreamWriter",
+                "<init>",
+                descriptor,
+                native_output_stream_writer_init,
+            );
+        }
         registry.register(
             "java/io/OutputStreamWriter",
-            "<init>",
-            descriptor,
-            native_output_stream_writer_init,
+            "write",
+            "(I)V",
+            native_output_stream_writer_write_int,
+        );
+        registry.register(
+            "java/io/OutputStreamWriter",
+            "write",
+            "([CII)V",
+            native_output_stream_writer_write_chars,
+        );
+        registry.register(
+            "java/io/OutputStreamWriter",
+            "write",
+            "(Ljava/lang/String;)V",
+            native_output_stream_writer_write_string,
+        );
+        registry.register(
+            "java/io/OutputStreamWriter",
+            "write",
+            "(Ljava/lang/String;II)V",
+            native_output_stream_writer_write_string_range,
+        );
+        registry.register(
+            "java/io/OutputStreamWriter",
+            "flush",
+            "()V",
+            native_output_stream_writer_flush,
+        );
+        registry.register(
+            "java/io/OutputStreamWriter",
+            "close",
+            "()V",
+            native_output_stream_writer_close,
         );
     }
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "write",
-        "(I)V",
-        native_output_stream_writer_write_int,
-    );
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "write",
-        "([CII)V",
-        native_output_stream_writer_write_chars,
-    );
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "write",
-        "(Ljava/lang/String;)V",
-        native_output_stream_writer_write_string,
-    );
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "write",
-        "(Ljava/lang/String;II)V",
-        native_output_stream_writer_write_string_range,
-    );
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "flush",
-        "()V",
-        native_output_stream_writer_flush,
-    );
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "close",
-        "()V",
-        native_output_stream_writer_close,
-    );
 
+    // Real JDK BufferedInputStream has a layout and close protocol that the
+    // old synthetic bridge cannot emulate safely.  In particular, dispatching
+    // its `skip`/`ensureOpen` path through this bridge leaves `buf` looking
+    // closed while Jandex indexes a class stream.  Keep the bridge only for
+    // synthetic-JDK builds; real-JDK execution must use the class bytecode.
+    if cfg!(feature = "synthetic-jdk") {
     registry.register(
         "java/io/BufferedInputStream",
         "<init>",
@@ -26736,6 +26933,26 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Int(-1)));
             }
             let limit = len.min(arr_len - off);
+            // With no active mark/replay state, BufferedInputStream may pass a
+            // large read straight to its delegate. This is the common Jandex
+            // class-file path and avoids turning every bulk read into thousands
+            // of single-byte virtual calls.
+            if buffered_input_stream_can_delegate_bulk(ctx, this) {
+                if let Some(input) = buffered_input_stream_input(ctx, this) {
+                    return Ok(ctx
+                        .invoke_virtual(
+                            input,
+                            "read",
+                            "([BII)I",
+                            &[
+                                Value::Object(Some(arr)),
+                                Value::Int(off as i32),
+                                Value::Int(limit as i32),
+                            ],
+                        )?
+                        .or(Some(Value::Int(-1))));
+                }
+            }
             let mut read = 0usize;
             for i in 0..limit {
                 let b = buffered_input_stream_read_one(ctx, this)?;
@@ -26843,6 +27060,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
+    }
     registry.register(
         "org/apache/tomcat/util/buf/CharChunk",
         "equals",
@@ -33764,16 +33982,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let Some(Value::Object(Some(logger))) = args.first() else {
                 return Ok(None);
             };
+            let logger = *logger;
             let handler = args.get(1).copied().unwrap_or(Value::Object(None));
-            let handlers = match ctx.get_field(*logger, 2) {
-                Value::Object(Some(list)) => list,
-                _ => {
+            let handlers = match jul_logger_handlers_get(ctx, logger) {
+                Some(list) => list,
+                None => {
                     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
                     cratonvm_native_collections::native_al_init(
                         ctx,
                         &[Value::Object(Some(list))],
                     )?;
-                    ctx.set_field(*logger, 2, Value::Object(Some(list)));
+                    jul_logger_handlers_set(ctx, logger, list);
                     list
                 }
             };
@@ -33792,7 +34011,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let Some(Value::Object(Some(logger))) = args.first() else {
                 return Ok(None);
             };
-            if let Value::Object(Some(handlers)) = ctx.get_field(*logger, 2) {
+            let logger = *logger;
+            if let Some(handlers) = jul_logger_handlers_get(ctx, logger) {
                 let size = match ctx.invoke_virtual(handlers, "size", "()I", &[])? {
                     Some(Value::Int(size)) if size > 0 => size as usize,
                     _ => 0,
@@ -33816,7 +34036,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // This native logger has no parent-handler chain. Once the JULI
             // fixture detaches its handler, discard the now-empty/stale list
             // so a later parameterized fixture starts from a clean receiver.
-            ctx.set_field(*logger, 2, Value::Object(None));
+            jul_logger_handlers_clear(ctx, logger);
             Ok(None)
         },
     );
@@ -33826,7 +34046,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/util/logging/Handler;",
         |ctx, args| {
             if let Some(Value::Object(Some(logger))) = args.first() {
-                if let Value::Object(Some(handlers)) = ctx.get_field(*logger, 2) {
+                let logger = *logger;
+                if let Some(handlers) = jul_logger_handlers_get(ctx, logger) {
                     return cratonvm_native_collections::native_al_to_array(
                         ctx,
                         &[Value::Object(Some(handlers))],
@@ -34120,6 +34341,36 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let pos = ctx.get_field(this, pos_idx).as_int().unwrap_or(0);
             let count = ctx.get_field(this, count_idx).as_int().unwrap_or(0);
             Ok(Some(Value::Int(count - pos)))
+        },
+    );
+    registry.register(
+        "java/io/BufferedInputStream",
+        "skip",
+        "(J)J",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(object))) => *object,
+                _ => return Ok(Some(Value::Long(0))),
+            };
+            let requested = args.get(1).and_then(|value| value.as_long()).unwrap_or(0);
+            Ok(Some(Value::Long(buffered_input_stream_skip(
+                ctx, this, requested,
+            )?)))
+        },
+    );
+    registry.register(
+        "java/io/ByteArrayInputStream",
+        "skip",
+        "(J)J",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(object))) => *object,
+                _ => return Ok(Some(Value::Long(0))),
+            };
+            let requested = args.get(1).and_then(|value| value.as_long()).unwrap_or(0);
+            Ok(Some(Value::Long(byte_array_input_stream_skip(
+                ctx, this, requested,
+            ))))
         },
     );
     registry.register(
@@ -36403,6 +36654,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
+    crate::phases_late::register_p66_file_visitor(registry);
     // Restore the caller's category so later registrars keep their intended tag.
     registry.set_category(prev_category);
     let after = registry.len();
@@ -36805,10 +37057,20 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
                 Value::Object(Some(o)) => o,
                 _ => return Ok(Some(Value::Object(Some(this)))),
             };
-            let existing = ctx.read_string(sb).unwrap_or_default();
-            let combined = format!("{}{}", existing, formatted_str);
-            let new_str = ctx.create_string(&combined);
-            ctx.set_field(this, 0, Value::Object(Some(new_str)));
+            if let Some(existing) = ctx.read_string(sb) {
+                let combined = format!("{}{}", existing, formatted_str);
+                let new_str = ctx.create_string(&combined);
+                ctx.set_field(this, 0, Value::Object(Some(new_str)));
+            } else {
+                // Preserve a caller-supplied Appendable.
+                let text = ctx.create_string(&formatted_str);
+                let _ = ctx.invoke_virtual(
+                    sb,
+                    "append",
+                    "(Ljava/lang/CharSequence;)Ljava/lang/Appendable;",
+                    &[Value::Object(Some(text))],
+                )?;
+            }
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -36849,6 +37111,11 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
             _ => return Ok(None),
         };
         if let Value::Object(Some(target)) = ctx.get_field(this, 0) {
+            // StringBuilder implements Appendable but not Flushable. Avoid
+            // inventing a StringBuilder.flush() call for the in-memory sink.
+            if ctx.read_string(target).is_none() {
+                return Ok(None);
+            }
             let _ = ctx.invoke_virtual(target, "flush", "()V", &[]);
         }
         Ok(None)
@@ -37073,16 +37340,17 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
             let Some(Value::Object(Some(logger))) = args.first() else {
                 return Ok(None);
             };
+            let logger = *logger;
             let handler = args.get(1).copied().unwrap_or(Value::Object(None));
-            let handlers = match ctx.get_field(*logger, 2) {
-                Value::Object(Some(list)) => list,
-                _ => {
+            let handlers = match jul_logger_handlers_get(ctx, logger) {
+                Some(list) => list,
+                None => {
                     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
                     cratonvm_native_collections::native_al_init(
                         ctx,
                         &[Value::Object(Some(list))],
                     )?;
-                    ctx.set_field(*logger, 2, Value::Object(Some(list)));
+                    jul_logger_handlers_set(ctx, logger, list);
                     list
                 }
             };
@@ -37103,7 +37371,7 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
             };
             // This native logger has no parent-handler chain. Once JULI
             // detaches a fixture handler, discard its list for the next case.
-            ctx.set_field(*logger, 2, Value::Object(None));
+            jul_logger_handlers_clear(ctx, *logger);
             Ok(None)
         },
     );
@@ -37113,7 +37381,8 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
         "()[Ljava/util/logging/Handler;",
         |ctx, args| {
             if let Some(Value::Object(Some(logger))) = args.first() {
-                if let Value::Object(Some(handlers)) = ctx.get_field(*logger, 2) {
+                let logger = *logger;
+                if let Some(handlers) = jul_logger_handlers_get(ctx, logger) {
                     return cratonvm_native_collections::native_al_to_array(
                         ctx,
                         &[Value::Object(Some(handlers))],
@@ -37332,6 +37601,11 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // identity/return-this no-ops are available without the JIT/interpreter
     // having to resolve the override on the receiver's pipeline class.
     crate::streams::register_stream_overrides(registry);
+    // Predicate's compositional defaults are invokedynamic captures in the
+    // real JDK. Register the GC-visible bridge implementations in real-JDK
+    // mode as well so field-filter composition does not retain a stale capture
+    // receiver through JUnit cleanup.
+    crate::phases_late::register_phase56_function_extras(registry);
 
     // Spring XML namespace parsing: preserve validation and namespace-aware
     // parsing, but attach a VM-wide Xerces grammar pool so repeated
@@ -43672,6 +43946,45 @@ fn native_printwriter_write_string(
     args: &[Value],
 ) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first().copied() {
+        // Real JDK's `PrintWriter.write(String)` body is `write(s, 0,
+        // s.length())` — a VIRTUAL call back on `this`. A user subclass that
+        // overrides `write(String,int,int)` (e.g. Spring's
+        // `MockHttpServletResponse`'s private `ResponsePrintWriter`, which
+        // auto-flushes and tracks commit state on every write) depends on
+        // that dispatch. Writing straight to the backing `out` object below
+        // skips `this` entirely: the char data still reaches the backing
+        // Writer, but any subclass side effect the override exists to provide
+        // (here, forcing the buffered `OutputStreamWriter`/`StreamEncoder`
+        // bytes out to the real sink) never runs — silently losing the
+        // content once the request stops touching the response any further
+        // (e.g. a `View.render()`/`@ExceptionHandler` write with no later
+        // explicit flush). Detect the subclass case first and re-dispatch
+        // through `this`, so ordinary virtual method resolution finds the
+        // override; when there isn't one, `write(String,int,int)` falls
+        // through to `native_printwriter_write_string_range` below —
+        // functionally identical to the fast path already taken here for a
+        // plain `java.io.PrintWriter` receiver, just one indirection deeper.
+        let this_cid = ctx.class_id_of_object(this);
+        let this_cname = ctx.class_name_of_id(this_cid);
+        let is_plain_printwriter = this_cname.as_deref() == Some("java/io/PrintWriter");
+        if !is_plain_printwriter {
+            if let Some(Value::Object(Some(s))) = args.get(1).copied() {
+                if let Some(text) = ctx.read_string(s) {
+                    let len = text.encode_utf16().count() as i32;
+                    let _ = ctx.invoke_virtual(
+                        this,
+                        "write",
+                        "(Ljava/lang/String;II)V",
+                        &[Value::Object(Some(s)), Value::Int(0), Value::Int(len)],
+                    );
+                    return Ok(None);
+                }
+            }
+            // Null/non-String arg: real `write(String)` would NPE inside
+            // `s.length()` before ever reaching a writer — fall through to
+            // the pre-existing behaviour below rather than invent new null
+            // semantics here.
+        }
         if let Some(out_obj) = printwriter_get_backing_writer(ctx, this) {
             // Pass the EXISTING Java String arg directly to out.write(String).
             // Do NOT call write_string_to_writer (which does ctx.create_string → GC hazard:
@@ -43932,7 +44245,12 @@ fn native_uuid_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         (lsb >> 48) & 0xFFFF,
         lsb & 0xFFFF_FFFF_FFFF
     );
-    let str_obj = ctx.create_string(&s);
+    // UUID text is dynamically produced.  Interning every distinct value keeps
+    // the entire monotonicity-test output alive and turns normal allocation
+    // pressure into repeated intern-table stalls.  The receiver is pinned by
+    // safe_native_call and its fields have already been read above, so this
+    // native can safely request collection before the transient allocation.
+    let str_obj = ctx.create_string_uninterned_gc_safe(&s);
     Ok(Some(Value::Object(Some(str_obj))))
 }
 
@@ -51650,12 +51968,29 @@ fn javac_empty_array_list(ctx: &mut dyn NativeContext) -> ObjectRef {
 
 fn javac_array_list_from_values(ctx: &mut dyn NativeContext, values: &[Value]) -> ObjectRef {
     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let pin_base = ctx.pin_native_root(list);
+    let value_pins: Vec<Option<(usize, ObjectRef)>> = values
+        .iter()
+        .map(|value| match value {
+            Value::Object(Some(obj)) => Some((ctx.pin_native_root(*obj), *obj)),
+            _ => None,
+        })
+        .collect();
     let data = ctx.new_array(cratonvm_types::ArrayElementType::Reference, values.len());
+    let data_pin = ctx.pin_native_root(data);
     for (idx, value) in values.iter().copied().enumerate() {
+        let value = match value_pins[idx] {
+            Some((pin, fallback)) => Value::Object(Some(ctx.read_native_pin(pin, fallback))),
+            None => value,
+        };
+        let data = ctx.read_native_pin(data_pin, data);
         ctx.set_array_element(data, idx, value);
     }
+    let list = ctx.read_native_pin(pin_base, list);
+    let data = ctx.read_native_pin(data_pin, data);
     ctx.set_field_by_name(list, "elementData", Value::Object(Some(data)));
     ctx.set_field_by_name(list, "size", Value::Int(values.len() as i32));
+    ctx.unpin_native_roots(pin_base);
     list
 }
 
@@ -51683,75 +52018,206 @@ fn javac_platform_class_file_object(
     )
 }
 
-fn native_javac_file_manager_list(
+fn native_javac_file_manager_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let location = args.get(1).copied().unwrap_or(Value::Object(None));
+    let package = args.get(2).copied().unwrap_or(Value::Object(None));
+    let kinds = args.get(3).copied().unwrap_or(Value::Object(None));
+    // Every branch below can allocate or call back into javac. Keep the native
+    // arguments and every accumulated JavaFileObject live and relocatable until
+    // the result list is fully materialized. Without these pins, a young GC in
+    // getJavaFileForInput truncated java.lang.annotation to the three objects
+    // that happened to remain at their old addresses.
+    let pin_base = ctx.pin_native_root(this);
+    let location_pin = match location {
+        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+        _ => None,
+    };
+    let package_pin = match package {
+        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+        _ => None,
+    };
+    let kinds_pin = match kinds {
+        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+        _ => None,
+    };
+    let result = (|| -> MethodCallResult {
+        let this = ctx.read_native_pin(pin_base, this);
+        let location = match location_pin {
+            Some((pin, fallback)) => Value::Object(Some(ctx.read_native_pin(pin, fallback))),
+            None => location,
+        };
+        let location_name = match location {
+            Value::Object(Some(location_obj)) => {
+                match ctx.invoke_virtual(location_obj, "getName", "()Ljava/lang/String;", &[])? {
+                    Some(Value::Object(Some(name_obj))) => {
+                        ctx.read_string(name_obj).unwrap_or_default()
+                    }
+                    _ => String::new(),
+                }
+            }
+            _ => String::new(),
+        };
+        let package = match package_pin {
+            Some((pin, fallback)) => Value::Object(Some(ctx.read_native_pin(pin, fallback))),
+            None => package,
+        };
+        let package_name = match package {
+            Value::Object(Some(name_obj)) => ctx.read_string(name_obj).unwrap_or_default(),
+            _ => String::new(),
+        };
+        if location_name == "CLASS_PATH"
+            && (package_name == "java"
+                || package_name.starts_with("java.")
+                || package_name == "com"
+                || package_name == "com.example"
+                || package_name.starts_with("com.example."))
+        {
+            return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
+        }
+        if let Some(module_name) = location_name
+            .strip_prefix("SYSTEM_MODULES[")
+            .and_then(|name| name.strip_suffix(']'))
+        {
+            if let Some(java_home) = ctx.get_system_property("java.home") {
+                let recurse = matches!(args.get(4), Some(Value::Int(v)) if *v != 0);
+                let class_names = phases_late::jrtfs_list_class_binary_names(
+                    &java_home,
+                    module_name,
+                    &package_name,
+                    recurse,
+                );
+                if class_names.is_empty() {
+                    return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
+                }
+                let Some(kind_class) = javac_java_file_object_kind_class(ctx) else {
+                    return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
+                };
+                let kind_class_pin = match kind_class {
+                    Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+                    _ => None,
+                };
+                let kinds = match kinds_pin {
+                    Some((pin, fallback)) => {
+                        Value::Object(Some(ctx.read_native_pin(pin, fallback)))
+                    }
+                    None => kinds,
+                };
+                let kind_class = match kind_class_pin {
+                    Some((pin, fallback)) => {
+                        Value::Object(Some(ctx.read_native_pin(pin, fallback)))
+                    }
+                    None => kind_class,
+                };
+                let accepts_classes = match kinds {
+                    Value::Object(Some(kinds_obj)) => matches!(
+                        ctx.invoke_virtual(
+                            kinds_obj,
+                            "contains",
+                            "(Ljava/lang/Object;)Z",
+                            &[kind_class],
+                        )?,
+                        Some(Value::Int(value)) if value != 0
+                    ),
+                    _ => false,
+                };
+                if !accepts_classes {
+                    return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
+                }
+                // Materialize directly into a pinned Java list. java.lang alone
+                // contains hundreds of classes; retaining every JavaFileObject
+                // in a Rust Vec plus one native pin per entry exhausted the
+                // native-root window before javac reached annotation packages.
+                let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                let list_pin = ctx.pin_native_root(list);
+                let data =
+                    ctx.new_array(cratonvm_types::ArrayElementType::Reference, class_names.len());
+                let data_pin = ctx.pin_native_root(data);
+                let mut file_count = 0usize;
+                for class_name in &class_names {
+                    let this = ctx.read_native_pin(pin_base, this);
+                    let location = match location_pin {
+                        Some((pin, fallback)) => {
+                            Value::Object(Some(ctx.read_native_pin(pin, fallback)))
+                        }
+                        None => location,
+                    };
+                    let kind_class = match kind_class_pin {
+                        Some((pin, fallback)) => {
+                            Value::Object(Some(ctx.read_native_pin(pin, fallback)))
+                        }
+                        None => kind_class,
+                    };
+                    if let Some(Value::Object(Some(file))) = javac_platform_class_file_object(
+                        ctx,
+                        this,
+                        location,
+                        kind_class,
+                        class_name,
+                    )? {
+                        let data = ctx.read_native_pin(data_pin, data);
+                        ctx.set_array_element(data, file_count, Value::Object(Some(file)));
+                        file_count += 1;
+                    }
+                }
+                let list = ctx.read_native_pin(list_pin, list);
+                let data = ctx.read_native_pin(data_pin, data);
+                ctx.set_field_by_name(list, "elementData", Value::Object(Some(data)));
+                ctx.set_field_by_name(list, "size", Value::Int(file_count as i32));
+                ctx.unpin_native_roots(list_pin);
+                return Ok(Some(Value::Object(Some(list))));
+            }
+        }
+        let this = ctx.read_native_pin(pin_base, this);
+        let location = match location_pin {
+            Some((pin, fallback)) => Value::Object(Some(ctx.read_native_pin(pin, fallback))),
+            None => location,
+        };
+        let mut forwarded_args = args[1..].to_vec();
+        forwarded_args[0] = location;
+        forwarded_args[1] = match package_pin {
+            Some((pin, fallback)) => Value::Object(Some(ctx.read_native_pin(pin, fallback))),
+            None => package,
+        };
+        forwarded_args[2] = match kinds_pin {
+            Some((pin, fallback)) => Value::Object(Some(ctx.read_native_pin(pin, fallback))),
+            None => kinds,
+        };
+        ctx.invoke_virtual_bytecode_only(
+            this,
+            "list",
+            "(Ljavax/tools/JavaFileManager$Location;Ljava/lang/String;Ljava/util/Set;Z)Ljava/lang/Iterable;",
+            &forwarded_args,
+        )
+    })();
+    ctx.unpin_native_roots(pin_base);
+    result
+}
+
+fn native_javac_path_and_container_compare_to(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let location = args.get(1).copied().unwrap_or(Value::Object(None));
-    let location_name = match location {
-        Value::Object(Some(location_obj)) => {
-            match ctx.invoke_virtual(location_obj, "getName", "()Ljava/lang/String;", &[])? {
-                Some(Value::Object(Some(name_obj))) => ctx.read_string(name_obj).unwrap_or_default(),
-                _ => String::new(),
-            }
-        }
+    let other = match args.get(1) {
+        Some(Value::Object(Some(value))) => *value,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let left = ctx.get_field_by_name(this, "index").as_int().unwrap_or(0);
+    let right = ctx.get_field_by_name(other, "index").as_int().unwrap_or(0);
+    Ok(Some(Value::Int(left.wrapping_sub(right))))
+}
+
+fn native_javac_string_name_hash_code(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let value = match ctx.get_field_by_name(this, "string") {
+        Value::Object(Some(value)) => ctx.read_string(value).unwrap_or_default(),
         _ => String::new(),
     };
-    let package_name = match args.get(2) {
-        Some(Value::Object(Some(name_obj))) => ctx.read_string(*name_obj).unwrap_or_default(),
-        _ => String::new(),
-    };
-    if location_name == "CLASS_PATH"
-        && (package_name == "java"
-            || package_name.starts_with("java.")
-            || package_name == "com"
-            || package_name == "com.example"
-            || package_name.starts_with("com.example."))
-    {
-        return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
-    }
-    if let Some(module_name) = location_name
-        .strip_prefix("SYSTEM_MODULES[")
-        .and_then(|name| name.strip_suffix(']'))
-    {
-        if let Some(java_home) = ctx.get_system_property("java.home") {
-            let recurse = matches!(args.get(4), Some(Value::Int(v)) if *v != 0);
-            let class_names = phases_late::jrtfs_list_class_binary_names(
-                &java_home,
-                module_name,
-                &package_name,
-                recurse,
-            );
-            if class_names.is_empty() {
-                return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
-            }
-            let Some(kind_class) = javac_java_file_object_kind_class(ctx) else {
-                return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
-            };
-            let mut files = Vec::with_capacity(class_names.len());
-            for class_name in &class_names {
-                if let Some(Value::Object(Some(file))) = javac_platform_class_file_object(
-                    ctx,
-                    this,
-                    location,
-                    kind_class,
-                    class_name,
-                )? {
-                    files.push(Value::Object(Some(file)));
-                }
-            }
-            return Ok(Some(Value::Object(Some(javac_array_list_from_values(
-                ctx, &files,
-            )))));
-        }
-    }
-    ctx.invoke_virtual_bytecode_only(
-        this,
-        "list",
-        "(Ljavax/tools/JavaFileManager$Location;Ljava/lang/String;Ljava/util/Set;Z)Ljava/lang/Iterable;",
-        &args[1..],
-    )
+    Ok(Some(Value::Int(java_string_hash_code_ascii(&value))))
 }
 
 fn javac_relative_path_string(ctx: &mut dyn NativeContext, obj: ObjectRef) -> String {
@@ -53252,6 +53718,7 @@ fn matcher_realjdk_field_indices(ctx: &mut dyn NativeContext) -> Option<MatcherF
 struct PatternFieldIndices {
     pattern: usize,
     flags: usize,
+    capturing_group_count: usize,
 }
 
 fn pattern_realjdk_field_indices(ctx: &mut dyn NativeContext) -> Option<PatternFieldIndices> {
@@ -53262,7 +53729,51 @@ fn pattern_realjdk_field_indices(ctx: &mut dyn NativeContext) -> Option<PatternF
         Some(PatternFieldIndices {
             pattern: ctx.resolve_field_index(CLASS, f::PATTERN)?,
             flags: ctx.resolve_field_index(CLASS, f::FLAGS)?,
+            capturing_group_count: ctx.resolve_field_index(CLASS, f::CAPTURING_GROUP_COUNT)?,
         })
+    })
+}
+
+/// Return the semantic capture count stored by the real JDK Pattern. This
+/// includes group zero. Some supported JDK Matcher layouts overallocate the
+/// backing `groups[]` array (for example, ten capture pairs for a one-group
+/// pattern), so array length is a capacity check, not the group count.
+fn matcher_realjdk_java_capture_count(
+    ctx: &mut dyn NativeContext,
+    matcher: ObjectRef,
+    idx: MatcherFieldIndices,
+    pattern_idx: PatternFieldIndices,
+) -> Option<usize> {
+    let pattern = match ctx.get_field(matcher, idx.parent_pattern) {
+        Value::Object(Some(pattern)) => pattern,
+        _ => return None,
+    };
+    let count = ctx
+        .get_field(pattern, pattern_idx.capturing_group_count)
+        .as_int()?;
+    (count > 0).then_some(count as usize)
+}
+
+fn matcher_realjdk_capture_layout_valid(
+    rust_capture_count: usize,
+    java_capture_count: usize,
+    groups_len: usize,
+) -> bool {
+    java_capture_count > 0
+        && rust_capture_count == java_capture_count
+        && groups_len >= java_capture_count.saturating_mul(2)
+}
+
+fn matcher_realjdk_capture_layout_ok(
+    ctx: &mut dyn NativeContext,
+    matcher: ObjectRef,
+    idx: MatcherFieldIndices,
+    pattern_idx: PatternFieldIndices,
+    re: &JavaRegex,
+    groups: ObjectRef,
+) -> bool {
+    matcher_realjdk_java_capture_count(ctx, matcher, idx, pattern_idx).is_some_and(|count| {
+        matcher_realjdk_capture_layout_valid(re.captures_len(), count, ctx.array_length(groups))
     })
 }
 
@@ -53480,8 +53991,8 @@ fn matcher_realjdk_search(
     // it here instead would mean bailing to real bytecode after already
     // having overwritten `first`/`oldLast` above, corrupting the state the
     // bytecode fallback itself depends on). Trust the caller: by the time
-    // we're here, `re.captures_len() == groups_obj.length / 2` is already
-    // established, so every `caps.len()` below is guaranteed to match.
+    // we're here, Rust's capture count matches Pattern.capturingGroupCount and
+    // `groups_obj` has enough capacity, so every write below is in bounds.
     let caps = re.captures_at(region_slice, search_from_byte);
     let matched = match caps {
         Some(caps) => {
@@ -53603,10 +54114,9 @@ fn native_matcher_find_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Value::Object(Some(g)) => g,
         _ => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
     };
-    // Group-count safety net, checked BEFORE any field mutation below (see
-    // the comment in `matcher_realjdk_search` for why bailing after
-    // mutating `first`/`oldLast` would corrupt the fallback's own state).
-    if re.captures_len() != ctx.array_length(groups_obj) / 2 {
+    // Group-count safety net, checked BEFORE any field mutation below. The
+    // Pattern field is the semantic count; groups[] may be overallocated.
+    if !matcher_realjdk_capture_layout_ok(ctx, this, idx, pattern_idx, &re, groups_obj) {
         return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]);
     }
 
@@ -53703,9 +54213,9 @@ fn native_matcher_find_at_realjdk(
         Value::Object(Some(g)) => g,
         _ => return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]),
     };
-    // Group-count safety net — checked before any field mutation below; see
-    // the comment in `matcher_realjdk_search`.
-    if re.captures_len() != ctx.array_length(groups_obj) / 2 {
+    // Group-count safety net — checked before any field mutation below. The
+    // Pattern field is the semantic count; groups[] may be overallocated.
+    if !matcher_realjdk_capture_layout_ok(ctx, this, idx, pattern_idx, &re, groups_obj) {
         return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]);
     }
 
@@ -53755,11 +54265,57 @@ fn native_matcher_find_at_realjdk(
 /// (not a subclass CratonVM has a dedicated `RuntimeError` variant for) on an
 /// invalid index — the caller bails to real bytecode for that rare case so
 /// it throws the exact right exception, rather than fabricating one here.
-/// Returns `true` when `group` is in bounds (`0..=groupCount()`, where
-/// `groupCount() == groups_obj.length/2 - 1`).
-fn matcher_realjdk_group_in_bounds(ctx: &mut dyn NativeContext, groups_obj: ObjectRef, group: i32) -> bool {
-    let group_count = (ctx.array_length(groups_obj) / 2) as i32 - 1;
-    group >= 0 && group <= group_count
+/// Returns `true` when `group` is in bounds (`0..=groupCount()`). Pattern's
+/// semantic capture count is authoritative because groups[] may be larger.
+fn matcher_realjdk_group_index_in_bounds(
+    group: i32,
+    capture_count: usize,
+    groups_len: usize,
+) -> bool {
+    if group < 0 {
+        return false;
+    }
+    let group = group as usize;
+    group < capture_count && group.saturating_mul(2).saturating_add(1) < groups_len
+}
+
+fn matcher_realjdk_group_in_bounds(
+    ctx: &mut dyn NativeContext,
+    matcher: ObjectRef,
+    idx: MatcherFieldIndices,
+    groups_obj: ObjectRef,
+    group: i32,
+) -> bool {
+    let Some(pattern_idx) = pattern_realjdk_field_indices(ctx) else {
+        return false;
+    };
+    let Some(capture_count) = matcher_realjdk_java_capture_count(ctx, matcher, idx, pattern_idx)
+    else {
+        return false;
+    };
+    matcher_realjdk_group_index_in_bounds(group, capture_count, ctx.array_length(groups_obj))
+}
+
+#[cfg(test)]
+mod matcher_realjdk_layout_tests {
+    use super::{matcher_realjdk_capture_layout_valid, matcher_realjdk_group_index_in_bounds};
+
+    #[test]
+    fn overallocated_groups_array_is_capacity_not_capture_count() {
+        assert!(matcher_realjdk_capture_layout_valid(2, 2, 20));
+        assert!(matcher_realjdk_group_index_in_bounds(1, 2, 20));
+        assert!(!matcher_realjdk_group_index_in_bounds(2, 2, 20));
+    }
+
+    #[test]
+    fn layout_rejects_semantic_count_mismatch_or_short_capacity() {
+        assert!(!matcher_realjdk_capture_layout_valid(3, 2, 20));
+        assert!(!matcher_realjdk_capture_layout_valid(2, 3, 20));
+        assert!(!matcher_realjdk_capture_layout_valid(2, 2, 3));
+        assert!(!matcher_realjdk_capture_layout_valid(0, 0, 0));
+        assert!(!matcher_realjdk_group_index_in_bounds(-1, 2, 20));
+        assert!(!matcher_realjdk_group_index_in_bounds(1, 2, 3));
+    }
 }
 
 fn native_matcher_start_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -53828,7 +54384,7 @@ fn native_matcher_start_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value])
         Value::Object(Some(g)) => g,
         _ => return matcher_realjdk_bail(ctx, this, "start", "(I)I", &[Value::Int(group)]),
     };
-    if !matcher_realjdk_group_in_bounds(ctx, groups_obj, group) {
+    if !matcher_realjdk_group_in_bounds(ctx, this, idx, groups_obj, group) {
         return matcher_realjdk_bail(ctx, this, "start", "(I)I", &[Value::Int(group)]);
     }
     Ok(Some(ctx.get_array_element(groups_obj, 2 * group as usize)))
@@ -53858,7 +54414,7 @@ fn native_matcher_end_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -
         Value::Object(Some(g)) => g,
         _ => return matcher_realjdk_bail(ctx, this, "end", "(I)I", &[Value::Int(group)]),
     };
-    if !matcher_realjdk_group_in_bounds(ctx, groups_obj, group) {
+    if !matcher_realjdk_group_in_bounds(ctx, this, idx, groups_obj, group) {
         return matcher_realjdk_bail(ctx, this, "end", "(I)I", &[Value::Int(group)]);
     }
     Ok(Some(ctx.get_array_element(groups_obj, 2 * group as usize + 1)))
@@ -53916,7 +54472,7 @@ fn native_matcher_group_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value])
             )
         }
     };
-    if !matcher_realjdk_group_in_bounds(ctx, groups_obj, group) {
+    if !matcher_realjdk_group_in_bounds(ctx, this, idx, groups_obj, group) {
         return matcher_realjdk_bail(
             ctx,
             this,
@@ -53953,6 +54509,37 @@ fn native_matcher_group_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value])
             )
         }
     };
+    // The comment above ("groups[] would still be all -1") only holds for
+    // callers that reach `groups[]` via THIS fast path's own `find()`/
+    // `find(int)` (which does bail early for non-String text — see
+    // `matcher_realjdk_cached`). `Matcher.matches()`/`lookingAt()` are NOT
+    // natively intercepted at all, so they run as real interpreted bytecode
+    // against ANY `CharSequence` (correctly — that's all the `CharSequence`
+    // contract promises) and populate `groups[]` just fine. A subsequent
+    // `matcher.group(int)` call then DOES reach here with valid `start`/`end`
+    // even though `text` is a non-String `CharSequence` (e.g. Spring's
+    // `AntPathMatcher$AntPathStringMatcher$MaxAttemptsCharSequence`, which
+    // implements only `subSequence`/`charAt`/`length`/`isEmpty` — no
+    // `substring`). Calling `.substring(int,int)` unconditionally then threw
+    // a spurious `NoSuchMethodError` instead of returning the matched text.
+    // Real JDK's `Matcher.group(int)` never calls `.substring()` either — it
+    // calls `getSubSequence(start,end).toString()`, `subSequence` being the
+    // one method every `CharSequence` actually guarantees. Keep the fast,
+    // allocation-light `substring` shortcut for genuine `String` text (the
+    // overwhelming common case) and bail to real bytecode for anything else,
+    // instead of assuming the receiver has a `substring` method it never
+    // promised to have.
+    let text_cid = ctx.class_id_of_object(text_obj);
+    let text_cname = ctx.class_name_of_id(text_cid);
+    if text_cname.as_deref() != Some("java/lang/String") {
+        return matcher_realjdk_bail(
+            ctx,
+            this,
+            "group",
+            "(I)Ljava/lang/String;",
+            &[Value::Int(group)],
+        );
+    }
     ctx.invoke_virtual(
         text_obj,
         "substring",
@@ -58698,6 +59285,17 @@ fn monitor_wait_keepalive(
     Ok(obj)
 }
 
+/// STW-TAKEOVER-FIX (2026-07-13): use `ctx.monitor_enter_gc_safe(obj)`
+/// (see `NativeContext::monitor_enter_gc_safe`'s doc) instead of a raw
+/// `ctx.monitor_enter(obj)` in any NEW native whose contended wait must be
+/// excused from an in-flight STW barrier pause AND that keeps referencing
+/// `obj` afterward — it pins, enters, and refreshes internally, returning
+/// the current (possibly GC-relocated) reference. Applied narrowly to the
+/// one call site with live-gdb-confirmed evidence of the WildFly
+/// `parallel-extension-add` deadlock:
+/// `native_cdl_await`/`native_cdl_await_timeout`/`native_cdl_count_down`
+/// below. Left as a doc pointer (not a helper function) since the trait
+/// method already does the whole job — no wrapper needed.
 fn bounded_monitor_wait_ms(remaining: std::time::Duration, cap_ms: u64) -> u64 {
     remaining.as_millis().clamp(1, cap_ms as u128) as u64
 }
@@ -59106,7 +59704,10 @@ fn native_cdl_count_down(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // Serialize the read-modify-write against concurrent countDown() calls —
     // two racing decrements must not lose one (the boot-thread/test-thread
     // handshake counts on exactly-N decrements releasing the latch).
-    ctx.monitor_enter(this);
+    // GC-SAFEPOINT FIX: monitor_enter_gc_safe's contended wait can span a
+    // completing GC pause; use its returned reference so a relocated `this`
+    // doesn't go stale under the calls below.
+    let this = ctx.monitor_enter_gc_safe(this);
     let count = cdl_count(ctx, this);
     if count > 0 {
         cdl_set_count(ctx, this, count - 1);
@@ -59133,7 +59734,10 @@ fn native_cdl_await(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         if cdl_count(ctx, this) <= 0 {
             return Ok(None);
         }
-        ctx.monitor_enter(this);
+        // GC-SAFEPOINT FIX: monitor_enter_gc_safe's contended wait can span a
+        // completing GC pause; use its returned reference so a relocated
+        // `this` doesn't go stale under the wait below.
+        this = ctx.monitor_enter_gc_safe(this);
         // GC-SAFEPOINT FIX: the wait can relocate `this`; pin + read back.
         let wait_result = monitor_wait_keepalive(ctx, this, Some(10));
         this = wait_result?;
@@ -59168,7 +59772,10 @@ fn native_cdl_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             return Ok(Some(Value::Int(0))); // false — timed out
         }
         let wait_ms = bounded_monitor_wait_ms(remaining, 10);
-        ctx.monitor_enter(this);
+        // GC-SAFEPOINT FIX: monitor_enter_gc_safe's contended wait can span a
+        // completing GC pause; use its returned reference so a relocated
+        // `this` doesn't go stale under the wait below.
+        this = ctx.monitor_enter_gc_safe(this);
         // GC-SAFEPOINT FIX: the wait can relocate `this`; pin + read back.
         this = monitor_wait_keepalive(ctx, this, Some(wait_ms))?;
         ctx.monitor_exit(this);
@@ -69118,6 +69725,10 @@ fn transition_real_executor_to_shutdown(
     // below. SHUTDOWN is run-state 0, so retain only the worker-count bits.
     let shutdown = current & 0x1fff_ffff;
     let _ = ctx.invoke_virtual(ctl, "set", "(I)V", &[Value::Int(shutdown)]);
+    // A graceful ThreadPoolExecutor shutdown must wake idle workers so they
+    // observe SHUTDOWN and leave getTask().  Merely updating ctl leaks every
+    // worker blocked in LinkedBlockingQueue.take().
+    let _ = interrupt_executor_workers(ctx, executor);
     Ok(None)
 }
 
@@ -72569,7 +73180,17 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         if let Some(addr) = rwl_parent_addr(ctx, this) {
+            // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
+            // rw_read_lock's internal contended wait is a raw
+            // parking_lot::Condvar::wait with NO GC-blocking-region bracket
+            // and no Java-heap touch inside — a thread contending for this
+            // lock while a writer holds it stays counted in the STW
+            // barrier's `expected` forever (not in JIT, never reaches a
+            // safepoint), livelocking any cross-thread STW pause requested
+            // while it waits.
+            ctx.begin_blocking_region();
             crate::stamped_lock::rw_read_lock(addr, ctx.thread_id());
+            ctx.end_blocking_region();
         }
         Ok(None)
     });
@@ -72619,7 +73240,10 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         if let Some(addr) = rwl_parent_addr(ctx, this) {
+            // GC-blocking audit — see the plain `lock()` registration above.
+            ctx.begin_blocking_region();
             crate::stamped_lock::rw_read_lock(addr, ctx.thread_id());
+            ctx.end_blocking_region();
         }
         Ok(None)
     });
@@ -72632,7 +73256,19 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         if let Some(addr) = rwl_parent_addr(ctx, this) {
+            // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
+            // rw_write_lock's internal contended wait is a raw
+            // parking_lot::Condvar::wait with NO GC-blocking-region bracket
+            // and no Java-heap touch inside — see the read-lock `lock()`
+            // registration above for the full rationale. Confirmed via
+            // symbolicated cdb stacks: TestOrderInterceptor's stuck
+            // ForkJoinPool worker threads were parked exactly here, not in
+            // LockSupport.park (which IS correctly bracketed) — this was the
+            // actual root cause of the STW takeover livelock, not a
+            // ForkJoinPool/AQS-specific issue.
+            ctx.begin_blocking_region();
             crate::stamped_lock::rw_write_lock(addr, ctx.thread_id());
+            ctx.end_blocking_region();
         }
         Ok(None)
     });
@@ -72679,7 +73315,10 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         if let Some(addr) = rwl_parent_addr(ctx, this) {
+            // GC-blocking audit — see the plain `lock()` registration above.
+            ctx.begin_blocking_region();
             crate::stamped_lock::rw_write_lock(addr, ctx.thread_id());
+            ctx.end_blocking_region();
         }
         Ok(None)
     });
@@ -72949,7 +73588,14 @@ fn native_stamped_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         None => return Ok(Some(Value::Long(0))),
     };
     let addr = stamped_addr_for_obj(ctx, obj);
+    // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
+    // stamped_write_lock's contended wait is a raw parking_lot::Condvar::wait
+    // with NO GC-blocking-region bracket — same missing-bracket bug as
+    // ReentrantReadWriteLock's rw_write_lock (see that registration's
+    // comment for the full rationale and how this was diagnosed).
+    ctx.begin_blocking_region();
     let stamp = crate::stamped_lock::stamped_write_lock(addr);
+    ctx.end_blocking_region();
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(stamp)))
 }
@@ -72960,7 +73606,10 @@ fn native_stamped_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         None => return Ok(Some(Value::Long(0))),
     };
     let addr = stamped_addr_for_obj(ctx, obj);
+    // GC-blocking audit — see `native_stamped_write_lock` above.
+    ctx.begin_blocking_region();
     let stamp = crate::stamped_lock::stamped_read_lock(addr);
+    ctx.end_blocking_region();
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(stamp)))
 }
@@ -72992,7 +73641,10 @@ fn native_stamped_write_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) -
         return Ok(None);
     };
     let addr = stamped_addr_for_obj(ctx, parent);
+    // GC-blocking audit — see `native_stamped_write_lock` above.
+    ctx.begin_blocking_region();
     crate::stamped_lock::stamped_write_lock(addr);
+    ctx.end_blocking_region();
     mirror_stamped_state(ctx, parent, addr);
     Ok(None)
 }
@@ -73033,7 +73685,10 @@ fn native_stamped_read_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) ->
         return Ok(None);
     };
     let addr = stamped_addr_for_obj(ctx, parent);
+    // GC-blocking audit — see `native_stamped_write_lock` above.
+    ctx.begin_blocking_region();
     crate::stamped_lock::stamped_read_lock(addr);
+    ctx.end_blocking_region();
     mirror_stamped_state(ctx, parent, addr);
     Ok(None)
 }

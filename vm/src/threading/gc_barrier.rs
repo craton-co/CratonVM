@@ -1086,9 +1086,7 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(true));
 
         // Pause active; thread 2 is excluded by the identity census.
-        assert!(
-            barrier.request_stw_counted_with_live_blocked(ThreadId(0), || (2, 1, vec![2]))
-        );
+        assert!(barrier.request_stw_counted_with_live_blocked(ThreadId(0), || (2, 1, vec![2])));
 
         let b = barrier.clone();
         let f = flag.clone();
@@ -1102,7 +1100,11 @@ mod tests {
             "flag must not clear while an excluding pause is active",
         );
         // The excluded leave must not have satisfied any quota either.
-        assert_eq!(barrier.pending_count(), 0, "expected was 0 (only initiator + excluded)");
+        assert_eq!(
+            barrier.pending_count(),
+            0,
+            "expected was 0 (only initiator + excluded)"
+        );
 
         barrier.complete_gc(HashMap::new());
         h.join().unwrap();

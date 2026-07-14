@@ -819,10 +819,56 @@ unsafe fn try_call_compiled_entry_inner(
                 let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
                 f(vm_ptr, args_slice[0], args_slice[1], args_slice[2])
             }
-            // TODO(round-6-wave-2): extend register-table coverage or
-            // emit stack-arg setup so 4+-arg with-ctx callees stay on
-            // the JIT fast-path. Until then return None so the caller
-            // bails to the interpreter (correct semantics, slower).
+            4 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    vm_ptr,
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                )
+            }
+            5 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    vm_ptr,
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                )
+            }
+            6 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    vm_ptr,
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                    args_slice[5],
+                )
+            }
+            7 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    vm_ptr,
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                    args_slice[5],
+                    args_slice[6],
+                )
+            }
             _ => return None,
         })
     } else {
@@ -857,7 +903,56 @@ unsafe fn try_call_compiled_entry_inner(
                 let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
                 f(args_slice[0], args_slice[1], args_slice[2], args_slice[3])
             }
-            // TODO(round-6-wave-2): see with-ctx branch above.
+            5 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                )
+            }
+            6 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                    args_slice[5],
+                )
+            }
+            7 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                    args_slice[5],
+                    args_slice[6],
+                )
+            }
+            8 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(entry);
+                f(
+                    args_slice[0],
+                    args_slice[1],
+                    args_slice[2],
+                    args_slice[3],
+                    args_slice[4],
+                    args_slice[5],
+                    args_slice[6],
+                    args_slice[7],
+                )
+            }
             _ => return None,
         })
     }
@@ -878,11 +973,27 @@ unsafe fn try_call_compiled_entry_reentrant(
     vm_ptr: i64,
     args_slice: &[i64],
 ) -> Option<i64> {
+    // This helper is itself called from compiled dispatch code.  Its raw ABI
+    // call used to enter the nested compiled method without registering a
+    // `JitEntryGuard`, so a GC triggered by that callee found a JIT return
+    // address above an empty guard chain.  The moving-young collector then
+    // had to fall back to conservative/non-moving collection and retained
+    // the repeated Hibernate bootstrap graphs until OOM.  Resolve the entry
+    // back to its live CompiledMethod and register the precise frame for the
+    // full duration of the nested call.
+    let jit_root_guard = cratonvm_jit::lookup_jit_code_range(entry).map(|cm_ptr| {
+        // SAFETY: the JIT code-range registry owns this CompiledMethod while
+        // its entry remains callable; the guard is dropped before this helper
+        // returns to the caller that holds the corresponding code cache entry.
+        let compiled = unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
+        crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(compiled)
+    });
     #[cfg(debug_assertions)]
     let borrow = suspend_jit_borrow();
     let result = try_call_compiled_entry(entry, needs_ctx, vm_ptr, args_slice);
     #[cfg(debug_assertions)]
     restore_jit_borrow(borrow);
+    drop(jit_root_guard);
     result
 }
 
@@ -3462,7 +3573,12 @@ thread_local! {
 unsafe fn jit_typecheck_resolve(
     vm: &SharedVm,
     obj_class_id: ClassId,
-    obj_ref: ObjectRef,
+    // GC-SAFETY (FMT-JIT-CCE): taken `&mut` so the slow path below can
+    // refresh the caller's copy after a GC-triggering class load — see the
+    // comment on that branch. Every read of `*obj_ref` in this function
+    // after that point observes the refreshed address; `jit_checkcast`'s
+    // caller reads it back too so its own return value isn't stale.
+    obj_ref: &mut ObjectRef,
     class_name: &str,
     // SBR-03: `checkcast` is lenient (preserve native `Object[]`→`T[]` casts),
     // `instanceof` is strict (a genuine `Object[]` is not an instance of `I[]`).
@@ -3483,8 +3599,8 @@ unsafe fn jit_typecheck_resolve(
     // the JIT'd lambda body because `checkcast [I` after the clone() return
     // hit the false branch below and zeroed the result. With this branch
     // in place, the cast succeeds and the array round-trips correctly.
-    if vm.heap.kind_of(obj_ref) == cratonvm_types::ObjectKind::Array {
-        if let Some(src_desc) = crate::runtime::interpreter::array_descriptor_of(vm, obj_ref) {
+    if vm.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array {
+        if let Some(src_desc) = crate::runtime::interpreter::array_descriptor_of(vm, *obj_ref) {
             let assignable = if lenient {
                 crate::runtime::interpreter::array_is_assignable_to(vm, &src_desc, class_name)
             } else {
@@ -3509,12 +3625,12 @@ unsafe fn jit_typecheck_resolve(
         class_name.len(),
     );
     let cached_target = JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
-        cache.get().and_then(|(cached_vm, cached_ptr, cached_len, raw)| {
-            (cached_vm == cache_key.0
-                && cached_ptr == cache_key.1
-                && cached_len == cache_key.2)
-                .then(|| ClassId::new(raw))
-        })
+        cache
+            .get()
+            .and_then(|(cached_vm, cached_ptr, cached_len, raw)| {
+                (cached_vm == cache_key.0 && cached_ptr == cache_key.1 && cached_len == cache_key.2)
+                    .then(|| ClassId::new(raw))
+            })
     });
     let target_class_id_opt = if cached_target.is_some() {
         cached_target
@@ -3522,7 +3638,12 @@ unsafe fn jit_typecheck_resolve(
         let resolved = vm.class_manager.read().find_class_by_name(class_name);
         if let Some(target) = resolved {
             JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
-                cache.set(Some((cache_key.0, cache_key.1, cache_key.2, target.as_u32())))
+                cache.set(Some((
+                    cache_key.0,
+                    cache_key.1,
+                    cache_key.2,
+                    target.as_u32(),
+                )))
             });
         }
         resolved
@@ -3553,7 +3674,50 @@ unsafe fn jit_typecheck_resolve(
         // matching what HotSpot does for unresolvable targets in instanceof
         // (instanceof on an unresolvable target returns false; checkcast
         // would have been linked earlier and is a different failure mode).
-        if let Ok(target_class_id) = vm.load_class_concurrent(class_name) {
+        //
+        // GC-SAFETY (FMT-JIT-CCE): `load_class_concurrent` parses/defines the
+        // target class — allocating its `Class` mirror, constant-pool
+        // strings, and method/field metadata, and potentially running a
+        // user classloader's `loadClass`/`findClass` bytecode — any of which
+        // can trigger a moving GC that relocates `*obj_ref`. Unlike the
+        // interpreter's `Checkcast` handler (which pins the receiver in
+        // `thread.native_pin_roots` around this exact class-resolution call
+        // — see `runtime/interpreter.rs`), this JIT helper used to carry
+        // `obj_ref` across the call unpinned and unrefreshed, so a GC landing
+        // here left every later use of `*obj_ref` — the fallback checks
+        // below, and critically `jit_checkcast`'s own returned pointer —
+        // pointing at memory the collector had already reused. Observed live
+        // as `ClassCastException: java.lang.Object cannot be cast to
+        // org.jboss.as.controller.AttributeDefinition` (and other targets)
+        // during WildFly's highly concurrent `parallel-extension-add` boot
+        // step, where ~30 extension threads allocate/classload
+        // simultaneously and a target interface like `AttributeDefinition`
+        // is commonly resolved here for the first time under heavy GC
+        // pressure. Pin `*obj_ref` in the current thread's
+        // `native_pin_roots` (same mechanism, same pattern) across the call
+        // and refresh it from the pin afterward.
+        let current_thread = jit_get_current_thread();
+        // Explicit `&mut *current_thread` reborrows (rather than letting
+        // `.push()`/indexing implicitly autoref the raw pointer) — each is
+        // scoped to a single statement and dropped well before
+        // `load_class_concurrent` runs, so there's no borrow held across
+        // that call (which may itself reborrow the same TLS thread pointer,
+        // e.g. while running a classloader's bytecode).
+        let pin_idx = if !current_thread.is_null() {
+            let thread_ref: &mut JvmThread = &mut *current_thread;
+            let idx = thread_ref.native_pin_roots.len();
+            thread_ref.native_pin_roots.push(*obj_ref);
+            Some(idx)
+        } else {
+            None
+        };
+        let load_result = vm.load_class_concurrent(class_name);
+        if let Some(idx) = pin_idx {
+            let thread_ref: &mut JvmThread = &mut *current_thread;
+            *obj_ref = thread_ref.native_pin_roots[idx];
+            thread_ref.native_pin_roots.truncate(idx);
+        }
+        if let Ok(target_class_id) = load_result {
             JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
                 cache.set(Some((
                     cache_key.0,
@@ -3588,8 +3752,10 @@ unsafe fn jit_typecheck_resolve(
         return true;
     }
     // Instance-aware annotation-proxy admission (the proxy's real annotation
-    // type lives on the heap object, not its shared ClassId).
-    if crate::runtime::interpreter::annotation_proxy_satisfies_target(vm, obj_ref, class_name) {
+    // type lives on the heap object, not its shared ClassId). Reads
+    // `*obj_ref`, which by this point reflects the refresh above if the slow
+    // path ran.
+    if crate::runtime::interpreter::annotation_proxy_satisfies_target(vm, *obj_ref, class_name) {
         return true;
     }
 
@@ -3608,7 +3774,7 @@ unsafe fn jit_typecheck_resolve(
     // ScannerTest / PackagedEntityManagerTest / SimpleTests). Gating the strict
     // path on the element kind fixes it. The lenient (`checkcast`) leniency is
     // preserved unchanged (SBR-03 keeps native `Object[]`→`T[]` casts working).
-    if vm.heap.kind_of(obj_ref) == cratonvm_types::ObjectKind::Array {
+    if vm.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array {
         if class_name == "java/lang/Object"
             || class_name == "java/io/Serializable"
             || class_name == "java/lang/Cloneable"
@@ -3616,13 +3782,12 @@ unsafe fn jit_typecheck_resolve(
             return true;
         }
         if class_name == "[Ljava/lang/Object;"
-            && (lenient || vm.heap.element_type_of(obj_ref) == ArrayElementType::Reference)
+            && (lenient || vm.heap.element_type_of(*obj_ref) == ArrayElementType::Reference)
         {
             return true;
         }
     }
 
-    let _ = obj_ref;
     false
 }
 
@@ -3657,7 +3822,7 @@ pub unsafe extern "C" fn jit_checkcast(
     }
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
-    let obj_ref = match vm.heap.is_object_address(obj_ptr as usize) {
+    let mut obj_ref = match vm.heap.is_object_address(obj_ptr as usize) {
         Some(r) => r,
         None => return 0,
     };
@@ -3672,8 +3837,19 @@ pub unsafe extern "C" fn jit_checkcast(
     };
     let obj_class_id = vm.heap.class_id_of(obj_ref);
     // checkcast: lenient (SBR-03).
-    if jit_typecheck_resolve(vm, obj_class_id, obj_ref, class_name, true) {
-        obj_ptr
+    //
+    // GC-SAFETY (FMT-JIT-CCE): `jit_typecheck_resolve` can trigger a moving
+    // GC (via `load_class_concurrent` on a not-yet-loaded target) that
+    // relocates `obj_ref`; it refreshes our local `obj_ref` in place through
+    // the `&mut` when that happens. Return the (possibly refreshed)
+    // `obj_ref.as_ptr()` on success, NOT the original `obj_ptr` argument —
+    // returning the stale `obj_ptr` would hand the JIT-compiled caller a
+    // dangling pointer into memory the collector already reused, which is
+    // exactly what surfaced as `ClassCastException: java.lang.Object cannot
+    // be cast to org.jboss.as.controller.AttributeDefinition` (and other
+    // targets) during WildFly's concurrent `parallel-extension-add` boot.
+    if jit_typecheck_resolve(vm, obj_class_id, &mut obj_ref, class_name, true) {
+        obj_ref.as_ptr() as i64
     } else {
         0
     }
@@ -3724,7 +3900,7 @@ pub unsafe extern "C" fn jit_instanceof(
     // dereferencing it, degrading a dangling reference to "not an
     // instance" instead of crashing — the same fallback every other stale-
     // reference guard in this codebase uses.
-    let obj_ref = match vm.heap.is_object_address(obj_ptr as usize) {
+    let mut obj_ref = match vm.heap.is_object_address(obj_ptr as usize) {
         Some(r) => r,
         None => return 0,
     };
@@ -3738,8 +3914,13 @@ pub unsafe extern "C" fn jit_instanceof(
         Err(_) => return 0,
     };
     let obj_class_id = vm.heap.class_id_of(obj_ref);
-    // instanceof: strict (SBR-03).
-    if jit_typecheck_resolve(vm, obj_class_id, obj_ref, class_name, false) {
+    // instanceof: strict (SBR-03). `obj_ref` is passed `&mut` — see the
+    // GC-SAFETY comment in `jit_checkcast` — so any GC triggered by
+    // resolving a not-yet-loaded target class inside `jit_typecheck_resolve`
+    // doesn't leave the fallback checks in that function reading through a
+    // stale pointer. `instanceof` returns a bool, not a pointer, so there is
+    // no analogous stale-return-value fix needed here.
+    if jit_typecheck_resolve(vm, obj_class_id, &mut obj_ref, class_name, false) {
         1
     } else {
         0
@@ -4326,6 +4507,47 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     };
 
     let info_key = info_ptr as usize;
+    // Cached HashMap-native fast path — the FIRST per-callsite probe. The
+    // resolution/insertion slow path stays further down (after the compile
+    // probes); this early block only serves sites the cache has already
+    // resolved. Rationale: `HashMap.put/get` are registered natives with no
+    // bytecode, so neither the Integer cache below nor the virtual-dispatch
+    // machinery can ever serve them — yet every map call paid those probes
+    // first. Probing the map cache first costs the (now direct-called on
+    // x64, hence rarely dispatched) Integer sites one extra hash lookup and
+    // saves one on every map operation. The receiver class-id equality
+    // check preserves the exact-receiver guard; the `any_class_redefined`
+    // gate matches the resolution site below. Runs ahead of the recursion
+    // depth guard like the Integer block: the cached callbacks are native
+    // leaves that never re-enter JIT code.
+    if matches!(info.invoke_kind, 0 | 2)
+        && !args_slice.is_empty()
+        && !crate::classloading::any_class_redefined()
+    {
+        let cached =
+            HASHMAP_NATIVE_DISPATCH_CACHE.with(|cache| cache.borrow().get(&info_key).copied());
+        if let Some(entry) = cached {
+            let receiver_raw = args_slice[0] as u64;
+            if receiver_raw != 0 && (receiver_raw & 0x7) == 0 && receiver_raw < (1u64 << 48) {
+                if let Some(receiver) = vm.heap.is_object_address(receiver_raw as usize) {
+                    if vm.heap.class_id_of(receiver).as_u32() == entry.receiver_class_id {
+                        if let Some((thread, _guard)) = jit_thread_mut() {
+                            if let Some(result) = call_hashmap_native_raw(
+                                vm,
+                                thread,
+                                info,
+                                receiver,
+                                args_slice,
+                                entry.callback,
+                            ) {
+                                return result;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     if !crate::classloading::any_class_redefined() {
         let cached =
             INTEGER_NATIVE_DISPATCH_CACHE.with(|cache| cache.borrow().get(&info_key).copied());
@@ -4899,6 +5121,215 @@ unsafe fn try_compile_callee(vm: &SharedVm, info: &JitInvokeInfo) -> Option<(usi
     try_jit_compile_callee(vm, info.class_name, info.method_name, info.descriptor, true)
 }
 
+/// Synthetic call-site info for [`jit_integer_value_of_direct`]'s error
+/// path: `handle_jit_dispatch_error` only reads the name triple for
+/// diagnostics/exception context, and this helper serves exactly one callee.
+static INTEGER_VALUE_OF_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/lang/Integer",
+    method_name: "valueOf",
+    descriptor: "(I)Ljava/lang/Integer;",
+    num_jit_args: 1,
+    return_type: b'L',
+    invoke_kind: 3,
+};
+
+/// Thin direct-call target for JIT `invokestatic Integer.valueOf(I)` sites
+/// (registered into `cratonvm_jit::INTEGER_VALUE_OF_DIRECT_FN` by
+/// `build_helpers`; the recognition lives in `jit::try_compile`).
+///
+/// Semantics are identical to the `IntegerNativeKind::ValueOf` arm of
+/// [`call_integer_native_raw`], minus the generic `jit_invoke_dispatch`
+/// round trip (info decode, per-call thread-local cache probes, argument
+/// buffer build):
+///  * out-of-range values allocate a fresh wrapper through the mutator's
+///    normal native-context TLAB path and publish it via
+///    `native_pending_return` (the established JIT→native object-return
+///    handoff root);
+///  * `-128..=127` (and the cold pre-discovery case, and any class-redefine
+///    window) route through `safe_native_call` to the canonical native
+///    callback, preserving the JLS identity-cache contract;
+///  * errors (OOM) route through `handle_jit_dispatch_error` exactly like
+///    the dispatch helper, so the returned sentinel carries properly
+///    stashed exception state for the caller's post-invoke check.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) -> i64 {
+    // Same Rust<->JIT boundary bookkeeping as `jit_invoke_dispatch`: the
+    // per-thread conservative-scan cache must be invalidated, and a callee
+    // that allocates may enter the GC barrier, so the SATB queue is flushed.
+    crate::jit::conservative_roots::note_jit_boundary();
+    jit_safepoint_flush_satb(vm_ptr);
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    let value = value as i32;
+    if !(-128..=127).contains(&value) && !crate::classloading::any_class_redefined() {
+        let vm_key = vm as *const SharedVm as usize;
+        let cached_class = INTEGER_WRAPPER_CLASS_CACHE.with(|cache| {
+            cache
+                .get()
+                .filter(|(cached_vm, _)| *cached_vm == vm_key)
+                .map(|(_, raw)| ClassId::new(raw))
+        });
+        if let Some(class_id) = cached_class {
+            if let Some((thread, _guard)) = jit_thread_mut() {
+                // Direct TLAB bump — the SAME allocation function
+                // `NativeContextImpl::alloc_object`'s TLAB arm uses (full
+                // header init, fresh identity hash), minus that method's
+                // per-call clamp-cache scan, alloc-pool probes and context
+                // plumbing. The slot count is the class's real declared
+                // field count, resolved once per (vm, class) below — so the
+                // undersized-layout clamp is honored, not skipped. TLAB
+                // exhaustion (or an oversized layout) falls back to the full
+                // allocator with its old-gen spill/batch behavior.
+                thread_local! {
+                    // (vm_key, class_id, slots) — invalidated implicitly by
+                    // the enclosing `any_class_redefined` gate (field counts
+                    // only change through redefinition).
+                    static INTEGER_ALLOC_SLOTS: std::cell::Cell<Option<(usize, u32, u32)>> =
+                        const { std::cell::Cell::new(None) };
+                }
+                let slots = INTEGER_ALLOC_SLOTS.with(|cache| {
+                    if let Some((vk, cid, slots)) = cache.get() {
+                        if vk == vm_key && cid == class_id.as_u32() {
+                            return slots as usize;
+                        }
+                    }
+                    let resolved = vm
+                        .class_manager
+                        .read()
+                        .get_class(class_id)
+                        .map(|c| c.num_total_fields.max(1))
+                        .unwrap_or(1);
+                    // Cast: field counts are far below u32::MAX.
+                    cache.set(Some((vm_key, class_id.as_u32(), resolved as u32)));
+                    resolved
+                });
+                use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+                let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+                let tlab_object = if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
+                    crate::runtime::interpreter::tlab_alloc_object(
+                        thread,
+                        vm,
+                        class_id,
+                        slots,
+                        requested_size,
+                    )
+                } else {
+                    None
+                };
+                let object = match tlab_object {
+                    Some(object) => object,
+                    None => {
+                        use cratonvm_native_api::NativeContext as _;
+                        // Reborrow: `thread` is used again after this arm for
+                        // the pending-return publication.
+                        let mut ctx = crate::vm::NativeContextImpl {
+                            shared: vm,
+                            thread: &mut *thread,
+                        };
+                        ctx.alloc_object(class_id, 1)
+                    }
+                };
+                // Direct descriptor-typed write: `Integer.value` is declared
+                // `int` (field 0, descriptor `I`) — skip `ctx.set_field`'s
+                // per-call `class_id_of` + descriptor resolution and hand the
+                // heap the same normalized store it would have produced.
+                vm.heap.set_field_as(object, 0, Value::Int(value), b'I');
+                // Object-return handoff root (see `call_integer_native_raw`).
+                thread.native_pending_return = Some(object);
+                return object.as_ptr() as i64;
+            }
+        }
+    }
+    // Cold / in-range / redefine-window path: canonical native callback via
+    // the full safe-native-call wrapper (identity cache; also discovers the
+    // real wrapper ClassId for the fast path above).
+    let Some((thread, _guard)) = jit_thread_mut() else {
+        // No JIT thread context — cannot safely run the native. Signal the
+        // deopt sentinel; the caller's post-invoke check bails to the
+        // interpreter, which re-dispatches through the normal path.
+        return i64::MIN;
+    };
+    let arg = Value::Int(value);
+    let result = match crate::vm::safe_native_call_prevalidated_objects(
+        vm,
+        thread,
+        cratonvm_native_builtins::intrinsics::integer::intrinsic_integer_value_of,
+        std::slice::from_ref(&arg),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return handle_jit_dispatch_error(vm, thread, error, &INTEGER_VALUE_OF_INFO)
+        }
+    };
+    match result {
+        Some(Value::Object(Some(object))) => {
+            INTEGER_WRAPPER_CLASS_CACHE.with(|cache| {
+                cache.set(Some((
+                    vm as *const SharedVm as usize,
+                    vm.heap.class_id_of(object).as_u32(),
+                )))
+            });
+            object.as_ptr() as i64
+        }
+        _ => 0,
+    }
+}
+
+/// Synthetic call-site info for [`jit_integer_int_value_direct`]'s
+/// generic-dispatch fallback (invalid non-null receiver — a shape the
+/// verifier rules out for a `final`-class receiver, kept for defensive
+/// parity with `call_integer_native_raw`'s bail-to-dispatch behavior).
+static INTEGER_INT_VALUE_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/lang/Integer",
+    method_name: "intValue",
+    descriptor: "()I",
+    num_jit_args: 1,
+    return_type: b'I',
+    invoke_kind: 0,
+};
+
+/// Thin direct-call target for JIT `invokevirtual Integer.intValue()` sites
+/// whose constant-pool class is exactly `java/lang/Integer` (a `final`
+/// class, so the site is statically monomorphic — no receiver guard
+/// needed; only `null` remains, which throws NPE per JVMS).
+///
+/// Mirrors the `IntegerNativeKind::IntValue` arm of
+/// [`call_integer_native_raw`]: a heap-validated field-0 read that cannot
+/// allocate or safepoint. Null receiver → pending-NPE + deopt sentinel
+/// (the canonical implicit-NPE signal). A non-null receiver that fails
+/// heap validation falls back to the full generic dispatcher, exactly like
+/// the existing arm's `None` return.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    let raw = receiver as u64;
+    if raw == 0 {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    if (raw & 0x7) == 0 && raw < (1u64 << 48) {
+        if let Some(object) = vm.heap.is_object_address(raw as usize) {
+            return match vm.heap.get_field(object, 0) {
+                Value::Int(value) => value as i64,
+                _ => 0,
+            };
+        }
+    }
+    // Defensive fallback: hand the call to the generic dispatcher (same
+    // machinery the non-direct site would have used).
+    let args = [receiver];
+    jit_invoke_dispatch(
+        vm_ptr,
+        &INTEGER_INT_VALUE_INFO as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        1,
+    )
+}
+
 #[inline]
 fn call_integer_native_raw(
     vm: &SharedVm,
@@ -4921,6 +5352,22 @@ fn call_integer_native_raw(
                     .map(|(_, raw)| ClassId::new(raw))
             });
             if let Some(class_id) = cached_class {
+                // Young-pressure relief for this cached fast path, which
+                // deliberately bypasses the `safe_native_call` boundary (and
+                // its young-pressure GC hook): the only argument here is a
+                // primitive `i32`, so initiating the orchestrated GC is
+                // exactly as safe as `jit_new_object`'s slow-path GC — no raw
+                // object pointers are held across it. Without this, a
+                // boxing-dominated compiled loop keeps spilling wrappers into
+                // old gen until `alloc_young_initialized` hard-aborts.
+                if vm.heap.young_spill_pressure() {
+                    if !crate::runtime::interpreter::gc_overhead_limit_exceeded(vm)
+                        && vm.heap.needs_gc()
+                    {
+                        crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+                    }
+                    vm.heap.clear_young_spill_pressure();
+                }
                 use cratonvm_native_api::NativeContext as _;
                 let mut ctx = crate::vm::NativeContextImpl { shared: vm, thread };
                 let object = ctx.alloc_object(class_id, 1);
@@ -6230,6 +6677,36 @@ mod tests {
     }
 
     #[test]
+    fn compiled_entry_reentrant_wrapper_preserves_stack_arg_abi() {
+        unsafe extern "C" fn sum_five(a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
+            a + b + c + d + e
+        }
+        unsafe extern "C" fn sum_ctx_four(ctx: i64, a: i64, b: i64, c: i64, d: i64) -> i64 {
+            ctx + a + b + c + d
+        }
+        // SAFETY: both functions use the C ABI selected by the helper, including
+        // the first stack-passed parameter on Windows.
+        let no_ctx = unsafe {
+            try_call_compiled_entry_reentrant(
+                sum_five as *const () as usize,
+                false,
+                0,
+                &[1, 2, 3, 4, 5],
+            )
+        };
+        let with_ctx = unsafe {
+            try_call_compiled_entry_reentrant(
+                sum_ctx_four as *const () as usize,
+                true,
+                10,
+                &[1, 2, 3, 4],
+            )
+        };
+        assert_eq!(no_ctx, Some(15));
+        assert_eq!(with_ctx, Some(20));
+    }
+
+    #[test]
     fn jit_checkcast_null_ptr_returns_zero() {
         // SAFETY: Passing all-zero/null arguments exercises the null-object fast path;
         // no heap pointers are dereferenced.
@@ -7525,6 +8002,17 @@ pub fn build_helpers() -> JitRuntimeHelpers {
     cratonvm_jit::x64::set_arm_savebase_watch_fn(jit_arm_savebase_watch as *const () as usize);
     cratonvm_jit::x64::set_disarm_savebase_watch_fn(
         jit_disarm_savebase_watch as *const () as usize,
+    );
+
+    // `Integer.valueOf(I)` / `Integer.intValue()` thin direct-call helpers —
+    // same no-ABI-change registration pattern as the savebase watch helpers
+    // above. See `jit_integer_value_of_direct` / `jit_integer_int_value_direct`
+    // and the recognition in `jit::try_compile`.
+    cratonvm_jit::set_integer_value_of_direct_fn(
+        jit_integer_value_of_direct as *const () as usize,
+    );
+    cratonvm_jit::set_integer_int_value_direct_fn(
+        jit_integer_int_value_direct as *const () as usize,
     );
 
     JitRuntimeHelpers {

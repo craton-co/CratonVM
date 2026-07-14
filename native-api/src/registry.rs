@@ -1131,6 +1131,14 @@ pub trait NativeContext {
         self.create_string(text)
     }
 
+    /// Create a dynamic String at a native-call safepoint when the caller has
+    /// no unpinned Java references.  The VM implementation may collect before
+    /// allocating; the default keeps mock contexts and legacy implementations
+    /// on the ordinary uninterned path.
+    fn create_string_uninterned_gc_safe(&mut self, text: &str) -> ObjectRef {
+        self.create_string_uninterned(text)
+    }
+
     /// Populate an *already-allocated* `java/lang/String` object's backing
     /// fields directly from raw UTF-16 code `units`, using the same
     /// Latin1-fits-in-a-byte bulk scan + little-endian compact-string layout
@@ -1401,6 +1409,38 @@ pub trait NativeContext {
 
     /// Acquire the monitor (synchronized) on the given object.
     fn monitor_enter(&mut self, obj: ObjectRef);
+
+    /// GC-safe variant of [`monitor_enter`], for the rare native whose
+    /// contended wait needs to be excused from an in-flight STW barrier
+    /// pause instead of leaving the calling thread counted in its `expected`
+    /// set for the whole wait (see
+    /// `docs/internal/fixed-suite-bugs/wildfly-standalone-boot-stw-jit-takeover-hang.md`).
+    ///
+    /// Deliberately NARROW: `monitor_enter` itself stays on its original,
+    /// non-GC-blocked path for the other ~80 native call sites that use
+    /// it (Semaphore/Phaser/Exchanger/blocking-queue/ConcurrentHashMap/
+    /// ReentrantLock/Condition/etc.) — a from-scratch audit of every one of
+    /// those (2026-07-13) found the overwhelming majority keep reading
+    /// fields off the SAME `obj`/`this` after the call without any
+    /// pin-and-refresh, so blanket-switching `monitor_enter`'s contended
+    /// path to span a completing (possibly moving) GC pause would expose
+    /// all of them to the stale-`ObjectRef`-across-GC bug class this
+    /// codebase has repeatedly hit (see
+    /// `docs/internal/wildfly-parallel-boot-stale-objectref-residual.md`)
+    /// — an unaudited-at-scale regression risk far worse than the original
+    /// hang. This method exists so the ONE call site with live-gdb-confirmed
+    /// evidence of the deadlock (`CountDownLatch`'s `native_cdl_await` /
+    /// `native_cdl_await_timeout` / `native_cdl_count_down` polling loop,
+    /// contending a shared handshake latch under WildFly's
+    /// `parallel-extension-add`) can opt in individually, and MUST use the
+    /// returned reference for anything after the call — the object may have
+    /// moved if the wait spanned a GC. Default implementation is a no-op
+    /// pass-through to `monitor_enter` (correct for every mock/test context
+    /// in this workspace, none of which move objects mid-wait).
+    fn monitor_enter_gc_safe(&mut self, obj: ObjectRef) -> ObjectRef {
+        self.monitor_enter(obj);
+        obj
+    }
 
     /// Release the monitor (synchronized) on the given object.
     fn monitor_exit(&mut self, obj: ObjectRef);
@@ -3359,7 +3399,31 @@ impl NativeMethodRegistry {
         // phases_late p72, net_phase_e re1/re2, socket_channel, …) — filtering
         // here catches them all in one place. See `reference_server_socket_gap`.
         if real_net_sockets_enabled()
-            && (class_name == "java/net/Socket" || class_name == "java/net/ServerSocket")
+            && (class_name == "java/net/Socket"
+                || class_name == "java/net/ServerSocket"
+                // DoHead third root cause (2026-07-13): the WildFly bootstrap
+                // batch (be6055605) added synthetic `javax/net/SocketFactory`
+                // getDefault/createSocket natives (phases_early.rs phase52)
+                // that hand out a natively-built `java/net/Socket`. Under
+                // CRATONVM_REAL_NET_SOCKETS every java/net/Socket native is
+                // dropped (above), so REAL Socket bytecode consumes that
+                // object and reads its uninitialized/clobbered real fields:
+                // NPE `"socketLock" is null`, bogus `SocketException: Socket
+                // is closed` (the port int lands on `state` and can satisfy
+                // the CLOSED bit), `NoSuchMethodError:
+                // java/lang/String.setOption` (the host String lands on
+                // `impl`) — the Tomcat `TestHttpServletDoHead*`
+                // testDoHeadHttp2 144/144 cluster
+                // (`Http2TestBase.openClientConnection` →
+                // `Socket.setSoTimeout`). Drop the factory natives too so
+                // real `SocketFactory`/`DefaultSocketFactory` bytecode
+                // constructs sockets through the real `Socket` constructors.
+                // NOT `javax/net/ServerSocketFactory` — its
+                // createServerSocket natives delegate to real constructors
+                // and are layout-correct. (Root-cause analysis shared with
+                // the concurrent dohead-third-cause session; landed here to
+                // complete the DoHead family fix.)
+                || class_name == "javax/net/SocketFactory")
         {
             return;
         }

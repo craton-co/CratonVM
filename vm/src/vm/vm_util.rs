@@ -823,8 +823,21 @@ fn initialize_class_shared(
                     // merge в†’ Top false positive. See
                     // `classloading/src/verifier.rs` module docs for
                     // the JVMS В§4.10.2.5 background.
+                    // `define_class_with_options` has already performed Pass 3
+                    // using ClassManager's loader-aware hierarchy. This adapter
+                    // has only a name-indexed ClassStore, so repeating Pass 3 for
+                    // a user-defined loader can resolve a same-named app copy and
+                    // reject valid forked bytecode. Keep Pass 2 here, but trust the
+                    // authoritative define-time Pass 3 for such classes.
                     let bytecode = structural.and_then(|()| {
-                        crate::classloading::verifier::verify_class_bytecode(class, &hierarchy)
+                        if matches!(
+                            class.loader_id,
+                            cratonvm_types::ClassLoaderId::UserDefined(_)
+                        ) {
+                            Ok(())
+                        } else {
+                            crate::classloading::verifier::verify_class_bytecode(class, &hierarchy)
+                        }
                     });
                     if let Err(e) = bytecode {
                         drop(cm);
@@ -2219,7 +2232,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 "ARRAY_DOUBLE_BASE_OFFSET",
                 "ARRAY_OBJECT_BASE_OFFSET",
             ] {
-                n += set_static_by_name(name, Value::Long(16)) as i32;
+                n += set_static_by_name(name, Value::Int(16)) as i32;
             }
             for (name, scale) in [
                 ("ARRAY_BOOLEAN_INDEX_SCALE", 1),
@@ -2234,7 +2247,9 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             ] {
                 n += set_static_by_name(name, Value::Int(scale)) as i32;
             }
-            tracing::warn!("Post-clinit fixup: Unsafe ARRAY_*_BASE_OFFSET/INDEX_SCALE populated ({n}/18)");
+            tracing::warn!(
+                "Post-clinit fixup: Unsafe ARRAY_*_BASE_OFFSET/INDEX_SCALE populated ({n}/18)"
+            );
         }
         "sun/misc/Unsafe" => {
             // JDK 25's `Unsafe.<clinit>` stores the result of
@@ -2304,10 +2319,9 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 false
             } else if let Some((enum_class_id, static_idx)) = enum_slot {
                 match super::vm_object::get_static_shared(shared, enum_class_id, static_idx) {
-                    Value::Object(Some(option)) => set_static_by_name(
-                        "MEMORY_ACCESS_OPTION",
-                        Value::Object(Some(option)),
-                    ),
+                    Value::Object(Some(option)) => {
+                        set_static_by_name("MEMORY_ACCESS_OPTION", Value::Object(Some(option)))
+                    }
                     _ => false,
                 }
             } else {

@@ -919,6 +919,60 @@ impl VmHeap {
         }
     }
 
+    /// Native-wrapper young-exhaustion signal, consumed at the
+    /// `safe_native_call` boundary to run the GC the wrappers themselves
+    /// cannot (see `GenHeap::young_spill_pressure`). Collectors without the
+    /// generational young→old spill-then-abort shape report `false`.
+    #[inline]
+    pub fn young_spill_pressure(&self) -> bool {
+        match self {
+            VmHeap::Generational(h) => h.young_spill_pressure(),
+            VmHeap::G1(_) => false,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => false,
+        }
+    }
+
+    /// Clear the native-wrapper young-exhaustion signal (no-op on
+    /// non-generational collectors).
+    #[inline]
+    pub fn clear_young_spill_pressure(&self) {
+        if let VmHeap::Generational(h) = self {
+            h.clear_young_spill_pressure();
+        }
+    }
+
+    /// Record a native-wrapper young-exhaustion spill (no-op on
+    /// non-generational collectors) — see `GenHeap::note_young_spill_pressure`.
+    #[inline]
+    pub fn note_young_spill_pressure(&self) {
+        if let VmHeap::Generational(h) = self {
+            h.note_young_spill_pressure();
+        }
+    }
+
+    /// Live-bytes estimate for GC-productivity accounting — see
+    /// `GenHeap::live_bytes_estimate` (young free-list-aware; the raw bump
+    /// cursor never retreats under the non-moving sweep). Other collectors
+    /// fall back to `allocated_bytes`, their historical metric.
+    pub fn live_bytes_estimate(&self) -> usize {
+        match self {
+            VmHeap::Generational(h) => h.live_bytes_estimate(),
+            _ => self.allocated_bytes(),
+        }
+    }
+
+    /// Total bytes promoted young→old across all collections (selective
+    /// promotion + the moving collector's tenuring). Used by the
+    /// GC-overhead productivity metric: a promotion-only cycle conserves
+    /// live bytes but did useful allocation-enabling work.
+    pub fn bytes_promoted_total(&self) -> u64 {
+        match self {
+            VmHeap::Generational(h) => h.stats().snapshot().bytes_promoted,
+            _ => 0,
+        }
+    }
+
     /// Run a garbage collection cycle.
     ///
     /// The `stw` parameter is type-level proof that the caller is in a
@@ -1657,6 +1711,54 @@ impl VmHeap {
     /// Must be called during a GC safepoint (all mutator threads paused).
     pub fn walk_objects(&self) -> Vec<(*mut u8, usize)> {
         dispatch!(self, walk_objects())
+    }
+
+    /// TEMPORARY diagnostic (CRATONVM_DBG_MIRRORPIN / TestDefaultInstanceManager
+    /// investigation): scan every live object in the heap for a reference to
+    /// `target_addr`, returning `(holder_addr, holder_class_id)` for each
+    /// match. Must be called during a GC safepoint (same contract as
+    /// `walk_objects`, which this is built on). O(live objects × avg field
+    /// count) — debug-only, never on a hot path. Remove once the
+    /// investigation concludes.
+    pub fn find_referrers(&self, target_addr: usize) -> Vec<(usize, u32)> {
+        let mut out = Vec::new();
+        for (obj_ptr, _size) in self.walk_objects() {
+            // SAFETY: `walk_objects` yields the start of each live object, so
+            // `obj_ptr` targets a valid, fully-initialized `ObjectHeader`.
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            let mut found = false;
+            unsafe {
+                crate::gen_heap::for_each_ref_slot(obj_ptr, header, |ref_ptr, _slot| {
+                    if ref_ptr as usize == target_addr {
+                        found = true;
+                    }
+                });
+            }
+            if found {
+                out.push((obj_ptr as usize, header.class_id.as_u32()));
+            }
+        }
+        out
+    }
+
+    /// TEMPORARY diagnostic (is_live_young_survivor false-positive
+    /// investigation): scan every live object in the heap for one whose
+    /// `class_id` matches `target_class_id`, returning its address. Used to
+    /// tell apart "a live instance of the evicted class genuinely still
+    /// exists somewhere (loader_pin correctly keeps its loader alive)" from
+    /// "nothing legitimate justifies the loader being marked alive." Must be
+    /// called during a GC safepoint (same contract as `walk_objects`).
+    pub fn find_instances_of_class(&self, target_class_id: u32) -> Vec<usize> {
+        let mut out = Vec::new();
+        for (obj_ptr, _size) in self.walk_objects() {
+            // SAFETY: `walk_objects` yields the start of each live object, so
+            // `obj_ptr` targets a valid, fully-initialized `ObjectHeader`.
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            if header.class_id.as_u32() == target_class_id {
+                out.push(obj_ptr as usize);
+            }
+        }
+        out
     }
 }
 

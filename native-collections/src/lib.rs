@@ -128,6 +128,54 @@ fn obj_key_shards() -> &'static [ObjKeyShard; OBJ_KEY_SHARDS] {
     REG.get_or_init(|| std::array::from_fn(|_| Mutex::new(StdHashMap::new())))
 }
 
+/// Reverse index for the collection-overlay GC edge: a collection object's
+/// current address maps to the stable side-table key(s) that hold state for it.
+///
+/// The GC must be able to answer "this collection has just been marked; which
+/// Rust-side references does it own?" without linearly scanning every overlay
+/// table for every marked heap object. `widened_obj_key` maintains this index
+/// whenever an overlay is touched, and the post-move/prune paths keep it in
+/// lockstep with `obj_key_registry`.
+fn overlay_owner_keys() -> &'static Mutex<StdHashMap<usize, Vec<usize>>> {
+    static INDEX: std::sync::OnceLock<Mutex<StdHashMap<usize, Vec<usize>>>> =
+        std::sync::OnceLock::new();
+    INDEX.get_or_init(|| Mutex::new(StdHashMap::new()))
+}
+
+#[inline]
+fn register_overlay_owner_key(owner_addr: usize, key: usize) -> usize {
+    let mut index = overlay_owner_keys()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let keys = index.entry(owner_addr).or_default();
+    if !keys.contains(&key) {
+        keys.push(key);
+    }
+    key
+}
+
+/// Remove one packed overlay key from its recorded collection owner.
+///
+/// Callers already know the owner address from the object-key registry.  Using
+/// it directly keeps cleanup proportional to that collection's own keys;
+/// scanning every live owner for every reclaimed key turns a large minor GC
+/// into quadratic work under short-lived collection churn.
+fn remove_overlay_owner_key(owner_addr: usize, key: usize) {
+    let mut index = overlay_owner_keys()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let remove_owner = index
+        .get_mut(&owner_addr)
+        .map(|keys| {
+            keys.retain(|registered| *registered != key);
+            keys.is_empty()
+        })
+        .unwrap_or(false);
+    if remove_owner {
+        index.remove(&owner_addr);
+    }
+}
+
 /// Select the registry shard for an identity hash. Mixes with the 64-bit
 /// Fibonacci/golden-ratio constant first because identity hashes can be
 /// low-entropy / sequentially assigned, which would otherwise cluster nearby
@@ -153,7 +201,7 @@ fn obj_key_shard_for(hash: u32) -> &'static ObjKeyShard {
 /// than the historical prune block, which omitted the TreeMap/TreeSet tables.
 /// Locks are poison-recovered (`into_inner`) so a panic elsewhere can never
 /// leave stale state stranded and re-aliasable.
-fn clear_overlay_entries_for_key(key: usize) {
+fn clear_overlay_entries_for_key(key: usize, owner_addr: usize) {
     hm_int_fast_table()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -192,6 +240,7 @@ fn clear_overlay_entries_for_key(key: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|_ptr, packed| *packed != key);
+    remove_overlay_owner_key(owner_addr, key);
 }
 
 /// Next never-recycled generation for a hash bucket: one past the maximum
@@ -227,7 +276,7 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     //    `gc_update_collection_overlay_refs` pass advances every relocated slot's
     //    `last_ptr` to the new address before the object is next observed.
     if let Some(slot) = slots.iter().find(|s| s.last_ptr == ptr) {
-        return pack_obj_key(hash, slot.generation);
+        return register_overlay_owner_key(ptr, pack_obj_key(hash, slot.generation));
     }
 
     // 2. Lone occupant of this hash bucket whose recorded pointer differs.
@@ -248,10 +297,11 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     if slots.len() == 1 {
         if slots[0].class_id == class_id {
             slots[0].last_ptr = ptr;
-            return pack_obj_key(hash, slots[0].generation);
+            return register_overlay_owner_key(ptr, pack_obj_key(hash, slots[0].generation));
         }
         // Different-class recycle: re-key + clear the stale overlay state.
         let stale_key = pack_obj_key(hash, slots[0].generation);
+        let stale_owner = slots[0].last_ptr;
         let generation = next_generation(slots);
         slots[0].last_ptr = ptr;
         slots[0].generation = generation;
@@ -261,8 +311,8 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
         // the reverse, so dropping it first keeps the lock order one-directional
         // and cannot deadlock against a concurrent side-table op.
         drop(reg);
-        clear_overlay_entries_for_key(stale_key);
-        return pack_obj_key(hash, generation);
+        clear_overlay_entries_for_key(stale_key, stale_owner);
+        return register_overlay_owner_key(ptr, pack_obj_key(hash, generation));
     }
 
     // 3. Genuine 32-bit collision among several simultaneously-live objects, or
@@ -275,7 +325,7 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
         generation,
         class_id,
     });
-    pack_obj_key(hash, generation)
+    register_overlay_owner_key(ptr, pack_obj_key(hash, generation))
 }
 
 /// Pack a 32-bit identity hash and a 32-bit generation into the full-width
@@ -11173,20 +11223,52 @@ fn make_list_of_raw(ctx: &mut dyn NativeContext, elems: &[Value]) -> ObjectRef {
 
 /// Helper: create a HashSet from a slice of values.
 fn make_set_of(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult {
+    // Building the synthetic set allocates both its backing map and bucket
+    // array, and each native_map_put may run Java equality/hash code and move
+    // the heap. Keep every input element and partially-built object rooted,
+    // refreshing their addresses immediately before use. A raw stream element
+    // here previously became an unrelated java.lang.Object while collecting
+    // TypeElement values with Collectors.toSet().
+    let (elem_base, elem_handles) = pin_value_slice(ctx, elems);
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+    let set_pin = ctx.pin_native_root(set);
     let backing_map = alloc_backing_map(ctx);
+    let backing_map_pin = ctx.pin_native_root(backing_map);
     let cap = std::cmp::max(elems.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
     let buckets = alloc_ref_array(ctx, cap);
+    let buckets_pin = ctx.pin_native_root(buckets);
+    let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
+    let buckets = ctx.read_native_pin(buckets_pin, buckets);
     ctx.set_field(backing_map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
     set_map_size(ctx, backing_map, 0);
     ctx.set_field(backing_map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    let set = ctx.read_native_pin(set_pin, set);
+    let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
 
     let sentinel = Value::Int(1);
-    for elem in elems {
-        native_map_put(ctx, &[Value::Object(Some(backing_map)), *elem, sentinel])?;
+    for (index, elem) in elems.iter().enumerate() {
+        let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
+        let elem = read_pinned_elem(ctx, elem_handles[index], *elem);
+        if let Err(err) = native_map_put(
+            ctx,
+            &[Value::Object(Some(backing_map)), elem, sentinel],
+        ) {
+            ctx.unpin_native_roots(if elem_base == usize::MAX {
+                set_pin
+            } else {
+                elem_base
+            });
+            return Err(err);
+        }
     }
 
+    let set = ctx.read_native_pin(set_pin, set);
+    ctx.unpin_native_roots(if elem_base == usize::MAX {
+        set_pin
+    } else {
+        elem_base
+    });
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -13307,6 +13389,53 @@ fn native_ts_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
 // -- Intermediate operations --
 
+/// Diagnostic-only tripwire for the pin/read-through-handle path shared by
+/// `native_stream_filter`/`native_stream_map`/`native_stream_flat_map`. Snapshots
+/// each input element's class id right after `pin_value_slice` and compares it
+/// against the class id read back via `read_pinned_elem` immediately before the
+/// element is dispatched to Java bytecode. A mismatch would mean a stale or
+/// incorrectly-forwarded native root slipped through a moving-GC window — the
+/// exact failure shape suspected (never confirmed) behind the intermittent
+/// `ConfigurationTest::testDatabaseProperties` `ClassCastException`, see
+/// docs/internal/fixed-suite-bugs/keycloak-quarkus-runtime-config-resolution-mismatches.md
+/// ("Residual" section). That race stopped reproducing before this canary could
+/// be validated against it; kept as a near-zero-overhead tripwire (one class-id
+/// comparison per element; no allocation/formatting unless it actually fires,
+/// and it reports only once per process) in case it ever resurfaces.
+static STREAM_PIN_CANARY_FIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn stream_pin_canary_snapshot(ctx: &dyn NativeContext, vals: &[Value]) -> Vec<Option<ClassId>> {
+    vals.iter()
+        .map(|v| match v {
+            Value::Object(Some(o)) => Some(ctx.class_id_of_object(*o)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[inline]
+fn stream_pin_canary_check(
+    ctx: &dyn NativeContext,
+    site: &'static str,
+    index: usize,
+    before: Option<ClassId>,
+    after: Value,
+) {
+    if let (Some(before), Value::Object(Some(o))) = (before, after) {
+        let after_cid = ctx.class_id_of_object(o);
+        if after_cid != before
+            && !STREAM_PIN_CANARY_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!(
+                "[CRATONVM_STREAM_PIN_CANARY] {site}: element {index} class id changed \
+                 {before:?} -> {after_cid:?} across pin/read (stale-ref race?)"
+            );
+        }
+    }
+}
+
 fn native_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
@@ -13334,11 +13463,13 @@ fn native_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // and rebuild the kept list by re-reading from the pins at the end.
     let pred_pin = ctx.pin_native_root(predicate);
     let (_, ehandles) = pin_value_slice(ctx, &elements);
+    let elem_cids = stream_pin_canary_snapshot(ctx, &elements);
     let mut kept_idx: Vec<usize> = Vec::new();
     let mut err = None;
     for i in 0..elements.len() {
         let p = ctx.read_native_pin(pred_pin, predicate);
         let e = read_pinned_elem(ctx, ehandles[i], elements[i]);
+        stream_pin_canary_check(ctx, "native_stream_filter", i, elem_cids[i], e);
         match ctx.invoke_virtual(p, "test", "(Ljava/lang/Object;)Z", &[e]) {
             Ok(r) => {
                 if matches!(r, Some(Value::Int(v)) if v != 0) {
@@ -13353,7 +13484,11 @@ fn native_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     }
     let kept: Vec<Value> = kept_idx
         .iter()
-        .map(|&i| read_pinned_elem(ctx, ehandles[i], elements[i]))
+        .map(|&i| {
+            let e = read_pinned_elem(ctx, ehandles[i], elements[i]);
+            stream_pin_canary_check(ctx, "native_stream_filter:rebuild", i, elem_cids[i], e);
+            e
+        })
         .collect();
     ctx.unpin_native_roots(pred_pin);
     if let Some(e) = err {
@@ -13384,12 +13519,14 @@ fn native_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // every result as it is produced, then rebuild `mapped` from those pins.
     let fn_pin = ctx.pin_native_root(function);
     let (_, ehandles) = pin_value_slice(ctx, &elements);
+    let elem_cids = stream_pin_canary_snapshot(ctx, &elements);
     let mut mapped = Vec::with_capacity(elements.len());
     let mut result_handles: Vec<usize> = Vec::with_capacity(elements.len());
     let mut err = None;
     for i in 0..elements.len() {
         let f = ctx.read_native_pin(fn_pin, function);
         let e = read_pinned_elem(ctx, ehandles[i], elements[i]);
+        stream_pin_canary_check(ctx, "native_stream_map", i, elem_cids[i], e);
         match ctx.invoke_virtual(f, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;", &[e]) {
             Ok(r) => {
                 let v = r.unwrap_or(Value::Object(None));
@@ -13431,11 +13568,13 @@ fn native_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let elements = stream_elements_mut(ctx, this)?;
     let fn_pin = ctx.pin_native_root(function);
     let (_, elem_handles) = pin_value_slice(ctx, &elements);
+    let elem_cids = stream_pin_canary_snapshot(ctx, &elements);
     let mut flat = Vec::new();
     let mut flat_handles = Vec::new();
     for i in 0..elements.len() {
         let function = ctx.read_native_pin(fn_pin, function);
         let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+        stream_pin_canary_check(ctx, "native_stream_flat_map", i, elem_cids[i], elem);
         let result = match ctx.invoke_virtual(
             function,
             "apply",
@@ -15213,8 +15352,23 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let elements = stream_elements_mut(ctx, this)?;
-    let tag = match collector_tag_of(ctx, Value::Object(Some(collector))) {
+    // Materializing a real/lazy stream may invoke Java bytecode and trigger a
+    // moving collection. Keep the Collector live and refresh its address before
+    // reading our synthetic tag; otherwise a moved `toSet()` collector can be
+    // mistaken for whichever object later occupies its old address (observed as
+    // tag 1 / ArrayList returned where the caller requires Set).
+    let collector_pin = ctx.pin_native_root(collector);
+    let elements = match stream_elements_mut(ctx, this) {
+        Ok(elements) => elements,
+        Err(err) => {
+            ctx.unpin_native_roots(collector_pin);
+            return Err(err);
+        }
+    };
+    let collector = ctx.read_native_pin(collector_pin, collector);
+    let tag = collector_tag_of(ctx, Value::Object(Some(collector)));
+    ctx.unpin_native_roots(collector_pin);
+    let tag = match tag {
         Some(t) => t,
         // Not one of our `make_collector` tagged fast-path collectors -
         // a real JDK/Guava `Collector`. Honour the standard contract
@@ -26656,6 +26810,133 @@ pub fn gc_scan_collection_overlay_roots(roots: &mut Vec<ObjectRef>) {
     for_each_overlay_ref(true, |r| roots.push(*r));
 }
 
+/// Return the Rust-side references owned by one already-marked collection.
+///
+/// On the Generational non-moving collector this is the conditional replacement
+/// for treating every overlay value as a process-global root: the marker calls
+/// it only after the collection object itself has been found reachable through
+/// ordinary Java roots/fields. The returned copy deliberately releases every
+/// side-table lock before the collector recursively marks the values.
+pub fn gc_overlay_roots_for_collection(owner_addr: usize) -> Vec<ObjectRef> {
+    let keys = {
+        let index = overlay_owner_keys()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        index.get(&owner_addr).cloned().unwrap_or_default()
+    };
+    if keys.is_empty() {
+        return Vec::new();
+    }
+
+    let mut roots = Vec::new();
+    for key in keys {
+        if let Some(state) = hm_int_fast_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            for (entry_key, value) in state.entries.values() {
+                roots.push(*entry_key);
+                if let Value::Object(Some(object)) = value {
+                    roots.push(*object);
+                }
+            }
+        }
+        if let Some(inner) = ll_overlay()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            for value in inner.values() {
+                if let Value::Object(Some(object)) = value {
+                    roots.push(*object);
+                }
+            }
+        }
+        if let Some(inner) = lhm_overlay()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            for value in inner.values() {
+                if let Value::Object(Some(object)) = value {
+                    roots.push(*object);
+                }
+            }
+        }
+        if let Some(state) = tm_array_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            if let Some(data) = state.data {
+                roots.push(data);
+            }
+            if let Value::Object(Some(comparator)) = state.comparator {
+                roots.push(comparator);
+            }
+        }
+        if let Some(entries) = tm_fast_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            for value in entries.values() {
+                if let Value::Object(Some(object)) = value {
+                    roots.push(*object);
+                }
+            }
+        }
+        if let Some(state) = ts_array_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            if let Some(data) = state.data {
+                roots.push(data);
+            }
+            if let Value::Object(Some(comparator)) = state.comparator {
+                roots.push(comparator);
+            }
+        }
+        if let Some(comparator) = cslm_comparator_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            roots.push(*comparator);
+        }
+    }
+    roots
+}
+
+/// Return overlay references whose owners satisfy `owner_matches`.
+///
+/// A young-only collection cannot tell whether an old-generation object is
+/// otherwise reachable: old objects are not swept in that cycle. Its overlay
+/// edges therefore need the same treatment as ordinary old→young card edges —
+/// retain them for the minor collection, then let the major marker apply the
+/// precise per-owner rule before old-space compaction.
+pub fn gc_overlay_roots_for_matching_owners(
+    owner_matches: impl Fn(usize) -> bool,
+) -> Vec<ObjectRef> {
+    let owners: Vec<usize> = {
+        let index = overlay_owner_keys()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        index
+            .keys()
+            .copied()
+            .filter(|owner| owner_matches(*owner))
+            .collect()
+    };
+    let mut roots = Vec::new();
+    for owner in owners {
+        roots.extend(gc_overlay_roots_for_collection(owner));
+    }
+    roots
+}
+
 /// Repoint every top-level ObjectRef held by the overlay-backed collections to
 /// its relocated address after a moving GC. Mirror of
 /// `gc_scan_collection_overlay_roots`.
@@ -26691,6 +26972,28 @@ pub fn gc_update_collection_overlay_refs(pointer_map: &StdHashMap<usize, usize>)
             }
         }
     }
+
+    // Keep the reverse owner index in the same post-move address space as the
+    // object-key registry. The marker uses this index on the next non-moving
+    // cycle, so leaving even one pre-copy address here would silently drop a
+    // live collection's overlay edge.
+    let mut owners = overlay_owner_keys()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let moves: Vec<(usize, usize)> = owners
+        .keys()
+        .filter_map(|old| pointer_map.get(old).map(|new| (*old, *new)))
+        .collect();
+    for (old, new) in moves {
+        if let Some(keys) = owners.remove(&old) {
+            let target = owners.entry(new).or_default();
+            for key in keys {
+                if !target.contains(&key) {
+                    target.push(key);
+                }
+            }
+        }
+    }
 }
 
 /// Prune overlay/side-table entries whose backing collection object is no
@@ -26717,6 +27020,21 @@ pub fn gc_update_collection_overlay_refs(pointer_map: &StdHashMap<usize, usize>)
 /// this crate's scope and is flagged in the change report rather than edited
 /// here.
 pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
+    let dbg = std::env::var_os("CRATONVM_DBG_MIRRORPIN").is_some();
+    if dbg {
+        let total_slots: usize = obj_key_shards()
+            .iter()
+            .map(|s| {
+                s.lock()
+                    .map(|reg| reg.values().map(|v| v.len()).sum::<usize>())
+                    .unwrap_or(0)
+            })
+            .sum();
+        eprintln!(
+            "[DBG_MIRRORPIN] gc_prune_dead_collection_overlays CALLED, total_slots={}",
+            total_slots
+        );
+    }
     // 1. Collect the packed keys of dead collection objects from the registry,
     //    and rebuild the registry without their slots. Done as an explicit
     //    two-pass walk (collect dead keys, then drop slots) to keep the
@@ -26726,7 +27044,7 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
     // of all shards is the whole registry); runs under GC so per-shard locking is
     // uncontended. Preserves the original early-return: if NO shard yielded a
     // dead key, skip the overlay-cleanup pass entirely.
-    let mut dead_keys: Vec<usize> = Vec::new();
+    let mut dead_keys: Vec<(usize, usize)> = Vec::new();
     for shard in obj_key_shards().iter() {
         if let Ok(mut reg) = shard.lock() {
             for (&hash, slots) in reg.iter() {
@@ -26735,7 +27053,7 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
                     // it as live (defensive — never prune what we can't classify).
                     let live = slot.last_ptr == 0 || is_live(slot.last_ptr);
                     if !live {
-                        dead_keys.push(pack_obj_key(hash, slot.generation));
+                        dead_keys.push((pack_obj_key(hash, slot.generation), slot.last_ptr));
                     }
                 }
             }
@@ -26746,6 +27064,12 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
             });
         }
     }
+    if dbg {
+        eprintln!(
+            "[DBG_MIRRORPIN] gc_prune_dead_collection_overlays dead_keys={}",
+            dead_keys.len()
+        );
+    }
     if dead_keys.is_empty() {
         return;
     }
@@ -26754,7 +27078,7 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
         let mut hm = hm_int_fast_table()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for k in &dead_keys {
+        for (k, _) in &dead_keys {
             hm.remove(k);
         }
     }
@@ -26772,37 +27096,37 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
     //    count independent of the number of dead keys.
     {
         let mut lhm = lhm_overlay().lock().unwrap_or_else(|e| e.into_inner());
-        for k in &dead_keys {
+        for (k, _) in &dead_keys {
             lhm.remove(k);
         }
     }
     {
         let mut hb = lhm_heap_backed().lock().unwrap_or_else(|e| e.into_inner());
-        for k in &dead_keys {
+        for (k, _) in &dead_keys {
             hb.remove(k);
         }
     }
     {
         let mut ll = ll_overlay().lock().unwrap_or_else(|e| e.into_inner());
-        for k in &dead_keys {
+        for (k, _) in &dead_keys {
             ll.remove(k);
         }
     }
     {
         let mut tm = tm_array_table().lock().unwrap_or_else(|e| e.into_inner());
-        for k in &dead_keys {
+        for (k, _) in &dead_keys {
             tm.remove(k);
         }
     }
     {
         let mut tmf = tm_fast_table().lock().unwrap_or_else(|e| e.into_inner());
-        for k in &dead_keys {
+        for (k, _) in &dead_keys {
             tmf.remove(k);
         }
     }
     {
         let mut ts = ts_array_table().lock().unwrap_or_else(|e| e.into_inner());
-        for k in &dead_keys {
+        for (k, _) in &dead_keys {
             ts.remove(k);
         }
     }
@@ -26812,7 +27136,7 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
         let mut cmps = cslm_comparator_table()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for k in &dead_keys {
+        for (k, _) in &dead_keys {
             cmps.remove(k);
         }
     }
@@ -26821,8 +27145,12 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
     // is now a dead packed key.
     {
         let mut cache = lhm_ptr_cache().lock().unwrap_or_else(|e| e.into_inner());
-        let dead: std::collections::HashSet<usize> = dead_keys.iter().copied().collect();
+        let dead: std::collections::HashSet<usize> =
+            dead_keys.iter().map(|(key, _)| *key).collect();
         cache.retain(|_ptr, packed| !dead.contains(packed));
+    }
+    for (key, owner_addr) in dead_keys {
+        remove_overlay_owner_key(owner_addr, key);
     }
 }
 

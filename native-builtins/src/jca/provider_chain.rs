@@ -1076,6 +1076,33 @@ fn seed_sunec_services() {
     }
 }
 
+/// Mirror the real `SUN` provider's `AlgorithmParameters.DSA` service entry
+/// (`sun.security.provider.SunEntries`) into our synthetic provider map.
+/// `KeyFactory`/`Signature` for DSA are handled by dedicated native
+/// short-circuits (`key_factory::kf_generate_public`/`signature::sig_verify`,
+/// gated on `route_dsa_to_real()`), but `sun.security.x509.AlgorithmId
+/// .decodeParams()` independently calls `AlgorithmParameters
+/// .getInstance("DSA")` (real bytecode, via this `GetInstance` bridge) to
+/// decode a DSA key's embedded `p`/`q`/`g` params. Without this entry that
+/// throws `NoSuchAlgorithmException`, silently caught by `decodeParams()`,
+/// leaving `DSAPublicKey.getParams()` null and
+/// `sun.security.provider.DSA.engineInitVerify` throwing
+/// `InvalidKeyException: DSA public key lacks parameters` — found
+/// root-causing `SecurityInfoTests.getWhenJarIsSigned`'s DSA-signed bcprov
+/// jar. `sun.security.provider.DSAParameters` is pure Java/ASN.1 (no native
+/// methods, has the implicit public no-arg ctor JCA requires), verified via
+/// source inspection of JDK 25.0.1's `src.zip`.
+fn seed_sun_dsa_services() {
+    const P: &str = "SUN";
+    put_service(
+        P,
+        "AlgorithmParameters",
+        "DSA",
+        "sun.security.provider.DSAParameters",
+    );
+    put_alias(P, "AlgorithmParameters", "1.2.840.10040.4.1", "DSA"); // id-dsa OID
+}
+
 /// Mirror the SunJCE PKCS#12 PBES2 `AlgorithmParameters` service table so
 /// `AlgorithmParameters.getInstance("PBEWithHmacSHA256AndAES_256")` (the
 /// default PKCS12 keystore entry-protection algorithm since JDK 8u+) resolves
@@ -2182,6 +2209,58 @@ fn getinstance_instance_search(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     ))
 }
 
+/// Real-JCA bring-up: build a genuine `java.security.cert.CertificateFactory`
+/// wrapping a real provider's `CertificateFactorySpi`, for
+/// `native-builtins/src/phases_late.rs`'s `CertificateFactory.getInstance
+/// (String)` native — the ONLY natively-intercepted overload of `getInstance`
+/// on this class (`getInstance(String, Provider)`/`getInstance(String,
+/// String)` are never intercepted at all and already reach real bytecode,
+/// which resolves through this same provider map via
+/// `getinstance_instance_provider`/`getinstance_instance_provider_obj`).
+/// Without this, `getInstance(String)` always handed out a 1-field synthetic
+/// stub with no real `certFacSpi` — fine for the two hand-rolled-DER-parser
+/// natives (`generateCertificate`/`generateCertificates`, both check for a
+/// real `certFacSpi` field first and fall back to ad-hoc parsing), but NPEs
+/// on every OTHER real-bytecode-only method (`generateCertPath`,
+/// `generateCRL(s)`, `getCertPathEncodings` — none natively intercepted).
+/// Found root-causing `sun.security.util.SignatureFileVerifier.getSigners()`'s
+/// `certificateFactory.generateCertPath(chain)` — jar-signature
+/// verification's final step, `SecurityInfoTests.getWhenJarIsSigned`'s DSA
+/// jar (`certificateFactory` is built via the exact 1-arg `getInstance("X509")`
+/// this fixes).
+///
+/// Returns `None` (caller falls back to the synthetic stub) when the
+/// algorithm doesn't resolve in any seeded provider.
+pub(crate) fn try_build_real_certificate_factory(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Option<ObjectRef> {
+    let algo = read_arg_string(ctx, args, 0);
+    let provider = find_service_provider("CertificateFactory", &algo)?;
+    let impl_ref = match build_jca_impl(ctx, &provider, "CertificateFactory", &algo)? {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    let pin = ctx.pin_native_root(impl_ref);
+    let provider_obj = resolve_or_make_provider(ctx, &provider);
+    let impl_ref = ctx.read_native_pin(pin, impl_ref);
+    let algo_str = ctx.create_string(&algo);
+    let result = ctx.new_object_initialized(
+        "java/security/cert/CertificateFactory",
+        "(Ljava/security/cert/CertificateFactorySpi;Ljava/security/Provider;Ljava/lang/String;)V",
+        &[
+            Value::Object(Some(impl_ref)),
+            Value::Object(Some(provider_obj)),
+            Value::Object(Some(algo_str)),
+        ],
+    );
+    ctx.unpin_native_roots(pin);
+    match result {
+        Ok(Some(Value::Object(Some(o)))) => Some(o),
+        _ => None,
+    }
+}
+
 /// Bridge for providers whose real `getService()`/`Service.newInstance()`
 /// never builds the SPI via reflection at all. BouncyCastle-FIPS's
 /// `BouncyCastleFipsProvider` is the motivating (and, so far, only known)
@@ -2484,17 +2563,25 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
     // provider service map, and instantiate real provider SPIs reflectively.
     // Wired whenever the real SunEC path is reachable — either full real-JCA
     // mode (`CRATONVM_REAL_JCA`) or EC-scoped default routing
-    // (`route_ec_to_real`, default ON). In pure-synthetic mode (kill-switch
-    // `CRATONVM_SYNTHETIC_EC=1`) the key_factory/signature short-circuits handle
-    // every `getInstance` and these bridges are never reached.  Even when wired
-    // in default mode the bridges are EC-only in practice: every non-EC engine
-    // (`MessageDigest`/RSA/AES/…) keeps its always-on synthetic native, so only
-    // real EC bytecode ever falls through to here.
-    let ec_real = crate::real_jca_mode() || crate::route_ec_to_real();
+    // (`route_ec_to_real`, default ON), OR DSA-scoped default routing
+    // (`route_dsa_to_real`, default ON) — `AlgorithmParameters.getInstance
+    // ("DSA")` needs this same bridge (see `seed_sun_dsa_services`). In
+    // pure-synthetic mode (kill-switches `CRATONVM_SYNTHETIC_EC=1`/
+    // `CRATONVM_SYNTHETIC_DSA=1`, both set) the key_factory/signature
+    // short-circuits handle every `getInstance` and these bridges are never
+    // reached.  Even when wired in default mode the bridges are EC/DSA-only in
+    // practice: every other engine (`MessageDigest`/RSA/AES/…) keeps its
+    // always-on synthetic native, so only real EC/DSA bytecode ever falls
+    // through to here.
+    let ec_real =
+        crate::real_jca_mode() || crate::route_ec_to_real() || crate::route_dsa_to_real();
     if ec_real {
         // Mirror SunEC's EC service table into our map so the no-provider
         // `getInstance("EC")` search resolves the real pure-Java SunEC SPIs.
         seed_sunec_services();
+        // Mirror the SUN provider's DSA `AlgorithmParameters` service entry
+        // (see `seed_sun_dsa_services` doc comment for the root-cause story).
+        seed_sun_dsa_services();
         // Mirror SunJSSE/SUN TLS service tables (KeyManagerFactory /
         // TrustManagerFactory / SSLContext / KeyStore) so the JSSE connector's
         // getInstance calls resolve real provider SPIs instead of dead-ending.

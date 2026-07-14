@@ -541,7 +541,10 @@ fn object_class_id(shared: &SharedVm) -> Option<ClassId> {
     if let Some(id) = OBJECT_CLASS_ID.get() {
         return Some(*id);
     }
-    let resolved = shared.class_manager.read().find_class_by_name("java/lang/Object")?;
+    let resolved = shared
+        .class_manager
+        .read()
+        .find_class_by_name("java/lang/Object")?;
     let _ = OBJECT_CLASS_ID.set(resolved); // races are harmless; loser just re-resolves next time
     Some(resolved)
 }
@@ -726,33 +729,103 @@ fn safe_native_call_impl(
             &format!("{des}  ->NATIVE {callee}"),
         );
     }
-    // Pin object arguments for the duration of the native: they have been
+    // Object arguments have just left the GC-visible operand stack. Refresh
+    // forwarded addresses before pinning them: pinning a stale from-space
+    // pointer preserves the bug rather than rooting the evacuated object.
+    // This is the native-call counterpart to the interpreter getfield read
+    // barrier and covers invokevirtual, invokeinterface, invokestatic, and
+    // every re-entrant native dispatch through this common choke point.
+    //
+    // No VM allocation or safepoint can occur between extracting the stack
+    // values and this barrier, so the forwarding header is still readable.
+    // Hot path: native calls overwhelmingly carry <= 4 arguments (receiver
+    // plus a couple of operands). The former unconditional `args.to_vec()` +
+    // `Vec::with_capacity(args.len())` pair below allocated TWICE per native
+    // call — measurable allocator traffic on autobox/map-heavy loops
+    // (millions of calls). Keep both scratch buffers inline for the small-
+    // arity case; longer slices (e.g. Set.of during Surefire bootstrap)
+    // fall back to the original heap buffers with identical behavior.
+    const INLINE_NATIVE_ARGS: usize = 4;
+    let mut inline_forwarded = [Value::Object(None); INLINE_NATIVE_ARGS];
+    let mut heap_forwarded: Vec<Value>;
+    let forwarded_args: &mut [Value] = if args.len() <= INLINE_NATIVE_ARGS {
+        inline_forwarded[..args.len()].copy_from_slice(args);
+        &mut inline_forwarded[..args.len()]
+    } else {
+        heap_forwarded = args.to_vec();
+        &mut heap_forwarded[..]
+    };
+    for value in forwarded_args.iter_mut() {
+        if let Value::Object(Some(obj)) = value {
+            *obj = shared.heap.load_and_forward(*obj);
+        }
+    }
+    let args: &[Value] = forwarded_args;
     // popped from the operand stack into this Rust slice and are otherwise
+    // Pin object arguments for the duration of the native: they have been
     // invisible to `collect_roots` / frame scanning during a safepoint GC.
     let pin_base = thread.native_pin_roots.len();
     // Retain a root index for every argument. Native calls are not restricted
-    // to the former four-element inline buffer: a re-entrant call with a
-    // longer slice (for example Set.of during Surefire bootstrap) must remain
+    // to the inline buffer: a re-entrant call with a longer slice must remain
     // remappable at a safepoint without an out-of-bounds access.
-    let mut arg_root_indices = Vec::with_capacity(args.len());
-    for a in args {
+    let mut inline_root_indices = [None::<usize>; INLINE_NATIVE_ARGS];
+    let mut heap_root_indices: Vec<Option<usize>>;
+    let arg_root_indices: &mut [Option<usize>] = if args.len() <= INLINE_NATIVE_ARGS {
+        &mut inline_root_indices[..args.len()]
+    } else {
+        heap_root_indices = vec![None; args.len()];
+        &mut heap_root_indices[..]
+    };
+    for (arg_index, a) in args.iter().enumerate() {
         let before = thread.native_pin_roots.len();
         match (prevalidated_objects, a) {
             (true, Value::Object(Some(object))) => thread.native_pin_roots.push(*object),
             _ => pin_value_for_native_call(shared, &mut thread.native_pin_roots, a),
         }
-        let root_index = (thread.native_pin_roots.len() > before).then_some(before);
-        arg_root_indices.push(root_index);
+        arg_root_indices[arg_index] = (thread.native_pin_roots.len() > before).then_some(before);
     }
     let native_pin_base = thread.native_pin_roots.len();
 
     let mut remapped_args = None;
-    if shared
+    let stw_pending = shared
         .gc_barrier
         .stw_requested
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
+        .load(std::sync::atomic::Ordering::Acquire);
+    if stw_pending {
         crate::runtime::interpreter::safepoint_check(shared, thread);
+    }
+    // Native-alloc young-pressure relief: when a native allocation wrapper
+    // had to spill into old gen because young was exhausted (the wrappers —
+    // `ctx.alloc_object`, `new_array`, … — must stay GC-free mid-callback,
+    // since their callers hold unrooted local `ObjectRef`s), run the same
+    // orchestrated GC the interpreter's `gc_alloc_*` slow path would, HERE:
+    // the one point on the native dispatch path where every argument is
+    // pinned in `native_pin_roots` and remapped below, exactly like the
+    // peer-STW `safepoint_check` above (so this adds no new hazard class for
+    // callers). Without this, a workload whose allocations all happen inside
+    // natives (e.g. a JIT'd HashMap<Integer,Integer> put loop: boxing + node
+    // allocs are both native) never initiates ANY collection — young fills
+    // once with mostly-dead wrappers, old gen absorbs every later allocation,
+    // and `gen_heap::alloc_young_initialized` hard-aborts a process whose
+    // heap is almost entirely garbage (HashMapOnly 30M at default -Xmx).
+    // Gated on the heap's own occupancy trigger (`needs_gc`, live-metric) +
+    // the GC-overhead limit so an all-live young cannot thrash boundary GCs;
+    // the flag check itself is one relaxed load on the hot path.
+    let mut pressure_gc = false;
+    if shared.heap.young_spill_pressure() {
+        if !crate::runtime::interpreter::gc_overhead_limit_exceeded(shared)
+            && shared.heap.needs_gc()
+        {
+            // `maybe_gc_forced` retires this thread's TLAB itself.
+            crate::runtime::interpreter::maybe_gc_forced_pub(shared, thread);
+            pressure_gc = true;
+        }
+        // Clear even when the gates said no: the flag was stale (another
+        // thread's GC already relieved young) or the heap is genuinely full
+        // of live data (overhead limit) — the next spill re-sets it.
+        shared.heap.clear_young_spill_pressure();
+    }
+    if stw_pending || pressure_gc {
         let mut fresh = args.to_vec();
         for (idx, root_idx) in arg_root_indices.iter().enumerate() {
             let Some(root_idx) = root_idx else {
@@ -976,8 +1049,11 @@ fn safe_native_call_impl(
                         )
                     })
                     .unwrap_or_default();
+                let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
+                    .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
                 tracing::error!(
-                    "Native method panic caught: {} (native invoked from {})",
+                    "Native method panic caught in {}: {} (native invoked from {})",
+                    callee,
                     msg,
                     top
                 );
@@ -1365,9 +1441,8 @@ fn resolve_field_descriptor_byte_cached(
     {
         let cache = shared.field_descriptor_cache.read();
         if let Some(&b) = cache.get(&(class_id, slot_index)) {
-            FIELD_DESCRIPTOR_LAST.with(|last| {
-                last.set(Some((vm_key, class_id.as_u32(), slot_index, b)))
-            });
+            FIELD_DESCRIPTOR_LAST
+                .with(|last| last.set(Some((vm_key, class_id.as_u32(), slot_index, b))));
             return if b == 0 { None } else { Some(b) };
         }
     }
@@ -1501,18 +1576,16 @@ fn resolve_field_descriptor_byte_cached(
                 .field_descriptor_cache
                 .write()
                 .insert((class_id, slot_index), b);
-            FIELD_DESCRIPTOR_LAST.with(|last| {
-                last.set(Some((vm_key, class_id.as_u32(), slot_index, b)))
-            });
+            FIELD_DESCRIPTOR_LAST
+                .with(|last| last.set(Some((vm_key, class_id.as_u32(), slot_index, b))));
         }
         None if cacheable => {
             shared
                 .field_descriptor_cache
                 .write()
                 .insert((class_id, slot_index), 0u8);
-            FIELD_DESCRIPTOR_LAST.with(|last| {
-                last.set(Some((vm_key, class_id.as_u32(), slot_index, 0u8)))
-            });
+            FIELD_DESCRIPTOR_LAST
+                .with(|last| last.set(Some((vm_key, class_id.as_u32(), slot_index, 0u8))));
         }
         None => {}
     }
@@ -2967,7 +3040,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
         #[cfg(not(feature = "gpu-offload"))]
         {
-            let _ = (class_name, method_name, descriptor, java_args, stream_handle);
+            let _ = (
+                class_name,
+                method_name,
+                descriptor,
+                java_args,
+                stream_handle,
+            );
             None
         }
     }
@@ -3018,7 +3097,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     /// `gpu_future_status` now uses — so a caller that already observed
     /// `isDone() == true` gets the result with no wait, and a caller
     /// that hasn't gets `None` rather than an implicit block.
-    fn gpu_future_take_result(&self, handle: u64) -> Option<cratonvm_native_api::registry::GpuFutureResult> {
+    fn gpu_future_take_result(
+        &self,
+        handle: u64,
+    ) -> Option<cratonvm_native_api::registry::GpuFutureResult> {
         #[cfg(feature = "gpu-offload")]
         {
             use crate::runtime::offload::{PollOutcome, SerializedResult, SubmissionStatus};
@@ -4022,6 +4104,31 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         super::create_java_string_uninterned(self.shared, text)
     }
 
+    fn create_string_uninterned_gc_safe(&mut self, text: &str) -> ObjectRef {
+        // Native callers opt into this only after pinning every live Java
+        // reference.  Native string construction uses two no-GC allocations
+        // (the String plus its backing byte[]); if young is fragmented, the
+        // generic fallible allocator would otherwise spill both into old gen
+        // without crossing `needs_gc()`.  Request a normal young collection
+        // before that spill, leaving old-gen collection policy unchanged.
+        const STRING_ALLOCATION_HEADROOM: usize = 256;
+        if !self
+            .shared
+            .heap
+            .young_bump_headroom(STRING_ALLOCATION_HEADROOM)
+            && !self
+                .shared
+                .heap
+                .young_has_free_block(STRING_ALLOCATION_HEADROOM)
+        {
+            self.shared
+                .gc_requested
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::runtime::interpreter::maybe_gc(self.shared, self.thread);
+        }
+        super::create_java_string_uninterned(self.shared, text)
+    }
+
     fn init_string_from_units(&mut self, this: ObjectRef, units: &[u16]) -> bool {
         super::populate_java_string_fields(self.shared, this, units)
     }
@@ -4233,13 +4340,64 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // `.max(class_num_total_fields(cid))` themselves. Synthetic
         // ClassIds not in the class manager report 0 here, so the
         // requested count is used unchanged for those.
-        let real_fields = self
-            .shared
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .map(|c| c.num_total_fields)
-            .unwrap_or(0);
+        //
+        // Hot path: this clamp runs on EVERY native allocation (notably each
+        // out-of-cache autoboxed wrapper — ~19% of the 1M-put/get HashMap
+        // probe sat in alloc_object, a large share of it in this RwLock
+        // acquire + class-store lookup). A registered class's
+        // `num_total_fields` is immutable for its ClassId except through
+        // class redefinition, which bumps the global layout generation — the
+        // same validation contract `gen_heap::compact_field_slot`'s cache
+        // already relies on. Keep a tiny per-thread working set keyed by
+        // (vm, class_id) and validated against that generation. Unregistered
+        // ids (`get_class` → None) are deliberately NOT cached: a class id
+        // observed mid-registration could otherwise pin a stale 0 clamp.
+        struct TotalFieldsCache {
+            // (vm_key, class_id, layout_generation, num_total_fields);
+            // vm_key == 0 marks an empty slot.
+            entries: [(usize, u32, u64, u32); 8],
+            next: usize,
+        }
+        thread_local! {
+            static TOTAL_FIELDS_CACHE: std::cell::RefCell<TotalFieldsCache> =
+                const {
+                    std::cell::RefCell::new(TotalFieldsCache {
+                        entries: [(0, 0, 0, 0); 8],
+                        next: 0,
+                    })
+                };
+        }
+        let vm_key = self.shared as *const SharedVm as usize;
+        let cid_u32 = class_id.as_u32();
+        let layout_gen = cratonvm_types::layout_generation();
+        let cached_fields = TOTAL_FIELDS_CACHE.with(|cell| {
+            let cache = cell.borrow();
+            cache.entries.iter().find_map(|&(vk, cid, gen, fields)| {
+                (vk == vm_key && cid == cid_u32 && gen == layout_gen).then_some(fields)
+            })
+        });
+        let real_fields = match cached_fields {
+            Some(fields) => fields as usize,
+            None => {
+                let resolved = self
+                    .shared
+                    .class_manager
+                    .read()
+                    .get_class(class_id)
+                    .map(|c| c.num_total_fields);
+                if let Some(fields) = resolved {
+                    // Cast: field counts are far below u32::MAX.
+                    let fields_u32 = fields as u32;
+                    TOTAL_FIELDS_CACHE.with(|cell| {
+                        let mut cache = cell.borrow_mut();
+                        let slot = cache.next;
+                        cache.entries[slot] = (vm_key, cid_u32, layout_gen, fields_u32);
+                        cache.next = (slot + 1) % cache.entries.len();
+                    });
+                }
+                resolved.unwrap_or(0)
+            }
+        };
         let slots = num_fields.max(real_fields);
         if self.thread.native_alloc_pool_layout == Some((class_id, slots)) {
             if let Some(obj) = self.thread.native_alloc_pool.pop() {
@@ -4262,7 +4420,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // callback: `tlab_alloc_object` only bumps/refills young space and
         // returns `None` when it cannot. The existing `heap.alloc_object`
         // fallback retains the previous spill/OOM behavior and native rooting
-        // contract.
+        // contract. Instead of collecting here, a TLAB failure flags
+        // `young_spill_pressure` so the NEXT `safe_native_call` boundary —
+        // where every argument is pinned and remappable — runs the
+        // orchestrated GC this method cannot (see `safe_native_call_impl`).
         use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
         let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
         if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
@@ -4275,6 +4436,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             ) {
                 return obj;
             }
+            // Young could not supply another TLAB chunk: every allocation
+            // below lands in old gen. The old-batch refill / heap spill arms
+            // below signal the native-call boundary GC (`note_young_spill_
+            // pressure` — advisability-gated, needs the old-gen lock those
+            // slow paths already pay for; calling it here would add an
+            // old-gen lock acquisition per allocation in spill mode).
         }
         // Once young space cannot provide another TLAB, amortize the
         // non-moving old-generation lock and free-list work across a chunk of
@@ -4649,6 +4816,26 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // holds raw `Value` copies (its args slice) that are neither rooted
         // nor remappable across a GC-blocked wait; block as an EXPECTED
         // mutator instead (a concurrent STW waits for us).
+        //
+        // STW-TAKEOVER-FIX (2026-07-13) follow-up: this reasoning IS the
+        // root cause of the WildFly `parallel-extension-add` STW-barrier
+        // deadlock (see
+        // `docs/internal/fixed-suite-bugs/wildfly-standalone-boot-stw-jit-takeover-hang.md`)
+        // for the one call site proven live via gdb to hit it
+        // (`CountDownLatch`'s polling loop). An earlier version of this fix
+        // switched THIS method wholesale to `monitor_enter_blocking`, but a
+        // full audit of every native caller of `monitor_enter` (~80 sites:
+        // Semaphore/Phaser/Exchanger/blocking-queue/ConcurrentHashMap/
+        // ReentrantLock/Condition/BouncyCastle-random/etc.) found the
+        // overwhelming majority keep using the SAME `obj`/`this` afterward
+        // without any pin-and-refresh — switching all of them to a
+        // GC-pausable wait at once would trade one hang for a batch of new,
+        // unaudited stale-`ObjectRef`-across-GC bugs (this codebase's most
+        // recurring defect class, see
+        // `docs/internal/wildfly-parallel-boot-stale-objectref-residual.md`).
+        // `monitor_enter` therefore stays on this original, non-GC-blocked
+        // path for everyone; `monitor_enter_gc_safe` (below) is the narrow,
+        // opt-in escape hatch for the one call site with live evidence.
         self.shared.monitors.enter(obj, self.thread.thread_id);
         if dbg_mon_dump {
             crate::vm::vm_init::clear_wait_site_snapshot();
@@ -4660,6 +4847,27 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             self.thread.pin_count = self.thread.pin_count.saturating_add(1);
             self.thread.pin_reason = "Monitor";
         }
+    }
+
+    fn monitor_enter_gc_safe(&mut self, obj: ObjectRef) -> ObjectRef {
+        // STW-TAKEOVER-FIX (2026-07-13): the narrow, opt-in counterpart to
+        // `monitor_enter` above — see its doc comment and
+        // `NativeContext::monitor_enter_gc_safe`'s trait doc for the full
+        // story. Delegates to the already-established, bytecode-tested
+        // `monitor_enter_blocking` (deposit root snapshot, retire TLAB,
+        // `GcBarrier::enter_blocked`/`arrive_and_wait_auto`, `block_enter`,
+        // `mark_blocked_region_leave`/`check_post_block_gc`, pin+remap the
+        // object across the wait) and returns the current, possibly-
+        // relocated reference — callers MUST use it for anything after this
+        // call. The fast (uncontended) path is unaffected:
+        // `monitor_enter_blocking` returns immediately, zero barrier
+        // interaction, when `enter_or_contend` acquires without contention.
+        let fixed = monitor_enter_blocking(self.shared, self.thread, obj);
+        if matches!(self.thread.kind, crate::threading::ThreadKind::Virtual) {
+            self.thread.pin_count = self.thread.pin_count.saturating_add(1);
+            self.thread.pin_reason = "Monitor";
+        }
+        fixed
     }
 
     fn monitor_exit(&mut self, obj: ObjectRef) {
@@ -6450,6 +6658,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // emits its current frames — no per-park snapshot cost needed.
         {
             let blk = self.shared.gc_barrier.enter_blocked();
+            // DIAGNOSTIC (2026-07-13, STW takeover 5-class cluster
+            // investigation): correlate against [stw-expected]'s identity
+            // list to see whether this thread's park() call landed before
+            // or after the pause was requested, and whether pre_stw-gated
+            // arrival actually fires.
+            if std::env::var_os("CRATONVM_DBG_STW_EXPECTED_IDS").is_some() {
+                eprintln!(
+                    "[stw-park] tid={} pre_stw={}",
+                    self.thread.thread_id.0, blk.pre_stw
+                );
+            }
             if blk.pre_stw {
                 // GCAUDIT-0711-FIX (finding 1a): `_auto` — the deposit above
                 // already raised `in_blocked_region` before this check.
@@ -6557,7 +6776,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             receiver = recovered;
             receiver_class_id = self.shared.heap.class_id_of(receiver);
         }
-
         // Check if the receiver is a lambda proxy.
         let call_site = {
             let proxies = self.shared.lambda_proxies.read();
@@ -6808,65 +7026,112 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                             .write()
                             .load_class(&lcs.impl_handle.class_name)?,
                     };
-                    super::ensure_class_initialized_shared(self.shared, self.thread, class_id)?;
-                    // Use `num_total_fields` (inherited + declared instance
-                    // fields), matching the `New` opcode and the sibling
-                    // NewInvokeSpecial path in `interpreter.rs`. `c.fields.len()`
-                    // is wrong here: it counts this class's declared fields
-                    // *including statics* while omitting inherited instance
-                    // fields, so a subclass constructor reference (e.g. JUnit5's
-                    // `DefaultClassDescriptor::new`, whose 2 fields are all
-                    // inherited from `AbstractAnnotatedDescriptorWrapper`)
-                    // under-allocates to 0 slots and trips the GC `get_field`
-                    // bounds guard on every inherited-field access.
-                    let num_fields = self
+                    // Array-constructor reference (`SomeType[]::new`) — see the
+                    // identical check in the sibling `interpreter.rs` path for
+                    // the full rationale. `load_class` resolves an array-shaped
+                    // impl class name to its synthesized array ClassId, but the
+                    // object-allocation + `<init>` dispatch below does not apply
+                    // to arrays (no fields, no constructor) and was silently
+                    // discarding the requested length, producing a corrupted
+                    // zero-field pseudo-object that fails a later checkcast to
+                    // the real array type.
+                    let array_info = self
                         .shared
                         .class_manager
                         .read()
                         .get_class(class_id)
-                        .map(|c| c.num_total_fields)
-                        .unwrap_or(0);
-                    let new_obj = match self.shared.heap.try_alloc_object(class_id, num_fields) {
-                        Some(obj) => obj,
-                        None => {
-                            self.thread.tlab.retire();
-                            crate::runtime::interpreter::maybe_gc_forced_pub(
+                        .and_then(|c| c.array_info.clone());
+                    if let Some(array_info) = array_info {
+                        let length =
+                            full_args.first().and_then(Value::as_int).ok_or_else(|| {
+                                VmError::Internal {
+                                    message: "array-constructor-reference: missing length arg"
+                                        .to_string(),
+                                }
+                            })?;
+                        if length < 0 {
+                            Err(RuntimeError::NegativeArraySizeException { size: length }.into())
+                        } else {
+                            let length = length as usize;
+                            let arr = if array_info.array_dimension == 1 {
+                                match &*array_info.leaf_component_name {
+                                    "boolean" => self.new_array(ArrayElementType::Boolean, length),
+                                    "char" => self.new_array(ArrayElementType::Char, length),
+                                    "float" => self.new_array(ArrayElementType::Float, length),
+                                    "double" => self.new_array(ArrayElementType::Double, length),
+                                    "byte" => self.new_array(ArrayElementType::Byte, length),
+                                    "short" => self.new_array(ArrayElementType::Short, length),
+                                    "int" => self.new_array(ArrayElementType::Int, length),
+                                    "long" => self.new_array(ArrayElementType::Long, length),
+                                    _ => self.new_ref_array(array_info.component_class_id, length),
+                                }
+                            } else {
+                                self.new_ref_array(array_info.component_class_id, length)
+                            };
+                            Ok(Some(Value::Object(Some(arr))))
+                        }
+                    } else {
+                        super::ensure_class_initialized_shared(self.shared, self.thread, class_id)?;
+                        // Use `num_total_fields` (inherited + declared instance
+                        // fields), matching the `New` opcode and the sibling
+                        // NewInvokeSpecial path in `interpreter.rs`. `c.fields.len()`
+                        // is wrong here: it counts this class's declared fields
+                        // *including statics* while omitting inherited instance
+                        // fields, so a subclass constructor reference (e.g. JUnit5's
+                        // `DefaultClassDescriptor::new`, whose 2 fields are all
+                        // inherited from `AbstractAnnotatedDescriptorWrapper`)
+                        // under-allocates to 0 slots and trips the GC `get_field`
+                        // bounds guard on every inherited-field access.
+                        let num_fields = self
+                            .shared
+                            .class_manager
+                            .read()
+                            .get_class(class_id)
+                            .map(|c| c.num_total_fields)
+                            .unwrap_or(0);
+                        let new_obj = match self.shared.heap.try_alloc_object(class_id, num_fields)
+                        {
+                            Some(obj) => obj,
+                            None => {
+                                self.thread.tlab.retire();
+                                crate::runtime::interpreter::maybe_gc_forced_pub(
+                                    self.shared,
+                                    self.thread,
+                                );
+                                self.shared.heap.try_alloc_object(class_id, num_fields).ok_or_else(|| {
+                                    MethodCallFailed::InternalError(crate::error::VmError::Runtime(
+                                        crate::error::RuntimeError::OutOfMemoryError {
+                                            message: format!("Java heap space (MethodHandle newInvokeSpecial, {} fields)", num_fields),
+                                        },
+                                    ))
+                                })?
+                            }
+                        };
+                        let new_obj_pin = self.thread.native_pin_roots.len();
+                        self.thread.native_pin_roots.push(new_obj);
+                        let init_result = {
+                            let mut init_args = Vec::with_capacity(1 + full_args.len());
+                            init_args.push(Value::Object(Some(new_obj)));
+                            init_args.extend_from_slice(&full_args);
+                            invoke_on_class_shared(
                                 self.shared,
                                 self.thread,
-                            );
-                            self.shared.heap.try_alloc_object(class_id, num_fields).ok_or_else(|| {
-                                MethodCallFailed::InternalError(crate::error::VmError::Runtime(
-                                    crate::error::RuntimeError::OutOfMemoryError {
-                                        message: format!("Java heap space (MethodHandle newInvokeSpecial, {} fields)", num_fields),
-                                    },
-                                ))
-                            })?
-                        }
-                    };
-                    let new_obj_pin = self.thread.native_pin_roots.len();
-                    self.thread.native_pin_roots.push(new_obj);
-                    let init_result = {
-                        let mut init_args = Vec::with_capacity(1 + full_args.len());
-                        init_args.push(Value::Object(Some(new_obj)));
-                        init_args.extend_from_slice(&full_args);
-                        invoke_on_class_shared(
-                            self.shared,
-                            self.thread,
-                            class_id,
-                            &lcs.impl_handle.member_name,
-                            &lcs.impl_handle.descriptor,
-                            &init_args,
-                        )
-                    };
-                    let forwarded = self
-                        .thread
-                        .native_pin_roots
-                        .get(new_obj_pin)
-                        .copied()
-                        .unwrap_or(new_obj);
-                    self.thread.native_pin_roots.truncate(new_obj_pin);
-                    init_result?;
-                    Ok(Some(Value::Object(Some(forwarded))))
+                                class_id,
+                                &lcs.impl_handle.member_name,
+                                &lcs.impl_handle.descriptor,
+                                &init_args,
+                            )
+                        };
+                        let forwarded = self
+                            .thread
+                            .native_pin_roots
+                            .get(new_obj_pin)
+                            .copied()
+                            .unwrap_or(new_obj);
+                        self.thread.native_pin_roots.truncate(new_obj_pin);
+                        init_result?;
+                        Ok(Some(Value::Object(Some(forwarded))))
+                    }
                 }
                 _ => {
                     // GetField, GetStatic, PutField, PutStatic вЂ” very rare for
@@ -7024,6 +7289,64 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     return Ok(Some(unboxed));
                 }
                 return Ok(None);
+            }
+
+            // `Class.forName(name, ..., loader)` invokes `loadClass(String)`
+            // through this NativeContext path.  For a subclass that merely
+            // inherits ClassLoader's implementation, virtual resolution must
+            // execute CratonVM's base ClassLoader native (which performs
+            // parent-first delegation and loader-local lookup), not the
+            // real-JDK bytecode/global-resolution fallback. Preserve genuine
+            // subclass overrides by checking the method's actual declarer.
+            //
+            // Spring's `DynamicClassLoader` is such an inheriting subclass;
+            // its generated classes deliberately live in the forked parent.
+            // The normal receiver resolver can retain the inherited JDK body
+            // before the base native gate sees it, collapsing this lookup to
+            // the global same-named class. Route this known inheriting loader
+            // directly through the base native to preserve parent-first
+            // fork-loader identity.
+            if method_name == "loadClass"
+                && descriptor == "(Ljava/lang/String;)Ljava/lang/Class;"
+                && class_name == "org/springframework/core/test/tools/DynamicClassLoader"
+            {
+                let mut full_args = Vec::with_capacity(1 + args.len());
+                full_args.push(Value::Object(Some(receiver)));
+                full_args.extend_from_slice(args);
+                return self.invoke_or_native(
+                    "java/lang/ClassLoader",
+                    method_name,
+                    descriptor,
+                    &full_args,
+                );
+            }
+            if method_name == "loadClass"
+                && descriptor == "(Ljava/lang/String;)Ljava/lang/Class;"
+                && resolved_from_receiver
+            {
+                let use_base_loader_native = {
+                    let cm = self.shared.class_manager.read();
+                    cm.get_class(receiver_class_id)
+                        .map(|receiver_class| {
+                            receiver_class.name.as_ref() == "java/lang/ClassLoader"
+                                || !receiver_class.methods.iter().any(|method| {
+                                    method.name.as_ref() == method_name
+                                        && method.descriptor.as_ref() == descriptor
+                                })
+                        })
+                        .unwrap_or(false)
+                };
+                if use_base_loader_native {
+                    let mut full_args = Vec::with_capacity(1 + args.len());
+                    full_args.push(Value::Object(Some(receiver)));
+                    full_args.extend_from_slice(args);
+                    return self.invoke_or_native(
+                        "java/lang/ClassLoader",
+                        method_name,
+                        descriptor,
+                        &full_args,
+                    );
+                }
             }
 
             // Prepend receiver to args.
@@ -8768,6 +9091,29 @@ pub fn invoke_or_native(
         return Ok(None);
     }
 
+    // In real-JDK mode ClassLoader's registered bridge can be tagged as a
+    // synthetic stub and therefore lose to the JDK bytecode selector. That
+    // bytecode uses the flat global class store and breaks child/fork-loader
+    // identity. The bridge is the authoritative implementation for these two
+    // base overloads, so invoke it directly once dispatch has selected
+    // `java/lang/ClassLoader`; subclass overrides remain outside this branch.
+    if effective_class == "java/lang/ClassLoader"
+        && method_name == "loadClass"
+        && matches!(
+            descriptor,
+            "(Ljava/lang/String;)Ljava/lang/Class;" | "(Ljava/lang/String;Z)Ljava/lang/Class;"
+        )
+    {
+        if let Some(callback) =
+            shared
+                .native_methods
+                .find("java/lang/ClassLoader", method_name, descriptor)
+        {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|v| coerce_native_return(v, descriptor));
+        }
+    }
+
     // peaceful-sammet — primitive-return functional-interface bridge.
     //
     // Spring/Eureka call `ToIntFunction.apply(Object)Object` on a receiver
@@ -9291,12 +9637,26 @@ pub fn invoke_special_shared(
     args: &[Value],
 ) -> MethodCallResult {
     // Native override always wins -- same priority order as invoke_or_native.
+    // EXCEPT for SyntheticStub-tagged natives on real-protected classes with
+    // loaded bytecode: invokespecial is how constructors and super-calls
+    // arrive, and running a stub <init> here while the method surface yields
+    // to real bytecode leaves the object half-initialized (observed
+    // 2026-07-13 with the since-removed OutputStreamWriter stub surface:
+    // the stub ctor never built the real StreamEncoder, so the real
+    // OSW.flush() bytecode NPE'd on `this.se`).
     if let Some(callback) = shared
         .native_methods
         .find(class_name, method_name, descriptor)
     {
-        return safe_native_call(shared, thread, callback, args)
-            .map(|v| coerce_native_return(v, descriptor));
+        if !crate::runtime::interpreter::synthetic_stub_should_yield_to_real_bytecode(
+            shared,
+            class_name,
+            method_name,
+            descriptor,
+        ) {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|v| coerce_native_return(v, descriptor));
+        }
     }
 
     // GC-safety: pin object args across class load + <clinit> and re-read the
@@ -10516,11 +10876,19 @@ fn adapt_array_contains(shared: &SharedVm, arr_val: Option<Value>, target_name: 
             Ok(Value::Object(Some(o))) => o,
             _ => continue,
         };
-        // Enum constant: slot 0 = name String (java.lang.Enum layout).
-        if let Value::Object(Some(name_obj)) = shared.heap.get_field(elem, 0) {
-            if let Some(s) = super::read_java_string(&shared.heap, name_obj) {
-                if s == target_name {
-                    return true;
+        // Resolve Enum.name through the actual hierarchy. In real-JDK mode
+        // subclasses may have fields before their inherited Enum fields, so
+        // assuming slot 0 causes CLASS_TO_STRING to be silently skipped.
+        let name_index = {
+            let cm = shared.class_manager.read();
+            resolve_field_index_in_hierarchy(shared.heap.class_id_of(elem), "name", &cm.class_store)
+        };
+        if let Some(name_index) = name_index {
+            if let Value::Object(Some(name_obj)) = shared.heap.get_field(elem, name_index) {
+                if let Some(s) = super::read_java_string(&shared.heap, name_obj) {
+                    if s == target_name {
+                        return true;
+                    }
                 }
             }
         }
@@ -11896,6 +12264,21 @@ fn invoke_on_class_shared_inner(
                     // (e.g. ByteArrayInputStream created by getResourceAsStream).
                     let check_override = method.is_abstract()
                         || class_name == "java/io/ByteArrayInputStream"
+                        // Jandex constructs a real-JDK BufferedInputStream around
+                        // a resource stream.  Its registered native methods use
+                        // the inherited `in` field, so its constructor must use
+                        // the matching native layout initialization as well.
+                        || (class_name == "java/io/BufferedInputStream"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("<init>", "(Ljava/io/InputStream;)V")
+                                    | ("<init>", "(Ljava/io/InputStream;I)V")
+                            ))
+                        || (class_name == "java/io/FilterInputStream"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("<init>", "(Ljava/io/InputStream;)V") | ("skip", "(J)J")
+                            ))
                         // `java.util.Base64` and its Encoder/Decoder methods
                         // are concrete JDK bytecode.  CratonVM supplies the
                         // complete family as native intrinsics so they can
@@ -13494,17 +13877,10 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/util/concurrent/LinkedBlockingDeque"
                             && method_name == "clear"
                             && descriptor == "()V")
-                        || (class_name == "java/io/BufferedInputStream"
+                        || (class_name == "java/io/FilterInputStream"
                             && matches!(
                                 (method_name, descriptor),
-                                ("read", "()I")
-                                    | ("read", "([BII)I")
-                                    | ("skip", "(J)J")
-                                    | ("available", "()I")
-                                    | ("mark", "(I)V")
-                                    | ("reset", "()V")
-                                    | ("markSupported", "()Z")
-                                    | ("close", "()V")
+                                ("<init>", "(Ljava/io/InputStream;)V") | ("skip", "(J)J")
                             ))
                         || (matches!(class_name, "java/lang/Iterable" | "java/util/Collection" | "java/util/Set" | "java/util/EnumSet")
                             && method_name == "iterator"
@@ -13761,6 +14137,30 @@ fn invoke_on_class_shared_inner(
                                 | "sign"
                                 | "verify"
                                 | "getAlgorithm"
+                            ))
+                        // SigProbe: `sun.security.util.SignatureUtil
+                        // .{initVerify,initSign}WithParam` — real bytecode
+                        // indirects through `SharedSecrets
+                        // .getJavaSecuritySignatureAccess()`, populated only by
+                        // `Signature.<clinit>` (no-op'd — see
+                        // `jca/key_factory.rs`'s `Signature.<clinit>`
+                        // registration), so the accessor is null and real
+                        // bytecode NPEs ("Cannot invoke initVerify on null").
+                        // `native-builtins/src/jca/signature.rs`'s
+                        // `sigutil_init_verify_key`/`sigutil_init_verify_cert`/
+                        // `sigutil_init_sign` exist specifically to bypass
+                        // this — but without an allowlist entry here,
+                        // `SignatureUtil` (a real, loadable class with real
+                        // bytecode for these static methods) never actually
+                        // reached them: `has_own_bytecode` was true, so real
+                        // bytecode always won and the natives were dead code.
+                        // Found while root-causing real PKCS7/DSA jar-signature
+                        // verification (`sun.security.pkcs.SignerInfo.verify()`
+                        // calls `SignatureUtil.initVerifyWithParam` directly).
+                        || (class_name == "sun/security/util/SignatureUtil"
+                            && matches!(
+                                method_name,
+                                "initVerifyWithParam" | "initSignWithParam"
                             ))
                         // SigProbe: `java.security.KeyFactory.getInstance` /
                         // `generatePublic` / `generatePrivate` — natives in
@@ -14083,6 +14483,11 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
+                        || crate::runtime::interpreter::is_class_mirror_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
                         || crate::runtime::interpreter::is_awt_imageio_native_override(
                             class_name,
                             method_name,
@@ -14205,7 +14610,19 @@ fn invoke_on_class_shared_inner(
                             class_name,
                             method_name,
                             descriptor,
-                        );
+                        )
+                        // `ClassLoader.loadClass` is backed by concrete JDK bytecode,
+                        // but CratonVM supplies the actual loader-aware implementation
+                        // as a native.  Let that native win when an inherited base
+                        // method is selected; direct subclass overrides still resolve
+                        // on their own declaring class and continue to run normally.
+                        || (class_name == "java/lang/ClassLoader"
+                            && method_name == "loadClass"
+                            && matches!(
+                                descriptor,
+                                "(Ljava/lang/String;)Ljava/lang/Class;"
+                                    | "(Ljava/lang/String;Z)Ljava/lang/Class;"
+                            ));
                     if check_override
                         && shared
                             .native_methods
@@ -15511,6 +15928,13 @@ fn invoke_on_class_shared_inner(
                 method_name,
                 descriptor,
             );
+        let force_interface_default_native =
+            crate::runtime::interpreter::should_force_registered_native_over_bytecode(
+                shared,
+                &class_name_for_override,
+                method_name,
+                descriptor,
+            );
         let override_cb = if declaring_is_interface
             && !is_static
             && !force_ffm_value_layout_interface_native
@@ -15518,7 +15942,19 @@ fn invoke_on_class_shared_inner(
             && !force_ffm_symbol_lookup_interface_native
             && !force_ffm_group_layout_interface_native
             && !force_ffm_memory_layout_interface_native
+            && !force_interface_default_native
         {
+            None
+        } else if crate::runtime::interpreter::synthetic_stub_should_yield_to_real_bytecode(
+            shared,
+            &class_name_for_override,
+            method_name,
+            descriptor,
+        ) {
+            // SyntheticStub-tagged native on a real-protected class whose real
+            // bytecode is loaded: the stub body exists only for stub-phase
+            // bootstraps — run the bytecode (same yield the other dispatch
+            // sites apply; without it this re-check kept serving the stub).
             None
         } else {
             shared

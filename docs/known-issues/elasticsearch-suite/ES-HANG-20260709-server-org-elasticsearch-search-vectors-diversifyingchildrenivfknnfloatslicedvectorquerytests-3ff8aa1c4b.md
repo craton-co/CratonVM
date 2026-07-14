@@ -1,3 +1,148 @@
+# 2026-07-13 follow-up: array-constructor-reference lambda bug found + fixed
+# (real, verified, but NOT yet confirmed as this doc's residual root cause)
+
+While independently re-investigating this cluster (parallel to, and without
+visibility into, the "2026-07-13 current-dev residual update" section
+immediately below until after landing this fix), found and fixed a real,
+previously-unknown interpreter correctness bug: **array-constructor-reference
+lambdas (`SomeType[]::new`, used as an `IntFunction<SomeType[]>` — the
+mechanism behind `Collection.toArray(SomeType[]::new)`, ubiquitous since
+Java 11, and any direct user code) allocated a corrupted zero-field pseudo-
+object instead of a real array.**
+
+Root cause: `MethodHandleKind::NewInvokeSpecial` (the constructor-reference
+lambda dispatch, `vm/src/runtime/interpreter.rs` and its duplicate in
+`vm/src/vm/vm_exec.rs`) unconditionally treated the impl handle's target as a
+regular class — allocate `num_total_fields` object slots, dispatch `<init>`.
+For an array-shaped impl class name (e.g. `"[Ljava/nio/ByteBuffer;"`),
+`load_class` correctly resolves it to the synthesized array `ClassId` (JVMS
+5.3.3), but arrays have neither fields nor a constructor: the old path
+allocated a zero-field object wearing the array's `ClassId`, silently
+discarded the requested length (the `IntFunction`'s sole `int` argument), and
+produced a value that fails a later `checkcast` to the real array type.
+
+This exact mechanism reproduces from real Lucene: `ByteBuffersDataInput`'s
+constructor does `this.blocks = list.toArray(ByteBuffer[]::new)`, immediately
+followed by `checkcast [Ljava/nio/ByteBuffer;`. A direct, isolated repro
+(`new ByteBuffersDataInput(list)` against the real `lucene-core-10.4.0.jar`,
+bypassing the whole ES/suite-runner harness) threw
+`ClassCastException: java.lang.Object cannot be cast to [Ljava.nio.ByteBuffer;`
+on unfixed `dev`, and one *direct* (non-suite-runner) repro of this doc's own
+`testSlicesDense` — bypassing the outer watchdog entirely — surfaced this
+identical exception in ~85s instead of the usual multi-hundred-second
+non-progress, i.e. this bug is a real, independent cause of SOME of this
+cluster's non-deterministic behavior (fast completion with a wrong-data
+exception, vs. the more common very-slow/non-progress runs), not necessarily
+of every manifestation.
+
+**Fixed** (commit on `fix/gc-stw-monitor-race-20260711-local`, merged to
+`dev`): detect the array case via the resolved `ClassId`'s `array_info`
+before the object-allocation path, and allocate a real array — primitive or
+reference, correct component type, correct length — the same way
+`anewarray`/`newarray` do for the same class metadata. Verified: the real
+`ByteBuffersDataInput` construct + `readByte()` + `slice()` repro now matches
+real JDK 25 output exactly. `cratonvm-vm --lib` lambda-proxy/lambda-dispatch
+suite 8/8 pass; full `cratonvm-vm --lib` 2185 passed / 23 failed, all 23
+pre-existing/environmental (debug-only lock-order assertions that cannot fire
+in a release build, JIT skip-list feature tests, JNI table-size tests,
+real-JDK-detection tests) and unrelated by name/code-path to this change.
+
+**CONFIRMED 2026-07-13 (same session, host came back):** re-ran the
+"2026-07-13 current-dev residual update" repro directly (`testSlicesSparseWithFilter`,
+direct-invocation form bypassing the suite runner, `--stack-dump-on-timeout 90`)
+against a fresh build of `origin/dev` including this fix (`fe76025e7`,
+worktree `/data/data/wt-gc-stw-monitor-race-20260711`, binary
+`/data/data/cratonvm-arrayctorfix-verify-20260713`). **4/4 runs now pass
+cleanly (`OK (1 test)`), consistently ~80-85s, no watchdog abort, no
+exception.** Before this fix every run hit the 90s watchdog with the process
+genuinely non-progressing inside `ByteBuffersIndexInput.slice`/
+`MockIndexInputWrapper.slice` (per the residual-update section above). This
+fix IS the root cause of that residual — the STW-monitor-race historical
+attribution is confirmed NOT applicable to `testSlicesSparseWithFilter` and
+can be retired for that test.
+
+**`testSlicesDense` (this doc's ORIGINAL 2026-07-09 subject) was ALSO
+re-tested against the same fixed build and is NOT resolved by this fix**:
+3/3 runs still hit the 90s watchdog. This is consistent with the earlier
+(pre-this-fix) finding elsewhere in this doc's history that `testSlicesDense`
+is genuinely, if very slowly, making forward progress rather than
+deadlocked — an unbounded run (no watchdog) earlier in this same
+investigation completed in ~602s, terminated by the test framework's own
+`-Dtests.timeoutSuite=580000!`, not by a VM-level hang. `testSlicesDense`'s
+slowness (not correctness) is therefore a SEPARATE, still-open issue from
+`testSlicesSparseWithFilter`'s (now-fixed) correctness bug — likely
+CratonVM interpreter overhead on a reflection/exception-handling-heavy path
+(deep `Method.invoke()` chains + `local_liveness::analyze` cache misses were
+observed dominating a live gdb snapshot of a `testSlicesDense` run), not a
+lost-wakeup or a data-corruption bug. Whoever picks this doc back up next
+should treat `testSlicesDense` as a performance investigation, not a hang/
+correctness investigation, and should NOT expect the STW-monitor-race /
+GC-audit finding 1 attribution to apply here either — finding 1(a) itself
+was independently fixed and merged (`371347920`) before this fix landed, and
+`testSlicesDense`'s slowness persists on top of that fix too.
+
+---
+
+# 2026-07-13 current-dev residual update
+
+**Status: OPEN.** This remains a real CratonVM-only non-progress failure, but
+the current evidence does **not** establish the historical GC/STW-monitor-race
+attribution as its root cause. Keep the cross-reference as historical context;
+do not use it to close or otherwise classify this current residual.
+
+Validated on `origin/dev` at `acf9aaf7`, in isolated worktree
+`/data/victor-worktrees/cratonvm-es-ivfknn-complete-20260712-1540`, using
+binary
+`/data/data/cratonvm-targets/es-ivfknn-complete-20260712-1540/release/cratonvm-es-ivfknn-complete-20260712-1540`
+and the existing Elasticsearch fixture
+`/data/data/cratonvm-worktrees/20260708-191002-es-nonpassed-rerun/apps/elasticsearch`.
+The current `others.tsv` selection is runner start `2538` (not the historical
+start `549`):
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File apps/elasticsearch-suite-runner/run-elasticsearch-suite.ps1 -Category others -Jit on -Vm craton -ElasticsearchRoot "/data/data/cratonvm-worktrees/20260708-191002-es-nonpassed-rerun/apps/elasticsearch" -WorkDir "/data/victor-worktrees/cratonvm-es-ivfknn-complete-20260712-1540/apps/elasticsearch-suite-runner/.suite-es-ivfknn-complete-20260712-1540" -Exe /data/data/cratonvm-targets/es-ivfknn-complete-20260712-1540/release/cratonvm-es-ivfknn-complete-20260712-1540 -JdkHome /home/victor/jdk25 -TimeoutSec 90 -RunName ivfknn-current -ModeName craton-current -Start 2538 -Count 1
+```
+
+Results:
+
+- The same selection passes on HotSpot/JDK 25 in 13.5 seconds.
+- With Craton JIT enabled, the runner aborts after roughly 5--8 seconds with
+  `Test abandoned because suite timeout was reached`; the in-test message says
+  `>=580000 msec`. This is not the outer 90-second runner timeout. Narrow
+  `System.nanoTime` and `TimeUnit.MILLISECONDS.toNanos(580000)` probes return
+  correct values, so a generic timeout-clock or `TimeUnit` conversion fault is
+  not an adequate explanation.
+- With `--nojit`, the process consumes about one CPU continuously and fails to
+  produce a test result before a 90-second outer timeout. A 150-second run
+  behaved the same. This is genuine non-progress, not merely a slow test.
+
+A Craton watchdog dump during the no-JIT run places the active worker in the
+vector-query path:
+
+```
+testSlicesSparseWithFilter -> doTestSlicesSparse -> doTestSlices
+-> IndexSearcher.search/rewrite -> IVFKnnFloatVectorQuery.rewrite
+-> AbstractIVFKnnVectorQuery.rewrite -> TaskExecutor.invokeAll
+-> searchLeaf -> IVFKnnFloatSlicedVectorQuery.getLeafResults
+-> CodecReader.getSortedDocValues -> Lucene90DocValuesProducer.getSorted
+-> IndexInput.randomAccessSlice -> MockIndexInputWrapper.slice
+-> ByteBuffersIndexInput.slice
+```
+
+The suite coordinator is waiting in `ThreadLeakControl.join` while that worker
+does not advance. A local, uncommitted experiment which decoded raw compact
+`long` arguments for `ByteBuffersDataInput.seek(long)` and `slice(long,long)`
+also still timed out in no-JIT mode at 90 seconds; it was deliberately not
+merged because it did not fix the residual.
+
+The host disallows non-parent `gdb -p` attachment through Yama ptrace policy,
+so native thread-state confirmation remains unavailable without a permitted
+parent/debug launch. The next investigation should obtain that capture (or
+equivalent VM instrumentation) around the `TaskExecutor`/`ByteBuffersIndexInput`
+path, rather than treating the older GC-monitor finding as proven for this
+current run.
+
+---
 # ES HANG - server org.elasticsearch.search.vectors.DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests
 
 Status: OPEN

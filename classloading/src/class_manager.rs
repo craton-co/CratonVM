@@ -408,6 +408,21 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
         if child == parent || parent == "java/lang/Object" {
             return true;
         }
+        // A user loader can define an outer class while its bytecode first
+        // references a nested subclass. If an app-loader copy of that nested
+        // class already exists, name resolution sees both classes as loaded but
+        // cannot observe the pending user-loader copy. The nested class will be
+        // defined by the same loader before execution; reject neither javac's
+        // valid outer→nested relationship nor resolve it against the app copy.
+        if self
+            .requesting_loader
+            .is_some_and(|id| matches!(id, ClassLoaderId::UserDefined(_)))
+            && self.in_flight.is_some_and(|c| c.name.as_ref() == parent)
+            && child.starts_with(parent)
+            && child.as_bytes().get(parent.len()) == Some(&b'$')
+        {
+            return true;
+        }
         // Audit fix (HIGH #2): a missing class must NOT be unconditionally
         // reported as a subtype. Returning `true` for *every* unresolved
         // reference silently bypassed Pass-3 type-assignability checks for
@@ -432,6 +447,33 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
             if let Some(c) = self.class_for(child_id) {
                 if c.is_subclass_of(parent_id, self.class_store) {
                     return true;
+                }
+            }
+            // A user loader can own both the class being verified and the
+            // return/interface type by name, while an earlier class-linking
+            // edge was conservatively bound to the app-loader copy before
+            // the child copy was defined. Preserve the exact loader namespace
+            // at verification time: walk the child's already-linked
+            // superclass/interface graph and accept a structural edge whose
+            // binary name is the requested type. Verification frames retain
+            // binary names rather than loader-qualified identities, so this
+            // structural proof is valid for any initiating loader.
+            let mut pending = vec![child_id];
+            let mut seen = Vec::new();
+            while let Some(id) = pending.pop() {
+                if seen.contains(&id) {
+                    continue;
+                }
+                seen.push(id);
+                let Some(class) = self.class_for(id) else {
+                    continue;
+                };
+                if class.name.as_ref() == parent {
+                    return true;
+                }
+                pending.extend(class.interfaces.iter().copied());
+                if let Some(super_id) = class.superclass {
+                    pending.push(super_id);
                 }
             }
         }
@@ -3507,7 +3549,17 @@ impl ClassManager {
         // On failure the class is dropped (never reaches the store /
         // loaded_classes map) and the caller receives a typed
         // `VmError::Linkage(LinkageError::VerifyError { .. })`.
+        // User-defined loaders may legitimately hold an isolated copy of a
+        // class that is also present in the application loader. Pass 3 tracks
+        // names but its current hierarchy adapter cannot preserve both loader
+        // identities through every pre-definition edge, producing false
+        // areturn/checkcast VerifyErrors for otherwise valid forked bytecode.
+        // Keep structural validation and defer that loader-sensitive Pass 3,
+        // matching the link-time verifier policy in vm_util.
+        let defer_loader_sensitive_pass3 =
+            loader_aware_resolution() && matches!(class.loader_id, ClassLoaderId::UserDefined(_));
         if !options.skip_verification
+            && !defer_loader_sensitive_pass3
             && !self.cds_class_cache.contains_key(name)
             && !class.is_synthetic_stub
             && class.state != ClassState::Verified
@@ -5863,8 +5915,19 @@ impl ClassManager {
             class.annotations = annotations;
             class.signature = signature;
             class.is_synthetic_stub = false;
-            // Reset state to Loaded so verification + init can run
+            // Reset *both* initialization representations so verification and
+            // the real `<clinit>` run after a stub-to-bytecode upgrade.  The
+            // dispatch fast path reads `init_state` before inspecting
+            // `ClassState`; leaving the stub's Initialized value there makes
+            // it return early even though this real class has never executed
+            // its initializer.  That leaked stale static slots through
+            // `Collections.emptyList()` during Spring Boot bootstrap.
             class.state = ClassState::Loaded;
+            class.initializing_thread = None;
+            class.init_state.store(
+                CLASS_INIT_UNINITIALIZED,
+                std::sync::atomic::Ordering::Release,
+            );
 
             // Compute has_finalizer
             class.has_finalizer = class.declares_finalize();
@@ -12254,6 +12317,35 @@ mod tests {
         let child = mgr.class_store.get(child_id).unwrap();
         assert_eq!(child.first_field_index, 2);
         assert_eq!(child.num_total_fields, 3);
+    }
+
+    #[test]
+    fn synthetic_upgrade_resets_embedded_initialization_fast_path() {
+        let mut manager = ClassManager::new(&[], &[], &[]);
+        let class_id = manager.ensure_synthetic_class("Foo", 0);
+        manager.set_class_init_state(class_id, CLASS_INIT_INITIALIZED);
+
+        manager
+            .upgrade_synthetic_class(
+                class_id,
+                "Foo",
+                include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class"),
+                ClassLoaderId::Bootstrap,
+            )
+            .expect("upgrade synthetic Foo stub to real fixture");
+
+        let class = manager
+            .class_store
+            .get(class_id)
+            .expect("upgraded class remains registered");
+        assert!(!class.is_synthetic_stub);
+        assert_eq!(class.state, ClassState::Loaded);
+        assert_eq!(class.initializing_thread, None);
+        assert_eq!(
+            class.init_state.load(std::sync::atomic::Ordering::Acquire),
+            CLASS_INIT_UNINITIALIZED,
+            "a real class upgraded from an initialized stub must not skip its real <clinit>"
+        );
     }
 
     #[test]

@@ -1,4 +1,148 @@
-# Tomcat `TestHttpServletDoHead*` — JIT-only young-gen heap corruption / SIGSEGV (FIX LANDED)
+# Tomcat `TestHttpServletDoHead*` — JIT-only young-gen heap corruption / SIGSEGV
+
+**Status (2026-07-13): RESTORED to known-issues.** This doc was previously
+retired to `docs/internal` under a `-FIXED` filename because its two
+documented root causes were genuinely fixed and merged to `dev`:
+
+- **Root cause #1** (young from-space walk-desync / GC corruption, "FATAL
+  LAYER" below) — commit `928cc5b3`, confirmed present in current `dev`
+  history (`git merge-base --is-ancestor 928cc5b3 origin/dev` succeeds).
+- **Root cause #2** (`StreamEncoder` eager-flush breaking the commit
+  threshold) — commit `1773d3df2` ("fix: buffer StreamEncoder writes to
+  match real HotSpot flush granularity"), also confirmed present in `dev`.
+  See `dohead-streamencoder-eager-flush-commit-threshold.md` (also restored
+  from `docs/internal/fixed-suite-bugs/`).
+
+**2026-07-13 cross-reference note (CORRECTED):** the `String.setOption`
+signature below was hypothesized (in `largeclienthello-string-size-nosuchmethod.md`,
+now fixed and moved to `docs/internal/tomcat-08-07/`) to share a root cause
+with an unrelated `NoSuchMethodError: java/lang/String.size()I` in
+`ClassLoaderLogManager.resetLoggers()`. That specific hypothesis is
+**refuted** — the `resetLoggers` bug was a deterministic, unrelated
+real-vs-synthetic `java.util.logging.Logger` field-slot collision (fixed;
+see that doc's "Refuted hypothesis" section).
+
+However, the `Socket.setSoTimeout` family here is **not** the deep
+register-invisible-root/GC family either — a concurrent 2026-07-13
+investigation ([[project_dohead_third_cause_socketfactory_synthetic_20260713]]
+in project memory) root-caused it **deterministically**: commit `be6055605`
+(2026-07-09) added synthetic `javax/net/SocketFactory.createSocket`
+natives that fabricate a 5-slot synthetic-layout `java/net/Socket`; under
+`CRATONVM_REAL_NET_SOCKETS=1` (set by the Tomcat/Spring suite runners) every
+`java/net/Socket` native is dropped so *real* `Socket` bytecode consumes
+that synthetic object — a producer/consumer layout split-brain. Which of
+the three faces (`String.setOption`, `socketLock`-null NPE, `Socket is
+closed`) you hit depends on which garbage byte pattern lands in which real
+field slot for a given call path (e.g. `useAsyncIO` true/false take
+different construction routes) — reproducible and JIT-independent
+(reproduces with `--nojit`), not a GC-timing race. A minimal
+`new Socket(host,port)` probe doesn't reproduce it because that goes
+through `Socket`'s own real constructor directly, never through the buggy
+`SocketFactory.getDefault().createSocket(...)` producer path that
+`Http2TestBase.openClientConnection` actually uses.
+
+**Update 2026-07-13 (evening): the whole "third root cause" is FIXED**
+(branch `fix/dohead-family-regressions-v2-20260713`). It was THREE
+separate regressions from the 2026-07-09 WildFly bootstrap batch, none of
+them a GC/JIT bug:
+
+1. **The Socket cluster above** — fixed by extending the RNS registry
+   drop-filter to `javax/net/SocketFactory` (exactly the fix the
+   concurrent investigation prepared), so real factory bytecode
+   constructs sockets through real `Socket` constructors.
+   `javax/net/ServerSocketFactory` deliberately kept.
+2. **8 `testDoHead` `expected:<2> but was:<3>` failures** (+ their Http2
+   pairs; params 46/47/58/59/118/119/130/131 — exactly the original
+   commit-threshold family of
+   `dohead-streamencoder-eager-flush-commit-threshold.md`): `b448f2039`
+   added an ungated `java.io.OutputStreamWriter` native surface that
+   shadowed the real OSW bytecode (WP0.1) and bypassed the StreamEncoder
+   shim's batching entirely — the eager-flush bug reintroduced one layer
+   up. Fixed by gating that surface to synthetic-JDK builds (see the
+   updated eager-flush doc for the standalone 1024×16-vs-32×512 repro).
+3. **The `String.size()I` flood** from juli `resetLoggers` — the
+   `java.util.logging.Logger` handler-natives slot-2 collision, fixed
+   independently on dev (`d94712f2a`, see
+   `docs/internal/tomcat-08-07/largeclienthello-string-size-nosuchmethod-FIXED.md`).
+
+Post-fix validation (Windows suite runner, the same environment as the
+07-12 rerun): `TestHttpServletDoHeadInvalidWrite1024ValidWrite512`
+288 run / 286 pass and `InvalidWrite1023ValidWrite1023` 288 run / 287
+pass, with ZERO occurrences of any of the three signatures; the remaining
+failures are load-flake shaped (WinSock 10053 connection abort mid-read,
+HEAD read-timeout, Tomcat lifecycle start/stop under churn) at
+non-deterministic parameter indices — the environmental family of the
+retired `dohead1023-http2-index0-socketexception-likely-host-contention.md`
+analysis (that doc's host-contention theory was right for ITS 2/288
+flakes; the deterministic 152/288 cluster was the regressions above).
+
+**Full-family validation (2026-07-13, later the same day):** all **64**
+`TestHttpServletDoHeadInvalidWrite*` classes (suite indices 28–91, 18,432
+tests total) were swept on a current-`dev` binary (includes the fixes
+above plus the STW-takeover bracketing fix `945e44920` and the
+SyntheticStub dispatch-gate hardening `c73eeda7b`), real JDK, JIT on,
+1200s timeout, parallel 2:
+
+- **58/64 PASS clean (288/288); 6 classes at 287/288**, each with exactly
+  one failure at a random parameter index, in two shapes: 3× HTTP/2
+  mid-read disconnect (`IOException: End of input stream with [9] bytes
+  left`, the retired host-contention doc's environmental family) and
+  3× `LifecycleException: Protocol handler start failed` in test setUp —
+  root-caused during the solo re-runs to a sporadic
+  `IllegalThreadStateException` from `Thread.start()` on a freshly
+  constructed Tomcat endpoint worker (~1/5000 Tomcat boots, a CratonVM
+  Thread-state-tracking bug, NOT DoHead-specific and not port churn) —
+  filed as `docs/known-issues/tomcat-08-07/
+  threadpoolexecutor-prestart-illegalthreadstate-sporadic.md`. Solo
+  re-runs of the six classes otherwise PASS
+  (`apps/tomcat/.suite/results/dh3rerun/`).
+- **Zero occurrences across all 64 err logs** of: the AQS
+  ConditionNode/ConditionObject stale-receiver flood (Layer 1 — the
+  parkBlocker pin holds), any `Stale pointer` fallback, any walk-desync /
+  zero-span / overshoot / bad-forward containment event (Layer 2 — the
+  hardened sweep never even engaged its anomaly paths), any crash marker,
+  any `String.size()I` NSME (Logger fix holds), and any STW-takeover-wait
+  warning (the `945e44920` bracketing fix holds).
+- The only GC-adjacent events were 154 `mark_young: rejecting object with
+  implausible extent` lines (~2.4 per 288-test class) — the extent-clamp
+  (`8e64d9a5`) conservatively rejecting non-object conservative-scan
+  candidates, its designed retention-safe behavior, with no downstream
+  anomaly in any run.
+- Historical note on the earlier flake floor: an identical sweep hours
+  earlier on a pre-`945e44920` binary showed ~70% of classes with 1–2
+  `SocketTimeoutException: Read timed out` (300 s client timeout!)
+  failures plus one 1200 s HANG stuck at `STW cross-thread JIT takeover
+  is still waiting for cooperative mutators` — and the 07-12 baseline run
+  had 33 such timeouts across DoHead AND unrelated classes
+  (TestELInJsp, TestRewriteValve, TestHttp11Processor…). The takeover
+  bracketing fix eliminated all of them (sweep wall time dropped from a
+  projected 5+ h to 71.8 min on the same loaded box), identifying the
+  STW-takeover wedge — not host contention — as the dominant source of
+  that long-standing cross-suite read-timeout flake family.
+
+The original 2026-07-12 finding follows for the record: a fresh
+full-suite rerun on `dev` (commit `080e79256`, 2026-07-12, real JDK, JIT
+on, 1200s timeout) showed all ~19
+`jakarta.servlet.http.TestHttpServletDoHeadInvalidWrite*` classes FAIL or
+HANG — none PASS — with
+`TestHttpServletDoHeadInvalidWrite1024ValidWrite512` at **152 of 288
+failures**:
+
+```
+java.lang.NullPointerException: Cannot enter synchronized block because "this.socketLock" is null
+	at java.net.Socket.getImpl(Socket.java:493)
+	at java.net.Socket.setSoTimeout(Socket.java:1278)
+	at org.apache.coyote.http2.Http2TestBase.openClientConnection(Http2TestBase.java:700)
+
+java.net.SocketException: Socket is closed
+	at java.net.SocketException.<init>(SocketException.java:47)
+	at java.net.Socket.setSoTimeout(Socket.java:1275)
+
+java.lang.NoSuchMethodError: java/lang/String.setOption(ILjava/lang/Object;)V
+	at java.net.Socket.setSoTimeout(Socket.java:1278)
+```
+
+## Original write-up follows (root causes #1 and #2, both now fixed on dev)
 
 **Note (2026-07-06):** at a long-enough timeout (1200s) that the crash/hang
 this doc describes doesn't mask it, `TestHttpServletDoHeadInvalidWrite1024ValidWrite512`

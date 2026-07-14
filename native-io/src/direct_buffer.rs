@@ -47,6 +47,7 @@
 //! See `direct_buffer_register_natives` for the FQNs registered.
 
 use std::alloc::{alloc, dealloc, Layout};
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -997,6 +998,131 @@ fn directbuffer_clean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     Ok(None)
 }
 
+/// `sun.nio.ch.Util$BufferCache` is intended to be thread-confined through a
+/// `ThreadLocal`, but the VM can currently expose one cache instance to several
+/// Java worker threads. Its JDK bytecode mutates `count`, `start`, and the
+/// `ByteBuffer[]` ring without a lock; concurrent `get`/`offer` calls then make
+/// `count` claim an entry whose array slot is null. NIO subsequently calls
+/// `capacity()` on that null entry.
+///
+/// Keep the cache itself on the Java heap (so its buffers remain visible to
+/// GC), and serialize only the ring operations. The lock is deliberately
+/// process-wide: cache operations are tiny and it also covers the accidental
+const TEMPORARY_BUFFER_POOL_LIMIT: usize = 3;
+const TEMPORARY_BUFFER_MAX_CAPACITY: i32 = 1 << 20;
+
+#[derive(Clone, Copy)]
+struct TemporaryBufferEntry {
+    vm_identity: usize,
+    capacity: i32,
+    root: usize,
+}
+
+thread_local! {
+    static TEMPORARY_BUFFERS: RefCell<Vec<TemporaryBufferEntry>> = const { RefCell::new(Vec::new()) };
+}
+
+/// sun.nio.ch.Util normally uses a Java ThreadLocal BufferCache. Under
+/// allocation-heavy concurrent postings reads, that cache can be observed by
+/// several VM worker threads and its unsynchronised ring produces null slots.
+/// Keep a tiny pool keyed by the native worker thread instead. Entries are
+/// persistent GC roots, so moving collection remaps them correctly; they are
+/// released on eviction and the real direct-buffer Cleaner then owns normal
+/// reclamation.
+fn temporary_direct_buffer_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let size = args.get(0).and_then(Value::as_int).unwrap_or(0);
+    if size < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "capacity < 0".into(),
+        }
+        .into());
+    }
+    let vm_identity = ctx.vm_identity();
+    let mut reusable = None;
+    TEMPORARY_BUFFERS.with(|entries| {
+        let mut entries = entries.borrow_mut();
+        if let Some(index) = entries
+            .iter()
+            .position(|entry| entry.vm_identity == vm_identity && entry.capacity >= size)
+        {
+            let entry = entries.remove(index);
+            reusable = ctx.resolve_global_root(entry.root).map(|buffer| (entry, buffer));
+            if reusable.is_none() {
+                ctx.remove_global_root(entry.root);
+            }
+        }
+    });
+    let buffer = match reusable {
+        Some((_entry, buffer)) => buffer,
+        None => match ctx.new_object_initialized(
+            "java/nio/DirectByteBuffer",
+            "(I)V",
+            &[Value::Int(size)],
+        )? {
+            Some(Value::Object(Some(buffer))) => buffer,
+            _ => return Ok(Some(Value::Object(None))),
+        },
+    };
+    ctx.set_field_by_name(buffer, "mark", Value::Int(-1));
+    ctx.set_field_by_name(buffer, "position", Value::Int(0));
+    ctx.set_field_by_name(buffer, "limit", Value::Int(size));
+    Ok(Some(Value::Object(Some(buffer))))
+}
+
+fn temporary_direct_buffer_release(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(buffer) = arg_obj(args, 0) else {
+        return Ok(None);
+    };
+    let capacity = ctx.get_field_by_name(buffer, "capacity").as_int().unwrap_or(-1);
+    if !(0..=TEMPORARY_BUFFER_MAX_CAPACITY).contains(&capacity) {
+        return Ok(None);
+    }
+    let vm_identity = ctx.vm_identity();
+    let root = ctx.add_global_root(buffer);
+    if root == 0 {
+        return Ok(None);
+    }
+    TEMPORARY_BUFFERS.with(|entries| {
+        let mut entries = entries.borrow_mut();
+        while entries.len() >= TEMPORARY_BUFFER_POOL_LIMIT {
+            let evicted = entries.remove(0);
+            ctx.remove_global_root(evicted.root);
+        }
+        entries.push(TemporaryBufferEntry {
+            vm_identity,
+            capacity,
+            root,
+        });
+    });
+    Ok(None)
+}
+
+fn cleaner_for_address(addr: u64) -> Option<i32> {
+    cleaners().lock().ok().and_then(|g| {
+        g.iter()
+            .find_map(|(id, entry)| (!entry.cleaned && entry.addr == addr).then_some(*id))
+    })
+}
+
+fn release_temporary_direct_buffer(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(buf) = arg_obj(args, 0) else {
+        return Ok(None);
+    };
+    let addr = match ctx.get_field_by_name(buf, "address") {
+        Value::Long(addr) => addr as u64,
+        _ => 0,
+    };
+    if addr != 0 {
+        if let Some(id) = cleaner_for_address(addr) {
+            fire_cleaner(id);
+        }
+    }
+    Ok(None)
+}
+
 /// Test-only hook: number of currently-tracked Cleaner registrations.
 #[cfg(test)]
 fn cleaners_pending_count() -> usize {
@@ -1062,12 +1188,8 @@ pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
         "(I)Ljava/nio/ByteBuffer;",
         dbb_allocate_direct0,
     );
-    r.register(
-        "java/nio/ByteBuffer",
-        "allocateDirect",
-        "(I)Ljava/nio/ByteBuffer;",
-        dbb_allocate_direct0,
-    );
+    // Keep ByteBuffer.allocateDirect on its real-JDK bytecode path so the
+    // DirectByteBuffer constructor installs its non-null Cleaner.
 
     // Cleaner natives.
     r.register(
@@ -1098,6 +1220,17 @@ pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;JJ)I",
         cleaner_create0,
     );
+
+    // `Util$BufferCache` is normally ThreadLocal. VM worker threads can
+    // currently share it, so make each ring operation atomic while retaining
+    // buffers in the Java-owned cache (rather than allocating a Cleaner on
+    // Avoid the racy Java BufferCache while preserving real direct buffers
+    // and their Cleaner contract. The pool is local to each native worker
+    // thread and bounded to three buffers.
+    r.register("sun/nio/ch/Util", "getTemporaryDirectBuffer", "(I)Ljava/nio/ByteBuffer;", temporary_direct_buffer_get);
+    for method in ["releaseTemporaryDirectBuffer", "offerFirstTemporaryDirectBuffer", "offerLastTemporaryDirectBuffer"] {
+        r.register("sun/nio/ch/Util", method, "(Ljava/nio/ByteBuffer;)V", temporary_direct_buffer_release);
+    }
 
     // DirectBuffer interface methods.
     r.register(

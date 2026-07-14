@@ -111,7 +111,7 @@ version.db.DbVersionTest
 
 - Rerun this exact 61-class list, ideally on a quiet/dedicated host (or at
   minimum, coordinate with concurrent host activity), with `SHARDS=1` (no
-  intra-run contention) and a longer `TIMEOUT` (e.g. 900s) to separate
+  intra-run contention) and a longer `TIMEOUT` (e.g. 1500s) to separate
   genuinely-hanging classes from ones that just need more wall-clock time
   under load.
 - Any class that reproduces a hang cleanly on a quiet host with a generous
