@@ -1,6 +1,6 @@
 # Elasticsearch fixture blocker - missing libvec.so
 
-Status: OPEN fixture blocker, not a CratonVM bug
+Status: FIXED fixture blocker
 
 Date observed: 2026-07-13
 
