@@ -18929,6 +18929,8 @@ fn coerce_arg(
 /// any case we can't decide without risk all pass without throwing.
 fn checkcast_lambda_instantiated_args(
     shared: &SharedVm,
+    thread: &JvmThread,
+    handles: &[Option<usize>],
     sam_desc: &str,
     inst_desc: &str,
     args: &[Value],
@@ -18950,10 +18952,26 @@ fn checkcast_lambda_instantiated_args(
             continue;
         }
         // SAM-supplied args follow the captures in `args`.
-        let obj_ref = match args.get(num_captures + sam_idx) {
-            Some(Value::Object(Some(o))) => *o,
-            // null (a `checkcast` of null always succeeds), primitive, or missing.
-            _ => continue,
+        //
+        // GC-safety: `args` is a plain Rust Vec copy handed to us by the
+        // caller, not itself a GC root -- only `thread.native_pin_roots`
+        // (which the caller pinned every object arg into before this call)
+        // is remapped by a moving GC. A prior loop iteration's
+        // `lambda_arg_provably_not_instance` call can trigger a GC via its
+        // proxy/annotation-satisfies helpers, which leaves any later
+        // `args[idx]` read here pointing at a stale, already-evacuated
+        // address. Read the CURRENT address back through the caller's pin
+        // (`handles`) instead of the raw `args` slice. Confirmed live via
+        // CRATONVM_DBG_STALE_OBJREF during WildFly parallel-extension-add --
+        // see docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+        let idx = num_captures + sam_idx;
+        let obj_ref = match handles.get(idx).copied().flatten() {
+            Some(h) => thread.native_pin_roots[h],
+            None => match args.get(idx) {
+                Some(Value::Object(Some(o))) => *o,
+                // null (a `checkcast` of null always succeeds), primitive, or missing.
+                _ => continue,
+            },
         };
         if lambda_arg_provably_not_instance(shared, obj_ref, inst_tok) {
             let obj_class_name = shared
@@ -19250,9 +19268,15 @@ pub fn coerce_lambda_args(
     // have performed, so a narrowed type variable still raises
     // `ClassCastException` for an incompatible argument. Runs before the
     // box/unbox coercion below, mirroring the bridge's cast-then-adapt order.
-    if let Err(e) =
-        checkcast_lambda_instantiated_args(shared, sam_desc, inst_desc, args, num_captures)
-    {
+    if let Err(e) = checkcast_lambda_instantiated_args(
+        shared,
+        thread,
+        &handles,
+        sam_desc,
+        inst_desc,
+        args,
+        num_captures,
+    ) {
         thread.native_pin_roots.truncate(pin_base);
         return Err(e);
     }
