@@ -25459,17 +25459,27 @@ impl Compiler {
                         // is smaller, so a legacy fit implies a compact fit.
                         // `emit_inline_tlab_new` computes the real compact size +
                         // writes array_length/GC_FLAG_COMPACT inline.
-                        // Inline TLAB allocation is not yet safe with the
-                        // precise moving young collector: under Hibernate's
-                        // repeated SessionFactory bootstrap it can leave the
-                        // heap walker at an invalid object boundary
-                        // (kind=Object with array payload metadata), whereas
-                        // the helper path initializes the canonical header
-                        // atomically.  Keep the optimization available for
-                        // focused validation, but require an explicit opt-in
-                        // until its moving-GC contract is proved.
-                        let can_inline = std::env::var_os("CRATONVM_JIT_ENABLE_INLINE_NEW")
-                            .is_some()
+                        // The pure inline path publishes a complete canonical
+                        // header before advancing the TLAB cursor and cannot
+                        // call into GC. Enable that safe subset by default.
+                        // Body clearing makes int-family typed zeroes safe in
+                        // the pure inline path. Sites requiring non-zero Value
+                        // tags (long/float/double) or finalizer registration
+                        // retain the helper path unless explicitly opted in.
+                        //
+                        // (Restored 2026-07-14: merge 96a1d0c2 resolved this
+                        // region to the pre-0ee32e122 opt-in gate — reverting
+                        // "Optimize Binary Trees allocation and recursion" and
+                        // regressing bt18 1.9s→6.0s. The old "not yet safe
+                        // with the precise moving young collector" rationale
+                        // belonged to the pre-redesign inline path; the
+                        // current one completes the header before the cursor
+                        // advance, which is what made default-on safe.)
+                        let skip_helper = !has_prim_init && !has_finalizer;
+                        let can_inline = std::env::var_os("CRATONVM_JIT_DISABLE_INLINE_NEW")
+                            .is_none()
+                            && (skip_helper
+                                || std::env::var_os("CRATONVM_JIT_ENABLE_INLINE_NEW").is_some())
                             && self.helpers.get_current_thread != 0
                             && self.helpers.tlab_post_init != 0
                             && self.helpers.new_object != 0
@@ -25494,7 +25504,6 @@ impl Compiler {
                             // the `new_info` doc in `jit/src/lib.rs`),
                             // so the conservative default `(true,true)`
                             // keeps the helper call in place for now.
-                            let skip_helper = !has_prim_init && !has_finalizer;
                             self.emit_inline_tlab_new(class_id_raw, num_fields, skip_helper);
                         } else {
                             // Slow path: full helper-call dispatch. Used when
