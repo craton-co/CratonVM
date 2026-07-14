@@ -824,7 +824,8 @@ impl TieredCompilationManager {
     /// the throttle, so calling `on_backedge` per iteration just to reach the
     /// count threshold would both pay a lock per back-edge and double-count.
     /// It is idempotent: a no-op (returns `None`) if the method is already
-    /// queued, already at/above C2, or has bailed out of C2. The enqueued task
+    /// queued or has bailed out of C2. Method-entry C2 does not suppress this
+    /// request because OSR bodies live in an independent cache. The enqueued task
     /// carries `osr_bci` so the background worker compiles an OSR-enterable
     /// artifact; the mutator enters it once published. (Threshold tuning of
     /// when a loop counts as "hot enough" is Step 6.)
@@ -843,7 +844,6 @@ impl TieredCompilationManager {
             return None;
         }
         if state.queued_for_compilation
-            || state.current_tier >= CompilationTier::C2
             || state.c2_bailout
             // Same "give up after repeated failures" convention as
             // `should_compile`/`request_c2_upgrade`: without this, a method
@@ -1455,19 +1455,18 @@ mod tests {
     }
 
     #[test]
-    fn step5_request_osr_skips_when_already_c2_or_bailed() {
+    fn step5_request_osr_is_independent_of_method_entry_c2_but_honors_bailout() {
         clear_osr_deny_list_for_test();
-        // Already at C2 → nothing to OSR-compile. `compilation_complete` /
-        // `on_c2_bailout` use `get_mut` (no-op on an unseen method), so the
-        // method must first be registered via `on_method_invocation`.
+        // A method-entry C2 body does not provide an OSR entry and therefore
+        // must not suppress the separately cached OSR artifact.
         let mgr = TieredCompilationManager::with_default_policy();
         let key = test_key();
         mgr.on_method_invocation(&key);
         mgr.compilation_complete(&key, CompilationTier::C2, 1);
-        assert!(
-            mgr.request_osr(&key, 7).is_none(),
-            "C2 method: no OSR enqueue"
-        );
+        let task = mgr
+            .request_osr(&key, 7)
+            .expect("method-entry C2 must still allow an OSR artifact");
+        assert_eq!(task.osr_bci, Some(7));
 
         // C2-bailed method → no OSR enqueue.
         let mgr2 = TieredCompilationManager::with_default_policy();

@@ -42,22 +42,24 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 
 | Benchmark                          | JDK 25 C2     | CratonVM default | Default ratio |
 |-------------------------------------|---------------|-------------------|---------------|
-| Arithmetic (2B ops)                 | 2,622 ms      | 11,465 ms         | 4.37x         |
-| Fibonacci(44)                       | 2,774 ms      | 9,321 ms          | 3.36x         |
-| Sieve (100K x 20,000)               | 5,253 ms      | 19,371 ms         | 3.69x         |
-| Matrix 1280x1280                    | 2,623 ms      | 10,364 ms         | 3.95x         |
-| **QuickBench TOTAL**                | **13,272 ms** | **50,521 ms**     | **3.81x**     |
+| Arithmetic (2B ops)                 | 2,075 ms      | 4,161 ms          | 2.01x         |
+| Fibonacci(44)                       | 2,486 ms      | 4,283 ms          | 1.72x         |
+| Sieve (100K x 20,000)               | 2,738 ms      | 16,711 ms         | 6.10x         |
+| Matrix 1280x1280                    | 2,099 ms      | 5,909 ms          | 2.82x         |
+| **QuickBench TOTAL**                | **9,398 ms**  | **31,064 ms**     | **3.31x**     |
 | HashMap (1M put/get, isolated)      | 51.1 ms       | 409.6 ms          | 8.01x         |
 | String/Regex (10K, isolated)        | 8 ms          | 153 ms            | 19.1x         |
 | Binary Trees (depth=18, isolated)   | 382 ms        | 4,916 ms          | 12.9x         |
 
-*Arithmetic/Fibonacci/Sieve/Matrix measured 2026-07-10 on the primary Windows dev box
-(hybrid P/E-core CPU, pinned to the 16 P-core logical processors via
-`ProcessorAffinity` — single-threaded benchmarks otherwise get scheduled onto slower
-E-cores, which skews results) against JDK 25 C2 and a CratonVM release build off `dev`
-with the guarded-inline-getfield JIT fast path at its default-on state (see below);
-not re-verified since. HashMap, String/Regex, and Binary Trees are each measured as a
-**separate, isolated, freshly-launched process** (not part of the combined run above,
+*Arithmetic/Fibonacci/Sieve/Matrix measured 2026-07-13 on the Azure Linux benchmark
+host, pinned to logical CPU 14 with `taskset`, as the median of three freshly launched
+processes against Temurin JDK 25.0.3 C2 and a CratonVM release candidate with default
+settings. Checksums matched on every run. The OSR scheduling and guarded scalar
+self-recursion changes behind these results are documented in
+[`docs/internal/performance/quickbench-half-gap-3rows-20260713.md`](docs/internal/performance/quickbench-half-gap-3rows-20260713.md).
+HashMap, String/Regex, and Binary Trees retain their prior isolated snapshots and are
+each measured as a **separate, isolated, freshly-launched process** (not part of the
+combined run above,
 median/mean of several rounds, checksums identical every round) — mixing any of them
 into the combined run inflates its ratio via accumulated GC/heap pressure from the
 preceding kernels in the same process, so each is kept isolated for a representative
