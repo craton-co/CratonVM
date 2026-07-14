@@ -943,6 +943,21 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                         let (n, blocked, tids, blocked_tids) =
                             shared.thread_registry.alive_count_blocked_and_os_tids();
                         counted_os_tids = tids;
+                        // DIAGNOSTIC (2026-07-13, STW takeover 5-class cluster
+                        // investigation): print the EXACT identity set counted
+                        // as "expected" (alive AND NOT in_blocked_region) at
+                        // the instant this pause is requested, to disambiguate
+                        // whether a thread later seen parked was already
+                        // excluded at request time or genuinely raced in.
+                        if std::env::var_os("CRATONVM_DBG_STW_EXPECTED_IDS").is_some() {
+                            let expected_ids: Vec<u64> = shared
+                                .thread_registry
+                                .alive_thread_ids_excluding(&blocked_tids);
+                            eprintln!(
+                                "[stw-expected] initiator={} n={} blocked={} expected_ids={:?}",
+                                thread.thread_id.0, n, blocked, expected_ids
+                            );
+                        }
                         (
                             u32::try_from(n).unwrap_or(u32::MAX),
                             u32::try_from(blocked).unwrap_or(u32::MAX),
@@ -1539,6 +1554,52 @@ fn process_references_after_gc(
             &is_marked,
             pointer_map,
         );
+        // Prune dead entries from the overlay-backed-collection side-tables
+        // (LinkedList / LinkedHashMap / TreeMap / TreeSet — `roots.rs` step 17
+        // / `native_collections::gc_scan_collection_overlay_roots`). This
+        // function existed but was never called from anywhere in the tree
+        // (confirmed: `gc_prune_dead_collection_overlays` had zero call
+        // sites) — a collection whose OWN object becomes genuinely
+        // unreachable left its registry entry (and every element it ever
+        // held) permanently behind, since nothing ever shrank these tables.
+        // Wiring this in is a real, independent, safe fix (verified: prunes
+        // ~1000/1470 stale entries per GC cycle in the Tomcat suite) with no
+        // change to rooting behavior — it only removes bookkeeping for
+        // collections `is_marked` already agrees are dead.
+        //
+        // NOTE: this does NOT fully close
+        // `docs/known-issues/tomcat-08-07/defaultinstancemanager-classunloading-count-mismatch.md`.
+        // `roots.rs` step 17 itself has a separate, deeper bug this session
+        // found but did not fix: `gc_scan_collection_overlay_roots` roots
+        // EVERY element of EVERY overlay-backed collection unconditionally,
+        // with no gate on whether the backing collection is reachable. A
+        // scratch `List<StackMapFrame>` the JDT compiler uses transiently
+        // during JSP compilation gets its elements force-rooted this way;
+        // forward-tracing from that illegitimate root walks back through the
+        // compiler's real field references into the evicted JSP's
+        // `JspServletWrapper` and its `ClassLoader`, keeping the whole
+        // cluster permanently, artificially reachable — confirmed via a
+        // root-membership closure check (21 direct hits, all contributed by
+        // step 17, not by any other root source). A full fix needs the same
+        // conditional-rooting + mark-time-propagation treatment this session
+        // gave `class_mirrors` (see `cratonvm_types::mirror_pin`), but scoped
+        // to every overlay table instead of just one cache — a materially
+        // larger, higher-risk change than fit in this session; left for a
+        // dedicated follow-up.
+        //
+        // Called here (not `update_all_roots`/gc.rs, where the existing
+        // remap call `gc_update_collection_overlay_refs` lives) for the same
+        // reason `reconcile_class_mirrors` is here and not there:
+        // `update_all_roots` early-returns when `pointer_map` is empty (the
+        // common case for the non-moving JIT-active sweep), so it would
+        // never run for that path. `is_marked` already handles PRE-GC
+        // addresses correctly for both the moving and non-moving cases
+        // (pointer_map lookup for moved survivors, `is_addr_live` for
+        // not-moved ones) — the same pattern `gc_reconcile_defining_loaders`
+        // above already relies on — so pruning here with pre-remap addresses
+        // is correct; the later `gc_update_collection_overlay_refs` remap
+        // pass in `update_all_roots` only touches whatever prune left behind.
+        cratonvm_native_collections::gc_prune_dead_collection_overlays(&is_marked);
         // Companion reconciliation for the class-mirror cache — see
         // `memory::gc::reconcile_class_mirrors` / `roots.rs` step 6. Same
         // "before the no_refproc short-circuit" rationale: the cache must
@@ -6293,7 +6354,7 @@ pub(crate) fn try_osr_with_backoff(
         let reusable = {
             let jc = shared.jit_cache.read();
             matches!(
-                jc.get(&cn, &mn, &md),
+                jc.get_osr(&cn, &mn, &md),
                 Some(c) if c.compiled_via_osr && c.can_osr_enter(entry_pc)
             )
         };
@@ -6303,11 +6364,20 @@ pub(crate) fn try_osr_with_backoff(
             // than spin. A subsequent hot back-edge finds the published
             // artifact and falls through to the reuse-enter below.
             let key = crate::jit::tiered::MethodKey::new(cn, mn, md);
-            if !crate::jit::tiered::is_osr_denied(&key) {
-                ensure_bg_compiler_started(shared);
-                let _ = shared.tiered_manager.request_osr(&key, entry_pc as u32);
+            if crate::jit::tiered::is_osr_denied(&key) {
+                thread.frames[*frame_idx].record_osr_rejection(entry_pc);
+                return OsrBackoffOutcome::Skip;
             }
-            thread.frames[*frame_idx].record_osr_rejection(entry_pc);
+            ensure_bg_compiler_started(shared);
+            let _ = shared.tiered_manager.request_osr(&key, entry_pc as u32);
+            // Waiting for an off-thread compile is not a failed OSR attempt.
+            // The old attempt counter reached its permanent cap within a few
+            // thousand interpreted iterations, usually before the worker had
+            // published, so the frame never probed the completed artifact.
+            // Restart the stride instead: this polls at most once per threshold
+            // while the task is queued. A real compile failure marks the method
+            // OSR-denied below and returns to the bounded rejection schedule.
+            thread.frames[*frame_idx].record_osr_background_pending();
             return OsrBackoffOutcome::Skip;
         }
         // `reusable`: fall through to `try_osr`, which reuses the published
@@ -11756,6 +11826,7 @@ fn execute_instruction(
     instruction: &Instruction,
     saved_pc: usize,
 ) -> Result<InstructionResult, MethodCallFailed> {
+    hotpath_counts::bump(&hotpath_counts::TOTAL_INSTRUCTIONS);
     match instruction {
         // -- Constants (T10.9.D direct CompactValue push) --
         Instruction::Nop => {}
@@ -16107,6 +16178,7 @@ fn lookup_loader_initiated(
     referencing_class_id: ClassId,
     name: &str,
 ) -> Option<ClassId> {
+    hotpath_counts::bump(&hotpath_counts::LOOKUP_LOADER_INITIATED_CALLS);
     if !should_use_loader_initiated_resolution(shared, referencing_class_id) {
         return None;
     }
@@ -16494,6 +16566,7 @@ fn retarget_instance_field_to_receiver(
     receiver_class_id: ClassId,
     field: &ResolvedField,
 ) -> Option<ResolvedField> {
+    hotpath_counts::bump(&hotpath_counts::RETARGET_FIELD_CALLS);
     if field.is_static
         || receiver_class_id == ClassId::new(0)
         || receiver_class_id == field.declaring_class_id
@@ -17246,6 +17319,18 @@ fn execute_invoke_kind(
 
     let (method_class_name, method_name, method_descriptor, num_params) =
         resolve_method_ref(shared, current_class_id, cp_index)?;
+
+    if crate::runtime::env_cache::dbg_hang_sample() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CALL_COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n % 200_000 == 0 {
+            eprintln!(
+                "[HANG_SAMPLE_V1] call#{n} {}.{}{}",
+                &*method_class_name, &*method_name, &*method_descriptor
+            );
+        }
+    }
 
     // KAFKA-DEFAULT-RESCUE: snapshot the CP-resolved class id (if loaded)
     // before any downstream code can move `method_class_name`. The default-
@@ -20224,6 +20309,63 @@ pub(crate) fn try_lambda_dispatch(
                     .write()
                     .load_class(&call_site.impl_handle.class_name)?,
             };
+            // Array-constructor reference (`SomeType[]::new`, e.g. as an
+            // `IntFunction<SomeType[]>` — the mechanism behind
+            // `Collection.toArray(SomeType[]::new)` and any direct user code).
+            // `load_class` already resolves an array-shaped impl class name
+            // (e.g. "[Ljava/nio/ByteBuffer;") to its synthesized array
+            // ClassId (JVMS 5.3.3 — array classes are never loaded from a
+            // class file), but everything below this point assumes a
+            // REGULAR object: it allocates `num_total_fields` (0 for an
+            // array class) object slots and dispatches `<init>`, which does
+            // not exist for arrays. That produced a zero-field object
+            // wearing the array's ClassId — no length header, no element
+            // storage, and the requested length (the sole `IntFunction`
+            // argument) silently discarded — which a later `checkcast` to
+            // the real array type then rejects
+            // (`ClassCastException: ... cannot be cast to [Lyour/Type;`).
+            // Detect the array case up front and dispatch to real array
+            // allocation instead.
+            let array_info = shared
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .and_then(|c| c.array_info.clone());
+            if let Some(array_info) = array_info {
+                let length = full_args
+                    .first()
+                    .and_then(Value::as_int)
+                    .ok_or_else(|| VmError::Internal {
+                        message: "array-constructor-reference: missing length arg".to_string(),
+                    })?;
+                if length < 0 {
+                    return Err(RuntimeError::NegativeArraySizeException { size: length }.into());
+                }
+                let (element_type, component_class_id) = if array_info.array_dimension == 1 {
+                    match &*array_info.leaf_component_name {
+                        "boolean" => (ArrayElementType::Boolean, ClassId::new(0)),
+                        "char" => (ArrayElementType::Char, ClassId::new(0)),
+                        "float" => (ArrayElementType::Float, ClassId::new(0)),
+                        "double" => (ArrayElementType::Double, ClassId::new(0)),
+                        "byte" => (ArrayElementType::Byte, ClassId::new(0)),
+                        "short" => (ArrayElementType::Short, ClassId::new(0)),
+                        "int" => (ArrayElementType::Int, ClassId::new(0)),
+                        "long" => (ArrayElementType::Long, ClassId::new(0)),
+                        _ => (ArrayElementType::Reference, array_info.component_class_id),
+                    }
+                } else {
+                    (ArrayElementType::Reference, array_info.component_class_id)
+                };
+                let arr = gc_alloc_array(
+                    shared,
+                    thread,
+                    component_class_id,
+                    element_type,
+                    length as usize,
+                )?;
+                maybe_gc(shared, thread);
+                return Ok(Some(Some(Value::Object(Some(arr)))));
+            }
             ensure_class_initialized_shared(shared, thread, class_id)?;
             // Use `num_total_fields` (inherited + declared instance fields),
             // matching the `New` opcode. `c.fields.len()` is wrong here: it
@@ -20556,6 +20698,12 @@ pub(crate) fn is_class_mirror_native_override(
                 | (
                     "getDeclaredAnnotationsByType",
                     "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;"
+                )
+                | ("getDeclaredFields", "()[Ljava/lang/reflect/Field;")
+                | ("getDeclaredFields0", "(Z)[Ljava/lang/reflect/Field;")
+                | (
+                    "getDeclaredField",
+                    "(Ljava/lang/String;)Ljava/lang/reflect/Field;"
                 )
         )
 }
@@ -22325,12 +22473,81 @@ pub(crate) fn is_reflection_factory_serialization_native_override(
     )
 }
 
+/// Temporary call-count instrumentation for the silent-hang-no-signature-
+/// cluster throughput residual (2026-07-13). Tallies invocations of several
+/// suspected interpreter dispatch hot-path functions, reported periodically
+/// via `CRATONVM_DBG_HOTPATH_COUNTS=1` — independent of wall-clock timing,
+/// so it stays valid signal even on a heavily contended/noisy host.
+pub(crate) mod hotpath_counts {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static FORCE_NATIVE_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static RESOLVE_METHOD_REF_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static LOOKUP_LOADER_INITIATED_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static RETARGET_FIELD_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static TOTAL_INSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn bump(counter: &AtomicU64) {
+        if !crate::runtime::env_cache::dbg_hotpath_counts() {
+            return;
+        }
+        let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() || n % 1_000_000 == 0 {
+            eprintln!(
+                "[hotpath-counts] force_native={} resolve_method_ref={} \
+                 lookup_loader_initiated={} retarget_field={} total_instr={}",
+                FORCE_NATIVE_CALLS.load(Ordering::Relaxed),
+                RESOLVE_METHOD_REF_CALLS.load(Ordering::Relaxed),
+                LOOKUP_LOADER_INITIATED_CALLS.load(Ordering::Relaxed),
+                RETARGET_FIELD_CALLS.load(Ordering::Relaxed),
+                TOTAL_INSTRUCTIONS.load(Ordering::Relaxed),
+            );
+        }
+    }
+}
+
 fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
+    hotpath_counts::bump(&hotpath_counts::FORCE_NATIVE_CALLS);
     if is_class_mirror_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // The real Collections.emptyList() returns the class's pre-built static
+    // singleton. During the Brave bootstrap that slot can retain a polluted
+    // ArrayList, so use the registered constructor-backed empty-list native
+    // instead of exposing that stale shared state.
+    if class_name == "java/util/Collections"
+        && method_name == "emptyList"
+        && method_descriptor == "()Ljava/util/List;"
+    {
+        return true;
+    }
+    if class_name == "java/util/function/Predicate"
+        && matches!(
+            (method_name, method_descriptor),
+            ("and", "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;")
+                | ("or", "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;")
+                | ("negate", "()Ljava/util/function/Predicate;")
+                | ("not", "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;")
+        )
+    {
+        return true;
+    }
+    // The real DecimalFormatSymbols factories enter CLDR's locale bootstrap.
+    // During the early Spring/JUnit summary path that bootstrap can observe a
+    // stale Collections empty-list slot, producing a type-correct but wrong
+    // List element.  The registered locale native constructs the same DFS
+    // instance without that provider walk; force it over the concrete JDK
+    // bytecode on every interpreter dispatch path.
+    if class_name == "java/text/DecimalFormatSymbols"
+        && matches!(
+            (method_name, method_descriptor),
+            ("initialize", "(Ljava/util/Locale;)V")
+                | ("getInstance", "(Ljava/util/Locale;)Ljava/text/DecimalFormatSymbols;")
+        )
+    {
         return true;
     }
     // Base64 encoders are represented by VM-side synthetic state.  The real
@@ -24216,7 +24433,7 @@ fn surefire_lazy_launcher_discover_native(
 /// Synthetic stubs are fallback implementations for fake or incomplete JDK
 /// classes. When the real class bytecode is loaded and explicitly protected,
 /// dispatch must prefer that bytecode over the approximate stub.
-fn synthetic_stub_should_yield_to_real_bytecode(
+pub(crate) fn synthetic_stub_should_yield_to_real_bytecode(
     shared: &SharedVm,
     class_name: &str,
     method_name: &str,
@@ -24230,7 +24447,37 @@ fn synthetic_stub_should_yield_to_real_bytecode(
         return false;
     }
 
-    let real_protected_stub = crate::runtime::env_cache::real_bytecode_selector()
+    if !real_protected_stub_class(class_name) {
+        return false;
+    }
+
+    let cm = shared.class_manager.read();
+    cm.get_loaded_class_id(class_name)
+        .and_then(|cid| {
+            cm.get_class(cid).and_then(|cls| {
+                if cls.is_synthetic_stub {
+                    None
+                } else {
+                    crate::classloading::find_method_recursive(
+                        cid,
+                        method_name,
+                        descriptor,
+                        &cm.class_store,
+                    )
+                    .map(|(m, _)| !m.is_native() && m.code().is_some())
+                }
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// The class allowlist for [`synthetic_stub_should_yield_to_real_bytecode`]
+/// (and `populate_invoke_cache`'s inline copy of the same predicate, which
+/// cannot call the full helper while holding the class-manager read lock):
+/// classes whose SyntheticStub natives exist only for stub-phase bootstraps
+/// and must yield to loaded real bytecode.
+pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
+    crate::runtime::env_cache::real_bytecode_selector()
         .prefers_real(class_name)
         || matches!(
             class_name,
@@ -24260,29 +24507,7 @@ fn synthetic_stub_should_yield_to_real_bytecode(
                 | "java/lang/ref/Cleaner"
                 | "java/lang/ref/Cleaner$Cleanable"
                 | "java/lang/management/ManagementFactory"
-        );
-    if !real_protected_stub {
-        return false;
-    }
-
-    let cm = shared.class_manager.read();
-    cm.get_loaded_class_id(class_name)
-        .and_then(|cid| {
-            cm.get_class(cid).and_then(|cls| {
-                if cls.is_synthetic_stub {
-                    None
-                } else {
-                    crate::classloading::find_method_recursive(
-                        cid,
-                        method_name,
-                        descriptor,
-                        &cm.class_store,
-                    )
-                    .map(|(m, _)| !m.is_native() && m.code().is_some())
-                }
-            })
-        })
-        .unwrap_or(false)
+        )
 }
 
 /// Stackless invoke: resolve a method and either call native (Handled) or push
@@ -24698,7 +24923,15 @@ fn try_stackless_invoke(
     // Reflection-metadata natives stay authoritative (see
     // `redefine_immune_reflection_native`) — a Mockito inline mock of
     // `java.lang.reflect.Method` must not disable annotation reflection.
-    if !(declaring_is_interface && !is_static)
+    let force_interface_default_native = declaring_is_interface
+        && !is_static
+        && should_force_registered_native_over_bytecode(
+            shared,
+            &class_name_arc,
+            method_name,
+            descriptor,
+        );
+    if (!(declaring_is_interface && !is_static) || force_interface_default_native)
         && (!native_shadow_suppressed_by_redefine(shared, &class_name_arc)
             || redefine_immune_forced_native(&class_name_arc, method_name, descriptor))
     {
@@ -25452,9 +25685,29 @@ fn populate_invoke_cache(
     // bytecode body, the cached Native entry must invalidate.  Look up
     // the class_id here rather than synthesizing a never-stale gate so
     // even native-resolved entries participate in JEP 109 invalidation.
+    //
+    // SyntheticStub yield: a stub-tagged native on a real-protected class
+    // whose real bytecode is loaded must NOT be cached (and especially not
+    // promoted to the cross-thread cache) — the stub body exists only for
+    // stub-phase bootstraps. Without this, a call site whose first
+    // resolution goes through this population path permanently pins the
+    // stub even though the slow-path dispatch sites correctly yield
+    // (observed 2026-07-13 with the since-removed OutputStreamWriter stub
+    // surface: `HttpServlet$NoBodyPrintWriter.resetBuffer`'s
+    // `new OutputStreamWriter` kept minting encoders with a null `se`
+    // while the sibling constructor call site ran the real ctor).
+    // Fall through to the bytecode resolution below instead.
     if let Some(callback) = shared
         .native_methods
         .find(&class_name, &method_name, &descriptor)
+        .filter(|_| {
+            !synthetic_stub_should_yield_to_real_bytecode(
+                shared,
+                &class_name,
+                &method_name,
+                &descriptor,
+            )
+        })
     {
         let cm = shared.class_manager.read();
         let gate = match cm.get_loaded_class_id(&class_name) {
@@ -25557,26 +25810,43 @@ fn populate_invoke_cache(
     // restored by the `cd396a04` "Merge branch 'main' into dev" merge).
     {
         let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
-        if let Some(callback) =
-            shared
-                .native_methods
-                .find(declaring_name, &method_name, &descriptor)
-        {
-            let gate = RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
-            drop(cm);
-            let target = CachedInvokeTarget::Native {
-                callback,
-                // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
-                num_params: num_params as u16,
-                gate,
-            };
-            shared
-                .shared_resolution
-                .insert_promoted_invoke(promoted_key, target.clone());
-            thread
-                .invoke_cache
-                .put(caller_class_id, cp_index, is_special, target);
-            return;
+        // Inline SyntheticStub yield (the full helper re-acquires the
+        // class-manager read lock, which is already held here): a stub-tagged
+        // native on a real-protected declaring class whose resolved method is
+        // real bytecode yields — do not cache the stub. `method`/`declaring_id`
+        // are the already-resolved real method/class from
+        // `find_method_recursive` above.
+        let stub_yields = shared
+            .native_methods
+            .kind_of(declaring_name, &method_name, &descriptor)
+            == Some(cratonvm_native_api::NativeKind::SyntheticStub)
+            && real_protected_stub_class(declaring_name)
+            && store.get(declaring_id).is_some_and(|c| !c.is_synthetic_stub)
+            && !method.is_native()
+            && method.code().is_some();
+        if !stub_yields {
+            if let Some(callback) =
+                shared
+                    .native_methods
+                    .find(declaring_name, &method_name, &descriptor)
+            {
+                let gate =
+                    RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
+                drop(cm);
+                let target = CachedInvokeTarget::Native {
+                    callback,
+                    // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
+                    num_params: num_params as u16,
+                    gate,
+                };
+                shared
+                    .shared_resolution
+                    .insert_promoted_invoke(promoted_key, target.clone());
+                thread
+                    .invoke_cache
+                    .put(caller_class_id, cp_index, is_special, target);
+                return;
+            }
         }
     }
 
@@ -26283,7 +26553,7 @@ fn compile_osr_artifact(
     // here (or no cached artifact) recompile exactly as before.
     let cached_osr = {
         let jit_cache = shared.jit_cache.read();
-        jit_cache.get(&class_name_arc, &method_name_arc, &descriptor_arc)
+        jit_cache.get_osr(&class_name_arc, &method_name_arc, &descriptor_arc)
     };
     // Only reuse artifacts the OSR path itself produced: those carry the
     // eager invokestatic callee wiring (direct calls). A first-call/upgrade
@@ -26947,13 +27217,13 @@ fn compile_osr_artifact(
                 &mut cm,
             );
             let mut jit_cache = shared.jit_cache.write();
-            jit_cache.put(
+            jit_cache.put_osr(
                 class_name_arc.clone(),
                 method_name_arc.clone(),
                 descriptor_arc.clone(),
                 cm,
             );
-            jit_cache.get(&class_name_arc, &method_name_arc, &descriptor_arc)
+            jit_cache.get_osr(&class_name_arc, &method_name_arc, &descriptor_arc)
         })()
     };
 
@@ -29473,6 +29743,64 @@ fn fetch_osr_compile_inputs(
     Some((class_id, padded, max_locals))
 }
 
+/// Admit the narrow scalar self-recursion shape directly to the optimizing IR
+/// backend on its first background compilation. Compiling it as C1 first is
+/// counterproductive: once a recursive C1 frame is entered, its direct calls
+/// remain in that slower body for the entire subtree even if C2 is published
+/// concurrently. Every call target is resolved here and must be this exact
+/// static `(I)I` method; all remaining structural checks live in the JIT crate.
+fn promote_scalar_selfrec_to_ir(shared: &SharedVm, key: &crate::jit::tiered::MethodKey) -> bool {
+    let Some((class_id, padded, _)) =
+        fetch_osr_compile_inputs(shared, &key.class_name, &key.method_name, &key.descriptor)
+    else {
+        return false;
+    };
+    let code_len = padded.len().saturating_sub(2);
+    if !cratonvm_jit::scalar_selfrec_ir_would_engage(&padded, code_len, &key.descriptor) {
+        return false;
+    }
+    let Some(scan) = crate::jit::x64::jit_scan(&padded, code_len, &key.descriptor) else {
+        return false;
+    };
+    let cm = shared.class_manager.read();
+    let Some(class) = cm.get_class(class_id) else {
+        return false;
+    };
+    let is_static = class
+        .methods
+        .iter()
+        .find(|m| &*m.name == &*key.method_name && &*m.descriptor == &*key.descriptor)
+        .map(|m| m.is_static())
+        .unwrap_or(false);
+    if !is_static {
+        return false;
+    }
+    scan.invoke_ops.iter().all(|(_, cp_idx, opcode)| {
+        if *opcode != 0xb8 {
+            return false;
+        }
+        let Some(ConstantPoolEntry::MethodReference {
+            class_index,
+            name_and_type_index,
+            ..
+        }) = class.constant_pool.get(*cp_idx)
+        else {
+            return false;
+        };
+        let Some(target_class) = class.constant_pool.get_class_name(*class_index) else {
+            return false;
+        };
+        let Some((target_name, target_desc)) =
+            class.constant_pool.get_name_and_type(*name_and_type_index)
+        else {
+            return false;
+        };
+        target_class == &*key.class_name
+            && target_name == &*key.method_name
+            && target_desc == &*key.descriptor
+    })
+}
+
 fn background_compile_task(
     weak_vm: &std::sync::Weak<SharedVm>,
     task: &crate::jit::tiered::CompilationTask,
@@ -29493,7 +29821,8 @@ fn background_compile_task(
     if task.osr_bci.is_some() && crate::jit::tiered::is_osr_denied(&task.method_key) {
         return fail(0);
     }
-    let optimized = crate::jit::tiered::tier_uses_optimized_backend(task.target_tier);
+    let optimized = crate::jit::tiered::tier_uses_optimized_backend(task.target_tier)
+        || (task.osr_bci.is_none() && promote_scalar_selfrec_to_ir(&shared, &task.method_key));
     if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
             "[cratonvm-jitc] bg-compile {}.{}{} tier={:?} optimized={}{}",
@@ -29537,6 +29866,13 @@ fn background_compile_task(
         } else {
             false
         };
+        if !published {
+            // The compile inputs and policy are stable for the life of this
+            // loaded method. Prevent a failed background artifact from being
+            // re-enqueued forever now that pending work no longer consumes the
+            // frame's permanent-rejection budget.
+            crate::jit::tiered::mark_osr_denied(task.method_key.clone());
+        }
         return CompileOutcome {
             // Widening: smaller integer -> 64-bit (zero/sign-extended).
             compile_time_ms: start.elapsed().as_millis() as u64,
@@ -33127,6 +33463,7 @@ fn resolve_method_ref(
     current_class_id: ClassId,
     cp_index: u16,
 ) -> Result<(Arc<str>, Arc<str>, Arc<str>, usize), MethodCallFailed> {
+    hotpath_counts::bump(&hotpath_counts::RESOLVE_METHOD_REF_CALLS);
     // Check cache first — Arc::clone is a cheap refcount bump, not an allocation.
     if let Some(cached) = shared
         .resolution_cache

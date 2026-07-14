@@ -490,3 +490,12 @@ should capture the live post-service-500 wait state (with GDB or the existing
 STW census only after the timeout condition is observed) and distinguish a
 remaining MSC dependency/liveness problem from a test-harness startup limit
 before making further broad changes.
+
+## Residual note 2026-07-13 (second session): one recurrence observed post-fix, not yet re-opened
+
+A 15-attempt clean-host baseline sample (unrelated STW-hang investigation, same day) using a binary
+built fresh from this fix's dev commit hit the WFLYCTL0153  symptom once (1/15) — the same signature 'Follow-up session 2'
+above already characterized as a genuinely concurrent  race rather than a single
+fixable unprotected-ObjectRef site. Consistent with a small residual rate, not a full regression of this
+fix — noted here rather than reopening Status, but flagging for whoever next investigates WFLYCTL0153
+recurrences.

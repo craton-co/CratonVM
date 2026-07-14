@@ -19384,6 +19384,19 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     });
     r.register(zi, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // Propagate to the wrapped underlying InputStream (field 0), same
+        // as real `ZipInputStream.close()` → `InflaterInputStream.close()`
+        // → `FilterInputStream.close()` → `in.close()`. `<init>` eagerly
+        // drains `this` into in-memory byte arrays, so nothing here itself
+        // holds an OS handle open — but the underlying stream might (e.g. a
+        // caller-supplied `Closeable`-backed stream). This synthetic path
+        // only runs under `--synthetic-jdk` (real-JDK boot dispatches to the
+        // genuine `ZipInputStream`/`InflaterInputStream` bytecode instead,
+        // per `check_override` in vm_exec.rs) — kept correct for parity with
+        // that mode rather than leaving an unconditional no-op here.
+        if let Value::Object(Some(underlying)) = ctx.get_field(this, 0) {
+            let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
+        }
         ctx.set_field(this, 1, Value::Object(None));
         ctx.set_field(this, 2, Value::Object(None));
         Ok(None)
@@ -19547,11 +19560,48 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
+    // `InflaterInputStream.close()` — NOT a blanket no-op. Real bytecode is
+    // `if (!closed) { if (usesDefaultInflater) inf.end(); in.close(); closed
+    // = true; }`; mirror it via by-name field access (real-layout objects,
+    // not a synthetic fixed-slot convention).
+    //
+    // NOTE: empirically this native is NOT reached under real-JDK-boot mode
+    // (the default) for concrete subclasses like Spring Boot loader's
+    // `ZipInflaterInputStream` — the interpreter correctly prefers real
+    // `InflaterInputStream.close()` bytecode there (confirmed via a
+    // standalone repro: closing a 3-arg-constructed `InflaterInputStream`
+    // wrapping a tracing stream correctly reached the tracing stream's
+    // `close()` both with and without this native registered). The actual
+    // cause of the Spring Boot `SecurityInfoTests`/`NestedJarFileTests`
+    // file-handle leak was a DIFFERENT, more impactful bug — see the
+    // `DataInputStream`/`BufferedInputStream` `"close"` registrations in
+    // `native-builtins/src/classloader.rs`. This fix is kept regardless:
+    // it's still correct, and matters for `--synthetic-jdk` mode (no real
+    // bytecode to fall back to) or if dispatch precedence ever changes.
     r.register(
         "java/util/zip/InflaterInputStream",
         "close",
         "()V",
-        native_noop_with_this,
+        |ctx, args| {
+            eprintln!("[IIS_CLOSE_DBG] native InflaterInputStream.close invoked");
+            let this = obj_arg(args, 0)?;
+            if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
+                return Ok(None);
+            }
+            if matches!(
+                ctx.get_field_by_name(this, "usesDefaultInflater"),
+                Value::Int(1)
+            ) {
+                if let Value::Object(Some(inf)) = ctx.get_field_by_name(this, "inf") {
+                    let _ = ctx.invoke_virtual(inf, "end", "()V", &[]);
+                }
+            }
+            if let Value::Object(Some(underlying)) = ctx.get_field_by_name(this, "in") {
+                let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
+            }
+            ctx.set_field_by_name(this, "closed", Value::Int(1));
+            Ok(None)
+        },
     );
     r.register(
         "java/util/zip/DeflaterOutputStream",
@@ -35989,11 +36039,9 @@ fn p98_invoke_file_visitor(
     })
 }
 
-/// Build the canonical five-field BasicFileAttributes layout for a
-/// Files.walkFileTree callback: creation=0, lastAccess=1, lastModified=2,
-/// isDirectory=3, size=4. Callers of FileVisitor legitimately inspect these
-/// attributes while javac discovers archive entries, so zero-field placeholders
-/// leak invalid return values from the BasicFileAttributes bridge.
+/// Build a concrete platform `BasicFileAttributes` implementation for a
+/// `Files.walkFileTree` visitor callback. The named-field bridge makes the
+/// representation independent from the platform class's physical field order.
 fn p98_alloc_basic_file_attributes(
     ctx: &mut dyn NativeContext,
     is_dir: bool,
@@ -38166,11 +38214,17 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             let bb = obj_arg(args, 1)?;
             // DF07: decode the destination buffer via the real-or-synthetic
             // accessor (a real HeapByteBuffer's array is `hb`, not slot 0).
+            // GC-blocking audit — see the matching comment on the sibling
+            // `write` registration below for the full rationale (found via
+            // the same STW-takeover-cluster residual investigation).
             let bytes_read = if fd_id >= 0 {
                 match aio_bb_region(ctx, bb) {
                     Some((arr, off, remaining)) if remaining > 0 => {
                         let mut tmp = vec![0u8; remaining];
-                        match ctx.fd_table().tcp_read(fd_id as u32, &mut tmp) {
+                        ctx.begin_blocking_region();
+                        let read_result = ctx.fd_table().tcp_read(fd_id as u32, &mut tmp);
+                        ctx.end_blocking_region();
+                        match read_result {
                             Ok(0) => -1,
                             Ok(n) => {
                                 ctx.write_byte_array_from(arr, off, &tmp[..n]);
@@ -38198,12 +38252,40 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             let fd_id = ctx.get_field(this, 2).as_int().unwrap_or(-1);
             let bb = obj_arg(args, 1)?;
             // DF07: source the bytes via the real-or-synthetic accessor (see read).
+            //
+            // GC-blocking audit (STW takeover 5-class cluster residual,
+            // 2026-07-13, Azure host follow-up): `tcp_write` is a raw
+            // blocking `send()` with NO GC-blocking-region bracket — found
+            // via gdb on a hung TestWsWebSocketContainerTimeoutClient (the
+            // test deliberately never drains the peer socket to force a
+            // write timeout, so this send() parks in the OS indefinitely
+            // once the send buffer fills). Bracketing it fixes the
+            // STW-takeover hang (this thread was counted in `expected`
+            // forever, `taken=0`, matching the doc's signature exactly).
+            //
+            // NOTE this does NOT fix the deeper issue that this Future-
+            // returning overload is synchronous (blocks the calling thread
+            // until the write completes or errors) rather than genuinely
+            // async like the sibling CompletionHandler-based overload in
+            // native-io/src/async_socket.rs's aio_asc_write (which
+            // dispatches to a worker pool via Job::Write and returns
+            // immediately with a real pending Future). A caller doing
+            // `write(bb).get(timeout, unit)` to detect a write timeout will
+            // still block inside this native call itself rather than inside
+            // `Future.get`, so the write always "succeeds" eventually (once
+            // the peer reads or the connection resets) instead of the
+            // caller's own timeout ever firing — a separate, out-of-scope-
+            // for-this-fix architectural gap. Filed as a residual; see
+            // docs/known-issues/tomcat-08-07/stw-crossthread-jit-takeover-hang-cluster.md.
             let bytes_written = if fd_id >= 0 {
                 match aio_bb_region(ctx, bb) {
                     Some((arr, off, remaining)) if remaining > 0 => {
                         let mut data = vec![0u8; remaining];
                         ctx.read_byte_array_into(arr, off, &mut data);
-                        match ctx.fd_table().tcp_write(fd_id as u32, &data) {
+                        ctx.begin_blocking_region();
+                        let write_result = ctx.fd_table().tcp_write(fd_id as u32, &data);
+                        ctx.end_blocking_region();
+                        match write_result {
                             Ok(n) => {
                                 aio_bb_advance(ctx, bb, n as i32);
                                 n as i32
@@ -43940,7 +44022,22 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         cf,
         "getInstance",
         "(Ljava/lang/String;)Ljava/security/cert/CertificateFactory;",
-        |ctx, _args| {
+        |ctx, args| {
+            // Real-JCA bring-up: prefer a genuine `CertificateFactory` wrapping
+            // a real provider SPI over the synthetic 1-field stub below — see
+            // `provider_chain::try_build_real_certificate_factory`'s doc
+            // comment for the root-cause story (real-bytecode-only methods
+            // like `generateCertPath` NPE on the synthetic stub's absent
+            // `certFacSpi`). Falls back to the stub when the algorithm can't
+            // be resolved (e.g. pure-synthetic mode, or an exotic type
+            // nothing seeds).
+            if crate::real_jca_mode() || crate::route_ec_to_real() || crate::route_dsa_to_real() {
+                if let Some(real_cf) =
+                    crate::jca::provider_chain::try_build_real_certificate_factory(ctx, args)
+                {
+                    return Ok(Some(Value::Object(Some(real_cf))));
+                }
+            }
             let obj = alloc_concurrent_synthetic(ctx, "java/security/cert/CertificateFactory", 1);
             ctx.set_field(obj, 0, Value::Object(None));
             Ok(Some(Value::Object(Some(obj))))

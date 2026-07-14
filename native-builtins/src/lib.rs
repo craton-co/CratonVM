@@ -2324,6 +2324,52 @@ fn native_mapper_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         message_bytes_set_string_object(ctx, host_mb, default_host_name);
     }
     native_message_bytes_to_chars(ctx, &[Value::Object(Some(host_mb))])?;
+
+    // Match Mapper.map()'s Java contract for a null URI. CoyoteAdapter
+    // deliberately recycles decodedURI after an early protocol error, then
+    // calls Mapper.map() only to identify the Host for error reporting. The
+    // Java implementation sets MappingData.host and returns before context
+    // / wrapper mapping. Mapping the null URI as an empty CharChunk instead
+    // selects the ROOT context and can emit its welcome-file redirect,
+    // overwriting the original protocol status (e.g. AJP's 403 secret
+    // rejection) with 302.
+    if ctx.get_field_by_name(uri_mb, "type").as_int().unwrap_or(0) == 0 {
+        let host_chunk = match ctx.get_field_by_name(host_mb, "charC") {
+            Value::Object(Some(o)) => o,
+            _ => return Ok(None),
+        };
+        let hosts = match ctx.get_field_by_name(this, "hosts") {
+            Value::Object(Some(o)) => o,
+            _ => return Ok(None),
+        };
+        let Some((host_buff, host_start, host_end)) = char_chunk_parts(ctx, host_chunk) else {
+            return Ok(None);
+        };
+        let mut mapped_host =
+            mapper_exact_find_chunk_range(ctx, hosts, host_chunk, host_start, host_end, true);
+        if mapped_host.is_none() {
+            let dot = (host_start..host_end)
+                .find(|&pos| char_chunk_char_at(ctx, host_buff, pos) == b'.' as u16);
+            if let Some(dot_pos) = dot {
+                mapped_host =
+                    mapper_exact_find_chunk_range(ctx, hosts, host_chunk, dot_pos, host_end, true);
+            }
+        }
+        if mapped_host.is_none() {
+            mapped_host = match ctx.get_field_by_name(this, "defaultHost") {
+                Value::Object(Some(o)) => Some(o),
+                _ => None,
+            };
+        }
+        if let Some(mapped_host) = mapped_host {
+            let host_object = match ctx.get_field_by_name(mapped_host, "object") {
+                Value::Object(o) => o,
+                _ => None,
+            };
+            ctx.set_field_by_name(mapping_data, "host", Value::Object(host_object));
+        }
+        return Ok(None);
+    }
     native_message_bytes_to_chars(ctx, &[Value::Object(Some(uri_mb))])?;
 
     let host_chunk = match ctx.get_field_by_name(host_mb, "charC") {
@@ -8427,6 +8473,25 @@ pub fn route_ec_to_real() -> bool {
     use std::sync::OnceLock;
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SYNTHETIC_EC").is_none())
+}
+
+/// Route DSA `Signature` sign/verify to the real JDK 25 `sun.security
+/// .provider.DSA$*` SPIs. Default ON — unlike EC/RSA, there is no synthetic
+/// DSA crypto in `crypto_impl` to fall back to at all (`verify_dispatch`/
+/// `sign_dispatch` never had a DSA arm), so this isn't an optimization vs. a
+/// slower-but-working synthetic path the way `route_ec_to_real` is — without
+/// it, every DSA signature verification silently returns `false` with no
+/// exception. `sun.security.provider.DSA$SHA256withDSA`/`SHA1withDSA` are
+/// plain, dependency-free SPI classes (construct + `engineInitVerify(key)` +
+/// `engineUpdate` + `engineVerify`), so real routing is strictly correct
+/// with no keygen/provider-bring-up cost to justify a synthetic shortcut.
+///
+/// Kill-switch `CRATONVM_SYNTHETIC_DSA=1` restores the legacy (always-false)
+/// behavior for debugging / regression bisecting.
+pub fn route_dsa_to_real() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SYNTHETIC_DSA").is_none())
 }
 
 /// Route the post-quantum families (ML-DSA via the SUN provider, ML-KEM via
@@ -37563,6 +37628,11 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // identity/return-this no-ops are available without the JIT/interpreter
     // having to resolve the override on the receiver's pipeline class.
     crate::streams::register_stream_overrides(registry);
+    // Predicate's compositional defaults are invokedynamic captures in the
+    // real JDK. Register the GC-visible bridge implementations in real-JDK
+    // mode as well so field-filter composition does not retain a stale capture
+    // receiver through JUnit cleanup.
+    crate::phases_late::register_phase56_function_extras(registry);
 
     // Spring XML namespace parsing: preserve validation and namespace-aware
     // parsing, but attach a VM-wide Xerces grammar pool so repeated
@@ -53727,6 +53797,7 @@ fn matcher_realjdk_field_indices(ctx: &mut dyn NativeContext) -> Option<MatcherF
 struct PatternFieldIndices {
     pattern: usize,
     flags: usize,
+    capturing_group_count: usize,
 }
 
 fn pattern_realjdk_field_indices(ctx: &mut dyn NativeContext) -> Option<PatternFieldIndices> {
@@ -53737,7 +53808,51 @@ fn pattern_realjdk_field_indices(ctx: &mut dyn NativeContext) -> Option<PatternF
         Some(PatternFieldIndices {
             pattern: ctx.resolve_field_index(CLASS, f::PATTERN)?,
             flags: ctx.resolve_field_index(CLASS, f::FLAGS)?,
+            capturing_group_count: ctx.resolve_field_index(CLASS, f::CAPTURING_GROUP_COUNT)?,
         })
+    })
+}
+
+/// Return the semantic capture count stored by the real JDK Pattern. This
+/// includes group zero. Some supported JDK Matcher layouts overallocate the
+/// backing `groups[]` array (for example, ten capture pairs for a one-group
+/// pattern), so array length is a capacity check, not the group count.
+fn matcher_realjdk_java_capture_count(
+    ctx: &mut dyn NativeContext,
+    matcher: ObjectRef,
+    idx: MatcherFieldIndices,
+    pattern_idx: PatternFieldIndices,
+) -> Option<usize> {
+    let pattern = match ctx.get_field(matcher, idx.parent_pattern) {
+        Value::Object(Some(pattern)) => pattern,
+        _ => return None,
+    };
+    let count = ctx
+        .get_field(pattern, pattern_idx.capturing_group_count)
+        .as_int()?;
+    (count > 0).then_some(count as usize)
+}
+
+fn matcher_realjdk_capture_layout_valid(
+    rust_capture_count: usize,
+    java_capture_count: usize,
+    groups_len: usize,
+) -> bool {
+    java_capture_count > 0
+        && rust_capture_count == java_capture_count
+        && groups_len >= java_capture_count.saturating_mul(2)
+}
+
+fn matcher_realjdk_capture_layout_ok(
+    ctx: &mut dyn NativeContext,
+    matcher: ObjectRef,
+    idx: MatcherFieldIndices,
+    pattern_idx: PatternFieldIndices,
+    re: &JavaRegex,
+    groups: ObjectRef,
+) -> bool {
+    matcher_realjdk_java_capture_count(ctx, matcher, idx, pattern_idx).is_some_and(|count| {
+        matcher_realjdk_capture_layout_valid(re.captures_len(), count, ctx.array_length(groups))
     })
 }
 
@@ -53955,8 +54070,8 @@ fn matcher_realjdk_search(
     // it here instead would mean bailing to real bytecode after already
     // having overwritten `first`/`oldLast` above, corrupting the state the
     // bytecode fallback itself depends on). Trust the caller: by the time
-    // we're here, `re.captures_len() == groups_obj.length / 2` is already
-    // established, so every `caps.len()` below is guaranteed to match.
+    // we're here, Rust's capture count matches Pattern.capturingGroupCount and
+    // `groups_obj` has enough capacity, so every write below is in bounds.
     let caps = re.captures_at(region_slice, search_from_byte);
     let matched = match caps {
         Some(caps) => {
@@ -54078,10 +54193,9 @@ fn native_matcher_find_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Value::Object(Some(g)) => g,
         _ => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
     };
-    // Group-count safety net, checked BEFORE any field mutation below (see
-    // the comment in `matcher_realjdk_search` for why bailing after
-    // mutating `first`/`oldLast` would corrupt the fallback's own state).
-    if re.captures_len() != ctx.array_length(groups_obj) / 2 {
+    // Group-count safety net, checked BEFORE any field mutation below. The
+    // Pattern field is the semantic count; groups[] may be overallocated.
+    if !matcher_realjdk_capture_layout_ok(ctx, this, idx, pattern_idx, &re, groups_obj) {
         return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]);
     }
 
@@ -54178,9 +54292,9 @@ fn native_matcher_find_at_realjdk(
         Value::Object(Some(g)) => g,
         _ => return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]),
     };
-    // Group-count safety net — checked before any field mutation below; see
-    // the comment in `matcher_realjdk_search`.
-    if re.captures_len() != ctx.array_length(groups_obj) / 2 {
+    // Group-count safety net — checked before any field mutation below. The
+    // Pattern field is the semantic count; groups[] may be overallocated.
+    if !matcher_realjdk_capture_layout_ok(ctx, this, idx, pattern_idx, &re, groups_obj) {
         return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]);
     }
 
@@ -54230,11 +54344,57 @@ fn native_matcher_find_at_realjdk(
 /// (not a subclass CratonVM has a dedicated `RuntimeError` variant for) on an
 /// invalid index — the caller bails to real bytecode for that rare case so
 /// it throws the exact right exception, rather than fabricating one here.
-/// Returns `true` when `group` is in bounds (`0..=groupCount()`, where
-/// `groupCount() == groups_obj.length/2 - 1`).
-fn matcher_realjdk_group_in_bounds(ctx: &mut dyn NativeContext, groups_obj: ObjectRef, group: i32) -> bool {
-    let group_count = (ctx.array_length(groups_obj) / 2) as i32 - 1;
-    group >= 0 && group <= group_count
+/// Returns `true` when `group` is in bounds (`0..=groupCount()`). Pattern's
+/// semantic capture count is authoritative because groups[] may be larger.
+fn matcher_realjdk_group_index_in_bounds(
+    group: i32,
+    capture_count: usize,
+    groups_len: usize,
+) -> bool {
+    if group < 0 {
+        return false;
+    }
+    let group = group as usize;
+    group < capture_count && group.saturating_mul(2).saturating_add(1) < groups_len
+}
+
+fn matcher_realjdk_group_in_bounds(
+    ctx: &mut dyn NativeContext,
+    matcher: ObjectRef,
+    idx: MatcherFieldIndices,
+    groups_obj: ObjectRef,
+    group: i32,
+) -> bool {
+    let Some(pattern_idx) = pattern_realjdk_field_indices(ctx) else {
+        return false;
+    };
+    let Some(capture_count) = matcher_realjdk_java_capture_count(ctx, matcher, idx, pattern_idx)
+    else {
+        return false;
+    };
+    matcher_realjdk_group_index_in_bounds(group, capture_count, ctx.array_length(groups_obj))
+}
+
+#[cfg(test)]
+mod matcher_realjdk_layout_tests {
+    use super::{matcher_realjdk_capture_layout_valid, matcher_realjdk_group_index_in_bounds};
+
+    #[test]
+    fn overallocated_groups_array_is_capacity_not_capture_count() {
+        assert!(matcher_realjdk_capture_layout_valid(2, 2, 20));
+        assert!(matcher_realjdk_group_index_in_bounds(1, 2, 20));
+        assert!(!matcher_realjdk_group_index_in_bounds(2, 2, 20));
+    }
+
+    #[test]
+    fn layout_rejects_semantic_count_mismatch_or_short_capacity() {
+        assert!(!matcher_realjdk_capture_layout_valid(3, 2, 20));
+        assert!(!matcher_realjdk_capture_layout_valid(2, 3, 20));
+        assert!(!matcher_realjdk_capture_layout_valid(2, 2, 3));
+        assert!(!matcher_realjdk_capture_layout_valid(0, 0, 0));
+        assert!(!matcher_realjdk_group_index_in_bounds(-1, 2, 20));
+        assert!(!matcher_realjdk_group_index_in_bounds(1, 2, 3));
+    }
 }
 
 fn native_matcher_start_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -54303,7 +54463,7 @@ fn native_matcher_start_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value])
         Value::Object(Some(g)) => g,
         _ => return matcher_realjdk_bail(ctx, this, "start", "(I)I", &[Value::Int(group)]),
     };
-    if !matcher_realjdk_group_in_bounds(ctx, groups_obj, group) {
+    if !matcher_realjdk_group_in_bounds(ctx, this, idx, groups_obj, group) {
         return matcher_realjdk_bail(ctx, this, "start", "(I)I", &[Value::Int(group)]);
     }
     Ok(Some(ctx.get_array_element(groups_obj, 2 * group as usize)))
@@ -54333,7 +54493,7 @@ fn native_matcher_end_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -
         Value::Object(Some(g)) => g,
         _ => return matcher_realjdk_bail(ctx, this, "end", "(I)I", &[Value::Int(group)]),
     };
-    if !matcher_realjdk_group_in_bounds(ctx, groups_obj, group) {
+    if !matcher_realjdk_group_in_bounds(ctx, this, idx, groups_obj, group) {
         return matcher_realjdk_bail(ctx, this, "end", "(I)I", &[Value::Int(group)]);
     }
     Ok(Some(ctx.get_array_element(groups_obj, 2 * group as usize + 1)))
@@ -54391,7 +54551,7 @@ fn native_matcher_group_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value])
             )
         }
     };
-    if !matcher_realjdk_group_in_bounds(ctx, groups_obj, group) {
+    if !matcher_realjdk_group_in_bounds(ctx, this, idx, groups_obj, group) {
         return matcher_realjdk_bail(
             ctx,
             this,
@@ -73048,7 +73208,17 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         if let Some(addr) = rwl_parent_addr(ctx, this) {
+            // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
+            // rw_read_lock's internal contended wait is a raw
+            // parking_lot::Condvar::wait with NO GC-blocking-region bracket
+            // and no Java-heap touch inside — a thread contending for this
+            // lock while a writer holds it stays counted in the STW
+            // barrier's `expected` forever (not in JIT, never reaches a
+            // safepoint), livelocking any cross-thread STW pause requested
+            // while it waits.
+            ctx.begin_blocking_region();
             crate::stamped_lock::rw_read_lock(addr, ctx.thread_id());
+            ctx.end_blocking_region();
         }
         Ok(None)
     });
@@ -73098,7 +73268,10 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         if let Some(addr) = rwl_parent_addr(ctx, this) {
+            // GC-blocking audit — see the plain `lock()` registration above.
+            ctx.begin_blocking_region();
             crate::stamped_lock::rw_read_lock(addr, ctx.thread_id());
+            ctx.end_blocking_region();
         }
         Ok(None)
     });
@@ -73111,7 +73284,19 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         if let Some(addr) = rwl_parent_addr(ctx, this) {
+            // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
+            // rw_write_lock's internal contended wait is a raw
+            // parking_lot::Condvar::wait with NO GC-blocking-region bracket
+            // and no Java-heap touch inside — see the read-lock `lock()`
+            // registration above for the full rationale. Confirmed via
+            // symbolicated cdb stacks: TestOrderInterceptor's stuck
+            // ForkJoinPool worker threads were parked exactly here, not in
+            // LockSupport.park (which IS correctly bracketed) — this was the
+            // actual root cause of the STW takeover livelock, not a
+            // ForkJoinPool/AQS-specific issue.
+            ctx.begin_blocking_region();
             crate::stamped_lock::rw_write_lock(addr, ctx.thread_id());
+            ctx.end_blocking_region();
         }
         Ok(None)
     });
@@ -73158,7 +73343,10 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         if let Some(addr) = rwl_parent_addr(ctx, this) {
+            // GC-blocking audit — see the plain `lock()` registration above.
+            ctx.begin_blocking_region();
             crate::stamped_lock::rw_write_lock(addr, ctx.thread_id());
+            ctx.end_blocking_region();
         }
         Ok(None)
     });
@@ -73428,7 +73616,14 @@ fn native_stamped_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         None => return Ok(Some(Value::Long(0))),
     };
     let addr = stamped_addr_for_obj(ctx, obj);
+    // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
+    // stamped_write_lock's contended wait is a raw parking_lot::Condvar::wait
+    // with NO GC-blocking-region bracket — same missing-bracket bug as
+    // ReentrantReadWriteLock's rw_write_lock (see that registration's
+    // comment for the full rationale and how this was diagnosed).
+    ctx.begin_blocking_region();
     let stamp = crate::stamped_lock::stamped_write_lock(addr);
+    ctx.end_blocking_region();
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(stamp)))
 }
@@ -73439,7 +73634,10 @@ fn native_stamped_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         None => return Ok(Some(Value::Long(0))),
     };
     let addr = stamped_addr_for_obj(ctx, obj);
+    // GC-blocking audit — see `native_stamped_write_lock` above.
+    ctx.begin_blocking_region();
     let stamp = crate::stamped_lock::stamped_read_lock(addr);
+    ctx.end_blocking_region();
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(stamp)))
 }
@@ -73471,7 +73669,10 @@ fn native_stamped_write_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) -
         return Ok(None);
     };
     let addr = stamped_addr_for_obj(ctx, parent);
+    // GC-blocking audit — see `native_stamped_write_lock` above.
+    ctx.begin_blocking_region();
     crate::stamped_lock::stamped_write_lock(addr);
+    ctx.end_blocking_region();
     mirror_stamped_state(ctx, parent, addr);
     Ok(None)
 }
@@ -73512,7 +73713,10 @@ fn native_stamped_read_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) ->
         return Ok(None);
     };
     let addr = stamped_addr_for_obj(ctx, parent);
+    // GC-blocking audit — see `native_stamped_write_lock` above.
+    ctx.begin_blocking_region();
     crate::stamped_lock::stamped_read_lock(addr);
+    ctx.end_blocking_region();
     mirror_stamped_state(ctx, parent, addr);
     Ok(None)
 }

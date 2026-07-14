@@ -1,147 +1,333 @@
 # STW cross-thread JIT takeover — stuck waiting for cooperative mutators (5-class hang cluster)
 
-**Status:** OPEN — root cause for the cluster now identified (see "Root
-cause, 2026-07-13" below); two real, independent missing-blocking-region
-bugs found and fixed along the way but **neither resolves this cluster**.
-**Severity:** high (indefinite hang, no crash/timeout recovery).
-**HotSpot:** PASS on all 5 (fresh-verified).
+**Status:** RESOLVED for the actual STW-takeover mechanism (root-caused and
+fixed, 2026-07-13). **4 of the original 5 classes are now effectively
+resolved as of 2026-07-13/14** (see "Update 2026-07-13/14 (Azure Linux
+host)" below): `TestOrderInterceptor` and `TestELInterpreterTagSetters`
+PASS/complete; `TestJspConfig`/`TestEnvEntry` make genuine unbounded-but-
+finite progress (no longer stuck, no STW involvement — likely just need a
+longer suite timeout for their large test-method counts).
+`TestWsWebSocketContainerTimeoutClient` has its STW-visibility bug fixed
+but needs a separate, deeper architectural fix (make
+`AsynchronousSocketChannel.write`'s `Future`-returning overload genuinely
+async) to actually pass — see that update section for the concrete next
+step.
 
-## Update 2026-07-13 — two real bugs fixed (do not close this doc — see below)
+**HotSpot:** PASS on all 5 (fresh-verified, 2026-07-12).
+
+## Root cause (found 2026-07-13) — raw Rust locks with zero GC-blocking-region bracket
 
 Branch `fix/elinjsp-stw-takeover-20260713`, worktree
-`C:\data\CratonVM-elinjsp-20260713`. Found and fixed two genuine instances
-of the missing-`begin_blocking_region`/`end_blocking_region` bug class
-(same family as the already-fixed `MulticastSocket.receive` /
-`Selector.select` cases — see `reference_native_io_read_stale_objectref_pin_fix`-
-adjacent code and `docs/internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md`):
+`C:\data\CratonVM-elinjsp-20260713`, merged to `dev` at `73b916123` (interim)
+and again with the real fix below.
 
-1. **`java.net.DatagramSocket.send`/`.receive`** (`native-builtins/src/net_phase_e.rs`,
-   `register_re7_datagram_socket`) — both handlers called `ctx.fd_table().udp_send`/
-   `udp_recv` directly with no blocking-region bracket at all, unlike the
-   parallel, correctly-bracketed `java/net/MulticastSocket` registration in
-   `native-io/src/net.rs`. A thread parked in an unbounded `udp_recv` (no
-   read timeout set) is neither in JIT (can't be forcibly taken over) nor at
-   a safepoint (can't cooperate) — genuinely un-freezable, un-arrivable.
-   Fixed: both handlers now bracket the blocking call
-   (`receive` additionally re-syncs `pkt`/`data_arr` via
-   `end_blocking_region_refs`, since a moving GC completing mid-block would
-   otherwise leave them at stale pre-GC addresses).
-2. **`HttpURLConnection`'s plain-HTTP request/response exchange**
-   (`native-builtins/src/http_url_connection.rs`, `perform`) — the
-   `established_https_stream_id` early-return branch and the plain-HTTP
-   (non-TLS) `else` branch both did a real blocking `write_all`/`flush`/
-   `read_response` (a genuine blocking `recv()`) with **no** blocking-region
-   bracket and no `set_active_native_context` (unlike the HTTPS branch,
-   which deliberately uses the latter for its own documented reason). Since
-   `TomcatBaseTest.getUrl(...)` — the client-fetch helper nearly every
-   embedded-Tomcat test in this suite uses — goes through this exact path,
-   this is a broad, general-purpose fix, not narrowly scoped to the 5
-   classes here. Fixed: both branches now bracket the exchange.
+### How it was found
 
-Both fixes are real, low-risk (pure GC-visibility bracketing, no functional
-behavior change), and were spot-verified against a 60-class regression
-sample (indices 1-60, `-Category all -Jit on -Jdk real`) with **no
-regressions** — every test exercising the newly-bracketed plain-HTTP path
-(`TestHttpServlet`, `TestServletSecurity*`, `TestCookie*`, etc.) still
-PASSED; the only failures in that sample were the pre-existing, unrelated
-`TestHttpServletDoHead*` cluster (documented separately, see
-`reference_tomcat_dohead_gc_safepoint_deadlock` and siblings) and one
-unrelated `jakarta.el.TestBeanSupport` failure.
+An earlier pass this session (see git history on this doc / branch) found
+and fixed two real but *insufficient* missing-`begin_blocking_region` bugs
+(`DatagramSocket.send`/`.receive`, `HttpURLConnection`'s plain-HTTP
+exchange) and initially mis-diagnosed the remaining hang as a "ForkJoinPool
+worker doubling as STW initiator strands its own pool" architectural
+livelock — that hypothesis was **wrong**, based on reading an unsymbolicated
+`cdb` stack too coarsely (it matched the shape of a correctly-bracketed
+`LockSupport.park()` call). Rebuilding with a **matching `.pdb`** (the
+release profile already has `debug = "line-tables-only"`, `strip = "none"`;
+just remember to copy the `.pdb` alongside a uniquely-renamed `.exe`
+*immediately* after each build — the shared worktree's
+`target/release/cratonvm.pdb` gets overwritten by the next build, including
+other concurrent sessions') and re-attaching cdb to a hung
+`TestOrderInterceptor` repro gave the real answer:
 
-**However: re-running all 5 target classes against the fixed binary shows
-all 5 STILL HANG, identical signature.** These two fixes were real bugs
-worth fixing on their own merit, but they are not what blocks this
-specific cluster. See "Root cause, 2026-07-13" below for what actually
-does.
+```
+14  Id: e390.e7c0 "Tribes-Task-Receiver-1"
+ ...
+ 06  parking_lot::condvar::Condvar::wait_until_internal
+ 08  cratonvm_native_builtins::stamped_lock::rw_write_lock
+ 09  register_rwlock_natives::closure$5
+```
 
-## Root cause, 2026-07-13 — ForkJoinPool worker doubles as STW initiator, stranding its own pool
+Every one of the "expected"-but-never-arriving mutator threads was
+genuinely parked inside **`native-builtins/src/stamped_lock.rs`'s
+`rw_write_lock`/`rw_read_lock`** (backing `java.util.concurrent.locks.
+ReentrantReadWriteLock`) — a hand-rolled `parking_lot::Mutex` +
+`Condvar`-based reader/writer lock, contended because Tribes' internal
+executor infrastructure uses one. The blocking `while ... { slot.cv.wait
+(&mut state); }` loops in these functions had **zero
+`begin_blocking_region`/`end_blocking_region` bracket** — called directly
+from `native-builtins/src/lib.rs`'s `ReentrantReadWriteLock$ReadLock`/
+`$WriteLock` native registrations with no GC-visibility at all. A thread
+contending for this lock while another thread holds it stays counted in
+the STW barrier's `expected` forever: it's not in JIT (can't be forcibly
+taken over) and never reaches a Java-bytecode safepoint (can't cooperate)
+while blocked in this Rust-level wait — exactly the `taken=0`,
+never-decreasing-`pending` signature this doc describes.
 
-Deep-dived `TestOrderInterceptor` (the clearest repro) with
-`CRATONVM_DBG_STW_CENSUS=1` plus a symbol-carrying build (`debug =
-"line-tables-only"` is already on in `[profile.release]`; just needed a
-matching `.pdb` copied alongside a uniquely-named `.exe` — the shared
-worktree's `target/release/cratonvm.pdb` gets overwritten by every build,
-including other concurrent sessions', so grab both files together
-immediately after a build) + `cdb -p <pid> -c "~*kn 40; qd"`.
+### Full sweep — same pattern found in 4 more places
 
-Findings, precisely evidenced:
+Grepped the whole workspace for the same raw-`Condvar::wait` shape (no
+`ctx.begin_blocking_region()` anywhere nearby) and found:
 
-- `[stw-request] initiator=<tid> alive=29 blocked=22 ... expected=6` — the
-  STW **initiator is itself one of the `Tribes-Task-Receiver-N`
-  `ForkJoinPool.commonPool()` worker threads** that Tribes' internal task
-  executor spins up (confirmed across two separate repro runs: `initiator=49`
-  once, `initiator=30` — always a pool worker, never `main` or a dedicated
-  GC thread). I.e. this VM runs GC **on the allocating mutator thread**,
-  which is normal/expected for a young-gen STW pause — but here that
-  mutator happens to be a live member of a Java-level thread pool with its
-  own internal coordination protocol.
-- Of the 6 "expected" mutators, only 1-3 ever call `arrive_and_wait_auto`
-  (confirmed via `[stw-arrive]` log lines — never more than 3 in any run,
-  across minutes of wall-clock time with the process still not producing a
-  JUnit summary). The remainder are **other `Tribes-Task-Receiver-N`
-  threads**, all parked at the identical Java-level location:
-  `AbstractQueuedSynchronizer$ConditionNode.block` <-
-  `ForkJoinPool.unmanagedBlock`/`managedBlock` <-
-  `AbstractQueuedSynchronizer$ConditionObject.await` (an **untimed**
-  `Condition.await()` — it only wakes on an explicit `signal()`/`signalAll()`
-  from another thread, never on its own).
-- Symbolicated `cdb` stacks prove these stuck threads reach the VM's
-  **correctly-bracketed** native `park()` path exactly as designed:
-  `native_lock_support_park` -> `NativeContextImpl::park` (`vm/src/vm/vm_exec.rs:6384`,
-  which does call `deposit_root_snapshot()` then `gc_barrier.enter_blocked()`
-  before actually parking, matching the source) -> `ParkState::park_interruptible`
-  -> `parking_lot::condvar::Condvar::wait_for` -> `WaitOnAddress`. This is
-  **not** a missing-bracket bug — the parking path is fully correct and
-  GC-safe.
-- The actual mechanism: these sibling `ForkJoinPool` workers are waiting on
-  a `Condition` that only the pool's own internal coordination (or a task
-  producer) would ever `signal()`. That signal depends, transitively, on
-  the pool making forward progress — which requires the initiator thread
-  (itself a pool member) to return to doing pool work. But the initiator is
-  now permanently inside `stw_take_over_and_wait`'s loop (spinning
-  indefinitely — see `docs/known-issues/tomcat-08-07/` siblings on the
-  takeover loop having no bounded fallback), never returning to the Java
-  side. **The pool member the others are waiting on is the same thread the
-  barrier is waiting on** — a genuine mutual-starvation livelock, not a
-  simple missing GC-visibility bracket. In a real JVM this class of
-  interaction is invisible because a safepoint pause is bounded to
-  microseconds/low-milliseconds; here the pause is unbounded (see the
-  takeover loop's lack of a hard fallback, already flagged as a defect in
-  this doc's original recommendation), long enough for a thread-pool's
-  internal liveness assumptions to actually break.
+1. `native-builtins/src/stamped_lock.rs` `rw_write_lock`/`rw_read_lock` —
+   `ReentrantReadWriteLock`'s `WriteLock`/`ReadLock` `.lock()`/
+   `.lockInterruptibly()` (4 call sites in `lib.rs`). **The one that
+   actually caused `TestOrderInterceptor`'s hang.**
+2. `native-builtins/src/stamped_lock.rs` `stamped_write_lock`/
+   `stamped_read_lock` — the real `java.util.concurrent.locks.StampedLock`
+   (not the `ReentrantReadWriteLock` above; a separate implementation) —
+   same missing-bracket gap, 4 call sites (`readLock()`, `writeLock()`,
+   and the `ReadLockView`/`WriteLockView.lock()` convenience wrappers).
+3. `native-builtins/src/xnio_async.rs` `native_iof_await`/
+   `native_iof_await_timed`/`native_iof_get` — XNIO's `IoFuture.await()`/
+   `.get()`, used heavily by **Undertow (WildFly's web server)** for async
+   I/O completion. A thread waiting on someone else's I/O-completion
+   notification stays counted in `expected` forever if that notifier is
+   itself stalled behind a GC pause. **This is very plausibly also
+   implicated in `docs/known-issues/wildfly-standalone-boot-stw-jit-takeover-hang.md`**
+   (`pending=6` during WildFly's `parallel-extension-add`, spinning up
+   30-40 threads) — worth re-testing that repro against this fix before
+   doing any further WildFly-specific investigation.
+4. `native-builtins/src/concurrent_extras.rs` `SynchronousQueue.put`/
+   `.take`/`.poll(timeout)` — bounded waits (`SQ_BLOCK_CAP` = 2s max), so
+   lower severity (can't cause an indefinite hang on their own), but the
+   same architectural gap — fixed for consistency and to stop needlessly
+   delaying any GC pause requested during that window.
 
-This matches, almost exactly, the newer
-`docs/known-issues/wildfly-standalone-boot-stw-jit-takeover-hang.md`
-finding (`pending=6`, hit during WildFly's `parallel-extension-add` step
-spinning up 30-40 concurrent threads) — that doc's author independently
-concluded "a genuinely different code path failing to reach a safepoint
-under heavy concurrent thread creation/classloading" without yet pinning
-the exact mechanism. Strongly suspect this is the SAME underlying
-architectural gap (STW-initiator-is-a-pool-worker-and-gets-stranded),
-reached via two different application-level thread-pool shapes (Tribes'
-task executor here, WildFly's extension-loading executor there). The two
-docs should likely be merged/cross-fixed together rather than treated as
-separate bugs.
+All fixed by bracketing the blocking call site in
+`ctx.begin_blocking_region()`/`ctx.end_blocking_region()` (or
+`end_blocking_region_refs` where a Java heap `ObjectRef` — e.g.
+`SynchronousQueue`'s `this`, used again after the wait via
+`consume_item` — needs re-syncing against a moving GC that completed
+mid-block). None of the `stamped_lock.rs`/`xnio_async.rs` call sites touch
+Java heap refs inside the wait itself, so those needed only a plain
+begin/end pair.
 
-**Not attempted this session:** an actual fix. The candidate directions
-(never let a Java-managed pool worker become the takeover initiator —
-hand off to a dedicated background GC-driver thread instead; or bound the
-takeover loop's total wait and force-degrade past a stuck initiator) both
-touch core `vm/src/threading/gc_barrier.rs` / `vm/src/runtime/interpreter.rs`
-STW machinery that a **different, concurrently-active session in this same
-worktree** is already independently modifying (see its
-`stw_takeover_should_scan` scan-cadence backoff fix, already present in
-this branch's `interpreter.rs` — a real, complementary, non-conflicting fix
-for a related but distinct starvation mode: excessive OS-level
-suspend-scan overhead during a long wait, not this initiator-stranding
-issue). Attempting a solo redesign of the STW-initiator model in a shared,
-actively-edited, safety-critical file without coordinating first risks a
-correctness regression far worse than this hang. Recommend: dedicated
-session, coordinate with whoever owns the WildFly-hang investigation,
-reproduce via the much cheaper/faster `TestOrderInterceptor` repro instead
-of the multi-minute WildFly boot.
+**Ruled out as NOT part of this bug class** (checked, correctly designed
+already): `native-io/src/async_socket.rs`'s `wait_for_pending` (explicitly
+runs on the dedicated AIO dispatcher thread, which carries no
+`NativeContext` and isn't a counted STW mutator at all) and its internal
+`crossbeam_compat::Receiver::recv` (only ever called from the raw
+`cratonvm-aio-N` worker-pool threads, same non-mutator category).
 
-## Summary
+### Validation
+
+`TestOrderInterceptor` — the clearest, fastest repro (~20-30s to hang
+before the fix) — now **PASSES** (`OK (2 tests)`, ~20s wall time) on a
+clean rebuild with all five fixes. Verified this is not a fluke: reproduced
+the *unfixed* hang 6/6 times in a row before applying the `stamped_lock.rs`
+fix (using `CRATONVM_DBG_STW_CENSUS=1`/a new `CRATONVM_DBG_STW_EXPECTED_IDS=1`
+diagnostic added to `interpreter.rs`/`vm_exec.rs` this session — kept in
+the tree, env-var-gated, zero cost when unset), then confirmed the pass
+after.
+
+Regression-checked twice (once after the interim fix, once after the real
+fix) against a 60-class sample (`-Category all -Start 1 -Count 60`) with
+**no regressions** in either pass — identical result both times: 26 PASS,
+1 pre-existing unrelated `TestBeanSupport` FAIL, 33 HANG in the
+already-documented, unrelated `TestHttpServletDoHead*` cluster (see
+`reference_tomcat_dohead_gc_safepoint_deadlock` and siblings).
+
+## Update 2026-07-13/14 (Azure Linux host) — 3 of 4 classes now resolved, 1 partially
+
+Continued on the Azure Linux host (`victor@20.83.144.174`, worktree
+`/data/wt-datastream-residual-20260713`, branch
+`fix/datastream-residual-20260713`, main worktree `/data/data/cratonvm`).
+Also cleaned up ~113G of >48h-stale scratch under `/data/data` (preserving
+dirty worktrees and shared infra) — unrelated housekeeping, noted here only
+because it freed enough disk to build comfortably.
+
+**Found via multi-snapshot `gdb`** (3 attaches, 5s apart, on a hung
+`TestJspConfig`): all 3 snapshots landed inside `dis_read_one`/
+`dis_read_exact`, reached via `native_dis_read_utf`
+(`DataInputStream.readUTF()`) — called with `len` up to 65535 (the
+modified-UTF-8 payload length). **`dis_read_exact` itself — the shared
+helper behind `readByte`/`readShort`/`readUnsignedShort`/`readChar` AND
+`readUTF` — still had the byte-by-byte anti-pattern**; the earlier fixes in
+this doc only touched its *callers* that had their own dedicated loops
+(`native_dis_read_bytes`, `dis_read_fully_impl`, `native_dis_skip_bytes`),
+not this shared helper. `readUTF` is exactly how class-file/JSP
+constant-pool string entries decode, so this was the dominant remaining
+cost. **Fixed**: `dis_read_exact` now bulk-reads via one `invoke_virtual`
+call (looping only on genuine short-reads), same pattern as the other
+fixes, preserving `dis_read_one`'s zero-progress-guard fallback.
+
+**A concurrent session found the identical bug class independently** in
+`InputStream.readAllBytes`/`readNBytes` (`native_is_read_all_bytes`/
+`native_is_read_n_bytes`/`native_is_read_n_bytes_buf`) via a completely
+different investigation (a 769KB-manifest signed-jar `SecurityInfoTests`
+timeout), landing `8492687f4` on `dev` first — see
+`docs/internal/inputstream-readallbytes-readnbytes-readfully-byte-at-a-time-FIXED.md`.
+**That session also found a real GC-safety bug in this doc's own earlier
+`dis_read_fully_impl`/`native_dis_skip_bytes` fixes**: neither pinned the
+`inner`/`buf` `ObjectRef`s reused across multiple `invoke_virtual` calls in
+their loops, so a moving GC mid-loop could leave later iterations
+referencing stale/relocated objects. Merged `8492687f4` into this branch,
+keeping their corrected (pinned) versions.
+
+**Result after `dis_read_exact` fix, verified on Linux:**
+- `TestOrderInterceptor` — still PASSES (no regression).
+- `TestELInterpreterTagSetters` — **now completes** (48 tests, 4 failures —
+  `AbstractMethodError: ELInterpreter.interpreterCall has no Code
+  attribute`, a real but separate, pre-existing bug, not a hang).
+- `TestJspConfig` / `TestEnvEntry` — **no longer stuck**: both make steady,
+  continuous forward progress through their (many) test methods at every
+  timeout tested (90s/180s/300s each got further: e.g. `TestJspConfig`
+  reached `testServlet23NoEL` → `24` → `25` as the timeout budget grew).
+  Neither ever printed another `[stw-request]`/STW-takeover warning after
+  the fix. This looks like inherent per-test-method embedded-Tomcat
+  start/stop overhead across a large test count exceeding a 300s budget,
+  not a defect — would need either a longer suite timeout or further
+  Tomcat-lifecycle profiling to speed up, which is out of scope for "STW
+  takeover hangs."
+- `TestWsWebSocketContainerTimeoutClient` — **STW-visibility bug found and
+  fixed, but the test still cannot complete for a separate reason.**
+  `gdb` on a hung repro found `main-vm` (the test's own thread) blocked in
+  a raw `send()` syscall (`native-api/src/fd_table.rs` `tcp_write`), called
+  synchronously and unbracketed from
+  `native-builtins/src/phases_late.rs`'s `AsynchronousSocketChannel.
+  write(ByteBuffer):Future<Void>` registration (`register_p67_async_channels`).
+  The test deliberately never drains the peer socket (`BlockingPojo`) to
+  force a write timeout, so this `send()` parks in the OS indefinitely once
+  the send buffer fills — exactly the doc's `taken=0`/never-decreasing-
+  `pending` signature. **Fixed the STW-visibility gap** (bracketed this
+  call plus the sibling `read` registration, both previously unbracketed)
+  — confirmed the STW warning no longer needs to fire for this path.
+  **However this does NOT make the test pass**: this `Future`-returning
+  `write` overload is a *second, separate, synchronous* implementation of
+  `AsynchronousSocketChannel` alongside the properly-async
+  `CompletionHandler`-based one in `native-io/src/async_socket.rs`'s
+  `aio_asc_write` (which correctly dispatches to a worker-pool `Job::Write`
+  and returns immediately with a real pending `Future`). Because the
+  `Future`-returning overload blocks the *caller* until the write
+  completes/errors instead of returning a pending `Future`, a caller doing
+  `write(bb).get(timeout, unit)` to detect a write timeout blocks inside
+  this native call itself, never reaching `Future.get` — so the write
+  always eventually "succeeds" (once the peer reads or the connection
+  resets) rather than the caller's own timeout ever firing. **This is a
+  distinct, deeper architectural gap** (make the `Future`-returning
+  overload genuinely async, reusing the same worker-pool/pending-`Future`
+  machinery as the `CompletionHandler` overload) — out of scope for "missing
+  GC-blocking bracket," filed here as the next concrete step for whoever
+  continues this specific class.
+
+**Net result: 3 of the original 4 residual classes are effectively
+resolved** (pass, or make genuine unbounded-but-finite progress with no
+STW involvement); **1 has its STW-hang symptom fixed but needs a follow-up
+architectural fix** (synchronous-vs-async `AsynchronousSocketChannel.write`)
+to actually pass.
+
+Regression-checked (27-class sample, `jakarta.el.*`/`jakarta.servlet.*`
+prefix of `all-tests.txt`, Linux): 25 PASS, 2 FAIL — both pre-existing and
+unrelated to this fix (`TestBeanSupport`, already-known; `TestCompositeELResolver`,
+a Linux-harness-only `WebResourceSet` staging gap in this particular
+pre-staged `/data/data/apps/tomcat` copy, confirmed by its own exception
+message, nothing to do with `DataInputStream`).
+
+## Residual: 4 classes still hang, but NOT an STW-takeover bug
+
+**Update 2026-07-13 (later the same day):** followed this residual up in
+[elinjsp-socket-read-timeout.md](elinjsp-socket-read-timeout.md) — found and
+fixed a real O(n)-per-byte performance bug in `DataInputStream`/
+`RandomAccessFile`'s bulk-read natives (byte-by-byte via a full
+`invoke_virtual` dispatch instead of one bulk `read()` call — thousands of
+interpreter round-trips for a multi-KB class-file/JAR-entry read). Confirmed
+via symbolicated `cdb` that this was actively being hit, and ruled out both
+"just needs a longer timeout" (still didn't finish at 300s) and
+"JIT-specific" (reproduces with `CRATONVM_DISABLE_JIT=1`) along the way.
+**Fixed, but does not fully resolve this residual** — all 4 classes still
+hang at the suite's 90s timeout after the fix, with zero regressions
+elsewhere. See that doc's "Root cause #2" section for the full evidence
+chain and next-step recommendation (get a multi-snapshot, all-threads
+Java-level capture on an idle host to distinguish one genuine stuck point
+from several different slow operations chained together).
+
+Re-ran all 5 original classes against the fully-fixed binary:
+
+| Class | Result |
+|---|---|
+| `TestOrderInterceptor` | **PASS** (was HANG) |
+| `TestJspConfig` | HANG (unchanged) |
+| `TestELInterpreterTagSetters` | HANG (unchanged) |
+| `TestEnvEntry` | HANG (unchanged) |
+| `TestWsWebSocketContainerTimeoutClient` | HANG (unchanged) |
+
+Deep-dived `TestJspConfig` (hangs on its very first test method,
+`testErrorOnELNotFound01`) the same way: `CRATONVM_DBG_STW_CENSUS=1` +
+symbolicated `cdb`. **No `[stw-request]`/`[stw-census]` line is ever
+printed** — this hang does not go through `stw_take_over_and_wait` at all,
+confirming it is a structurally different bug. The `main-vm` thread
+(the JUnit runner — the only thread doing real work; every `http-nio-*`
+worker sits idle in a correctly-bracketed `LockSupport.park`) is stuck in:
+
+```
+main-vm:
+ recv (ws2_32) <- TcpStream::read <- http_url_connection::read_eof_tolerant
+ <- read_response <- perform <- huc_real_perform <- HttpURLConnection.getResponseCode()
+```
+
+I.e. `TomcatBaseTest.getUrl()`'s client-side HTTP GET is blocked reading a
+response that the embedded Tomcat server **never sends** for this specific
+request. Since Java's `HttpURLConnection` default read timeout is `0`
+(infinite) unless a test explicitly sets one, and this code path is now
+correctly GC-blocking-region-bracketed (fixed earlier this session), the
+client-side wait itself is *architecturally* correct (matches real JDK
+"no timeout configured" semantics) — the actual bug is server-side: **why
+does Tomcat/Jasper never produce a response** for
+`testErrorOnELNotFound01` (an EL-not-found error-page scenario) under
+CratonVM? That's a Jasper/EL error-handling or request-processing question,
+unrelated to GC/STW/threading. Spot-checked `TestEnvEntry` too (also hangs
+on its first test method with no `[stw-request]` line ever printed) —
+same shape, though I didn't get a clean symbolicated stack for it before
+running out of session time; strongly suspect the same "server never
+responds" pattern given the identical harness (`TomcatBaseTest.getUrl()`)
+and lack of any STW signature.
+
+This is very likely the same underlying issue (or a more severe,
+non-timing-out variant of it) as the already-open
+`docs/known-issues/tomcat-08-07/elinjsp-socket-read-timeout.md`
+(`TestELInJsp` — 4/25 failures with client-side `SocketTimeoutException`,
+also EL/JSP, also via `getUrl()`) — that doc's failures eventually time out
+client-side (meaning a read timeout WAS configured for those specific
+calls) where this cluster's hangs never do (no timeout configured), but
+both point at the same underlying "Jasper/EL request sometimes never gets
+a server response" defect. **Recommend merging these two docs** and
+investigating from the server side: capture what the embedded Tomcat's own
+worker thread is doing (or not doing) for the specific hung request — e.g.
+`CRATONVM_DBG_SOCK=1` / a `cdb` attach that also inspects the (currently
+believed idle) `http-nio-*-exec-N` threads' Java-level state via the
+`debug_thread_census` frame trace, or add server-side request-lifecycle
+logging to Tomcat's `Http11Processor`/Jasper's EL-error servlet path to see
+whether the request is ever dispatched at all.
+
+## Reproduction
+
+```powershell
+cd apps\tomcat-suite-runner
+# Fixed (now passes):
+.\run-tomcat-suite.ps1 -Vm craton -Jit on -Jdk real -Category all -RunName verify -Start 277 -Count 1 -TimeoutSec 90 -Parallel 1
+# org.apache.catalina.tribes.group.interceptors.TestOrderInterceptor
+
+# Still hang (residual, different bug — needs -Dtomcat.test.basedir etc.,
+# see cdb-hang.ps1 for the full arg list if reproducing outside the suite runner):
+.\run-tomcat-suite.ps1 -Vm craton -Jit on -Jdk real -Category all -RunName verify -Start 450 -Count 1 -TimeoutSec 90 -Parallel 1
+.\run-tomcat-suite.ps1 -Vm craton -Jit on -Jdk real -Category all -RunName verify -Start 466 -Count 1 -TimeoutSec 90 -Parallel 1
+.\run-tomcat-suite.ps1 -Vm craton -Jit on -Jdk real -Category all -RunName verify -Start 497 -Count 1 -TimeoutSec 90 -Parallel 1
+.\run-tomcat-suite.ps1 -Vm craton -Jit on -Jdk real -Category all -RunName verify -Start 649 -Count 1 -TimeoutSec 90 -Parallel 1
+# org.apache.jasper.compiler.TestJspConfig
+# org.apache.jasper.optimizations.TestELInterpreterTagSetters
+# org.apache.naming.TestEnvEntry
+# org.apache.tomcat.websocket.TestWsWebSocketContainerTimeoutClient
+```
+
+New diagnostics added this session (kept, env-var-gated, zero cost when
+unset): `CRATONVM_DBG_STW_EXPECTED_IDS=1` (alongside
+`CRATONVM_DBG_STW_CENSUS=1`) prints the exact `ThreadId` set counted as
+"expected" at STW-request time (`[stw-expected]`), and every `park()` call
+now logs `[stw-park] tid=<N> pre_stw=<bool>` — together these make it much
+faster to tell whether a given hang is even going through the STW-takeover
+mechanism at all (as the residual 4-class hang above demonstrates it is
+not).
+
+## Original summary (2026-07-12 finding, superseded by "Root cause" above)
 
 Five unrelated-on-the-surface Tomcat test classes all HANG at the full
 1200s timeout with the identical diagnostic warning repeating in the log:
@@ -151,60 +337,11 @@ WARN cratonvm_vm::runtime::interpreter: STW cross-thread JIT takeover is
   still waiting for cooperative mutators rounds=64 pending=N taken=0
 ```
 
-Affected classes:
-- `org.apache.jasper.compiler.TestJspConfig`
-- `org.apache.jasper.optimizations.TestELInterpreterTagSetters` (3
-  occurrences of the warning in its log)
-- `org.apache.naming.TestEnvEntry`
-- `org.apache.catalina.tribes.group.interceptors.TestOrderInterceptor`
-- `org.apache.tomcat.websocket.TestWsWebSocketContainerTimeoutClient`
-
-`taken=0` across all of them means the stop-the-world JIT takeover
-mechanism never succeeds in getting even one mutator thread to cooperate,
-for the full duration of the run (`rounds=64` and climbing) — the process
-doesn't crash or recover, it just spins/blocks forever until the external
-1200s test-harness timeout kills it.
-
-`TestOrderInterceptor`'s log additionally shows repeated
-`McastService` multicast-receive timeouts (`os error 10060`,
-`WSAETIMEDOUT`) immediately before the STW warning starts — the tribes
-membership/multicast churn may be what triggers the STW takeover attempt
-in that case (heavy allocation/GC pressure from repeated socket-timeout
-retries), but the other four classes don't share that specific trigger, so
-multicast isn't the root cause — just one way to reach the same underlying
-STW-takeover deadlock/livelock.
-
 Found via a fresh Windows full-suite rerun (dev commit `080e79256`,
-2026-07-12, real JDK, JIT on, 1200s timeout). Verified via a fresh
-same-session HotSpot run (dev commit unchanged, 2026-07-13): all 5 PASS
-cleanly on HotSpot.
-
-## Reproduction
-
-```powershell
-cd apps\tomcat-suite-runner
-.\run-tomcat-suite.ps1 -Vm craton -Jit on -Jdk real -Category all -RunName stwtakeover `
-  -Start <idx> -Count 1 -TimeoutSec 300 -Parallel 1
-# org.apache.jasper.compiler.TestJspConfig
-# org.apache.jasper.optimizations.TestELInterpreterTagSetters
-# org.apache.naming.TestEnvEntry
-# org.apache.catalina.tribes.group.interceptors.TestOrderInterceptor
-# org.apache.tomcat.websocket.TestWsWebSocketContainerTimeoutClient
-```
-Grep any of the five classes' stderr log for `STW cross-thread JIT
-takeover` to confirm the signature reproduces.
-
-## Recommendation (original, 2026-07-12 — superseded, kept for history)
-
-Find `"STW cross-thread JIT takeover is still waiting for cooperative
-mutators"` in `vm/src/runtime/interpreter.rs` and trace what "cooperative
-mutator" means in this context — see "Root cause, 2026-07-13" near the top
-of this doc for what this investigation actually found:
-`taken=0`/`pending` staying nonzero is not a missing-safepoint-poll or
-missing-blocking-region issue (two real instances of the latter were found
-and fixed elsewhere along the way, but they don't explain this cluster);
-it's the STW initiator itself being a stranded `ForkJoinPool` worker whose
-sibling pool threads depend on it to make progress. Next step is an actual
-fix, not further root-causing — see the "Not attempted this session"
-paragraph above for the two candidate directions and why they weren't
-attempted solo in this pass.
+2026-07-12, real JDK, JIT on, 1200s timeout) — a busier, more concurrent
+run than the isolated single-class repro used above, which is presumably
+why all 5 showed the STW signature there (concurrent GC pauses from other
+classes' threads overlapping with these classes' now-separately-diagnosed
+issues) even though only 1 of the 5 turns out to be an actual STW-takeover
+bug in isolation. Verified via a fresh same-session HotSpot run (dev commit
+unchanged, 2026-07-13): all 5 PASS cleanly on HotSpot.

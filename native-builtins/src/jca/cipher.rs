@@ -1246,6 +1246,48 @@ pub fn register_cipher_clinit_shim(r: &mut NativeMethodRegistry) {
         "()V",
         clinit_noop,
     );
+    // `Providers.startJarVerification()` / `stopJarVerification(Object)` —
+    // a SEPARATE consumer of this same no-op'd clinit, unrelated to the
+    // Cipher/KeyGenerator bring-up this shim was written for.
+    // `sun.security.util.SignatureFileVerifier.<init>` (real jar-signature
+    // verification, e.g. `java.util.jar.JarEntry.getCertificates()` via
+    // `JarInputStream`/`JarVerifier`) always wraps its body in
+    // `try { obj = Providers.startJarVerification(); ... } finally {
+    // Providers.stopJarVerification(obj); }`. The real `<clinit>` normally
+    // sets the static fields `providerList` (`ProviderList
+    // .fromSecurityProperties()`) and `threadLists` (`new ThreadLocal<>()`);
+    // no-opping it leaves both null. `startJarVerification()` NPEs
+    // dereferencing `getSystemProviderList().getJarList(...)` on the null
+    // `providerList`, and the `finally` block's `stopJarVerification(null)`
+    // → `endThreadProviderList(null)` NPEs calling `.remove()` on the null
+    // `threadLists` `ThreadLocal` itself — the *finally*-block exception
+    // replaces the try-block one (plain try/finally, not try-with-resources,
+    // so nothing is recorded as suppressed), surfacing as: "Cannot invoke
+    // java.lang.ThreadLocal.remove() because sun.security.jca.Providers
+    // .threadLists is null". This broke every real-signed-jar case of
+    // Spring Boot loader's `SecurityInfoTests`/`NestedJarFileTests`
+    // (`SecurityInfo.load` → certs/codeSigners always null).
+    //
+    // The real purpose of this thread-local provider swap is to stop JAR
+    // verification from recursively loading providers out of the very JAR
+    // being verified — moot here, since CratonVM's actual crypto dispatch
+    // (CertificateFactory/Signature/MessageDigest) is native, not routed
+    // through a loaded `ProviderList` at all. So bypass the two entry
+    // points directly rather than resurrecting `ProviderList
+    // .fromSecurityProperties()`/`threadLists` bring-up (the exact chain
+    // the original no-op was written to avoid).
+    r.register(
+        "sun/security/jca/Providers",
+        "startJarVerification",
+        "()Ljava/lang/Object;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(
+        "sun/security/jca/Providers",
+        "stopJarVerification",
+        "(Ljava/lang/Object;)V",
+        clinit_noop,
+    );
 
     // `javax/crypto/JceSecurity.<clinit>` — the real JDK-25 clinit invokes
     // `setupJurisdictionPolicies()` which reads the `crypto.policy` Security

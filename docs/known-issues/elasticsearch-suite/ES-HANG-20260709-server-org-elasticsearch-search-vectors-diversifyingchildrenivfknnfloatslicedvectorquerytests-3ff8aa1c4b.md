@@ -1,3 +1,88 @@
+# 2026-07-13 follow-up: array-constructor-reference lambda bug found + fixed
+# (real, verified, but NOT yet confirmed as this doc's residual root cause)
+
+While independently re-investigating this cluster (parallel to, and without
+visibility into, the "2026-07-13 current-dev residual update" section
+immediately below until after landing this fix), found and fixed a real,
+previously-unknown interpreter correctness bug: **array-constructor-reference
+lambdas (`SomeType[]::new`, used as an `IntFunction<SomeType[]>` — the
+mechanism behind `Collection.toArray(SomeType[]::new)`, ubiquitous since
+Java 11, and any direct user code) allocated a corrupted zero-field pseudo-
+object instead of a real array.**
+
+Root cause: `MethodHandleKind::NewInvokeSpecial` (the constructor-reference
+lambda dispatch, `vm/src/runtime/interpreter.rs` and its duplicate in
+`vm/src/vm/vm_exec.rs`) unconditionally treated the impl handle's target as a
+regular class — allocate `num_total_fields` object slots, dispatch `<init>`.
+For an array-shaped impl class name (e.g. `"[Ljava/nio/ByteBuffer;"`),
+`load_class` correctly resolves it to the synthesized array `ClassId` (JVMS
+5.3.3), but arrays have neither fields nor a constructor: the old path
+allocated a zero-field object wearing the array's `ClassId`, silently
+discarded the requested length (the `IntFunction`'s sole `int` argument), and
+produced a value that fails a later `checkcast` to the real array type.
+
+This exact mechanism reproduces from real Lucene: `ByteBuffersDataInput`'s
+constructor does `this.blocks = list.toArray(ByteBuffer[]::new)`, immediately
+followed by `checkcast [Ljava/nio/ByteBuffer;`. A direct, isolated repro
+(`new ByteBuffersDataInput(list)` against the real `lucene-core-10.4.0.jar`,
+bypassing the whole ES/suite-runner harness) threw
+`ClassCastException: java.lang.Object cannot be cast to [Ljava.nio.ByteBuffer;`
+on unfixed `dev`, and one *direct* (non-suite-runner) repro of this doc's own
+`testSlicesDense` — bypassing the outer watchdog entirely — surfaced this
+identical exception in ~85s instead of the usual multi-hundred-second
+non-progress, i.e. this bug is a real, independent cause of SOME of this
+cluster's non-deterministic behavior (fast completion with a wrong-data
+exception, vs. the more common very-slow/non-progress runs), not necessarily
+of every manifestation.
+
+**Fixed** (commit on `fix/gc-stw-monitor-race-20260711-local`, merged to
+`dev`): detect the array case via the resolved `ClassId`'s `array_info`
+before the object-allocation path, and allocate a real array — primitive or
+reference, correct component type, correct length — the same way
+`anewarray`/`newarray` do for the same class metadata. Verified: the real
+`ByteBuffersDataInput` construct + `readByte()` + `slice()` repro now matches
+real JDK 25 output exactly. `cratonvm-vm --lib` lambda-proxy/lambda-dispatch
+suite 8/8 pass; full `cratonvm-vm --lib` 2185 passed / 23 failed, all 23
+pre-existing/environmental (debug-only lock-order assertions that cannot fire
+in a release build, JIT skip-list feature tests, JNI table-size tests,
+real-JDK-detection tests) and unrelated by name/code-path to this change.
+
+**CONFIRMED 2026-07-13 (same session, host came back):** re-ran the
+"2026-07-13 current-dev residual update" repro directly (`testSlicesSparseWithFilter`,
+direct-invocation form bypassing the suite runner, `--stack-dump-on-timeout 90`)
+against a fresh build of `origin/dev` including this fix (`fe76025e7`,
+worktree `/data/data/wt-gc-stw-monitor-race-20260711`, binary
+`/data/data/cratonvm-arrayctorfix-verify-20260713`). **4/4 runs now pass
+cleanly (`OK (1 test)`), consistently ~80-85s, no watchdog abort, no
+exception.** Before this fix every run hit the 90s watchdog with the process
+genuinely non-progressing inside `ByteBuffersIndexInput.slice`/
+`MockIndexInputWrapper.slice` (per the residual-update section above). This
+fix IS the root cause of that residual — the STW-monitor-race historical
+attribution is confirmed NOT applicable to `testSlicesSparseWithFilter` and
+can be retired for that test.
+
+**`testSlicesDense` (this doc's ORIGINAL 2026-07-09 subject) was ALSO
+re-tested against the same fixed build and is NOT resolved by this fix**:
+3/3 runs still hit the 90s watchdog. This is consistent with the earlier
+(pre-this-fix) finding elsewhere in this doc's history that `testSlicesDense`
+is genuinely, if very slowly, making forward progress rather than
+deadlocked — an unbounded run (no watchdog) earlier in this same
+investigation completed in ~602s, terminated by the test framework's own
+`-Dtests.timeoutSuite=580000!`, not by a VM-level hang. `testSlicesDense`'s
+slowness (not correctness) is therefore a SEPARATE, still-open issue from
+`testSlicesSparseWithFilter`'s (now-fixed) correctness bug — likely
+CratonVM interpreter overhead on a reflection/exception-handling-heavy path
+(deep `Method.invoke()` chains + `local_liveness::analyze` cache misses were
+observed dominating a live gdb snapshot of a `testSlicesDense` run), not a
+lost-wakeup or a data-corruption bug. Whoever picks this doc back up next
+should treat `testSlicesDense` as a performance investigation, not a hang/
+correctness investigation, and should NOT expect the STW-monitor-race /
+GC-audit finding 1 attribution to apply here either — finding 1(a) itself
+was independently fixed and merged (`371347920`) before this fix landed, and
+`testSlicesDense`'s slowness persists on top of that fix too.
+
+---
+
 # 2026-07-13 current-dev residual update
 
 **Status: OPEN.** This remains a real CratonVM-only non-progress failure, but

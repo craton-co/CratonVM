@@ -120,6 +120,20 @@ was also observed once against the fixed binary during verification, with no acc
 warning. `AttributeAccess` is a foundational WildFly-core class loaded far earlier than boot's
 `parallel-extension-add` step, so its checkcast almost certainly takes `jit_typecheck_resolve`'s **fast**
 path (target already loaded) — which has no `load_class_concurrent` call and so is not protected by this
-fix. This looks like a separate instance of the broader "register-invisible JIT root" / cross-thread GC
-takeover bug family tracked elsewhere (not this doc's scope, and not the STW-hang sibling either — it's a
-crash, not a hang) — flagged for whoever picks that family up next, not fixed here.
+fix.
+
+**2026-07-13 follow-up investigation ([[wildfly-standalone-boot-attributeaccess-cce-register-invisible-root]],
+`docs/known-issues/wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`): CONFIRMED**
+as a separate instance of the already-tracked "register-invisible JIT root" bug family (the `SB-CRASH-04`
+residual within the default-on precise-JIT-oop-map machinery), not a new bug and not this fix's scope.
+Confirmed from source that `jit_typecheck_resolve`'s fast path makes zero GC-triggering calls (so
+staleness must originate upstream of the checkcast helper) and that Generational's young collector
+never relocates objects while any JIT frame is active (so a moving-GC-evacuation mechanism is
+structurally excluded for a JIT-required bug) — leaving the non-moving sweep's marking phase missing a
+live root at a cooperative safepoint as the only mechanism consistent with the symptom, matching three
+other independent 2026-07-10 occurrences of the same family (DoHead, `TestSwallowAbortedUploads`,
+`TestAccessLogValve`). Live reproduction was inconclusive this session (host-contention-blocked, and a
+separate, real "Family 1" stale-`ObjectRef` bug — see the new doc's "Separate finding" — dominated every
+attempt instead), so this remains a code-analysis-based conclusion, not a fresh capture. Not fixed, per
+this bug family's established policy — see the new doc for full reasoning and the fresh "Family 1"
+finding, flagged separately as its own follow-up.

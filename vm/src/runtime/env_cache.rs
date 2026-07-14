@@ -647,12 +647,26 @@ cached_is_set!(dbg_jetty2, "CRATONVM_DBG_JETTY2");
 // environment on every dispatch.
 cached_is_set!(dbg_vdisp, "CRATONVM_DBG_VDISP");
 cached_is_set!(dbg_ccsprobe, "CRATONVM_DBG_CCSPROBE");
+// `CRATONVM_DBG_HANG_SAMPLE` -- temporary diagnostic for the AOT
+// bean-registration hang investigation (2026-07-13). Periodically samples
+// the method being invoked in `execute_invoke_kind` (every Nth call) so a
+// hung process's last-known activity can be inspected from stderr without a
+// native debugger. Not perf-sensitive: gated behind a cached env lookup and
+// only actually prints once every 200,000 calls.
+cached_is_set!(dbg_hang_sample, "CRATONVM_DBG_HANG_SAMPLE");
 cached_is_set!(dbg_pbstart, "CRATONVM_DBG_PBSTART");
 cached_is_set!(dbg_bblp, "CRATONVM_DBG_BBLP");
 cached_is_set!(dbg_jitc, "CRATONVM_DBG_JITC");
 cached_is_set!(dbg_unpark_miss, "CRATONVM_DBG_UNPARK_MISS");
 cached_is_set!(dbg_jit_ldc, "CRATONVM_DBG_JIT_LDC");
 cached_is_set!(trace_unimplemented, "CRATONVM_TRACE_UNIMPLEMENTED");
+/// `CRATONVM_DBG_HOTPATH_COUNTS` — temporary call-count instrumentation for
+/// the silent-hang-no-signature-cluster throughput residual investigation
+/// (2026-07-13). Tallies invocations of several suspected interpreter
+/// dispatch hot-path functions and periodically reports counts, independent
+/// of wall-clock timing (robust to host contention noise). See
+/// `interpreter::hotpath_counts`.
+cached_is_set!(dbg_hotpath_counts, "CRATONVM_DBG_HOTPATH_COUNTS");
 
 // ── Flags read via `env::var(...).is_ok()` ──────────────────────────────
 

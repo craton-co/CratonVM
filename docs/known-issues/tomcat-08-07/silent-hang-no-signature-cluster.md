@@ -1,9 +1,12 @@
 # Silent 1200s hangs with no diagnostic signature (3 classes)
 
-**Status:** PARTIALLY FIXED (3 root causes found and fixed 2026-07-13;
-branch `fix/silent-hang-no-signature-20260713`), residual throughput issue
-OPEN. **Severity:** medium (was high/indefinite-hang; now bounded-but-slow
-in the affected code paths). **HotSpot:** PASS on all 3 (fresh-verified).
+**Status:** PARTIALLY FIXED (4 fixes total, 2026-07-13; branch
+`fix/silent-hang-no-signature-20260713`) — 3 root-cause retry-storm/debug-
+probe bugs fixed, plus 1 throughput hot-path fix (~2x, not sufficient
+alone). Residual throughput issue OPEN, all 3 classes still HANG at the
+suite timeout. **Severity:** medium (was high/indefinite-hang; now
+bounded-but-slow in the affected code paths). **HotSpot:** PASS on all 3
+(fresh-verified).
 
 ## Summary
 
@@ -118,7 +121,65 @@ failed during start` / `Failed to start component
 root-caused — worth a dedicated investigation; may or may not be related
 to the throughput residual above (a component that fails fast instead of
 running the expensive path would trivially "fix" the hang for the wrong
-reason).
+reason). Did not reproduce again across several follow-up attempts (all
+hung normally instead) — likely rare/environment-dependent; deprioritized
+until the throughput residual is far enough along for full runs to
+complete reliably enough to catch it again.
+
+### Follow-up (2026-07-13, same day): one hot-path fix found + landed, ~2x — not sufficient alone
+
+Built lightweight call-count instrumentation (`CRATONVM_DBG_HOTPATH_COUNTS`,
+cached/gated like every other debug flag in `env_cache`, safe to leave in
+tree) to get real per-function call frequency independent of wall-clock
+noise (this dev box has an active, recurring cryptominer infection during
+this session — see `reference_windows_box_cryptominer_infection_20260710`
+in memory — that makes absolute timing comparisons unreliable run-to-run).
+Measured against the `Response.toAbsolute()` benchmark above:
+
+```
+force_native_over_real_jdk_bytecode:        ~51% of ALL executed instructions
+retarget_instance_field_to_receiver:        ~37%
+lookup_loader_initiated:                    ~14%
+resolve_method_ref:                         ~21%
+```
+
+Traced `lookup_loader_initiated`/`retarget_instance_field_to_receiver`
+(51% combined) to `should_use_loader_initiated_resolution`, which calls
+`defining_loader_for` (native-builtins/src/classloader.rs) UNCONDITIONALLY
+— and that function took a `std::sync::Mutex` on every single call. Its
+backing map is populated only when a user-defined `ClassLoader` (ByteBuddy/
+cglib/Hibernate-proxies/Groovy) defines a class — never true for this
+Tomcat suite — so the map is empty for the whole process lifetime. Fixed:
+added `ANY_DEFINING_LOADER_REGISTERED` (a plain `AtomicBool`, set only at
+the map's single insertion site) so `defining_loader_for` skips the mutex
+entirely when nothing has ever been registered — provably correct (empty
+map ⟹ `None` for every class_id regardless of the flag; see commit for the
+full correctness argument).
+
+**Result: ~2x** (`Response.toAbsolute()`: ~0.60ms/call → ~0.31ms/call
+measured via the standalone microbenchmark). Landed on
+`fix/silent-hang-no-signature-20260713`. **Confirmed NOT sufficient
+alone** — re-tested `TestContextConfig`/`TestValidator` with this fix and
+both still HANG at a 120s timeout. The `force_native_over_real_jdk_bytecode`
+~51%-of-instructions figure is itself still unexplained/unoptimized: it's
+a ~1400-line sequential string-comparison special-case dispatcher (ANTLR,
+AWT, BouncyCastle, ByteBuddy, H2, Hibernate, JBoss, Jython, liquibase,
+Spring, XNIO, Xerces, and ~15 more JDK-internal cases) called on roughly
+half of all executed bytecode — but a hand-rolled package-prefix
+allowlist to fast-reject non-special classes was judged TOO RISKY to
+attempt without exhaustive enumeration (a first-pass attempt missed the
+`liquibase/` case entirely, hiding inside a nested helper function not
+visible to a naive text scan of the outer function's literals) — a wrong/
+incomplete allowlist would silently break framework compatibility rather
+than just being slow. `&str` equality in Rust short-circuits on length
+mismatch, so each individual comparison is likely only a few ns; whether
+the *aggregate* cost across ~50-100 sequential comparisons × 51% of all
+instructions is actually significant, versus this being noise in a
+statistically small stack-sample set, is not yet directly measured (the
+`hotpath_counts` instrumentation added this session only counts calls, not
+time — a natural next step is a paired counter+cheap-timestamp, or an
+allow-list built by mechanically enumerating every literal INCLUDING
+inside nested `is_*_native_override` helpers, not by hand).
 
 **Confounding factor for any future measurement on this specific host**:
 an active cryptominer infection was confirmed present throughout this

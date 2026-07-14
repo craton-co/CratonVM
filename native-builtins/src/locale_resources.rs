@@ -1774,6 +1774,19 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
+    registry.register(
+        "java/text/DecimalFormatSymbols",
+        "getInstance",
+        "(Ljava/util/Locale;)Ljava/text/DecimalFormatSymbols;",
+        |ctx, args| {
+            let locale = args.first().copied().unwrap_or(Value::Object(None));
+            ctx.new_object_initialized(
+                "java/text/DecimalFormatSymbols",
+                "(Ljava/util/Locale;)V",
+                &[locale],
+            )
+        },
+    );
 
     // LocaleResources.getNumberPatterns() → String[] of 4 patterns
     // (number / currency / percent / scientific).  Used by
