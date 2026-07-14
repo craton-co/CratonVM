@@ -54060,6 +54060,26 @@ fn matcher_realjdk_search(
     Ok(Some(Value::Int(if matched { 1 } else { 0 })))
 }
 
+/// Resolve the default-on real-layout Matcher intrinsics for exact-receiver
+/// JIT dispatch. The VM applies the same feature gate as registration before
+/// consulting this table.
+pub fn matcher_realjdk_native_callback(
+    method_name: &str,
+    descriptor: &str,
+) -> Option<cratonvm_native_api::NativeCallback> {
+    match (method_name, descriptor) {
+        ("find", "()Z") => Some(native_matcher_find_realjdk),
+        ("find", "(I)Z") => Some(native_matcher_find_at_realjdk),
+        ("start", "()I") => Some(native_matcher_start_realjdk),
+        ("start", "(I)I") => Some(native_matcher_start_idx_realjdk),
+        ("end", "()I") => Some(native_matcher_end_realjdk),
+        ("end", "(I)I") => Some(native_matcher_end_idx_realjdk),
+        ("group", "()Ljava/lang/String;") => Some(native_matcher_group_realjdk),
+        ("group", "(I)Ljava/lang/String;") => Some(native_matcher_group_idx_realjdk),
+        _ => None,
+    }
+}
+
 /// Real-JDK-layout `Matcher.find()Z`. See module banner for the full
 /// contract; mirrors real bytecode's own two-step algorithm exactly
 /// (`find()` computes the resume position from `first`/`last`/`from`/`to`,
@@ -54286,8 +54306,27 @@ fn matcher_realjdk_group_in_bounds(
 mod matcher_realjdk_layout_tests {
     use super::{
         compile_java_regex, matcher_realjdk_capture_layout_valid,
-        matcher_realjdk_group_index_in_bounds,
+        matcher_realjdk_group_index_in_bounds, matcher_realjdk_native_callback,
     };
+
+    #[test]
+    fn jit_dispatch_resolver_covers_only_real_layout_matcher_intrinsics() {
+        for (name, descriptor) in [
+            ("find", "()Z"),
+            ("find", "(I)Z"),
+            ("start", "()I"),
+            ("start", "(I)I"),
+            ("end", "()I"),
+            ("end", "(I)I"),
+            ("group", "()Ljava/lang/String;"),
+            ("group", "(I)Ljava/lang/String;"),
+        ] {
+            assert!(matcher_realjdk_native_callback(name, descriptor).is_some());
+        }
+        assert!(matcher_realjdk_native_callback("matches", "()Z").is_none());
+        assert!(matcher_realjdk_native_callback("group", "(Ljava/lang/String;)Ljava/lang/String;")
+            .is_none());
+    }
 
     #[test]
     fn capture_range_visitor_reports_std_and_fancy_offsets() {
