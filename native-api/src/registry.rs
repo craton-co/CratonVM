@@ -3429,6 +3429,18 @@ impl NativeMethodRegistry {
         // fake. Bridges and intrinsics are always registered. (See the
         // `drop_synthetic_stubs` field doc.)
         if self.drop_synthetic_stubs && self.current_category == NativeKind::SyntheticStub {
+            // CRATONVM_DBG_DROPPED_STUBS=1: list every registration this mode
+            // silently drops. Added 2026-07-14 while chasing a real-JDK-mode
+            // bootstrap regression (`InternalError: null property: java.home`)
+            // that traced back to a whole register_* function's worth of
+            // permanent bridges (java.util.Properties' side-table natives)
+            // being mis-tagged SyntheticStub by inheriting the wrong ambient
+            // category at one of its call sites — this made the drop visible
+            // in seconds instead of a multi-round bisection. Cheap/no-op when
+            // unset; kept as a permanent diagnostic for the next occurrence.
+            if std::env::var_os("CRATONVM_DBG_DROPPED_STUBS").is_some() {
+                eprintln!("[DROPPED-STUB] {class_name}.{method_name}{descriptor}");
+            }
             return;
         }
         // NIO-SERVER-SOCKET (route 1): when `CRATONVM_REAL_NET_SOCKETS` is set,

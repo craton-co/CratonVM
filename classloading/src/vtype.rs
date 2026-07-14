@@ -31,6 +31,16 @@ pub trait ClassHierarchy {
     /// Both names are internal form (e.g. `"java/lang/String"`).
     fn is_subclass(&self, child: &str, parent: &str) -> bool;
 
+    /// Is `parent` the directly linked superclass of `child`?
+    ///
+    /// Constructor verification needs this stricter relationship for an
+    /// `uninitializedThis` receiver. The default is deliberately conservative
+    /// for lightweight test hierarchies; production hierarchy providers that
+    /// retain linked class metadata should override it.
+    fn is_direct_superclass(&self, _child: &str, _parent: &str) -> bool {
+        false
+    }
+
     /// Find the nearest common superclass of `a` and `b`.
     /// Returns `"java/lang/Object"` if no better common ancestor exists.
     fn common_superclass(&self, a: &str, b: &str) -> String;

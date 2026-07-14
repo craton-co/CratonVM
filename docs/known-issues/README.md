@@ -4,6 +4,11 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-14 TestClassServerTest URLClassLoader isolation FIXED; severe new String.getBytes() regression found
+
+- FIXED (moved to `docs/internal/`): [`keycloak-testclassserver-invalidpackage-classnotfound-FIXED.md`](../internal/keycloak-testclassserver-invalidpackage-classnotfound-FIXED.md) -- root cause was the same underlying defect as `spring-boot-probe-sweep/SBR-14-urlclassloader-parent-null-bypassed.md`: a null-parent `URLClassLoader` never consulted its own URL/HTTP classpath at all, resolving through CratonVM's flat global class store instead (breaking isolation AND making `testInvalidPackage`'s expected `ClassNotFoundException` never fire). Fixed in `native-builtins/src/classloader.rs`/`classloader_real.rs` (defer-to-`findClass` gate now covers bare `URLClassLoader`, not just subclasses) plus a genuine HTTP(S) fetch path added for URLClassLoader entries (`http_client.rs`). Verified via an isolated A/B repro against a real external HTTP server; the literal upstream test still can't run end-to-end due to the new bug below.
+- 🔴 NEW, severe: [`string-getbytes-empty-real-jdk-mode.md`](string-getbytes-empty-real-jdk-mode.md) -- `String.getBytes()` (all overloads) returns an empty byte array in real-JDK mode, confirmed pre-existing (present on unmodified `dev` HEAD, not introduced by the fix above). Suspected fallout from the same-day commit `d8092acb`'s new synthetic-native-stub-dropping hardening silently dropping a genuine bridge native that was never re-categorized. Broad blast radius suspected (anything doing String-to-bytes: I/O, hashing, HTTP bodies) -- likely under-detected because failures land on higher-layer symptoms. Not yet fixed.
+
 ## 2026-07-14 Spring Boot `crashfail-20260714` rerun; 9 new bug clusters filed under `springboot/`
 
 Full-suite rerun after the 7 clusters from 07-11/07-13 were fixed (see
@@ -46,7 +51,7 @@ The remaining six are OPEN with strong, evidence-backed hypotheses not yet confi
 ## 2026-07-13 Keycloak quarkus/runtime SmallRye Config resolution mismatches FIXED (3/4); PicocliTest hang split out as separate open bug
 
 - FIXED (moved to `docs/internal/`): [`fixed-suite-bugs/keycloak-quarkus-runtime-config-resolution-mismatches.md`](../internal/fixed-suite-bugs/keycloak-quarkus-runtime-config-resolution-mismatches.md) вЂ” landed on `dev` via commit `10a561f21` earlier the same day this doc's investigation resumed. 3 of 4 original symptoms confirmed fixed by rerun: `DatasourcesConfigurationTest` (host-env-leak into `propagatedPropertyNames`, plus the interceptor-context `NoSuchMethodError`), `TracingConfigurationTest` (hardcoded-wrong `isTracingEnabled` native stub removed), `IgnoredArtifactsTest`. A narrower residual remains OPEN and is tracked inline in that doc rather than as a separate file: `ConfigurationTest::testDatabaseProperties` intermittently (~80% of runs) throws a `ClassCastException: Object cannot be cast to String` from `SmallRyeConfig$ConfigSources$PropertyNames.latest()` вЂ” confirmed genuinely racy (diagnostic instrumentation that merely reads extra class-name info per stream iteration made it disappear 6/6 vs failing 5/5 without it), not reproducible in a clean standalone repro (needs accumulated state from ~72 prior tests in the class), root cause not pinned down (leading suspect: `PropertyMappingInterceptor.iterateNames()`'s `mappersWithoutValues.stream()...` combined with `hasInferredValue`'s reentrant `context.restart()` call, but not confirmed).
-- OPEN, newly filed: [`quarkus-runtime-picocli-arggroupspec-synopsis-hang-20260713.md`](keycloak/quarkus-runtime-picocli-arggroupspec-synopsis-hang-20260713.md) вЂ” the config-resolution doc's 2026-07-13 update had speculated `PicocliTest`'s 27/107 failures "may share a root cause" with the config-mismatch bugs above; that hypothesis is REFUTED. Confirmed via CPU-time flatlining + a `--stack-dump-on-timeout` thread dump that `PicocliTest` genuinely hangs 58 frames deep inside picocli's own `ArgGroupSpec`/`ColorScheme`/`Text` CLI-help-synopsis text building вЂ” entirely unrelated to SmallRye config sources/interceptors, and not touched by the `10a561f21` fix.
+- FIXED (moved to `docs/internal/`, 2026-07-14): [`fixed-suite-bugs/quarkus-runtime-picocli-arggroupspec-synopsis-hang-20260713-FIXED.md`](../internal/fixed-suite-bugs/quarkus-runtime-picocli-arggroupspec-synopsis-hang-20260713-FIXED.md) — the full 107-test `PicocliTest` class now runs to completion with no hang (verified twice, including at the true current `dev` tip), and the doc's own exponential-fan-out theory (N possibly 30-40) is refuted by direct measurement (real N=3). A separate, distinct correctness issue (26/107 assertion failures, newly visible now that the class runs to completion) is being triaged independently and is not part of this closure.
 ## 2026-07-13 DoHead 64-class family sweep GREEN + new sporadic Thread.start() finding
 
 Full-family validation of all 64 `TestHttpServletDoHeadInvalidWrite*`
@@ -134,7 +139,7 @@ bean-registration TIMEOUT cluster (all hard-hang at the 120s ceiling), an
 WebFlux reactive FAIL/EMPTY cluster, and 6 ABEND crashes with `found=0`
 (crash before test discovery, distinct from the mid-run HIB-CV-32 crash
 shape). See
-[`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](../internal/CRATONVM-SPRING-GENUINE-BUGLIST-125.md)
+[`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](CRATONVM-SPRING-GENUINE-BUGLIST-125.md)
 for full detail.
 
 ## 2026-07-11 `HashMap` native-dispatch overhead вЂ” FIXED/RETIRED
@@ -623,7 +628,7 @@ surfaced three distinct, layered issues:
 
 ## 2026-07-09 Spring suite genuine-bug list, updated (125, down from 159)
 
-- [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](../internal/CRATONVM-SPRING-GENUINE-BUGLIST-125.md) вЂ” full per-test-method detail for 125 CratonVM-unique Spring failures (HotSpot passes, CratonVM doesn't), cross-referenced against a clean HotSpot baseline with the classpath-dump gap fixed (spring-websocket/oxm/jms/orm/core-test jars were never built вЂ” `./gradlew jar testFixturesJar testClasses` fixed it). Down from 159 two dev commits ago: 65 newly fixed (entire SpEL cluster + spring-jms module), 31 "newly broken" are **not** new regressions вЂ” root-caused to the already-tracked HIB-CV-32 batch/load-dependent heap-corruption family (25/31 SIGSEGV, one test confirmed passing standalone but ABEND under full-suite load).
+- [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](CRATONVM-SPRING-GENUINE-BUGLIST-125.md) вЂ” full per-test-method detail for 125 CratonVM-unique Spring failures (HotSpot passes, CratonVM doesn't), cross-referenced against a clean HotSpot baseline with the classpath-dump gap fixed (spring-websocket/oxm/jms/orm/core-test jars were never built вЂ” `./gradlew jar testFixturesJar testClasses` fixed it). Down from 159 two dev commits ago: 65 newly fixed (entire SpEL cluster + spring-jms module), 31 "newly broken" are **not** new regressions вЂ” root-caused to the already-tracked HIB-CV-32 batch/load-dependent heap-corruption family (25/31 SIGSEGV, one test confirmed passing standalone but ABEND under full-suite load).
 
 ## 2026-07-09 BC-java `asn1-regression` X9Test SIGSEGV retired
 
