@@ -4,6 +4,11 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-14 TestClassServerTest URLClassLoader isolation FIXED; severe new String.getBytes() regression found
+
+- FIXED (moved to `docs/internal/`): [`keycloak-testclassserver-invalidpackage-classnotfound-FIXED.md`](../internal/keycloak-testclassserver-invalidpackage-classnotfound-FIXED.md) -- root cause was the same underlying defect as `spring-boot-probe-sweep/SBR-14-urlclassloader-parent-null-bypassed.md`: a null-parent `URLClassLoader` never consulted its own URL/HTTP classpath at all, resolving through CratonVM's flat global class store instead (breaking isolation AND making `testInvalidPackage`'s expected `ClassNotFoundException` never fire). Fixed in `native-builtins/src/classloader.rs`/`classloader_real.rs` (defer-to-`findClass` gate now covers bare `URLClassLoader`, not just subclasses) plus a genuine HTTP(S) fetch path added for URLClassLoader entries (`http_client.rs`). Verified via an isolated A/B repro against a real external HTTP server; the literal upstream test still can't run end-to-end due to the new bug below.
+- 🔴 NEW, severe: [`string-getbytes-empty-real-jdk-mode.md`](string-getbytes-empty-real-jdk-mode.md) -- `String.getBytes()` (all overloads) returns an empty byte array in real-JDK mode, confirmed pre-existing (present on unmodified `dev` HEAD, not introduced by the fix above). Suspected fallout from the same-day commit `d8092acb`'s new synthetic-native-stub-dropping hardening silently dropping a genuine bridge native that was never re-categorized. Broad blast radius suspected (anything doing String-to-bytes: I/O, hashing, HTTP bodies) -- likely under-detected because failures land on higher-layer symptoms. Not yet fixed.
+
 ## 2026-07-14 Spring Boot `crashfail-20260714` rerun; 9 new bug clusters filed under `springboot/`
 
 Full-suite rerun after the 7 clusters from 07-11/07-13 were fixed (see

@@ -884,8 +884,20 @@ pub(crate) fn receiver_overrides_find_class(ctx: &mut dyn NativeContext, this: O
             Some(n) => n,
             None => return false,
         };
+        if name == "java/net/URLClassLoader" {
+            // `URLClassLoader` provides a genuine, non-trivial `findClass`
+            // (its own URL/HTTP-based resolution -- `ucl_real_find_class` /
+            // `ucl_find_class`) even for a bare instance or a subclass that
+            // does not itself declare `findClass`, unlike `java/lang/
+            // ClassLoader` / `SecureClassLoader` (whose inherited findClass
+            // just throws). Must NOT be treated as a "no override" builtin
+            // base, or a null-parent `URLClassLoader` never consults its own
+            // URLs at all -- see docs/known-issues/keycloak/
+            // test-classserver-invalidpackage-classnotfound-not-thrown.md.
+            return true;
+        }
         if is_builtin_loader_class(&name) {
-            // Reached the builtin base without seeing a user override.
+            // Reached a different builtin base without seeing a user override.
             return false;
         }
         // A `findClass` declared on this (non-builtin) class is a real
@@ -896,6 +908,45 @@ pub(crate) fn receiver_overrides_find_class(ctx: &mut dyn NativeContext, this: O
             .any(|m| m.name == "findClass")
         {
             return true;
+        }
+        cid = ctx.superclass_of(id);
+    }
+    false
+}
+
+/// True iff the receiver's `findClass` resolution is CratonVM's own
+/// URLClassLoader native (`ucl_real_find_class` / `ucl_find_class`) rather
+/// than user-supplied bytecode -- i.e. no subclass in the hierarchy declares
+/// its own `findClass` before the walk reaches `java/net/URLClassLoader`. A
+/// `ClassNotFoundException` from this source reflects a genuine,
+/// authoritative miss against the loader's own recorded URLs (including a
+/// real HTTP fetch) and must propagate as-is. A genuine user `findClass`
+/// override's miss, by contrast, may just reflect incomplete CratonVM
+/// emulation of whatever custom source it reads from, so it keeps the
+/// existing best-effort global-store fallback (HIB-CV-24 / SBR-14 step 2b /
+/// step 6). See `receiver_overrides_find_class` above for the paired check.
+pub(crate) fn find_class_is_urlclassloader_native(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> bool {
+    let mut cid = Some(ctx.class_id_of_object(this));
+    while let Some(id) = cid {
+        let name = match ctx.class_name_of_id(id) {
+            Some(n) => n,
+            None => return false,
+        };
+        if name == "java/net/URLClassLoader" {
+            return true;
+        }
+        if is_builtin_loader_class(&name) {
+            return false;
+        }
+        if ctx
+            .declared_methods(id)
+            .iter()
+            .any(|m| m.name == "findClass")
+        {
+            return false;
         }
         cid = ctx.superclass_of(id);
     }
@@ -1490,6 +1541,18 @@ fn cl_load_class_base_delegation(
             Ok(Some(Value::Object(Some(_)))) => {
                 return result
             },
+            // A miss from URLClassLoader's own native URL/HTTP search is
+            // authoritative -- propagate it (e.g. ClassNotFoundException)
+            // rather than falling through to step 6's global-store fallback,
+            // which would let a null-parent URLClassLoader resolve
+            // application classes its own (failed) URL search should have
+            // hidden from it. See docs/known-issues/keycloak/
+            // test-classserver-invalidpackage-classnotfound-not-thrown.md.
+            _ if defer_to_find_class
+                && find_class_is_urlclassloader_native(ctx, this) =>
+            {
+                return result
+            }
             // findClass threw (ClassNotFoundException) or returned null — fall through.
             _ => {}
         }
@@ -4401,6 +4464,119 @@ fn loader_constructor_url_paths(ctx: &dyn NativeContext, loader: ObjectRef) -> V
     out
 }
 
+/// Collect `http`/`https` base URL strings from a URLClassLoader's own
+/// constructor URLs -- the network-classpath counterpart of
+/// `loader_constructor_url_paths` (which only handles `file:`/`jar:` entries
+/// resolvable as local filesystem paths).
+fn loader_constructor_http_bases(ctx: &dyn NativeContext, loader: ObjectRef) -> Vec<String> {
+    let mut out = Vec::new();
+
+    if let Value::Object(Some(urls)) = ctx.get_field(loader, UCL_URLS_ARRAY) {
+        let count = match ctx.get_field(loader, UCL_URL_COUNT) {
+            Value::Int(n) if n > 0 => (n as usize).min(ctx.array_length(urls)),
+            _ => 0,
+        };
+        for i in 0..count {
+            if let Value::Object(Some(url)) = ctx.get_array_element(urls, i) {
+                if let Some(base) = http_base_from_url(ctx, url) {
+                    out.push(base);
+                }
+            }
+        }
+    }
+
+    if let Value::Object(Some(ucp)) = ctx.get_field_by_name(loader, "ucp") {
+        if let Value::Object(Some(urls)) = ctx.get_field(ucp, UCP_STASHED_URLS) {
+            for i in 0..ctx.array_length(urls) {
+                if let Value::Object(Some(url)) = ctx.get_array_element(urls, i) {
+                    if let Some(base) = http_base_from_url(ctx, url) {
+                        out.push(base);
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// Reconstruct an `http(s)://host[:port]/path` base string from a
+/// `java.net.URL` object, or `None` if it is not an http/https URL. Reads
+/// fields by NAME first (works for real-JDK URL objects, which carry genuine
+/// JDK field names -- the same pattern `ucp_add_url`'s `"protocol"` read
+/// uses), falling back to the synthetic numeric layout (`URL_FIELD_*`) so
+/// synthetic-JDK mode's placeholder URL objects resolve too.
+fn http_base_from_url(ctx: &dyn NativeContext, url_obj: ObjectRef) -> Option<String> {
+    let read = |name: &str, idx: usize| -> Option<String> {
+        match ctx.get_field_by_name(url_obj, name) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => match ctx.get_field(url_obj, idx) {
+                Value::Object(Some(s)) => ctx.read_string(s),
+                _ => None,
+            },
+        }
+    };
+    let protocol = read("protocol", 0)?;
+    if protocol != "http" && protocol != "https" {
+        return None;
+    }
+    let host = read("host", 1).unwrap_or_default();
+    let port = match ctx.get_field_by_name(url_obj, "port") {
+        Value::Int(p) if p > 0 => Some(p),
+        _ => match ctx.get_field(url_obj, 2) {
+            Value::Int(p) if p > 0 => Some(p),
+            _ => None,
+        },
+    };
+    let path = read("path", 3).unwrap_or_default();
+
+    let mut base = format!("{protocol}://{host}");
+    if let Some(p) = port {
+        base.push(':');
+        base.push_str(&p.to_string());
+    }
+    base.push_str(&path);
+    Some(base)
+}
+
+/// Attempt a real HTTP(S) GET for `resource_name` against each of `bases` in
+/// turn (each a base URL collected by `loader_constructor_http_bases`, e.g.
+/// `http://localhost:8500/test-classes/`). Returns the response body on the
+/// first `200 OK`; returns `None` when every base yields a non-2xx status or
+/// a connection failure -- a definitive "not found via this loader's own
+/// classpath" the caller must NOT paper over with CratonVM's flat global
+/// class store (see docs/known-issues/keycloak/
+/// test-classserver-invalidpackage-classnotfound-not-thrown.md -- Keycloak's
+/// `TestClassServer` answers a non-permitted package with HTTP 403, which
+/// must surface as `ClassNotFoundException`, not a silent success).
+fn fetch_http_resource(
+    ctx: &mut dyn NativeContext,
+    bases: &[String],
+    resource_name: &str,
+) -> Option<Vec<u8>> {
+    for base in bases {
+        let sep = if base.ends_with('/') { "" } else { "/" };
+        let uri = format!("{base}{sep}{resource_name}");
+        ctx.begin_blocking_region();
+        let result = crate::http_client::perform_request(
+            "GET",
+            &uri,
+            &[],
+            &[],
+            std::time::Duration::from_secs(10),
+            false,
+            5,
+        );
+        ctx.end_blocking_region();
+        if let Ok(resp) = result {
+            if resp.status == 200 {
+                return Some(resp.body);
+            }
+        }
+    }
+    None
+}
+
 fn loader_local_resource_urls(
     ctx: &dyn NativeContext,
     loader: ObjectRef,
@@ -4414,9 +4590,19 @@ fn loader_local_resource_urls(
 }
 
 /// Try to resolve `URLClassLoader.findClass(name)` from the receiver's own
-/// URL set and define the resulting class under that receiver's loader
-/// namespace. Returns `None` when the receiver's URLs do not contain the class,
-/// leaving callers free to use their historical fallback path.
+/// URL set (local filesystem paths and/or real HTTP(S) fetches) and define
+/// the resulting class under that receiver's loader namespace.
+///
+/// Returns `None` only when this loader has NO usable URL entries at all (no
+/// local paths, no http(s) bases) -- leaving callers free to use their
+/// historical fallback path. Returns `Some(Err(ClassNotFoundException))` when
+/// the loader DOES have http(s) entries but none of them produced the class
+/// (e.g. every base answered non-200, or refused the connection) -- this is a
+/// definitive miss against the loader's own recorded sources and callers
+/// must propagate it rather than falling back to the flat global class
+/// store, which would let a `URLClassLoader(urls, null)` resolve application
+/// classes its own (failed) URL search should have hidden from it. See
+/// docs/known-issues/keycloak/test-classserver-invalidpackage-classnotfound-not-thrown.md.
 pub(crate) fn ucl_try_define_local_class(
     ctx: &mut dyn NativeContext,
     loader: ObjectRef,
@@ -4428,10 +4614,34 @@ pub(crate) fn ucl_try_define_local_class(
 
     let resource_name = format!("{internal_name}.class");
     let paths = loader_constructor_url_paths(ctx, loader);
-    if paths.is_empty() {
-        return None;
-    }
-    let bytes = cratonvm_classloading::ClassPath::new(&paths).find_resource(&resource_name)?;
+    let bytes = if !paths.is_empty() {
+        cratonvm_classloading::ClassPath::new(&paths).find_resource(&resource_name)
+    } else {
+        None
+    };
+
+    let http_bases = loader_constructor_http_bases(ctx, loader);
+    let bytes = match bytes {
+        Some(b) => Some(b),
+        None if !http_bases.is_empty() => fetch_http_resource(ctx, &http_bases, &resource_name),
+        None => None,
+    };
+
+    let bytes = match bytes {
+        Some(b) => b,
+        None if http_bases.is_empty() => return None,
+        None => {
+            let exc = crate::jboss_module_loader::alloc_single_message_exception(
+                ctx,
+                "java/lang/ClassNotFoundException",
+                1,
+                internal_name,
+            );
+            return Some(Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+                exc,
+            )));
+        }
+    };
 
     let loader_pin = ctx.pin_native_root(loader);
     let loader_live = ctx.read_native_pin(loader_pin, loader);
