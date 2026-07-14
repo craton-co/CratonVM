@@ -5511,7 +5511,7 @@ fn native_is_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 /// chunks, same pattern as `native_is_transfer_to` below) — real
 /// `ZipInputStream`/`InflaterInputStream`/etc. already implement that
 /// overload efficiently (native inflate), so this just stops bypassing it.
-fn native_is_read_all_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_is_read_all_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {

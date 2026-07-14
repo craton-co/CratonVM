@@ -24,16 +24,23 @@ java.lang.RuntimeException: Failed to resolve artifact: org.keycloak.testframewo
   ... Caused by: io.quarkus.bootstrap.resolver.maven.BootstrapMavenException: Failed to load current project at .../tests/base/pom.xml
 ```
 
-**RETRACTED 2026-07-13 — this IS a CratonVM bug, not an environment gap.** The 2026-07-07 "NOT A BUG" triage
-(`docs/internal/keycloak-tests-base-remote-providers-artifact-resolution-NOT-A-BUG.md`) was based on a HotSpot
-comparison run against a since-discovered-**stale** `keycloak-999.0.0-SNAPSHOT.zip` distribution artifact
-(weeks old), under which HotSpot itself failed to boot the test server for unrelated reasons. After rebuilding
-the distribution fresh and re-running under real HotSpot (solo/sequential, avoiding a shared-extraction-directory
-race), HotSpot cleanly PASSES the large majority of these classes, while CratonVM still fails every one of them
-with an identical, narrower root cause: CratonVM's file I/O drops/corrupts the `?` character in the `<?xml ...?>`
-declaration when Quarkus's embedded Maven resolver reads `tests/base/pom.xml` in-process, breaking POM parsing.
-See `docs/known-issues/keycloak/pom-xml-declaration-char-corruption-breaks-quarkus-maven-bootstrap.md` for the
-full writeup, evidence, and retraction details.
+**RETRACTED 2026-07-13, then CLOSED 2026-07-14.** The 2026-07-07 "NOT A BUG" triage
+(docs/internal/keycloak-tests-base-remote-providers-artifact-resolution-NOT-A-BUG.md) was based on a HotSpot
+comparison run against a since-discovered-**stale** keycloak-999.0.0-SNAPSHOT.zip distribution artifact
+(weeks old), under which HotSpot itself failed to boot the test server for unrelated reasons -- retracted the
+same day pending further investigation of an apparent CratonVM-side pom.xml char-corruption bug. That followup
+investigation (2026-07-14) could NOT reproduce the corruption via an exhaustive, byte-exact, full-harness
+retest (real Keycloak 26.6.1 Quarkus dist built from source, real tests/base/pom.xml, the actual
+keycloak-test-framework bootstrap, both at current dev and bisected back to the exact commit the corruption was
+originally observed at) -- see
+docs/internal/fixed-suite-bugs/pom-xml-declaration-char-corruption-breaks-quarkus-maven-bootstrap-FIXED.md
+for the full writeup. Two separate, genuine CratonVM bugs were found and fixed in the same
+DistributionKeycloakServer.start() code path along the way (ProcessBuilder silently dropping a
+LinkedList-backed command list; Process.descendants()/ProcessPipeInputStream.readAllBytes() unregistered),
+and the real Keycloak server now boots successfully under CratonVM through this exact path. Three further,
+unrelated residuals (Selenium/HtmlUnit JSON parsing, a missing sun.management native, a resteasy classpath
+gap) were newly discovered downstream of a successful server boot -- flagged separately, not part of this
+issue.
 
 ## 3. FIPS-mode `Assume.assumeTrue` skip pattern — 10 `crypto/fips1402` classes
 
