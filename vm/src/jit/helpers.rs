@@ -4458,6 +4458,48 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         Err(sentinel) => return sentinel,
     };
 
+    // Cached HashMap-native fast path, checked BEFORE the virtual-dispatch
+    // machinery below. The resolution/insertion slow path stays further down
+    // (after the compile probes); this early block only serves sites the
+    // cache has already resolved. Rationale: `HashMap.put/get` are registered
+    // natives with no bytecode, so for these sites the virtual-dispatch fast
+    // path below can never install a compiled entry — yet every call still
+    // paid its full probe cost (`virtual_dispatch_target_for_receiver` +
+    // `get_loaded_class_id` + `mic_callee_has_exception_table`: three
+    // class-manager read locks and a recursive method walk) before falling
+    // through to the HashMap cache on the slow path. On the 1M put/get probe
+    // that wasted work was ~12% of total runtime. The receiver class-id
+    // equality check preserves the exact-receiver guard, and the
+    // `any_class_redefined` gate matches the resolution site below.
+    if matches!(info.invoke_kind, 0 | 2)
+        && !args_slice.is_empty()
+        && !crate::classloading::any_class_redefined()
+    {
+        let cached =
+            HASHMAP_NATIVE_DISPATCH_CACHE.with(|cache| cache.borrow().get(&info_key).copied());
+        if let Some(entry) = cached {
+            let receiver_raw = args_slice[0] as u64;
+            if receiver_raw != 0 && (receiver_raw & 0x7) == 0 && receiver_raw < (1u64 << 48) {
+                if let Some(receiver) = vm.heap.is_object_address(receiver_raw as usize) {
+                    if vm.heap.class_id_of(receiver).as_u32() == entry.receiver_class_id {
+                        if let Some((thread, _guard)) = jit_thread_mut() {
+                            if let Some(result) = call_hashmap_native_raw(
+                                vm,
+                                thread,
+                                info,
+                                receiver,
+                                args_slice,
+                                entry.callback,
+                            ) {
+                                return result;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Fast path: check thread-local dispatch cache for a previously-compiled callee.
     // This avoids the JIT cache lock on every call.
     // Virtual/interface dispatch (invoke_kind 0/2) must resolve on the RUNTIME
@@ -4983,6 +5025,160 @@ unsafe fn try_compile_callee(vm: &SharedVm, info: &JitInvokeInfo) -> Option<(usi
     use crate::runtime::interpreter::try_jit_compile_callee;
     // JIT-dispatch callee compile — optimized (C2-equivalent) tier.
     try_jit_compile_callee(vm, info.class_name, info.method_name, info.descriptor, true)
+}
+
+/// Synthetic call-site info for [`jit_integer_value_of_direct`]'s error
+/// path: `handle_jit_dispatch_error` only reads the name triple for
+/// diagnostics/exception context, and this helper serves exactly one callee.
+static INTEGER_VALUE_OF_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/lang/Integer",
+    method_name: "valueOf",
+    descriptor: "(I)Ljava/lang/Integer;",
+    num_jit_args: 1,
+    return_type: b'L',
+    invoke_kind: 3,
+};
+
+/// Thin direct-call target for JIT `invokestatic Integer.valueOf(I)` sites
+/// (registered into `cratonvm_jit::INTEGER_VALUE_OF_DIRECT_FN` by
+/// `build_helpers`; the recognition lives in `jit::try_compile`).
+///
+/// Semantics are identical to the `IntegerNativeKind::ValueOf` arm of
+/// [`call_integer_native_raw`], minus the generic `jit_invoke_dispatch`
+/// round trip (info decode, per-call thread-local cache probes, argument
+/// buffer build):
+///  * out-of-range values allocate a fresh wrapper through the mutator's
+///    normal native-context TLAB path and publish it via
+///    `native_pending_return` (the established JIT→native object-return
+///    handoff root);
+///  * `-128..=127` (and the cold pre-discovery case, and any class-redefine
+///    window) route through `safe_native_call` to the canonical native
+///    callback, preserving the JLS identity-cache contract;
+///  * errors (OOM) route through `handle_jit_dispatch_error` exactly like
+///    the dispatch helper, so the returned sentinel carries properly
+///    stashed exception state for the caller's post-invoke check.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) -> i64 {
+    // Same Rust<->JIT boundary bookkeeping as `jit_invoke_dispatch`: the
+    // per-thread conservative-scan cache must be invalidated, and a callee
+    // that allocates may enter the GC barrier, so the SATB queue is flushed.
+    crate::jit::conservative_roots::note_jit_boundary();
+    jit_safepoint_flush_satb(vm_ptr);
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    let value = value as i32;
+    if !(-128..=127).contains(&value) && !crate::classloading::any_class_redefined() {
+        let vm_key = vm as *const SharedVm as usize;
+        let cached_class = INTEGER_WRAPPER_CLASS_CACHE.with(|cache| {
+            cache
+                .get()
+                .filter(|(cached_vm, _)| *cached_vm == vm_key)
+                .map(|(_, raw)| ClassId::new(raw))
+        });
+        if let Some(class_id) = cached_class {
+            if let Some((thread, _guard)) = jit_thread_mut() {
+                use cratonvm_native_api::NativeContext as _;
+                let mut ctx = crate::vm::NativeContextImpl { shared: vm, thread };
+                let object = ctx.alloc_object(class_id, 1);
+                // Direct descriptor-typed write: `Integer.value` is declared
+                // `int` (field 0, descriptor `I`) — skip `ctx.set_field`'s
+                // per-call `class_id_of` + descriptor resolution and hand the
+                // heap the same normalized store it would have produced.
+                vm.heap.set_field_as(object, 0, Value::Int(value), b'I');
+                // Object-return handoff root (see `call_integer_native_raw`).
+                ctx.thread.native_pending_return = Some(object);
+                return object.as_ptr() as i64;
+            }
+        }
+    }
+    // Cold / in-range / redefine-window path: canonical native callback via
+    // the full safe-native-call wrapper (identity cache; also discovers the
+    // real wrapper ClassId for the fast path above).
+    let Some((thread, _guard)) = jit_thread_mut() else {
+        // No JIT thread context — cannot safely run the native. Signal the
+        // deopt sentinel; the caller's post-invoke check bails to the
+        // interpreter, which re-dispatches through the normal path.
+        return i64::MIN;
+    };
+    let arg = Value::Int(value);
+    let result = match crate::vm::safe_native_call_prevalidated_objects(
+        vm,
+        thread,
+        cratonvm_native_builtins::intrinsics::integer::intrinsic_integer_value_of,
+        std::slice::from_ref(&arg),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return handle_jit_dispatch_error(vm, thread, error, &INTEGER_VALUE_OF_INFO)
+        }
+    };
+    match result {
+        Some(Value::Object(Some(object))) => {
+            INTEGER_WRAPPER_CLASS_CACHE.with(|cache| {
+                cache.set(Some((
+                    vm as *const SharedVm as usize,
+                    vm.heap.class_id_of(object).as_u32(),
+                )))
+            });
+            object.as_ptr() as i64
+        }
+        _ => 0,
+    }
+}
+
+/// Synthetic call-site info for [`jit_integer_int_value_direct`]'s
+/// generic-dispatch fallback (invalid non-null receiver — a shape the
+/// verifier rules out for a `final`-class receiver, kept for defensive
+/// parity with `call_integer_native_raw`'s bail-to-dispatch behavior).
+static INTEGER_INT_VALUE_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/lang/Integer",
+    method_name: "intValue",
+    descriptor: "()I",
+    num_jit_args: 1,
+    return_type: b'I',
+    invoke_kind: 0,
+};
+
+/// Thin direct-call target for JIT `invokevirtual Integer.intValue()` sites
+/// whose constant-pool class is exactly `java/lang/Integer` (a `final`
+/// class, so the site is statically monomorphic — no receiver guard
+/// needed; only `null` remains, which throws NPE per JVMS).
+///
+/// Mirrors the `IntegerNativeKind::IntValue` arm of
+/// [`call_integer_native_raw`]: a heap-validated field-0 read that cannot
+/// allocate or safepoint. Null receiver → pending-NPE + deopt sentinel
+/// (the canonical implicit-NPE signal). A non-null receiver that fails
+/// heap validation falls back to the full generic dispatcher, exactly like
+/// the existing arm's `None` return.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    let raw = receiver as u64;
+    if raw == 0 {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    if (raw & 0x7) == 0 && raw < (1u64 << 48) {
+        if let Some(object) = vm.heap.is_object_address(raw as usize) {
+            return match vm.heap.get_field(object, 0) {
+                Value::Int(value) => value as i64,
+                _ => 0,
+            };
+        }
+    }
+    // Defensive fallback: hand the call to the generic dispatcher (same
+    // machinery the non-direct site would have used).
+    let args = [receiver];
+    jit_invoke_dispatch(
+        vm_ptr,
+        &INTEGER_INT_VALUE_INFO as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        1,
+    )
 }
 
 #[inline]
@@ -7611,6 +7807,17 @@ pub fn build_helpers() -> JitRuntimeHelpers {
     cratonvm_jit::x64::set_arm_savebase_watch_fn(jit_arm_savebase_watch as *const () as usize);
     cratonvm_jit::x64::set_disarm_savebase_watch_fn(
         jit_disarm_savebase_watch as *const () as usize,
+    );
+
+    // `Integer.valueOf(I)` / `Integer.intValue()` thin direct-call helpers —
+    // same no-ABI-change registration pattern as the savebase watch helpers
+    // above. See `jit_integer_value_of_direct` / `jit_integer_int_value_direct`
+    // and the recognition in `jit::try_compile`.
+    cratonvm_jit::set_integer_value_of_direct_fn(
+        jit_integer_value_of_direct as *const () as usize,
+    );
+    cratonvm_jit::set_integer_int_value_direct_fn(
+        jit_integer_int_value_direct as *const () as usize,
     );
 
     JitRuntimeHelpers {

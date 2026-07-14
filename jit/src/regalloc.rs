@@ -914,6 +914,66 @@ fn find_float_locals(code: &[u8], code_len: usize, num_locals: usize) -> u64 {
     float_mask
 }
 
+/// Bitmask of locals that are ever accessed as a REFERENCE (`aload`/`astore`
+/// in any encoding, including the `wide` forms). Mirrors
+/// [`find_float_locals`]' structure.
+///
+/// Used by the pure-kernel callee-saved-GPR local-homes path in the x64
+/// backend: reference locals must keep their canonical frame-slot homes so
+/// the conservative JIT-frame root scan (and every deopt/exception path that
+/// reads locals from the frame) still sees them — only non-reference locals
+/// may live exclusively in callee-saved registers. javac reuses local slots
+/// across unrelated scopes, so a single `aload` anywhere taints the slot for
+/// the whole method (conservative and sound).
+pub(crate) fn find_reference_locals(code: &[u8], code_len: usize, num_locals: usize) -> u64 {
+    let mut ref_mask = 0u64;
+    let mut pc = 0;
+    while pc < code_len {
+        match code[pc] {
+            // aload_0..aload_3
+            0x2a..=0x2d => {
+                let idx = (code[pc] - 0x2a) as usize;
+                if idx < 64 {
+                    ref_mask |= 1u64 << idx;
+                }
+            }
+            // astore_0..astore_3
+            0x4b..=0x4e => {
+                let idx = (code[pc] - 0x4b) as usize;
+                if idx < 64 {
+                    ref_mask |= 1u64 << idx;
+                }
+            }
+            // aload / astore (u8 index)
+            0x19 | 0x3a => {
+                let Some(&raw_idx) = code.get(pc + 1) else {
+                    pc += bc_len(code, pc);
+                    continue;
+                };
+                let idx = raw_idx as usize;
+                if idx < 64 {
+                    ref_mask |= 1u64 << idx;
+                }
+            }
+            // wide aload/astore
+            0xc4 => {
+                if matches!(code.get(pc + 1), Some(&0x19 | &0x3a)) {
+                    if let (Some(&hi), Some(&lo)) = (code.get(pc + 2), code.get(pc + 3)) {
+                        let idx = u16::from_be_bytes([hi, lo]) as usize;
+                        if idx < 64 {
+                            ref_mask |= 1u64 << idx;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        pc += bc_len(code, pc);
+    }
+    let _ = num_locals;
+    ref_mask
+}
+
 /// Run register allocation for a method (x86-64).
 pub fn allocate_registers(
     code: &[u8],

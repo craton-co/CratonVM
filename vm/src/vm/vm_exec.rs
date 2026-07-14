@@ -738,30 +738,51 @@ fn safe_native_call_impl(
     //
     // No VM allocation or safepoint can occur between extracting the stack
     // values and this barrier, so the forwarding header is still readable.
-    let mut forwarded_args = args.to_vec();
-    for value in &mut forwarded_args {
+    // Hot path: native calls overwhelmingly carry <= 4 arguments (receiver
+    // plus a couple of operands). The former unconditional `args.to_vec()` +
+    // `Vec::with_capacity(args.len())` pair below allocated TWICE per native
+    // call — measurable allocator traffic on autobox/map-heavy loops
+    // (millions of calls). Keep both scratch buffers inline for the small-
+    // arity case; longer slices (e.g. Set.of during Surefire bootstrap)
+    // fall back to the original heap buffers with identical behavior.
+    const INLINE_NATIVE_ARGS: usize = 4;
+    let mut inline_forwarded = [Value::Object(None); INLINE_NATIVE_ARGS];
+    let mut heap_forwarded: Vec<Value>;
+    let forwarded_args: &mut [Value] = if args.len() <= INLINE_NATIVE_ARGS {
+        inline_forwarded[..args.len()].copy_from_slice(args);
+        &mut inline_forwarded[..args.len()]
+    } else {
+        heap_forwarded = args.to_vec();
+        &mut heap_forwarded[..]
+    };
+    for value in forwarded_args.iter_mut() {
         if let Value::Object(Some(obj)) = value {
             *obj = shared.heap.load_and_forward(*obj);
         }
     }
-    let args = forwarded_args.as_slice();
+    let args: &[Value] = forwarded_args;
     // popped from the operand stack into this Rust slice and are otherwise
     // Pin object arguments for the duration of the native: they have been
     // invisible to `collect_roots` / frame scanning during a safepoint GC.
     let pin_base = thread.native_pin_roots.len();
     // Retain a root index for every argument. Native calls are not restricted
-    // to the former four-element inline buffer: a re-entrant call with a
-    // longer slice (for example Set.of during Surefire bootstrap) must remain
+    // to the inline buffer: a re-entrant call with a longer slice must remain
     // remappable at a safepoint without an out-of-bounds access.
-    let mut arg_root_indices = Vec::with_capacity(args.len());
-    for a in args {
+    let mut inline_root_indices = [None::<usize>; INLINE_NATIVE_ARGS];
+    let mut heap_root_indices: Vec<Option<usize>>;
+    let arg_root_indices: &mut [Option<usize>] = if args.len() <= INLINE_NATIVE_ARGS {
+        &mut inline_root_indices[..args.len()]
+    } else {
+        heap_root_indices = vec![None; args.len()];
+        &mut heap_root_indices[..]
+    };
+    for (arg_index, a) in args.iter().enumerate() {
         let before = thread.native_pin_roots.len();
         match (prevalidated_objects, a) {
             (true, Value::Object(Some(object))) => thread.native_pin_roots.push(*object),
             _ => pin_value_for_native_call(shared, &mut thread.native_pin_roots, a),
         }
-        let root_index = (thread.native_pin_roots.len() > before).then_some(before);
-        arg_root_indices.push(root_index);
+        arg_root_indices[arg_index] = (thread.native_pin_roots.len() > before).then_some(before);
     }
     let native_pin_base = thread.native_pin_roots.len();
 
@@ -4261,13 +4282,64 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // `.max(class_num_total_fields(cid))` themselves. Synthetic
         // ClassIds not in the class manager report 0 here, so the
         // requested count is used unchanged for those.
-        let real_fields = self
-            .shared
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .map(|c| c.num_total_fields)
-            .unwrap_or(0);
+        //
+        // Hot path: this clamp runs on EVERY native allocation (notably each
+        // out-of-cache autoboxed wrapper — ~19% of the 1M-put/get HashMap
+        // probe sat in alloc_object, a large share of it in this RwLock
+        // acquire + class-store lookup). A registered class's
+        // `num_total_fields` is immutable for its ClassId except through
+        // class redefinition, which bumps the global layout generation — the
+        // same validation contract `gen_heap::compact_field_slot`'s cache
+        // already relies on. Keep a tiny per-thread working set keyed by
+        // (vm, class_id) and validated against that generation. Unregistered
+        // ids (`get_class` → None) are deliberately NOT cached: a class id
+        // observed mid-registration could otherwise pin a stale 0 clamp.
+        struct TotalFieldsCache {
+            // (vm_key, class_id, layout_generation, num_total_fields);
+            // vm_key == 0 marks an empty slot.
+            entries: [(usize, u32, u64, u32); 8],
+            next: usize,
+        }
+        thread_local! {
+            static TOTAL_FIELDS_CACHE: std::cell::RefCell<TotalFieldsCache> =
+                const {
+                    std::cell::RefCell::new(TotalFieldsCache {
+                        entries: [(0, 0, 0, 0); 8],
+                        next: 0,
+                    })
+                };
+        }
+        let vm_key = self.shared as *const SharedVm as usize;
+        let cid_u32 = class_id.as_u32();
+        let layout_gen = cratonvm_types::layout_generation();
+        let cached_fields = TOTAL_FIELDS_CACHE.with(|cell| {
+            let cache = cell.borrow();
+            cache.entries.iter().find_map(|&(vk, cid, gen, fields)| {
+                (vk == vm_key && cid == cid_u32 && gen == layout_gen).then_some(fields)
+            })
+        });
+        let real_fields = match cached_fields {
+            Some(fields) => fields as usize,
+            None => {
+                let resolved = self
+                    .shared
+                    .class_manager
+                    .read()
+                    .get_class(class_id)
+                    .map(|c| c.num_total_fields);
+                if let Some(fields) = resolved {
+                    // Cast: field counts are far below u32::MAX.
+                    let fields_u32 = fields as u32;
+                    TOTAL_FIELDS_CACHE.with(|cell| {
+                        let mut cache = cell.borrow_mut();
+                        let slot = cache.next;
+                        cache.entries[slot] = (vm_key, cid_u32, layout_gen, fields_u32);
+                        cache.next = (slot + 1) % cache.entries.len();
+                    });
+                }
+                resolved.unwrap_or(0)
+            }
+        };
         let slots = num_fields.max(real_fields);
         if self.thread.native_alloc_pool_layout == Some((class_id, slots)) {
             if let Some(obj) = self.thread.native_alloc_pool.pop() {
