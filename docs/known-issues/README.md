@@ -1067,8 +1067,8 @@ it under `docs/internal`.
   [`abstractajpprocessor-socket-not-connected-FIXED.md`](../internal/tomcat-08-07/abstractajpprocessor-socket-not-connected-FIXED.md).
   The AJP secret residual is now fixed and retired; see
   [`ajp-testsecret-secret-attribute-not-enforced-FIXED.md`](../internal/tomcat-08-07/ajp-testsecret-secret-attribute-not-enforced-FIXED.md).
-  The one independently tracked remaining residual is
-  [`ajp-testnoheaders-response-body-not-empty.md`](tomcat-08-07/ajp-testnoheaders-response-body-not-empty.md).
+  The AJP no-headers residual is also fixed and retired; see
+  [`ajp-testnoheaders-response-body-not-empty-FIXED.md`](../internal/tomcat-08-07/ajp-testnoheaders-response-body-not-empty-FIXED.md).
 
 ## How many distinct bugs are here?
 
