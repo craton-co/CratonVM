@@ -1,8 +1,12 @@
 # Stream/ArrayList under extreme concurrent GC pressure: heap corruption (small-heap only), NOT fixed by the Stream/Comparator ObjectRef pin
 
-Status: OPEN — found by accident 2026-07-14 while verifying dev commit `671c8df3`
+Status: OPEN (partially fixed) — found by accident 2026-07-14 while verifying dev commit `671c8df3`
 ("fix(native-collections): pin Stream/Comparator ObjectRefs across GC-triggering calls"). Distinct,
-separate residual — not resolved by that fix. Not yet root-caused; no fix attempted yet.
+separate residual, not resolved by that fix. **2026-07-14 update:** root-caused and fixed one real,
+confirmed instance (`ArrayList.add`/`add(int,Object)`/`addAll` never pinned `this`/the added
+element(s) across `al_ensure_capacity`'s internal allocation — see "Fix landed" below), but the crash
+still reproduces at `-Xmx32m` after that fix via at least one more, not-yet-pinpointed site. Repro
+source is now checked in at `docs/known-issues/repros/stream-arraylist-gc-pressure/StreamOnlyStressRepro.java`.
 
 ## Repro
 
@@ -14,10 +18,8 @@ separate residual — not resolved by that fix. Not yet root-caused; no fix atte
 Run under CratonVM real-JDK25 mode with `-Xmx32m` (small heap, to force heavy GC pressure) and
 `CRATONVM_DBG_STALE_OBJREF=1`.
 
-Java source can be reconstructed from the above description. It may still exist as
-`StreamOnlyStressRepro.java` on the Azure Linux build host at `/data/data/` — not confirmed present at
-time of writing (host cleanup may have removed it); it was NOT copied into this repo's `docs/known-issues/repros/`
-tree, so treat it as lost unless found there.
+Source: `docs/known-issues/repros/stream-arraylist-gc-pressure/StreamOnlyStressRepro.java` (reconstructed
+from the description below, since the original was never checked in; passes clean on real HotSpot).
 
 ## Observed
 
@@ -58,16 +60,57 @@ the wrong order/incompletely under GC-triggered preemption — worth checking fi
 is specific enough to search for directly (`array_length` header field set before `kind=Array` is
 committed).
 
+## Fix landed (2026-07-14): `ArrayList.add`/`add(int,Object)`/`addAll` never pinned across their own resize
+
+Static read of `native-collections/src/lib.rs` found a real, previously-unfixed instance of the exact
+"Family 1" stale-`ObjectRef`-across-GC pattern this whole class of bug belongs to: `al_ensure_capacity`
+(the shared backing-array-grow helper behind `ArrayList.add`, `add(int,Object)`, and `addAll`) calls
+`alloc_ref_array` — a real, GC-triggering allocation — and then writes the new buffer back onto `this`
+via `al_set_data`'s `ctx.set_field(this, ...)`, all without ever pinning `this` (or the old backing
+array, in the copy branch) first. Every caller has the identical gap on its own copy of `this` (used
+again afterward for `al_set_size`) and, in `add`/`add(int,Object)`, on the element being added. This is
+by far the hottest allocation site in the repro (~10 resizes per 30-element list × 3000 iterations ×
+24 threads). Fixed by pinning `this`/the old buffer inside `al_ensure_capacity` itself, plus pinning
+`this`/`elem`/`other_data`/`elems` at each of the three call sites, refreshing after the call returns —
+same idiom as `671c8df3` and this week's broader sweep.
+
+**Verified with a real A/B build** (dev tip + this fix vs. dev tip alone, both Windows release builds):
+- Pre-fix, a `-Xmx32m` run reliably hit the debug assertion cleanly: `CRATONVM_DBG_STALE_OBJREF: stale
+  ObjectRef detected at 0x... — this object was evacuated by a moving GC to 0x... but native/interpreter
+  code dereferenced the OLD address`, panicking inside `StreamOnlyStressRepro.lambda$main$0` — a clean,
+  unambiguous confirmation of this exact bug class, not previously seen this cleanly for this repro.
+- Post-fix, that specific clean panic **no longer occurs** (0 occurrences across repeated `-Xmx32m`
+  runs) — this fix is real and eliminates a genuine crash mode.
+- **However, the process still hits heap corruption at `-Xmx32m` after this fix**, this time *without*
+  a clean assertion fire — instead via the generic defensive guard added by the (unrelated, already
+  "✅ FIXED") HIB-CV-32 fix (`gen_heap.rs::read_slot`'s `read_value_checked`): `gen_heap::read_slot:
+  corrupt Value cell (out-of-range discriminant) — returning null instead of a UB-on-match Value. Heap
+  reference-integrity defect (see HIB-CV-32)`, plus the same `GC: inconsistent header` warnings as
+  before, eventually ending in a native crash-handler dump. This is exactly the harder-to-catch case
+  this doc originally described ("the assertion didn't fire cleanly... its forwarding-record window had
+  already been reclaimed by the time of the bad read") — so **there is at least one more unpinned site
+  still to find**, separate from `ArrayList.add`'s family. `-Xmx512m` still passes clean (0 warnings,
+  `RESULT=OK`) post-fix, confirming the residual is still heap-pressure-dependent, not a regression.
+
+Ruled out by re-reading (already correctly pin/refresh their locals across every allocating call, per
+the same idiom): `native_al_stream`, `stream_apply_chain_full`, `stream_process_chain`,
+`stream_pull_internal`/`stream_pull_synthetic_downstream`/`stream_pull_any_downstream`,
+`invoke_deferred_stream_lambda`, `stream_make_lazy_derived`. The residual is likely in a path not yet
+inspected this session — candidates: the `invokedynamic` string-concatenation path behind
+`"a" + p2.id` (used by the `flatMap` lambda's `Stream.of(...)` arguments), `Integer`/`String` boxing
+helpers, or another ArrayList-adjacent site not covered by this fix (e.g. `Collectors.toUnmodifiableList`'s
+own backing-list construction, distinct from `stream_apply_chain_full`'s per-element pinning).
+
 ## Suggested next steps
 
-1. Try to recover or reconstruct `StreamOnlyStressRepro.java` (check the Azure Linux build host at
-   `/data/data/` first; reconstruct from the description above otherwise) and add it under
-   `docs/known-issues/repros/` so it isn't lost again.
-2. `CRATONVM_DBG_STALE_OBJREF=1` + `RUST_BACKTRACE=1` first — but since the assertion didn't cleanly
-   fire in the corrupted case, be ready to fall back to gdb-based live debugging (this repo's
-   established gdb-live-wrapper / SpinPoll techniques for GC-adjacent bugs — note that a gdb-attached
-   live wrapper can itself suppress the race by changing timing; prefer `core_pattern`+`ulimit -c`
-   core-dump capture for the segfault case).
-3. Bisect the "wrong size" case first (deterministic-ish once you have `-Xmx32m` reproducing it; the
-   segfault case is likely the same root cause hit harder/earlier) — narrow to the specific native call
-   site with the same pin/refresh-before-write pattern `671c8df3` used.
+1. Get a Linux core dump of the still-crashing fixed binary (`kernel.core_pattern` + `ulimit -c
+   unlimited`, per this repo's established technique — a live gdb wrapper can suppress GC-timing races,
+   so prefer raw execution + post-mortem `gdb <binary> <core>` over attaching live) and get a real
+   backtrace for the corruption that survives this fix.
+2. Since the debug assertion doesn't fire cleanly for this residual, consider instrumenting
+   `gen_heap.rs::read_slot`'s `read_value_checked` fallback (the HIB-CV-32 guard that's currently
+   catching this) to log the corrupt cell's *reader* call site/backtrace, not just the raw bytes — that
+   would turn this into the same kind of clean, attributable signal the `ArrayList.add` fix above got
+   from `CRATONVM_DBG_STALE_OBJREF`.
+3. Audit the `invokedynamic` string-concat bootstrap and any other native helper the `flatMap`
+   lambda's `Stream.of("a"+p2.id, ...)` touches for the same unpinned-across-allocation shape.
