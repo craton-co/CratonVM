@@ -43946,6 +43946,45 @@ fn native_printwriter_write_string(
     args: &[Value],
 ) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first().copied() {
+        // Real JDK's `PrintWriter.write(String)` body is `write(s, 0,
+        // s.length())` — a VIRTUAL call back on `this`. A user subclass that
+        // overrides `write(String,int,int)` (e.g. Spring's
+        // `MockHttpServletResponse`'s private `ResponsePrintWriter`, which
+        // auto-flushes and tracks commit state on every write) depends on
+        // that dispatch. Writing straight to the backing `out` object below
+        // skips `this` entirely: the char data still reaches the backing
+        // Writer, but any subclass side effect the override exists to provide
+        // (here, forcing the buffered `OutputStreamWriter`/`StreamEncoder`
+        // bytes out to the real sink) never runs — silently losing the
+        // content once the request stops touching the response any further
+        // (e.g. a `View.render()`/`@ExceptionHandler` write with no later
+        // explicit flush). Detect the subclass case first and re-dispatch
+        // through `this`, so ordinary virtual method resolution finds the
+        // override; when there isn't one, `write(String,int,int)` falls
+        // through to `native_printwriter_write_string_range` below —
+        // functionally identical to the fast path already taken here for a
+        // plain `java.io.PrintWriter` receiver, just one indirection deeper.
+        let this_cid = ctx.class_id_of_object(this);
+        let this_cname = ctx.class_name_of_id(this_cid);
+        let is_plain_printwriter = this_cname.as_deref() == Some("java/io/PrintWriter");
+        if !is_plain_printwriter {
+            if let Some(Value::Object(Some(s))) = args.get(1).copied() {
+                if let Some(text) = ctx.read_string(s) {
+                    let len = text.encode_utf16().count() as i32;
+                    let _ = ctx.invoke_virtual(
+                        this,
+                        "write",
+                        "(Ljava/lang/String;II)V",
+                        &[Value::Object(Some(s)), Value::Int(0), Value::Int(len)],
+                    );
+                    return Ok(None);
+                }
+            }
+            // Null/non-String arg: real `write(String)` would NPE inside
+            // `s.length()` before ever reaching a writer — fall through to
+            // the pre-existing behaviour below rather than invent new null
+            // semantics here.
+        }
         if let Some(out_obj) = printwriter_get_backing_writer(ctx, this) {
             // Pass the EXISTING Java String arg directly to out.write(String).
             // Do NOT call write_string_to_writer (which does ctx.create_string → GC hazard:
@@ -54465,6 +54504,37 @@ fn native_matcher_group_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value])
             )
         }
     };
+    // The comment above ("groups[] would still be all -1") only holds for
+    // callers that reach `groups[]` via THIS fast path's own `find()`/
+    // `find(int)` (which does bail early for non-String text — see
+    // `matcher_realjdk_cached`). `Matcher.matches()`/`lookingAt()` are NOT
+    // natively intercepted at all, so they run as real interpreted bytecode
+    // against ANY `CharSequence` (correctly — that's all the `CharSequence`
+    // contract promises) and populate `groups[]` just fine. A subsequent
+    // `matcher.group(int)` call then DOES reach here with valid `start`/`end`
+    // even though `text` is a non-String `CharSequence` (e.g. Spring's
+    // `AntPathMatcher$AntPathStringMatcher$MaxAttemptsCharSequence`, which
+    // implements only `subSequence`/`charAt`/`length`/`isEmpty` — no
+    // `substring`). Calling `.substring(int,int)` unconditionally then threw
+    // a spurious `NoSuchMethodError` instead of returning the matched text.
+    // Real JDK's `Matcher.group(int)` never calls `.substring()` either — it
+    // calls `getSubSequence(start,end).toString()`, `subSequence` being the
+    // one method every `CharSequence` actually guarantees. Keep the fast,
+    // allocation-light `substring` shortcut for genuine `String` text (the
+    // overwhelming common case) and bail to real bytecode for anything else,
+    // instead of assuming the receiver has a `substring` method it never
+    // promised to have.
+    let text_cid = ctx.class_id_of_object(text_obj);
+    let text_cname = ctx.class_name_of_id(text_cid);
+    if text_cname.as_deref() != Some("java/lang/String") {
+        return matcher_realjdk_bail(
+            ctx,
+            this,
+            "group",
+            "(I)Ljava/lang/String;",
+            &[Value::Int(group)],
+        );
+    }
     ctx.invoke_virtual(
         text_obj,
         "substring",
