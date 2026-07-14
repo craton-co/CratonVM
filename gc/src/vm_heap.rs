@@ -1083,6 +1083,34 @@ impl VmHeap {
         }
     }
 
+    /// Enqueue a reference as live for an active SATB mark cycle without
+    /// performing a heap store. This is used by `Reference.get()` paths: the
+    /// referent was read, not overwritten, so it must not participate in the
+    /// debug `(pre, store, post)` triad tracked by [`Self::write_barrier_pre`].
+    #[inline]
+    pub fn write_barrier_keep_alive(&self, referent: ObjectRef) {
+        match self {
+            VmHeap::Generational(h) => {
+                <GenerationalHeap as GarbageCollector>::write_barrier_pre(
+                    h,
+                    std::ptr::null_mut(),
+                    referent,
+                )
+            }
+            VmHeap::G1(h) => <G1Collector as GarbageCollector>::write_barrier_pre(
+                h,
+                std::ptr::null_mut(),
+                referent,
+            ),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => <ZgcRealHeap as GarbageCollector>::write_barrier_pre(
+                h,
+                std::ptr::null_mut(),
+                referent,
+            ),
+        }
+    }
+
     pub fn allocated_bytes(&self) -> usize {
         match self {
             VmHeap::Generational(h) => h.allocated_bytes(),
