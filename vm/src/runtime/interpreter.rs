@@ -20597,20 +20597,23 @@ pub(crate) fn try_lambda_dispatch(
     }
 }
 
-/// Invoke a cached native callback with [`safe_native_call`] (pins jobject
-/// args / return values across safepoint GC) and push any result.
 #[inline]
-fn invoke_cached_native_callback(
+fn invoke_cached_native_callback_impl(
     shared: &SharedVm,
     thread: &mut JvmThread,
     frame_idx: usize,
     callback: cratonvm_native_api::NativeCallback,
     args: &[Value],
     method_descriptor: &str,
+    objects_prevalidated: bool,
 ) -> Result<(), MethodCallFailed> {
     // Widening: small integer index -> usize (non-negative, fits in pointer width)
     let _ring_idx = cratonvm_native_api::native_ring::record_enter(callback as usize);
-    let result = crate::vm::safe_native_call(shared, thread, callback, args);
+    let result = if objects_prevalidated {
+        crate::vm::safe_native_call_prevalidated_objects(shared, thread, callback, args)
+    } else {
+        crate::vm::safe_native_call(shared, thread, callback, args)
+    };
     cratonvm_native_api::native_ring::record_exit(_ring_idx);
     let result = result?;
     if let Some(value) = result {
@@ -20632,6 +20635,48 @@ fn invoke_cached_native_callback(
         }
     }
     Ok(())
+}
+
+/// Invoke a cached native callback with [`safe_native_call`] (pins jobject
+/// args / return values across safepoint GC) and push any result.
+#[inline]
+fn invoke_cached_native_callback(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    callback: cratonvm_native_api::NativeCallback,
+    args: &[Value],
+    method_descriptor: &str,
+) -> Result<(), MethodCallFailed> {
+    invoke_cached_native_callback_impl(
+        shared,
+        thread,
+        frame_idx,
+        callback,
+        args,
+        method_descriptor,
+        false,
+    )
+}
+
+#[inline]
+fn invoke_cached_native_callback_prevalidated(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    callback: cratonvm_native_api::NativeCallback,
+    args: &[Value],
+    method_descriptor: &str,
+) -> Result<(), MethodCallFailed> {
+    invoke_cached_native_callback_impl(
+        shared,
+        thread,
+        frame_idx,
+        callback,
+        args,
+        method_descriptor,
+        true,
+    )
 }
 
 /// Registered Rust natives that must win over real-JDK bytecode on the same
@@ -32576,6 +32621,32 @@ fn execute_invokevirtual_cached(
                     }
                     if actual_class_id != receiver_class_id {
                         return Ok(CachedCallResult::CacheMiss);
+                    }
+                    // The callback identity proves this cache entry is one of
+                    // the eight real-layout Matcher leaves. The receiver was
+                    // just checked against the cache's monomorphic class guard,
+                    // so it cannot be a lambda/annotation proxy and its sole
+                    // object argument is already heap-validated. Skip those two
+                    // generic proxy locks and the duplicate heap-membership
+                    // search while retaining ordinary native pinning, return,
+                    // and exception handling.
+                    if cratonvm_native_builtins::is_matcher_realjdk_native_callback(callback) {
+                        let (args, method_descriptor) = pop_coerced_invoke_args_virtual(
+                            shared,
+                            caller_class_id,
+                            cp_index,
+                            frame_idx,
+                            thread,
+                        )?;
+                        invoke_cached_native_callback_prevalidated(
+                            shared,
+                            thread,
+                            frame_idx,
+                            callback,
+                            &args,
+                            &method_descriptor,
+                        )?;
+                        return Ok(CachedCallResult::Handled);
                     }
                     // Lambda proxies require the slow `try_lambda_dispatch`
                     // route instead of a cached interface target.

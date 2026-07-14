@@ -1522,11 +1522,28 @@ pub(crate) fn sb_append_chars(
     this: cratonvm_types::ObjectRef,
     chars: &[u16],
 ) {
-    let (this, buf) = sb_ensure_capacity(ctx, this, chars.len());
-    let (_, count) = sb_state(ctx, this);
-    let count = count as usize;
-    for (i, &ch) in chars.iter().enumerate() {
-        ctx.set_array_element(buf, count + i, Value::Int(ch as i32));
+    // Most appends do not grow. Reuse this first state read instead of
+    // entering `sb_ensure_capacity` and then reading the buffer/count again.
+    let (current_buf, current_count) = sb_state(ctx, this);
+    let current_cap = current_buf.map_or(0, |buf| ctx.array_length(buf));
+    let current_count = (current_count.max(0) as usize).min(current_cap);
+    let (this, buf, count) = if let Some(buf) = current_buf.filter(|_| {
+        current_count.saturating_add(chars.len()) <= current_cap
+    }) {
+        (this, buf, current_count)
+    } else {
+        let (this, buf) = sb_ensure_capacity(ctx, this, chars.len());
+        let (_, count) = sb_state(ctx, this);
+        (this, buf, count.max(0) as usize)
+    };
+
+    // Char arrays are compact u16 payloads in the VM. The bulk override is a
+    // single checked copy; retain the element loop only for mock contexts or
+    // unusual heaps that decline the fast path.
+    if !ctx.write_char_array_from(buf, count, chars) {
+        for (i, &ch) in chars.iter().enumerate() {
+            ctx.set_array_element(buf, count + i, Value::Int(ch as i32));
+        }
     }
     sb_set_count(ctx, this, (count + chars.len()) as i32);
 }

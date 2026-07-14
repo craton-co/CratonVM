@@ -50681,6 +50681,37 @@ impl JavaRegex {
         }
     }
 
+    /// Visit capture byte ranges for one search without materialising owned
+    /// match strings, a capture `Vec`, or a named-group map. Stateful Matcher
+    /// fast paths only need offsets to update the Java `groups[]` array; using
+    /// `captures_at` there would otherwise allocate several Rust objects for
+    /// every successful `find()`.
+    pub fn visit_capture_ranges_at(
+        &self,
+        text: &str,
+        start: usize,
+        mut visit: impl FnMut(usize, Option<(usize, usize)>),
+    ) -> Option<usize> {
+        match self {
+            JavaRegex::Std(r) => {
+                let caps = r.captures_at(text, start)?;
+                let len = caps.len();
+                for i in 0..len {
+                    visit(i, caps.get(i).map(|m| (m.start(), m.end())));
+                }
+                Some(len)
+            }
+            JavaRegex::Fancy(r) => {
+                let caps = r.captures_from_pos(text, start).ok().flatten()?;
+                let len = caps.len();
+                for i in 0..len {
+                    visit(i, caps.get(i).map(|m| (m.start(), m.end())));
+                }
+                Some(len)
+            }
+        }
+    }
+
     pub fn captures(&self, text: &str) -> Option<JavaCaptures> {
         match self {
             JavaRegex::Std(r) => {
@@ -53734,26 +53765,6 @@ fn pattern_realjdk_field_indices(ctx: &mut dyn NativeContext) -> Option<PatternF
     })
 }
 
-/// Return the semantic capture count stored by the real JDK Pattern. This
-/// includes group zero. Some supported JDK Matcher layouts overallocate the
-/// backing `groups[]` array (for example, ten capture pairs for a one-group
-/// pattern), so array length is a capacity check, not the group count.
-fn matcher_realjdk_java_capture_count(
-    ctx: &mut dyn NativeContext,
-    matcher: ObjectRef,
-    idx: MatcherFieldIndices,
-    pattern_idx: PatternFieldIndices,
-) -> Option<usize> {
-    let pattern = match ctx.get_field(matcher, idx.parent_pattern) {
-        Value::Object(Some(pattern)) => pattern,
-        _ => return None,
-    };
-    let count = ctx
-        .get_field(pattern, pattern_idx.capturing_group_count)
-        .as_int()?;
-    (count > 0).then_some(count as usize)
-}
-
 fn matcher_realjdk_capture_layout_valid(
     rust_capture_count: usize,
     java_capture_count: usize,
@@ -53766,15 +53777,10 @@ fn matcher_realjdk_capture_layout_valid(
 
 fn matcher_realjdk_capture_layout_ok(
     ctx: &mut dyn NativeContext,
-    matcher: ObjectRef,
-    idx: MatcherFieldIndices,
-    pattern_idx: PatternFieldIndices,
-    re: &JavaRegex,
+    capture_count: usize,
     groups: ObjectRef,
 ) -> bool {
-    matcher_realjdk_java_capture_count(ctx, matcher, idx, pattern_idx).is_some_and(|count| {
-        matcher_realjdk_capture_layout_valid(re.captures_len(), count, ctx.array_length(groups))
-    })
+    ctx.array_length(groups) >= capture_count.saturating_mul(2)
 }
 
 /// One matcher's decoded input text plus the UTF-8-byte <-> UTF-16-code-unit
@@ -53801,6 +53807,10 @@ struct MatcherRealCache {
     /// `usePattern(Pattern)` swapping the compiled pattern invalidates this
     /// entry too.
     pattern_identity: i32,
+    /// The semantic capture count, validated against the compiled Rust regex
+    /// on cache construction. The exact Pattern object is part of the cache
+    /// key, so steady-state find calls only need to recheck groups[] capacity.
+    capture_count: usize,
     utf8: std::sync::Arc<str>,
     /// `byte_to_utf16[byte_offset] == utf16 code-unit offset at that byte`.
     /// Length `utf8.len() + 1` (entries at non-char-boundary byte offsets
@@ -53821,10 +53831,102 @@ struct MatcherRealCache {
     re: JavaRegex,
 }
 
-fn matcher_realjdk_cache() -> &'static Mutex<std::collections::HashMap<i32, MatcherRealCache>> {
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<i32, MatcherRealCache>>> =
+fn matcher_realjdk_cache(
+) -> &'static Mutex<std::collections::HashMap<i32, std::sync::Arc<MatcherRealCache>>> {
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<i32, std::sync::Arc<MatcherRealCache>>>,
+    > =
         OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+thread_local! {
+    /// A Matcher is explicitly not thread-safe, so the most recent cache entry
+    /// on this Java thread is the overwhelmingly common case. The global map
+    /// remains the cross-thread/cold fallback.
+    static MATCHER_REAL_LAST_CACHE:
+        std::cell::RefCell<Option<(usize, usize, usize, std::sync::Arc<MatcherRealCache>)>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// Java's public Matcher state-changing methods increment `modCount`.
+    /// Cache the fields needed by the next `find()` behind that guard so a
+    /// steady-state loop pays one field read instead of five.
+    static MATCHER_REAL_LAST_STATE:
+        std::cell::Cell<Option<MatcherRealState>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[derive(Clone, Copy)]
+struct MatcherRealState {
+    matcher_raw: usize,
+    groups_raw: usize,
+    mod_count: i32,
+    first: i32,
+    last: i32,
+    from: i32,
+    to: i32,
+}
+
+fn matcher_realjdk_group_slice<'a>(
+    utf8: &'a str,
+    utf16_to_byte: &[u32],
+    start: i32,
+    end: i32,
+) -> Option<&'a str> {
+    let start = usize::try_from(start).ok()?;
+    let end = usize::try_from(end).ok()?;
+    if start > end || end >= utf16_to_byte.len() {
+        return None;
+    }
+    let is_scalar_boundary = |offset: usize| {
+        offset == 0
+            || offset + 1 == utf16_to_byte.len()
+            || utf16_to_byte[offset] != utf16_to_byte[offset - 1]
+    };
+    if !is_scalar_boundary(start) || !is_scalar_boundary(end) {
+        return None;
+    }
+    let start_byte = utf16_to_byte[start] as usize;
+    let end_byte = utf16_to_byte[end] as usize;
+    utf8.get(start_byte..end_byte)
+}
+
+/// Materialize a group directly from the decoded String cached by the native
+/// find path. Returns `None` when the Matcher was populated by bytecode, its
+/// text changed, or a boundary falls inside a surrogate pair.
+fn matcher_realjdk_cached_group_string(
+    ctx: &mut dyn NativeContext,
+    matcher: ObjectRef,
+    text: ObjectRef,
+    start: i32,
+    end: i32,
+) -> Option<ObjectRef> {
+    let matcher_raw = matcher.as_ptr() as usize;
+    let text_raw = text.as_ptr() as usize;
+    let last = MATCHER_REAL_LAST_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|(cached_matcher, cached_text, _, _)| {
+                *cached_matcher == matcher_raw && *cached_text == text_raw
+            })
+            .map(|(_, _, _, entry)| entry.clone())
+    });
+    let entry = match last {
+        Some(entry) => Some(entry),
+        None => {
+            let matcher_identity = ctx.identity_hash_code(matcher);
+            let text_identity = ctx.identity_hash_code(text);
+            let guard = matcher_realjdk_cache().lock().ok()?;
+            guard
+                .get(&matcher_identity)
+                .filter(|entry| entry.text_identity == text_identity)
+                .cloned()
+        }
+    }?;
+
+    let text = matcher_realjdk_group_slice(&entry.utf8, &entry.utf16_to_byte, start, end)?;
+    Some(ctx.create_string_uninterned(text))
 }
 
 /// Build both offset tables in one O(n) pass over `s`.
@@ -53861,12 +53963,7 @@ fn matcher_realjdk_cached(
     matcher: ObjectRef,
     idx: MatcherFieldIndices,
     pattern_idx: PatternFieldIndices,
-) -> Option<(
-    std::sync::Arc<str>,
-    std::sync::Arc<[u32]>,
-    std::sync::Arc<[u32]>,
-    JavaRegex,
-)> {
+) -> Option<std::sync::Arc<MatcherRealCache>> {
     let text_obj = match ctx.get_field(matcher, idx.text) {
         Value::Object(Some(r)) => r,
         _ => return None,
@@ -53875,6 +53972,27 @@ fn matcher_realjdk_cached(
         Value::Object(Some(p)) => p,
         _ => return None,
     };
+    let matcher_raw = matcher.as_ptr() as usize;
+    let text_raw = text_obj.as_ptr() as usize;
+    let pattern_raw = pattern_obj.as_ptr() as usize;
+    let last = MATCHER_REAL_LAST_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|(cached_matcher, cached_text, cached_pattern, _)| {
+                *cached_matcher == matcher_raw
+                    && *cached_text == text_raw
+                    && *cached_pattern == pattern_raw
+            })
+            .map(|(_, _, _, entry)| entry.clone())
+    });
+    if last.is_some() {
+        return last;
+    }
+
+    // Raw references change when a moving collector forwards any member of
+    // the triple, producing a safe TLS miss. Stable identity hashes retain the
+    // cross-GC/global lookup semantics on that cold refresh path.
     let text_identity = ctx.identity_hash_code(text_obj);
     let pattern_identity = ctx.identity_hash_code(pattern_obj);
     let matcher_identity = ctx.identity_hash_code(matcher);
@@ -53883,12 +54001,16 @@ fn matcher_realjdk_cached(
         if let Some(entry) = guard.get(&matcher_identity) {
             if entry.text_identity == text_identity && entry.pattern_identity == pattern_identity
             {
-                return Some((
-                    entry.utf8.clone(),
-                    entry.byte_to_utf16.clone(),
-                    entry.utf16_to_byte.clone(),
-                    entry.re.clone(),
-                ));
+                let entry = entry.clone();
+                MATCHER_REAL_LAST_CACHE.with(|cache| {
+                    cache.borrow_mut().replace((
+                        matcher_raw,
+                        text_raw,
+                        pattern_raw,
+                        entry.clone(),
+                    ));
+                });
+                return Some(entry);
             }
         }
     }
@@ -53914,26 +54036,40 @@ fn matcher_realjdk_cached(
         .as_int()
         .unwrap_or(0);
     let re = compile_java_regex(&pattern_text, flags).ok()?;
+    let capture_count = ctx
+        .get_field(pattern_obj, pattern_idx.capturing_group_count)
+        .as_int()
+        .and_then(|count| (count > 0).then_some(count as usize))?;
+    if re.captures_len() != capture_count {
+        return None;
+    }
 
     let (byte_to_utf16, utf16_to_byte) = matcher_realjdk_build_offset_tables(&decoded);
     let utf8: std::sync::Arc<str> = std::sync::Arc::from(decoded.into_boxed_str());
     let byte_to_utf16: std::sync::Arc<[u32]> = std::sync::Arc::from(byte_to_utf16.into_boxed_slice());
     let utf16_to_byte: std::sync::Arc<[u32]> = std::sync::Arc::from(utf16_to_byte.into_boxed_slice());
 
+    let entry = std::sync::Arc::new(MatcherRealCache {
+        text_identity,
+        pattern_identity,
+        capture_count,
+        utf8,
+        byte_to_utf16,
+        utf16_to_byte,
+        re,
+    });
     if let Ok(mut guard) = matcher_realjdk_cache().lock() {
-        guard.insert(
-            matcher_identity,
-            MatcherRealCache {
-                text_identity,
-                pattern_identity,
-                utf8: utf8.clone(),
-                byte_to_utf16: byte_to_utf16.clone(),
-                utf16_to_byte: utf16_to_byte.clone(),
-                re: re.clone(),
-            },
-        );
+        guard.insert(matcher_identity, entry.clone());
     }
-    Some((utf8, byte_to_utf16, utf16_to_byte, re))
+    MATCHER_REAL_LAST_CACHE.with(|cache| {
+        cache.borrow_mut().replace((
+            matcher_raw,
+            text_raw,
+            pattern_raw,
+            entry.clone(),
+        ));
+    });
+    Some(entry)
 }
 
 /// Decline this fast path for the current call: re-enter the SAME (class,
@@ -53972,6 +54108,8 @@ fn matcher_realjdk_search(
     region_from_utf16: i32,
     region_to_utf16: i32,
     next_search_utf16: i32,
+    previous_last_utf16: i32,
+    previous_mod_count: i32,
 ) -> MethodCallResult {
     let region_from_byte = utf16_to_byte[region_from_utf16.max(0) as usize] as usize;
     let region_to_byte = utf16_to_byte[region_to_utf16.max(0) as usize] as usize;
@@ -53979,44 +54117,36 @@ fn matcher_realjdk_search(
         utf16_to_byte[next_search_utf16.max(0) as usize] as usize - region_from_byte;
     let region_slice = &utf8[region_from_byte..region_to_byte];
 
-    ctx.set_field(this, idx.first, Value::Int(next_search_utf16));
-    // `oldLast = oldLast < 0 ? from : oldLast` — mirrors real `search(int)`.
-    let old_last = ctx.get_field(this, idx.old_last).as_int().unwrap_or(-1);
-    if old_last < 0 {
-        ctx.set_field(this, idx.old_last, Value::Int(next_search_utf16));
-    }
-
     // Group-count safety net (checked by both callers via
-    // `matcher_realjdk_group_count_ok` BEFORE any field is mutated — doing
+    // `matcher_realjdk_capture_layout_ok` BEFORE any field is mutated — doing
     // it here instead would mean bailing to real bytecode after already
     // having overwritten `first`/`oldLast` above, corrupting the state the
     // bytecode fallback itself depends on). Trust the caller: by the time
     // we're here, Rust's capture count matches Pattern.capturingGroupCount and
     // `groups_obj` has enough capacity, so every write below is in bounds.
-    let caps = re.captures_at(region_slice, search_from_byte);
-    let matched = match caps {
-        Some(caps) => {
-            let mut whole_start = -1i32;
-            let mut whole_end = -1i32;
-            for i in 0..caps.len() {
-                let (s, e) = match caps.get(i) {
-                    Some(g) => {
-                        let abs_start_byte = region_from_byte + g.start;
-                        let abs_end_byte = region_from_byte + g.end;
-                        (
-                            byte_to_utf16[abs_start_byte] as i32,
-                            byte_to_utf16[abs_end_byte] as i32,
-                        )
-                    }
-                    None => (-1, -1),
-                };
-                if i == 0 {
-                    whole_start = s;
-                    whole_end = e;
-                }
-                ctx.set_array_element(groups_obj, 2 * i, Value::Int(s));
-                ctx.set_array_element(groups_obj, 2 * i + 1, Value::Int(e));
+    let mut whole_start = -1i32;
+    let mut whole_end = -1i32;
+    let capture_count = re.visit_capture_ranges_at(region_slice, search_from_byte, |i, range| {
+        let (s, e) = match range {
+            Some((start, end)) => {
+                let abs_start_byte = region_from_byte + start;
+                let abs_end_byte = region_from_byte + end;
+                (
+                    byte_to_utf16[abs_start_byte] as i32,
+                    byte_to_utf16[abs_end_byte] as i32,
+                )
             }
+            None => (-1, -1),
+        };
+        if i == 0 {
+            whole_start = s;
+            whole_end = e;
+        }
+        ctx.set_array_element(groups_obj, 2 * i, Value::Int(s));
+        ctx.set_array_element(groups_obj, 2 * i + 1, Value::Int(e));
+    });
+    let matched = match capture_count {
+        Some(_) => {
             // `this.first`/`this.last` are the WHOLE MATCH's actual bounds
             // (== groups[0]/groups[1]), NOT the position the search resumed
             // from — real `Pattern$Start.match`'s own scan loop overwrites
@@ -54025,11 +54155,7 @@ fn matcher_realjdk_search(
             // itself begins, which for an unanchored pattern is commonly
             // LATER than the resume position search started scanning at
             // (e.g. `(a+)(b)` found starting at index 2 while the scan began
-            // at index 0). The provisional `FIRST = next_search_utf16` write
-            // above this match block exists only so a FAILED search still
-            // leaves a sensible in-progress value for any code that reads
-            // `first` mid-traversal in real JDK — overwritten here on
-            // success, matching what the real `Start` node does.
+            // at index 0).
             ctx.set_field(this, idx.first, Value::Int(whole_start));
             ctx.set_field(this, idx.last, Value::Int(whole_end));
             // `hitEnd` approximation (see module banner): real HotSpot's
@@ -54066,12 +54192,74 @@ fn matcher_realjdk_search(
             false
         }
     };
-    let last = ctx.get_field(this, idx.last).as_int().unwrap_or(0);
-    ctx.set_field(this, idx.old_last, Value::Int(last));
-    let mod_count = ctx.get_field(this, idx.mod_count).as_int().unwrap_or(0);
-    ctx.set_field(this, idx.mod_count, Value::Int(mod_count.wrapping_add(1)));
+    // Rust's regex engine cannot call back into Java while a search is in
+    // progress, so the real bytecode's provisional `first`/`oldLast` writes
+    // are unobservable. Commit only the final state, using the caller's
+    // already-read previous `last` on failure instead of reading it again.
+    let completed_last = if matched {
+        whole_end
+    } else {
+        previous_last_utf16
+    };
+    ctx.set_field(this, idx.old_last, Value::Int(completed_last));
+    let completed_first = if matched { whole_start } else { -1 };
+    let completed_mod_count = previous_mod_count.wrapping_add(1);
+    ctx.set_field(this, idx.mod_count, Value::Int(completed_mod_count));
+    MATCHER_REAL_LAST_STATE.with(|state| {
+        state.set(Some(MatcherRealState {
+            matcher_raw: this.as_ptr() as usize,
+            groups_raw: groups_obj.as_ptr() as usize,
+            mod_count: completed_mod_count,
+            first: completed_first,
+            last: completed_last,
+            from: region_from_utf16,
+            to: region_to_utf16,
+        }));
+    });
 
     Ok(Some(Value::Int(if matched { 1 } else { 0 })))
+}
+
+/// Resolve the default-on real-layout Matcher intrinsics for exact-receiver
+/// JIT dispatch. The VM applies the same feature gate as registration before
+/// consulting this table.
+pub fn matcher_realjdk_native_callback(
+    method_name: &str,
+    descriptor: &str,
+) -> Option<cratonvm_native_api::NativeCallback> {
+    match (method_name, descriptor) {
+        ("find", "()Z") => Some(native_matcher_find_realjdk),
+        ("find", "(I)Z") => Some(native_matcher_find_at_realjdk),
+        ("start", "()I") => Some(native_matcher_start_realjdk),
+        ("start", "(I)I") => Some(native_matcher_start_idx_realjdk),
+        ("end", "()I") => Some(native_matcher_end_realjdk),
+        ("end", "(I)I") => Some(native_matcher_end_idx_realjdk),
+        ("group", "()Ljava/lang/String;") => Some(native_matcher_group_realjdk),
+        ("group", "(I)Ljava/lang/String;") => Some(native_matcher_group_idx_realjdk),
+        _ => None,
+    }
+}
+
+/// Whether a cached native target is one of the real-layout Matcher leaves.
+/// Used by the interpreter after its monomorphic receiver-class guard has
+/// already succeeded.
+#[inline]
+pub fn is_matcher_realjdk_native_callback(
+    callback: cratonvm_native_api::NativeCallback,
+) -> bool {
+    let callback = callback as usize;
+    [
+        native_matcher_find_realjdk as cratonvm_native_api::NativeCallback,
+        native_matcher_find_at_realjdk,
+        native_matcher_start_realjdk,
+        native_matcher_start_idx_realjdk,
+        native_matcher_end_realjdk,
+        native_matcher_end_idx_realjdk,
+        native_matcher_group_realjdk,
+        native_matcher_group_idx_realjdk,
+    ]
+    .into_iter()
+    .any(|candidate| candidate as usize == callback)
 }
 
 /// Real-JDK-layout `Matcher.find()Z`. See module banner for the full
@@ -54105,28 +54293,52 @@ fn native_matcher_find_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(p) => p,
         None => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
     };
-    let (utf8, byte_to_utf16, utf16_to_byte, re) =
-        match matcher_realjdk_cached(ctx, this, idx, pattern_idx) {
-            Some(t) => t,
-            None => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
-        };
     let groups_obj = match ctx.get_field(this, idx.groups) {
         Value::Object(Some(g)) => g,
         _ => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
     };
+    let mod_count = ctx.get_field(this, idx.mod_count).as_int().unwrap_or(0);
+    let matcher_raw = this.as_ptr() as usize;
+    let groups_raw = groups_obj.as_ptr() as usize;
+    let state = MATCHER_REAL_LAST_STATE.with(|state| {
+        state.get().filter(|state| {
+            state.matcher_raw == matcher_raw
+                && state.groups_raw == groups_raw
+                && state.mod_count == mod_count
+        })
+    });
+    let steady_cached = state.and_then(|_| {
+        MATCHER_REAL_LAST_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .as_ref()
+                .filter(|(cached_matcher, _, _, _)| *cached_matcher == matcher_raw)
+                .map(|(_, _, _, entry)| entry.clone())
+        })
+    });
+    let cached = match steady_cached.or_else(|| matcher_realjdk_cached(ctx, this, idx, pattern_idx))
+    {
+        Some(cached) => cached,
+        None => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
+    };
     // Group-count safety net, checked BEFORE any field mutation below. The
     // Pattern field is the semantic count; groups[] may be overallocated.
-    if !matcher_realjdk_capture_layout_ok(ctx, this, idx, pattern_idx, &re, groups_obj) {
+    if !matcher_realjdk_capture_layout_ok(ctx, cached.capture_count, groups_obj) {
         return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]);
     }
 
-    let from = ctx.get_field(this, idx.from).as_int().unwrap_or(0);
-    let to = ctx
-        .get_field(this, idx.to)
-        .as_int()
-        .unwrap_or(byte_to_utf16[utf8.len()] as i32);
-    let first = ctx.get_field(this, idx.first).as_int().unwrap_or(-1);
-    let last = ctx.get_field(this, idx.last).as_int().unwrap_or(0);
+    let (from, to, first, last) = state
+        .map(|state| (state.from, state.to, state.first, state.last))
+        .unwrap_or_else(|| {
+            (
+                ctx.get_field(this, idx.from).as_int().unwrap_or(0),
+                ctx.get_field(this, idx.to)
+                    .as_int()
+                    .unwrap_or(cached.byte_to_utf16[cached.utf8.len()] as i32),
+                ctx.get_field(this, idx.first).as_int().unwrap_or(-1),
+                ctx.get_field(this, idx.last).as_int().unwrap_or(0),
+            )
+        });
 
     let mut next_search = last;
     if next_search == first {
@@ -54150,14 +54362,16 @@ fn native_matcher_find_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         ctx,
         this,
         idx,
-        &re,
-        &utf8,
-        &byte_to_utf16,
-        &utf16_to_byte,
+        &cached.re,
+        &cached.utf8,
+        &cached.byte_to_utf16,
+        &cached.utf16_to_byte,
         groups_obj,
         from,
         to,
         next_search,
+        last,
+        mod_count,
     )
 }
 
@@ -54194,12 +54408,11 @@ fn native_matcher_find_at_realjdk(
         Some(p) => p,
         None => return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]),
     };
-    let (utf8, byte_to_utf16, utf16_to_byte, re) =
-        match matcher_realjdk_cached(ctx, this, idx, pattern_idx) {
-            Some(t) => t,
-            None => return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]),
-        };
-    let text_len_utf16 = byte_to_utf16[utf8.len()] as i32;
+    let cached = match matcher_realjdk_cached(ctx, this, idx, pattern_idx) {
+        Some(cached) => cached,
+        None => return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]),
+    };
+    let text_len_utf16 = cached.byte_to_utf16[cached.utf8.len()] as i32;
 
     // Out-of-range `start`: let the real bytecode throw the exact
     // `IndexOutOfBoundsException` Java specifies (no matching RuntimeError
@@ -54215,7 +54428,7 @@ fn native_matcher_find_at_realjdk(
     };
     // Group-count safety net — checked before any field mutation below. The
     // Pattern field is the semantic count; groups[] may be overallocated.
-    if !matcher_realjdk_capture_layout_ok(ctx, this, idx, pattern_idx, &re, groups_obj) {
+    if !matcher_realjdk_capture_layout_ok(ctx, cached.capture_count, groups_obj) {
         return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]);
     }
 
@@ -54229,20 +54442,23 @@ fn native_matcher_find_at_realjdk(
     ctx.set_field(this, idx.from, Value::Int(0));
     ctx.set_field(this, idx.to, Value::Int(text_len_utf16));
     let mod_count = ctx.get_field(this, idx.mod_count).as_int().unwrap_or(0);
-    ctx.set_field(this, idx.mod_count, Value::Int(mod_count.wrapping_add(1)));
+    let reset_mod_count = mod_count.wrapping_add(1);
+    ctx.set_field(this, idx.mod_count, Value::Int(reset_mod_count));
 
     matcher_realjdk_search(
         ctx,
         this,
         idx,
-        &re,
-        &utf8,
-        &byte_to_utf16,
-        &utf16_to_byte,
+        &cached.re,
+        &cached.utf8,
+        &cached.byte_to_utf16,
+        &cached.utf16_to_byte,
         groups_obj,
         0,
         text_len_utf16,
         start,
+        0,
+        reset_mod_count,
     )
 }
 
@@ -54289,8 +54505,27 @@ fn matcher_realjdk_group_in_bounds(
     let Some(pattern_idx) = pattern_realjdk_field_indices(ctx) else {
         return false;
     };
-    let Some(capture_count) = matcher_realjdk_java_capture_count(ctx, matcher, idx, pattern_idx)
-    else {
+    let pattern = match ctx.get_field(matcher, idx.parent_pattern) {
+        Value::Object(Some(pattern)) => pattern,
+        _ => return false,
+    };
+    let matcher_raw = matcher.as_ptr() as usize;
+    let pattern_raw = pattern.as_ptr() as usize;
+    let cached_count = MATCHER_REAL_LAST_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|(cached_matcher, _, cached_pattern, _)| {
+                *cached_matcher == matcher_raw && *cached_pattern == pattern_raw
+            })
+            .map(|(_, _, _, entry)| entry.capture_count)
+    });
+    let capture_count = cached_count.or_else(|| {
+        ctx.get_field(pattern, pattern_idx.capturing_group_count)
+            .as_int()
+            .and_then(|count| (count > 0).then_some(count as usize))
+    });
+    let Some(capture_count) = capture_count else {
         return false;
     };
     matcher_realjdk_group_index_in_bounds(group, capture_count, ctx.array_length(groups_obj))
@@ -54298,7 +54533,72 @@ fn matcher_realjdk_group_in_bounds(
 
 #[cfg(test)]
 mod matcher_realjdk_layout_tests {
-    use super::{matcher_realjdk_capture_layout_valid, matcher_realjdk_group_index_in_bounds};
+    use super::{
+        compile_java_regex, is_matcher_realjdk_native_callback,
+        matcher_realjdk_build_offset_tables,
+        matcher_realjdk_capture_layout_valid, matcher_realjdk_group_index_in_bounds,
+        matcher_realjdk_group_slice, matcher_realjdk_native_callback,
+    };
+
+    #[test]
+    fn cached_group_slice_preserves_utf16_boundaries() {
+        let text = "x😀value12,y";
+        let (_, utf16_to_byte) = matcher_realjdk_build_offset_tables(text);
+        assert_eq!(
+            matcher_realjdk_group_slice(text, &utf16_to_byte, 3, 10),
+            Some("value12")
+        );
+        assert_eq!(matcher_realjdk_group_slice(text, &utf16_to_byte, 2, 10), None);
+        assert_eq!(matcher_realjdk_group_slice(text, &utf16_to_byte, 1, 2), None);
+    }
+
+    #[test]
+    fn jit_dispatch_resolver_covers_only_real_layout_matcher_intrinsics() {
+        for (name, descriptor) in [
+            ("find", "()Z"),
+            ("find", "(I)Z"),
+            ("start", "()I"),
+            ("start", "(I)I"),
+            ("end", "()I"),
+            ("end", "(I)I"),
+            ("group", "()Ljava/lang/String;"),
+            ("group", "(I)Ljava/lang/String;"),
+        ] {
+            let callback = matcher_realjdk_native_callback(name, descriptor).unwrap();
+            assert!(is_matcher_realjdk_native_callback(callback));
+        }
+        assert!(matcher_realjdk_native_callback("matches", "()Z").is_none());
+        assert!(matcher_realjdk_native_callback("group", "(Ljava/lang/String;)Ljava/lang/String;")
+            .is_none());
+    }
+
+    #[test]
+    fn capture_range_visitor_reports_std_and_fancy_offsets() {
+        let std = compile_java_regex(r"value(\d+),", 0).unwrap();
+        let mut std_ranges = Vec::new();
+        assert_eq!(
+            std.visit_capture_ranges_at("xvalue12,y", 1, |i, range| {
+                assert_eq!(i, std_ranges.len());
+                std_ranges.push(range);
+            }),
+            Some(2)
+        );
+        assert_eq!(std_ranges, vec![Some((1, 9)), Some((6, 8))]);
+
+        let fancy = compile_java_regex(r"(?=(value(\d+),))", 0).unwrap();
+        let mut fancy_ranges = Vec::new();
+        assert_eq!(
+            fancy.visit_capture_ranges_at("xvalue12,y", 1, |i, range| {
+                assert_eq!(i, fancy_ranges.len());
+                fancy_ranges.push(range);
+            }),
+            Some(3)
+        );
+        assert_eq!(
+            fancy_ranges,
+            vec![Some((1, 1)), Some((1, 9)), Some((6, 8))]
+        );
+    }
 
     #[test]
     fn overallocated_groups_array_is_capacity_not_capture_count() {
@@ -54509,6 +54809,11 @@ fn native_matcher_group_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value])
             )
         }
     };
+    if let Some(group_string) =
+        matcher_realjdk_cached_group_string(ctx, this, text_obj, start, end)
+    {
+        return Ok(Some(Value::Object(Some(group_string))));
+    }
     // The comment above ("groups[] would still be all -1") only holds for
     // callers that reach `groups[]` via THIS fast path's own `find()`/
     // `find(int)` (which does bail early for non-String text — see
@@ -54540,11 +54845,15 @@ fn native_matcher_group_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value])
             &[Value::Int(group)],
         );
     }
-    ctx.invoke_virtual(
-        text_obj,
-        "substring",
-        "(II)Ljava/lang/String;",
-        &[Value::Int(start), Value::Int(end)],
+    // Genuine String input: call the registered substring native directly,
+    // avoiding another generic virtual dispatch on every captured group.
+    lang_string::native_string_substring(
+        ctx,
+        &[
+            Value::Object(Some(text_obj)),
+            Value::Int(start),
+            Value::Int(end),
+        ],
     )
 }
 
