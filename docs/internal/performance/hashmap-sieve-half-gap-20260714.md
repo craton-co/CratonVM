@@ -1,7 +1,8 @@
 # HashMap + Sieve gap reduction (2026-07-14)
 
 Status: merged; Sieve target met (gap cut by ~2/3), HashMap partial (gap cut
-by ~39%, residuals documented below).
+by ~39% in round 1, ~42% after round 2 — see the Round 2 section at the end;
+residuals documented below).
 
 ## Goal
 
@@ -140,3 +141,62 @@ thin prevalidated wrapper for the two exact map natives.
 - Hibernate ORM smoke (Linux harness, 2 real classes): 27/27 tests green.
 - QuickBench Arithmetic/Fibonacci/Matrix: no CratonVM-side regressions
   (4,161→4,109 / 4,283→4,231 / 5,909→5,583 ms).
+
+## Round 2 (2026-07-14, second session): 274 → 264 ms, plus the size sweep
+
+Same host/methodology, branch `perf/hashmap-round2-20260714` off dev
+`a80a0af9`. Two changes landed (isolated same-commit A/B, checksums
+identical, `HashMapSemanticsProbe` normal + GC-stress green, `BinT` 16/18
+byte-identical, QuickBench rows unchanged):
+
+1. `jit_integer_value_of_direct` allocates through a direct
+   `tlab_alloc_object` call (the same function `alloc_object`'s TLAB arm
+   uses, real field-count clamp resolved once per (vm, class)), skipping the
+   per-call clamp-cache scan, pool probes and context plumbing.
+2. `jit_invoke_dispatch` probes the cached exact-HashMap entry FIRST —
+   with `valueOf`/`intValue` now direct calls, the Integer-cache probe ahead
+   of every `Map.put/get` was a dead hash lookup.
+
+**Measured and REJECTED** — candidate (1) from the follow-up list, a
+per-map `Arc<Mutex<HmIntFastState>>` with a thread-local epoch-validated
+handle cache to bypass the global `hm_int_fast_table` mutex: on the same
+probe it measured **+18 ms** (274→282 while changes 1+2 alone hit 264).
+Uncontended, the global `std::sync::Mutex` + one FxHashMap probe of a
+1-entry table (~15-20 ns) is CHEAPER than the replacement's Arc refcount
+traffic + `RefCell` TLS bookkeeping + per-state mutex. The design (with the
+full lock-order/GC-walker analysis) is preserved in this session's notes;
+revisit only for a workload with real multi-thread map contention, and
+benchmark first.
+
+### Size sweep (fresh alternating pairs, default flags unless noted)
+
+| n (put+get pairs) | HotSpot | CratonVM | Ratio | Notes |
+|---|---:|---:|---:|---|
+| 1M | ~42 ms | 264 ms | ~6.3x | dense overlay path throughout |
+| 10M | 980 ms | 2,767 ms | **2.82x** | dense; live set ≈ young capacity |
+| 30M | 3,193 ms | 13,457 ms | 4.21x | both `-Xmx16g`; keys >16,777,216 spill to the overlay's SPARSE FxHashMap (`DenseIntEntries::MAX_DENSE_KEY`) |
+| 100M | 23,377 ms | **aborts** | — | pre-existing, see below |
+
+The ratio bottoms out near 10M: the fixed per-op dispatch/boxing tax
+amortizes against HotSpot's growing cache-miss cost, until (a) the 16M
+dense-key cap sends ~half the keys to the sparse map and (b) GC pressure
+rises.
+
+### Pre-existing finding: default-heap OOM abort at ≥ ~20M live wrappers
+
+`HashMapOnly 30000000` (and 100M) at default flags aborts on the DEV
+BASELINE binary as well:
+
+```
+FATAL: OutOfMemoryError: young gen exhausted — tried to allocate 56 bytes,
+from-space has 1073741824/1073741824 used
+```
+
+`-Xmx` scales young (12g → 3 GiB from-space) but 100M still aborts: the
+live wrapper set exceeds what young can hold and the panicking native
+allocation wrapper (`gen_heap::alloc_young_initialized`, used by the
+native `alloc_object`/`alloc_array` convenience path) `std::process::abort`s
+instead of triggering a collection/promotion and retrying like the
+interpreter's `gc_alloc_*` path. Not a round-2 regression; filed as a
+follow-up — the fix direction is routing the native wrapper through the
+fallible GC-and-retry allocator.

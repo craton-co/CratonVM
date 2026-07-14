@@ -47,7 +47,7 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 | Sieve (100K x 20,000)               | 2,742 ms      | 5,567 ms          | 2.03x         |
 | Matrix 1280x1280                    | 2,085 ms      | 5,583 ms          | 2.68x         |
 | **QuickBench TOTAL**                | **8,330 ms**  | **19,491 ms**     | **2.34x**     |
-| HashMap (1M put/get, isolated)      | 42 ms         | 274 ms            | 6.52x         |
+| HashMap (1M put/get, isolated)      | 42 ms         | 264 ms            | 6.29x         |
 | String/Regex (100K, isolated)       | 58 ms         | 476 ms            | 8.21x         |
 | Binary Trees (depth=18, isolated)   | 382 ms        | 4,916 ms          | 12.9x         |
 
@@ -156,9 +156,15 @@ exact-HashMap dispatch check moved ahead of the (always-futile for native callee
 virtual-dispatch probes, `alloc_object`'s field-count clamp lookup is now served
 from a layout-generation-validated thread-local cache, `Integer.valueOf`/`intValue`
 JIT callsites compile to thin direct helper calls, and `safe_native_call` no longer
-heap-allocates two scratch Vecs per call. Per-op cost is size-linear (4M put/get:
-3.45x); the remaining 1M-row residual is boxing-allocation and map-native internals —
-follow-ups are listed in
+heap-allocates two scratch Vecs per call. A second round took the row to **6.29x**
+(264 ms): `Integer.valueOf` boxing allocates via a direct TLAB bump, and the map
+dispatch cache is the first per-callsite probe. The 1M row is also the WORST size
+for CratonVM: the fixed per-op dispatch/boxing tax amortizes against HotSpot's
+growing cache-miss cost at larger sizes — 10M put/get measures **2.82x**
+(2,767 ms vs 980 ms, checksums equal) — until the overlay's 16M dense-key cap
+sends keys to a sparse fallback (30M at matched `-Xmx16g`: 4.21x). The remaining
+1M residual is boxing-allocation and map-native internals; follow-ups (and one
+measured-and-rejected design) are listed in
 [`docs/internal/performance/hashmap-sieve-half-gap-20260714.md`](docs/internal/performance/hashmap-sieve-half-gap-20260714.md).*
 
 See [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full 26-round JIT optimization journey.
