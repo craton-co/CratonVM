@@ -50637,6 +50637,37 @@ impl JavaRegex {
         }
     }
 
+    /// Visit capture byte ranges for one search without materialising owned
+    /// match strings, a capture `Vec`, or a named-group map. Stateful Matcher
+    /// fast paths only need offsets to update the Java `groups[]` array; using
+    /// `captures_at` there would otherwise allocate several Rust objects for
+    /// every successful `find()`.
+    pub fn visit_capture_ranges_at(
+        &self,
+        text: &str,
+        start: usize,
+        mut visit: impl FnMut(usize, Option<(usize, usize)>),
+    ) -> Option<usize> {
+        match self {
+            JavaRegex::Std(r) => {
+                let caps = r.captures_at(text, start)?;
+                let len = caps.len();
+                for i in 0..len {
+                    visit(i, caps.get(i).map(|m| (m.start(), m.end())));
+                }
+                Some(len)
+            }
+            JavaRegex::Fancy(r) => {
+                let caps = r.captures_from_pos(text, start).ok().flatten()?;
+                let len = caps.len();
+                for i in 0..len {
+                    visit(i, caps.get(i).map(|m| (m.start(), m.end())));
+                }
+                Some(len)
+            }
+        }
+    }
+
     pub fn captures(&self, text: &str) -> Option<JavaCaptures> {
         match self {
             JavaRegex::Std(r) => {
@@ -53949,30 +53980,29 @@ fn matcher_realjdk_search(
     // bytecode fallback itself depends on). Trust the caller: by the time
     // we're here, Rust's capture count matches Pattern.capturingGroupCount and
     // `groups_obj` has enough capacity, so every write below is in bounds.
-    let caps = re.captures_at(region_slice, search_from_byte);
-    let matched = match caps {
-        Some(caps) => {
-            let mut whole_start = -1i32;
-            let mut whole_end = -1i32;
-            for i in 0..caps.len() {
-                let (s, e) = match caps.get(i) {
-                    Some(g) => {
-                        let abs_start_byte = region_from_byte + g.start;
-                        let abs_end_byte = region_from_byte + g.end;
-                        (
-                            byte_to_utf16[abs_start_byte] as i32,
-                            byte_to_utf16[abs_end_byte] as i32,
-                        )
-                    }
-                    None => (-1, -1),
-                };
-                if i == 0 {
-                    whole_start = s;
-                    whole_end = e;
-                }
-                ctx.set_array_element(groups_obj, 2 * i, Value::Int(s));
-                ctx.set_array_element(groups_obj, 2 * i + 1, Value::Int(e));
+    let mut whole_start = -1i32;
+    let mut whole_end = -1i32;
+    let capture_count = re.visit_capture_ranges_at(region_slice, search_from_byte, |i, range| {
+        let (s, e) = match range {
+            Some((start, end)) => {
+                let abs_start_byte = region_from_byte + start;
+                let abs_end_byte = region_from_byte + end;
+                (
+                    byte_to_utf16[abs_start_byte] as i32,
+                    byte_to_utf16[abs_end_byte] as i32,
+                )
             }
+            None => (-1, -1),
+        };
+        if i == 0 {
+            whole_start = s;
+            whole_end = e;
+        }
+        ctx.set_array_element(groups_obj, 2 * i, Value::Int(s));
+        ctx.set_array_element(groups_obj, 2 * i + 1, Value::Int(e));
+    });
+    let matched = match capture_count {
+        Some(_) => {
             // `this.first`/`this.last` are the WHOLE MATCH's actual bounds
             // (== groups[0]/groups[1]), NOT the position the search resumed
             // from — real `Pattern$Start.match`'s own scan loop overwrites
@@ -54254,7 +54284,38 @@ fn matcher_realjdk_group_in_bounds(
 
 #[cfg(test)]
 mod matcher_realjdk_layout_tests {
-    use super::{matcher_realjdk_capture_layout_valid, matcher_realjdk_group_index_in_bounds};
+    use super::{
+        compile_java_regex, matcher_realjdk_capture_layout_valid,
+        matcher_realjdk_group_index_in_bounds,
+    };
+
+    #[test]
+    fn capture_range_visitor_reports_std_and_fancy_offsets() {
+        let std = compile_java_regex(r"value(\d+),", 0).unwrap();
+        let mut std_ranges = Vec::new();
+        assert_eq!(
+            std.visit_capture_ranges_at("xvalue12,y", 1, |i, range| {
+                assert_eq!(i, std_ranges.len());
+                std_ranges.push(range);
+            }),
+            Some(2)
+        );
+        assert_eq!(std_ranges, vec![Some((1, 9)), Some((6, 8))]);
+
+        let fancy = compile_java_regex(r"(?=(value(\d+),))", 0).unwrap();
+        let mut fancy_ranges = Vec::new();
+        assert_eq!(
+            fancy.visit_capture_ranges_at("xvalue12,y", 1, |i, range| {
+                assert_eq!(i, fancy_ranges.len());
+                fancy_ranges.push(range);
+            }),
+            Some(3)
+        );
+        assert_eq!(
+            fancy_ranges,
+            vec![Some((1, 1)), Some((1, 9)), Some((6, 8))]
+        );
+    }
 
     #[test]
     fn overallocated_groups_array_is_capacity_not_capture_count() {
