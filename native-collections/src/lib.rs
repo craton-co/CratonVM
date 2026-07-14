@@ -21164,7 +21164,7 @@ fn ll_real_field(name: &str) -> Option<&'static str> {
 
 fn ll_get(ctx: &dyn NativeContext, this: ObjectRef, name: &'static str) -> Value {
     {
-        let ov = ll_overlay().lock().unwrap();
+        let ov = ll_overlay().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(v) = ov
             .get(&widened_obj_key(ctx, this))
             .and_then(|m| m.get(name))
@@ -22578,7 +22578,7 @@ fn lhm_overlay_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
 }
 fn lhm_get(ctx: &dyn NativeContext, this: ObjectRef, name: &str, _fallback: usize) -> Value {
     {
-        let m = lhm_overlay().lock().unwrap();
+        let m = lhm_overlay().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(v) = m
             .get(&lhm_overlay_key(ctx, this))
             .and_then(|inner| inner.get(name))
@@ -22613,7 +22613,7 @@ fn lhm_set(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback: 
         .unwrap()
         .insert(this.as_ptr() as usize, key);
     {
-        let mut m = lhm_overlay().lock().unwrap();
+        let mut m = lhm_overlay().lock().unwrap_or_else(|e| e.into_inner());
         m.entry(key).or_default().insert(name.to_string(), v);
     }
     // Mirror the structural pointers to the REAL JDK heap fields so that
@@ -22656,7 +22656,7 @@ fn lhm_set(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback: 
 /// the clone produces an empty overlay — acceptable because pre-rekey
 /// the same call leaked the entry entirely on every GC move.
 pub fn clone_lhm_overlay(src: ObjectRef, dst: ObjectRef) {
-    let cache = lhm_ptr_cache().lock().unwrap();
+    let cache = lhm_ptr_cache().lock().unwrap_or_else(|e| e.into_inner());
     let src_key = match cache.get(&(src.as_ptr() as usize)) {
         Some(k) => *k,
         None => return,
@@ -22671,7 +22671,7 @@ pub fn clone_lhm_overlay(src: ObjectRef, dst: ObjectRef) {
         None => dst.as_ptr() as usize,
     };
     drop(cache);
-    let mut m = lhm_overlay().lock().unwrap();
+    let mut m = lhm_overlay().lock().unwrap_or_else(|e| e.into_inner());
     let src_state = m.get(&src_key).cloned();
     if let Some(s) = src_state {
         m.insert(dst_key, s);
@@ -22685,7 +22685,7 @@ pub fn clone_lhm_overlay(src: ObjectRef, dst: ObjectRef) {
 pub fn clone_lhm_overlay_ctx(ctx: &dyn NativeContext, src: ObjectRef, dst: ObjectRef) {
     let src_key = lhm_overlay_key(ctx, src);
     let dst_key = lhm_overlay_key(ctx, dst);
-    let mut m = lhm_overlay().lock().unwrap();
+    let mut m = lhm_overlay().lock().unwrap_or_else(|e| e.into_inner());
     let src_state = m.get(&src_key).cloned();
     if let Some(s) = src_state {
         m.insert(dst_key, s);

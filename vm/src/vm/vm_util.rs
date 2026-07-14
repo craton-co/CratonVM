@@ -1163,10 +1163,32 @@ fn initialize_class_shared(
                 // JDK 25's legacy sun.misc.Unsafe derives its memory-access
                 // policy from the nested MemoryAccessOption enum during
                 // <clinit>. Real-JDK execution can leave the final result
-                // field null even though the enum value itself is available;
-                // repair that slot before any ordered Unsafe access reaches
-                // beforeMemoryAccessSlow().
+                // field null and can also skip loading the nested enum. Load
+                // and initialize that enum only after Unsafe itself has been
+                // finalized, then repair the slot before any ordered Unsafe
+                // access reaches beforeMemoryAccessSlow(). Doing this inside
+                // post_clinit_fixup used to deadlock because Unsafe was still
+                // claimed as Initializing at that point.
                 if matches!(&*class_name_for_jfr, "sun/misc/Unsafe") {
+                    match shared.load_class_concurrent("sun/misc/Unsafe$MemoryAccessOption") {
+                        Ok(enum_class_id) => {
+                            if let Err(error) =
+                                ensure_class_initialized_shared(shared, thread, enum_class_id)
+                            {
+                                tracing::warn!(
+                                    "Post-clinit fixup: failed to initialize \
+                                     sun.misc.Unsafe$MemoryAccessOption after Unsafe finalization: \
+                                     {error:?}"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "Post-clinit fixup: failed to load sun.misc.Unsafe$MemoryAccessOption \
+                                 after Unsafe finalization: {error:?}"
+                            );
+                        }
+                    }
                     post_clinit_fixup(shared, class_id, &class_name_for_jfr);
                 }
                 // (Removed) R15 WildFly Module.<clinit> post-success fixup.
@@ -2322,21 +2344,10 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             // Azure host): the already-initialized check below correctly read
             // `Value::Int(0)` here (genuinely uninitialized, not a false
             // positive) while `find_class_by_name` returned `None` for
-            // `sun/misc/Unsafe$MemoryAccessOption` — i.e. in this minimal
-            // repro the enum class was never loaded by anything, so the
-            // repair has nothing to copy from. A follow-up attempt to
-            // eagerly force-load + force-initialize the enum class here
-            // (`load_class_concurrent` + `ensure_class_initialized_shared`)
-            // deadlocked: `post_clinit_fixup` runs from inside
-            // `initialize_class_shared` for `sun/misc/Unsafe` itself, before
-            // that call's `InitCleanupGuard`/`finalize_init` releases its
-            // claim on the class, so recursively driving another class's
-            // full initialization from here is unsafe. Reverted — a
-            // non-recursive fix (e.g. scheduling the eager load for after
-            // `finalize_init`, or fixing why real-bytecode `Unsafe.<clinit>`
-            // doesn't itself reach `MemoryAccessOption.value()` in this
-            // scenario) is left for follow-up. See docs/known-issues/
-            // keycloak/unsafe-memoryaccessoption-repair-field-index-false-positive.md.
+            // `sun/misc/Unsafe$MemoryAccessOption`. The success path now
+            // loads and initializes that enum after finalizing Unsafe, before
+            // this lookup-only repair pass runs. See docs/internal once the
+            // regression is closed.
             let enum_class_id = shared
                 .class_manager
                 .read()

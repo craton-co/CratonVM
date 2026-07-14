@@ -23,43 +23,44 @@ classloader-visibility symptoms (`MockitoException`, `CompilationException:
 Unable to compile source`, CGLIB-proxy `ABEND`s) — not individually
 root-caused.
 
-## Current status (2026-07-14)
+## Current status (2026-07-14, final current-dev validation)
 
 This issue remains **open** and belongs in `docs/known-issues`. The final
-merged-dev AOT validation used
-`cratonvm-aot-final-merged-dev-20260714-release.exe`
-(SHA-256 `A94B4CCB0CCA098459FE2C79B4AEF4BCC16D9801DC157F5AB1D6393FF1955B26`)
-against the exact 11 original cluster classes, one class per VM, with both
-batch and recovery watchdogs set to 600 seconds. It ran for 12,219 seconds:
+current-dev rerun used dev `4409dd21`, the real JDK
+`25.0.3.9-hotspot`, JIT enabled, and one VM per class. Both watchdogs were
+600 seconds. The complete machine-readable record is
+`apps/spring-suite-runner/out/aot-current-dev-cluster-20260714-jit-real-all-20260714-182306/results.tsv`.
 
-- 10 classes timed out in both the batch and isolated recovery executions
-  (`found=0/succ=0/fail=0`, 600,000 ms each).
-- `PersistenceAnnotationBeanPostProcessorAotContributionTests` completed in
-  6,579 ms, but all 8 methods failed with
-  `NoClassDefFoundError: org/springframework/orm/jpa/support/PersistenceAnnotationBeanPostProcessor`.
+| class | result | methods (`found/succ/fail`) | elapsed |
+|---|---|---:|---:|
+| `AutowiredAnnotationBeanRegistrationAotContributionTests` | FAIL | 14/1/13 | 14,863 ms |
+| `BeanDefinitionMethodGeneratorTests` | FAIL | 34/3/31 | 21,277 ms |
+| `BeanDefinitionPropertiesCodeGeneratorTests` | FAIL | 47/0/47 | 29,790 ms |
+| `BeanRegistrationsAotContributionTests` | TIMEOUT | 0/0/0 | 600,000 ms |
+| `InstanceSupplierCodeGeneratorTests` | FAIL | 26/0/24 | 61,726 ms |
+| `CommonAnnotationBeanRegistrationAotContributionTests` | FAIL | 8/1/7 | 8,687 ms |
+| `ConfigurationClassPostProcessorAotContributionTests` | FAIL | 20/8/12 | 84,582 ms |
+| `ApplicationContextAotGeneratorTests` | ABEND | 0/0/0 | — |
+| `PersistenceAnnotationBeanPostProcessorAotContributionTests` | FAIL | 8/0/8 | 15,529 ms |
+| `TestClassScannerTests` | TIMEOUT | 0/0/0 | 600,000 ms |
+| `TestContextAotGeneratorIntegrationTests` | FAIL | 4/0/4 | 393,958 ms |
 
-Consequently, none of the 11 cluster entries was removed as fixed. The
-intermediate fixes listed below are retained because they removed concrete
-verifier/file-manager defects, but they did not resolve the class-level AOT
-cluster.
+This is significant progress over the preceding 10-timeout run: nine former
+timeouts now reach method discovery/execution. However, none of the 11
+classes passes, so **no AOT-cluster entry is removed as fixed**.
 
-The AOT compiler investigation remains **open**. The real-JDK `javac` path
-now delegates `JavacFileManager.list` to the JDK implementation, uses the
-native `Files.walkFileTree` bridge for archive discovery, and correctly
-dispatches erased `FileVisitor` methods. JRT package links are also exposed as
-links to their backing module trees. These changes restored system-module and
-archive discovery sufficiently for a focused release run of
-`BeanDefinitionPropertiesCodeGeneratorTests#setAutowireCandidateWhenFalse` to
-pass (`found=1`, `succ=1`, `fail=0`).
+The two remaining timeouts are `BeanRegistrationsAotContributionTests` and
+`TestClassScannerTests`. The other residuals are now actionable functional
+failures: generated source is sometimes empty (`IllegalStateException:
+WritableContent did not append any content`), persistence AOT cannot load
+`PersistenceAnnotationBeanPostProcessor`, and the application-context AOT
+probe aborts while loading a generated Spring CGLIB class
+`ConfigurableCglibConfiguration$$SpringCGLIB$$0`.
 
-The full `BeanDefinitionPropertiesCodeGeneratorTests` and
-`BeanDefinitionMethodGeneratorTests` classes nevertheless remain CPU-bound at
-the file-manager boundary. A 600-second watchdog captured repeated traversal
-through `ClassFinder.fillIn`, `DynamicJavaFileManager.inferBinaryName`, and
-`PathFileObject.toBinaryName`; this is progress from the former hard hang, but
-not a complete class-level fix. `cargo check -p cratonvm-native-builtins`
-passes. The 11-class AOT TIMEOUT cluster therefore remains tracked below, and
-this document must stay in `docs/known-issues` rather than being archived.
+The real-JDK `javac` file-manager fixes remain valid (a focused
+`BeanDefinitionPropertiesCodeGeneratorTests#setAutowireCandidateWhenFalse`
+previously passed), but they do not establish whole-class AOT correctness.
+The original 11-class cluster must therefore remain tracked below.
 
 **65 classes newly fixed** between the first two runs, most notably:
 - The entire SpEL cluster (11 classes: `LiteralTests`, `OperatorTests`,
@@ -205,7 +206,7 @@ Reconfirmed via a fresh scoped rerun of exactly this 125-class list on dev
 Patterns observed in the dev-`9948295e` reconfirmation run that weren't
 called out before — grouped for future investigation, not yet root-caused:
 
-**AOT bean-registration residual cluster (11 classes, final validation
+**AOT bean-registration residual cluster (11 classes, superseded validation
 2026-07-14)** — 10 of these hit the exact 600000ms ceiling in both batch and
 isolated recovery with `found=0/succ=0/fail=0`:
 `beans.factory.annotation.AutowiredAnnotationBeanRegistrationAotContributionTests`,
@@ -226,6 +227,17 @@ the final traces reach generated Java source, CGLIB enhancement, Hibernate
 validation, and Spring Test scanning before stalling. This is no longer
 consistent with the earlier direct-superclass verifier error, which is fixed,
 but remains an unresolved shared AOT execution defect.
+
+**Final current-dev AOT-cluster validation (2026-07-14, dev `4409dd21`)**
+supersedes that historical timeout record. Only
+`BeanRegistrationsAotContributionTests` and `TestClassScannerTests` now time
+out at 600,000 ms. The other nine classes reach execution but remain
+non-passing: seven FAIL, one ABEND, and
+`TestContextAotGeneratorIntegrationTests` fails after 393,958 ms. This exposes
+three concrete residual shapes: empty generated `WritableContent`, missing
+`PersistenceAnnotationBeanPostProcessor`, and failure to load generated
+Spring CGLIB code. None of the 11 entries is genuinely fixed, so none is
+removed from this issue list.
 
 **Groovy scripting cluster (8 classes)** — `scripting.groovy.GroovyAspectTests`,
 `scripting.groovy.GroovyAspectIntegrationTests`,

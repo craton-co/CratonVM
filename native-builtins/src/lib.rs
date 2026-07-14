@@ -76302,7 +76302,18 @@ fn native_snapshot_list_itr_previous_index(
 
 fn register_function_identity_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
-    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    // `java/util/function/Function$Identity` is a purely VM-internal
+    // synthetic stand-in for the real lambda-based `Function.identity()`
+    // (real OpenJDK's `identity()` returns `t -> t`, an invokedynamic
+    // lambda -- there is no real classfile named `Function$Identity` to
+    // fall back to at all). Tagging this SyntheticStub broke real-JDK-mode
+    // boot the moment `set_drop_synthetic_stubs(true)` started actually
+    // dropping SyntheticStub registrations (dev d8092acb, 2026-07-14):
+    // WildFly's very first `getRuntimeMXBean()`-adjacent lambda hit
+    // `UnsatisfiedLinkError: Function$Identity.andThen`. Tag as Bridge
+    // (needed in both modes) instead -- same class of bug/fix as the
+    // `native-builtins/src/jmx.rs` JMX cluster retag, both landed together.
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     registry.register(
         "java/util/function/Function",
         "identity",
