@@ -53815,6 +53815,7 @@ thread_local! {
 #[derive(Clone, Copy)]
 struct MatcherRealState {
     matcher_raw: usize,
+    groups_raw: usize,
     mod_count: i32,
     first: i32,
     last: i32,
@@ -54163,6 +54164,7 @@ fn matcher_realjdk_search(
     MATCHER_REAL_LAST_STATE.with(|state| {
         state.set(Some(MatcherRealState {
             matcher_raw: this.as_ptr() as usize,
+            groups_raw: groups_obj.as_ptr() as usize,
             mod_count: completed_mod_count,
             first: completed_first,
             last: completed_last,
@@ -54247,13 +54249,33 @@ fn native_matcher_find_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(p) => p,
         None => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
     };
-    let cached = match matcher_realjdk_cached(ctx, this, idx, pattern_idx) {
-        Some(cached) => cached,
-        None => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
-    };
     let groups_obj = match ctx.get_field(this, idx.groups) {
         Value::Object(Some(g)) => g,
         _ => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
+    };
+    let mod_count = ctx.get_field(this, idx.mod_count).as_int().unwrap_or(0);
+    let matcher_raw = this.as_ptr() as usize;
+    let groups_raw = groups_obj.as_ptr() as usize;
+    let state = MATCHER_REAL_LAST_STATE.with(|state| {
+        state.get().filter(|state| {
+            state.matcher_raw == matcher_raw
+                && state.groups_raw == groups_raw
+                && state.mod_count == mod_count
+        })
+    });
+    let steady_cached = state.and_then(|_| {
+        MATCHER_REAL_LAST_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .as_ref()
+                .filter(|(cached_matcher, _, _, _)| *cached_matcher == matcher_raw)
+                .map(|(_, _, _, entry)| entry.clone())
+        })
+    });
+    let cached = match steady_cached.or_else(|| matcher_realjdk_cached(ctx, this, idx, pattern_idx))
+    {
+        Some(cached) => cached,
+        None => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
     };
     // Group-count safety net, checked BEFORE any field mutation below. The
     // Pattern field is the semantic count; groups[] may be overallocated.
@@ -54261,13 +54283,6 @@ fn native_matcher_find_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]);
     }
 
-    let mod_count = ctx.get_field(this, idx.mod_count).as_int().unwrap_or(0);
-    let matcher_raw = this.as_ptr() as usize;
-    let state = MATCHER_REAL_LAST_STATE.with(|state| {
-        state
-            .get()
-            .filter(|state| state.matcher_raw == matcher_raw && state.mod_count == mod_count)
-    });
     let (from, to, first, last) = state
         .map(|state| (state.from, state.to, state.first, state.last))
         .unwrap_or_else(|| {
