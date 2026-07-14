@@ -54046,6 +54046,7 @@ fn matcher_realjdk_search(
     region_from_utf16: i32,
     region_to_utf16: i32,
     next_search_utf16: i32,
+    previous_last_utf16: i32,
 ) -> MethodCallResult {
     let region_from_byte = utf16_to_byte[region_from_utf16.max(0) as usize] as usize;
     let region_to_byte = utf16_to_byte[region_to_utf16.max(0) as usize] as usize;
@@ -54053,15 +54054,8 @@ fn matcher_realjdk_search(
         utf16_to_byte[next_search_utf16.max(0) as usize] as usize - region_from_byte;
     let region_slice = &utf8[region_from_byte..region_to_byte];
 
-    ctx.set_field(this, idx.first, Value::Int(next_search_utf16));
-    // `oldLast = oldLast < 0 ? from : oldLast` — mirrors real `search(int)`.
-    let old_last = ctx.get_field(this, idx.old_last).as_int().unwrap_or(-1);
-    if old_last < 0 {
-        ctx.set_field(this, idx.old_last, Value::Int(next_search_utf16));
-    }
-
     // Group-count safety net (checked by both callers via
-    // `matcher_realjdk_group_count_ok` BEFORE any field is mutated — doing
+    // `matcher_realjdk_capture_layout_ok` BEFORE any field is mutated — doing
     // it here instead would mean bailing to real bytecode after already
     // having overwritten `first`/`oldLast` above, corrupting the state the
     // bytecode fallback itself depends on). Trust the caller: by the time
@@ -54098,11 +54092,7 @@ fn matcher_realjdk_search(
             // itself begins, which for an unanchored pattern is commonly
             // LATER than the resume position search started scanning at
             // (e.g. `(a+)(b)` found starting at index 2 while the scan began
-            // at index 0). The provisional `FIRST = next_search_utf16` write
-            // above this match block exists only so a FAILED search still
-            // leaves a sensible in-progress value for any code that reads
-            // `first` mid-traversal in real JDK — overwritten here on
-            // success, matching what the real `Start` node does.
+            // at index 0).
             ctx.set_field(this, idx.first, Value::Int(whole_start));
             ctx.set_field(this, idx.last, Value::Int(whole_end));
             // `hitEnd` approximation (see module banner): real HotSpot's
@@ -54139,8 +54129,16 @@ fn matcher_realjdk_search(
             false
         }
     };
-    let last = ctx.get_field(this, idx.last).as_int().unwrap_or(0);
-    ctx.set_field(this, idx.old_last, Value::Int(last));
+    // Rust's regex engine cannot call back into Java while a search is in
+    // progress, so the real bytecode's provisional `first`/`oldLast` writes
+    // are unobservable. Commit only the final state, using the caller's
+    // already-read previous `last` on failure instead of reading it again.
+    let completed_last = if matched {
+        whole_end
+    } else {
+        previous_last_utf16
+    };
+    ctx.set_field(this, idx.old_last, Value::Int(completed_last));
     let mod_count = ctx.get_field(this, idx.mod_count).as_int().unwrap_or(0);
     ctx.set_field(this, idx.mod_count, Value::Int(mod_count.wrapping_add(1)));
 
@@ -54272,6 +54270,7 @@ fn native_matcher_find_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         from,
         to,
         next_search,
+        last,
     )
 }
 
@@ -54356,6 +54355,7 @@ fn native_matcher_find_at_realjdk(
         0,
         text_len_utf16,
         start,
+        0,
     )
 }
 
