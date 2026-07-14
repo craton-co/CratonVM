@@ -54129,6 +54129,28 @@ pub fn matcher_realjdk_native_callback(
     }
 }
 
+/// Whether a cached native target is one of the real-layout Matcher leaves.
+/// Used by the interpreter after its monomorphic receiver-class guard has
+/// already succeeded.
+#[inline]
+pub fn is_matcher_realjdk_native_callback(
+    callback: cratonvm_native_api::NativeCallback,
+) -> bool {
+    let callback = callback as usize;
+    [
+        native_matcher_find_realjdk as cratonvm_native_api::NativeCallback,
+        native_matcher_find_at_realjdk,
+        native_matcher_start_realjdk,
+        native_matcher_start_idx_realjdk,
+        native_matcher_end_realjdk,
+        native_matcher_end_idx_realjdk,
+        native_matcher_group_realjdk,
+        native_matcher_group_idx_realjdk,
+    ]
+    .into_iter()
+    .any(|candidate| candidate as usize == callback)
+}
+
 /// Real-JDK-layout `Matcher.find()Z`. See module banner for the full
 /// contract; mirrors real bytecode's own two-step algorithm exactly
 /// (`find()` computes the resume position from `first`/`last`/`from`/`to`,
@@ -54354,7 +54376,8 @@ fn matcher_realjdk_group_in_bounds(
 #[cfg(test)]
 mod matcher_realjdk_layout_tests {
     use super::{
-        compile_java_regex, matcher_realjdk_build_offset_tables,
+        compile_java_regex, is_matcher_realjdk_native_callback,
+        matcher_realjdk_build_offset_tables,
         matcher_realjdk_capture_layout_valid, matcher_realjdk_group_index_in_bounds,
         matcher_realjdk_group_slice, matcher_realjdk_native_callback,
     };
@@ -54383,7 +54406,8 @@ mod matcher_realjdk_layout_tests {
             ("group", "()Ljava/lang/String;"),
             ("group", "(I)Ljava/lang/String;"),
         ] {
-            assert!(matcher_realjdk_native_callback(name, descriptor).is_some());
+            let callback = matcher_realjdk_native_callback(name, descriptor).unwrap();
+            assert!(is_matcher_realjdk_native_callback(callback));
         }
         assert!(matcher_realjdk_native_callback("matches", "()Z").is_none());
         assert!(matcher_realjdk_native_callback("group", "(Ljava/lang/String;)Ljava/lang/String;")
