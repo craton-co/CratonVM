@@ -122,3 +122,55 @@ Ratio: 35.0x
 ```
 
 The fix reduces CratonVM latency by 77.0% and reduces the ratio gap to parity by 78.8%.
+
+## Steady-state 1M follow-up (2026-07-14)
+
+The first 1M result above exposed fixed work that the 100K run largely hid behind
+startup. The follow-up on `codex/perf-string-regex-steady-20260714-001` keeps the same
+real-JDK-layout escape hatches while reducing the successful-match path:
+
+- visit capture ranges directly instead of allocating a capture vector per match;
+- materialize groups from the already-decoded cached text rather than nested virtual
+  substring dispatch;
+- retain the decoded text/offset tables/compiled regex in an `Arc`, with a thread-local
+  exact-object hit and the stable-identity global map as the cold/GC fallback;
+- validate and cache `Pattern.capturingGroupCount` once per exact Pattern, while still
+  checking the current `groups[]` capacity;
+- guard cached `from`/`to`/`first`/`last` state with JDK 25's `Matcher.modCount`, so
+  reset, region, usePattern, and other public match operations force a refresh;
+- bulk-create captured ASCII compact Strings while preserving fresh object identity;
+- reuse the first StringBuilder state read and bulk-write its char-array append payload.
+
+The final retained release artifact is:
+
+```text
+/data/cratonvm-perf-string-regex-artifacts-20260713/
+  cratonvm-string-regex-steady-sbbulk-05750b3d-20260714-014.bin
+SHA-256 af84d4819b58c6c0250f4b4acd347c97110ada0c2bd4970345123b67c799dca7
+```
+
+It was built from runtime commit `05750b3d` in the dedicated target directory
+`/data/data/cratonvm-perf-string-regex-steady-target-20260714-39633721-001`.
+The later bulk-decoder experiment was performance-neutral and was reverted; the final
+branch source for the retained StringBuilder path is byte-for-byte identical to this
+artifact's source.
+
+Final method: the same Azure host and `StringRegexOnly 1000000` harness, Temurin JDK
+25.0.3 C2, logical CPU 14 via `taskset`, fresh process per sample, alternating launch
+order for nine paired rounds. No `rustc` process was active when the set began. Every
+sample returned checksum `500000500000`.
+
+```text
+CratonVM: 3468, 3475, 3489, 3511, 3422, 3448, 3427, 3428, 3490 ms
+HotSpot:   143,  144,  144,  144,  142,  143,  141,  147,  145 ms
+Median:  3468 ms CratonVM / 144 ms HotSpot = 24.1x
+```
+
+Relative to the prior 1M README median (4,785 ms / 146 ms = 32.8x), CratonVM time is
+1,317 ms lower (**27.5%**) and the ratio is down to **24.1x**. The full 15-case
+`MatcherFastPathParity` output remained byte-for-byte identical to HotSpot across
+basic/optional captures, indexed accessors, reset/new input, `find(int)`, Unicode,
+zero-width matches, regions, anchoring, and transparent-bounds fallback. Focused
+validation also passed five Matcher layout/cache tests, 21 StringBuilder tests, the
+compact-ASCII fresh-identity round-trip test, and the 107-observation interpreter
+intrinsic on/off differential.
