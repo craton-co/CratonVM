@@ -440,12 +440,12 @@ fn build_http1_request(
 }
 
 #[derive(Debug, Clone)]
-struct WireResponse {
-    status: u16,
-    version_h2: bool,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-    keep_alive: bool,
+pub(crate) struct WireResponse {
+    pub(crate) status: u16,
+    pub(crate) version_h2: bool,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Vec<u8>,
+    pub(crate) keep_alive: bool,
 }
 
 /// Read and parse an HTTP/1.1 response head + body using `httparse`.
@@ -1100,7 +1100,7 @@ fn decode_hpack_string(input: &[u8]) -> Result<(String, &[u8]), String> {
 // Top-level send: dispatch on ALPN result.
 // ---------------------------------------------------------------------------
 
-fn perform_request(
+pub(crate) fn perform_request(
     method: &str,
     uri: &str,
     headers: &[(String, String)],
