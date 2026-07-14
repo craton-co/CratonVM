@@ -233,6 +233,11 @@ struct ClassStoreHierarchy<'a> {
     loaded_classes: &'a LoadedClassesMap,
     /// The class currently being verified (not yet in `class_store`).
     in_flight: Option<&'a Class>,
+    /// The parsed direct-superclass name of the class currently being
+    /// verified. Its resolved ClassId can still refer to an incomplete
+    /// bootstrap placeholder, so constructor verification needs this exact
+    /// symbolic edge before the class is registered.
+    in_flight_super_name: Option<&'a str>,
     /// The defining/initiating loader of the class being verified, used to
     /// make `lookup` loader-aware (CL-CLASSMANAGER fix). When `Some`, a
     /// name is resolved by walking that loader's parent-delegation chain
@@ -497,6 +502,54 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
             return true;
         }
         false
+    }
+
+    fn is_direct_superclass(&self, child: &str, parent: &str) -> bool {
+        if self
+            .in_flight
+            .is_some_and(|in_flight| in_flight.name.as_ref() == child)
+        {
+            return self.in_flight_super_name == Some(parent);
+        }
+        let Some(child_id) = self.lookup(child) else {
+            return false;
+        };
+        let Some(child_class) = self.class_for(child_id) else {
+            return false;
+        };
+        let Some(super_id) = child_class.superclass else {
+            return false;
+        };
+        // The hierarchy is queried while `child_class` is still in flight.
+        // Its direct parent can have a resolved ClassId before its Class
+        // record is materialized in this store (notably java/lang/Object for
+        // a freshly defined application class). Comparing the loader-aware
+        // resolved ids retains the exact direct edge without requiring the
+        // parent record itself to be present.
+        if self.lookup(parent).is_some_and(|parent_id| parent_id == super_id) {
+            return true;
+        }
+        // The parent may have been resolved by a different initiating loader
+        // and therefore not be returned by `lookup(parent)` for the current
+        // verifier context. The loaded-class index still retains the exact
+        // ClassId-to-binary-name association; use that reverse proof instead
+        // of weakening constructor verification to any ancestor.
+        if self
+            .loaded_classes
+            .iter()
+            .any(|((_, name), id)| *id == super_id && name.as_ref() == parent)
+        {
+            return true;
+        }
+        if let Some(super_class) = self.class_for(super_id) {
+            return super_class.name.as_ref() == parent;
+        }
+        // The bootstrap Object edge is represented by a reserved ClassId in
+        // a few early definition paths, before an Object Class record is
+        // materialized or indexed. A non-Object direct parent is loaded and
+        // therefore handled by one of the exact checks above; accept only
+        // this bootstrap representation, never a general ancestor lookup.
+        parent == "java/lang/Object"
     }
 
     fn common_superclass(&self, a: &str, b: &str) -> String {
@@ -3571,6 +3624,7 @@ impl ClassManager {
                 // in `class_store`; pass it explicitly so self-references
                 // (its own name / id) resolve during verification.
                 in_flight: Some(&class),
+                in_flight_super_name: class_file.super_class.as_deref(),
                 // CL-CLASSMANAGER fix: make type resolution loader-aware —
                 // referenced names resolve through this class's defining
                 // loader's delegation order, not a global first-match.
@@ -4923,6 +4977,7 @@ impl ClassManager {
                     // Redefine verifies a class already resident in the
                     // store (in-place mutation), so no in-flight class.
                     in_flight: None,
+                    in_flight_super_name: None,
                     // CL-CLASSMANAGER fix: the redefined class is resident
                     // at `class_id`; resolve referenced names through its
                     // own defining loader's delegation order so two loaders
@@ -11808,6 +11863,7 @@ mod tests {
             class_store: &cm.class_store,
             loaded_classes: &cm.loaded_classes,
             in_flight: None,
+            in_flight_super_name: None,
             requesting_loader: None,
         };
         use crate::vtype::ClassHierarchy;

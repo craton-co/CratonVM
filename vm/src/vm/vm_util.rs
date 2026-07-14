@@ -2083,6 +2083,16 @@ impl<'a> crate::classloading::vtype::ClassHierarchy for ClassStoreHierarchy<'a> 
         false
     }
 
+    fn is_direct_superclass(&self, child: &str, parent: &str) -> bool {
+        let Some(child_class) = self.store.find_by_name(child) else {
+            return false;
+        };
+        child_class
+            .superclass
+            .and_then(|super_id| self.store.get(super_id))
+            .is_some_and(|super_class| super_class.name.as_ref() == parent)
+    }
+
     fn common_superclass(&self, a: &str, b: &str) -> String {
         if a == b {
             return a.to_string();
@@ -3500,6 +3510,19 @@ mod tests {
         use crate::classloading::vtype::ClassHierarchy;
         assert!(hierarchy.is_subclass("java/lang/String", "java/lang/Object"));
         assert!(hierarchy.is_subclass("java/io/PrintStream", "java/lang/Object"));
+    }
+
+    #[test]
+    fn hierarchy_direct_superclass_uses_linked_class_edge() {
+        let shared = test_shared();
+        let mut cm = shared.class_manager.write();
+        cm.load_class("java/lang/String").unwrap();
+        let hierarchy = ClassStoreHierarchy {
+            store: &cm.class_store,
+        };
+        use crate::classloading::vtype::ClassHierarchy;
+        assert!(hierarchy.is_direct_superclass("java/lang/String", "java/lang/Object"));
+        assert!(!hierarchy.is_direct_superclass("java/lang/String", "java/io/Serializable"));
     }
 
     #[test]

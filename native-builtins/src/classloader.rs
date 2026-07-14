@@ -1478,9 +1478,12 @@ fn cl_load_class_base_delegation(
     //    throws ClassNotFoundException (e.g. EmbeddedImplClassLoader with
     //    empty jarMetas).
     if receiver_overrides_find_class(ctx, this) {
-        // `invoke_virtual` resolves on the receiver's actual class, so this
-        // dispatches to the subclass's overriding `findClass` bytecode.
-        let result = ctx.invoke_virtual(
+        // The base `ClassLoader.findClass` itself is registered as a native.
+        // A regular virtual call can therefore re-enter that native through
+        // the inherited declaration and bypass this known subclass override.
+        // The predicate above proves a real bytecode implementation exists on
+        // the receiver hierarchy; select that implementation explicitly.
+        let result = ctx.invoke_virtual_bytecode_only(
             this,
             "findClass",
             "(Ljava/lang/String;)Ljava/lang/Class;",

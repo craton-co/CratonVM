@@ -25246,6 +25246,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         native_javac_file_manager_list,
     );
     registry.register(
+        "com/sun/tools/javac/file/JavacFileManager",
+        "inferBinaryName",
+        "(Ljavax/tools/JavaFileManager$Location;Ljavax/tools/JavaFileObject;)Ljava/lang/String;",
+        native_javac_file_manager_infer_binary_name,
+    );
+    registry.register(
         "com/sun/tools/javac/file/JavacFileManager$PathAndContainer",
         "compareTo",
         "(Ljava/lang/Object;)I",
@@ -25256,6 +25262,33 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "hashCode",
         "()I",
         native_javac_string_name_hash_code,
+    );
+    // `Name.equals` is on javac's compiler lookup hot path. Preserve the JDK
+    // identity/table semantics in native code so package and class resolution
+    // does not repeatedly interpret this small virtual dispatch.
+    registry.register(
+        "com/sun/tools/javac/util/Name",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_javac_shared_name_equals,
+    );
+    registry.register(
+        "com/sun/tools/javac/util/SharedNameTable$NameImpl",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_javac_shared_name_equals,
+    );
+    registry.register(
+        "com/sun/tools/javac/util/StringNameTable$NameImpl",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_javac_shared_name_equals,
+    );
+    registry.register(
+        "org/springframework/core/test/tools/CompileWithForkedClassLoaderExtension",
+        "isUsingForkedClassPathLoader",
+        "(Lorg/junit/jupiter/api/extension/ExtensionContext;)Z",
+        native_spring_is_using_forked_class_path_loader,
     );
 
     registry.register(
@@ -52253,6 +52286,115 @@ fn native_javac_file_manager_list(ctx: &mut dyn NativeContext, args: &[Value]) -
     result
 }
 
+/// Converts a `PathFileObject` path to the binary name that javac derives by
+/// removing its final extension and replacing path separators with dots.
+///
+/// The three callers below already hand us a path relative to their respective
+/// classpath root: `RelativePath.path` for directories, a ZIP filesystem root
+/// relative path for jars, and a JRT path below `modules/<module>`. Keeping the
+/// transformation here explicit avoids re-entering the real-JDK Path and
+/// Locations machinery for every scanned class file.
+fn javac_binary_name_from_relative_path(path: &str) -> String {
+    let path = path.trim_start_matches(['/', '\\']);
+    let path = path.rsplit_once('.').map_or(path, |(stem, _)| stem);
+    path.replace(['/', '\\'], ".")
+}
+
+fn javac_binary_name_from_jrt_path(path: &str) -> Option<String> {
+    let path = path.trim_start_matches(['/', '\\']);
+    let rest = path.strip_prefix("modules/")?;
+    let (_, class_path) = rest.split_once(['/', '\\'])?;
+    Some(javac_binary_name_from_relative_path(class_path))
+}
+
+#[cfg(test)]
+#[test]
+fn javac_binary_name_from_path_matches_javac_path_file_objects() {
+    assert_eq!(
+        javac_binary_name_from_relative_path("org/springframework/aot/Hint.class"),
+        "org.springframework.aot.Hint"
+    );
+    assert_eq!(
+        javac_binary_name_from_relative_path("\\org\\springframework\\aot\\Hint.class"),
+        "org.springframework.aot.Hint"
+    );
+    assert_eq!(
+        javac_binary_name_from_jrt_path("/modules/java.base/java/lang/String.class"),
+        Some("java.lang.String".to_string())
+    );
+    assert_eq!(javac_binary_name_from_jrt_path("/not-modules/String.class"), None);
+}
+
+/// Native equivalent of the JDK 25 `JavacFileManager.inferBinaryName` fast
+/// path for the concrete `PathFileObject` variants returned by its file
+/// manager. The JDK bytecode first rebuilds the location path collection, then
+/// dispatches to a tiny variant-specific conversion. During Spring AOT's
+/// classpath scan that overhead is paid once per discovered class file.
+///
+/// Unknown JavaFileObject implementations deliberately delegate to bytecode:
+/// they can encode a binary name with semantics not represented by a path.
+fn native_javac_file_manager_infer_binary_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let location = obj_arg(args, 1)?;
+    let file = obj_arg(args, 2)?;
+    native_javac_file_manager_check_not_module_oriented_location(
+        ctx,
+        &[Value::Object(Some(this)), Value::Object(Some(location))],
+    )?;
+
+    let class_name = ctx.class_name_of_id(ctx.class_id_of_object(file)).unwrap_or_default();
+    let binary_name = match class_name.as_str() {
+        "com/sun/tools/javac/file/PathFileObject$DirectoryFileObject" => {
+            let relative_path = match ctx.get_field_by_name(file, "relativePath") {
+                Value::Object(Some(relative_path)) => match ctx.get_field_by_name(relative_path, "path") {
+                    Value::Object(Some(path)) => ctx.read_string(path),
+                    _ => None,
+                },
+                _ => None,
+            };
+            relative_path.map(|path| javac_binary_name_from_relative_path(&path))
+        }
+        "com/sun/tools/javac/file/PathFileObject$JarFileObject" => {
+            let path = match ctx.get_field_by_name(file, "path") {
+                Value::Object(Some(path)) => ctx
+                    .invoke_virtual(path, "toString", "()Ljava/lang/String;", &[])?
+                    .and_then(|value| match value {
+                        Value::Object(Some(path)) => ctx.read_string(path),
+                        _ => None,
+                    }),
+                _ => None,
+            };
+            path.map(|path| javac_binary_name_from_relative_path(&path))
+        }
+        "com/sun/tools/javac/file/PathFileObject$JRTFileObject" => {
+            let path = match ctx.get_field_by_name(file, "path") {
+                Value::Object(Some(path)) => ctx
+                    .invoke_virtual(path, "toString", "()Ljava/lang/String;", &[])?
+                    .and_then(|value| match value {
+                        Value::Object(Some(path)) => ctx.read_string(path),
+                        _ => None,
+                    }),
+                _ => None,
+            };
+            path.and_then(|path| javac_binary_name_from_jrt_path(&path))
+        }
+        _ => None,
+    };
+
+    if let Some(binary_name) = binary_name {
+        return Ok(Some(Value::Object(Some(ctx.create_string(&binary_name)))));
+    }
+    ctx.invoke_virtual_bytecode_only(
+        this,
+        "inferBinaryName",
+        "(Ljavax/tools/JavaFileManager$Location;Ljavax/tools/JavaFileObject;)Ljava/lang/String;",
+        &args[1..],
+    )
+}
+
 fn native_javac_path_and_container_compare_to(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -52277,6 +52419,102 @@ fn native_javac_string_name_hash_code(
         _ => String::new(),
     };
     Ok(Some(Value::Int(java_string_hash_code_ascii(&value))))
+}
+
+/// JDK 25 `Name.equals`: identity first, then exact concrete class and table,
+/// followed by the representation-specific name comparison. Shared names are
+/// indexed in their table; string-table names compare their String contents.
+fn native_javac_shared_name_equals(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let other = match args.get(1) {
+        Some(Value::Object(Some(other))) => *other,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if this == other {
+        return Ok(Some(Value::Int(1)));
+    }
+
+    let this_class = ctx.class_id_of_object(this);
+    if this_class != ctx.class_id_of_object(other) {
+        return Ok(Some(Value::Int(0)));
+    }
+    if ctx.get_field_by_name(this, "table") != ctx.get_field_by_name(other, "table") {
+        return Ok(Some(Value::Int(0)));
+    }
+
+    let class_name = ctx.class_name_of_id(this_class).unwrap_or_default();
+    let equal = match class_name.as_str() {
+        "com/sun/tools/javac/util/SharedNameTable$NameImpl" => {
+            ctx.get_field_by_name(this, "index") == ctx.get_field_by_name(other, "index")
+        }
+        "com/sun/tools/javac/util/StringNameTable$NameImpl" => {
+            let left = match ctx.get_field_by_name(this, "string") {
+                Value::Object(Some(value)) => ctx.read_string(value).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let right = match ctx.get_field_by_name(other, "string") {
+                Value::Object(Some(value)) => ctx.read_string(value).unwrap_or_default(),
+                _ => String::new(),
+            };
+            left == right
+        }
+        // The concrete representations above are the javac tables exercised by
+        // the real-JDK compiler path. Do not guess equality for an unfamiliar
+        // implementation: exact-class non-identical names are unequal here.
+        _ => false,
+    };
+    Ok(Some(Value::Int(equal as i32)))
+}
+
+/// Spring's forked compiler-test launcher sets the thread context class loader
+/// immediately before rediscovering the test. CratonVM can otherwise reuse the
+/// parent test class from its class cache, making Spring's original
+/// `testClass.getClassLoader()` check false and recursively launching the same
+/// test. The context loader is the authoritative state for that child run.
+/// Outside that state this delegates to the original private method.
+fn native_spring_is_using_forked_class_path_loader(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let this_pin = ctx.pin_native_root(this);
+    let is_forked = (|| {
+        let thread = ctx
+            .invoke("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;", &[])
+            .ok()
+            .flatten();
+        let Some(Value::Object(Some(thread))) = thread else {
+            return false;
+        };
+        let thread_pin = ctx.pin_native_root(thread);
+        let loader = ctx
+            .invoke(
+                "java/lang/Thread",
+                "getContextClassLoader",
+                "()Ljava/lang/ClassLoader;",
+                &[Value::Object(Some(thread))],
+            )
+            .ok()
+            .flatten();
+        ctx.unpin_native_roots(thread_pin);
+        matches!(loader, Some(Value::Object(Some(loader)))
+            if ctx.class_name_of_id(ctx.class_id_of_object(loader)).as_deref()
+                == Some("org/springframework/core/test/tools/CompileWithForkedClassLoaderClassLoader"))
+    })();
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    if is_forked {
+        return Ok(Some(Value::Int(1)));
+    }
+    ctx.invoke_virtual_bytecode_only(
+        this,
+        "isUsingForkedClassPathLoader",
+        "(Lorg/junit/jupiter/api/extension/ExtensionContext;)Z",
+        &args[1..],
+    )
 }
 
 fn javac_relative_path_string(ctx: &mut dyn NativeContext, obj: ObjectRef) -> String {
