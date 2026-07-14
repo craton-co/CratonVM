@@ -4407,6 +4407,47 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     };
 
     let info_key = info_ptr as usize;
+    // Cached HashMap-native fast path — the FIRST per-callsite probe. The
+    // resolution/insertion slow path stays further down (after the compile
+    // probes); this early block only serves sites the cache has already
+    // resolved. Rationale: `HashMap.put/get` are registered natives with no
+    // bytecode, so neither the Integer cache below nor the virtual-dispatch
+    // machinery can ever serve them — yet every map call paid those probes
+    // first. Probing the map cache first costs the (now direct-called on
+    // x64, hence rarely dispatched) Integer sites one extra hash lookup and
+    // saves one on every map operation. The receiver class-id equality
+    // check preserves the exact-receiver guard; the `any_class_redefined`
+    // gate matches the resolution site below. Runs ahead of the recursion
+    // depth guard like the Integer block: the cached callbacks are native
+    // leaves that never re-enter JIT code.
+    if matches!(info.invoke_kind, 0 | 2)
+        && !args_slice.is_empty()
+        && !crate::classloading::any_class_redefined()
+    {
+        let cached =
+            HASHMAP_NATIVE_DISPATCH_CACHE.with(|cache| cache.borrow().get(&info_key).copied());
+        if let Some(entry) = cached {
+            let receiver_raw = args_slice[0] as u64;
+            if receiver_raw != 0 && (receiver_raw & 0x7) == 0 && receiver_raw < (1u64 << 48) {
+                if let Some(receiver) = vm.heap.is_object_address(receiver_raw as usize) {
+                    if vm.heap.class_id_of(receiver).as_u32() == entry.receiver_class_id {
+                        if let Some((thread, _guard)) = jit_thread_mut() {
+                            if let Some(result) = call_hashmap_native_raw(
+                                vm,
+                                thread,
+                                info,
+                                receiver,
+                                args_slice,
+                                entry.callback,
+                            ) {
+                                return result;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     if !crate::classloading::any_class_redefined() {
         let cached =
             INTEGER_NATIVE_DISPATCH_CACHE.with(|cache| cache.borrow().get(&info_key).copied());
@@ -4452,48 +4493,6 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         Ok(g) => g,
         Err(sentinel) => return sentinel,
     };
-
-    // Cached HashMap-native fast path, checked BEFORE the virtual-dispatch
-    // machinery below. The resolution/insertion slow path stays further down
-    // (after the compile probes); this early block only serves sites the
-    // cache has already resolved. Rationale: `HashMap.put/get` are registered
-    // natives with no bytecode, so for these sites the virtual-dispatch fast
-    // path below can never install a compiled entry — yet every call still
-    // paid its full probe cost (`virtual_dispatch_target_for_receiver` +
-    // `get_loaded_class_id` + `mic_callee_has_exception_table`: three
-    // class-manager read locks and a recursive method walk) before falling
-    // through to the HashMap cache on the slow path. On the 1M put/get probe
-    // that wasted work was ~12% of total runtime. The receiver class-id
-    // equality check preserves the exact-receiver guard, and the
-    // `any_class_redefined` gate matches the resolution site below.
-    if matches!(info.invoke_kind, 0 | 2)
-        && !args_slice.is_empty()
-        && !crate::classloading::any_class_redefined()
-    {
-        let cached =
-            HASHMAP_NATIVE_DISPATCH_CACHE.with(|cache| cache.borrow().get(&info_key).copied());
-        if let Some(entry) = cached {
-            let receiver_raw = args_slice[0] as u64;
-            if receiver_raw != 0 && (receiver_raw & 0x7) == 0 && receiver_raw < (1u64 << 48) {
-                if let Some(receiver) = vm.heap.is_object_address(receiver_raw as usize) {
-                    if vm.heap.class_id_of(receiver).as_u32() == entry.receiver_class_id {
-                        if let Some((thread, _guard)) = jit_thread_mut() {
-                            if let Some(result) = call_hashmap_native_raw(
-                                vm,
-                                thread,
-                                info,
-                                receiver,
-                                args_slice,
-                                entry.callback,
-                            ) {
-                                return result;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     // Fast path: check thread-local dispatch cache for a previously-compiled callee.
     // This avoids the JIT cache lock on every call.
@@ -5073,16 +5072,71 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
         });
         if let Some(class_id) = cached_class {
             if let Some((thread, _guard)) = jit_thread_mut() {
-                use cratonvm_native_api::NativeContext as _;
-                let mut ctx = crate::vm::NativeContextImpl { shared: vm, thread };
-                let object = ctx.alloc_object(class_id, 1);
+                // Direct TLAB bump — the SAME allocation function
+                // `NativeContextImpl::alloc_object`'s TLAB arm uses (full
+                // header init, fresh identity hash), minus that method's
+                // per-call clamp-cache scan, alloc-pool probes and context
+                // plumbing. The slot count is the class's real declared
+                // field count, resolved once per (vm, class) below — so the
+                // undersized-layout clamp is honored, not skipped. TLAB
+                // exhaustion (or an oversized layout) falls back to the full
+                // allocator with its old-gen spill/batch behavior.
+                thread_local! {
+                    // (vm_key, class_id, slots) — invalidated implicitly by
+                    // the enclosing `any_class_redefined` gate (field counts
+                    // only change through redefinition).
+                    static INTEGER_ALLOC_SLOTS: std::cell::Cell<Option<(usize, u32, u32)>> =
+                        const { std::cell::Cell::new(None) };
+                }
+                let slots = INTEGER_ALLOC_SLOTS.with(|cache| {
+                    if let Some((vk, cid, slots)) = cache.get() {
+                        if vk == vm_key && cid == class_id.as_u32() {
+                            return slots as usize;
+                        }
+                    }
+                    let resolved = vm
+                        .class_manager
+                        .read()
+                        .get_class(class_id)
+                        .map(|c| c.num_total_fields.max(1))
+                        .unwrap_or(1);
+                    // Cast: field counts are far below u32::MAX.
+                    cache.set(Some((vm_key, class_id.as_u32(), resolved as u32)));
+                    resolved
+                });
+                use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+                let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+                let tlab_object = if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
+                    crate::runtime::interpreter::tlab_alloc_object(
+                        thread,
+                        vm,
+                        class_id,
+                        slots,
+                        requested_size,
+                    )
+                } else {
+                    None
+                };
+                let object = match tlab_object {
+                    Some(object) => object,
+                    None => {
+                        use cratonvm_native_api::NativeContext as _;
+                        // Reborrow: `thread` is used again after this arm for
+                        // the pending-return publication.
+                        let mut ctx = crate::vm::NativeContextImpl {
+                            shared: vm,
+                            thread: &mut *thread,
+                        };
+                        ctx.alloc_object(class_id, 1)
+                    }
+                };
                 // Direct descriptor-typed write: `Integer.value` is declared
                 // `int` (field 0, descriptor `I`) — skip `ctx.set_field`'s
                 // per-call `class_id_of` + descriptor resolution and hand the
                 // heap the same normalized store it would have produced.
                 vm.heap.set_field_as(object, 0, Value::Int(value), b'I');
                 // Object-return handoff root (see `call_integer_native_raw`).
-                ctx.thread.native_pending_return = Some(object);
+                thread.native_pending_return = Some(object);
                 return object.as_ptr() as i64;
             }
         }
