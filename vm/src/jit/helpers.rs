@@ -2066,6 +2066,33 @@ fn dbg_jit_alloc_filter() -> Option<u32> {
 // class_id_raw and num_fields must match the class metadata resolved at compile time.
 // The returned i64 is a raw heap pointer to the newly allocated object.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+/// DBG (CRATONVM_DBG_TLABMISS): count why `jit_new_object` fell past the
+/// TLAB arm — the bimodal-bt18 discriminator. reason: 0=oversized,
+/// 1=guarded-refill returned None, 2=JIT_THREAD TLS null. Prints a running
+/// breakdown every 2^20 misses.
+#[inline]
+fn dbg_tlabmiss(reason: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_TLABMISS").is_some()) {
+        return;
+    }
+    static COUNTS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    let n = COUNTS[reason].fetch_add(1, Ordering::Relaxed) + 1;
+    let total = COUNTS[0].load(Ordering::Relaxed)
+        + COUNTS[1].load(Ordering::Relaxed)
+        + COUNTS[2].load(Ordering::Relaxed);
+    if total & 0xFFFFF == 0 || (n == 1 && reason == 2) {
+        eprintln!(
+            "[tlabmiss] oversized={} refill_none={} jit_thread_null={}",
+            COUNTS[0].load(Ordering::Relaxed),
+            COUNTS[1].load(Ordering::Relaxed),
+            COUNTS[2].load(Ordering::Relaxed),
+        );
+    }
+}
+
 pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fields: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -2139,7 +2166,12 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
                 }
                 return obj_ref.as_ptr() as i64;
             }
+            dbg_tlabmiss(1); // guarded refill returned None
+        } else {
+            dbg_tlabmiss(2); // JIT_THREAD TLS pointer is null
         }
+    } else {
+        dbg_tlabmiss(0); // oversized for TLAB
     }
     // Fallible young → old-gen alloc (preserves alloc_object's old-gen spill);
     // on exhaustion surface a catchable OutOfMemoryError instead of the hard

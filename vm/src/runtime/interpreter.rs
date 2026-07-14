@@ -2026,6 +2026,53 @@ pub(crate) fn tlab_alloc_object_guarded_refill(
     tlab_alloc_object_inner(thread, shared, class_id, num_fields, total_size, true)
 }
 
+/// DBG (CRATONVM_DBG_TLABMISS): gate-failure state dump — the live young
+/// arena facts at the moment the guarded-refill young-room gate said no.
+/// Sampled every 2^20 failures (plus the first).
+fn dbg_refill_fail_state(shared: &SharedVm, requested: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_TLABMISS").is_some()) {
+        return;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n & 0xFFFFF == 1 {
+        let (used, cap, fl, largest) = shared.heap.young_arena_diag();
+        eprintln!(
+            "[gatefail] n={n} requested={requested} used={used}/{cap} free_list={fl} largest_free={largest} headroom={} has_free={}",
+            shared.heap.young_bump_headroom(requested),
+            shared.heap.young_has_free_block(requested),
+        );
+    }
+}
+
+/// DBG (CRATONVM_DBG_TLABMISS): which step of the guarded TLAB refill fails
+/// and with what request size. stage: 0=young-room gate, 1=refill_tlab
+/// returned None. Prints every 2^20 events per stage.
+#[inline]
+fn dbg_refill_fail(stage: usize, requested: usize) {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_TLABMISS").is_some()) {
+        return;
+    }
+    static COUNTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    static LAST_REQ: AtomicUsize = AtomicUsize::new(0);
+    LAST_REQ.store(requested, Ordering::Relaxed);
+    let n = COUNTS[stage].fetch_add(1, Ordering::Relaxed) + 1;
+    if n & 0xFFFFF == 1 {
+        eprintln!(
+            "[refillfail] gate={} refill_none={} last_requested={}",
+            COUNTS[0].load(Ordering::Relaxed),
+            COUNTS[1].load(Ordering::Relaxed),
+            requested,
+        );
+    }
+}
+
 #[inline(always)]
 fn tlab_alloc_object_inner(
     thread: &mut JvmThread,
@@ -2083,10 +2130,21 @@ fn tlab_alloc_object_inner(
     // check, then the amortized-O(1) reclaimed-span probe. Otherwise bail to
     // the caller's non-TLAB fallback (old-gen spill). See the wrapper doc
     // for the failure modes this gate was shaped by.
+    // Fragmentation-tolerant free-block probe: any reclaimed span that can
+    // hold a minimum-sized TLAB is worth refilling from — `refill_tlab`'s
+    // fragmentation fallback serves the largest available block capped at
+    // `requested` (see the wedge note there). Probing for the FULL
+    // `requested` size wedged this gate shut on a free list made entirely of
+    // just-under-`requested` split remnants (the bimodal-bt18 4.5s mode:
+    // ~2 GiB of 131056-byte blocks vs a 131072-byte request, every
+    // allocation crawling through the per-object slow path while the young
+    // collection that would re-coalesce them never triggered).
+    let free_block_floor = cratonvm_gc::tlab::min_tlab_size().max(256).min(requested);
     if refill_needs_young_room
         && !shared.heap.young_bump_headroom(requested)
-        && !shared.heap.young_has_free_block(requested)
+        && !shared.heap.young_has_free_block(free_block_floor)
     {
+        dbg_refill_fail_state(shared, requested);
         return None;
     }
 
@@ -2113,6 +2171,9 @@ fn tlab_alloc_object_inner(
     thread.tlab.retire();
 
     let refill = shared.heap.refill_tlab(requested);
+    if refill.is_none() {
+        dbg_refill_fail(1, requested);
+    }
     if let Some((buf, size)) = refill {
         shared.tlab_refill_count.fetch_add(1, Ordering::Relaxed);
         // SAFETY: buf and size were just returned by the arena allocator and the memory is zeroed.
@@ -18868,6 +18929,8 @@ fn coerce_arg(
 /// any case we can't decide without risk all pass without throwing.
 fn checkcast_lambda_instantiated_args(
     shared: &SharedVm,
+    thread: &JvmThread,
+    handles: &[Option<usize>],
     sam_desc: &str,
     inst_desc: &str,
     args: &[Value],
@@ -18889,10 +18952,26 @@ fn checkcast_lambda_instantiated_args(
             continue;
         }
         // SAM-supplied args follow the captures in `args`.
-        let obj_ref = match args.get(num_captures + sam_idx) {
-            Some(Value::Object(Some(o))) => *o,
-            // null (a `checkcast` of null always succeeds), primitive, or missing.
-            _ => continue,
+        //
+        // GC-safety: `args` is a plain Rust Vec copy handed to us by the
+        // caller, not itself a GC root -- only `thread.native_pin_roots`
+        // (which the caller pinned every object arg into before this call)
+        // is remapped by a moving GC. A prior loop iteration's
+        // `lambda_arg_provably_not_instance` call can trigger a GC via its
+        // proxy/annotation-satisfies helpers, which leaves any later
+        // `args[idx]` read here pointing at a stale, already-evacuated
+        // address. Read the CURRENT address back through the caller's pin
+        // (`handles`) instead of the raw `args` slice. Confirmed live via
+        // CRATONVM_DBG_STALE_OBJREF during WildFly parallel-extension-add --
+        // see docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+        let idx = num_captures + sam_idx;
+        let obj_ref = match handles.get(idx).copied().flatten() {
+            Some(h) => thread.native_pin_roots[h],
+            None => match args.get(idx) {
+                Some(Value::Object(Some(o))) => *o,
+                // null (a `checkcast` of null always succeeds), primitive, or missing.
+                _ => continue,
+            },
         };
         if lambda_arg_provably_not_instance(shared, obj_ref, inst_tok) {
             let obj_class_name = shared
@@ -19189,9 +19268,15 @@ pub fn coerce_lambda_args(
     // have performed, so a narrowed type variable still raises
     // `ClassCastException` for an incompatible argument. Runs before the
     // box/unbox coercion below, mirroring the bridge's cast-then-adapt order.
-    if let Err(e) =
-        checkcast_lambda_instantiated_args(shared, sam_desc, inst_desc, args, num_captures)
-    {
+    if let Err(e) = checkcast_lambda_instantiated_args(
+        shared,
+        thread,
+        &handles,
+        sam_desc,
+        inst_desc,
+        args,
+        num_captures,
+    ) {
         thread.native_pin_roots.truncate(pin_base);
         return Err(e);
     }

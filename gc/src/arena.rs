@@ -486,7 +486,11 @@ impl Arena {
             self.cursor,
         );
         let old_base = self.data.as_ptr();
+        let old_capacity = self.data.len();
         self.data.resize(new_capacity, 0);
+        if std::env::var_os("CRATONVM_DBG_YOUNGSTATE").is_some() {
+            eprintln!("[youngstate] arena-grow {old_capacity} -> {new_capacity} bytes");
+        }
         old_base
     }
 

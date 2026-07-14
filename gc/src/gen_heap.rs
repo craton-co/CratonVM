@@ -3256,6 +3256,22 @@ impl GenerationalHeap {
             // `.expect(...)` panicked (monitor.rs registry/mark-word desync).
             // Re-key the registry here, identically to the moving path.
             monitors.remap_after_gc(&result.0.pointer_map);
+            // DBG (CRATONVM_DBG_YOUNGSTATE): post-collection young/old arena
+            // state — the bimodal-bt18 discriminator (is young allocatable
+            // after this sweep, and from which structure?).
+            if std::env::var_os("CRATONVM_DBG_YOUNGSTATE").is_some() {
+                let from = self.young_from.lock();
+                let og = self.old_gen.lock();
+                eprintln!(
+                    "[youngstate] post-sweep used={}/{} free_list={} largest_free={} old={}/{}",
+                    from.used(),
+                    from.capacity(),
+                    from.free_list_bytes(),
+                    from.largest_free_block(),
+                    og.used(),
+                    og.capacity(),
+                );
+            }
             return result;
         }
 
@@ -7316,6 +7332,19 @@ impl GenerationalHeap {
         self.young_from.lock().has_free_block_at_least(size)
     }
 
+    /// DBG: one-shot young-arena state snapshot `(used, capacity,
+    /// free_list_bytes, largest_free_block)` — diagnostics only (full
+    /// free-list scans under the lock).
+    pub fn young_arena_diag(&self) -> (usize, usize, usize, usize) {
+        let from = self.young_from.lock();
+        (
+            from.used(),
+            from.capacity(),
+            from.free_list_bytes(),
+            from.largest_free_block(),
+        )
+    }
+
     /// Carve out a TLAB-sized chunk from the young from-space.
     ///
     /// Returns `Some((ptr, size))` on success, where `ptr` is the start of
@@ -7341,11 +7370,40 @@ impl GenerationalHeap {
             return None; // Not enough for a useful TLAB
         }
         let actual_size = requested_size.min(available);
-        let ptr = from.alloc(actual_size, 8)?;
-        // Zero the TLAB region
-        // SAFETY: `ptr` was just allocated from the arena with `actual_size` bytes; zeroing is within bounds.
-        unsafe { std::ptr::write_bytes(ptr, 0, actual_size) };
-        Some((ptr, actual_size))
+        if let Some(ptr) = from.alloc(actual_size, 8) {
+            // Zero the TLAB region
+            // SAFETY: `ptr` was just allocated from the arena with `actual_size` bytes; zeroing is within bounds.
+            unsafe { std::ptr::write_bytes(ptr, 0, actual_size) };
+            return Some((ptr, actual_size));
+        }
+        // Fragmentation fallback (the bimodal-bt18 wedge): no single span fits
+        // `actual_size`, but a smaller one can still make a useful TLAB.
+        // Steady-state refills carve exact `requested_size` chunks out of the
+        // sweep's coalesced spans; the split leftovers converge on blocks a
+        // few bytes SHORT of the adaptive sizer's request (observed: a ~2 GiB
+        // free list made entirely of 131056-byte blocks vs. a 131072-byte
+        // request). Without this fallback the refill gate then fails on every
+        // allocation while tiny object allocations keep succeeding off the
+        // remnants — so the young collection (whose coalescer would heal the
+        // fragmentation) is never triggered either, and the entire rest of
+        // the run crawls through the per-object slow path (bt18: 1.9s → 4.5s
+        // on a ~50% coin flip of whether the post-sweep workload outlasted
+        // the recycled spans). Serving the largest available block (capped at
+        // the request, floored at a useful TLAB size) keeps the remnants
+        // flowing through the bump fast path instead; the cost — one
+        // O(free-list) largest-block scan — is paid once per served TLAB,
+        // not per object.
+        let largest = from.largest_free_block();
+        let floor = crate::tlab::min_tlab_size().max(256);
+        if largest >= floor {
+            let take = largest.min(actual_size);
+            if let Some(ptr) = from.alloc(take, 8) {
+                // SAFETY: `ptr` was just allocated from the arena with `take` bytes; zeroing is within bounds.
+                unsafe { std::ptr::write_bytes(ptr, 0, take) };
+                return Some((ptr, take));
+            }
+        }
+        None
     }
 
     /// Allocate bytes in the young from-space and initialize the object before

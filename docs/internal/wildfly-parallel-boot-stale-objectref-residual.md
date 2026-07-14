@@ -543,3 +543,43 @@ next (smaller, WildFly-boot-relevant, realistic to finish in one session) before
 Phase-N files.
 
 **Addendum**: servlet.rs (14 functions, full pass) and spring_startup_bootstrap.rs (19 functions, full pass) were both fully triaged and fixed same-day by a sub-agent of this sweep session — commit 2d609591 (merged on top of e3d5fbb4/139e2644). Both files are now COMPLETE, not partial ("still-untriaged" list above should drop them). cargo test -p cratonvm-native-builtins --lib: 2983 passed / 7 failed, identical pre-existing baseline.
+
+## WFLYCTL0153 CLOSED (2026-07-14) — root cause + fix
+
+The `WFLYCTL0153: No META-INF/services/.../Extension found` recurrence flagged in the prior session's
+addendum (and originally characterized across 3 earlier sessions as a genuinely concurrent
+`DeferredExtensionContext` race) is now root-caused and fixed: `dev` commit `9b153844` (merging
+`a0b0289a`, branch `fix/wflyctl0153-race-20260714`).
+
+**Root cause**: several more Family-1 stale-ObjectRef-across-GC sites, root-caused via live
+`CRATONVM_DBG_STALE_OBJREF=1 RUST_BACKTRACE=1` debugging against the isolated repro (poll-the-crash
+technique, not static analysis this time):
+- `native-collections/src/lib.rs`: `native_al_hash_code`, `native_map_put_evict_pinned`,
+  `native_hashmap_get_exact`, `native_map_contains_key`, `comparator_compare` (the
+  `ToIntFunction`/`ToLongFunction`/`ToDoubleFunction`/key-extractor-`Function` dispatch arms —
+  functionally identical fix to one an independent concurrent session ALSO landed same-day as
+  "Family-1 stale-ObjectRef fix (2026-07-13, follow-up)"; the merge conflict was comment-text-only, code
+  was byte-identical), `lhm_init_with_cap` — HashMap/ArrayList/LinkedHashMap natives holding `this`/a
+  search key/a bucket-chain `node` across a Java `hashCode()`/`equals()`/`compareTo()` dispatch (a
+  moving-GC risk) without pinning.
+- `vm/src/runtime/interpreter.rs`: `checkcast_lambda_instantiated_args` read a raw `args` slice element
+  after a prior loop iteration's own GC-risking call, instead of reading back through the caller's
+  already-established `native_pin_roots` handles.
+
+**Verification**: iterative `CRATONVM_DBG_STALE_OBJREF` diagnostic loops (25 attempts each) went from
+18/25 panics on an early candidate to 0/25 reproducing these specific call chains on the final candidate;
+a follow-on 20-attempt PRODUCTION-mode (no debug flag) isolated repro of the original WFLYCTL0153 symptom:
+**0/20 occurrences** (vs ~1/15 historical baseline — the exact symptom this doc has tracked across 3+
+sessions). `cargo test -p cratonvm-native-builtins --lib` / `-p cratonvm-vm --lib` both clean vs baseline.
+
+**Important caveat — the debug flag surfaced a MUCH larger remaining backlog, not fully mined**: even on
+the final fixed binary, `CRATONVM_DBG_STALE_OBJREF` still panicked on a large fraction of repro attempts
+(the fix above closes the sites that were reachable from THIS specific symptom's call chain, not the
+whole boot path). Raw per-attempt logs with full backtraces from this session's iterative debugging are
+preserved at `/data/data/wt-wflyctl0153-20260714-repro/out-fix2-diag/` and `out-fix3-diag/` (Azure host) —
+each `HIT_staleobjref_N.log` has a full stack trace pinpointing an exact file:line. This is a rich,
+live-confirmed data source for whoever continues the static-analysis sweep next: mining these logs for
+distinct call sites (dedupe by the innermost non-generic frame, e.g. `grep -A20 'panicked at
+gc/src/gen_heap.rs'`) will likely surface real sites faster than another blind static scan, though note
+the logs span several iterations of an evolving fix candidate so not every panic in them is still live on
+current `dev` — cross-check against the final commit's diff before assuming a given site is still open.
