@@ -4922,6 +4922,58 @@ pub fn execute(
                                 ));
                                 continue;
                             }
+                            // `Integer.valueOf(I)` thin direct call — statically
+                            // bound NATIVE callee, so the eager callee compile can
+                            // never succeed and the generic dispatch round trip is
+                            // pure fixed overhead on the hottest autoboxing path.
+                            // Parity with the recognition in `jit::try_compile`;
+                            // see `jit::helpers::jit_integer_value_of_direct`.
+                            if invoke_kind == 3
+                                && target_class == "java/lang/Integer"
+                                && method_name_ref == "valueOf"
+                                && descriptor_ref == "(I)Ljava/lang/Integer;"
+                            {
+                                // VM crate: take the helper's address directly —
+                                // no registration-order dependency (the atomic in
+                                // the jit crate is only for `jit::try_compile`,
+                                // which cannot name VM symbols).
+                                let entry = crate::jit::helpers::jit_integer_value_of_direct
+                                    as *const () as usize;
+                                direct_calls_early.push((
+                                    pc,
+                                    crate::jit::JitDirectCall {
+                                        entry,
+                                        needs_context: true,
+                                        num_params: 1,
+                                        return_type: b'L',
+                                        guard_class_id: 0,
+                                    },
+                                ));
+                                continue;
+                            }
+                            // `Integer.intValue()` thin direct call — `Integer`
+                            // is `final`, so a site declared against it is
+                            // statically monomorphic (guard-free); the helper
+                            // handles the null-receiver NPE itself.
+                            if invoke_kind == 0
+                                && target_class == "java/lang/Integer"
+                                && method_name_ref == "intValue"
+                                && descriptor_ref == "()I"
+                            {
+                                let entry = crate::jit::helpers::jit_integer_int_value_direct
+                                    as *const () as usize;
+                                direct_calls_early.push((
+                                    pc,
+                                    crate::jit::JitDirectCall {
+                                        entry,
+                                        needs_context: true,
+                                        num_params: 0,
+                                        return_type: b'I',
+                                        guard_class_id: 0,
+                                    },
+                                ));
+                                continue;
+                            }
                             // Defer trivial `<init>()V` sites for after-lock
                             // elidability resolution (see the block + pending
                             // list comments above).
@@ -26769,6 +26821,62 @@ fn compile_osr_artifact(
                                 needs_context: false,
                                 num_params: 1,
                                 return_type: b'D',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                    // `Integer.valueOf(I)` thin direct call — statically bound
+                    // NATIVE callee, so the eager callee compile below can never
+                    // succeed and the generic dispatch round trip is pure fixed
+                    // overhead on the hottest autoboxing path. Parity with the
+                    // recognition in `jit::try_compile`; see
+                    // `jit::helpers::jit_integer_value_of_direct`. This OSR-tier
+                    // site matters most: a single-invocation harness method
+                    // (e.g. a benchmark main loop) runs its entire life inside
+                    // the OSR body.
+                    if invoke_kind == 3
+                        && target_class == "java/lang/Integer"
+                        && mn == "valueOf"
+                        && desc == "(I)Ljava/lang/Integer;"
+                    {
+                        // VM crate: take the helper's address directly — no
+                        // registration-order dependency. (This OSR path calls
+                        // `build_helpers` — which registers the jit-crate
+                        // atomic — only AFTER this construction block, so the
+                        // first OSR compile in a process would read 0 there.)
+                        let entry = crate::jit::helpers::jit_integer_value_of_direct
+                            as *const () as usize;
+                        direct_calls2.push((
+                            pc,
+                            crate::jit::JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 1,
+                                return_type: b'L',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                    // `Integer.intValue()` thin direct call — `Integer` is
+                    // `final`, so a site declared against it is statically
+                    // monomorphic (guard-free); the helper handles the
+                    // null-receiver NPE itself.
+                    if invoke_kind == 0
+                        && target_class == "java/lang/Integer"
+                        && mn == "intValue"
+                        && desc == "()I"
+                    {
+                        let entry = crate::jit::helpers::jit_integer_int_value_direct
+                            as *const () as usize;
+                        direct_calls2.push((
+                            pc,
+                            crate::jit::JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 0,
+                                return_type: b'I',
                                 guard_class_id: 0,
                             },
                         ));
