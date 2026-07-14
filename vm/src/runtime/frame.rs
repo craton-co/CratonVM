@@ -589,6 +589,13 @@ impl Frame {
         self.osr_attempt_counts.push((entry_pc, 1));
     }
 
+    /// Throttle the next poll while an off-thread OSR compile is pending without
+    /// consuming the bounded permanent-rejection budget.
+    #[inline]
+    pub fn record_osr_background_pending(&mut self) {
+        self.backward_count = 0;
+    }
+
     /// Create a new frame for a method (converts owned String/Vec to Arc).
     ///
     /// `args` are copied into the first local variable slots.
@@ -2664,5 +2671,28 @@ mod tests {
         );
         assert_eq!(frame.pc, 0);
         assert_eq!(frame.backward_count, 0);
+    }
+
+    #[test]
+    fn background_osr_pending_restarts_stride_without_spending_rejection() {
+        let mut frame = Frame::new(
+            ClassId::new(0),
+            "Test".to_string(),
+            "hotLoop".to_string(),
+            "()V".to_string(),
+            None,
+            vec![0xb1],
+            vec![],
+            1,
+            1,
+            &[],
+        );
+        frame.backward_count = 10_000;
+        frame.osr_attempt_counts.push((4, 2));
+
+        frame.record_osr_background_pending();
+
+        assert_eq!(frame.backward_count, 0);
+        assert_eq!(frame.osr_attempt_counts, vec![(4, 2)]);
     }
 }
