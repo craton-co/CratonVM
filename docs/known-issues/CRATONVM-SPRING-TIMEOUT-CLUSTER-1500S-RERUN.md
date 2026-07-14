@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN (12 genuinely hung, 10 slow-but-failing, 1 crash; 2 non-residual items removed). **2026-07-13 update**: 8 Bucket-1 + 3 Bucket-2 classes reconfirmed locally — one narrower bug fixed (`7ae137e4`), the hang itself still OPEN; see the 2026-07-13 section below. **2026-07-13 update #2**: `context.annotation.ImportSelectorTests`'s `StackOverflowError` root-caused — it is a Mockito `spy()` cross-hierarchy recursion, **unrelated to Spring's `ImportSelector` mechanism** (the original hypothesis below was wrong); still OPEN, see its own section. **2026-07-13 update #3**: both `web.service.registry.*` residuals (`ImportHttpServiceRegistrarTests`, `GroupsMetadataValueDelegateTests`) root-caused to `@CompileWithForkedClassLoader`'s custom-ClassLoader machinery interacting with Spring's AOT/test-compiler pipeline — two distinct defects, neither fixed; still OPEN, see dedicated section. **2026-07-13 update #4**: the 4 non-AOT, non-`ImportSelectorTests` Bucket-1 classes (`cache.jcache.JCacheEhCacheAnnotationTests`, `context.annotation.ComponentScanParserBeanDefinitionDefaultsTests`, `context.annotation.InitDestroyMethodLifecycleTests`, `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests`) **no longer hang** — reconfirmed clean on 2 independent runs each against a freshly-built `origin/dev` tip; see the dedicated section below. No new code was needed — all 4 were incidental beneficiaries of other unrelated fixes already on `dev`. **2026-07-13 update #5**: the "missing `ApiVersionStrategy` bean" `BeanCreationException` (2 classes: `CrossOriginAnnotationIntegrationTests`, `RequestMappingMessageConversionIntegrationTests`) **no longer reproduces** — confirmed fixed (likely a side effect of earlier JSpecify/reflection work), but both classes now fail a different way instead: a genuine **deadlock in `Semaphore.release()`'s internal monitor**, confirmed via a live `gdb` thread dump. Still OPEN, new root cause, see dedicated section. |
+| **Status** | OPEN (12 genuinely hung, 10 slow-but-failing, 0 crash — 1 FIXED; 2 non-residual items removed). **2026-07-13 update**: 8 Bucket-1 + 3 Bucket-2 classes reconfirmed locally — one narrower bug fixed (`7ae137e4`), the hang itself still OPEN; see the 2026-07-13 section below. **2026-07-13 update #2**: `context.annotation.ImportSelectorTests`'s `StackOverflowError` root-caused — it is a Mockito `spy()` cross-hierarchy recursion, **unrelated to Spring's `ImportSelector` mechanism** (the original hypothesis below was wrong); still OPEN, see its own section. **2026-07-13 update #3**: both `web.service.registry.*` residuals (`ImportHttpServiceRegistrarTests`, `GroupsMetadataValueDelegateTests`) root-caused to `@CompileWithForkedClassLoader`'s custom-ClassLoader machinery interacting with Spring's AOT/test-compiler pipeline — two distinct defects, neither fixed; still OPEN, see dedicated section. **2026-07-13 update #4**: the 4 non-AOT, non-`ImportSelectorTests` Bucket-1 classes (`cache.jcache.JCacheEhCacheAnnotationTests`, `context.annotation.ComponentScanParserBeanDefinitionDefaultsTests`, `context.annotation.InitDestroyMethodLifecycleTests`, `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests`) **no longer hang** — reconfirmed clean on 2 independent runs each against a freshly-built `origin/dev` tip; see the dedicated section below. No new code was needed — all 4 were incidental beneficiaries of other unrelated fixes already on `dev`. **2026-07-13 update #5**: the "missing `ApiVersionStrategy` bean" `BeanCreationException` (2 classes: `CrossOriginAnnotationIntegrationTests`, `RequestMappingMessageConversionIntegrationTests`) **no longer reproduces** — confirmed fixed (likely a side effect of earlier JSpecify/reflection work), but both classes now fail a different way instead: a genuine **deadlock in `Semaphore.release()`'s internal monitor**, confirmed via a live `gdb` thread dump. Still OPEN, new root cause, see dedicated section. **2026-07-13 update #6**: Bucket 3's `scripting.groovy.GroovyScriptFactoryTests` SIGSEGV **FIXED** (`2724ea5b`, pushed to `dev`) — root cause was a JIT codegen bug (stale deferred patch-list offsets surviving a rewound speculative-inline attempt, corrupting a later safepoint-id store in a hot, frequently-recompiled method); see dedicated section below. |
 | **Discovered** | 2026-07-11, following up on the 25 classes that hit TIMEOUT in the
 125-class scoped rerun (dev `9948295e`, standard 120s timeout — see
 [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](../internal/CRATONVM-SPRING-GENUINE-BUGLIST-125.md)). |
@@ -964,9 +964,9 @@ rather than a coincidence:
 | Class | Status | Elapsed | Pass/Total | First FAILCAUSE |
 |---|---|--:|--:|---|
 | `orm.jpa.support.InjectionCodeGeneratorTests` | FAIL → **TIMEOUT as of 2026-07-13** | 206s | 3/10 | `CompilationException: Unable to compile source` → now hangs instead, see [2026-07-13 update](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open) |
-| `web.socket.messaging.StompWebSocketIntegrationTests` | FAIL | 169s | 0/16 | `ServletException` / `UnsatisfiedDependencyException` (no `MessageHandler` bean) |
+| `web.socket.messaging.StompWebSocketIntegrationTests` | FAIL -> **TIMEOUT as of 2026-07-14** | 169s -> 600s+ (2x) | 0/16 -> 0/0 | `ServletException`/`UnsatisfiedDependencyException` (no `MessageHandler` bean) -> **bean/startup bug no longer reproduces**, now hangs instead, see 2026-07-14 update below |
 | `web.reactive.result.method.annotation.CrossOriginAnnotationIntegrationTests` | FAIL → **TIMEOUT as of 2026-07-13** | 492s → 600s×2 (+1500s dedicated probe) | 0/68 → 0/0 | `BeanCreationException`: no `ApiVersionStrategy` bean → **bean bug fixed**, now deadlocks in `Semaphore.release()`'s monitor instead, see [2026-07-13 update #5](#2026-07-13-local-investigation-5--missing-apiversionstrategy-bean-resolved-both-classes-now-hit-a-different-new-deadlock-still-open) |
-| `web.servlet.mvc.method.annotation.ServletAnnotationControllerHandlerMethodTests` | FAIL | 445s | 211/241 | `AssertionFailedError` (mostly passing — a real partial failure) |
+| `web.servlet.mvc.method.annotation.ServletAnnotationControllerHandlerMethodTests` | **FIXED 2026-07-14** | 445s -> 149s | 211/241 -> **241/241** | Two native bugs, both fixed (`cd90774e`, `72a9ad40`): `PrintWriter.write(String)` bypassed subclass `write(String,int,int)` overrides (broke Spring test fixture auto-flush); `Matcher.group(int)` assumed cached text was always `java.lang.String`, threw spurious `NoSuchMethodError` on a general `CharSequence` (e.g. `AntPathMatcher`'s `MaxAttemptsCharSequence`) |
 | `beans.factory.aot.BeanDefinitionPropertiesCodeGeneratorTests` | FAIL → **TIMEOUT as of 2026-07-13** | 693s | 0/47 | `CompilationException: Unable to compile source` → now hangs instead, see [2026-07-13 update](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open) |
 | `beans.factory.aot.InstanceSupplierCodeGeneratorTests` | FAIL → **TIMEOUT as of 2026-07-13** | 730s | 4/26 | `CompilationException: Unable to compile source` → now hangs instead, see [2026-07-13 update](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open) |
 | `web.service.registry.ImportHttpServiceRegistrarTests` | FAIL, root-caused 2026-07-13 (still OPEN) | 763s (10s on the 2026-07-13 isolated rerun) | 3/5 | `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;` in `ConfigurationClassParser$SourceClass.getAnnotationAttributes` — see dedicated section below |
@@ -1009,14 +1009,124 @@ Notable sub-clusters within this bucket (candidates for shared root cause):
   Spring `ImportSelector`/`ConfigurationClassParser` recursion as originally
   guessed — reproduces standalone with no Spring context involved at all.
 
-## Bucket 3 — Immediate crash, not a hang (1/25)
+## 2026-07-14 local investigation — StompWebSocketIntegrationTests: one real bug fixed, class still doesn't pass (a different, deeper hang) — OPEN
 
-- `scripting.groovy.GroovyScriptFactoryTests` — **ABEND**, `rc=139` (SIGSEGV),
-  crashes during VM bootstrap warmup (`Post-clinit fixup` lines only, no test
-  discovery output), `found=0`. This is a crash-on-load, categorically
-  different from the TIMEOUT/hang classes above — was previously
-  misclassified as TIMEOUT purely because it also exceeded 120s (the crash
-  itself doesn't happen instantly; something before it is slow too).
+Worktree `cratonvm-stompws-20260713` on the Azure host, branch
+`fix/stompws-cluster-20260713`, merged to `origin/dev` (commit `0bb89ebf`,
+plus a doc-only follow-up).
+
+**What was fixed and verified real:** `SocketChannel.read`/`write`/`accept`
+(plain blocking mode) and `AsynchronousSocketChannel`'s underlying
+blocking-recv-faked-as-async read/write natives
+(`native-builtins/src/phases_late.rs`) had **zero `begin_blocking_region`/
+`end_blocking_region` bracket** around the genuinely-blocking OS `recv()`/
+`send()`/`accept()` syscall. A thread parked in one of these can never reach
+a JIT-takeover safepoint on its own, so a concurrent STW pause that expects
+every mutator to cooperate waits forever (`pending=1 taken=0`) — this is the
+same "STW cross-thread JIT takeover" bug class documented in
+[`docs/known-issues/tomcat-08-07/stw-crossthread-jit-takeover-hang-cluster.md`](tomcat-08-07/stw-crossthread-jit-takeover-hang-cluster.md),
+applied here to a different subsystem (raw socket I/O rather than locks/
+`IoFuture`). `origin/dev` already had an independent, concurrently-landed
+fix for the *async*-channel half of this (same root cause, found via a
+different investigation) but without ObjectRef-relocation tracking across
+the blocking window; the merge kept this session's more complete
+`end_blocking_region_refs`-based version. This fix is real, confirmed via
+live gdb (thread genuinely parked in `tcp_read`/`recv()` with no
+`begin_blocking_region` before the fix), and is independently valuable
+(protects any future test that hits these exact native call sites during a
+concurrent GC pause) even though — see below — it doesn't make this specific
+class pass.
+
+**Why the class still doesn't pass:** the original `ServletException`/
+`UnsatisfiedDependencyException` ("no `MessageHandler` bean") failure no
+longer reproduces at all — likely fixed as an incidental side effect of
+other AOT/annotation-processing work that landed on `dev` this week, the
+same pattern seen with the `ApiVersionStrategy` bean cluster below. With
+that gone, the test gets much further: it actually opens a STOMP connection
+and starts exchanging messages, then hits a **genuine, different hang** —
+confirmed via a live gdb `thread apply all bt` on a stuck 2026-07-14 rerun
+(binary `cratonvm-stompws-final.bin`, both a 600s batch attempt and the
+600s individual crash-recovery retry timed out identically):
+
+- `main-vm` (the test's own thread) is parked in a plain
+  `LockSupport.park()` (`native_lock_support_park`), reached via a
+  reflective `Method.invoke` call chain — consistent with a test-framework
+  timeout/await helper (e.g. a `CountDownLatch.await(timeout)` or
+  `CompletableFuture.get(timeout)` wrapper) waiting on a result that never
+  arrives.
+- A `SimpleAsyncTaskExecutor`-spawned thread is correctly parked inside
+  `tcp_read()`/`recv()` — **with the STW-cooperation fix above already
+  covering this exact call site** (`phases_late.rs` line ~38221, the
+  `AsynchronousSocketChannel` async-channel read path) — genuinely blocked
+  waiting for incoming socket data that never arrives, not spinning or
+  deadlocked at the VM level.
+
+This is **not** the STW-takeover bug: `begin_blocking_region` is correctly
+in effect (verified by inspecting the frame — the fix from this session is
+active on the exact code path caught mid-hang), so a concurrent STW pause
+would NOT wait on this thread. The test is stuck because **no STOMP message
+ever arrives** on that socket — a functional gap somewhere in message
+routing/broker delivery, not a VM-level concurrency bug. Root cause not yet
+found; needs tracing on the server (broker) side to see whether it's
+sending the expected frame at all, or a client-side subscription/session
+bug. Left as the open item for a future session.
+
+## Bucket 3 — Immediate crash, not a hang (0/25 — FIXED 2026-07-13)
+
+- `scripting.groovy.GroovyScriptFactoryTests` — was **ABEND**, `rc=139`
+  (SIGSEGV), crashing during VM bootstrap warmup (`Post-clinit fixup` lines
+  only, no test discovery output), `found=0`. **FIXED, commit `2724ea5b` on
+  `dev`.**
+
+  **Root cause**: a JIT codegen bug in the speculative-inlining rollback path
+  (`try_emit_inline`, `jit/src/x64.rs`). When a speculative inline attempt for
+  a callee bails partway through, the compiler already rewound the code
+  buffer position, operand stack, oop-mark vector, and spill cursor — but did
+  **not** roll back seven other deferred patch-list `Vec`s
+  (`exception_check_stubs`, `deopt_stubs`, `forward_patches`,
+  `jump_table_patches`, `self_call_patches`, `bounds_check_stubs`,
+  `null_check_store_stubs`). Any bytecode instruction the abandoned inline
+  attempt simulated (e.g. an inlined `invoke*` via
+  `emit_post_invoke_exception_check`) could push a raw buffer offset onto one
+  of those Vecs. That offset is only meaningful while it still points at the
+  placeholder bytes live when it was recorded; after a bail the buffer is
+  rewound and the fall-through normal-call path emits *different* code over
+  that same range, but the stale offset survived and was blindly patched
+  later — once, at the very end of `compile_bytecode`, over the FINAL,
+  already-reused buffer — corrupting whatever real instruction now occupied
+  that offset.
+
+  Concretely, on `groovyjarjarasm.asm.Handler.getExceptionTableSize`
+  (`return 2 + 8 * getExceptionTableLength(firstHandler)`, pulled in hot by
+  Groovy's ASM-based class generation under `GroovyScriptFactoryTests`, and
+  JIT-compiled very early in bootstrap) a stale `exception_check_stubs` entry
+  from a rewound inline attempt got 4-byte-patched into the middle of the
+  *kept* method's precise-maps safepoint-id store, replacing its bytecode-PC
+  immediate with garbage and clobbering the REX.W prefix of the very next
+  store instruction. Execution ran straight off the end of the mangled `mov`
+  into undefined bytes that happened to decode as a wild memory-writing
+  `ADD`, producing an immediate SIGSEGV the instant the (extremely hot)
+  method next ran — well before JUnit test discovery even started, matching
+  the observed `found=0` / `Post-clinit-fixup`-only crash signature exactly.
+  Root-caused via a live gdb attach on the JIT-compiled method (mapped
+  `r-xp` region with no symbol, located precisely via a `CRATONVM_DBG_JIT_NAMES`
+  entry-address diagnostic added during the investigation) plus a targeted
+  `CRATONVM_DBG_SPID` eprintln bisection confirming the safepoint-id store's
+  operands were corrupted; `CRATONVM_NO_PRECISE_JIT_MAPS=1` (which skips the
+  clobbered code path entirely) was the confirming A/B signal before the
+  precise fix landed.
+
+  **Fix**: snapshot the length of all seven deferred patch-list `Vec`s before
+  a speculative inline attempt and `truncate()` them back on bail, mirroring
+  the pre-existing buffer/stack/oop-mark/spill-cursor rollback.
+
+  **Verified**: rebuilt from a clean worktree synced to the merged `dev` tip
+  (`2724ea5b`) and reran the real class through `apps/spring-suite-runner/suite-run.sh`
+  with the doc's exact recipe (`BATCH=1 BATCH_TO=1500 ONE_TO=1500
+  CRATONVM_DEFAULT_HEAP_MAX_MB=2048`): `found=38 succ=21 fail=17`, `crashes.log`
+  empty — no more SIGSEGV, full test discovery/execution now happens. The
+  remaining 17 failures are pre-existing, unrelated Spring/Groovy functional
+  issues (not crashes), out of scope for this ticket.
 
 ## Raw data
 

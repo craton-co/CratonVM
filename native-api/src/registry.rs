@@ -305,6 +305,14 @@ pub enum GpuFutureResult {
 /// The `Vm` struct implements this trait. Using a trait here avoids circular
 /// module dependencies between `native` and `vm`.
 pub trait NativeContext {
+    /// Whether this context can construct and dispatch real generated proxy
+    /// classes. Lightweight unit-test contexts intentionally return `false`:
+    /// they model native object state but do not own a VM-wide class-loader and
+    /// proxy-class namespace.
+    fn supports_real_proxy_generation(&self) -> bool {
+        true
+    }
+
     /// Load a class by name. Returns the ClassId.
     fn load_class(&mut self, name: &str) -> MethodCallResult;
 
@@ -1129,6 +1137,14 @@ pub trait NativeContext {
     /// for mock/test contexts.
     fn create_string_uninterned(&mut self, text: &str) -> ObjectRef {
         self.create_string(text)
+    }
+
+    /// Create a dynamic String at a native-call safepoint when the caller has
+    /// no unpinned Java references.  The VM implementation may collect before
+    /// allocating; the default keeps mock contexts and legacy implementations
+    /// on the ordinary uninterned path.
+    fn create_string_uninterned_gc_safe(&mut self, text: &str) -> ObjectRef {
+        self.create_string_uninterned(text)
     }
 
     /// Populate an *already-allocated* `java/lang/String` object's backing

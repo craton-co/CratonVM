@@ -43946,6 +43946,45 @@ fn native_printwriter_write_string(
     args: &[Value],
 ) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first().copied() {
+        // Real JDK's `PrintWriter.write(String)` body is `write(s, 0,
+        // s.length())` — a VIRTUAL call back on `this`. A user subclass that
+        // overrides `write(String,int,int)` (e.g. Spring's
+        // `MockHttpServletResponse`'s private `ResponsePrintWriter`, which
+        // auto-flushes and tracks commit state on every write) depends on
+        // that dispatch. Writing straight to the backing `out` object below
+        // skips `this` entirely: the char data still reaches the backing
+        // Writer, but any subclass side effect the override exists to provide
+        // (here, forcing the buffered `OutputStreamWriter`/`StreamEncoder`
+        // bytes out to the real sink) never runs — silently losing the
+        // content once the request stops touching the response any further
+        // (e.g. a `View.render()`/`@ExceptionHandler` write with no later
+        // explicit flush). Detect the subclass case first and re-dispatch
+        // through `this`, so ordinary virtual method resolution finds the
+        // override; when there isn't one, `write(String,int,int)` falls
+        // through to `native_printwriter_write_string_range` below —
+        // functionally identical to the fast path already taken here for a
+        // plain `java.io.PrintWriter` receiver, just one indirection deeper.
+        let this_cid = ctx.class_id_of_object(this);
+        let this_cname = ctx.class_name_of_id(this_cid);
+        let is_plain_printwriter = this_cname.as_deref() == Some("java/io/PrintWriter");
+        if !is_plain_printwriter {
+            if let Some(Value::Object(Some(s))) = args.get(1).copied() {
+                if let Some(text) = ctx.read_string(s) {
+                    let len = text.encode_utf16().count() as i32;
+                    let _ = ctx.invoke_virtual(
+                        this,
+                        "write",
+                        "(Ljava/lang/String;II)V",
+                        &[Value::Object(Some(s)), Value::Int(0), Value::Int(len)],
+                    );
+                    return Ok(None);
+                }
+            }
+            // Null/non-String arg: real `write(String)` would NPE inside
+            // `s.length()` before ever reaching a writer — fall through to
+            // the pre-existing behaviour below rather than invent new null
+            // semantics here.
+        }
         if let Some(out_obj) = printwriter_get_backing_writer(ctx, this) {
             // Pass the EXISTING Java String arg directly to out.write(String).
             // Do NOT call write_string_to_writer (which does ctx.create_string → GC hazard:
@@ -44206,7 +44245,12 @@ fn native_uuid_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         (lsb >> 48) & 0xFFFF,
         lsb & 0xFFFF_FFFF_FFFF
     );
-    let str_obj = ctx.create_string(&s);
+    // UUID text is dynamically produced.  Interning every distinct value keeps
+    // the entire monotonicity-test output alive and turns normal allocation
+    // pressure into repeated intern-table stalls.  The receiver is pinned by
+    // safe_native_call and its fields have already been read above, so this
+    // native can safely request collection before the transient allocation.
+    let str_obj = ctx.create_string_uninterned_gc_safe(&s);
     Ok(Some(Value::Object(Some(str_obj))))
 }
 
@@ -53674,6 +53718,7 @@ fn matcher_realjdk_field_indices(ctx: &mut dyn NativeContext) -> Option<MatcherF
 struct PatternFieldIndices {
     pattern: usize,
     flags: usize,
+    capturing_group_count: usize,
 }
 
 fn pattern_realjdk_field_indices(ctx: &mut dyn NativeContext) -> Option<PatternFieldIndices> {
@@ -53684,7 +53729,51 @@ fn pattern_realjdk_field_indices(ctx: &mut dyn NativeContext) -> Option<PatternF
         Some(PatternFieldIndices {
             pattern: ctx.resolve_field_index(CLASS, f::PATTERN)?,
             flags: ctx.resolve_field_index(CLASS, f::FLAGS)?,
+            capturing_group_count: ctx.resolve_field_index(CLASS, f::CAPTURING_GROUP_COUNT)?,
         })
+    })
+}
+
+/// Return the semantic capture count stored by the real JDK Pattern. This
+/// includes group zero. Some supported JDK Matcher layouts overallocate the
+/// backing `groups[]` array (for example, ten capture pairs for a one-group
+/// pattern), so array length is a capacity check, not the group count.
+fn matcher_realjdk_java_capture_count(
+    ctx: &mut dyn NativeContext,
+    matcher: ObjectRef,
+    idx: MatcherFieldIndices,
+    pattern_idx: PatternFieldIndices,
+) -> Option<usize> {
+    let pattern = match ctx.get_field(matcher, idx.parent_pattern) {
+        Value::Object(Some(pattern)) => pattern,
+        _ => return None,
+    };
+    let count = ctx
+        .get_field(pattern, pattern_idx.capturing_group_count)
+        .as_int()?;
+    (count > 0).then_some(count as usize)
+}
+
+fn matcher_realjdk_capture_layout_valid(
+    rust_capture_count: usize,
+    java_capture_count: usize,
+    groups_len: usize,
+) -> bool {
+    java_capture_count > 0
+        && rust_capture_count == java_capture_count
+        && groups_len >= java_capture_count.saturating_mul(2)
+}
+
+fn matcher_realjdk_capture_layout_ok(
+    ctx: &mut dyn NativeContext,
+    matcher: ObjectRef,
+    idx: MatcherFieldIndices,
+    pattern_idx: PatternFieldIndices,
+    re: &JavaRegex,
+    groups: ObjectRef,
+) -> bool {
+    matcher_realjdk_java_capture_count(ctx, matcher, idx, pattern_idx).is_some_and(|count| {
+        matcher_realjdk_capture_layout_valid(re.captures_len(), count, ctx.array_length(groups))
     })
 }
 
@@ -53902,8 +53991,8 @@ fn matcher_realjdk_search(
     // it here instead would mean bailing to real bytecode after already
     // having overwritten `first`/`oldLast` above, corrupting the state the
     // bytecode fallback itself depends on). Trust the caller: by the time
-    // we're here, `re.captures_len() == groups_obj.length / 2` is already
-    // established, so every `caps.len()` below is guaranteed to match.
+    // we're here, Rust's capture count matches Pattern.capturingGroupCount and
+    // `groups_obj` has enough capacity, so every write below is in bounds.
     let caps = re.captures_at(region_slice, search_from_byte);
     let matched = match caps {
         Some(caps) => {
@@ -54025,10 +54114,9 @@ fn native_matcher_find_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Value::Object(Some(g)) => g,
         _ => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
     };
-    // Group-count safety net, checked BEFORE any field mutation below (see
-    // the comment in `matcher_realjdk_search` for why bailing after
-    // mutating `first`/`oldLast` would corrupt the fallback's own state).
-    if re.captures_len() != ctx.array_length(groups_obj) / 2 {
+    // Group-count safety net, checked BEFORE any field mutation below. The
+    // Pattern field is the semantic count; groups[] may be overallocated.
+    if !matcher_realjdk_capture_layout_ok(ctx, this, idx, pattern_idx, &re, groups_obj) {
         return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]);
     }
 
@@ -54125,9 +54213,9 @@ fn native_matcher_find_at_realjdk(
         Value::Object(Some(g)) => g,
         _ => return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]),
     };
-    // Group-count safety net — checked before any field mutation below; see
-    // the comment in `matcher_realjdk_search`.
-    if re.captures_len() != ctx.array_length(groups_obj) / 2 {
+    // Group-count safety net — checked before any field mutation below. The
+    // Pattern field is the semantic count; groups[] may be overallocated.
+    if !matcher_realjdk_capture_layout_ok(ctx, this, idx, pattern_idx, &re, groups_obj) {
         return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]);
     }
 
@@ -54177,11 +54265,57 @@ fn native_matcher_find_at_realjdk(
 /// (not a subclass CratonVM has a dedicated `RuntimeError` variant for) on an
 /// invalid index — the caller bails to real bytecode for that rare case so
 /// it throws the exact right exception, rather than fabricating one here.
-/// Returns `true` when `group` is in bounds (`0..=groupCount()`, where
-/// `groupCount() == groups_obj.length/2 - 1`).
-fn matcher_realjdk_group_in_bounds(ctx: &mut dyn NativeContext, groups_obj: ObjectRef, group: i32) -> bool {
-    let group_count = (ctx.array_length(groups_obj) / 2) as i32 - 1;
-    group >= 0 && group <= group_count
+/// Returns `true` when `group` is in bounds (`0..=groupCount()`). Pattern's
+/// semantic capture count is authoritative because groups[] may be larger.
+fn matcher_realjdk_group_index_in_bounds(
+    group: i32,
+    capture_count: usize,
+    groups_len: usize,
+) -> bool {
+    if group < 0 {
+        return false;
+    }
+    let group = group as usize;
+    group < capture_count && group.saturating_mul(2).saturating_add(1) < groups_len
+}
+
+fn matcher_realjdk_group_in_bounds(
+    ctx: &mut dyn NativeContext,
+    matcher: ObjectRef,
+    idx: MatcherFieldIndices,
+    groups_obj: ObjectRef,
+    group: i32,
+) -> bool {
+    let Some(pattern_idx) = pattern_realjdk_field_indices(ctx) else {
+        return false;
+    };
+    let Some(capture_count) = matcher_realjdk_java_capture_count(ctx, matcher, idx, pattern_idx)
+    else {
+        return false;
+    };
+    matcher_realjdk_group_index_in_bounds(group, capture_count, ctx.array_length(groups_obj))
+}
+
+#[cfg(test)]
+mod matcher_realjdk_layout_tests {
+    use super::{matcher_realjdk_capture_layout_valid, matcher_realjdk_group_index_in_bounds};
+
+    #[test]
+    fn overallocated_groups_array_is_capacity_not_capture_count() {
+        assert!(matcher_realjdk_capture_layout_valid(2, 2, 20));
+        assert!(matcher_realjdk_group_index_in_bounds(1, 2, 20));
+        assert!(!matcher_realjdk_group_index_in_bounds(2, 2, 20));
+    }
+
+    #[test]
+    fn layout_rejects_semantic_count_mismatch_or_short_capacity() {
+        assert!(!matcher_realjdk_capture_layout_valid(3, 2, 20));
+        assert!(!matcher_realjdk_capture_layout_valid(2, 3, 20));
+        assert!(!matcher_realjdk_capture_layout_valid(2, 2, 3));
+        assert!(!matcher_realjdk_capture_layout_valid(0, 0, 0));
+        assert!(!matcher_realjdk_group_index_in_bounds(-1, 2, 20));
+        assert!(!matcher_realjdk_group_index_in_bounds(1, 2, 3));
+    }
 }
 
 fn native_matcher_start_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -54250,7 +54384,7 @@ fn native_matcher_start_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value])
         Value::Object(Some(g)) => g,
         _ => return matcher_realjdk_bail(ctx, this, "start", "(I)I", &[Value::Int(group)]),
     };
-    if !matcher_realjdk_group_in_bounds(ctx, groups_obj, group) {
+    if !matcher_realjdk_group_in_bounds(ctx, this, idx, groups_obj, group) {
         return matcher_realjdk_bail(ctx, this, "start", "(I)I", &[Value::Int(group)]);
     }
     Ok(Some(ctx.get_array_element(groups_obj, 2 * group as usize)))
@@ -54280,7 +54414,7 @@ fn native_matcher_end_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -
         Value::Object(Some(g)) => g,
         _ => return matcher_realjdk_bail(ctx, this, "end", "(I)I", &[Value::Int(group)]),
     };
-    if !matcher_realjdk_group_in_bounds(ctx, groups_obj, group) {
+    if !matcher_realjdk_group_in_bounds(ctx, this, idx, groups_obj, group) {
         return matcher_realjdk_bail(ctx, this, "end", "(I)I", &[Value::Int(group)]);
     }
     Ok(Some(ctx.get_array_element(groups_obj, 2 * group as usize + 1)))
@@ -54338,7 +54472,7 @@ fn native_matcher_group_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value])
             )
         }
     };
-    if !matcher_realjdk_group_in_bounds(ctx, groups_obj, group) {
+    if !matcher_realjdk_group_in_bounds(ctx, this, idx, groups_obj, group) {
         return matcher_realjdk_bail(
             ctx,
             this,
@@ -54375,6 +54509,37 @@ fn native_matcher_group_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value])
             )
         }
     };
+    // The comment above ("groups[] would still be all -1") only holds for
+    // callers that reach `groups[]` via THIS fast path's own `find()`/
+    // `find(int)` (which does bail early for non-String text — see
+    // `matcher_realjdk_cached`). `Matcher.matches()`/`lookingAt()` are NOT
+    // natively intercepted at all, so they run as real interpreted bytecode
+    // against ANY `CharSequence` (correctly — that's all the `CharSequence`
+    // contract promises) and populate `groups[]` just fine. A subsequent
+    // `matcher.group(int)` call then DOES reach here with valid `start`/`end`
+    // even though `text` is a non-String `CharSequence` (e.g. Spring's
+    // `AntPathMatcher$AntPathStringMatcher$MaxAttemptsCharSequence`, which
+    // implements only `subSequence`/`charAt`/`length`/`isEmpty` — no
+    // `substring`). Calling `.substring(int,int)` unconditionally then threw
+    // a spurious `NoSuchMethodError` instead of returning the matched text.
+    // Real JDK's `Matcher.group(int)` never calls `.substring()` either — it
+    // calls `getSubSequence(start,end).toString()`, `subSequence` being the
+    // one method every `CharSequence` actually guarantees. Keep the fast,
+    // allocation-light `substring` shortcut for genuine `String` text (the
+    // overwhelming common case) and bail to real bytecode for anything else,
+    // instead of assuming the receiver has a `substring` method it never
+    // promised to have.
+    let text_cid = ctx.class_id_of_object(text_obj);
+    let text_cname = ctx.class_name_of_id(text_cid);
+    if text_cname.as_deref() != Some("java/lang/String") {
+        return matcher_realjdk_bail(
+            ctx,
+            this,
+            "group",
+            "(I)Ljava/lang/String;",
+            &[Value::Int(group)],
+        );
+    }
     ctx.invoke_virtual(
         text_obj,
         "substring",
@@ -69215,6 +69380,22 @@ fn native_heap_bytebuffer_allocate(
             Value::Int(capacity.min(i32::MAX as usize) as i32),
         ],
     );
+    // A full JVM dispatches the HeapByteBuffer constructor above.  The
+    // native-only allocation entry point is also used by minimal contexts,
+    // which cannot run that Java body, so establish the same fields through
+    // the constructor's native implementation.
+    if let Ok(Some(Value::Object(Some(buffer)))) = &result {
+        native_heap_byte_buffer_init_array_offset_len(
+            ctx,
+            &[
+                Value::Object(Some(*buffer)),
+                Value::Object(Some(bytes)),
+                Value::Int(0),
+                Value::Int(capacity.min(i32::MAX as usize) as i32),
+                Value::Object(None),
+            ],
+        )?;
+    }
     ctx.unpin_native_roots(bytes_pin);
     result
 }
@@ -81702,7 +81883,9 @@ mod xerces_xml_parser_tests {
         )
         .expect("normalize replace")
         .expect("replace value");
-        assert_eq!(string_result(&ctx, replaced), " a  b  c ");
+        // XML Schema's `replace` facet maps TAB/LF/CR to U+0020 and does
+        // not collapse pre-existing or newly adjacent spaces.
+        assert_eq!(string_result(&ctx, replaced), " a  b c ");
 
         let collapsed = native_xssimple_type_normalize_string(
             &mut ctx,

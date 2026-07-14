@@ -18359,7 +18359,29 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Int(0)));
         }
         let mut buf = vec![0u8; remaining];
-        match ctx.fd_table().tcp_read(fd as u32, &mut buf) {
+        // STW-TAKEOVER-FIX (2026-07-14): plain blocking-mode
+        // `SocketChannel.read` — the real socket path used by embedded
+        // Tomcat/Jetty NIO connectors for accepted client connections
+        // (unlike `AsynchronousSocketChannel`, this is the hot path for
+        // ordinary server sockets). Same missing-GC-barrier-cooperation gap
+        // as the `AsynchronousSocketChannel.read`/`write` fix above: a
+        // genuinely blocking OS recv() with no bound on wait time, with no
+        // `begin_blocking_region`/`end_blocking_region` around it, so a
+        // concurrent STW pause waits forever for this thread to reach a
+        // safepoint it can never reach while parked in recv(). `bb` is an
+        // ObjectRef used again after the call returns (both `get_field`/
+        // `set_field` on it), so it goes through
+        // `end_blocking_region_refs` to pick up any relocation from a GC
+        // that ran while blocked.
+        let mut blocked_refs = [Value::Object(Some(bb))];
+        ctx.begin_blocking_region();
+        let read_result = ctx.fd_table().tcp_read(fd as u32, &mut buf);
+        ctx.end_blocking_region_refs(&mut blocked_refs);
+        let bb = match blocked_refs[0] {
+            Value::Object(Some(o)) => o,
+            _ => bb,
+        };
+        match read_result {
             Ok(0) => Ok(Some(Value::Int(-1))),
             Ok(n) => {
                 if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
@@ -18396,7 +18418,19 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
                 }
             }
         }
-        match ctx.fd_table().tcp_write(fd as u32, &data) {
+        // STW-TAKEOVER-FIX (2026-07-14): see `SocketChannel.read` above —
+        // same genuinely-blocking-socket-call gap. `arr` was already fully
+        // consumed above (copied into the Rust-owned `data` buffer before
+        // this call), so only `bb` needs to survive the blocking window.
+        let mut blocked_refs = [Value::Object(Some(bb))];
+        ctx.begin_blocking_region();
+        let write_result = ctx.fd_table().tcp_write(fd as u32, &data);
+        ctx.end_blocking_region_refs(&mut blocked_refs);
+        let bb = match blocked_refs[0] {
+            Value::Object(Some(o)) => o,
+            _ => bb,
+        };
+        match write_result {
             Ok(n) => {
                 ctx.set_field(bb, 1, Value::Int((pos + n) as i32));
                 Ok(Some(Value::Int(n as i32)))
@@ -18622,7 +18656,17 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
             if fd < 0 {
                 return Ok(Some(Value::Object(None)));
             }
-            match ctx.fd_table().tcp_accept(fd as u32) {
+            // STW-TAKEOVER-FIX (2026-07-14): `ServerSocketChannel.accept()`
+            // blocks indefinitely (in blocking mode) waiting for an
+            // incoming connection — the same missing-GC-barrier-cooperation
+            // gap as the `SocketChannel.read`/`write` fixes above, on the
+            // acceptor-thread side this time. No ObjectRef needs to survive
+            // the call (`this` is not reused afterward; a fresh object is
+            // allocated post-accept), so a plain begin/end pair suffices.
+            ctx.begin_blocking_region();
+            let accept_result = ctx.fd_table().tcp_accept(fd as u32);
+            ctx.end_blocking_region();
+            match accept_result {
                 Ok((stream_fd, addr)) => {
                     let sc = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 4);
                     // Pin across the create_string below — a moving young GC
@@ -38144,11 +38188,47 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             let bb = obj_arg(args, 1)?;
             // DF07: decode the destination buffer via the real-or-synthetic
             // accessor (a real HeapByteBuffer's array is `hb`, not slot 0).
+            // GC-blocking audit — see the matching comment on the sibling
+            // `write` registration below for the full rationale (found via
+            // the same STW-takeover-cluster residual investigation).
             let bytes_read = if fd_id >= 0 {
                 match aio_bb_region(ctx, bb) {
                     Some((arr, off, remaining)) if remaining > 0 => {
                         let mut tmp = vec![0u8; remaining];
-                        match ctx.fd_table().tcp_read(fd_id as u32, &mut tmp) {
+                        // STW-TAKEOVER-FIX (2026-07-14): tcp_read performs a
+                        // genuinely blocking OS recv() (real socket I/O
+                        // faked up as "async" via an already-completed
+                        // Future, not offloaded to a worker thread) with no
+                        // bound on wait time. Without a GC-barrier blocking
+                        // region, a concurrent STW pause counts this thread
+                        // as an ordinary cooperating mutator and waits
+                        // forever for it to reach a safepoint it can never
+                        // reach while parked in recv() — this is the
+                        // `pending=1`/`taken=0` permanent
+                        // "STW cross-thread JIT takeover" hang confirmed via
+                        // live gdb (thread blocked in
+                        // native-api/src/fd_table.rs's `tcp_read` ->
+                        // std::net::TcpStream::read, no frame trace, not
+                        // recognized as GC-safe) in
+                        // web.socket.messaging.StompWebSocketIntegrationTests's
+                        // `sendMessageToBrokerAndReceiveInOrder`. `arr`/`bb`
+                        // are ObjectRefs used again after the call returns,
+                        // so they go through `end_blocking_region_refs` to
+                        // pick up any relocation from a GC that ran while
+                        // blocked.
+                        let mut blocked_refs = [Value::Object(Some(arr)), Value::Object(Some(bb))];
+                        ctx.begin_blocking_region();
+                        let read_result = ctx.fd_table().tcp_read(fd_id as u32, &mut tmp);
+                        ctx.end_blocking_region_refs(&mut blocked_refs);
+                        let arr = match blocked_refs[0] {
+                            Value::Object(Some(o)) => o,
+                            _ => arr,
+                        };
+                        let bb = match blocked_refs[1] {
+                            Value::Object(Some(o)) => o,
+                            _ => bb,
+                        };
+                        match read_result {
                             Ok(0) => -1,
                             Ok(n) => {
                                 ctx.write_byte_array_from(arr, off, &tmp[..n]);
@@ -38176,12 +38256,53 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             let fd_id = ctx.get_field(this, 2).as_int().unwrap_or(-1);
             let bb = obj_arg(args, 1)?;
             // DF07: source the bytes via the real-or-synthetic accessor (see read).
+            //
+            // GC-blocking audit (STW takeover 5-class cluster residual,
+            // 2026-07-13, Azure host follow-up): `tcp_write` is a raw
+            // blocking `send()` with NO GC-blocking-region bracket — found
+            // via gdb on a hung TestWsWebSocketContainerTimeoutClient (the
+            // test deliberately never drains the peer socket to force a
+            // write timeout, so this send() parks in the OS indefinitely
+            // once the send buffer fills). Bracketing it fixes the
+            // STW-takeover hang (this thread was counted in `expected`
+            // forever, `taken=0`, matching the doc's signature exactly).
+            //
+            // NOTE this does NOT fix the deeper issue that this Future-
+            // returning overload is synchronous (blocks the calling thread
+            // until the write completes or errors) rather than genuinely
+            // async like the sibling CompletionHandler-based overload in
+            // native-io/src/async_socket.rs's aio_asc_write (which
+            // dispatches to a worker pool via Job::Write and returns
+            // immediately with a real pending Future). A caller doing
+            // `write(bb).get(timeout, unit)` to detect a write timeout will
+            // still block inside this native call itself rather than inside
+            // `Future.get`, so the write always "succeeds" eventually (once
+            // the peer reads or the connection resets) instead of the
+            // caller's own timeout ever firing — a separate, out-of-scope-
+            // for-this-fix architectural gap. Filed as a residual; see
+            // docs/known-issues/tomcat-08-07/stw-crossthread-jit-takeover-hang-cluster.md.
             let bytes_written = if fd_id >= 0 {
                 match aio_bb_region(ctx, bb) {
                     Some((arr, off, remaining)) if remaining > 0 => {
                         let mut data = vec![0u8; remaining];
                         ctx.read_byte_array_into(arr, off, &mut data);
-                        match ctx.fd_table().tcp_write(fd_id as u32, &data) {
+                        // STW-TAKEOVER-FIX (2026-07-14): see the `read`
+                        // registration above — tcp_write is the same
+                        // genuinely-blocking-socket-call-with-no-GC-barrier-
+                        // registration shape (the write-side counterpart of
+                        // the same missing-safepoint-cooperation gap). `arr`
+                        // was already fully consumed above (copied into the
+                        // Rust-owned `data` buffer), so only `bb` needs to
+                        // survive the blocking window.
+                        let mut blocked_refs = [Value::Object(Some(bb))];
+                        ctx.begin_blocking_region();
+                        let write_result = ctx.fd_table().tcp_write(fd_id as u32, &data);
+                        ctx.end_blocking_region_refs(&mut blocked_refs);
+                        let bb = match blocked_refs[0] {
+                            Value::Object(Some(o)) => o,
+                            _ => bb,
+                        };
+                        match write_result {
                             Ok(n) => {
                                 aio_bb_advance(ctx, bb, n as i32);
                                 n as i32
@@ -49288,6 +49409,17 @@ pub(crate) fn register_p69_websocket(r: &mut NativeMethodRegistry) {
             path, host, ws_key
         );
         let req_bytes = upgrade_req.as_bytes();
+        // STW-TAKEOVER-FIX (2026-07-14): this whole handshake (write +
+        // byte-at-a-time read loop below) is genuinely blocking network I/O
+        // with no bound on wait time and, until now, no GC-barrier
+        // cooperation at all — the JDK `HttpClient`/`WebSocket` "Standard"
+        // client path used by e.g.
+        // `web.socket.messaging.StompWebSocketIntegrationTests`'s
+        // `client = Standard` parameterization. No Java ObjectRef is held
+        // across this section (the URI string was already read above; the
+        // WebSocket object/CompletableFuture are only allocated after this
+        // block completes), so a plain begin/end pair suffices.
+        ctx.begin_blocking_region();
         if use_tls {
             let _ = ctx.fd_table().tls_write(fd_id, req_bytes);
         } else {
@@ -49309,6 +49441,7 @@ pub(crate) fn register_p69_websocket(r: &mut NativeMethodRegistry) {
                 break;
             }
         }
+        ctx.end_blocking_region();
 
         // Verify 101 Switching Protocols
         let resp_str = String::from_utf8_lossy(&response);

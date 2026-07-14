@@ -80,10 +80,12 @@ use std::sync::Arc;
 
 use cratonvm_types::{ArrayElementType, ClassId, Value};
 use cratonvm_vm::config::VmConfig;
-use cratonvm_vm::runtime::gpu_marshal::{host_view_i16, host_view_i8, write_back_i16, write_back_i8};
+use cratonvm_vm::runtime::gpu_marshal::{
+    host_view_i16, host_view_i8, write_back_i16, write_back_i8,
+};
 use cratonvm_vm::runtime::offload::{
-    self, dispatch_method_from_native, finalize_submission, lookup_submission,
-    release_submission, DispatchOutcome, LookupOutcome, OffloadCacheRegistry,
+    self, dispatch_method_from_native, finalize_submission, lookup_submission, release_submission,
+    DispatchOutcome, LookupOutcome, OffloadCacheRegistry,
 };
 use cratonvm_vm::runtime::offload_jit_gate::{caller_blocks_jit, caller_blocks_jit_by_name};
 use cratonvm_vm::vm::{ensure_class_initialized_shared, SharedVm, Vm};
@@ -343,7 +345,9 @@ fn offload_cache_registry_skip_for_eligible_method_without_device() {
     ) {
         LookupOutcome::Skip => {}
         LookupOutcome::Blacklisted => panic!("expected Skip on no-device path, got Blacklisted"),
-        LookupOutcome::Hit(_) => panic!("expected Skip on no-device path, got Hit (machine has a GPU?)"),
+        LookupOutcome::Hit(_) => {
+            panic!("expected Skip on no-device path, got Hit (machine has a GPU?)")
+        }
     }
 }
 
@@ -375,7 +379,10 @@ fn dispatch_method_from_native_no_device_yields_failed_submission() {
     // before the marshal loop would look at it.
     let handle =
         dispatch_method_from_native(&shared, "EligibleVectorAdd", "vectorAdd", "([I[I[I)V", &[]);
-    assert!(handle > 0, "dispatch_method_from_native must hand back a handle even on failure");
+    assert!(
+        handle > 0,
+        "dispatch_method_from_native must hand back a handle even on failure"
+    );
 
     let submission = lookup_submission(handle).expect("just-registered submission must be found");
     match finalize_submission(&shared, &submission) {
@@ -401,8 +408,10 @@ fn dispatch_method_from_native_handles_are_unique_per_call() {
     }
     let shared = Arc::new(SharedVm::new(gpu_config()));
 
-    let h1 = dispatch_method_from_native(&shared, "EligibleVectorAdd", "vectorAdd", "([I[I[I)V", &[]);
-    let h2 = dispatch_method_from_native(&shared, "EligibleVectorAdd", "vectorAdd", "([I[I[I)V", &[]);
+    let h1 =
+        dispatch_method_from_native(&shared, "EligibleVectorAdd", "vectorAdd", "([I[I[I)V", &[]);
+    let h2 =
+        dispatch_method_from_native(&shared, "EligibleVectorAdd", "vectorAdd", "([I[I[I)V", &[]);
     assert_ne!(h1, h2, "two submissions must never share a handle");
     assert!(lookup_submission(h1).is_some());
     assert!(lookup_submission(h2).is_some());
@@ -470,7 +479,9 @@ fn poll_submission_status_unknown_handle_returns_none() {
 fn host_view_i16_round_trips_through_shared_vm_heap() {
     let shared = Arc::new(SharedVm::new(VmConfig::new()));
     let token = shared.heap.enter_gpu_critical();
-    let arr = shared.heap.alloc_array(ClassId::new(1), ArrayElementType::Short, 6);
+    let arr = shared
+        .heap
+        .alloc_array(ClassId::new(1), ArrayElementType::Short, 6);
 
     let src: Vec<i16> = vec![0, -1, 12345, i16::MIN, i16::MAX, 7];
     write_back_i16(arr, &shared.heap, &src, &token);
@@ -492,7 +503,9 @@ fn host_view_i16_round_trips_through_shared_vm_heap() {
 fn host_view_i8_round_trips_through_shared_vm_heap() {
     let shared = Arc::new(SharedVm::new(VmConfig::new()));
     let token = shared.heap.enter_gpu_critical();
-    let arr = shared.heap.alloc_array(ClassId::new(1), ArrayElementType::Byte, 5);
+    let arr = shared
+        .heap
+        .alloc_array(ClassId::new(1), ArrayElementType::Byte, 5);
 
     let src: Vec<i8> = vec![0, -1, 1, i8::MIN, i8::MAX];
     write_back_i8(arr, &shared.heap, &src, &token);
@@ -553,15 +566,30 @@ fn device_vector_add_handled_with_correct_output() {
     ensure_class_initialized_shared(&vm.shared, &mut vm.main_thread, class_id)
         .expect("EligibleVectorAdd must initialize cleanly (no <clinit> to fail)");
 
-    let a = vm.shared.heap.alloc_array(ClassId::new(1), ArrayElementType::Int, n);
-    let b = vm.shared.heap.alloc_array(ClassId::new(1), ArrayElementType::Int, n);
-    let out = vm.shared.heap.alloc_array(ClassId::new(1), ArrayElementType::Int, n);
+    let a = vm
+        .shared
+        .heap
+        .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
+    let b = vm
+        .shared
+        .heap
+        .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
+    let out = vm
+        .shared
+        .heap
+        .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
     let mut expected = vec![0i32; n];
     for i in 0..n {
         let av = i as i32;
         let bv = 2 * i as i32;
-        vm.shared.heap.set_array_element(a, i, Value::Int(av)).unwrap();
-        vm.shared.heap.set_array_element(b, i, Value::Int(bv)).unwrap();
+        vm.shared
+            .heap
+            .set_array_element(a, i, Value::Int(av))
+            .unwrap();
+        vm.shared
+            .heap
+            .set_array_element(b, i, Value::Int(bv))
+            .unwrap();
         expected[i] = av.wrapping_add(bv);
     }
 
@@ -616,14 +644,26 @@ fn device_dot_product_handled_with_value_matches_host_reference() {
     ensure_class_initialized_shared(&vm.shared, &mut vm.main_thread, class_id)
         .expect("EligibleDotProduct must initialize cleanly (no <clinit> to fail)");
 
-    let a = vm.shared.heap.alloc_array(ClassId::new(1), ArrayElementType::Int, n);
-    let b = vm.shared.heap.alloc_array(ClassId::new(1), ArrayElementType::Int, n);
+    let a = vm
+        .shared
+        .heap
+        .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
+    let b = vm
+        .shared
+        .heap
+        .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
     let mut expected: i64 = 0;
     for i in 0..n {
         let av = (i % 13) as i32 - 6;
         let bv = (i % 7) as i32 - 3;
-        vm.shared.heap.set_array_element(a, i, Value::Int(av)).unwrap();
-        vm.shared.heap.set_array_element(b, i, Value::Int(bv)).unwrap();
+        vm.shared
+            .heap
+            .set_array_element(a, i, Value::Int(av))
+            .unwrap();
+        vm.shared
+            .heap
+            .set_array_element(b, i, Value::Int(bv))
+            .unwrap();
         expected += (av as i64) * (bv as i64);
     }
 
@@ -667,12 +707,27 @@ fn device_vector_add_below_min_work_keeps_call_site_hooked() {
     ensure_class_initialized_shared(&vm.shared, &mut vm.main_thread, class_id)
         .expect("EligibleVectorAdd must initialize cleanly");
 
-    let a = vm.shared.heap.alloc_array(ClassId::new(1), ArrayElementType::Int, n);
-    let b = vm.shared.heap.alloc_array(ClassId::new(1), ArrayElementType::Int, n);
-    let out = vm.shared.heap.alloc_array(ClassId::new(1), ArrayElementType::Int, n);
+    let a = vm
+        .shared
+        .heap
+        .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
+    let b = vm
+        .shared
+        .heap
+        .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
+    let out = vm
+        .shared
+        .heap
+        .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
     for i in 0..n {
-        vm.shared.heap.set_array_element(a, i, Value::Int(i as i32)).unwrap();
-        vm.shared.heap.set_array_element(b, i, Value::Int(1)).unwrap();
+        vm.shared
+            .heap
+            .set_array_element(a, i, Value::Int(i as i32))
+            .unwrap();
+        vm.shared
+            .heap
+            .set_array_element(b, i, Value::Int(1))
+            .unwrap();
     }
 
     let args = [
@@ -728,15 +783,30 @@ fn device_submission_completes_spontaneously_without_any_poll_call() {
     ensure_class_initialized_shared(&vm.shared, &mut vm.main_thread, class_id)
         .expect("EligibleVectorAdd must initialize cleanly");
 
-    let a = vm.shared.heap.alloc_array(ClassId::new(1), ArrayElementType::Int, n);
-    let b = vm.shared.heap.alloc_array(ClassId::new(1), ArrayElementType::Int, n);
-    let out = vm.shared.heap.alloc_array(ClassId::new(1), ArrayElementType::Int, n);
+    let a = vm
+        .shared
+        .heap
+        .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
+    let b = vm
+        .shared
+        .heap
+        .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
+    let out = vm
+        .shared
+        .heap
+        .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
     let mut expected = vec![0i32; n];
     for i in 0..n {
         let av = i as i32;
         let bv = 2 * i as i32;
-        vm.shared.heap.set_array_element(a, i, Value::Int(av)).unwrap();
-        vm.shared.heap.set_array_element(b, i, Value::Int(bv)).unwrap();
+        vm.shared
+            .heap
+            .set_array_element(a, i, Value::Int(av))
+            .unwrap();
+        vm.shared
+            .heap
+            .set_array_element(b, i, Value::Int(bv))
+            .unwrap();
         expected[i] = av.wrapping_add(bv);
     }
 

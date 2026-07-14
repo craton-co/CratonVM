@@ -47,20 +47,39 @@ pre-existing/environmental (debug-only lock-order assertions that cannot fire
 in a release build, JIT skip-list feature tests, JNI table-size tests,
 real-JDK-detection tests) and unrelated by name/code-path to this change.
 
-**Open question for whoever picks this doc back up next:** does this fix
-change the outcome of the "2026-07-13 current-dev residual update" repro
-below (`testSlicesSparseWithFilter`, `others.tsv -Start 2538`,
-`ByteBuffersIndexInput.slice`/`MockIndexInputWrapper.slice` non-progress)? A
-corrupted zero-field pseudo-array being read back as if it had a real array
-length header (garbage/huge length) is mechanistically consistent with
-"consumes one CPU continuously, fails to produce a result before a 90s
-timeout" — but this was NOT confirmed against that exact repro (host
-unavailable for the remainder of this session). Re-run that doc's exact
-repro command against a build including this fix before doing further
-investigation into `ByteBuffersIndexInput`/`TaskExecutor` specifically — if
-this fix resolves it, this cluster's genuine remaining root cause was never
-GC/threading at all, and the STW-monitor-race historical attribution can be
-retired for real.
+**CONFIRMED 2026-07-13 (same session, host came back):** re-ran the
+"2026-07-13 current-dev residual update" repro directly (`testSlicesSparseWithFilter`,
+direct-invocation form bypassing the suite runner, `--stack-dump-on-timeout 90`)
+against a fresh build of `origin/dev` including this fix (`fe76025e7`,
+worktree `/data/data/wt-gc-stw-monitor-race-20260711`, binary
+`/data/data/cratonvm-arrayctorfix-verify-20260713`). **4/4 runs now pass
+cleanly (`OK (1 test)`), consistently ~80-85s, no watchdog abort, no
+exception.** Before this fix every run hit the 90s watchdog with the process
+genuinely non-progressing inside `ByteBuffersIndexInput.slice`/
+`MockIndexInputWrapper.slice` (per the residual-update section above). This
+fix IS the root cause of that residual — the STW-monitor-race historical
+attribution is confirmed NOT applicable to `testSlicesSparseWithFilter` and
+can be retired for that test.
+
+**`testSlicesDense` (this doc's ORIGINAL 2026-07-09 subject) was ALSO
+re-tested against the same fixed build and is NOT resolved by this fix**:
+3/3 runs still hit the 90s watchdog. This is consistent with the earlier
+(pre-this-fix) finding elsewhere in this doc's history that `testSlicesDense`
+is genuinely, if very slowly, making forward progress rather than
+deadlocked — an unbounded run (no watchdog) earlier in this same
+investigation completed in ~602s, terminated by the test framework's own
+`-Dtests.timeoutSuite=580000!`, not by a VM-level hang. `testSlicesDense`'s
+slowness (not correctness) is therefore a SEPARATE, still-open issue from
+`testSlicesSparseWithFilter`'s (now-fixed) correctness bug — likely
+CratonVM interpreter overhead on a reflection/exception-handling-heavy path
+(deep `Method.invoke()` chains + `local_liveness::analyze` cache misses were
+observed dominating a live gdb snapshot of a `testSlicesDense` run), not a
+lost-wakeup or a data-corruption bug. Whoever picks this doc back up next
+should treat `testSlicesDense` as a performance investigation, not a hang/
+correctness investigation, and should NOT expect the STW-monitor-race /
+GC-audit finding 1 attribution to apply here either — finding 1(a) itself
+was independently fixed and merged (`371347920`) before this fix landed, and
+`testSlicesDense`'s slowness persists on top of that fix too.
 
 ---
 
