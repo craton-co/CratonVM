@@ -11,9 +11,10 @@ goes through the exact same `SocketFactory.getDefault().createSocket(host,
 port)` call as `Http2TestBase`. Post-fix validation on the Windows suite
 runner: `TestAbstractAjpProcessor` went from 30/30 failing (`Socket is not
 connected`) to 2/30 failing — the 2 remaining are newly-VISIBLE,
-unrelated, genuine residuals (were masked by the whole-class failure), each
-tracked in its own doc:
-[`ajp-testsecret-secret-attribute-not-enforced.md`](../../known-issues/tomcat-08-07/ajp-testsecret-secret-attribute-not-enforced.md),
+unrelated, genuine residuals (were masked by the whole-class failure). The
+AJP secret residual is now fixed; see
+[`ajp-testsecret-secret-attribute-not-enforced-FIXED.md`](ajp-testsecret-secret-attribute-not-enforced-FIXED.md).
+The only separately tracked remaining residual is
 [`ajp-testnoheaders-response-body-not-empty.md`](../../known-issues/tomcat-08-07/ajp-testnoheaders-response-body-not-empty.md).
 
 Original write-up follows for the record.

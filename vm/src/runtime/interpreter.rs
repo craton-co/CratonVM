@@ -6354,7 +6354,7 @@ pub(crate) fn try_osr_with_backoff(
         let reusable = {
             let jc = shared.jit_cache.read();
             matches!(
-                jc.get(&cn, &mn, &md),
+                jc.get_osr(&cn, &mn, &md),
                 Some(c) if c.compiled_via_osr && c.can_osr_enter(entry_pc)
             )
         };
@@ -6364,11 +6364,20 @@ pub(crate) fn try_osr_with_backoff(
             // than spin. A subsequent hot back-edge finds the published
             // artifact and falls through to the reuse-enter below.
             let key = crate::jit::tiered::MethodKey::new(cn, mn, md);
-            if !crate::jit::tiered::is_osr_denied(&key) {
-                ensure_bg_compiler_started(shared);
-                let _ = shared.tiered_manager.request_osr(&key, entry_pc as u32);
+            if crate::jit::tiered::is_osr_denied(&key) {
+                thread.frames[*frame_idx].record_osr_rejection(entry_pc);
+                return OsrBackoffOutcome::Skip;
             }
-            thread.frames[*frame_idx].record_osr_rejection(entry_pc);
+            ensure_bg_compiler_started(shared);
+            let _ = shared.tiered_manager.request_osr(&key, entry_pc as u32);
+            // Waiting for an off-thread compile is not a failed OSR attempt.
+            // The old attempt counter reached its permanent cap within a few
+            // thousand interpreted iterations, usually before the worker had
+            // published, so the frame never probed the completed artifact.
+            // Restart the stride instead: this polls at most once per threshold
+            // while the task is queued. A real compile failure marks the method
+            // OSR-denied below and returns to the bounded rejection schedule.
+            thread.frames[*frame_idx].record_osr_background_pending();
             return OsrBackoffOutcome::Skip;
         }
         // `reusable`: fall through to `try_osr`, which reuses the published
@@ -20690,6 +20699,12 @@ pub(crate) fn is_class_mirror_native_override(
                     "getDeclaredAnnotationsByType",
                     "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;"
                 )
+                | ("getDeclaredFields", "()[Ljava/lang/reflect/Field;")
+                | ("getDeclaredFields0", "(Z)[Ljava/lang/reflect/Field;")
+                | (
+                    "getDeclaredField",
+                    "(Ljava/lang/String;)Ljava/lang/reflect/Field;"
+                )
         )
 }
 
@@ -22497,6 +22512,42 @@ fn force_native_over_real_jdk_bytecode(
 ) -> bool {
     hotpath_counts::bump(&hotpath_counts::FORCE_NATIVE_CALLS);
     if is_class_mirror_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // The real Collections.emptyList() returns the class's pre-built static
+    // singleton. During the Brave bootstrap that slot can retain a polluted
+    // ArrayList, so use the registered constructor-backed empty-list native
+    // instead of exposing that stale shared state.
+    if class_name == "java/util/Collections"
+        && method_name == "emptyList"
+        && method_descriptor == "()Ljava/util/List;"
+    {
+        return true;
+    }
+    if class_name == "java/util/function/Predicate"
+        && matches!(
+            (method_name, method_descriptor),
+            ("and", "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;")
+                | ("or", "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;")
+                | ("negate", "()Ljava/util/function/Predicate;")
+                | ("not", "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;")
+        )
+    {
+        return true;
+    }
+    // The real DecimalFormatSymbols factories enter CLDR's locale bootstrap.
+    // During the early Spring/JUnit summary path that bootstrap can observe a
+    // stale Collections empty-list slot, producing a type-correct but wrong
+    // List element.  The registered locale native constructs the same DFS
+    // instance without that provider walk; force it over the concrete JDK
+    // bytecode on every interpreter dispatch path.
+    if class_name == "java/text/DecimalFormatSymbols"
+        && matches!(
+            (method_name, method_descriptor),
+            ("initialize", "(Ljava/util/Locale;)V")
+                | ("getInstance", "(Ljava/util/Locale;)Ljava/text/DecimalFormatSymbols;")
+        )
+    {
         return true;
     }
     // Base64 encoders are represented by VM-side synthetic state.  The real
@@ -24834,7 +24885,15 @@ fn try_stackless_invoke(
     // Reflection-metadata natives stay authoritative (see
     // `redefine_immune_reflection_native`) — a Mockito inline mock of
     // `java.lang.reflect.Method` must not disable annotation reflection.
-    if !(declaring_is_interface && !is_static)
+    let force_interface_default_native = declaring_is_interface
+        && !is_static
+        && should_force_registered_native_over_bytecode(
+            shared,
+            &class_name_arc,
+            method_name,
+            descriptor,
+        );
+    if (!(declaring_is_interface && !is_static) || force_interface_default_native)
         && (!native_shadow_suppressed_by_redefine(shared, &class_name_arc)
             || redefine_immune_forced_native(&class_name_arc, method_name, descriptor))
     {
@@ -26456,7 +26515,7 @@ fn compile_osr_artifact(
     // here (or no cached artifact) recompile exactly as before.
     let cached_osr = {
         let jit_cache = shared.jit_cache.read();
-        jit_cache.get(&class_name_arc, &method_name_arc, &descriptor_arc)
+        jit_cache.get_osr(&class_name_arc, &method_name_arc, &descriptor_arc)
     };
     // Only reuse artifacts the OSR path itself produced: those carry the
     // eager invokestatic callee wiring (direct calls). A first-call/upgrade
@@ -27120,13 +27179,13 @@ fn compile_osr_artifact(
                 &mut cm,
             );
             let mut jit_cache = shared.jit_cache.write();
-            jit_cache.put(
+            jit_cache.put_osr(
                 class_name_arc.clone(),
                 method_name_arc.clone(),
                 descriptor_arc.clone(),
                 cm,
             );
-            jit_cache.get(&class_name_arc, &method_name_arc, &descriptor_arc)
+            jit_cache.get_osr(&class_name_arc, &method_name_arc, &descriptor_arc)
         })()
     };
 
@@ -29646,6 +29705,64 @@ fn fetch_osr_compile_inputs(
     Some((class_id, padded, max_locals))
 }
 
+/// Admit the narrow scalar self-recursion shape directly to the optimizing IR
+/// backend on its first background compilation. Compiling it as C1 first is
+/// counterproductive: once a recursive C1 frame is entered, its direct calls
+/// remain in that slower body for the entire subtree even if C2 is published
+/// concurrently. Every call target is resolved here and must be this exact
+/// static `(I)I` method; all remaining structural checks live in the JIT crate.
+fn promote_scalar_selfrec_to_ir(shared: &SharedVm, key: &crate::jit::tiered::MethodKey) -> bool {
+    let Some((class_id, padded, _)) =
+        fetch_osr_compile_inputs(shared, &key.class_name, &key.method_name, &key.descriptor)
+    else {
+        return false;
+    };
+    let code_len = padded.len().saturating_sub(2);
+    if !cratonvm_jit::scalar_selfrec_ir_would_engage(&padded, code_len, &key.descriptor) {
+        return false;
+    }
+    let Some(scan) = crate::jit::x64::jit_scan(&padded, code_len, &key.descriptor) else {
+        return false;
+    };
+    let cm = shared.class_manager.read();
+    let Some(class) = cm.get_class(class_id) else {
+        return false;
+    };
+    let is_static = class
+        .methods
+        .iter()
+        .find(|m| &*m.name == &*key.method_name && &*m.descriptor == &*key.descriptor)
+        .map(|m| m.is_static())
+        .unwrap_or(false);
+    if !is_static {
+        return false;
+    }
+    scan.invoke_ops.iter().all(|(_, cp_idx, opcode)| {
+        if *opcode != 0xb8 {
+            return false;
+        }
+        let Some(ConstantPoolEntry::MethodReference {
+            class_index,
+            name_and_type_index,
+            ..
+        }) = class.constant_pool.get(*cp_idx)
+        else {
+            return false;
+        };
+        let Some(target_class) = class.constant_pool.get_class_name(*class_index) else {
+            return false;
+        };
+        let Some((target_name, target_desc)) =
+            class.constant_pool.get_name_and_type(*name_and_type_index)
+        else {
+            return false;
+        };
+        target_class == &*key.class_name
+            && target_name == &*key.method_name
+            && target_desc == &*key.descriptor
+    })
+}
+
 fn background_compile_task(
     weak_vm: &std::sync::Weak<SharedVm>,
     task: &crate::jit::tiered::CompilationTask,
@@ -29666,7 +29783,8 @@ fn background_compile_task(
     if task.osr_bci.is_some() && crate::jit::tiered::is_osr_denied(&task.method_key) {
         return fail(0);
     }
-    let optimized = crate::jit::tiered::tier_uses_optimized_backend(task.target_tier);
+    let optimized = crate::jit::tiered::tier_uses_optimized_backend(task.target_tier)
+        || (task.osr_bci.is_none() && promote_scalar_selfrec_to_ir(&shared, &task.method_key));
     if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
             "[cratonvm-jitc] bg-compile {}.{}{} tier={:?} optimized={}{}",
@@ -29710,6 +29828,13 @@ fn background_compile_task(
         } else {
             false
         };
+        if !published {
+            // The compile inputs and policy are stable for the life of this
+            // loaded method. Prevent a failed background artifact from being
+            // re-enqueued forever now that pending work no longer consumes the
+            // frame's permanent-rejection budget.
+            crate::jit::tiered::mark_osr_denied(task.method_key.clone());
+        }
         return CompileOutcome {
             // Widening: smaller integer -> 64-bit (zero/sign-extended).
             compile_time_ms: start.elapsed().as_millis() as u64,

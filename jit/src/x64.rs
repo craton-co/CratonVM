@@ -9363,6 +9363,12 @@ impl Compiler {
         // argument register, and args are already staged in ARG_REGS before
         // this call, so clobbering RAX here is safe. Gated off by default.
         if self.precise_maps && self.sp_id_slot_off != 0 {
+            if std::env::var_os("CRATONVM_DBG_SPID").is_some() {
+                eprintln!(
+                    "[DBG_SPID] cur_bc_pc={} sp_id_slot_off={}",
+                    self.cur_bc_pc, self.sp_id_slot_off
+                );
+            }
             self.emit_mov_imm32_sx(RAX, self.cur_bc_pc as i32); // Cast: bytecode PC fits i32
             self.emit_store_local(self.sp_id_slot_off, RAX);
             // Stage A.2 — this is a GC-capable safepoint that flushed its

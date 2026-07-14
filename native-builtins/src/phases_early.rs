@@ -578,11 +578,11 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     // --- Collections.emptyList/emptyMap/emptySet ---
     let cu = "java/util/Collections";
     r.register(cu, "emptyList", "()Ljava/util/List;", |ctx, _args| {
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-        ctx.set_field(list, 0, Value::Object(Some(arr)));
-        ctx.set_field(list, 1, Value::Int(0));
-        Ok(Some(Value::Object(Some(list))))
+        // Do not hand-assemble ArrayList's internal fields, and do not return
+        // a native-side allocation across a potential collection. `List.of()`
+        // is the JDK-owned empty immutable list construction and keeps its
+        // result live through the ordinary VM invocation path.
+        ctx.invoke("java/util/List", "of", "()Ljava/util/List;", &[])
     });
     r.register(cu, "emptyMap", "()Ljava/util/Map;", |ctx, _args| {
         let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
@@ -8945,7 +8945,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
             Ok(Some(Value::Object(Some(sv))))
         },
     );
-// BUG FIX (2026-07-10, es-storedscripts-retire): these Executors factory
+    // BUG FIX (2026-07-10, es-storedscripts-retire): these Executors factory
     // registrations (newFixedThreadPool, newCachedThreadPool x2,
     // newSingleThreadExecutor below) were copy-pasted from the
     // newScheduledThreadPool/newSingleThreadScheduledExecutor blocks above
@@ -8992,11 +8992,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                 Some(Value::Int(v)) => *v,
                 _ => 1,
             };
-            let sv = alloc_concurrent_synthetic(
-                ctx,
-                "java/util/concurrent/ThreadPoolExecutor",
-                2,
-            );
+            let sv = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
             initialize_real_thread_pool_executor(
                 ctx,
                 sv,
@@ -9015,11 +9011,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         "newCachedThreadPool",
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
-            let sv = alloc_concurrent_synthetic(
-                ctx,
-                "java/util/concurrent/ThreadPoolExecutor",
-                2,
-            );
+            let sv = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
             initialize_real_thread_pool_executor(
                 ctx,
                 sv,
@@ -9042,11 +9034,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                 Some(Value::Object(Some(f))) => Some(*f),
                 _ => None,
             };
-            let sv = alloc_concurrent_synthetic(
-                ctx,
-                "java/util/concurrent/ThreadPoolExecutor",
-                2,
-            );
+            let sv = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
             initialize_real_thread_pool_executor(
                 ctx,
                 sv,
@@ -9065,11 +9053,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         "newSingleThreadExecutor",
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
-            let sv = alloc_concurrent_synthetic(
-                ctx,
-                "java/util/concurrent/ThreadPoolExecutor",
-                2,
-            );
+            let sv = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
             initialize_real_thread_pool_executor(
                 ctx,
                 sv,
