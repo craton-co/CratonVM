@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN (12 genuinely hung, 10 slow-but-failing, 1 crash; 2 non-residual items removed). **2026-07-13 update**: 8 Bucket-1 + 3 Bucket-2 classes reconfirmed locally — one narrower bug fixed (`7ae137e4`), the hang itself still OPEN; see the 2026-07-13 section below. **2026-07-13 update #2**: `context.annotation.ImportSelectorTests`'s `StackOverflowError` root-caused — it is a Mockito `spy()` cross-hierarchy recursion, **unrelated to Spring's `ImportSelector` mechanism** (the original hypothesis below was wrong); still OPEN, see its own section. **2026-07-13 update #3**: both `web.service.registry.*` residuals (`ImportHttpServiceRegistrarTests`, `GroupsMetadataValueDelegateTests`) root-caused to `@CompileWithForkedClassLoader`'s custom-ClassLoader machinery interacting with Spring's AOT/test-compiler pipeline — two distinct defects, neither fixed; still OPEN, see dedicated section. **2026-07-13 update #4**: the 4 non-AOT, non-`ImportSelectorTests` Bucket-1 classes (`cache.jcache.JCacheEhCacheAnnotationTests`, `context.annotation.ComponentScanParserBeanDefinitionDefaultsTests`, `context.annotation.InitDestroyMethodLifecycleTests`, `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests`) **no longer hang** — reconfirmed clean on 2 independent runs each against a freshly-built `origin/dev` tip; see the dedicated section below. No new code was needed — all 4 were incidental beneficiaries of other unrelated fixes already on `dev`. **2026-07-13 update #5**: the "missing `ApiVersionStrategy` bean" `BeanCreationException` (2 classes: `CrossOriginAnnotationIntegrationTests`, `RequestMappingMessageConversionIntegrationTests`) **no longer reproduces** — confirmed fixed (likely a side effect of earlier JSpecify/reflection work), but both classes now fail a different way instead: a genuine **deadlock in `Semaphore.release()`'s internal monitor**, confirmed via a live `gdb` thread dump. Still OPEN, new root cause, see dedicated section. |
+| **Status** | OPEN (12 genuinely hung, 10 slow-but-failing, 0 crash — 1 FIXED; 2 non-residual items removed). **2026-07-13 update**: 8 Bucket-1 + 3 Bucket-2 classes reconfirmed locally — one narrower bug fixed (`7ae137e4`), the hang itself still OPEN; see the 2026-07-13 section below. **2026-07-13 update #2**: `context.annotation.ImportSelectorTests`'s `StackOverflowError` root-caused — it is a Mockito `spy()` cross-hierarchy recursion, **unrelated to Spring's `ImportSelector` mechanism** (the original hypothesis below was wrong); still OPEN, see its own section. **2026-07-13 update #3**: both `web.service.registry.*` residuals (`ImportHttpServiceRegistrarTests`, `GroupsMetadataValueDelegateTests`) root-caused to `@CompileWithForkedClassLoader`'s custom-ClassLoader machinery interacting with Spring's AOT/test-compiler pipeline — two distinct defects, neither fixed; still OPEN, see dedicated section. **2026-07-13 update #4**: the 4 non-AOT, non-`ImportSelectorTests` Bucket-1 classes (`cache.jcache.JCacheEhCacheAnnotationTests`, `context.annotation.ComponentScanParserBeanDefinitionDefaultsTests`, `context.annotation.InitDestroyMethodLifecycleTests`, `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests`) **no longer hang** — reconfirmed clean on 2 independent runs each against a freshly-built `origin/dev` tip; see the dedicated section below. No new code was needed — all 4 were incidental beneficiaries of other unrelated fixes already on `dev`. **2026-07-13 update #5**: the "missing `ApiVersionStrategy` bean" `BeanCreationException` (2 classes: `CrossOriginAnnotationIntegrationTests`, `RequestMappingMessageConversionIntegrationTests`) **no longer reproduces** — confirmed fixed (likely a side effect of earlier JSpecify/reflection work), but both classes now fail a different way instead: a genuine **deadlock in `Semaphore.release()`'s internal monitor**, confirmed via a live `gdb` thread dump. Still OPEN, new root cause, see dedicated section. **2026-07-13 update #6**: Bucket 3's `scripting.groovy.GroovyScriptFactoryTests` SIGSEGV **FIXED** (`2724ea5b`, pushed to `dev`) — root cause was a JIT codegen bug (stale deferred patch-list offsets surviving a rewound speculative-inline attempt, corrupting a later safepoint-id store in a hot, frequently-recompiled method); see dedicated section below. |
 | **Discovered** | 2026-07-11, following up on the 25 classes that hit TIMEOUT in the
 125-class scoped rerun (dev `9948295e`, standard 120s timeout — see
 [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](../internal/CRATONVM-SPRING-GENUINE-BUGLIST-125.md)). |
@@ -1009,14 +1009,62 @@ Notable sub-clusters within this bucket (candidates for shared root cause):
   Spring `ImportSelector`/`ConfigurationClassParser` recursion as originally
   guessed — reproduces standalone with no Spring context involved at all.
 
-## Bucket 3 — Immediate crash, not a hang (1/25)
+## Bucket 3 — Immediate crash, not a hang (0/25 — FIXED 2026-07-13)
 
-- `scripting.groovy.GroovyScriptFactoryTests` — **ABEND**, `rc=139` (SIGSEGV),
-  crashes during VM bootstrap warmup (`Post-clinit fixup` lines only, no test
-  discovery output), `found=0`. This is a crash-on-load, categorically
-  different from the TIMEOUT/hang classes above — was previously
-  misclassified as TIMEOUT purely because it also exceeded 120s (the crash
-  itself doesn't happen instantly; something before it is slow too).
+- `scripting.groovy.GroovyScriptFactoryTests` — was **ABEND**, `rc=139`
+  (SIGSEGV), crashing during VM bootstrap warmup (`Post-clinit fixup` lines
+  only, no test discovery output), `found=0`. **FIXED, commit `2724ea5b` on
+  `dev`.**
+
+  **Root cause**: a JIT codegen bug in the speculative-inlining rollback path
+  (`try_emit_inline`, `jit/src/x64.rs`). When a speculative inline attempt for
+  a callee bails partway through, the compiler already rewound the code
+  buffer position, operand stack, oop-mark vector, and spill cursor — but did
+  **not** roll back seven other deferred patch-list `Vec`s
+  (`exception_check_stubs`, `deopt_stubs`, `forward_patches`,
+  `jump_table_patches`, `self_call_patches`, `bounds_check_stubs`,
+  `null_check_store_stubs`). Any bytecode instruction the abandoned inline
+  attempt simulated (e.g. an inlined `invoke*` via
+  `emit_post_invoke_exception_check`) could push a raw buffer offset onto one
+  of those Vecs. That offset is only meaningful while it still points at the
+  placeholder bytes live when it was recorded; after a bail the buffer is
+  rewound and the fall-through normal-call path emits *different* code over
+  that same range, but the stale offset survived and was blindly patched
+  later — once, at the very end of `compile_bytecode`, over the FINAL,
+  already-reused buffer — corrupting whatever real instruction now occupied
+  that offset.
+
+  Concretely, on `groovyjarjarasm.asm.Handler.getExceptionTableSize`
+  (`return 2 + 8 * getExceptionTableLength(firstHandler)`, pulled in hot by
+  Groovy's ASM-based class generation under `GroovyScriptFactoryTests`, and
+  JIT-compiled very early in bootstrap) a stale `exception_check_stubs` entry
+  from a rewound inline attempt got 4-byte-patched into the middle of the
+  *kept* method's precise-maps safepoint-id store, replacing its bytecode-PC
+  immediate with garbage and clobbering the REX.W prefix of the very next
+  store instruction. Execution ran straight off the end of the mangled `mov`
+  into undefined bytes that happened to decode as a wild memory-writing
+  `ADD`, producing an immediate SIGSEGV the instant the (extremely hot)
+  method next ran — well before JUnit test discovery even started, matching
+  the observed `found=0` / `Post-clinit-fixup`-only crash signature exactly.
+  Root-caused via a live gdb attach on the JIT-compiled method (mapped
+  `r-xp` region with no symbol, located precisely via a `CRATONVM_DBG_JIT_NAMES`
+  entry-address diagnostic added during the investigation) plus a targeted
+  `CRATONVM_DBG_SPID` eprintln bisection confirming the safepoint-id store's
+  operands were corrupted; `CRATONVM_NO_PRECISE_JIT_MAPS=1` (which skips the
+  clobbered code path entirely) was the confirming A/B signal before the
+  precise fix landed.
+
+  **Fix**: snapshot the length of all seven deferred patch-list `Vec`s before
+  a speculative inline attempt and `truncate()` them back on bail, mirroring
+  the pre-existing buffer/stack/oop-mark/spill-cursor rollback.
+
+  **Verified**: rebuilt from a clean worktree synced to the merged `dev` tip
+  (`2724ea5b`) and reran the real class through `apps/spring-suite-runner/suite-run.sh`
+  with the doc's exact recipe (`BATCH=1 BATCH_TO=1500 ONE_TO=1500
+  CRATONVM_DEFAULT_HEAP_MAX_MB=2048`): `found=38 succ=21 fail=17`, `crashes.log`
+  empty — no more SIGSEGV, full test discovery/execution now happens. The
+  remaining 17 failures are pre-existing, unrelated Spring/Groovy functional
+  issues (not crashes), out of scope for this ticket.
 
 ## Raw data
 
