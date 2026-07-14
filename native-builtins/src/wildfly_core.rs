@@ -120,23 +120,34 @@ fn native_path_address_from_elements(
         Some(Value::Object(Some(list))) => list,
         _ => alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2),
     };
+    // `list` is a live ObjectRef that survives multiple GC-triggering calls
+    // below (the `add` calls in the loop, then the `pathAddress`/ctor
+    // dispatch); pin it across all of them and re-read before each use.
+    let list_pin = ctx.pin_native_root(list);
     for i in 0..ctx.array_length(arr) {
         let elem = ctx.get_array_element(arr, i);
+        let list = ctx.read_native_pin(list_pin, list);
         ctx.invoke_virtual(list, "add", "(Ljava/lang/Object;)Z", &[elem])?;
     }
-    match ctx.invoke(
+    let list = ctx.read_native_pin(list_pin, list);
+    let result = match ctx.invoke(
         "org/jboss/as/controller/PathAddress",
         "pathAddress",
         "(Ljava/util/List;)Lorg/jboss/as/controller/PathAddress;",
         &[Value::Object(Some(list))],
     ) {
         Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
-        _ => ctx.new_object_initialized(
-            "org/jboss/as/controller/PathAddress",
-            "(Ljava/util/List;)V",
-            &[Value::Object(Some(list))],
-        ),
-    }
+        _ => {
+            let list = ctx.read_native_pin(list_pin, list);
+            ctx.new_object_initialized(
+                "org/jboss/as/controller/PathAddress",
+                "(Ljava/util/List;)V",
+                &[Value::Object(Some(list))],
+            )
+        }
+    };
+    ctx.unpin_native_roots(list_pin);
+    result
 }
 
 /// One deployment in flight.  `name` is the archive name as the WildFly

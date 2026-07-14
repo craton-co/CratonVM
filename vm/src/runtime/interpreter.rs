@@ -1061,14 +1061,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
     // GC-overhead accounting: live set BEFORE the collection (post-TLAB-retire),
     // so `note_gc_productivity` can compute how much this forced GC actually
     // freed (`before - after`). See `note_gc_productivity` / `gc_overhead_limit_exceeded`.
-    // Free-list-aware metric: the non-moving young sweep reclaims into the
-    // from-space free list without retreating the bump cursor, so the raw
-    // `allocated_bytes` reads "freed 0" for a perfectly-productive sweep and
-    // the overhead limit falsely latches (then no GC ever runs again).
-    // Promoted bytes count as productivity too — a promotion-only cycle
-    // conserves live bytes but drained young for new allocation.
-    let before_live = shared.heap.live_bytes_estimate();
-    let before_promoted = shared.heap.bytes_promoted_total();
+    let before_live = shared.heap.allocated_bytes();
     // Round-5 fix (CRIT — UAF): see comment in `maybe_gc`. The forced
     // path is also an initiator path; drain its per-thread SATB buffer
     // before scanning roots.
@@ -1095,7 +1088,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
         shared
             .gc_cycle_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        note_gc_productivity(shared, before_live, before_promoted);
+        note_gc_productivity(shared, before_live);
     } else {
         let mut counted_os_tids: Vec<u32> = Vec::new();
         let should_initiate_gc = {
@@ -1153,7 +1146,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             shared
                 .gc_cycle_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            note_gc_productivity(shared, before_live, before_promoted);
+            note_gc_productivity(shared, before_live);
         } else {
             safepoint_check(shared, thread);
         }
@@ -1177,30 +1170,17 @@ const GC_OVERHEAD_LIMIT_CYCLES: u32 = 8;
 /// generational heap: in a retained-allocation death-spiral the young semi-space
 /// is emptied every cycle (so total *fullness* sits near young/total ≈ 50% and
 /// never looks exhausted), yet the GC frees ~nothing net because every survivor
-/// is promoted into an already-full old generation. Promoted bytes DO count
-/// toward productivity (they re-enable young allocation, which is the point of
-/// the collection) — but the 2%-of-capacity threshold still catches the
-/// death-spiral: a wedged, ~full old generation cannot absorb 2% of total heap
-/// capacity per cycle, so its sliver-promotions stay "unproductive" and the
-/// streak still trips the overhead limit. A healthy young→old drain moves far
-/// more than 2% and resets it.
+/// is promoted into an already-full old generation. `before - after` captures
+/// exactly that — promotion is not freeing, so it does not reset the streak.
 /// Forced GCs only happen on genuine allocation failure (young full *and*
 /// promotion blocked), so this never fires during ordinary young-GC churn.
-fn note_gc_productivity(shared: &SharedVm, before_live: usize, before_promoted: u64) {
+fn note_gc_productivity(shared: &SharedVm, before_live: usize) {
     let cap = shared.heap.heap_capacity();
     if cap == 0 {
         return;
     }
-    // Free-list-aware live metric (see the capture site in `maybe_gc_forced`):
-    // the non-moving sweep reclaims into the young free list without moving
-    // the bump cursor, so `allocated_bytes` would read a fully-productive
-    // sweep as "freed 0" and falsely latch the overhead limit.
-    let after_live = shared.heap.live_bytes_estimate();
-    let promoted = shared
-        .heap
-        .bytes_promoted_total()
-        .saturating_sub(before_promoted) as usize;
-    let freed = before_live.saturating_sub(after_live).saturating_add(promoted);
+    let after_live = shared.heap.allocated_bytes();
+    let freed = before_live.saturating_sub(after_live);
     // unproductive: freed < 2% of capacity
     // Cast: numeric/representation conversion
     let unproductive = (freed as u128) * 100 < (cap as u128) * 2;
@@ -1217,7 +1197,7 @@ fn note_gc_productivity(shared: &SharedVm, before_live: usize, before_promoted: 
     };
     if std::env::var_os("CRATONVM_DBG_GC_OVERHEAD").is_some() {
         eprintln!(
-            "[GC_OVERHEAD] before={before_live} after={after_live} promoted={promoted} freed={freed} cap={cap} unproductive={unproductive} streak={streak}"
+            "[GC_OVERHEAD] before={before_live} after={after_live} freed={freed} cap={cap} unproductive={unproductive} streak={streak}"
         );
     }
 }
@@ -8724,6 +8704,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let tdigest_kernel = frame.class_name() == "org/elasticsearch/tdigest/Dist"
                         && matches!(frame.method_name(), "quantile" | "cdf")
                         && frame.method_descriptor() == "(DILjava/util/function/Function;)D";
+                    // SAFETY: `code_ptr` addresses this frame's bytecode and the
+                    // preceding length check proves every inspected offset is in bounds.
                     if tdigest_kernel
                         && saved_pc + 14 <= code_len
                         && unsafe { *code_ptr.add(saved_pc + 3) } == 0xb9
@@ -10309,6 +10291,8 @@ pub(crate) fn build_deopt_frame_inner(
     for m in &rframe.monitors {
         match &m.object {
             FrameValue::Object(addr) => {
+                // SAFETY: materialization produced this raw oop and the frame is
+                // pinned before any allocation or GC can make the address stale.
                 let obj = unsafe { ObjectRef::from_raw(*addr as usize as *mut u8) };
                 thread.native_pin_roots.push(obj);
                 monitor_depths.push(m.lock_depth);
@@ -19607,6 +19591,8 @@ fn try_invoke_cached_lambda_impl(
                             crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(
                                 &*compiled,
                             );
+                        // SAFETY: the compiled entry's ABI and optional context
+                        // are selected from its own verified metadata above.
                         unsafe {
                             if compiled.needs_context() {
                                 compiled.try_call_with_context(vm_ptr, &jit_args)
@@ -34476,7 +34462,7 @@ mod tests {
     }
 
     #[test]
-    fn buffered_input_stream_force_native_covers_constructors_and_io_surface() {
+    fn buffered_input_stream_real_jdk_uses_its_own_bytecode() {
         let buffered = "java/io/BufferedInputStream";
         for (name, descriptor) in [
             ("<init>", "(Ljava/io/InputStream;)V"),
@@ -34491,8 +34477,8 @@ mod tests {
             ("close", "()V"),
         ] {
             assert!(
-                force_native_over_real_jdk_bytecode(buffered, name, descriptor),
-                "BufferedInputStream.{name}{descriptor} must use its registered native"
+                !force_native_over_real_jdk_bytecode(buffered, name, descriptor),
+                "BufferedInputStream.{name}{descriptor} must keep its real-JDK bytecode"
             );
         }
         assert!(force_native_over_real_jdk_bytecode(

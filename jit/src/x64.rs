@@ -21117,7 +21117,14 @@ impl Compiler {
                         if self.stack.len() >= 2 {
                             // Keep the lambda receiver on the simulated stack
                             // through the safepoint so the oop map roots it.
-                            let index_slot = *self.stack.last().expect("index on stack");
+                            let Some(&index_slot) = self.stack.last() else {
+                                // The specialized pattern was recognized but
+                                // its simulated stack no longer matches. Bail
+                                // out of JIT compilation; the interpreter can
+                                // execute the ordinary invoke path safely.
+                                self.failed = true;
+                                return false;
+                            };
                             let lambda_slot = self.stack[self.stack.len() - 2];
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.load_slot_to_reg(ARG_REGS[1], lambda_slot);

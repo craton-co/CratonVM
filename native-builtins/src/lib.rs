@@ -69380,6 +69380,22 @@ fn native_heap_bytebuffer_allocate(
             Value::Int(capacity.min(i32::MAX as usize) as i32),
         ],
     );
+    // A full JVM dispatches the HeapByteBuffer constructor above.  The
+    // native-only allocation entry point is also used by minimal contexts,
+    // which cannot run that Java body, so establish the same fields through
+    // the constructor's native implementation.
+    if let Ok(Some(Value::Object(Some(buffer)))) = &result {
+        native_heap_byte_buffer_init_array_offset_len(
+            ctx,
+            &[
+                Value::Object(Some(*buffer)),
+                Value::Object(Some(bytes)),
+                Value::Int(0),
+                Value::Int(capacity.min(i32::MAX as usize) as i32),
+                Value::Object(None),
+            ],
+        )?;
+    }
     ctx.unpin_native_roots(bytes_pin);
     result
 }
@@ -81867,7 +81883,9 @@ mod xerces_xml_parser_tests {
         )
         .expect("normalize replace")
         .expect("replace value");
-        assert_eq!(string_result(&ctx, replaced), " a  b  c ");
+        // XML Schema's `replace` facet maps TAB/LF/CR to U+0020 and does
+        // not collapse pre-existing or newly adjacent spaces.
+        assert_eq!(string_result(&ctx, replaced), " a  b c ");
 
         let collapsed = native_xssimple_type_normalize_string(
             &mut ctx,
