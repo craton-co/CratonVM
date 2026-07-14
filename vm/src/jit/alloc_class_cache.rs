@@ -181,21 +181,15 @@ impl Drop for JitAllocClassCache {
 
 /// Whether the cache is enabled.
 ///
-/// **DEFAULT OFF** (opt in with `CRATONVM_JIT_ALLOC_CLASS_CACHE=1`). Rationale
-/// (perf/throughput-20260710 continuation, 2026-07-10): cdb sampling of
-/// binarytrees-20 on current dev shows the JIT slow-path allocation cost is
-/// dominated by young-GC sweep + arena free-list scanning + old-gen spill, NOT
-/// the per-class `class_manager` lookups this cache removes —
-/// `jit_init_primitive_fields` appears as ~1 leaf sample (was ~8% in the stale
-/// 2026-07-06 profile, before the intervening inlining/OSR work absorbed it).
-/// A back-to-back bt18 A/B measured a wash within noise. Left in as an opt-in
-/// so it can be re-measured on an idle box (the dev box was CPU-contended when
-/// this landed); do NOT flip to default-on without an idle-box A/B showing a
-/// real win, per the hot-op-helperization-trap rule.
+/// Enabled by default. Opt out with `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE=1`.
+/// Fresh isolated bintrees measurements show that removing the repeated class
+/// manager lookup materially complements the inline allocation path; cache
+/// entries are immutable and scoped to a `SharedVm`, so this does not weaken
+/// allocation or class-lifetime correctness.
 #[inline]
 pub fn alloc_class_cache_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_JIT_ALLOC_CLASS_CACHE").is_some())
+    *ON.get_or_init(|| std::env::var_os("CRATONVM_NO_JIT_ALLOC_CLASS_CACHE").is_none())
 }
 
 #[cfg(test)]

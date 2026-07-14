@@ -3530,12 +3530,12 @@ unsafe fn jit_typecheck_resolve(
         class_name.len(),
     );
     let cached_target = JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
-        cache.get().and_then(|(cached_vm, cached_ptr, cached_len, raw)| {
-            (cached_vm == cache_key.0
-                && cached_ptr == cache_key.1
-                && cached_len == cache_key.2)
-                .then(|| ClassId::new(raw))
-        })
+        cache
+            .get()
+            .and_then(|(cached_vm, cached_ptr, cached_len, raw)| {
+                (cached_vm == cache_key.0 && cached_ptr == cache_key.1 && cached_len == cache_key.2)
+                    .then(|| ClassId::new(raw))
+            })
     });
     let target_class_id_opt = if cached_target.is_some() {
         cached_target
@@ -3543,7 +3543,12 @@ unsafe fn jit_typecheck_resolve(
         let resolved = vm.class_manager.read().find_class_by_name(class_name);
         if let Some(target) = resolved {
             JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
-                cache.set(Some((cache_key.0, cache_key.1, cache_key.2, target.as_u32())))
+                cache.set(Some((
+                    cache_key.0,
+                    cache_key.1,
+                    cache_key.2,
+                    target.as_u32(),
+                )))
             });
         }
         resolved

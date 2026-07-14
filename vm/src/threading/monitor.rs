@@ -1063,8 +1063,7 @@ impl MonitorTable {
                     {
                         static REINFLATE_MISSES: std::sync::atomic::AtomicUsize =
                             std::sync::atomic::AtomicUsize::new(0);
-                        let n = REINFLATE_MISSES
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let n = REINFLATE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if n < 8 {
                             tracing::warn!(
                                 obj = obj_ref.as_ptr() as usize,

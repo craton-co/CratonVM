@@ -464,6 +464,12 @@ impl ExecutableBuffer {
         self.ptr
     }
 
+    /// Size of the private executable allocation backing this method.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Get the emitted bytes as a slice.
     pub fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
@@ -5215,7 +5221,7 @@ pub fn try_compile(
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
-    // CRIT-2 — returns (class_id, num_fields, has_primitive_init,
+    // CRIT-2 — returns (class_id, num_fields, has_nonzero_tag_primitive_init,
     // has_finalizer). The two flags feed the inline-TLAB `new` fast path;
     // resolvers that cannot compute them must return `(_, _, true, true)`
     // so the post-init helper call stays in place.
@@ -5537,7 +5543,7 @@ fn try_compile_inner(
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
-    // (class_id, num_fields, has_primitive_init, has_finalizer) — see `try_compile`.
+    // (class_id, num_fields, has_nonzero_tag_primitive_init, has_finalizer) — see `try_compile`.
     cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
     cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<i64>>,
     cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<(i64, bool)>>, // inc 35: (bits, is_double)
@@ -6309,9 +6315,8 @@ fn try_compile_inner(
 
     // CRIT-2 — new_info tuple shape:
     //   (pc, class_id_raw, num_fields,
-    //    has_primitive_init,    // class has primitive-typed fields that
-    //                           // need typed-zero defaults applied by
-    //                           // `jit_init_primitive_fields`
+    //    has_nonzero_tag_primitive_init, // class has long/float/double fields
+    //                                    // whose typed-zero Value tag is nonzero
     //    has_finalizer)         // class overrides `finalize()` and must
     //                           // be registered with the finalizer queue
     //
@@ -7806,18 +7811,18 @@ pub fn invokestatic_self_call_uses_tail_jump(code: &[u8], code_len: usize, pc: u
 // Tests
 // ---------------------------------------------------------------------------
 
-    #[test]
-    fn hsqldb_jit_deny_matches_slash_and_dot_names() {
-        assert_eq!(
-            hsqldb_jit_deny_prefix("org/hsqldb/map/BaseHashMap"),
-            Some("org/hsqldb/")
-        );
-        assert_eq!(
-            hsqldb_jit_deny_prefix("org.hsqldb.map.BaseHashMap"),
-            Some("org.hsqldb.")
-        );
-        assert_eq!(hsqldb_jit_deny_prefix("org/example/Foo"), None);
-    }
+#[test]
+fn hsqldb_jit_deny_matches_slash_and_dot_names() {
+    assert_eq!(
+        hsqldb_jit_deny_prefix("org/hsqldb/map/BaseHashMap"),
+        Some("org/hsqldb/")
+    );
+    assert_eq!(
+        hsqldb_jit_deny_prefix("org.hsqldb.map.BaseHashMap"),
+        Some("org.hsqldb.")
+    );
+    assert_eq!(hsqldb_jit_deny_prefix("org/example/Foo"), None);
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7845,7 +7850,10 @@ mod tests {
             jaxb_mapping_jit_deny_prefix("org.glassfish.jaxb.runtime.v2.ContextFactory"),
             Some("org.glassfish.jaxb.")
         );
-        assert_eq!(jaxb_mapping_jit_deny_prefix("org/glassfish/other/Foo"), None);
+        assert_eq!(
+            jaxb_mapping_jit_deny_prefix("org/glassfish/other/Foo"),
+            None
+        );
     }
 
     #[test]
