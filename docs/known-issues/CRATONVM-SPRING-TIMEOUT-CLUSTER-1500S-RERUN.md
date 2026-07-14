@@ -1323,8 +1323,8 @@ rather than a coincidence:
 | `web.servlet.mvc.method.annotation.ServletAnnotationControllerHandlerMethodTests` | **FIXED 2026-07-14** | 445s -> 149s | 211/241 -> **241/241** | Two native bugs, both fixed (`cd90774e`, `72a9ad40`): `PrintWriter.write(String)` bypassed subclass `write(String,int,int)` overrides (broke Spring test fixture auto-flush); `Matcher.group(int)` assumed cached text was always `java.lang.String`, threw spurious `NoSuchMethodError` on a general `CharSequence` (e.g. `AntPathMatcher`'s `MaxAttemptsCharSequence`) |
 | `beans.factory.aot.BeanDefinitionPropertiesCodeGeneratorTests` | FAIL → **TIMEOUT as of 2026-07-13** | 693s | 0/47 | `CompilationException: Unable to compile source` → now hangs instead, see [2026-07-13 update](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open) |
 | `beans.factory.aot.InstanceSupplierCodeGeneratorTests` | FAIL → **TIMEOUT as of 2026-07-13** | 730s | 4/26 | `CompilationException: Unable to compile source` → now hangs instead, see [2026-07-13 update](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open) |
-| `web.service.registry.ImportHttpServiceRegistrarTests` | FAIL, root-caused 2026-07-13 (still OPEN) | 763s (10s on the 2026-07-13 isolated rerun) | 3/5 | `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;` in `ConfigurationClassParser$SourceClass.getAnnotationAttributes` — see dedicated section below |
-| `web.service.registry.GroupsMetadataValueDelegateTests` | ABEND, root-caused 2026-07-13 (still OPEN) | 1039s (1306s on the 2026-07-13 rerun) | 0/8 | fatal VM error `class file error: class not found: .../GroupsMetadata__TestCode` — see dedicated section below |
+| `web.service.registry.ImportHttpServiceRegistrarTests` | FAIL, root-caused 2026-07-13, reconfirmed unchanged 2026-07-14 (still OPEN) | 763s (25s on the 2026-07-14 isolated rerun) | 3/5 | `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;` in `ConfigurationClassParser$SourceClass.getAnnotationAttributes` — see dedicated section below |
+| `web.service.registry.GroupsMetadataValueDelegateTests` | **ABEND FIXED 2026-07-14** (`9bca11f5`); now FAIL on a new, distinct residual (still OPEN) | 1039s (25s combined w/ above on the 2026-07-14 rerun) | 0/8 | was fatal VM error `class file error: class not found: .../GroupsMetadata__TestCode` (FIXED); now `IllegalStateException: WritableContent did not append any content` — see dedicated section below |
 | `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` | FAIL → **TIMEOUT as of 2026-07-13** | 1132s → 600s×2 | 0/160 → 0/0 | `BeanCreationException`: no `ApiVersionStrategy` bean (same as `CrossOriginAnnotationIntegrationTests`) → **bean bug fixed**, now TIMEOUTs the same way, see [2026-07-13 update #5](#2026-07-13-local-investigation-5--missing-apiversionstrategy-bean-resolved-both-classes-now-hit-a-different-new-deadlock-still-open) |
 | `context.annotation.ImportSelectorTests` | FAIL, root-caused 2026-07-13 (still OPEN) | 1456s (734s on the 2026-07-13 rebuild) | 4/9 | `StackOverflowError` — Mockito `spy()` recursion, not Spring; see dedicated section below |
 
@@ -1343,11 +1343,15 @@ Notable sub-clusters within this bucket (candidates for shared root cause):
   [2026-07-13 local investigation](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open)
   section above — still OPEN.
 - **`web.service.registry.*` residuals** (2 classes: `ImportHttpServiceRegistrarTests`,
-  `GroupsMetadataValueDelegateTests`) — both now root-caused to the same
-  general area (`@CompileWithForkedClassLoader`'s custom-ClassLoader
-  machinery interacting with Spring's AOT/test-compiler pipeline), but with
-  two DIFFERENT specific defects. Neither fixed. See the dedicated section
-  below.
+  `GroupsMetadataValueDelegateTests`) — both root-caused to the same general
+  area (`@CompileWithForkedClassLoader`'s custom-ClassLoader machinery
+  interacting with Spring's AOT/test-compiler pipeline), but with two
+  DIFFERENT specific defects. `GroupsMetadataValueDelegateTests`'s fatal
+  VM-abort defect (a loader-blind, name-based class re-resolution ambiguity
+  in reflective static-method `Method.invoke()`) is **FIXED** (`9bca11f5`),
+  though the class still doesn't fully pass (new, distinct, unrelated
+  `WritableContent` residual). `ImportHttpServiceRegistrarTests`'s
+  `ClassCastException` remains OPEN. See the dedicated section below.
 - **Missing `ApiVersionStrategy` bean** (2 classes: `CrossOriginAnnotationIntegrationTests`,
   `RequestMappingMessageConversionIntegrationTests`) — **resolved as of
   2026-07-13**: the `BeanCreationException` no longer reproduces (confirmed
