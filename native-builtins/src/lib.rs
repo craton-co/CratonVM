@@ -60329,16 +60329,35 @@ fn native_sem_init_fair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 fn sem_acquire_blocking(ctx: &mut dyn NativeContext, this: ObjectRef, n: i32) -> MethodCallResult {
     // Install the holder up-front (re-binding `this` across the possible
     // allocation) so no allocation happens inside the monitor section.
-    let this = sem_prepare(ctx, this);
+    let mut this = sem_prepare(ctx, this);
     loop {
-        ctx.monitor_enter(this);
+        // GC-SAFEPOINT FIX (STW cross-thread JIT-takeover barrier deadlock,
+        // same class as native_cdl_await's fix in commit 51a508e1): a raw
+        // `ctx.monitor_enter` never marks this thread GC-blocked, so a
+        // contended wait here stays counted in the barrier's `expected` set
+        // forever, deadlocking any pause requested while we wait on another
+        // thread's held lock (a 3-way wedge: us waiting on the owner, the
+        // owner GC-blocked waiting for the pause, the pause waiting on us).
+        // `monitor_enter_gc_safe` wraps the wait in the proper GC-blocked
+        // protocol and returns the possibly-relocated reference — use it for
+        // every subsequent access.
+        this = ctx.monitor_enter_gc_safe(this);
         let permits = sem_permits(ctx, this);
         if permits >= n {
             sem_set_permits(ctx, this, permits - n);
             ctx.monitor_exit(this);
             return Ok(None);
         }
-        let wait_result = ctx.monitor_wait(this, Some(10));
+        // GC-SAFEPOINT FIX: the wait itself can also span a relocating GC;
+        // keep `this` valid across it. On error (e.g. InterruptedException)
+        // fall back to the pre-wait reference for the cleanup exit below —
+        // matches the original (always-exit) control flow rather than the
+        // CDL precedent's skip-exit-on-error shape.
+        let wait_result = monitor_wait_keepalive(ctx, this, Some(10));
+        this = match &wait_result {
+            Ok(o) => *o,
+            Err(_) => this,
+        };
         ctx.monitor_exit(this);
         wait_result?;
     }
@@ -60366,7 +60385,13 @@ fn native_sem_acquire_n(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 fn sem_release_n_inner(ctx: &mut dyn NativeContext, this: ObjectRef, n: i32) -> MethodCallResult {
     let this = sem_prepare(ctx, this);
-    ctx.monitor_enter(this);
+    // GC-SAFEPOINT FIX: see sem_acquire_blocking above for the full story —
+    // this is the exact call site live-gdb-confirmed to hang
+    // CrossOriginAnnotationIntegrationTests/RequestMappingMessageConversionIntegrationTests
+    // (main-vm parked forever in MonitorTable::enter's contended wait,
+    // uncounted-as-blocked, while the true owner is itself GC-blocked
+    // waiting on a pause that waits on us).
+    let this = ctx.monitor_enter_gc_safe(this);
     let permits = sem_permits(ctx, this);
     sem_set_permits(ctx, this, permits + n);
     let notify_result = ctx.monitor_notify_all(this);
@@ -60397,7 +60422,8 @@ fn native_sem_release_n(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 fn sem_try_acquire_inner(ctx: &mut dyn NativeContext, this: ObjectRef, n: i32) -> bool {
     let this = sem_prepare(ctx, this);
-    ctx.monitor_enter(this);
+    // GC-SAFEPOINT FIX: see sem_acquire_blocking above.
+    let this = ctx.monitor_enter_gc_safe(this);
     let permits = sem_permits(ctx, this);
     let ok = permits >= n;
     if ok {
@@ -60438,7 +60464,7 @@ fn native_sem_try_acquire_n(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 fn native_sem_try_acquire_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args: this, timeout(long), TimeUnit — honor the timeout with bounded
     // monitor-waits (was: ignored the timeout and returned tryAcquire()).
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -60462,8 +60488,15 @@ fn native_sem_try_acquire_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -
             return Ok(Some(Value::Int(0)));
         }
         let wait_ms = bounded_monitor_wait_ms(remaining, 10);
-        ctx.monitor_enter(this);
-        let wait_result = ctx.monitor_wait(this, Some(wait_ms));
+        // GC-SAFEPOINT FIX: see sem_acquire_blocking above; `this` must stay
+        // fresh across both calls below AND into the next loop iteration's
+        // `sem_try_acquire_inner(ctx, this, 1)`.
+        this = ctx.monitor_enter_gc_safe(this);
+        let wait_result = monitor_wait_keepalive(ctx, this, Some(wait_ms));
+        this = match &wait_result {
+            Ok(o) => *o,
+            Err(_) => this,
+        };
         ctx.monitor_exit(this);
         wait_result?;
     }
@@ -60484,7 +60517,8 @@ fn native_sem_drain_permits(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return Ok(Some(Value::Int(0))),
     };
     let this = sem_prepare(ctx, this);
-    ctx.monitor_enter(this);
+    // GC-SAFEPOINT FIX: see sem_acquire_blocking above.
+    let this = ctx.monitor_enter_gc_safe(this);
     let permits = sem_permits(ctx, this);
     sem_set_permits(ctx, this, 0);
     ctx.monitor_exit(this);
