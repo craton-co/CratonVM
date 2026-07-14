@@ -7184,32 +7184,64 @@ fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) {
         }
     };
     let entries = collect_entries_any(ctx, source);
+
+    // GC-SAFETY: the entry-view branch below allocates a new `SimpleEntry`
+    // per element via `alloc_live_entry`, and `alloc_ref_array` further down
+    // allocates the new backing array -- both can trigger a moving GC.
+    // `list` (needed by the trailing `al_set_data`/`al_set_size`) and
+    // `source` (re-embedded into every minted entry, so at risk again on the
+    // very next loop iteration) are pinned across these calls and re-read
+    // before each subsequent use; the entry-view branch additionally pins
+    // every key/value already collected into `entries` (a plain Rust `Vec`,
+    // not itself a GC root) since an earlier iteration's allocation can
+    // relocate a later iteration's key/value before it's read. Confirmed
+    // live via CRATONVM_DBG_STALE_OBJREF: native_al_stream ->
+    // resync_values_view -> al_set_data -> al_slots_for dereferencing a
+    // stale `list`.
+    let list_pin = ctx.pin_native_root(list);
+    let source_pin = ctx.pin_native_root(source);
+
     let vals: Vec<Value> = if is_entry_view {
-        entries
-            .into_iter()
-            .map(|(k, v)| {
-                Value::Object(Some(alloc_live_entry(
-                    ctx,
-                    // Real Map.Entry impl (see native_tm_entry_set): reflective
-                    // property access over rebuilt TreeMap entrySet elements.
-                    "java/util/AbstractMap$SimpleEntry",
-                    k,
-                    v,
-                    source,
-                )))
-            })
-            .collect()
+        let mut flat_entries: Vec<Value> = Vec::with_capacity(entries.len() * 2);
+        for (k, v) in &entries {
+            flat_entries.push(*k);
+            flat_entries.push(*v);
+        }
+        let (_entries_pin, entries_handles) = pin_value_slice(ctx, &flat_entries);
+        let mut out = Vec::with_capacity(entries.len());
+        for i in 0..entries.len() {
+            let k = read_pinned_elem(ctx, entries_handles[2 * i], flat_entries[2 * i]);
+            let v = read_pinned_elem(ctx, entries_handles[2 * i + 1], flat_entries[2 * i + 1]);
+            let source_cur = ctx.read_native_pin(source_pin, source);
+            let entry = alloc_live_entry(
+                ctx,
+                // Real Map.Entry impl (see native_tm_entry_set): reflective
+                // property access over rebuilt TreeMap entrySet elements.
+                "java/util/AbstractMap$SimpleEntry",
+                k,
+                v,
+                source_cur,
+            );
+            out.push(Value::Object(Some(entry)));
+        }
+        out
     } else {
         entries.into_iter().map(|(_, v)| v).collect()
     };
+
+    let (_vals_pin, vals_handles) = pin_value_slice(ctx, &vals);
     let cap = vals.len().max(AL_DEFAULT_CAPACITY) + 1;
     let buf = alloc_ref_array(ctx, cap);
+    let list = ctx.read_native_pin(list_pin, list);
+    let source = ctx.read_native_pin(source_pin, source);
+    let vals = read_value_slice(ctx, &vals_handles, &vals);
     for (i, v) in vals.iter().enumerate() {
         ctx.set_array_element(buf, i, *v);
     }
     ctx.set_array_element(buf, cap - 1, Value::Object(Some(source)));
     al_set_data(ctx, list, buf);
     al_set_size(ctx, list, vals.len() as i32);
+    ctx.unpin_native_roots(list_pin);
 }
 
 /// If `list`'s element array carries a `values()`-view source-map marker in
@@ -10414,6 +10446,21 @@ fn sort_with_comparator(
     // The comparison is fallible: a comparator that throws propagates the
     // error out and short-circuits the sort. A non-Int return is treated as
     // 0 ("equal"), preserving the previous insertion-sort semantics.
+    //
+    // GC-SAFETY (Family-1 stale-ObjectRef fix, follow-up to the TreeMap/TreeSet
+    // comparator_compare fix): `merge_sort_fallible` dispatches the caller's
+    // (possibly `thenComparing`-chained) Comparator via `comparator_compare`
+    // up to O(n log n) times, and each dispatch can invoke a user lambda and
+    // trigger a moving GC. `data` and `comparator` were already pinned/
+    // refreshed here, but the `list` parameter itself was held raw across the
+    // WHOLE sort and dereferenced only at the very end by
+    // `values_view_source(ctx, list)` (which reads `list`'s class via
+    // `al_state`/`unwrap_unmod`/`class_id_of_object`) -- pin it too. Confirmed
+    // via a targeted repro (concurrent `ArrayList.sort(Comparator
+    // .comparingInt(f).thenComparing(g))` under GC pressure) as the actual
+    // root cause of the `Comparator.lambda$thenComparing$...` (class_id 6)
+    // panics surviving the TreeMap/TreeSet fix.
+    let list_pin = ctx.pin_native_root(list);
     let data_pin = ctx.pin_native_root(data);
     let cmp_pin = ctx.pin_native_root(comparator);
     let (_, elem_handles) = pin_value_slice(ctx, &elems);
@@ -10438,7 +10485,7 @@ fn sort_with_comparator(
         }
     });
     if let Err(e) = sort_result {
-        ctx.unpin_native_roots(data_pin);
+        ctx.unpin_native_roots(list_pin);
         return Err(e);
     }
 
@@ -10452,7 +10499,8 @@ fn sort_with_comparator(
         let val = read_pinned_elem(ctx, elem_handles[i], elems[i]);
         ctx.set_array_element(data, out, val);
     }
-    ctx.unpin_native_roots(data_pin);
+    let list = ctx.read_native_pin(list_pin, list);
+    ctx.unpin_native_roots(list_pin);
     // Detach from `Map.values()` live-view semantics. Real `Map.values()`'s
     // return type doesn't implement `List` (no `.sort()` possible on it at
     // all on HotSpot) — reaching this native means whatever called
@@ -12406,11 +12454,35 @@ fn stream_apply_chain_full(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
 ) -> Result<Vec<Value>, MethodCallFailed> {
+    // GC-SAFETY: the pull loop below re-invokes the chain's user lambdas
+    // (map/flatMap/filter/peek) once per emitted element via `stream_pull` ->
+    // `stream_process_chain` -> `invoke_deferred_stream_lambda`, and each
+    // dispatch can allocate and trigger a moving GC. Earlier iterations'
+    // results were being accumulated into `out` as bare `Value`s with no pin,
+    // so a LATER element's lambda call could relocate an EARLIER element
+    // already sitting in `out`, leaving it stale by the time a downstream
+    // terminal (e.g. `collect(toUnmodifiableList())`'s `make_list_of`) reads
+    // it back. Pin every emitted value immediately and rebuild `out` from
+    // those pins once the whole pull completes. Observed as class_id 64/65
+    // panics inside Xerces' `DefaultXMLSequence` ctor's `particles.stream()
+    // .map(...).flatMap(...).collect(Collectors.toUnmodifiableList())`
+    // pipeline.
     let mut out = Vec::new();
-    stream_pull(ctx, this, |_c, v| {
+    let mut handles: Vec<usize> = Vec::new();
+    let mut base = usize::MAX;
+    stream_pull(ctx, this, |c, v| {
+        let h = pin_value(c, v);
+        if base == usize::MAX {
+            base = h;
+        }
+        handles.push(h);
         out.push(v);
         Ok(PullStep::Continue)
     })?;
+    let out = read_value_slice(ctx, &handles, &out);
+    if base != usize::MAX {
+        ctx.unpin_native_roots(base);
+    }
     Ok(out)
 }
 
@@ -14022,6 +14094,15 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // one element at a time, so a side-effecting consumer observes per-element
     // processing exactly like the JDK (the fix for DetachedPreviousRowStateTest).
     if let Some(spl) = stream_lazy_spliterator(ctx, this) {
+        // GC-SAFETY: the `tryAdvance` loop below re-enters Java once per
+        // element and can trigger a moving GC that relocates `this`; the
+        // trailing `set_field(this, ...)` after the loop was reading the
+        // stale address captured at function entry. Pin `this` alongside
+        // `spl`/`consumer` and re-read it before that final use. Confirmed
+        // live via CRATONVM_DBG_STALE_OBJREF during WildFly parallel-boot
+        // ServiceLoader stream draining -- see
+        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+        let this_pin = ctx.pin_native_root(this);
         let spl_pin = ctx.pin_native_root(spl);
         let con_pin = ctx.pin_native_root(consumer);
         const SAFETY_CAP: usize = 1_000_000;
@@ -14045,6 +14126,8 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
                 Err(e) => break Err(e),
             }
         };
+        let this = ctx.read_native_pin(this_pin, this);
+        ctx.unpin_native_roots(this_pin);
         ctx.unpin_native_roots(spl_pin);
         ctx.unpin_native_roots(con_pin);
         // Mark consumed so a (illegal) second terminal sees an empty stream.
@@ -14235,9 +14318,26 @@ fn native_stream_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             found = Some(v);
             Ok(PullStep::Stop)
         })?;
+        // GC-SAFETY: `alloc_synthetic` below allocates the Optional wrapper and
+        // can trigger a moving GC; `found` is a bare `Value` captured from the
+        // pull closure with no pin. Pin it first and refresh after, matching
+        // the eager branch a few lines below.
+        let found_pin = match found {
+            Some(Value::Object(Some(o))) => Some(ctx.pin_native_root(o)),
+            _ => None,
+        };
         let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
         if let Some(fv) = found {
+            let fv = match (fv, found_pin) {
+                (Value::Object(Some(o)), Some(pin)) => {
+                    Value::Object(Some(ctx.read_native_pin(pin, o)))
+                }
+                _ => fv,
+            };
             ctx.set_field(opt, OPT_FIELD_VALUE, fv);
+        }
+        if let Some(pin) = found_pin {
+            ctx.unpin_native_roots(pin);
         }
         return Ok(Some(Value::Object(Some(opt))));
     }
@@ -19794,8 +19894,17 @@ fn make_comparing(ctx: &mut dyn NativeContext, args: &[Value], tag: i32) -> Meth
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // GC-SAFETY (Family-1 stale-ObjectRef fix, follow-up to the TreeMap/TreeSet
+    // comparator_compare fix): `make_comparator` allocates the tagged synthetic
+    // Comparator$Native object (via `alloc_synthetic` -> `ensure_class_initialized`
+    // + the allocation itself), either of which can run a `<clinit>` and trigger a
+    // moving GC. `key_fn` is a raw ObjectRef held across that call and reused
+    // afterward in `set_field` -- pin it first and refresh before the write.
+    let key_fn_pin = ctx.pin_native_root(key_fn);
     let cmp = make_comparator(ctx, tag);
+    let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
     ctx.set_field(cmp, CMP_FIELD_ARG1, Value::Object(Some(key_fn)));
+    ctx.unpin_native_roots(key_fn_pin);
     Ok(Some(Value::Object(Some(cmp))))
 }
 
@@ -19829,8 +19938,13 @@ fn native_comparator_reversed(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // GC-SAFETY: same `make_comparator` allocation hazard as `make_comparing`
+    // above -- pin `this` across it and refresh before the write-back.
+    let this_pin = ctx.pin_native_root(this);
     let cmp = make_comparator(ctx, CMP_TAG_REVERSED);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(cmp, CMP_FIELD_ARG1, Value::Object(Some(this)));
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(cmp))))
 }
 
@@ -19854,17 +19968,36 @@ fn make_then_comparing(
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // GC-SAFETY (Family-1 stale-ObjectRef fix, follow-up to the TreeMap/TreeSet
+    // comparator_compare fix -- this residual survived that fix because it's a
+    // DIFFERENT native entry point: comparator *construction*, not comparator
+    // *dispatch*). Building a `thenComparing*` comparator can allocate TWICE
+    // (the inner key-extractor comparator when `inner_tag` is `Some`, then the
+    // outer THEN_COMPARING comparator always) via `make_comparator` ->
+    // `alloc_synthetic` -> `ensure_class_initialized` + the allocation itself,
+    // either of which can run a `<clinit>` and trigger a moving GC. `this` and
+    // `arg1` are raw ObjectRefs read from `args` before either allocation and
+    // then written into fields afterward -- pin both up front, refresh right
+    // before each write. Observed as `Comparator.lambda$thenComparing$...`
+    // (class_id 6) panics surviving the TreeMap/TreeSet fix.
+    let this_pin = ctx.pin_native_root(this);
+    let arg1_pin = ctx.pin_native_root(arg1);
     let secondary = match inner_tag {
         None => arg1,
         Some(key_tag) => {
             let inner = make_comparator(ctx, key_tag);
+            let arg1 = ctx.read_native_pin(arg1_pin, arg1);
             ctx.set_field(inner, CMP_FIELD_ARG1, Value::Object(Some(arg1)));
             inner
         }
     };
+    let secondary_pin = ctx.pin_native_root(secondary);
     let cmp = make_comparator(ctx, CMP_TAG_THEN_COMPARING);
+    let this = ctx.read_native_pin(this_pin, this);
+    let secondary = ctx.read_native_pin(secondary_pin, secondary);
     ctx.set_field(cmp, CMP_FIELD_ARG1, Value::Object(Some(this)));
     ctx.set_field(cmp, CMP_FIELD_ARG2, Value::Object(Some(secondary)));
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(cmp))))
 }
 
@@ -22712,31 +22845,63 @@ fn lhm_find_node(
     this: ObjectRef,
     key: &Value,
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    // GC-safety: same "Family 1" stale-ObjectRef pattern fixed in
+    // `native_map_contains_key` (see its comment for the live
+    // CRATONVM_DBG_STALE_OBJREF capture this mirrors) -- `map_hash_key`/
+    // `map_keys_equal` dispatch arbitrary Java code (hashCode()/equals()),
+    // which can trigger a moving GC. Pin `this` and the search key up front,
+    // and pin/re-read the bucket-chain `node` around each `equals()` call.
+    let this_pin = ctx.pin_native_root(this);
+    let key_val = *key;
+    let key_pin = pin_value(ctx, key_val);
+    let (hash, is_null, key_ref) = match key_val {
+        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false, Some(k)),
+        Value::Object(None) => (0, true, None),
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(None);
+        }
+    };
+    let this = ctx.read_native_pin(this_pin, this);
+    let key_val = read_pinned_elem(ctx, key_pin, key_val);
+
     let (buckets, _, cap) = lhm_state(ctx, this);
     let buckets = match buckets {
         Some(b) => b,
-        None => return Ok(None),
-    };
-    let (hash, is_null) = match key {
-        Value::Object(Some(k)) => (map_hash_key(ctx, *k)?, false),
-        Value::Object(None) => (0, true),
-        _ => return Ok(None),
+        None => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(None);
+        }
     };
     let idx = map_bucket_index(hash, cap);
     let mut node_val = ctx.get_array_element(buckets, idx);
-    while let Value::Object(Some(node)) = node_val {
+    while let Value::Object(Some(mut node)) = node_val {
         let node_key = ctx.get_field(node, LHM_NODE_KEY);
         if is_null {
             if matches!(node_key, Value::Object(None)) {
+                ctx.unpin_native_roots(this_pin);
                 return Ok(Some(node));
             }
-        } else if let (Value::Object(Some(nk)), Value::Object(Some(k))) = (node_key, key) {
-            if map_keys_equal(ctx, nk, *k)? {
+        } else if let Value::Object(Some(nk)) = node_key {
+            let node_pin = ctx.pin_native_root(node);
+            let node_key_pin = ctx.pin_native_root(nk);
+            let nk = ctx.read_native_pin(node_key_pin, nk);
+            let k_cur = match read_pinned_elem(ctx, key_pin, key_val) {
+                Value::Object(Some(kk)) => kk,
+                _ => key_ref.unwrap(),
+            };
+            let eq = map_keys_equal(ctx, nk, k_cur)?;
+            node = ctx.read_native_pin(node_pin, node);
+            ctx.unpin_native_roots(node_key_pin);
+            ctx.unpin_native_roots(node_pin);
+            if eq {
+                ctx.unpin_native_roots(this_pin);
                 return Ok(Some(node));
             }
         }
         node_val = ctx.get_field(node, LHM_NODE_NEXT);
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -23129,11 +23294,28 @@ fn native_lhm_put_evict(
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
 
+    // GC-SAFETY: `this` is a bare Rust local read from `args`, not itself a
+    // GC root -- only a `pin_native_root`/`read_native_pin` handle survives a
+    // moving GC. `map_hash_key` (key.hashCode()), `lhm_resize` (allocates a
+    // new bucket array), `lhm_find_node` (key.equals() dispatch per
+    // bucket-chain probe), `new_object_initialized`, and `invoke_virtual`
+    // (removeEldestEntry) below can all trigger one; this function used
+    // `this` again after each without ever refreshing it. Confirmed live via
+    // CRATONVM_DBG_STALE_OBJREF: native_lhm_put_evict -> lhm_state ->
+    // lhm_get -> lhm_overlay_key -> widened_obj_key -> identity_hash_code
+    // dereferencing a stale `this`. Pin once up front, re-read after every
+    // hazard, and unpin once at each exit.
+    let this_pin = ctx.pin_native_root(this);
+
     let hash = match key_val {
         Value::Object(Some(k)) => map_hash_key(ctx, k)?,
         Value::Object(None) => 0,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(Value::Object(None)));
+        }
     };
+    let this = ctx.read_native_pin(this_pin, this);
 
     // Check for resize. Also initialize table when buckets is None
     // (e.g. `org/springframework/core/annotation/AnnotationAttributes`
@@ -23148,9 +23330,11 @@ fn native_lhm_put_evict(
     if initial_buckets.is_none() || size + 1 > (cap * 3) / 4 {
         lhm_resize(ctx, this);
     }
+    let this = ctx.read_native_pin(this_pin, this);
 
     // Check for existing key
     if let Some(node) = lhm_find_node(ctx, this, &key_val)? {
+        let this = ctx.read_native_pin(this_pin, this);
         let old = ctx.get_field(node, LHM_NODE_VALUE);
         ctx.set_field(node, LHM_NODE_VALUE, value);
         // Access-order semantics: re-inserting a value for an existing key
@@ -23160,14 +23344,19 @@ fn native_lhm_put_evict(
         if lhm_is_access_order(ctx, this) {
             lhm_move_to_tail(ctx, this, node);
         }
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(old));
     }
+    let this = ctx.read_native_pin(this_pin, this);
 
     // Insert new node
     let (buckets, size, cap) = lhm_state(ctx, this);
     let buckets = match buckets {
         Some(b) => b,
-        None => return Ok(Some(Value::Object(None))),
+        None => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(Value::Object(None)));
+        }
     };
     let idx = map_bucket_index(hash, cap);
 
@@ -23176,8 +23365,8 @@ fn native_lhm_put_evict(
     // Rust locals captured above). The stale addresses would make the
     // head-insert `set_array_element(buckets, ..)` and the `this` writes below
     // land in freed-and-reused storage (same corrupt-cell family as
-    // native_map_put). Pin both across the alloc and re-read after.
-    let this_pin = ctx.pin_native_root(this);
+    // native_map_put). Pin `buckets` across the alloc and re-read both after
+    // (`this` reuses the outer `this_pin` established at function entry).
     let buckets_pin = ctx.pin_native_root(buckets);
     let new_node = lhm_alloc_node(ctx, key_val, value, hash);
     let this = ctx.read_native_pin(this_pin, this);
@@ -23194,7 +23383,6 @@ fn native_lhm_put_evict(
     lhm_link_tail(ctx, this, new_node);
 
     lhm_set(ctx, this, "size", LHM_FIELD_SIZE, Value::Int(size + 1));
-    ctx.unpin_native_roots(this_pin); // gcstress residual face-1 fix
 
     // Replicate `LinkedHashMap.afterNodeInsertion(true)`: after a NEW node is
     // inserted, consult the (overridable) `removeEldestEntry` hook on the
@@ -23234,8 +23422,14 @@ fn native_lhm_put_evict(
                 &[key, val],
             )? {
                 Some(Value::Object(Some(e))) => e,
-                _ => return Ok(Some(Value::Object(None))),
+                _ => {
+                    ctx.unpin_native_roots(this_pin);
+                    return Ok(Some(Value::Object(None)));
+                }
             };
+            // `new_object_initialized` above allocates and can trigger a
+            // moving GC; refresh `this` before the virtual dispatch below.
+            let this = ctx.read_native_pin(this_pin, this);
             let verdict = ctx.invoke_virtual(
                 this,
                 "removeEldestEntry",
@@ -23243,6 +23437,9 @@ fn native_lhm_put_evict(
                 &[Value::Object(Some(eldest))],
             )?;
             if matches!(verdict, Some(Value::Int(n)) if n != 0) {
+                // `invoke_virtual` above runs arbitrary Java and can trigger
+                // a moving GC; refresh `this` before the reentrant remove.
+                let this = ctx.read_native_pin(this_pin, this);
                 // Evict the eldest by key. If the override already removed it
                 // reentrantly (Hibernate's LRU calls `segment.remove` ->
                 // `eviction.onEntryRemove` -> `this.remove`), this is an
@@ -23253,6 +23450,7 @@ fn native_lhm_put_evict(
         }
     }
 
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(None)))
 }
 
@@ -23262,7 +23460,15 @@ fn native_lhm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    if let Some(node) = lhm_find_node(ctx, this, &key)? {
+    // GC-SAFETY: `lhm_find_node` dispatches key.hashCode()/equals() (Java
+    // bytecode), which can trigger a moving GC; `this` must be re-read
+    // through a pin before any post-lookup use, on both the hit and miss
+    // paths. Same "Family 1" pattern as `native_lhm_put_evict`.
+    let this_pin = ctx.pin_native_root(this);
+    let node = lhm_find_node(ctx, this, &key)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    if let Some(node) = node {
         let value = ctx.get_field(node, LHM_NODE_VALUE);
         // Round-9 HIGH: access-order semantics. When the LHM was
         // constructed with `(IFZ)V` accessOrder=true, `get` must move
@@ -23324,28 +23530,63 @@ fn native_lhm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
-    let (hash, is_null) = match key_val {
-        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false),
-        Value::Object(None) => (0, true),
-        _ => return Ok(Some(Value::Object(None))),
+    // GC-SAFETY: same "Family 1" stale-ObjectRef pattern fixed in
+    // `lhm_find_node`/`native_lhm_put_evict` -- `map_hash_key`/
+    // `map_keys_equal` dispatch arbitrary Java code (hashCode()/equals()),
+    // which can trigger a moving GC. Pin `this` and the search key up
+    // front; pin/re-read `buckets`, the walked `node`, and the
+    // carried-over `prev` around every such call too.
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key_val);
+
+    let (hash, is_null, key_ref) = match key_val {
+        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false, Some(k)),
+        Value::Object(None) => (0, true, None),
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(Value::Object(None)));
+        }
     };
+    let mut this = ctx.read_native_pin(this_pin, this);
+    let key_val = read_pinned_elem(ctx, key_pin, key_val);
 
     let (buckets, size, cap) = lhm_state(ctx, this);
-    let buckets = match buckets {
+    let mut buckets = match buckets {
         Some(b) => b,
-        None => return Ok(Some(Value::Object(None))),
+        None => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(Value::Object(None)));
+        }
     };
+    let buckets_pin = ctx.pin_native_root(buckets);
     let idx = map_bucket_index(hash, cap);
 
     // Walk bucket chain, tracking prev
     let mut prev: Option<ObjectRef> = None;
+    let mut prev_pin: Option<usize> = None;
     let mut node_val = ctx.get_array_element(buckets, idx);
-    while let Value::Object(Some(node)) = node_val {
+    while let Value::Object(Some(mut node)) = node_val {
         let node_key = ctx.get_field(node, LHM_NODE_KEY);
         let found = if is_null {
             matches!(node_key, Value::Object(None))
-        } else if let (Value::Object(Some(nk)), Value::Object(Some(k))) = (node_key, key_val) {
-            map_keys_equal(ctx, nk, k)?
+        } else if let Value::Object(Some(nk)) = node_key {
+            let node_pin = ctx.pin_native_root(node);
+            let node_key_pin = ctx.pin_native_root(nk);
+            let nk = ctx.read_native_pin(node_key_pin, nk);
+            let key_cur = match read_pinned_elem(ctx, key_pin, key_val) {
+                Value::Object(Some(kk)) => kk,
+                _ => key_ref.unwrap(),
+            };
+            let eq = map_keys_equal(ctx, nk, key_cur)?;
+            node = ctx.read_native_pin(node_pin, node);
+            this = ctx.read_native_pin(this_pin, this);
+            buckets = ctx.read_native_pin(buckets_pin, buckets);
+            if let (Some(p), Some(pp)) = (prev, prev_pin) {
+                prev = Some(ctx.read_native_pin(pp, p));
+            }
+            ctx.unpin_native_roots(node_key_pin);
+            ctx.unpin_native_roots(node_pin);
+            eq
         } else {
             false
         };
@@ -23365,12 +23606,15 @@ fn native_lhm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             lhm_unlink(ctx, this, node);
 
             lhm_set(ctx, this, "size", LHM_FIELD_SIZE, Value::Int(size - 1));
+            ctx.unpin_native_roots(this_pin);
             return Ok(Some(old_value));
         }
 
         prev = Some(node);
+        prev_pin = Some(ctx.pin_native_root(node));
         node_val = ctx.get_field(node, LHM_NODE_NEXT);
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(None)))
 }
 
@@ -23545,7 +23789,15 @@ fn native_lhm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let default = args.get(2).copied().unwrap_or(Value::Object(None));
-    if let Some(node) = lhm_find_node(ctx, this, &key)? {
+    // GC-SAFETY: `lhm_find_node` dispatches key.hashCode()/equals() (Java
+    // bytecode), which can trigger a moving GC; `this` must be re-read
+    // through a pin before any post-lookup use. Same "Family 1" pattern as
+    // `native_lhm_get`/`native_lhm_put_evict`.
+    let this_pin = ctx.pin_native_root(this);
+    let node = lhm_find_node(ctx, this, &key)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    if let Some(node) = node {
         let value = ctx.get_field(node, LHM_NODE_VALUE);
         // Round-9 HIGH: `getOrDefault` is also an access for access-order
         // semantics — same reorder as `get`. The JDK's `LinkedHashMap`

@@ -975,8 +975,20 @@ fn cl_real_load_class_base(
         match result {
             // findClass produced the class — that is the answer.
             Ok(Some(Value::Object(Some(_)))) => return result,
+            // A miss from URLClassLoader's own native URL/HTTP search is
+            // authoritative -- propagate it (e.g. ClassNotFoundException)
+            // rather than falling through to step 2b's global-store
+            // fallback, which would let a null-parent URLClassLoader resolve
+            // application classes its own (failed) URL search should have
+            // hidden from it. See docs/known-issues/keycloak/
+            // test-classserver-invalidpackage-classnotfound-not-thrown.md.
+            _ if defer_to_find_class
+                && crate::classloader::find_class_is_urlclassloader_native(ctx, this) =>
+            {
+                return result;
+            }
             // In the deferred case, findClass missing/throwing falls through to
-            // the global store as the last resort (below). Otherwise propagate.
+            // the global store as the last resort. Otherwise propagate.
             _ if !defer_to_find_class => return result,
             _ => {}
         }

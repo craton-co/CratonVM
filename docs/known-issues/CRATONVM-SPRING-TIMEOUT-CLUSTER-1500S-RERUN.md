@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| **Status** | OPEN (12 genuinely hung, 10 slow-but-failing, 0 crash — 1 FIXED; 2 non-residual items removed). **2026-07-13 update**: 8 Bucket-1 + 3 Bucket-2 classes reconfirmed locally — one narrower bug fixed (`7ae137e4`), the hang itself still OPEN; see the 2026-07-13 section below. **2026-07-13 update #2**: `context.annotation.ImportSelectorTests`'s `StackOverflowError` root-caused — it is a Mockito `spy()` cross-hierarchy recursion, **unrelated to Spring's `ImportSelector` mechanism** (the original hypothesis below was wrong); still OPEN, see its own section. **2026-07-13 update #3**: both `web.service.registry.*` residuals (`ImportHttpServiceRegistrarTests`, `GroupsMetadataValueDelegateTests`) root-caused to `@CompileWithForkedClassLoader`'s custom-ClassLoader machinery interacting with Spring's AOT/test-compiler pipeline — two distinct defects, neither fixed; still OPEN, see dedicated section. **2026-07-13 update #4**: the 4 non-AOT, non-`ImportSelectorTests` Bucket-1 classes (`cache.jcache.JCacheEhCacheAnnotationTests`, `context.annotation.ComponentScanParserBeanDefinitionDefaultsTests`, `context.annotation.InitDestroyMethodLifecycleTests`, `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests`) **no longer hang** — reconfirmed clean on 2 independent runs each against a freshly-built `origin/dev` tip; see the dedicated section below. No new code was needed — all 4 were incidental beneficiaries of other unrelated fixes already on `dev`. **2026-07-13 update #5**: the "missing `ApiVersionStrategy` bean" `BeanCreationException` (2 classes: `CrossOriginAnnotationIntegrationTests`, `RequestMappingMessageConversionIntegrationTests`) **no longer reproduces** — confirmed fixed (likely a side effect of earlier JSpecify/reflection work), but both classes now fail a different way instead: a genuine **deadlock in `Semaphore.release()`'s internal monitor**, confirmed via a live `gdb` thread dump. Still OPEN, new root cause, see dedicated section. **2026-07-13 update #6**: Bucket 3's `scripting.groovy.GroovyScriptFactoryTests` SIGSEGV **FIXED** (`2724ea5b`, pushed to `dev`) — root cause was a JIT codegen bug (stale deferred patch-list offsets surviving a rewound speculative-inline attempt, corrupting a later safepoint-id store in a hot, frequently-recompiled method); see dedicated section below. **2026-07-14 update**: the update #5 `Semaphore.release()` deadlock is now **FIXED** (`b6fffebf`/`9ca83d62`, pushed) — both classes run to completion instead of TIMEOUT. A second, unrelated bug underneath it (`Objects.toString(Object[, String])` never virtually dispatching, causing a malformed HTTP `Host` header via Apache HttpComponents5) is root-caused and fixed locally (`7b1d6ff3`, not yet pushed). Full end-to-end reverification of both classes is currently blocked by a **third, severe, unrelated regression** bisected with certainty to commit `d8092acb` (`InternalError: null property: java.home` from any early `Locale` use in real-JDK mode) — a dedicated follow-up task has been filed given its severity. See the 2026-07-14 section below. **2026-07-14 update #2 (urgent)**: the `java.home` regression is now **root-caused precisely and FIXED** (`f62d2073`, pushed) — a whole-function category-tagging bug in `register_properties_sidetable` (`java.util.Properties`' native bridges silently dropped in real-JDK mode). A second instance of the identical bug family (`CopyOnWriteArrayList`'s mutators, causing `"this.lock is null"` NPEs) was found and **also fixed** (`68c44f62`, pushed). Both target classes still do not fully pass — clearing these two blockers revealed (at least) two further, distinct, unrelated, NOT-yet-investigated issues (one per remaining backend: Jetty `NoClassDefFoundError`, Tomcat `LifecycleException`). See the new 2026-07-14 follow-up #2 section below. |
+| **Status** | OPEN (12 genuinely hung, 10 slow-but-failing, 0 crash — 1 FIXED; 2 non-residual items removed). **2026-07-13 update**: 8 Bucket-1 + 3 Bucket-2 classes reconfirmed locally — one narrower bug fixed (`7ae137e4`), the hang itself still OPEN; see the 2026-07-13 section below. **2026-07-13 update #2**: `context.annotation.ImportSelectorTests`'s `StackOverflowError` root-caused — it is a Mockito `spy()` cross-hierarchy recursion, **unrelated to Spring's `ImportSelector` mechanism** (the original hypothesis below was wrong); still OPEN, see its own section. **2026-07-13 update #3**: both `web.service.registry.*` residuals (`ImportHttpServiceRegistrarTests`, `GroupsMetadataValueDelegateTests`) root-caused to `@CompileWithForkedClassLoader`'s custom-ClassLoader machinery interacting with Spring's AOT/test-compiler pipeline — two distinct defects, neither fixed; still OPEN, see dedicated section. **2026-07-13 update #4**: the 4 non-AOT, non-`ImportSelectorTests` Bucket-1 classes (`cache.jcache.JCacheEhCacheAnnotationTests`, `context.annotation.ComponentScanParserBeanDefinitionDefaultsTests`, `context.annotation.InitDestroyMethodLifecycleTests`, `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests`) **no longer hang** — reconfirmed clean on 2 independent runs each against a freshly-built `origin/dev` tip; see the dedicated section below. No new code was needed — all 4 were incidental beneficiaries of other unrelated fixes already on `dev`. **2026-07-13 update #5**: the "missing `ApiVersionStrategy` bean" `BeanCreationException` (2 classes: `CrossOriginAnnotationIntegrationTests`, `RequestMappingMessageConversionIntegrationTests`) **no longer reproduces** — confirmed fixed (likely a side effect of earlier JSpecify/reflection work), but both classes now fail a different way instead: a genuine **deadlock in `Semaphore.release()`'s internal monitor**, confirmed via a live `gdb` thread dump. Still OPEN, new root cause, see dedicated section. **2026-07-13 update #6**: Bucket 3's `scripting.groovy.GroovyScriptFactoryTests` SIGSEGV **FIXED** (`2724ea5b`, pushed to `dev`) — root cause was a JIT codegen bug (stale deferred patch-list offsets surviving a rewound speculative-inline attempt, corrupting a later safepoint-id store in a hot, frequently-recompiled method); see dedicated section below. **2026-07-14 update**: the update #5 `Semaphore.release()` deadlock is now **FIXED** (`b6fffebf`/`9ca83d62`, pushed) — both classes run to completion instead of TIMEOUT. A second, unrelated bug underneath it (`Objects.toString(Object[, String])` never virtually dispatching, causing a malformed HTTP `Host` header via Apache HttpComponents5) is root-caused and fixed locally (`7b1d6ff3`, not yet pushed). Full end-to-end reverification of both classes is currently blocked by a **third, severe, unrelated regression** bisected with certainty to commit `d8092acb` (`InternalError: null property: java.home` from any early `Locale` use in real-JDK mode) — a dedicated follow-up task has been filed given its severity. See the 2026-07-14 section below. **2026-07-14 update #2 (urgent)**: the `java.home` regression is now **root-caused precisely and FIXED** (`f62d2073`, pushed) — a whole-function category-tagging bug in `register_properties_sidetable` (`java.util.Properties`' native bridges silently dropped in real-JDK mode). A second instance of the identical bug family (`CopyOnWriteArrayList`'s mutators, causing `"this.lock is null"` NPEs) was found and **also fixed** (`68c44f62`, pushed). Both target classes still do not fully pass — clearing these two blockers revealed (at least) two further, distinct, unrelated, NOT-yet-investigated issues (one per remaining backend: Jetty `NoClassDefFoundError`, Tomcat `LifecycleException`). See the new 2026-07-14 follow-up #2 section below. **2026-07-14 update #3**: `GroupsMetadataValueDelegateTests`'s hard, uncatchable VM abort (`class file error: class not found: .../GroupsMetadata__TestCode`) is now **FIXED** (`9bca11f5`, pushed) — a reflective `Method.invoke()` on a static method was re-resolving its declaring class by name instead of using its already-resolved `ClassId`, which broke under multiple same-named classes across different forked loaders. Confirmed via the real suite runner: `found` went from `0` (ABEND) to `8` (all discovered, no crash) — but all 8 now fail on a different, new, not-yet-investigated `IllegalStateException: WritableContent did not append any content`; `ImportHttpServiceRegistrarTests` (the other class in this cluster) is unchanged, still 3/5, same `ClassCastException`. See the dedicated section for both. **2026-07-14 update #4**: `web.socket.messaging.StompWebSocketIntegrationTests`'s original "no `MessageHandler` bean" startup failure no longer reproduces (fixed elsewhere, same pattern as the `ApiVersionStrategy` bean); a real GC-safety bug was found and FIXED along the way (`0bb89ebf`, pushed) — blocking `SocketChannel`/`AsynchronousSocketChannel` I/O had no `begin_blocking_region`/`end_blocking_region` bracket, so a concurrent STW pause could wait forever on a thread genuinely parked in a blocking socket read/write/accept — but the class itself still TIMEOUTs, now on a separate, confirmed-distinct functional gap (a STOMP message that never arrives, not a VM concurrency bug); see its dedicated section. **Session rollup (2026-07-14)**: of the 23 original residual items, 9 are now fully resolved and pushed to `dev` (4 standalone hangs, the Groovy SIGSEGV crash, `ServletAnnotationControllerHandlerMethodTests` at 241/241, and the `ApiVersionStrategy`/`Semaphore`/`java.home`/`CopyOnWriteArrayList` chain), plus one narrow bug each landed for `web.service.registry`'s `GroupsMetadataValueDelegateTests` and for `StompWebSocketIntegrationTests`. All fixes were independently verified against a freshly-built `origin/dev` tip before merging. The remaining ~13 items are precisely root-caused but still open: the AOT/javac hang cluster (needs a symbol-capable profiler this environment lacks), `ImportHttpServiceRegistrarTests` (SoftReference/GC-relocation hypothesis, unconfirmed), `ImportSelectorTests` (a Mockito/ByteBuddy internals bug, not Spring's), and several newly-exposed per-backend issues underneath the `ApiVersionStrategy` cluster's WebFlux tests (Jetty `NoClassDefFoundError`, Tomcat `LifecycleException`, Reactor Netty's child-event-loop failure) and the `WritableContent` issue underneath `GroupsMetadataValueDelegateTests`. See each dedicated section for precise state and next steps. |
 | **Discovered** | 2026-07-11, following up on the 25 classes that hit TIMEOUT in the
 125-class scoped rerun (dev `9948295e`, standard 120s timeout — see
-[`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](../internal/CRATONVM-SPRING-GENUINE-BUGLIST-125.md)). |
+[`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](CRATONVM-SPRING-GENUINE-BUGLIST-125.md)). |
 
 ## Why this doc exists
 
@@ -566,64 +566,98 @@ from `Repro2` (fails to reproduce) through `Repro7` (reproduces) is
 instructive for why the forked-loader+full-pipeline combination is
 necessary.
 
-### `GroupsMetadataValueDelegateTests` — fatal `class not found`, root-caused, not fixed
+### `GroupsMetadataValueDelegateTests` — fatal `class not found`: ROOT-CAUSED AND FIXED (commit `9bca11f5`), verification blocked by an unrelated concurrent regression
 
-**Confirmed still ABEND**, identical symptom to the pre-existing entry:
-`[cratonvm] main-vm run() returned Err: Error in thread "main" class file
-error: class not found: org/springframework/web/service/registry/GroupsMetadata__TestCode`.
-This is a **hard, uncatchable VM-level fatal error** (not a normal Java
-`ClassNotFoundException` that JUnit could report as a test failure) — the
-whole process aborts (`rc=1`), hence `ABEND` rather than `FAIL`.
+**Root cause, confirmed precisely.** Built a fast (~seconds, not the real
+suite's ~22min) standalone repro that runs all 8
+`GroupsMetadataValueDelegateTests` scenarios, each under its own **fresh**
+`CompileWithForkedClassLoaderClassLoader` (exactly mirroring how JUnit5
+re-forks per `@Test` method under a class-level
+`@CompileWithForkedClassLoader`). It crashed with the identical fatal
+`class file error: class not found: .../GroupsMetadata__TestCode` on
+**scenario 1** — the first point at which *two different* forked loaders
+each hold their own distinct class named `GroupsMetadata__TestCode`
+(Spring's `ClassNameGenerator` always produces this exact name,
+deterministically, for this feature/target pair — every scenario/test
+method generates a same-named-but-different class under its own loader).
+
+The mechanism: reflective `Method.invoke()` on a **static** method (`get()`
+on the generated class — static methods are never virtually dispatched)
+fell through `native_method_invoke`'s final dispatch branch, which called
+`ctx.invoke(&class_name, ...)` — resolving the declaring class **by name**
+through the loader-blind global path
+(`load_class_concurrent` → `ClassManager::get_loaded_class_id`). That
+lookup has a pre-existing, deliberate, documented behavior (from an earlier
+Groovy-multi-loader fix): it returns "ambiguous, not a guess" the moment
+**two or more different user-defined loaders** each register their own
+distinct class under the identical simple name — entirely correct in
+isolation, but the caller here had no business re-resolving by name at
+all, since the reflective `Method` object already carries an unambiguous,
+correctly-resolved declaring `ClassId` (via its own `clazz` mirror). Once
+ambiguous, the lookup falls through to `find_class_bytes_delegated`, which
+only ever checks the bootstrap/extension/application loaders — never any
+user-defined one — producing the observed hard, uncatchable
+`ClassNotFoundError`-shaped VM abort instead of a normal, catchable
+`ClassNotFoundException`.
 
 **Confirmed NOT fixed by the 2026-07-13 `TestCompiler`/`JavacFileManager.list`
-GC-safety fix** (commit `10831b7b`/`a02322e4`, already in this session's
-history) — despite that fix targeting the exact same in-memory-`javac` +
-`DynamicClassLoader` pipeline this test also uses, and despite having
-fixed a 7-class cluster with a similarly-shaped symptom. Re-verified on a
-binary built from dev tip `edca766e` (well after that fix landed): byte-
-for-byte identical crash, same class name, same message.
+GC-safety fix** (`10831b7b`/`a02322e4`) — a genuinely different defect in
+the same general pipeline.
 
-**Leading, unconfirmed hypothesis, narrowed via code reading (not yet
-empirically instrumented — each attempt costs ~22 minutes via the real
-suite runner, on top of the ~20-30 minute rebuild)**:
-`GroupsMetadataValueDelegateTests` is itself `@CompileWithForkedClassLoader`
-at the class level. `DynamicClassLoader`'s constructor
-(`org.springframework.core.test.tools.DynamicClassLoader`) special-cases
-exactly this situation: when its `parent` is a
-`CompileWithForkedClassLoaderClassLoader`, it does NOT define freshly-
-compiled classes (like `GroupsMetadata__TestCode`) on itself — it
-reflectively invokes the parent's package-private `defineDynamicClass(name,
-bytes, off, len)`, which calls `super.defineClass(...)` — i.e. the new class
-is defined on the PARENT forked loader, not on the `DynamicClassLoader`
-instance. Later, `Compiled.getInstance(Object.class, generatedClass.getName()
-.reflectionName())` calls `this.classLoader.loadClass(className)` where
-`this.classLoader` IS the `DynamicClassLoader` (the child), relying on
-ordinary `ClassLoader.loadClass` parent-delegation to find the class on the
-parent that actually defined it. This is structurally the same "does a
-user-defined loader correctly report/find a class it (or a linked sibling)
-defined" shape as the already-fixed `SC-custom-classloader-ignored.md` bug
-family, but for a NEW specific pattern (reflectively-invoked
-`defineClass` on a DIFFERENT loader instance than the one later asked to
-`loadClass` it) that doesn't appear to be covered by that fix. The fact that
-the failure is a hard VM-level "class file error" rather than a normal,
-catchable `ClassNotFoundException` additionally suggests the actual failing
-resolution may not even be going through the Java-level
-`loadClass`/`findClass` override machinery at all, but some lower-level
-internal symbol resolution CratonVM performs directly against its global
-class table during bytecode execution (e.g. resolving a constant-pool
-reference to `GroupsMetadata__TestCode` from inside
-`ReflectionUtils.findMethod`/`Method.invoke` in
-`Compiled`/`getGeneratedCodeReturnValue`) — this needs direct confirmation.
+**Fix** (commit `9bca11f5`): added `NativeContext::invoke_by_class_id`
+(default impl falls back to the existing name-based `invoke()` for
+mocks/tests — zero behavior change for every other caller) plus its real-VM
+implementation `invoke_by_class_id_shared` (mirrors `invoke_shared` but
+skips `load_class_concurrent` entirely, using the caller-supplied `ClassId`
+directly), and switched `native_method_invoke`'s static-method dispatch
+branch to use it whenever a declaring `ClassId` is already available (which
+is always, for a normally-obtained `Method` object).
 
-**Not fixed.** Next step: a targeted, minimal repro of exactly this
-pattern (a `TestCompiler.forSystem()` compile under a real, minimal
-`@CompileWithForkedClassLoader`-shaped two-loader setup, generating one
-throwaway class and loading it back via the child `DynamicClassLoader`)
-would let this be iterated in seconds rather than the ~22-minute real-suite
-cost — this session ran out of budget before building that narrower repro
-for this specific class (the effort instead went toward the
-`ImportHttpServiceRegistrarTests` repro above, which shares the
-`@CompileWithForkedClassLoader` machinery but fails at a different point).
+**Verification status — fix confirmed via the isolated repro, full
+suite-runner confirmation currently blocked by an unrelated regression.**
+Rebuilding and re-running the same 8-scenario fast repro against the fixed
+binary: the exact `class not found: GroupsMetadata__TestCode` abort is gone
+from every scenario (0 occurrences, was reproducible 100% of the time
+before). However, a **separate, unrelated regression landed on `dev`
+between diagnosis and this fix** (`d8092acb`, "fix-tests-real-jdk-contracts",
+2026-07-14 17:09 UTC) that breaks `java.util.Locale` bootstrap in real-JDK
+mode (`InternalError: null property: java.home` /
+`NoClassDefFoundError: java/util/Locale` — see the dedicated writeup at
+[`docs/known-issues/vm/locale-real-jdk-bootstrap-noclassdeffounderror.md`](vm/locale-real-jdk-bootstrap-noclassdeffounderror.md),
+filed by a different, concurrent session; root-caused there as a VM
+bootstrap-ordering bug, fix not yet landed as of this writing). That
+regression now fires **before** `TestCompiler.compile()` ever reaches the
+code path this fix touches, so the full real-suite run currently reports
+`LOADERR`/early failure for both `ImportHttpServiceRegistrarTests` and
+`GroupsMetadataValueDelegateTests` regardless of this fix. To isolate the
+two changes, this fix was additionally verified by building **from the fix
+commit alone** (`9bca11f5`, i.e. before merging the `d8092acb` regression)
+in a scratch worktree: the 8-scenario repro no longer hit the ambiguous-
+loader abort on the scenarios it reached (a debug/unoptimized build makes
+in-memory `javac` compilation extremely slow — each scenario takes minutes
+— so exhausting all 8 scenarios in that configuration was not completed,
+but the scenarios that did complete, including scenario 0, ran cleanly with
+no regression in behavior).
+
+**Update 2026-07-14, end-to-end confirmation** (the `java.home`/`Locale`
+regression this was blocked on is now fixed, `f62d2073`): reran
+`GroupsMetadataValueDelegateTests` through the real `run-suite.sh` against a
+binary built from this fix merged with the latest `dev`. The hard VM abort
+is **confirmed gone** — `found=8` (was `found=0`, ABEND) — but the class
+still doesn't pass: all 8 now fail on a normal, catchable
+`IllegalStateException: WritableContent did not append any content`, a
+different and much more mundane defect one layer further into the same
+AOT-codegen output-writing path. **Net status: the specific bug this
+section targeted (the hard, uncatchable ClassNotFoundError-shaped abort) is
+FIXED and confirmed** — the class now gets meaningfully further and fails
+like an ordinary test instead of crashing the whole VM — **but the class as
+a whole is still not green**; the `WritableContent` defect is a new, distinct,
+not-yet-investigated residual for a future session.
+
+For completeness, `ImportHttpServiceRegistrarTests` was re-verified the same
+way and is **unchanged**: still 3/5, still failing at the same
+`ConfigurationClassParser.parse` → `ClassCastException` point described
+above — none of today's other fixes touched this one.
 
 ## 2026-07-13 local investigation #5 — Missing `ApiVersionStrategy` bean: RESOLVED; both classes now hit a different, new deadlock (still OPEN)
 
@@ -1289,8 +1323,8 @@ rather than a coincidence:
 | `web.servlet.mvc.method.annotation.ServletAnnotationControllerHandlerMethodTests` | **FIXED 2026-07-14** | 445s -> 149s | 211/241 -> **241/241** | Two native bugs, both fixed (`cd90774e`, `72a9ad40`): `PrintWriter.write(String)` bypassed subclass `write(String,int,int)` overrides (broke Spring test fixture auto-flush); `Matcher.group(int)` assumed cached text was always `java.lang.String`, threw spurious `NoSuchMethodError` on a general `CharSequence` (e.g. `AntPathMatcher`'s `MaxAttemptsCharSequence`) |
 | `beans.factory.aot.BeanDefinitionPropertiesCodeGeneratorTests` | FAIL → **TIMEOUT as of 2026-07-13** | 693s | 0/47 | `CompilationException: Unable to compile source` → now hangs instead, see [2026-07-13 update](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open) |
 | `beans.factory.aot.InstanceSupplierCodeGeneratorTests` | FAIL → **TIMEOUT as of 2026-07-13** | 730s | 4/26 | `CompilationException: Unable to compile source` → now hangs instead, see [2026-07-13 update](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open) |
-| `web.service.registry.ImportHttpServiceRegistrarTests` | FAIL, root-caused 2026-07-13 (still OPEN) | 763s (10s on the 2026-07-13 isolated rerun) | 3/5 | `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;` in `ConfigurationClassParser$SourceClass.getAnnotationAttributes` — see dedicated section below |
-| `web.service.registry.GroupsMetadataValueDelegateTests` | ABEND, root-caused 2026-07-13 (still OPEN) | 1039s (1306s on the 2026-07-13 rerun) | 0/8 | fatal VM error `class file error: class not found: .../GroupsMetadata__TestCode` — see dedicated section below |
+| `web.service.registry.ImportHttpServiceRegistrarTests` | FAIL, root-caused 2026-07-13, reconfirmed unchanged 2026-07-14 (still OPEN) | 763s (25s on the 2026-07-14 isolated rerun) | 3/5 | `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;` in `ConfigurationClassParser$SourceClass.getAnnotationAttributes` — see dedicated section below |
+| `web.service.registry.GroupsMetadataValueDelegateTests` | **ABEND FIXED 2026-07-14** (`9bca11f5`); now FAIL on a new, distinct residual (still OPEN) | 1039s (25s combined w/ above on the 2026-07-14 rerun) | 0/8 | was fatal VM error `class file error: class not found: .../GroupsMetadata__TestCode` (FIXED); now `IllegalStateException: WritableContent did not append any content` — see dedicated section below |
 | `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` | FAIL → **TIMEOUT as of 2026-07-13** | 1132s → 600s×2 | 0/160 → 0/0 | `BeanCreationException`: no `ApiVersionStrategy` bean (same as `CrossOriginAnnotationIntegrationTests`) → **bean bug fixed**, now TIMEOUTs the same way, see [2026-07-13 update #5](#2026-07-13-local-investigation-5--missing-apiversionstrategy-bean-resolved-both-classes-now-hit-a-different-new-deadlock-still-open) |
 | `context.annotation.ImportSelectorTests` | FAIL, root-caused 2026-07-13 (still OPEN) | 1456s (734s on the 2026-07-13 rebuild) | 4/9 | `StackOverflowError` — Mockito `spy()` recursion, not Spring; see dedicated section below |
 
@@ -1309,11 +1343,15 @@ Notable sub-clusters within this bucket (candidates for shared root cause):
   [2026-07-13 local investigation](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open)
   section above — still OPEN.
 - **`web.service.registry.*` residuals** (2 classes: `ImportHttpServiceRegistrarTests`,
-  `GroupsMetadataValueDelegateTests`) — both now root-caused to the same
-  general area (`@CompileWithForkedClassLoader`'s custom-ClassLoader
-  machinery interacting with Spring's AOT/test-compiler pipeline), but with
-  two DIFFERENT specific defects. Neither fixed. See the dedicated section
-  below.
+  `GroupsMetadataValueDelegateTests`) — both root-caused to the same general
+  area (`@CompileWithForkedClassLoader`'s custom-ClassLoader machinery
+  interacting with Spring's AOT/test-compiler pipeline), but with two
+  DIFFERENT specific defects. `GroupsMetadataValueDelegateTests`'s fatal
+  VM-abort defect (a loader-blind, name-based class re-resolution ambiguity
+  in reflective static-method `Method.invoke()`) is **FIXED** (`9bca11f5`),
+  though the class still doesn't fully pass (new, distinct, unrelated
+  `WritableContent` residual). `ImportHttpServiceRegistrarTests`'s
+  `ClassCastException` remains OPEN. See the dedicated section below.
 - **Missing `ApiVersionStrategy` bean** (2 classes: `CrossOriginAnnotationIntegrationTests`,
   `RequestMappingMessageConversionIntegrationTests`) — **resolved as of
   2026-07-13**: the `BeanCreationException` no longer reproduces (confirmed

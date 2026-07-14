@@ -1163,10 +1163,32 @@ fn initialize_class_shared(
                 // JDK 25's legacy sun.misc.Unsafe derives its memory-access
                 // policy from the nested MemoryAccessOption enum during
                 // <clinit>. Real-JDK execution can leave the final result
-                // field null even though the enum value itself is available;
-                // repair that slot before any ordered Unsafe access reaches
-                // beforeMemoryAccessSlow().
+                // field null and can also skip loading the nested enum. Load
+                // and initialize that enum only after Unsafe itself has been
+                // finalized, then repair the slot before any ordered Unsafe
+                // access reaches beforeMemoryAccessSlow(). Doing this inside
+                // post_clinit_fixup used to deadlock because Unsafe was still
+                // claimed as Initializing at that point.
                 if matches!(&*class_name_for_jfr, "sun/misc/Unsafe") {
+                    match shared.load_class_concurrent("sun/misc/Unsafe$MemoryAccessOption") {
+                        Ok(enum_class_id) => {
+                            if let Err(error) =
+                                ensure_class_initialized_shared(shared, thread, enum_class_id)
+                            {
+                                tracing::warn!(
+                                    "Post-clinit fixup: failed to initialize \
+                                     sun.misc.Unsafe$MemoryAccessOption after Unsafe finalization: \
+                                     {error:?}"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "Post-clinit fixup: failed to load sun.misc.Unsafe$MemoryAccessOption \
+                                 after Unsafe finalization: {error:?}"
+                            );
+                        }
+                    }
                     post_clinit_fixup(shared, class_id, &class_name_for_jfr);
                 }
                 // (Removed) R15 WildFly Module.<clinit> post-success fixup.
@@ -2302,15 +2324,55 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                     None
                 })
             };
+            // KEYCLOAK-MEMACCESS-FIELDINDEX-20260714: the manually-recomputed
+            // `static_idx` above uses the same static-only, declaration-order
+            // convention as `resolve_field_ref`/`set_static_by_name`, so it is
+            // NOT the bug (verified against both call sites). But under the
+            // real Keycloak/Infinispan boot path (unlike the isolated repair
+            // probes), `sun/misc/Unsafe`'s statics vec can be lazily
+            // pre-sized/touched by an unrelated earlier static write before
+            // MEMORY_ACCESS_OPTION's own `<clinit>` store runs, and/or this
+            // slot can otherwise hold a stale non-null `Object` left over from
+            // a different code path than the enum constant this repair
+            // expects. Trusting "slot is non-null" alone as "already
+            // initialized" is therefore a false-positive trap: it forces
+            // `repaired=false` and leaves the true null in place, reproducing
+            // the exact NPE this fixup exists to prevent. Require the slot to
+            // actually hold an instance of `MemoryAccessOption` (not just any
+            // non-null object) before treating it as already initialized.
+            // EVIDENCE (2026-07-14, isolated reflection-only Unsafe probe on
+            // Azure host): the already-initialized check below correctly read
+            // `Value::Int(0)` here (genuinely uninitialized, not a false
+            // positive) while `find_class_by_name` returned `None` for
+            // `sun/misc/Unsafe$MemoryAccessOption`. The success path now
+            // loads and initializes that enum after finalizing Unsafe, before
+            // this lookup-only repair pass runs. See docs/internal once the
+            // regression is closed.
+            let enum_class_id = shared
+                .class_manager
+                .read()
+                .find_class_by_name("sun/misc/Unsafe$MemoryAccessOption");
             let already_initialized = unsafe_option_slot.is_some_and(|static_idx| {
-                matches!(
-                    super::vm_object::get_static_shared(shared, class_id, static_idx),
-                    Value::Object(Some(_))
-                )
+                match super::vm_object::get_static_shared(shared, class_id, static_idx) {
+                    Value::Object(Some(obj)) => {
+                        let obj_class_id = shared.heap.class_id_of(obj);
+                        let is_option = enum_class_id.is_some_and(|eid| obj_class_id == eid);
+                        if !is_option {
+                            tracing::warn!(
+                                "Post-clinit fixup: sun.misc.Unsafe MEMORY_ACCESS_OPTION slot \
+                                 held a non-null object of class_id={obj_class_id:?} (expected \
+                                 MemoryAccessOption class_id={enum_class_id:?}) — treating as \
+                                 NOT already initialized"
+                            );
+                        }
+                        is_option
+                    }
+                    _ => false,
+                }
             });
             let enum_slot = {
                 let cm = shared.class_manager.read();
-                cm.find_class_by_name("sun/misc/Unsafe$MemoryAccessOption")
+                enum_class_id
                     .and_then(|enum_class_id| cm.get_class(enum_class_id))
                     .and_then(|enum_class| {
                         let mut static_idx = 0usize;
@@ -2332,9 +2394,22 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                     Value::Object(Some(option)) => {
                         set_static_by_name("MEMORY_ACCESS_OPTION", Value::Object(Some(option)))
                     }
-                    _ => false,
+                    other => {
+                        tracing::warn!(
+                            "Post-clinit fixup: sun.misc.Unsafe MEMORY_ACCESS_OPTION repair \
+                             found enum_slot but its value was {other:?}, not \
+                             Value::Object(Some(_)) — repair skipped"
+                        );
+                        false
+                    }
                 }
             } else {
+                tracing::warn!(
+                    "Post-clinit fixup: sun.misc.Unsafe MEMORY_ACCESS_OPTION repair could not \
+                     resolve enum_slot (unsafe_option_slot={unsafe_option_slot:?} \
+                     enum_class_id={enum_class_id:?} policy_field={policy_field}) — repair \
+                     skipped"
+                );
                 false
             };
             tracing::warn!(

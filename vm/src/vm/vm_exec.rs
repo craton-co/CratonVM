@@ -2798,6 +2798,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         )
     }
 
+    fn invoke_by_class_id(
+        &mut self,
+        class_id: ClassId,
+        _class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        invoke_by_class_id_shared(
+            self.shared,
+            self.thread,
+            class_id,
+            method_name,
+            descriptor,
+            args,
+        )
+    }
+
     fn invoke_special(
         &mut self,
         class_name: &str,
@@ -9560,6 +9578,61 @@ pub(super) fn values_equal_for_cas(a: &Value, b: &Value) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Invoke a method by class name. Used by the interpreter and NativeContextImpl.
+/// Like [`invoke_shared`], but the caller already has an unambiguous,
+/// resolved declaring `ClassId` in hand (e.g. from a reflective `Method`
+/// object's own `clazz` mirror) and must NOT re-resolve it by name.
+///
+/// `invoke_shared`'s `shared.load_class_concurrent(class_name)` step goes
+/// through the loader-blind global name lookup, which intentionally reports
+/// "ambiguous" (not a guess) the moment two or more *different*
+/// user-defined loaders each have their OWN distinct class registered under
+/// the identical simple name (`ClassManager::get_loaded_class_id`) — a
+/// completely ordinary occurrence for any harness that repeatedly mints a
+/// fresh `ClassLoader` + identically-named generated class (Spring's
+/// `TestCompiler`/`@CompileWithForkedClassLoader`). Skipping that
+/// re-resolution when the caller already knows the exact `ClassId` avoids
+/// hitting the ambiguity guard for a lookup that was never actually
+/// ambiguous — the caller resolved a SPECIFIC class through a SPECIFIC
+/// loader already.
+pub fn invoke_by_class_id_shared(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    class_id: ClassId,
+    method_name: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> MethodCallResult {
+    let pin_base = thread.native_pin_roots.len();
+    let mut has_obj_args = false;
+    for a in args {
+        if let Value::Object(Some(o)) = a {
+            thread.native_pin_roots.push(*o);
+            has_obj_args = true;
+        }
+    }
+
+    if let Err(e) = super::ensure_class_initialized_shared(shared, thread, class_id) {
+        thread.native_pin_roots.truncate(pin_base);
+        return Err(e);
+    }
+
+    let result = if has_obj_args {
+        let mut fresh: Vec<Value> = args.to_vec();
+        let mut k = pin_base;
+        for v in fresh.iter_mut() {
+            if let Value::Object(Some(_)) = v {
+                *v = Value::Object(Some(thread.native_pin_roots[k]));
+                k += 1;
+            }
+        }
+        invoke_on_class_shared(shared, thread, class_id, method_name, descriptor, &fresh)
+    } else {
+        invoke_on_class_shared(shared, thread, class_id, method_name, descriptor, args)
+    };
+    thread.native_pin_roots.truncate(pin_base);
+    result
+}
+
 pub fn invoke_shared(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -11647,6 +11720,20 @@ pub(crate) fn annotation_proxy_dispatch_impl(
         Value::Object(Some(a)) => a,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if std::env::var_os("CRATONVM_ANN_PROXY_DISPATCH_TRACE").is_some() && method_name == "value" {
+        let type_desc = match shared.heap.get_field(proxy, 0) {
+            Value::Object(Some(s)) => super::read_java_string(&shared.heap, s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        if type_desc.contains("Import") {
+            eprintln!(
+                "[ANN-PROXY-DISPATCH] proxy={:p} method={} type_desc={}",
+                proxy.as_ptr(),
+                method_name,
+                type_desc
+            );
+        }
+    }
     let n = shared.heap.array_length(names_arr);
     for i in 0..n {
         if let Ok(Value::Object(Some(name_ref))) = shared.heap.get_array_element(names_arr, i) {

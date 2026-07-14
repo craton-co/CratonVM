@@ -530,8 +530,12 @@ pub fn register_management_factory_platform_server_stub(r: &mut NativeMethodRegi
 /// real-JDK mode (synthetic-mode-only field layouts).
 pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
-    // (probe eprintln removed — registration confirmed working)
+    // These are native entry points of real JDK classes, not replacements for
+    // synthetic class bytecode. In real-JDK mode a SyntheticStub registration
+    // is deliberately excluded from dispatch, which made getVersion0 appear
+    // missing despite being registered here. Keep this bridge category pinned
+    // so ManagementFactory's VMManagementImpl can link during application boot.
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/VMManagementImpl";
 
     // Management interface version. OpenJDK reports "10.0" for JDK 8+.
