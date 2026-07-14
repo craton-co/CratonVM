@@ -25246,6 +25246,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         native_javac_file_manager_list,
     );
     registry.register(
+        "com/sun/tools/javac/file/JavacFileManager",
+        "inferBinaryName",
+        "(Ljavax/tools/JavaFileManager$Location;Ljavax/tools/JavaFileObject;)Ljava/lang/String;",
+        native_javac_file_manager_infer_binary_name,
+    );
+    registry.register(
         "com/sun/tools/javac/file/JavacFileManager$PathAndContainer",
         "compareTo",
         "(Ljava/lang/Object;)I",
@@ -52175,6 +52181,115 @@ fn native_javac_file_manager_list(ctx: &mut dyn NativeContext, args: &[Value]) -
     })();
     ctx.unpin_native_roots(pin_base);
     result
+}
+
+/// Converts a `PathFileObject` path to the binary name that javac derives by
+/// removing its final extension and replacing path separators with dots.
+///
+/// The three callers below already hand us a path relative to their respective
+/// classpath root: `RelativePath.path` for directories, a ZIP filesystem root
+/// relative path for jars, and a JRT path below `modules/<module>`. Keeping the
+/// transformation here explicit avoids re-entering the real-JDK Path and
+/// Locations machinery for every scanned class file.
+fn javac_binary_name_from_relative_path(path: &str) -> String {
+    let path = path.trim_start_matches(['/', '\\']);
+    let path = path.rsplit_once('.').map_or(path, |(stem, _)| stem);
+    path.replace(['/', '\\'], ".")
+}
+
+fn javac_binary_name_from_jrt_path(path: &str) -> Option<String> {
+    let path = path.trim_start_matches(['/', '\\']);
+    let rest = path.strip_prefix("modules/")?;
+    let (_, class_path) = rest.split_once(['/', '\\'])?;
+    Some(javac_binary_name_from_relative_path(class_path))
+}
+
+#[cfg(test)]
+#[test]
+fn javac_binary_name_from_path_matches_javac_path_file_objects() {
+    assert_eq!(
+        javac_binary_name_from_relative_path("org/springframework/aot/Hint.class"),
+        "org.springframework.aot.Hint"
+    );
+    assert_eq!(
+        javac_binary_name_from_relative_path("\\org\\springframework\\aot\\Hint.class"),
+        "org.springframework.aot.Hint"
+    );
+    assert_eq!(
+        javac_binary_name_from_jrt_path("/modules/java.base/java/lang/String.class"),
+        Some("java.lang.String".to_string())
+    );
+    assert_eq!(javac_binary_name_from_jrt_path("/not-modules/String.class"), None);
+}
+
+/// Native equivalent of the JDK 25 `JavacFileManager.inferBinaryName` fast
+/// path for the concrete `PathFileObject` variants returned by its file
+/// manager. The JDK bytecode first rebuilds the location path collection, then
+/// dispatches to a tiny variant-specific conversion. During Spring AOT's
+/// classpath scan that overhead is paid once per discovered class file.
+///
+/// Unknown JavaFileObject implementations deliberately delegate to bytecode:
+/// they can encode a binary name with semantics not represented by a path.
+fn native_javac_file_manager_infer_binary_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let location = obj_arg(args, 1)?;
+    let file = obj_arg(args, 2)?;
+    native_javac_file_manager_check_not_module_oriented_location(
+        ctx,
+        &[Value::Object(Some(this)), Value::Object(Some(location))],
+    )?;
+
+    let class_name = ctx.class_name_of_id(ctx.class_id_of_object(file)).unwrap_or_default();
+    let binary_name = match class_name.as_str() {
+        "com/sun/tools/javac/file/PathFileObject$DirectoryFileObject" => {
+            let relative_path = match ctx.get_field_by_name(file, "relativePath") {
+                Value::Object(Some(relative_path)) => match ctx.get_field_by_name(relative_path, "path") {
+                    Value::Object(Some(path)) => ctx.read_string(path),
+                    _ => None,
+                },
+                _ => None,
+            };
+            relative_path.map(|path| javac_binary_name_from_relative_path(&path))
+        }
+        "com/sun/tools/javac/file/PathFileObject$JarFileObject" => {
+            let path = match ctx.get_field_by_name(file, "path") {
+                Value::Object(Some(path)) => ctx
+                    .invoke_virtual(path, "toString", "()Ljava/lang/String;", &[])?
+                    .and_then(|value| match value {
+                        Value::Object(Some(path)) => ctx.read_string(path),
+                        _ => None,
+                    }),
+                _ => None,
+            };
+            path.map(|path| javac_binary_name_from_relative_path(&path))
+        }
+        "com/sun/tools/javac/file/PathFileObject$JRTFileObject" => {
+            let path = match ctx.get_field_by_name(file, "path") {
+                Value::Object(Some(path)) => ctx
+                    .invoke_virtual(path, "toString", "()Ljava/lang/String;", &[])?
+                    .and_then(|value| match value {
+                        Value::Object(Some(path)) => ctx.read_string(path),
+                        _ => None,
+                    }),
+                _ => None,
+            };
+            path.and_then(|path| javac_binary_name_from_jrt_path(&path))
+        }
+        _ => None,
+    };
+
+    if let Some(binary_name) = binary_name {
+        return Ok(Some(Value::Object(Some(ctx.create_string(&binary_name)))));
+    }
+    ctx.invoke_virtual_bytecode_only(
+        this,
+        "inferBinaryName",
+        "(Ljavax/tools/JavaFileManager$Location;Ljavax/tools/JavaFileObject;)Ljava/lang/String;",
+        &args[1..],
+    )
 }
 
 fn native_javac_path_and_container_compare_to(

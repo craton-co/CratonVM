@@ -23416,6 +23416,10 @@ fn force_native_over_real_jdk_bytecode(
                     "list",
                     "(Ljavax/tools/JavaFileManager$Location;Ljava/lang/String;Ljava/util/Set;Z)Ljava/lang/Iterable;"
                 )
+                | (
+                    "inferBinaryName",
+                    "(Ljavax/tools/JavaFileManager$Location;Ljavax/tools/JavaFileObject;)Ljava/lang/String;"
+                )
         )
     {
         return true;
@@ -34614,7 +34618,7 @@ mod tests {
             "list",
             "(Ljavax/tools/JavaFileManager$Location;Ljava/lang/String;Ljava/util/Set;Z)Ljava/lang/Iterable;"
         ));
-        assert!(!force_native_over_real_jdk_bytecode(
+        assert!(force_native_over_real_jdk_bytecode(
             "com/sun/tools/javac/file/JavacFileManager",
             "inferBinaryName",
             "(Ljavax/tools/JavaFileManager$Location;Ljavax/tools/JavaFileObject;)Ljava/lang/String;"
