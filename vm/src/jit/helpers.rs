@@ -5257,6 +5257,22 @@ fn call_integer_native_raw(
                     .map(|(_, raw)| ClassId::new(raw))
             });
             if let Some(class_id) = cached_class {
+                // Young-pressure relief for this cached fast path, which
+                // deliberately bypasses the `safe_native_call` boundary (and
+                // its young-pressure GC hook): the only argument here is a
+                // primitive `i32`, so initiating the orchestrated GC is
+                // exactly as safe as `jit_new_object`'s slow-path GC — no raw
+                // object pointers are held across it. Without this, a
+                // boxing-dominated compiled loop keeps spilling wrappers into
+                // old gen until `alloc_young_initialized` hard-aborts.
+                if vm.heap.young_spill_pressure() {
+                    if !crate::runtime::interpreter::gc_overhead_limit_exceeded(vm)
+                        && vm.heap.needs_gc()
+                    {
+                        crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+                    }
+                    vm.heap.clear_young_spill_pressure();
+                }
                 use cratonvm_native_api::NativeContext as _;
                 let mut ctx = crate::vm::NativeContextImpl { shared: vm, thread };
                 let object = ctx.alloc_object(class_id, 1);
