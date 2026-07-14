@@ -8534,9 +8534,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     /// slot). No-op when no cycle is active; on Generational/ZGC the
     /// pre-barrier's own marking-active gate keeps it equally cheap.
     fn gc_reference_keep_alive(&mut self, referent: ObjectRef) {
-        self.shared
-            .heap
-            .write_barrier_pre(std::ptr::null_mut(), referent);
+        self.shared.heap.write_barrier_keep_alive(referent);
     }
 
     fn record_thread_sleep(&mut self, sleep_nanos: i64, actual_duration_nanos: u64) {
