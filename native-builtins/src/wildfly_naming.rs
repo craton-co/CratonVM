@@ -730,8 +730,16 @@ fn url_pkgs_env(ctx: &mut dyn NativeContext, incoming: Value) -> Value {
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => return incoming,
     };
+    // GC-SAFETY: `ht` is used again after its own `put` dispatch (the final
+    // return), and `key` is used again after `val`'s own `create_string`
+    // call -- both are moving-GC hazards. Pin as each is produced and
+    // re-read before each subsequent use.
+    let ht_pin = ctx.pin_native_root(ht);
     let key = ctx.create_string("java.naming.factory.url.pkgs");
+    let key_pin = ctx.pin_native_root(key);
     let val = ctx.create_string(&pkgs);
+    let ht = ctx.read_native_pin(ht_pin, ht);
+    let key = ctx.read_native_pin(key_pin, key);
     if ctx
         .invoke_virtual(
             ht,
@@ -741,8 +749,11 @@ fn url_pkgs_env(ctx: &mut dyn NativeContext, incoming: Value) -> Value {
         )
         .is_err()
     {
+        ctx.unpin_native_roots(ht_pin);
         return incoming;
     }
+    let ht = ctx.read_native_pin(ht_pin, ht);
+    ctx.unpin_native_roots(ht_pin);
     Value::Object(Some(ht))
 }
 
@@ -1027,17 +1038,31 @@ fn native_context_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         }
     };
 
+    // GC-SAFETY: `this` and `value` are bare Rust locals read from `args`,
+    // not themselves GC roots. `builder_initial_context`/`java_url_context`/
+    // `tomcat_default_init_ctx` (each dispatches real Java) and this
+    // function's own `create_string`/`invoke_virtual`/`class_id_of_object`
+    // calls can all trigger a moving GC; every branch below used `this`/
+    // `value` again after one of these without ever refreshing them. Pin
+    // both up front and re-read before each subsequent use.
+    let this_pin = ctx.pin_native_root(this);
+    let value_pin = ctx.pin_native_root(value);
+
     // Delegate to a user-installed `InitialContextFactoryBuilder`'s context so
     // reads and writes share the same namespace (see `do_context_lookup`).
     if let Some(deleg) = builder_initial_context(ctx, this)? {
         let name_obj = ctx.create_string(&name);
-        return ctx.invoke_virtual(
+        let value = ctx.read_native_pin(value_pin, value);
+        let result = ctx.invoke_virtual(
             deleg,
             "bind",
             "(Ljava/lang/String;Ljava/lang/Object;)V",
             &[Value::Object(Some(name_obj)), Value::Object(Some(value))],
         );
+        ctx.unpin_native_roots(this_pin);
+        return result;
     }
+    let this = ctx.read_native_pin(this_pin, this);
 
     // `java:` URL-scheme names go through the JDK URL-context factory so
     // the binding lands in Tomcat's own context (kept consistent with the
@@ -1046,31 +1071,41 @@ fn native_context_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         let env = initial_context_env(ctx, this);
         if let Some(url_ctx) = java_url_context(ctx, env)? {
             let name_obj = ctx.create_string(&name);
-            return ctx.invoke_virtual(
+            let value = ctx.read_native_pin(value_pin, value);
+            let result = ctx.invoke_virtual(
                 url_ctx,
                 "bind",
                 "(Ljava/lang/String;Ljava/lang/Object;)V",
                 &[Value::Object(Some(name_obj)), Value::Object(Some(value))],
             );
+            ctx.unpin_native_roots(this_pin);
+            return result;
         }
         if let Some(def_ctx) = tomcat_default_init_ctx(ctx, env)? {
             let name_obj = ctx.create_string(&name);
-            return ctx.invoke_virtual(
+            let value = ctx.read_native_pin(value_pin, value);
+            let result = ctx.invoke_virtual(
                 def_ctx,
                 "bind",
                 "(Ljava/lang/String;Ljava/lang/Object;)V",
                 &[Value::Object(Some(name_obj)), Value::Object(Some(value))],
             );
+            ctx.unpin_native_roots(this_pin);
+            return result;
         }
     }
 
+    let value = ctx.read_native_pin(value_pin, value);
     let class_name = ctx
         .class_name_of_id(ctx.class_id_of_object(value))
         .unwrap_or_else(|| "java/lang/Object".to_string());
-    if let Err(msg) = bind_value(&name, &class_name, value) {
-        return Err(flat_store_error(ctx, &msg));
-    }
-    Ok(None)
+    let result = if let Err(msg) = bind_value(&name, &class_name, value) {
+        Err(flat_store_error(ctx, &msg))
+    } else {
+        Ok(None)
+    };
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn native_context_rebind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1089,45 +1124,63 @@ fn native_context_rebind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         }
     };
 
+    // GC-SAFETY: same pattern as `native_context_bind` -- see its comment.
+    let this_pin = ctx.pin_native_root(this);
+    let value_pin = ctx.pin_native_root(value);
+
     if let Some(deleg) = builder_initial_context(ctx, this)? {
         let name_obj = ctx.create_string(&name);
-        return ctx.invoke_virtual(
+        let value = ctx.read_native_pin(value_pin, value);
+        let result = ctx.invoke_virtual(
             deleg,
             "rebind",
             "(Ljava/lang/String;Ljava/lang/Object;)V",
             &[Value::Object(Some(name_obj)), Value::Object(Some(value))],
         );
+        ctx.unpin_native_roots(this_pin);
+        return result;
     }
+    let this = ctx.read_native_pin(this_pin, this);
 
     if is_java_url_scheme(&name) {
         let env = initial_context_env(ctx, this);
         if let Some(url_ctx) = java_url_context(ctx, env)? {
             let name_obj = ctx.create_string(&name);
-            return ctx.invoke_virtual(
+            let value = ctx.read_native_pin(value_pin, value);
+            let result = ctx.invoke_virtual(
                 url_ctx,
                 "rebind",
                 "(Ljava/lang/String;Ljava/lang/Object;)V",
                 &[Value::Object(Some(name_obj)), Value::Object(Some(value))],
             );
+            ctx.unpin_native_roots(this_pin);
+            return result;
         }
         if let Some(def_ctx) = tomcat_default_init_ctx(ctx, env)? {
             let name_obj = ctx.create_string(&name);
-            return ctx.invoke_virtual(
+            let value = ctx.read_native_pin(value_pin, value);
+            let result = ctx.invoke_virtual(
                 def_ctx,
                 "rebind",
                 "(Ljava/lang/String;Ljava/lang/Object;)V",
                 &[Value::Object(Some(name_obj)), Value::Object(Some(value))],
             );
+            ctx.unpin_native_roots(this_pin);
+            return result;
         }
     }
 
+    let value = ctx.read_native_pin(value_pin, value);
     let class_name = ctx
         .class_name_of_id(ctx.class_id_of_object(value))
         .unwrap_or_else(|| "java/lang/Object".to_string());
-    if let Err(msg) = rebind_value(&name, &class_name, value) {
-        return Err(flat_store_error(ctx, &msg));
-    }
-    Ok(None)
+    let result = if let Err(msg) = rebind_value(&name, &class_name, value) {
+        Err(flat_store_error(ctx, &msg))
+    } else {
+        Ok(None)
+    };
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn native_context_unbind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1247,11 +1300,22 @@ fn alloc_java_binding(
     object: ObjectRef,
 ) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "javax/naming/Binding", BINDING_NUM_SLOTS);
+    // GC-SAFETY: `obj` (the freshly-allocated Binding) and `object` (the
+    // caller-supplied bound value) are both used again after the two
+    // `create_string` calls below, which can each trigger a moving GC. Pin
+    // both up front and re-read before each subsequent use.
+    let obj_pin = ctx.pin_native_root(obj);
+    let object_pin = ctx.pin_native_root(object);
     let name_s = ctx.create_string(name);
+    let name_s_pin = ctx.pin_native_root(name_s);
     let cn_s = ctx.create_string(class_name);
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    let object = ctx.read_native_pin(object_pin, object);
+    let name_s = ctx.read_native_pin(name_s_pin, name_s);
     ctx.set_field(obj, BINDING_FIELD_NAME, Value::Object(Some(name_s)));
     ctx.set_field(obj, BINDING_FIELD_CLASS_NAME, Value::Object(Some(cn_s)));
     ctx.set_field(obj, BINDING_FIELD_OBJECT, Value::Object(Some(object)));
+    ctx.unpin_native_roots(obj_pin);
     obj
 }
 
@@ -1365,12 +1429,25 @@ fn native_context_names_bind_info_for(
         "org/jboss/as/naming/deployment/ContextNames$BindInfo",
         BIND_INFO_NUM_SLOTS,
     );
+    // GC-SAFETY: each of `obj`/`parent_obj`/`binder_obj`/`bind_name_s` is
+    // captured well before its own `set_field_by_name` use below, and every
+    // intervening `alloc_java_service_name`/`create_string` call can trigger
+    // a moving GC. Pin each as it's produced and re-read immediately before
+    // its use.
+    let obj_pin = ctx.pin_native_root(obj);
     // Mirror ContextNames$BindInfo's real field layout exactly: parent
     // ServiceName, binder ServiceName, bindName String, absolute name String.
     let parent_obj = alloc_java_service_name(ctx, &info.parent_context_service_name);
+    let parent_pin = ctx.pin_native_root(parent_obj);
     let binder_obj = alloc_java_service_name(ctx, &info.binder_service_name);
+    let binder_pin = ctx.pin_native_root(binder_obj);
     let bind_name_s = ctx.create_string(info.binding_name.as_ref());
+    let bind_name_pin = ctx.pin_native_root(bind_name_s);
     let absolute_s = ctx.create_string(info.absolute_name.as_ref());
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    let parent_obj = ctx.read_native_pin(parent_pin, parent_obj);
+    let binder_obj = ctx.read_native_pin(binder_pin, binder_obj);
+    let bind_name_s = ctx.read_native_pin(bind_name_pin, bind_name_s);
     ctx.set_field_by_name(obj, BIND_INFO_FIELD_PARENT, Value::Object(Some(parent_obj)));
     ctx.set_field_by_name(obj, BIND_INFO_FIELD_BINDER, Value::Object(Some(binder_obj)));
     ctx.set_field_by_name(
@@ -1383,6 +1460,7 @@ fn native_context_names_bind_info_for(
         BIND_INFO_FIELD_ABSOLUTE,
         Value::Object(Some(absolute_s)),
     );
+    ctx.unpin_native_roots(obj_pin);
     Ok(Some(Value::Object(Some(obj))))
 }
 
