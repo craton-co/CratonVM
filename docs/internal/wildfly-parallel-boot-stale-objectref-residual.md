@@ -768,3 +768,40 @@ Subtracting this session's coverage from the prior list:
 **How to apply**: re-derive the scanner from this doc's cumulative methodology (sessions 3, 4, and this one)
 rather than starting over — the false-positive fixes and the diverging-path/line-anchoring corrections from
 this session are worth preserving in whatever script version comes next.
+
+## Follow-up session 5 (2026-07-14, third round): 5 more files/areas, log-mining shortcut proven out
+
+Continued the sweep, merged to `dev` (`93c50351`, branch `fix/objectref-sweep3-20260714`). This round's
+notable methodology addition: mining the WFLYCTL0153 investigation's own live
+`CRATONVM_DBG_STALE_OBJREF` diagnostic logs (`/data/data/wt-wflyctl0153-20260714-repro/out-fix{2,3}-diag/`)
+for already-captured real crash backtraces, instead of only static grep-scanning — worked well, found 8
+real sites in one pass this way alone.
+
+**Fixed this session**:
+- 8 sites found via live-log mining (commit `2d45ef40`) — spanning `native-builtins/src/classloader.rs`,
+  `classloader_real.rs`, `http_client.rs`, `charset.rs` per the diff (exact function list not separately
+  itemized in the commit message — check `git show 2d45ef40 --stat` for the touched-file breakdown).
+- `wildfly_naming.rs`: 5 sites, full static-analysis pass (commit `01ffde60`).
+- `lang_class.rs`: 5 more sites, scanner-refined pass (commit `c0ed1211` — on top of the 3 fixed in
+  Follow-up session 4, and the 2 fixed in the original sweep).
+- `lang_invoke.rs`: 1 more site, scanner-refined pass (commit `e2193fef`).
+- `native-collections/src/lib.rs`: Stream/Comparator `ObjectRef`s pinned across GC-triggering calls
+  (commit `671c8df3`).
+
+Overall diff for this round: `native-api/src/registry.rs` (+34), `native-builtins/src/{charset,
+classloader,classloader_real,http_client,lang_class,lang_invoke,wildfly_core,wildfly_naming}.rs`,
+`native-collections/src/lib.rs` (+338/-worth of changes), `vm/src/jit/helpers.rs`, `vm/src/vm/vm_exec.rs`.
+
+**Updated still-untriaged list**: `wildfly_naming.rs` now COMPLETE. `lang_class.rs`/`lang_invoke.rs` have
+now had 3 rounds of partial coverage each — worth a full fresh scanner run against current `dev` to get an
+accurate remaining-candidate count rather than trusting the original session's stale counts.
+`wildfly_security.rs` still NOT started. `servlet.rs`/`spring_startup_bootstrap.rs` remain fully complete
+(session 4). `lib.rs` (673 candidates), `phases_late.rs` (592), `phases_early.rs` (287) remain the largest
+unaddressed surface, still essentially unreviewed after 5 sweep sessions — these three giant
+"Phase N native registration" files are the natural next target, ideally with a dedicated session budgeting
+enough time to actually get through a meaningful fraction rather than another partial pass.
+
+**Note on parallel activity**: this same day, at least one other independent session
+(`fix/stream-thencompar-stale-objref-20260714`) landed its own separate stale-ObjectRef fixes in the same
+file family — confirms this bug class is being actively hunted from multiple angles concurrently on this
+project right now. Always fetch + shadow-check before finalizing a fix in this area.
