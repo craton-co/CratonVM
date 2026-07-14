@@ -2065,22 +2065,61 @@ fn register_platform_logging_mxbean(r: &mut NativeMethodRegistry) {
 }
 
 // ---------------------------------------------------------------------------
-// 3. MemoryMXBean — 6-field synthetic
+// 3. MemoryMXBean — concrete real-JDK MemoryImpl
 // ---------------------------------------------------------------------------
 
+/// Populate the inherited state that `NotificationEmitterSupport` normally
+/// establishes in its Java constructor.
+///
+/// Synthetic management beans are allocated without running Java constructors.
+/// `sun.management.MemoryImpl` inherits `NotificationEmitterSupport`, whose
+/// `addNotificationListener` synchronizes on `listenerLock` and then mutates
+/// `listenerList`. Leaving either field null makes a real JMX client (notably
+/// Micrometer's `JvmHeapPressureMetrics`) fail during bootstrap.
+fn init_notification_emitter_support(ctx: &mut dyn NativeContext, emitter: ObjectRef) -> ObjectRef {
+    // Both construction paths can allocate and relocate the receiver, so keep
+    // it rooted and re-read it before every field access.
+    let pin = ctx.pin_native_root(emitter);
+    let current = ctx.read_native_pin(pin, emitter);
+    if !matches!(
+        ctx.get_field_by_name(current, "listenerLock"),
+        Value::Object(Some(_))
+    ) {
+        let lock = match ctx.new_object("java/lang/Object") {
+            Ok(Some(Value::Object(Some(lock)))) => lock,
+            _ => alloc_concurrent_synthetic(ctx, "java/lang/Object", 0),
+        };
+        let current = ctx.read_native_pin(pin, emitter);
+        ctx.set_field_by_name(current, "listenerLock", Value::Object(Some(lock)));
+    }
+
+    let current = ctx.read_native_pin(pin, emitter);
+    if !matches!(
+        ctx.get_field_by_name(current, "listenerList"),
+        Value::Object(Some(_))
+    ) {
+        let list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[]) {
+            Ok(Some(Value::Object(Some(list)))) => list,
+            // Synthetic-mode fallback. The real initialized ArrayList above
+            // is required for real-JDK mode and covered by the probe.
+            _ => alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2),
+        };
+        let current = ctx.read_native_pin(pin, emitter);
+        ctx.set_field_by_name(current, "listenerList", Value::Object(Some(list)));
+    }
+
+    let result = ctx.read_native_pin(pin, emitter);
+    ctx.unpin_native_roots(pin);
+    result
+}
+
 fn alloc_memory_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryMXBean", 6);
-    // Wire to real heap stats
-    let heap_used = ctx.heap_allocated_bytes() as i64;
-    let heap_max = ctx.max_heap_bytes(); // configured -Xmx (container-aware)
-    let heap_committed = heap_used.max(64 * 1024 * 1024); // committed >= used
-    ctx.set_field(obj, 0, Value::Long(heap_used)); // heapUsed (real)
-    ctx.set_field(obj, 1, Value::Long(heap_max)); // heapMax
-    ctx.set_field(obj, 2, Value::Long(heap_committed)); // heapCommitted
-    ctx.set_field(obj, 3, Value::Long(4 * 1024 * 1024)); // nonHeapUsed
-    ctx.set_field(obj, 4, Value::Long(64 * 1024 * 1024)); // nonHeapMax
-    ctx.set_field(obj, 5, Value::Int(0)); // objectPendingFinalization
-    obj
+    // `MemoryMXBean` is an interface. Returning an object stamped with that
+    // interface makes `instanceof NotificationEmitter` false and hides
+    // MemoryImpl's inherited listener implementation. The concrete class's
+    // registered `getMemoryUsage0` bridge still supplies live heap values.
+    let obj = alloc_concurrent_synthetic(ctx, "sun/management/MemoryImpl", 1);
+    init_notification_emitter_support(ctx, obj)
 }
 
 fn alloc_memory_usage(

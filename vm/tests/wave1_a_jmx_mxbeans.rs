@@ -69,11 +69,36 @@ fn java_home() -> Option<String> {
     None
 }
 
+fn compile_jmx_probe(probe: &Path) -> bool {
+    let source = probe.join("JmxProbe.java");
+    if !source.exists() {
+        eprintln!("[wave1_a_jmx] JmxProbe.java missing");
+        return false;
+    }
+    let javac = java_home()
+        .map(|home| {
+            PathBuf::from(home)
+                .join("bin")
+                .join(if cfg!(windows) { "javac.exe" } else { "javac" })
+        })
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "javac.exe" } else { "javac" }));
+    match Command::new(javac).arg(&source).current_dir(probe).status() {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            eprintln!("[wave1_a_jmx] javac exited {status}");
+            false
+        }
+        Err(error) => {
+            eprintln!("[wave1_a_jmx] failed to launch javac: {error}");
+            false
+        }
+    }
+}
 fn run_jmx_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
     let bin = cratonvm_binary()?;
     let probe = probe_dir();
-    if !probe.join("JmxProbe.class").exists() {
-        eprintln!("[wave1_a_jmx] JmxProbe.class missing — run javac in apps/jmx_probe");
+    if !compile_jmx_probe(&probe) {
         return None;
     }
     let mut cmd = Command::new(&bin);
@@ -142,6 +167,11 @@ fn jmx_probe_returns_nonempty_mxbean_lists() {
         rc,
         stdout,
         stderr
+    );
+    assert!(
+        stdout.contains("listener=OK"),
+        "wave1_a_jmx: MemoryMXBean listener registration must complete. Got stdout={:?}",
+        stdout
     );
     assert!(
         stdout.contains("OK"),
