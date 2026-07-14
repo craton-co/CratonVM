@@ -53808,10 +53808,22 @@ struct MatcherRealCache {
     re: JavaRegex,
 }
 
-fn matcher_realjdk_cache() -> &'static Mutex<std::collections::HashMap<i32, MatcherRealCache>> {
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<i32, MatcherRealCache>>> =
+fn matcher_realjdk_cache(
+) -> &'static Mutex<std::collections::HashMap<i32, std::sync::Arc<MatcherRealCache>>> {
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<i32, std::sync::Arc<MatcherRealCache>>>,
+    > =
         OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+thread_local! {
+    /// A Matcher is explicitly not thread-safe, so the most recent cache entry
+    /// on this Java thread is the overwhelmingly common case. The global map
+    /// remains the cross-thread/cold fallback.
+    static MATCHER_REAL_LAST_CACHE:
+        std::cell::RefCell<Option<(i32, i32, i32, std::sync::Arc<MatcherRealCache>)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn matcher_realjdk_group_slice<'a>(
@@ -53850,16 +53862,25 @@ fn matcher_realjdk_cached_group_string(
 ) -> Option<ObjectRef> {
     let matcher_identity = ctx.identity_hash_code(matcher);
     let text_identity = ctx.identity_hash_code(text);
-    let (utf8, utf16_to_byte) = {
-        let guard = matcher_realjdk_cache().lock().ok()?;
-        let entry = guard.get(&matcher_identity)?;
-        if entry.text_identity != text_identity {
-            return None;
-        }
-        (entry.utf8.clone(), entry.utf16_to_byte.clone())
-    };
+    let entry = MATCHER_REAL_LAST_CACHE
+        .with(|cache| {
+            cache
+                .borrow()
+                .as_ref()
+                .filter(|(matcher_id, text_id, _, _)| {
+                    *matcher_id == matcher_identity && *text_id == text_identity
+                })
+                .map(|(_, _, _, entry)| entry.clone())
+        })
+        .or_else(|| {
+            let guard = matcher_realjdk_cache().lock().ok()?;
+            guard
+                .get(&matcher_identity)
+                .filter(|entry| entry.text_identity == text_identity)
+                .cloned()
+        })?;
 
-    let text = matcher_realjdk_group_slice(&utf8, &utf16_to_byte, start, end)?;
+    let text = matcher_realjdk_group_slice(&entry.utf8, &entry.utf16_to_byte, start, end)?;
     Some(ctx.create_string_uninterned(text))
 }
 
@@ -53897,12 +53918,7 @@ fn matcher_realjdk_cached(
     matcher: ObjectRef,
     idx: MatcherFieldIndices,
     pattern_idx: PatternFieldIndices,
-) -> Option<(
-    std::sync::Arc<str>,
-    std::sync::Arc<[u32]>,
-    std::sync::Arc<[u32]>,
-    JavaRegex,
-)> {
+) -> Option<std::sync::Arc<MatcherRealCache>> {
     let text_obj = match ctx.get_field(matcher, idx.text) {
         Value::Object(Some(r)) => r,
         _ => return None,
@@ -53915,16 +53931,35 @@ fn matcher_realjdk_cached(
     let pattern_identity = ctx.identity_hash_code(pattern_obj);
     let matcher_identity = ctx.identity_hash_code(matcher);
 
+    let last = MATCHER_REAL_LAST_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|(matcher_id, text_id, pattern_id, _)| {
+                *matcher_id == matcher_identity
+                    && *text_id == text_identity
+                    && *pattern_id == pattern_identity
+            })
+            .map(|(_, _, _, entry)| entry.clone())
+    });
+    if last.is_some() {
+        return last;
+    }
+
     if let Ok(guard) = matcher_realjdk_cache().lock() {
         if let Some(entry) = guard.get(&matcher_identity) {
             if entry.text_identity == text_identity && entry.pattern_identity == pattern_identity
             {
-                return Some((
-                    entry.utf8.clone(),
-                    entry.byte_to_utf16.clone(),
-                    entry.utf16_to_byte.clone(),
-                    entry.re.clone(),
-                ));
+                let entry = entry.clone();
+                MATCHER_REAL_LAST_CACHE.with(|cache| {
+                    cache.borrow_mut().replace((
+                        matcher_identity,
+                        text_identity,
+                        pattern_identity,
+                        entry.clone(),
+                    ));
+                });
+                return Some(entry);
             }
         }
     }
@@ -53956,20 +53991,26 @@ fn matcher_realjdk_cached(
     let byte_to_utf16: std::sync::Arc<[u32]> = std::sync::Arc::from(byte_to_utf16.into_boxed_slice());
     let utf16_to_byte: std::sync::Arc<[u32]> = std::sync::Arc::from(utf16_to_byte.into_boxed_slice());
 
+    let entry = std::sync::Arc::new(MatcherRealCache {
+        text_identity,
+        pattern_identity,
+        utf8,
+        byte_to_utf16,
+        utf16_to_byte,
+        re,
+    });
     if let Ok(mut guard) = matcher_realjdk_cache().lock() {
-        guard.insert(
-            matcher_identity,
-            MatcherRealCache {
-                text_identity,
-                pattern_identity,
-                utf8: utf8.clone(),
-                byte_to_utf16: byte_to_utf16.clone(),
-                utf16_to_byte: utf16_to_byte.clone(),
-                re: re.clone(),
-            },
-        );
+        guard.insert(matcher_identity, entry.clone());
     }
-    Some((utf8, byte_to_utf16, utf16_to_byte, re))
+    MATCHER_REAL_LAST_CACHE.with(|cache| {
+        cache.borrow_mut().replace((
+            matcher_identity,
+            text_identity,
+            pattern_identity,
+            entry.clone(),
+        ));
+    });
+    Some(entry)
 }
 
 /// Decline this fast path for the current call: re-enter the SAME (class,
@@ -54182,18 +54223,17 @@ fn native_matcher_find_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(p) => p,
         None => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
     };
-    let (utf8, byte_to_utf16, utf16_to_byte, re) =
-        match matcher_realjdk_cached(ctx, this, idx, pattern_idx) {
-            Some(t) => t,
-            None => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
-        };
+    let cached = match matcher_realjdk_cached(ctx, this, idx, pattern_idx) {
+        Some(cached) => cached,
+        None => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
+    };
     let groups_obj = match ctx.get_field(this, idx.groups) {
         Value::Object(Some(g)) => g,
         _ => return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]),
     };
     // Group-count safety net, checked BEFORE any field mutation below. The
     // Pattern field is the semantic count; groups[] may be overallocated.
-    if !matcher_realjdk_capture_layout_ok(ctx, this, idx, pattern_idx, &re, groups_obj) {
+    if !matcher_realjdk_capture_layout_ok(ctx, this, idx, pattern_idx, &cached.re, groups_obj) {
         return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]);
     }
 
@@ -54201,7 +54241,7 @@ fn native_matcher_find_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let to = ctx
         .get_field(this, idx.to)
         .as_int()
-        .unwrap_or(byte_to_utf16[utf8.len()] as i32);
+        .unwrap_or(cached.byte_to_utf16[cached.utf8.len()] as i32);
     let first = ctx.get_field(this, idx.first).as_int().unwrap_or(-1);
     let last = ctx.get_field(this, idx.last).as_int().unwrap_or(0);
 
@@ -54227,10 +54267,10 @@ fn native_matcher_find_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         ctx,
         this,
         idx,
-        &re,
-        &utf8,
-        &byte_to_utf16,
-        &utf16_to_byte,
+        &cached.re,
+        &cached.utf8,
+        &cached.byte_to_utf16,
+        &cached.utf16_to_byte,
         groups_obj,
         from,
         to,
@@ -54271,12 +54311,11 @@ fn native_matcher_find_at_realjdk(
         Some(p) => p,
         None => return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]),
     };
-    let (utf8, byte_to_utf16, utf16_to_byte, re) =
-        match matcher_realjdk_cached(ctx, this, idx, pattern_idx) {
-            Some(t) => t,
-            None => return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]),
-        };
-    let text_len_utf16 = byte_to_utf16[utf8.len()] as i32;
+    let cached = match matcher_realjdk_cached(ctx, this, idx, pattern_idx) {
+        Some(cached) => cached,
+        None => return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]),
+    };
+    let text_len_utf16 = cached.byte_to_utf16[cached.utf8.len()] as i32;
 
     // Out-of-range `start`: let the real bytecode throw the exact
     // `IndexOutOfBoundsException` Java specifies (no matching RuntimeError
@@ -54292,7 +54331,7 @@ fn native_matcher_find_at_realjdk(
     };
     // Group-count safety net — checked before any field mutation below. The
     // Pattern field is the semantic count; groups[] may be overallocated.
-    if !matcher_realjdk_capture_layout_ok(ctx, this, idx, pattern_idx, &re, groups_obj) {
+    if !matcher_realjdk_capture_layout_ok(ctx, this, idx, pattern_idx, &cached.re, groups_obj) {
         return matcher_realjdk_bail(ctx, this, "find", "(I)Z", &[Value::Int(start)]);
     }
 
@@ -54312,10 +54351,10 @@ fn native_matcher_find_at_realjdk(
         ctx,
         this,
         idx,
-        &re,
-        &utf8,
-        &byte_to_utf16,
-        &utf16_to_byte,
+        &cached.re,
+        &cached.utf8,
+        &cached.byte_to_utf16,
+        &cached.utf16_to_byte,
         groups_obj,
         0,
         text_len_utf16,
