@@ -2277,12 +2277,20 @@ pub(crate) fn define_class_via_full(
                 set_class_data(mirror, data);
             }
             // Eager-init request: run <clinit> now (defineClass0 path
-            // when `initialize == true`).
+            // when `initialize == true`). `ctx.initialize_class` can
+            // allocate and trigger a moving GC, so `mirror` (a raw
+            // `ObjectRef` captured above and returned again below) must be
+            // rooted across the call — same Family-1 stale-ObjectRef
+            // pattern as the sibling `lk_ensure_initialized` fix. See
+            // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+            let mirror_pin = ctx.pin_native_root(mirror);
             if initialize {
                 if let Err(msg) = ctx.initialize_class(cid) {
                     tracing::warn!("defineClass0 initialize: <clinit> for {name} failed: {msg}");
                 }
             }
+            let mirror = ctx.read_native_pin(mirror_pin, mirror);
+            ctx.unpin_native_roots(mirror_pin);
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {
@@ -4908,6 +4916,14 @@ fn lk_ensure_initialized(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             message: "Lookup.ensureInitialized target is not a Class mirror".to_string(),
         }
     })?;
+    // Family-1 stale-ObjectRef fix (2026-07-13): `ctx.initialize_class` runs
+    // the target's `<clinit>`, which can allocate and trigger a moving GC.
+    // `target_class` is a raw `ObjectRef` captured above and was being
+    // returned again after this call without being refreshed — exactly the
+    // "held across a GC-triggering call" pattern documented in
+    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    // Root and re-read it around the call.
+    let target_class_pin = ctx.pin_native_root(target_class);
     ctx.initialize_class(class_id).map_err(|message| {
         cratonvm_types::error::MethodCallFailed::InternalError(
             cratonvm_types::error::VmError::Internal {
@@ -4915,6 +4931,8 @@ fn lk_ensure_initialized(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             },
         )
     })?;
+    let target_class = ctx.read_native_pin(target_class_pin, target_class);
+    ctx.unpin_native_roots(target_class_pin);
     Ok(Some(Value::Object(Some(target_class))))
 }
 
