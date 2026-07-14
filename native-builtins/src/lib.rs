@@ -54565,6 +54565,25 @@ fn native_matcher_group_idx_realjdk(ctx: &mut dyn NativeContext, args: &[Value])
             )
         }
     };
+    // The real-layout find fast path only caches an actual `String` input.
+    // Call the same registered substring native directly for that common case
+    // instead of re-entering generic virtual dispatch for every captured group.
+    // A Matcher populated by bytecode over another CharSequence keeps the real
+    // `substring` dispatch/fallback behavior below.
+    if ctx
+        .class_name_of_id(ctx.class_id_of_object(text_obj))
+        .as_deref()
+        == Some("java/lang/String")
+    {
+        return lang_string::native_string_substring(
+            ctx,
+            &[
+                Value::Object(Some(text_obj)),
+                Value::Int(start),
+                Value::Int(end),
+            ],
+        );
+    }
     ctx.invoke_virtual(
         text_obj,
         "substring",
