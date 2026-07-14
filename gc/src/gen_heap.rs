@@ -3240,7 +3240,27 @@ impl GenerationalHeap {
                 moving_young,
                 force_non_moving_jit_roots,
             );
-            let result = self.sweep_young_non_moving(roots, finalizer_addrs);
+            let mut result = self.sweep_young_non_moving(roots, finalizer_addrs);
+            // The JIT-active path cannot use the ordinary old-gen compactor:
+            // conservative JIT stack/register roots cannot be rewritten when an
+            // old object moves.  Previously this early return therefore skipped
+            // old collection altogether.  Long allocation-heavy runs eventually
+            // filled old space with dead objects promoted by the selective young
+            // sweep (or spilled there by an allocation slow path), making depth
+            // 20 Binary Trees OOM despite a small live tree.  Sweep old space in
+            // place once it reaches the same pressure threshold as the compacting
+            // path.  The shared marker retains every conservative root, while
+            // the non-moving sweep only returns unreachable blocks to OldGen's
+            // free lists and never invalidates a raw JIT pointer.
+            let old_capacity = self.old_gen_capacity();
+            if old_capacity > 0 && self.old_gen_used() >= old_capacity * 75 / 100 {
+                let old_freed = self.sweep_old_gen_non_moving(roots);
+                result.0.stats.bytes_freed += old_freed;
+                self.stats
+                    .bytes_freed_old
+                    .fetch_add(old_freed as u64, Ordering::Relaxed);
+                self.stats.major_gc_count.fetch_add(1, Ordering::Relaxed);
+            }
             // BUG-V fix: the non-moving sweep still *relocates* objects via
             // selective promotion (young→old, see `selective_on` in
             // `sweep_young_non_moving`). Those relocations land in
@@ -6751,6 +6771,18 @@ impl GenerationalHeap {
         )
     }
 
+    /// Run a non-moving mark-sweep of old space while conservative JIT roots are
+    /// active.  The supplied roots are copied only because the shared marker's
+    /// compacting mode can rewrite its mutable root slice; this mode never does.
+    fn sweep_old_gen_non_moving(&self, roots: &[ObjectRef]) -> usize {
+        let young_from = self.young_from.lock();
+        let mut old_gen = self.old_gen.lock();
+        let before = old_gen.used();
+        let mut root_shadow = roots.to_vec();
+        let _ = Self::old_gen_gc(&mut root_shadow, &young_from, &mut old_gen, false);
+        before.saturating_sub(old_gen.used())
+    }
+
     /// Run a major garbage collection on the old generation using mark-compact.
     ///
     /// 1. **Mark phase:** starting from `roots` + all young-gen objects, traverse
@@ -6767,6 +6799,18 @@ impl GenerationalHeap {
         roots: &mut [ObjectRef],
         young_from: &Arena,
         old_gen: &mut OldGen,
+    ) -> HashMap<usize, usize> {
+        Self::old_gen_gc(roots, young_from, old_gen, true)
+    }
+
+    /// Mark old space from the complete root set and either compact it (when
+    /// every root is rewritable) or reclaim dead blocks in place (when JIT
+    /// roots are conservative).
+    fn old_gen_gc(
+        roots: &mut [ObjectRef],
+        young_from: &Arena,
+        old_gen: &mut OldGen,
+        compact: bool,
     ) -> HashMap<usize, usize> {
         // ---- Mark phase ---- BFS from roots + young-gen cross-references ----
 
@@ -6935,6 +6979,23 @@ impl GenerationalHeap {
                     }
                 }
             }
+        }
+
+        if !compact {
+            let objects = old_gen.walk_objects();
+            for (obj_ptr, total_size) in objects {
+                // SAFETY: `walk_objects` returns valid old-gen object starts.
+                // Marked objects remain at their current address; every other
+                // object was unreachable from the complete precise +
+                // conservative root set and can be returned to the free list.
+                let header = unsafe { &mut *(obj_ptr as *mut ObjectHeader) };
+                if header.gc_flags & GC_FLAG_MARKED != 0 {
+                    header.gc_flags &= !GC_FLAG_MARKED;
+                } else {
+                    unsafe { old_gen.free(obj_ptr, total_size) };
+                }
+            }
+            return HashMap::new();
         }
 
         // ---- Compact phase ---- sliding compaction of old gen ----
@@ -10103,6 +10164,40 @@ mod tests {
             }
             other => panic!("live chain corrupted after hole reuse: {other:?}"),
         }
+    }
+
+    #[test]
+    fn non_moving_old_sweep_reclaims_dead_promotions_without_relocation() {
+        let heap = GenerationalHeap::with_sizes(4 * 1024, 16 * 1024);
+        let monitors = NoOpMonitors;
+
+        let live = heap.alloc_object(ClassId::new(1), 1);
+        let dead = heap.alloc_object(ClassId::new(2), 1);
+        heap.set_field(live, 0, Value::Int(4242));
+        heap.set_field(dead, 0, Value::Int(-1));
+
+        // Age both objects into old space through the ordinary moving path.
+        let mut roots = vec![live, dead];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        let live_old = roots[0];
+        assert!(heap.is_in_old(live_old.as_ptr()));
+        assert!(heap.is_in_old(roots[1].as_ptr()));
+
+        let old_used_before = heap.old_gen_used();
+        let reclaimed = heap.sweep_old_gen_non_moving(&[live_old]);
+
+        assert!(
+            reclaimed > 0,
+            "unreachable promoted object must be reclaimed"
+        );
+        assert!(heap.old_gen_used() < old_used_before);
+        assert_eq!(
+            heap.get_field(live_old, 0).as_int(),
+            Some(4242),
+            "the rooted old object must stay at its original address"
+        );
     }
 
     /// RandomizedContext WeakHashMap<Thread,...> fix regression: a
