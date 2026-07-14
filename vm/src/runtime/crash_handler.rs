@@ -621,7 +621,8 @@ mod windows_fault {
             // disarm on the very first hit.
             if dr0 != 0
                 && crate::runtime::crash_handler::GENERIC_HEAP_WATCH_MODE.load(Ordering::Relaxed)
-                && !crate::runtime::crash_handler::SAVEBASE_WATCH_CAUGHT.swap(true, Ordering::SeqCst)
+                && !crate::runtime::crash_handler::SAVEBASE_WATCH_CAUGHT
+                    .swap(true, Ordering::SeqCst)
             {
                 let val = core::ptr::read_unaligned(dr0 as *const u64);
                 let mb = GetModuleHandleW(core::ptr::null()) as u64;

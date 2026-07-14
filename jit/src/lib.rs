@@ -464,6 +464,12 @@ impl ExecutableBuffer {
         self.ptr
     }
 
+    /// Size of the private executable allocation backing this method.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Get the emitted bytes as a slice.
     pub fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
@@ -3028,6 +3034,44 @@ mod math_intrinsic_aliases {
 }
 pub use math_intrinsic_aliases::*;
 
+/// Process-global pointer to the VM-side
+/// `jit_integer_value_of_direct(vm_ptr, value) -> i64` thin helper,
+/// registered once at VM init (`build_helpers`). Avoids a
+/// `JitRuntimeHelpers` ABI change (same pattern as
+/// `x64::ARM_SAVEBASE_WATCH_FN`). `0` = not wired → the recognition below
+/// is skipped and `Integer.valueOf` sites use the generic dispatch helper.
+///
+/// Why: `invokestatic Integer.valueOf(I)` is statically bound and its
+/// callee is a registered native, so the generic `jit_invoke_dispatch`
+/// round trip (info decode, per-call thread-local cache probes, argument
+/// buffer build, safe-native-call wrapper) is pure fixed overhead on one
+/// of the hottest autoboxing paths (three `valueOf` calls per
+/// `HashMap<Integer,Integer>` put+get pair). A direct `CALL` to the thin
+/// helper keeps the exact allocation, `-128..=127` identity-cache, and
+/// pending-return rooting semantics while skipping the dispatch machinery.
+pub static INTEGER_VALUE_OF_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the `Integer.valueOf` thin direct-call helper (called once from
+/// the VM's `build_helpers`).
+pub fn set_integer_value_of_direct_fn(addr: usize) {
+    INTEGER_VALUE_OF_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `Integer.intValue()` sibling of [`INTEGER_VALUE_OF_DIRECT_FN`].
+/// `java/lang/Integer` is `final`, so an `invokevirtual` site whose
+/// constant-pool class is exactly `Integer` is statically monomorphic and
+/// can take the plain (guard-free) virtual direct-call path; the thin
+/// helper handles the null-receiver NPE itself.
+pub static INTEGER_INT_VALUE_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the `Integer.intValue` thin direct-call helper (called once from
+/// the VM's `build_helpers`).
+pub fn set_integer_int_value_direct_fn(addr: usize) {
+    INTEGER_INT_VALUE_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Resolve a method invocation to a JIT call-site intrinsic, if one applies.
 ///
 /// Returns `Some((entry, num_params, return_type))` where `entry` is the
@@ -5177,7 +5221,7 @@ pub fn try_compile(
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
-    // CRIT-2 — returns (class_id, num_fields, has_primitive_init,
+    // CRIT-2 — returns (class_id, num_fields, has_nonzero_tag_primitive_init,
     // has_finalizer). The two flags feed the inline-TLAB `new` fast path;
     // resolvers that cannot compute them must return `(_, _, true, true)`
     // so the post-init helper call stays in place.
@@ -5499,7 +5543,7 @@ fn try_compile_inner(
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
-    // (class_id, num_fields, has_primitive_init, has_finalizer) — see `try_compile`.
+    // (class_id, num_fields, has_nonzero_tag_primitive_init, has_finalizer) — see `try_compile`.
     cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
     cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<i64>>,
     cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<(i64, bool)>>, // inc 35: (bits, is_double)
@@ -6271,9 +6315,8 @@ fn try_compile_inner(
 
     // CRIT-2 — new_info tuple shape:
     //   (pc, class_id_raw, num_fields,
-    //    has_primitive_init,    // class has primitive-typed fields that
-    //                           // need typed-zero defaults applied by
-    //                           // `jit_init_primitive_fields`
+    //    has_nonzero_tag_primitive_init, // class has long/float/double fields
+    //                                    // whose typed-zero Value tag is nonzero
     //    has_finalizer)         // class overrides `finalize()` and must
     //                           // be registered with the finalizer queue
     //
@@ -6456,6 +6499,35 @@ fn try_compile_inner(
                 }
 
                 if !planned_inline {
+                    // `Integer.valueOf(I)` thin direct call (see
+                    // `INTEGER_VALUE_OF_DIRECT_FN`): statically bound, native
+                    // callee — the eager callee-compile attempt below can
+                    // never succeed for it, and the generic dispatch fallback
+                    // pays the full helper round trip per call. `needs_context`
+                    // routes vm_ptr as arg 0; the helper preserves the
+                    // identity-cache and pending-return rooting contracts.
+                    if invoke_kind == 3
+                        && class_name == "java/lang/Integer"
+                        && method_name == "valueOf"
+                        && descriptor == "(I)Ljava/lang/Integer;"
+                    {
+                        let entry = INTEGER_VALUE_OF_DIRECT_FN
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        if entry != 0 {
+                            needs_heap = true;
+                            direct_calls.push((
+                                pc,
+                                JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params: 1,
+                                    return_type: b'L',
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
                     if let Some(compiler) = callee_compiler.as_ref() {
                         if let Some((entry, callee_needs_ctx)) =
                             compiler(&class_name, &method_name, &descriptor)
@@ -6571,6 +6643,33 @@ fn try_compile_inner(
             // `guard_class_id` stays 0 and the CRC32 codegen bails the site
             // to normal dispatch (0 is never a real class id).
             if !is_recursive_call && (invoke_kind == 0 || invoke_kind == 2) {
+                // `Integer.intValue()` thin direct call (see
+                // `INTEGER_INT_VALUE_DIRECT_FN`): `Integer` is `final`, so a
+                // site declared against it is statically monomorphic — the
+                // plain guard-free virtual direct-call path is sound, and
+                // the helper handles the null-receiver NPE itself.
+                if invoke_kind == 0
+                    && class_name == "java/lang/Integer"
+                    && method_name == "intValue"
+                    && descriptor == "()I"
+                {
+                    let entry =
+                        INTEGER_INT_VALUE_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
+                    if entry != 0 {
+                        needs_heap = true;
+                        direct_calls.push((
+                            pc,
+                            JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 0,
+                                return_type: b'I',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                }
                 // First the layout-independent instance intrinsics.
                 if let Some((entry, num_params, ret)) =
                     try_resolve_intrinsic(&class_name, &method_name, &descriptor)
@@ -6862,6 +6961,14 @@ fn try_compile_inner(
     );
 
     x64::set_pending_verified_max_stack(cached.max_stack as usize);
+    // Pure-kernel GPR local homes: this is the METHOD-ENTRY compile path
+    // (OSR artifacts go through the interpreter's `compile_osr_artifact`,
+    // which never sets this), so request the kernel register homes. The
+    // backend engages them only for call/field/alloc/typecheck-free bodies
+    // with no speculative-BCE guards, keeps reference locals frame-homed,
+    // and publishes the body without OSR entry points — see
+    // `x64::kernel_reg_locals_enabled` for the safety argument.
+    x64::set_kernel_reg_homes_request(true);
     let mut compiled = x64::compile_with_param_slots(
         code,
         code_len,
@@ -7704,18 +7811,18 @@ pub fn invokestatic_self_call_uses_tail_jump(code: &[u8], code_len: usize, pc: u
 // Tests
 // ---------------------------------------------------------------------------
 
-    #[test]
-    fn hsqldb_jit_deny_matches_slash_and_dot_names() {
-        assert_eq!(
-            hsqldb_jit_deny_prefix("org/hsqldb/map/BaseHashMap"),
-            Some("org/hsqldb/")
-        );
-        assert_eq!(
-            hsqldb_jit_deny_prefix("org.hsqldb.map.BaseHashMap"),
-            Some("org.hsqldb.")
-        );
-        assert_eq!(hsqldb_jit_deny_prefix("org/example/Foo"), None);
-    }
+#[test]
+fn hsqldb_jit_deny_matches_slash_and_dot_names() {
+    assert_eq!(
+        hsqldb_jit_deny_prefix("org/hsqldb/map/BaseHashMap"),
+        Some("org/hsqldb/")
+    );
+    assert_eq!(
+        hsqldb_jit_deny_prefix("org.hsqldb.map.BaseHashMap"),
+        Some("org.hsqldb.")
+    );
+    assert_eq!(hsqldb_jit_deny_prefix("org/example/Foo"), None);
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7743,7 +7850,10 @@ mod tests {
             jaxb_mapping_jit_deny_prefix("org.glassfish.jaxb.runtime.v2.ContextFactory"),
             Some("org.glassfish.jaxb.")
         );
-        assert_eq!(jaxb_mapping_jit_deny_prefix("org/glassfish/other/Foo"), None);
+        assert_eq!(
+            jaxb_mapping_jit_deny_prefix("org/glassfish/other/Foo"),
+            None
+        );
     }
 
     #[test]

@@ -2257,7 +2257,9 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             ] {
                 n += set_static_by_name(name, Value::Int(scale)) as i32;
             }
-            tracing::warn!("Post-clinit fixup: Unsafe ARRAY_*_BASE_OFFSET/INDEX_SCALE populated ({n}/18)");
+            tracing::warn!(
+                "Post-clinit fixup: Unsafe ARRAY_*_BASE_OFFSET/INDEX_SCALE populated ({n}/18)"
+            );
         }
         "sun/misc/Unsafe" => {
             // JDK 25's `Unsafe.<clinit>` stores the result of
@@ -2327,10 +2329,9 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 false
             } else if let Some((enum_class_id, static_idx)) = enum_slot {
                 match super::vm_object::get_static_shared(shared, enum_class_id, static_idx) {
-                    Value::Object(Some(option)) => set_static_by_name(
-                        "MEMORY_ACCESS_OPTION",
-                        Value::Object(Some(option)),
-                    ),
+                    Value::Object(Some(option)) => {
+                        set_static_by_name("MEMORY_ACCESS_OPTION", Value::Object(Some(option)))
+                    }
                     _ => false,
                 }
             } else {
