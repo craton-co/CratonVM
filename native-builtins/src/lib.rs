@@ -59120,6 +59120,17 @@ fn monitor_wait_keepalive(
     Ok(obj)
 }
 
+/// STW-TAKEOVER-FIX (2026-07-13): use `ctx.monitor_enter_gc_safe(obj)`
+/// (see `NativeContext::monitor_enter_gc_safe`'s doc) instead of a raw
+/// `ctx.monitor_enter(obj)` in any NEW native whose contended wait must be
+/// excused from an in-flight STW barrier pause AND that keeps referencing
+/// `obj` afterward — it pins, enters, and refreshes internally, returning
+/// the current (possibly GC-relocated) reference. Applied narrowly to the
+/// one call site with live-gdb-confirmed evidence of the WildFly
+/// `parallel-extension-add` deadlock:
+/// `native_cdl_await`/`native_cdl_await_timeout`/`native_cdl_count_down`
+/// below. Left as a doc pointer (not a helper function) since the trait
+/// method already does the whole job — no wrapper needed.
 fn bounded_monitor_wait_ms(remaining: std::time::Duration, cap_ms: u64) -> u64 {
     remaining.as_millis().clamp(1, cap_ms as u128) as u64
 }
@@ -59528,7 +59539,10 @@ fn native_cdl_count_down(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // Serialize the read-modify-write against concurrent countDown() calls —
     // two racing decrements must not lose one (the boot-thread/test-thread
     // handshake counts on exactly-N decrements releasing the latch).
-    ctx.monitor_enter(this);
+    // GC-SAFEPOINT FIX: monitor_enter_gc_safe's contended wait can span a
+    // completing GC pause; use its returned reference so a relocated `this`
+    // doesn't go stale under the calls below.
+    let this = ctx.monitor_enter_gc_safe(this);
     let count = cdl_count(ctx, this);
     if count > 0 {
         cdl_set_count(ctx, this, count - 1);
@@ -59555,7 +59569,10 @@ fn native_cdl_await(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         if cdl_count(ctx, this) <= 0 {
             return Ok(None);
         }
-        ctx.monitor_enter(this);
+        // GC-SAFEPOINT FIX: monitor_enter_gc_safe's contended wait can span a
+        // completing GC pause; use its returned reference so a relocated
+        // `this` doesn't go stale under the wait below.
+        this = ctx.monitor_enter_gc_safe(this);
         // GC-SAFEPOINT FIX: the wait can relocate `this`; pin + read back.
         let wait_result = monitor_wait_keepalive(ctx, this, Some(10));
         this = wait_result?;
@@ -59590,7 +59607,10 @@ fn native_cdl_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             return Ok(Some(Value::Int(0))); // false — timed out
         }
         let wait_ms = bounded_monitor_wait_ms(remaining, 10);
-        ctx.monitor_enter(this);
+        // GC-SAFEPOINT FIX: monitor_enter_gc_safe's contended wait can span a
+        // completing GC pause; use its returned reference so a relocated
+        // `this` doesn't go stale under the wait below.
+        this = ctx.monitor_enter_gc_safe(this);
         // GC-SAFEPOINT FIX: the wait can relocate `this`; pin + read back.
         this = monitor_wait_keepalive(ctx, this, Some(wait_ms))?;
         ctx.monitor_exit(this);
