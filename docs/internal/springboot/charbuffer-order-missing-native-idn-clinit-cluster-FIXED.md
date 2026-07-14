@@ -1,6 +1,35 @@
 # `CharBuffer.order()` has no native registration — poisons `java.net.IDN`'s `<clinit>` for the rest of the process (FAIL cluster + 1 fatal CRASH)
 
-**Status: OPEN.**
+**Status: FIXED 2026-07-14** (the `order()` root cause described below).
+Registered `order()` natively on `java/nio/CharBuffer` (native platform
+order, matching real `HeapCharBuffer.order()`) and on the four
+`ByteBufferAsCharBuffer{B,L,RB,RL}` view classes (fixed endianness per the
+class-name suffix, matching real per-view-class overrides) —
+`native-builtins/src/phases_late.rs::register_p62_char_buffer`. Verified
+with a standalone repro (`java.net.IDN.toASCII("example.com")` at process
+start): the `AbstractMethodError: java/nio/CharBuffer.order()...` is gone,
+confirmed by direct re-run against a fresh build.
+
+**Residual found while verifying this fix**: with `order()` no longer
+throwing, `IDN.<clinit>` now runs further and hits a **different, deeper,
+pre-existing bug** — `java.lang.ArrayIndexOutOfBoundsException` inside
+`CharBuffer.getArray(I[CII)` (`CharBuffer.java:972`, the private bulk-get
+helper), specifically inside its `ScopedMemoryAccess.copyMemory` fast path
+(`isAddressable()` is unconditional `true` for every real `CharBuffer` per
+its own concrete bytecode — see decompile below — so this path is always
+taken, not just for direct buffers). `java.net.IDN.toASCII` therefore still
+does not fully succeed end-to-end on this build; the Spring Boot classes in
+this cluster will still FAIL/CRASH, just with the new, different exception
+instead of the old `AbstractMethodError`/`NoClassDefFoundError` chain. This
+residual has **not** been root-caused or fixed — it needs its own
+investigation into `ScopedMemoryAccess.copyMemory`'s native implementation
+(likely misinterpreting the heap-relative `address`/`ARRAY_BASE_OFFSET`
+math for a non-direct `CharBuffer`'s backing array) and is filed separately:
+[`../../known-issues/springboot/charbuffer-getarray-scopedmemoryaccess-copymemory-aioobe.md`](../../known-issues/springboot/charbuffer-getarray-scopedmemoryaccess-copymemory-aioobe.md).
+
+---
+
+**Original OPEN report follows (kept for the `order()` root-cause record):**
 
 ## Symptom
 

@@ -1,6 +1,26 @@
 # `Map.Entry::getKey`/`getValue` method references over synthetic wrapper entries: interface-level native override wins over the wrapper's own, returning the wrong object
 
-**Status: OPEN**
+**Status: FIXED 2026-07-14.** `vm/src/vm/vm_exec.rs::invoke_on_class_shared_inner`'s
+"C25 rescue" (the receiver-specific native-registry check for abstract
+methods) was gated behind `if !native && ...`, so it never ran once the
+earlier, less-specific interface-level native lookup (`check_override`) had
+already matched. Removed the `!native` gate: the receiver's own class
+registry is now always consulted for a more specific native when the
+method resolves to an abstract declaration on a different class, and — if
+found — takes precedence over whatever generic interface-level native
+already matched. A match on the receiver's own concrete class is always at
+least as specific as one found via the abstract declaring class, so this
+ordering is strictly more correct with no identified downside.
+
+Verified with the standalone repro from this doc (`Map.of("spring",
+"boot").entrySet()` + `Map.Entry::getKey` as a method reference): now
+correctly prints `"spring"` instead of throwing
+`ClassCastException: java.util.AbstractMap$SimpleEntry cannot be cast to
+java.lang.String`. Also re-verified the `Enumeration$Impl`/
+`Iterator.hasNext()` case this rescue mechanism was originally written for
+still works (no regression — that case never had a competing
+interface-level native to begin with, so it is unaffected by removing the
+`!native` gate).
 
 ## Symptom
 
