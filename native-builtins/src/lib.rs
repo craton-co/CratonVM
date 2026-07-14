@@ -53803,6 +53803,23 @@ thread_local! {
     static MATCHER_REAL_LAST_CACHE:
         std::cell::RefCell<Option<(usize, usize, usize, std::sync::Arc<MatcherRealCache>)>> =
         const { std::cell::RefCell::new(None) };
+
+    /// Java's public Matcher state-changing methods increment `modCount`.
+    /// Cache the fields needed by the next `find()` behind that guard so a
+    /// steady-state loop pays one field read instead of five.
+    static MATCHER_REAL_LAST_STATE:
+        std::cell::Cell<Option<MatcherRealState>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[derive(Clone, Copy)]
+struct MatcherRealState {
+    matcher_raw: usize,
+    mod_count: i32,
+    first: i32,
+    last: i32,
+    from: i32,
+    to: i32,
 }
 
 fn matcher_realjdk_group_slice<'a>(
@@ -54047,6 +54064,7 @@ fn matcher_realjdk_search(
     region_to_utf16: i32,
     next_search_utf16: i32,
     previous_last_utf16: i32,
+    previous_mod_count: i32,
 ) -> MethodCallResult {
     let region_from_byte = utf16_to_byte[region_from_utf16.max(0) as usize] as usize;
     let region_to_byte = utf16_to_byte[region_to_utf16.max(0) as usize] as usize;
@@ -54139,8 +54157,19 @@ fn matcher_realjdk_search(
         previous_last_utf16
     };
     ctx.set_field(this, idx.old_last, Value::Int(completed_last));
-    let mod_count = ctx.get_field(this, idx.mod_count).as_int().unwrap_or(0);
-    ctx.set_field(this, idx.mod_count, Value::Int(mod_count.wrapping_add(1)));
+    let completed_first = if matched { whole_start } else { -1 };
+    let completed_mod_count = previous_mod_count.wrapping_add(1);
+    ctx.set_field(this, idx.mod_count, Value::Int(completed_mod_count));
+    MATCHER_REAL_LAST_STATE.with(|state| {
+        state.set(Some(MatcherRealState {
+            matcher_raw: this.as_ptr() as usize,
+            mod_count: completed_mod_count,
+            first: completed_first,
+            last: completed_last,
+            from: region_from_utf16,
+            to: region_to_utf16,
+        }));
+    });
 
     Ok(Some(Value::Int(if matched { 1 } else { 0 })))
 }
@@ -54232,13 +54261,25 @@ fn native_matcher_find_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         return matcher_realjdk_bail(ctx, this, "find", "()Z", &[]);
     }
 
-    let from = ctx.get_field(this, idx.from).as_int().unwrap_or(0);
-    let to = ctx
-        .get_field(this, idx.to)
-        .as_int()
-        .unwrap_or(cached.byte_to_utf16[cached.utf8.len()] as i32);
-    let first = ctx.get_field(this, idx.first).as_int().unwrap_or(-1);
-    let last = ctx.get_field(this, idx.last).as_int().unwrap_or(0);
+    let mod_count = ctx.get_field(this, idx.mod_count).as_int().unwrap_or(0);
+    let matcher_raw = this.as_ptr() as usize;
+    let state = MATCHER_REAL_LAST_STATE.with(|state| {
+        state
+            .get()
+            .filter(|state| state.matcher_raw == matcher_raw && state.mod_count == mod_count)
+    });
+    let (from, to, first, last) = state
+        .map(|state| (state.from, state.to, state.first, state.last))
+        .unwrap_or_else(|| {
+            (
+                ctx.get_field(this, idx.from).as_int().unwrap_or(0),
+                ctx.get_field(this, idx.to)
+                    .as_int()
+                    .unwrap_or(cached.byte_to_utf16[cached.utf8.len()] as i32),
+                ctx.get_field(this, idx.first).as_int().unwrap_or(-1),
+                ctx.get_field(this, idx.last).as_int().unwrap_or(0),
+            )
+        });
 
     let mut next_search = last;
     if next_search == first {
@@ -54271,6 +54312,7 @@ fn native_matcher_find_realjdk(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         to,
         next_search,
         last,
+        mod_count,
     )
 }
 
@@ -54341,7 +54383,8 @@ fn native_matcher_find_at_realjdk(
     ctx.set_field(this, idx.from, Value::Int(0));
     ctx.set_field(this, idx.to, Value::Int(text_len_utf16));
     let mod_count = ctx.get_field(this, idx.mod_count).as_int().unwrap_or(0);
-    ctx.set_field(this, idx.mod_count, Value::Int(mod_count.wrapping_add(1)));
+    let reset_mod_count = mod_count.wrapping_add(1);
+    ctx.set_field(this, idx.mod_count, Value::Int(reset_mod_count));
 
     matcher_realjdk_search(
         ctx,
@@ -54356,6 +54399,7 @@ fn native_matcher_find_at_realjdk(
         text_len_utf16,
         start,
         0,
+        reset_mod_count,
     )
 }
 
