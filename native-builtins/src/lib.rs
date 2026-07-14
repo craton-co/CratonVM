@@ -50458,18 +50458,46 @@ fn native_objects_hash(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_objects_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Real JDK: `Objects.toString(Object o)` is `return String.valueOf(o);`,
+    // and the two-arg `Objects.toString(Object o, String nullDefault)` is
+    // `return (o != null) ? o.toString() : nullDefault;` (the null case is
+    // handled separately by native_objects_to_string_default below, which
+    // never calls this function for a null `o`). Both non-null paths reduce
+    // to the SAME thing: invoke the object's own (possibly overridden)
+    // `toString()` virtually and use its result verbatim.
+    //
+    // BUG (found 2026-07-14 via CrossOriginAnnotationIntegrationTests /
+    // RequestMappingMessageConversionIntegrationTests, both 0/N against a
+    // real HTTP backend): this previously built `ClassName@hex` directly
+    // from `identity_hash_code` for every non-String object, WITHOUT ever
+    // dispatching to the object's real `toString()` override. Every other
+    // toString-invoking path (`Object.toString()` itself, implicit string
+    // concat, `String.valueOf(Object)`, `StringBuilder.append(Object)`) had
+    // already been fixed/verified to virtually dispatch correctly (see
+    // `object-tostring-uses-identity-not-virtual-hashcode` memory / commit
+    // d7116160) — `Objects.toString(Object[, String])` was a separate,
+    // missed native registration that silently regressed the exact same
+    // class of bug. Concretely: Apache HttpComponents5's
+    // `RequestTargetHost.process()` builds the outgoing `Host` header via
+    // `httpRequest.addHeader("Host", authority)` where `authority` is a
+    // `URIAuthority` (an `Object` overload!) — `BasicHeader`'s constructor
+    // stores the header value via `Objects.toString(value, null)`, so this
+    // bug sent the *raw identity form* of the `URIAuthority` object
+    // (`org.apache.hc.core5.net.URIAuthority@<hex>`) as the literal `Host`
+    // header text, which every server-side backend correctly rejected as a
+    // malformed Host header (400 Bad Request / "Bad HostPort" / "the
+    // character [@] is never valid in a domain name") — for EVERY request,
+    // on every backend, in any WebFlux/httpclient5-based integration test.
+    //
+    // Fix: dispatch to invoke_to_string (same helper `String.valueOf(Object)`
+    // already uses correctly) instead of hand-rolling the identity format.
     let s = match args.first() {
         Some(Value::Object(None)) | None => "null".to_string(),
         Some(Value::Object(Some(obj))) => {
             if let Some(s) = ctx.read_string(*obj) {
                 s
             } else {
-                let class_id = ctx.class_id_of_object(*obj);
-                let class_name = ctx
-                    .class_name_of_id(class_id)
-                    .unwrap_or_else(|| "?".to_string());
-                let hash = ctx.identity_hash_code(*obj);
-                format!("{}@{:x}", class_name.replace('/', "."), hash)
+                invoke_to_string(ctx, *obj)?
             }
         }
         Some(Value::Int(v)) => v.to_string(),
