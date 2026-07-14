@@ -499,3 +499,45 @@ above already characterized as a genuinely concurrent  race rather than a single
 fixable unprotected-ObjectRef site. Consistent with a small residual rate, not a full regression of this
 fix — noted here rather than reopening Status, but flagging for whoever next investigates WFLYCTL0153
 recurrences.
+
+## Follow-up session 4 (2026-07-14): scanner refined, 5 more WildFly-relevant files triaged
+
+Continued the static-analysis sweep this doc's Follow-up session 3 started but left mostly untriaged.
+Scanner refined this session to eliminate several false-positive classes found in the prior sweep's
+output: match-arm mutual exclusivity, `Value::Object(None)` diverging-arm pollution, if-let/while-let
+unrecognized binds, return-argument terminal hazards, and RHS-window truncation on heavily-commented
+multi-line statements.
+
+**Triaged and fixed this session** (496 insertions / 35 deletions, `dev` commit `e3d5fbb4`):
+- `lang_class.rs`: `synthetic_class_mirror`, `illegal_arg_exc_null_to_primitive`,
+  `wrap_as_invocation_target_exception`.
+- `lang_invoke.rs` (the bulk of this session's fixes): `make_drop_arguments_adapter`,
+  `alloc_method_handle`, `string_concat_render_value`, `alloc_string_concat_method_handle`,
+  `mh_dispatch_filter`, `make_fold_adapter`, `mh_dispatch_fold`, `mh_dispatch_catch`, `mh_dispatch`
+  (CONSTRUCTOR/GUARD/STRING_CONCAT/COLLECT/INVOKER arms), `lookup_find_special`, `record_deser_dispatch`,
+  `build_method_type_from_descriptor`, `mhs_permute_arguments`, `mhs_guard_with_test`,
+  `native_mhn_resolve`, `native_mhn_init`, `native_mhn_get_member_vm_info`.
+- `jboss_msc.rs`, `wildfly_core.rs`, `wildfly_undertow.rs`: several more sites, same pattern.
+
+**Verification**: `cargo check` clean; `cargo test -p cratonvm-native-builtins --lib`: 2983 passed / 7
+failed, all 7 confirmed identical against the unmodified pre-fix baseline (`git stash`) — no regressions.
+Merged to `dev` (`e3d5fbb4`), build-verified post-merge.
+
+**Updated still-untriaged list** (subtract this session's coverage from Follow-up session 3's original
+list):
+- `lang_class.rs` — most of its ~116 candidates still unreviewed (only 5 total fixed across 2 sessions now)
+- `lang_invoke.rs` — the ~16 functions above are fixed; the remainder of its 123 original candidates not
+  yet individually re-confirmed against the refined scanner (worth a rerun — the earlier count used the
+  cruder scanner and may over/undercount now)
+- `servlet.rs` (49 candidates) — NOT started
+- `spring_startup_bootstrap.rs` — NOT started
+- `wildfly_naming.rs`, `wildfly_security.rs` — NOT started (only `wildfly_core.rs`/`wildfly_undertow.rs`
+  got partial coverage this session)
+- `lib.rs` (673 candidates), `phases_late.rs` (592), `phases_early.rs` (287) — still essentially
+  unreviewed; these three giant files remain the largest unaddressed surface
+
+**How to apply**: re-derive the scanner from this doc's methodology description (Follow-up sessions 3+4
+combined) rather than starting over — the false-positive fixes from this session are worth preserving in
+whatever script version comes next. Prioritize `servlet.rs` and `wildfly_naming.rs`/`wildfly_security.rs`
+next (smaller, WildFly-boot-relevant, realistic to finish in one session) before attempting the three giant
+Phase-N files.
