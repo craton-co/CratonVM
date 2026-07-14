@@ -951,6 +951,14 @@ impl VmHeap {
         }
     }
 
+    /// DBG: young-arena state snapshot — see `GenHeap::young_arena_diag`.
+    pub fn young_arena_diag(&self) -> (usize, usize, usize, usize) {
+        match self {
+            VmHeap::Generational(h) => h.young_arena_diag(),
+            _ => (0, 0, 0, 0),
+        }
+    }
+
     /// Live-bytes estimate for GC-productivity accounting — see
     /// `GenHeap::live_bytes_estimate` (young free-list-aware; the raw bump
     /// cursor never retreats under the non-moving sweep). Other collectors
