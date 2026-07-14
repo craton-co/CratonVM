@@ -232,17 +232,35 @@ fn ioex(msg: impl Into<String>) -> MethodCallFailed {
 }
 
 fn map_err(ctx: &str, e: std::io::Error) -> MethodCallFailed {
-    let prefix = match e.kind() {
-        ErrorKind::ConnectionRefused => "ConnectException",
-        ErrorKind::AddrInUse => "BindException: Address already in use",
-        ErrorKind::AddrNotAvailable => "BindException: Cannot assign requested address",
-        ErrorKind::PermissionDenied => "BindException: Permission denied",
-        ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset => "SocketException",
-        ErrorKind::NotConnected => "SocketException: Not connected",
-        ErrorKind::TimedOut => "SocketTimeoutException",
-        _ => "SocketException",
-    };
-    ioex(format!("{prefix}: {ctx}: {e}"))
+    // BUGFIX [nb-socket-channel]: these must throw the CONCRETE `java.net.*`
+    // exception types, not a generic `IOException` whose message merely
+    // mentions the class name as a text prefix — real code catches them by
+    // type (e.g. ES `RestClientMultipleHostsIntegTests.testNodeSelector`
+    // does `catch (ConnectException e)` around a connect to a stopped host;
+    // a bare IOException escapes that catch and fails the test even though
+    // the underlying refusal was detected correctly).
+    match e.kind() {
+        ErrorKind::ConnectionRefused => RuntimeError::ConnectException {
+            message: format!("{ctx}: {e}"),
+        }
+        .into(),
+        ErrorKind::TimedOut => RuntimeError::SocketTimeoutException {
+            message: format!("{ctx}: {e}"),
+        }
+        .into(),
+        ErrorKind::AddrInUse => ioex(format!("BindException: Address already in use: {ctx}: {e}")),
+        ErrorKind::AddrNotAvailable => {
+            ioex(format!("BindException: Cannot assign requested address: {ctx}: {e}"))
+        }
+        ErrorKind::PermissionDenied => {
+            ioex(format!("BindException: Permission denied: {ctx}: {e}"))
+        }
+        ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset => {
+            ioex(format!("SocketException: {ctx}: {e}"))
+        }
+        ErrorKind::NotConnected => ioex(format!("SocketException: Not connected: {ctx}: {e}")),
+        _ => ioex(format!("SocketException: {ctx}: {e}")),
+    }
 }
 
 // ---------------------------------------------------------------------------

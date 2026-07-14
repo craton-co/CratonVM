@@ -3391,7 +3391,31 @@ impl NativeMethodRegistry {
         // phases_late p72, net_phase_e re1/re2, socket_channel, …) — filtering
         // here catches them all in one place. See `reference_server_socket_gap`.
         if real_net_sockets_enabled()
-            && (class_name == "java/net/Socket" || class_name == "java/net/ServerSocket")
+            && (class_name == "java/net/Socket"
+                || class_name == "java/net/ServerSocket"
+                // DoHead third root cause (2026-07-13): the WildFly bootstrap
+                // batch (be6055605) added synthetic `javax/net/SocketFactory`
+                // getDefault/createSocket natives (phases_early.rs phase52)
+                // that hand out a natively-built `java/net/Socket`. Under
+                // CRATONVM_REAL_NET_SOCKETS every java/net/Socket native is
+                // dropped (above), so REAL Socket bytecode consumes that
+                // object and reads its uninitialized/clobbered real fields:
+                // NPE `"socketLock" is null`, bogus `SocketException: Socket
+                // is closed` (the port int lands on `state` and can satisfy
+                // the CLOSED bit), `NoSuchMethodError:
+                // java/lang/String.setOption` (the host String lands on
+                // `impl`) — the Tomcat `TestHttpServletDoHead*`
+                // testDoHeadHttp2 144/144 cluster
+                // (`Http2TestBase.openClientConnection` →
+                // `Socket.setSoTimeout`). Drop the factory natives too so
+                // real `SocketFactory`/`DefaultSocketFactory` bytecode
+                // constructs sockets through the real `Socket` constructors.
+                // NOT `javax/net/ServerSocketFactory` — its
+                // createServerSocket natives delegate to real constructors
+                // and are layout-correct. (Root-cause analysis shared with
+                // the concurrent dohead-third-cause session; landed here to
+                // complete the DoHead family fix.)
+                || class_name == "javax/net/SocketFactory")
         {
             return;
         }

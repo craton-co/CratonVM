@@ -16,6 +16,7 @@ pub mod float_format;
 mod heap_types;
 pub mod intern;
 pub mod loader_pin;
+pub mod mirror_pin;
 pub mod reflective_probe;
 mod value;
 

@@ -578,11 +578,11 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     // --- Collections.emptyList/emptyMap/emptySet ---
     let cu = "java/util/Collections";
     r.register(cu, "emptyList", "()Ljava/util/List;", |ctx, _args| {
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-        ctx.set_field(list, 0, Value::Object(Some(arr)));
-        ctx.set_field(list, 1, Value::Int(0));
-        Ok(Some(Value::Object(Some(list))))
+        // Do not hand-assemble ArrayList's internal fields, and do not return
+        // a native-side allocation across a potential collection. `List.of()`
+        // is the JDK-owned empty immutable list construction and keeps its
+        // result live through the ordinary VM invocation path.
+        ctx.invoke("java/util/List", "of", "()Ljava/util/List;", &[])
     });
     r.register(cu, "emptyMap", "()Ljava/util/Map;", |ctx, _args| {
         let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
@@ -8945,7 +8945,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
             Ok(Some(Value::Object(Some(sv))))
         },
     );
-// BUG FIX (2026-07-10, es-storedscripts-retire): these Executors factory
+    // BUG FIX (2026-07-10, es-storedscripts-retire): these Executors factory
     // registrations (newFixedThreadPool, newCachedThreadPool x2,
     // newSingleThreadExecutor below) were copy-pasted from the
     // newScheduledThreadPool/newSingleThreadScheduledExecutor blocks above
@@ -8992,11 +8992,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                 Some(Value::Int(v)) => *v,
                 _ => 1,
             };
-            let sv = alloc_concurrent_synthetic(
-                ctx,
-                "java/util/concurrent/ThreadPoolExecutor",
-                2,
-            );
+            let sv = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
             initialize_real_thread_pool_executor(
                 ctx,
                 sv,
@@ -9015,11 +9011,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         "newCachedThreadPool",
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
-            let sv = alloc_concurrent_synthetic(
-                ctx,
-                "java/util/concurrent/ThreadPoolExecutor",
-                2,
-            );
+            let sv = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
             initialize_real_thread_pool_executor(
                 ctx,
                 sv,
@@ -9042,11 +9034,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                 Some(Value::Object(Some(f))) => Some(*f),
                 _ => None,
             };
-            let sv = alloc_concurrent_synthetic(
-                ctx,
-                "java/util/concurrent/ThreadPoolExecutor",
-                2,
-            );
+            let sv = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
             initialize_real_thread_pool_executor(
                 ctx,
                 sv,
@@ -9065,11 +9053,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         "newSingleThreadExecutor",
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
-            let sv = alloc_concurrent_synthetic(
-                ctx,
-                "java/util/concurrent/ThreadPoolExecutor",
-                2,
-            );
+            let sv = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
             initialize_real_thread_pool_executor(
                 ctx,
                 sv,
@@ -10690,13 +10674,36 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
 
 fn phase52_alloc_socket(ctx: &mut dyn NativeContext) -> ObjectRef {
     let sock = alloc_concurrent_synthetic(ctx, "java/net/Socket", 5);
-    let empty = ctx.create_string("");
-    ctx.set_field(sock, SOCK_HOST, Value::Object(Some(empty)));
+    // FIX (jndirealmintegration-ldap-connection-npe residual): field index 0
+    // (SOCK_HOST in this synthetic-mode convention) lands on the REAL
+    // `java.net.Socket.impl` field whenever the real class is loaded (see
+    // `alloc_concurrent_synthetic`'s doc comment -- it reuses the real class
+    // identity/layout when loadable). Writing a non-null empty String there
+    // (the old behavior) left `impl` non-null-but-wrong-typed, so real
+    // `Socket.getImpl()` bytecode skipped `createImpl()` and virtual-dispatched
+    // `create(Z)V` on a `java.lang.String` receiver -- `NoSuchMethodError:
+    // java/lang/String.create(Z)V`. Write `null` instead (matching
+    // net_phase_e.rs's `register_re1_socket`'s own `<init>()V`), which keeps
+    // `impl` unset so real bytecode's lazy `createImpl()` runs correctly.
+    ctx.set_field(sock, SOCK_HOST, Value::Object(None));
     ctx.set_field(sock, SOCK_PORT, Value::Int(0));
     ctx.set_field(sock, SOCK_LOCAL_PORT, Value::Int(0));
     ctx.set_field(sock, SOCK_CLOSED, Value::Int(0));
     ctx.set_field(sock, SOCK_STREAM_ID, Value::Int(-1));
-    sock
+    // This allocation skips real `java.net.Socket.<init>`, which is where
+    // `socketLock`/`closeLock` (`final Object` instance-initializer fields)
+    // normally get set. Any later real-bytecode `Socket` method that does
+    // `synchronized (socketLock)` -- e.g. `getImpl()`, reached from
+    // `connect()`/`close()`/etc. -- throws "Cannot enter synchronized block
+    // because ... socketLock is null" otherwise. Hit via
+    // `javax.net.SocketFactory.createSocket()` (this native, used
+    // unconditionally regardless of CRATONVM_REAL_NET_SOCKETS) feeding a real
+    // `Socket.connect()` call, e.g. UnboundID LDAP SDK's `ConnectThread`
+    // (see jndirealmintegration-ldap-connection-npe.md). Reuse the same
+    // GC-safe helper `net_phase_e::re1_init_socket_locks` already used by the
+    // synthetic `Socket.<init>`/`ServerSocket.accept()` paths, rather than
+    // duplicating its pin-across-allocation logic here.
+    crate::net_phase_e::re1_init_socket_locks(ctx, sock)
 }
 
 fn phase52_socket_connect(
@@ -15580,6 +15587,10 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         match stream_id {
             Some(sid) => {
                 let client = alloc_concurrent_synthetic(ctx, "java/net/Socket", 5);
+                // Seed socketLock/closeLock -- this bare allocation skips real
+                // `Socket.<init>`; see net_phase_e::re1_init_socket_locks doc
+                // comment and jndirealmintegration-ldap-connection-npe.md.
+                let client = crate::net_phase_e::re1_init_socket_locks(ctx, client);
                 // Get peer address from the stream
                 let (peer_host, peer_port) = {
                     let reg = s2_registry().lock();

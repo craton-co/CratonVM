@@ -1511,14 +1511,28 @@ impl GenerationalHeap {
         // evacuated memory would already have been zeroed by the time a
         // mutator could observe it.
         if crate::stale_objref_debug::enabled() && header.is_forwarded() {
+            // DIAGNOSTIC-ONLY (attrib-cce-investigate, 2026-07-13): read the
+            // object's REAL, fully-valid header at the forwarded (new)
+            // address so the panic message identifies which class/kind went
+            // stale — the old-address header is just a forwarding marker by
+            // this point. Not a functional change: only executed on the
+            // already-panicking path, gated behind the same debug flag.
+            let fwd_ptr = header.forwarding_address();
+            let (fwd_class_id, fwd_kind) = if !fwd_ptr.is_null() {
+                let fwd_header = unsafe { &*(fwd_ptr as *const ObjectHeader) };
+                (fwd_header.class_id.as_u32(), format!("{:?}", fwd_header.kind))
+            } else {
+                (u32::MAX, "<null-forward>".to_string())
+            };
             panic!(
                 "CRATONVM_DBG_STALE_OBJREF: stale ObjectRef detected at {:p} — this \
-                 object was evacuated by a moving GC to {:p}, but native/interpreter code \
+                 object was evacuated by a moving GC to {:p} (class_id={fwd_class_id} \
+                 kind={fwd_kind}), but native/interpreter code \
                  dereferenced the OLD address. This means a raw ObjectRef local was held \
                  across a GC-triggering call without pin_native_root/read_native_pin. See \
                  docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.",
                 obj_ref.as_ptr(),
-                header.forwarding_address(),
+                fwd_ptr,
             );
         }
         header
@@ -4061,10 +4075,27 @@ impl GenerationalHeap {
         // reliable within the next non-moving epoch, where A2's desync occurs).
         crate::a2dbg::clear();
 
-        // Phase 5: Check if old gen is getting full — trigger major GC (mark-compact)
-        let major_ran = if old_gen.used() >= old_gen.capacity() * 75 / 100 {
+        // Phase 5: Check if old gen is getting full — trigger major GC (mark-compact).
+        //
+        // `take_major_gc_request` is ALWAYS evaluated (not short-circuited by
+        // `||`) so an explicit `System.gc()` request is consumed exactly once
+        // per cycle even when the occupancy threshold was independently also
+        // crossed — otherwise the request would leak into and force a LATER,
+        // unrelated allocation-triggered minor GC into a major cycle it never
+        // asked for. See `gc_quiescence`'s doc comment for the full rationale.
+        let major_requested = crate::gc_quiescence::take_major_gc_request();
+        if std::env::var_os("CRATONVM_DBG_MIRRORPIN").is_some() {
+            eprintln!(
+                "[DBG_MIRRORPIN] Phase5 old_gen_used={} old_gen_cap={} major_requested={} will_run_major={}",
+                old_gen.used(),
+                old_gen.capacity(),
+                major_requested,
+                old_gen.used() >= old_gen.capacity() * 75 / 100 || major_requested
+            );
+        }
+        let major_ran = if old_gen.used() >= old_gen.capacity() * 75 / 100 || major_requested {
             tracing::debug!(
-                "Old gen at {}% — running major GC (mark-compact)",
+                "Old gen at {}% (or explicit System.gc() request) — running major GC (mark-compact)",
                 old_gen.used() * 100 / old_gen.capacity(),
             );
             let old_used_before = old_gen.used();
@@ -4637,6 +4668,20 @@ impl GenerationalHeap {
         // next collection still sees these old→young references.
         self.card_table.mark_dirty_bulk(&redirty_cards);
 
+        // Overlay-backed collections have old→young edges that do not occupy
+        // a Java heap slot, so no card can describe them. A minor collection
+        // leaves old gen intact and cannot decide which old owners will later
+        // be dead; retain edges of every current old owner here just as the
+        // card scan does. The major marker below applies the precise
+        // owner-reachable rule before it compacts old space.
+        for overlay_ref in
+            cratonvm_native_collections::gc_overlay_roots_for_matching_owners(|owner_addr| {
+                old_gen.contains(owner_addr as *mut u8)
+            })
+        {
+            mark_young(overlay_ref.as_ptr(), &mut worklist, &mut side_marks);
+        }
+
         // DBG (CRATONVM_DBG_SEED_ALL_OLD): decisive test for the sweep-edges
         // verdict that bt18's leak is an old→young CLEAN-CARD miss. Seed the mark
         // from EVERY old-gen object's young references (not just dirty cards). If
@@ -4670,6 +4715,17 @@ impl GenerationalHeap {
                     mark_young(ref_ptr, &mut worklist, &mut side_marks);
                 });
             }
+            // Collection-overlay liveness pin: an overlay is an out-of-heap
+            // edge owned by its backing collection, not a process-global root.
+            // This non-moving marker has stable object addresses, so once this
+            // collection itself is marked we can follow only ITS side-table
+            // references. The root gatherer omits the unconditional overlay
+            // scan for this exact collector mode.
+            for overlay_ref in
+                cratonvm_native_collections::gc_overlay_roots_for_collection(obj_ptr as usize)
+            {
+                mark_young(overlay_ref.as_ptr(), &mut worklist, &mut side_marks);
+            }
             // HIB-CV-24: also mark this object's defining ClassLoader so a live
             // (e.g. leaked-via-ThreadLocal) instance keeps its loader alive.
             if loader_pin_on {
@@ -4677,6 +4733,22 @@ impl GenerationalHeap {
                     cratonvm_types::loader_pin::loader_pin_addr(header.class_id.as_u32())
                 {
                     mark_young(loader_addr as *mut u8, &mut worklist, &mut side_marks);
+                }
+            }
+            // Class-mirror liveness pin (mirror_pin, companion to loader_pin
+            // above — see `vm::memory::roots` step 6 and
+            // `cratonvm_types::mirror_pin`): this object is non-moving here,
+            // so `obj_ptr` is a stable key. If it IS itself a user-defined
+            // `ClassLoader` that has defined mirror-having classes, mark
+            // those mirrors alive too — the edge a real JDK's
+            // `ClassLoader.classes` field gives for free, which this VM's
+            // synthetic `ClassLoader` doesn't carry as a heap-traceable
+            // field.
+            if let Some(mirror_addrs) =
+                cratonvm_types::mirror_pin::mirrors_for_loader(obj_ptr as usize)
+            {
+                for mirror_addr in mirror_addrs {
+                    mark_young(mirror_addr as *mut u8, &mut worklist, &mut side_marks);
                 }
             }
         }
@@ -6481,6 +6553,26 @@ impl GenerationalHeap {
         // Seed: young from-space references into old gen
         Self::mark_young_to_old_refs(young_from, old_gen, &mut worklist);
 
+        // `mark_young_to_old_refs` walks only real Java heap fields. Follow
+        // the equivalent out-of-heap edges for all current young owners too;
+        // young from-space is conservatively retained for this major cycle,
+        // matching the ordinary cross-generation seed's contract.
+        for overlay_ref in
+            cratonvm_native_collections::gc_overlay_roots_for_matching_owners(|owner_addr| {
+                young_from.contains(owner_addr as *mut u8)
+            })
+        {
+            let overlay_ptr = overlay_ref.as_ptr();
+            if old_gen.contains(overlay_ptr) {
+                // SAFETY: `overlay_ptr` lies in old gen, verified above.
+                let h = unsafe { &mut *(overlay_ptr as *mut ObjectHeader) };
+                if h.gc_flags & GC_FLAG_MARKED == 0 {
+                    h.gc_flags |= GC_FLAG_MARKED;
+                    worklist.push(overlay_ptr);
+                }
+            }
+        }
+
         // BFS: transitively mark all reachable old-gen objects
         // HIB-CV-24: a live object keeps its class's defining ClassLoader alive
         // (instance→loader). Conservative — only ever marks MORE live, so it can
@@ -6489,6 +6581,24 @@ impl GenerationalHeap {
         let loader_pin_on = cratonvm_types::loader_pin::loader_pinning_enabled();
         while let Some(obj_ptr) = worklist.pop() {
             Self::scan_object_for_old_refs(obj_ptr, old_gen, &mut worklist);
+            // Same owner→overlay propagation as the young non-moving marker
+            // above. Major GC also uses stable pre-compaction addresses, so it
+            // can reclaim an unreachable old collection and its side-table
+            // graph together instead of treating every entry as a global root.
+            for overlay_ref in
+                cratonvm_native_collections::gc_overlay_roots_for_collection(obj_ptr as usize)
+            {
+                let overlay_ptr = overlay_ref.as_ptr();
+                if old_gen.contains(overlay_ptr) {
+                    // SAFETY: `overlay_ptr` is in old gen; this is the same
+                    // marking transition used by the defining-loader pin below.
+                    let h = unsafe { &mut *(overlay_ptr as *mut ObjectHeader) };
+                    if h.gc_flags & GC_FLAG_MARKED == 0 {
+                        h.gc_flags |= GC_FLAG_MARKED;
+                        worklist.push(overlay_ptr);
+                    }
+                }
+            }
             if loader_pin_on {
                 // SAFETY: `obj_ptr` is a marked old-gen object with a valid header.
                 let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
@@ -6502,6 +6612,31 @@ impl GenerationalHeap {
                         if h.gc_flags & GC_FLAG_MARKED == 0 {
                             h.gc_flags |= GC_FLAG_MARKED;
                             worklist.push(lp);
+                        }
+                    }
+                }
+            }
+            // Class-mirror liveness pin (mirror_pin, companion to loader_pin
+            // above — see `vm::memory::roots` step 6 and
+            // `cratonvm_types::mirror_pin`). Old gen doesn't move during this
+            // BFS (compaction happens after), so `obj_ptr` is a stable key.
+            // If this marked object IS itself a user-defined `ClassLoader`
+            // that defined mirror-having classes, mark those mirrors alive
+            // too — same "conservative, only ever marks MORE live" property
+            // as the loader_pin check above. Same young-gen exemption as
+            // loader_pin: a still-young mirror is already live as a major-GC
+            // root.
+            if let Some(mirror_addrs) =
+                cratonvm_types::mirror_pin::mirrors_for_loader(obj_ptr as usize)
+            {
+                for mirror_addr in mirror_addrs {
+                    let mp = mirror_addr as *mut u8;
+                    if old_gen.contains(mp) {
+                        // SAFETY: `mp` is within old gen (verified by `contains`).
+                        let h = unsafe { &mut *(mp as *mut ObjectHeader) };
+                        if h.gc_flags & GC_FLAG_MARKED == 0 {
+                            h.gc_flags |= GC_FLAG_MARKED;
+                            worklist.push(mp);
                         }
                     }
                 }

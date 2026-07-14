@@ -72,17 +72,6 @@ pub use cratonvm_native_builtins::stamped_lock::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    // STW-TAKEOVER-FIX companion (2026-07-13): `stamped_write_lock` /
-    // `rw_write_lock` (and their `stamped_read_lock` / `rw_read_lock`
-    // siblings) now take a `&mut dyn NativeContext` first argument so a
-    // genuinely contended wait can register itself as a GC-blocked region
-    // (`ctx.begin_blocking_region()`/`end_blocking_region()`) instead of
-    // staying counted in the STW barrier's `expected` set forever — see
-    // `native-builtins/src/stamped_lock.rs`. These smoke tests exercise the
-    // pure-Rust lock backend without a real `SharedVm`/`JvmThread`, so a
-    // `MockNativeContext` (whose `begin_blocking_region`/`end_blocking_region`
-    // fall back to the trait's no-op default) stands in for the real one.
-    use cratonvm_native_api::test_mock::MockNativeContext;
 
     /// Smoke test that the re-exports actually resolve to the
     /// native-builtins backend and that a fresh init returns the
@@ -95,13 +84,12 @@ mod tests {
         // fresh address each call.
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0xDEAD_0000);
         let a = N.fetch_add(8, std::sync::atomic::Ordering::SeqCst);
-        let mut ctx = MockNativeContext::new();
 
         stamped_init(a);
         assert_eq!(stamped_try_optimistic_read(a), STAMPED_ORIGIN);
 
         // Write lock should round-trip through the same backend.
-        let s = stamped_write_lock(&mut ctx, a);
+        let s = stamped_write_lock(a);
         assert!(s & 1 != 0);
         stamped_unlock_write(a);
     }
@@ -110,10 +98,9 @@ mod tests {
     fn rwlock_shim_basic_round_trip() {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0xCAFE_0000);
         let a = N.fetch_add(8, std::sync::atomic::Ordering::SeqCst);
-        let mut ctx = MockNativeContext::new();
 
         rw_init(a, false);
-        rw_write_lock(&mut ctx, a, 1);
+        rw_write_lock(a, 1);
         assert!(rw_is_write_locked(a));
         rw_write_unlock(a, 1);
         assert!(!rw_is_write_locked(a));

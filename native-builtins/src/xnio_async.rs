@@ -1644,10 +1644,21 @@ fn native_iof_get_status(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn native_iof_await(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let inner = inner_from_future(ctx, this)?;
+    // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13): an
+    // unbounded IoFuture.await() is a raw parking_lot::Condvar::wait with no
+    // GC-blocking-region bracket — same missing-bracket bug found and fixed
+    // across ReentrantReadWriteLock/StampedLock's native locks. A thread
+    // waiting here for another thread's I/O completion notification stays
+    // counted in the STW barrier's `expected` forever if that notifier is
+    // itself stalled behind a GC pause. `inner`/`guard` hold no Java heap
+    // refs, so a plain begin/end pair (no ref re-sync) suffices.
+    ctx.begin_blocking_region();
     let mut guard = inner.state.lock();
     while inner.status.load(Ordering::SeqCst) == STATUS_WAITING {
         inner.cv.wait(&mut guard);
     }
+    drop(guard);
+    ctx.end_blocking_region();
     Ok(Some(Value::Int(inner.status.load(Ordering::SeqCst) as i32)))
 }
 
@@ -1661,6 +1672,10 @@ fn native_iof_await_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // monotonic status makes correct.
     let dur = Duration::from_nanos(time.max(0) as u64);
     let deadline = Instant::now() + dur;
+    // GC-blocking audit — see `native_iof_await` above. Even though this
+    // wait is bounded, the thread stays counted in the STW barrier's
+    // `expected` for the full duration, so it still needs the bracket.
+    ctx.begin_blocking_region();
     let mut guard = inner.state.lock();
     while inner.status.load(Ordering::SeqCst) == STATUS_WAITING {
         let now = Instant::now();
@@ -1669,6 +1684,8 @@ fn native_iof_await_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
         let _ = inner.cv.wait_for(&mut guard, deadline - now);
     }
+    drop(guard);
+    ctx.end_blocking_region();
     Ok(Some(Value::Int(inner.status.load(Ordering::SeqCst) as i32)))
 }
 
@@ -1726,12 +1743,16 @@ fn native_iof_add_notifier(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 fn native_iof_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let inner = inner_from_future(ctx, this)?;
-    // Block like `await()`.
+    // Block like `await()` — see `native_iof_await`'s GC-blocking audit
+    // comment above for the full rationale.
     {
+        ctx.begin_blocking_region();
         let mut guard = inner.state.lock();
         while inner.status.load(Ordering::SeqCst) == STATUS_WAITING {
             inner.cv.wait(&mut guard);
         }
+        drop(guard);
+        ctx.end_blocking_region();
     }
     match inner.status.load(Ordering::SeqCst) {
         STATUS_DONE => {

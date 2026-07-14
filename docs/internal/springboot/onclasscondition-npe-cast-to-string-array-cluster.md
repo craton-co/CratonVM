@@ -1,9 +1,12 @@
-> **RETIRED 2026-07-13 — superseded by
-> [`docs/known-issues/springboot/onclasscondition-fix-blocked-by-heap-corruption.md`](../../known-issues/springboot/onclasscondition-fix-blocked-by-heap-corruption.md).**
+> **RETIRED 2026-07-13 — FIXED and merged to `dev`. Superseded by
+> [`docs/internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md`](onclasscondition-npe-cast-string-array-cluster-FIXED.md).**
 > The root cause documented below was found and a fix was verified to
-> eliminate all 75/75 occurrences. The fix is NOT merged — it exposes a
-> separate, unrelated heap-corruption bug in 3 test classes that isn't yet
-> understood. See the successor doc for the full picture (fix + blocker).
+> eliminate all 75/75 occurrences. The fix initially appeared to expose a
+> separate heap-corruption bug in 3 test classes; that turned out to be a
+> pre-existing, already-fixed-on-`dev` bug (`e7e3bb91f`) hit far more often
+> by this fix's new code path — see the successor doc for the full
+> resolution. One small, separate, non-memory-unsafe residual remains open:
+> [`docs/known-issues/springboot/brave-baggagefields-classcast-summary-printing.md`](../../known-issues/springboot/brave-baggagefields-classcast-summary-printing.md).
 > Kept here for historical reference only, per this repo's
 > known-issues-must-not-contain-addressed-bugs convention.
 

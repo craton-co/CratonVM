@@ -37,6 +37,8 @@ Thumbs.db
 
 # Claude Code
 .claude/
+.codex/
+.codex*/
 
 # Application logs
 applogs/

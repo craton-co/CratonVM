@@ -6510,6 +6510,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // emits its current frames — no per-park snapshot cost needed.
         {
             let blk = self.shared.gc_barrier.enter_blocked();
+            // DIAGNOSTIC (2026-07-13, STW takeover 5-class cluster
+            // investigation): correlate against [stw-expected]'s identity
+            // list to see whether this thread's park() call landed before
+            // or after the pause was requested, and whether pre_stw-gated
+            // arrival actually fires.
+            if std::env::var_os("CRATONVM_DBG_STW_EXPECTED_IDS").is_some() {
+                eprintln!(
+                    "[stw-park] tid={} pre_stw={}",
+                    self.thread.thread_id.0, blk.pre_stw
+                );
+            }
             if blk.pre_stw {
                 // GCAUDIT-0711-FIX (finding 1a): `_auto` — the deposit above
                 // already raised `in_blocked_region` before this check.
@@ -6867,65 +6878,111 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                             .write()
                             .load_class(&lcs.impl_handle.class_name)?,
                     };
-                    super::ensure_class_initialized_shared(self.shared, self.thread, class_id)?;
-                    // Use `num_total_fields` (inherited + declared instance
-                    // fields), matching the `New` opcode and the sibling
-                    // NewInvokeSpecial path in `interpreter.rs`. `c.fields.len()`
-                    // is wrong here: it counts this class's declared fields
-                    // *including statics* while omitting inherited instance
-                    // fields, so a subclass constructor reference (e.g. JUnit5's
-                    // `DefaultClassDescriptor::new`, whose 2 fields are all
-                    // inherited from `AbstractAnnotatedDescriptorWrapper`)
-                    // under-allocates to 0 slots and trips the GC `get_field`
-                    // bounds guard on every inherited-field access.
-                    let num_fields = self
+                    // Array-constructor reference (`SomeType[]::new`) — see the
+                    // identical check in the sibling `interpreter.rs` path for
+                    // the full rationale. `load_class` resolves an array-shaped
+                    // impl class name to its synthesized array ClassId, but the
+                    // object-allocation + `<init>` dispatch below does not apply
+                    // to arrays (no fields, no constructor) and was silently
+                    // discarding the requested length, producing a corrupted
+                    // zero-field pseudo-object that fails a later checkcast to
+                    // the real array type.
+                    let array_info = self
                         .shared
                         .class_manager
                         .read()
                         .get_class(class_id)
-                        .map(|c| c.num_total_fields)
-                        .unwrap_or(0);
-                    let new_obj = match self.shared.heap.try_alloc_object(class_id, num_fields) {
-                        Some(obj) => obj,
-                        None => {
-                            self.thread.tlab.retire();
-                            crate::runtime::interpreter::maybe_gc_forced_pub(
+                        .and_then(|c| c.array_info.clone());
+                    if let Some(array_info) = array_info {
+                        let length = full_args
+                            .first()
+                            .and_then(Value::as_int)
+                            .ok_or_else(|| VmError::Internal {
+                                message: "array-constructor-reference: missing length arg"
+                                    .to_string(),
+                            })?;
+                        if length < 0 {
+                            Err(RuntimeError::NegativeArraySizeException { size: length }.into())
+                        } else {
+                            let length = length as usize;
+                            let arr = if array_info.array_dimension == 1 {
+                                match &*array_info.leaf_component_name {
+                                    "boolean" => self.new_array(ArrayElementType::Boolean, length),
+                                    "char" => self.new_array(ArrayElementType::Char, length),
+                                    "float" => self.new_array(ArrayElementType::Float, length),
+                                    "double" => self.new_array(ArrayElementType::Double, length),
+                                    "byte" => self.new_array(ArrayElementType::Byte, length),
+                                    "short" => self.new_array(ArrayElementType::Short, length),
+                                    "int" => self.new_array(ArrayElementType::Int, length),
+                                    "long" => self.new_array(ArrayElementType::Long, length),
+                                    _ => self.new_ref_array(array_info.component_class_id, length),
+                                }
+                            } else {
+                                self.new_ref_array(array_info.component_class_id, length)
+                            };
+                            Ok(Some(Value::Object(Some(arr))))
+                        }
+                    } else {
+                        super::ensure_class_initialized_shared(self.shared, self.thread, class_id)?;
+                        // Use `num_total_fields` (inherited + declared instance
+                        // fields), matching the `New` opcode and the sibling
+                        // NewInvokeSpecial path in `interpreter.rs`. `c.fields.len()`
+                        // is wrong here: it counts this class's declared fields
+                        // *including statics* while omitting inherited instance
+                        // fields, so a subclass constructor reference (e.g. JUnit5's
+                        // `DefaultClassDescriptor::new`, whose 2 fields are all
+                        // inherited from `AbstractAnnotatedDescriptorWrapper`)
+                        // under-allocates to 0 slots and trips the GC `get_field`
+                        // bounds guard on every inherited-field access.
+                        let num_fields = self
+                            .shared
+                            .class_manager
+                            .read()
+                            .get_class(class_id)
+                            .map(|c| c.num_total_fields)
+                            .unwrap_or(0);
+                        let new_obj = match self.shared.heap.try_alloc_object(class_id, num_fields) {
+                            Some(obj) => obj,
+                            None => {
+                                self.thread.tlab.retire();
+                                crate::runtime::interpreter::maybe_gc_forced_pub(
+                                    self.shared,
+                                    self.thread,
+                                );
+                                self.shared.heap.try_alloc_object(class_id, num_fields).ok_or_else(|| {
+                                    MethodCallFailed::InternalError(crate::error::VmError::Runtime(
+                                        crate::error::RuntimeError::OutOfMemoryError {
+                                            message: format!("Java heap space (MethodHandle newInvokeSpecial, {} fields)", num_fields),
+                                        },
+                                    ))
+                                })?
+                            }
+                        };
+                        let new_obj_pin = self.thread.native_pin_roots.len();
+                        self.thread.native_pin_roots.push(new_obj);
+                        let init_result = {
+                            let mut init_args = Vec::with_capacity(1 + full_args.len());
+                            init_args.push(Value::Object(Some(new_obj)));
+                            init_args.extend_from_slice(&full_args);
+                            invoke_on_class_shared(
                                 self.shared,
                                 self.thread,
-                            );
-                            self.shared.heap.try_alloc_object(class_id, num_fields).ok_or_else(|| {
-                                MethodCallFailed::InternalError(crate::error::VmError::Runtime(
-                                    crate::error::RuntimeError::OutOfMemoryError {
-                                        message: format!("Java heap space (MethodHandle newInvokeSpecial, {} fields)", num_fields),
-                                    },
-                                ))
-                            })?
-                        }
-                    };
-                    let new_obj_pin = self.thread.native_pin_roots.len();
-                    self.thread.native_pin_roots.push(new_obj);
-                    let init_result = {
-                        let mut init_args = Vec::with_capacity(1 + full_args.len());
-                        init_args.push(Value::Object(Some(new_obj)));
-                        init_args.extend_from_slice(&full_args);
-                        invoke_on_class_shared(
-                            self.shared,
-                            self.thread,
-                            class_id,
-                            &lcs.impl_handle.member_name,
-                            &lcs.impl_handle.descriptor,
-                            &init_args,
-                        )
-                    };
-                    let forwarded = self
-                        .thread
-                        .native_pin_roots
-                        .get(new_obj_pin)
-                        .copied()
-                        .unwrap_or(new_obj);
-                    self.thread.native_pin_roots.truncate(new_obj_pin);
-                    init_result?;
-                    Ok(Some(Value::Object(Some(forwarded))))
+                                class_id,
+                                &lcs.impl_handle.member_name,
+                                &lcs.impl_handle.descriptor,
+                                &init_args,
+                            )
+                        };
+                        let forwarded = self
+                            .thread
+                            .native_pin_roots
+                            .get(new_obj_pin)
+                            .copied()
+                            .unwrap_or(new_obj);
+                        self.thread.native_pin_roots.truncate(new_obj_pin);
+                        init_result?;
+                        Ok(Some(Value::Object(Some(forwarded))))
+                    }
                 }
                 _ => {
                     // GetField, GetStatic, PutField, PutStatic вЂ” very rare for
@@ -9431,12 +9488,26 @@ pub fn invoke_special_shared(
     args: &[Value],
 ) -> MethodCallResult {
     // Native override always wins -- same priority order as invoke_or_native.
+    // EXCEPT for SyntheticStub-tagged natives on real-protected classes with
+    // loaded bytecode: invokespecial is how constructors and super-calls
+    // arrive, and running a stub <init> here while the method surface yields
+    // to real bytecode leaves the object half-initialized (observed
+    // 2026-07-13 with the since-removed OutputStreamWriter stub surface:
+    // the stub ctor never built the real StreamEncoder, so the real
+    // OSW.flush() bytecode NPE'd on `this.se`).
     if let Some(callback) = shared
         .native_methods
         .find(class_name, method_name, descriptor)
     {
-        return safe_native_call(shared, thread, callback, args)
-            .map(|v| coerce_native_return(v, descriptor));
+        if !crate::runtime::interpreter::synthetic_stub_should_yield_to_real_bytecode(
+            shared,
+            class_name,
+            method_name,
+            descriptor,
+        ) {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|v| coerce_native_return(v, descriptor));
+        }
     }
 
     // GC-safety: pin object args across class load + <clinit> and re-read the
@@ -13922,6 +13993,30 @@ fn invoke_on_class_shared_inner(
                                 | "verify"
                                 | "getAlgorithm"
                             ))
+                        // SigProbe: `sun.security.util.SignatureUtil
+                        // .{initVerify,initSign}WithParam` — real bytecode
+                        // indirects through `SharedSecrets
+                        // .getJavaSecuritySignatureAccess()`, populated only by
+                        // `Signature.<clinit>` (no-op'd — see
+                        // `jca/key_factory.rs`'s `Signature.<clinit>`
+                        // registration), so the accessor is null and real
+                        // bytecode NPEs ("Cannot invoke initVerify on null").
+                        // `native-builtins/src/jca/signature.rs`'s
+                        // `sigutil_init_verify_key`/`sigutil_init_verify_cert`/
+                        // `sigutil_init_sign` exist specifically to bypass
+                        // this — but without an allowlist entry here,
+                        // `SignatureUtil` (a real, loadable class with real
+                        // bytecode for these static methods) never actually
+                        // reached them: `has_own_bytecode` was true, so real
+                        // bytecode always won and the natives were dead code.
+                        // Found while root-causing real PKCS7/DSA jar-signature
+                        // verification (`sun.security.pkcs.SignerInfo.verify()`
+                        // calls `SignatureUtil.initVerifyWithParam` directly).
+                        || (class_name == "sun/security/util/SignatureUtil"
+                            && matches!(
+                                method_name,
+                                "initVerifyWithParam" | "initSignWithParam"
+                            ))
                         // SigProbe: `java.security.KeyFactory.getInstance` /
                         // `generatePublic` / `generatePrivate` — natives in
                         // `native-builtins/src/jca/key_factory.rs`.
@@ -15688,6 +15783,13 @@ fn invoke_on_class_shared_inner(
                 method_name,
                 descriptor,
             );
+        let force_interface_default_native =
+            crate::runtime::interpreter::should_force_registered_native_over_bytecode(
+                shared,
+                &class_name_for_override,
+                method_name,
+                descriptor,
+            );
         let override_cb = if declaring_is_interface
             && !is_static
             && !force_ffm_value_layout_interface_native
@@ -15695,7 +15797,19 @@ fn invoke_on_class_shared_inner(
             && !force_ffm_symbol_lookup_interface_native
             && !force_ffm_group_layout_interface_native
             && !force_ffm_memory_layout_interface_native
+            && !force_interface_default_native
         {
+            None
+        } else if crate::runtime::interpreter::synthetic_stub_should_yield_to_real_bytecode(
+            shared,
+            &class_name_for_override,
+            method_name,
+            descriptor,
+        ) {
+            // SyntheticStub-tagged native on a real-protected class whose real
+            // bytecode is loaded: the stub body exists only for stub-phase
+            // bootstraps — run the bytecode (same yield the other dispatch
+            // sites apply; without it this re-check kept serving the stub).
             None
         } else {
             shared

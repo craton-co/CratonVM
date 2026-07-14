@@ -64,8 +64,6 @@ use std::sync::OnceLock;
 
 use parking_lot::{Condvar, Mutex};
 
-use cratonvm_native_api::NativeContext;
-
 /// First stamp returned by a freshly initialised `StampedLock`. Matches the
 /// JDK's `WBIT << 8` (= 256). Picking a non-zero origin makes the
 /// "stamp != 0" gate in `validate(stamp)` actually mean something: a
@@ -149,37 +147,11 @@ pub fn stamped_init(addr: usize) {
 
 /// `writeLock()` — block until exclusive write access is granted, return
 /// the (odd) stamp.
-///
-/// T19.H1 (STW/JIT-takeover deadlock fix): a genuinely contended wait here
-/// blocks the calling Java thread for an unbounded, application-controlled
-/// duration — indistinguishable from `LockSupport.park`/`Object.wait` from
-/// the GC barrier's point of view. Without `begin_blocking_region`, this
-/// thread stays counted in the STW barrier's `expected` set while parked,
-/// and if the lock's current holder itself needs to cooperate with the same
-/// pause (e.g. it allocates and hits a safepoint poll while still holding
-/// the lock), the pause can never complete: the pause waits for us to
-/// arrive, we wait for the holder to unlock, the holder waits for the pause
-/// to finish. See `docs/known-issues/wildfly-standalone-boot-stw-jit-takeover-hang.md`.
-pub fn stamped_write_lock(ctx: &mut dyn NativeContext, addr: usize) -> i64 {
+pub fn stamped_write_lock(addr: usize) -> i64 {
     let slot = stamped_slot(addr);
     let mut state = slot.state.lock();
-    if state.write_held() || state.readers > 0 {
-        // LOCK-ORDER FIX (2026-07-13): begin_blocking_region/
-        // end_blocking_region must NOT run while holding `state` -- see the
-        // module-level note on this file's lock-ordering discipline. Drop
-        // the raw guard around both calls (each can synchronously block
-        // for an entire in-flight STW pause via `arrive_and_wait_auto`/
-        // `mark_blocked_region_leave`); only the actual `cv.wait` loop
-        // needs the guard, and it manages its own atomic release/reacquire.
-        drop(state);
-        ctx.begin_blocking_region();
-        state = slot.state.lock();
-        while state.write_held() || state.readers > 0 {
-            slot.cv.wait(&mut state);
-        }
-        drop(state);
-        ctx.end_blocking_region();
-        state = slot.state.lock();
+    while state.write_held() || state.readers > 0 {
+        slot.cv.wait(&mut state);
     }
     state.stamp |= 1; // set write bit
     state.stamp
@@ -201,24 +173,11 @@ pub fn stamped_try_write_lock(addr: usize) -> i64 {
 /// reader count. Returns the current (even) stamp — the JDK uses bits
 /// 0..7 to encode reader count, but our higher-level state lives in
 /// `readers` so we just hand back the even part of the stamp.
-///
-/// T19.H1 — see `stamped_write_lock` for why a contended wait here must be
-/// registered as a GC-blocked region.
-pub fn stamped_read_lock(ctx: &mut dyn NativeContext, addr: usize) -> i64 {
+pub fn stamped_read_lock(addr: usize) -> i64 {
     let slot = stamped_slot(addr);
     let mut state = slot.state.lock();
-    if state.write_held() {
-        // LOCK-ORDER FIX (2026-07-13): see `stamped_write_lock` -- do not
-        // hold `state` across begin_blocking_region/end_blocking_region.
-        drop(state);
-        ctx.begin_blocking_region();
-        state = slot.state.lock();
-        while state.write_held() {
-            slot.cv.wait(&mut state);
-        }
-        drop(state);
-        ctx.end_blocking_region();
-        state = slot.state.lock();
+    while state.write_held() {
+        slot.cv.wait(&mut state);
     }
     state.readers += 1;
     state.stamp
@@ -506,27 +465,11 @@ fn reader_can_proceed(state: &RwLockState, tid: u64) -> bool {
 
 /// `ReentrantReadWriteLock$ReadLock.lock()` — block until allowed, then
 /// increment per-thread + total reader counts.
-///
-/// T19.H1 (STW/JIT-takeover deadlock fix, 2026-07-13) — see `rw_write_lock`
-/// for the full mechanism this closes: contended waits here must be
-/// registered as a GC-blocked region so the STW barrier doesn't count this
-/// thread as an uncooperative mutator while it's genuinely parked on
-/// another Java thread's lock hold.
-pub fn rw_read_lock(ctx: &mut dyn NativeContext, parent_addr: usize, tid: u64) {
+pub fn rw_read_lock(parent_addr: usize, tid: u64) {
     let slot = rw_slot(parent_addr, false);
     let mut state = slot.state.lock();
-    if !reader_can_proceed(&state, tid) {
-        // LOCK-ORDER FIX (2026-07-13): see `rw_write_lock` -- do not hold
-        // `state` across begin_blocking_region/end_blocking_region.
-        drop(state);
-        ctx.begin_blocking_region();
-        state = slot.state.lock();
-        while !reader_can_proceed(&state, tid) {
-            slot.cv.wait(&mut state);
-        }
-        drop(state);
-        ctx.end_blocking_region();
-        state = slot.state.lock();
+    while !reader_can_proceed(&state, tid) {
+        slot.cv.wait(&mut state);
     }
     *state.read_holds.entry(tid).or_insert(0) += 1;
     state.total_readers += 1;
@@ -573,30 +516,7 @@ pub fn rw_read_unlock(parent_addr: usize, tid: u64) {
 
 /// `ReentrantReadWriteLock$WriteLock.lock()` — block until exclusive
 /// access is granted (no readers, no other writer).
-///
-/// T19.H1 (STW/JIT-takeover deadlock fix, 2026-07-13): found via a
-/// poll-and-pounce live gdb capture of the WildFly standalone-boot hang
-/// (`docs/known-issues/wildfly-standalone-boot-stw-jit-takeover-hang.md`) —
-/// during `parallel-extension-add`, ~30-40 threads race to register
-/// resources through a shared `ConcreteResourceRegistration`, contending
-/// this exact write lock. Two threads were caught permanently parked in
-/// `slot.cv.wait` here while a GC-driven STW pause's cross-thread JIT
-/// takeover spun at `rounds=64 pending=2 taken=0` forever: this wait never
-/// called into the GC barrier's blocked-region bookkeeping (unlike
-/// `NativeContextImpl::park`, used for `Object.wait`/`LockSupport.park`), so
-/// both waiters stayed counted in the barrier's `expected` set. If the lock
-/// holder itself needs to cooperate with the very same pause (e.g. it
-/// allocates and hits a safepoint poll while still holding the write lock),
-/// the three-way cycle deadlocks permanently: the pause waits for the
-/// waiters to arrive, the waiters wait for the holder to unlock, the holder
-/// waits for the pause to finish. Wrapping the wait in
-/// `begin_blocking_region`/`end_blocking_region` excuses a genuinely
-/// contended waiter from the barrier's `expected` set (mirroring the
-/// `ThreadRegistry::wait_for_non_daemon_threads` fix in `bee86ff0` and the
-/// `ReferenceQueue.remove` pattern in `reference.rs`), breaking the cycle:
-/// the pause no longer needs the waiter, only the (still-cooperating)
-/// holder, so it completes and the holder releases the lock normally.
-pub fn rw_write_lock(ctx: &mut dyn NativeContext, parent_addr: usize, tid: u64) {
+pub fn rw_write_lock(parent_addr: usize, tid: u64) {
     let slot = rw_slot(parent_addr, false);
     let mut state = slot.state.lock();
     // Re-entrant write: already held by us → just bump count.
@@ -608,36 +528,8 @@ pub fn rw_write_lock(ctx: &mut dyn NativeContext, parent_addr: usize, tid: u64) 
     // readers know to yield. Decrement on every wakeup, even if we don't
     // win the race (recheck and increment again before waiting).
     state.waiting_writers += 1;
-    if state.writer_thread.is_some() || state.total_readers > 0 {
-        // LOCK-ORDER FIX (2026-07-13, second-session live-gdb capture,
-        // silent-hang regression): begin_blocking_region/end_blocking_region
-        // must NOT run while holding `state`. `begin_blocking_region`'s
-        // `GcBarrier::arrive_and_wait_auto` (and `end_blocking_region`'s
-        // `mark_blocked_region_leave`) can block SYNCHRONOUSLY until an
-        // in-flight STW pause fully completes -- potentially for the
-        // pause's whole duration. Holding `state` (this lock's own raw
-        // parking_lot mutex) across that call means the ACTUAL write-lock
-        // holder -- or any other waiter -- can never acquire `state` to
-        // release/re-check, while the STW pause may itself be waiting for
-        // THAT thread to arrive: pause waits for holder, holder waits for
-        // `state`, this waiter holds `state` waiting for the pause. Caught
-        // live: 18 threads piled up in this exact `cv.wait` below with
-        // zero progress and no STW warning ever printed (the arrived
-        // waiter's own wait for `gc_complete` isn't reflected in the
-        // initiator's `rounds`/`pending` diagnostic), reproducing in
-        // 8-11/15 isolated WildFly boot attempts after the original
-        // T19.H1 fix landed -- a regression worse than the hang it closed.
-        // Fix: drop the guard around both calls; only the actual `cv.wait`
-        // loop needs it, and manages its own atomic release/reacquire.
-        drop(state);
-        ctx.begin_blocking_region();
-        state = slot.state.lock();
-        while state.writer_thread.is_some() || state.total_readers > 0 {
-            slot.cv.wait(&mut state);
-        }
-        drop(state);
-        ctx.end_blocking_region();
-        state = slot.state.lock();
+    while state.writer_thread.is_some() || state.total_readers > 0 {
+        slot.cv.wait(&mut state);
     }
     state.waiting_writers -= 1;
     state.writer_thread = Some(tid);
@@ -716,7 +608,6 @@ pub fn rw_is_write_locked(parent_addr: usize) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use crate::test_utils::mock_ctx;
 
     /// Each test allocates a unique synthetic "object address" so the
     /// global tables stay disjoint between tests.
@@ -740,7 +631,7 @@ mod tests {
     fn stamped_write_lock_yields_odd_stamp() {
         let a = fresh_addr();
         stamped_init(a);
-        let s = stamped_write_lock(&mut mock_ctx(), a);
+        let s = stamped_write_lock(a);
         assert!(s & 1 != 0, "write stamp should be odd");
         stamped_unlock_write(a);
     }
@@ -750,7 +641,7 @@ mod tests {
         let a = fresh_addr();
         stamped_init(a);
         let s0 = stamped_try_optimistic_read(a);
-        stamped_write_lock(&mut mock_ctx(), a);
+        stamped_write_lock(a);
         stamped_unlock_write(a);
         let s1 = stamped_try_optimistic_read(a);
         assert!(s1 > s0, "stamp must advance: {} -> {}", s0, s1);
@@ -769,7 +660,7 @@ mod tests {
         let a = fresh_addr();
         stamped_init(a);
         let s = stamped_try_optimistic_read(a);
-        stamped_write_lock(&mut mock_ctx(), a);
+        stamped_write_lock(a);
         stamped_unlock_write(a);
         assert!(!stamped_validate(a, s));
     }
@@ -778,7 +669,7 @@ mod tests {
     fn stamped_try_write_blocked_by_reader() {
         let a = fresh_addr();
         stamped_init(a);
-        stamped_read_lock(&mut mock_ctx(), a);
+        stamped_read_lock(a);
         assert_eq!(stamped_try_write_lock(a), 0);
         stamped_unlock_read(a);
     }
@@ -787,7 +678,7 @@ mod tests {
     fn stamped_try_read_blocked_by_writer() {
         let a = fresh_addr();
         stamped_init(a);
-        stamped_write_lock(&mut mock_ctx(), a);
+        stamped_write_lock(a);
         assert_eq!(stamped_try_read_lock(a), 0);
         stamped_unlock_write(a);
     }
@@ -796,7 +687,7 @@ mod tests {
     fn stamped_convert_to_write_succeeds_with_one_reader() {
         let a = fresh_addr();
         stamped_init(a);
-        let r = stamped_read_lock(&mut mock_ctx(), a);
+        let r = stamped_read_lock(a);
         let w = stamped_try_convert_to_write(a, r);
         assert!(w != 0);
         assert!(stamped_is_write_locked(a));
@@ -808,8 +699,8 @@ mod tests {
     fn stamped_convert_to_write_fails_with_two_readers() {
         let a = fresh_addr();
         stamped_init(a);
-        let r1 = stamped_read_lock(&mut mock_ctx(), a);
-        let _r2 = stamped_read_lock(&mut mock_ctx(), a);
+        let r1 = stamped_read_lock(a);
+        let _r2 = stamped_read_lock(a);
         assert_eq!(stamped_try_convert_to_write(a, r1), 0);
         stamped_unlock_read(a);
         stamped_unlock_read(a);
@@ -821,9 +712,9 @@ mod tests {
         // write, reader makes progress.
         let a = fresh_addr();
         stamped_init(a);
-        stamped_write_lock(&mut mock_ctx(), a);
+        stamped_write_lock(a);
         let join = std::thread::spawn(move || {
-            let s = stamped_read_lock(&mut mock_ctx(), a);
+            let s = stamped_read_lock(a);
             stamped_unlock_read(a);
             s
         });
@@ -848,7 +739,7 @@ mod tests {
         for _ in 0..8 {
             handles.push(std::thread::spawn(move || {
                 for _ in 0..200 {
-                    let s = stamped_read_lock(&mut mock_ctx(), a);
+                    let s = stamped_read_lock(a);
                     let _ = s;
                     stamped_unlock_read(a);
                 }
@@ -856,7 +747,7 @@ mod tests {
         }
         // Writer churns the lock alongside the readers.
         for _ in 0..50 {
-            stamped_write_lock(&mut mock_ctx(), a);
+            stamped_write_lock(a);
             stamped_unlock_write(a);
         }
         for h in handles {
@@ -871,7 +762,7 @@ mod tests {
     fn rw_basic_read_lock_unlock() {
         let a = fresh_addr();
         rw_init(a, false);
-        rw_read_lock(&mut mock_ctx(), a, 1);
+        rw_read_lock(a, 1);
         assert_eq!(rw_read_count(a), 1);
         rw_read_unlock(a, 1);
         assert_eq!(rw_read_count(a), 0);
@@ -881,7 +772,7 @@ mod tests {
     fn rw_basic_write_lock_unlock() {
         let a = fresh_addr();
         rw_init(a, false);
-        rw_write_lock(&mut mock_ctx(), a, 1);
+        rw_write_lock(a, 1);
         assert!(rw_is_write_locked(a));
         assert!(rw_write_is_held(a, 1));
         assert!(!rw_write_is_held(a, 2));
@@ -893,8 +784,8 @@ mod tests {
     fn rw_reentrant_write() {
         let a = fresh_addr();
         rw_init(a, false);
-        rw_write_lock(&mut mock_ctx(), a, 1);
-        rw_write_lock(&mut mock_ctx(), a, 1); // same thread re-enters
+        rw_write_lock(a, 1);
+        rw_write_lock(a, 1); // same thread re-enters
         assert!(rw_write_is_held(a, 1));
         rw_write_unlock(a, 1);
         assert!(rw_write_is_held(a, 1)); // still held
@@ -906,8 +797,8 @@ mod tests {
     fn rw_reentrant_read() {
         let a = fresh_addr();
         rw_init(a, false);
-        rw_read_lock(&mut mock_ctx(), a, 1);
-        rw_read_lock(&mut mock_ctx(), a, 1); // same thread re-enters
+        rw_read_lock(a, 1);
+        rw_read_lock(a, 1); // same thread re-enters
         assert_eq!(rw_read_count(a), 2);
         rw_read_unlock(a, 1);
         rw_read_unlock(a, 1);
@@ -918,7 +809,7 @@ mod tests {
     fn rw_try_write_blocked_by_reader_from_other_thread() {
         let a = fresh_addr();
         rw_init(a, false);
-        rw_read_lock(&mut mock_ctx(), a, 1);
+        rw_read_lock(a, 1);
         assert!(!rw_try_write_lock(a, 2));
         rw_read_unlock(a, 1);
         assert!(rw_try_write_lock(a, 2));
@@ -929,7 +820,7 @@ mod tests {
     fn rw_try_read_blocked_by_writer_from_other_thread() {
         let a = fresh_addr();
         rw_init(a, false);
-        rw_write_lock(&mut mock_ctx(), a, 1);
+        rw_write_lock(a, 1);
         assert!(!rw_try_read_lock(a, 2));
         rw_write_unlock(a, 1);
         assert!(rw_try_read_lock(a, 2));
@@ -940,9 +831,9 @@ mod tests {
     fn rw_writer_blocks_on_readers_and_releases() {
         let a = fresh_addr();
         rw_init(a, false);
-        rw_read_lock(&mut mock_ctx(), a, 1);
+        rw_read_lock(a, 1);
         let h = std::thread::spawn(move || {
-            rw_write_lock(&mut mock_ctx(), a, 2);
+            rw_write_lock(a, 2);
             rw_write_unlock(a, 2);
         });
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -961,7 +852,7 @@ mod tests {
         for tid in 0..n as u64 {
             let b = barrier.clone();
             handles.push(std::thread::spawn(move || {
-                rw_read_lock(&mut mock_ctx(), a, tid + 1);
+                rw_read_lock(a, tid + 1);
                 // All readers must be holding simultaneously here.
                 b.wait();
                 let count = rw_read_count(a);

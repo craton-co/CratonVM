@@ -128,6 +128,42 @@ fn obj_key_shards() -> &'static [ObjKeyShard; OBJ_KEY_SHARDS] {
     REG.get_or_init(|| std::array::from_fn(|_| Mutex::new(StdHashMap::new())))
 }
 
+/// Reverse index for the collection-overlay GC edge: a collection object's
+/// current address maps to the stable side-table key(s) that hold state for it.
+///
+/// The GC must be able to answer "this collection has just been marked; which
+/// Rust-side references does it own?" without linearly scanning every overlay
+/// table for every marked heap object. `widened_obj_key` maintains this index
+/// whenever an overlay is touched, and the post-move/prune paths keep it in
+/// lockstep with `obj_key_registry`.
+fn overlay_owner_keys() -> &'static Mutex<StdHashMap<usize, Vec<usize>>> {
+    static INDEX: std::sync::OnceLock<Mutex<StdHashMap<usize, Vec<usize>>>> =
+        std::sync::OnceLock::new();
+    INDEX.get_or_init(|| Mutex::new(StdHashMap::new()))
+}
+
+#[inline]
+fn register_overlay_owner_key(owner_addr: usize, key: usize) -> usize {
+    let mut index = overlay_owner_keys()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let keys = index.entry(owner_addr).or_default();
+    if !keys.contains(&key) {
+        keys.push(key);
+    }
+    key
+}
+
+fn remove_overlay_owner_key(key: usize) {
+    let mut index = overlay_owner_keys()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    index.retain(|_, keys| {
+        keys.retain(|registered| *registered != key);
+        !keys.is_empty()
+    });
+}
+
 /// Select the registry shard for an identity hash. Mixes with the 64-bit
 /// Fibonacci/golden-ratio constant first because identity hashes can be
 /// low-entropy / sequentially assigned, which would otherwise cluster nearby
@@ -192,6 +228,7 @@ fn clear_overlay_entries_for_key(key: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|_ptr, packed| *packed != key);
+    remove_overlay_owner_key(key);
 }
 
 /// Next never-recycled generation for a hash bucket: one past the maximum
@@ -227,7 +264,7 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     //    `gc_update_collection_overlay_refs` pass advances every relocated slot's
     //    `last_ptr` to the new address before the object is next observed.
     if let Some(slot) = slots.iter().find(|s| s.last_ptr == ptr) {
-        return pack_obj_key(hash, slot.generation);
+        return register_overlay_owner_key(ptr, pack_obj_key(hash, slot.generation));
     }
 
     // 2. Lone occupant of this hash bucket whose recorded pointer differs.
@@ -248,7 +285,7 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     if slots.len() == 1 {
         if slots[0].class_id == class_id {
             slots[0].last_ptr = ptr;
-            return pack_obj_key(hash, slots[0].generation);
+            return register_overlay_owner_key(ptr, pack_obj_key(hash, slots[0].generation));
         }
         // Different-class recycle: re-key + clear the stale overlay state.
         let stale_key = pack_obj_key(hash, slots[0].generation);
@@ -262,7 +299,7 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
         // and cannot deadlock against a concurrent side-table op.
         drop(reg);
         clear_overlay_entries_for_key(stale_key);
-        return pack_obj_key(hash, generation);
+        return register_overlay_owner_key(ptr, pack_obj_key(hash, generation));
     }
 
     // 3. Genuine 32-bit collision among several simultaneously-live objects, or
@@ -275,7 +312,7 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
         generation,
         class_id,
     });
-    pack_obj_key(hash, generation)
+    register_overlay_owner_key(ptr, pack_obj_key(hash, generation))
 }
 
 /// Pack a 32-bit identity hash and a 32-bit generation into the full-width
@@ -26703,6 +26740,133 @@ pub fn gc_scan_collection_overlay_roots(roots: &mut Vec<ObjectRef>) {
     for_each_overlay_ref(true, |r| roots.push(*r));
 }
 
+/// Return the Rust-side references owned by one already-marked collection.
+///
+/// On the Generational non-moving collector this is the conditional replacement
+/// for treating every overlay value as a process-global root: the marker calls
+/// it only after the collection object itself has been found reachable through
+/// ordinary Java roots/fields. The returned copy deliberately releases every
+/// side-table lock before the collector recursively marks the values.
+pub fn gc_overlay_roots_for_collection(owner_addr: usize) -> Vec<ObjectRef> {
+    let keys = {
+        let index = overlay_owner_keys()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        index.get(&owner_addr).cloned().unwrap_or_default()
+    };
+    if keys.is_empty() {
+        return Vec::new();
+    }
+
+    let mut roots = Vec::new();
+    for key in keys {
+        if let Some(state) = hm_int_fast_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            for (entry_key, value) in state.entries.values() {
+                roots.push(*entry_key);
+                if let Value::Object(Some(object)) = value {
+                    roots.push(*object);
+                }
+            }
+        }
+        if let Some(inner) = ll_overlay()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            for value in inner.values() {
+                if let Value::Object(Some(object)) = value {
+                    roots.push(*object);
+                }
+            }
+        }
+        if let Some(inner) = lhm_overlay()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            for value in inner.values() {
+                if let Value::Object(Some(object)) = value {
+                    roots.push(*object);
+                }
+            }
+        }
+        if let Some(state) = tm_array_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            if let Some(data) = state.data {
+                roots.push(data);
+            }
+            if let Value::Object(Some(comparator)) = state.comparator {
+                roots.push(comparator);
+            }
+        }
+        if let Some(entries) = tm_fast_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            for value in entries.values() {
+                if let Value::Object(Some(object)) = value {
+                    roots.push(*object);
+                }
+            }
+        }
+        if let Some(state) = ts_array_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            if let Some(data) = state.data {
+                roots.push(data);
+            }
+            if let Value::Object(Some(comparator)) = state.comparator {
+                roots.push(comparator);
+            }
+        }
+        if let Some(comparator) = cslm_comparator_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            roots.push(*comparator);
+        }
+    }
+    roots
+}
+
+/// Return overlay references whose owners satisfy `owner_matches`.
+///
+/// A young-only collection cannot tell whether an old-generation object is
+/// otherwise reachable: old objects are not swept in that cycle. Its overlay
+/// edges therefore need the same treatment as ordinary old→young card edges —
+/// retain them for the minor collection, then let the major marker apply the
+/// precise per-owner rule before old-space compaction.
+pub fn gc_overlay_roots_for_matching_owners(
+    owner_matches: impl Fn(usize) -> bool,
+) -> Vec<ObjectRef> {
+    let owners: Vec<usize> = {
+        let index = overlay_owner_keys()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        index
+            .keys()
+            .copied()
+            .filter(|owner| owner_matches(*owner))
+            .collect()
+    };
+    let mut roots = Vec::new();
+    for owner in owners {
+        roots.extend(gc_overlay_roots_for_collection(owner));
+    }
+    roots
+}
+
 /// Repoint every top-level ObjectRef held by the overlay-backed collections to
 /// its relocated address after a moving GC. Mirror of
 /// `gc_scan_collection_overlay_roots`.
@@ -26738,6 +26902,28 @@ pub fn gc_update_collection_overlay_refs(pointer_map: &StdHashMap<usize, usize>)
             }
         }
     }
+
+    // Keep the reverse owner index in the same post-move address space as the
+    // object-key registry. The marker uses this index on the next non-moving
+    // cycle, so leaving even one pre-copy address here would silently drop a
+    // live collection's overlay edge.
+    let mut owners = overlay_owner_keys()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let moves: Vec<(usize, usize)> = owners
+        .keys()
+        .filter_map(|old| pointer_map.get(old).map(|new| (*old, *new)))
+        .collect();
+    for (old, new) in moves {
+        if let Some(keys) = owners.remove(&old) {
+            let target = owners.entry(new).or_default();
+            for key in keys {
+                if !target.contains(&key) {
+                    target.push(key);
+                }
+            }
+        }
+    }
 }
 
 /// Prune overlay/side-table entries whose backing collection object is no
@@ -26764,6 +26950,21 @@ pub fn gc_update_collection_overlay_refs(pointer_map: &StdHashMap<usize, usize>)
 /// this crate's scope and is flagged in the change report rather than edited
 /// here.
 pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
+    let dbg = std::env::var_os("CRATONVM_DBG_MIRRORPIN").is_some();
+    if dbg {
+        let total_slots: usize = obj_key_shards()
+            .iter()
+            .map(|s| {
+                s.lock()
+                    .map(|reg| reg.values().map(|v| v.len()).sum::<usize>())
+                    .unwrap_or(0)
+            })
+            .sum();
+        eprintln!(
+            "[DBG_MIRRORPIN] gc_prune_dead_collection_overlays CALLED, total_slots={}",
+            total_slots
+        );
+    }
     // 1. Collect the packed keys of dead collection objects from the registry,
     //    and rebuild the registry without their slots. Done as an explicit
     //    two-pass walk (collect dead keys, then drop slots) to keep the
@@ -26792,6 +26993,12 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
                 !slots.is_empty()
             });
         }
+    }
+    if dbg {
+        eprintln!(
+            "[DBG_MIRRORPIN] gc_prune_dead_collection_overlays dead_keys={}",
+            dead_keys.len()
+        );
     }
     if dead_keys.is_empty() {
         return;
@@ -26870,6 +27077,9 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
         let mut cache = lhm_ptr_cache().lock().unwrap_or_else(|e| e.into_inner());
         let dead: std::collections::HashSet<usize> = dead_keys.iter().copied().collect();
         cache.retain(|_ptr, packed| !dead.contains(packed));
+    }
+    for key in dead_keys {
+        remove_overlay_owner_key(key);
     }
 }
 

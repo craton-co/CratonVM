@@ -1,3 +1,69 @@
+# 2026-07-13 follow-up: array-constructor-reference lambda bug found + fixed
+# (real, verified, but NOT yet confirmed as this doc's residual root cause)
+
+While independently re-investigating this cluster (parallel to, and without
+visibility into, the "2026-07-13 current-dev residual update" section
+immediately below until after landing this fix), found and fixed a real,
+previously-unknown interpreter correctness bug: **array-constructor-reference
+lambdas (`SomeType[]::new`, used as an `IntFunction<SomeType[]>` — the
+mechanism behind `Collection.toArray(SomeType[]::new)`, ubiquitous since
+Java 11, and any direct user code) allocated a corrupted zero-field pseudo-
+object instead of a real array.**
+
+Root cause: `MethodHandleKind::NewInvokeSpecial` (the constructor-reference
+lambda dispatch, `vm/src/runtime/interpreter.rs` and its duplicate in
+`vm/src/vm/vm_exec.rs`) unconditionally treated the impl handle's target as a
+regular class — allocate `num_total_fields` object slots, dispatch `<init>`.
+For an array-shaped impl class name (e.g. `"[Ljava/nio/ByteBuffer;"`),
+`load_class` correctly resolves it to the synthesized array `ClassId` (JVMS
+5.3.3), but arrays have neither fields nor a constructor: the old path
+allocated a zero-field object wearing the array's `ClassId`, silently
+discarded the requested length (the `IntFunction`'s sole `int` argument), and
+produced a value that fails a later `checkcast` to the real array type.
+
+This exact mechanism reproduces from real Lucene: `ByteBuffersDataInput`'s
+constructor does `this.blocks = list.toArray(ByteBuffer[]::new)`, immediately
+followed by `checkcast [Ljava/nio/ByteBuffer;`. A direct, isolated repro
+(`new ByteBuffersDataInput(list)` against the real `lucene-core-10.4.0.jar`,
+bypassing the whole ES/suite-runner harness) threw
+`ClassCastException: java.lang.Object cannot be cast to [Ljava.nio.ByteBuffer;`
+on unfixed `dev`, and one *direct* (non-suite-runner) repro of this doc's own
+`testSlicesDense` — bypassing the outer watchdog entirely — surfaced this
+identical exception in ~85s instead of the usual multi-hundred-second
+non-progress, i.e. this bug is a real, independent cause of SOME of this
+cluster's non-deterministic behavior (fast completion with a wrong-data
+exception, vs. the more common very-slow/non-progress runs), not necessarily
+of every manifestation.
+
+**Fixed** (commit on `fix/gc-stw-monitor-race-20260711-local`, merged to
+`dev`): detect the array case via the resolved `ClassId`'s `array_info`
+before the object-allocation path, and allocate a real array — primitive or
+reference, correct component type, correct length — the same way
+`anewarray`/`newarray` do for the same class metadata. Verified: the real
+`ByteBuffersDataInput` construct + `readByte()` + `slice()` repro now matches
+real JDK 25 output exactly. `cratonvm-vm --lib` lambda-proxy/lambda-dispatch
+suite 8/8 pass; full `cratonvm-vm --lib` 2185 passed / 23 failed, all 23
+pre-existing/environmental (debug-only lock-order assertions that cannot fire
+in a release build, JIT skip-list feature tests, JNI table-size tests,
+real-JDK-detection tests) and unrelated by name/code-path to this change.
+
+**Open question for whoever picks this doc back up next:** does this fix
+change the outcome of the "2026-07-13 current-dev residual update" repro
+below (`testSlicesSparseWithFilter`, `others.tsv -Start 2538`,
+`ByteBuffersIndexInput.slice`/`MockIndexInputWrapper.slice` non-progress)? A
+corrupted zero-field pseudo-array being read back as if it had a real array
+length header (garbage/huge length) is mechanistically consistent with
+"consumes one CPU continuously, fails to produce a result before a 90s
+timeout" — but this was NOT confirmed against that exact repro (host
+unavailable for the remainder of this session). Re-run that doc's exact
+repro command against a build including this fix before doing further
+investigation into `ByteBuffersIndexInput`/`TaskExecutor` specifically — if
+this fix resolves it, this cluster's genuine remaining root cause was never
+GC/threading at all, and the STW-monitor-race historical attribution can be
+retired for real.
+
+---
+
 # 2026-07-13 current-dev residual update
 
 **Status: OPEN.** This remains a real CratonVM-only non-progress failure, but
