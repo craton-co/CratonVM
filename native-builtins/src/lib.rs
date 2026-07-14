@@ -57043,6 +57043,26 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     // classfile didn't define those fields.  All COWAL natives below
     // use these helpers so they work for both layouts without further
     // per-method branching.
+    //
+    // FIX (2026-07-14, java.home/Locale bootstrap regression family): pin
+    // these to Bridge explicitly. This whole block (like
+    // register_properties_sidetable's) inherited whatever category was
+    // ambient at this function's call site instead of declaring its own,
+    // and was silently getting SyntheticStub in real-JDK mode. Every
+    // mutator here (add/set/remove/clear/addIfAbsent) is a permanent
+    // bridge, not an approximation: `<init>()V` is left to run real JDK
+    // bytecode on purpose (see the comment below) so `this.lock` gets
+    // properly constructed, but real JDK's own `add`/`set`/`remove`/`clear`
+    // bytecode (`getfield lock; monitorenter`, confirmed via `javap`) is
+    // what these natives exist to bypass — dropping them made every
+    // mutating call on a real COWAL instance fall through to bytecode that
+    // is otherwise fine but exposed a `this.lock` NPE downstream in
+    // Spring's own COWAL-backed listener/post-processor lists once the
+    // ByteBuffer/CodingErrorAction stubs (this same file) were confirmed
+    // safe to drop and the Properties fix above unmasked deeper bootstrap
+    // progress. Found via CRATONVM_DBG_DROPPED_STUBS during a live
+    // CrossOriginAnnotationIntegrationTests run.
+    registry.with_category(cratonvm_native_api::NativeKind::Bridge, |registry| {
     let cowal = "java/util/concurrent/CopyOnWriteArrayList";
     // We removed the bytecode `<init>` override entirely so the real
     // JDK constructor runs and properly initialises `lock` and
@@ -57454,6 +57474,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         cowal_write_array(ctx, this, new_arr);
         ctx.monitor_exit(this);
         Ok(None)
+    });
     });
 }
 
