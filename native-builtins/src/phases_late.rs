@@ -40673,6 +40673,108 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
     }
 
     let linker = "java/lang/foreign/Linker";
+
+    // Real JDK Arena.ofAuto returns ArenaImpl; its concrete allocate(long,
+    // long) must be intercepted so default SegmentAllocator.allocate(layout)
+    // produces our validated native MemorySegment representation.
+    r.register(
+        "jdk/internal/foreign/ArenaImpl",
+        "allocate",
+        "(JJ)Ljava/lang/foreign/MemorySegment;",
+        crate::panama::pe_arena_allocate,
+    );
+    r.register(
+        "java/lang/foreign/Arena",
+        "allocate",
+        "(JJ)Ljava/lang/foreign/MemorySegment;",
+        crate::panama::pe_arena_allocate,
+    );
+    // Arena.allocate(long) is an interface default method in the real JDK.
+    // Route it directly so it cannot construct a JDK segment whose layout
+    // differs from the native MemorySegment bridge.
+    r.register(
+        "java/lang/foreign/Arena",
+        "allocate",
+        "(J)Ljava/lang/foreign/MemorySegment;",
+        crate::panama::pe_arena_allocate,
+    );
+    r.register(
+        "java/lang/foreign/MemorySegment",
+        "reinterpret",
+        "(J)Ljava/lang/foreign/MemorySegment;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let size = match args.get(1) {
+                Some(Value::Long(size)) => *size,
+                _ => 0,
+            };
+            let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+            ctx.set_field(seg, 0, ctx.get_field(this, 0));
+            ctx.set_field(seg, 1, Value::Long(size));
+            ctx.set_field(seg, 2, ctx.get_field(this, 2));
+            ctx.set_field(seg, 3, ctx.get_field(this, 3));
+            ctx.set_field(seg, 4, Value::Int(1));
+            ctx.set_field(seg, 5, ctx.get_field(this, 5));
+            Ok(Some(Value::Object(Some(seg))))
+        },
+    );
+    r.register(
+        "java/lang/foreign/MemorySegment",
+        "getUtf8String",
+        "(J)Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let offset = match args.get(1) {
+                Some(Value::Long(offset)) if *offset >= 0 => *offset,
+                _ => 0,
+            };
+            let base = match ctx.get_field(this, 0) {
+                Value::Long(address) => address,
+                _ => 0,
+            };
+            let base_offset = match ctx.get_field(this, 5) {
+                Value::Long(offset) => offset,
+                _ => 0,
+            };
+            let remaining = match ctx.get_field(this, 1) {
+                Value::Long(size) if size > offset => size - offset,
+                _ => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "getUtf8String requires a non-empty reinterpreted MemorySegment"
+                            .into(),
+                    }
+                    .into());
+                }
+            };
+            let address = (base as u64)
+                .checked_add(base_offset as u64)
+                .and_then(|address| address.checked_add(offset as u64))
+                .ok_or_else(|| -> MethodCallFailed {
+                    RuntimeError::IllegalStateException {
+                        message: "getUtf8String address arithmetic overflow".into(),
+                    }
+                    .into()
+                })? as *const u8;
+            if address.is_null() {
+                return Ok(Some(Value::Object(None)));
+            }
+            let bytes =
+                unsafe { std::slice::from_raw_parts(address, (remaining as usize).min(4096)) };
+            let nul =
+                bytes
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .ok_or_else(|| -> MethodCallFailed {
+                        RuntimeError::IllegalStateException {
+                            message: "getUtf8String exceeded its bounded scan".into(),
+                        }
+                        .into()
+                    })?;
+            let text = std::str::from_utf8(&bytes[..nul]).unwrap_or("");
+            Ok(Some(Value::Object(Some(ctx.create_string(text)))))
+        },
+    );
+
     r.register(
         linker,
         "nativeLinker",
@@ -40705,10 +40807,14 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             };
 
             let mut variadic_fixed: i64 = -1;
+            let mut capture_call_state = false;
             if let Some(Value::Object(Some(opts))) = args.get(3) {
                 let n = ctx.array_length(*opts);
                 for i in 0..n {
                     if let Value::Object(Some(opt)) = ctx.get_array_element(*opts, i) {
+                        if crate::panama::downcall_option_captures_call_state(ctx, opt) {
+                            capture_call_state = true;
+                        }
                         let kind = match ctx.get_field(opt, 0) {
                             Value::Int(k) => k,
                             _ => -1,
@@ -40724,11 +40830,18 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 }
             }
 
-            let dh = alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 4);
+            if std::env::var_os("CRATONVM_DBG_LINKER").is_some() {
+                eprintln!(
+                    "[LATE_LINKER] option downcall addr=0x{fn_addr:x} options={}",
+                    args.get(3).is_some()
+                );
+            }
+            let dh = alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 5);
             ctx.set_field(dh, 0, Value::Long(fn_addr));
             ctx.set_field(dh, 1, Value::Object(Some(descriptor)));
             ctx.set_field(dh, 2, Value::Long(variadic_fixed));
             ctx.set_field(dh, 3, Value::Long(0)); // cif cache not yet built
+            ctx.set_field(dh, 4, Value::Int(capture_call_state as i32));
             Ok(Some(Value::Object(Some(dh))))
         }
     );
@@ -40744,6 +40857,18 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "invokeExact",
         "([Ljava/lang/Object;)Ljava/lang/Object;",
         crate::panama::pe_downcall_invoke,
+    );
+    r.register(
+        dh,
+        "invokeBasic",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        crate::panama::pe_downcall_invoke,
+    );
+    r.register(
+        dh,
+        "type",
+        "()Ljava/lang/invoke/MethodType;",
+        crate::panama::pe_downcall_type,
     );
 
     // FunctionDescriptor

@@ -48,13 +48,33 @@ fixture, so it is not a CratonVM-only signal.
 
 ## Resolution
 
-Rebuild or restore the native Linux artifacts for the exact compiled
-Elasticsearch fixture, including `libvec.so`, then rerun the 1,343 affected
-classes. Preserve the result classification separately from real CratonVM
-FAIL/HANG/CRASH families; this blocker otherwise masks nearly the entire
-suite screen.
+Resolved in the Elasticsearch fixture/runtime path. The exact compiled fixture
+now supplies apps/elasticsearch/lib/platform/linux-x64/libvec.so; CratonVM
+loads that explicit third-party library through the JDK 25 System.load path
+rather than suppressing it with the management-library compatibility shim.
+
+The FFM bridge now represents DowncallHandle as a MethodHandle, preserves its
+full descriptor/options metadata, supports heap-backed float segments, and
+dispatches signature-polymorphic downcalls through libffi. Elasticsearch's
+optional process-wide seccomp sandbox is treated as unavailable on CratonVM so
+it does not prevent native-vector tests from starting.
+
+The original 1,343-row result classification remains historical and must be
+rerun separately; this issue no longer justifies attributing those rows to a
+missing libvec.so fixture artifact.
 
 ## Evidence
+
+- Azure isolated worktree binary:
+  cratonvm-esfixture-libvec-land-20260715-r98
+- JDKVectorLibraryFloat32Tests.testRandomFloats: OK (62 tests) with
+  Using native vector library.
+- Focused r94 checks (same code path before final scope cleanup): all 62
+  parameters passed for testFloat32Bulk, testFloat32BulkWithOffsets,
+  testFloat32BulkWithOffsetsAndPitch, and
+  testFloat32BulkWithOffsetsHeapSegments.
+- Exact testBulkOffsetsOutOfRange contract: DIRECT_OUT_OF_RANGE_OK=62.
+
 
 - Run summary:
   `ES-RUN-20260713-002914-resume-nonpassed-summary.md`

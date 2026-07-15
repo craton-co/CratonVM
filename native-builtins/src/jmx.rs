@@ -983,6 +983,15 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
         "()V",
         |_ctx, _args| Ok(None),
     );
+    // CratonVM does not install a process-wide seccomp filter. Elasticsearch
+    // probes this only during test bootstrap; treating the optional sandbox as
+    // unavailable keeps native vector access independent from that capability.
+    r.register(
+        "org/elasticsearch/nativeaccess/LinuxNativeAccess",
+        "tryInstallExecSandbox",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
     r.register(
         "java/lang/System",
         "loadLibrary",
@@ -993,7 +1002,13 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
         "java/lang/System",
         "load",
         "(Ljava/lang/String;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            if let Some(Value::Object(Some(path))) = args.first() {
+                let path = ctx.read_string(*path).unwrap_or_default();
+                let _ = ctx.load_native_library(&path);
+            }
+            Ok(None)
+        },
     );
     r.register(
         "java/lang/Runtime",
@@ -1005,7 +1020,13 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
         "java/lang/Runtime",
         "load0",
         "(Ljava/lang/Class;Ljava/lang/String;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            if let Some(Value::Object(Some(path))) = args.get(1) {
+                let path = ctx.read_string(*path).unwrap_or_default();
+                let _ = ctx.load_native_library(&path);
+            }
+            Ok(None)
+        },
     );
 
     // Wave 1 / Task A: short-circuit `ManagementFactory.getPlatformMXBeans
