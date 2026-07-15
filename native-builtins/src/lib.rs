@@ -9003,7 +9003,25 @@ fn native_thread_get_context_class_loader(
     if let Some(Value::Object(Some(this))) = args.first() {
         match ctx.get_field_by_name(*this, "contextClassLoader") {
             Value::Object(Some(loader)) => {
-                return Ok(Some(Value::Object(Some(loader))));
+                // A stale/mis-slotted Thread field can contain an unrelated
+                // heap object (observed as String.findResources during
+                // Mockito plugin discovery). Never expose that as a loader:
+                // Java callers immediately virtual-dispatch on the result.
+                // Do not route this check through `Class.isInstance`: during
+                // early real-JDK bootstrap its mirror metadata can be stale
+                // enough to admit a String.  The VM's actual class hierarchy
+                // is the authoritative type relation here.
+                let is_loader = ctx
+                    .class_id_by_name("java/lang/ClassLoader")
+                    .map(|loader_class_id| {
+                        let actual_class_id = ctx.class_id_of_object(loader);
+                        actual_class_id == loader_class_id
+                            || ctx.is_subclass(actual_class_id, loader_class_id)
+                    })
+                    .unwrap_or(false);
+                if is_loader {
+                    return Ok(Some(Value::Object(Some(loader))));
+                }
             }
             _ => {
                 if thread_context_loader_is_explicit_null(ctx, *this) {
@@ -11463,6 +11481,103 @@ fn native_antlr_default_error_strategy_sync(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
+    Ok(None)
+}
+
+// ANTLR's inline recovery should classify EOF after a statement as a missing
+// delimiter when the sole expected token is that delimiter.  The interpreter
+// reaches the same recovery state but reports an InputMismatchException
+// instead, which prevents clients such as Hibernate's import-script listener
+// from turning the syntax error into their domain exception.  Keep the normal
+// ANTLR message for every other mismatch and correct only this EOF insertion
+// boundary.
+fn native_antlr_default_error_strategy_report_input_mismatch(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let strategy = obj_arg(args, 0)?;
+    let parser = obj_arg(args, 1)?;
+    let mismatch = obj_arg(args, 2)?;
+    let names = antlr_names_for_object(ctx, parser);
+    let prefix = if names.pc == GROOVY_ANTLR_PC {
+        "groovyjarjarantlr4/v4/runtime"
+    } else {
+        "org/antlr/v4/runtime"
+    };
+    let token_desc = format!("L{prefix}/Token;");
+    let interval_set_desc = format!("L{prefix}/misc/IntervalSet;");
+    let vocabulary_desc = format!("L{prefix}/Vocabulary;");
+    let recognition_desc = format!("L{prefix}/RecognitionException;");
+
+    let offending = match ctx.invoke_virtual(
+        mismatch,
+        "getOffendingToken",
+        &format!("(){token_desc}"),
+        &[],
+    )? {
+        Some(Value::Object(Some(token))) => token,
+        _ => return Ok(None),
+    };
+    let expected = match ctx.invoke_virtual(
+        mismatch,
+        "getExpectedTokens",
+        &format!("(){interval_set_desc}"),
+        &[],
+    )? {
+        Some(Value::Object(Some(set))) => set,
+        _ => return Ok(None),
+    };
+    let token_type = match ctx.invoke_virtual(offending, "getType", "()I", &[])? {
+        Some(Value::Int(value)) => value,
+        _ => 0,
+    };
+    let expected_size = match ctx.invoke_virtual(expected, "size", "()I", &[])? {
+        Some(Value::Int(value)) => value,
+        _ => 0,
+    };
+    let vocabulary = match ctx.invoke_virtual(
+        parser,
+        "getVocabulary",
+        &format!("(){vocabulary_desc}"),
+        &[],
+    )? {
+        Some(Value::Object(Some(vocabulary))) => vocabulary,
+        _ => return Ok(None),
+    };
+    let expected_text = match ctx.invoke_virtual(
+        expected,
+        "toString",
+        &format!("({vocabulary_desc})Ljava/lang/String;"),
+        &[Value::Object(Some(vocabulary))],
+    )? {
+        Some(Value::Object(Some(text))) => ctx.read_string(text).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let token_text = match ctx.invoke_virtual(
+        strategy,
+        "getTokenErrorDisplay",
+        &format!("({token_desc})Ljava/lang/String;"),
+        &[Value::Object(Some(offending))],
+    )? {
+        Some(Value::Object(Some(text))) => ctx.read_string(text).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let message = if token_type == -1 && expected_size == 1 {
+        format!("missing {expected_text} at {token_text}")
+    } else {
+        format!("mismatched input {token_text} expecting {expected_text}")
+    };
+    let message = ctx.create_string(&message);
+    ctx.invoke_virtual(
+        parser,
+        "notifyErrorListeners",
+        &format!("({token_desc}Ljava/lang/String;{recognition_desc})V"),
+        &[
+            Value::Object(Some(offending)),
+            Value::Object(Some(message)),
+            Value::Object(Some(mismatch)),
+        ],
+    )?;
     Ok(None)
 }
 
@@ -17840,7 +17955,13 @@ fn register_antlr_prediction_context_intrinsics(registry: &mut NativeMethodRegis
             &format!("({parser_desc})V"),
             native_antlr_default_error_strategy_sync,
         );
-
+        let mismatch_desc = format!("L{prefix}/InputMismatchException;");
+        registry.register(
+            &default_error_strategy,
+            "reportInputMismatch",
+            &format!("({parser_desc}{mismatch_desc})V"),
+            native_antlr_default_error_strategy_report_input_mismatch,
+        );
         let semantic_context = format!("{prefix}/atn/SemanticContext");
         let semantic_context_desc = format!("L{prefix}/atn/SemanticContext;");
         let semantic_combine_desc =
@@ -35010,6 +35131,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "findResources",
         "(Ljava/lang/String;)Ljava/util/Enumeration;",
         classloader::ucl_find_resources,
+    );
+    registry.register(
+        "java/net/URLClassLoader",
+        "addURL",
+        "(Ljava/net/URL;)V",
+        classloader::ucl_add_url_real,
     );
     // URLClassLoader.findClass — the real bytecode resolves via the shimmed
     // `ucp` (URLClassPath) and so throws CNFE for everything. Serve it from the

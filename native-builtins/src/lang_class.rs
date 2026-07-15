@@ -250,7 +250,11 @@ pub(crate) fn simple_class_name(class_id: ClassId, raw: &str, is_real_inner: boo
 /// anonymous classes — a top-level class with literal `$` characters in its
 /// binary name (dynamically-generated proxies) has no such entry. Same
 /// lookup `native_class_get_simple_binary_name` uses.
-fn has_own_inner_classes_entry(ctx: &mut dyn NativeContext, class_id: ClassId, class_name: &str) -> bool {
+fn has_own_inner_classes_entry(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+    class_name: &str,
+) -> bool {
     ctx.inner_classes(class_id)
         .iter()
         .any(|(inner_class, _, _, _)| inner_class == class_name)
@@ -1772,7 +1776,10 @@ pub(crate) fn native_class_for_name(
         } else {
             loader
         };
-        let invoke_args = [Value::Object(Some(lookup_loader)), Value::Object(Some(name_obj))];
+        let invoke_args = [
+            Value::Object(Some(lookup_loader)),
+            Value::Object(Some(name_obj)),
+        ];
         match ctx.invoke_virtual(
             lookup_loader,
             "loadClass",
@@ -8244,8 +8251,7 @@ pub(crate) fn native_constructor_new_instance(
     let (param_descs, _) = parse_descriptor_param_and_return(&descriptor);
 
     // Extract arguments from Object[] (args[1])
-    let args_array = args_array_pin
-        .map(|(pin, arr)| ctx.read_native_pin(pin, arr));
+    let args_array = args_array_pin.map(|(pin, arr)| ctx.read_native_pin(pin, arr));
     let actual_arg_count = match args_array {
         Some(arr) => ctx.array_length(arr),
         None => 0,
@@ -10038,9 +10044,7 @@ fn make_type_not_present_exception(
     crate::lang_misc::write_throwable_detail_message(ctx, exc, Value::Object(Some(msg_obj)));
     let exc = ctx.read_native_pin(pin, exc);
     if let Some(c) = cause {
-        let c = cause_pin
-            .map(|p| ctx.read_native_pin(p, c))
-            .unwrap_or(c);
+        let c = cause_pin.map(|p| ctx.read_native_pin(p, c)).unwrap_or(c);
         crate::lang_misc::write_throwable_cause(ctx, exc, Value::Object(Some(c)));
     }
     let exc = ctx.read_native_pin(pin, exc);
@@ -13878,7 +13882,20 @@ pub(crate) fn native_class_get_class_loader(
     // sanity check (`Class.forName(name, false, cl).getClassLoader() == cl`)
     // fails with "Class already loaded" and Hibernate's proxy generation breaks.
     if let Some(loader) = crate::classloader::defining_loader_for(class_id.as_u32()) {
-        return Ok(Some(Value::Object(Some(loader))));
+        // Defining-loader entries live in a Rust side table.  Reject a stale
+        // object reference before returning it as a ClassLoader; otherwise a
+        // reused String slot reaches ServiceLoader as `findResources()`.
+        let is_loader = ctx
+            .class_id_by_name("java/lang/ClassLoader")
+            .map(|loader_class_id| {
+                let actual_class_id = ctx.class_id_of_object(loader);
+                actual_class_id == loader_class_id
+                    || ctx.is_subclass(actual_class_id, loader_class_id)
+            })
+            .unwrap_or(false);
+        if is_loader {
+            return Ok(Some(Value::Object(Some(loader))));
+        }
     }
     let loader_type = ctx.loader_id_of_class(class_id);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
