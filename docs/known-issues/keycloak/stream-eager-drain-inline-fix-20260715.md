@@ -152,9 +152,15 @@ listed above; no other crate touched.
   actually engages the (now-fixed) lazy-spliterator machinery, if full end-to-end confidence via the
   real library is wanted.
 - **The unrelated zipfs `Files.copy` bug** (item 3 in the referenced doc, tracked separately as
-  task_eccb7c4c) still blocks running the actual `WelcomePageTest` Selenium suite end-to-end (Keycloak
-  distribution extraction fails before the server even boots). Not attempted or touched in this
-  session — out of scope, per the referenced doc.
+  task_eccb7c4c) was not touched by this session — out of scope, per the referenced doc. It was,
+  however, independently fixed and closed by a concurrent session on this same shared host while
+  this fix was in progress: see `90cc7e73` ("merge: fix zipfs Files.copy source-path bug into dev")
+  and `896a7da5` ("docs(known-issues): close zipfs Files.copy bug FIXED, teardown hang re-verified
+  not reproducing" -> `docs/internal/fixed-suite-bugs/zipfs-files-copy-wrapped-path-FIXED.md`), both
+  now ancestors of `dev`. That doc also re-verified the originally-reported `WelcomePageTest`
+  teardown hang (item 4) as no longer reproducing. Full `WelcomePageTest` end-to-end re-verification
+  specifically exercising THIS fix (rather than the standalone JSON-parsing checks above) was not
+  attempted here and remains open follow-up scope if desired.
 - **`Stream.iterate`/`Stream.generate`-style infinite lazy streams** consumed only through `limit()`
   were not specifically exercised beyond the `limit`/`skip` chain-op coverage already in the regression
   suite (those apply to array-backed sources in the suite, not a genuinely infinite spliterator). The
