@@ -18583,15 +18583,41 @@ fn execute_invoke_kind(
     {
         Some(*declaring_id)
     } else if !is_special && crate::runtime::env_cache::loader_aware_resolution() {
-        receiver_class_id.filter(|rcv_cid| {
-            *rcv_cid != ClassId::new(0) && {
-                let cm = shared.class_manager.read();
-                cm.get_loaded_class_id(&invoke_class) != Some(*rcv_cid)
-                    && cm
-                        .get_class(*rcv_cid)
-                        .map(|c| &*c.name == &*invoke_class)
-                        .unwrap_or(false)
-            }
+        // Lambda-proxy receiver invoking a non-SAM (default) interface
+        // method: `invoke_class` was set to the functional interface NAME
+        // (see the lambda_iface branch above), and the name re-resolution
+        // below collapses to ONE copy per name. The proxy call site carries
+        // the loader-resolved interface id captured at bootstrap time
+        // (forked-classloader tests re-define the whole framework, so the
+        // app copy and the fork copy both exist); dispatch on that id so the
+        // default method executes in the DEFINING loader context and its own
+        // constant-pool resolutions stay inside that loader (Spring AOT
+        // `ArgumentCodeGenerator.and()` chain, 2026-07-15).
+        let lambda_iface_override = receiver_class_id.and_then(|rcv_cid| {
+            let iface_id = shared
+                .lambda_proxies
+                .read()
+                .get(&rcv_cid)
+                .and_then(|lcs| lcs.functional_interface_id)?;
+            let cm = shared.class_manager.read();
+            let iface_matches_invoke = cm
+                .get_class(iface_id)
+                .map(|c| &*c.name == &*invoke_class)
+                .unwrap_or(false);
+            (iface_matches_invoke && cm.get_loaded_class_id(&invoke_class) != Some(iface_id))
+                .then_some(iface_id)
+        });
+        lambda_iface_override.or_else(|| {
+            receiver_class_id.filter(|rcv_cid| {
+                *rcv_cid != ClassId::new(0) && {
+                    let cm = shared.class_manager.read();
+                    cm.get_loaded_class_id(&invoke_class) != Some(*rcv_cid)
+                        && cm
+                            .get_class(*rcv_cid)
+                            .map(|c| &*c.name == &*invoke_class)
+                            .unwrap_or(false)
+                }
+            })
         })
     } else if is_special && crate::runtime::env_cache::loader_aware_resolution() {
         // invokespecial owner is the CP-resolved class NAME (`method_class_name`),
@@ -19465,17 +19491,32 @@ fn try_lambda_default_method_dispatch(
     method_descriptor: &str,
     full_args: &[Value],
 ) -> Result<Option<Option<Value>>, MethodCallFailed> {
-    let interface_name = {
+    let (interface_name, interface_id_hint) = {
         let proxies = shared.lambda_proxies.read();
         match proxies.get(&obj_class_id) {
-            Some(call_site) => call_site.functional_interface.clone(),
+            Some(call_site) => (
+                call_site.functional_interface.clone(),
+                call_site.functional_interface_id,
+            ),
             None => return Ok(None),
         }
     };
 
+    if std::env::var_os("CRATONVM_DBG_LAMBDA_DISPATCH").is_some() {
+        eprintln!(
+            "[DBG_LAMBDA] default-dispatch proxy={:?} method={}{} hint={:?}",
+            obj_class_id, method_name, method_descriptor, interface_id_hint
+        );
+    }
     let declaring_id = {
         let cm = shared.class_manager.read();
-        let Some(interface_id) = cm.get_loaded_class_id(&interface_name) else {
+        // Prefer the loader-resolved interface captured at bootstrap time:
+        // a bare name lookup returns an arbitrary copy when several loaders
+        // define the same interface, executing the default method in the
+        // wrong loader's context.
+        let Some(interface_id) =
+            interface_id_hint.or_else(|| cm.get_loaded_class_id(&interface_name))
+        else {
             return Ok(None);
         };
         match crate::classloading::find_method_recursive(
@@ -36776,6 +36817,7 @@ mod tests {
         // Register a lambda proxy with 3 capture types
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
+            functional_interface_id: None,
             functional_interface: Arc::from("test/Func"),
             sam_method_name: Arc::from("apply"),
             sam_descriptor: Arc::from("()V"),

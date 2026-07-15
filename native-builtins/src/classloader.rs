@@ -197,6 +197,25 @@ pub fn gc_reconcile_defining_loaders(
         .map(|(&cid, obj_ref)| (cid, obj_ref.as_ptr() as usize))
         .collect();
     cratonvm_types::loader_pin::replace_loader_pins(&pins);
+
+    // Same treatment for the loader-namespace side-table (object-keyed): drop
+    // entries whose loader was collected this cycle, remap survivors that
+    // moved. A pruned dead loader's address can then be reused by a NEW
+    // loader without inheriting the dead namespace.
+    let mut ns = loader_namespace_id_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    ns.retain_mut(|(obj_ref, _)| {
+        let old_addr = obj_ref.as_ptr() as usize;
+        if !is_marked(old_addr) {
+            return false;
+        }
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+        true
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,9 +1054,16 @@ pub(crate) fn is_user_defined_loader(ctx: &mut dyn NativeContext, this: ObjectRe
 /// In real-JDK mode that slot is a genuine `java.lang.ClassLoader` field and
 /// cannot be repurposed, so the id is keyed instead on the loader's STABLE
 /// identity hash. Holds only `i32 → u32` (no `ObjectRef`s) — no GC rooting.
-fn loader_namespace_id_store() -> &'static Mutex<std::collections::HashMap<i32, u32>> {
-    static INSTANCE: OnceLock<Mutex<std::collections::HashMap<i32, u32>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+fn loader_namespace_id_store() -> &'static Mutex<Vec<(ObjectRef, u32)>> {
+    // Keyed by the loader OBJECT, not its identity hash: identity hashes can
+    // collide across distinct loader instances (address-derived hashes recur
+    // after a collection reuses the region), and the old hash-keyed map never
+    // pruned dead loaders — a fresh per-compile loader (Spring TestCompiler's
+    // DynamicClassLoader) could inherit a dead sibling's namespace id and
+    // resolve THAT loader's same-named generated classes. Entries are
+    // remapped/pruned post-GC by [`gc_reconcile_defining_loaders`].
+    static INSTANCE: OnceLock<Mutex<Vec<(ObjectRef, u32)>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// Stable CratonVM loader-namespace id for a `ClassLoader` instance, allocating
@@ -1056,15 +1082,14 @@ pub(crate) fn loader_namespace_id(ctx: &mut dyn NativeContext, loader: ObjectRef
             return v as u32;
         }
     }
-    let ihc = ctx.identity_hash_code(loader);
     let mut map = loader_namespace_id_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if let Some(id) = map.get(&ihc) {
-        return *id;
+    if let Some(&(_, id)) = map.iter().find(|(l, _)| l.as_ptr() == loader.as_ptr()) {
+        return id;
     }
     let id = ctx.allocate_loader_id();
-    map.insert(ihc, id);
+    map.push((loader, id));
     id
 }
 
@@ -1083,12 +1108,12 @@ pub(crate) fn peek_loader_namespace_id(
             return Some(v as u32);
         }
     }
-    let ihc = ctx.identity_hash_code(loader);
     loader_namespace_id_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&ihc)
-        .copied()
+        .iter()
+        .find(|(l, _)| l.as_ptr() == loader.as_ptr())
+        .map(|&(_, id)| id)
 }
 
 /// True for a JDK dynamic-proxy class's internal name (`jdk/proxyN/$ProxyM` on
@@ -1398,6 +1423,11 @@ fn cl_load_class_base_delegation(
     let defer_to_find_class = cl_bootstrap_scoped()
         && (parent_is_null || parent_is_platform)
         && !is_bootstrap_class_name(&internal)
+        // A jar appended via Instrumentation.appendToBootstrapClassLoaderSearch
+        // belongs to the bootstrap loader: parent delegation must serve it
+        // BEFORE any findClass override defines a per-loader copy (Mockito
+        // asserts its injected MockMethodDispatcher has a null loader).
+        && !cratonvm_classloading::is_bootstrap_appended_class(&internal)
         && receiver_has_find_class_override;
     // JVM spec §5.3.2 — parent-first delegation:
     // 1. Check if this loader already loaded the class (findLoadedClass)
@@ -7348,11 +7378,10 @@ mod classloader_tests {
     fn test_reset_clears_real_jdk_loader_namespace_ids() {
         let mut ctx = MockNativeContext::new();
         let loader = new_object_ref(&mut ctx, "example/IsolatedLoader");
-        let ihc = ctx.identity_hash_code(loader);
         loader_namespace_id_store()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(ihc, 42);
+            .push((loader, 42));
 
         assert_eq!(peek_loader_namespace_id(&mut ctx, loader), Some(42));
 

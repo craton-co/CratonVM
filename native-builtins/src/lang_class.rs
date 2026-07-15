@@ -10875,15 +10875,33 @@ fn build_annotation_array(
     ctx: &mut dyn NativeContext,
     annotations: &[cratonvm_native_api::AnnotationData],
 ) -> ObjectRef {
+    build_annotation_array_for(ctx, None, annotations)
+}
+
+/// Like [`build_annotation_array`] but resolves each annotation TYPE through
+/// the declaring class's defining loader (HotSpot `AnnotationParser`'s
+/// "container"). Under classloader isolation (Spring's
+/// `@CompileWithForkedClassLoader` fork re-defines the whole framework), the
+/// member's declaring class and the framework code comparing annotation types
+/// live in the SAME loader; resolving the annotation type globally instead
+/// yields the app loader's copy and every `annotationType()` identity
+/// comparison silently fails (e.g. `@Autowired` detection returning no
+/// injection metadata).
+fn build_annotation_array_for(
+    ctx: &mut dyn NativeContext,
+    declaring_class_id: Option<ClassId>,
+    annotations: &[cratonvm_native_api::AnnotationData],
+) -> ObjectRef {
     let comp = annotation_component_class_id(ctx);
     let resolvable: Vec<&cratonvm_native_api::AnnotationData> = annotations
         .iter()
         .filter(|a| annotation_type_loadable(ctx, a))
         .collect();
+    let container_loader = declaring_class_id
+        .and_then(|cid| crate::classloader::defining_loader_for(cid.as_u32()));
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
-    // No container class here (non-cached array path) в†’ global Class resolution.
     build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
-        create_annotation_proxy(ctx, resolvable[i], None)
+        create_annotation_proxy(ctx, resolvable[i], container_loader)
     })
 }
 
@@ -11489,7 +11507,7 @@ pub(crate) fn native_field_get_annotations(
         }
     };
     let annotations = ctx.field_annotations(class_id, &field_name);
-    let arr = build_annotation_array(ctx, &annotations);
+    let arr = build_annotation_array_for(ctx, Some(class_id), &annotations);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -11604,7 +11622,7 @@ pub(crate) fn native_method_get_annotations(
             }
         }
     }
-    let arr = build_annotation_array(ctx, &annotations);
+    let arr = build_annotation_array_for(ctx, Some(class_id), &annotations);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -11746,7 +11764,7 @@ pub(crate) fn native_method_get_parameter_annotations(
     for i in 0..aligned_annotations.len() {
         let anns = aligned_annotations
             .get(i)
-            .map(|a| build_annotation_array(ctx, a))
+            .map(|a| build_annotation_array_for(ctx, Some(class_id), a))
             .unwrap_or_else(|| ctx.new_ref_array(inner_comp, 0));
         ctx.set_array_element(outer, i, Value::Object(Some(anns)));
     }

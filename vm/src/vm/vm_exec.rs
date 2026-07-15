@@ -4540,6 +4540,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             MethodHandleKind::from_tag(impl_ref_kind).unwrap_or(MethodHandleKind::InvokeStatic);
         let proxy_class_id = self.shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
+                functional_interface_id: None,
             functional_interface: Arc::from(functional_interface),
             sam_method_name: Arc::from(sam_method_name),
             sam_descriptor: Arc::from(sam_descriptor),
