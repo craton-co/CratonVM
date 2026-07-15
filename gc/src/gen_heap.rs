@@ -3165,6 +3165,10 @@ impl GenerationalHeap {
         // NON-MOVING sweep exactly as for a registered JIT frame (`is_active()`).
         let has_conservative_roots = crate::gc_quiescence::is_active()
             || crate::gc_quiescence::unregistered_jit_frame_on_stack();
+        // System.gc() requests an old-gen-inclusive cycle. Route that cycle
+        // through the non-moving marker so it can follow collection-overlay
+        // edges from live owners instead of globally rooting every overlay.
+        let explicit_full_gc = crate::gc_quiescence::major_gc_requested();
         // HIB-CV-22/32/33 ROOT FIX: only honor `promotion_oom_risk` as a reason
         // to divert into the non-moving sweep when there are un-rewritable
         // conservative JIT roots to protect. The non-moving sweep exists SOLELY
@@ -3214,7 +3218,8 @@ impl GenerationalHeap {
         let moving_young = moving_young_requested && !divert_for_incomplete_moving_coverage;
         let divert_non_moving = (has_conservative_roots && !moving_young_requested)
             || honor_promotion_oom_risk
-            || divert_for_incomplete_moving_coverage;
+            || divert_for_incomplete_moving_coverage
+            || explicit_full_gc;
         if watchref_dbg() {
             eprintln!(
                 "[watchref] collect_garbage_inner: has_conservative_roots={has_conservative_roots} moving_young_requested={moving_young_requested} divert_non_moving={divert_non_moving} force_moving={force_moving}"
@@ -3252,8 +3257,14 @@ impl GenerationalHeap {
             // path.  The shared marker retains every conservative root, while
             // the non-moving sweep only returns unreachable blocks to OldGen's
             // free lists and never invalidates a raw JIT pointer.
+            // In this path a pending System.gc() must still sweep old gen,
+            // even below the normal occupancy threshold. Consume the request
+            // here because the moving Phase-5 check below is skipped.
+            let major_requested = crate::gc_quiescence::take_major_gc_request();
             let old_capacity = self.old_gen_capacity();
-            if old_capacity > 0 && self.old_gen_used() >= old_capacity * 75 / 100 {
+            if old_capacity > 0
+                && (self.old_gen_used() >= old_capacity * 75 / 100 || major_requested)
+            {
                 let old_freed = self.sweep_old_gen_non_moving(roots);
                 result.0.stats.bytes_freed += old_freed;
                 self.stats

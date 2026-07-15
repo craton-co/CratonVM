@@ -238,7 +238,9 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         let class_mirrors = shared.class_mirrors.read();
         if cratonvm_native_builtins::classloader::loader_unload_enabled()
             && shared.config.gc_algorithm == crate::config::GcAlgorithm::Generational
-            && cratonvm_gc::gc_quiescence::is_active()
+            && (cratonvm_gc::gc_quiescence::is_active()
+                || cratonvm_gc::gc_quiescence::unregistered_jit_frame_on_stack()
+                || cratonvm_gc::gc_quiescence::major_gc_requested())
         {
             let cm = shared.class_manager.read();
             for (&class_id, obj_ref) in class_mirrors.iter() {
@@ -576,12 +578,15 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     invisible to ordinary field tracing. The moving/G1/ZGC paths retain
     //     the conservative global-root behavior because their marker has no
     //     stable-address overlay propagation. The Generational non-moving
-    //     marker, however, can propagate an overlay only after its OWNER has
-    //     been marked (gen_heap.rs): globally rooting every entry there turns a
-    //     dead scratch collection into a permanent root chain.
+    //     marker can propagate an overlay only after its OWNER has been marked
+    //     (gen_heap.rs). An explicit System.gc() also selects that non-moving
+    //     full-GC path so it can reclaim an otherwise-dead overlay owner rather
+    //     than globally rooting its transient compiler graph.
     let conditional_overlay_marking = shared.config.gc_algorithm
         == crate::config::GcAlgorithm::Generational
-        && cratonvm_gc::gc_quiescence::is_active();
+        && (cratonvm_gc::gc_quiescence::is_active()
+            || cratonvm_gc::gc_quiescence::unregistered_jit_frame_on_stack()
+            || cratonvm_gc::gc_quiescence::major_gc_requested());
     if !conditional_overlay_marking {
         cratonvm_native_collections::gc_scan_collection_overlay_roots(&mut roots);
     }
