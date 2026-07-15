@@ -224,11 +224,7 @@ resolved the wrong view and completed instead of erroring. Scheme detection now 
 parser (first stop char among `:/?#` must be `:`, ALPHA-start + alphanum/`+`/`-`/`.` name — the same
 rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is now 11/11 OK.
 
-Classes that FAIL in *batched* suite runs but pass solo at HotSpot parity (batch-context
-contamination — a prior class in the shared VM poisons a `<clinit>`; not yet root-caused, likely one
-more cross-class-state bug): `SseIntegrationTests` (solo 48 found / 42 succ / 6 aborted == HotSpot),
-`WebSocketIntegrationTests` (solo 72/72), `DefaultRenderingBuilderTests` (solo 11/11, batched shows
-`ExceptionInInitializerError` → `NoClassDefFoundError: ViewResolverSupport` on the redirect tests).
+**RETRACTED 2026-07-15**: the "batch-context `<clinit>` contamination" theorized below (classes failing only in batched suite runs, passing solo) was investigated further and is **NOT a CratonVM bug**. Root cause was Azure-host environment corruption, confirmed live: (1) `/home/victor/jdk25` (the symlink itself) had vanished mid-session — every `--java-home ~/jdk25` invocation failed with `path does not exist`, producing zero test output, easily misread as a VM hang; (2) separately, `/tmp` (the directory itself, not just stale contents) had vanished — `Tomcat.initBaseDir()` threw `IllegalStateException: Unable to create the directory [/tmp]`, which looks exactly like a filesystem native bug but is the OS directory missing. After `ln -sf /data/data/jdk25-real ~/jdk25` and `mkdir -p /tmp && chmod 1777 /tmp`, the exact same 8-class batch that previously showed `SseIntegrationTests` failing 9/48 (deterministically, 3/3 reruns) now passes 42/48 with 6 aborted, byte-for-byte matching the HotSpot baseline shape, and `DefaultRenderingBuilderTests` never reproduced its `ExceptionInInitializerError` again across 3 clean reruns of the identical batch order on the identical binary. See `azure-host-disk-full-flapping-20260715.md` memory (Claude's memory system) for the full host instability catalog.
 
 **Remaining OPEN reactive residuals:**
 *   `http.client.reactive.ClientHttpConnectorTests` — TIMEOUT. `StepVerifier` in `basic()` waits forever;
@@ -241,5 +237,4 @@ more cross-class-state bug): `SseIntegrationTests` (solo 48 found / 42 succ / 6 
     `Symbol#to_s`/string interpolation returns empty inside `eval` heredocs
     (`rubygems/specification.rb` generates `@ = nil` from `"@#{key} = nil"`), so the engine bootstrap
     fails with a SyntaxError. Not reactive-specific; JRuby's embedding is its own bug family.
-*   Batch-context `<clinit>` contamination (see above) — affects SSE/WebSocket/DefaultRenderingBuilder
-    only when many reactive classes share one VM; every one of them is green solo.
+*   ~~Batch-context `<clinit>` contamination~~ — RETRACTED, see above (host environment issue: missing /tmp + missing ~/jdk25 symlink, not CratonVM).
