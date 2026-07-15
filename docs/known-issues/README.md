@@ -4,6 +4,36 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-15 `WFLYCTL0079` (any extension) during `parallel-extension-add`: generalized to the existing `AttributeAccess` CCE doc; "JIT required" DISPROVED; one real site FIXED, residual re-characterized
+
+With the 2026-07-14 ObjectName fix below and the prior session's stale-`ObjectRef` fixes in place,
+WildFly standalone boot progresses well past `parallel-extension-add` into "Building security domain"
+before hitting `WFLYCTL0079: Failed initializing module org.wildfly.extension.io` (or, non-deterministically,
+almost any other extension). Investigation found this is **the same bug** as
+[`wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`](wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md)'s
+`ClassCastException: java.lang.Object cannot be cast to X` family, just generalized: repro batches hit it
+against `org.wildfly.extension.elytron`, `org.jboss.as.jaxrs`, `org.wildfly.extension.undertow`,
+`org.jboss.as.clustering.infinispan`, and `org.wildfly.extension.io` itself (twice), with cast targets
+`AttributeAccess`, `AttributeDefinition`, `Comparable`, `RegistrationPoint`, `CapabilityRegistration`,
+`Predicate`, and an `AttributeAccess$Flag[]` array — confirming the originally-reported module name is
+circumstantial (whichever of the ~37-42 concurrent `parallel-extension-add` worker threads reads a
+just-corrupted address first), not diagnostic. That doc's own "JIT is required" conclusion is **disproved**:
+the identical crash reproduces under `--nojit` (4/8 attempts). One genuine, narrow contributing site was
+found and FIXED —
+[`../internal/fixed-suite-bugs/wildfly-invoke-virtual-lambda-sam-compat-stale-locals-FIXED.md`](../internal/fixed-suite-bugs/wildfly-invoke-virtual-lambda-sam-compat-stale-locals-FIXED.md):
+`vm/src/vm/vm_exec.rs::invoke_virtual`'s lambda-dispatch decision point read `receiver`/`args` again,
+unpinned, after its own `.filter()` predicate's `lambda_args_sam_compatible` call (which can trigger class
+loading) — fixed by pinning both across that window. Verified via `cargo test -p cratonvm-vm --lib`
+(2202 passed / 9 pre-existing `--release`-only failures, identical before/after via `git stash`), zero
+regressions. **Does not close the residual**: matched before/after repro batches show the same overall
+`WFLYCTL0079` rate (5/12 both). A live diagnostic (temporary instrumentation, not landed) proved the
+remaining stale reads go through the codebase's existing pin-protection path (`via_pin=true`) and are
+*still* stale — ruling out "yet another missed-pin site" and pointing instead at a cross-thread
+GC-root-visibility/timing race across WildFly's ~37-42 concurrently-executing worker threads, a
+meaningfully different (though related) characterization than the original doc's JIT-only
+`SB-CRASH-04` attribution. See that doc's own 2026-07-15 follow-up section for the full evidence chain;
+still OPEN, deliberately not further patched (deep GC/threading infrastructure work).
+
 ## 2026-07-14 WildFly standalone boot ObjectName `_ca_array` NPE FIXED (100% boot blocker, open since 2026-07-10's "Bug 3a")
 
 - FIXED (moved to `docs/internal/fixed-suite-bugs/`): [`wildfly-standalone-boot-objectname-ca-array-npe-FIXED.md`](../internal/fixed-suite-bugs/wildfly-standalone-boot-objectname-ca-array-npe-FIXED.md) -- bisected regression (introduced by `d8092acb`, the same "fix-tests-real-jdk-contracts" commit responsible for the `String.getBytes()`/`java.util.Properties`/JMX-native-surface regressions in this file) that blocked 100% of WildFly-standalone-boot attempts on real JDK25, on the very first JMX MBean registration. Root cause: `d8092acb` correctly stopped `MBeanServerFactory.createMBeanServer` from being unconditionally shadowed by a synthetic server in real-JDK mode, which let real bytecode reach `Repository.addNewDomMoi` -> `ObjectName.getCanonicalKeyPropertyListString()` for the first time -- a method never natively covered against the synthetic 1-field `ObjectName` model (already known and deliberately left unfixed as "Bug 3a" in `managerwebapp-deploy-bare-assertion-FIXED.md`, 2026-07-10, when the synthetic-server shadow was still masking it). Fixed by adding `getCanonicalKeyPropertyListString`/`isPattern`/`isDomainPattern`/`isPropertyPattern`/`isPropertyListPattern` natives derived from the same canonical-string text model the rest of `ObjectName`'s natives already use. Note: a concurrent same-day fix below (`6a0eedd8`) independently re-masks `getPlatformMBeanServer()` (fixing its own, broader JMX-native-surface regression), so the *specific* WildFly boot path no longer exercises this fix either -- but the underlying `ObjectName` defect is now genuinely closed, not just re-masked, closing Bug 3a for good.
