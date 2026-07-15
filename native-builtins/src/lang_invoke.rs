@@ -5109,6 +5109,28 @@ pub(crate) const MH_KIND_INVOKER: i32 = 20;
 /// by the leading original arguments that fit the handler's type.
 pub(crate) const MH_KIND_CATCH: i32 = 21;
 
+/// Return-value-filtering adapter produced by `MethodHandles.filterReturnValue`.
+/// `MH_BOUND` holds a 2-field wrapper: field 0 = target MH, field 1 = filter MH
+/// (unary, applied to the target's return value). Dispatch invokes `target`
+/// with the incoming args, then passes its result through `filter`, returning
+/// the filter's result in place of the target's raw one.
+///
+/// Was previously a no-op stub (`filterReturnValue` returned `target`
+/// unchanged, silently dropping `filter`). JRuby 10.x's
+/// `org.jruby.runtime.invokedynamic.VariableSite.ivar` bootstrap builds its
+/// instance-variable-getter call-site targets by filtering the raw
+/// `IRubyObject.getInstanceVariable(String)` result (which is a genuine Java
+/// `null` for an unset ivar -- normal at that raw layer) through a handle that
+/// substitutes the JRuby runtime's `nil` singleton. With the filter dropped,
+/// `mh.invoke()` returned the raw `null` straight through; the caller (e.g.
+/// `@canonical_segments ||= ...`'s truthiness test) then fed that `null` into
+/// `org.jruby.ir.targets.indy.IsTrueSite.init`, which unconditionally calls
+/// `obj.getRuntime()` on it -- `NullPointerException`. Found chasing the
+/// residual `JRubyScriptTemplateTests` failure left after the array-vs-scalar
+/// SAM-mismatch fix (2026-07-15); `require 'erb'; require 'ostruct'` alone
+/// reproduces it standalone, no Spring needed.
+pub(crate) const MH_KIND_RETURN_FILTER: i32 = 22;
+
 // ---------------------------------------------------------------------------
 // Round-9 perf: LambdaMetafactory CallSite cache.
 // ---------------------------------------------------------------------------
@@ -5847,6 +5869,44 @@ fn mh_dispatch_catch(
         other => other,
     }
 }
+
+/// `MethodHandles.filterReturnValue` dispatch (`MH_KIND_RETURN_FILTER`).
+/// `bound` is the 2-field wrapper (target MH, filter MH). Invokes `target`
+/// with the incoming args, then passes its result through the unary `filter`
+/// handle, returning the filter's result. A `void`-returning target (mh_
+/// dispatch yields `Ok(None)`) is paired only with a zero-arg filter per the
+/// JDK contract (the filter's sole parameter type must match the target's
+/// return type), so the filter is invoked with no arguments in that case.
+fn mh_dispatch_return_filter(
+    ctx: &mut dyn NativeContext,
+    bound: Value,
+    extra_args: &[Value],
+) -> MethodCallResult {
+    let wrapper = match bound {
+        Value::Object(Some(w)) => w,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let target = match ctx.get_field(wrapper, 0) {
+        Value::Object(Some(t)) => t,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let filter = match ctx.get_field(wrapper, 1) {
+        Value::Object(Some(f)) => f,
+        // No filter -> behave like the bare target.
+        _ => return mh_dispatch(ctx, target, extra_args),
+    };
+    // GC-safety: `mh_dispatch(ctx, target, ...)` below can trigger a
+    // collection that relocates `filter` (captured above, read again after).
+    let filter_pin = ctx.pin_native_root(filter);
+    let result = mh_dispatch(ctx, target, extra_args)?;
+    let filter = ctx.read_native_pin(filter_pin, filter);
+    ctx.unpin_native_roots(filter_pin);
+    match result {
+        Some(v) => mh_dispatch(ctx, filter, &[v]),
+        None => mh_dispatch(ctx, filter, &[]),
+    }
+}
+
 pub(crate) fn mh_dispatch(
     ctx: &mut dyn NativeContext,
     mh: cratonvm_types::ObjectRef,
@@ -6434,6 +6494,7 @@ pub(crate) fn mh_dispatch(
         MH_KIND_FILTER => mh_dispatch_filter(ctx, bound, extra_args),
         MH_KIND_FOLD => mh_dispatch_fold(ctx, bound, extra_args),
         MH_KIND_CATCH => mh_dispatch_catch(ctx, bound, extra_args),
+        MH_KIND_RETURN_FILTER => mh_dispatch_return_filter(ctx, bound, extra_args),
         MH_KIND_INVOKER => {
             // `MethodHandles.exactInvoker`/`invoker`/`spreadInvoker`: the
             // target handle is the FIRST incoming argument (not captured at
@@ -7971,9 +8032,43 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         mhs,
         "filterReturnValue",
         "(Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodHandle;)Ljava/lang/invoke/MethodHandle;",
-        |_ctx, args| {
-            // Simplified: return the target MH unchanged
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+        |ctx, args| {
+            // filterReturnValue(target, filter): invoke target, then pass its
+            // result through the unary filter, returning the filter's result.
+            // See MH_KIND_RETURN_FILTER's doc comment for why this can no
+            // longer be the earlier "return target unchanged" simplification
+            // (JRuby's ivar-getter call sites rely on this filter step to
+            // substitute the runtime `nil` singleton for a raw Java `null`).
+            let target = match args.first() {
+                Some(Value::Object(Some(t))) => *t,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let filter = match args.get(1) {
+                Some(Value::Object(Some(f))) => *f,
+                // No filter -> behaves like the identity wrapper over target.
+                _ => return Ok(Some(Value::Object(Some(target)))),
+            };
+            let wrapper = alloc_concurrent_synthetic(ctx, "__mh_retfilter_wrapper__", 2);
+            ctx.set_field(wrapper, 0, Value::Object(Some(target)));
+            ctx.set_field(wrapper, 1, Value::Object(Some(filter)));
+            // The adapter's parameter types match the target's; its return
+            // type matches the filter's return type (JDK contract: the
+            // filter's sole parameter type must equal the target's return
+            // type, and the filter's own return type becomes the adapter's).
+            let target_desc = mh_type_descriptor(ctx, target)
+                .or_else(|| mh_read_desc(ctx, target))
+                .unwrap_or_default();
+            let filter_desc = mh_type_descriptor(ctx, filter).or_else(|| mh_read_desc(ctx, filter));
+            let desc = match (filter_desc, target_desc.rfind(')')) {
+                (Some(fd), Some(paren)) => {
+                    format!("{}){}", &target_desc[..paren], return_type_desc(&fd))
+                }
+                _ => target_desc,
+            };
+            let adapter =
+                alloc_method_handle(ctx, "__adapter__", "retfilter", &desc, MH_KIND_RETURN_FILTER);
+            ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
+            Ok(Some(Value::Object(Some(adapter))))
         },
     );
     // foldArguments(target, combiner): fold at position 0.
