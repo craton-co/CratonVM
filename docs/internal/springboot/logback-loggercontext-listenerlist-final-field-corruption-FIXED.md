@@ -5,17 +5,21 @@
 ## Resolution
 
 The original heap/GC diagnosis was incorrect. CratonVM registered
-`LoggerContext.<init>()V` as a no-op in two native-bridge paths, while the
-SLF4J `StaticLoggerBinder` native allocated a real-classed `LoggerContext`
-directly instead of invoking its constructor. Consequently the object had the
-real 27-slot layout but its final `loggerContextListenerList` field (slot 17)
-was never initialized.
+`LoggerContext.<init>()V` as a no-op in three native-registration paths, while
+the SLF4J `StaticLoggerBinder` native allocated a real-classed
+`LoggerContext` directly instead of invoking its constructor. Consequently the
+object had the real 27-slot layout but its final `loggerContextListenerList`
+field (slot 17) was never initialized.
 
 The binder now calls `NativeContext::new_object_initialized` for
-`LoggerContext`, and the two no-op constructor registrations were removed.
+`LoggerContext`; every no-op constructor registration and every
+constructor-bypass shim for `ContextBase` state was removed. Logback now owns
+its real context maps, status manager, and turbo-filter list in both native
+registration modes.
 
-Verified with Spring Boot 4.2.0-SNAPSHOT and Logback 1.5.34 using the unique
-`cratonvm-springboot-logback-listenerfield-realctor-20260715-001.exe` binary:
+Final verification used Spring Boot 4.2.0-SNAPSHOT and Logback 1.5.34 with
+the unique
+`cratonvm-springboot-logback-listenerfield-fullstate-20260715-002.exe` binary:
 
 - `BannerTests`: 6/6 pass with `--nojit`.
 - `BannerTests`: 6/6 pass with JIT enabled.

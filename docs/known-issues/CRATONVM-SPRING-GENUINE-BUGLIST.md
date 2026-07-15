@@ -320,14 +320,133 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
 **RETRACTED 2026-07-15**: the "batch-context `<clinit>` contamination" theorized below (classes failing only in batched suite runs, passing solo) was investigated further and is **NOT a CratonVM bug**. Root cause was Azure-host environment corruption, confirmed live: (1) `/home/victor/jdk25` (the symlink itself) had vanished mid-session — every `--java-home ~/jdk25` invocation failed with `path does not exist`, producing zero test output, easily misread as a VM hang; (2) separately, `/tmp` (the directory itself, not just stale contents) had vanished — `Tomcat.initBaseDir()` threw `IllegalStateException: Unable to create the directory [/tmp]`, which looks exactly like a filesystem native bug but is the OS directory missing. After `ln -sf /data/data/jdk25-real ~/jdk25` and `mkdir -p /tmp && chmod 1777 /tmp`, the exact same 8-class batch that previously showed `SseIntegrationTests` failing 9/48 (deterministically, 3/3 reruns) now passes 42/48 with 6 aborted, byte-for-byte matching the HotSpot baseline shape, and `DefaultRenderingBuilderTests` never reproduced its `ExceptionInInitializerError` again across 3 clean reruns of the identical batch order on the identical binary. See `azure-host-disk-full-flapping-20260715.md` memory (Claude's memory system) for the full host instability catalog.
 
 **Remaining OPEN reactive residuals:**
-*   `http.client.reactive.ClientHttpConnectorTests` — TIMEOUT. `StepVerifier` in `basic()` waits forever;
-    at dump time the Jetty client pool and MockWebServer-side threads are idle and no
-    okhttp/MockWebServer accept thread is visible. Also: the T19.H1 watchdog stack-dump itself SIGSEGVs
-    when JIT frames are on the stacks (separate small bug; `--nojit` dumps work).
-*   `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` — pathological
+*   `http.client.reactive.ClientHttpConnectorTests` — **PARTIALLY FIXED 2026-07-15**
+    (`fix/jdkclient-patch-hang-20260715`, commit `8e47b8a9`). Root-caused ONE genuine mechanism: the
+    `java.net.http.HttpClient` native implementation (RE.5, `net_phase_e.rs`) performs its
+    "async" `sendAsync()` synchronously on the calling thread via raw `TcpStream`
+    connect/write/read (30s socket timeout) and a request-body `Publisher`-draining condvar wait
+    (10s), neither of which was bracketed with `begin_blocking_region()`/`end_blocking_region()` —
+    unlike every other blocking native I/O call in the same file. A concurrent Stop-The-World pause
+    (GC/JIT takeover) then waits indefinitely on this uncooperative thread, while the SAME pause is
+    what freezes the real Java thread on the other end of the socket (e.g. MockWebServer's response
+    dispatcher) that this thread is blocked waiting to hear from — a genuine deadlock. Live capture
+    (`CRATONVM_DBG_RE5=1`, new diagnostic) caught it in the act: a `DELETE` request's write
+    succeeded, then the response read blocked the full 30s and failed with `WouldBlock`, with a
+    `"STW cross-thread JIT takeover is still waiting for cooperative mutators rounds=64 pending=1
+    taken=0"` warning firing mid-block. Confirmed CratonVM-specific and connector-specific:
+    HotSpot ran the identical 32-request sequential-`MockWebServer` probe (`ReactorNetty`/`Jetty`/
+    `HttpComponents`/`Jdk` × 8 HTTP methods each, reusing one connector instance per type) 8/8 clean;
+    CratonVM hit the hang on ~2/13 attempts, always on the `Jdk` connector, never the other 3 (which
+    don't route through this raw-socket path). Fixed both blocking sites; verified 15/15 clean on the
+    same probe post-fix, `cargo test -p cratonvm-native-builtins --lib` 2996/0.
+    ~~**Still OPEN residual investigated 2026-07-15**~~ (`fix/httpconn-residual-20260715`, commit
+    `91cb806c`). Bisected the "which of the other 3 connectors" question with a
+    `FullMatrixProbe`-style stress harness plus a from-scratch JUnit launcher driving the real
+    `ClientHttpConnectorTests` class (49 sub-tests) directly under CratonVM, both stress-run
+    dozens of times with `sudo gdb -p <pid> --batch -ex 'thread apply all bt'` snapshots captured
+    live on reproduced hangs (Jetty `TRACE`, Jdk `OPTIONS`/`DELETE` all reproduced the shape).
+    **Found and fixed two genuine instances of the same missing-`begin_blocking_region` bug
+    pattern**, but in the *shared* `java.net.Socket`/`java.net.ServerSocket` implementation
+    (`native-builtins/src/plain_socket.rs`, JDK13+'s `NioSocketImpl` backing both classes) rather
+    than in any one connector's own code — `java.net.ServerSocket.accept()` is what MockWebServer
+    itself uses to accept every connection for all 4 connector cases:
+      - `socket_accept()`: `listener.accept()` (both the `SO_TIMEOUT` busy-poll branch and the
+        unbounded branch) was never bracketed in `begin_blocking_region`/`end_blocking_region`.
+      - `socket_connect()`: worse than just missing the STW bracket — `connect()`/`connect_timeout()`
+        ran *inside* `with_socket()`'s closure, which holds the single global socket-registry
+        write lock for the call's duration, serializing every other blocking `Socket` op
+        process-wide for as long as the connect takes.
+    Applied the same fix defensively to `native-io/src/socket_channel.rs`'s blocking-mode
+    `SocketChannel` paths (`sc_connect_inner`'s `allow_block` branch, `sc_read`/`sc_write`), which
+    match the identical pattern but were not directly confirmed as hit by these connectors (all
+    3 remaining connectors configure their channels non-blocking).
+    **However, direct gdb evidence shows this missing-wrap pattern is NOT what actually causes the
+    residual hangs.** Every reproduced hang (both pre- and post-fix, including from the real
+    `ClientHttpConnectorTests` class itself) showed: zero threads parked in an unwrapped blocking
+    `accept`/`connect`/`read`/`write` syscall; zero `"STW cross-thread JIT takeover is still
+    waiting for cooperative mutators"` warnings; and thread counts that *dropped* between
+    successive snapshots 4s apart (proving forward progress, not a permanent deadlock). What IS
+    reproducibly visible at every capture: one thread executing `vm/src/runtime/interpreter.rs`'s
+    JIT-to-interpreter transition (`jit_invoke_virtual_mic` → `invoke_on_class_shared_inner` →
+    `execute()` at `interpreter.rs:4163`) deep-cloning a method's `CodeAttribute` — specifically its
+    `LineNumberEntry`/`LocalVariableEntry` vectors (`reader/src/attribute.rs::clone()`) — taking
+    multiple seconds, in one capture while another thread waited on a `ConcurrentHashMap` per-bin
+    monitor (`native_chm_compute` → `monitor_enter_gc_safe`, itself correctly GC-safe) presumably
+    held by a thread doing the same slow clone. This looks like severe, non-deterministic
+    interpreter/attribute-cloning + lock-contention slowness under the heavy thread-pool
+    accumulation the 45-sub-test class produces in one process (76+ live threads by sub-test 6),
+    not a deadlock — StepVerifier's wait just outlasts whatever timeout the harness enforces.
+    **Verification**: `cargo test -p cratonvm-native-builtins --lib` 2996/0 and
+    `cargo test -p cratonvm-native-io --lib` 349/0 unchanged (no regression). Stress comparison
+    of the fix vs. pre-fix binary was inconclusive/confounded (both showed hangs at broadly
+    similar rates under concurrent-load conditions on the shared build host) — the fix is landed
+    because it closes a real, verified bug of the exact hypothesized pattern, not because it was
+    confirmed to eliminate this residual. **Still OPEN**: the interpreter/attribute-cloning
+    slowness above is the real next step, flagged separately for a dedicated investigation (not a
+    quick missing-wrap fix — needs profiling why `CodeAttribute` line-number/local-variable data is
+    deep-cloned per invocation instead of shared/cached).
+    Also unfixed: the T19.H1 watchdog stack-dump itself SIGSEGVs when JIT frames are on the stack
+    (separate small bug; `--nojit` dumps work).
+*   `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` —
+    pathological slowness (>1800s vs HotSpot's 13s, 160 tests). **2026-07-15 update**: confirmed
+    genuine forward progress, not a hang (frame counts change across successive
+    `--stack-dump-on-timeout` watchdog dumps — the watchdog fires repeatedly during a single run,
+    which doubles as a free sampling profiler: 10,970 dumps captured over ~40s). Aggregating the
+    innermost non-framework frame across all dumps found the hot path: **`ConfigurationClassParser.
+    parse`** (6004 samples), **`AbstractHttpHandlerIntegrationTests.startServer`** (5970), and —
+    disproportionately — raw **Xerces XML parsing** (`XML11Configuration.parse` 4638 samples,
+    `XMLDTDValidator.emptyElement` 1986, full SAX/DTD-scanning call chain beneath it) — roughly
+    **42% of all sampled CPU time** inside Xerces, for a workload (annotation-`@Configuration`
+    Spring context + embedded Tomcat/Reactor/Jetty bootstrap, 160x) that should barely touch XML
+    parsing at all. `org/apache/catalina/util/LifecycleBase.start` (2751) confirms embedded Tomcat
+    startup as a major contributor — Tomcat's own bootstrap parses internal
+    `web.xml`/`web-fragment.xml`-shaped descriptors (with DTD validation) even for a minimal
+    reactive server, once per test-created server instance. **Leading hypothesis**: CratonVM's
+    Xerces execution has a performance bug (missing JIT tier-up for Xerces's hot methods — matching
+    the already-documented `jit-instance-methods-no-invocation-tierup` family — or per-native-call
+    dispatch overhead compounding across Xerces's very high internal call count per parse, matching
+    the already-fixed-but-precedent-setting `HashMap native-dispatch overhead` investigation) rather
+    than a fixed per-file cost, since the SAME small descriptor is likely reparsed from scratch on
+    every one of the 160 tests' server instantiations. **Next step**: isolate a minimal repro
+    (`DocumentBuilderFactory`/`SAXParserFactory` parsing a small DTD-validated XML file in a tight
+    loop, timed vs HotSpot) to get a clean per-parse ratio, then decide whether the fix is JIT
+    tier-up eligibility for Xerces's classes or a native-dispatch hot-path optimization; if a DTD/
+    entity cache is supposed to make repeat parses of the same descriptor cheap on HotSpot, verify
+    that cache is actually effective under CratonVM's classloading model.
     slowness, see section 2 above.
-*   `web.reactive.result.view.script.JRubyScriptTemplateTests` — JRuby-on-CratonVM: Ruby
-    `Symbol#to_s`/string interpolation returns empty inside `eval` heredocs
-    (`rubygems/specification.rb` generates `@ = nil` from `"@#{key} = nil"`), so the engine bootstrap
-    fails with a SyntaxError. Not reactive-specific; JRuby's embedding is its own bug family.
+*   `web.reactive.result.view.script.JRubyScriptTemplateTests` — JRuby-on-CratonVM: JRuby's own
+    bundled `rubygems/specification.rb` bootstrap fails with a Ruby-level `SyntaxError` from code it
+    generates itself: `#{@@nil_attributes.map {|key| "@#{key} = nil" }.join "; "}` (a Ruby
+    string interpolation reading a `.map {|key| ...}` block parameter, inside JRuby's own
+    precompiled-to-JVM-bytecode stdlib) interpolates `key` as EMPTY instead of the Symbol's name,
+    producing malformed generated Ruby source (`"@ = nil; @ = nil; ..."`) that a second, inner
+    `Kernel#eval` then rejects. **2026-07-15 update**: minimal standalone repro isolated (no Spring
+    needed — `ScriptEngineManager().getEngineByName("jruby").eval(...)` alone triggers it during
+    JRuby's own lazy bootstrap, before any user script runs); confirmed CratonVM-specific
+    (`Symbol#to_s` and simple top-level `"#{key}"` interpolation both work correctly in isolation —
+    the bug is specific to a block-parameter interpolated inside JRuby's own PRE-COMPILED bytecode,
+    not JRuby's general interpolation mechanism). Found a concrete, reproducible clue: 5
+    `[GC-ARRAY-GUARD] array_length(non-array)` warnings fire (`class_id=1013` in one run,
+    consistently 5 of them — matching `@@nil_attributes`' likely element count) at the EXACT moment
+    the interpolation corrupts, from `gc/src/gen_heap.rs:2314`'s defensive guard (a raw JVM
+    `arraylength` bytecode instruction executing against a heap object CratonVM's GC does NOT
+    consider an array — silently returns 0 instead of crashing). `CRATONVM_DBG_STALE_OBJREF=1`
+    was tried but did NOT visibly fire for this repro (inconclusive either way — this assertion has
+    known coverage gaps for other bug families, per `stream-arraylist-gc-pressure-heap-corruption-
+    found-20260714.md`). **Leading hypothesis, not confirmed**: a stale/wrong `ObjectRef` — the
+    JVM bytecode JRuby's own compiler emitted for this interpolation legitimately expects an array
+    (its own internal representation of the block-parameter/interpolation-piece list), but by the
+    time the `arraylength` instruction executes, the reference has been relocated/reused to point at
+    a non-array object — matching the broader stale-ObjectRef bug family already extensively
+    tracked in this codebase (see `wildfly-parallel-boot-stale-objectref-residual.md`,
+    `stale-objectref-static-sweep-20260711.md`) but not yet localized to a specific call site here.
+    **Next step**: reproduce under `RUST_BACKTRACE=1` + the `CRATONVM_GC_ARRAY_GUARD_BT=1` backtrace
+    (already captured once — the backtrace bottoms out in the raw interpreter `arraylength` opcode
+    handler, `interpreter.rs:8638`, giving no further attribution on its own) combined with a
+    JRuby-side decompile of the exact bytecode `specification.rb`'s `set_nil_attributes_to_nil`
+    heredoc-eval compiles to (JRuby ships this stdlib file pre-compiled; extract the `.class`
+    equivalent from the `jruby-stdlib` jar with `javap` to see the literal `arraylength`
+    instruction's context) to identify which allocation/GC event upstream could relocate the
+    reference this instruction reads. Not reactive-specific; a fix here likely benefits any JRuby
+    (or generally: any dynamic-bytecode-generating library that emits `arraylength`) workload.
 *   ~~Batch-context `<clinit>` contamination~~ — RETRACTED, see above (host environment issue: missing /tmp + missing ~/jdk25 symlink, not CratonVM).
