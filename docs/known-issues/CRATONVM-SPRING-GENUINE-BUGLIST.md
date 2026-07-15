@@ -359,7 +359,7 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     don't route through this raw-socket path). Fixed both blocking sites; verified 15/15 clean on the
     same probe post-fix, `cargo test -p cratonvm-native-builtins --lib` 2996/0.
     ~~**Still OPEN residual investigated 2026-07-15**~~ (`fix/httpconn-residual-20260715`, commit
-    `4a98f066`). Bisected the "which of the other 3 connectors" question with a
+    `91cb806c`). Bisected the "which of the other 3 connectors" question with a
     `FullMatrixProbe`-style stress harness plus a from-scratch JUnit launcher driving the real
     `ClientHttpConnectorTests` class (49 sub-tests) directly under CratonVM, both stress-run
     dozens of times with `sudo gdb -p <pid> --batch -ex 'thread apply all bt'` snapshots captured
