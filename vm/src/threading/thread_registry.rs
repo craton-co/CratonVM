@@ -1188,6 +1188,26 @@ impl ThreadRegistry {
     /// for `thread_id` (see `ThreadEntry::os_tid`). Called by the thread
     /// itself at startup, before it can execute any Java/JIT code.
     pub fn set_os_tid_current(&self, thread_id: ThreadId) {
+        // CRATONVM_DBG_BLOCKED_ACCESS: register THIS thread's authoritative
+        // `in_blocked_region` flag with the gc crate's heap-access canary,
+        // which cannot reach the `JvmThread` from the `get_header` funnel.
+        // Like the os_tid publish itself, this always runs on the owning
+        // thread at startup (main / spawned / native-carrier). No-op when the
+        // gate is off. The leaked `Arc<GcBlockState>` clone (debug-gated, one
+        // per thread) pins the flag's address for the process lifetime, which
+        // is the safety contract `register_self_blocked_flag` requires.
+        if cratonvm_gc::blocked_access_debug::enabled() {
+            let threads = self.threads.lock();
+            if let Some(entry) = threads.get(&thread_id) {
+                let keep = entry.gc_block_state.clone();
+                let flag: *const std::sync::atomic::AtomicBool = &keep.in_blocked_region;
+                std::mem::forget(keep);
+                // SAFETY: `flag` points into the leaked Arc's referent above,
+                // so it stays valid for the process lifetime; only the owning
+                // thread reads it back through its TLS slot.
+                unsafe { cratonvm_gc::blocked_access_debug::register_self_blocked_flag(flag) };
+            }
+        }
         #[cfg(windows)]
         {
             #[link(name = "kernel32")]

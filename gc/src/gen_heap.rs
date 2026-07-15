@@ -1572,6 +1572,16 @@ impl GenerationalHeap {
                 fwd_ptr,
             );
         }
+        // CRATONVM_DBG_BLOCKED_ACCESS: a header access on a thread whose own
+        // `in_blocked_region` flag is raised races any concurrently running
+        // collection — the STW census excluded this thread, so nothing on it
+        // may touch the heap until `check_post_block_gc` re-syncs it. No-op
+        // (one cached-bool branch) when the gate is off. See
+        // `blocked_access_debug` for the full rationale.
+        crate::blocked_access_debug::check_blocked_access(
+            "heap header access",
+            obj_ref.as_ptr() as usize,
+        );
         header
     }
 

@@ -1,6 +1,12 @@
 # WildFly domain boot: `WFLYHC0053` inventory transport resolved; server-output reader residual remains
 
-Status: OPEN — the `WFLYHC0053` inventory timeout itself is fixed. This record remains open only for the newly exposed moving-GC stale-reference residual described below.
+Status: OPEN — narrowed twice. The `WFLYHC0053` inventory timeout itself is fixed (2026-07-14), and the
+StreamDecoder stale-buffer residual below is fixed (2026-07-15, `21c5d6f6`). What keeps this record open
+is only the final "both managed servers reach WFLYSRV0025" bar: managed servers now launch, connect, and
+register, but full server start was blocked during verification by the (since-fixed) STW/CHM boot wedges
+tracked in `wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md` (2026-07-15
+follow-up) and by shared-host load; see "2026-07-15 verification" below for exactly how far each probe
+got.
 
 ## Fixed and removed from the active issue scope (2026-07-14)
 
@@ -16,19 +22,52 @@ Two adjacent GC-safety defects exposed by the now-progressing boot were fixed in
 
 With the unique remote binary `/data/bin/cratonvm-wildfly-hc0053-complete-20260714-231440`, a fresh WildFly 32.0.1.Final no-JIT domain probe passed the former handshake point, produced neither `Invalid command byte` nor `WFLYHC0053`, and launched both `Server:server-one` and `Server:server-two`.
 
-## Remaining residual (not fixed in this checkpoint)
+## Fixed 2026-07-15: the StreamDecoder server-output reader residual
 
-With `CRATONVM_DBG_STALE_OBJREF=1`, both launched server stderr-reader threads later fail the stale-reference canary while executing `java/io/InputStreamReader.read([CII)I`. The reported object is an array. Real-mode `InputStreamReader` delegates to `sun.nio.cs.StreamDecoder`; `native-io/src/stream_decoder.rs::decode_into` allocates a temporary byte array, invokes `InputStream.read([BII)I` (which may trigger a moving GC), then reads the temporary array through its pre-GC raw reference. This is the next concrete defect to fix: pin and refresh that temporary buffer, and also preserve any destination array used after the delegate call, then repeat clean no-JIT and JIT domain boots.
+The previous "Remaining residual" — both launched servers' stderr-reader threads failing the
+`CRATONVM_DBG_STALE_OBJREF` canary inside `java/io/InputStreamReader.read([CII)I` — is fixed on branch
+`fix/wildfly-gc-pin-stream-20260715` (commit `21c5d6f6`, merged to dev with this doc update).
+`native-io/src/stream_decoder.rs::decode_into` held three raw refs across its GC-capable refill window
+(the temporary byte array across the potentially blocking `InputStream.read([BII)I` invoke; the
+destination char array and `this` across the same window); `native_sd_read` re-used `this`+`out` across
+`decode_into` iterations unpinned; `native_sd_close` re-used `this` after re-entering Java via
+`close()`. All now pin and re-read through `native_pin_roots` per the Family-1 contract.
 
-This residual is distinct from the resolved Process Controller inventory defect. It must remain under investigation until the stale-reference canary and clean repeated probes both pass.
+Verified: three no-JIT domain probes with `CRATONVM_DBG_STALE_OBJREF=1` (2026-07-15, fixed binary)
+produced **zero canary firings anywhere in the process** — previously both server stderr-reader threads
+tripped it. `cargo test -p cratonvm-native-io --lib`: 349 passed.
+
+## 2026-07-15 verification state (why this record is still open)
+
+Domain probes on the fixed binaries (Azure host, WildFly 32.0.1.Final, unique loopback/ports; logs under
+`/data/wt-wfgc-20260715/probes/`):
+
+- No `Invalid command byte`, no `WFLYHC0053`, no stale-canary firing in any probe (6+ runs, no-JIT and
+  JIT, plain and canary-flagged).
+- The Host Controller completes its own boot (`WFLYSRV0025 ... (Host Controller) started`), both managed
+  server processes are spawned (`Starting process 'Server:server-one'`/`'server-two'`) and register
+  (`WFLYHC0020: Registering server server-two`), and both emit `WFLYSRV0049 ... starting` on the console.
+- Neither server reached its own `WFLYSRV0025 started` within the probe timeouts. Two boot-wide wedge
+  mechanisms in exactly this window (a census-counted CHM segment-monitor deadlock against the STW
+  barrier, and a segment-monitor ↔ registry-RWLock ordering cycle) were root-caused and fixed during
+  this same session — see the 2026-07-15 follow-up in
+  `wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`. The HC itself was measured
+  stalling for minutes per STW pause pre-fix (`STW cross-thread JIT takeover ... rounds=64` in the HC
+  log), which starved the server-registration sync; that marker is gone post-fix. The remaining
+  verification gap is a clean post-fix domain run on a quiet host reaching `WFLYSRV0025` in both
+  server logs.
 
 ## Verification completed for committed changes
 
 - `cargo test -p cratonvm-native-builtins jboss_msc --lib`: 18 passed.
 - `cargo test -p cratonvm-native-builtins net_phase_e --lib`: 36 passed.
 - `cargo test -p cratonvm-native-collections --lib`: 72 passed.
-- Remote fresh WildFly 32.0.1.Final domain probe reached managed-server launch and cleared the original protocol failure.
+- `cargo test -p cratonvm-native-io --lib`: 349 passed (2026-07-15).
+- Remote fresh WildFly 32.0.1.Final domain probe reached managed-server launch and cleared the original protocol failure; 2026-07-15 probes additionally cleared the stale-canary bar and reached both-servers-registering.
 
 ## Next step
 
-Fix the StreamDecoder temporary-buffer lifetime described above, rebuild a uniquely named binary, and require at least one stale-canary no-JIT run plus clean no-JIT and JIT domain boots with both managed servers started before resolving this record.
+Re-run the no-JIT and JIT domain probes against a dev build containing `21c5d6f6` + `7831ce2c` +
+`b1ac28f3` on a host with load ≤ cores, with generous (≥900 s) timeouts, and confirm
+`domain/servers/server-{one,two}/log/server.log` each contain `WFLYSRV0025`. Everything else in this
+record is fixed and verified.
