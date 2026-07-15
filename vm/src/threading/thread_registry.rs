@@ -26,6 +26,18 @@ struct ThreadEntry {
     join_handle: Option<JoinHandle<()>>,
     /// The Java `Thread` object on the heap.
     java_thread_obj: Option<ObjectRef>,
+    /// The Java-side `Thread.tid` value of `java_thread_obj` (real-JDK mode).
+    /// `Thread.tid` is `final`, assigned once in the constructor from a
+    /// process-wide monotonic counter, and NEVER reused across Thread
+    /// objects — unlike a heap address, which the collector can recycle for
+    /// a brand-new `Thread` after this entry's mirror dies. All identity
+    /// lookups (getState/isAlive/interrupt/unpark) therefore prefer this
+    /// key over pointer comparison; see `find_thread_id_by_java_tid` and
+    /// the aliasing incident writeup in
+    /// docs/known-issues/tomcat-08-07/dohead-residual-http2-midrun-hang.md.
+    /// 0 = unknown (synthetic-layout mirror, or registered mid-construction
+    /// before the ctor assigned `tid` — backfilled lazily on first lookup).
+    java_tid: u64,
     /// Whether this thread is still running.
     alive: AtomicBool,
     /// Whether this thread can currently participate in counted STW barriers.
@@ -126,6 +138,13 @@ pub struct ThreadRegistry {
     /// Keyed by `ObjectRef::as_ptr() as usize` because `ObjectRef`
     /// already hashes by pointer; we just need a `Hash + Eq` form.
     thread_obj_to_park: Mutex<FxHashMap<usize, Arc<ParkState>>>,
+    /// Reverse index from Java-side `Thread.tid` (unique, never reused —
+    /// see `ThreadEntry::java_tid`) to registry `ThreadId`. This is the
+    /// aliasing-proof identity map: a dead thread's entry stays here for
+    /// TERMINATED `getState()` answers, but a NEW `Thread` allocated at the
+    /// dead mirror's recycled heap address has a different `tid` and can
+    /// never be confused with it (the address-keyed maps can).
+    java_tid_to_id: Mutex<FxHashMap<u64, ThreadId>>,
     /// Vacated heap addresses of relocated `java.lang.Thread` mirrors →
     /// owning thread id, for stale-receiver recovery (see
     /// [`Self::recover_stale_mirror`]). Populated by
@@ -159,6 +178,7 @@ impl ThreadRegistry {
             threads: Mutex::new(FxHashMap::default()),
             next_id: AtomicU64::new(1),
             thread_obj_to_park: Mutex::new(FxHashMap::default()),
+            java_tid_to_id: Mutex::new(FxHashMap::default()),
             former_mirror_addrs: Mutex::new((
                 FxHashMap::default(),
                 std::collections::VecDeque::new(),
@@ -217,6 +237,7 @@ impl ThreadRegistry {
             name: name.to_string(),
             join_handle: None,
             java_thread_obj,
+            java_tid: 0,
             alive: AtomicBool::new(true),
             stw_ready: AtomicBool::new(stw_ready),
             daemon: AtomicBool::new(daemon),
@@ -518,7 +539,13 @@ impl ThreadRegistry {
 
     /// Mark a thread as dead (called when the thread finishes execution).
     pub fn mark_dead(&self, thread_id: ThreadId) {
-        if let Some(entry) = self.threads.lock().get_mut(&thread_id) {
+        let dead_mirror;
+        let dead_park_state;
+        {
+            let mut threads = self.threads.lock();
+            let Some(entry) = threads.get_mut(&thread_id) else {
+                return;
+            };
             entry.alive.store(false, Ordering::Release);
             // Reclaim the OS thread handle. Tomcat's poller/acceptor/pool
             // threads are daemon threads that are never `join()`ed, so their
@@ -531,7 +558,91 @@ impl ThreadRegistry {
             // dropping the handle simply detaches it; a later `join()` of an
             // already-dead thread still returns immediately (see `join`).
             entry.join_handle.take();
+            dead_mirror = entry.java_thread_obj;
+            dead_park_state = entry.park_state.clone();
         }
+        // Drop the dead thread's mirror-ADDRESS→ParkState reverse-index entry.
+        // The entry itself is retained (TERMINATED `getState()` answers), but
+        // once the mirror is unreachable the collector can recycle its heap
+        // address for a brand-new `Thread`; a lingering address key would then
+        // route that NEW thread's `unpark`/`interrupt` wakeups to this dead
+        // ParkState — a silently lost wakeup (observed as Tomcat executor
+        // workers parked forever across DoHead's 288 Tomcat start/stop cycles).
+        // Guarded by Arc identity so a same-address re-registration that
+        // already overwrote the slot (new thread registered before this ran)
+        // is left untouched. Lock order threads → thread_obj_to_park matches
+        // the register/set paths.
+        if let Some(obj) = dead_mirror {
+            let mut idx = self.thread_obj_to_park.lock();
+            if let Some(mapped) = idx.get(&(obj.as_ptr() as usize)) {
+                if Arc::ptr_eq(mapped, &dead_park_state) {
+                    idx.remove(&(obj.as_ptr() as usize));
+                }
+            }
+        }
+    }
+
+    /// Aliasing-proof identity lookup: registry `ThreadId` by the Java-side
+    /// `Thread.tid` value (see `ThreadEntry::java_tid`). Dead threads remain
+    /// resolvable (TERMINATED), but a recycled mirror address can never alias
+    /// because `tid` values are unique for the life of the process.
+    pub fn find_thread_id_by_java_tid(&self, java_tid: u64) -> Option<ThreadId> {
+        if java_tid == 0 {
+            return None;
+        }
+        self.java_tid_to_id.lock().get(&java_tid).copied()
+    }
+
+    /// ParkState lookup by Java-side `Thread.tid` — the aliasing-proof
+    /// counterpart of `find_park_state_by_thread_obj` (see
+    /// `find_thread_id_by_java_tid`).
+    pub fn find_park_state_by_java_tid(&self, java_tid: u64) -> Option<Arc<ParkState>> {
+        let id = self.find_thread_id_by_java_tid(java_tid)?;
+        self.get_park_state(id)
+    }
+
+    /// Pointer-identity walk like `find_thread_id_by_thread_obj`, but guarded
+    /// by the caller-supplied Java `tid` of the queried mirror: an entry at
+    /// the same address whose recorded `java_tid` differs is a DEAD thread's
+    /// stale entry whose mirror address was recycled for the queried (new)
+    /// Thread — matching it would misreport a freshly constructed thread as
+    /// RUNNABLE/TERMINATED (the DoHead `IllegalThreadStateException`-at-
+    /// engine-start flake). An entry with `java_tid == 0` (registered
+    /// mid-construction, before the ctor assigned `tid`) is accepted and
+    /// lazily backfilled so subsequent lookups take the O(1) tid index.
+    pub fn find_thread_id_by_thread_obj_tid_checked(
+        &self,
+        obj: ObjectRef,
+        java_tid: u64,
+    ) -> Option<ThreadId> {
+        let mut threads = self.threads.lock();
+        let mut found: Option<ThreadId> = None;
+        for (id, entry) in threads.iter() {
+            if let Some(thread_obj) = entry.java_thread_obj {
+                if std::ptr::eq(thread_obj.as_ptr(), obj.as_ptr())
+                    && (entry.java_tid == java_tid || entry.java_tid == 0)
+                {
+                    found = Some(*id);
+                    break;
+                }
+            }
+        }
+        if let Some(id) = found {
+            if java_tid != 0 {
+                let mut backfilled = false;
+                if let Some(entry) = threads.get_mut(&id) {
+                    if entry.java_tid == 0 {
+                        entry.java_tid = java_tid;
+                        backfilled = true;
+                    }
+                }
+                drop(threads);
+                if backfilled {
+                    self.java_tid_to_id.lock().insert(java_tid, id);
+                }
+            }
+        }
+        found
     }
 
     /// Check if a thread is still alive.
@@ -632,6 +743,25 @@ impl ThreadRegistry {
             *g.0.get(&stale_addr)?
         };
         self.java_thread_obj(tid)
+    }
+
+    /// Set the Java Thread object for a given ThreadId, recording the
+    /// mirror's Java-side `Thread.tid` (0 = unknown; see
+    /// `ThreadEntry::java_tid`) so identity lookups can use the
+    /// aliasing-proof tid index instead of the mirror's (recyclable) address.
+    pub fn set_java_thread_obj_with_tid(&self, thread_id: ThreadId, obj: ObjectRef, java_tid: u64) {
+        self.set_java_thread_obj(thread_id, obj);
+        if java_tid != 0 {
+            {
+                let mut threads = self.threads.lock();
+                if let Some(entry) = threads.get_mut(&thread_id) {
+                    entry.java_tid = java_tid;
+                } else {
+                    return;
+                }
+            }
+            self.java_tid_to_id.lock().insert(java_tid, thread_id);
+        }
     }
 
     /// Set the Java Thread object for a given ThreadId.

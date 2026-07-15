@@ -2576,7 +2576,49 @@ impl NativeThreadBlocker for VmNativeThreadBlocker {
     }
 }
 
+/// Read the real-JDK `java.lang.Thread.tid` field from a Thread mirror.
+///
+/// `tid` is `final`, assigned once in the constructor from a process-wide
+/// monotonic counter, and never reused across Thread objects — making it an
+/// aliasing-proof identity key where the mirror's heap address is not (the
+/// collector recycles a dead mirror's address for new allocations; see the
+/// DoHead engine-start `IllegalThreadStateException` incident). Returns
+/// `None` for synthetic-layout threads (no `tid` field in the hierarchy),
+/// for mirrors whose constructor hasn't assigned it yet (reads 0), or when
+/// the slot doesn't read back as a `Long` (don't trust a corrupt layout).
+pub(crate) fn read_java_thread_tid(shared: &SharedVm, thread_obj: ObjectRef) -> Option<u64> {
+    // Callers pass mirrors that can be stale (an unpark racing a moving GC);
+    // don't dereference anything that isn't a live heap address.
+    shared.heap.is_heap_addr(thread_obj.as_ptr() as usize)?;
+    let header = shared.heap.get_header(thread_obj);
+    let slot = {
+        let cm = shared.class_manager.read();
+        resolve_field_index_in_hierarchy(header.class_id, "tid", &cm.class_store)?
+    };
+    match shared.heap.get_field(thread_obj, slot) {
+        Value::Long(v) if v > 0 => Some(v as u64),
+        _ => None,
+    }
+}
+
 fn resolve_thread_id_from_thread_obj(shared: &SharedVm, thread_obj: ObjectRef) -> Option<ThreadId> {
+    // Real-JDK mirrors: resolve by the unique Java `Thread.tid` first — immune
+    // to the mirror-address recycling that makes the pointer walk misreport a
+    // freshly constructed Thread as RUNNABLE/TERMINATED (a dead thread's
+    // retained entry at the same recycled address) and misroute
+    // interrupt/unpark wakeups. The tid-guarded pointer walk below covers
+    // mirrors registered mid-construction (entry recorded before the ctor
+    // assigned `tid`), backfilling the index for subsequent O(1) hits.
+    if let Some(java_tid) = read_java_thread_tid(shared, thread_obj) {
+        if let Some(id) = shared.thread_registry.find_thread_id_by_java_tid(java_tid) {
+            return Some(id);
+        }
+        return shared
+            .thread_registry
+            .find_thread_id_by_thread_obj_tid_checked(thread_obj, java_tid);
+    }
+    // Synthetic-layout / pre-ctor mirrors: legacy pointer walk, then the
+    // synthetic convention of the registry id stored as a Long at slot 2.
     shared
         .thread_registry
         .find_thread_id_by_thread_obj(thread_obj)
@@ -5159,6 +5201,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             Some(thread_obj),
             is_daemon,
         );
+        // Record the mirror's Java `Thread.tid` (fully constructed by
+        // `start()` time) so identity lookups take the aliasing-proof tid
+        // index instead of comparing the mirror's recyclable heap address.
+        if let Some(java_tid) = read_java_thread_tid(self.shared, thread_obj) {
+            self.shared
+                .thread_registry
+                .set_java_thread_obj_with_tid(tid, thread_obj, java_tid);
+        }
 
         // Record JFR thread start event
         {
@@ -5803,11 +5853,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
         // Register immediately so any recursive call to
         // `current_thread_object` during holder/group construction
-        // observes the in-progress object and doesn't loop.
+        // observes the in-progress object and doesn't loop. The mirror's
+        // Java `tid` is usually still 0 here (ctor not run yet) — the
+        // tid-guarded lookup path backfills it on first use.
         self.thread.java_thread_obj = Some(thread_obj);
-        self.shared
-            .thread_registry
-            .set_java_thread_obj(self.thread.thread_id, thread_obj);
+        let java_tid = read_java_thread_tid(self.shared, thread_obj).unwrap_or(0);
+        self.shared.thread_registry.set_java_thread_obj_with_tid(
+            self.thread.thread_id,
+            thread_obj,
+            java_tid,
+        );
 
         let name_str = super::create_java_string(self.shared, &self.thread.name);
         // Re-sync after the string allocation (may have moved the mirror).
@@ -6000,10 +6055,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // Cross-thread query (e.g. `ThreadPoolExecutor` checking a worker):
         // resolve the target's registry id and read its shared interrupt flag.
         // Unknown / not-yet-registered threads default to false, matching the
-        // registry's "missing means absent" convention.
-        self.shared
-            .thread_registry
-            .find_thread_id_by_thread_obj(thread_obj)
+        // registry's "missing means absent" convention. Resolution goes
+        // through the tid-keyed resolver — a raw pointer walk here can alias
+        // a recycled mirror address to a dead thread's entry.
+        resolve_thread_id_from_thread_obj(self.shared, thread_obj)
             .and_then(|tid| self.shared.thread_registry.get_interrupted_flag(tid))
             .map(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
             .unwrap_or(false)
@@ -6196,9 +6251,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if self.shared.thread_registry.thread_name(tid).is_none() {
             return false;
         }
+        let java_tid = read_java_thread_tid(self.shared, java_thread_obj).unwrap_or(0);
         self.shared
             .thread_registry
-            .set_java_thread_obj(tid, java_thread_obj);
+            .set_java_thread_obj_with_tid(tid, java_thread_obj, java_tid);
         true
     }
 

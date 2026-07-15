@@ -4492,10 +4492,25 @@ impl SharedVm {
 impl SharedVm {
     /// Find the park state for a thread identified by its Java Thread object.
     /// Used by `unpark()` in NativeContextImpl.
+    ///
+    /// Resolution prefers the Java-side `Thread.tid` (unique, never reused)
+    /// over the mirror's heap address: the address-keyed reverse index can
+    /// alias a NEW thread's mirror allocated at a dead thread's recycled
+    /// address, silently routing the wakeup to the dead thread's ParkState
+    /// (observed as Tomcat executor workers parked forever after their
+    /// `shutdownNow()` interrupt was lost — the DoHead leaked-worker face).
+    /// The tid path also survives a relocated-but-intact stale mirror copy:
+    /// the stale address is gone from the reverse index, but its memory
+    /// still holds the correct `tid`.
     pub fn find_park_state_for_thread_obj(
         &self,
         thread_obj: ObjectRef,
     ) -> Option<std::sync::Arc<crate::threading::ParkState>> {
+        if let Some(java_tid) = super::vm_exec::read_java_thread_tid(self, thread_obj) {
+            if let Some(ps) = self.thread_registry.find_park_state_by_java_tid(java_tid) {
+                return Some(ps);
+            }
+        }
         self.thread_registry
             .find_park_state_by_thread_obj(thread_obj)
     }
