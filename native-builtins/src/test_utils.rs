@@ -1156,6 +1156,31 @@ impl MockNativeContext {
 }
 
 impl NativeContext for MockNativeContext {
+    // Mirror the production NativeContext memory bridge for REAL pointers:
+    // vm_exec falls through to a raw copy when the address is not a tagged
+    // Unsafe-arena handle. The t27_tls direct-buffer tests hand this mock
+    // genuine malloc pointers (Vec backing stores), so the arena-aware
+    // accessors (bb_get_byte & co.) must be able to reach them here too.
+    fn copy_from_native_memory(&self, addr: i64, out: &mut [u8]) -> bool {
+        if addr <= 0 {
+            return false;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(addr as usize as *const u8, out.as_mut_ptr(), out.len());
+        }
+        true
+    }
+
+    fn copy_to_native_memory(&mut self, addr: i64, data: &[u8]) -> bool {
+        if addr <= 0 {
+            return false;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), addr as usize as *mut u8, data.len());
+        }
+        true
+    }
+
     fn supports_real_proxy_generation(&self) -> bool {
         false
     }

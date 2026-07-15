@@ -1,5 +1,28 @@
 # `CharBuffer.getArray`'s `ScopedMemoryAccess.copyMemory` fast path throws `ArrayIndexOutOfBoundsException` on a heap-backed view — blocks `java.net.IDN`/ICU4X end-to-end
 
+**Status: FIXED 2026-07-15** (reactive-cluster session, branch
+`fix/reactive-cluster-20260715`). The doc's leading hypothesis was close
+but the actual defect was one level up: `s2_bb_as_char_buffer`
+(`native-builtins/src/servlet.rs`) never seeded the view's
+`java.nio.Buffer.address` field, so the real `CharBuffer.getArray`
+bulk path computed a source offset of `0 + (index << 1)` — below the
+array-base offset (16) that `ScopedMemoryAccess.copyMemory`'s
+array-offset decode requires — and threw AIOOBE. Fixed by seeding
+`address = ARRAY_CHAR_BASE_OFFSET` (16), written after the indexed
+fallback writes (BB_MARK aliases the real `address` slot), exactly
+like `charset.rs::alloc_char_buffer` already did. Verified:
+`IDN.toASCII("bücher.example")` == HotSpot (`xn--bcher-kva.example`),
+bulk `CharBuffer.get(char[])` on an `asCharBuffer()` view returns
+correct data, and the whole reactive Netty cluster this poisoned
+(UCharacterProperty.<clinit> → ByteBufUtil NCDFE → RSocket/Reactor
+Netty ABENDs) cleared. Known cosmetic divergence kept: the view
+reports native byte order (its decoded char[] storage's true order)
+while HotSpot reports the source ByteBuffer's order.
+
+Original doc below.
+
+---
+
 **Status: OPEN.** Found 2026-07-14 while verifying the fix for
 [`../../internal/springboot/charbuffer-order-missing-native-idn-clinit-cluster-FIXED.md`](../../internal/springboot/charbuffer-order-missing-native-idn-clinit-cluster-FIXED.md)
 (that doc's `CharBuffer.order()` `AbstractMethodError` was masking this

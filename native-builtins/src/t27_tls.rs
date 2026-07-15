@@ -4903,10 +4903,21 @@ fn bb_get_byte(
             if i >= v.cap {
                 return None;
             }
-            // SAFETY: `addr` is the buffer's live native allocation (minted
-            // by `dbb_allocate`, or `parent.address + offset` for slices)
-            // and `i < cap` keeps the access inside it.
-            Some(unsafe { std::ptr::read((addr as usize + i) as *const u8) })
+            // `addr` is either a REAL native pointer (`dbb_allocate`) or an
+            // Unsafe-ARENA TAGGED handle: real-JDK `DirectByteBuffer`s (and
+            // Netty's `PlatformDependent` pooled buffers, the reactor-http
+            // TLS path) get their `address` from `Unsafe.allocateMemory`,
+            // which mints tagged arena handles — raw-dereferencing one is a
+            // wild pointer (SIGSEGV in `SSLEngine.unwrap`, reactor-http-nio,
+            // ServerHttpsRequestIntegrationTests). Route through the
+            // arena-aware NativeContext bridge, which dispatches
+            // arena-vs-real-pointer exactly like `Unsafe.copyMemory` does.
+            let mut b = [0u8; 1];
+            if ctx.copy_from_native_memory((addr as usize + i) as i64, &mut b) {
+                Some(b[0])
+            } else {
+                None
+            }
         }
         BbBacking::Unresolved => None,
     }
@@ -4932,9 +4943,13 @@ fn bb_bytes_range(
             if end <= from {
                 return Vec::new();
             }
-            // SAFETY: bounded by `cap` — see `bb_get_byte`.
-            unsafe {
-                std::slice::from_raw_parts((addr as usize + from) as *const u8, end - from).to_vec()
+            // Arena-aware read — see `bb_get_byte` for why raw dereference
+            // is unsound here (tagged Unsafe-arena handles).
+            let mut buf = vec![0u8; end - from];
+            if ctx.copy_from_native_memory((addr as usize + from) as i64, &mut buf) {
+                buf
+            } else {
+                Vec::new()
             }
         }
         BbBacking::Unresolved => Vec::new(),
@@ -4962,11 +4977,13 @@ fn bb_put_bytes(
                 return 0;
             }
             let n = end - at;
-            // SAFETY: bounded by `cap` — see `bb_get_byte`.
-            unsafe {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), (addr as usize + at) as *mut u8, n);
+            // Arena-aware write — see `bb_get_byte` for why raw dereference
+            // is unsound here (tagged Unsafe-arena handles).
+            if ctx.copy_to_native_memory((addr as usize + at) as i64, &data[..n]) {
+                n
+            } else {
+                0
             }
-            n
         }
         BbBacking::Unresolved => 0,
     }

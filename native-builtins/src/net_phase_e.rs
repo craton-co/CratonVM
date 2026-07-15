@@ -1813,14 +1813,47 @@ pub(crate) fn uri_select_raw_path(raw: &str) -> Option<String> {
     Some(after_auth[..end].to_string())
 }
 
+/// Byte index of the scheme-terminating `:`, or `None` for a relative
+/// reference. Mirrors the real JDK parser (`uri_scheme_name_fail_index` in
+/// lib.rs): scan for the first stop char among `:/?#`; only a `:` counts,
+/// and the text before it must be a valid scheme name (ALPHA start,
+/// alphanum/`+`/`-`/`.` body). Without this rule a colon inside a relative
+/// path ("/redirect:account", Spring's view-name redirect tests) was taken
+/// as a scheme delimiter, corrupting scheme/ssp/path derivation.
+pub(crate) fn uri_scheme_colon(raw: &str) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut p = 0usize;
+    while p < bytes.len() {
+        match bytes[p] {
+            b'/' | b'?' | b'#' => return None,
+            b':' => break,
+            _ => p += 1,
+        }
+    }
+    if p == 0 || p >= bytes.len() {
+        return None;
+    }
+    if !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    if !bytes[1..p]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(p)
+}
+
 /// Raw scheme-specific part, excluding the fragment delimiter and fragment.
 /// `java.net.URI` treats `#fragment` as outside the SSP for both opaque
-/// (`mailto:a#b`) and hierarchical (`https://h/p#b`) URIs.
+/// (`mailto:a#b`) and hierarchical (`https://h/p#b`) URIs. For a relative
+/// reference (no valid scheme) the SSP is the whole input minus fragment.
 fn uri_raw_scheme_specific_part(raw: &str) -> String {
-    let Some(colon) = raw.find(':') else {
-        return raw.to_string();
+    let ssp = match uri_scheme_colon(raw) {
+        Some(colon) => &raw[colon + 1..],
+        None => raw,
     };
-    let ssp = &raw[colon + 1..];
     let end = ssp.find('#').unwrap_or(ssp.len());
     ssp[..end].to_string()
 }
@@ -2135,16 +2168,12 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                 }
             }
         }
-        // Parse from raw string.
+        // Parse from raw string — JDK scheme rules (a colon inside a relative
+        // path is NOT a scheme delimiter, see `uri_scheme_colon`).
         let raw = uri_raw_string(ctx, this);
-        let scheme = raw
-            .find(':')
-            .map(|i| raw[..i].to_string())
-            .unwrap_or_default();
-        if scheme.is_empty() {
-            Ok(Some(Value::Object(None)))
-        } else {
-            Ok(Some(Value::Object(Some(ctx.create_string(&scheme)))))
+        match uri_scheme_colon(&raw) {
+            Some(i) => Ok(Some(Value::Object(Some(ctx.create_string(&raw[..i]))))),
+            None => Ok(Some(Value::Object(None))),
         }
     });
 

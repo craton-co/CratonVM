@@ -9883,31 +9883,69 @@ fn ensure_collections_empty_singletons(
         return Ok(());
     };
 
+    // The singletons MUST be genuinely immutable, non-ArrayList/HashMap/HashSet
+    // typed instances. They were previously seeded as ORDINARY MUTABLE synthetic
+    // `java/util/ArrayList` / `java/util/HashMap` / `java/util/HashSet` objects,
+    // which broke process-global correctness two ways:
+    //   1. `emptyList() instanceof ArrayList` answered true. kotlin-reflect's
+    //      shaded protobuf (`SmallSortedMap.ensureEntryArrayMutable`) uses
+    //      exactly that check to decide whether it must replace its
+    //      `Collections.emptyList()` placeholder with a fresh ArrayList before
+    //      inserting — so it skipped the replacement and mutated the singleton.
+    //   2. The mutation SUCCEEDED (our ArrayList natives happily grow whatever
+    //      has the arraylist layout), so from that point on EVERY
+    //      `Collections.emptyList()` in the process contained a phantom
+    //      `SmallSortedMap$Entry`: JUnit's `ReflectionUtils.findFields` blew up
+    //      with "SmallSortedMap$Entry cannot be cast to Field" on ALL classes,
+    //      taking down the whole Kotlin slice of the spring-webflux reactive
+    //      suite (LOADERRs + jupiter discovery failures + per-test CCEs).
+    // Seed the real JDK `Collections$Empty*` instances instead (their
+    // mutators run real `AbstractList`/`AbstractMap` bytecode and throw
+    // UnsupportedOperationException; `try_delegate_real_collection` already
+    // handles them on every interface-registered native). Fall back to the
+    // legacy mutable synthetics only when the real classes are unavailable
+    // (synthetic-jdk mode), preserving the old behaviour there.
     if let Some(idx) = ctx.static_field_index_by_name(cid, "EMPTY_LIST") {
         if !matches!(ctx.get_static_field(cid, idx), Value::Object(Some(_))) {
-            let __al_n_fields = al_slots(ctx).2;
-            let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
-            let arr = alloc_ref_array(ctx, 0);
-            al_set_data(ctx, list, arr);
-            al_set_size(ctx, list, 0);
+            let list = alloc_real_jdk(ctx, "java/util/Collections$EmptyList")
+                .unwrap_or_else(|| {
+                    let __al_n_fields = al_slots(ctx).2;
+                    let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
+                    let arr = alloc_ref_array(ctx, 0);
+                    al_set_data(ctx, list, arr);
+                    al_set_size(ctx, list, 0);
+                    list
+                });
             ctx.set_static_field(cid, idx, Value::Object(Some(list)));
         }
     }
 
     if let Some(idx) = ctx.static_field_index_by_name(cid, "EMPTY_MAP") {
         if !matches!(ctx.get_static_field(cid, idx), Value::Object(Some(_))) {
-            let map = alloc_backing_map(ctx);
-            native_map_init(ctx, &[Value::Object(Some(map))])?;
+            let map = match alloc_real_jdk(ctx, "java/util/Collections$EmptyMap") {
+                Some(m) => m,
+                None => {
+                    let map = alloc_backing_map(ctx);
+                    native_map_init(ctx, &[Value::Object(Some(map))])?;
+                    map
+                }
+            };
             ctx.set_static_field(cid, idx, Value::Object(Some(map)));
         }
     }
 
     if let Some(idx) = ctx.static_field_index_by_name(cid, "EMPTY_SET") {
         if !matches!(ctx.get_static_field(cid, idx), Value::Object(Some(_))) {
-            let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
-            let inner_map = alloc_backing_map(ctx);
-            native_map_init(ctx, &[Value::Object(Some(inner_map))])?;
-            ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(inner_map)));
+            let set = match alloc_real_jdk(ctx, "java/util/Collections$EmptySet") {
+                Some(s) => s,
+                None => {
+                    let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+                    let inner_map = alloc_backing_map(ctx);
+                    native_map_init(ctx, &[Value::Object(Some(inner_map))])?;
+                    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(inner_map)));
+                    set
+                }
+            };
             ctx.set_static_field(cid, idx, Value::Object(Some(set)));
         }
     }
@@ -15310,9 +15348,78 @@ fn native_collfn_accumulator_accept(
     Ok(None)
 }
 
-/// `finisher.apply(container)` — identity (container collectors are IDENTITY_FINISH).
-fn native_collfn_finisher_apply(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
+/// `finisher.apply(container)` — identity for the IDENTITY_FINISH container
+/// collectors (toList/toSet/toMap/toCollection), but non-identity collectors
+/// must materialise their real result here: external drivers of the raw
+/// Collector protocol — Reactor's `MonoStreamCollector`
+/// (`Flux.collect(Collectors.joining(...))`) or any hand-rolled
+/// supplier/accumulator/finisher loop — call this Function directly rather
+/// than going through CratonVM's eager `Stream.collect` native. Returning the
+/// raw accumulation LIST for a joining collector made
+/// `WebClientIntegrationTests.retrieveJsonArrayAsBodilessEntityShouldRelease
+/// Connection` die with "java.util.ArrayList cannot be cast to
+/// java.lang.String" at the `.block()` cast.
+fn native_collfn_finisher_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let container = args.get(1).copied().unwrap_or(Value::Object(None));
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(container)),
+    };
+    let coll = ctx.get_field(this, 0);
+    let read_str = |ctx: &dyn NativeContext, field: usize| -> String {
+        match coll {
+            Value::Object(Some(c)) => match ctx.get_field(c, field) {
+                Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
+                _ => String::new(),
+            },
+            _ => String::new(),
+        }
+    };
+    let container_values = |ctx: &dyn NativeContext| -> Vec<Value> {
+        match container {
+            Value::Object(Some(l)) => {
+                let (data, size) = al_state(ctx, l);
+                match data {
+                    Some(data) => (0..(size.max(0) as usize))
+                        .map(|i| ctx.get_array_element(data, i))
+                        .collect(),
+                    None => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        }
+    };
+    match collector_tag_of(ctx, coll) {
+        Some(tag @ (COLLECTOR_TAG_JOINING | COLLECTOR_TAG_JOINING_DELIM)) => {
+            let elements = container_values(ctx);
+            let mut parts = Vec::with_capacity(elements.len());
+            for elem in &elements {
+                parts.push(obj_to_display_string(ctx, elem));
+            }
+            let (delim, prefix, suffix) = if tag == COLLECTOR_TAG_JOINING_DELIM {
+                (
+                    read_str(ctx, COLLECTOR_FIELD_ARG1),
+                    read_str(ctx, COLLECTOR_FIELD_ARG2),
+                    read_str(ctx, COLLECTOR_FIELD_ARG3),
+                )
+            } else {
+                (String::new(), String::new(), String::new())
+            };
+            let joined = format!("{}{}{}", prefix, parts.join(&delim), suffix);
+            let s = ctx.create_string(&joined);
+            Ok(Some(Value::Object(Some(s))))
+        }
+        Some(COLLECTOR_TAG_COUNTING) => {
+            // Box as java/lang/Long — Function.apply returns Object, and a
+            // bare primitive Value here reads back as null to the caller
+            // (reactor: NullPointerException "Collector returned null").
+            let n = container_values(ctx).len() as i64;
+            let long_obj = alloc_synthetic(ctx, "java/lang/Long", 1);
+            ctx.set_field(long_obj, 0, Value::Long(n));
+            Ok(Some(Value::Object(Some(long_obj))))
+        }
+        _ => Ok(Some(container)),
+    }
 }
 
 /// `combiner.apply(a, b)` — a.addAll(b); a.

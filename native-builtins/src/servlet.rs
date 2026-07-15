@@ -3749,6 +3749,21 @@ fn s2_bb_as_char_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     ctx.set_field(vb, BB_CAP, Value::Int(rem_chars as i32));
     ctx.set_field(vb, BB_MARK, Value::Int(-1));
     ctx.set_field(vb, BB_ORDER, Value::Int(order));
+    // `java.nio.Buffer.address` (long) — real `CharBuffer.get(char[])` routes
+    // through the bulk `getArray` fast path (`isAddressable()` is
+    // unconditionally true in real bytecode), which computes the source
+    // offset as `address + (index << 1)` and hands it to
+    // `ScopedMemoryAccess.copyMemory`'s array-offset decode. A heap view must
+    // therefore seed `address = ARRAY_CHAR_BASE_OFFSET` (16); the previous
+    // default of 0 decoded below the array base and threw
+    // ArrayIndexOutOfBoundsException on every bulk get — poisoning
+    // `jdk.internal.icu.impl.UCharacterProperty.<clinit>` (ICUBinary.getChars)
+    // and with it `java.net.IDN` and Netty's buffer stack. See
+    // docs/known-issues/springboot/charbuffer-getarray-scopedmemoryaccess-copymemory-aioobe.md.
+    // Written LAST so the indexed BB_* fallback writes above (BB_MARK aliases
+    // the real `address` slot) can't clobber it — same pattern as
+    // `charset.rs::alloc_char_buffer`.
+    ctx.set_field_by_name(vb, "address", Value::Long(16));
     Ok(Some(Value::Object(Some(vb))))
 }
 

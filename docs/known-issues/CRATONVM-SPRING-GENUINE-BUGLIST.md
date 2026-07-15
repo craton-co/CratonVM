@@ -33,10 +33,18 @@ These classes had blocking VM crashes fixed, but now fail on new, distinct resid
 ### WebFlux Backend-Specific Failures
 (`web.reactive.result.method.annotation.CrossOriginAnnotationIntegrationTests`, `RequestMappingMessageConversionIntegrationTests`)
 *   **Update**: The missing `ApiVersionStrategy` bean, the `Semaphore.release()` deadlock, the `Objects.toString` defect, and a `CopyOnWriteArrayList` NPE were all fixed.
-*   **Current Residual (OPEN)**: The classes now complete but fail 0% of their sub-tests depending on the backend used:
-  *   **Jetty**: `NoClassDefFoundError: org/eclipse/jetty/http/MimeTypes$Mutable`
-  *   **Tomcat**: `IllegalStateException: org.apache.catalina.LifecycleException: Failed to initialize component [StandardServer[-1]]`
-  *   **Reactor Netty**: `IllegalStateException: failed to create a child event loop`
+*   **Update 2026-07-15 (reactive-cluster session, branch `fix/reactive-cluster-20260715`)**: the whole
+    per-backend residual cluster was root-caused to process-global poisoning chains and fixed:
+    `CharBuffer.getArray` AIOOBE (missing `Buffer.address` seed on `asCharBuffer()` views) poisoned
+    `jdk.internal.icu` → `java.net.IDN` → Netty's buffer stack; a JIT NPE in `sun.misc.Unsafe.putOrderedLong`
+    (the native `<clinit>` shadow never populated `theInternalUnsafe`; the interpreter's C11/C16 null-receiver
+    rescue papered over it but compiled code has no such rescue) killed `ByteBufUtil.<clinit>` at Netty's
+    `MpmcArrayQueue(4096)` init loop. **`CrossOriginAnnotationIntegrationTests` is now fully OK (68/68)**
+    on all backends.
+*   **Current Residual (OPEN)**: `RequestMappingMessageConversionIntegrationTests` (160 tests) runs but is
+    pathologically slow — it makes steady progress (fresh `AnnotationConfigApplicationContext` + HTTP server
+    per test; watchdog stack dumps show active bean creation, no deadlock) yet does not finish within 1800s
+    (HotSpot: 13s). Needs a dedicated perf investigation.
 
 ### AOT / In-Memory Javac Residuals
 The original 1500-second infinite hangs have largely shifted into execution
@@ -102,3 +110,54 @@ The following tests are genuinely open (FAIL, ABEND, or TIMEOUT). *Note: 21 clas
 **AOP / Beans**
 *   `aop.scope.ScopedProxyBeanRegistrationAotProcessorTests` - FAIL (`BeanCreationException` / `CompilationException`)
 *   `aot.nativex.fea
+
+
+---
+
+## 4. Reactive cluster session 2026-07-15 (branch `fix/reactive-cluster-20260715`)
+
+Full 295-class reactive sweep (`web.reactive.*`, `messaging.rsocket.*`, `test.web.reactive.*`,
+`http.server.reactive.*`, `http.client.reactive.*`, reactive tx/core classes) vs a same-day HotSpot
+baseline. Baseline on the 2026-07-15 dev tip: 178 OK / 50 FAIL / 12 LOADERR / 5 ABEND / 4 TIMEOUT /
+46 EMPTY. After the session's 7 VM fixes (missing `Buffer.address` on `asCharBuffer()` views;
+`theInternalUnsafe` never populated by the `sun/misc/Unsafe` clinit shadow — JIT-compiled
+`putOrderedLong` NPE; mutable-`ArrayList`-typed `Collections.EMPTY_LIST/MAP/SET` singletons that
+kotlin-reflect's shaded protobuf mutated in place, corrupting `emptyList()` process-wide; speculative-BCE
+loop-header guard missing the null-array check — freemarker `TemplateElement.setChildren` SIGSEGV; raw
+pointer dereference of tagged Unsafe-arena handles in the TLS engine's direct-buffer accessors —
+`SSLEngine.unwrap` SIGSEGV; `cratonvm/net/HttpBodyReplaySubscription` not declaring
+`Flow$Subscription` — 40 sub-test failures on the `[2] JDK` WebClient connector; identity `finisher()`
+on JOINING/COUNTING collectors when Reactor drives the raw Collector protocol) the sweep reaches
+**HotSpot parity minus the residuals below** (the only EMPTY classes are the same 4 abstract classes
+HotSpot reports EMPTY, and `ResourceWebHandlerTests` fails the same single
+`servesResourcesFromFileSystem` test on both VMs).
+
+An 8th fix landed during final validation: `java.net.URI`'s construction-time field writes
+(`uri_store_named`) and the `getScheme`/`getRawSchemeSpecificPart` raw-string fallbacks treated ANY
+first colon as a scheme delimiter, so a relative reference with a colon in its first path segment
+(`/redirect:account`) parsed as `scheme="/redirect", path="account"`. Spring's view-resolution tests
+derive the default view name from the request path, so `ViewResolutionResultHandlerTests.
+defaultViewNameWithRedirectPrefixFails` (the FAIL this doc has tracked since the 516-class runs)
+resolved the wrong view and completed instead of erroring. Scheme detection now mirrors the real JDK
+parser (first stop char among `:/?#` must be `:`, ALPHA-start + alphanum/`+`/`-`/`.` name — the same
+rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is now 11/11 OK.
+
+Classes that FAIL in *batched* suite runs but pass solo at HotSpot parity (batch-context
+contamination — a prior class in the shared VM poisons a `<clinit>`; not yet root-caused, likely one
+more cross-class-state bug): `SseIntegrationTests` (solo 48 found / 42 succ / 6 aborted == HotSpot),
+`WebSocketIntegrationTests` (solo 72/72), `DefaultRenderingBuilderTests` (solo 11/11, batched shows
+`ExceptionInInitializerError` → `NoClassDefFoundError: ViewResolverSupport` on the redirect tests).
+
+**Remaining OPEN reactive residuals:**
+*   `http.client.reactive.ClientHttpConnectorTests` — TIMEOUT. `StepVerifier` in `basic()` waits forever;
+    at dump time the Jetty client pool and MockWebServer-side threads are idle and no
+    okhttp/MockWebServer accept thread is visible. Also: the T19.H1 watchdog stack-dump itself SIGSEGVs
+    when JIT frames are on the stacks (separate small bug; `--nojit` dumps work).
+*   `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` — pathological
+    slowness, see section 2 above.
+*   `web.reactive.result.view.script.JRubyScriptTemplateTests` — JRuby-on-CratonVM: Ruby
+    `Symbol#to_s`/string interpolation returns empty inside `eval` heredocs
+    (`rubygems/specification.rb` generates `@ = nil` from `"@#{key} = nil"`), so the engine bootstrap
+    fails with a SyntaxError. Not reactive-specific; JRuby's embedding is its own bug family.
+*   Batch-context `<clinit>` contamination (see above) — affects SSE/WebSocket/DefaultRenderingBuilder
+    only when many reactive classes share one VM; every one of them is green solo.
