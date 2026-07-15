@@ -69,11 +69,10 @@ missing libvec.so fixture artifact.
   cratonvm-esfixture-libvec-land-20260715-r98
 - JDKVectorLibraryFloat32Tests.testRandomFloats: OK (62 tests) with
   Using native vector library.
-- Focused r94 checks (same code path before final scope cleanup): all 62
-  parameters passed for testFloat32Bulk, testFloat32BulkWithOffsets,
-  testFloat32BulkWithOffsetsAndPitch, and
+- Final r98 checks: all 62 parameters passed for testFloat32Bulk,
+  testFloat32BulkWithOffsets, testFloat32BulkWithOffsetsAndPitch, and
   testFloat32BulkWithOffsetsHeapSegments.
-- Exact testBulkOffsetsOutOfRange contract: DIRECT_OUT_OF_RANGE_OK=62.
+- Exact testBulkOffsetsOutOfRange contract on r98: DIRECT_OUT_OF_RANGE_OK=62.
 
 
 - Run summary:
