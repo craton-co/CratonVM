@@ -47,6 +47,9 @@ pub struct MockCtx {
     /// class_id → name and reverse.
     class_names: HashMap<u32, String>,
     name_to_id: HashMap<String, u32>,
+    class_interfaces: UnsafeCell<HashMap<u32, Vec<ClassId>>>,
+    lambda_functional_interfaces: UnsafeCell<HashMap<u32, String>>,
+    lambda_proxy_hosts: UnsafeCell<HashMap<u32, String>>,
     next_class_id: u32,
     next_ptr: usize,
     /// Stable identity hashes — assigned on first probe and remembered.
@@ -111,6 +114,9 @@ impl MockCtx {
             ptr_to_index: UnsafeCell::new(HashMap::new()),
             class_names,
             name_to_id,
+            class_interfaces: UnsafeCell::new(HashMap::new()),
+            lambda_functional_interfaces: UnsafeCell::new(HashMap::new()),
+            lambda_proxy_hosts: UnsafeCell::new(HashMap::new()),
             next_class_id: 1,
             next_ptr: ptr_base,
             identity_hashes: UnsafeCell::new(HashMap::new()),
@@ -145,6 +151,20 @@ impl MockCtx {
         // SAFETY: single-threaded test code.
         unsafe {
             *self.relocate_pins_on_invoke.get() = enabled;
+        }
+    }
+
+    pub fn set_class_interfaces(&self, class_id: ClassId, interfaces: Vec<ClassId>) {
+        // SAFETY: single-threaded test code.
+        unsafe { (*self.class_interfaces.get()).insert(class_id.as_u32(), interfaces); }
+    }
+
+    /// Registers hidden-lambda metadata without adding it to the class table.
+    pub fn set_lambda_proxy_metadata(&self, class_id: ClassId, functional_interface: &str, host: &str) {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.lambda_functional_interfaces.get()).insert(class_id.as_u32(), functional_interface.to_string());
+            (*self.lambda_proxy_hosts.get()).insert(class_id.as_u32(), host.to_string());
         }
     }
 
@@ -710,8 +730,17 @@ impl NativeContext for MockCtx {
     fn declared_methods(&self, _c: ClassId) -> Vec<MethodMetadata> {
         Vec::new()
     }
-    fn class_interfaces(&self, _c: ClassId) -> Vec<ClassId> {
-        Vec::new()
+    fn class_interfaces(&self, class_id: ClassId) -> Vec<ClassId> {
+        // SAFETY: single-threaded test code.
+        unsafe { (*self.class_interfaces.get()).get(&class_id.as_u32()).cloned().unwrap_or_default() }
+    }
+    fn lambda_functional_interface(&self, class_id: ClassId) -> Option<String> {
+        // SAFETY: single-threaded test code.
+        unsafe { (*self.lambda_functional_interfaces.get()).get(&class_id.as_u32()).cloned() }
+    }
+    fn lambda_proxy_host(&self, class_id: ClassId) -> Option<String> {
+        // SAFETY: single-threaded test code.
+        unsafe { (*self.lambda_proxy_hosts.get()).get(&class_id.as_u32()).cloned() }
     }
     fn class_access_flags(&self, _c: ClassId) -> u16 {
         0

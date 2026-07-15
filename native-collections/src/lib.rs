@@ -9435,9 +9435,7 @@ fn native_arrays_sort_objects(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     for v in &items {
         if let Value::Object(Some(obj)) = v {
             if !implements_comparable(ctx, *obj) {
-                let cname = ctx
-                    .class_name_of_id(ctx.class_id_of_object(*obj))
-                    .unwrap_or_else(|| "<unknown>".to_string());
+                let cname = object_class_name(ctx, *obj);
                 return Err(cratonvm_types::error::RuntimeError::ClassCastException {
                     message: format!(
                         "element of class {} does not implement java.lang.Comparable",
@@ -9473,7 +9471,11 @@ fn native_arrays_sort_objects(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         let ib = if let Value::Int(v) = b { *v as usize } else { 0 };
         let ea = read_pinned_elem(c, elem_handles[ia], items[ia]);
         let eb = read_pinned_elem(c, elem_handles[ib], items[ib]);
-        compare_via_compare_to(c, &ea, &eb)
+        // JDK natural-order sorting probes the right run against the left
+        // while identifying/merging ordered runs. That is equivalent for a
+        // normal antisymmetric Comparable, but matters when an inherited
+        // interface default returns 0 and a concrete peer supplies ordering.
+        compare_via_compare_to(c, &eb, &ea).map(i32::saturating_neg)
     });
     if let Err(e) = sort_result {
         ctx.unpin_native_roots(arr_pin);
@@ -9496,6 +9498,15 @@ fn native_arrays_sort_objects(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 fn implements_comparable(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
     let mut cid = ctx.class_id_of_object(obj);
     for _ in 0..64 {
+        // Lambda proxy classes live outside `class_manager`, so their direct
+        // interfaces must be resolved through the lambda registry first.
+        if let Some(iface_name) = ctx.lambda_functional_interface(cid) {
+            if let Some(iface) = ctx.class_id_by_name(&iface_name) {
+                if iface_extends_comparable(ctx, iface) {
+                    return true;
+                }
+            }
+        }
         for iface in ctx.class_interfaces(cid) {
             if iface_extends_comparable(ctx, iface) {
                 return true;
@@ -9507,6 +9518,15 @@ fn implements_comparable(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
         }
     }
     false
+}
+
+/// Return a useful identity for diagnostics, including hidden lambda proxies.
+fn object_class_name(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
+    let cid = ctx.class_id_of_object(obj);
+    ctx.class_name_of_id(cid)
+        .or_else(|| ctx.lambda_proxy_host(cid).map(|host| format!("{host}$$Lambda/0x{:x}", cid.as_u32())))
+        .or_else(|| ctx.lambda_functional_interface(cid).map(|iface| format!("lambda implementing {iface}")))
+        .unwrap_or_else(|| "<unknown>".to_string())
 }
 
 /// True iff `iface` IS `java/lang/Comparable` or transitively extends it.
@@ -9556,10 +9576,7 @@ fn compare_via_compare_to(
             // the original set when the elements aren't comparable) would not catch a
             // `NoSuchMethodError` and the real failure would escape (spring-bug-04).
             if !implements_comparable(ctx, *ao) {
-                let cname = ctx
-                    .class_name_of_id(ctx.class_id_of_object(*ao))
-                    .unwrap_or_else(|| "<unknown>".to_string())
-                    .replace('/', ".");
+                let cname = object_class_name(ctx, *ao).replace('/', ".");
                 return Err(cratonvm_types::error::RuntimeError::ClassCastException {
                     message: format!("class {cname} cannot be cast to class java.lang.Comparable"),
                 }
@@ -9854,9 +9871,7 @@ fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     for v in &items {
         if let Value::Object(Some(obj)) = v {
             if !implements_comparable(ctx, *obj) {
-                let cname = ctx
-                    .class_name_of_id(ctx.class_id_of_object(*obj))
-                    .unwrap_or_else(|| "<unknown>".to_string());
+                let cname = object_class_name(ctx, *obj);
                 return Err(cratonvm_types::error::RuntimeError::ClassCastException {
                     message: format!(
                         "element of class {} does not implement java.lang.Comparable",
@@ -9891,7 +9906,9 @@ fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         let ib = if let Value::Int(v) = b { *v as usize } else { 0 };
         let ea = read_pinned_elem(c, elem_handles[ia], items[ia]);
         let eb = read_pinned_elem(c, elem_handles[ib], items[ib]);
-        compare_via_compare_to(c, &ea, &eb)
+        // See Arrays.sort(Object[]) above: retain the JDK's right-vs-left
+        // natural-order probe for default-method Comparable implementations.
+        compare_via_compare_to(c, &eb, &ea).map(i32::saturating_neg)
     });
     if let Err(e) = sort_result {
         ctx.unpin_native_roots(data_pin);
