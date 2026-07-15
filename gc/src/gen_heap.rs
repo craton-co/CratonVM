@@ -3272,7 +3272,18 @@ impl GenerationalHeap {
             // here because the moving Phase-5 check below is skipped.
             let major_requested = crate::gc_quiescence::take_major_gc_request();
             let old_capacity = self.old_gen_capacity();
-            if old_capacity > 0
+            // CRATONVM_OLD_SWEEP_JIT=0 opts out of the in-place old sweep on
+            // this conservative-roots path (diagnostic escape hatch / A-B
+            // bisection knob for suspected live-object reclaims — the young
+            // sweep survives an imperfect root set via conservative
+            // over-marking and side-mark containment, but this old sweep
+            // frees purely on GC_FLAG_MARKED, so any root-set gap frees a
+            // LIVE promoted object). Read once per GC cycle — not hot.
+            let old_sweep_enabled = std::env::var("CRATONVM_OLD_SWEEP_JIT")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            if old_sweep_enabled
+                && old_capacity > 0
                 && (self.old_gen_used() >= old_capacity * 75 / 100 || major_requested)
             {
                 let old_freed = self.sweep_old_gen_non_moving(roots);
@@ -7013,6 +7024,19 @@ impl GenerationalHeap {
                 if header.gc_flags & GC_FLAG_MARKED != 0 {
                     header.gc_flags &= !GC_FLAG_MARKED;
                 } else {
+                    // A2 forensic breadcrumb (CRATONVM_DBG_A2): preserve the
+                    // victim's pre-free identity so a later zero-header /
+                    // wild-receiver access at this address can be attributed
+                    // to THIS sweep having freed a still-referenced object
+                    // (the DoHead freed-while-live investigation).
+                    if crate::a2dbg::enabled() {
+                        crate::a2dbg::record_old_sweep_free(
+                            obj_ptr as usize,
+                            header.class_id.as_u32(),
+                            header.num_slots,
+                            total_size,
+                        );
+                    }
                     unsafe { old_gen.free(obj_ptr, total_size) };
                 }
             }

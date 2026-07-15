@@ -104,6 +104,19 @@ pub fn record_free(addr: usize) {
     record(addr, 0, 0xFF, 0xFF, 0, 0, 0);
 }
 
+/// Mark an OLD-GEN block freed by the in-place old sweep
+/// (`sweep_old_gen_non_moving`), preserving the victim's pre-free header
+/// identity (class_id/num_slots/size) so a later zero-header access at this
+/// address can be attributed: "the old sweep freed a live `class_id=X`
+/// object here" is the smoking gun for a root-set gap in that sweep's mark
+/// phase (kind sentinel 0xFE; size recorded but excluded from
+/// `lookup_covering` semantics is NOT needed — covering hits on a freed span
+/// are exactly what we want surfaced, so the real size is kept).
+#[inline]
+pub fn record_old_sweep_free(addr: usize, class_id: u32, num_slots: u32, size: usize) {
+    record(addr, class_id, 0xFE, 0xFE, 0, num_slots, size);
+}
+
 /// Most-recent allocation whose `[addr, addr+size)` covers `target`.
 pub fn lookup_covering(target: usize) -> Option<Rec> {
     let l = LOG.lock().ok()?;

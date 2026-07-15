@@ -166,17 +166,36 @@ struct DirtyBufferGuard {
 
 impl Drop for DirtyBufferGuard {
     fn drop(&mut self) {
-        // SECURITY FIX (V6): deregister this thread's buffer so the collector
-        // never drains a buffer belonging to a dead thread. We cannot fold
-        // residual offsets into `pending_offsets` here (no `&CardTable` is in
-        // scope), but that is safe: a thread that is tearing down is no longer
-        // a GC root and holds no live references the collector must preserve,
-        // and the registry holds an `Arc` clone so the underlying buffer
-        // storage stays alive until both this guard and the registry entry
-        // are dropped. Match the registry entry by `Arc` identity for exact
-        // removal.
+        // DoHead freed-while-live fix (2026-07-15): the previous behavior
+        // ALWAYS deregistered here, discarding any residual buffered offsets
+        // on the rationale that "a thread that is tearing down is no longer a
+        // GC root and holds no live references the collector must preserve".
+        // That conflated the thread's STACK roots with the HEAP edges its
+        // writes created: a buffered offset records an old→young reference
+        // stored INTO THE HEAP (e.g. a Tomcat worker's final responses
+        // installing fresh nodes into the static `FastHttpDateFormat`
+        // ConcurrentLinkedQueue via CAS), and that edge outlives the thread.
+        // Discarding up to THREAD_BUFFER_FLUSH_THRESHOLD-1 such records per
+        // exiting thread left the next minor GC blind to the edge, freeing a
+        // still-referenced young object — under thread churn (a Tomcat
+        // start/stop per test parameterization retires a whole worker pool)
+        // plus GC pressure this zeroed live ConcurrentLinkedQueue nodes and
+        // surfaced as per-response NPEs / truncated responses / wild-pointer
+        // SIGSEGVs across the DoHead family (and, historically, the
+        // BouncyCastle FixedPointTest premature reclamation this table's
+        // RSET audit was built for).
+        //
+        // Fix: if any bucket still holds offsets, LEAVE the registry entry in
+        // place. The registry's `Arc` keeps the storage alive with no owner
+        // thread; the collector's `flush_all` (STW) drains it like any other
+        // buffer and reaps the orphan once it is empty (see the reap logic
+        // there). An empty buffer deregisters immediately, as before.
+        // Lock order (registry → buffer) matches `flush_all`.
         let self_ptr = Arc::as_ptr(&self.buffer);
         let mut reg = BUFFER_REGISTRY.lock();
+        if !self.buffer.lock().buckets.is_empty() {
+            return;
+        }
         if let Some(pos) = reg.iter().position(|b| Arc::as_ptr(b) == self_ptr) {
             reg.swap_remove(pos);
         }
@@ -558,8 +577,9 @@ impl CardTable {
     /// walk so a concurrently *exiting* thread cannot remove (and free) a
     /// buffer we are about to drain.
     pub fn flush_all(&self) {
-        let reg = BUFFER_REGISTRY.lock();
-        for buf in reg.iter() {
+        let mut reg = BUFFER_REGISTRY.lock();
+        let mut i = 0;
+        while i < reg.len() {
             // Lock order matches the mutator fast path (buffer-lock before
             // pending-lock) so the two can never deadlock even if, contrary
             // to the STW invariant, they were ever to run concurrently.
@@ -569,11 +589,29 @@ impl CardTable {
             // for that table's own collector. The take is a single bucket
             // lookup + O(1) `swap_remove`, not a `retain`-scan over all of the
             // thread's buffered offsets across tables.
-            let offsets = buf.lock().take(self.id);
-            if offsets.is_empty() {
-                continue;
+            let buf = Arc::clone(&reg[i]);
+            let (offsets, orphan_empty) = {
+                let mut b = buf.lock();
+                let offsets = b.take(self.id);
+                // DoHead freed-while-live fix (2026-07-15): an exiting thread
+                // with residual buffered offsets leaves its entry registered
+                // (see `DirtyBufferGuard::drop`) so those heap-edge records
+                // survive until a collector drains them. Reap such an orphan
+                // once nothing is left in ANY bucket: strong_count == 2 means
+                // registry + our local clone only (an owning thread's TLS
+                // guard would make it 3), and a dead thread can never push
+                // again, so an empty orphan stays empty.
+                let orphan_empty = Arc::strong_count(&reg[i]) == 2 && b.buckets.is_empty();
+                (offsets, orphan_empty)
+            };
+            if !offsets.is_empty() {
+                self.pending_offsets.lock().extend(offsets);
             }
-            self.pending_offsets.lock().extend(offsets);
+            if orphan_empty {
+                reg.swap_remove(i);
+            } else {
+                i += 1;
+            }
         }
     }
 
@@ -991,6 +1029,42 @@ mod tests {
         let newly = ct.drain_pending();
         assert_eq!(newly, 1);
         assert!(ct.is_dirty(0));
+    }
+
+    #[test]
+    fn dying_thread_residual_offsets_survive_until_flush_all() {
+        // DoHead freed-while-live regression (2026-07-15): a mutator thread
+        // that buffers an old→young edge and EXITS without flushing (fewer
+        // than THREAD_BUFFER_FLUSH_THRESHOLD entries buffered) must not lose
+        // the record — the edge lives in the heap and outlives the thread.
+        // Pre-fix, `DirtyBufferGuard::drop` deregistered the buffer and the
+        // offsets were silently discarded; the next minor GC freed the
+        // still-referenced young object (Tomcat's static FastHttpDateFormat
+        // ConcurrentLinkedQueue nodes zeroing under worker-pool churn).
+        let ct = std::sync::Arc::new(CardTable::new(0x0, 4096));
+        let ct2 = std::sync::Arc::clone(&ct);
+        std::thread::spawn(move || {
+            // One buffered edge, far below the auto-flush threshold; the
+            // thread exits immediately after, running DirtyBufferGuard::drop.
+            ct2.thread_local_dirty(128);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            ct.pending_count(),
+            0,
+            "edge must still be in the (orphaned) thread buffer, not pending"
+        );
+        // Collector at STW: must recover the dead thread's buffered edge and
+        // reap the orphaned buffer.
+        ct.flush_all();
+        assert_eq!(ct.pending_count(), 1, "dead thread's edge must survive");
+        let newly = ct.drain_pending();
+        assert_eq!(newly, 1);
+        assert!(ct.is_dirty(128 / CARD_SIZE));
+        // Second flush_all: the orphan was reaped, nothing left to drain.
+        ct.flush_all();
+        assert_eq!(ct.pending_count(), 0);
     }
 
     // -----------------------------------------------------------------

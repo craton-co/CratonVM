@@ -13334,6 +13334,41 @@ fn execute_instruction(
                         }
                         .into());
                     }
+                    // DoHead freed-while-live forensics (2026-07-15): the other
+                    // stale-receiver face — a VALID heap address whose object
+                    // was zeroed (all-zero header: ClassId(0), num_slots=0)
+                    // while a long-lived holder kept serving it. The gc guard
+                    // contains each read but names no Java context; print it
+                    // here (capped) so the holder structure is identifiable.
+                    // A getfield on a 0-slot object is always OOB, so this
+                    // never fires for a legitimate zero-hash ClassId(0)
+                    // container with fields.
+                    if p != 0 && shared.heap.is_heap_addr(p).is_some() {
+                        let h = shared.heap.get_header(obj_ref);
+                        if h.class_id.as_u32() == 0 && h.num_slots == 0 {
+                            use std::sync::atomic::{AtomicUsize, Ordering};
+                            static NZ: AtomicUsize = AtomicUsize::new(0);
+                            let n = NZ.fetch_add(1, Ordering::Relaxed);
+                            if n < 12 {
+                                let field_name =
+                                    resolve_field_name(shared, current_class_id, *index);
+                                let cn = thread.frames[frame_idx].class_name().to_string();
+                                let mn = thread.frames[frame_idx].method_name().to_string();
+                                let pc = thread.frames[frame_idx].pc;
+                                eprintln!(
+                                    "[BADRECV-Z #{n}] getfield ZEROED receiver=0x{p:x} \
+                                 field={field_name:?} field_index={} in {cn}.{mn} pc={pc}",
+                                    field.field_index,
+                                );
+                                eprintln!("[BADRECV-Z #{n}] Java frames (innermost first):");
+                                for f in thread.frames.iter().rev().take(24) {
+                                    eprintln!("    {}.{}", f.class_name(), f.method_name());
+                                }
+                                use std::io::Write;
+                                let _ = std::io::stderr().flush();
+                            }
+                        }
+                    }
                 }
                 if crate::runtime::env_cache::hashtableofint_trace() {
                     let cname = thread.frames[frame_idx].class_name();
