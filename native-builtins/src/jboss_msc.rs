@@ -4242,30 +4242,13 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         "org/jboss/msc/service/ServiceControllerImpl",
     );
 
-    // DelegatingServiceController is another concrete wrapper selected at
-    // dispatch sites such as the datasource parallel boot task. Its inherited
-    // ServiceController methods have no Code attribute, so it needs the same
-    // complete bridge as ServiceControllerImpl.
-    r.alias_class(
-        "org/jboss/msc/service/ServiceController",
-        "org/jboss/msc/service/DelegatingServiceController",
-    );
-    // DelegatingServiceController resolves these interface declarations under
-    // its own class key, so register them explicitly as well as aliasing the
-    // complete bridge above.
-    let delegating_controller = "org/jboss/msc/service/DelegatingServiceController";
-    r.register(
-        delegating_controller,
-        "getService",
-        "()Lorg/jboss/msc/service/Service;",
-        native_service_controller_get_service,
-    );
-    r.register(
-        delegating_controller,
-        "getName",
-        "()Lorg/jboss/msc/service/ServiceName;",
-        native_service_controller_get_name,
-    );
+    // Do not alias ServiceController natives onto DelegatingServiceController.
+    // It has real forwarding bytecode and a two-field wrapper layout; aliasing
+    // getState()/getService()/getName() bypasses that bytecode and makes the
+    // synthetic-controller natives read SC_FIELD_ID (slot 5) from the wrapper.
+    // OperationContextServiceController extends this type, so that misdispatch
+    // rolls back WildFly management services before domain inventory startup.
+    // Let the wrapper forward to its synthetic ServiceController delegate.
 
     let _ = CTX_NUM_SLOTS; // silence unused constant when debug builds elide.
     r.set_category(__prev_cat);
@@ -4427,11 +4410,25 @@ mod tests {
         for class in [
             "org/jboss/msc/service/ServiceController",
             "org/jboss/msc/service/ServiceControllerImpl",
-            "org/jboss/msc/service/DelegatingServiceController",
         ] {
             assert!(
                 registry.find(class, "getService", descriptor).is_some(),
                 "{class}.getService must use the descriptor from jboss-msc 1.5"
+            );
+        }
+
+        // This class has real bytecode which forwards every ServiceController
+        // method to its delegate. It must never receive the synthetic mirror
+        // natives (whose slot-5 controller ID is not in its two-field layout).
+        let delegating = "org/jboss/msc/service/DelegatingServiceController";
+        for (method, descriptor) in [
+            ("getState", "()Lorg/jboss/msc/service/ServiceController$State;"),
+            ("getService", descriptor),
+            ("getName", "()Lorg/jboss/msc/service/ServiceName;"),
+        ] {
+            assert!(
+                registry.find(delegating, method, descriptor).is_none(),
+                "{delegating}.{method}{descriptor} must retain its Java forwarding bytecode"
             );
         }
     }
