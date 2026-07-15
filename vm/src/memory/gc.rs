@@ -67,14 +67,22 @@ pub fn reconcile_class_mirrors(shared: &crate::vm::SharedVm, is_marked: &dyn Fn(
 /// unconditionally: bounded by `class_mirrors.len()`, each entry a single
 /// `defining_loader_for` hash lookup that returns `None` (skipped) for every
 /// built-in-loader class — the overwhelmingly common case.
-pub fn rebuild_mirror_pins(shared: &crate::vm::SharedVm) {
+pub fn rebuild_mirror_pins(
+    shared: &crate::vm::SharedVm,
+    pointer_map: &HashMap<usize, usize>,
+) {
     let class_mirrors = shared.class_mirrors.read();
     let mut entries: Vec<(usize, usize)> = Vec::new();
     for (&class_id, mirror_ref) in class_mirrors.iter() {
         if let Some(loader) =
             cratonvm_native_builtins::classloader::defining_loader_for(class_id.as_u32())
         {
-            entries.push((loader.as_ptr() as usize, mirror_ref.as_ptr() as usize));
+            let old_mirror_addr = mirror_ref.as_ptr() as usize;
+            let mirror_addr = pointer_map
+                .get(&old_mirror_addr)
+                .copied()
+                .unwrap_or(old_mirror_addr);
+            entries.push((loader.as_ptr() as usize, mirror_addr));
         }
     }
     drop(class_mirrors);

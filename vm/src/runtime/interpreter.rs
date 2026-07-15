@@ -189,6 +189,16 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
         .iter()
         .flat_map(|&(ref_obj, referent)| [ref_obj, referent])
         .collect();
+    let queue_watch_addrs = {
+        let rp = shared.ref_processor.lock();
+        rp.weak_phantom_active_queue_addrs()
+    };
+    let mut watched_reference_liveness = watch_addrs;
+    watched_reference_liveness.extend(queue_watch_addrs);
+    // Queue addresses need the same non-moving survival proof as their
+    // Reference objects; post-GC enqueue writes both endpoints.
+    let watch_addrs = watched_reference_liveness;
+
     if std::env::var_os("CRATONVM_DBG_WATCHREF").is_some() {
         eprintln!(
             "[watchref] publishing {} watched referent(s): {:x?}",
@@ -1607,7 +1617,7 @@ fn process_references_after_gc(
         // Rebuild the mirror_pin registry the GC marker consults (gen_heap.rs)
         // from the now-pruned class_mirrors + just-remapped defining-loader
         // side-table, so the marker sees current addresses next cycle.
-        crate::memory::gc::rebuild_mirror_pins(shared);
+        crate::memory::gc::rebuild_mirror_pins(shared, pointer_map);
     }
 
     // bc math-ec 0x4 (CRATONVM_DBG_NO_REFPROC): subsystem-level exclusion
