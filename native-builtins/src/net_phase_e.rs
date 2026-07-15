@@ -2927,7 +2927,9 @@ fn re1_socket_write_stream(
                 Ok(Some(Value::Object(Some(exc)))) => {
                     let exc_pin = ctx.pin_native_root(exc);
                     let exc = ctx.read_native_pin(exc_pin, exc);
-                    Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc))
+                    Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+                        exc,
+                    ))
                 }
                 _ => Err(ioex(format!("Socket write failed: {e}"))),
             };
@@ -5506,9 +5508,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         ctx.set_field(stream, 1, Value::Int(0)); // pos
         ctx.set_field(stream, 2, Value::Int(0)); // mark
         ctx.set_field(stream, 3, Value::Int(len)); // count
-        // The constructor dispatch can allocate as well.  Pin the newly
-        // allocated stream alongside its backing array, then return the
-        // post-GC stream address rather than the stale Rust local.
+                                                   // The constructor dispatch can allocate as well.  Pin the newly
+                                                   // allocated stream alongside its backing array, then return the
+                                                   // post-GC stream address rather than the stale Rust local.
         let stream_pin = ctx.pin_native_root(stream);
         let stream = ctx.read_native_pin(stream_pin, stream);
         let body = ctx.read_native_pin(body_pin, body);
@@ -8371,14 +8373,12 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         ctx_cls,
         "setDefault",
         "(Ljavax/net/ssl/SSLContext;)V",
-        |_ctx, args| {
-            match args.first().copied() {
-                Some(Value::Object(Some(ctx_obj))) => {
-                    crate::t27_tls::set_runtime_default_ssl_context(ctx_obj);
-                    Ok(None)
-                }
-                _ => Err(npe("context")),
+        |_ctx, args| match args.first().copied() {
+            Some(Value::Object(Some(ctx_obj))) => {
+                crate::t27_tls::set_runtime_default_ssl_context(ctx_obj);
+                Ok(None)
             }
+            _ => Err(npe("context")),
         },
     );
     r.register(
@@ -8432,23 +8432,13 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let f = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
             ctx.set_field(f, 0, Value::Object(Some(this)));
-            // getSocketFactory() is a CLIENT-side call (the server uses
-            // createSSLEngine / getServerSocketFactory), so if this context
-            // carries a per-context identity it is the client cert. Install it
-            // as the default client identity for the native HttpsURLConnection
-            // client (`http_url_connection::perform`), which can't route through
-            // the synthetic factory. This is the reliable capture point —
-            // overriding the concrete `setDefaultSSLSocketFactory` bytecode does
-            // not work (real JDK method body wins over a native override).
-            if let Some((cert, key)) = crate::t27_tls::ctx_identity(ctx, this) {
-                crate::t27_tls::set_huc_default_client_identity(Some((cert, key)));
-            }
-            // Likewise remember this context's captured KeyManager objects
-            // (if any — see `SSLContext.init` above) so the native
-            // HttpsURLConnection client can consult a real
-            // `KeyManager.chooseClientAlias` mid-handshake instead of only
-            // ever presenting one fixed identity.
-            crate::t27_tls::capture_huc_key_managers_ctx_key(ctx, this);
+            // getSocketFactory() is a client-side call (the server uses
+            // createSSLEngine / getServerSocketFactory). Capture the complete
+            // context for native HttpsURLConnection, including anonymous
+            // client contexts: its ClientConfig owns the TLS ticket cache.
+            // This is the reliable capture point because the real JDK
+            // setDefaultSSLSocketFactory bytecode cannot be overridden here.
+            crate::t27_tls::capture_huc_ssl_context(ctx, this);
             Ok(Some(Value::Object(Some(f))))
         },
     );
@@ -8659,6 +8649,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let cfg = crate::t27_tls::build_engine_client_config_with_identity(
                 &["http/1.1"],
                 client_ident.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
+                None,
                 None,
             )
             .map_err(|e| ioex(format!("client TLS config: {e}")))?;

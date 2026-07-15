@@ -66,7 +66,10 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{atomic::{AtomicI64, Ordering}, Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicI64, Ordering},
+    Mutex, OnceLock,
+};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
@@ -148,6 +151,14 @@ fn logger_registry() -> &'static Mutex<HashMap<String, u64>> {
 /// (Tomcat's `LogCapture` is one such user), not only console output.
 fn logger_handlers() -> &'static Mutex<HashMap<String, Vec<u64>>> {
     static INSTANCE: OnceLock<Mutex<HashMap<String, Vec<u64>>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Explicit JUL levels for real Logger objects. Their private configuration
+/// layout is not always materialized by the VM, but callers such as Tomcat's
+/// LogCapture rely on `setLevel(FINE)` taking effect immediately.
+fn logger_explicit_levels() -> &'static Mutex<HashMap<String, i32>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<String, i32>>> = OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -1004,9 +1015,7 @@ fn native_level_parse(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 for candidate in names {
                     if let Some(idx) = ctx.static_field_index_by_name(cid, candidate) {
                         if let Value::Object(Some(level_obj)) = ctx.get_static_field(cid, idx) {
-                            if let Value::Int(v) =
-                                ctx.get_field_by_name(level_obj, "value")
-                            {
+                            if let Value::Int(v) = ctx.get_field_by_name(level_obj, "value") {
                                 if v == target {
                                     return Ok(Some(Value::Object(Some(level_obj))));
                                 }
@@ -1886,7 +1895,8 @@ fn native_jul_log_record_get_message(
 /// Store an explicit handler without relying on the private JDK Logger layout.
 fn native_jul_logger_add_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let (Some(Value::Object(Some(logger))), Some(Value::Object(Some(handler)))) =
-        (args.first(), args.get(1)) else {
+        (args.first(), args.get(1))
+    else {
         return Ok(None);
     };
     let name = read_jul_logger_name(ctx, *logger);
@@ -1898,9 +1908,13 @@ fn native_jul_logger_add_handler(ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(None)
 }
 
-fn native_jul_logger_remove_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_jul_logger_remove_handler(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let (Some(Value::Object(Some(logger))), Some(Value::Object(Some(handler)))) =
-        (args.first(), args.get(1)) else {
+        (args.first(), args.get(1))
+    else {
         return Ok(None);
     };
     let name = read_jul_logger_name(ctx, *logger);
@@ -1960,7 +1974,9 @@ fn publish_jul_handlers(
         // stable identity across the moving collector.
         let record_id = next_log_record_id();
         ctx.set_field(record, 1, Value::Long(record_id));
-        let mut messages = log_record_messages().lock().unwrap_or_else(|e| e.into_inner());
+        let mut messages = log_record_messages()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         messages.insert(record_id, ctx.read_string(message).unwrap_or_default());
         // A long-lived handler must not turn the bridge into an unbounded
         // message cache. Records are ephemeral; retain a generous recent
@@ -2030,7 +2046,16 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         "WARNING" => "WARN",
         "INFO" => "INFO",
         "CONFIG" => "INFO",
-        "FINE" | "FINER" | "FINEST" => return Ok(None), // suppress noise
+        // Keep fine-grained messages off the console, but do publish them to
+        // explicitly installed handlers. Tomcat's LogCapture sets a logger to
+        // FINE specifically to assert a recoverable handshake underflow.
+        "FINE" | "FINER" | "FINEST" => {
+            publish_jul_handlers(ctx, this, level_obj, message_obj);
+            if let (Some(logger), Some(level), Some(message)) = (this, level_obj, message_obj) {
+                publish_to_jul_handlers(ctx, logger, level, message)?;
+            }
+            return Ok(None);
+        }
         other => other,
     };
     let message = message_obj
@@ -2082,9 +2107,14 @@ fn publish_to_jul_handlers(
         let logger = ctx.read_native_pin(base_pin, logger);
         let level = ctx.read_native_pin(level_pin, level);
         let message = ctx.read_native_pin(message_pin, message);
-        let handlers = match ctx.get_field(logger, LOGGER_FIELD_PARENT) {
-            Value::Object(Some(list)) => list,
-            _ => return Ok(None),
+        let handlers = crate::jul_logger_handlers_get(ctx, logger).or_else(|| {
+            match ctx.get_field(logger, LOGGER_FIELD_PARENT) {
+                Value::Object(Some(list)) => Some(list),
+                _ => None,
+            }
+        });
+        let Some(handlers) = handlers else {
+            return Ok(None);
         };
         let handlers_pin = ctx.pin_native_root(handlers);
         let record = match ctx.new_object_initialized(
@@ -2346,13 +2376,22 @@ fn native_jul_logger_log_record(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 /// prints nothing" symptom). Mirror the JDK default: the root logger
 /// is INFO, so anything at INFO or higher (INTvalue >= 800) is
 /// loggable, and FINE/FINER/FINEST are not.
-fn native_jul_logger_is_loggable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_jul_logger_is_loggable(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let logger = match args.first() {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
     let level_obj = match args.get(1) {
         Some(Value::Object(o)) => *o,
         _ => None,
     };
     // `Level` exposes an int `value` field (e.g. WARNING=900, INFO=800,
-    // CONFIG=700, FINE=500). Compare against the JDK default root level.
+    // CONFIG=700, FINE=500). Use the logger's configured level when it is a
+    // real JUL Logger (LogCapture temporarily sets it to FINE); otherwise
+    // mirror the JDK root default of INFO.
     let level_value = level_obj
         .and_then(|o| match ctx.get_field_by_name(o, "value") {
             Value::Int(v) => Some(v),
@@ -2380,7 +2419,55 @@ fn native_jul_logger_is_loggable(ctx: &mut dyn NativeContext, args: &[Value]) ->
                 })
         })
         .unwrap_or(800);
-    Ok(Some(Value::Int(if level_value >= 800 { 1 } else { 0 })))
+    let configured_threshold = logger
+        .and_then(|logger| match ctx.get_field_by_name(logger, "config") {
+            Value::Object(Some(config)) => match ctx.get_field_by_name(config, "levelObject") {
+                Value::Object(Some(level)) => match ctx.get_field_by_name(level, "value") {
+                    Value::Int(value) => Some(value),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap_or(800);
+    let threshold = logger
+        .map(|logger| read_jul_logger_name(ctx, logger))
+        .and_then(|name| {
+            logger_explicit_levels()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&name)
+                .copied()
+        })
+        .unwrap_or(configured_threshold);
+    Ok(Some(Value::Int(if level_value >= threshold {
+        1
+    } else {
+        0
+    })))
+}
+
+pub(crate) fn record_jul_logger_level(ctx: &dyn NativeContext, logger: ObjectRef, level: Value) {
+    let name = read_jul_logger_name(ctx, logger);
+    if name.is_empty() {
+        return;
+    }
+    let value = match level {
+        Value::Object(Some(level)) => match ctx.get_field_by_name(level, "value") {
+            Value::Int(value) => Some(value),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut levels = logger_explicit_levels()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(value) = value {
+        levels.insert(name, value);
+    } else {
+        levels.remove(&name);
+    }
 }
 
 fn native_jul_logger_info(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2398,8 +2485,10 @@ fn native_jul_logger_severe(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     publish_jul_convenience(ctx, args, "SEVERE")?;
     Ok(None)
 }
-fn native_jul_logger_fine(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Suppress fine/finer/finest — too noisy and not useful for boot visibility.
+fn native_jul_logger_fine(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Keep fine/finer/finest quiet on the console, but explicit JUL handlers
+    // (for example Tomcat's LogCapture) must still receive the record.
+    publish_jul_convenience(ctx, args, "FINE")?;
     Ok(None)
 }
 
