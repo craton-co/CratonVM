@@ -1,9 +1,42 @@
-# Keycloak WelcomePageTest residuals follow-up (2026-07-15) — one confirmed fixed, one root-caused (not fixed, architectural), one newly found (not root-caused), one blocked
+# Keycloak WelcomePageTest residuals follow-up (2026-07-15) — one confirmed fixed, one root-caused (not fixed, architectural), one FIXED same-day in a follow-up session, one partially re-verified
 
-Status: investigation complete for 3 of 4 items; no code changes land from this session (see "What changed" below).
+Status: item 3 (zipfs `Files.copy`) is now FIXED — see the 2026-07-15 (later) update section immediately below.
+Item 4 (teardown hang) has been re-verified: it did NOT reproduce once item 3 was fixed. Original investigation
+(3 of 4 items, no code changes) follows unchanged below for history.
 Follow-up to `docs/internal/fixed-suite-bugs/pom-xml-declaration-char-corruption-breaks-quarkus-maven-bootstrap-FIXED.md`,
 which fixed the pom.xml bootstrap path and left three further residuals for dedicated investigation. This doc covers
 all three, plus a fourth issue discovered along the way.
+
+## 2026-07-15 (later same day) update: item 3 FIXED, item 4 re-verified NOT reproducing
+
+Item 3 (`Files.copy()` from a non-default `FileSystemProvider` path) turned out to be **two** stacked
+path-layout bugs, not one: `Files.copy` itself didn't classify a jarfs-encoded *source* (only the
+destination was handled), and — the more severe bug, only reachable through Quarkus's *real*
+`ZipUtils.unzip()` code path (not the hand-written repro in item 3 below, which is why it wasn't found
+sooner) — `p57_read_path()` silently mis-read a Quarkus `PathWrapper` decorator Path as an empty
+string, which made the zip mount silently fall back to the **real host filesystem root**, causing
+`Files.walkFileTree` to try to copy the entire host disk into the extraction target. Full root-cause,
+fix, and verification detail: `docs/internal/fixed-suite-bugs/zipfs-files-copy-wrapped-path-FIXED.md`.
+Fixed and merged to `dev`: `e38d6f60`/`90cc7e73` (bug 1, `Files.copy` source), `a43436fc`/`882395cd`
+(bug 2, `p57_read_path`).
+
+With item 3 fixed, item 4's originally-reported ~27-minute post-test-completion hang was re-run
+end-to-end (`org.keycloak.tests.welcomepage.WelcomePageTest` via the existing `TimedKcRunner` harness,
+`--stack-dump-on-timeout 1800`): the Keycloak 26.6.1 test server now boots successfully, all 6 test
+methods run, and the process exits cleanly **~183 seconds** after starting (well under a second after
+the last test method finishes) — no hang, no orphaned server process left behind. The originally-reported
+hang did not reproduce; it's plausible the hang was somehow related to the runaway host-filesystem-copy
+condition in bug 2 (a walk of the entire host disk under heavy shared-host I/O contention could plausibly
+manifest as an apparent multi-minute-to-tens-of-minutes stall depending on exactly where/when it was
+observed), though this was not proven and the original report predates this fix, so no conclusive causal
+link is claimed — only that the specific symptom no longer reproduces after this fix.
+
+All 6 `WelcomePageTest` methods still individually FAIL (server boots, but the tests themselves don't
+pass yet): the WebDriver-backed methods hit the pre-existing, separately root-caused (not fixed) item 2
+Stream/Spliterator Selenium-JSON bug below; the non-WebDriver methods now fail later, on
+`Failed to resolve artifact: org.keycloak.testframework:keycloak-test-framework-remote-providers`
+(a Maven/Sisu artifact-resolution failure, not obviously a CratonVM defect) — not investigated further,
+flagged as the next blocker in this chain.
 
 ## 1. resteasy `ApacheHttpClient43Engine` NoClassDefFoundError — CONFIRMED RESOLVED
 

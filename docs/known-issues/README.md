@@ -4,6 +4,26 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-15 Keycloak `WelcomePageTest` zipfs `Files.copy` bug FIXED (two stacked path-layout bugs); teardown hang re-verified NOT reproducing
+
+FIXED (moved to `docs/internal/fixed-suite-bugs/`): [`zipfs-files-copy-wrapped-path-FIXED.md`](../internal/fixed-suite-bugs/zipfs-files-copy-wrapped-path-FIXED.md)
+-- closes item 3 of [`keycloak/welcomepagetest-stream-spliterator-zipcopy-residuals-20260715.md`](keycloak/welcomepagetest-stream-spliterator-zipcopy-residuals-20260715.md)
+("`Files.copy()` from a non-default `FileSystemProvider` path fails"), which blocked Quarkus's
+`ZipUtils.unzip()` (used by `DistributionKeycloakServer.createInstallation()` to extract the Keycloak
+distribution for every `tests/base` integration test that needs a running server). Two independent
+`native-builtins/src/phases_late.rs` bugs stacked: (1) `Files.copy`'s native didn't classify a
+jarfs-encoded *source* path, only the destination; (2) `p57_read_path()` silently mis-read a Quarkus
+`PathWrapper` decorator Path (used by `ZipUtils`'s `ignoreFileWriteability` before every zip mount) as
+an empty string, which made the zip mount silently fall back to the *real host filesystem root* --
+`Files.walkFileTree` then tried to copy the entire host disk into the extraction target. Fixed +
+merged to `dev`: `e38d6f60`/`90cc7e73` (bug 1), `a43436fc`/`882395cd` (bug 2). With both fixed, the
+Keycloak 26.6.1 test server now boots successfully under `WelcomePageTest`, and the previously-reported
+~27-minute post-test-completion teardown hang was re-run end-to-end and did NOT reproduce (process now
+exits cleanly ~183s after starting, well under a second after the last test method finishes). The tests
+themselves still fail for unrelated, already-tracked reasons (item 2's Selenium/Stream bug, and a newly
+observed Maven artifact-resolution failure) -- see the known-issues doc's 2026-07-15 update section for
+detail.
+
 ## 2026-07-15 `WFLYCTL0079` (any extension) during `parallel-extension-add`: generalized to the existing `AttributeAccess` CCE doc; "JIT required" DISPROVED; one real site FIXED, residual re-characterized
 
 With the 2026-07-14 ObjectName fix below and the prior session's stale-`ObjectRef` fixes in place,
