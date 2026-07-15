@@ -19,8 +19,8 @@ silently accepted.
 
 ## Validation
 
-Built the isolated release binary
-`cratonvm-springboot-lazy-cglib-closure-20260715-build9.exe` and ran each
+Built the merged-state isolated release binary
+`cratonvm-springboot-lazy-cglib-closure-20260715-build10.exe` and ran each
 originally affected class with the Spring Boot test runner in both modes:
 
 | Test class | JIT | `--nojit` |
