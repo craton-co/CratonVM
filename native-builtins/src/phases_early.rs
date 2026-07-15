@@ -17292,7 +17292,14 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/logging/LogRecord;)Ljava/lang/String;",
         |ctx, args| {
             if let Some(Value::Object(Some(rec))) = args.get(1) {
-                Ok(Some(ctx.get_field(*rec, 1)))
+                // LogRecord slot 1 is its sequence number on the real JDK
+                // layout, not the message. Resolve through the public method
+                // so concrete JULI formatters receive the string populated by
+                // the logging bridge.
+                match ctx.invoke_virtual(*rec, "getMessage", "()Ljava/lang/String;", &[])? {
+                    Some(Value::Object(Some(message))) => Ok(Some(Value::Object(Some(message)))),
+                    _ => Ok(Some(Value::Object(Some(ctx.create_string(""))))),
+                }
             } else {
                 let s = ctx.create_string("");
                 Ok(Some(Value::Object(Some(s))))

@@ -34551,12 +34551,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         native_juli_filehandler_clean,
     );
 
-    // KC26: Handler / ExtHandler / QuarkusDelayedHandler no-op stubs.
-    // These fire when our post-clinit fixup populates DELAYED_HANDLER with
-    // a synthetic object whose fields are all null. The close/flush/publish
-    // calls must not NPE on null internal arrays.
+    // KC26: ExtHandler / QuarkusDelayedHandler no-op stubs. These fire when
+    // our post-clinit fixup populates DELAYED_HANDLER with a synthetic object
+    // whose fields are all null. Do not register these on java.util.logging.Handler:
+    // native lookup is inherited by real FileHandler subclasses, where it would
+    // suppress their publish/flush bytecode and silently drop JULI output.
     for handler_class in &[
-        "java/util/logging/Handler",
         "org/jboss/logmanager/ExtHandler",
         "io/quarkus/bootstrap/logging/QuarkusDelayedHandler",
     ] {
@@ -37854,6 +37854,19 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     });
     registry.register(
         "java/util/logging/Handler",
+        "setLevel",
+        "(Ljava/util/logging/Level;)V",
+        |ctx, args| {
+            ctx.set_field_by_name(
+                obj_arg(args, 0)?,
+                "logLevel",
+                args.get(1).copied().unwrap_or(Value::Object(None)),
+            );
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/util/logging/Handler",
         "getLevel",
         "()Ljava/util/logging/Level;",
         |ctx, args| Ok(Some(ctx.get_field_by_name(obj_arg(args, 0)?, "logLevel"))),
@@ -37904,6 +37917,25 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
             }
             Ok(Some(Value::Int(1)))
         },
+    );
+    registry.register(
+        "java/util/logging/Handler",
+        "setFormatter",
+        "(Ljava/util/logging/Formatter;)V",
+        |ctx, args| {
+            ctx.set_field_by_name(
+                obj_arg(args, 0)?,
+                "formatter",
+                args.get(1).copied().unwrap_or(Value::Object(None)),
+            );
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/util/logging/Handler",
+        "getFormatter",
+        "()Ljava/util/logging/Formatter;",
+        |ctx, args| Ok(Some(ctx.get_field_by_name(obj_arg(args, 0)?, "formatter"))),
     );
     register_log4j_stacklocator_bridge(registry);
 
