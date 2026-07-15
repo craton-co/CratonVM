@@ -17378,6 +17378,24 @@ impl Compiler {
                     } else {
                         self.emit_load_local(RAX, self.local_offset(guard.array_local));
                     }
+                    // Null guard: TEST RAX, RAX (48 85 C0); JZ deopt (0F 84) — the header
+                    // guard runs UNCONDITIONALLY, even when the loop is zero-trip
+                    // (`bound == 0`), where the original bytecode never dereferences
+                    // the array at all. A null array with bound 0 is a perfectly
+                    // legal program state (freemarker's
+                    // `TemplateElement.setChildren` receives `buffer == null,
+                    // count == 0` for childless elements and SIGSEGV'd here on the
+                    // raw length load — reactor `boundedElastic` render thread,
+                    // FreeMarkerMacroTests/FreeMarkerViewTests ABEND). Route null
+                    // to the same reason-2 deopt stub: the interpreter re-runs the
+                    // loop with real per-access semantics (returning normally for
+                    // zero-trip, throwing NPE only if an access is actually
+                    // reached). Mirrors the LICM hoist null guard below.
+                    self.buf.emit(&[0x48, 0x85, 0xC0]);
+                    self.buf.emit(&[0x0F, 0x84]);
+                    let null_patch = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    self.deopt_stubs.push((null_patch, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
                     // MOV R10D, DWORD [RAX + ARRAY_LENGTH_OFFSET] — array length
                     self.buf
                         .emit(&[0x44, 0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // Cast: x86-64 register encoding

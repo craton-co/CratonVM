@@ -5,17 +5,11 @@ fully accounted for. Most of the volume is **not** new CratonVM bugs — it's a 
 environment/harness gaps repeating across many classes. The genuinely new/still-open bugs from this rerun each
 have their own doc in this folder (see list at the bottom); this doc just closes the loop on everything else.
 
-## 1. Arquillian `auth-server-undertow` container-provisioning gap — ~543 classes (541 `testsuite/integration-arquillian/tests/base` + 2 `testsuite/integration-arquillian/tests/other/sssd`)
+## 1. Arquillian `auth-server-undertow` container-provisioning gap — FIXED (2026-07-15)
 
-```
-java.lang.IllegalStateException: Not found frontend container: auth-server-undertow
-  org.keycloak.testsuite.arquillian.AuthServerTestEnricher.initializeSuiteContext(AuthServerTestEnricher.java:233)
-```
-
-Every class under `testsuite/integration-arquillian` needs a fully-configured Arquillian container adapter
-(`auth-server-undertow`) that this harness/environment doesn't provision. Not a CratonVM bug — this is an
-Arquillian container-configuration prerequisite, would fail identically under any JVM without the right
-Arquillian setup.
+The per-class runner now materializes the effective Maven Surefire configuration and supplies the transformed
+Arquillian descriptor. The focused HotSpot probe executes all five tests with all three containers successful.
+The retired record is [here](../../internal/fixed-suite-bugs/keycloak-arquillian-auth-server-undertow-container-not-found-FIXED.md).
 
 ## 2. `keycloak-test-framework-remote-providers` Maven artifact-resolution gap — ~345 classes (341 `tests/base` + 4 `tests/webauthn`)
 
@@ -42,15 +36,13 @@ unrelated residuals (Selenium/HtmlUnit JSON parsing, a missing sun.management na
 gap) were newly discovered downstream of a successful server boot -- flagged separately, not part of this
 issue.
 
-## 3. FIPS-mode `Assume.assumeTrue` skip pattern — 10 `crypto/fips1402` classes
+## 3. FIPS-mode JUnit assumptions — reporting classification fixed (2026-07-15)
 
-```
-KCRUNNER_RESULT tests=N failed=0 aborted=N ...
-```
-(all tests "aborted", zero "failed" — from `Assume.assumeTrue(Environment.isJavaInFipsMode())` at the top of
-each FIPS1402 test class)
-
-This environment isn't running in FIPS mode, so these tests correctly self-skip — the same on any JVM. Not a bug.
+The historical rerun counted ten `crypto/fips1402` assumption-gated classes as `FAIL` because the harness treated
+every JUnit abort as a failure. The runner now reports all-aborted classes as `SKIP` and mixed pass/abort classes as
+`PARTIAL`; actual failures remain `FAIL`. A focused current-dev Azure comparison of all 21 FIPS classes produced
+the identical HotSpot/CratonVM distribution: 11 PASS, 3 PARTIAL, 7 SKIP, 0 failed, and 0 failed containers.
+See [the fixed reporting record](../../internal/fixed-suite-bugs/keycloak-fips1402-assumption-aborts-classification-FIXED.md).
 
 ## 4. Docker not available — 2 `tests/clustering` classes
 
@@ -98,3 +90,6 @@ Single test, not re-investigated this pass (already flagged as low-priority in t
 + 37 (Unsafe/Netty) + 1 (SCIM ANTLR) + 2 (Cipher AESWrap) + 2 (EdDSA KeySpec) + 1 (X509 CN) + 4 (Quarkus config)
 = **952** of 953 FAILs accounted for (the remaining 1 is likely rounding/an edge case in one of the above
 buckets' exact counts — not independently investigated further given the overwhelming majority is explained).
+
+Historical note: the 10 FIPS assumption-gated rows above were formerly labelled `FAIL`; they now report as
+non-failure `SKIP`/`PARTIAL` outcomes under the corrected harness policy.

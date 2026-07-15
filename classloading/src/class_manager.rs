@@ -6744,6 +6744,16 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         "java/util/Collections$EmptyEnumeration" => {
             &["java/util/Enumeration", "java/io/Serializable"]
         }
+        // RE.5 JDK-HttpClient reactive path: the one-shot replay subscription
+        // handed to a real `BodySubscriber` (`net_phase_e.rs::
+        // RE5_REPLAY_SUBSCRIPTION`). Real JDK bytecode checkcasts it —
+        // `ResponseSubscribers$PublishingBodySubscriber.onSubscribe` completes
+        // a `CompletableFuture<Flow.Subscription>` whose downstream stage casts
+        // the value — so the wrapper class must genuinely implement the
+        // interface or Spring's reactive `JdkClientHttpConnector` dies with
+        // "HttpBodyReplaySubscription cannot be cast to Flow$Subscription"
+        // (WebClientIntegrationTests "[2] JDK", 40 sub-tests).
+        "cratonvm/net/HttpBodyReplaySubscription" => &["java/util/concurrent/Flow$Subscription"],
         "java/util/ArrayList$Itr" => &["java/util/Iterator"],
         "java/util/ArrayList$ListItr" => &["java/util/ListIterator", "java/util/Iterator"],
         "java/util/Dictionary" => &[],

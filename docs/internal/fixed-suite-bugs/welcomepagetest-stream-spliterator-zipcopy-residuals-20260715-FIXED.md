@@ -1,3 +1,16 @@
+# FIXED and retired on 2026-07-15
+
+All runtime residuals in this follow-up are now resolved on `dev`.
+
+- The Stream/Spliterator cursor pipeline defect was fixed by the dedicated eager-drain change already on `dev`. The current development VM passed all 27 focused `StreamRegressionSmoke` checks, including the deferred-consumption cursor case that originally produced the Selenium JSON failure.
+- The cross-provider zipfs `Files.copy` defects were fixed earlier the same day (`e38d6f60`/`90cc7e73`, `a43436fc`/`882395cd`), and the prior end-to-end rerun showed the Keycloak server boot and teardown completing without the reported hang.
+- During final verification, loading `java.net.IDN` exposed a separate real-JDK `CharBuffer` layout corruption in `s2_bb_as_char_buffer`: the legacy indexed `BB_MARK` write overwrote `Buffer.address`. Commit `14ab79ba` now writes the real `address` field and restricts legacy slots to synthetic layouts. The focused `IdentityProbe` now loads `java.net.IDN` successfully under the uniquely named fixed VM.
+
+The recovered `WelcomePageTest` class was also run through the suite `KcRunner` with its 674-entry test classpath. That fixture lacks Keycloak external-server provisioning, so all methods stop at uninitialized injected fields before page logic. This is a harness limitation, not a remaining VM failure; it does not reproduce the former stream, zipfs, IDN, or teardown symptoms.
+
+This historical report is retained under `docs/internal/fixed-suite-bugs` as the closure record.
+
+---
 # Keycloak WelcomePageTest residuals follow-up (2026-07-15) — one confirmed fixed, one root-caused (not fixed, architectural), one FIXED same-day in a follow-up session, one partially re-verified
 
 Status: item 3 (zipfs `Files.copy`) is now FIXED — see the 2026-07-15 (later) update section immediately below.

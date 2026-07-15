@@ -1,3 +1,43 @@
+# FIXED and retired on 2026-07-15
+
+All runtime residuals named in this record are now closed on `dev`.
+
+## Final closure verification
+
+The original fix (`cf45bb80`, merged through `07d2080b`) is retained unchanged:
+reference streams sourced by a live spliterator drive one source element through
+their complete deferred operation chain before the next `tryAdvance` call. This
+final closure used a fresh release build of current `origin/dev` in the isolated
+worktree `fix/keycloak-stream-eager-drain-residuals-20260715-001` and the unique
+binary `cratonvm-keycloak-stream-eager-drain-residuals-20260715-001`.
+
+- `cargo test -p cratonvm-native-collections --lib`: 72 passed, 0 failed.
+- A focused cursor/infinite-source probe passed identically on HotSpot 17 and
+  CratonVM: a live `StreamSupport.stream` cursor stopped after exactly seven
+  elements through `limit()`, and `Stream.iterate`/`Stream.generate` limits
+  produced their exact expected lists. It also exercised deliberately
+  state-advancing `Spliterator.OfInt`, `OfLong`, and `OfDouble` sources through
+  `StreamSupport.intStream`/`longStream`/`doubleStream`; each emitted exactly
+  `[0,1,2,3,4]` with no over-read. Thus the primitive-stream item was a
+  speculative coverage gap, not an unfixed runtime defect.
+- Selenium 4.39.0's actual `Json`/`MapCoercer` path passed on both VMs for flat,
+  nested, escaped, and a 512-key nested-map payload (516 decoded fields total).
+  This directly exercises the `JsonInputIterator` shape that motivated the
+  original report and no longer produces `JsonException`.
+- The preserved `WelcomePageTest` runner completed all six methods and reached
+  `RUN-END` in 258 ms under the fresh VM, with no stream JSON exception, hang,
+  or orphaned process. Its remaining failures are uninitialized framework
+  injection fields and unavailable floating-IP configuration: the preserved
+  runner no longer provisions Keycloak's external test server on this host.
+  They are fixture/environment failures, not a CratonVM residual. The earlier
+  provisioned run recorded the actual Keycloak 26.6.1 server boot and clean
+  teardown after the zipfs repair.
+
+No open CratonVM issue remains in this family. The prior wording below is kept
+as the implementation and historical investigation record.
+
+---
+
 # Stream/Spliterator eager-drain fix: lazy sources now drive their op-chain inline (2026-07-15)
 
 Status: FIXED, merged to `dev`. Follow-up to

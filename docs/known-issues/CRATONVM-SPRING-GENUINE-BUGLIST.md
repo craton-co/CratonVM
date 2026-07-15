@@ -14,6 +14,27 @@ This document tracks the **genuine remaining failures**.
   *   **Status**: **OPEN** (Fails 4/9 tests)
   *   **Root Cause**: Mockito's `spy()` inline mock maker retransforms the class hierarchy; the `ThreadLocal`-based `MockMethodAdvice$SelfCallInfo.checkSelfCall` guard fails to match on CratonVM, causing infinite recursion.
   *   **Next Step**: Instrument `MockMethodDispatcher.get()` for distinct Class/Advice instances across the redefined hierarchy.
+  *   **2026-07-15 (reactive-cluster session, mockk sibling analysis)**: the same self-call SOE family
+    blocks ~10 Kotlin reactive test classes via **mockk** (not Mockito): `WebTestClientExtensionsTests`,
+    `WebClientExtensionsTests`, `ServerResponseExtensionsTests`, `ServerRequestExtensionsTests`,
+    `RenderingResponseExtensionsTests`, `ClientResponseExtensionsTests`, `RSocketRequesterExtensionsTests`,
+    `WebClientObservationTests`, `CoExchangeFilterFunctionTests`, `InvocableHandlerMethodKotlinTests`. All
+    fail identically on **pure origin/dev** (pre-existing, not a regression). Sharpened via mockk 1.14.5
+    decompile + probes: the recursion is `mock.hashCode()` -> `JvmMockKProxyInterceptor.intercept` ->
+    `JvmMockKDispatcher.get(id, mock)` returns the advice -> `BaseAdvice.handle` -> `BaseAdvice.handler`
+    -> `handlers.get(mock)`, where `handlers` is a plain `Collections.synchronizedMap(LinkedHashMap)` (NOT
+    identity-keyed -- confirmed from the no-arg `SynchronizedMockHandlersMap()` ctor bytecode), so
+    `LinkedHashMap.get(mock)` calls `mock.hashCode()` again -> infinite. This recursion exists in the
+    bytecode on BOTH VMs, yet HotSpot terminates -- so **CratonVM routes the ByteBuddy-generated mock's
+    `hashCode()` through the interceptor where HotSpot dispatches to the real `Object.hashCode`**.
+    **ThreadLocal is RULED OUT** (TLProbe on v13: identity-preserved, get-twice-same, withInitial, remove,
+    guard-flip all correct). So the sibling "ThreadLocal guard fails to match" hypothesis above is likely
+    WRONG for both -- the real divergence is ByteBuddy method-resolution/vtable: which methods of the
+    generated mock subclass are instrumented vs left as real super-calls. The `SelfCallEliminator.isSelf`
+    guard runs too LATE (inside `handler`, AFTER `handlers.get(mock)` already triggered the recursive
+    `hashCode`). **Next step**: instrument, on a minimal mockk/Mockito mock, WHICH methods route to the
+    interceptor on CratonVM vs HotSpot (esp. `hashCode`/`equals`/`toString`); the fix is almost certainly
+    in how CratonVM resolves the mock subclass's inherited-vs-overridden method dispatch.
 *   **`@Import` attribute CCE across `@CompileWithForkedClassLoader`** (`web.service.registry.ImportHttpServiceRegistrarTests`)
   *   **Status**: **OPEN** (2/5 methods: `basicListingWithAot`, `basicScanWithAot` — `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;` at `ConfigurationClassParser$SourceClass.getAnnotationAttributes`)
   *   **2026-07-15 update**: reproduces SOLO in ~1s (`/data/tmp/aotfix-runs/MethodRun.java` single-method launcher on the Azure host). The 2026-07-14 SoftReference/GC-relocation hypothesis is now DOUBTED: this failure survived eight classloader-identity fixes, and three focused probes (plain `@Import` reflection, forked-loader variant, `@Import` as meta-annotation on a repeatable annotation type — `ImportProbe2.java`) all PASS. The divergence is somewhere in the full `ConfigurationClassParser`/`MergedAnnotations` path for the repeatable `@ImportHttpServices` container under a forked loader.
@@ -161,7 +182,64 @@ are unchanged by the 2026-07-15 AOT work — consult the historical doc.*
 
 ### WebFlux Backend-Specific Failures
 (`web.reactive.result.method.annotation.CrossOriginAnnotationIntegrationTests`, `RequestMappingMessageConversionIntegrationTests`)
-*   **Current Residual (OPEN)**: classes complete but sub-tests fail depending on backend:
-  *   **Jetty**: `NoClassDefFoundError: org/eclipse/jetty/http/MimeTypes$Mutable`
-  *   **Tomcat**: `IllegalStateException: ... Failed to initialize component [StandardServer[-1]]`
-  *   **Reactor Netty**: `IllegalStateException: failed to create a child event loop`
+*   **Update 2026-07-15 (reactive-cluster session, branch `fix/reactive-cluster-20260715`)**: the whole
+    per-backend residual cluster (Jetty `MimeTypes$Mutable` NCDFE / Tomcat `StandardServer`
+    LifecycleException / Reactor Netty "failed to create a child event loop") was root-caused to
+    process-global poisoning chains and fixed: `CharBuffer.getArray` AIOOBE (missing `Buffer.address`
+    seed on `asCharBuffer()` views) poisoned `jdk.internal.icu` → `java.net.IDN` → Netty's buffer
+    stack; a JIT NPE in `sun.misc.Unsafe.putOrderedLong` (the native `<clinit>` shadow never populated
+    `theInternalUnsafe`; the interpreter's C11/C16 null-receiver rescue papered over it but compiled
+    code has no such rescue) killed `ByteBufUtil.<clinit>` at Netty's `MpmcArrayQueue(4096)` init loop.
+    **`CrossOriginAnnotationIntegrationTests` is now fully OK (68/68)** on all backends.
+*   **Current Residual (OPEN)**: `RequestMappingMessageConversionIntegrationTests` (160 tests) runs but
+    is pathologically slow — steady progress (fresh `AnnotationConfigApplicationContext` + HTTP server
+    per test; watchdog stack dumps show active bean creation, no deadlock) yet does not finish within
+    1800s (HotSpot: 13s). Needs a dedicated perf investigation.
+
+## 4. Reactive cluster session 2026-07-15 (branch `fix/reactive-cluster-20260715`)
+
+Full 295-class reactive sweep (`web.reactive.*`, `messaging.rsocket.*`, `test.web.reactive.*`,
+`http.server.reactive.*`, `http.client.reactive.*`, reactive tx/core classes) vs a same-day HotSpot
+baseline. Baseline on the 2026-07-15 dev tip: 178 OK / 50 FAIL / 12 LOADERR / 5 ABEND / 4 TIMEOUT /
+46 EMPTY. After the session's 7 VM fixes (missing `Buffer.address` on `asCharBuffer()` views;
+`theInternalUnsafe` never populated by the `sun/misc/Unsafe` clinit shadow — JIT-compiled
+`putOrderedLong` NPE; mutable-`ArrayList`-typed `Collections.EMPTY_LIST/MAP/SET` singletons that
+kotlin-reflect's shaded protobuf mutated in place, corrupting `emptyList()` process-wide; speculative-BCE
+loop-header guard missing the null-array check — freemarker `TemplateElement.setChildren` SIGSEGV; raw
+pointer dereference of tagged Unsafe-arena handles in the TLS engine's direct-buffer accessors —
+`SSLEngine.unwrap` SIGSEGV; `cratonvm/net/HttpBodyReplaySubscription` not declaring
+`Flow$Subscription` — 40 sub-test failures on the `[2] JDK` WebClient connector; identity `finisher()`
+on JOINING/COUNTING collectors when Reactor drives the raw Collector protocol) the sweep reaches
+**HotSpot parity minus the residuals below** (the only EMPTY classes are the same 4 abstract classes
+HotSpot reports EMPTY, and `ResourceWebHandlerTests` fails the same single
+`servesResourcesFromFileSystem` test on both VMs).
+
+An 8th fix landed during final validation: `java.net.URI`'s construction-time field writes
+(`uri_store_named`) and the `getScheme`/`getRawSchemeSpecificPart` raw-string fallbacks treated ANY
+first colon as a scheme delimiter, so a relative reference with a colon in its first path segment
+(`/redirect:account`) parsed as `scheme="/redirect", path="account"`. Spring's view-resolution tests
+derive the default view name from the request path, so `ViewResolutionResultHandlerTests.
+defaultViewNameWithRedirectPrefixFails` (the FAIL this doc has tracked since the 516-class runs)
+resolved the wrong view and completed instead of erroring. Scheme detection now mirrors the real JDK
+parser (first stop char among `:/?#` must be `:`, ALPHA-start + alphanum/`+`/`-`/`.` name — the same
+rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is now 11/11 OK.
+
+Classes that FAIL in *batched* suite runs but pass solo at HotSpot parity (batch-context
+contamination — a prior class in the shared VM poisons a `<clinit>`; not yet root-caused, likely one
+more cross-class-state bug): `SseIntegrationTests` (solo 48 found / 42 succ / 6 aborted == HotSpot),
+`WebSocketIntegrationTests` (solo 72/72), `DefaultRenderingBuilderTests` (solo 11/11, batched shows
+`ExceptionInInitializerError` → `NoClassDefFoundError: ViewResolverSupport` on the redirect tests).
+
+**Remaining OPEN reactive residuals:**
+*   `http.client.reactive.ClientHttpConnectorTests` — TIMEOUT. `StepVerifier` in `basic()` waits forever;
+    at dump time the Jetty client pool and MockWebServer-side threads are idle and no
+    okhttp/MockWebServer accept thread is visible. Also: the T19.H1 watchdog stack-dump itself SIGSEGVs
+    when JIT frames are on the stacks (separate small bug; `--nojit` dumps work).
+*   `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` — pathological
+    slowness, see section 2 above.
+*   `web.reactive.result.view.script.JRubyScriptTemplateTests` — JRuby-on-CratonVM: Ruby
+    `Symbol#to_s`/string interpolation returns empty inside `eval` heredocs
+    (`rubygems/specification.rb` generates `@ = nil` from `"@#{key} = nil"`), so the engine bootstrap
+    fails with a SyntaxError. Not reactive-specific; JRuby's embedding is its own bug family.
+*   Batch-context `<clinit>` contamination (see above) — affects SSE/WebSocket/DefaultRenderingBuilder
+    only when many reactive classes share one VM; every one of them is green solo.

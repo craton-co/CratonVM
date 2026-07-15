@@ -1818,14 +1818,47 @@ pub(crate) fn uri_select_raw_path(raw: &str) -> Option<String> {
     Some(after_auth[..end].to_string())
 }
 
+/// Byte index of the scheme-terminating `:`, or `None` for a relative
+/// reference. Mirrors the real JDK parser (`uri_scheme_name_fail_index` in
+/// lib.rs): scan for the first stop char among `:/?#`; only a `:` counts,
+/// and the text before it must be a valid scheme name (ALPHA start,
+/// alphanum/`+`/`-`/`.` body). Without this rule a colon inside a relative
+/// path ("/redirect:account", Spring's view-name redirect tests) was taken
+/// as a scheme delimiter, corrupting scheme/ssp/path derivation.
+pub(crate) fn uri_scheme_colon(raw: &str) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut p = 0usize;
+    while p < bytes.len() {
+        match bytes[p] {
+            b'/' | b'?' | b'#' => return None,
+            b':' => break,
+            _ => p += 1,
+        }
+    }
+    if p == 0 || p >= bytes.len() {
+        return None;
+    }
+    if !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    if !bytes[1..p]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(p)
+}
+
 /// Raw scheme-specific part, excluding the fragment delimiter and fragment.
 /// `java.net.URI` treats `#fragment` as outside the SSP for both opaque
-/// (`mailto:a#b`) and hierarchical (`https://h/p#b`) URIs.
+/// (`mailto:a#b`) and hierarchical (`https://h/p#b`) URIs. For a relative
+/// reference (no valid scheme) the SSP is the whole input minus fragment.
 fn uri_raw_scheme_specific_part(raw: &str) -> String {
-    let Some(colon) = raw.find(':') else {
-        return raw.to_string();
+    let ssp = match uri_scheme_colon(raw) {
+        Some(colon) => &raw[colon + 1..],
+        None => raw,
     };
-    let ssp = &raw[colon + 1..];
     let end = ssp.find('#').unwrap_or(ssp.len());
     ssp[..end].to_string()
 }
@@ -2140,16 +2173,12 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                 }
             }
         }
-        // Parse from raw string.
+        // Parse from raw string — JDK scheme rules (a colon inside a relative
+        // path is NOT a scheme delimiter, see `uri_scheme_colon`).
         let raw = uri_raw_string(ctx, this);
-        let scheme = raw
-            .find(':')
-            .map(|i| raw[..i].to_string())
-            .unwrap_or_default();
-        if scheme.is_empty() {
-            Ok(Some(Value::Object(None)))
-        } else {
-            Ok(Some(Value::Object(Some(ctx.create_string(&scheme)))))
+        match uri_scheme_colon(&raw) {
+            Some(i) => Ok(Some(Value::Object(Some(ctx.create_string(&raw[..i]))))),
+            None => Ok(Some(Value::Object(None))),
         }
     });
 
@@ -2790,6 +2819,30 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(None))),
             };
             let s = ctx.read_string(s_obj).unwrap_or_default();
+            // URI.create(String) translates URI(String) parse failures to
+            // IllegalArgumentException, but valid results must keep make_uri's
+            // field layout for the URI accessors used by Keycloak.
+            if let Some((pos, reason)) = crate::uri_scheme_name_fail_index(&s) {
+                return Err(iae(format!("{reason} at index {pos}: {s}")));
+            }
+            let strict_uri_chars = std::env::var("CRATONVM_URI_STRICT_CHARS")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            let illegal = if strict_uri_chars {
+                crate::uri_first_illegal_index(&s)
+            } else {
+                s.char_indices()
+                    .find(|(_, c)| (*c as u32) < 0x20 || (*c as u32) == 0x7f)
+                    .map(|(i, _)| i)
+            };
+            if let Some(pos) = illegal {
+                return Err(iae(format!("Illegal character in URI at index {pos}: {s}")));
+            }
+            if let Some(pos) = crate::uri_empty_ssp_fail_index(&s) {
+                return Err(iae(format!(
+                    "Expected scheme-specific part at index {pos}: {s}"
+                )));
+            }
             Ok(Some(Value::Object(Some(make_uri(ctx, &s)))))
         },
     );
@@ -3855,6 +3908,10 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // This native bypasses ServerSocket's field initializers.  Preserve
+        // the real object's synchronization invariant before its bytecode
+        // options path reaches getImpl().
+        let this = re1_init_socket_locks(ctx, this);
         ss_set(ctx, this, |s| {
             s.port = -1;
             s.backlog = 50;
@@ -3866,6 +3923,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let this = re1_init_socket_locks(ctx, this);
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         re2_bind_listener(ctx, this, "0.0.0.0", port, 50)
     });
@@ -3878,6 +3936,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "<init>", "(II)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let this = re1_init_socket_locks(ctx, this);
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(50);
         re2_bind_listener(ctx, this, "0.0.0.0", port, backlog)
@@ -3885,6 +3944,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "<init>", "(IILjava/net/InetAddress;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let this = re1_init_socket_locks(ctx, this);
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(50);
         let host = match args.get(3) {
@@ -3960,6 +4020,20 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(1)))
     });
 
+
+    // The RE2 constructors own listener state outside the real ServerSocket
+    // implementation.  JGroups configures this option before bind, where it
+    // must be accepted without entering the real getImpl() bytecode path.
+    r.register(ss, "setReceiveBufferSize", "(I)V", |_ctx, args| {
+        let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        if size <= 0 {
+            return Err(iae(format!("negative receive buffer size: {size}")));
+        }
+        Ok(None)
+    });
+    r.register(ss, "getReceiveBufferSize", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(8192)))
+    });
     r.register(ss, "close", "()V", re2_server_socket_close);
 
     r.register(ss, "isBound", "()Z", |ctx, args| {

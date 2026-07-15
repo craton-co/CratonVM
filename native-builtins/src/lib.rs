@@ -44828,6 +44828,37 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         let class_name = "sun/misc/Unsafe";
         let unsafe_obj = alloc_concurrent_synthetic(ctx, class_name, 0);
         ctx.set_static_field_by_name(class_name, "theUnsafe", Value::Object(Some(unsafe_obj)));
+        // `theInternalUnsafe` (the real `<clinit>` seeds it with
+        // `jdk.internal.misc.Unsafe.getUnsafe()`) must ALSO be populated by
+        // this shadow: every sun.misc.Unsafe method that is NOT natively
+        // registered (putOrderedLong/putOrderedInt/putOrderedObject, ...)
+        // runs its real bytecode, which is just
+        // `theInternalUnsafe.putLongRelease(...)` etc. The interpreter
+        // papered over the null via the C11/C16 null-receiver Unsafe rescue
+        // (interpreter.rs invokevirtual: dispatch on the constant-pool class
+        // when the receiver is null and the class is an Unsafe), but
+        // JIT-compiled bytecode has no such rescue — its receiver null-check
+        // throws NullPointerException as soon as the method tiers up.
+        // Surfaced by netty's shaded jctools
+        // `ConcurrentSequencedCircularArrayQueue.<init>` init loop
+        // (`UnsafeLongArrayAccess.soLongElement` -> `Unsafe.putOrderedLong`):
+        // a capacity >= ~1000 crosses the JIT threshold mid-loop, so
+        // `MpmcArrayQueue(4096)` NPE'd while `MpmcArrayQueue(8)` worked,
+        // poisoning `ByteBufUtil.<clinit>` and with it the whole
+        // RSocket / Reactor-Netty reactive test cluster.
+        if ctx
+            .ensure_class_initialized("jdk/internal/misc/Unsafe")
+            .is_ok()
+        {
+            if let Some(cid) = ctx.class_id_by_name("jdk/internal/misc/Unsafe") {
+                if let Some(idx) = ctx.static_field_index_by_name(cid, "theUnsafe") {
+                    let v = ctx.get_static_field(cid, idx);
+                    if matches!(v, Value::Object(Some(_))) {
+                        ctx.set_static_field_by_name(class_name, "theInternalUnsafe", v);
+                    }
+                }
+            }
+        }
         Ok(None)
     });
     r.register(u, "getUnsafe", "()Lsun/misc/Unsafe;", |ctx, _args| {
@@ -68878,7 +68909,15 @@ fn native_url_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 pub(crate) fn uri_store_named(ctx: &mut dyn NativeContext, this: ObjectRef, full: &str) {
     let full_obj = ctx.create_string(full);
     ctx.set_field_by_name(this, "string", Value::Object(Some(full_obj)));
-    if let Some(colon) = full.find(':') {
+    // JDK scheme detection (see `net_phase_e::uri_scheme_colon`): a colon
+    // inside a relative reference's path ("/redirect:account") is NOT a
+    // scheme delimiter. The previous bare `find(':')` wrote scheme="/redirect"
+    // and path="account" here, which the getPath/getRawPath field-preference
+    // fallback then surfaced — Spring derived default view name "account"
+    // instead of "redirect:account" and ViewResolutionResultHandlerTests'
+    // defaultViewNameWithRedirectPrefixFails saw onComplete() instead of the
+    // expected resolution error.
+    if let Some(colon) = net_phase_e::uri_scheme_colon(full) {
         let scheme = &full[..colon];
         let raw_ssp = &full[colon + 1..];
         let ssp = raw_ssp.split('#').next().unwrap_or(raw_ssp);
@@ -68899,6 +68938,18 @@ pub(crate) fn uri_store_named(ctx: &mut dyn NativeContext, this: ObjectRef, full
         if !path.is_empty() {
             let path_obj = ctx.create_string(path);
             ctx.set_field_by_name(this, "path", Value::Object(Some(path_obj)));
+        }
+    } else {
+        // Relative reference: no scheme field; the SSP is the whole input
+        // minus the fragment, and the path parse is authority-aware.
+        let ssp = full.split('#').next().unwrap_or(full);
+        let ssp_obj = ctx.create_string(ssp);
+        ctx.set_field_by_name(this, "schemeSpecificPart", Value::Object(Some(ssp_obj)));
+        if let Some(path) = net_phase_e::uri_select_raw_path(full) {
+            if !path.is_empty() {
+                let path_obj = ctx.create_string(&path);
+                ctx.set_field_by_name(this, "path", Value::Object(Some(path_obj)));
+            }
         }
     }
 }
