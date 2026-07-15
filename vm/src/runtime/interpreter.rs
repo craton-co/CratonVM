@@ -20015,11 +20015,58 @@ pub(crate) fn try_lambda_dispatch(
     // Bug B: same name + same arity but mismatched parameter types is an
     // overloaded interface default (e.g. AnnotationFilter.matches(Class) vs the
     // SAM matches(String)), not the SAM. Fall through so the real default runs.
-    if method_name == &*call_site.sam_method_name
-        && !lambda_args_sam_compatible(shared, &call_site.sam_descriptor, call_args)
-    {
-        return Ok(None);
+    //
+    // GC-safety: `lambda_args_sam_compatible` can trigger class loading -- a
+    // GC-triggering call -- through its proxy/annotation-satisfies helper
+    // family (`lambda_proxy_satisfies`/`synthetic_implements`/
+    // `proxy_instance_satisfies_target`/`annotation_proxy_satisfies_target`).
+    // This is the exact same predicate whose sibling call site in
+    // `vm_exec.rs`'s `invoke_virtual` was fixed in commit d64fab85 for
+    // identical reasons; this call site was missed by that fix. `obj_ref`
+    // and every object element of `call_args` are plain Rust locals/borrows
+    // at this point, invisible to the collector, so a moving GC landing
+    // inside the predicate leaves them stale for every subsequent heap read
+    // in this function -- starting with the captured-value
+    // `get_field(obj_ref, ...)` reads used to build `full_args` further
+    // down (both in the Scala `apply$mc*$sp` bridge branch and the main
+    // dispatch path below). Pin both before the predicate can run and
+    // re-read through the pins once it returns.
+    let mut obj_ref = obj_ref;
+    let mut call_args_refreshed: Option<Vec<Value>> = None;
+    if method_name == &*call_site.sam_method_name {
+        let sam_compat_pin_base = thread.native_pin_roots.len();
+        thread.native_pin_roots.push(obj_ref);
+        let arg_pins: Vec<Option<usize>> = call_args
+            .iter()
+            .map(|a| match a {
+                Value::Object(Some(o)) => {
+                    let idx = thread.native_pin_roots.len();
+                    thread.native_pin_roots.push(*o);
+                    Some(idx)
+                }
+                _ => None,
+            })
+            .collect();
+        let compatible =
+            lambda_args_sam_compatible(shared, &call_site.sam_descriptor, call_args);
+        // Re-read obj_ref/call_args through the pins -- the compatibility
+        // check above may have triggered a moving GC that relocated either.
+        obj_ref = thread.native_pin_roots[sam_compat_pin_base];
+        let refreshed: Vec<Value> = call_args
+            .iter()
+            .zip(arg_pins.iter())
+            .map(|(orig, pin)| match pin {
+                Some(idx) => Value::Object(Some(thread.native_pin_roots[*idx])),
+                None => *orig,
+            })
+            .collect();
+        thread.native_pin_roots.truncate(sam_compat_pin_base);
+        if !compatible {
+            return Ok(None);
+        }
+        call_args_refreshed = Some(refreshed);
     }
+    let call_args: &[Value] = call_args_refreshed.as_deref().unwrap_or(call_args);
 
     // Only intercept calls to the SAM (single abstract method). Default
     // methods on the functional interface (e.g. Function.andThen,
