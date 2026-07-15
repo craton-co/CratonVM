@@ -498,7 +498,7 @@ fn native_object_name_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 /// stub and the method would otherwise be missing.
 pub fn register_management_factory_platform_server_stub(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(
         "java/lang/management/ManagementFactory",
         "getPlatformMBeanServer",
@@ -3158,7 +3158,7 @@ fn mbs_lookup_bean_at(ctx: &dyn NativeContext, server: ObjectRef, i: usize) -> O
 
 pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "javax/management/MBeanServer";
     r.register(cls, "<init>", "()V", |ctx, args| {
         // Initialise the registry on a freshly-constructed synthetic server

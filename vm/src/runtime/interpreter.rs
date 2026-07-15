@@ -22705,6 +22705,12 @@ fn force_native_over_real_jdk_bytecode(
     if is_class_mirror_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
+    // The platform-server bridge returns a synthetic MBeanServer receiver.
+    // Interface call sites must select its registered bridge methods rather
+    // than executing the abstract interface declarations.
+    if class_name == "javax/management/MBeanServer" {
+        return true;
+    }
     // The real Collections.emptyList() returns the class's pre-built static
     // singleton. During the Brave bootstrap that slot can retain a polluted
     // ArrayList, so use the registered constructor-backed empty-list native
