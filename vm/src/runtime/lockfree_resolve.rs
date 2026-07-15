@@ -983,6 +983,7 @@ mod tests {
             num_params: 0,
             is_synchronized: false,
             is_static: false,
+            force_native_cache: std::sync::OnceLock::new(),
         })
     }
 

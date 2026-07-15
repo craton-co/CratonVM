@@ -809,6 +809,37 @@ fn jit_code_ranges() -> &'static std::sync::Mutex<Vec<(usize, usize, usize)>> {
     JIT_CODE_RANGES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
+/// PERF (2026-07-15, RequestMappingMessageConversionIntegrationTests bootstrap
+/// slowness, round 2): monotonically-increasing generation counter, bumped
+/// whenever the registered code-range set changes. `native_stack_has_jit_frame`
+/// (`vm/src/jit/conservative_roots.rs`) used to call `snapshot_code_ranges_into`
+/// — a full lock + Vec copy + `sort_unstable()` over the ENTIRE set — on every
+/// single call, even though it caches the result in a thread-local buffer.
+/// That "cache" was write-only: it got clobbered and fully rebuilt every call
+/// regardless of whether the underlying set had changed since the previous
+/// call. Since `native_stack_has_jit_frame` runs on the per-native-call
+/// root-snapshot path (see the comment on that function) and the set of
+/// registered ranges only grows (compiled code is retained, not freed, per the
+/// `JIT_CODE_RANGES` doc comment above), this was an O(n log n) cost paid on
+/// EVERY native call, with n = total JIT-compiled methods ever registered —
+/// i.e. the cost of every native call grew as the process JIT-compiled more
+/// code, for the lifetime of the process. Exposed dramatically by the
+/// 2026-07-15 invoke-cache fix (this same file's caller-side history): making
+/// JDK-internal bytecode actually tier up to JIT (previously it barely did)
+/// multiplied the number of registered code ranges, which multiplied this
+/// per-call sort cost right along with it. Callers now compare this counter
+/// against a cached "last-seen" value and skip the resnapshot/resort entirely
+/// when nothing changed (the overwhelmingly common case within one scan burst).
+static JIT_CODE_RANGES_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Current code-range-set generation. Callers that cache a sorted snapshot
+/// (e.g. `native_stack_has_jit_frame`'s thread-local buffer) can skip a
+/// resnapshot/resort when this hasn't advanced since their last read.
+pub fn jit_code_ranges_generation() -> u64 {
+    JIT_CODE_RANGES_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Register `[entry, entry+len)` → `cm_ptr` (the `Arc<CompiledMethod>` inner
 /// address). No-op for empty/zero ranges. Stage 5.
 pub fn register_jit_code_range(entry: usize, len: usize, cm_ptr: usize) {
@@ -817,6 +848,10 @@ pub fn register_jit_code_range(entry: usize, len: usize, cm_ptr: usize) {
     }
     if let Ok(mut v) = jit_code_ranges().lock() {
         v.push((entry, entry + len, cm_ptr));
+        // Release: any cached snapshot taken with Acquire after this point must
+        // see the push above (ordinary Mutex unlock already provides this, but
+        // the counter itself is read outside the lock by cache-check callers).
+        JIT_CODE_RANGES_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -829,6 +864,7 @@ pub fn unregister_jit_code_range(entry: usize) {
     }
     if let Ok(mut v) = jit_code_ranges().lock() {
         v.retain(|&(e, _, _)| e != entry);
+        JIT_CODE_RANGES_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -6746,26 +6782,16 @@ fn try_compile_inner(
             }
 
             // BUG-1 companion — when the dedicated self-call stack guard is
-            // wired (`helpers.self_call_stack_guard`), NON-tail static
-            // self-recursive sites also stay on the raw direct-CALL path:
-            // the x64 self-call arm emits one cheap guard call (which raises
-            // a catchable StackOverflowError near native-stack exhaustion)
-            // before the rel32 CALL, replacing the full `jit_invoke_dispatch`
-            // round trip these sites were routed through purely to reach the
-            // dispatch depth guard. That round trip is the dominant cost of
-            // recursive workloads: fib(42) and binarytrees' `make`/`check`
-            // pay it on every level. `needs_heap` guarantees the vm_ptr frame
-            // slot the guard is called with. Mutual-recursion cycle targets
+            // Earlier revisions routed NON-tail static self-recursive sites
+            // through a raw direct-CALL path with a self-call guard. It avoids
+            // a dispatch round trip, but the target has no loader identity.
+            // Mutual-recursion cycle targets
             // (`recursive_cycle_target`) keep the dispatch route — a direct
             // call into ANOTHER method's artifact is a different hazard the
             // guard does not cover.
-            if invoke_kind == 3
-                && is_same_method_recursive_call
-                && helpers.self_call_stack_guard != 0
-            {
-                needs_heap = true;
-                continue;
-            }
+            // Non-tail same-method candidates deliberately retain dispatch
+            // metadata: a raw direct entry call has no loader identity and
+            // can invoke a different same-named method recursively.
 
             // Trivial-constructor elision (callee/IR tier, via try_compile): an
             // elidable `invokespecial C.<init>()V` is emitted AS
@@ -7909,14 +7935,13 @@ mod tests {
 
     /// BUG-1 companion — routing of NON-tail static self-recursive call sites.
     ///
-    /// With `helpers.self_call_stack_guard` wired, the site must stay on the
-    /// raw direct-CALL path with the guard baked in (no `invoke_dispatch`
-    /// round trip); unwired, it must keep the historical dispatch routing.
+    /// The site must retain `invoke_dispatch` even when a self-call guard is
+    /// available, so class-loader identity is resolved at dispatch time.
     /// Proven from the emitted machine code: `emit_call_absolute` bakes the
     /// helper address as a `MOV RAX, imm64`, so the 8-byte LE address pattern
     /// appearing in the code identifies which helper the site calls.
     #[test]
-    fn self_recursive_nontail_site_routes_direct_with_guard() {
+    fn self_recursive_nontail_site_routes_through_dispatch() {
         use std::sync::Arc;
 
         // `static int f(int n) { return n <= 0 ? 0 : f(n - 1) + 1; }`
@@ -7961,7 +7986,7 @@ mod tests {
             hay.windows(needle.len()).any(|w| w == needle)
         };
 
-        // (a) Guard WIRED → direct self-call: guard baked, no dispatch.
+        // (a) Guard wired: loader-correct dispatch is still required.
         let mut helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
         helpers.self_call_stack_guard = GUARD_ADDR;
         helpers.invoke_dispatch = DISPATCH_ADDR;
@@ -7989,15 +8014,15 @@ mod tests {
             false,
             None,
         )
-        .expect("guard-wired self-recursive method must compile");
+        .expect("self-recursive method must compile through dispatch");
         let bytes = compiled.code_bytes().to_vec();
         assert!(
-            contains(&bytes, GUARD_ADDR),
-            "wired guard must be baked at the self-call site"
+            !contains(&bytes, GUARD_ADDR),
+            "non-tail self-call must not bake a raw self-entry guard"
         );
         assert!(
-            !contains(&bytes, DISPATCH_ADDR),
-            "wired guard must remove the invoke_dispatch round trip"
+            contains(&bytes, DISPATCH_ADDR),
+            "non-tail self-call must use invoke_dispatch"
         );
 
         // (b) Guard UNWIRED → historical dispatch routing.

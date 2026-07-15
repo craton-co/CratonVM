@@ -640,6 +640,13 @@ fn bootstrap_generic(
 
     // --- Pop the dynamic call arguments (descriptor-typed) and pin objects. ---
     let arg_types = parse_descriptor_args(&info.target_descriptor);
+    if dbg {
+        eprintln!(
+            "[indy-generic] about to pop {} dyn args; stack depth before pop = {}",
+            arg_types.len(),
+            thread.frames[frame_idx].stack.len(),
+        );
+    }
     let mut dyn_args: Vec<Value> = Vec::with_capacity(arg_types.len());
     for i in 0..arg_types.len() {
         let cv = thread.frames[frame_idx].stack.pop_compact();

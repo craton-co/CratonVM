@@ -2235,9 +2235,17 @@ fn key_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 
 fn key_get_encoded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let der = match ctx.get_field(this, KEY_FIELD_DER) {
-        Value::Object(Some(arr)) => read_byte_array(ctx, arr),
-        _ => Vec::new(),
+    let der = if ctx.object_num_fields(this) > KEY_FIELD_DER {
+        match ctx.get_field(this, KEY_FIELD_DER) {
+            Value::Object(Some(arr)) => read_byte_array(ctx, arr),
+            _ => Vec::new(),
+        }
+    } else {
+        // `keystore::engine_get_key` deliberately uses a compact four-slot
+        // PrivateKey proxy: slot 3 identifies the staged entry, so there is no
+        // in-object DER at slot 4. Resolve that handle instead of treating the
+        // key as the five-slot KeyFactory synthetic layout.
+        crate::keystore::private_key_der_from_proxy(ctx, this).unwrap_or_default()
     };
     let arr = alloc_byte_array(ctx, &der);
     Ok(Some(Value::Object(Some(arr))))
@@ -2525,6 +2533,43 @@ mod tests {
         assert_eq!(algo_name(ALGO_ED25519), "Ed25519");
         assert_eq!(algo_name(ALGO_ED448), "Ed448");
         assert_eq!(algo_name(-1), "Unknown");
+    }
+
+    #[test]
+    fn compact_keystore_private_key_get_encoded_uses_registry_der() {
+        let alias = "key-factory-four-slot-private-key";
+        let der = b"test-pkcs8-der".to_vec();
+        let store = crate::keystore::LoadedKeyStore {
+            entries: [(
+                alias.to_string(),
+                crate::keystore::KeyStoreEntry {
+                    alias: alias.to_string(),
+                    creation_time_ms: 0,
+                    kind: crate::keystore::EntryKind::PrivateKey {
+                        key_der: der.clone(),
+                        chain: Vec::new(),
+                    },
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let store_id = crate::keystore::keystore_register(store);
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let key = alloc_concurrent_synthetic(&mut ctx, "java/security/PrivateKey", 4);
+        let alias_hash = alias.as_bytes().iter().fold(0x811c_9dc5_u32, |hash, byte| {
+            (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+        });
+        let composite = ((i64::from(store_id) & 0xffff_ffff) << 32) | i64::from(alias_hash);
+        ctx.set_field(key, KEY_FIELD_KEYID, Value::Long(composite));
+
+        let encoded = key_get_encoded(&mut ctx, &[Value::Object(Some(key))])
+            .expect("compact key getEncoded must succeed")
+            .expect("compact key getEncoded must return a byte array");
+        let Value::Object(Some(array)) = encoded else {
+            panic!("expected byte[] from compact key getEncoded");
+        };
+        assert_eq!(read_byte_array(&mut ctx, array), der);
     }
 
     #[test]

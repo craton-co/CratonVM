@@ -932,13 +932,31 @@ fn native_stack_has_jit_frame(lo: usize, hi: usize) -> bool {
         }
         return false;
     }
+    // PERF (2026-07-15, round 2 of the RequestMappingMessageConversionIntegrationTests
+    // bootstrap-slowness investigation): the thread-local buffer below used to be
+    // rebuilt (full table lock + Vec copy + `sort_unstable()` over every
+    // registered JIT code range) on EVERY call to this function, even though
+    // nothing had changed since the previous call — a write-only "cache" in
+    // name only. This function runs on the per-native-call root-snapshot path,
+    // so that cost was paid on every native call, and it grew as the process
+    // JIT-compiled more code (the registered range set only grows — see
+    // `JIT_CODE_RANGES`'s doc comment in `jit/src/lib.rs`). Now the cached
+    // generation is compared against `cratonvm_jit::jit_code_ranges_generation()`
+    // first; the expensive resnapshot/resort only runs when the set actually
+    // changed since this thread last looked (the overwhelmingly common case is
+    // a burst of many calls between any two JIT compiles finishing).
     thread_local! {
-        static RANGE_SNAPSHOT: std::cell::RefCell<Vec<(usize, usize)>> =
-            const { std::cell::RefCell::new(Vec::new()) };
+        static RANGE_SNAPSHOT: std::cell::RefCell<(u64, Vec<(usize, usize)>)> =
+            const { std::cell::RefCell::new((u64::MAX, Vec::new())) };
     }
     RANGE_SNAPSHOT.with(|cell| {
-        let mut ranges = cell.borrow_mut();
-        cratonvm_jit::snapshot_code_ranges_into(&mut ranges);
+        let mut cached = cell.borrow_mut();
+        let (cached_gen, ranges) = &mut *cached;
+        let current_gen = cratonvm_jit::jit_code_ranges_generation();
+        if *cached_gen != current_gen {
+            cratonvm_jit::snapshot_code_ranges_into(ranges);
+            *cached_gen = current_gen;
+        }
         if ranges.is_empty() {
             return false;
         }
