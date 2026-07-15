@@ -46,6 +46,7 @@
 
 pub mod a2dbg;
 pub mod arena;
+pub mod blocked_access_debug;
 pub mod card_table;
 pub mod class_unloading;
 pub mod collector;

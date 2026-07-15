@@ -2777,6 +2777,21 @@ mod root_snapshot_cache_tests {
 /// then applies the pointer map to update its own frame references.
 pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
     use std::sync::atomic::Ordering;
+    // CRATONVM_DBG_BLOCKED_ACCESS: reaching an interpreter safepoint with the
+    // thread's own `in_blocked_region` flag still raised means every STW
+    // census is excluding a RUNNING mutator — a moving GC can complete under
+    // its feet, and nothing ever applies its accumulated blocked-fixup. This
+    // catches stuck flags from any raise site whose wake/error path skipped
+    // `check_post_block_gc` (the monitor_wait early-return bug class). No-op
+    // when the gate is off.
+    if cratonvm_gc::blocked_access_debug::enabled()
+        && thread.gc_block_state.in_blocked_region.load(Ordering::Acquire)
+    {
+        cratonvm_gc::blocked_access_debug::report_blocked_violation(
+            "interpreter safepoint reached with in_blocked_region raised",
+            0,
+        );
+    }
     // bc math-ec 0x4 (CRATONVM_DBG_MEMWATCH): O(1) poll of one absolute
     // watched address at full safepoint frequency — catches the corrupting
     // write within one safepoint window, with the live Java stack. Off ⇒

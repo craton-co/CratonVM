@@ -2495,6 +2495,21 @@ impl<'a> NativeContextImpl<'a> {
 }
 
 fn pin_native_object_values(thread: &mut JvmThread, values: &[Value]) -> Vec<Option<usize>> {
+    // CRATONVM_DBG_BLOCKED_ACCESS: see `pin_native_root` — pins pushed while
+    // the thread's `in_blocked_region` flag is raised are invisible to the
+    // root scan and the blocked fold.
+    if cratonvm_gc::blocked_access_debug::enabled()
+        && thread
+            .gc_block_state
+            .in_blocked_region
+            .load(std::sync::atomic::Ordering::Acquire)
+        && values.iter().any(|v| matches!(v, Value::Object(Some(_))))
+    {
+        cratonvm_gc::blocked_access_debug::report_blocked_violation(
+            "pin_native_object_values push on a census-excluded thread",
+            0,
+        );
+    }
     let mut handles = Vec::with_capacity(values.len());
     for value in values {
         if let Value::Object(Some(obj)) = value {
@@ -2740,6 +2755,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn pin_native_root(&mut self, obj: ObjectRef) -> usize {
+        // CRATONVM_DBG_BLOCKED_ACCESS: a pin pushed while this thread's
+        // `in_blocked_region` flag is raised is invisible to BOTH the STW root
+        // scan (which reads the deposit-time snapshot) and the blocked-thread
+        // fold (seeded from that same snapshot) — the object dies or moves and
+        // the pin is never remapped, defeating the self-healing pinned
+        // re-read pattern. No-op when the gate is off.
+        if cratonvm_gc::blocked_access_debug::enabled()
+            && self
+                .thread
+                .gc_block_state
+                .in_blocked_region
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            cratonvm_gc::blocked_access_debug::report_blocked_violation(
+                "pin_native_root push on a census-excluded thread",
+                obj.as_ptr() as usize,
+            );
+        }
         let idx = self.thread.native_pin_roots.len();
         self.thread.native_pin_roots.push(obj);
         idx
