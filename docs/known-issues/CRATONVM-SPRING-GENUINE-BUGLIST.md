@@ -722,7 +722,7 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     apparently not for this native-call conservative-scan site), which is a substantially larger
     effort than a bug-fix session: expect a dedicated investigation, not a quick follow-up.
 *   ~~`web.reactive.result.view.script.JRubyScriptTemplateTests`~~ **PARTIALLY FIXED
-    (2026-07-15) -- 3 of (at least) 4 chained bugs closed, test class still FAILS.** JRuby's own
+    (2026-07-15) -- 4 of (at least) 5 chained bugs closed, test class still FAILS.** JRuby's own
     bootstrap (`rubygems/specification.rb` / `rubygems/version.rb`) turned out to hit a CHAIN of
     independent CratonVM bugs, each masking the next -- fixing one just exposes the next further
     into the same bootstrap. Root-caused and fixed so far:
@@ -876,22 +876,60 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
        2999 passed / 0 failed; `cargo test -p cratonvm-vm --lib --release`: 2205 passed / 9
        pre-existing `--release`-only `lock_order` failures, unrelated.
 
-    **OPEN -- bug 4, current blocker, NOT fixed (found 2026-07-15, round 3).** After bug 3's fix,
-    the full `JRubyScriptTemplateTests` class still FAILS -- but the observable failure moved.
-    Live tracing (with bug 3's fix applied) shows the crash is no longer at the `.sub()` call
-    site itself; it now surfaces downstream, inside `canonical_segments`'s
-    `segments.all? { |s| s >= 0 }`-shaped check: `org.jruby.RubyComparable.op_ge` ->
-    `InvokeSite.performIndirectCall` -> `JavaMethod$JavaMethodOneOrTwoBlock.call` ->
-    `Arity.raiseArgumentError`, raising `ArgumentError: wrong number of arguments (given 0,
-    expected 1..2)` -- a Java-backed core method (a `Comparable`/numeric operator, invoked via
-    JRuby's OWN `JavaMethod` binding path, which is a DIFFERENT dispatch mechanism than the
-    synthetic-MethodHandle `InvokeSite` chain bug 3 fixed) being called with zero Ruby-level
-    arguments where 1-2 are required. Not yet root-caused: plausibly a second, structurally
-    similar instance of the same "argument count/shape lost across an adaptation boundary"
-    defect family in JRuby's `JavaMethod` argument-marshalling path (distinct code from
-    `mh_dispatch`/`collect_trailing_varargs`), or a downstream knock-on effect of some other
-    still-corrupted value reaching this comparison after bug 3's fix changed what flows through
-    `.sub()`. `JRubyScriptTemplateTests` remains FAILING end-to-end -- flagged for a dedicated
-    follow-up tracing JRuby's `JavaMethodOneOrTwoBlock`/`Arity` call-argument marshalling for
-    this specific `op_ge` call site.
+    4. **FIXED, commit `fc9c3a85`.** Live tracing (with bug 3's fix applied) showed the
+       `RubyComparable.op_ge` -> `JavaMethod$JavaMethodOneOrTwoBlock` `ArgumentError` (given 0,
+       expected 1..2) was NOT a different dispatch mechanism after all -- it was the SAME
+       `collect_trailing_varargs` (`native-builtins/src/lang_invoke.rs`) that bug 3 touched,
+       with two more precise gaps in the SAME function, both hit by the exact same
+       `canonical_segments` call chain immediately after the `.sub()` call bug 3 fixed:
+       (a) it assumed the array-typed parameter is always the descriptor's LAST parameter
+       (`ptypes.last()`), but JRuby's Ruby-call convention routinely appends a trailing `Block`
+       parameter AFTER the args array (`InvokeSite#invoke(ThreadContext, IRubyObject,
+       IRubyObject, IRubyObject[], Block)`), so the array sits at `len - 2`, not `len - 1`, and
+       the old code bailed out before even checking arity -- worse, because CratonVM's
+       `MethodHandles.insertArguments` chain never collapses the array until this function runs,
+       the `Block` value is frequently spliced into the MIDDLE of what should become the array's
+       contents (traced: `[..., Regexp, Block, replacement]`), so a naive "last N positions"
+       split can't recover the right grouping even once the array is found; fixed by locating
+       the array by scanning (not assuming last) and recovering the split by matching each
+       trailing declared type (e.g. `Block`) against its RUNTIME class within the tail region,
+       pulling matches out wherever they actually sit. (b) the `arity_excess` trigger
+       (`params.len() > declared_param_count`) only caught cases with MORE flat args than
+       declared params; a single data value destined for a 1-element array arrives with
+       `params.len() == declared_param_count` exactly (no excess) but the value at the array's
+       position is a bare scalar -- traced on `org.jruby.ir.targets.indy.SelfInvokeSite.invoke`
+       (the very next call in the same chain, right after `.sub()`): arrived with exactly 4 flat
+       args matching declared arity, 3rd (array-typed) slot holding one bare `IRubyObject`,
+       surfacing as `ArgumentError: wrong number of arguments (given 0, expected 1)` inside the
+       interpreted Ruby method it called; fixed by also triggering collection when the exact
+       arity matches but the array-position value isn't already array-shaped (nor null).
+       `cargo test -p cratonvm-native-builtins --lib --release -- --test-threads=1`: 2999
+       passed / 0 failed (the default multi-threaded run showed 1 unrelated pre-existing
+       test-ordering flake, `lang_system::checkexec_security_tests::
+       denying_sm_blocks_runtime_exec_before_spawn`, confirmed passing alone and under
+       `--test-threads=1`); `cargo test -p cratonvm-vm --lib --release`: 2205 passed / 9
+       pre-existing `--release`-only `lock_order` failures, unrelated.
+
+       **Shared root cause found** (per the coordinator's request to check across bugs 1/3/4):
+       bugs 3 and 4 turned out to share ONE root cause -- both were gaps in the SAME
+       `collect_trailing_varargs` function, now closed together in this one commit. Bug 1
+       (SAM/lambda array-vs-scalar dispatch, `lambda_args_sam_compatible` in `interpreter.rs`)
+       remains a genuinely separate code path -- already independently confirmed in the round-1
+       investigation, no further common root found there.
+
+    **Evidence for bug 3+4 combined**: with both fixes applied, the minimal repro (and the full
+    `JRubyScriptTemplateTests` class) progress completely PAST `rubygems/version.rb` -- both the
+    `op_ge` arity bug and the `SelfInvokeSite` scalar-wrap bug are gone, `Gem::Version` comparison
+    now works end-to-end -- into `require 'ostruct'`, hitting a new, unrelated failure.
+
+    **OPEN -- bug 5, current blocker, NOT fixed (found 2026-07-15, round 4).** After bugs 3+4,
+    `JRubyScriptTemplateTests` still FAILS, now with `java.lang.ArrayIndexOutOfBoundsException` in
+    `org.jruby.ir.targets.indy.BuildDynamicStringSite.<init>` (`BuildDynamicStringSite.java:62`),
+    raised while interpreting `ostruct.rb:477` (inside `OpenStruct`'s class body, iterating
+    `RubyArray#each`). This is a Ruby STRING-INTERPOLATION construction site (JRuby's `"#{...}"`
+    dynamic-string bytecode-generation machinery) -- a different JRuby subsystem entirely from
+    the argument-collection/marshaling family bugs 1/3/4 all turned out to belong to. Not yet
+    investigated. `JRubyScriptTemplateTests` remains FAILING end-to-end -- flagged for a
+    dedicated follow-up root-causing `BuildDynamicStringSite`'s construction against whatever
+    value/count CratonVM is supplying it.
 *   ~~Batch-context `<clinit>` contamination~~ — RETRACTED, see above (host environment issue: missing /tmp + missing ~/jdk25 symlink, not CratonVM).
