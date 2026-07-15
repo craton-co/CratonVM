@@ -2790,6 +2790,30 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(None))),
             };
             let s = ctx.read_string(s_obj).unwrap_or_default();
+            // URI.create(String) translates URI(String) parse failures to
+            // IllegalArgumentException, but valid results must keep make_uri's
+            // field layout for the URI accessors used by Keycloak.
+            if let Some((pos, reason)) = crate::uri_scheme_name_fail_index(&s) {
+                return Err(iae(format!("{reason} at index {pos}: {s}")));
+            }
+            let strict_uri_chars = std::env::var("CRATONVM_URI_STRICT_CHARS")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            let illegal = if strict_uri_chars {
+                crate::uri_first_illegal_index(&s)
+            } else {
+                s.char_indices()
+                    .find(|(_, c)| (*c as u32) < 0x20 || (*c as u32) == 0x7f)
+                    .map(|(i, _)| i)
+            };
+            if let Some(pos) = illegal {
+                return Err(iae(format!("Illegal character in URI at index {pos}: {s}")));
+            }
+            if let Some(pos) = crate::uri_empty_ssp_fail_index(&s) {
+                return Err(iae(format!(
+                    "Expected scheme-specific part at index {pos}: {s}"
+                )));
+            }
             Ok(Some(Value::Object(Some(make_uri(ctx, &s)))))
         },
     );
