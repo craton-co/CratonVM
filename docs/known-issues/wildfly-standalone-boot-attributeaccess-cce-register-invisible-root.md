@@ -1,23 +1,77 @@
 # WildFly standalone boot: `ClassCastException: java.lang.Object cannot be cast to org.jboss.as.controller.registry.AttributeAccess` during `parallel-extension-add` — register-invisible JIT root family, confirmed occurrence
 
-Status: OPEN — generalized 2026-07-15 (see "2026-07-15 follow-up" section
-below): this is the same underlying bug as `WFLYCTL0079: Failed initializing
-module <any extension>` seen throughout `parallel-extension-add` boot
-attempts, not limited to `AttributeAccess` or to this doc's originally-named
-extensions. **The 2026-07-15 follow-up disproves this doc's own "JIT is
-required" claim** (reproduces identically under `--nojit`) and narrows the
-mechanism further: a live capture proved the stale read goes through the
-*pinned* path (not a missed-pin fallback), pointing at a cross-thread
-GC-root-visibility gap rather than a simple unpinned-local bug. One genuine,
-narrow contributing site was found and FIXED (see
+Status: OPEN — two independent 2026-07-14/2026-07-15 follow-ups (both below)
+narrow this further without closing it. The 2026-07-14 revalidation ruled out
+the default-on full-GPR safepoint spill (`02b91823`), both JIT/root-scan
+caches, and broadened STW peer scanning as fixes. The 2026-07-15 follow-up
+generalizes the symptom to `WFLYCTL0079: Failed initializing module <any
+extension>` (not limited to `AttributeAccess` or to this doc's
+originally-named extensions), **disproves this doc's own "JIT is required"
+claim** (reproduces identically under `--nojit`), and — consistent with the
+2026-07-14 finding that broadened STW scanning didn't help — found via live
+capture that the stale read goes through the *pinned* path (not a
+missed-pin fallback), pointing at a cross-thread GC-root-visibility race
+rather than a simple unpinned-local or JIT-register-visibility bug. One
+genuine, narrow contributing site (unrelated to the ruled-out mechanisms
+above) was found and FIXED (see
 `docs/internal/fixed-suite-bugs/wildfly-invoke-virtual-lambda-sam-compat-stale-locals-FIXED.md`)
 but does not close the residual. Still documented here, not further patched
-— see the follow-up section for why.
+— see both follow-up sections below for the full evidence chain.
 
 Investigated 2026-07-13, worktree
 `C:/craton/cratonvm/.claude/worktrees/attrib-cce-investigate`, branch
 `investigate/wildfly-attributeaccess-cce-20260713`, forked from `origin/dev @
 a7680d77`.
+
+## 2026-07-14 revalidation and residual isolation
+
+The supplied Azure host built cratonvm-cli --release from ab423500 with
+CARGO_TARGET_DIR=/data/target-wildfly-attributeaccess-rootfix-20260714 and
+used the uniquely named binary
+/data/target-wildfly-attributeaccess-rootfix-20260714/release/java-wildfly-attributeaccess-rootfix-20260714.
+Each probe cloned the WildFly standalone installation into
+/data/wildfly-attributeaccess-rootfix-20260714-probe, cleared standalone/data/tmp,
+and ran the real jboss-modules standalone boot with a 45-second limit. Logs are
+under /data/wildfly-attributeaccess-rootfix-20260714-probe/logs/ on that host.
+
+### Control result: the issue still reproduces on current dev
+
+Ten clean boots of the current dev binary produced one AttributeAccess CCE,
+five sibling AttributeDefinition CCEs, two complete boots, one SIGSEGV
+(exit 139), and one STW hang. The target failure is in boot_1.log; sibling
+failures are in boot_3.log, boot_4.log, boot_6.log, boot_7.log, and boot_9.log.
+
+This is direct counter-evidence to treating 02b91823 as a complete fix for
+this document. Its full-GPR safepoint spill remains present in the build, but
+both CCE forms still occur.
+
+### Root-scanning experiments that did not fix it
+
+* CRATONVM_DBG_FULLSTACK_SCAN=1 was used for nine completed-or-timed probe
+  attempts. A sibling AttributeDefinition CCE still occurred. This batch did
+  not sample an AttributeAccess CCE, so it neither proves nor disproves
+  suppression of the target alone; it does disprove a complete family fix.
+* Disabling both the JIT scan cache and root-snapshot cache with
+  CRATONVM_NO_JIT_SCAN_CACHE=1 CRATONVM_ROOTSNAP_CACHE=0 produced two
+  AttributeAccess CCEs, two AttributeDefinition CCEs, one complete boot, two
+  STW hangs, and one timeout in eight attempts. Neither cache is the cause of
+  this residual.
+* An isolated source experiment expanded STW peer scanning to include every
+  alive peer rather than only the blocked JIT-return window. Ten boots still
+  produced one AttributeAccess CCE, five AttributeDefinition CCEs, one
+  complete boot, one SIGSEGV, one STW hang, and one timeout. The experiment
+  was reverted and is not part of the commit.
+
+### Current conclusion
+
+The CCE family remains reproducible, but the tested explanations are now
+excluded: default full-GPR safepoint spilling, the two root-scan caches, and
+broadened STW peer scanning do not eliminate it. The existing fast-path
+analysis below remains useful for locating where the stale reference is
+observed, but it is not sufficient to attribute the corruption to a
+register-invisible root. The upstream stale-object/reference corruption point
+is still unknown. There are no newly fixed items to remove or move to
+docs/internal.
 
 ## Background
 
