@@ -855,6 +855,40 @@ pub(crate) fn is_bootstrap_class_name(internal: &str) -> bool {
         || internal.starts_with("[")
 }
 
+/// Whether `loader_obj` is eligible for loader-initiated resolution of a
+/// class it defined -- either the global `CRATONVM_LOADER_AWARE_RESOLUTION`
+/// gate is on (default-on since the Hibernate custom-loader soak; see
+/// `vm::runtime::env_cache::loader_aware_resolution`'s doc comment for the
+/// validation history -- duplicated here rather than shared because
+/// `native-builtins` cannot depend on `vm`), or `loader_obj` is a
+/// `groovy.lang.GroovyClassLoader` / Spring's own AOT-test isolating loaders
+/// (`org.springframework.core.test.tools.{DynamicClassLoader,
+/// CompileWithForkedClassLoaderClassLoader}`) -- narrow carve-outs for when
+/// the global gate is explicitly disabled (`CRATONVM_LOADER_AWARE_
+/// RESOLUTION=0`), mirroring `is_groovy_class_loader` in interpreter.rs.
+pub(crate) fn is_loader_aware_resolution_eligible(
+    ctx: &mut dyn NativeContext,
+    loader_obj: ObjectRef,
+) -> bool {
+    let global_gate = match std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => true,
+    };
+    if global_gate {
+        return true;
+    }
+    let loader_cid = ctx.class_id_of_object(loader_obj);
+    const NARROW_CARVEOUT: [&str; 3] = [
+        "groovy/lang/GroovyClassLoader",
+        "org/springframework/core/test/tools/DynamicClassLoader",
+        "org/springframework/core/test/tools/CompileWithForkedClassLoaderClassLoader",
+    ];
+    NARROW_CARVEOUT.iter().any(|name| {
+        ctx.class_id_by_name(name)
+            .is_some_and(|id| loader_cid == id || ctx.is_subclass(loader_cid, id))
+    })
+}
+
 /// HIB-CV-24 / SBR-14 gate. When ON (default), `findBootstrapClass` is scoped to
 /// genuine bootstrap classes for a custom loader that overrides `findClass` with
 /// a null parent — so the real `ClassLoader.loadClass` bytecode proceeds to that

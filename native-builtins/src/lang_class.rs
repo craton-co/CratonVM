@@ -14014,6 +14014,18 @@ pub(crate) fn native_class_get_declaring_class(
         None => return Ok(Some(Value::Object(None))),
     };
 
+    // Loader-aware path FIRST: a nested class redefined under an isolating
+    // loader must resolve ITS OWN loader's copy of its enclosing class, not
+    // whichever loader's copy of the same-named outer class the flat global
+    // store happens to already hold (see `declaring_class_loader_aware`'s
+    // doc comment). Only consulted for classes with a registered, eligible
+    // defining loader -- every ordinary class falls straight through to the
+    // unchanged fast/slow paths below.
+    if let Some(outer_id) = declaring_class_loader_aware(ctx, class_id) {
+        let mirror = ctx.get_class_mirror(outer_id);
+        return Ok(Some(Value::Object(Some(mirror))));
+    }
+
     // Fast path: the enclosing class is already loaded, so the VM's
     // `find_class_by_name`-backed `declaring_class` resolves it directly.
     if let Some(outer_id) = ctx.declaring_class(class_id) {
@@ -14058,6 +14070,65 @@ pub(crate) fn native_class_get_declaring_class(
         }
     }
     Ok(Some(Value::Object(None)))
+}
+
+/// Isolating-loader carve-out for `Class.getEnclosingClass()`/
+/// `getDeclaringClass()`. Returns `None` (falls through to the existing
+/// global-lookup fast/slow paths, unchanged) unless `class_id` has a
+/// registered defining loader (`defining_loader_for`) that's eligible per
+/// `is_loader_aware_resolution_eligible`, AND `class_id` genuinely has an
+/// `InnerClasses` self-entry naming an outer class. When both hold, resolves
+/// the outer-class NAME by invoking that loader's OWN `loadClass()`
+/// (mirrors `drive_defining_loader_load`'s re-entrant-call pattern in
+/// `vm::runtime::interpreter`) so the returned `ClassId` is the SAME
+/// loader's copy as `class_id` itself -- never a stale, different-loader
+/// copy from CratonVM's flat global store.
+fn declaring_class_loader_aware(
+    ctx: &mut dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+) -> Option<cratonvm_types::ClassId> {
+    let loader_obj = crate::classloader::defining_loader_for(class_id.as_u32())?;
+
+    // Cheap short-circuit FIRST: if the VM's existing global-lookup answer
+    // already belongs to the SAME defining loader as `class_id`, it's
+    // already correct -- skip the eligibility check and the expensive
+    // re-entrant `loadClass()` call below entirely. This keeps the fix's
+    // cost near-zero for the overwhelming common case (a single loader, no
+    // same-named-outer-class collision) and only pays for loader-driven
+    // resolution when there's a genuine mismatch worth fixing.
+    if let Some(existing) = ctx.declaring_class(class_id) {
+        if let Some(existing_loader) = crate::classloader::defining_loader_for(existing.as_u32()) {
+            if existing_loader.as_ptr() == loader_obj.as_ptr() {
+                return None;
+            }
+        }
+        // `existing` has no registered loader (a built-in/app-loader class)
+        // or a DIFFERENT registered loader than `class_id` -- a genuine
+        // potential mismatch, worth checking further below.
+    }
+
+    if !crate::classloader::is_loader_aware_resolution_eligible(ctx, loader_obj) {
+        return None;
+    }
+    let class_name = ctx.class_name_of_id(class_id)?;
+    let outer_class = ctx
+        .inner_classes(class_id)
+        .into_iter()
+        .find(|(inner, outer, inner_name, _)| {
+            inner == &class_name && !outer.is_empty() && !inner_name.is_empty()
+        })
+        .map(|(_, outer, _, _)| outer)?;
+    let dotted = outer_class.replace('/', ".");
+    let name_obj = ctx.create_string(&dotted);
+    match ctx.invoke_virtual(
+        loader_obj,
+        "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[Value::Object(Some(name_obj))],
+    ) {
+        Ok(Some(Value::Object(Some(mirror_obj)))) => ctx.class_id_from_mirror(mirror_obj),
+        _ => None,
+    }
 }
 
 /// `java/lang/Class.getSimpleBinaryName0()Ljava/lang/String;`
