@@ -1320,7 +1320,7 @@ fn classloader_parent(ctx: &mut dyn NativeContext, loader: ObjectRef) -> Option<
 /// including `loader` itself. A `false` answer means the chain terminates at
 /// the bootstrap (null) without ever passing a built-in loader, so per
 /// JVMS 5.3 only bootstrap classes are resolvable through delegation.
-fn builtin_loader_reachable(ctx: &mut dyn NativeContext, loader: ObjectRef) -> bool {
+pub(crate) fn builtin_loader_reachable(ctx: &mut dyn NativeContext, loader: ObjectRef) -> bool {
     let mut cur = Some(loader);
     for _ in 0..256 {
         let Some(l) = cur else { break };

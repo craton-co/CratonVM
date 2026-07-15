@@ -907,10 +907,14 @@ function Complete-ProcessRecord {
     if ($status -ne 'CRASH' -and $status -ne 'HANG') {
       if ($combined -match 'KCRUNNER_LOAD_FAIL') {
         $status = 'LOADFAIL'
-      } elseif ($failed -gt 0 -or $aborted -gt 0 -or $containersFailed -gt 0) {
+      } elseif ($failed -gt 0 -or $containersFailed -gt 0) {
         $status = 'FAIL'
       } elseif ($tests -eq 0) {
         $status = 'EMPTY'
+      } elseif ($aborted -ge $tests) {
+        $status = 'SKIP'
+      } elseif ($aborted -gt 0) {
+        $status = 'PARTIAL'
       } else {
         $status = 'PASS'
       }
@@ -937,7 +941,9 @@ function Complete-ProcessRecord {
     }
   }
   if ($note.Length -gt 180) { $note = $note.Substring(0, 180) }
-  if ($status -eq 'PASS' -or $status -eq 'EMPTY') {
+  if ($status -eq 'SKIP') {
+    $note = "all $tests test(s) aborted by a JUnit assumption"
+  } elseif ($status -eq 'PASS' -or $status -eq 'EMPTY') {
     $note = ''
   }
 

@@ -948,9 +948,28 @@ fn cl_real_load_class_base(
         && (parent_is_null || parent_is_platform)
         && crate::classloader::cl_bootstrap_scoped()
         && !crate::classloader::is_bootstrap_class_name(&internal);
+    // JVMS 5.3-faithful scoping of the flat-store fallback (real-JDK-mode
+    // counterpart of the same fix in classloader.rs's synthetic-mode base
+    // delegation — this file has its OWN parallel loadClass implementation,
+    // gated on real-vs-synthetic JDK mode, and was missed the first time).
+    // CratonVM's global store stands in for "the app classpath, reachable
+    // through the parent chain". A loader whose REAL parent chain never
+    // passes a built-in loader (e.g. `new ClassLoader(null) {}`, or a loader
+    // parented to such) can only see bootstrap classes on HotSpot; answering
+    // an application class from the flat store bypasses the loader's own
+    // fallback logic (ThrowawayClassLoaderTests.loadingClassFromResourceClosesInputStream:
+    // the resource-stream fallback never ran because loadClass resolved the
+    // probe class globally first, failing its stream-closing contract test).
+    // A loader with a findClass override keeps its step-2b rescue below, so
+    // only override-less chains change.
+    let scoped_user_chain = crate::classloader::cl_bootstrap_scoped()
+        && !crate::classloader::is_bootstrap_class_name(&internal)
+        && !cratonvm_classloading::is_bootstrap_appended_class(&internal)
+        && !crate::classloader::builtin_loader_reachable(ctx, this);
 
-    // 1. Standard VM class loading (skipped when deferring to a custom findClass).
-    if !defer_to_find_class {
+    // 1. Standard VM class loading (skipped when deferring to a custom findClass,
+    //    or when the loader's chain cannot reach a built-in loader).
+    if !defer_to_find_class && !scoped_user_chain {
         if let Some(mirror) = load_class_visible_to(ctx, this, &internal) {
             return Ok(Some(mirror));
         }
@@ -997,7 +1016,7 @@ fn cl_real_load_class_base(
     // 2b. Deferred-resolution last resort (HIB-CV-24): CratonVM's flat store is
     //     the only source of application classes, so a findClass-overriding loader
     //     whose override legitimately misses still resolves here.
-    if defer_to_find_class {
+    if defer_to_find_class && !scoped_user_chain {
         if let Some(mirror) = load_class_visible_to(ctx, this, &internal) {
             return Ok(Some(mirror));
         }

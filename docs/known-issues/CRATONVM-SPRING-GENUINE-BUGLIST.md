@@ -109,13 +109,27 @@ the WRONG same-named copy. Eight fixes landed on
 *   `TestCompilerTests` — 4 residuals: package-private access via
     `@CompileWithTargetClassAccess`-style flows + additional-class references
     (`CompilationException: Unable to compile source`).
-*   `aot.nativex.feature.ThrowawayClassLoaderTests` — 1 residual
-    (`InputStream closed` contract). Minimal repro `TCLProbe.java`:
-    `new ClassLoader(null){}.loadClass(<app class>)` RESOLVES the app class
-    under CratonVM real mode where HotSpot throws CNFE, so the loader's
-    resource fallback never runs. The leaking surface is inside the
-    real-bytecode `loadClass(String,boolean)` chain (not forName / JLA probe /
-    findBootstrapClass native / findLoadedClass native — all traced clean).
+*   ~~`aot.nativex.feature.ThrowawayClassLoaderTests`~~ **FIXED (2026-07-15,
+    commit `56a98cc4`)**. `native-builtins/src/classloader_real.rs`'s
+    `cl_real_load_class_base` — the REAL-JDK-mode counterpart of the
+    synthetic-mode function fixed earlier in this doc's round 2 — had the
+    same missing JVMS 5.3 chain-scoping: `new ClassLoader(null){}.loadClass(x)`
+    resolved app classes directly from the flat store even though the
+    loader's real parent chain never reaches a built-in loader. Ported the
+    same `scoped_user_chain` gate. Full class now 2/2 OK.
+*   **BeanDefinitionMethodGeneratorTests — new lead, not yet fixed.** Full
+    bisection of the `generateBeanDefinitionMethodWhenHasExplicitResolvableType`
+    residual (`MethodRun.java` accepts N method names to run together in one
+    process) shows the failure is **COUNT-dependent, not content-dependent**:
+    9 preceding `TestCompiler` compile cycles before the target passes; 10
+    fails — and ANY of three different 9th-method candidates tested
+    reproduces it identically. Points at a fixed-size cache or counter
+    (per-loader-epoch resolution cache in `vm/src/runtime/lockfree_resolve.rs`
+    is the prime suspect, unconfirmed) overflowing/evicting between 9 and 10
+    entries. Likely the same root cause as the `PersistenceAnnotation...`
+    ByteBuddy `NoSuchMethodError` on the 3rd+ independent fork redefinition
+    (see `BBProbe4.java` repro) — both are "Nth redefinition of the same
+    class across independent loaders loses coherence" symptoms.
 
 ---
 
