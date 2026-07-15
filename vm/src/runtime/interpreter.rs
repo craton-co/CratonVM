@@ -30810,6 +30810,37 @@ fn background_compile_task(
     if crate::classloading::any_class_redefined() {
         return fail(0);
     }
+    // Keep asynchronous tiering aligned with the foreground admission paths.
+    // Without this gate, methods rejected by the conservative skip list are
+    // repeatedly queued by the tier manager. The final compiler gate then
+    // declines each task, but the hot interpreter path keeps paying for the
+    // failed background attempts. Hibernate's package-level fail-closed
+    // policy made that retry loop large enough to turn ordinary suite classes
+    // into timeout candidates.
+    let policy = if shared.config.jit_aggressive_compilation {
+        crate::jit::skip_list::SkipPolicy::Aggressive
+    } else {
+        crate::jit::skip_list::SkipPolicy::Conservative
+    };
+    let is_interface_default = {
+        let cm = shared.class_manager.read();
+        cm.get_loaded_class_id(&task.method_key.class_name)
+            .and_then(|id| cm.get_class(id))
+            .map_or(false, |class| class.is_interface())
+    };
+    if crate::jit::skip_list::should_skip_jit_with_init(
+        &task.method_key.class_name,
+        &task.method_key.method_name,
+        is_interface_default,
+        std::thread::current().name().is_some(),
+        policy,
+        crate::jit::skip_list::allow_packages_from_env(),
+        crate::jit::skip_list::InitComplexity::Unknown,
+    )
+    .is_some()
+    {
+        return fail(0);
+    }
     if task.osr_bci.is_some() && crate::jit::tiered::is_osr_denied(&task.method_key) {
         return fail(0);
     }

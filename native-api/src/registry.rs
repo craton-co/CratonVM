@@ -3674,12 +3674,26 @@ impl NativeMethodRegistry {
                     | ("group", "()Ljava/lang/String;")
                     | ("group", "(I)Ljava/lang/String;")
             );
+        // Pattern is immutable after its constructor finishes.  The two
+        // static factories below may therefore return a VM-rooted, fully
+        // constructed real-JDK Pattern from a bounded cache; unlike the old
+        // synthetic regex bridge they never fabricate or partially initialize
+        // a Pattern/Matcher layout.
+        let keep_real_pattern_compile_cache = self.current_category == NativeKind::Intrinsic
+            && class_name == "java/util/regex/Pattern"
+            && method_name == "compile"
+            && matches!(
+                descriptor,
+                "(Ljava/lang/String;)Ljava/util/regex/Pattern;"
+                    | "(Ljava/lang/String;I)Ljava/util/regex/Pattern;"
+            );
         if self.drop_real_layout_synthetic
             && matches!(
                 class_name,
                 "java/util/regex/Pattern" | "java/util/regex/Matcher"
             )
             && !keep_real_matcher_find_fastpath
+            && !keep_real_pattern_compile_cache
         {
             return;
         }
