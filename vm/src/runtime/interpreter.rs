@@ -2036,6 +2036,38 @@ pub(crate) fn tlab_alloc_object_guarded_refill(
     tlab_alloc_object_inner(thread, shared, class_id, num_fields, total_size, true)
 }
 
+/// DBG (CRATONVM_DBG_INVOKESTATS): counts invoke-dispatch path outcomes to
+/// diagnose whether the monomorphic inline cache (`InvokeCache`) is actually
+/// staying warm for a workload, or whether calls are falling through to the
+/// vtable-fast / full-slow-path resolution on every call. index: 0=inline
+/// cache HIT, 1=inline cache MISS, 2=vtable_fast reached, 3=execute_invoke_kind
+/// (full slow path) reached. Prints a running tally every 100000 events on
+/// each counter to bound output volume for long-running processes.
+fn dbg_invoke_stats_record(index: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_INVOKESTATS").is_some()) {
+        return;
+    }
+    static COUNTS: [AtomicU64; 4] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    let n = COUNTS[index].fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 100000 == 1 {
+        eprintln!(
+            "[invokestats] cache_hit={} cache_miss={} vtable_fast={} slow_path={}",
+            COUNTS[0].load(Ordering::Relaxed),
+            COUNTS[1].load(Ordering::Relaxed),
+            COUNTS[2].load(Ordering::Relaxed),
+            COUNTS[3].load(Ordering::Relaxed),
+        );
+    }
+}
+
 /// DBG (CRATONVM_DBG_TLABMISS): gate-failure state dump — the live young
 /// arena facts at the moment the guarded-refill young-room gate said no.
 /// Sampled every 2^20 failures (plus the first).
@@ -13895,18 +13927,55 @@ fn execute_instruction(
         }
 
         // -- Method invocation (slow path) --
+        //
+        // PERF FIX (2026-07-15, RequestMappingMessageConversionIntegrationTests
+        // pathological slowness): this `Instruction::decode`-driven path is what
+        // ALL bytecode from `is_jdk_class` frames runs through, because the
+        // raw-byte-peek fast dispatch loop at the top of `execute_frame` is
+        // gated off for JDK-internal classes (`use_fast_path =
+        // !is_jdk_class && ...`, T14 comment above) — that gate exists because
+        // some of the fast loop's opcode fusions (iload/istore/iadd etc.) use
+        // truly-unchecked stack pops tuned for synthetic bytecode shapes.
+        // The monomorphic `InvokeCache` consulted by `execute_invokevirtual_cached`
+        // does NOT share that risk: its arg decode already goes through
+        // `pop_arg_for_descriptor_checked` (descriptor-aware, checked), and a
+        // miss/edge-case (receiver-class change, lambda proxy, annotation
+        // proxy, stack-depth limit, JVMTI redefine) just returns `CacheMiss`
+        // and falls through to the exact same slow path used before this fix.
+        // Previously this arm called `execute_invoke`/`execute_invoke_kind`
+        // UNCONDITIONALLY, so every single invoke instruction executed by
+        // JDK-internal bytecode (java.xml/Xerces, java.util, java.io, …) paid
+        // full method resolution every time — native-registry hash lookup,
+        // `force_native_over_real_jdk_bytecode` / `synthetic_stub_should_yield_
+        // to_real_bytecode` special-case checks, a superclass hierarchy walk,
+        // `class_manager` RwLock reads — instead of the lock-free O(1) cache
+        // hit non-JDK bytecode already enjoyed. Measured impact: a standalone
+        // SAX/DTD parse-loop repro (no Spring/Tomcat involved) went from
+        // ~155ms/parse to ~0.6ms/parse on CratonVM after this fix (HotSpot:
+        // ~0.46ms/parse) — see docs/known-issues/CRATONVM-SPRING-GENUINE-
+        // BUGLIST.md, RequestMappingMessageConversionIntegrationTests entry.
         Instruction::Invokevirtual(index) | Instruction::Invokespecial(index) => {
-            match execute_invoke(
+            let is_special_invoke = matches!(instruction, Instruction::Invokespecial(_));
+            match execute_invokevirtual_cached(
                 shared,
                 thread,
                 frame_idx,
                 *index,
-                matches!(instruction, Instruction::Invokespecial(_)),
+                saved_pc,
+                is_special_invoke,
             )? {
                 CachedCallResult::FramePushed => {
                     return Ok(InstructionResult::FramePushed);
                 }
-                _ => {}
+                CachedCallResult::Handled => {}
+                CachedCallResult::CacheMiss => {
+                    match execute_invoke(shared, thread, frame_idx, *index, is_special_invoke)? {
+                        CachedCallResult::FramePushed => {
+                            return Ok(InstructionResult::FramePushed);
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
         Instruction::Invokestatic(index) => {
@@ -13919,12 +13988,27 @@ fn execute_instruction(
         }
         Instruction::Invokeinterface { index, count: _ } => {
             // is_interface=true threads γ's stash so the default-method
-            // rescue can fire on NSME for invokeinterface only.
-            match execute_invoke_kind(shared, thread, frame_idx, *index, false, true)? {
+            // rescue can fire on NSME for invokeinterface only. Same cache
+            // consultation as invokevirtual/invokespecial above (PERF FIX
+            // 2026-07-15) — the vtable slot resolved by the cache is
+            // identical for invokevirtual and invokeinterface call sites
+            // once a receiver's concrete class is known (see the
+            // `execute_invokevirtual_vtable_fast` "miss path" comment in the
+            // raw fast-dispatch loop, which already relies on this fact).
+            match execute_invokevirtual_cached(shared, thread, frame_idx, *index, saved_pc, false)?
+            {
                 CachedCallResult::FramePushed => {
                     return Ok(InstructionResult::FramePushed);
                 }
-                _ => {}
+                CachedCallResult::Handled => {}
+                CachedCallResult::CacheMiss => {
+                    match execute_invoke_kind(shared, thread, frame_idx, *index, false, true)? {
+                        CachedCallResult::FramePushed => {
+                            return Ok(InstructionResult::FramePushed);
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
 
@@ -17467,6 +17551,7 @@ fn execute_invoke_kind(
     is_special: bool,
     is_interface: bool,
 ) -> Result<CachedCallResult, MethodCallFailed> {
+    dbg_invoke_stats_record(3);
     let current_class_id = thread.frames[frame_idx].class_id;
 
     let (method_class_name, method_name, method_descriptor, num_params) =
@@ -31912,6 +31997,7 @@ fn execute_invokevirtual_vtable_fast(
     cp_index: u16,
     site_pc: usize,
 ) -> Result<CachedCallResult, MethodCallFailed> {
+    dbg_invoke_stats_record(2);
     let caller_class_id = thread.frames[frame_idx].class_id;
 
     // Step 1 — already covered by the caller (execute_invokevirtual_cached
@@ -32641,8 +32727,14 @@ fn execute_invokevirtual_cached(
         .invoke_cache
         .get(caller_class_id, cp_index, is_special)
     {
-        Some(t) => t.clone(),
-        None => return Ok(CachedCallResult::CacheMiss),
+        Some(t) => {
+            dbg_invoke_stats_record(0);
+            t.clone()
+        }
+        None => {
+            dbg_invoke_stats_record(1);
+            return Ok(CachedCallResult::CacheMiss);
+        }
     };
     // JVMTI redefine guard: never serve a cached native/intrinsic SHADOW for a
     // class an agent has redefined in place — evict the entry and re-resolve
