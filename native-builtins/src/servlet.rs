@@ -3742,28 +3742,19 @@ fn s2_bb_as_char_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     ctx.set_field_by_name(vb, "limit", Value::Int(rem_chars as i32));
     ctx.set_field_by_name(vb, "capacity", Value::Int(rem_chars as i32));
     ctx.set_field_by_name(vb, "mark", Value::Int(-1));
-    // Synthetic-mode fallback (older paths still indexed-slot based).
-    ctx.set_field(vb, BB_ARRAY, Value::Object(Some(chars_arr)));
-    ctx.set_field(vb, BB_POS, Value::Int(0));
-    ctx.set_field(vb, BB_LIMIT, Value::Int(rem_chars as i32));
-    ctx.set_field(vb, BB_CAP, Value::Int(rem_chars as i32));
-    ctx.set_field(vb, BB_MARK, Value::Int(-1));
-    ctx.set_field(vb, BB_ORDER, Value::Int(order));
-    // `java.nio.Buffer.address` (long) — real `CharBuffer.get(char[])` routes
-    // through the bulk `getArray` fast path (`isAddressable()` is
-    // unconditionally true in real bytecode), which computes the source
-    // offset as `address + (index << 1)` and hands it to
-    // `ScopedMemoryAccess.copyMemory`'s array-offset decode. A heap view must
-    // therefore seed `address = ARRAY_CHAR_BASE_OFFSET` (16); the previous
-    // default of 0 decoded below the array base and threw
-    // ArrayIndexOutOfBoundsException on every bulk get — poisoning
-    // `jdk.internal.icu.impl.UCharacterProperty.<clinit>` (ICUBinary.getChars)
-    // and with it `java.net.IDN` and Netty's buffer stack. See
-    // docs/known-issues/springboot/charbuffer-getarray-scopedmemoryaccess-copymemory-aioobe.md.
-    // Written LAST so the indexed BB_* fallback writes above (BB_MARK aliases
-    // the real `address` slot) can't clobber it — same pattern as
-    // `charset.rs::alloc_char_buffer`.
+    // Heap CharBuffers use ARRAY_CHAR_BASE_OFFSET (16) as their address.
+    // Do not unconditionally write the old indexed overlay: in real-JDK
+    // layout its slot 4 is Buffer.address, so BB_MARK=-1 made bulk get()
+    // call Unsafe.copyMemory with an invalid source offset.
     ctx.set_field_by_name(vb, "address", Value::Long(16));
+    if s2_bb_synthetic_layout(ctx, vb) {
+        ctx.set_field(vb, BB_ARRAY, Value::Object(Some(chars_arr)));
+        ctx.set_field(vb, BB_POS, Value::Int(0));
+        ctx.set_field(vb, BB_LIMIT, Value::Int(rem_chars as i32));
+        ctx.set_field(vb, BB_CAP, Value::Int(rem_chars as i32));
+        ctx.set_field(vb, BB_MARK, Value::Int(-1));
+        ctx.set_field(vb, BB_ORDER, Value::Int(order));
+    }
     Ok(Some(Value::Object(Some(vb))))
 }
 
