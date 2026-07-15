@@ -11991,6 +11991,7 @@ fn lazy_streams_enabled() -> bool {
 }
 
 /// A single deferred intermediate op read back from a stream's chain.
+#[derive(Clone)]
 struct LazyOp {
     kind: i32,
     lambda: Option<ObjectRef>,
@@ -12070,8 +12071,25 @@ fn stream_make_lazy_derived(
     let src_pin = ctx.pin_native_root(src);
     let lambda_pin = lambda.map(|l| ctx.pin_native_root(l)).unwrap_or(usize::MAX);
     let src_cur = ctx.read_native_pin(src_pin, src);
-    materialize_lazy_stream(ctx, src_cur);
-    let src_cur = ctx.read_native_pin(src_pin, src);
+    // FIX (stream-eager-drain-20260715): do NOT eagerly materialize `src`
+    // here. A `src` that still holds a live, undrained lazy spliterator
+    // (STREAM_FIELD_LAZY_SPLITERATOR, slot 2 -- from
+    // `StreamSupport.stream(spliterator, false)`) must have that spliterator
+    // propagated forward, UNDRAINED, onto the new derived stream, alongside
+    // the extended op-chain built below. Draining it eagerly at THIS point
+    // (before the current op is even recorded on the chain) runs the raw
+    // `tryAdvance` loop fully disconnected from ANY downstream processing --
+    // exactly the "cursor" Iterator bug (`next()` returns `this`; real
+    // per-element consumption happens inside the mapper/filter/etc that was
+    // about to be appended to the chain) documented in
+    // docs/known-issues/keycloak/stream-eager-drain-inline-fix-20260715.md.
+    // The actual drive now happens inline, one element at a time through the
+    // FULL chain, the first time a terminal genuinely needs concrete
+    // elements (`stream_pull_internal` / `stream_pull_synthetic_downstream`).
+    let src_lazy_spl = stream_lazy_spliterator(ctx, src_cur);
+    let spl_pin = src_lazy_spl
+        .map(|s| ctx.pin_native_root(s))
+        .unwrap_or(usize::MAX);
     let source = ctx.get_field(src_cur, STREAM_FIELD_ELEMENTS);
     let source_pin = pin_value(ctx, source);
     let src_chain = if ctx.object_num_fields(src_cur) > STREAM_FIELD_OP_CHAIN {
@@ -12118,8 +12136,21 @@ fn stream_make_lazy_derived(
         STREAM_FIELD_OP_CHAIN,
         Value::Object(Some(new_chain)),
     );
+    // Propagate the still-undrained lazy spliterator (if any) forward so the
+    // eventual terminal drives it inline through the now-extended chain.
+    if let Some(spl) = src_lazy_spl {
+        let spl_cur = ctx.read_native_pin(spl_pin, spl);
+        ctx.set_field(
+            stream,
+            STREAM_FIELD_LAZY_SPLITERATOR,
+            Value::Object(Some(spl_cur)),
+        );
+    }
     let src_cur = ctx.read_native_pin(src_pin, src);
     stream_inherit_close_handlers(ctx, src_cur, stream);
+    if spl_pin != usize::MAX {
+        ctx.unpin_native_roots(spl_pin);
+    }
     ctx.unpin_native_roots(src_pin);
     Ok(Some(Value::Object(Some(stream))))
 }
@@ -12355,13 +12386,49 @@ fn stream_pull_internal(
 ) -> Result<PullStep, MethodCallFailed> {
     let stream_pin = ctx.pin_native_root(this);
     let stream = ctx.read_native_pin(stream_pin, this);
-    let base = stream_source_elems(ctx, stream);
-    let (_, base_pins) = pin_value_slice(ctx, &base);
-    let stream = ctx.read_native_pin(stream_pin, this);
     let chain = stream_read_chain(ctx, stream);
     let chain_pins = pin_lazy_chain_lambdas(ctx, &chain);
 
     let result: Result<PullStep, MethodCallFailed> = (|| {
+        let stream = ctx.read_native_pin(stream_pin, this);
+        // FIX (stream-eager-drain-20260715): a stream still holding a live,
+        // undrained lazy spliterator must have its elements driven INLINE
+        // through `chain`, one `tryAdvance` at a time -- NOT via
+        // `stream_source_elems` (which would fully drain the raw source with
+        // a dumb append-only collector BEFORE any op in `chain` ever runs).
+        // See docs/known-issues/keycloak/stream-eager-drain-inline-fix-20260715.md.
+        if let Some(spl) = stream_lazy_spliterator(ctx, stream) {
+            let mut emit_stopped = false;
+            {
+                let mut wrapped_emit =
+                    |c: &mut dyn NativeContext, v: Value| -> Result<PullStep, MethodCallFailed> {
+                        let step = emit(c, v)?;
+                        if step == PullStep::Stop {
+                            emit_stopped = true;
+                        }
+                        Ok(step)
+                    };
+                drain_spliterator_inline(ctx, spl, &chain, &chain_pins, &mut wrapped_emit)?;
+            }
+            // The spliterator is single-pass and is now spent (exhausted or
+            // short-circuited): clear the lazy slot and record an empty
+            // element array so a stray second terminal call on the same
+            // stream object behaves like an already-drained ordinary stream
+            // (mirrors `materialize_lazy_stream`'s post-drain bookkeeping).
+            let stream = ctx.read_native_pin(stream_pin, this);
+            let empty = alloc_ref_array(ctx, 0);
+            let stream = ctx.read_native_pin(stream_pin, this);
+            ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(empty)));
+            ctx.set_field(stream, STREAM_FIELD_LAZY_SPLITERATOR, Value::Object(None));
+            return Ok(if emit_stopped {
+                PullStep::Stop
+            } else {
+                PullStep::Continue
+            });
+        }
+
+        let base = stream_source_elems(ctx, stream);
+        let (_, base_pins) = pin_value_slice(ctx, &base);
         let mut state = stream_new_pull_state(chain.len());
         for (idx, v) in base.iter().copied().enumerate() {
             if stream_limit_saturated(&chain, &state, 0) {
@@ -12458,14 +12525,51 @@ fn stream_pull_synthetic_downstream(
     emit: &mut StreamEmit<'_>,
 ) -> Result<PullStep, MethodCallFailed> {
     let stream_pin = ctx.pin_native_root(stream);
-    let stream = ctx.read_native_pin(stream_pin, stream);
-    let base = stream_source_elems(ctx, stream);
-    let (_, base_pins) = pin_value_slice(ctx, &base);
-    let stream = ctx.read_native_pin(stream_pin, stream);
-    let chain = stream_read_chain(ctx, stream);
+    let stream_cur = ctx.read_native_pin(stream_pin, stream);
+    let chain = stream_read_chain(ctx, stream_cur);
     let chain_pins = pin_lazy_chain_lambdas(ctx, &chain);
 
     let result: Result<PullStep, MethodCallFailed> = (|| {
+        let stream_cur = ctx.read_native_pin(stream_pin, stream);
+        // FIX (stream-eager-drain-20260715): a `flatMap` mapper commonly
+        // returns a fresh `StreamSupport.stream(sp, false)` -- drive it
+        // inline through its own chain too, same as `stream_pull_internal`,
+        // instead of materializing it raw first.
+        if let Some(spl) = stream_lazy_spliterator(ctx, stream_cur) {
+            let mut downstream_stopped = false;
+            {
+                let mut downstream_emit =
+                    |c: &mut dyn NativeContext, v: Value| -> Result<PullStep, MethodCallFailed> {
+                        let step = stream_process_chain(
+                            c,
+                            v,
+                            downstream_chain,
+                            downstream_chain_pins,
+                            downstream_start,
+                            downstream_state,
+                            emit,
+                        )?;
+                        if step == PullStep::Stop {
+                            downstream_stopped = true;
+                        }
+                        Ok(step)
+                    };
+                drain_spliterator_inline(ctx, spl, &chain, &chain_pins, &mut downstream_emit)?;
+            }
+            let stream_cur = ctx.read_native_pin(stream_pin, stream);
+            let empty = alloc_ref_array(ctx, 0);
+            let stream_cur = ctx.read_native_pin(stream_pin, stream);
+            ctx.set_field(stream_cur, STREAM_FIELD_ELEMENTS, Value::Object(Some(empty)));
+            ctx.set_field(stream_cur, STREAM_FIELD_LAZY_SPLITERATOR, Value::Object(None));
+            return Ok(if downstream_stopped {
+                PullStep::Stop
+            } else {
+                PullStep::Continue
+            });
+        }
+
+        let base = stream_source_elems(ctx, stream_cur);
+        let (_, base_pins) = pin_value_slice(ctx, &base);
         let mut state = stream_new_pull_state(chain.len());
         for (idx, v) in base.iter().copied().enumerate() {
             if stream_limit_saturated(downstream_chain, downstream_state, downstream_start) {
@@ -12582,6 +12686,262 @@ where
 {
     let _ = stream_pull_internal(ctx, this, &mut emit)?;
     Ok(())
+}
+
+// ===========================================================================
+// FIX (stream-eager-drain-20260715): inline per-element drive of a LAZY
+// spliterator-sourced stream through its downstream op-chain.
+//
+// The Part-B chain machinery above (`stream_process_chain` et al.) already
+// threads one element through map/filter/peek/limit/skip/flatMap in a single
+// interleaved step -- but only once it HAS an element in hand. Every call
+// site used to obtain that element via `stream_source_elems` /
+// `materialize_lazy_stream`, which for a lazy (`StreamSupport.stream(sp,
+// false)`) source fully drains the RAW spliterator with a dumb
+// append-only collector BEFORE the chain ever runs on ANY element. That is
+// invisible for the common case (`next()` returns an independent fresh
+// value each call) but breaks the "cursor" idiom -- `next()` returns `this`;
+// the real per-element consumption happens inside a downstream op
+// (`org.openqa.selenium.json.JsonInputIterator`/`MapCoercer` being the
+// motivating real-world case) -- because `hasNext()` can never observe a
+// state change during that disconnected raw drain, so it never returns
+// `false`, and the drain runs until `drain_spliterator_to_array`'s
+// 1,000,000-iteration safety cap. See
+// docs/known-issues/keycloak/stream-eager-drain-inline-fix-20260715.md.
+//
+// `drain_spliterator_inline` below fixes this by driving `tryAdvance` itself
+// and running EACH element through the chain from inside the reentrant
+// `Consumer.accept` callback, before asking for the next one.
+// ===========================================================================
+
+/// One in-flight "drive a lazy spliterator inline through its downstream
+/// op-chain" job (`drain_spliterator_inline`). Pushed onto
+/// `SPLITERATOR_PULL_STACK` for the duration of the `tryAdvance` loop that
+/// owns it (via `PullFrameGuard`), popped when that loop ends (normal
+/// exhaustion, short-circuit stop, or a propagated lambda error). The
+/// `accept(Object)V` native on `cratonvm/internal/StreamChainCollector`
+/// (registered below) reads the TOP frame on each reentrant call made from
+/// `tryAdvance`.
+///
+/// `chain`/`chain_pins` are cloned in (cheap: a handful of ops at most) so
+/// `accept` never needs to borrow back into the driving function's stack
+/// frame for them. `state` is genuinely mutated across calls (limit/skip
+/// counters) and lives here for exactly that reason.
+struct SpliteratorPullFrame {
+    chain: Vec<LazyOp>,
+    chain_pins: Vec<usize>,
+    state: StreamPullState,
+    // SAFETY: `emit` points at a `&mut StreamEmit` owned by
+    // `drain_spliterator_inline`'s caller and borrowed for the exact
+    // duration of that call. The frame holding this pointer is pushed
+    // immediately before, and popped (via `PullFrameGuard`'s `Drop`,
+    // unconditionally, including on early return via `?`) immediately
+    // after, the `tryAdvance` loop that is the ONLY code that can trigger a
+    // reentrant `accept()` call observing this frame. No other code path
+    // can extend this pointer's effective lifetime past that window. This
+    // mirrors the established `ChmMonitorGuard` raw-pointer-RAII-guard
+    // pattern already used elsewhere in this file for the same
+    // "&mut dyn NativeContext-shaped borrow must outlive a guard, but is
+    // provably scope-bounded" situation.
+    emit: *mut dyn FnMut(&mut dyn NativeContext, Value) -> Result<PullStep, MethodCallFailed>,
+    stop: bool,
+    error: Option<MethodCallFailed>,
+}
+
+thread_local! {
+    /// Stack of in-flight `drain_spliterator_inline` jobs on this thread.
+    /// A `Vec`, not a single slot, because a downstream lambda invoked from
+    /// `stream_process_chain` (e.g. a `.map()` function, or a nested
+    /// `.flatMap()`) can itself start ANOTHER inline spliterator drive
+    /// before the outer one finishes -- always exactly nested (push/pop
+    /// discipline), never interleaved, since everything here is synchronous
+    /// single-threaded JVM native execution.
+    static SPLITERATOR_PULL_STACK: std::cell::RefCell<Vec<SpliteratorPullFrame>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// RAII guard: pushes a frame on construction, pops it (from the TOP of the
+/// stack -- always correct given the strict nesting discipline above) on
+/// `Drop`, so an early return (including via `?` on a propagated lambda
+/// error) can never leave a stale frame behind for a LATER, unrelated
+/// `accept()` call to misread.
+struct PullFrameGuard;
+
+impl PullFrameGuard {
+    fn push(frame: SpliteratorPullFrame) -> Self {
+        SPLITERATOR_PULL_STACK.with(|s| s.borrow_mut().push(frame));
+        PullFrameGuard
+    }
+
+    /// Peek this job's `stop` flag and take its `error` (if any) after one
+    /// `accept()` call. `error` is taken (moved out) since it can only be
+    /// reported once.
+    fn poll(&self) -> (bool, Option<MethodCallFailed>) {
+        SPLITERATOR_PULL_STACK.with(|s| {
+            let mut s = s.borrow_mut();
+            let frame = s.last_mut().expect("PullFrameGuard::poll: frame missing");
+            (frame.stop, frame.error.take())
+        })
+    }
+}
+
+impl Drop for PullFrameGuard {
+    fn drop(&mut self) {
+        SPLITERATOR_PULL_STACK.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+const STREAM_CHAIN_COLLECTOR_CLASS: &str = "cratonvm/internal/StreamChainCollector";
+
+/// `accept(Object)V` native for `cratonvm/internal/StreamChainCollector`.
+/// Reentrant callback target for the `tryAdvance` loop in
+/// `drain_spliterator_inline`: runs the ONE element it's just been handed
+/// straight through the top `SPLITERATOR_PULL_STACK` frame's `chain` (and,
+/// through that, the caller's ultimate `emit`) before returning control to
+/// `tryAdvance` -- this per-`tryAdvance`-call interleaving is what makes the
+/// drive genuinely pull-based rather than a raw disconnected drain.
+fn native_stream_chain_collector_accept(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+
+    // Snapshot what's needed to run the chain, then release the RefCell
+    // borrow BEFORE calling `stream_process_chain` -- that call can re-enter
+    // Java (a map/filter/flatMap lambda) which may itself start a NESTED
+    // `drain_spliterator_inline` job that pushes onto this same thread-local
+    // stack; holding the borrow across the call would panic on that nested
+    // `borrow_mut()`.
+    let (chain, chain_pins, mut state, emit_ptr, skip) = SPLITERATOR_PULL_STACK.with(|s| {
+        let mut s = s.borrow_mut();
+        let frame = s
+            .last_mut()
+            .expect("StreamChainCollector.accept called with no active pull frame");
+        let skip = frame.stop || frame.error.is_some();
+        (
+            frame.chain.clone(),
+            frame.chain_pins.clone(),
+            std::mem::replace(&mut frame.state, stream_new_pull_state(0)),
+            frame.emit,
+            skip,
+        )
+    });
+
+    if skip {
+        return Ok(None);
+    }
+
+    // SAFETY: see `SpliteratorPullFrame::emit`'s doc comment above.
+    let emit: &mut dyn FnMut(
+        &mut dyn NativeContext,
+        Value,
+    ) -> Result<PullStep, MethodCallFailed> = unsafe { &mut *emit_ptr };
+    let outcome = stream_process_chain(ctx, elem, &chain, &chain_pins, 0, &mut state, emit);
+
+    SPLITERATOR_PULL_STACK.with(|s| {
+        let mut s = s.borrow_mut();
+        let frame = s
+            .last_mut()
+            .expect("StreamChainCollector.accept: frame vanished mid-call");
+        frame.state = state;
+        match outcome {
+            Ok(PullStep::Stop) => frame.stop = true,
+            Ok(PullStep::Continue) => {}
+            Err(e) => frame.error = Some(e),
+        }
+    });
+    Ok(None)
+}
+
+/// Drain a LAZY spliterator-sourced stream's elements INLINE through its
+/// downstream op-chain: each `tryAdvance` hands its one element straight to
+/// `native_stream_chain_collector_accept`, which runs it through `chain` (and
+/// ultimately `emit`) before the loop asks the spliterator for the next
+/// element -- HotSpot's pull-based per-element interleaving, and the fix for
+/// the "cursor" Iterator idiom described in the module doc comment above.
+///
+/// Stops calling `tryAdvance` the moment the chain is satisfied (a `limit`,
+/// or `emit` returning `PullStep::Stop`), so a short-circuiting terminal over
+/// a lazy source genuinely short-circuits instead of first draining
+/// everything. Returns the raw `PullStep` of the last element processed
+/// (`Stop` if the loop ended via the chain/emit; `Continue` if the
+/// spliterator was simply exhausted) -- callers translate that into their
+/// own "did the ultimate sink actually ask to stop" result exactly as the
+/// array-based `stream_process_chain` loops already do (via their own
+/// `emit`/`downstream_emit` wrapper's captured flag), so this is a drop-in
+/// replacement for "get `base` then loop `stream_process_chain` over it".
+fn drain_spliterator_inline(
+    ctx: &mut dyn NativeContext,
+    spl: ObjectRef,
+    chain: &[LazyOp],
+    chain_pins: &[usize],
+    emit: &mut StreamEmit<'_>,
+) -> Result<PullStep, MethodCallFailed> {
+    let collector = alloc_synthetic(ctx, STREAM_CHAIN_COLLECTOR_CLASS, 0);
+    let spl_pin = ctx.pin_native_root(spl);
+    let col_pin = ctx.pin_native_root(collector);
+
+    // SAFETY: `emit`'s borrow covers this entire function body; `guard`
+    // pops the frame (unconditionally, via `Drop`) before we return by any
+    // path below, so nothing outside this function can ever observe the
+    // pointer stashed in the frame. Coerce to a raw pointer at `emit`'s own
+    // (short) lifetime, then transmute away the lifetime so it fits the
+    // frame's (unbounded) field type -- mirrors `ChmMonitorGuard::acquire`'s
+    // `&mut dyn NativeContext` lifetime-erasure a few hundred lines above.
+    let emit_raw: *mut dyn FnMut(&mut dyn NativeContext, Value) -> Result<PullStep, MethodCallFailed> =
+        emit;
+    let emit_ptr: *mut dyn FnMut(&mut dyn NativeContext, Value) -> Result<PullStep, MethodCallFailed> =
+        unsafe { core::mem::transmute(emit_raw) };
+    let guard = PullFrameGuard::push(SpliteratorPullFrame {
+        chain: chain.to_vec(),
+        chain_pins: chain_pins.to_vec(),
+        state: stream_new_pull_state(chain.len()),
+        emit: emit_ptr,
+        stop: false,
+        error: None,
+    });
+
+    const SAFETY_CAP: usize = 1_000_000;
+    let mut n = 0usize;
+    let mut last_step = PullStep::Continue;
+    let loop_result: Result<(), MethodCallFailed> = (|| {
+        loop {
+            let s = ctx.read_native_pin(spl_pin, spl);
+            let c = ctx.read_native_pin(col_pin, collector);
+            match ctx.invoke_virtual(
+                s,
+                "tryAdvance",
+                "(Ljava/util/function/Consumer;)Z",
+                &[Value::Object(Some(c))],
+            ) {
+                Ok(Some(Value::Int(v))) if v != 0 => {
+                    let (stopped, err) = guard.poll();
+                    if let Some(e) = err {
+                        return Err(e);
+                    }
+                    if stopped {
+                        last_step = PullStep::Stop;
+                        break;
+                    }
+                    n += 1;
+                    if n >= SAFETY_CAP {
+                        break;
+                    }
+                }
+                Ok(_) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    })();
+
+    ctx.unpin_native_roots(spl_pin);
+    ctx.unpin_native_roots(col_pin);
+    drop(guard);
+    loop_result?;
+    Ok(last_step)
 }
 
 /// Fully materialise a lazy stream's op-chain (apply every op to every source
@@ -12735,18 +13095,13 @@ fn stream_elements(
     ctx: &mut dyn NativeContext,
     stream: ObjectRef,
 ) -> Result<Vec<Value>, MethodCallFailed> {
-    // GC-SAFETY: `materialize_lazy_stream` (and the `toArray()` fallback below)
-    // allocate / drive an allocating spliterator drain that can relocate
-    // `stream`. Every subsequent use of `stream` here (class lookup, field read,
-    // toArray dispatch) must see the forwarded reference, or we read a zeroed
-    // header and mis-dispatch (`Object.toArray()` / empty stream). Pin it.
+    // GC-SAFETY: `materialize_lazy_stream`/`stream_apply_chain_full` (and the
+    // `toArray()` fallback below) allocate / drive an allocating spliterator
+    // drain that can relocate `stream`. Every subsequent use of `stream` here
+    // (class lookup, field read, toArray dispatch) must see the forwarded
+    // reference, or we read a zeroed header and mis-dispatch
+    // (`Object.toArray()` / empty stream). Pin it.
     let stream_pin = ctx.pin_native_root(stream);
-    // Lazy streams (from `StreamSupport.stream(realSpliterator, false)`) hold
-    // their source spliterator in slot 2 with no element array yet — drain it
-    // now so EVERY non-forEach op sees the full element list. (`forEach` handles
-    // the lazy case itself, driving the spliterator one element at a time.)
-    materialize_lazy_stream(ctx, stream)?;
-    let stream = ctx.read_native_pin(stream_pin, stream);
     // For our synthetic Stream object, field 0 holds an Object[] of elements.
     // But some streams are real JDK ReferencePipeline instances (returned by
     // e.g. Spring's MergedAnnotations.stream()) — materialize those via toArray().
@@ -12755,16 +13110,35 @@ fn stream_elements(
     // Single-exit so the `stream` pin is always released (see GC-SAFETY above).
     let result: Result<Vec<Value>, MethodCallFailed> = if is_synthetic_stream(&class_name) {
         // keycloak-16 Part B: a lazy stream defers its peek/map/filter/limit/skip
-        // ops onto slot 3 while sharing the upstream SOURCE array (slot 0). Apply
-        // the chain here so every eager terminal/op sees the fully-transformed
+        // ops onto slot 3 while sharing the upstream SOURCE (slot 0, which may
+        // itself still be an undrained lazy spliterator -- slot 2). Apply the
+        // chain here so every eager terminal/op sees the fully-transformed
         // elements. Gate-off (default) never has a chain, so this is inert.
+        //
+        // FIX (stream-eager-drain-20260715): when a chain IS present, route
+        // through `stream_apply_chain_full` (-> `stream_pull` ->
+        // `stream_pull_internal`) WITHOUT first calling `materialize_lazy_stream`
+        // here. `stream_pull_internal` itself now checks for a still-live lazy
+        // spliterator and, if found, drives it INLINE through the chain one
+        // element at a time. Doing the plain `materialize_lazy_stream` drain
+        // unconditionally BEFORE this check (the old code) ran the raw
+        // dumb-collector drain fully disconnected from the chain -- the bug.
         if lazy_streams_enabled() && stream_has_chain(ctx, stream) {
             stream_apply_chain_full(ctx, stream)
-        } else if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
-            let len = ctx.array_length(arr);
-            Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect())
         } else {
-            Ok(Vec::new())
+            // No chain: either an ordinary eager stream, or a lazy stream with
+            // no intermediate ops at all (e.g. `StreamSupport.stream(sp,
+            // false).collect(...)` directly) -- draining it raw here is
+            // correct/unavoidable in that case (there is no downstream
+            // processing to interleave with `tryAdvance` either way).
+            materialize_lazy_stream(ctx, stream)?;
+            let stream = ctx.read_native_pin(stream_pin, stream);
+            if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
+                let len = ctx.array_length(arr);
+                Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect())
+            } else {
+                Ok(Vec::new())
+            }
         }
     } else {
         // Real JDK object pipeline (e.g. Spring's MergedAnnotations.stream()):
@@ -12849,6 +13223,18 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/stream/Stream";
+
+    // FIX (stream-eager-drain-20260715): `accept(Object)V` native for the
+    // `cratonvm/internal/StreamChainCollector` consumer used by
+    // `drain_spliterator_inline` to drive a lazy spliterator's elements
+    // straight through their downstream op-chain, one `tryAdvance` at a
+    // time. See docs/known-issues/keycloak/stream-eager-drain-inline-fix-20260715.md.
+    r.register(
+        STREAM_CHAIN_COLLECTOR_CLASS,
+        "accept",
+        "(Ljava/lang/Object;)V",
+        native_stream_chain_collector_accept,
+    );
 
     // Source methods
     r.register(
@@ -14245,6 +14631,17 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // false)` (no intervening op materialised it) drives its source spliterator
     // one element at a time, so a side-effecting consumer observes per-element
     // processing exactly like the JDK (the fix for DetachedPreviousRowStateTest).
+    // FIX (stream-eager-drain-20260715): only take this direct/bespoke lazy
+    // loop when `this` has NO deferred op-chain (a straight
+    // `StreamSupport.stream(sp, false).forEach(consumer)` with no
+    // intervening map/filter/etc) -- feeding raw elements straight to
+    // `consumer` is correct there. A `this` that DOES carry a chain
+    // (`.map(...).forEach(...)`) must NOT take this branch: it would hand
+    // the consumer raw pre-map elements, skipping the chain entirely. Fall
+    // through to `stream_elements` below instead, which (as of this fix)
+    // drives a still-lazy source inline through the chain via
+    // `stream_pull_internal`.
+    if !stream_has_chain(ctx, this) {
     if let Some(spl) = stream_lazy_spliterator(ctx, this) {
         // GC-SAFETY: the `tryAdvance` loop below re-enters Java once per
         // element and can trigger a moving GC that relocates `this`; the
@@ -14285,6 +14682,7 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         // Mark consumed so a (illegal) second terminal sees an empty stream.
         ctx.set_field(this, STREAM_FIELD_LAZY_SPLITERATOR, Value::Object(None));
         return result;
+    }
     }
     let elements = stream_elements(ctx, this)?;
     // GC-SAFETY: `accept` re-enters Java and can trigger a moving young GC that
