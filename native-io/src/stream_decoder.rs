@@ -331,26 +331,39 @@ fn native_sd_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(o) => o,
         None => return Ok(Some(Value::Int(-1))),
     };
+    // GC-safety: `decode_into` allocates and re-enters Java
+    // (`InputStream.read`), either of which can run a moving GC, and this
+    // loop re-uses `this` and `out` across those windows. Pin both and
+    // re-read the current address through the pin before every use.
+    let this_pin = ctx.pin_native_root(this);
     let out = ctx.new_array(ArrayElementType::Char, 1);
+    let out_pin = ctx.pin_native_root(out);
     // `decode_into` always consumes ≥1 fresh byte when the carry alone can't
     // form a char, so the loop makes progress and terminates (a full char
     // needs ≤4 bytes; EOF flushes). Bounded for safety.
-    for _ in 0..8 {
-        let n = decode_into(ctx, this, out, 0, 1)?;
-        if n > 0 {
-            let ch = match ctx.get_array_element(out, 0) {
-                Value::Int(v) => v & 0xFFFF,
-                _ => -1,
-            };
-            return Ok(Some(Value::Int(ch)));
+    let result: MethodCallResult = (|| {
+        for _ in 0..8 {
+            let cur_this = ctx.read_native_pin(this_pin, this);
+            let cur_out = ctx.read_native_pin(out_pin, out);
+            let n = decode_into(ctx, cur_this, cur_out, 0, 1)?;
+            if n > 0 {
+                let cur_out = ctx.read_native_pin(out_pin, out);
+                let ch = match ctx.get_array_element(cur_out, 0) {
+                    Value::Int(v) => v & 0xFFFF,
+                    _ => -1,
+                };
+                return Ok(Some(Value::Int(ch)));
+            }
+            if n < 0 {
+                return Ok(Some(Value::Int(-1)));
+            }
+            // n == 0: incomplete multi-byte sequence; decode_into pulled more
+            // bytes into the carry — retry.
         }
-        if n < 0 {
-            return Ok(Some(Value::Int(-1)));
-        }
-        // n == 0: incomplete multi-byte sequence; decode_into pulled more
-        // bytes into the carry — retry.
-    }
-    Ok(Some(Value::Int(-1)))
+        Ok(Some(Value::Int(-1)))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 /// `read(char[] cbuf, int off, int len) -> int`.
@@ -381,9 +394,15 @@ fn native_sd_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(o) => o,
         None => return Ok(None),
     };
+    // GC-safety: `close()` re-enters Java; `this` is used again afterward
+    // (field clear + side-table key), so pin it across the call and re-read
+    // the current address before those uses.
+    let this_pin = ctx.pin_native_root(this);
     if let Value::Object(Some(is)) = ctx.get_field_by_name(this, "in") {
         let _ = ctx.invoke_virtual(is, "close", "()V", &[]);
     }
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     ctx.set_field_by_name(this, "in", Value::Object(None));
     let key = sd_key(ctx, this);
     sd_table().lock().unwrap().remove(&key);
@@ -446,6 +465,16 @@ fn decode_into(
         }
     };
 
+    // GC-safety: the refill below allocates (`new_array`) and re-enters Java
+    // (`InputStream.read`), either of which can run a moving GC — and `this`,
+    // `out`, and the temporary refill buffer are all used after those
+    // windows. Pin each and re-read the current address through the pin
+    // before every post-window use (the WildFly domain-boot server-output
+    // reader threads tripped the CRATONVM_DBG_STALE_OBJREF canary exactly
+    // here — see wildfly-domain-hc0053-server-inventory-timeout.md).
+    let this_pin = ctx.pin_native_root(this);
+    let out_pin = ctx.pin_native_root(out);
+
     // Keep total bytes ≤ len so decoded chars ≤ len. Force ≥1 fresh byte when
     // the carry alone fills `len` (tiny len) so we always make progress.
     let mut want = len.saturating_sub(bytes.len());
@@ -454,21 +483,39 @@ fn decode_into(
     }
     let mut eof = false;
     if want > 0 {
-        if let Value::Object(Some(is)) = ctx.get_field_by_name(this, "in") {
+        if matches!(ctx.get_field_by_name(this, "in"), Value::Object(Some(_))) {
+            // Allocate the buffer BEFORE resolving the stream reference: the
+            // allocation itself can move `this` (and its `in` referent), so
+            // the stream is re-read through the refreshed `this` right before
+            // the call, leaving no GC window between the read and its use.
             let tmp = ctx.new_array(ArrayElementType::Byte, want);
-            let r = ctx.invoke_virtual(
-                is,
-                "read",
-                "([BII)I",
-                &[
-                    Value::Object(Some(tmp)),
-                    Value::Int(0),
-                    Value::Int(want as i32),
-                ],
-            )?;
+            let tmp_pin = ctx.pin_native_root(tmp);
+            let cur_this = ctx.read_native_pin(this_pin, this);
+            let r = match ctx.get_field_by_name(cur_this, "in") {
+                Value::Object(Some(is)) => ctx.invoke_virtual(
+                    is,
+                    "read",
+                    "([BII)I",
+                    &[
+                        Value::Object(Some(tmp)),
+                        Value::Int(0),
+                        Value::Int(want as i32),
+                    ],
+                ),
+                _ => Ok(Some(Value::Int(-1))),
+            };
+            // Re-read the buffer through its pin before touching it: the
+            // (potentially blocking) read above is exactly where a
+            // peer-initiated moving GC runs.
+            let tmp = ctx.read_native_pin(tmp_pin, tmp);
+            ctx.unpin_native_roots(tmp_pin);
             let n = match r {
-                Some(Value::Int(v)) => v,
-                _ => -1,
+                Ok(Some(Value::Int(v))) => v,
+                Ok(_) => -1,
+                Err(e) => {
+                    ctx.unpin_native_roots(this_pin);
+                    return Err(e);
+                }
             };
             if n > 0 {
                 let start = bytes.len();
@@ -483,6 +530,7 @@ fn decode_into(
     }
 
     if bytes.is_empty() {
+        ctx.unpin_native_roots(this_pin);
         return Ok(-1);
     }
 
@@ -512,8 +560,12 @@ fn decode_into(
     };
     let ncopy = chars.len().min(len);
     if ncopy > 0 {
-        ctx.write_char_array_from(out, off, &chars[..ncopy]);
+        // Re-read the destination through its pin: the refill window above
+        // may have moved it.
+        let cur_out = ctx.read_native_pin(out_pin, out);
+        ctx.write_char_array_from(cur_out, off, &chars[..ncopy]);
     }
+    ctx.unpin_native_roots(this_pin);
 
     // Persist the incomplete trailing bytes (and any updated property-decoder
     // fallback state) for the next call.
