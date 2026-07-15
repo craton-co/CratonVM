@@ -1017,3 +1017,132 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     nested/chained-composition unit tests for them before the next multi-hour bug hunt finds
     another one this way.
 *   ~~Batch-context `<clinit>` contamination~~ — RETRACTED, see above (host environment issue: missing /tmp + missing ~/jdk25 symlink, not CratonVM).
+
+## 5. Combined verification (2026-07-15, post-merge sign-off)
+
+Independent, from-scratch verification of `dev` tip `22dfc55e` after all three parallel
+2026-07-15 fix sessions landed together (`ClientHttpConnectorTests` 2 fixes `91cb806c`/`3d1449a7`,
+`RequestMappingMessageConversionIntegrationTests` 5 fixes `4290124b`/`96c8a57f`/`b7a1ed84`,
+`JRubyScriptTemplateTests` 6 fixes `d8ae2b96`/`3af9ab62`/`9a6e945a`/`fc9c3a85`/`74745ee4`/`78198922`).
+Fresh worktree (`verify/final-reactive-cluster-20260715`), fresh release binary
+(`~/vmfix-finalverify-20260715`), independent of any fixing agent's own build/binary.
+
+**Good news first:**
+*   `cargo test -p cratonvm-native-builtins --lib --release`: **2999 passed / 0 failed** (top of
+    expected 2997-2999 range).
+*   `cargo test -p cratonvm-gc --lib --release`: **787 passed / 0 failed** (exact baseline match).
+*   `cargo test -p cratonvm-native-io --lib --release`: **349 passed / 0 failed** (exact baseline
+    match).
+*   `cargo test -p cratonvm-vm --lib --release`: **2197 passed / 18 failed** — all 18 are
+    pre-existing and already documented, not new: 9 are `jit::skip_list::tests::*` (unrelated
+    concurrent Hibernate-longtail session, confirmed via `git log -S` on `jit/skip_list.rs` —
+    doc's own JRuby-fix section already noted 8 of these before that session added a 9th) and 9
+    are `runtime::lock_order::tests::*`, all of which fail under plain `--release` simply because
+    lock-order enforcement is gated off by default outside debug builds (`vm/src/runtime/
+    lock_order.rs`, opt back in with `CRATONVM_LOCK_ORDER_CHECK=1`); re-ran with that env var set
+    and 8 of the 9 immediately pass, the 9th (`enforcement_active_in_debug_builds`) asserts
+    `cfg!(debug_assertions)` itself and is *designed* to fail under `--release` — not a functional
+    regression, a test/harness nuance.
+*   `JRubyScriptTemplateTests`: **12/12 clean runs** (`found=1 succ=1 fail=0`), fresh independent
+    binary — corroborates the "FULLY FIXED" claim.
+*   `RequestMappingMessageConversionIntegrationTests`: **completes in 563s** (well under the
+    documented 1200s bound) with **158/160 passing**. This is *better* than the doc's "still does
+    NOT complete" residual note — worth a doc update in section 2/4, not investigated further here
+    for time. The 2 failures are both HTTP 500s on the `[3] Reactor Netty` and `[4] Tomcat` server
+    backends (`org.springframework.web.client.HttpServerErrorException$InternalServerError`), not
+    yet root-caused.
+
+**Real finding — `cargo test --workspace --release` does not compile.** `cratonvm-jit`'s own
+`#[cfg(test)]` code fails with 11× `error[E0063]: missing field `force_native_cache` in
+initializer of `cratonvm_jit_api::CachedBytecodeMethod`` at `jit/src/lib.rs:7963,8109,8179,8633,
+8772,8883,8998,9055,9115,10319,10333`. Root cause confirmed via `git log -S'force_native_cache'`:
+commit `3d1449a7` ("perf(interp): memoize force_native_over_real_jdk_bytecode per invoke-cache
+entry", the round-2 `ClientHttpConnectorTests` fix) added the `force_native_cache: OnceLock<bool>`
+field to `CachedBytecodeMethod` in `jit-api/src/lib.rs` and correctly updated every *production*
+construction site (`vm/src/runtime/interpreter.rs`, `vm/src/runtime/vtable.rs`,
+`vm/src/jit/helpers.rs`, `vm/src/runtime/lockfree_resolve.rs`) but never touched
+`jit/src/lib.rs`, whose own unit-test fixtures build `CachedBytecodeMethod` literals directly.
+Reproduce: `cd <dev-tip-checkout> && cargo test -p cratonvm-jit --lib --release`. This means the
+`jit` crate's own unit test suite has been uncompilable on `dev` since `3d1449a7` landed, and
+nobody has been able to run it standalone since — worth a one-line follow-up fix (add
+`force_native_cache: std::sync::OnceLock::new()` at the 11 sites) but per this task's scope, not
+applied here.
+
+**Real finding — `ClientHttpConnectorTests` hangs 21/21 times (100%), not ~27%.** Ran the class
+15× under moderate host load (matching the doc's own stress-test setup) and, after confirming
+that wasn't a load artifact, 6 more times completely isolated (host load average 1.09, zero other
+CratonVM/cargo processes) — **every single one of the 21 runs timed out at 180s**, versus the
+doc's own clean 15-run measurement of 4/15 (27%) immediately after `3d1449a7` landed. Every one of
+the 21 hangs shows the identical signature on the `MockWebServer` connection-handling thread,
+seconds into the run:
+```
+ERROR [mockwebserver3.MockWebServer] MockWebServer{port=...} connection from 127.0.0.1/127.0.0.1 crashed
+java.lang.ClassCastException: java.lang.Object cannot be cast to okio.Segment
+	at okio.SegmentPool.take(SegmentPool.kt:81)
+	at okio.Buffer.writableSegment$okio(Buffer.kt:1440)
+	at okio.internal.DefaultSocket$SocketSource.read(DefaultSocket.kt:120)
+	...
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1090)
+```
+i.e. a pooled-object slot that should hold an `okio.Segment` yields a plain `Object` instead —
+classic type-confusion in a shared pool/cache, not present in the isolated `3d1449a7` verification
+(that investigation's own writeup describes a pure CPU-bound spin in
+`force_native_over_real_jdk_bytecode`/interpreter dispatch, no exception of any kind). This reads
+as a genuine "concurrent fix + concurrent fix" interaction: `3d1449a7` itself is a caching change
+to `CachedBytecodeMethod`/invoke-cache entries, landing alongside `b7a1ed84`'s own JIT
+code-range/free-list caching changes (`gc/src/arena.rs`, `jit/src/lib.rs`) from the
+`RequestMappingMessageConversionIntegrationTests` session — plausibly corrupting shared pooled-
+object bookkeeping under concurrent load, though the exact mechanism has not been root-caused here
+(out of scope — verification only). Repro: build `dev` tip `22dfc55e` release,
+`cratonvm --java-home <jdk25> --enable-native-access=ALL-UNNAMED KRun
+org.springframework.http.client.reactive.ClientHttpConnectorTests`, repeat a handful of times.
+
+**Second, related finding — `ClassCastException: java.util.concurrent.CompletableFuture cannot be
+cast to io.netty.util.concurrent.Future`.** Surfaced consistently in a 36-class representative
+slice of the reactive cluster (see below): every failing sub-test of
+`ReactorClientHttpConnectorTests` (3/5 failing, previously 5/5 OK in the 02:xx same-day baseline)
+and 5 sub-tests of `RSocketClientToServerIntegrationTests` (previously 1/12 failing, now
+12/12 — all failing) show this exact cast failure, e.g.:
+```
+RSocketClientToServerIntegrationTests :: echo() :: java.lang.AssertionError: expectation
+"expectNext(Hello 1)" failed (expected: onNext(Hello 1); actual: onError(
+java.lang.ClassCastException: java.util.concurrent.CompletableFuture cannot be cast to
+io.netty.util.concurrent.Future))
+```
+Both affected classes are Reactor-Netty-backed. Given the JRuby fix cluster's changes are all in
+MethodHandle/invokedynamic dispatch (`native-builtins/src/lang_invoke.rs`,
+`vm/src/runtime/invokedynamic.rs` — Reactor Netty's own `CompletableFuture`⇄Netty-`Future` bridging
+is lambda/MethodHandle-heavy), this is a plausible second instance of the same "combined fix
+interaction" class as the `okio.Segment` one above, but likewise not root-caused here.
+
+**Broader 36-class reactive sample** (representative slice of the 295-class sweep in section 4,
+not the same day-of exhaustive run — direct comparison confounded by the fact **most of the
+02:xx same-day baseline's EMPTY/ABEND/LOADERR/TIMEOUT statuses turned out to be caused by the
+suite driver never passing `--enable-native-access`, not real bugs** — re-running the identical
+36-class list with the flag on flips the large majority of those categories to OK, e.g.
+`DefaultWebClientTests` EMPTY→OK 25/25, `RequestMappingIntegrationTests` FAIL 20/15/5→OK 20/20,
+`WebClientIntegrationTests` TIMEOUT→completes in 12.8s with 126/170 passing,
+`RSocketServiceMethodTests` ABEND→OK 4/4). Net effect is strongly positive, but four classes look
+worse than the (imperfectly comparable) same-day baseline and are flagged for follow-up rather
+than treated as confirmed regressions given the confound above:
+*   `ReactorClientHttpConnectorTests` — was OK 5/5/0, now FAIL 5/2/3 (see `CompletableFuture`/
+    `Future` CCE above).
+*   `RSocketClientToServerIntegrationTests` — was FAIL 12/0/1, now FAIL 12/0/12 (same CCE family).
+*   `JythonScriptTemplateTests` — was OK 1/1/0, now FAIL 1/0/1,
+    `java.lang.ExceptionInInitializerError: null` (not investigated further).
+*   `WebSocketIntegrationTests` — was FAIL 72/48/24, now FAIL 72/24/48 (pass/fail ratio inverted;
+    not investigated further).
+
+**Bottom line**: the three fix sessions' own individually-claimed numbers hold up (native-builtins,
+gc, native-io unit suites clean; `JRubyScriptTemplateTests` genuinely solid;
+`RequestMappingMessageConversionIntegrationTests` now actually completes, better than documented).
+But the combined tip has at least two real, previously-undocumented defects not visible to any
+single fixing session's own isolated verification: (1) `cratonvm-jit`'s test target does not
+compile (trivial one-line-per-site fix, `3d1449a7`'s responsibility), and (2) `ClientHttpConnectorTests`
+and Reactor-Netty-backed classes generally are now hanging/failing dramatically more than the
+27% figure `3d1449a7` was verified against in isolation, with two consistent `ClassCastException`
+signatures (`okio.Segment`, `io.netty.util.concurrent.Future`) that were never observed during that
+session's own investigation. This is exactly the "concurrent fix + concurrent fix ≠ correct"
+failure mode this verification pass was commissioned to check for. **Recommend NOT treating the
+`ClientHttpConnectorTests`/reactive-connector residual as merely "diffuse throughput, 27% hang,
+accepted" going forward — re-open it as a correctness regression, not a perf residual.**
