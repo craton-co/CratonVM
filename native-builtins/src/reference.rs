@@ -82,6 +82,18 @@ pub(crate) fn register_reference_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/lang/ref/ReferenceQueue;)V",
         native_weak_ref_init_queue,
     );
+    // Brave stores `WeakKey` instances in ConcurrentHashMap but removes them
+    // with the live TraceContext referent.  Its asymmetric Java `equals`
+    // relies on ConcurrentHashMap's key comparison order.  Keep the bridge
+    // explicit for the real-JDK reference layout so this path remains correct
+    // even when a shared Object.equals call site was previously cached for a
+    // different receiver shape.
+    registry.register(
+        "brave/internal/collect/WeakConcurrentMap$WeakKey",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_brave_weak_key_equals,
+    );
 
     // SoftReference constructors
     registry.register(
@@ -167,6 +179,22 @@ pub(crate) fn register_reference_natives(registry: &mut NativeMethodRegistry) {
         native_rq_remove_timeout,
     );
     registry.set_category(__prev_cat);
+}
+
+fn native_brave_weak_key_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first() else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let Some(Value::Object(Some(other))) = args.get(1) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    if this == other {
+        return Ok(Some(Value::Int(1)));
+    }
+    let referent = ctx.get_field(*this, REF_FIELD_REFERENT);
+    Ok(Some(Value::Int(
+        matches!(referent, Value::Object(Some(value)) if value == *other) as i32,
+    )))
 }
 
 // ---------------------------------------------------------------------------

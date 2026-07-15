@@ -182,7 +182,7 @@ Cherry-picked `e7e3bb91f` into `fix/onclasscondition-npe-array-alias-20260712`.
 `SecurityAutoConfigurationTests` (both now clean, no corruption, `FAIL` for
 genuinely unrelated pre-existing reasons) and `BraveAutoConfigurationTests`
 (corruption gone, but see the separate small residual doc
-`brave-baggagefields-classcast-summary-printing.md`) — plus a full 75-class
+`brave-baggagefields-classcast-summary-printing-FIXED.md`, now retired) — plus a full 75-class
 re-run: **zero** occurrences of the dangerous corruption signature anywhere,
 **zero** residual `ClassCastException`s from the original bug. The remaining
 scattered "corrupt Value cell" (HIB-CV-32) guard hits in a handful of other

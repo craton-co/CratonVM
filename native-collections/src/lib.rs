@@ -10294,7 +10294,14 @@ fn native_map_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    let entries = map_collect_entries(ctx, this);
+    // `Map.forEach` is a default interface method. Running the real JDK body
+    // on a synthetic immutable map falls back through `entrySet()` and a
+    // HashSet view, which hashes every entry while constructing its iterator.
+    // That is observably wrong for a map whose value refers back to the map:
+    // iteration must hand the value to the consumer, not evaluate its
+    // `hashCode()`. Use the concrete-backend collector so this bridge is also
+    // safe for LinkedHashMap, TreeMap, immutable wrappers, and foreign maps.
+    let entries = collect_entries_any(ctx, this);
     // GC-SAFETY: the BiConsumer `accept` allocates → moving young GC relocates
     // `action` and every key/value; pin all and re-read from the handles before
     // each dispatch.
@@ -19392,19 +19399,14 @@ fn register_interface_natives(registry: &mut NativeMethodRegistry) {
         native_collection_to_array_generator,
     );
 
-    // --- java/lang/Iterable ---
-    registry.register(
-        "java/lang/Iterable",
-        "iterator",
-        "()Ljava/util/Iterator;",
-        native_al_iterator,
-    );
-    registry.register(
-        "java/lang/Iterable",
-        "forEach",
-        "(Ljava/util/function/Consumer;)V",
-        native_al_for_each,
-    );
+    // Do not register ArrayList-shaped bridges directly on `Iterable`.
+    // A method-reference lambda such as `list::iterator` implements Iterable
+    // too, but its receiver is the lambda proxy rather than an ArrayList. A
+    // direct interface native would therefore manufacture an iterator over the
+    // proxy's fields and silently report no elements. Leaving Iterable to the
+    // interpreter lets its lambda-SAM rescue dispatch the real implementation;
+    // synthetic collection receivers still reach the ArrayList fallback from
+    // the no-Code interface-dispatch path.
 
     // --- forEach on Collection / List / Set ---
     registry.register(
@@ -19438,6 +19440,12 @@ fn register_interface_natives(registry: &mut NativeMethodRegistry) {
 
     // --- java/util/Map ---
     registry.register("java/util/Map", "size", "()I", native_map_size);
+    registry.register(
+        "java/util/Map",
+        "forEach",
+        "(Ljava/util/function/BiConsumer;)V",
+        native_map_for_each,
+    );
     registry.register(
         "java/util/Map",
         "get",
@@ -43175,6 +43183,20 @@ mod tests {
         assert!(
             r.find(c, "stream", "()Ljava/util/stream/Stream;").is_some(),
             "AL stream"
+        );
+    }
+
+    #[test]
+    fn map_for_each_interface_native_registered() {
+        let r = build_registry();
+        assert!(
+            r.find(
+                "java/util/Map",
+                "forEach",
+                "(Ljava/util/function/BiConsumer;)V"
+            )
+            .is_some(),
+            "Map.forEach must have a native bridge for immutable-map snapshots"
         );
     }
 
