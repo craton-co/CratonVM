@@ -6801,6 +6801,35 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             proxies.get(&receiver_class_id).cloned()
         };
 
+        // GC-safety: `lambda_args_sam_compatible` (invoked from the
+        // `.filter()` predicate immediately below) can trigger class loading
+        // -- a GC-triggering call -- through its proxy/annotation-satisfies
+        // helpers (the same helper family flagged in
+        // `checkcast_lambda_instantiated_args`'s own GC-safety comment
+        // elsewhere in this codebase). `receiver` and every object element of
+        // `args` are plain Rust locals here, invisible to the collector, so a
+        // moving GC landing inside that predicate leaves them stale for the
+        // `get_field`/`extend_from_slice` reads used to build `full_args`
+        // just below. Pin both before the predicate runs and re-read through
+        // the pins once it returns, instead of trusting the original locals.
+        // Confirmed live via `CRATONVM_DBG_STALE_OBJREF` during WildFly
+        // `parallel-extension-add` (a `java.util.stream` lambda pipeline
+        // stage triggered it) -- see
+        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+        let sam_compat_pin_base = self.thread.native_pin_roots.len();
+        self.thread.native_pin_roots.push(receiver);
+        let arg_pins: Vec<Option<usize>> = args
+            .iter()
+            .map(|a| match a {
+                Value::Object(Some(o)) => {
+                    let idx = self.thread.native_pin_roots.len();
+                    self.thread.native_pin_roots.push(*o);
+                    Some(idx)
+                }
+                _ => None,
+            })
+            .collect();
+
         if let Some(lcs) = call_site.filter(|lcs| {
             // Match the SAM by name AND parameter count. A functional
             // interface may declare OTHER same-named methods (overloaded
@@ -6828,14 +6857,29 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     args,
                 )
         }) {
+            // Re-read receiver and args through the pins established above --
+            // the SAM-compatibility check just run may have triggered a
+            // moving GC that relocated either one.
+            receiver = self.thread.native_pin_roots[sam_compat_pin_base];
+            let refreshed_args: Vec<Value> = args
+                .iter()
+                .zip(arg_pins.iter())
+                .map(|(orig, pin)| match pin {
+                    Some(idx) => Value::Object(Some(self.thread.native_pin_roots[*idx])),
+                    None => *orig,
+                })
+                .collect();
+            self.thread.native_pin_roots.truncate(sam_compat_pin_base);
+
             // Lambda dispatch: read captured values from proxy fields, then
             // prepend them to the invocation args.
             let num_captures = lcs.capture_types.len();
-            let mut full_args: Vec<Value> = Vec::with_capacity(num_captures + args.len());
+            let mut full_args: Vec<Value> =
+                Vec::with_capacity(num_captures + refreshed_args.len());
             for i in 0..num_captures {
                 full_args.push(self.shared.heap.get_field(receiver, i));
             }
-            full_args.extend_from_slice(args);
+            full_args.extend_from_slice(&refreshed_args);
 
             // Coerce args between SAM and impl descriptors (box/unbox
             // primitives at the SAM boundary so impl sees matched types).
@@ -7206,6 +7250,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 r,
             )
         } else {
+            // Not a lambda-dispatch call after all (the receiver wasn't a
+            // recognized proxy, or the `.filter()` predicate above rejected
+            // it) -- release the pins from the GC-safety block above. Refresh
+            // `receiver` through its pin in case the SAM-compatibility check
+            // ran (and triggered a GC) before the predicate rejected the
+            // match; `args` itself is not rebuilt here for the (rare, only
+            // reachable when a lambda receiver's SAM-shaped overload check
+            // fails) non-lambda fallback dispatch on a lambda-proxy receiver
+            // -- see the GC-safety comment above this block's `if`.
+            receiver = self.thread.native_pin_roots[sam_compat_pin_base];
+            self.thread.native_pin_roots.truncate(sam_compat_pin_base);
             // Not a lambda proxy SAM call вЂ” normal virtual dispatch.
             // If the receiver IS a lambda proxy but calling a non-SAM method
             // (e.g. andThen), dispatch on the functional interface class.

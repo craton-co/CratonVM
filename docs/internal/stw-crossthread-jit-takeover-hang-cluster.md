@@ -13,6 +13,32 @@ but needs a separate, deeper architectural fix (make
 async) to actually pass — see that update section for the concrete next
 step.
 
+## Closure update (2026-07-14)
+
+**Status: RESOLVED and retired.** The remaining observations in this record
+were two separate defects plus one harness confound, all now closed:
+
+- `AsynchronousSocketChannel.write(ByteBuffer):Future` now queues its write
+  on the AIO worker pool and returns a pending real `CompletableFuture`.
+  `TestWsWebSocketContainerTimeoutClient` passes both tests (`OK (2 tests)`,
+  16.3s) with the intended `Future.get()` timeout contract.
+- `Class.getCanonicalName()` and `getSimpleName()` now derive a member name
+  from its `InnerClasses` entry instead of treating every `$` as a nesting
+  separator. This preserves legal names such as
+  `TesterFunctions.Inner$Class`; `TestELInJsp#testBug49555` passes (76.9s).
+- The apparent no-response hangs for `TestJspConfig` and
+  `TestELInJsp#testBug61854a` were reproduced only while the temporary helper
+  put the artifact-heavy `C:\tmp` root on Tomcat's class path, causing its
+  annotation scanner to recursively traverse unrelated build outputs. A
+  clean helper-only classpath makes `testErrorOnELNotFound01` pass (66.2s)
+  and `testBug61854a` pass (76.9s). `TestEnvEntry#testEnvEntryBasic` also
+  completes normally before a 120-second watchdog deadline; its long startup
+  is embedded-Tomcat/JSP lifecycle cost, not a blocked request or STW stall.
+
+The linked EL/JSP record has been retired alongside this one. The source
+regressions are `lang_class::tests::class_get_canonical_name_preserves_literal_dollar_in_member_name`
+and `async_socket::tests`; both pass.
+
 **HotSpot:** PASS on all 5 (fresh-verified, 2026-07-12).
 
 ## Root cause (found 2026-07-13) — raw Rust locks with zero GC-blocking-region bracket
