@@ -1165,6 +1165,23 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
+        // HIB-ANTLR.1 (2026-07-15) -- Hibernate uses the ordinary ANTLR4
+        // runtime rather than Groovy's shaded copy. After a full HQL parse,
+        // JIT-compiled ATN simulation could leave an ATNState with a null
+        // `transitions` array; the next parse then failed in
+        // ParserATNSimulator.computeTargetState. A fresh process passed the
+        // same query, isolating the defect to state corrupted by the compiled
+        // parser path rather than Hibernate's grammar or query metadata.
+        //
+        // This is the unshaded counterpart of ANTLR.1 above. Keep it
+        // liftable for JIT bisection, but default to the sound interpreter
+        // path until the compiled ATN-state mutation is root-caused.
+        if class_name.starts_with("org/antlr/v4/runtime/")
+            && !package_allowed("org/antlr/v4/runtime/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
         // SPB.6 (Session 113 r1) — provisional blanket ban for the
         // Netflix Eureka discovery client. `com/netflix/discovery/
         // DiscoveryClient.<init>` allocates Eureka `InstanceInfo` /
@@ -3657,6 +3674,33 @@ mod tests {
             ),
             None,
             "CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/ is the cold-path validation lift"
+        );
+    }
+
+    #[test]
+    fn hibernate_unshaded_antlr_runtime_stays_interpreted_by_default() {
+        assert_eq!(
+            check(
+                "org/antlr/v4/runtime/atn/ParserATNSimulator",
+                "computeTargetState",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            Some(SkipReason::RustJvmTestFixture),
+            "Hibernate's unshaded ANTLR runtime must not corrupt ATN state under JIT"
+        );
+        assert_eq!(
+            check_with(
+                "org/antlr/v4/runtime/atn/ParserATNSimulator",
+                "computeTargetState",
+                false,
+                true,
+                SkipPolicy::Conservative,
+                &["org/antlr/v4/runtime/"],
+            ),
+            None,
+            "the unshaded ANTLR guard must remain available for JIT bisection"
         );
     }
 

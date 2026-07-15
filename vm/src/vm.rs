@@ -41541,6 +41541,42 @@ mod tests {
     }
 
     #[test]
+    fn process_handle_parent_is_present_p57() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
+        let handle = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ProcessHandle",
+            "current",
+            "()Ljava/lang/ProcessHandle;",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        let parent = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ProcessHandle",
+            "parent",
+            "()Ljava/util/Optional;",
+            &[handle],
+        )
+        .unwrap()
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .unwrap();
+        let parent_handle = shared
+            .heap
+            .get_field(parent, 0)
+            .as_object()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(shared.heap.get_field(parent_handle, 0), Value::Long(pid) if pid > 0));
+    }
+
+    #[test]
     fn decimal_format_basics_p57() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");

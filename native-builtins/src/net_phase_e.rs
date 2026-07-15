@@ -2927,7 +2927,9 @@ fn re1_socket_write_stream(
                 Ok(Some(Value::Object(Some(exc)))) => {
                     let exc_pin = ctx.pin_native_root(exc);
                     let exc = ctx.read_native_pin(exc_pin, exc);
-                    Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc))
+                    Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+                        exc,
+                    ))
                 }
                 _ => Err(ioex(format!("Socket write failed: {e}"))),
             };
@@ -5506,9 +5508,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         ctx.set_field(stream, 1, Value::Int(0)); // pos
         ctx.set_field(stream, 2, Value::Int(0)); // mark
         ctx.set_field(stream, 3, Value::Int(len)); // count
-        // The constructor dispatch can allocate as well.  Pin the newly
-        // allocated stream alongside its backing array, then return the
-        // post-GC stream address rather than the stale Rust local.
+                                                   // The constructor dispatch can allocate as well.  Pin the newly
+                                                   // allocated stream alongside its backing array, then return the
+                                                   // post-GC stream address rather than the stale Rust local.
         let stream_pin = ctx.pin_native_root(stream);
         let stream = ctx.read_native_pin(stream_pin, stream);
         let body = ctx.read_native_pin(body_pin, body);
@@ -8371,14 +8373,12 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         ctx_cls,
         "setDefault",
         "(Ljavax/net/ssl/SSLContext;)V",
-        |_ctx, args| {
-            match args.first().copied() {
-                Some(Value::Object(Some(ctx_obj))) => {
-                    crate::t27_tls::set_runtime_default_ssl_context(ctx_obj);
-                    Ok(None)
-                }
-                _ => Err(npe("context")),
+        |_ctx, args| match args.first().copied() {
+            Some(Value::Object(Some(ctx_obj))) => {
+                crate::t27_tls::set_runtime_default_ssl_context(ctx_obj);
+                Ok(None)
             }
+            _ => Err(npe("context")),
         },
     );
     r.register(

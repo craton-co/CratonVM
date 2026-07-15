@@ -2174,15 +2174,20 @@ impl SharedVm {
             // WP2.5: java.lang.reflect.Proxy natives. See companion
             // call in the `feature = "synthetic-jdk"` branch above.
             cratonvm_native_builtins::register_reflect_proxy_natives(&mut native_methods);
-            // WP2.4-A: java.lang.instrument runtime natives. See
-            // companion call in the `feature = "synthetic-jdk"` branch
-            // above.
+            // WP2.4-A: java.lang.instrument runtime natives and the
+            // in-process Attach API are VM bridges, not synthetic stubs.
+            // The default real-JDK build drops synthetic registrations, so
+            // tag this pair explicitly or JDK InstrumentationImpl native
+            // methods resolve as missing before any javaagent premain runs.
+            let __prev_instrument_bridge = native_methods.current_category();
+            native_methods.set_category(cratonvm_native_api::NativeKind::Bridge);
             crate::runtime::instrument::register_instrumentation_natives(&mut native_methods);
             // In-process self-attach (com.sun.tools.attach.VirtualMachine) so
             // runtime-attach agents (Mockito inline mock maker, JaCoCo) can
             // load themselves without `-javaagent:`. See companion call in the
             // `feature = "synthetic-jdk"` branch above.
             crate::runtime::instrument::register_self_attach_natives(&mut native_methods);
+            native_methods.set_category(__prev_instrument_bridge);
             // RKC16N.10: VMManagementImpl natives. See companion call
             // in the `feature = "synthetic-jdk"` branch above.
             cratonvm_native_builtins::jmx::register_vm_management_impl(&mut native_methods);
@@ -3014,7 +3019,7 @@ impl SharedVm {
             if class.is_synthetic_stub {
                 continue;
             }
-            if let Some(bytes) = cm.class_bytes_cache.get(&*class.name) {
+            if let Some(bytes) = cm.class_bytes_cache.get(&class.id) {
                 let entry = cratonvm_native_builtins::cds::CdsArchiveEntry {
                     class_name: class.name.to_string(),
                     bytes_offset: 0,

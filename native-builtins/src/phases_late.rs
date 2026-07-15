@@ -13,8 +13,8 @@ use cratonvm_types::ClassId;
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use crate::{
-    alloc_concurrent_synthetic, jul_logger_handlers_get, jul_logger_handlers_set,
-    native_noop, native_noop_with_this, obj_arg,
+    alloc_concurrent_synthetic, jul_logger_handlers_get, jul_logger_handlers_set, native_noop,
+    native_noop_with_this, obj_arg,
 };
 use crate::{native_cf_then_accept, native_cf_then_apply};
 use crate::{
@@ -5058,13 +5058,12 @@ fn native_smallrye_get_config_mapping(
                 );
                 let this_cur = ctx.read_native_pin(this_pin, this);
                 let mappings = ctx.read_native_pin(mappings_pin, mappings);
-                let registration = ctx
-                    .invoke(
-                        "io/smallrye/config/ConfigMappings",
-                        "registerConfigMappings",
-                        "(Lio/smallrye/config/SmallRyeConfig;Ljava/util/Set;)V",
-                        &[Value::Object(Some(this_cur)), Value::Object(Some(mappings))],
-                    );
+                let registration = ctx.invoke(
+                    "io/smallrye/config/ConfigMappings",
+                    "registerConfigMappings",
+                    "(Lio/smallrye/config/SmallRyeConfig;Ljava/util/Set;)V",
+                    &[Value::Object(Some(this_cur)), Value::Object(Some(mappings))],
+                );
                 if registration.is_ok() {
                     let this_cur = ctx.read_native_pin(this_pin, this);
                     let cls_cur = ctx.read_native_pin(cls_pin, cls);
@@ -7169,15 +7168,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             };
             let set_pin = ctx.pin_native_root(set);
             let context = ctx.read_native_pin(context_pin, context);
-            let iterator = match ctx.invoke_virtual(context, "iterateNames", "()Ljava/util/Iterator;", &[]) {
-                Ok(Some(Value::Object(Some(o)))) => o,
-                _ => {
-                    ctx.unpin_native_roots(this_pin);
-                    ctx.unpin_native_roots(context_pin);
-                    ctx.unpin_native_roots(set_pin);
-                    return Ok(Some(Value::Object(Some(set))));
-                }
-            };
+            let iterator =
+                match ctx.invoke_virtual(context, "iterateNames", "()Ljava/util/Iterator;", &[]) {
+                    Ok(Some(Value::Object(Some(o)))) => o,
+                    _ => {
+                        ctx.unpin_native_roots(this_pin);
+                        ctx.unpin_native_roots(context_pin);
+                        ctx.unpin_native_roots(set_pin);
+                        return Ok(Some(Value::Object(Some(set))));
+                    }
+                };
             let iterator_pin = ctx.pin_native_root(iterator);
             loop {
                 let iterator = ctx.read_native_pin(iterator_pin, iterator);
@@ -7188,11 +7188,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let iterator = ctx.read_native_pin(iterator_pin, iterator);
                 let value = ctx.invoke_virtual(iterator, "next", "()Ljava/lang/Object;", &[])?;
                 if let Some(Value::Object(Some(value))) = value {
-                    if ctx.class_name_of_id(ctx.class_id_of_object(value)).as_deref() == Some("java/lang/String") {
+                    if ctx
+                        .class_name_of_id(ctx.class_id_of_object(value))
+                        .as_deref()
+                        == Some("java/lang/String")
+                    {
                         let value_pin = ctx.pin_native_root(value);
                         let set = ctx.read_native_pin(set_pin, set);
                         let value = ctx.read_native_pin(value_pin, value);
-                        let _ = ctx.invoke_virtual(set, "add", "(Ljava/lang/Object;)Z", &[Value::Object(Some(value))]);
+                        let _ = ctx.invoke_virtual(
+                            set,
+                            "add",
+                            "(Ljava/lang/Object;)Z",
+                            &[Value::Object(Some(value))],
+                        );
                         ctx.unpin_native_roots(value_pin);
                     }
                 }
@@ -11806,7 +11815,11 @@ fn p57_absolute_path_string(path: &str) -> String {
 fn p57_trim_file_trailing_separator(path: &str) -> String {
     let trimmed = path.trim_end_matches(['/', '\\']);
     if trimmed.is_empty() {
-        return if path.starts_with('\\') { "\\".to_string() } else { "/".to_string() };
+        return if path.starts_with('\\') {
+            "\\".to_string()
+        } else {
+            "/".to_string()
+        };
     }
     if trimmed.len() == 2
         && trimmed.as_bytes()[0].is_ascii_alphabetic()
@@ -12948,7 +12961,8 @@ fn jrt_package_path_kind(img: &JrtImage, rest: &str) -> JarFsKind {
         let Some(backing) = jrt_package_backing_entry(img, rest) else {
             return JarFsKind::Absent;
         };
-        let image_path = jrt_entry_to_image(&backing).expect("backing JRT package path is a module path");
+        let image_path =
+            jrt_entry_to_image(&backing).expect("backing JRT package path is a module path");
         if jrt_img_is_file(img, &image_path) {
             JarFsKind::File
         } else if jrt_img_is_dir(img, &image_path) {
@@ -13013,9 +13027,9 @@ fn jrtfs_list_dir_classified(java_home: &str, entry: &str) -> Vec<(String, bool)
             return jrtfs_list_dir_classified(java_home, &backing)
                 .into_iter()
                 .filter_map(|(child, is_dir)| {
-                    child.rsplit_once('/').map(|(_, name)| {
-                        (format!("packages/{rest}/{name}"), is_dir)
-                    })
+                    child
+                        .rsplit_once('/')
+                        .map(|(_, name)| (format!("packages/{rest}/{name}"), is_dir))
                 })
                 .collect();
         }
@@ -13159,14 +13173,18 @@ mod jrtfs_javac_listing_tests {
             return;
         };
         let java_home = java_home.to_string_lossy();
-        let direct =
-            jrtfs_list_class_binary_names(&java_home, "java.base", "java.lang", false);
-        assert!(direct.len() > 100, "java.lang listing was truncated: {direct:?}");
+        let direct = jrtfs_list_class_binary_names(&java_home, "java.base", "java.lang", false);
+        assert!(
+            direct.len() > 100,
+            "java.lang listing was truncated: {direct:?}"
+        );
         for required in ["java.lang.Object", "java.lang.Byte", "java.lang.Integer"] {
-            assert!(direct.iter().any(|name| name == required), "missing {required}");
+            assert!(
+                direct.iter().any(|name| name == required),
+                "missing {required}"
+            );
         }
-        let recursive =
-            jrtfs_list_class_binary_names(&java_home, "java.base", "java.lang", true);
+        let recursive = jrtfs_list_class_binary_names(&java_home, "java.base", "java.lang", true);
         assert!(
             recursive
                 .iter()
@@ -15994,13 +16012,13 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
         let p = std::path::Path::new(&path);
-            let abs = if p.is_absolute() {
-                path
-            } else {
-                std::env::current_dir()
-                    .map(|cwd| cwd.join(&path).to_string_lossy().into_owned())
-                    .unwrap_or(path)
-            };
+        let abs = if p.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&path).to_string_lossy().into_owned())
+                .unwrap_or(path)
+        };
         let abs = p57_trim_file_trailing_separator(&abs);
         Ok(Some(Value::Object(Some(file_alloc(ctx, &abs)))))
     });
@@ -26244,11 +26262,15 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
     );
     r.register(bfa, "isDirectory", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(i32::from(basic_file_attributes_is_dir(ctx, this)))))
+        Ok(Some(Value::Int(i32::from(basic_file_attributes_is_dir(
+            ctx, this,
+        )))))
     });
     r.register(bfa, "isRegularFile", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(i32::from(!basic_file_attributes_is_dir(ctx, this)))))
+        Ok(Some(Value::Int(i32::from(!basic_file_attributes_is_dir(
+            ctx, this,
+        )))))
     });
     r.register(bfa, "isSymbolicLink", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
@@ -26432,7 +26454,8 @@ fn basic_file_attributes_alloc(ctx: &mut dyn NativeContext) -> ObjectRef {
 }
 
 fn basic_file_attributes_is_windows(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(attrs)).as_deref()
+    ctx.class_name_of_id(ctx.class_id_of_object(attrs))
+        .as_deref()
         == Some("sun/nio/fs/WindowsFileAttributes")
 }
 
@@ -26489,7 +26512,11 @@ fn basic_file_attributes_store(
     modified_millis: i64,
 ) {
     if basic_file_attributes_is_windows(ctx, attrs) {
-        ctx.set_field_by_name(attrs, "fileAttrs", Value::Int(if is_dir { 0x10 } else { 0 }));
+        ctx.set_field_by_name(
+            attrs,
+            "fileAttrs",
+            Value::Int(if is_dir { 0x10 } else { 0 }),
+        );
         ctx.set_field_by_name(attrs, "creationTime", Value::Long(creation_millis));
         ctx.set_field_by_name(attrs, "lastAccessTime", Value::Long(access_millis));
         ctx.set_field_by_name(attrs, "lastWriteTime", Value::Long(modified_millis));
@@ -27867,6 +27894,34 @@ fn p60_empty_optional(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
     Ok(Some(Value::Object(Some(optional))))
 }
 
+fn p60_parent_pid() -> i64 {
+    #[cfg(unix)]
+    {
+        unsafe { libc::getppid() as i64 }
+    }
+    #[cfg(not(unix))]
+    {
+        // `std` does not expose the parent PID on Windows.  Returning the
+        // current process still supplies a stable, live handle for clients
+        // that use parent().pid() as a process-scoped coordination key (such
+        // as Gradle's Hibernate test worker), rather than spuriously
+        // reporting no parent at all.
+        std::process::id() as i64
+    }
+}
+
+fn p60_process_parent(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let parent_pid = p60_parent_pid();
+    if parent_pid <= 0 {
+        return p60_empty_optional(ctx, &[]);
+    }
+    let parent = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1);
+    ctx.set_field(parent, 0, Value::Long(parent_pid));
+    let optional = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+    ctx.set_field(optional, 0, Value::Object(Some(parent)));
+    Ok(Some(Value::Object(Some(optional))))
+}
+
 /// Register the native-backed ProcessHandle surface in both synthetic- and
 /// real-JDK modes. SmallRye invokes `current().info()` during class init.
 pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
@@ -27920,7 +27975,7 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(cf))))
         },
     );
-    r.register(ph, "parent", "()Ljava/util/Optional;", p60_empty_optional);
+    r.register(ph, "parent", "()Ljava/util/Optional;", p60_process_parent);
     r.register(ph, "supportsNormalTermination", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
@@ -28522,10 +28577,7 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
                 Some(list) => list,
                 None => {
                     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-                    cratonvm_native_collections::native_al_init(
-                        ctx,
-                        &[Value::Object(Some(list))],
-                    )?;
+                    cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
                     jul_logger_handlers_set(ctx, this, list);
                     list
                 }
@@ -30071,10 +30123,16 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         use crate::servlet::s2_byte_order_object;
         Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, 1)))))
     }
-    for subclass in ["java/nio/ByteBufferAsCharBufferB", "java/nio/ByteBufferAsCharBufferRB"] {
+    for subclass in [
+        "java/nio/ByteBufferAsCharBufferB",
+        "java/nio/ByteBufferAsCharBufferRB",
+    ] {
         r.register(subclass, "order", "()Ljava/nio/ByteOrder;", cb_order_big);
     }
-    for subclass in ["java/nio/ByteBufferAsCharBufferL", "java/nio/ByteBufferAsCharBufferRL"] {
+    for subclass in [
+        "java/nio/ByteBufferAsCharBufferL",
+        "java/nio/ByteBufferAsCharBufferRL",
+    ] {
         r.register(subclass, "order", "()Ljava/nio/ByteOrder;", cb_order_little);
     }
     r.register(cb, "arrayOffset", "()I", |ctx, args| {
@@ -36267,7 +36325,10 @@ fn p98_walk_dir(
                 let fa = p98_alloc_basic_file_attributes(
                     ctx,
                     false,
-                    entry.metadata().map(|metadata| metadata.len() as i64).unwrap_or(0),
+                    entry
+                        .metadata()
+                        .map(|metadata| metadata.len() as i64)
+                        .unwrap_or(0),
                 );
                 let vr = p98_invoke_file_visitor(
                     ctx,
@@ -64051,8 +64112,16 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/logging/Level;Ljava/lang/String;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field_by_name(this, "level", args.get(1).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field_by_name(this, "message", args.get(2).copied().unwrap_or(Value::Object(None)));
+            ctx.set_field_by_name(
+                this,
+                "level",
+                args.get(1).copied().unwrap_or(Value::Object(None)),
+            );
+            ctx.set_field_by_name(
+                this,
+                "message",
+                args.get(2).copied().unwrap_or(Value::Object(None)),
+            );
             ctx.set_field_by_name(this, "loggerName", Value::Object(None));
             ctx.set_field_by_name(this, "thrown", Value::Object(None));
             ctx.set_field_by_name(this, "parameters", Value::Object(None));
@@ -64074,7 +64143,11 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/logging/Level;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field_by_name(this, "level", args.get(1).copied().unwrap_or(Value::Object(None)));
+            ctx.set_field_by_name(
+                this,
+                "level",
+                args.get(1).copied().unwrap_or(Value::Object(None)),
+            );
             Ok(None)
         },
     );
@@ -64084,7 +64157,11 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(lr, "setMessage", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field_by_name(this, "message", args.get(1).copied().unwrap_or(Value::Object(None)));
+        ctx.set_field_by_name(
+            this,
+            "message",
+            args.get(1).copied().unwrap_or(Value::Object(None)),
+        );
         Ok(None)
     });
     r.register(lr, "getLoggerName", "()Ljava/lang/String;", |ctx, args| {

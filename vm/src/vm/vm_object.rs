@@ -631,6 +631,14 @@ struct ClassMirrorSlots {
     class_redefined_count: Option<usize>,
     /// `reflectionData : Ljava/lang/ref/SoftReference;`
     reflection_data: Option<usize>,
+    /// `classLoader : Ljava/lang/ClassLoader;`
+    ///
+    /// This is deliberately populated for user-defined classes. Besides making
+    /// the real-JDK field layout faithful, it is the heap reachability edge
+    /// that keeps a loader alive while application code still holds its
+    /// `Class<?>` mirror. The mirror cache itself does not root user loaders
+    /// when unloading is enabled.
+    class_loader: Option<usize>,
 }
 
 /// Legacy fixed slot layout used for the **synthetic** `java/lang/Class` stub
@@ -668,6 +676,7 @@ fn resolve_class_mirror_slots(
             primitive: slot(LEGACY_PRIMITIVE_SLOT),
             class_redefined_count: slot(LEGACY_CLASS_REDEFINED_COUNT_SLOT),
             reflection_data: None,
+            class_loader: None,
         };
     }
     // Real classfile: resolve by name. Accept a field only when its descriptor
@@ -686,6 +695,7 @@ fn resolve_class_mirror_slots(
         primitive: resolve("primitive", &["Z"]),
         class_redefined_count: resolve("classRedefinedCount", &["I"]),
         reflection_data: resolve("reflectionData", &["Ljava/lang/ref/SoftReference;"]),
+        class_loader: resolve("classLoader", &["Ljava/lang/ClassLoader;"]),
     }
 }
 
@@ -843,6 +853,19 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     // it directly via bytecode).
     if let Some(idx) = slots.class_redefined_count {
         shared.heap.set_field(mirror, idx, Value::Int(0));
+    }
+    // A live Class mirror must keep its defining user loader live. Without
+    // this real heap edge, the loader-unload pass can prune the side-table
+    // entry while a framework (notably Hibernate's nested JUnit engine) still
+    // retains the Class object. Subsequent `getClassLoader()` then falls back
+    // to the app loader and same-named class selection crosses loaders.
+    if let (Some(idx), Some(loader)) = (
+        slots.class_loader,
+        cratonvm_native_builtins::classloader::defining_loader_for(class_id.as_u32()),
+    ) {
+        shared
+            .heap
+            .set_field(mirror, idx, Value::Object(Some(loader)));
     }
 
     mirrors.insert(class_id, mirror);

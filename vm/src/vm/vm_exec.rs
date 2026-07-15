@@ -7264,7 +7264,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // Check for java.lang.reflect.Proxy dynamic proxy dispatch.
             // When Java code calls any method on a Proxy$Instance object, we
             // intercept and forward to the InvocationHandler.invoke().
-            if class_name == "java/lang/reflect/Proxy$Instance" {
+            if class_name == "java/lang/reflect/Proxy$Instance"
+                || crate::runtime::interpreter::class_chain_reaches_proxy_instance(
+                    self.shared,
+                    receiver_class_id,
+                )
+            {
                 return proxy_invoke_handler(self, receiver, method_name, descriptor, args);
             }
 
@@ -8181,8 +8186,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn class_bytes(&self, class_id: ClassId) -> Option<Vec<u8>> {
         let cm = self.shared.class_manager.read();
-        let name = cm.class_store.get(class_id)?.name.to_string();
-        cm.class_bytes_cache.get(&name).cloned()
+        cm.class_bytes_cache.get(&class_id).cloned()
     }
 
     fn find_all_resource_urls(&self, name: &str) -> Vec<String> {
@@ -10029,6 +10033,21 @@ pub(super) fn proxy_invoke_handler(
         }
     };
 
+    // A real JDK annotation is a generated `$ProxyN` whose handler is our
+    // synthetic AnnotationProxy. Its primitive members must leave this native
+    // virtual-dispatch boundary as raw JVM Values, not boxed wrappers.
+    if class_name_is(
+        ctx.shared,
+        handler_ref,
+        "java/lang/annotation/AnnotationProxy",
+    ) {
+        return proxy_unbox_primitive_return(
+            ctx.shared,
+            descriptor,
+            proxy_annotation_handler_invoke(ctx.shared, handler_ref, method_name, args),
+        );
+    }
+
     // WP2.5 вЂ” build the Method object using **field-name-based** writes
     // so the JDK-real layout (which has many inherited fields from
     // AccessibleObject and Executable before `name`/`returnType`/...)
@@ -10323,6 +10342,70 @@ fn class_name_is(shared: &SharedVm, obj: ObjectRef, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Return the result of an annotation handler as the proxied method's JVM
+/// return value. Annotation element values are stored as Java wrappers, while
+/// the generated `$ProxyN` method has a primitive JVM return descriptor. Keep
+/// the boundary here (rather than in the individual callers) so native and
+/// interpreter proxy dispatch cannot accidentally hand an `Integer` reference
+/// to code expecting an `int`.
+fn proxy_unbox_primitive_return(
+    shared: &SharedVm,
+    descriptor: &str,
+    result: MethodCallResult,
+) -> MethodCallResult {
+    let Some(value) = result? else {
+        return Ok(None);
+    };
+    let ret = descriptor
+        .rsplit(')')
+        .next()
+        .unwrap_or("L")
+        .chars()
+        .next()
+        .unwrap_or('L');
+    match ret {
+        'I' | 'Z' | 'B' | 'C' | 'S' | 'J' | 'F' | 'D' => {
+            if let Value::Object(Some(wrapper)) = value {
+                Ok(Some(shared.heap.get_field(wrapper, 0)))
+            } else {
+                Ok(Some(value))
+            }
+        }
+        _ => Ok(Some(value)),
+    }
+}
+
+/// Dispatch a real JDK `$ProxyN` annotation method through its synthetic
+/// AnnotationProxy handler. `equals` needs the other real proxy unwrapped so
+/// annotation equality compares its members rather than proxy identity.
+fn proxy_annotation_handler_invoke(
+    shared: &SharedVm,
+    handler_ref: ObjectRef,
+    method_name: &str,
+    args: &[Value],
+) -> MethodCallResult {
+    if method_name == "equals" {
+        if let Some(Value::Object(Some(other))) = args.first().copied() {
+            if let Value::Object(Some(other_handler)) = shared.heap.get_field(other, 0) {
+                if class_name_is(
+                    shared,
+                    other_handler,
+                    "java/lang/annotation/AnnotationProxy",
+                ) {
+                    let routed = [Value::Object(Some(other_handler))];
+                    return annotation_proxy_dispatch_impl(
+                        shared,
+                        handler_ref,
+                        method_name,
+                        &routed,
+                    );
+                }
+            }
+        }
+    }
+    annotation_proxy_dispatch_impl(shared, handler_ref, method_name, args)
+}
+
 pub(crate) fn proxy_invoke_handler_shared(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -10347,29 +10430,11 @@ pub(crate) fn proxy_invoke_handler_shared(
     // unchanged. getClass() is intercepted earlier (the proxy hook returns the
     // real `$ProxyN` mirror), so it never reaches here.
     if class_name_is(shared, handler_ref, "java/lang/annotation/AnnotationProxy") {
-        // For equals(Object), unwrap a real-proxy argument to its
-        // AnnotationProxy handler so annotation equality compares member data,
-        // not proxy reference identity.
-        if method_name == "equals" {
-            if let Some(Value::Object(Some(other))) = args.first().copied() {
-                if let Value::Object(Some(other_handler)) = shared.heap.get_field(other, 0) {
-                    if class_name_is(
-                        shared,
-                        other_handler,
-                        "java/lang/annotation/AnnotationProxy",
-                    ) {
-                        let routed = [Value::Object(Some(other_handler))];
-                        return annotation_proxy_dispatch_impl(
-                            shared,
-                            handler_ref,
-                            method_name,
-                            &routed,
-                        );
-                    }
-                }
-            }
-        }
-        return annotation_proxy_dispatch_impl(shared, handler_ref, method_name, args);
+        return proxy_unbox_primitive_return(
+            shared,
+            descriptor,
+            proxy_annotation_handler_invoke(shared, handler_ref, method_name, args),
+        );
     }
 
     // WP2.5 вЂ” build the Method object using **field-name-based** writes.
@@ -12332,6 +12397,58 @@ fn invoke_on_class_shared_inner(
     } else {
         class_id
     };
+    // `VirtualMachine.attach` is a concrete JDK method, so the normal
+    // real-bytecode preference would enter AttachProvider discovery before
+    // reaching the registered in-process self-attach native.  Byte Buddy
+    // invokes this exact surface reflectively for Mockito's inline maker.
+    // Resolve it here, after the reflective Method target is known but before
+    // bytecode selection, so it cannot dispatch through the unsupported
+    // socket/provider protocol.
+    let class_name = {
+        let cm = shared.class_manager.read();
+        cm.get_class(class_id)
+            .map(|class| class.name.to_string())
+            .unwrap_or_default()
+    };
+    if class_name == "com/sun/tools/attach/VirtualMachine"
+        && matches!(
+            (method_name, descriptor),
+            (
+                "attach",
+                "(Ljava/lang/String;)Lcom/sun/tools/attach/VirtualMachine;"
+            ) | ("loadAgent", "(Ljava/lang/String;Ljava/lang/String;)V")
+                | ("loadAgent", "(Ljava/lang/String;)V")
+                | ("detach", "()V")
+        )
+    {
+        if let Some(callback) = shared
+            .native_methods
+            .find(&class_name, method_name, descriptor)
+        {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|value| coerce_native_return(value, descriptor));
+        }
+    }
+    // The real-JDK Thread methods read the host field layout directly.  A
+    // CratonVM Thread can instead carry a stale/mis-slotted value there, which
+    // made Mockito plugin discovery dispatch `getResources` on a String.
+    // The registered natives resolve the VM-owned context-loader state and
+    // must win over those concrete bodies.
+    if class_name == "java/lang/Thread"
+        && matches!(
+            (method_name, descriptor),
+            ("getContextClassLoader", "()Ljava/lang/ClassLoader;")
+                | ("setContextClassLoader", "(Ljava/lang/ClassLoader;)V")
+        )
+    {
+        if let Some(callback) = shared
+            .native_methods
+            .find(&class_name, method_name, descriptor)
+        {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|value| coerce_native_return(value, descriptor));
+        }
+    }
     // Find the method (walking the superclass chain)
     let (is_native, is_synchronized, is_static, declaring_class_id) = {
         let cm = shared.class_manager.read();
@@ -12688,6 +12805,8 @@ fn invoke_on_class_shared_inner(
                                 || (method_name == "findResources"
                                     && descriptor
                                         == "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                                || (method_name == "addURL"
+                                    && descriptor == "(Ljava/net/URL;)V")
                                 || (method_name == "<init>"
                                     && matches!(
                                         descriptor,
