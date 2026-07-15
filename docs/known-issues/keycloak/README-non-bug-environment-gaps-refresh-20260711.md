@@ -42,15 +42,13 @@ unrelated residuals (Selenium/HtmlUnit JSON parsing, a missing sun.management na
 gap) were newly discovered downstream of a successful server boot -- flagged separately, not part of this
 issue.
 
-## 3. FIPS-mode `Assume.assumeTrue` skip pattern — 10 `crypto/fips1402` classes
+## 3. FIPS-mode JUnit assumptions — reporting classification fixed (2026-07-15)
 
-```
-KCRUNNER_RESULT tests=N failed=0 aborted=N ...
-```
-(all tests "aborted", zero "failed" — from `Assume.assumeTrue(Environment.isJavaInFipsMode())` at the top of
-each FIPS1402 test class)
-
-This environment isn't running in FIPS mode, so these tests correctly self-skip — the same on any JVM. Not a bug.
+The historical rerun counted ten `crypto/fips1402` assumption-gated classes as `FAIL` because the harness treated
+every JUnit abort as a failure. The runner now reports all-aborted classes as `SKIP` and mixed pass/abort classes as
+`PARTIAL`; actual failures remain `FAIL`. A focused current-dev Azure comparison of all 21 FIPS classes produced
+the identical HotSpot/CratonVM distribution: 11 PASS, 3 PARTIAL, 7 SKIP, 0 failed, and 0 failed containers.
+See [the fixed reporting record](../../internal/fixed-suite-bugs/keycloak-fips1402-assumption-aborts-classification-FIXED.md).
 
 ## 4. Docker not available — 2 `tests/clustering` classes
 
@@ -98,3 +96,6 @@ Single test, not re-investigated this pass (already flagged as low-priority in t
 + 37 (Unsafe/Netty) + 1 (SCIM ANTLR) + 2 (Cipher AESWrap) + 2 (EdDSA KeySpec) + 1 (X509 CN) + 4 (Quarkus config)
 = **952** of 953 FAILs accounted for (the remaining 1 is likely rounding/an edge case in one of the above
 buckets' exact counts — not independently investigated further given the overwhelming majority is explained).
+
+Historical note: the 10 FIPS assumption-gated rows above were formerly labelled `FAIL`; they now report as
+non-failure `SKIP`/`PARTIAL` outcomes under the corrected harness policy.

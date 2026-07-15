@@ -202,8 +202,10 @@ aborted, skipped, containersFailed, stdoutLog, stderrLog, note
 
 Status values:
 
-- `PASS`: KcRunner reported tests and zero failures/container failures.
-- `FAIL`: KcRunner reported failed/aborted tests or failed containers.
+- `PASS`: KcRunner reported tests and zero failures, aborts, or container failures.
+- `SKIP`: every discovered test was aborted by a JUnit assumption; this is a non-failure environment outcome.
+- `PARTIAL`: a mix of passed tests and JUnit-assumption aborts, with no failures or failed containers.
+- `FAIL`: KcRunner reported failed tests or failed containers.
 - `EMPTY`: KcRunner completed but found zero tests.
 - `LOADFAIL`: class loading failed before execution.
 - `HANG`: the process exceeded `-TimeoutSec` and was killed by PID.
