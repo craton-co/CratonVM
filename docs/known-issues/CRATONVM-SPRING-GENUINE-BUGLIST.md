@@ -475,39 +475,38 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     HotSpot's 13s.** The next step for that specific goal is a separate investigation into what
     dominates per-test wall-clock time in this class — likely embedded-server bootstrap/socket/
     thread costs — ideally run on an uncontended host to get a clean baseline.
-*   `web.reactive.result.view.script.JRubyScriptTemplateTests` — JRuby-on-CratonVM: JRuby's own
-    bundled `rubygems/specification.rb` bootstrap fails with a Ruby-level `SyntaxError` from code it
-    generates itself: `#{@@nil_attributes.map {|key| "@#{key} = nil" }.join "; "}` (a Ruby
-    string interpolation reading a `.map {|key| ...}` block parameter, inside JRuby's own
-    precompiled-to-JVM-bytecode stdlib) interpolates `key` as EMPTY instead of the Symbol's name,
-    producing malformed generated Ruby source (`"@ = nil; @ = nil; ..."`) that a second, inner
-    `Kernel#eval` then rejects. **2026-07-15 update**: minimal standalone repro isolated (no Spring
-    needed — `ScriptEngineManager().getEngineByName("jruby").eval(...)` alone triggers it during
-    JRuby's own lazy bootstrap, before any user script runs); confirmed CratonVM-specific
-    (`Symbol#to_s` and simple top-level `"#{key}"` interpolation both work correctly in isolation —
-    the bug is specific to a block-parameter interpolated inside JRuby's own PRE-COMPILED bytecode,
-    not JRuby's general interpolation mechanism). Found a concrete, reproducible clue: 5
-    `[GC-ARRAY-GUARD] array_length(non-array)` warnings fire (`class_id=1013` in one run,
-    consistently 5 of them — matching `@@nil_attributes`' likely element count) at the EXACT moment
-    the interpolation corrupts, from `gc/src/gen_heap.rs:2314`'s defensive guard (a raw JVM
-    `arraylength` bytecode instruction executing against a heap object CratonVM's GC does NOT
-    consider an array — silently returns 0 instead of crashing). `CRATONVM_DBG_STALE_OBJREF=1`
-    was tried but did NOT visibly fire for this repro (inconclusive either way — this assertion has
-    known coverage gaps for other bug families, per `stream-arraylist-gc-pressure-heap-corruption-
-    found-20260714.md`). **Leading hypothesis, not confirmed**: a stale/wrong `ObjectRef` — the
-    JVM bytecode JRuby's own compiler emitted for this interpolation legitimately expects an array
-    (its own internal representation of the block-parameter/interpolation-piece list), but by the
-    time the `arraylength` instruction executes, the reference has been relocated/reused to point at
-    a non-array object — matching the broader stale-ObjectRef bug family already extensively
-    tracked in this codebase (see `wildfly-parallel-boot-stale-objectref-residual.md`,
-    `stale-objectref-static-sweep-20260711.md`) but not yet localized to a specific call site here.
-    **Next step**: reproduce under `RUST_BACKTRACE=1` + the `CRATONVM_GC_ARRAY_GUARD_BT=1` backtrace
-    (already captured once — the backtrace bottoms out in the raw interpreter `arraylength` opcode
-    handler, `interpreter.rs:8638`, giving no further attribution on its own) combined with a
-    JRuby-side decompile of the exact bytecode `specification.rb`'s `set_nil_attributes_to_nil`
-    heredoc-eval compiles to (JRuby ships this stdlib file pre-compiled; extract the `.class`
-    equivalent from the `jruby-stdlib` jar with `javap` to see the literal `arraylength`
-    instruction's context) to identify which allocation/GC event upstream could relocate the
-    reference this instruction reads. Not reactive-specific; a fix here likely benefits any JRuby
-    (or generally: any dynamic-bytecode-generating library that emits `arraylength`) workload.
+*   ~~`web.reactive.result.view.script.JRubyScriptTemplateTests`~~ **FIXED (2026-07-15, commit
+    `d8ae2b96`).** Root cause was NOT the leading stale-`ObjectRef` hypothesis below (that
+    investigation misdiagnosed the bug against a stale `jruby-complete-9.1.17.0.jar` decompile; the
+    ACTUAL test classpath uses `jruby-base`/`jruby-stdlib` 10.0.2.0, whose `BlockCallback`
+    interface differs materially). The real bug: `org.jruby.runtime.BlockCallback` in JRuby 10.x
+    declares one abstract SAM `call(ThreadContext, IRubyObject[], Block)` plus five same-named
+    DEFAULT overloads, including `call(ThreadContext, IRubyObject, Block)` (scalar) which should
+    wrap its argument into a 1-element array and re-invoke the real SAM.
+    `interpreter::lambda_args_sam_compatible` (`vm/src/runtime/interpreter.rs`) unconditionally
+    skipped array-typed SAM parameters (`!pd.starts_with('L')` is true for `[...`, so the
+    "generic/erased — never second-guess" catch-all swallowed them), so it could never tell the
+    scalar DEFAULT `call` apart from the array-taking abstract SAM. `try_lambda_dispatch` then fed
+    the raw scalar (a `RubySymbol`, e.g. `:foo` from `Enumerable#partition`'s per-element block
+    callback) straight into the array-typed lambda body, so
+    `RubyEnumerable.packEnumValues(ThreadContext, IRubyObject[])` executed `arraylength` against a
+    bare `RubySymbol` — the `[GC-ARRAY-GUARD]` hit — silently returning 0 instead of throwing,
+    which produced the empty `"@#{key} = nil"` → `"@ = nil"` corruption that a nested `eval()`
+    rejected as a `SyntaxError` during `rubygems/specification.rb` bootstrap. Fix: when a SAM
+    parameter descriptor is array-typed, require the actual argument to be null, missing, or a
+    genuine array; a present non-array object there now correctly returns `false` (overloaded
+    default), so `try_lambda_dispatch` falls through to the real default method instead of
+    misdispatching. A related, narrower GC-safety hardening (pin `obj_ref`/`call_args` across
+    `lambda_args_sam_compatible`'s class-loading-capable helpers, mirroring the existing
+    `invoke_virtual` fix in `d64fab85`) landed alongside it in commit `6d652338` — legitimate but,
+    on its own, insufficient for this bug. **Evidence**: minimal `ScriptEngineManager` repro
+    (`[:foo,:bar].map {|key| "@#{key} = nil"}.join`) now produces the correct interpolated output
+    matching HotSpot; the `[GC-ARRAY-GUARD]` warning count for a full `JRubyScriptTemplateTests`
+    run dropped from 6 to 0; `cargo test -p cratonvm-vm --lib --release` unchanged at
+    2203 passed / 9 pre-existing `--release`-only `lock_order` failures. **Residual (separate,
+    newly-exposed, NOT a regression)**: the test class still fails after this fix, now via a
+    previously-unreached `NullPointerException` in JRuby's own indy-based
+    `org.jruby.ir.targets.indy.IsTrueSite.init` bootstrap (`rubygems/version.rb`'s
+    `canonical_segments`) — masked until this fix let bootstrap progress past `specification.rb`;
+    not investigated further under this fix, flagged for follow-up.
 *   ~~Batch-context `<clinit>` contamination~~ — RETRACTED, see above (host environment issue: missing /tmp + missing ~/jdk25 symlink, not CratonVM).

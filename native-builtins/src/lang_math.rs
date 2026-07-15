@@ -4097,7 +4097,15 @@ pub(crate) fn native_long_to_string_radix(
     let text = if radix == 10 {
         val.to_string()
     } else if val < 0 {
-        format!("-{}", i64_to_radix_string(-val, radix))
+        // NB: negating val overflows (panics in debug builds) when
+        // val == i64::MIN, since i64::MIN has no positive counterpart
+        // in twos-complement. Using the wrapping negation is safe
+        // here: for every val != i64::MIN it equals plain negation,
+        // and for val == i64::MIN it wraps back to i64::MIN, whose
+        // unsigned bit pattern (i64_to_radix_string reinterprets its
+        // arg as u64) is exactly 2 to the 63 -- the correct unsigned
+        // magnitude of i64::MIN.
+        format!("-{}", i64_to_radix_string(val.wrapping_neg(), radix))
     } else {
         i64_to_radix_string(val, radix)
     };

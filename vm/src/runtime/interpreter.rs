@@ -19563,8 +19563,38 @@ pub(crate) fn lambda_args_sam_compatible(
 ) -> bool {
     let (params, _ret) = split_method_descriptor(sam_descriptor);
     for (i, pd) in params.iter().enumerate() {
+        if pd.starts_with('[') {
+            // Array-typed SAM param. This was previously covered by the
+            // `!pd.starts_with('L')` catch-all below (arrays don't start
+            // with 'L'), which unconditionally skipped it -- "never
+            // second-guess". That silently let a same-named, same-arity
+            // interface DEFAULT method whose one differing parameter is a
+            // scalar reference where the real SAM wants an array (e.g.
+            // JRuby 10.x's `BlockCallback` -- abstract SAM
+            // `call(ThreadContext, IRubyObject[], Block)` plus five
+            // default overloads sharing the name "call", including
+            // `call(ThreadContext, IRubyObject, Block)`) get misjudged as
+            // SAM-compatible. `try_lambda_dispatch` then fed the raw
+            // scalar argument directly into the array-typed lambda body
+            // instead of falling through to the real default method (which
+            // wraps the scalar into a 1-element array before re-invoking
+            // the SAM) -- observed as `RubyEnumerable.packEnumValues`
+            // calling `arraylength` on a bare `RubySymbol` during
+            // `Enumerable#partition`'s per-element block callback
+            // (JRubyScriptTemplateTests GC-ARRAY-GUARD investigation,
+            // 2026-07-15). A present, non-null, non-array argument here is
+            // provably NOT an instance of this SAM param -> treat as an
+            // overloaded default, same as the concrete-class mismatch case
+            // below.
+            if let Some(Value::Object(Some(a))) = args.get(i) {
+                if shared.heap.kind_of(*a) != cratonvm_types::ObjectKind::Array {
+                    return false;
+                }
+            }
+            continue; // null / missing / genuinely an array -- don't second-guess further
+        }
         if !pd.starts_with('L') || pd.as_str() == "Ljava/lang/Object;" {
-            continue; // generic/erased or non-reference param — never second-guess
+            continue; // generic/erased or non-reference param -- never second-guess
         }
         let arg = match args.get(i) {
             Some(Value::Object(Some(a))) => *a,
@@ -20015,11 +20045,58 @@ pub(crate) fn try_lambda_dispatch(
     // Bug B: same name + same arity but mismatched parameter types is an
     // overloaded interface default (e.g. AnnotationFilter.matches(Class) vs the
     // SAM matches(String)), not the SAM. Fall through so the real default runs.
-    if method_name == &*call_site.sam_method_name
-        && !lambda_args_sam_compatible(shared, &call_site.sam_descriptor, call_args)
-    {
-        return Ok(None);
+    //
+    // GC-safety: `lambda_args_sam_compatible` can trigger class loading -- a
+    // GC-triggering call -- through its proxy/annotation-satisfies helper
+    // family (`lambda_proxy_satisfies`/`synthetic_implements`/
+    // `proxy_instance_satisfies_target`/`annotation_proxy_satisfies_target`).
+    // This is the exact same predicate whose sibling call site in
+    // `vm_exec.rs`'s `invoke_virtual` was fixed in commit d64fab85 for
+    // identical reasons; this call site was missed by that fix. `obj_ref`
+    // and every object element of `call_args` are plain Rust locals/borrows
+    // at this point, invisible to the collector, so a moving GC landing
+    // inside the predicate leaves them stale for every subsequent heap read
+    // in this function -- starting with the captured-value
+    // `get_field(obj_ref, ...)` reads used to build `full_args` further
+    // down (both in the Scala `apply$mc*$sp` bridge branch and the main
+    // dispatch path below). Pin both before the predicate can run and
+    // re-read through the pins once it returns.
+    let mut obj_ref = obj_ref;
+    let mut call_args_refreshed: Option<Vec<Value>> = None;
+    if method_name == &*call_site.sam_method_name {
+        let sam_compat_pin_base = thread.native_pin_roots.len();
+        thread.native_pin_roots.push(obj_ref);
+        let arg_pins: Vec<Option<usize>> = call_args
+            .iter()
+            .map(|a| match a {
+                Value::Object(Some(o)) => {
+                    let idx = thread.native_pin_roots.len();
+                    thread.native_pin_roots.push(*o);
+                    Some(idx)
+                }
+                _ => None,
+            })
+            .collect();
+        let compatible =
+            lambda_args_sam_compatible(shared, &call_site.sam_descriptor, call_args);
+        // Re-read obj_ref/call_args through the pins -- the compatibility
+        // check above may have triggered a moving GC that relocated either.
+        obj_ref = thread.native_pin_roots[sam_compat_pin_base];
+        let refreshed: Vec<Value> = call_args
+            .iter()
+            .zip(arg_pins.iter())
+            .map(|(orig, pin)| match pin {
+                Some(idx) => Value::Object(Some(thread.native_pin_roots[*idx])),
+                None => *orig,
+            })
+            .collect();
+        thread.native_pin_roots.truncate(sam_compat_pin_base);
+        if !compatible {
+            return Ok(None);
+        }
+        call_args_refreshed = Some(refreshed);
     }
+    let call_args: &[Value] = call_args_refreshed.as_deref().unwrap_or(call_args);
 
     // Only intercept calls to the SAM (single abstract method). Default
     // methods on the functional interface (e.g. Function.andThen,
