@@ -148,7 +148,7 @@ the WRONG same-named copy. Eight fixes landed on
 | `ScopedProxyBeanRegistrationAotProcessorTests` | FAIL (3 methods) | **OK 5/5** |
 | `PersistenceManagedTypesBeanRegistrationAotProcessorTests` | FAIL | FAIL 2/0 (host lacks JDK 24+, see below — not a VM bug) |
 | `TestClassScannerTests` | TIMEOUT 600 s | **completes 177 s** (7/7 or flaky 7/6) |
-| `TestCompilerTests` | TIMEOUT 600 s+ | **completes 40 s**, FAIL 22/18/4 |
+| `TestCompilerTests` | TIMEOUT 600 s+ | **completes 40 s**, FAIL 22/21/1 (3 of 4 fixed) |
 | `ApplicationContextAotGeneratorTests` | ABEND (CGLIB load) | discovers+runs 40 methods (see residuals) |
 | `BeanDefinitionMethodGeneratorTests` | FAIL 34/3 | **OK 34/34** |
 | `ConfigurationClassPostProcessorAotContributionTests` | FAIL 20/8 | **OK-ish 20/15/5** (5 residual = host ClassFile gap, see below) |
@@ -231,9 +231,47 @@ the WRONG same-named copy. Eight fixes landed on
     `ClassCastException: kotlin.reflect...protobuf.SmallSortedMap$Entry cannot
     be cast to java.lang.reflect.Field / AnnotationSpec` (separate
     heap/collection-identity family, kotlin-reflect metadata parsing).
-*   `TestCompilerTests` — 4 residuals: package-private access via
-    `@CompileWithTargetClassAccess`-style flows + additional-class references
-    (`CompilationException: Unable to compile source`).
+*   `TestCompilerTests` — **3 of 4 residuals FIXED 2026-07-15 (commit
+    `0ee485a2`).** All three `CompilationException: Unable to compile source`
+    residuals (`compiledCodeCanAccessExistingPackagePrivateClassIfAnnotated`,
+    `compiledCodeCanReferenceAdditionalClassInSamePackage`,
+    `compiledCodeCanReferenceAdditionalClassInDifferentPackage`) shared one
+    root cause: `native_javac_file_manager_list`
+    (`native-builtins/src/lib.rs`, the native override backing
+    `JavaFileManager.list()` for TestCompiler's in-process javac) had a
+    hardcoded short-circuit returning an EMPTY list for `CLASS_PATH`
+    listings of the `com`/`com.example`/`com.example.*` packages (alongside
+    the legitimate `java.*`/`javax.*` bootstrap-classpath exclusion) —
+    presumably added because `com.example` is TestCompiler's own scratch
+    namespace for dynamically generated, in-memory-only classes. That
+    blanket rule also hid genuine, pre-compiled-to-disk fixtures in the
+    same package (`com.example.PublicInterface`/`PackagePrivate` in
+    spring-core-test's own test-classes directory) from javac's symbol
+    resolution, surfacing as "cannot find symbol: class PublicInterface"
+    even though `getJavaFileForInput` (direct by-name lookup, never
+    short-circuited) always found it fine — confirmed via a standalone
+    `StandardJavaFileManager` probe, plus separate probes ruling out any
+    lower-level `File.listFiles()`/`Files.newDirectoryStream()` bug (both
+    correctly enumerate the same directory). Removed `com`/`com.example`
+    from the short-circuit; only `java.*`/`javax.*` remain fast-pathed to
+    empty (JVMS-correct — those never live on the application classpath).
+    Verified 22/18/4 → 22/21/1; regression-checked
+    `BeanDefinitionMethodGeneratorTests` (heavy TestCompiler/`com.example`
+    user) clean at 34/34.
+
+    **Remaining 1 residual — DIFFERENT, pre-existing bug, NOT fixed:**
+    `compiledCodeCannotAccessExistingPackagePrivateClassIfNotAnnotated`
+    expects an `IllegalAccessError` when code in a fresh `DynamicClassLoader`
+    (a DIFFERENT defining loader than the one that defined the
+    package-private `PackagePrivate`, same package NAME but different
+    runtime package per JVMS §5.4.4) accesses it WITHOUT
+    `@CompileWithForkedClassLoader` — but no exception is thrown; access
+    silently succeeds. This already failed with this exact `AssertionError`
+    (not `CompilationException`) BEFORE the fix above, so it is unaffected
+    by it. Points at CratonVM's runtime package-private access check not
+    correctly comparing DEFINING LOADERS across a same-named-package,
+    different-loader pair — a genuinely separate investigation (runtime
+    access control, not compile-time symbol resolution).
 *   ~~`aot.nativex.feature.ThrowawayClassLoaderTests`~~ **FIXED (2026-07-15,
     commit `56a98cc4`)**. `native-builtins/src/classloader_real.rs`'s
     `cl_real_load_class_base` — the REAL-JDK-mode counterpart of the
