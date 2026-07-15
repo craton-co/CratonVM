@@ -332,13 +332,18 @@ are unchanged by the 2026-07-15 AOT work — consult the historical doc.*
     is pathologically slow — steady progress (fresh `AnnotationConfigApplicationContext` + HTTP server
     per test; watchdog stack dumps show active bean creation, no deadlock) yet does not finish within
     1800s (HotSpot: 13s). Needs a dedicated perf investigation.~~
-    **PARTIALLY FIXED (2026-07-15, commit `96c8a57f`, branch `fix/xerces-perf-20260715`)**: root-caused
-    and fixed a genuine, general CPU-dispatch bug (JDK-internal bytecode — including Xerces — never
-    consulted the interpreter's monomorphic invoke cache; see the detailed writeup further down in
-    this document, section 2, same bullet). Verified via an isolated repro: 2.7x-3.4x faster
-    per-parse. **Full-class wall-clock improvement on this specific test NOT confirmed** — see the
-    detailed entry below for the honest caveat (host-contention-confounded A/B comparison, and
-    evidence the per-test cost here is dominated by something other than the bug fixed).
+    **PARTIALLY FIXED across two rounds (2026-07-15, commits `4290124b`/`96c8a57f`/`b7a1ed84`, branch
+    `fix/xerces-perf-20260715`)**: root-caused and fixed 5 real, independently-verified bugs — a
+    missing invoke-cache consult for JDK-internal bytecode, two JIT-eligibility-check memoization
+    gaps, an unbounded per-native-call JIT-code-range resort, a SipHash-vs-FxHash hasher choice, and
+    an O(n) free-list byte recount inside the per-allocation `needs_gc` check. Each individually
+    verified (isolated repro speedups, `perf record` before/after, zero test regressions). **STILL
+    NOT sufficient to close the class-level gap**: live-profiling the real class after all 5 fixes
+    shows the true remaining bottleneck is CratonVM's conservative (non-precise) GC root scanning on
+    the interpreter's native-call path (`is_object_address` + `update_root_snapshot`, >60% of sampled
+    CPU) — an already-documented, deliberately-deferred architectural item (see `gc/src/arena.rs`'s
+    `Arena::reset` doc comment), not a quick-fix bug. Full detailed writeup, all numbers, and the
+    concrete next step further down in this document, section 2, same bullet.
 
 ## 4. Reactive cluster session 2026-07-15 (branch `fix/reactive-cluster-20260715`)
 
@@ -536,22 +541,77 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     be a debug build" — an artifact of running `cargo test --release`, unrelated to this change) /
     111 ignored.
 
-    **Full-class wall-clock impact: NOT confirmed, OPEN follow-up**. A same-day A/B run of the full
-    160-test class (fixed vs. pre-fix binary, bounded ~10-minute windows, same shared build host) was
-    inconclusive: the fixed binary averaged ~49.7s/test vs. ~40.9s/test pre-fix in that particular
-    window — but the host had a load average of 5-6 on 16 cores with a *different concurrent
-    session's* Spring suite run consuming 169% CPU at the time, so this specific comparison is not
-    trustworthy in either direction and should not be read as "the fix made this test slower." More
-    significant than the noise: per-test wall time in both runs was ~40-55 SECONDS — two to three
-    orders of magnitude larger than what the isolated repro's few-hundred-ms Xerces parse cost could
-    plausibly explain per test — meaning this specific integration test's dominant per-test cost is
-    something else entirely (each test builds a fresh embedded Tomcat/Reactor instance: real socket
-    bind, NIO connector startup, thread-pool bootstrap), not the CPU-bound bytecode-dispatch overhead
-    this fix targets. **This means the fix is real, general, and verified, but is not sufficient on
-    its own to bring `RequestMappingMessageConversionIntegrationTests` down to a small multiple of
-    HotSpot's 13s.** The next step for that specific goal is a separate investigation into what
-    dominates per-test wall-clock time in this class — likely embedded-server bootstrap/socket/
-    thread costs — ideally run on an uncontended host to get a clean baseline.
+    **Full-class wall-clock impact after round 1: NOT confirmed** — the round-1 A/B comparison
+    above was inconclusive (host contention), but its qualitative observation was right: per-test
+    wall time (~40-55s) was far larger than the Xerces-repro cost could explain, meaning something
+    else dominated. Investigated further same-day, round 2 (2026-07-15, commit `b7a1ed84`, same
+    branch):
+
+    **Repro correction first**: the original standalone bootstrap repro (`BootstrapRepro.java`) had
+    no package declaration, so its `@ComponentScan` scanned the entire classpath root recursively —
+    an unrealistic worst case. The real test's `WebConfig` is properly packaged
+    (`org.springframework.web.reactive.result.method.annotation`), scoping its scan to one package.
+    A corrected, properly-packaged repro (`BootstrapRepro2.java`, package
+    `com.example.bootstraprepro`) dropped HotSpot's steady-state `ctx_ms` from ~90-140ms to
+    ~20-32ms — the original repro was measuring an artificial worst case, not the real per-test cost.
+    This mistake cost real investigation time; flagging the lesson (fair repro scope matters as much
+    as the fix) for future sessions chasing this class of bug.
+
+    **Three further, independent, verified fixes** found via `perf record` (both on the isolated
+    repro and, critically, `perf record -p <pid>` attached LIVE to an in-progress real-class run —
+    the isolated repro's profile shape and the real class's profile shape turned out to be quite
+    different, so both were needed) plus live gdb stack sampling:
+
+    1. `jit/src/lib.rs` (`snapshot_code_ranges_into`): the per-native-call JIT-code-range snapshot
+       used by `native_stack_has_jit_frame` (`vm/src/jit/conservative_roots.rs`) was rebuilt (full
+       lock + Vec copy + `sort_unstable()` over every registered range) on EVERY call despite being
+       cached in a thread-local buffer — a write-only "cache". Since registered ranges only grow
+       over a process's life (compiled code is retained), and round 1's own fix made more JDK-class
+       code tier up to JIT, this was an O(n log n) cost per native call that grew across a session —
+       directly visible as `ctx_ms` climbing 14.8s→26.2s across BootstrapRepro iterations sharing one
+       process, and `perf record` showing 7.19% self-time in a deeply-recursive `quicksort`. Fixed
+       with a generation counter, bumped only on actual add/remove, gating the resnapshot/resort.
+    2. `vm/src/runtime/local_liveness.rs` (`live_locals_mask`): used `std::collections::HashMap`'s
+       default SipHash hasher instead of this codebase's usual `FxHashMap` for its (also
+       per-native-call) code-blob cache and per-pc liveness table. Pure hasher swap.
+    3. `gc/src/arena.rs` (`Arena::free_list_bytes`): summed both free-list tiers from scratch on
+       every call; its only caller, `GenerationalHeap::needs_gc`, runs on every allocation attempt.
+       Live-profiling an ACTUAL `RequestMappingMessageConversionIntegrationTests` run in progress
+       found `needs_gc` alone at **24.5% of all sampled CPU time**. Fixed with the same
+       generation-counter-cache shape as #1. Verified with a second live-attached `perf record`:
+       `needs_gc` dropped 24.5%→7.2% of sampled CPU with no other symbol regressing.
+
+    All three: `cargo test -p cratonvm-gc --lib` 787/0 and `cargo test -p cratonvm-vm --lib`
+    2203/9(pre-existing debug-only)/111 unchanged (no regressions).
+
+    **Class-level result: still NOT resolved.** A live-attached `perf record` on the real class
+    AFTER all three round-2 fixes shows the true remaining bottleneck clearly: with `needs_gc` fixed,
+    `GenerationalHeap::is_object_address` (28.7% direct + 10.1% via its `VmHeap` wrapper ≈ **38.7%**)
+    and `update_root_snapshot` (22.2%) now dominate — together over 60% of sampled CPU, i.e. the SAME
+    conservative-GC-root-scanning family as the fixes above, but the piece of it that ISN'T a bug: on
+    every object-returning native call, CratonVM's conservative (non-precise) collector validates
+    every 8-byte-aligned candidate word in the scanned native-stack/frame regions against
+    `is_object_address` (alignment + region-bounds + header-tag-plausibility checks) because it has
+    no precise stack map for that call site. This is explicitly documented, pre-existing, deliberately
+    deferred architecture — see the doc comment on `Arena::reset` in `gc/src/arena.rs`: *"the
+    audit-flagged 'perf bug' is a real cost, but the correctness hazard outweighs it... until
+    `is_object_address` is tightened to honour the cursor bound"* / *"when the GC switches to precise
+    stack maps"* — not a quick-fix bug. Confirmed empirically: a full-class run with all 3 round-2
+    fixes reached the same ~29 Tomcat-backend tests in a 1200s bound as the pre-round-2 binary — a
+    real, individually-verified reduction in one contributor (`needs_gc`) did not move the class-level
+    wall clock outside measurement noise, because the now-larger `is_object_address` /
+    `update_root_snapshot` contributor was untouched.
+
+    **Honest summary across both rounds**: 5 real, independently-verified CPU-dispatch and
+    GC-bookkeeping bugs found and fixed (commits `4290124b`, `96c8a57f`, `b7a1ed84`), each with clean
+    before/after measurements and no regressions. `RequestMappingMessageConversionIntegrationTests`
+    still does not complete in a reasonable multiple of HotSpot's 13s — it did not finish within a
+    1200s bound even after all 5 fixes. The remaining, now clearly-identified bottleneck is
+    architectural: CratonVM's conservative (stack-map-free) GC root scanning on the interpreter's
+    native-call path. Closing that gap requires precise stack maps for that specific scan path (the
+    project has PARTIAL precise-map coverage already — see the precise-jit-maps roadmap items — but
+    apparently not for this native-call conservative-scan site), which is a substantially larger
+    effort than a bug-fix session: expect a dedicated investigation, not a quick follow-up.
 *   ~~`web.reactive.result.view.script.JRubyScriptTemplateTests`~~ **PARTIALLY FIXED
     (2026-07-15) -- 2 of (at least) 3 chained bugs closed, test class still FAILS.** JRuby's own
     bootstrap (`rubygems/specification.rb` / `rubygems/version.rb`) turned out to hit a CHAIN of
