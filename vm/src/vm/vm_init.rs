@@ -2611,6 +2611,9 @@ impl SharedVm {
         let offload_registry =
             std::sync::Arc::new(crate::runtime::offload::OffloadCacheRegistry::new());
 
+        // The real-JDK platform-server bridge needs its interface methods.
+        cratonvm_native_builtins::jmx::register_mbean_server(&mut native_methods);
+
         let vm = Self {
             vm_identity: NEXT_VM_IDENTITY.fetch_add(1, Ordering::Relaxed),
             config,
