@@ -1,6 +1,23 @@
 # TestWarURLConnection — getContentLength() returns -1 instead of the real size
 
-**Status:** FIXED. **Severity:** medium. **HotSpot:** PASS (fresh-verified).
+**Status (2026-07-15): REOPENED.** The fix below (commit `09a505435`,
+confirmed present in the exact binary tested — `war_nested_jar_bytes` is in
+the built `native-builtins/src/net_phase_e.rs`) does not resolve the bug on
+this Windows box: a fresh rerun on `dev` @ `f23a3f42a` reproduces the
+**identical** original failure —
+```
+1) testContentLength(org.apache.catalina.webresources.war.TestWarURLConnection)
+java.lang.AssertionError: expected:<137> but was:<-1>
+```
+Since the fix's own validation section below doesn't specify a platform and
+the fix parses a `war:file:<war-path>*/WEB-INF/lib/test.jar` string to
+locate the nested jar, a leading candidate is Windows path syntax
+(`C:\...` drive prefix, `\` separators) breaking whatever prefix/pattern
+match `war_nested_jar_bytes` uses to recognize the `war:file:<path>*/...`
+shape — the fix may only have been validated on Linux. Needs a Windows-
+specific repro/trace before assuming a plain regression.
+
+**Original status:** FIXED. **Severity:** medium. **HotSpot:** PASS (fresh-verified).
 
 ## Summary
 
