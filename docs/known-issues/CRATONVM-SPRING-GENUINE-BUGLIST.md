@@ -89,11 +89,11 @@ the WRONG same-named copy. Eight fixes landed on
 | `DefaultBeanRegistrationCodeFragmentsTests` | (was fixed) | **OK 19/19** |
 | `GroupsMetadataValueDelegateTests` (WritableContent residual) | FAIL | **OK 8/8** |
 | `ScopedProxyBeanRegistrationAotProcessorTests` | FAIL (3 methods) | **OK 5/5** |
-| `PersistenceManagedTypesBeanRegistrationAotProcessorTests` | FAIL | **OK 2/2** |
+| `PersistenceManagedTypesBeanRegistrationAotProcessorTests` | FAIL | FAIL 2/0 (see below, unrelated regression) |
 | `TestClassScannerTests` | TIMEOUT 600 s | **completes 177 s** (7/7 or flaky 7/6) |
 | `TestCompilerTests` | TIMEOUT 600 s+ | **completes 40 s**, FAIL 22/18/4 |
 | `ApplicationContextAotGeneratorTests` | ABEND (CGLIB load) | discovers+runs 40 methods (see residuals) |
-| `BeanDefinitionMethodGeneratorTests` | FAIL 34/3 | FAIL 34/31/3 |
+| `BeanDefinitionMethodGeneratorTests` | FAIL 34/3 | **OK 34/34** |
 | `ConfigurationClassPostProcessorAotContributionTests` | FAIL 20/8 | FAIL 20/18/2 |
 | `PersistenceAnnotationBeanPostProcessorAotContributionTests` | FAIL 8/0 (NCDFE) | FAIL 8/2/6 (Mockito attach residuals) |
 | `TestContextAotGeneratorIntegrationTests` | FAIL 4/0 @393 s | (see residuals) |
@@ -107,12 +107,6 @@ the WRONG same-named copy. Eight fixes landed on
     (`InlineDelegateByteBuddyMockMaker.lambda$new$2/3`) plus GC frame-root
     scanning — an interpreter-throughput problem under constructor
     instrumentation, needing perf work rather than a correctness fix.
-*   `BeanDefinitionMethodGeneratorTests` — 3 deterministic residuals:
-    `NoSuchMethodError CustomBean__BeanDefinitions.getTestBeanDefinition` /
-    `AnnotatedBean__BeanDefinitions.getTestInnerBeanBeanDefinition` (stale
-    same-FQN generated class), plus one AssertionFailedError
-    (`...HasExplicitResolvableType`). SOLO and PAIRWISE runs PASS — needs the
-    full-class accumulated GC/JIT state to reproduce.
 *   `ConfigurationClassPostProcessorAotContributionTests` — 2 residuals in
     `BeanRegistrarTests` under fork: `IllegalArgumentException: parameter 0 of
     type ListableBeanFactory is not supported` (same DefaultMethodReference
@@ -123,6 +117,17 @@ the WRONG same-named copy. Eight fixes landed on
     `PremainAttachAccess` -> "Byte Buddy agent is not initialized", and (b) a
     NEW ByteBuddy generics failure past the dispatcher: `IllegalArgumentException:
     Cannot resolve T from class ...EntityManagerFactory$MockitoMock$...`.
+*   `PersistenceManagedTypesBeanRegistrationAotProcessorTests` — **REGRESSED
+    from OK 2/2 to FAIL 2/0** since this doc's 2026-07-14 baseline (unrelated
+    to the 2026-07-15 orphaned-defining-loader fix below — reproduces
+    byte-identically on a binary built *without* that fix, from the same
+    tree). Both `processEntityManagerWithPackagesToScan` and
+    `contributeJpaHints` now hit `NoClassDefFoundError:
+    java/lang/classfile/ClassFile` inside
+    `ClassFileMetadataReader.parseClassModel` — a JDK 24+ Class-File API
+    (JEP 484) class that real-JDK-mode CratonVM apparently can no longer
+    resolve. Needs its own investigation; not caused by any fix in this
+    document.
 *   `InstanceSupplierCodeGeneratorKotlinTests` — 4/0/5, all
     `ClassCastException: kotlin.reflect...protobuf.SmallSortedMap$Entry cannot
     be cast to java.lang.reflect.Field / AnnotationSpec` (separate
@@ -138,19 +143,29 @@ the WRONG same-named copy. Eight fixes landed on
     resolved app classes directly from the flat store even though the
     loader's real parent chain never reaches a built-in loader. Ported the
     same `scoped_user_chain` gate. Full class now 2/2 OK.
-*   **BeanDefinitionMethodGeneratorTests — new lead, not yet fixed.** Full
-    bisection of the `generateBeanDefinitionMethodWhenHasExplicitResolvableType`
-    residual (`MethodRun.java` accepts N method names to run together in one
-    process) shows the failure is **COUNT-dependent, not content-dependent**:
-    9 preceding `TestCompiler` compile cycles before the target passes; 10
-    fails — and ANY of three different 9th-method candidates tested
-    reproduces it identically. Points at a fixed-size cache or counter
-    (per-loader-epoch resolution cache in `vm/src/runtime/lockfree_resolve.rs`
-    is the prime suspect, unconfirmed) overflowing/evicting between 9 and 10
-    entries. Likely the same root cause as the `PersistenceAnnotation...`
-    ByteBuddy `NoSuchMethodError` on the 3rd+ independent fork redefinition
-    (see `BBProbe4.java` repro) — both are "Nth redefinition of the same
-    class across independent loaders loses coherence" symptoms.
+*   ~~`BeanDefinitionMethodGeneratorTests`~~ **FIXED (2026-07-15, commit
+    `d017aa36`).** Bisection of the
+    `generateBeanDefinitionMethodWhenHasExplicitResolvableType` residual
+    (`MethodRun.java` accepts N method names to run together in one process)
+    showed the failure was **COUNT-dependent, not content-dependent**: 9
+    preceding `TestCompiler` compile cycles before the target passed; 10
+    failed, regardless of which methods supplied the 9th/10th cycle. Root
+    cause: `gc_reconcile_defining_loaders`
+    (`native-builtins/src/classloader.rs`) DROPS a class's defining-loader
+    registry entry once that loader is collected, and `cid_visible_mirror`
+    reads a missing entry as "never restricted, visible to everyone" — the
+    same answer it gives a class that was never loader-scoped. Once the Nth
+    cycle's `DynamicClassLoader` was collected, its generated companion class
+    silently became visible to every OTHER loader, so the next cycle's
+    `DynamicClassLoader` reused the stale, wrong-scenario copy instead of
+    generating its own. Fixed by tombstoning pruned class-ids in a permanent
+    orphaned set, checked before the live-registry lookup, so a class whose
+    defining loader died stays invisible to everyone forever (matches real
+    unloading semantics). Full class now 34/34 OK. This is a DIFFERENT root
+    cause than originally hypothesized here — it does NOT explain the
+    `PersistenceAnnotationBeanPostProcessorAotContributionTests` ByteBuddy
+    `NoSuchMethodError` family (confirmed unaffected, still 8/2/6 after this
+    fix); that remains open and unrelated.
 
 ---
 
@@ -209,11 +224,7 @@ resolved the wrong view and completed instead of erroring. Scheme detection now 
 parser (first stop char among `:/?#` must be `:`, ALPHA-start + alphanum/`+`/`-`/`.` name — the same
 rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is now 11/11 OK.
 
-Classes that FAIL in *batched* suite runs but pass solo at HotSpot parity (batch-context
-contamination — a prior class in the shared VM poisons a `<clinit>`; not yet root-caused, likely one
-more cross-class-state bug): `SseIntegrationTests` (solo 48 found / 42 succ / 6 aborted == HotSpot),
-`WebSocketIntegrationTests` (solo 72/72), `DefaultRenderingBuilderTests` (solo 11/11, batched shows
-`ExceptionInInitializerError` → `NoClassDefFoundError: ViewResolverSupport` on the redirect tests).
+**RETRACTED 2026-07-15**: the "batch-context `<clinit>` contamination" theorized below (classes failing only in batched suite runs, passing solo) was investigated further and is **NOT a CratonVM bug**. Root cause was Azure-host environment corruption, confirmed live: (1) `/home/victor/jdk25` (the symlink itself) had vanished mid-session — every `--java-home ~/jdk25` invocation failed with `path does not exist`, producing zero test output, easily misread as a VM hang; (2) separately, `/tmp` (the directory itself, not just stale contents) had vanished — `Tomcat.initBaseDir()` threw `IllegalStateException: Unable to create the directory [/tmp]`, which looks exactly like a filesystem native bug but is the OS directory missing. After `ln -sf /data/data/jdk25-real ~/jdk25` and `mkdir -p /tmp && chmod 1777 /tmp`, the exact same 8-class batch that previously showed `SseIntegrationTests` failing 9/48 (deterministically, 3/3 reruns) now passes 42/48 with 6 aborted, byte-for-byte matching the HotSpot baseline shape, and `DefaultRenderingBuilderTests` never reproduced its `ExceptionInInitializerError` again across 3 clean reruns of the identical batch order on the identical binary. See `azure-host-disk-full-flapping-20260715.md` memory (Claude's memory system) for the full host instability catalog.
 
 **Remaining OPEN reactive residuals:**
 *   `http.client.reactive.ClientHttpConnectorTests` — TIMEOUT. `StepVerifier` in `basic()` waits forever;
@@ -226,5 +237,4 @@ more cross-class-state bug): `SseIntegrationTests` (solo 48 found / 42 succ / 6 
     `Symbol#to_s`/string interpolation returns empty inside `eval` heredocs
     (`rubygems/specification.rb` generates `@ = nil` from `"@#{key} = nil"`), so the engine bootstrap
     fails with a SyntaxError. Not reactive-specific; JRuby's embedding is its own bug family.
-*   Batch-context `<clinit>` contamination (see above) — affects SSE/WebSocket/DefaultRenderingBuilder
-    only when many reactive classes share one VM; every one of them is green solo.
+*   ~~Batch-context `<clinit>` contamination~~ — RETRACTED, see above (host environment issue: missing /tmp + missing ~/jdk25 symlink, not CratonVM).

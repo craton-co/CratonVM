@@ -54,6 +54,10 @@ pub fn reset_loader_singletons() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+    orphaned_defining_loader_classes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     ANY_DEFINING_LOADER_REGISTERED.store(false, Ordering::Release);
     loader_namespace_id_store()
         .lock()
@@ -180,6 +184,15 @@ pub fn gc_reconcile_defining_loaders(
         if !alive {
             // Loader unreachable and collected this cycle — drop the stale entry.
             // (No deref of `obj_ref`; the memory may already be freed/reused.)
+            // Record the class as permanently orphaned FIRST: dropping the
+            // entry alone makes `defining_loader_for` indistinguishable from
+            // "never restricted", which would make this class incorrectly
+            // visible to every other loader from now on (see
+            // `is_defining_loader_orphaned` doc comment).
+            orphaned_defining_loader_classes()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(*_class_id);
             return false;
         }
         // Survivor: remap if it relocated (moving collection).
@@ -267,6 +280,30 @@ fn class_data_store() -> &'static Mutex<std::collections::HashMap<ObjectRef, Val
 fn defining_loader_store() -> &'static Mutex<std::collections::HashMap<u32, ObjectRef>> {
     static INSTANCE: OnceLock<Mutex<std::collections::HashMap<u32, ObjectRef>>> = OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Class-ids whose registered defining loader was confirmed DEAD by a prior
+/// `gc_reconcile_defining_loaders` pass. Once a class lands here it must
+/// never again be treated as globally visible: `defining_loader_for`
+/// returning `None` is ALSO the answer for "never had a registered loader in
+/// the first place" (the overwhelmingly common built-in-loader case), so
+/// `cid_visible_mirror` cannot distinguish "no restriction" from "the
+/// restriction's target died" without this separate permanent record.
+/// Entries are never removed (matches real unloading: once a defining loader
+/// is gone, the class is gone from every OTHER loader's perspective forever;
+/// a new loader wanting the same simple name must define its own copy).
+fn orphaned_defining_loader_classes() -> &'static Mutex<std::collections::HashSet<u32>> {
+    static INSTANCE: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Whether `class_id`'s defining loader has been confirmed collected. See
+/// [`orphaned_defining_loader_classes`].
+pub(crate) fn is_defining_loader_orphaned(class_id: u32) -> bool {
+    orphaned_defining_loader_classes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&class_id)
 }
 
 /// Perf (silent-hang-no-signature-cluster throughput residual, 2026-07-13):
@@ -1368,6 +1405,13 @@ pub(crate) fn cid_visible_mirror(
     this: ObjectRef,
     cid: cratonvm_types::ClassId,
 ) -> Option<ObjectRef> {
+    // A class whose defining loader was confirmed collected is gone from
+    // every OTHER loader's perspective (real unloading semantics) -- checked
+    // BEFORE the live-registry lookup so a pruned entry never falls through
+    // to "no restriction, visible to all" (see `is_defining_loader_orphaned`).
+    if is_defining_loader_orphaned(cid.as_u32()) {
+        return None;
+    }
     if let Some(def) = defining_loader_for(cid.as_u32()) {
         if !loader_can_see_defining(ctx, this, def) {
             return None;

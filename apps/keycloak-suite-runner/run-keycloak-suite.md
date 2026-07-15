@@ -114,6 +114,26 @@ Both HotSpot and CratonVM are then launched with `-jar`/`--jar` against that
 pathing JAR, whose manifest points at `KcRunner`, the module classes, test
 classes, and dependency jars.
 
+### Arquillian integration modules
+
+Classes below `testsuite/integration-arquillian/tests/` are normally launched
+by Maven Surefire/Failsafe, which provides a transformed `arquillian.xml` and
+its effective `systemPropertyVariables`. The per-class runner now preserves
+that bootstrap contract: it reads `target/dependency/arquillian.xml`, obtains
+the module's effective Maven POM, and forwards the resolved Surefire system
+properties to KcRunner. The effective POM is cached under:
+
+```text
+.suite\arquillian-bootstrap\
+```
+
+Build the module's test resources before running one of these classes. This
+applies to the `base` module and legacy leaf modules such as `other/sssd`; if
+the module can only be selected through its aggregator, the runner retries
+from the module directory. A missing descriptor produces an actionable build
+command instead of the misleading `Not found frontend container` suite-init
+failure.
+
 Any `CRATONVM_*` environment variable already set in the shell is inherited by
 every CratonVM child process. Example:
 
