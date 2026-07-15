@@ -19563,8 +19563,38 @@ pub(crate) fn lambda_args_sam_compatible(
 ) -> bool {
     let (params, _ret) = split_method_descriptor(sam_descriptor);
     for (i, pd) in params.iter().enumerate() {
+        if pd.starts_with('[') {
+            // Array-typed SAM param. This was previously covered by the
+            // `!pd.starts_with('L')` catch-all below (arrays don't start
+            // with 'L'), which unconditionally skipped it -- "never
+            // second-guess". That silently let a same-named, same-arity
+            // interface DEFAULT method whose one differing parameter is a
+            // scalar reference where the real SAM wants an array (e.g.
+            // JRuby 10.x's `BlockCallback` -- abstract SAM
+            // `call(ThreadContext, IRubyObject[], Block)` plus five
+            // default overloads sharing the name "call", including
+            // `call(ThreadContext, IRubyObject, Block)`) get misjudged as
+            // SAM-compatible. `try_lambda_dispatch` then fed the raw
+            // scalar argument directly into the array-typed lambda body
+            // instead of falling through to the real default method (which
+            // wraps the scalar into a 1-element array before re-invoking
+            // the SAM) -- observed as `RubyEnumerable.packEnumValues`
+            // calling `arraylength` on a bare `RubySymbol` during
+            // `Enumerable#partition`'s per-element block callback
+            // (JRubyScriptTemplateTests GC-ARRAY-GUARD investigation,
+            // 2026-07-15). A present, non-null, non-array argument here is
+            // provably NOT an instance of this SAM param -> treat as an
+            // overloaded default, same as the concrete-class mismatch case
+            // below.
+            if let Some(Value::Object(Some(a))) = args.get(i) {
+                if shared.heap.kind_of(*a) != cratonvm_types::ObjectKind::Array {
+                    return false;
+                }
+            }
+            continue; // null / missing / genuinely an array -- don't second-guess further
+        }
         if !pd.starts_with('L') || pd.as_str() == "Ljava/lang/Object;" {
-            continue; // generic/erased or non-reference param — never second-guess
+            continue; // generic/erased or non-reference param -- never second-guess
         }
         let arg = match args.get(i) {
             Some(Value::Object(Some(a))) => *a,
