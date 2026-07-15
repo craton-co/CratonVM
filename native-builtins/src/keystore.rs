@@ -1488,6 +1488,39 @@ fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     }
 }
 
+/// Return the DER behind the compact four-slot `PrivateKey` proxy emitted by
+/// [`engine_get_key`]. The proxy's final slot is a `(store_id, alias_hash)`
+/// handle, not a fifth in-object DER field; `Key.getEncoded()` must resolve it
+/// through the keystore registry instead of reading past the real interface
+/// object's layout.
+pub(crate) fn private_key_der_from_proxy(
+    ctx: &mut dyn NativeContext,
+    key: ObjectRef,
+) -> Option<Vec<u8>> {
+    if ctx.object_num_fields(key) <= 3 {
+        return None;
+    }
+    let composite = match ctx.get_field(key, 3) {
+        Value::Long(value) => value,
+        _ => return None,
+    };
+    let store_id = (composite >> 32) as i32;
+    if store_id <= 0 {
+        return None;
+    }
+    let alias_hash = composite as u32;
+    let store = keystore_lookup(store_id)?;
+    store.entries.values().find_map(|entry| {
+        if fnv1a_32(entry.alias.as_bytes()) != alias_hash {
+            return None;
+        }
+        match &entry.kind {
+            EntryKind::PrivateKey { key_der, .. } => Some(key_der.clone()),
+            _ => None,
+        }
+    })
+}
+
 fn engine_get_certificate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
