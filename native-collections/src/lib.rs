@@ -32861,13 +32861,39 @@ fn native_chm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let this = ctx.read_native_pin(roots_base, this);
     let result = match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
-            let _resize_flag = ChmResizeLockGuard::enter();
-            // GC-pausable contended wait — re-read the pinned locals AFTER
-            // acquiring (see `acquire_gc_safe`'s doc).
-            let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
-            let key = read_pinned_elem(ctx, key_pin, key);
-            let func = read_pinned_elem(ctx, func_pin, func);
-            native_map_compute_if_absent(ctx, &[Value::Object(Some(seg)), key, func])
+            // JDK-exact lock-free fast path: `computeIfAbsent` on a PRESENT
+            // key returns the existing value WITHOUT locking. Real CHM locks
+            // a single bin, so a mapping callback that takes unrelated locks
+            // (WildFly's registry callbacks take the management-registry
+            // write lock) never orders against other keys' operations; our
+            // segment monitor is far coarser, and locking it just to discover
+            // the key already exists created a segment-monitor ↔ registry-
+            // RWLock cycle that wedged `parallel-extension-add` boots (the
+            // mode-2 wedge: gdb showed writers starving at
+            // stamped_lock::rw_write_lock while a read-lock holder waited in
+            // acquire_gc_safe on the same segment).
+            let key_now = read_pinned_elem(ctx, key_pin, key);
+            match chm_seg_get(ctx, seg, key_now)? {
+                Some(existing) if !matches!(existing, Value::Object(None)) => Ok(Some(existing)),
+                _ => {
+                    let this = ctx.read_native_pin(roots_base, this);
+                    match chm_segment_for(ctx, this, hash) {
+                        Some(seg) => {
+                            let _resize_flag = ChmResizeLockGuard::enter();
+                            // GC-pausable contended wait — re-read the pinned
+                            // locals AFTER acquiring (see `acquire_gc_safe`).
+                            let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
+                            let key = read_pinned_elem(ctx, key_pin, key);
+                            let func = read_pinned_elem(ctx, func_pin, func);
+                            native_map_compute_if_absent(
+                                ctx,
+                                &[Value::Object(Some(seg)), key, func],
+                            )
+                        }
+                        None => Ok(Some(Value::Object(None))),
+                    }
+                }
+            }
         }
         None => Ok(Some(Value::Object(None))),
     };
@@ -32935,13 +32961,33 @@ fn native_chm_compute_if_present(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let this = ctx.read_native_pin(roots_base, this);
     let result = match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
-            let _resize_flag = ChmResizeLockGuard::enter();
-            // GC-pausable contended wait — re-read the pinned locals AFTER
-            // acquiring (see `acquire_gc_safe`'s doc).
-            let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
-            let key = read_pinned_elem(ctx, key_pin, key);
-            let func = read_pinned_elem(ctx, func_pin, func);
-            native_map_compute_if_present(ctx, &[Value::Object(Some(seg)), key, func])
+            // JDK-exact lock-free fast path: `computeIfPresent` on an ABSENT
+            // key returns null WITHOUT locking (real CHM's lock-free tabAt
+            // probe). See `native_chm_compute_if_absent` for why avoiding the
+            // segment monitor here matters (callback-under-coarse-lock
+            // ordering cycles).
+            let key_now = read_pinned_elem(ctx, key_pin, key);
+            match chm_seg_get(ctx, seg, key_now)? {
+                None => Ok(Some(Value::Object(None))),
+                Some(_) => {
+                    let this = ctx.read_native_pin(roots_base, this);
+                    match chm_segment_for(ctx, this, hash) {
+                        Some(seg) => {
+                            let _resize_flag = ChmResizeLockGuard::enter();
+                            // GC-pausable contended wait — re-read the pinned
+                            // locals AFTER acquiring (see `acquire_gc_safe`).
+                            let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
+                            let key = read_pinned_elem(ctx, key_pin, key);
+                            let func = read_pinned_elem(ctx, func_pin, func);
+                            native_map_compute_if_present(
+                                ctx,
+                                &[Value::Object(Some(seg)), key, func],
+                            )
+                        }
+                        None => Ok(Some(Value::Object(None))),
+                    }
+                }
+            }
         }
         None => Ok(Some(Value::Object(None))),
     };
