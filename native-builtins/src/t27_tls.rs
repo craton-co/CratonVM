@@ -495,6 +495,7 @@ pub(crate) fn build_engine_client_config_with_identity(
     alpn: &[&str],
     client_identity: Option<(&str, &str)>,
     km_ctx_key: Option<u64>,
+    trust_managers_ctx_key: Option<u64>,
 ) -> Result<Arc<ClientConfig>, String> {
     let trust_roots = active_client_trust_roots();
     let revocation = trust_roots.as_ref().and_then(|r| r.revocation.clone());
@@ -506,6 +507,14 @@ pub(crate) fn build_engine_client_config_with_identity(
             client_identity.is_some()
         );
     }
+    let use_java_trust_manager = trust_managers_ctx_key
+        .and_then(|key| {
+            ctx_trust_managers_table()
+                .lock()
+                .get(&key)
+                .map(|managers| (!managers.is_empty()).then_some(key))
+        })
+        .is_some();
     if let Some(key) = km_ctx_key {
         let has_kms = ctx_key_managers_table()
             .lock()
@@ -524,11 +533,21 @@ pub(crate) fn build_engine_client_config_with_identity(
                 provider: Arc::new(rustls::crypto::ring::default_provider()),
             });
             return build_client_config_with_revocation_and_resolver(
-                roots, alpn, revocation, resolver,
+                roots,
+                alpn,
+                revocation,
+                resolver,
+                use_java_trust_manager,
             );
         }
     }
-    build_client_config_with_revocation(roots, alpn, client_identity, revocation)
+    build_client_config_with_revocation(
+        roots,
+        alpn,
+        client_identity,
+        revocation,
+        use_java_trust_manager,
+    )
 }
 
 /// As `build_engine_client_config_with_identity`, but additionally restricts
@@ -555,6 +574,10 @@ pub(crate) fn build_engine_client_config_with_identity_ciphers(
 // certificate for mTLS (e.g. `TestClientCertTls13`'s `getUrl`/`postUrl`).
 static HUC_DEFAULT_CLIENT_IDENTITY: OnceLock<Mutex<Option<(String, String)>>> = OnceLock::new();
 static HUC_DEFAULT_TRUST_ROOTS: OnceLock<Mutex<Option<TlsTrustRoots>>> = OnceLock::new();
+// A ClientConfig owns rustls's client-side session store. HttpsURLConnection
+// makes a new connection for each URL request, so rebuilding this config for
+// every request discards the TLS 1.3 ticket needed by the next request.
+static HUC_DEFAULT_CLIENT_CONFIG: OnceLock<Mutex<Option<Arc<ClientConfig>>>> = OnceLock::new();
 
 fn huc_default_identity_slot() -> &'static Mutex<Option<(String, String)>> {
     HUC_DEFAULT_CLIENT_IDENTITY.get_or_init(|| Mutex::new(None))
@@ -564,7 +587,16 @@ fn huc_default_trust_roots_slot() -> &'static Mutex<Option<TlsTrustRoots>> {
     HUC_DEFAULT_TRUST_ROOTS.get_or_init(|| Mutex::new(None))
 }
 
+fn huc_default_client_config_slot() -> &'static Mutex<Option<Arc<ClientConfig>>> {
+    HUC_DEFAULT_CLIENT_CONFIG.get_or_init(|| Mutex::new(None))
+}
+
+fn clear_huc_default_client_config() {
+    *huc_default_client_config_slot().lock() = None;
+}
+
 pub(crate) fn set_huc_default_client_identity(ident: Option<(String, String)>) {
+    clear_huc_default_client_config();
     *huc_default_identity_slot().lock() = ident;
     let roots = selected_context_trust_roots();
     if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
@@ -594,17 +626,37 @@ fn huc_default_trust_roots() -> Option<TlsTrustRoots> {
 /// plain `u64` — never the `KeyManager` `ObjectRef`s themselves, which stay
 /// solely in the GC-rooted `ctx_key_managers_table` (see that table's doc).
 static HUC_DEFAULT_KM_CTX_KEY: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
+static HUC_DEFAULT_TM_CTX_KEY: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
 
 fn huc_default_km_ctx_key_slot() -> &'static Mutex<Option<u64>> {
     HUC_DEFAULT_KM_CTX_KEY.get_or_init(|| Mutex::new(None))
 }
 
+fn huc_default_tm_ctx_key_slot() -> &'static Mutex<Option<u64>> {
+    HUC_DEFAULT_TM_CTX_KEY.get_or_init(|| Mutex::new(None))
+}
+
 pub(crate) fn set_huc_default_key_managers_ctx_key(key: Option<u64>) {
+    clear_huc_default_client_config();
     *huc_default_km_ctx_key_slot().lock() = key;
 }
 
 pub(crate) fn huc_default_key_managers_ctx_key() -> Option<u64> {
     *huc_default_km_ctx_key_slot().lock()
+}
+
+fn capture_huc_trust_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) {
+    let key = ctx_obj_key(ctx, ctx_obj);
+    let has_managers = ctx_trust_managers_table()
+        .lock()
+        .get(&key)
+        .map(|managers| !managers.is_empty())
+        .unwrap_or(false);
+    *huc_default_tm_ctx_key_slot().lock() = has_managers.then_some(key);
+}
+
+pub(crate) fn huc_default_trust_managers_ctx_key() -> Option<u64> {
+    *huc_default_tm_ctx_key_slot().lock()
 }
 
 /// `SSLContext.getSocketFactory()` calls this alongside
@@ -624,6 +676,36 @@ pub(crate) fn capture_huc_key_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_
         );
     }
     set_huc_default_key_managers_ctx_key(if has_kms { Some(key) } else { None });
+}
+
+/// Capture all TLS state for the Java SSLContext supplying HttpsURLConnection.
+/// This also runs for anonymous clients: `ctx_identity` transfers scoped trust
+/// roots even when it returns no client certificate, and every context needs a
+/// stable ClientConfig to retain TLS 1.3 tickets across URL requests.
+pub(crate) fn capture_huc_ssl_context(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) {
+    let ident = ctx_identity(ctx, ctx_obj);
+    set_huc_default_client_identity(ident);
+    capture_huc_key_managers_ctx_key(ctx, ctx_obj);
+    capture_huc_trust_managers_ctx_key(ctx, ctx_obj);
+
+    let ident = huc_default_client_identity();
+    let km_ctx_key = huc_default_key_managers_ctx_key();
+    let trust_managers_ctx_key = huc_default_trust_managers_ctx_key();
+    let config = build_engine_client_config_with_identity(
+        &["http/1.1"],
+        ident
+            .as_ref()
+            .map(|(cert, key)| (cert.as_str(), key.as_str())),
+        km_ctx_key,
+        trust_managers_ctx_key,
+    );
+    *huc_default_client_config_slot().lock() = config.ok();
+}
+
+/// Returns the shared HttpsURLConnection config selected by its SSLContext.
+/// Cloning the Arc intentionally shares rustls's session-resumption store.
+pub(crate) fn huc_default_client_config() -> Option<Arc<ClientConfig>> {
+    huc_default_client_config_slot().lock().clone()
 }
 
 // -----------------------------------------------------------------------------
@@ -1243,6 +1325,51 @@ struct OcspAwareServerCertVerifier {
     revocation: crate::x509_manager::RevocationConfig,
 }
 
+/// A cryptographic-only verifier used when the caller supplied Java
+/// `TrustManager`s. Chain and hostname policy is then applied immediately
+/// after the handshake by `run_client_trust_check_for_chain`; this preserves
+/// custom managers such as Tomcat's test-only `TrustAllCerts` without making
+/// their policy invisible to the native HttpURLConnection path.
+#[derive(Debug)]
+struct PassthroughServerCertVerifier {
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PassthroughServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algorithms.supported_schemes()
+    }
+}
+
 impl rustls::client::danger::ServerCertVerifier for OcspAwareServerCertVerifier {
     fn verify_server_cert(
         &self,
@@ -1358,15 +1485,17 @@ pub(crate) fn build_client_config_with_revocation(
     alpn_protocols: &[&str],
     client_auth: Option<(&str, &str)>,
     revocation: Option<crate::x509_manager::RevocationConfig>,
+    use_java_trust_manager: bool,
 ) -> Result<Arc<ClientConfig>, String> {
-    let Some(revocation) = revocation else {
+    if revocation.is_none() && !use_java_trust_manager {
         return build_client_config(roots, alpn_protocols, client_auth);
-    };
+    }
     build_client_config_ex(
         roots,
         alpn_protocols,
         ClientAuthMode::Fixed(client_auth),
-        Some(revocation),
+        revocation,
+        use_java_trust_manager,
     )
 }
 
@@ -1382,12 +1511,14 @@ fn build_client_config_with_revocation_and_resolver(
     alpn_protocols: &[&str],
     revocation: Option<crate::x509_manager::RevocationConfig>,
     resolver: Arc<dyn ResolvesClientCert>,
+    use_java_trust_manager: bool,
 ) -> Result<Arc<ClientConfig>, String> {
     build_client_config_ex(
         roots,
         alpn_protocols,
         ClientAuthMode::Resolver(resolver),
         revocation,
+        use_java_trust_manager,
     )
 }
 
@@ -1411,20 +1542,34 @@ fn build_client_config_ex(
     alpn_protocols: &[&str],
     client_auth: ClientAuthMode<'_>,
     revocation: Option<crate::x509_manager::RevocationConfig>,
+    use_java_trust_manager: bool,
 ) -> Result<Arc<ClientConfig>, String> {
-    let builder = match revocation {
-        Some(revocation) => {
-            let roots = Arc::new(roots);
-            let inner = rustls::client::WebPkiServerVerifier::builder(roots)
-                .build()
-                .map_err(|e| format!("WebPkiServerVerifier::builder failed: {e}"))?;
-            let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
-                Arc::new(OcspAwareServerCertVerifier { inner, revocation });
-            ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(verifier)
+    let builder = if use_java_trust_manager {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+            Arc::new(PassthroughServerCertVerifier {
+                algorithms: provider.signature_verification_algorithms.clone(),
+            });
+        ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("with_safe_default_protocol_versions failed: {e}"))?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+    } else {
+        match revocation {
+            Some(revocation) => {
+                let roots = Arc::new(roots);
+                let inner = rustls::client::WebPkiServerVerifier::builder(roots)
+                    .build()
+                    .map_err(|e| format!("WebPkiServerVerifier::builder failed: {e}"))?;
+                let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+                    Arc::new(OcspAwareServerCertVerifier { inner, revocation });
+                ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(verifier)
+            }
+            None => ClientConfig::builder().with_root_certificates(roots),
         }
-        None => ClientConfig::builder().with_root_certificates(roots),
     };
     let mut config = match client_auth {
         ClientAuthMode::Resolver(resolver) => builder.with_client_cert_resolver(resolver),
@@ -2697,7 +2842,7 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         factory: ObjectRef,
     ) {
         if let Value::Object(Some(sslctx)) = ctx.get_field(factory, 0) {
-            set_huc_default_client_identity(ctx_identity(ctx, sslctx));
+            capture_huc_ssl_context(ctx, sslctx);
         }
     }
     r.register(
@@ -3623,8 +3768,8 @@ mod tests {
     }
 
     /// T2.7.13 — session resumption: two sequential handshakes to the same
-    /// server should succeed (both complete without error), demonstrating
-    /// rustls's built-in TLS 1.3 ticket-based resumption cache is active.
+    /// server must resume, demonstrating that rustls's TLS 1.3 ticket cache is
+    /// retained by the shared client configuration.
     #[test]
     fn t27_session_resumption() {
         let server_config =
@@ -3689,10 +3834,19 @@ mod tests {
                 stream.conn.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3),
                 "first handshake should be TLSv1.3"
             );
+            // The server sends TLS 1.3's NewSessionTicket after the handshake.
+            // Drain through its close_notify so rustls stores that ticket on
+            // the shared ClientConfig before the next connection is created.
+            let mut eof = [0u8; 1];
+            assert_eq!(
+                stream.read(&mut eof).unwrap(),
+                0,
+                "first connection should close after delivering its ticket"
+            );
             stream.conn.send_close_notify();
             let _ = stream.flush();
         }
-        // Second connection — should also succeed (resumption or full).
+        // Second connection must use the ticket received on the first.
         {
             let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
             let sni = ServerName::try_from("localhost".to_string()).unwrap();
@@ -3710,6 +3864,11 @@ mod tests {
             assert!(
                 stream.conn.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3),
                 "second (resumed) handshake should be TLSv1.3"
+            );
+            assert_eq!(
+                stream.conn.handshake_kind(),
+                Some(rustls::HandshakeKind::Resumed),
+                "second handshake must use the ticket from the first connection"
             );
             stream.conn.send_close_notify();
             let _ = stream.flush();
@@ -4516,6 +4675,13 @@ fn handshake_status_of(s: &EngineState) -> i32 {
     if s.closed_inbound && s.closed_outbound {
         return HS_NOT_HANDSHAKING_R;
     }
+    // `write_tls()` may have produced more than one complete TLS record. A
+    // previous wrap can legitimately emit only the first record when the
+    // caller's destination buffer is smaller than the whole flight; keep
+    // driving wrap until that queued remainder is on the wire.
+    if !s.outbound.is_empty() {
+        return HS_NEED_WRAP_R;
+    }
     let conn = match s.conn.as_ref() {
         Some(c) => c,
         None => return HS_NOT_HANDSHAKING_R,
@@ -5167,8 +5333,25 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
     Ok(())
 }
 
-/// Pump rustls outbound bytes into `state.outbound`, then transfer up to
-/// `dst`'s remaining capacity. Returns (consumed_from_app, produced_into_dst).
+/// Return the largest prefix containing only complete TLS records that fits in
+/// `capacity`. TLS records must never be split across SSLEngine.wrap calls:
+/// Tomcat writes each produced buffer directly to the channel, so a partial
+/// next record would make the peer reject the otherwise valid handshake.
+fn complete_tls_record_prefix(data: &[u8], capacity: usize) -> usize {
+    let mut end = 0usize;
+    while end + 5 <= data.len() {
+        let body_len = ((data[end + 3] as usize) << 8) | data[end + 4] as usize;
+        let record_end = end.saturating_add(5).saturating_add(body_len);
+        if record_end > data.len() || record_end > capacity {
+            break;
+        }
+        end = record_end;
+    }
+    end
+}
+
+/// Pump rustls outbound bytes into `state.outbound`, then determine how many
+/// complete TLS records fit in `dst`. Returns (consumed_from_app, produced).
 fn engine_wrap_pump(
     state: &mut EngineState,
     app_bytes: &[u8],
@@ -5194,11 +5377,10 @@ fn engine_wrap_pump(
         state.outbound.extend(out);
     }
 
-    let take = state.outbound.len().min(dst_remaining);
+    let take = complete_tls_record_prefix(&state.outbound, dst_remaining);
     let produced = take;
     if take > 0 {
-        // Drained chunk is the head of `outbound`.
-        // Caller writes it into `dst`.
+        // The caller drains this complete-record prefix into dst.
     }
     (consumed, produced)
 }
@@ -6132,22 +6314,19 @@ fn do_wrap(
             }
         };
         let (cons, _produced) = engine_wrap_pump(s, &app_bytes, dst_remaining);
-        // Drain head of state.outbound up to dst_remaining
-        let take = s.outbound.len().min(dst_remaining);
+        // Drain only complete TLS records. A partial record written to the
+        // channel cannot be recovered by a later wrap call.
+        let take = complete_tls_record_prefix(&s.outbound, dst_remaining);
         let drained: Vec<u8> = s.outbound.drain(0..take).collect();
 
-        let mut status = SR_OK;
-        if !s.outbound.is_empty() && drained.len() < dst_remaining + s.outbound.len() {
-            // We had data to put but ran out of room.
-            // (only true if dst_remaining < drained + leftover)
-            if dst_remaining == 0 || !s.outbound.is_empty() {
-                status = SR_BUFFER_OVERFLOW;
-            }
-        }
-        // dst with no remaining and we had bytes to emit -> overflow
-        if drained.is_empty() && dst_remaining == 0 && !s.outbound.is_empty() {
-            status = SR_BUFFER_OVERFLOW;
-        }
+        // Report overflow only when the destination cannot hold even the next
+        // complete record. If at least one record was emitted, returning OK
+        // lets Tomcat flush it and call wrap again for the remaining record.
+        let status = if drained.is_empty() && !s.outbound.is_empty() {
+            SR_BUFFER_OVERFLOW
+        } else {
+            SR_OK
+        };
         engine_capture_negotiation(s);
         let hs = handshake_status_of(s);
         if hs == HS_FINISHED_R {

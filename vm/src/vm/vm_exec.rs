@@ -8547,14 +8547,15 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     /// INT-8: `Reference.get()` keep-alive — route the just-read referent
-    /// through the heap's SATB pre-barrier so an active G1 mark cycle logs
+    /// through the heap's standalone SATB barrier so an active G1 mark cycle logs
     /// it as a root (the marker cannot see it through the hidden referent
     /// slot). No-op when no cycle is active; on Generational/ZGC the
-    /// pre-barrier's own marking-active gate keeps it equally cheap.
+    /// SATB barrier's marking-active gate keeps it equally cheap.
     fn gc_reference_keep_alive(&mut self, referent: ObjectRef) {
-        self.shared
-            .heap
-            .write_barrier_pre(std::ptr::null_mut(), referent);
+        // This is a keep-alive, not a reference store. `write_barrier_pre`
+        // must pair with a post-store barrier; using the standalone SATB
+        // enqueue avoids leaving that debug triad armed.
+        self.shared.heap.satb_barrier(Value::Object(Some(referent)));
     }
 
     fn record_thread_sleep(&mut self, sleep_nanos: i64, actual_duration_nanos: u64) {
