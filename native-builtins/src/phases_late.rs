@@ -9919,15 +9919,35 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // `catalina.webresources` cluster — `preVisitDirectory` does
             // `Files.copy(dir, …)`). Branch on the source kind; tolerate an
             // already-existing target dir (mirrors the file path's overwrite).
-            let src_is_dir = std::fs::symlink_metadata(&src_path)
-                .map(|m| m.is_dir())
-                .unwrap_or(false);
-            let result = if let Some((jar, entry)) = jarfs_decode(&dst_path) {
+            // Classify the SOURCE too: `src_path` may itself be a jarfs-encoded
+            // entry (e.g. a Path from `FileSystems.newFileSystem(zipPath, ...)`,
+            // as used by Quarkus's `ZipUtils.unzip`/`copyFromZip` to extract a
+            // mounted zip's contents to the real filesystem). Previously this
+            // only special-cased a jarfs DESTINATION and always read the source
+            // via `std::fs::symlink_metadata`/`std::fs::copy`, which treats the
+            // jarfs-encoded source string as a literal OS path — it never is
+            // one, so both calls failed with a raw `NotFound` ("No such file or
+            // directory (os error 2)"), surfacing as `IllegalStateException:
+            // IOException: No such file or directory (os error 2)` even though
+            // `Files.isDirectory`/`isRegularFile` on the same Path (which DO
+            // classify via `vfs_classify`/`jarfs_classify`) reported correctly.
+            let src_jarfs = jarfs_decode(&src_path);
+            let src_is_dir = if let Some((ref jar, ref entry)) = src_jarfs {
+                matches!(jarfs_classify(jar, entry), JarFsKind::Dir)
+            } else {
+                std::fs::symlink_metadata(&src_path)
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false)
+            };
+            let result = if let Some((dst_jar, dst_entry)) = jarfs_decode(&dst_path) {
                 if src_is_dir {
-                    jarfs_create_dir_entry(&jar, &entry)
+                    jarfs_create_dir_entry(&dst_jar, &dst_entry)
+                } else if let Some((src_jar, src_entry)) = &src_jarfs {
+                    jarfs_read_entry(src_jar, src_entry)
+                        .and_then(|bytes| jarfs_write_file_entry(&dst_jar, &dst_entry, &bytes))
                 } else {
                     std::fs::read(&src_path)
-                        .and_then(|bytes| jarfs_write_file_entry(&jar, &entry, &bytes))
+                        .and_then(|bytes| jarfs_write_file_entry(&dst_jar, &dst_entry, &bytes))
                 }
             } else if src_is_dir {
                 match std::fs::create_dir(&dst_path) {
@@ -9935,6 +9955,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
                     Err(e) => Err(e),
                 }
+            } else if let Some((src_jar, src_entry)) = &src_jarfs {
+                jarfs_read_entry(src_jar, src_entry)
+                    .and_then(|bytes| std::fs::write(&dst_path, &bytes))
             } else {
                 std::fs::copy(&src_path, &dst_path).map(|_| ())
             };
@@ -11763,11 +11786,45 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 }
 
 fn p57_read_path(ctx: &mut dyn NativeContext, path_obj: ObjectRef) -> String {
-    let raw = match ctx.get_field(path_obj, P57_PATH_FIELD) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => return String::new(),
-    };
-    p57_to_os_path(&raw)
+    // Fast path: CratonVM's own synthetic Path layout stores the path String
+    // directly at field 0 (P57_PATH_FIELD).
+    //
+    // Real-JDK Path implementations we don't control the layout of -- e.g. a
+    // decorator/wrapper Path like Quarkus's `io.quarkus.fs.util.sysfs.
+    // PathWrapper` (extends `DelegatingPath`, whose field 0 is the wrapped
+    // delegate Path OBJECT, not a String) -- do NOT share this layout.
+    // `io.quarkus.fs.util.FileSystemHelper.ignoreFileWriteability` wraps
+    // every Path in exactly this decorator before `ZipUtils.unzip()` mounts
+    // it, so `FileSystemProvider.newFileSystem(Path,Map)`'s jar-path
+    // extraction (below) was blindly field-0-reading a PathWrapper and
+    // silently getting back "" (read_string correctly refuses to
+    // mis-interpret the delegate-Path object as a String, but the old code
+    // treated that failure as "no path" rather than "wrong layout").  An
+    // empty jar path made `p57_alloc_jar_filesystem` skip mounting the
+    // archive at all, so the resulting FileSystem's `getRootDirectories()`
+    // fell back to the REAL host filesystem root -- `Files.walkFileTree`
+    // over "/" then tried to copy the ENTIRE host filesystem into the
+    // extraction target (observed: ~6GB and climbing, "No space left on
+    // device", then an `IOException: the source path is neither a regular
+    // file nor a symlink to a regular file` once it reached a device/socket
+    // special file under the real root).
+    //
+    // Fall back to a real virtual dispatch to `toString()` -- which every
+    // concrete Path (including delegating wrappers, via their real bytecode
+    // delegating implementation) implements correctly -- whenever the fast
+    // path doesn't yield a String.
+    if let Value::Object(Some(s)) = ctx.get_field(path_obj, P57_PATH_FIELD) {
+        if let Some(raw) = ctx.read_string(s) {
+            return p57_to_os_path(&raw);
+        }
+    }
+    match ctx.invoke_virtual(path_obj, "toString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => {
+            let raw = ctx.read_string(s).unwrap_or_default();
+            p57_to_os_path(&raw)
+        }
+        _ => String::new(),
+    }
 }
 
 /// Convert a Java-style path to an OS-native path.

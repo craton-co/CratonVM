@@ -812,7 +812,7 @@ fn bootstrap_lambda(
 
     // Parse bootstrap arguments from constant pool
     // We need to re-acquire the class manager lock briefly to resolve the BSM args
-    let (sam_erased_desc, impl_handle, instantiated_desc) = {
+    let (sam_erased_desc, impl_handle, instantiated_desc, host_loader) = {
         let cm = shared.class_manager.read();
         let class = cm
             .get_class(current_class_id)
@@ -843,7 +843,7 @@ fn bootstrap_lambda(
                 message: "LambdaMetafactory: invalid instantiated MethodType".to_string(),
             })?;
 
-        (sam_erased, impl_mh, instantiated)
+        (sam_erased, impl_mh, instantiated, class.loader_id)
     };
 
     // Parse the factory descriptor to determine:
@@ -858,12 +858,31 @@ fn bootstrap_lambda(
             ),
         })?;
 
+    // Resolve the functional interface through the HOST class's loader.
+    // A name-only lookup at dispatch time picks an arbitrary copy when two
+    // loaders define the same interface (forked-classloader tests re-define
+    // the whole framework); default methods would then execute in the wrong
+    // loader's context and produce objects failing cross-loader identity
+    // checks (Spring AOT `ArgumentCodeGenerator.and()` → javapoet
+    // `TypeName.equals` getClass() mismatch).
+    let functional_interface_id = shared
+        .class_manager
+        .read()
+        .get_loaded_class_id_for_requester(&functional_interface, host_loader);
+
+    if std::env::var_os("CRATONVM_DBG_LAMBDA_DISPATCH").is_some() {
+        eprintln!(
+            "[DBG_LAMBDA] bootstrap host={:?} loader={:?} iface={} resolved_id={:?}",
+            current_class_id, host_loader, functional_interface, functional_interface_id
+        );
+    }
     // Allocate a synthetic proxy ClassId
     let proxy_class_id = shared.alloc_lambda_proxy_id();
 
     // Build the LambdaCallSite
     let call_site = LambdaCallSite {
         functional_interface: Arc::from(functional_interface),
+        functional_interface_id,
         sam_method_name: Arc::from(info.target_name.clone()),
         sam_descriptor: Arc::from(sam_erased_desc),
         impl_handle,

@@ -258,16 +258,36 @@ fn has_own_inner_classes_entry(ctx: &mut dyn NativeContext, class_id: ClassId, c
 
 /// Canonical name: dotted form plus inner-class `$` в†’ `.` substitution.
 /// Cached per `ClassId`.
-pub(crate) fn canonical_class_name(class_id: ClassId, slashed: &str) -> Arc<str> {
+pub(crate) fn canonical_class_name(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+    slashed: &str,
+) -> Arc<str> {
     if let Some(arc) = cache_get(&CANONICAL_CLASS_NAME_CACHE, class_id) {
         return arc;
     }
     let canonical: Arc<str> = if slashed.starts_with('[') {
         Arc::from(array_descriptor_to_canonical_name(slashed).unwrap_or_default())
-    } else if slashed.contains('/') || slashed.contains('$') {
-        Arc::from(slashed.replace(['/', '$'], "."))
+    } else if let Some((_, outer_class, inner_name, _)) = ctx
+        .inner_classes(class_id)
+        .into_iter()
+        .find(|(inner_class, _, _, _)| inner_class == slashed)
+    {
+        if !outer_class.is_empty() && !inner_name.is_empty() {
+            let outer_name = ctx
+                .declaring_class(class_id)
+                .and_then(|outer_id| {
+                    ctx.class_name_of_id(outer_id).map(|outer_slashed| {
+                        canonical_class_name(ctx, outer_id, &outer_slashed).to_string()
+                    })
+                })
+                .unwrap_or_else(|| outer_class.replace(['/', '$'], "."));
+            Arc::from(format!("{outer_name}.{inner_name}"))
+        } else {
+            Arc::from(slashed.replace(['/', '$'], "."))
+        }
     } else {
-        Arc::from(slashed)
+        Arc::from(slashed.replace('/', "."))
     };
     cache_insert(&CANONICAL_CLASS_NAME_CACHE, class_id, canonical)
 }
@@ -1722,9 +1742,32 @@ pub(crate) fn native_class_for_name(
         let lookup_loader = if loader_class_name_debug
             == "org/springframework/core/test/tools/DynamicClassLoader"
         {
-            match ctx.get_field_by_name(loader, "parent") {
-                Value::Object(Some(parent)) => parent,
-                _ => loader,
+            // Only reroute when the parent is the FORKED test loader: in that
+            // configuration DynamicClassLoader's constructor defines every
+            // generated class into the fork (defineDynamicClass), so the
+            // fork's namespace is authoritative. A plain per-compile
+            // DynamicClassLoader (parent = app/test loader) defines classes
+            // ITSELF — both its lazily-defined generated classes and classes
+            // third parties (CGLIB's ReflectUtils.defineClass fallback) push
+            // into it — and rerouting to the app parent hid those,
+            // CNFE-failing the Class.forName(name, true, loader) that CGLIB
+            // issues right after a successful define.
+            let parent_is_fork = match ctx.get_field_by_name(loader, "parent") {
+                Value::Object(Some(parent)) => {
+                    let pid = ctx.class_id_of_object(parent);
+                    ctx.class_name_of_id(pid).is_some_and(|n| {
+                        n == "org/springframework/core/test/tools/CompileWithForkedClassLoaderClassLoader"
+                    })
+                }
+                _ => false,
+            };
+            if parent_is_fork {
+                match ctx.get_field_by_name(loader, "parent") {
+                    Value::Object(Some(parent)) => parent,
+                    _ => loader,
+                }
+            } else {
+                loader
             }
         } else {
             loader
@@ -2844,6 +2887,17 @@ pub(crate) fn native_class_get_simple_name(
             return Ok(Some(Value::Object(Some(result))));
         }
         if let Some(name) = ctx.class_name_of_id(class_id) {
+            if let Some((_, _, inner_name, _)) = ctx
+                .inner_classes(class_id)
+                .into_iter()
+                .find(|(inner_class, _, _, _)| inner_class == &name)
+            {
+                if !inner_name.is_empty() {
+                    let simple = cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, Arc::from(inner_name));
+                    let result = ctx.create_string(&simple);
+                    return Ok(Some(Value::Object(Some(result))));
+                }
+            }
             let is_real_inner = has_own_inner_classes_entry(ctx, class_id, &name);
             let simple = simple_class_name(class_id, &name, is_real_inner);
             let result = ctx.create_string(&simple);
@@ -10875,15 +10929,33 @@ fn build_annotation_array(
     ctx: &mut dyn NativeContext,
     annotations: &[cratonvm_native_api::AnnotationData],
 ) -> ObjectRef {
+    build_annotation_array_for(ctx, None, annotations)
+}
+
+/// Like [`build_annotation_array`] but resolves each annotation TYPE through
+/// the declaring class's defining loader (HotSpot `AnnotationParser`'s
+/// "container"). Under classloader isolation (Spring's
+/// `@CompileWithForkedClassLoader` fork re-defines the whole framework), the
+/// member's declaring class and the framework code comparing annotation types
+/// live in the SAME loader; resolving the annotation type globally instead
+/// yields the app loader's copy and every `annotationType()` identity
+/// comparison silently fails (e.g. `@Autowired` detection returning no
+/// injection metadata).
+fn build_annotation_array_for(
+    ctx: &mut dyn NativeContext,
+    declaring_class_id: Option<ClassId>,
+    annotations: &[cratonvm_native_api::AnnotationData],
+) -> ObjectRef {
     let comp = annotation_component_class_id(ctx);
     let resolvable: Vec<&cratonvm_native_api::AnnotationData> = annotations
         .iter()
         .filter(|a| annotation_type_loadable(ctx, a))
         .collect();
+    let container_loader = declaring_class_id
+        .and_then(|cid| crate::classloader::defining_loader_for(cid.as_u32()));
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
-    // No container class here (non-cached array path) в†’ global Class resolution.
     build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
-        create_annotation_proxy(ctx, resolvable[i], None)
+        create_annotation_proxy(ctx, resolvable[i], container_loader)
     })
 }
 
@@ -11489,7 +11561,7 @@ pub(crate) fn native_field_get_annotations(
         }
     };
     let annotations = ctx.field_annotations(class_id, &field_name);
-    let arr = build_annotation_array(ctx, &annotations);
+    let arr = build_annotation_array_for(ctx, Some(class_id), &annotations);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -11604,7 +11676,7 @@ pub(crate) fn native_method_get_annotations(
             }
         }
     }
-    let arr = build_annotation_array(ctx, &annotations);
+    let arr = build_annotation_array_for(ctx, Some(class_id), &annotations);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -11746,7 +11818,7 @@ pub(crate) fn native_method_get_parameter_annotations(
     for i in 0..aligned_annotations.len() {
         let anns = aligned_annotations
             .get(i)
-            .map(|a| build_annotation_array(ctx, a))
+            .map(|a| build_annotation_array_for(ctx, Some(class_id), a))
             .unwrap_or_else(|| ctx.new_ref_array(inner_comp, 0));
         ctx.set_array_element(outer, i, Value::Object(Some(anns)));
     }
@@ -13578,7 +13650,7 @@ pub(crate) fn native_class_get_canonical_name(
             return Ok(Some(Value::Object(Some(ctx.create_string(&arc)))));
         }
         if let Some(name) = ctx.class_name_of_id(class_id) {
-            let canonical = canonical_class_name(class_id, &name);
+            let canonical = canonical_class_name(ctx, class_id, &name);
             return Ok(Some(Value::Object(Some(ctx.create_string(&canonical)))));
         }
     }
@@ -16258,6 +16330,43 @@ mod tests {
             other => panic!("expected Object, got {other:?}"),
         };
         assert_eq!(ctx.read_string(obj).unwrap(), "Entry");
+    }
+
+    #[test]
+    fn class_get_canonical_name_preserves_literal_dollar_in_member_name() {
+        let mut ctx = mock_ctx();
+        let cid = ctx
+            .ensure_class_initialized("org/apache/el/TesterFunctions$Inner$Class")
+            .unwrap();
+        ctx.set_inner_classes(
+            cid,
+            vec![(
+                "org/apache/el/TesterFunctions$Inner$Class".to_string(),
+                "org/apache/el/TesterFunctions".to_string(),
+                "Inner$Class".to_string(),
+                0,
+            )],
+        );
+        let mirror = make_class_mirror(
+            &mut ctx,
+            cid.as_u32(),
+            "org/apache/el/TesterFunctions$Inner$Class",
+        );
+        let result = native_class_get_canonical_name(&mut ctx, &[Value::Object(Some(mirror))]);
+        let obj = match result.unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected Object, got {other:?}"),
+        };
+        assert_eq!(
+            ctx.read_string(obj).unwrap(),
+            "org.apache.el.TesterFunctions.Inner$Class"
+        );
+        let result = native_class_get_simple_name(&mut ctx, &[Value::Object(Some(mirror))]);
+        let obj = match result.unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected Object, got {other:?}"),
+        };
+        assert_eq!(ctx.read_string(obj).unwrap(), "Inner$Class");
     }
 
     #[test]

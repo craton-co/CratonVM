@@ -780,11 +780,11 @@ fn initialize_class_shared(
     // constraints, abstract-method implementation, Code attribute presence),
     // which is cheap and well-tested on both synthetic and real .class files.
     //
-    // Pass 3 (bytecode type-checking) is run for synthetic stub classes
-    // unconditionally. For real .class files (already verified by javac), Pass 3
-    // is run unless `--noverify` is set on the CLI, matching HotSpot's default
-    // behavior. Failures convert to `VerifyError` and prevent the class from
-    // being linked.
+    // Pass 3 (bytecode type-checking) runs at DEFINE time only
+    // (`define_class_with_options`, class_manager.rs), where ClassManager's
+    // loader-aware ClassStoreHierarchy resolves referenced names through the
+    // defining loader's delegation order. It is deliberately not repeated
+    // here; see the comment at the former call site below.
     if !shared.config.skip_verification {
         let cm = shared.class_manager.read();
         let store = &cm.class_store;
@@ -810,35 +810,28 @@ fn initialize_class_shared(
                 // This matches HotSpot's behavior: -Xverify:none for
                 // java.base, -Xverify:remote for application classes.
                 if !per_class_skip && !verifier_skip_eligible(class) {
-                    let hierarchy = ClassStoreHierarchy { store };
                     // Pass 2 вЂ” structural verification.
                     let structural =
                         crate::classloading::verifier::verify_class_structure(class, store);
-                    // Pass 3 вЂ” bytecode type-checking, lenient mode.
-                    // F3: route through `verify_class_bytecode` (JSR-aware)
-                    // instead of `bytecode_verifier::verify_bytecode` so
-                    // pre-Java-7 classes with `jsr`/`ret` subroutines
-                    // (e.g. ByteBuddy 1.12 targeting Java 5) are not
-                    // rejected by the worklist's two-`ReturnAddress`
-                    // merge в†’ Top false positive. See
-                    // `classloading/src/verifier.rs` module docs for
-                    // the JVMS В§4.10.2.5 background.
-                    // `define_class_with_options` has already performed Pass 3
-                    // using ClassManager's loader-aware hierarchy. This adapter
-                    // has only a name-indexed ClassStore, so repeating Pass 3 for
-                    // a user-defined loader can resolve a same-named app copy and
-                    // reject valid forked bytecode. Keep Pass 2 here, but trust the
-                    // authoritative define-time Pass 3 for such classes.
-                    let bytecode = structural.and_then(|()| {
-                        if matches!(
-                            class.loader_id,
-                            cratonvm_types::ClassLoaderId::UserDefined(_)
-                        ) {
-                            Ok(())
-                        } else {
-                            crate::classloading::verifier::verify_class_bytecode(class, &hierarchy)
-                        }
-                    });
+                    // Pass 3 (bytecode type-checking) is deliberately NOT
+                    // repeated at link time. Define time already ran it with
+                    // the loader-aware hierarchy; the adapter available here
+                    // is only a name-indexed ClassStore (first match across
+                    // ALL loaders). When an unrelated user-defined loader
+                    // (e.g. Spring's per-test forked TestCompiler loader)
+                    // also defines a same-named library class, is_subclass /
+                    // is_direct_superclass walk the WRONG class's hierarchy
+                    // and this re-check throws a spurious VerifyError for
+                    // bytecode the authoritative define-time Pass 3 already
+                    // accepted (seen on AssertJ's
+                    // AbstractThrowableAssert.<init> super() call in the
+                    // Spring AOT bean-registration cluster, 2026-07-13).
+                    // UserDefined-loaded classes deliberately defer Pass 3 at
+                    // define time for the same loader-fidelity reason
+                    // (`defer_loader_sensitive_pass3`), so re-checking any
+                    // loader's classes here with the naive hierarchy only
+                    // reintroduces false rejections.
+                    let bytecode = structural;
                     if let Err(e) = bytecode {
                         drop(cm);
                         // Cleanup (state -> InitializationError, clear the init
