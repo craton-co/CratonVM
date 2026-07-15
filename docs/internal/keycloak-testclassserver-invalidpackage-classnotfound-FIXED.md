@@ -97,7 +97,7 @@ underlying defect as `docs/internal/spring-boot-probe-sweep/SBR-14-urlclassloade
 
 **Verified** via an isolated A/B repro against both a `permit` and `deny`
 real external HTTP server (Python `http.server`, standing in for Keycloak's
-`TestClassServer` — see "residual" note below for why the literal upstream
+`TestClassServer` — see the historical follow-up note below for why the literal upstream
 test still can't be run end-to-end): baseline (`dev` HEAD) resolves the class
 through the app loader regardless of the server's response and never throws;
 fixed binary correctly (a) fetches real bytes and defines the class under the
@@ -111,15 +111,4 @@ resolves correctly under its own identity.
 
 Merged to `dev`.
 
-**Residual — NOT fixed by this change, tracked separately:** the literal
-`TestClassServerTest` (both `testPermittedPackage` and `testInvalidPackage`)
-still cannot be run end-to-end via Keycloak's own
-`com.sun.net.httpserver.HttpServer`, because of an unrelated, severe,
-pre-existing (confirmed present before this fix too) bug where
-`String.getBytes()` always returns an empty byte array in real-JDK mode —
-see [`string-getbytes-empty-real-jdk-mode.md`](../known-issues/string-getbytes-empty-real-jdk-mode.md).
-That bug makes `TestClassServer`'s own HTTP handler serve every response with
-`Content-Length: 0` regardless of the classloader fix above. The classloader
-defect this doc originally tracked is genuinely fixed and was verified with
-a faithful substitute (a real external HTTP server) precisely to isolate it
-from that separate, still-open blocker.
+**Follow-up resolved 2026-07-14**: the two unrelated HTTP-server blockers identified after this classloader fix are now closed: `String.getBytes()` once again produces response bytes, and [`HttpExchange.getRequestURI()` now returns a complete URI](httpserver-exchange-requesturi-getpath-empty-FIXED.md) for the handler's path routing. This document's original classloader isolation defect remains independently verified; the literal upstream Keycloak class was not rerun as part of this documentation update.

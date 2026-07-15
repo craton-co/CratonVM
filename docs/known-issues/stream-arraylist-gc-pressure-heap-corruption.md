@@ -7,15 +7,21 @@ separate residual, not resolved by that fix. **2026-07-14 update:** root-caused 
 confirmed instance (`ArrayList.add`/`add(int,Object)`/`addAll` never pinned `this`/the added
 element(s) across `al_ensure_capacity`'s internal allocation — see "Fix landed" below), but the crash
 still reproduces at `-Xmx32m` after that fix via at least one more, not-yet-pinpointed site.
-**2026-07-15 update:** fixed two more confirmed unpinned-across-GC sites (`invoke_virtual`'s lambda
-checkcast path, `native_al_stream`'s call into `resync_values_view` — the latter directly contradicts
-this doc's own 2026-07-14 "ruled out" note, which missed that `resync_values_view` runs *before*
-`native_al_stream`'s own pin), but exhaustive re-testing (30 runs at `-Xmx32m`) shows the corruption
-persists at a similar rate, with core dumps recurring at the *exact same* two call sites even after
-both fixes — meaning the staleness enters earlier than any of these functions' own bodies. Strong new
-evidence (see below) now points at a **known, previously-only-partially-mitigated GC header-race bug
-class** ("inline-alloc forgot to set kind=Array", `gen_heap.rs:8862-8880`) as the more likely root
-cause, rather than more instances of the simple stale-pin pattern. Repro source is checked in at
+**2026-07-15 update:** fixed one more confirmed unpinned-across-GC site (`native_al_stream`'s call into
+`resync_values_view` — directly contradicts this doc's own 2026-07-14 "ruled out" note, which missed
+that `resync_values_view` runs *before* `native_al_stream`'s own pin); a second (`invoke_virtual`'s
+lambda checkcast path) turned out to be the identical bug independently found and fixed, more
+thoroughly, by a same-day WildFly `parallel-extension-add` investigation — took their fix during the
+merge into `dev` (see "Fix landed #1" below). Exhaustive re-testing (30 runs at `-Xmx32m`) shows the
+corruption persists at a similar rate regardless, with core dumps recurring at the *exact same* two
+call sites even after both fixes — meaning the staleness enters earlier than any of these functions'
+own bodies. **This independently cross-confirms** that same WildFly investigation's own deeper
+finding (live instrumentation proved stale reads recur *even through the pin-table's "self-healing"
+path*): the residual is most likely a **cross-thread GC-root-visibility/timing race** in the pin-table
+remap protocol itself, not more instances of the simple stale-pin pattern. A secondary, narrower
+hypothesis (a known, previously-only-partially-mitigated GC header-race bug class — "inline-alloc
+forgot to set kind=Array", `gen_heap.rs:8862-8880`) is also documented below but not preferred over the
+cross-thread-race explanation. Repro source is checked in at
 `docs/known-issues/repros/stream-arraylist-gc-pressure/StreamOnlyStressRepro.java`.
 
 ## Repro
@@ -111,7 +117,7 @@ inspected this session — candidates: the `invokedynamic` string-concatenation 
 helpers, or another ArrayList-adjacent site not covered by this fix (e.g. `Collectors.toUnmodifiableList`'s
 own backing-list construction, distinct from `stream_apply_chain_full`'s per-element pinning).
 
-## Fix landed (2026-07-15, #1): `invoke_virtual`'s lambda-checkcast path used an `args` slice several GC-triggering calls old
+## Fix landed (2026-07-15, #1): `invoke_virtual`'s lambda-checkcast path used an `args` slice several GC-triggering calls old — superseded by a more thorough independent fix already on `dev`
 
 Got a Linux core dump (Azure host, `core_pattern` + `ulimit -c unlimited`, raw execution not a live
 gdb attach, per this repo's established technique) of the post-`8665d1ad` binary still corrupting at
@@ -139,10 +145,25 @@ invisible to the collector, so any GC in that span leaves it stale — and pinni
 snapshot (which is all `coerce_lambda_args` can do with what it's given) doesn't recover the real
 object.
 
-**Fix**: `vm/src/vm/vm_exec.rs`, `invoke_virtual`'s lambda-dispatch branch — pin every object arg via
-the existing `pin_native_object_values`/`reread_native_object_values` helpers (already used elsewhere
-in this same file for the identical `<init>`-args hazard) immediately on entering the branch, refresh
-into a local `args` before building `full_args`.
+**This is the identical bug** independently found the same day by the WildFly `parallel-extension-add`
+investigation — see
+[`../internal/fixed-suite-bugs/wildfly-invoke-virtual-lambda-sam-compat-stale-locals-FIXED.md`](../internal/fixed-suite-bugs/wildfly-invoke-virtual-lambda-sam-compat-stale-locals-FIXED.md)
+— whose fix is more thorough than the one originally landed here (it pins `receiver`/`args` *before*
+`call_site.filter(...)`'s `lambda_args_sam_compatible` call runs, not just before `full_args` is
+built afterward, and also refreshes `receiver` in the non-lambda fallback branch). Took their version
+during the merge into `dev`, verified via `cargo test -p cratonvm-vm --lib` (2202 passed / 9
+pre-existing unrelated failures) rather than re-landing a narrower duplicate.
+
+**Critical follow-up from that investigation, load-bearing for this doc's own residual (see below):**
+after landing that fix, temporary diagnostic instrumentation on `checkcast_lambda_instantiated_args`'s
+per-argument loop proved the *remaining* stale reads (post-fix, still ~5/12 repro rate) go through the
+"self-healing" pinned path (`via_pin=true`) and are **still stale** — ruling out "yet another missed
+pin site" for that residual and pointing at a **cross-thread GC-root-visibility/timing race** in the
+pin-table remap protocol itself (`thread.native_pin_roots`'s per-thread remap not reliably visible to
+that thread's own next read under WildFly's ~37-42 concurrently-executing worker threads, or an
+equivalent push-vs-concurrent-GC-cycle race). This independently confirms the same conclusion this
+doc's own "Still open after 3 pin fixes" section below reaches from a completely different repro (see
+that section).
 
 ## Fix landed (2026-07-15, #2): `native_al_stream` called `resync_values_view` on an unpinned receiver
 
@@ -168,7 +189,7 @@ before `native_al_stream` ever pins anything. (See
 `ctx.pin_native_root(this)` to before the `resync_values_view` call, and refresh via
 `ctx.read_native_pin` both before and after it (it can move `this` again via its own allocations).
 
-## Still open after 3 pin fixes: evidence this is NOT (just) more instances of the simple stale-pin pattern
+## Still open after 3 pin fixes: cross-confirms the "cross-thread GC-root-visibility race" finding from the WFLYCTL0079 investigation, on a completely different repro
 
 With both 2026-07-15 fixes applied (`cvfix3-alstream-argpin-20260714.bin`), 30 runs at `-Xmx32m`
 (Azure Linux host) still show ~90% failure (segfault or hang) — no better than before these two
@@ -187,60 +208,63 @@ Re-reading the crash mechanics: `al_state`'s `ctx.get_field(this, data_slot)` ca
 bad `arr` is a **fresh** read of `this`'s field (not a stale local) — and `al_state`/`values_view_source`/
 `al_slots_for`/`unwrap_unmod` all take `&dyn NativeContext` (shared, not `&mut`), so nothing in that
 call chain can itself allocate/GC. That means `this.elementData`'s **stored field value** is already
-wrong by the time it's read — this looks like write-side corruption of the field, not read-side
-staleness of a local variable.
+wrong by the time it's read.
 
-Separately, `gen_heap.rs:8862-8880` (`gen_object_total_size`, used by the old-gen non-moving sweep
-walker) has an existing, detailed comment describing **exactly this shape** of corruption, already
-seen once before in the "binary-trees" workload:
+**This matches, independently, the `via_pin=true` finding from the same-day `WFLYCTL0079` investigation**
+(see the "Fix landed #1" section above and
+[`wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`](wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md)'s
+2026-07-15 follow-up): that investigation proved, with live instrumentation this session didn't have
+time to reproduce here, that stale reads recur *even through the pin-table's own "self-healing" path*
+— i.e. the pin was created, was current at creation time, and the read that finally used it *still*
+observed a stale/reclaimed address. That's a stronger, better-evidenced version of this section's own
+conclusion ("the value was already wrong before either function was entered"), and points at the same
+root: a **cross-thread GC-root-visibility/timing race** in the pin-table remap protocol — either the
+per-thread `native_pin_roots` remap a moving GC performs doesn't reliably reach every thread's own copy
+before that thread's next read, or an equivalent race in how a newly-pushed pin becomes visible to a
+GC cycle starting concurrently with the push. Two structurally unrelated repros (this one: plain
+ArrayList/Stream stress, no WildFly; theirs: WildFly's `parallel-extension-add`, ~37-42 concurrent
+worker threads) hitting the identical mechanism is strong corroboration this is a systemic gap, not a
+repro-specific coincidence.
 
-> "a JIT inline-allocation path that writes `array_length` into the header but leaves `kind` at its
-> TLAB-zeroed default of `Object`" — logged as `GC: inconsistent header — kind=Object but
-> array_length=N (num_slots=N, class_id=N); inline-alloc forgot to set kind=Array` — **exactly** the
-> warning text seen in this doc's original 2026-07-14 "Unfixed" repro output.
-
-Critically, that code only makes the **old-gen sweep walker** robust to the corruption (treats it as
-"size 0", skips/resyncs past it during a major-GC sweep) — it is a defensive mitigation for one
-specific reader, not a fix for whatever JIT/allocator codegen writes the header fields
-out-of-order/incompletely in the first place. It does **nothing** to protect ordinary mutator-side
-header reads (`get_header`/`kind_of`/`class_id_of`, used by `heap_kind_of` and everything else) from
-hitting the same corrupted header directly — which plausibly also explains why
-`CRATONVM_DBG_STALE_OBJREF`'s `is_forwarded()` check sometimes fires on **garbage** (a corrupted,
-never-fully-initialized header can have random bits that happen to set the "forwarded" flag with a
-garbage forwarding address — `get_header`'s panic path dereferences that garbage pointer and
-segfaults, rather than printing the clean panic message, exactly the two failure modes this doc's
-"Observed" section already listed for the unfixed binary).
-
-Checked and ruled out: the plain-Rust array allocator path actually used by `alloc_ref_array`
-(`gc/src/gen_heap.rs:1294`, `GenHeap::try_alloc_array`) builds the *entire* `ObjectHeader` as a local
-struct (with `kind` correctly set) and writes it in one `std::ptr::write` — no obvious ordering bug
-there. If the header race is real, it's most likely in the **JIT-compiled** bytecode-level
-`newarray`/`anewarray` fast path (`jit/src/x64.rs`, `jit/src/aarch64_backend.rs`, and/or the IR
-lowering of `Op::NewArray` in `jit/src/ir.rs`) rather than this native-call allocator — plausible here
-because the repro's hot loop (24 threads × 3000 iterations) very likely crosses this VM's tiering
-threshold and gets JIT-compiled, and `Stream.of(a, b, c)`'s implicit varargs array plus any
-autoboxing in the lambda bodies are exactly the kind of array/object allocations that would go through
-JIT-emitted code once hot. This has **not** been verified directly (no confirmed backtrace showing a
-corrupted object was allocated via JIT-emitted code specifically) — it's the best-supported hypothesis
-given (a) the exact log message match to an already-documented JIT-codegen bug class, and (b) ruling
-out the native allocator as the source.
+Secondary, narrower hypothesis (not ruled in or out, may be a *specific instance* of the above rather
+than a separate mechanism): `gen_heap.rs:8862-8880` (`gen_object_total_size`, used by the old-gen
+non-moving sweep walker) has an existing, detailed comment describing a matching corruption shape,
+already seen once before in the "binary-trees" workload — "a JIT inline-allocation path that writes
+`array_length` into the header but leaves `kind` at its TLAB-zeroed default of `Object`", logged as
+`GC: inconsistent header — kind=Object but array_length=N...; inline-alloc forgot to set kind=Array` —
+**exactly** the warning text in this doc's original 2026-07-14 "Unfixed" repro output. That code only
+makes the *old-gen sweep walker* robust to the corruption (skips/resyncs past it during a major-GC
+sweep); it does nothing to protect ordinary mutator-side header reads (`get_header`/`kind_of`/
+`class_id_of`) from hitting the same corrupted header directly, which would also explain why
+`CRATONVM_DBG_STALE_OBJREF`'s `is_forwarded()` check sometimes fires on garbage (a never-fully-
+initialized header can have random bits that coincidentally set the "forwarded" flag with a garbage
+forwarding address). Checked and ruled out as the *allocator's own* bug: the plain-Rust array
+allocator path actually used by `alloc_ref_array` (`gc/src/gen_heap.rs:1294`, `GenHeap::try_alloc_array`)
+builds the entire `ObjectHeader` as a local struct (with `kind` correctly set) before a single
+`std::ptr::write` — no ordering bug there. If this mechanism is real (as opposed to being just another
+manifestation of the cross-thread pin-visibility race above), it's most likely in the JIT-compiled
+bytecode-level `newarray`/`anewarray` fast path (`jit/src/x64.rs`, `jit/src/aarch64_backend.rs`, and/or
+the IR lowering of `Op::NewArray` in `jit/src/ir.rs`) — not verified directly this session.
 
 ## Suggested next steps
 
-1. Confirm or refute the JIT-codegen hypothesis directly: instrument (or manually trace with a
-   debugger) whether a corrupted array's allocation site in a failing run was JIT-compiled code vs. a
-   native call. `jit/src/x64.rs:21980`'s arraycopy-intrinsic guard documents the header layout
-   (`kind` at offset 4, `element_type` at offset 5, `array_length` at offset 12) but is a *reader*, not
-   the allocation site — the actual header-*write* codegen for `newarray`/`anewarray` still needs to be
-   located and audited for a missing/misordered `kind=Array` store, especially under old-gen-spillover
-   or memory-pressure conditions (matches why this only reproduces at `-Xmx32m`, never `-Xmx512m`).
-2. Per this repo's established technique for GC-adjacent bugs where post-mortem analysis can't
-   distinguish "stale read" from "bad write once the field is already wrong": attach a live gdb
-   hardware watchpoint (`watch *(uint8_t*)addr`) on a specific ArrayList's `elementData` field slot (or
-   the backing array's own header `kind` byte) across its full lifetime, to catch the exact write that
-   corrupts it. A pure post-mortem core dump only shows the state *after* corruption already happened.
-3. If (1) confirms a JIT-codegen bug, this is a much larger, riskier fix (raw machine-code emission,
-   needs auditing across both the IR-based and single-pass JITs and both x64/aarch64 backends) than
-   the three pin/refresh fixes landed so far — treat as a separate, dedicated investigation rather than
-   folding it into further "just add one more pin" attempts, which this session's evidence suggests
-   will not resolve it.
+Per the WFLYCTL0079 investigation's own conclusion (which this doc's independent evidence now backs),
+**diagnosing the exact cross-thread pin-visibility gap is its own dedicated GC/threading-infrastructure
+investigation** — not a per-call-site pin audit, which both that investigation and this one have now
+shown does not resolve it:
+
+1. Instrument the pin-table remap protocol itself (`gc/src/gen_heap.rs` and whatever cross-thread
+   suspend/scan machinery services `thread.native_pin_roots`, outside the JIT-specific
+   `vm/src/jit/xt_root_scan.rs` path) to log, per remap cycle, which threads' pin tables were actually
+   walked/updated and when — looking for a thread whose pin entry was pushed at (or just after) the
+   start of a concurrent remap cycle and never got included in it.
+2. Alternatively, per this repo's established technique for GC races that post-mortem analysis can't
+   fully explain: attach a live gdb hardware watchpoint (`watch *(uint8_t*)addr`) on a specific
+   ArrayList's `elementData` field slot, or the backing array's own header `kind` byte, across its full
+   lifetime and across a GC cycle, to catch the exact write (or the exact remap step) that corrupts it.
+3. Only pursue the JIT inline-alloc `kind=Array` header-race hypothesis as a distinct investigation if
+   (1) or (2) rule out the cross-thread pin-visibility race as the explanation — don't chase both at
+   once; they may turn out to be the same underlying gap.
+4. Do not attempt further individual "add one more pin" patches for this residual without first trying
+   (1) or (2) — this session and the WFLYCTL0079 session both found and fixed a real, confirmed
+   unpinned site each, and neither made a measurable dent in the failure rate.

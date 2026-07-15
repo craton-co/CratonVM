@@ -4,23 +4,64 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
-## 2026-07-14 Stream/ArrayList heap corruption under extreme small-heap GC pressure — found by accident, NOT root-caused
+## 2026-07-15 `WFLYCTL0079` (any extension) during `parallel-extension-add`: generalized to the existing `AttributeAccess` CCE doc; "JIT required" DISPROVED; one real site FIXED, residual re-characterized
+
+With the 2026-07-14 ObjectName fix below and the prior session's stale-`ObjectRef` fixes in place,
+WildFly standalone boot progresses well past `parallel-extension-add` into "Building security domain"
+before hitting `WFLYCTL0079: Failed initializing module org.wildfly.extension.io` (or, non-deterministically,
+almost any other extension). Investigation found this is **the same bug** as
+[`wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`](wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md)'s
+`ClassCastException: java.lang.Object cannot be cast to X` family, just generalized: repro batches hit it
+against `org.wildfly.extension.elytron`, `org.jboss.as.jaxrs`, `org.wildfly.extension.undertow`,
+`org.jboss.as.clustering.infinispan`, and `org.wildfly.extension.io` itself (twice), with cast targets
+`AttributeAccess`, `AttributeDefinition`, `Comparable`, `RegistrationPoint`, `CapabilityRegistration`,
+`Predicate`, and an `AttributeAccess$Flag[]` array — confirming the originally-reported module name is
+circumstantial (whichever of the ~37-42 concurrent `parallel-extension-add` worker threads reads a
+just-corrupted address first), not diagnostic. That doc's own "JIT is required" conclusion is **disproved**:
+the identical crash reproduces under `--nojit` (4/8 attempts). One genuine, narrow contributing site was
+found and FIXED —
+[`../internal/fixed-suite-bugs/wildfly-invoke-virtual-lambda-sam-compat-stale-locals-FIXED.md`](../internal/fixed-suite-bugs/wildfly-invoke-virtual-lambda-sam-compat-stale-locals-FIXED.md):
+`vm/src/vm/vm_exec.rs::invoke_virtual`'s lambda-dispatch decision point read `receiver`/`args` again,
+unpinned, after its own `.filter()` predicate's `lambda_args_sam_compatible` call (which can trigger class
+loading) — fixed by pinning both across that window. Verified via `cargo test -p cratonvm-vm --lib`
+(2202 passed / 9 pre-existing `--release`-only failures, identical before/after via `git stash`), zero
+regressions. **Does not close the residual**: matched before/after repro batches show the same overall
+`WFLYCTL0079` rate (5/12 both). A live diagnostic (temporary instrumentation, not landed) proved the
+remaining stale reads go through the codebase's existing pin-protection path (`via_pin=true`) and are
+*still* stale — ruling out "yet another missed-pin site" and pointing instead at a cross-thread
+GC-root-visibility/timing race across WildFly's ~37-42 concurrently-executing worker threads, a
+meaningfully different (though related) characterization than the original doc's JIT-only
+`SB-CRASH-04` attribution. See that doc's own 2026-07-15 follow-up section for the full evidence chain;
+still OPEN, deliberately not further patched (deep GC/threading infrastructure work).
+
+## 2026-07-14 Stream/ArrayList heap corruption under extreme small-heap GC pressure — two more unpinned sites found+fixed 2026-07-15, still OPEN (independent cross-confirmation of the cross-thread pin-visibility race above)
 
 Found while verifying dev commit `671c8df3` (Stream/Comparator `ObjectRef` pin fix). A 24-thread
 stress repro (`ArrayList<P>` build + `stream().map().flatMap().collect(toUnmodifiableList())` +
 `stream().map().filter().findFirst()`, 3000 iterations/thread) under `-Xmx32m` segfaults on the
-unfixed binary (GC header-corruption warnings, `CRATONVM_DBG_STALE_OBJREF` did not cleanly fire) and,
-even with `671c8df3`'s fix applied, occasionally returns a silently-wrong (too-short) collected list
-instead of crashing. Both binaries pass clean at `-Xmx512m` — heap-pressure/GC-timing dependent, not a
-deterministic logic bug, and **not** something `671c8df3` was expected to fix. See
+unfixed binary and, even after `671c8df3` and a follow-up `ArrayList.add`/`addAll` pin fix
+(`8665d1ad`), still corrupts. **2026-07-15 update:** fixed two more confirmed unpinned-across-GC
+sites — `invoke_virtual`'s lambda-checkcast path (same bug as, and superseded in favor of, the
+more thorough fix in the `WFLYCTL0079` entry above) and `native_al_stream` calling
+`resync_values_view` before pinning its own receiver. Both confirmed via clean
+`CRATONVM_DBG_STALE_OBJREF` panics / core-dump backtraces. **Neither closes the residual**: 30 runs
+at `-Xmx32m` with both fixes applied still corrupt at a similar rate, recurring at the exact same
+two call stacks — independent evidence, from a completely different repro (plain ArrayList/Stream,
+no WildFly involved), for the same conclusion the `WFLYCTL0079` investigation above reached: this
+is not simply more missed-pin sites. See
 [`stream-arraylist-gc-pressure-heap-corruption.md`](stream-arraylist-gc-pressure-heap-corruption.md)
-for the full repro, symptoms, and suggested next steps. Not yet root-caused or fixed.
+for the full analysis, including a ruled-out JIT inline-alloc header-race hypothesis and suggested
+next steps (live gdb watchpoint on a corrupted field across its full lifetime).
 
-## 2026-07-14 (cont'd) String.getBytes() + Locale bootstrap regressions FIXED; new HttpExchange URI bug found
+## 2026-07-14 WildFly standalone boot ObjectName `_ca_array` NPE FIXED (100% boot blocker, open since 2026-07-10's "Bug 3a")
+
+- FIXED (moved to `docs/internal/fixed-suite-bugs/`): [`wildfly-standalone-boot-objectname-ca-array-npe-FIXED.md`](../internal/fixed-suite-bugs/wildfly-standalone-boot-objectname-ca-array-npe-FIXED.md) -- bisected regression (introduced by `d8092acb`, the same "fix-tests-real-jdk-contracts" commit responsible for the `String.getBytes()`/`java.util.Properties`/JMX-native-surface regressions in this file) that blocked 100% of WildFly-standalone-boot attempts on real JDK25, on the very first JMX MBean registration. Root cause: `d8092acb` correctly stopped `MBeanServerFactory.createMBeanServer` from being unconditionally shadowed by a synthetic server in real-JDK mode, which let real bytecode reach `Repository.addNewDomMoi` -> `ObjectName.getCanonicalKeyPropertyListString()` for the first time -- a method never natively covered against the synthetic 1-field `ObjectName` model (already known and deliberately left unfixed as "Bug 3a" in `managerwebapp-deploy-bare-assertion-FIXED.md`, 2026-07-10, when the synthetic-server shadow was still masking it). Fixed by adding `getCanonicalKeyPropertyListString`/`isPattern`/`isDomainPattern`/`isPropertyPattern`/`isPropertyListPattern` natives derived from the same canonical-string text model the rest of `ObjectName`'s natives already use. Note: a concurrent same-day fix below (`6a0eedd8`) independently re-masks `getPlatformMBeanServer()` (fixing its own, broader JMX-native-surface regression), so the *specific* WildFly boot path no longer exercises this fix either -- but the underlying `ObjectName` defect is now genuinely closed, not just re-masked, closing Bug 3a for good.
+
+## 2026-07-14 (cont'd) String.getBytes(), Locale bootstrap, and HttpExchange URI regressions FIXED
 
 - FIXED (moved to `docs/internal/`): [`string-getbytes-empty-real-jdk-mode-FIXED.md`](../internal/string-getbytes-empty-real-jdk-mode-FIXED.md) -- same failure class as the `java.util.Properties` fix (`f62d2073`): `register_real_charset_natives` (`native-builtins/src/charset.rs`) never set its own registry category, so its real-JDK-mode call sites inherited the default `SyntheticStub` and got silently dropped by `d8092acb`'s hardening. Fixed by wrapping the whole function body in `with_category(Bridge, ...)`. This was also the true root cause of the `com.sun.net.httpserver.HttpServer` "always empty body" symptom noted in the URLClassLoader fix above.
 - FIXED (moved to `docs/internal/`, found already fixed on `dev` by a concurrent session): [`locale-real-jdk-bootstrap-noclassdeffounderror-FIXED.md`](../internal/locale-real-jdk-bootstrap-noclassdeffounderror-FIXED.md) -- same root mechanism, fixed via `f62d2073`'s `java.util.Properties` bridge-pinning (the `Locale`/`BaseLocale`/`StaticProperty` chain bottoms out in the same `System.getProperties()` read that fix restored).
-- 🔴 NEW: [`httpserver-exchange-requesturi-getpath-empty.md`](httpserver-exchange-requesturi-getpath-empty.md) -- `HttpExchange.getRequestURI()` returns a `URI` whose `toString()`/`getPath()` are empty (a plain directly-constructed `URI` works fine, so this is specific to how the exchange's request URI gets built during request parsing). Now the last confirmed blocker for running Keycloak's `TestClassServerTest` end-to-end via the real `com.sun.net.httpserver.HttpServer` (its handler routes on the request path). Not yet investigated.
+- FIXED (moved to `docs/internal/`): [`httpserver-exchange-requesturi-getpath-empty-FIXED.md`](../internal/httpserver-exchange-requesturi-getpath-empty-FIXED.md) -- `HttpExchange.getRequestURI()` was writing the request target into a guessed synthetic `URI` slot (real-JDK slot 0 is `scheme`), leaving `toString()`/`getPath()` empty. It now uses the shared field-name-safe URI constructor; a live server probe verified the full target, decoded/raw path, and query.
 
 ## 2026-07-14 TestClassServerTest URLClassLoader isolation FIXED; severe new String.getBytes() regression found
 
@@ -1079,8 +1120,8 @@ it under `docs/internal`.
   [`abstractajpprocessor-socket-not-connected-FIXED.md`](../internal/tomcat-08-07/abstractajpprocessor-socket-not-connected-FIXED.md).
   The AJP secret residual is now fixed and retired; see
   [`ajp-testsecret-secret-attribute-not-enforced-FIXED.md`](../internal/tomcat-08-07/ajp-testsecret-secret-attribute-not-enforced-FIXED.md).
-  The one independently tracked remaining residual is
-  [`ajp-testnoheaders-response-body-not-empty.md`](tomcat-08-07/ajp-testnoheaders-response-body-not-empty.md).
+  The AJP no-headers residual is also fixed and retired; see
+  [`ajp-testnoheaders-response-body-not-empty-FIXED.md`](../internal/tomcat-08-07/ajp-testnoheaders-response-body-not-empty-FIXED.md).
 
 ## How many distinct bugs are here?
 

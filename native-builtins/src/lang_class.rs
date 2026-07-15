@@ -258,16 +258,36 @@ fn has_own_inner_classes_entry(ctx: &mut dyn NativeContext, class_id: ClassId, c
 
 /// Canonical name: dotted form plus inner-class `$` в†’ `.` substitution.
 /// Cached per `ClassId`.
-pub(crate) fn canonical_class_name(class_id: ClassId, slashed: &str) -> Arc<str> {
+pub(crate) fn canonical_class_name(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+    slashed: &str,
+) -> Arc<str> {
     if let Some(arc) = cache_get(&CANONICAL_CLASS_NAME_CACHE, class_id) {
         return arc;
     }
     let canonical: Arc<str> = if slashed.starts_with('[') {
         Arc::from(array_descriptor_to_canonical_name(slashed).unwrap_or_default())
-    } else if slashed.contains('/') || slashed.contains('$') {
-        Arc::from(slashed.replace(['/', '$'], "."))
+    } else if let Some((_, outer_class, inner_name, _)) = ctx
+        .inner_classes(class_id)
+        .into_iter()
+        .find(|(inner_class, _, _, _)| inner_class == slashed)
+    {
+        if !outer_class.is_empty() && !inner_name.is_empty() {
+            let outer_name = ctx
+                .declaring_class(class_id)
+                .and_then(|outer_id| {
+                    ctx.class_name_of_id(outer_id).map(|outer_slashed| {
+                        canonical_class_name(ctx, outer_id, &outer_slashed).to_string()
+                    })
+                })
+                .unwrap_or_else(|| outer_class.replace(['/', '$'], "."));
+            Arc::from(format!("{outer_name}.{inner_name}"))
+        } else {
+            Arc::from(slashed.replace(['/', '$'], "."))
+        }
     } else {
-        Arc::from(slashed)
+        Arc::from(slashed.replace('/', "."))
     };
     cache_insert(&CANONICAL_CLASS_NAME_CACHE, class_id, canonical)
 }
@@ -2844,6 +2864,17 @@ pub(crate) fn native_class_get_simple_name(
             return Ok(Some(Value::Object(Some(result))));
         }
         if let Some(name) = ctx.class_name_of_id(class_id) {
+            if let Some((_, _, inner_name, _)) = ctx
+                .inner_classes(class_id)
+                .into_iter()
+                .find(|(inner_class, _, _, _)| inner_class == &name)
+            {
+                if !inner_name.is_empty() {
+                    let simple = cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, Arc::from(inner_name));
+                    let result = ctx.create_string(&simple);
+                    return Ok(Some(Value::Object(Some(result))));
+                }
+            }
             let is_real_inner = has_own_inner_classes_entry(ctx, class_id, &name);
             let simple = simple_class_name(class_id, &name, is_real_inner);
             let result = ctx.create_string(&simple);
@@ -13578,7 +13609,7 @@ pub(crate) fn native_class_get_canonical_name(
             return Ok(Some(Value::Object(Some(ctx.create_string(&arc)))));
         }
         if let Some(name) = ctx.class_name_of_id(class_id) {
-            let canonical = canonical_class_name(class_id, &name);
+            let canonical = canonical_class_name(ctx, class_id, &name);
             return Ok(Some(Value::Object(Some(ctx.create_string(&canonical)))));
         }
     }
@@ -16258,6 +16289,43 @@ mod tests {
             other => panic!("expected Object, got {other:?}"),
         };
         assert_eq!(ctx.read_string(obj).unwrap(), "Entry");
+    }
+
+    #[test]
+    fn class_get_canonical_name_preserves_literal_dollar_in_member_name() {
+        let mut ctx = mock_ctx();
+        let cid = ctx
+            .ensure_class_initialized("org/apache/el/TesterFunctions$Inner$Class")
+            .unwrap();
+        ctx.set_inner_classes(
+            cid,
+            vec![(
+                "org/apache/el/TesterFunctions$Inner$Class".to_string(),
+                "org/apache/el/TesterFunctions".to_string(),
+                "Inner$Class".to_string(),
+                0,
+            )],
+        );
+        let mirror = make_class_mirror(
+            &mut ctx,
+            cid.as_u32(),
+            "org/apache/el/TesterFunctions$Inner$Class",
+        );
+        let result = native_class_get_canonical_name(&mut ctx, &[Value::Object(Some(mirror))]);
+        let obj = match result.unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected Object, got {other:?}"),
+        };
+        assert_eq!(
+            ctx.read_string(obj).unwrap(),
+            "org.apache.el.TesterFunctions.Inner$Class"
+        );
+        let result = native_class_get_simple_name(&mut ctx, &[Value::Object(Some(mirror))]);
+        let obj = match result.unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected Object, got {other:?}"),
+        };
+        assert_eq!(ctx.read_string(obj).unwrap(), "Inner$Class");
     }
 
     #[test]

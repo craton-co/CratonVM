@@ -1,17 +1,77 @@
 # WildFly standalone boot: `ClassCastException: java.lang.Object cannot be cast to org.jboss.as.controller.registry.AttributeAccess` during `parallel-extension-add` — register-invisible JIT root family, confirmed occurrence
 
-Status: OPEN — confirmed (from source, cross-referenced against three
-independent prior investigations) as an occurrence of the already-tracked
-"register-invisible JIT root" bug family (a residual gap within the
-default-on precise-JIT-oop-map machinery, tracked as `SB-CRASH-04` in
-`jit/src/x64.rs`). Documented here, not fixed — this repo's established
-policy for this family is to document, not speculatively patch (see "Why not
-fixed" below).
+Status: OPEN — two independent 2026-07-14/2026-07-15 follow-ups (both below)
+narrow this further without closing it. The 2026-07-14 revalidation ruled out
+the default-on full-GPR safepoint spill (`02b91823`), both JIT/root-scan
+caches, and broadened STW peer scanning as fixes. The 2026-07-15 follow-up
+generalizes the symptom to `WFLYCTL0079: Failed initializing module <any
+extension>` (not limited to `AttributeAccess` or to this doc's
+originally-named extensions), **disproves this doc's own "JIT is required"
+claim** (reproduces identically under `--nojit`), and — consistent with the
+2026-07-14 finding that broadened STW scanning didn't help — found via live
+capture that the stale read goes through the *pinned* path (not a
+missed-pin fallback), pointing at a cross-thread GC-root-visibility race
+rather than a simple unpinned-local or JIT-register-visibility bug. One
+genuine, narrow contributing site (unrelated to the ruled-out mechanisms
+above) was found and FIXED (see
+`docs/internal/fixed-suite-bugs/wildfly-invoke-virtual-lambda-sam-compat-stale-locals-FIXED.md`)
+but does not close the residual. Still documented here, not further patched
+— see both follow-up sections below for the full evidence chain.
 
 Investigated 2026-07-13, worktree
 `C:/craton/cratonvm/.claude/worktrees/attrib-cce-investigate`, branch
 `investigate/wildfly-attributeaccess-cce-20260713`, forked from `origin/dev @
 a7680d77`.
+
+## 2026-07-14 revalidation and residual isolation
+
+The supplied Azure host built cratonvm-cli --release from ab423500 with
+CARGO_TARGET_DIR=/data/target-wildfly-attributeaccess-rootfix-20260714 and
+used the uniquely named binary
+/data/target-wildfly-attributeaccess-rootfix-20260714/release/java-wildfly-attributeaccess-rootfix-20260714.
+Each probe cloned the WildFly standalone installation into
+/data/wildfly-attributeaccess-rootfix-20260714-probe, cleared standalone/data/tmp,
+and ran the real jboss-modules standalone boot with a 45-second limit. Logs are
+under /data/wildfly-attributeaccess-rootfix-20260714-probe/logs/ on that host.
+
+### Control result: the issue still reproduces on current dev
+
+Ten clean boots of the current dev binary produced one AttributeAccess CCE,
+five sibling AttributeDefinition CCEs, two complete boots, one SIGSEGV
+(exit 139), and one STW hang. The target failure is in boot_1.log; sibling
+failures are in boot_3.log, boot_4.log, boot_6.log, boot_7.log, and boot_9.log.
+
+This is direct counter-evidence to treating 02b91823 as a complete fix for
+this document. Its full-GPR safepoint spill remains present in the build, but
+both CCE forms still occur.
+
+### Root-scanning experiments that did not fix it
+
+* CRATONVM_DBG_FULLSTACK_SCAN=1 was used for nine completed-or-timed probe
+  attempts. A sibling AttributeDefinition CCE still occurred. This batch did
+  not sample an AttributeAccess CCE, so it neither proves nor disproves
+  suppression of the target alone; it does disprove a complete family fix.
+* Disabling both the JIT scan cache and root-snapshot cache with
+  CRATONVM_NO_JIT_SCAN_CACHE=1 CRATONVM_ROOTSNAP_CACHE=0 produced two
+  AttributeAccess CCEs, two AttributeDefinition CCEs, one complete boot, two
+  STW hangs, and one timeout in eight attempts. Neither cache is the cause of
+  this residual.
+* An isolated source experiment expanded STW peer scanning to include every
+  alive peer rather than only the blocked JIT-return window. Ten boots still
+  produced one AttributeAccess CCE, five AttributeDefinition CCEs, one
+  complete boot, one SIGSEGV, one STW hang, and one timeout. The experiment
+  was reverted and is not part of the commit.
+
+### Current conclusion
+
+The CCE family remains reproducible, but the tested explanations are now
+excluded: default full-GPR safepoint spilling, the two root-scan caches, and
+broadened STW peer scanning do not eliminate it. The existing fast-path
+analysis below remains useful for locating where the stale reference is
+observed, but it is not sufficient to attribute the corruption to a
+register-invisible root. The upstream stale-object/reference corruption point
+is still unknown. There are no newly fixed items to remove or move to
+docs/internal.
 
 ## Background
 
@@ -428,3 +488,107 @@ found insufficient or actively broken.
   "Family 1" bug class this session's `CRATONVM_DBG_STALE_OBJREF` run
   instead mostly caught a fresh (post-"FIXED") instance of; see "Separate
   finding" above.
+
+## 2026-07-15 follow-up: generalized to `WFLYCTL0079` (any extension), "JIT required" DISPROVED, one real contributing site FIXED, residual re-characterized as a likely cross-thread GC-root-visibility gap
+
+Investigated 2026-07-15, isolated worktree `/data/data/wt-io0079-20260715` (Azure host), forked from
+`origin/dev @ 3a6bd4a6`, following up on a fresh sighting of `WFLYCTL0079: Failed initializing module
+org.wildfly.extension.io` (the generic `parallel-extension-add` wrapper this doc's `AttributeAccess` CCE
+also produces).
+
+### This is the same bug, not `io`-specific, and not `AttributeAccess`-specific
+
+A 12-attempt plain repro batch (default JIT-on, real JDK25, no diagnostic flags — matching this project's
+standard WildFly repro recipe) against a fresh baseline binary hit `WFLYCTL0079` via
+`ClassCastException: java.lang.Object cannot be cast to X` 5/12 times, with `X` and the failing extension
+different on every occurrence:
+
+| Run | Failing extension | Cast target `X` |
+|---|---|---|
+| 1 | `org.wildfly.extension.elytron` | `org.jboss.as.controller.registry.AttributeAccess` |
+| 4 | `org.jboss.as.jaxrs` | `org.jboss.as.controller.registry.AttributeAccess` |
+| 5 | `org.wildfly.extension.undertow` | `org.jboss.as.controller.registry.AttributeAccess` |
+| 6 | `org.jboss.as.clustering.infinispan` | `java.lang.Comparable` |
+| 11 | `org.jboss.as.jaxrs` | `org.jboss.as.controller.AttributeDefinition` |
+
+A second such batch (see "Verification" under the fix doc below) also hit `WFLYCTL0079` directly against
+**`org.wildfly.extension.io`** twice (cast targets `AttributeDefinition` both times), confirming the
+original bug report's module name is circumstantial — whichever of the ~37-42 `parallel-extension-add`
+worker threads happens to read a just-corrupted/reclaimed address first is the one that fails, and that's
+a function of GC/scheduling timing, not anything specific to the `io`/XNIO extension itself. Other
+observed cast targets across both sessions: `[Lorg.jboss.as.controller.registry.AttributeAccess$Flag;`
+(an array type), `org.jboss.as.controller.capability.registry.RegistrationPoint`,
+`org.jboss.as.controller.capability.registry.CapabilityRegistration`,
+`java.util.function.Predicate`. This is one bug family, not several — updating this doc's status
+accordingly rather than filing a separate `WFLYCTL0079` doc.
+
+### "JIT is required" is DISPROVED — reproduces identically under `--nojit`
+
+This doc's own "Conclusion" section (above) rests centrally on: "Generational's young collector provably
+never relocates objects while any JIT frame is active... so the 'moving GC left a dangling old-address
+pointer' mechanism is structurally excluded" when JIT is required for the bug. An 8-attempt repro batch
+with `CRATONVM_DISABLE_JIT=1` (zero JIT frames anywhere in the process) hit the byte-for-byte identical
+`ClassCastException: java.lang.Object cannot be cast to X` / `WFLYCTL0079` shape 4/8 times (cast targets:
+`java.util.function.Predicate`, `org.jboss.as.controller.AttributeDefinition` ×2,
+`org.jboss.as.controller.registry.AttributeAccess`,
+`org.jboss.as.controller.capability.registry.RegistrationPoint`). **JIT is not required.** This doc's
+"register-invisible JIT root" / `SB-CRASH-04` attribution — a gap specifically in the JIT's precise
+local-oop dataflow tracking — cannot be the (sole) mechanism, since there is no JIT-compiled code involved
+in a `--nojit` run at all. The underlying moving-GC-during-active-mutation mechanism this doc's own
+"Conclusion" reasoned must be excluded is, per this new evidence, not excluded — it is precisely what
+happens when JIT is off (Generational's own documented invariant only suppresses the moving collector
+`while any JIT frame is active`; nothing suppresses it when there are none).
+
+### Live root-cause chase: found and fixed one genuine, narrow contributing site
+
+Live `CRATONVM_DBG_STALE_OBJREF=1 RUST_BACKTRACE=1` captures consistently isolated the panic to a
+`java.util.stream` pipeline's deferred lambda dispatch:
+`native_stream_to_array_gen` → `stream_process_chain` → `invoke_deferred_stream_lambda` → `invoke_virtual`
+→ `coerce_lambda_args` → `checkcast_lambda_instantiated_args` → `lambda_arg_provably_not_instance` →
+panic in `get_header`. Reading `invoke_virtual` (`vm/src/vm/vm_exec.rs`) found a genuine, unpinned-local
+GC-safety bug at its lambda-dispatch decision point: `receiver` and `args` are read again (to build
+`full_args`) *after* the `.filter()` predicate's `lambda_args_sam_compatible` call, which can itself
+trigger class loading (a GC-triggering call) — and neither local was pinned across that window. **Fixed**
+— see `docs/internal/fixed-suite-bugs/wildfly-invoke-virtual-lambda-sam-compat-stale-locals-FIXED.md` for
+the full fix writeup and verification (`cargo test -p cratonvm-vm --lib`: 2202 passed / 9 pre-existing
+unrelated failures, byte-for-byte identical before/after via `git stash`).
+
+### The fix does not close the residual — and the residual is NOT another missed-pin site
+
+Matched 12-attempt plain repro batches before/after the fix show `WFLYCTL0079`-via-CCE at essentially the
+same rate (5/12 both). To find out why, temporary diagnostic instrumentation was added to
+`checkcast_lambda_instantiated_args`'s per-argument loop (`vm/src/runtime/interpreter.rs`, reverted before
+landing — not part of the committed fix) to log, for the exact argument index that panics, whether the
+read went through the pinned path (`handles.get(idx) => Some(h) => thread.native_pin_roots[h]`) or the
+raw unpinned fallback (`args.get(idx)`).
+
+**Result: `via_pin=true` on every captured panic, both with JIT on and with `--nojit`.** The stale read is
+not falling through to the unpinned fallback branch — it goes through the "self-healing" pinned path this
+function's own GC-safety comment describes, and *still* observes a stale/reclaimed address. This rules out
+"another site simply forgot to pin" as the explanation for the residual (that class of bug is
+straightforwardly fixable per-site, as the `invoke_virtual` fix above demonstrates) and points instead at
+something more fundamental: either the per-thread `native_pin_roots` remap performed during a moving GC
+does not reliably reach every thread's pin table before that thread's own next read (a cross-thread
+visibility/ordering gap, plausible given `parallel-extension-add` runs ~37-42 concurrently *executing*
+mutator threads, each independently pinning/reading its own native locals while a GC initiated by any one
+of them needs to freeze — or at least correctly observe — all the others), or an equivalent race in how a
+newly-pushed pin becomes visible to a GC cycle that starts concurrently with the push. Both are
+plausible restatements of the general "register-invisible root" concern this doc already tracks, but the
+concrete mechanism is now better characterized as a **cross-thread GC-root-visibility/timing race**,
+distinct from (though related to) the JIT-specific precise-oop-map dataflow gap (`SB-CRASH-04`) this doc's
+original "Conclusion" attributed it to. Diagnosing the exact synchronization gap (in the GC's cross-thread
+pin-scan/remap protocol, `gc/src/gen_heap.rs` and whatever cross-thread suspend/scan machinery it uses
+outside the JIT-specific `vm/src/jit/xt_root_scan.rs` path) is its own dedicated investigation — deep
+GC/threading infrastructure work, consistent with this doc's existing policy of documenting rather than
+speculatively patching this family. Not attempted here.
+
+### Updated conclusion
+
+`WFLYCTL0079`/`AttributeAccess`/`AttributeDefinition`/etc. CCEs during `parallel-extension-add` remain
+**OPEN**. One confirmed, narrow, real contributing site was found and fixed
+(`wildfly-invoke-virtual-lambda-sam-compat-stale-locals-FIXED.md`), safe to land on its own merits
+(verified via `cargo test`, zero regressions) but not sufficient to close this residual. The residual
+itself is now better evidenced as a cross-thread GC-root-visibility race rather than confirmed to be the
+JIT-only `SB-CRASH-04` gap the original investigation named — that attribution should be treated as
+superseded by this section, not as still-authoritative. Whoever picks this up next should start from the
+`via_pin=true` finding above rather than re-chasing individual unpinned-local sites.

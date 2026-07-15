@@ -1,11 +1,19 @@
-# TestELInJsp — 4/25 failures with client-side SocketTimeoutException
+# TestELInJsp — historical SocketTimeoutException residuals (retired)
 
-**Status:** PARTIALLY FIXED (2026-07-13) — the STW cross-thread JIT takeover
-mechanism that caused `testBug45427` to fail is root-caused and fixed;
-`testBug45427` now PASSES reliably. A separate, still-open residual remains
-(see below), shared with
-[stw-crossthread-jit-takeover-hang-cluster.md](stw-crossthread-jit-takeover-hang-cluster.md).
-**Severity:** medium. **HotSpot:** PASS (fresh-verified).
+**Historical status (2026-07-13):** this note initially recorded the STW
+takeover failure and two later JSP/socket residuals. It is retained solely as
+the investigation history; no known issue remains.
+
+## Closure update (2026-07-15)
+
+**Status: RESOLVED and retired.** The `Class.getCanonicalName()` repair,
+STW takeover work, and async socket fixes are on `dev`. Fresh Azure release
+validation with a unique binary passed all three issue-specific contracts:
+`TestELInJsp#testBug45427`, `#testBug49555`, and `#testBug61854a`.
+The last test used the built examples-webapp libraries required by its JSTL
+fixture; it completed in about four seconds rather than timing out.
+
+**Severity:** closed. **HotSpot:** PASS (fresh-verified).
 
 ## Root cause #1 (FIXED) — STW takeover self-inflicted scan storm
 

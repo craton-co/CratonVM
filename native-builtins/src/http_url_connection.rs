@@ -1528,19 +1528,11 @@ fn perform(
                 let _ = ctx.new_ref_array(cid, 0);
             }
         }
-        // Build a client config that trusts the gathered test/truststore roots
-        // (not just the OS root store — a loopback test server's cert is signed
-        // by a test CA) and presents the client certificate installed via
-        // HttpsURLConnection.setDefaultSSLSocketFactory (mTLS). Falls back to the
-        // cached system-roots config when no test roots / client identity exist.
-        let huc_ident = crate::t27_tls::huc_default_client_identity();
-        let huc_km_ctx_key = crate::t27_tls::huc_default_key_managers_ctx_key();
-        let cfg = crate::t27_tls::build_engine_client_config_with_identity(
-            &["http/1.1"],
-            huc_ident.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
-            huc_km_ctx_key,
-        )
-        .unwrap_or_else(|_| shared_legacy_config());
+        // Reuse the ClientConfig captured from SSLContext.getSocketFactory().
+        // It contains the configured trust roots/client identity and owns the
+        // TLS ticket cache required for a following connection to resume.
+        // If no custom SSLContext was captured, use cached system roots.
+        let cfg = crate::t27_tls::huc_default_client_config().unwrap_or_else(shared_legacy_config);
         let server_name = ServerName::try_from(parsed.host.clone())
             .map_err(|e| format!("bad server name {}: {e}", parsed.host))?;
         let conn = ClientConnection::new(cfg, server_name)
@@ -1612,6 +1604,26 @@ fn perform(
                     })?;
                 }
             }
+            if let Some(tm_ctx_key) = crate::t27_tls::huc_default_trust_managers_ctx_key() {
+                let peer_chain: Vec<Vec<u8>> = stream
+                    .conn
+                    .peer_certificates()
+                    .map(|certs| certs.iter().map(|cert| cert.as_ref().to_vec()).collect())
+                    .unwrap_or_default();
+                if peer_chain.is_empty() {
+                    return Err(format!(
+                        "{TLS_HANDSHAKE_FAILURE_SENTINEL}no peer certificate available for \
+                         TrustManager verification"
+                    ));
+                }
+                crate::t27_tls::run_client_trust_check_for_chain(ctx, tm_ctx_key, peer_chain)
+                    .map_err(|_| {
+                        format!(
+                            "{TLS_HANDSHAKE_FAILURE_SENTINEL}TrustManager rejected the peer \
+                             certificate chain"
+                        )
+                    })?;
+            }
             stream.write_all(&req).map_err(|e| format!("write: {e}"))?;
             stream.flush().map_err(|e| format!("flush: {e}"))?;
             // A TLS 1.3 client considers ITS side of the handshake finished (and so
@@ -1626,7 +1638,7 @@ fn perform(
             // falling through to `huc_real_perform`'s generic "-1" contract (which
             // is correct for a genuinely malformed-but-present HTTP response, not
             // for zero bytes at all).
-            read_response(&mut stream, head).map_err(|e| {
+            let response = read_response(&mut stream, head).map_err(|e| {
                 if e == "connection closed before response head" {
                     format!(
                         "{TLS_HANDSHAKE_FAILURE_SENTINEL}connection closed immediately after the \
@@ -1636,7 +1648,36 @@ fn perform(
                 } else {
                     e
                 }
-            })
+            })?;
+            // TLS 1.3 tickets are post-handshake messages. The response body
+            // may finish before the server's NewSessionTicket has been read;
+            // consume any immediately available control records so the shared
+            // ClientConfig retains the ticket for the next URL connection.
+            let old_timeout = stream.sock.read_timeout().ok().flatten();
+            let _ = stream
+                .sock
+                .set_read_timeout(Some(Duration::from_millis(100)));
+            while stream.conn.wants_read() {
+                match stream.conn.read_tls(&mut stream.sock) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        stream.conn.process_new_packets().map_err(|e| {
+                            format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}post-handshake TLS: {e}")
+                        })?;
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(e) => return Err(format!("post-handshake TLS read: {e}")),
+                }
+            }
+            let _ = stream.sock.set_read_timeout(old_timeout);
+            Ok(response)
         })();
         drop(active_ctx_guard);
         outcome

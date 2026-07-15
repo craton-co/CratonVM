@@ -152,6 +152,46 @@ fn register_object_name(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/lang/String;",
         native_object_name_get_key_property,
     );
+    // RKC-ObjectName-01: `getCanonicalKeyPropertyListString` and the
+    // `is*Pattern` family are real, un-intercepted-until-now `ObjectName`
+    // methods that `com.sun.jmx.mbeanserver.Repository`/`JmxMBeanServer`
+    // call on every `addMBean`/`queryNames` dispatch as soon as real JDK
+    // bytecode constructs a genuine `JmxMBeanServer` (see
+    // `native-api/src/registry.rs`'s `drop_synthetic_stubs` and
+    // `vm/src/vm/vm_init.rs`). The real bytecode for these methods reads
+    // private fields (`_ca_array`, `_compressed_storage`, ...) that this
+    // synthetic 1-field `ObjectName` model never populates (construction is
+    // always native-Bridge-shortcut, see `object_name_new`/`object_name_set_text`
+    // above) -- `_ca_array` in particular is a reference field, so an
+    // out-of-bounds read of it yields `null`, and real bytecode's
+    // `_ca_array.length` then NPEs. Implement these against the same
+    // canonical-string text model the rest of this file already uses
+    // (`object_name_parts`, `getDomain`, `getKeyProperty`) instead.
+    r.register(
+        cls,
+        "getCanonicalKeyPropertyListString",
+        "()Ljava/lang/String;",
+        native_object_name_get_canonical_key_property_list_string,
+    );
+    r.register(cls, "isPattern", "()Z", native_object_name_is_pattern);
+    r.register(
+        cls,
+        "isDomainPattern",
+        "()Z",
+        native_object_name_is_domain_pattern,
+    );
+    r.register(
+        cls,
+        "isPropertyPattern",
+        "()Z",
+        native_object_name_is_property_pattern,
+    );
+    r.register(
+        cls,
+        "isPropertyListPattern",
+        "()Z",
+        native_object_name_is_property_list_pattern,
+    );
     r.register(
         cls,
         "apply",
@@ -417,6 +457,91 @@ fn object_name_parts(text: &str) -> (String, Vec<(String, String)>, bool) {
     (domain.to_string(), props, is_pattern)
 }
 
+/// `ObjectName.getCanonicalKeyPropertyListString()`: the canonical
+/// (domain-and-pattern-suffix-stripped) key-property-list portion of the
+/// name, e.g. `"type=MBeanServerDelegate"` for
+/// `"JMImplementation:type=MBeanServerDelegate"`. Mirrors real JDK's
+/// `_canonicalName.substring(domainLength + 1, len)` but derived from the
+/// synthetic text model (field 0) instead of the real private fields.
+fn native_object_name_get_canonical_key_property_list_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let text = object_name_text(ctx, this);
+    let props_str = text.split_once(':').map(|(_, p)| p).unwrap_or("");
+    let props_str = props_str.strip_suffix(",*").unwrap_or(props_str);
+    let props_str = if props_str == "*" { "" } else { props_str };
+    let s = ctx.create_string(props_str);
+    Ok(Some(Value::Object(Some(s))))
+}
+
+fn native_object_name_is_domain_pattern(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let text = object_name_text(ctx, this);
+    let (domain, _, _) = object_name_parts(&text);
+    Ok(Some(Value::Int(
+        (domain.contains('*') || domain.contains('?')) as i32,
+    )))
+}
+
+fn native_object_name_is_property_list_pattern(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let text = object_name_text(ctx, this);
+    let (_, _, is_plist_pattern) = object_name_parts(&text);
+    Ok(Some(Value::Int(is_plist_pattern as i32)))
+}
+
+fn native_object_name_is_property_pattern(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let text = object_name_text(ctx, this);
+    let (_, props, is_plist_pattern) = object_name_parts(&text);
+    let value_pattern = props
+        .iter()
+        .any(|(_, v)| v.contains('*') || v.contains('?'));
+    Ok(Some(Value::Int((is_plist_pattern || value_pattern) as i32)))
+}
+
+/// `ObjectName.isPattern()`: true iff the domain contains a wildcard or the
+/// name is a property pattern (property-list pattern, e.g. `"d:k=v,*"`, or a
+/// property-value pattern, e.g. `"d:k=*"`).
+fn native_object_name_is_pattern(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let text = object_name_text(ctx, this);
+    let (domain, props, is_plist_pattern) = object_name_parts(&text);
+    let domain_pattern = domain.contains('*') || domain.contains('?');
+    let value_pattern = props
+        .iter()
+        .any(|(_, v)| v.contains('*') || v.contains('?'));
+    Ok(Some(Value::Int(
+        (domain_pattern || is_plist_pattern || value_pattern) as i32,
+    )))
+}
+
 fn native_object_name_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -489,16 +614,31 @@ fn native_object_name_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Int(hash)))
 }
 
-/// Fake-JDK fallback for `ManagementFactory.getPlatformMBeanServer()`.
+/// Synthetic `ManagementFactory.getPlatformMBeanServer()` used in BOTH
+/// real- and fake-JDK modes.
 ///
-/// Real-JDK mode must normally run the JDK bytecode for this method so it can
-/// construct a concrete `JmxMBeanServer`. This native is tagged as a
-/// SyntheticStub and the dispatcher protects the real bytecode path; it only
-/// exists for fake-JDK launches where `ManagementFactory` itself is a synthetic
-/// stub and the method would otherwise be missing.
+/// UPDATED 2026-07-14: this was previously tagged SyntheticStub on the
+/// theory that real-JDK mode should "normally run the JDK bytecode for
+/// this method" and only fall back to this stub for fake-JDK launches.
+/// That theory was never actually exercised until `set_drop_synthetic_stubs`
+/// started defaulting on for real-JDK mode (dev d8092acb) and this
+/// registration got dropped for the first time: real bytecode for
+/// `getPlatformMBeanServer()` -> `MBeanServerFactory.createMBeanServer()`
+/// -> `new JmxMBeanServer(...)` -> ... -> `Repository.addMBean` ->
+/// `ObjectName.getCanonicalKeyPropertyListString()` NPEs on a null
+/// `_ca_array` deep inside real `com.sun.jmx.mbeanserver.*` bytecode that
+/// this VM has apparently never successfully interpreted end-to-end before.
+/// That's a real, deep, uninvestigated interpreter/real-mode gap -- not
+/// something to chase here. Tag as Bridge (registered in both modes,
+/// intercepting the real bytecode path entirely) so boot doesn't depend on
+/// that untested path succeeding, matching this file's established
+/// register_mbean_server/register_management_factory precedent ("its own
+/// comment: `register_mbean_server` ... `register_management_factory` ...
+/// deliberately called unconditionally by `register_jmx_natives` in BOTH
+/// real- and synthetic-JDK registration branches").
 pub fn register_management_factory_platform_server_stub(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(
         "java/lang/management/ManagementFactory",
         "getPlatformMBeanServer",
@@ -530,8 +670,12 @@ pub fn register_management_factory_platform_server_stub(r: &mut NativeMethodRegi
 /// real-JDK mode (synthetic-mode-only field layouts).
 pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
-    // (probe eprintln removed — registration confirmed working)
+    // These are native entry points of real JDK classes, not replacements for
+    // synthetic class bytecode. In real-JDK mode a SyntheticStub registration
+    // is deliberately excluded from dispatch, which made getVersion0 appear
+    // missing despite being registered here. Keep this bridge category pinned
+    // so ManagementFactory's VMManagementImpl can link during application boot.
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/VMManagementImpl";
 
     // Management interface version. OpenJDK reports "10.0" for JDK 8+.
@@ -997,7 +1141,7 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 fn register_jmx_connector_factory(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(
         "javax/management/remote/JMXConnectorFactory",
         "newJMXConnector",
@@ -1235,7 +1379,7 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
 /// `ManagementFactoryHelper`, so this is intentionally minimal.
 pub fn register_class_loading_impl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/ClassLoadingImpl";
 
     // setVerboseClass(Z)V — accept and ignore (synthetic verbose flag is
@@ -1261,7 +1405,7 @@ pub fn register_class_loading_impl(r: &mut NativeMethodRegistry) {
 /// `VMManagementImpl.isGcNotificationSupported` returns `false`).
 pub fn register_garbage_collector_impl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/GarbageCollectorImpl";
 
     // getCollectionCount — REAL: cumulative GC count from the VM's own
@@ -1326,7 +1470,7 @@ pub fn register_garbage_collector_impl(r: &mut NativeMethodRegistry) {
 /// `ManagementFactoryHelper` doesn't filter the bean out.)
 pub fn register_memory_manager_impl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/MemoryManagerImpl";
 
     r.register(
@@ -1367,7 +1511,7 @@ pub fn register_memory_manager_impl(r: &mut NativeMethodRegistry) {
 /// regardless of field-layout drift.
 pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/MemoryPoolImpl";
 
     r.register(
@@ -1504,7 +1648,7 @@ pub fn alloc_garbage_collector_impl(ctx: &mut dyn NativeContext, name: &str) -> 
 /// via the OperatingSystemMXBean alloc above, not from this class.)
 pub fn register_operating_system_impl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/OperatingSystemImpl";
 
     let neg_one_long: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
@@ -1592,7 +1736,7 @@ pub fn register_hotspot_diagnostic(r: &mut NativeMethodRegistry) {
     // OpenJDK's HotSpotDiagnostic class is in `sun.management` (the public
     // facade lives in `com.sun.management.HotSpotDiagnosticMXBean`).
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/HotSpotDiagnostic";
 
     // dumpHeap0(String, Z)V — heap dumping is a major separate effort;
@@ -1625,7 +1769,7 @@ pub fn register_hotspot_diagnostic(r: &mut NativeMethodRegistry) {
 /// queries return zero / empty.
 pub fn register_flag_impl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/Flag";
 
     r.register(cls, "getInternalFlagCount", "()I", |_ctx, _args| {
@@ -1715,7 +1859,7 @@ pub fn register_flag_impl(r: &mut NativeMethodRegistry) {
 
 fn register_management_factory(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/ManagementFactory";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -2046,22 +2190,61 @@ fn register_platform_logging_mxbean(r: &mut NativeMethodRegistry) {
 }
 
 // ---------------------------------------------------------------------------
-// 3. MemoryMXBean — 6-field synthetic
+// 3. MemoryMXBean — concrete real-JDK MemoryImpl
 // ---------------------------------------------------------------------------
 
+/// Populate the inherited state that `NotificationEmitterSupport` normally
+/// establishes in its Java constructor.
+///
+/// Synthetic management beans are allocated without running Java constructors.
+/// `sun.management.MemoryImpl` inherits `NotificationEmitterSupport`, whose
+/// `addNotificationListener` synchronizes on `listenerLock` and then mutates
+/// `listenerList`. Leaving either field null makes a real JMX client (notably
+/// Micrometer's `JvmHeapPressureMetrics`) fail during bootstrap.
+fn init_notification_emitter_support(ctx: &mut dyn NativeContext, emitter: ObjectRef) -> ObjectRef {
+    // Both construction paths can allocate and relocate the receiver, so keep
+    // it rooted and re-read it before every field access.
+    let pin = ctx.pin_native_root(emitter);
+    let current = ctx.read_native_pin(pin, emitter);
+    if !matches!(
+        ctx.get_field_by_name(current, "listenerLock"),
+        Value::Object(Some(_))
+    ) {
+        let lock = match ctx.new_object("java/lang/Object") {
+            Ok(Some(Value::Object(Some(lock)))) => lock,
+            _ => alloc_concurrent_synthetic(ctx, "java/lang/Object", 0),
+        };
+        let current = ctx.read_native_pin(pin, emitter);
+        ctx.set_field_by_name(current, "listenerLock", Value::Object(Some(lock)));
+    }
+
+    let current = ctx.read_native_pin(pin, emitter);
+    if !matches!(
+        ctx.get_field_by_name(current, "listenerList"),
+        Value::Object(Some(_))
+    ) {
+        let list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[]) {
+            Ok(Some(Value::Object(Some(list)))) => list,
+            // Synthetic-mode fallback. The real initialized ArrayList above
+            // is required for real-JDK mode and covered by the probe.
+            _ => alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2),
+        };
+        let current = ctx.read_native_pin(pin, emitter);
+        ctx.set_field_by_name(current, "listenerList", Value::Object(Some(list)));
+    }
+
+    let result = ctx.read_native_pin(pin, emitter);
+    ctx.unpin_native_roots(pin);
+    result
+}
+
 fn alloc_memory_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryMXBean", 6);
-    // Wire to real heap stats
-    let heap_used = ctx.heap_allocated_bytes() as i64;
-    let heap_max = ctx.max_heap_bytes(); // configured -Xmx (container-aware)
-    let heap_committed = heap_used.max(64 * 1024 * 1024); // committed >= used
-    ctx.set_field(obj, 0, Value::Long(heap_used)); // heapUsed (real)
-    ctx.set_field(obj, 1, Value::Long(heap_max)); // heapMax
-    ctx.set_field(obj, 2, Value::Long(heap_committed)); // heapCommitted
-    ctx.set_field(obj, 3, Value::Long(4 * 1024 * 1024)); // nonHeapUsed
-    ctx.set_field(obj, 4, Value::Long(64 * 1024 * 1024)); // nonHeapMax
-    ctx.set_field(obj, 5, Value::Int(0)); // objectPendingFinalization
-    obj
+    // `MemoryMXBean` is an interface. Returning an object stamped with that
+    // interface makes `instanceof NotificationEmitter` false and hides
+    // MemoryImpl's inherited listener implementation. The concrete class's
+    // registered `getMemoryUsage0` bridge still supplies live heap values.
+    let obj = alloc_concurrent_synthetic(ctx, "sun/management/MemoryImpl", 1);
+    init_notification_emitter_support(ctx, obj)
 }
 
 fn alloc_memory_usage(
@@ -2694,7 +2877,7 @@ fn alloc_compilation_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
 
 fn register_compilation_mxbean(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/CompilationMXBean";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -3158,7 +3341,7 @@ fn mbs_lookup_bean_at(ctx: &dyn NativeContext, server: ObjectRef, i: usize) -> O
 
 pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "javax/management/MBeanServer";
     r.register(cls, "<init>", "()V", |ctx, args| {
         // Initialise the registry on a freshly-constructed synthetic server
@@ -4135,6 +4318,105 @@ mod jmx_tests {
         );
         // Null name -> empty key, no panic.
         assert_eq!(object_name_key(&mut ctx, None), "");
+    }
+
+    #[test]
+    fn test_object_name_new_natives_are_registered_bridge() {
+        // RKC-ObjectName-01 regression test: getCanonicalKeyPropertyListString
+        // and the is*Pattern family must be registered (previously they fell
+        // through to real bytecode, which NPEs on the synthetic 1-field
+        // ObjectName's never-populated `_ca_array`/`_compressed_storage`).
+        let mut r = NativeMethodRegistry::new();
+        register_jmx_natives(&mut r);
+        let cls = "javax/management/ObjectName";
+        assert!(r
+            .find(cls, "getCanonicalKeyPropertyListString", "()Ljava/lang/String;")
+            .is_some());
+        assert!(r.find(cls, "isPattern", "()Z").is_some());
+        assert!(r.find(cls, "isDomainPattern", "()Z").is_some());
+        assert!(r.find(cls, "isPropertyPattern", "()Z").is_some());
+        assert!(r.find(cls, "isPropertyListPattern", "()Z").is_some());
+    }
+
+    #[test]
+    fn test_object_name_get_canonical_key_property_list_string() {
+        let mut ctx = crate::test_utils::mock_ctx();
+        let name = object_name_new(
+            &mut ctx,
+            "JMImplementation:type=MBeanServerDelegate".to_string(),
+        );
+        let result = native_object_name_get_canonical_key_property_list_string(
+            &mut ctx,
+            &[Value::Object(Some(name))],
+        )
+        .unwrap()
+        .unwrap();
+        let s = match result {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap(),
+            other => panic!("expected a String, got {other:?}"),
+        };
+        assert_eq!(s, "type=MBeanServerDelegate");
+
+        // Domain-only pattern ("d:*") has no key properties.
+        let pattern_name = object_name_new(&mut ctx, "java.lang:*".to_string());
+        let result = native_object_name_get_canonical_key_property_list_string(
+            &mut ctx,
+            &[Value::Object(Some(pattern_name))],
+        )
+        .unwrap()
+        .unwrap();
+        let s = match result {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap(),
+            other => panic!("expected a String, got {other:?}"),
+        };
+        assert_eq!(s, "");
+
+        // Property-list pattern ("d:k=v,*") strips the trailing ",*".
+        let plist_pattern = object_name_new(&mut ctx, "d:k=v,*".to_string());
+        let result = native_object_name_get_canonical_key_property_list_string(
+            &mut ctx,
+            &[Value::Object(Some(plist_pattern))],
+        )
+        .unwrap()
+        .unwrap();
+        let s = match result {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap(),
+            other => panic!("expected a String, got {other:?}"),
+        };
+        assert_eq!(s, "k=v");
+    }
+
+    #[test]
+    fn test_object_name_is_pattern_family() {
+        let mut ctx = crate::test_utils::mock_ctx();
+
+        let concrete = object_name_new(
+            &mut ctx,
+            "JMImplementation:type=MBeanServerDelegate".to_string(),
+        );
+        let is_pattern = |ctx: &mut dyn NativeContext, f: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult, obj: ObjectRef| {
+            matches!(f(ctx, &[Value::Object(Some(obj))]).unwrap().unwrap(), Value::Int(1))
+        };
+        assert!(!is_pattern(&mut ctx, native_object_name_is_pattern, concrete));
+        assert!(!is_pattern(&mut ctx, native_object_name_is_domain_pattern, concrete));
+        assert!(!is_pattern(&mut ctx, native_object_name_is_property_pattern, concrete));
+        assert!(!is_pattern(&mut ctx, native_object_name_is_property_list_pattern, concrete));
+
+        let domain_pattern = object_name_new(&mut ctx, "java.*:type=Memory".to_string());
+        assert!(is_pattern(&mut ctx, native_object_name_is_pattern, domain_pattern));
+        assert!(is_pattern(&mut ctx, native_object_name_is_domain_pattern, domain_pattern));
+        assert!(!is_pattern(&mut ctx, native_object_name_is_property_list_pattern, domain_pattern));
+
+        let plist_pattern = object_name_new(&mut ctx, "d:k=v,*".to_string());
+        assert!(is_pattern(&mut ctx, native_object_name_is_pattern, plist_pattern));
+        assert!(is_pattern(&mut ctx, native_object_name_is_property_pattern, plist_pattern));
+        assert!(is_pattern(&mut ctx, native_object_name_is_property_list_pattern, plist_pattern));
+        assert!(!is_pattern(&mut ctx, native_object_name_is_domain_pattern, plist_pattern));
+
+        let value_pattern = object_name_new(&mut ctx, "d:k=*".to_string());
+        assert!(is_pattern(&mut ctx, native_object_name_is_pattern, value_pattern));
+        assert!(is_pattern(&mut ctx, native_object_name_is_property_pattern, value_pattern));
+        assert!(!is_pattern(&mut ctx, native_object_name_is_property_list_pattern, value_pattern));
     }
 
     #[test]

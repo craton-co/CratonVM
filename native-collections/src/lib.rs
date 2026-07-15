@@ -2135,7 +2135,7 @@ pub fn native_al_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    resync_values_view(ctx, this);
+    let this = resync_values_view(ctx, this);
     let (data, size) = al_state(ctx, this);
     if data.is_none() {
         if let Some(r) =
@@ -2152,7 +2152,7 @@ pub fn native_al_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
-    resync_values_view(ctx, this);
+    let this = resync_values_view(ctx, this);
     let (data, size) = al_state(ctx, this);
     if data.is_none() {
         if let Some(r) =
@@ -2173,7 +2173,7 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Int(i)) => *i,
         _ => return Ok(Some(Value::Object(None))),
     };
-    resync_values_view(ctx, this);
+    let this = resync_values_view(ctx, this);
     let (data, size) = al_state(ctx, this);
     if index < 0 || index >= size {
         // JDK contract: out-of-range index throws IndexOutOfBoundsException
@@ -2377,7 +2377,7 @@ pub fn native_al_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    resync_values_view(ctx, this);
+    let this = resync_values_view(ctx, this);
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
     if let Some(cls_name) = ctx.class_name_of_id(ctx.class_id_of_object(this)) {
         if cls_name == "java/util/EnumSet" {
@@ -2680,7 +2680,7 @@ pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    resync_values_view(ctx, this);
+    let this = resync_values_view(ctx, this);
     // `java/util/List.iterator()` / `Collection.iterator()` / `Iterable.iterator()`
     // are all wired to this native at the interface level (see
     // `register_interface_natives`).  When the receiver is *not* a
@@ -7221,11 +7221,15 @@ fn is_synthetic_map_entry_class(name: &str) -> bool {
             || name.ends_with("$SimpleImmutableEntry"))
 }
 
-fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) {
+fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) -> ObjectRef {
     let source = match values_view_source(ctx, list) {
         Some(s) => s,
-        None => return,
+        None => return list,
     };
+    let list_pin = ctx.pin_native_root(list);
+    let source_pin = ctx.pin_native_root(source);
+    let list = ctx.read_native_pin(list_pin, list);
+    let source = ctx.read_native_pin(source_pin, source);
     // Determine whether elements are Map.Entry (entrySet) by inspecting the
     // current head element's class — restricted to our synthetic entry classes
     // so an app value type named `*Entry` is not misread as an entry.
@@ -7257,8 +7261,6 @@ fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) {
     // live via CRATONVM_DBG_STALE_OBJREF: native_al_stream ->
     // resync_values_view -> al_set_data -> al_slots_for dereferencing a
     // stale `list`.
-    let list_pin = ctx.pin_native_root(list);
-    let source_pin = ctx.pin_native_root(source);
 
     let vals: Vec<Value> = if is_entry_view {
         let mut flat_entries: Vec<Value> = Vec::with_capacity(entries.len() * 2);
@@ -7300,7 +7302,9 @@ fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) {
     ctx.set_array_element(buf, cap - 1, Value::Object(Some(source)));
     al_set_data(ctx, list, buf);
     al_set_size(ctx, list, vals.len() as i32);
+    let list = ctx.read_native_pin(list_pin, list);
     ctx.unpin_native_roots(list_pin);
+    list
 }
 
 /// If `list`'s element array carries a `values()`-view source-map marker in
@@ -9446,11 +9450,42 @@ fn native_arrays_sort_objects(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     }
 
     // Stable merge sort (O(n log n)) with fallible comparator.
-    merge_sort_fallible(ctx, &mut items, |c, a, b| compare_via_compare_to(c, a, b))?;
-
-    for (i, val) in items.iter().enumerate() {
-        ctx.set_array_element(arr, i, *val);
+    //
+    // GC-SAFETY (Family-1 stale-ObjectRef fix, mirroring native_collections_sort's
+    // established idiom): `compare_via_compare_to` dispatches the elements'
+    // `compareTo` via `invoke_virtual` up to O(n log n) times, and each dispatch
+    // can run arbitrary user bytecode and trigger a moving GC. `arr` was held
+    // raw across the whole sort and reused directly afterward by the
+    // `set_array_element` write-back loop below -- and every entry in `items`
+    // is a raw `ObjectRef` snapshot taken once before the sort and never
+    // refreshed, so a GC triggered by comparing any OTHER pair can relocate an
+    // element already sitting in `items`, leaving both the eventual write-back
+    // and the *next* `compare_via_compare_to` dispatch on that element
+    // operating on a stale/dangling reference. Pin `arr` and every element (via
+    // the same index-array trick as `native_collections_sort`, which keeps
+    // `items`/`elem_handles` index-stable while only the `idx` permutation is
+    // shuffled by the merge), refresh each right before use.
+    let arr_pin = ctx.pin_native_root(arr);
+    let (_, elem_handles) = pin_value_slice(ctx, &items);
+    let mut idx: Vec<Value> = (0..items.len() as i32).map(Value::Int).collect();
+    let sort_result = merge_sort_fallible(ctx, &mut idx, |c, a, b| {
+        let ia = if let Value::Int(v) = a { *v as usize } else { 0 };
+        let ib = if let Value::Int(v) = b { *v as usize } else { 0 };
+        let ea = read_pinned_elem(c, elem_handles[ia], items[ia]);
+        let eb = read_pinned_elem(c, elem_handles[ib], items[ib]);
+        compare_via_compare_to(c, &ea, &eb)
+    });
+    if let Err(e) = sort_result {
+        ctx.unpin_native_roots(arr_pin);
+        return Err(e);
     }
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    for (out, slot) in idx.iter().enumerate() {
+        let i = if let Value::Int(v) = slot { *v as usize } else { 0 };
+        let val = read_pinned_elem(ctx, elem_handles[i], items[i]);
+        ctx.set_array_element(arr, out, val);
+    }
+    ctx.unpin_native_roots(arr_pin);
     Ok(None)
 }
 
@@ -9833,10 +9868,42 @@ fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     }
     // Stable merge sort (O(n log n)) with fallible comparator.
-    merge_sort_fallible(ctx, &mut items, |c, a, b| compare_via_compare_to(c, a, b))?;
-    for (i, val) in items.iter().enumerate() {
-        ctx.set_array_element(data, i, *val);
+    //
+    // GC-SAFETY (Family-1 stale-ObjectRef fix, mirroring sort_with_comparator's
+    // established idiom): `compare_via_compare_to` dispatches the elements'
+    // `compareTo` via `invoke_virtual` up to O(n log n) times, and each
+    // dispatch can run arbitrary user bytecode and trigger a moving GC. `data`
+    // was held raw across the whole sort and reused directly afterward by the
+    // `set_array_element` write-back loop below -- and every entry in `items`
+    // is a raw `ObjectRef` snapshot taken once before the sort and never
+    // refreshed, so a GC triggered by comparing any OTHER pair can relocate an
+    // element already sitting in `items`, leaving both the eventual write-back
+    // and the *next* `compare_via_compare_to` dispatch on that element
+    // operating on a stale/dangling reference. Pin `data` and every element
+    // (via the same index-array trick as `sort_with_comparator`, which keeps
+    // `items`/`elem_handles` index-stable while only the `idx` permutation is
+    // shuffled by the merge), refresh each right before use.
+    let data_pin = ctx.pin_native_root(data);
+    let (_, elem_handles) = pin_value_slice(ctx, &items);
+    let mut idx: Vec<Value> = (0..items.len() as i32).map(Value::Int).collect();
+    let sort_result = merge_sort_fallible(ctx, &mut idx, |c, a, b| {
+        let ia = if let Value::Int(v) = a { *v as usize } else { 0 };
+        let ib = if let Value::Int(v) = b { *v as usize } else { 0 };
+        let ea = read_pinned_elem(c, elem_handles[ia], items[ia]);
+        let eb = read_pinned_elem(c, elem_handles[ib], items[ib]);
+        compare_via_compare_to(c, &ea, &eb)
+    });
+    if let Err(e) = sort_result {
+        ctx.unpin_native_roots(data_pin);
+        return Err(e);
     }
+    let data = ctx.read_native_pin(data_pin, data);
+    for (out, slot) in idx.iter().enumerate() {
+        let i = if let Value::Int(v) = slot { *v as usize } else { 0 };
+        let val = read_pinned_elem(ctx, elem_handles[i], items[i]);
+        ctx.set_array_element(data, out, val);
+    }
+    ctx.unpin_native_roots(data_pin);
     Ok(None)
 }
 
@@ -10035,7 +10102,7 @@ fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    resync_values_view(ctx, this);
+    let this = resync_values_view(ctx, this);
     // Collect elements first to avoid borrowing issues during invoke_virtual.
     // Use the generic helper so non-ArrayList collections (EnumSet/TreeSet/…)
     // routed here through the AbstractCollection/Iterable interface natives are
@@ -12164,8 +12231,10 @@ fn stream_process_chain(
         return Ok(PullStep::Stop);
     }
 
+    let mut cur_pin = pin_value(ctx, cur);
     let mut i = start;
     while i < chain.len() {
+        cur = read_pinned_elem(ctx, cur_pin, cur);
         let op = &chain[i];
         let lambda =
             read_lazy_chain_lambda(ctx, op, chain_pins.get(i).copied().unwrap_or(usize::MAX));
@@ -12190,7 +12259,13 @@ fn stream_process_chain(
                         "(Ljava/lang/Object;)Ljava/lang/Object;",
                         &[cur],
                     ) {
-                        Ok(r) => cur = r.unwrap_or(Value::Object(None)),
+                        Ok(r) => {
+                            if cur_pin != usize::MAX {
+                                ctx.unpin_native_roots(cur_pin);
+                            }
+                            cur = r.unwrap_or(Value::Object(None));
+                            cur_pin = pin_value(ctx, cur);
+                        },
                         Err(e) if is_placeholder_object_class_cast(ctx, cur, &e) => {
                             // SPR-AOT-JUNIT-URI.1 (2026-07-08) - JUnit suite
                             // discovery can leak a raw Object placeholder into
@@ -12265,7 +12340,12 @@ fn stream_process_chain(
         }
         i += 1;
     }
-    emit(ctx, cur)
+    let cur = read_pinned_elem(ctx, cur_pin, cur);
+    let result = emit(ctx, cur);
+    if cur_pin != usize::MAX {
+        ctx.unpin_native_roots(cur_pin);
+    }
+    result
 }
 
 fn stream_pull_internal(
@@ -13545,21 +13625,19 @@ fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return make_stream(ctx, &[]),
     };
     // GC-safety: `this` is a plain Rust copy of the interpreter's args slice,
-    // invisible to the collector. `resync_values_view` allocates (a
-    // values()-view resync mints a new backing array, an entrySet resync
-    // mints a SimpleEntry per element) and can trigger a moving GC before
-    // this function ever pins anything -- leaving `this` stale for
-    // resync_values_view's own first dereference (values_view_source ->
-    // al_state -> heap_kind_of), which then decodes a stale/reused array
-    // header as "inconsistent" and segfaults or silently corrupts the
-    // resulting stream. Pin `this` up front and refresh both before and
-    // after resync_values_view (which can itself move `this` again via its
-    // own allocations). Confirmed live via CRATONVM_DBG_STALE_OBJREF under
-    // concurrent stream map/flatMap stress at -Xmx32m; see
+    // invisible to the collector, and may already be stale by the time this
+    // native runs. `resync_values_view`'s first read (values_view_source ->
+    // al_state -> heap_kind_of) dereferences `this` immediately -- pin and
+    // refresh before handing it off rather than trusting the incoming copy.
+    // `resync_values_view` itself now returns the (possibly further
+    // refreshed) list -- it allocates internally for an actual values()-view
+    // resync and can move `this` again via its own allocations. Confirmed
+    // live via CRATONVM_DBG_STALE_OBJREF under concurrent stream map/flatMap
+    // stress at -Xmx32m; see
     // docs/known-issues/stream-arraylist-gc-pressure-heap-corruption.md.
     let this_pin = ctx.pin_native_root(this);
     let this = ctx.read_native_pin(this_pin, this);
-    resync_values_view(ctx, this);
+    let this = resync_values_view(ctx, this);
     // `al_state` returns an empty ArrayList (Some, size 0) — not None — for a
     // non-ArrayList collection like RegularEnumSet, so the old `Some` branch
     // produced an empty stream for `enumSet.stream()`. Use the generic helper,
@@ -21238,7 +21316,7 @@ fn ll_real_field(name: &str) -> Option<&'static str> {
 
 fn ll_get(ctx: &dyn NativeContext, this: ObjectRef, name: &'static str) -> Value {
     {
-        let ov = ll_overlay().lock().unwrap();
+        let ov = ll_overlay().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(v) = ov
             .get(&widened_obj_key(ctx, this))
             .and_then(|m| m.get(name))
@@ -22652,7 +22730,7 @@ fn lhm_overlay_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
 }
 fn lhm_get(ctx: &dyn NativeContext, this: ObjectRef, name: &str, _fallback: usize) -> Value {
     {
-        let m = lhm_overlay().lock().unwrap();
+        let m = lhm_overlay().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(v) = m
             .get(&lhm_overlay_key(ctx, this))
             .and_then(|inner| inner.get(name))
@@ -22687,7 +22765,7 @@ fn lhm_set(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback: 
         .unwrap()
         .insert(this.as_ptr() as usize, key);
     {
-        let mut m = lhm_overlay().lock().unwrap();
+        let mut m = lhm_overlay().lock().unwrap_or_else(|e| e.into_inner());
         m.entry(key).or_default().insert(name.to_string(), v);
     }
     // Mirror the structural pointers to the REAL JDK heap fields so that
@@ -22730,7 +22808,7 @@ fn lhm_set(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback: 
 /// the clone produces an empty overlay — acceptable because pre-rekey
 /// the same call leaked the entry entirely on every GC move.
 pub fn clone_lhm_overlay(src: ObjectRef, dst: ObjectRef) {
-    let cache = lhm_ptr_cache().lock().unwrap();
+    let cache = lhm_ptr_cache().lock().unwrap_or_else(|e| e.into_inner());
     let src_key = match cache.get(&(src.as_ptr() as usize)) {
         Some(k) => *k,
         None => return,
@@ -22745,7 +22823,7 @@ pub fn clone_lhm_overlay(src: ObjectRef, dst: ObjectRef) {
         None => dst.as_ptr() as usize,
     };
     drop(cache);
-    let mut m = lhm_overlay().lock().unwrap();
+    let mut m = lhm_overlay().lock().unwrap_or_else(|e| e.into_inner());
     let src_state = m.get(&src_key).cloned();
     if let Some(s) = src_state {
         m.insert(dst_key, s);
@@ -22759,7 +22837,7 @@ pub fn clone_lhm_overlay(src: ObjectRef, dst: ObjectRef) {
 pub fn clone_lhm_overlay_ctx(ctx: &dyn NativeContext, src: ObjectRef, dst: ObjectRef) {
     let src_key = lhm_overlay_key(ctx, src);
     let dst_key = lhm_overlay_key(ctx, dst);
-    let mut m = lhm_overlay().lock().unwrap();
+    let mut m = lhm_overlay().lock().unwrap_or_else(|e| e.into_inner());
     let src_state = m.get(&src_key).cloned();
     if let Some(s) = src_state {
         m.insert(dst_key, s);
@@ -23380,6 +23458,10 @@ fn native_lhm_put_evict(
     // dereferencing a stale `this`. Pin once up front, re-read after every
     // hazard, and unpin once at each exit.
     let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key_val);
+    let value_pin = pin_value(ctx, value);
+    let key_val = read_pinned_elem(ctx, key_pin, key_val);
+    let value = read_pinned_elem(ctx, value_pin, value);
 
     let hash = match key_val {
         Value::Object(Some(k)) => map_hash_key(ctx, k)?,
@@ -23390,6 +23472,8 @@ fn native_lhm_put_evict(
         }
     };
     let this = ctx.read_native_pin(this_pin, this);
+    let key_val = read_pinned_elem(ctx, key_pin, key_val);
+    let value = read_pinned_elem(ctx, value_pin, value);
 
     // Check for resize. Also initialize table when buckets is None
     // (e.g. `org/springframework/core/annotation/AnnotationAttributes`
@@ -23405,11 +23489,14 @@ fn native_lhm_put_evict(
         lhm_resize(ctx, this);
     }
     let this = ctx.read_native_pin(this_pin, this);
+    let key_val = read_pinned_elem(ctx, key_pin, key_val);
+    let value = read_pinned_elem(ctx, value_pin, value);
 
     // Check for existing key
     if let Some(node) = lhm_find_node(ctx, this, &key_val)? {
         let this = ctx.read_native_pin(this_pin, this);
         let old = ctx.get_field(node, LHM_NODE_VALUE);
+        let value = read_pinned_elem(ctx, value_pin, value);
         ctx.set_field(node, LHM_NODE_VALUE, value);
         // Access-order semantics: re-inserting a value for an existing key
         // counts as a structural access, so the entry must move to the tail
@@ -23442,6 +23529,8 @@ fn native_lhm_put_evict(
     // native_map_put). Pin `buckets` across the alloc and re-read both after
     // (`this` reuses the outer `this_pin` established at function entry).
     let buckets_pin = ctx.pin_native_root(buckets);
+    let key_val = read_pinned_elem(ctx, key_pin, key_val);
+    let value = read_pinned_elem(ctx, value_pin, value);
     let new_node = lhm_alloc_node(ctx, key_val, value, hash);
     let this = ctx.read_native_pin(this_pin, this);
     let buckets = ctx.read_native_pin(buckets_pin, buckets);

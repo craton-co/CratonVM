@@ -1,10 +1,29 @@
-# `com.sun.net.httpserver.HttpExchange.getRequestURI()` returns a `URI` whose `toString()`/`getPath()` are empty
+# FIXED: `HttpExchange.getRequestURI()` now returns a complete `URI`
 
-Status: open — found while verifying [`string-getbytes-empty-real-jdk-mode.md`](string-getbytes-empty-real-jdk-mode.md) (now FIXED, moved to `docs/internal/`); not yet root-caused or fixed.
+Status: FIXED 2026-07-14 - remote build-and-probe verified.
 
 Date observed: 2026-07-14, Azure Linux build host.
 
-## Summary
+## Resolution (2026-07-14)
+
+`HttpExchange.getRequestURI()` stored the HTTP request target as a `String`,
+but then allocated a six-slot synthetic `java.net.URI` and wrote that text to
+slot 0. In real-JDK mode slot 0 is the `scheme`, not the URI's full-text
+cache/path, so the URI natives correctly observed no usable path or external
+form.
+
+The getter now reads the target before allocating and uses the existing
+layout-safe `make_uri` helper. That helper populates real JDK URI fields by
+name (`string`, `path`, query, and scheme-specific-part), avoiding all
+synthetic-versus-real field-slot collisions.
+
+## Verification
+
+A dedicated release build on the Azure Linux host served
+`GET /hello/a%20b?mode=check` with `uri=/hello/a%20b?mode=check`, decoded
+`path=/hello/a b`, `rawPath=/hello/a%20b`, and `query=mode=check`.
+
+## Original symptom (fixed)
 
 Inside a `com.sun.net.httpserver.HttpHandler.handle(HttpExchange)` callback,
 `exchange.getRequestURI()` returns a real, non-null `java.net.URI` instance
@@ -35,7 +54,7 @@ constructed/populated during request parsing inside CratonVM's
 `com.sun.net.httpserver.HttpServer` implementation
 (`native-builtins/src/net_phase_e.rs`), not the `URI` class itself.
 
-## Impact
+## Original impact (fixed)
 
 Blocks any `HttpHandler` that routes on the request path — which is exactly
 what Keycloak's `TestClassServer` (see
@@ -51,7 +70,7 @@ end-to-end via the real upstream `com.sun.net.httpserver.HttpServer` (the two
 other blockers found the same day — `String.getBytes()` returning empty, and
 the underlying `URLClassLoader` isolation bug — are both fixed).
 
-## Repro
+## Original repro
 
 ```java
 import com.sun.net.httpserver.*;
@@ -79,7 +98,9 @@ curl http://127.0.0.1:8613/hello/x
 # actual:          uri=,        path=
 ```
 
-## Next steps
+## Historical investigation notes (superseded)
+
+The notes below are retained for provenance; the resolution and verification above are authoritative.
 
 Not investigated yet — the fix session for the co-discovered
 `String.getBytes()`/`java.util.Properties` bugs above ran out of scope budget
