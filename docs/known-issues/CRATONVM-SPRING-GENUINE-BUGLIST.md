@@ -370,10 +370,66 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     connector's blocking native call sites for the same missing `begin_blocking_region` pattern.
     Also unfixed: the T19.H1 watchdog stack-dump itself SIGSEGVs when JIT frames are on the stack
     (separate small bug; `--nojit` dumps work).
-*   `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` — pathological
+*   `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` —
+    pathological slowness (>1800s vs HotSpot's 13s, 160 tests). **2026-07-15 update**: confirmed
+    genuine forward progress, not a hang (frame counts change across successive
+    `--stack-dump-on-timeout` watchdog dumps — the watchdog fires repeatedly during a single run,
+    which doubles as a free sampling profiler: 10,970 dumps captured over ~40s). Aggregating the
+    innermost non-framework frame across all dumps found the hot path: **`ConfigurationClassParser.
+    parse`** (6004 samples), **`AbstractHttpHandlerIntegrationTests.startServer`** (5970), and —
+    disproportionately — raw **Xerces XML parsing** (`XML11Configuration.parse` 4638 samples,
+    `XMLDTDValidator.emptyElement` 1986, full SAX/DTD-scanning call chain beneath it) — roughly
+    **42% of all sampled CPU time** inside Xerces, for a workload (annotation-`@Configuration`
+    Spring context + embedded Tomcat/Reactor/Jetty bootstrap, 160x) that should barely touch XML
+    parsing at all. `org/apache/catalina/util/LifecycleBase.start` (2751) confirms embedded Tomcat
+    startup as a major contributor — Tomcat's own bootstrap parses internal
+    `web.xml`/`web-fragment.xml`-shaped descriptors (with DTD validation) even for a minimal
+    reactive server, once per test-created server instance. **Leading hypothesis**: CratonVM's
+    Xerces execution has a performance bug (missing JIT tier-up for Xerces's hot methods — matching
+    the already-documented `jit-instance-methods-no-invocation-tierup` family — or per-native-call
+    dispatch overhead compounding across Xerces's very high internal call count per parse, matching
+    the already-fixed-but-precedent-setting `HashMap native-dispatch overhead` investigation) rather
+    than a fixed per-file cost, since the SAME small descriptor is likely reparsed from scratch on
+    every one of the 160 tests' server instantiations. **Next step**: isolate a minimal repro
+    (`DocumentBuilderFactory`/`SAXParserFactory` parsing a small DTD-validated XML file in a tight
+    loop, timed vs HotSpot) to get a clean per-parse ratio, then decide whether the fix is JIT
+    tier-up eligibility for Xerces's classes or a native-dispatch hot-path optimization; if a DTD/
+    entity cache is supposed to make repeat parses of the same descriptor cheap on HotSpot, verify
+    that cache is actually effective under CratonVM's classloading model.
     slowness, see section 2 above.
-*   `web.reactive.result.view.script.JRubyScriptTemplateTests` — JRuby-on-CratonVM: Ruby
-    `Symbol#to_s`/string interpolation returns empty inside `eval` heredocs
-    (`rubygems/specification.rb` generates `@ = nil` from `"@#{key} = nil"`), so the engine bootstrap
-    fails with a SyntaxError. Not reactive-specific; JRuby's embedding is its own bug family.
+*   `web.reactive.result.view.script.JRubyScriptTemplateTests` — JRuby-on-CratonVM: JRuby's own
+    bundled `rubygems/specification.rb` bootstrap fails with a Ruby-level `SyntaxError` from code it
+    generates itself: `#{@@nil_attributes.map {|key| "@#{key} = nil" }.join "; "}` (a Ruby
+    string interpolation reading a `.map {|key| ...}` block parameter, inside JRuby's own
+    precompiled-to-JVM-bytecode stdlib) interpolates `key` as EMPTY instead of the Symbol's name,
+    producing malformed generated Ruby source (`"@ = nil; @ = nil; ..."`) that a second, inner
+    `Kernel#eval` then rejects. **2026-07-15 update**: minimal standalone repro isolated (no Spring
+    needed — `ScriptEngineManager().getEngineByName("jruby").eval(...)` alone triggers it during
+    JRuby's own lazy bootstrap, before any user script runs); confirmed CratonVM-specific
+    (`Symbol#to_s` and simple top-level `"#{key}"` interpolation both work correctly in isolation —
+    the bug is specific to a block-parameter interpolated inside JRuby's own PRE-COMPILED bytecode,
+    not JRuby's general interpolation mechanism). Found a concrete, reproducible clue: 5
+    `[GC-ARRAY-GUARD] array_length(non-array)` warnings fire (`class_id=1013` in one run,
+    consistently 5 of them — matching `@@nil_attributes`' likely element count) at the EXACT moment
+    the interpolation corrupts, from `gc/src/gen_heap.rs:2314`'s defensive guard (a raw JVM
+    `arraylength` bytecode instruction executing against a heap object CratonVM's GC does NOT
+    consider an array — silently returns 0 instead of crashing). `CRATONVM_DBG_STALE_OBJREF=1`
+    was tried but did NOT visibly fire for this repro (inconclusive either way — this assertion has
+    known coverage gaps for other bug families, per `stream-arraylist-gc-pressure-heap-corruption-
+    found-20260714.md`). **Leading hypothesis, not confirmed**: a stale/wrong `ObjectRef` — the
+    JVM bytecode JRuby's own compiler emitted for this interpolation legitimately expects an array
+    (its own internal representation of the block-parameter/interpolation-piece list), but by the
+    time the `arraylength` instruction executes, the reference has been relocated/reused to point at
+    a non-array object — matching the broader stale-ObjectRef bug family already extensively
+    tracked in this codebase (see `wildfly-parallel-boot-stale-objectref-residual.md`,
+    `stale-objectref-static-sweep-20260711.md`) but not yet localized to a specific call site here.
+    **Next step**: reproduce under `RUST_BACKTRACE=1` + the `CRATONVM_GC_ARRAY_GUARD_BT=1` backtrace
+    (already captured once — the backtrace bottoms out in the raw interpreter `arraylength` opcode
+    handler, `interpreter.rs:8638`, giving no further attribution on its own) combined with a
+    JRuby-side decompile of the exact bytecode `specification.rb`'s `set_nil_attributes_to_nil`
+    heredoc-eval compiles to (JRuby ships this stdlib file pre-compiled; extract the `.class`
+    equivalent from the `jruby-stdlib` jar with `javap` to see the literal `arraylength`
+    instruction's context) to identify which allocation/GC event upstream could relocate the
+    reference this instruction reads. Not reactive-specific; a fix here likely benefits any JRuby
+    (or generally: any dynamic-bytecode-generating library that emits `arraylength`) workload.
 *   ~~Batch-context `<clinit>` contamination~~ — RETRACTED, see above (host environment issue: missing /tmp + missing ~/jdk25 symlink, not CratonVM).
