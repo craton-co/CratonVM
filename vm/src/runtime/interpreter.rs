@@ -5007,7 +5007,8 @@ pub fn execute(
                                 // the jit crate is only for `jit::try_compile`,
                                 // which cannot name VM symbols).
                                 let entry = crate::jit::helpers::jit_integer_value_of_direct
-                                    as *const () as usize;
+                                    as *const ()
+                                    as usize;
                                 direct_calls_early.push((
                                     pc,
                                     crate::jit::JitDirectCall {
@@ -5030,7 +5031,8 @@ pub fn execute(
                                 && descriptor_ref == "()I"
                             {
                                 let entry = crate::jit::helpers::jit_integer_int_value_direct
-                                    as *const () as usize;
+                                    as *const ()
+                                    as usize;
                                 direct_calls_early.push((
                                     pc,
                                     crate::jit::JitDirectCall {
@@ -15634,6 +15636,12 @@ fn synthetic_implements(shared: &SharedVm, obj_class_id: ClassId, target_class_n
         None => return false,
     };
 
+    if obj_name == "java/lang/foreign/DowncallHandle"
+        && target_class_name == "java/lang/invoke/MethodHandle"
+    {
+        return true;
+    }
+
     // Map.Entry implementations
     if target_class_name == "java/util/Map$Entry" {
         return matches!(
@@ -22772,6 +22780,7 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+
     if class_name == "java/util/function/Predicate"
         && matches!(
             (method_name, method_descriptor),
@@ -23396,6 +23405,7 @@ fn force_native_over_real_jdk_bytecode(
                 | "isMapped"
                 | "isReadOnly"
                 | "scope"
+                | "ofArray"
         )
     {
         return true;
@@ -23699,7 +23709,8 @@ fn force_native_over_real_jdk_bytecode(
         "com/sun/tools/javac/util/Name"
             | "com/sun/tools/javac/util/SharedNameTable$NameImpl"
             | "com/sun/tools/javac/util/StringNameTable$NameImpl"
-    ) && method_name == "equals" && method_descriptor == "(Ljava/lang/Object;)Z"
+    ) && method_name == "equals"
+        && method_descriptor == "(Ljava/lang/Object;)Z"
     {
         return true;
     }
@@ -24896,6 +24907,44 @@ fn try_stackless_invoke(
     //      Object.toString() native). If it doesn't (e.g. RunnerClassLoader.getParent()),
     //      walking finds the parent's native (ClassLoader.getParent native).
     let native_cb = match args.first() {
+        Some(Value::Object(Some(obj)))
+            if method_name == "type" && descriptor == "()Ljava/lang/invoke/MethodType;" =>
+        {
+            let is_downcall = shared
+                .class_manager
+                .read()
+                .get_class(shared.heap.class_id_of(*obj))
+                .map(|class| class.name.as_ref() == "java/lang/foreign/DowncallHandle")
+                .unwrap_or(false);
+            if is_downcall {
+                shared.native_methods.find(
+                    "java/lang/foreign/DowncallHandle",
+                    "type",
+                    "()Ljava/lang/invoke/MethodType;",
+                )
+            } else {
+                surefire_lazy_launcher_discover_native(shared, method_name, descriptor, *obj)
+            }
+        }
+        Some(Value::Object(Some(obj)))
+            if matches!(method_name, "invoke" | "invokeExact" | "invokeBasic") =>
+        {
+            let is_downcall = shared
+                .class_manager
+                .read()
+                .get_class(shared.heap.class_id_of(*obj))
+                .map(|class| class.name.as_ref() == "java/lang/foreign/DowncallHandle")
+                .unwrap_or(false);
+            if is_downcall {
+                shared.native_methods.find(
+                    "java/lang/foreign/DowncallHandle",
+                    method_name,
+                    "([Ljava/lang/Object;)Ljava/lang/Object;",
+                )
+            } else {
+                surefire_lazy_launcher_discover_native(shared, method_name, descriptor, *obj)
+            }
+        }
         Some(Value::Object(Some(obj))) => {
             surefire_lazy_launcher_discover_native(shared, method_name, descriptor, *obj)
         }
@@ -25010,6 +25059,41 @@ fn try_stackless_invoke(
     } else {
         native_cb
     };
+    // Real-JDK Linker can adapt a void downcall through a generic
+    // MethodHandle. Its field 0 retains the actual DowncallHandle. Preserve
+    // the call-site arguments but substitute that target for native dispatch.
+    let mut downcall_adapter_args: Option<Vec<Value>> = None;
+    let native_cb = native_cb.or_else(|| {
+        if !matches!(method_name, "invoke" | "invokeExact" | "invokeBasic") {
+            return None;
+        }
+        let adapter = match args.first() {
+            Some(Value::Object(Some(adapter))) => *adapter,
+            _ => return None,
+        };
+        let target = match shared.heap.get_field(adapter, 0) {
+            Value::Object(Some(target)) => target,
+            _ => return None,
+        };
+        let is_downcall = shared
+            .class_manager
+            .read()
+            .get_class(shared.heap.class_id_of(target))
+            .map(|class| class.name.as_ref() == "java/lang/foreign/DowncallHandle")
+            .unwrap_or(false);
+        if !is_downcall {
+            return None;
+        }
+        let callback = shared.native_methods.find(
+            "java/lang/foreign/DowncallHandle",
+            method_name,
+            "([Ljava/lang/Object;)Ljava/lang/Object;",
+        )?;
+        let mut routed = args.to_vec();
+        routed[0] = Value::Object(Some(target));
+        downcall_adapter_args = Some(routed);
+        Some(callback)
+    });
     if crate::runtime::env_cache::bd_debug()
         && (method_name == "intValue"
             || (class_name.contains("BigDecimal")
@@ -25033,9 +25117,95 @@ fn try_stackless_invoke(
         eprintln!("STTRACE_DBG_TSI class={class_name} desc={descriptor} native_cb={} walk={walk_native_hierarchy}",
                   native_cb.is_some());
     }
+    // invoke/invokeExact are signature-polymorphic. Their native bridge is
+    // registered under the erased Object[] descriptor, while a real call site
+    // carries its concrete descriptor. Route those concrete signatures through
+    // the bridge so synthetic combinators (notably guardWithTest around a
+    // foreign downcall) retain and dispatch their target.
+    let native_cb = native_cb.or_else(|| {
+        if class_name == "java/lang/invoke/MethodHandle"
+            && matches!(method_name, "invoke" | "invokeExact" | "invokeBasic")
+        {
+            shared.native_methods.find(
+                "java/lang/invoke/MethodHandle",
+                method_name,
+                "([Ljava/lang/Object;)Ljava/lang/Object;",
+            )
+        } else {
+            None
+        }
+    });
+    if std::env::var_os("CRATONVM_DBG_MH_STACK").is_some()
+        && matches!(method_name, "invoke" | "invokeExact" | "invokeBasic")
+    {
+        eprintln!(
+            "[MH_STACK] class={class_name} method={method_name} desc={descriptor} native_cb={} args={}",
+            native_cb.is_some(),
+            args.len()
+        );
+    }
+    if std::env::var_os("CRATONVM_DBG_MH_ADAPTER").is_some()
+        && method_name == "invokeExact"
+        && descriptor == "(Ljava/lang/foreign/MemorySegment;Ljava/lang/foreign/MemorySegment;IILjava/lang/foreign/MemorySegment;)V"
+    {
+        if let Some(Value::Object(Some(receiver))) = args.first() {
+            let target = match shared.heap.get_field(*receiver, 0) {
+                Value::Object(Some(target)) => Some(target),
+                _ => None,
+            };
+            let target_class = target.and_then(|target| {
+                shared
+                    .class_manager
+                    .read()
+                    .get_class(shared.heap.class_id_of(target))
+                    .map(|class| class.name.to_string())
+            });
+            eprintln!(
+                "[MH_ADAPTER] class={class_name} target={} f0={:?} f1={:?} f2={:?} f3={:?} f4={:?} f16={:?} f17={:?} f18={:?} f19={:?} f20={:?} arg1={:?}",
+                target_class.as_deref().unwrap_or("<unknown>"),
+                shared.heap.get_field(*receiver, 0),
+                shared.heap.get_field(*receiver, 1),
+                shared.heap.get_field(*receiver, 2),
+                shared.heap.get_field(*receiver, 3),
+                shared.heap.get_field(*receiver, 4),
+                shared.heap.get_field(*receiver, 16),
+                shared.heap.get_field(*receiver, 17),
+                shared.heap.get_field(*receiver, 18),
+                shared.heap.get_field(*receiver, 19),
+                shared.heap.get_field(*receiver, 20),
+                args.get(1),
+            );
+        }
+    }
     if let Some(callback) = native_cb {
-        let result = safe_native_call(shared, thread, callback, args)?;
+        let call_args = downcall_adapter_args.as_deref().unwrap_or(args);
+        let result = safe_native_call(shared, thread, callback, call_args)?;
         if let Some(value) = result {
+            // Signature-polymorphic MethodHandle natives are registered with an
+            // erased Object return and therefore box primitive results. The
+            // current bytecode descriptor is concrete; unbox a matching wrapper
+            // before the typed return-slot coercion (notably Panama float
+            // downcalls, which otherwise became 0.0f).
+            let value = if class_name == "java/lang/invoke/MethodHandle"
+                && ret_type == b'F'
+                && matches!(value, Value::Object(Some(_)))
+            {
+                match value {
+                    Value::Object(Some(obj))
+                        if shared
+                            .class_manager
+                            .read()
+                            .get_class(shared.heap.class_id_of(obj))
+                            .map(|class| class.name.as_ref() == "java/lang/Float")
+                            .unwrap_or(false) =>
+                    {
+                        shared.heap.get_field(obj, 0)
+                    }
+                    other => other,
+                }
+            } else {
+                value
+            };
             if std::env::var_os("CRATONVM_DBG_STACKLESS").is_some() {
                 eprintln!(
                     "[STACKLESS_RET] {}.{}{} -> {:?}",

@@ -9128,6 +9128,51 @@ pub fn invoke_or_native(
     };
 
     // Fast-path: a virtual call whose dispatch class is the synthetic
+    // DowncallHandle has a compact synthetic layout, not the JDK
+    // MethodHandle layout. Intercept its signature-polymorphic calls before
+    // the JDK invokeBasic bytecode can read incompatible receiver fields.
+    if method_name == "type" && descriptor == "()Ljava/lang/invoke/MethodType;" {
+        if let Some(Value::Object(Some(receiver))) = args.first() {
+            let is_downcall = shared
+                .class_manager
+                .read()
+                .get_class(shared.heap.class_id_of(*receiver))
+                .map(|class| class.name.as_ref() == "java/lang/foreign/DowncallHandle")
+                .unwrap_or(false);
+            if is_downcall {
+                if let Some(callback) = shared.native_methods.find(
+                    "java/lang/foreign/DowncallHandle",
+                    "type",
+                    "()Ljava/lang/invoke/MethodType;",
+                ) {
+                    return safe_native_call(shared, thread, callback, args)
+                        .map(|value| coerce_native_return(value, descriptor));
+                }
+            }
+        }
+    }
+
+    if matches!(method_name, "invoke" | "invokeExact" | "invokeBasic") {
+        if let Some(Value::Object(Some(receiver))) = args.first() {
+            let is_downcall = shared
+                .class_manager
+                .read()
+                .get_class(shared.heap.class_id_of(*receiver))
+                .map(|class| class.name.as_ref() == "java/lang/foreign/DowncallHandle")
+                .unwrap_or(false);
+            if is_downcall {
+                if let Some(callback) = shared.native_methods.find(
+                    "java/lang/foreign/DowncallHandle",
+                    method_name,
+                    "([Ljava/lang/Object;)Ljava/lang/Object;",
+                ) {
+                    return safe_native_call(shared, thread, callback, args)
+                        .map(|value| coerce_native_return(value, descriptor));
+                }
+            }
+        }
+    }
+
     // `java/lang/annotation/AnnotationProxy`. The proxy has no bytecode methods,
     // so without this every call (`annotationType`/`value`/`equals`/element
     // accessors — heavily exercised by JUnit/Arquillian/Spring annotation
@@ -12840,12 +12885,14 @@ fn invoke_on_class_shared_inner(
                         // no-op native override registered in
                         // `lang_system::register_lang_system_natives` so the
                         // bytecode never runs the throwing path.
+                        || (class_name == "org/elasticsearch/nativeaccess/LinuxNativeAccess"
+                            && method_name == "tryInstallExecSandbox"
+                            && descriptor == "()V")
                         || ({
                             let m = (class_name == "java/lang/System"
                                 && matches!(method_name, "loadLibrary" | "load"))
                                 || (class_name == "java/lang/Runtime"
-                                    && matches!(method_name, "loadLibrary0" | "load0"
-                                        | "loadLibrary" | "load"));
+                                    && matches!(method_name, "loadLibrary0" | "load0" | "loadLibrary"));
                             if m {
                                 tracing::debug!(
                                     target: "rkc16n12",
@@ -14973,6 +15020,7 @@ fn invoke_on_class_shared_inner(
                 if method_name == "invoke"
                     || method_name == "invokeExact"
                     || method_name == "invokeWithArguments"
+                    || method_name == "invokeBasic"
                     || method_name == "get"
                     || method_name == "set"
                     || method_name == "getVolatile"
@@ -15042,12 +15090,34 @@ fn invoke_on_class_shared_inner(
                         ];
                         let prefer_exact =
                             prefers_exact_signature_polymorphic_receiver(&class_name);
-                        if prefer_exact {
+                        // The resolved owner of invokeExact is MethodHandle, not
+                        // the concrete receiver. Route a synthetic Panama
+                        // DowncallHandle by its runtime class before falling
+                        // back to MethodHandle's generic bridge.
+                        let dynamic_downcall = args
+                            .first()
+                            .and_then(|value| match value {
+                                Value::Object(Some(receiver)) => shared
+                                    .class_manager
+                                    .read()
+                                    .get_class(shared.heap.class_id_of(*receiver))
+                                    .map(|class| {
+                                        class.name.as_ref() == "java/lang/foreign/DowncallHandle"
+                                    }),
+                                _ => None,
+                            })
+                            .unwrap_or(false);
+                        let exact_class = if dynamic_downcall {
+                            "java/lang/foreign/DowncallHandle"
+                        } else {
+                            class_name.as_str()
+                        };
+                        if prefer_exact || dynamic_downcall {
                             for poly_desc in &poly_descs {
                                 if let Some(cb) =
                                     shared
                                         .native_methods
-                                        .find(&class_name, method_name, poly_desc)
+                                        .find(exact_class, method_name, poly_desc)
                                 {
                                     let r = safe_native_call(shared, thread, cb, args)?;
                                     return Ok(unbox_poly_return(shared, r, descriptor));
@@ -16072,6 +16142,7 @@ fn invoke_on_class_shared_inner(
                     | "isMapped"
                     | "isReadOnly"
                     | "scope"
+                    | "ofArray"
             );
         let force_ffm_symbol_lookup_interface_native =
             crate::runtime::interpreter::is_ffm_symbol_lookup_native_override(

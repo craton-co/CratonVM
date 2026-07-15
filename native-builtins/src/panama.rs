@@ -18,6 +18,11 @@ use cratonvm_native_api::ffi::{
 /// Maximum number of bytes for a single memory copy/fill operation.
 const MAX_COPY_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
 
+// ofArray segments do not have an arena. Reuse their arena/alive slots to
+// retain the Java backing array and its primitive layout kind.
+const SEG_BACKING_ARRAY_FIELD: usize = 2;
+const SEG_BACKING_KIND_FIELD: usize = 4;
+
 /// Maximum length to scan when reading a C string from native memory.
 const MAX_CSTR_LEN: usize = 4096;
 
@@ -471,7 +476,7 @@ fn register_pe_value_layout(r: &mut NativeMethodRegistry) {
 // --- Arena: lifecycle-scoped memory management ---
 // Arena synthetic: [0]=kind (Int), [1]=alloc_ids (Object — int array of alloc IDs), [2]=closed (Int), [3]=count (Int)
 
-fn register_pe_arena(r: &mut NativeMethodRegistry) {
+pub(crate) fn register_pe_arena(r: &mut NativeMethodRegistry) {
     let arena = "java/lang/foreign/Arena";
 
     r.register(arena, "global", "()Ljava/lang/foreign/Arena;", |ctx, _| {
@@ -558,19 +563,37 @@ fn register_pe_arena(r: &mut NativeMethodRegistry) {
             pe_arena_allocate_impl(ctx, this, size, size)
         },
     );
+    // allocate(MemoryLayout) uses the interface descriptor emitted for
+    // StructLayout capture-state allocations in real-JDK bytecode.
+    r.register(
+        arena,
+        "allocate",
+        "(Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemorySegment;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let layout = obj_arg(args, 1)?;
+            let size = crate::panama_libffi::layout_total_size(ctx, layout)? as i64;
+            let align = crate::panama_libffi::layout_align(ctx, layout) as i64;
+            pe_arena_allocate_impl(ctx, this, size, align)
+        },
+    );
 
     // close() — free all allocations in this arena
     r.register(arena, "close", "()V", pe_arena_close);
 }
 
-fn pe_arena_allocate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn pe_arena_allocate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let size = match args.get(1) {
         Some(Value::Long(n)) => *n,
+        Some(Value::Int(n)) => *n as i64,
+        Some(Value::Double(n)) => i64::from_le_bytes(n.to_le_bytes()),
         _ => 0,
     };
     let align = match args.get(2) {
         Some(Value::Long(n)) => *n,
+        Some(Value::Int(n)) => *n as i64,
+        Some(Value::Double(n)) => i64::from_le_bytes(n.to_le_bytes()),
         _ => 1,
     };
     pe_arena_allocate_impl(ctx, this, size, align)
@@ -652,7 +675,11 @@ fn pe_arena_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 
 // --- MemorySegment: off-heap byte buffer ---
 
-fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
+pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
+    // Real-JDK callers dispatch these interface methods directly; retain the
+    // concrete native bridges when SyntheticStub registrations are filtered.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let ms = "java/lang/foreign/MemorySegment";
 
     // byteSize() → long
@@ -698,7 +725,21 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         pe_segment_set,
     );
 
-    // getAtIndex(ValueLayout, long index) → value
+    // Real-JDK bytecode resolves the covariant ValueLayout descriptors rather
+    // than the erased Object signature above.
+    for desc in [
+        "(Ljava/lang/foreign/ValueLayout$OfBoolean;J)Z",
+        "(Ljava/lang/foreign/ValueLayout$OfByte;J)B",
+        "(Ljava/lang/foreign/ValueLayout$OfChar;J)C",
+        "(Ljava/lang/foreign/ValueLayout$OfShort;J)S",
+        "(Ljava/lang/foreign/ValueLayout$OfInt;J)I",
+        "(Ljava/lang/foreign/ValueLayout$OfLong;J)J",
+        "(Ljava/lang/foreign/ValueLayout$OfFloat;J)F",
+        "(Ljava/lang/foreign/ValueLayout$OfDouble;J)D",
+        "(Ljava/lang/foreign/AddressLayout;J)Ljava/lang/foreign/MemorySegment;",
+    ] {
+        r.register(ms, "get", desc, pe_segment_get);
+    }
     r.register(
         ms,
         "getAtIndex",
@@ -745,6 +786,35 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // Real-JDK bytecode resolves the covariant ValueLayout descriptors rather
+    // than the erased Object signatures above.
+    for desc in [
+        "(Ljava/lang/foreign/ValueLayout$OfBoolean;J)Z",
+        "(Ljava/lang/foreign/ValueLayout$OfByte;J)B",
+        "(Ljava/lang/foreign/ValueLayout$OfChar;J)C",
+        "(Ljava/lang/foreign/ValueLayout$OfShort;J)S",
+        "(Ljava/lang/foreign/ValueLayout$OfInt;J)I",
+        "(Ljava/lang/foreign/ValueLayout$OfLong;J)J",
+        "(Ljava/lang/foreign/ValueLayout$OfFloat;J)F",
+        "(Ljava/lang/foreign/ValueLayout$OfDouble;J)D",
+        "(Ljava/lang/foreign/AddressLayout;J)Ljava/lang/foreign/MemorySegment;",
+    ] {
+        r.register(ms, "getAtIndex", desc, pe_segment_get_at_index);
+    }
+    for desc in [
+        "(Ljava/lang/foreign/ValueLayout$OfBoolean;JZ)V",
+        "(Ljava/lang/foreign/ValueLayout$OfByte;JB)V",
+        "(Ljava/lang/foreign/ValueLayout$OfChar;JC)V",
+        "(Ljava/lang/foreign/ValueLayout$OfShort;JS)V",
+        "(Ljava/lang/foreign/ValueLayout$OfInt;JI)V",
+        "(Ljava/lang/foreign/ValueLayout$OfLong;JJ)V",
+        "(Ljava/lang/foreign/ValueLayout$OfFloat;JF)V",
+        "(Ljava/lang/foreign/ValueLayout$OfDouble;JD)V",
+        "(Ljava/lang/foreign/AddressLayout;JLjava/lang/foreign/MemorySegment;)V",
+    ] {
+        r.register(ms, "setAtIndex", desc, pe_segment_set_at_index);
+    }
+
     // asSlice(long offset, long size) → MemorySegment
     r.register(
         ms,
@@ -775,7 +845,7 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
             ctx.set_field(slice, 1, Value::Long(new_size));
             ctx.set_field(slice, 2, arena_val);
             ctx.set_field(slice, 3, ctx.get_field(this, 3)); // inherit read-only
-            ctx.set_field(slice, 4, Value::Int(1)); // alive
+            ctx.set_field(slice, 4, ctx.get_field(this, 4)); // retain alive/kind marker
             ctx.set_field(slice, 5, Value::Long(base_off + offset));
             Ok(Some(Value::Object(Some(slice))))
         },
@@ -899,6 +969,8 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                 ctx.set_field(seg, 3, Value::Int(0)); // read-write
                 ctx.set_field(seg, 4, Value::Int(1)); // alive
                 ctx.set_field(seg, 5, Value::Long(0));
+                ctx.set_field(seg, SEG_BACKING_ARRAY_FIELD, Value::Object(Some(arr)));
+                ctx.set_field(seg, SEG_BACKING_KIND_FIELD, Value::Int(LAYOUT_INT));
                 // Store alloc_id so it can be freed (field 0 encodes the pointer)
                 let _ = alloc_id; // tracked by NativeMemoryTable
                 Ok(Some(Value::Object(Some(seg))))
@@ -939,6 +1011,8 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                 ctx.set_field(seg, 3, Value::Int(0));
                 ctx.set_field(seg, 4, Value::Int(1));
                 ctx.set_field(seg, 5, Value::Long(0));
+                ctx.set_field(seg, SEG_BACKING_ARRAY_FIELD, Value::Object(Some(arr)));
+                ctx.set_field(seg, SEG_BACKING_KIND_FIELD, Value::Int(LAYOUT_LONG));
                 Ok(Some(Value::Object(Some(seg))))
             } else {
                 Err(RuntimeError::OutOfMemoryError {
@@ -948,6 +1022,55 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
             }
         },
     );
+    // ofArray(float[]) → MemorySegment
+    for (owner, method, descriptor) in [
+        (ms, "ofArray", "([F)Ljava/lang/foreign/MemorySegment;"),
+        (
+            "jdk/internal/foreign/SegmentFactories",
+            "fromArray",
+            "([F)Ljdk/internal/foreign/HeapMemorySegmentImpl$OfFloat;",
+        ),
+    ] {
+        r.register(owner, method, descriptor, |ctx, args| {
+            let arr = match args.first() {
+                Some(Value::Object(Some(a))) => *a,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let len = ctx.array_length(arr);
+            let byte_size = (len * 4) as i64;
+            let result = ctx.allocate_native_memory(byte_size as usize, 4);
+            if let Some((_alloc_id, ptr)) = result {
+                for i in 0..len {
+                    let value = match ctx.get_array_element(arr, i) {
+                        Value::Float(v) => v,
+                        // Primitive float arrays are stored as raw IEEE-754
+                        // bits in this VM's generic array representation.
+                        Value::Int(bits) => f32::from_bits(bits as u32),
+                        _ => 0.0,
+                    };
+                    unsafe {
+                        let dest = (ptr as *mut f32).add(i);
+                        *dest = value;
+                    }
+                }
+                let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+                ctx.set_field(seg, 0, Value::Long(ptr as i64));
+                ctx.set_field(seg, 1, Value::Long(byte_size));
+                ctx.set_field(seg, 2, Value::Object(None));
+                ctx.set_field(seg, 3, Value::Int(0));
+                ctx.set_field(seg, 4, Value::Int(1));
+                ctx.set_field(seg, 5, Value::Long(0));
+                ctx.set_field(seg, SEG_BACKING_ARRAY_FIELD, Value::Object(Some(arr)));
+                ctx.set_field(seg, SEG_BACKING_KIND_FIELD, Value::Int(LAYOUT_FLOAT));
+                Ok(Some(Value::Object(Some(seg))))
+            } else {
+                Err(RuntimeError::OutOfMemoryError {
+                    message: "Failed to allocate native memory for ofArray".into(),
+                }
+                .into())
+            }
+        });
+    }
     // ofArray(double[]) → MemorySegment
     r.register(
         ms,
@@ -977,6 +1100,8 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                 ctx.set_field(seg, 3, Value::Int(0));
                 ctx.set_field(seg, 4, Value::Int(1));
                 ctx.set_field(seg, 5, Value::Long(0));
+                ctx.set_field(seg, SEG_BACKING_ARRAY_FIELD, Value::Object(Some(arr)));
+                ctx.set_field(seg, SEG_BACKING_KIND_FIELD, Value::Int(LAYOUT_DOUBLE));
                 Ok(Some(Value::Object(Some(seg))))
             } else {
                 Err(RuntimeError::OutOfMemoryError {
@@ -984,6 +1109,57 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                 }
                 .into())
             }
+        },
+    );
+
+    // Copy primitive array elements into a native segment. Elasticsearch uses
+    // this overload to stage float[] rows for bulk vector kernels.
+    r.register(
+        ms,
+        "copy",
+        "(Ljava/lang/Object;ILjava/lang/foreign/MemorySegment;Ljava/lang/foreign/ValueLayout;JI)V",
+        |ctx, args| {
+            require_native_access("copy")?;
+            let src = obj_arg(args, 0)?;
+            let src_index = match args.get(1) {
+                Some(Value::Int(v)) if *v >= 0 => *v as usize,
+                _ => 0,
+            };
+            let dst = obj_arg(args, 2)?;
+            let layout = obj_arg(args, 3)?;
+            let dst_offset = match args.get(4) {
+                Some(Value::Long(v)) => *v,
+                _ => 0,
+            };
+            let count = match args.get(5) {
+                Some(Value::Int(v)) if *v >= 0 => *v as usize,
+                _ => 0,
+            };
+            let length = ctx.array_length(src);
+            if src_index
+                .checked_add(count)
+                .map_or(true, |end| end > length)
+            {
+                return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                    index: src_index as i32,
+                }
+                .into());
+            }
+            let kind = crate::panama_libffi::read_layout_kind(ctx, layout);
+            let width = ffi::layout_byte_size(kind) as i64;
+            for i in 0..count {
+                let value = ctx.get_array_element(src, src_index + i);
+                // Primitive float arrays use their raw IEEE-754 bits in the
+                // interpreter's array representation. The set helper expects
+                // the typed Value::Float form; otherwise its type switch
+                // silently falls through and leaves the destination zeroed.
+                let value = match (kind, value) {
+                    (LAYOUT_FLOAT, Value::Int(bits)) => Value::Float(f32::from_bits(bits as u32)),
+                    (_, value) => value,
+                };
+                pe_segment_set_impl(ctx, dst, layout, dst_offset + (i as i64) * width, value)?;
+            }
+            Ok(None)
         },
     );
 
@@ -1168,6 +1344,7 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(this))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 /// Validate a single-element access (get/set) against the segment's declared
@@ -1244,6 +1421,35 @@ fn pe_segment_access_addr(
     }
 }
 
+// Exact primitive/covariant descriptors used by real-JDK MemorySegment
+// default methods. They share the checked erased implementation above.
+fn pe_segment_get_at_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    require_native_access("getAtIndex")?;
+    let this = obj_arg(args, 0)?;
+    let layout = obj_arg(args, 1)?;
+    let index = match args.get(2) {
+        Some(Value::Long(n)) => *n,
+        _ => 0,
+    };
+    let elem_size =
+        ffi::layout_byte_size(crate::panama_libffi::read_layout_kind(ctx, layout)) as i64;
+    pe_segment_get_impl(ctx, this, layout, index * elem_size)
+}
+
+fn pe_segment_set_at_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    require_native_access("setAtIndex")?;
+    let this = obj_arg(args, 0)?;
+    let layout = obj_arg(args, 1)?;
+    let index = match args.get(2) {
+        Some(Value::Long(n)) => *n,
+        _ => 0,
+    };
+    let value = args.get(3).copied().unwrap_or(Value::Int(0));
+    let elem_size =
+        ffi::layout_byte_size(crate::panama_libffi::read_layout_kind(ctx, layout)) as i64;
+    pe_segment_set_impl(ctx, this, layout, index * elem_size, value)
+}
+
 fn pe_segment_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Defense-in-depth: get() dereferences the segment's raw `ptr` field.
     require_native_access("get")?;
@@ -1262,10 +1468,7 @@ fn pe_segment_get_impl(
     layout: ObjectRef,
     offset: i64,
 ) -> MethodCallResult {
-    let kind = match ctx.get_field(layout, 0) {
-        Value::Int(n) => n,
-        _ => 0,
-    };
+    let kind = crate::panama_libffi::read_layout_kind(ctx, layout);
     // Reject reads that fall outside the segment's declared bounds, overflow
     // the address space, or target a zero-size segment. The access width is
     // derived from the layout kind, matching the read widths below.
@@ -1287,6 +1490,16 @@ fn pe_segment_get_impl(
             _ => Value::Int(0),
         }
     };
+    if std::env::var_os("CRATONVM_DBG_MH_DISPATCH").is_some() && kind == LAYOUT_FLOAT && offset == 0
+    {
+        eprintln!(
+            "[PANAMA_GET_FLOAT] runtime={} ptr={:?} base_offset={:?} value={value:?}",
+            ctx.class_name_of_id(ctx.class_id_of_object(seg))
+                .unwrap_or_default(),
+            ctx.get_field(seg, 0),
+            ctx.get_field(seg, 5),
+        );
+    }
     Ok(Some(value))
 }
 
@@ -1310,10 +1523,7 @@ fn pe_segment_set_impl(
     offset: i64,
     value: Value,
 ) -> MethodCallResult {
-    let kind = match ctx.get_field(layout, 0) {
-        Value::Int(n) => n,
-        _ => 0,
-    };
+    let kind = crate::panama_libffi::read_layout_kind(ctx, layout);
     // Reject writes that fall outside the segment's declared bounds, overflow
     // the address space, or target a zero-size segment. The access width is
     // derived from the layout kind, matching the write widths below.
@@ -1335,7 +1545,75 @@ fn pe_segment_set_impl(
             _ => {}
         }
     }
+    sync_heap_backed_segment(ctx, seg, false);
     Ok(None)
+}
+
+/// Synchronize a primitive-array-backed synthetic MemorySegment at the FFI
+/// boundary. The VM cannot expose a moving Java heap array directly to
+/// native code, so ofArray owns a native mirror; this retains the Java
+/// backing array and copies it immediately before and after a downcall.
+fn sync_heap_backed_segment(ctx: &mut dyn NativeContext, seg: ObjectRef, to_native: bool) {
+    let backing = match ctx.get_field(seg, SEG_BACKING_ARRAY_FIELD) {
+        Value::Object(Some(array)) if ctx.object_is_array(array) => array,
+        _ => return,
+    };
+    let kind = match ctx.get_field(seg, SEG_BACKING_KIND_FIELD) {
+        Value::Int(kind) => kind,
+        _ => return,
+    };
+    let width = ffi::layout_byte_size(kind);
+    if width == 0 {
+        return;
+    }
+    let (base_ptr, segment_offset, byte_size) = match (
+        ctx.get_field(seg, 0),
+        ctx.get_field(seg, 5),
+        ctx.get_field(seg, 1),
+    ) {
+        (Value::Long(ptr), Value::Long(offset), Value::Long(size))
+            if ptr > 0 && offset >= 0 && size >= 0 =>
+        {
+            (ptr as usize, offset as usize, size as usize)
+        }
+        _ => return,
+    };
+    let array_start = segment_offset / width;
+    if segment_offset % width != 0 || array_start >= ctx.array_length(backing) {
+        return;
+    }
+    let count = (byte_size / width).min(ctx.array_length(backing) - array_start);
+    let Some(native_addr) = base_ptr.checked_add(segment_offset) else {
+        return;
+    };
+    for i in 0..count {
+        let addr = unsafe { (native_addr as *mut u8).add(i * width) };
+        if to_native {
+            unsafe {
+                match (kind, ctx.get_array_element(backing, array_start + i)) {
+                    (LAYOUT_INT, Value::Int(value)) => *(addr as *mut i32) = value,
+                    (LAYOUT_LONG, Value::Long(value)) => *(addr as *mut i64) = value,
+                    (LAYOUT_FLOAT, Value::Float(value)) => *(addr as *mut f32) = value,
+                    (LAYOUT_FLOAT, Value::Int(bits)) => {
+                        *(addr as *mut f32) = f32::from_bits(bits as u32)
+                    }
+                    (LAYOUT_DOUBLE, Value::Double(value)) => *(addr as *mut f64) = value,
+                    _ => {}
+                }
+            }
+        } else {
+            unsafe {
+                let value = match kind {
+                    LAYOUT_INT => Value::Int(*(addr as *const i32)),
+                    LAYOUT_LONG => Value::Long(*(addr as *const i64)),
+                    LAYOUT_FLOAT => Value::Float(*(addr as *const f32)),
+                    LAYOUT_DOUBLE => Value::Double(*(addr as *const f64)),
+                    _ => continue,
+                };
+                ctx.set_array_element(backing, array_start + i, value);
+            }
+        }
+    }
 }
 
 // --- SymbolLookup: load shared libraries and find symbols ---
@@ -1516,7 +1794,8 @@ pub(crate) fn register_pe_raw_native_libraries(r: &mut NativeMethodRegistry) {
 }
 
 // --- Linker: create downcall handles ---
-// DowncallHandle synthetic: [0]=function_address (Long), [1]=descriptor (Object)
+// DowncallHandle synthetic: [0]=function_address, [1]=descriptor,
+// [2]=first variadic argument, [3]=cached CIF, [4]=captureCallState flag.
 
 pub(crate) fn register_pe_linker_options(r: &mut NativeMethodRegistry) {
     let option = "java/lang/foreign/Linker$Option";
@@ -1532,6 +1811,19 @@ pub(crate) fn register_pe_linker_options(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(opt))))
         },
     );
+}
+
+/// True for the real-JDK option that adds a leading MemorySegment state
+/// argument to a downcall handle.
+pub(crate) fn downcall_option_captures_call_state(
+    ctx: &dyn NativeContext,
+    option: ObjectRef,
+) -> bool {
+    matches!(
+        ctx.class_name_of_id(ctx.class_id_of_object(option))
+            .as_deref(),
+        Some("jdk/internal/foreign/abi/LinkerOptions$CaptureCallState")
+    )
 }
 
 fn register_pe_linker(r: &mut NativeMethodRegistry) {
@@ -1561,11 +1853,12 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
         let descriptor = obj_arg(args, 2)?;
         let fn_addr = match ctx.get_field(addr_seg, 0) { Value::Long(n) => n, _ => 0 };
 
-        let handle = alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 4);
+        let handle = alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 5);
         ctx.set_field(handle, 0, Value::Long(fn_addr));
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
         ctx.set_field(handle, 2, Value::Long(-1));
         ctx.set_field(handle, 3, Value::Long(0)); // cif not yet cached
+        ctx.set_field(handle, 4, Value::Int(0)); // captureCallState disabled
         Ok(Some(Value::Object(Some(handle))))
     });
 
@@ -1580,10 +1873,14 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
             // Scan the option array for a firstVariadicArg option (kind=0).
             // Linker.Option synthetic layout: field 0 = kind (Int), field 1 = payload (Long).
             let mut variadic_fixed: i64 = -1;
+            let mut capture_call_state = false;
             if let Some(Value::Object(Some(opts))) = args.get(3) {
                 let n = ctx.array_length(*opts);
                 for i in 0..n {
                     if let Value::Object(Some(opt)) = ctx.get_array_element(*opts, i) {
+                        if downcall_option_captures_call_state(ctx, opt) {
+                            capture_call_state = true;
+                        }
                         let kind = match ctx.get_field(opt, 0) {
                             Value::Int(k) => k,
                             _ => -1,
@@ -1599,11 +1896,18 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
                 }
             }
 
-            let handle = alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 4);
+            if std::env::var_os("CRATONVM_DBG_LINKER").is_some() {
+                eprintln!(
+                    "[PANAMA_LINKER] option downcall addr=0x{fn_addr:x} options={}",
+                    args.get(3).is_some()
+                );
+            }
+            let handle = alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 5);
             ctx.set_field(handle, 0, Value::Long(fn_addr));
             ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
             ctx.set_field(handle, 2, Value::Long(variadic_fixed));
             ctx.set_field(handle, 3, Value::Long(0)); // cif not yet cached
+            ctx.set_field(handle, 4, Value::Int(capture_call_state as i32));
             Ok(Some(Value::Object(Some(handle))))
         },
     );
@@ -1638,6 +1942,18 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/Object;)Ljava/lang/Object;",
         pe_downcall_invoke,
     );
+    r.register(
+        dh,
+        "invokeBasic",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        pe_downcall_invoke,
+    );
+    r.register(
+        dh,
+        "type",
+        "()Ljava/lang/invoke/MethodType;",
+        pe_downcall_type,
+    );
 
     // upcallHandle(target, descriptor, arena) → MemorySegment wrapping trampoline address
     r.register(linker, "upcallHandle",
@@ -1652,6 +1968,96 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/Object;)Ljava/lang/Object;",
         pe_upcall_invoke,
     );
+}
+
+/// Return the MethodHandle type represented by a synthetic DowncallHandle.
+///
+/// The synthetic stores its FunctionDescriptor in field 1, while JDK callers
+/// still invoke inherited MethodHandle.type(). Derive its carrier signature
+/// from that descriptor instead of exposing an untyped Object[] invoker.
+pub(crate) fn pe_downcall_type(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use crate::panama_libffi as plf;
+
+    let handle = obj_arg(args, 0)?;
+    let descriptor = match ctx.get_field(handle, 1) {
+        Value::Object(Some(descriptor)) => descriptor,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "DowncallHandle has no FunctionDescriptor".into(),
+            }
+            .into());
+        }
+    };
+
+    let mut method_descriptor = String::from("(");
+    if downcall_handle_captures_call_state(ctx, handle) {
+        method_descriptor.push_str("Ljava/lang/foreign/MemorySegment;");
+    }
+    for layout in plf::descriptor_param_layouts(ctx, descriptor) {
+        let layout = layout.ok_or_else(|| -> MethodCallFailed {
+            RuntimeError::IllegalStateException {
+                message: "DowncallHandle FunctionDescriptor has null parameter layout".into(),
+            }
+            .into()
+        })?;
+        method_descriptor.push_str(downcall_layout_carrier_descriptor(plf::read_layout_kind(
+            ctx, layout,
+        )));
+    }
+    method_descriptor.push(')');
+    match plf::descriptor_return_layout(ctx, descriptor) {
+        Some(layout) => method_descriptor.push_str(downcall_layout_carrier_descriptor(
+            plf::read_layout_kind(ctx, layout),
+        )),
+        None => method_descriptor.push('V'),
+    }
+
+    let method_type =
+        crate::lang_invoke::build_method_type_from_descriptor(ctx, &method_descriptor).ok_or_else(
+            || -> MethodCallFailed {
+                RuntimeError::IllegalStateException {
+                    message: format!(
+                "Unable to construct MethodType for DowncallHandle descriptor {method_descriptor}"
+            ),
+                }
+                .into()
+            },
+        )?;
+    Ok(Some(Value::Object(Some(method_type))))
+}
+
+fn downcall_layout_carrier_descriptor(kind: i32) -> &'static str {
+    match kind {
+        LAYOUT_BOOLEAN => "Z",
+        LAYOUT_BYTE => "B",
+        LAYOUT_SHORT => "S",
+        LAYOUT_CHAR => "C",
+        LAYOUT_INT => "I",
+        LAYOUT_LONG => "J",
+        LAYOUT_FLOAT => "F",
+        LAYOUT_DOUBLE => "D",
+        // ADDRESS and aggregate layouts use the FFM MemorySegment carrier.
+        _ => "Ljava/lang/foreign/MemorySegment;",
+    }
+}
+
+fn downcall_handle_captures_call_state(ctx: &dyn NativeContext, handle: ObjectRef) -> bool {
+    matches!(ctx.get_field(handle, 4), Value::Int(flag) if flag != 0)
+}
+
+fn write_downcall_capture_state(ctx: &dyn NativeContext, state: ObjectRef) {
+    #[cfg(target_os = "linux")]
+    {
+        let addr = crate::panama_libffi::segment_address(ctx, state);
+        if addr != 0 {
+            // The standard Linux capture-state layout starts with errno.
+            unsafe { *(addr as *mut i32) = *libc::__errno_location() };
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (ctx, state);
+    }
 }
 
 /// Execute a downcall via libffi (NEW-18).
@@ -1722,16 +2128,43 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let param_layout_objs = plf::descriptor_param_layouts(ctx, descriptor);
     let return_layout = plf::descriptor_return_layout(ctx, descriptor);
 
-    // ----- Read incoming Java arguments (args[1] = Object[] of values) -----
-    let call_args: Vec<Value> = if args.len() > 1 {
-        if let Value::Object(Some(arr)) = args[1] {
-            let len = ctx.array_length(arr);
-            (0..len).map(|i| ctx.get_array_element(arr, i)).collect()
-        } else {
-            Vec::new()
+    // ----- Read incoming Java arguments -----
+    //
+    // The legacy synthetic bridge calls invoke(Object[]) and supplies one
+    // boxed array after the handle. Signature-polymorphic real-JDK calls
+    // arrive as [handle, arg0, arg1, ...], so preserve those concrete
+    // values instead of interpreting the first reference argument as an
+    // array.
+    let mut call_args: Vec<Value> = match args.get(1) {
+        Some(Value::Object(Some(arr))) if args.len() == 2 && ctx.object_is_array(*arr) => {
+            let len = ctx.array_length(*arr);
+            (0..len).map(|i| ctx.get_array_element(*arr, i)).collect()
+        }
+        _ => args[1..].to_vec(),
+    };
+
+    let capture_state = if downcall_handle_captures_call_state(ctx, handle) {
+        if call_args.len() != param_layout_objs.len() + 1 {
+            return Err(RuntimeError::IllegalStateException {
+                message: format!(
+                    "Panama capture-state downcall expected {} arguments, got {}",
+                    param_layout_objs.len() + 1,
+                    call_args.len()
+                ),
+            }
+            .into());
+        }
+        match call_args.remove(0) {
+            Value::Object(Some(state)) => Some(state),
+            _ => {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "Panama capture-state argument is not a MemorySegment".into(),
+                }
+                .into());
+            }
         }
     } else {
-        Vec::new()
+        None
     };
 
     if call_args.len() != param_layout_objs.len() {
@@ -1743,6 +2176,14 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
             ),
         }
         .into());
+    }
+
+    // Heap-array segments use a native mirror so moving GC cannot expose the
+    // Java heap directly. Refresh mirrors at the precise foreign boundary.
+    for value in &call_args {
+        if let Value::Object(Some(segment)) = value {
+            sync_heap_backed_segment(ctx, *segment, true);
+        }
     }
 
     // ----- Marshal arguments into per-slot scratch storage -----
@@ -1833,28 +2274,46 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // the stashed `Box<Cif>` on the handle synthetic (field 3), which
     // lives for the remainder of the handle's lifetime.
     unsafe {
-        let code_ptr = CodePtr::from_ptr(fn_addr as *const std::ffi::c_void);
-        if ret_slot.is_empty() {
-            // void return — libffi still wants a writable result slot of
-            // size_t bytes for ffi_arg. Provide one and discard.
-            let mut sink = [0u8; std::mem::size_of::<usize>()];
-            libffi::low::call::<()>(
-                raw_cif_ptr,
-                code_ptr,
-                arg_refs.as_ptr() as *mut *mut std::ffi::c_void,
-            );
-            let _ = sink;
+        // ffi_call requires a real writable result address even for a void
+        // descriptor. Do not use low::call<()> here: its zero-sized return
+        // slot gives libffi a dangling result pointer and caused native void
+        // calls (the Elasticsearch bulk-vector symbols) to leave outputs
+        // untouched on this ABI.
+        let mut void_sink = [0u8; std::mem::size_of::<usize>()];
+        let result_ptr = if ret_slot.is_empty() {
+            void_sink.as_mut_ptr() as *mut std::ffi::c_void
         } else {
-            // For all primitive returns we use the slot directly. libffi
-            // promises to write at most max(size_of<usize>, ffi_type::size)
-            // bytes — we already pad ret_slot up to size_of<usize>.
-            libffi::raw::ffi_call(
-                raw_cif_ptr,
-                Some(*CodePtr::from_ptr(fn_addr as *const std::ffi::c_void).as_safe_fun()),
-                ret_slot.as_mut_ptr() as *mut std::ffi::c_void,
-                arg_refs.as_ptr() as *mut *mut std::ffi::c_void,
-            );
+            ret_slot.as_mut_ptr() as *mut std::ffi::c_void
+        };
+        libffi::raw::ffi_call(
+            raw_cif_ptr,
+            Some(*CodePtr::from_ptr(fn_addr as *const std::ffi::c_void).as_safe_fun()),
+            result_ptr,
+            arg_refs.as_ptr() as *mut *mut std::ffi::c_void,
+        );
+    }
+
+    for value in &call_args {
+        if let Value::Object(Some(segment)) = value {
+            sync_heap_backed_segment(ctx, *segment, false);
         }
+    }
+
+    if std::env::var_os("CRATONVM_DBG_MH_DISPATCH").is_some()
+        && return_layout.is_none()
+        && call_args.len() == 5
+    {
+        if let Some(Value::Object(Some(out))) = call_args.last() {
+            if let Value::Long(ptr) = ctx.get_field(*out, 0) {
+                if ptr != 0 {
+                    let first = unsafe { *(ptr as *const f32) };
+                    eprintln!("[PANAMA_POST_VOID] fn=0x{fn_addr:x} out=0x{ptr:x} first={first}");
+                }
+            }
+        }
+    }
+    if let Some(state) = capture_state {
+        write_downcall_capture_state(ctx, state);
     }
 
     // ----- Unmarshal return -----
@@ -1862,7 +2321,20 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
         None => Value::Object(None),
         Some(rl) => {
             let kind = plf::read_layout_kind(ctx, rl);
-            if kind < 10 {
+            if kind == LAYOUT_ADDRESS {
+                let address = match plf::unmarshal_return_primitive(kind, &ret_slot) {
+                    Value::Long(address) => address,
+                    _ => 0,
+                };
+                let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+                ctx.set_field(seg, 0, Value::Long(address));
+                ctx.set_field(seg, 1, Value::Long(0));
+                ctx.set_field(seg, 2, Value::Object(None));
+                ctx.set_field(seg, 3, Value::Int(0));
+                ctx.set_field(seg, 4, Value::Int(1));
+                ctx.set_field(seg, 5, Value::Long(0));
+                Value::Object(Some(seg))
+            } else if kind < 10 {
                 plf::unmarshal_return_primitive(kind, &ret_slot)
             } else {
                 // Struct/union/sequence return: copy the bytes into a
@@ -1905,8 +2377,19 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
 fn register_pe_function_descriptor(r: &mut NativeMethodRegistry) {
     let fd = "java/lang/foreign/FunctionDescriptor";
 
+    let prev_category = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // of(returnLayout, paramLayouts...) → FunctionDescriptor
     r.register(fd, "of", "(Ljava/lang/foreign/ValueLayout;[Ljava/lang/foreign/ValueLayout;)Ljava/lang/foreign/FunctionDescriptor;", |ctx, args| {
+        let ret_layout = args.first().copied().unwrap_or(Value::Object(None));
+        let params = args.get(1).copied().unwrap_or(Value::Object(None));
+        let desc = alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2);
+        ctx.set_field(desc, 0, ret_layout);
+        ctx.set_field(desc, 1, params);
+        Ok(Some(Value::Object(Some(desc))))
+    });
+
+    r.register(fd, "of", "(Ljava/lang/foreign/MemoryLayout;[Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/FunctionDescriptor;", |ctx, args| {
         let ret_layout = args.first().copied().unwrap_or(Value::Object(None));
         let params = args.get(1).copied().unwrap_or(Value::Object(None));
         let desc = alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2);
@@ -1924,6 +2407,19 @@ fn register_pe_function_descriptor(r: &mut NativeMethodRegistry) {
             let params = args.first().copied().unwrap_or(Value::Object(None));
             let desc = alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2);
             ctx.set_field(desc, 0, Value::Object(None)); // void return
+            ctx.set_field(desc, 1, params);
+            Ok(Some(Value::Object(Some(desc))))
+        },
+    );
+
+    r.register(
+        fd,
+        "ofVoid",
+        "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/FunctionDescriptor;",
+        |ctx, args| {
+            let params = args.first().copied().unwrap_or(Value::Object(None));
+            let desc = alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2);
+            ctx.set_field(desc, 0, Value::Object(None));
             ctx.set_field(desc, 1, params);
             Ok(Some(Value::Object(Some(desc))))
         },
@@ -1948,6 +2444,7 @@ fn register_pe_function_descriptor(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, 1)))
         },
     );
+    r.set_category(prev_category);
 }
 
 // ---------------------------------------------------------------------------
