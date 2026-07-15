@@ -15627,10 +15627,34 @@ fn native_mockito_mock_method_advice_is_overridden(
 ) -> MethodCallResult {
     let mock = obj_arg(args, 1)?;
     let method = obj_arg(args, 2)?;
-    let mock_class_name = ctx
-        .class_name_of_id(ctx.class_id_of_object(mock))
-        .unwrap_or_default();
+    let mock_class_id = ctx.class_id_of_object(mock);
+    let mock_class_name = ctx.class_name_of_id(mock_class_id).unwrap_or_default();
     if !mock_class_name.contains("$MockitoMock$") {
+        let Some((declaring_class_id, method_name, descriptor)) =
+            crate::lang_class::method_class_name_desc(ctx, method)
+        else {
+            return Ok(Some(Value::Int(0)));
+        };
+        if ctx.is_interface_class(declaring_class_id) {
+            return Ok(Some(Value::Int(0)));
+        }
+
+        // Mockito supplies a Method declared by an ancestor, while the mock
+        // can inherit its concrete override through one or more intermediate
+        // classes.  For example, RestTemplate inherits setRequestFactory from
+        // InterceptingHttpAccessor, but Mockito asks about HttpAccessor's
+        // Method.  Stop before the declaring class: its own implementation is
+        // not an override and must remain eligible for ordinary interception.
+        let mut candidate = Some(mock_class_id);
+        while let Some(class_id) = candidate {
+            if class_id == declaring_class_id {
+                break;
+            }
+            if ctx.class_declares_method(class_id, &method_name, &descriptor) {
+                return Ok(Some(Value::Int(1)));
+            }
+            candidate = ctx.superclass_of(class_id);
+        }
         return Ok(Some(Value::Int(0)));
     }
 

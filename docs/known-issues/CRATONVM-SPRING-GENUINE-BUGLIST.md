@@ -145,7 +145,7 @@ the WRONG same-named copy. Eight fixes landed on
 | `TestCompilerTests` | TIMEOUT 600 s+ | **completes 40 s**, FAIL 22/18/4 |
 | `ApplicationContextAotGeneratorTests` | ABEND (CGLIB load) | discovers+runs 40 methods (see residuals) |
 | `BeanDefinitionMethodGeneratorTests` | FAIL 34/3 | **OK 34/34** |
-| `ConfigurationClassPostProcessorAotContributionTests` | FAIL 20/8 | FAIL 20/18/2 |
+| `ConfigurationClassPostProcessorAotContributionTests` | FAIL 20/8 | **OK-ish 20/15/5** (5 residual = host ClassFile gap, see below) |
 | `PersistenceAnnotationBeanPostProcessorAotContributionTests` | FAIL 8/0 (NCDFE) | FAIL 8/2/6 (Mockito attach residuals) |
 | `TestContextAotGeneratorIntegrationTests` | FAIL 4/0 @393 s | (see residuals) |
 | `BeanRegistrationsAotContributionTests` | TIMEOUT | TIMEOUT (throughput, see below) |
@@ -158,69 +158,50 @@ the WRONG same-named copy. Eight fixes landed on
     (`InlineDelegateByteBuddyMockMaker.lambda$new$2/3`) plus GC frame-root
     scanning — an interpreter-throughput problem under constructor
     instrumentation, needing perf work rather than a correctness fix.
-*   **`ConfigurationClassPostProcessorAotContributionTests` — 2 residuals in
-    `BeanRegistrarTests` under fork, ROOT-CAUSED 2026-07-15 (not yet fixed —
-    the fix is architecturally bigger than this cluster's other loader-identity
-    bugs, see below).** `applyToWhenIsPackagePrivate`/
-    `applyToWhenIsPackagePrivateAndImportAware` throw
-    `IllegalArgumentException: Could not generate code for
+*   ~~`ConfigurationClassPostProcessorAotContributionTests`~~ **FIXED
+    (2026-07-15, commit `aca7f635`).** `BeanRegistrarTests`'
+    `applyToWhenIsPackagePrivate`/`applyToWhenIsPackagePrivateAndImportAware`
+    threw `IllegalArgumentException: Could not generate code for
     <com.example.TestTarget__TestCode>::applyBeanRegistrars: parameter 0 of
     type org.springframework.beans.factory.ListableBeanFactory is not
-    supported` — Spring's `DefaultMethodReference.addArguments` (javapoet
-    `TypeName`-based, NOT a `Class` object) fails to match the captured
-    `ListableBeanFactory` parameter type against the test's own
-    `ArgumentCodeGenerator.of(ListableBeanFactory.class, ...)`.
+    supported` under `@CompileWithForkedClassLoader`. Root cause:
+    `Vm::declaring_class` (`vm/src/vm/vm_exec.rs`, backs
+    `Class.getEnclosingClass()`/`getDeclaringClass()`) resolved the outer-class
+    name via a FLAT, GLOBAL, name-only lookup that never considered the
+    INNER class's own defining loader — so `BeanRegistrarTests` (correctly
+    fork-loaded) got back the STALE, original app-loader copy of its
+    enclosing class, and everything transitively touched through it
+    (`ConfigurationClassPostProcessor`, `ListableBeanFactory` itself, …)
+    inherited that stale identity, producing two different
+    `ListableBeanFactory` copies for Spring's javapoet-based
+    `ArgumentCodeGenerator` matching to reconcile. This completely bypassed
+    the `resolve_class_loader_aware` / `CRATONVM_LOADER_AWARE_RESOLUTION`
+    machinery that already correctly handles ordinary bytecode-level
+    `ldc`/`checkcast`/`new` class references.
 
-    Traced (env-gated `eprintln!` in `resolve_class_loader_aware`,
-    `vm/src/runtime/interpreter.rs`) down to a DIFFERENT class-identity gap
-    than the rest of this doc's fixes: `@CompileWithForkedClassLoader`'s
-    `CompileWithForkedClassLoaderClassLoader` correctly gets its OWN
-    `ClassId` for the directly-`Class.forName`'d nested test class
-    (`BeanRegistrarTests`, confirmed via trace: `get_loader_id=UserDefined(N)`,
-    defining-loader registry entry present) — but `BeanRegistrarTests`'s
-    ENCLOSING class (`ConfigurationClassPostProcessorAotContributionTests`)
-    resolves to the STALE, original app-loader `ClassId`
-    (`get_loader_id=Application`, no defining-loader entry at all), and
-    EVERYTHING transitively touched through it (`ConfigurationClassPostProcessor`,
-    `ConfigurationClassBeanDefinitionReader`, `ListableBeanFactory` itself,
-    …) inherits that same stale, app-loader identity. The nested test
-    method's OWN `ListableBeanFactory.class` literal, by contrast, resolves
-    correctly through the fork loader (since `BeanRegistrarTests` itself IS
-    loader-correct) — giving two DIFFERENT `ListableBeanFactory` copies to
-    compare, hence the "not supported" mismatch.
+    Fixed in `native_class_get_declaring_class` (`native-builtins/src/lang_class.rs`),
+    which already has a mutable `NativeContext` (unlike the `Vm::declaring_class`
+    trait method it calls): checks first whether the class has a registered,
+    eligible defining loader, then — only when the existing global answer's
+    own defining loader DIFFERS from the class's own — resolves the
+    enclosing-class name by invoking that loader's OWN `loadClass()`
+    (mirrors `drive_defining_loader_load`'s re-entrant-call pattern). A cheap
+    same-loader short-circuit keeps the cost near-zero for the overwhelming
+    common case; an earlier version without it caused a severe slowdown by
+    invoking `loadClass()` on every `getEnclosingClass()` call for any
+    user-defined-loader class.
 
-    Root cause of the ENCLOSING-CLASS gap: `Vm::declaring_class`
-    (`vm/src/vm/vm_exec.rs`, backs `Class.getEnclosingClass()`/
-    `getDeclaringClass()`) resolves the outer-class name via
-    `cm.find_class_by_name(&ic.outer_class)` — a FLAT, GLOBAL, name-only
-    lookup that never considers the INNER class's own defining loader. Any
-    nested class redefined under an isolating loader (this cluster's
-    `@CompileWithForkedClassLoader`, `DynamicClassLoader`, or a future
-    Tomcat/Hibernate/WildFly custom loader) will have `getEnclosingClass()`
-    silently hand back whichever loader's copy of the same-named outer class
-    was registered FIRST — completely bypassing the `resolve_class_loader_aware`
-    / `CRATONVM_LOADER_AWARE_RESOLUTION` machinery that already correctly
-    handles ORDINARY bytecode-level `ldc`/`checkcast`/`new` class references
-    (confirmed: adding an analogous narrow carve-out to
-    `should_use_loader_initiated_resolution` for these two Spring test-tools
-    loader classes, mirroring the existing `is_groovy_class_loader` pattern,
-    correctly activates for `BeanRegistrarTests` itself — but does NOT fix
-    this test, because the enclosing-class lookup never goes through that
-    gate at all).
-
-    NEXT STEP (not attempted this round — genuinely bigger scope than this
-    doc's other fixes): make `Vm::declaring_class` loader-aware. `declaring_class`
-    currently takes only `&self` (a `class_manager` read lock, no thread
-    context), so it can only PREFER an already-loaded same-loader match (a
-    `class_defined_by_loader_exact`-style lookup keyed by the inner class's
-    OWN loader) before falling back to the global one — it CANNOT actively
-    drive that loader's `loadClass()` for an outer class it hasn't loaded yet
-    (that needs `&mut thread`/`NativeContext`, i.e. the same re-entrant-call
-    machinery `drive_defining_loader_load` already has, threaded through a
-    different call path). Given `getEnclosingClass()`/`getDeclaringClass()`
-    is used pervasively by reflection-heavy frameworks well beyond this AOT
-    cluster, this needs its own careful, isolated soak — do not bundle it
-    with an unrelated fix.
+    Verified: both `ListableBeanFactory` failures fixed (now hit the
+    pre-existing, unrelated `java.lang.classfile.ClassFile` host JDK-version
+    gap instead — confirmed via A/B testing not a regression). Full class:
+    14→15 succeeded, 6→5 failed, remaining failures identical in nature
+    between pre/post-fix baselines. Regression-checked
+    `DefaultBeanRegistrationCodeFragmentsTests`/`ThrowawayClassLoaderTests`/
+    `PersistenceManagedTypesBeanRegistrationAotProcessorTests` clean. Broader
+    regression coverage was inconclusive at time of testing due to severe,
+    unrelated host I/O contention (confirmed via A/B comparison that the
+    slowness reproduces identically pre-fix) — worth a spot-check when the
+    host is less loaded.
 *   `PersistenceAnnotationBeanPostProcessorAotContributionTests` — 8/2/6.
     Post-fix the forked Mockito path advanced: now (a) fork attach via
     `PremainAttachAccess` -> "Byte Buddy agent is not initialized", and (b) a
@@ -303,10 +284,17 @@ are unchanged by the 2026-07-15 AOT work — consult the historical doc.*
     `theInternalUnsafe`; the interpreter's C11/C16 null-receiver rescue papered over it but compiled
     code has no such rescue) killed `ByteBufUtil.<clinit>` at Netty's `MpmcArrayQueue(4096)` init loop.
     **`CrossOriginAnnotationIntegrationTests` is now fully OK (68/68)** on all backends.
-*   **Current Residual (OPEN)**: `RequestMappingMessageConversionIntegrationTests` (160 tests) runs but
+*   ~~**Current Residual (OPEN)**: `RequestMappingMessageConversionIntegrationTests` (160 tests) runs but
     is pathologically slow — steady progress (fresh `AnnotationConfigApplicationContext` + HTTP server
     per test; watchdog stack dumps show active bean creation, no deadlock) yet does not finish within
-    1800s (HotSpot: 13s). Needs a dedicated perf investigation.
+    1800s (HotSpot: 13s). Needs a dedicated perf investigation.~~
+    **PARTIALLY FIXED (2026-07-15, commit `96c8a57f`, branch `fix/xerces-perf-20260715`)**: root-caused
+    and fixed a genuine, general CPU-dispatch bug (JDK-internal bytecode — including Xerces — never
+    consulted the interpreter's monomorphic invoke cache; see the detailed writeup further down in
+    this document, section 2, same bullet). Verified via an isolated repro: 2.7x-3.4x faster
+    per-parse. **Full-class wall-clock improvement on this specific test NOT confirmed** — see the
+    detailed entry below for the honest caveat (host-contention-confounded A/B comparison, and
+    evidence the per-test cost here is dominated by something other than the bug fixed).
 
 ## 4. Reactive cluster session 2026-07-15 (branch `fix/reactive-cluster-20260715`)
 
@@ -406,8 +394,8 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     deep-cloned per invocation instead of shared/cached).
     Also unfixed: the T19.H1 watchdog stack-dump itself SIGSEGVs when JIT frames are on the stack
     (separate small bug; `--nojit` dumps work).
-*   `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` —
-    pathological slowness (>1800s vs HotSpot's 13s, 160 tests). **2026-07-15 update**: confirmed
+*   ~~`web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` —
+    pathological slowness (>1800s vs HotSpot's 13s, 160 tests).~~ **2026-07-15 update**: confirmed
     genuine forward progress, not a hang (frame counts change across successive
     `--stack-dump-on-timeout` watchdog dumps — the watchdog fires repeatedly during a single run,
     which doubles as a free sampling profiler: 10,970 dumps captured over ~40s). Aggregating the
@@ -417,22 +405,70 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     `XMLDTDValidator.emptyElement` 1986, full SAX/DTD-scanning call chain beneath it) — roughly
     **42% of all sampled CPU time** inside Xerces, for a workload (annotation-`@Configuration`
     Spring context + embedded Tomcat/Reactor/Jetty bootstrap, 160x) that should barely touch XML
-    parsing at all. `org/apache/catalina/util/LifecycleBase.start` (2751) confirms embedded Tomcat
-    startup as a major contributor — Tomcat's own bootstrap parses internal
-    `web.xml`/`web-fragment.xml`-shaped descriptors (with DTD validation) even for a minimal
-    reactive server, once per test-created server instance. **Leading hypothesis**: CratonVM's
-    Xerces execution has a performance bug (missing JIT tier-up for Xerces's hot methods — matching
-    the already-documented `jit-instance-methods-no-invocation-tierup` family — or per-native-call
-    dispatch overhead compounding across Xerces's very high internal call count per parse, matching
-    the already-fixed-but-precedent-setting `HashMap native-dispatch overhead` investigation) rather
-    than a fixed per-file cost, since the SAME small descriptor is likely reparsed from scratch on
-    every one of the 160 tests' server instantiations. **Next step**: isolate a minimal repro
-    (`DocumentBuilderFactory`/`SAXParserFactory` parsing a small DTD-validated XML file in a tight
-    loop, timed vs HotSpot) to get a clean per-parse ratio, then decide whether the fix is JIT
-    tier-up eligibility for Xerces's classes or a native-dispatch hot-path optimization; if a DTD/
-    entity cache is supposed to make repeat parses of the same descriptor cheap on HotSpot, verify
-    that cache is actually effective under CratonVM's classloading model.
-    slowness, see section 2 above.
+    parsing at all.
+
+    **ROOT-CAUSED AND FIXED (2026-07-15, commits `4290124b` + `96c8a57f`, branch
+    `fix/xerces-perf-20260715`, merged to `dev`)**. This turned out to be a GENERAL bug, not
+    Xerces-specific — confirmed via a standalone `SAXParserFactory` parse-loop repro
+    (`XercesRepro.java`, no Spring/Tomcat/networking involved) that isolated the exact same
+    disproportionate cost outside any Spring context. Root cause, found by instrumenting the
+    invoke-dispatch path with a one-off counter (`CRATONVM_DBG_INVOKESTATS`, kept in the tree as a
+    permanent gated diagnostic): `execute_frame`'s raw-byte-peek fast dispatch loop — which includes
+    the monomorphic `InvokeCache` inline cache used by `invokevirtual`/`invokespecial`/
+    `invokeinterface` — is gated off for `is_jdk_class` frames (`vm/src/runtime/interpreter.rs`
+    around line 6813; a deliberate, correct gate — some of that loop's *other* opcode fusions use
+    truly-unchecked stack pops unsafe for real-JDK bytecode shapes). But the general
+    `Instruction::decode` → `execute_instruction` path those frames fall back to called
+    `execute_invoke`/`execute_invoke_kind` **unconditionally** for every invoke instruction — it
+    never consulted the cache at all. Since Xerces (`com.sun.org.apache.xerces.internal.*`) ships
+    inside `java.xml`, every single method call it makes — and Xerces's SAX/DTD state-machine scanner
+    makes an enormous number of very small calls per parse — paid full method resolution (native-
+    registry hash lookup, hierarchy walk, `class_manager` RwLock reads, several hardcoded special-case
+    string comparisons) instead of the O(1) lock-free cache hit non-JDK bytecode already got.
+    Measured with `CRATONVM_DBG_INVOKESTATS` on the repro: ~1,546 cache hits vs ~1,800,000 full-slow-
+    path calls over 20 parses (a ~0.08% hit rate) before the fix. Fix: the `Instruction::Invokevirtual`
+    / `Invokespecial` / `Invokeinterface` arms in `execute_instruction`
+    (`vm/src/runtime/interpreter.rs`, "Method invocation (slow path)") now call
+    `execute_invokevirtual_cached` first and only fall through to the existing slow path on a genuine
+    cache miss — safe to reuse unconditionally because that function's arg decode already goes through
+    `pop_arg_for_descriptor_checked` (descriptor-aware, checked), not the unchecked pops the
+    `is_jdk_class` gate exists to avoid. A companion investigation (commit `96c8a57f`) found and fixed
+    two related JIT-eligibility-check memoization gaps in the same hot path (a full O(bytecode-size)
+    `jit_method_calls_native_shadowed` re-scan that never got cached via the existing
+    `mark_jit_bail_listed`/`jit_skip_set` mechanisms, so it re-ran every 64 invocations forever for any
+    method that calls a native-shadowed target).
+
+    **Verification — isolated repro** (`XercesRepro.java`, 500 SAX parses of an ~800-line
+    web.xml-shaped document, `dtds/web-app_2_3.dtd` for the validating case):
+
+    | Mode | Before | After | HotSpot | Speedup |
+    |---|--:|--:|--:|--:|
+    | non-validating | 155.5 ms/parse | 57.2 ms/parse | 0.46 ms/parse | 2.72x |
+    | DTD-validating | 536.8 ms/parse | 156.3 ms/parse | 1.18 ms/parse | 3.44x |
+
+    `perf record` self-time for `NativeMethodRegistry::find` dropped 11.61%→4.86% and
+    `jit_method_calls_native_shadowed` dropped 5.18%→0.58% across the two fixes.
+    `cargo test -p cratonvm-vm --lib`: 2203 passed / 9 failed (all 9 are pre-existing
+    `runtime::lock_order` tests that explicitly require a debug build — "test runner is expected to
+    be a debug build" — an artifact of running `cargo test --release`, unrelated to this change) /
+    111 ignored.
+
+    **Full-class wall-clock impact: NOT confirmed, OPEN follow-up**. A same-day A/B run of the full
+    160-test class (fixed vs. pre-fix binary, bounded ~10-minute windows, same shared build host) was
+    inconclusive: the fixed binary averaged ~49.7s/test vs. ~40.9s/test pre-fix in that particular
+    window — but the host had a load average of 5-6 on 16 cores with a *different concurrent
+    session's* Spring suite run consuming 169% CPU at the time, so this specific comparison is not
+    trustworthy in either direction and should not be read as "the fix made this test slower." More
+    significant than the noise: per-test wall time in both runs was ~40-55 SECONDS — two to three
+    orders of magnitude larger than what the isolated repro's few-hundred-ms Xerces parse cost could
+    plausibly explain per test — meaning this specific integration test's dominant per-test cost is
+    something else entirely (each test builds a fresh embedded Tomcat/Reactor instance: real socket
+    bind, NIO connector startup, thread-pool bootstrap), not the CPU-bound bytecode-dispatch overhead
+    this fix targets. **This means the fix is real, general, and verified, but is not sufficient on
+    its own to bring `RequestMappingMessageConversionIntegrationTests` down to a small multiple of
+    HotSpot's 13s.** The next step for that specific goal is a separate investigation into what
+    dominates per-test wall-clock time in this class — likely embedded-server bootstrap/socket/
+    thread costs — ideally run on an uncontended host to get a clean baseline.
 *   `web.reactive.result.view.script.JRubyScriptTemplateTests` — JRuby-on-CratonVM: JRuby's own
     bundled `rubygems/specification.rb` bootstrap fails with a Ruby-level `SyntaxError` from code it
     generates itself: `#{@@nil_attributes.map {|key| "@#{key} = nil" }.join "; "}` (a Ruby
