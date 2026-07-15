@@ -5957,7 +5957,7 @@ pub(crate) fn mh_dispatch(
             .class_name_of_id(ctx.class_id_of_object(mh))
             .unwrap_or_else(|| "<unknown>".to_string());
         eprintln!(
-            "[MH_DISPATCH] runtime={runtime_class} class={class} name={name} kind={kind} bound={bound:?} argc={}",
+            "[MH_DISPATCH] runtime={runtime_class} class={class} name={name} desc={desc:?} kind={kind} bound={bound:?} argc={}",
             extra_args.len()
         );
         // T2.9.X-dbg: dump each dynamic arg's runtime class (or the raw
@@ -7205,8 +7205,42 @@ fn collect_trailing_varargs(
             _ => {}
         }
     }
-    // Only now (last param is an array AND args aren't packed) confirm the
-    // target is actually ACC_VARARGS before reshaping the arguments.
+    // Confirm collection is actually warranted before reshaping the
+    // arguments. Two independent triggers, either one is sufficient:
+    //
+    //  1. `is_varargs` -- the target is a genuine Java ACC_VARARGS method
+    //     (`foo(Object... xs)`), reached via reflection/MethodHandle spread
+    //     calling convention (`invokeWithArguments`, Groovy's boxed-args
+    //     dispatch, ...). This was the ONLY trigger originally.
+    //
+    //  2. `params.len() > p` -- MORE flat argument values were supplied than
+    //     the target descriptor declares params for, and the last declared
+    //     param is an array type. This covers a target method whose trailing
+    //     array parameter is an ORDINARY (non-varargs) `T[]` -- e.g. JRuby
+    //     10.x's `org.jruby.ir.targets.indy.InvokeSite`/`NormalInvokeSite
+    //     .invoke(ThreadContext, IRubyObject, IRubyObject, IRubyObject[],
+    //     Block)` (confirmed via `javap` -- both real overloads take a plain
+    //     array, neither is declared `IRubyObject...`, so ACC_VARARGS is
+    //     never set on either). JRuby's `invokebinder`-built call-site chain
+    //     supplies the trailing Ruby-level arguments as flat individual
+    //     values via a sequence of `MethodHandles.insertArguments` calls
+    //     (CratonVM's `MH_KIND_INSERT`, which splices correctly at its own
+    //     `pos` -- verified by direct value tracing, not the bug) and never
+    //     calls `MethodHandle.asCollector`/anything else that would pack
+    //     them -- so by the time dispatch reaches the target method's own
+    //     descriptor, arity strictly exceeds the declared param count with a
+    //     trailing array type declared. In a signature-polymorphic
+    //     MethodHandle-mediated call this arity/type mismatch has exactly
+    //     one legal resolution (collect the excess into the array); passing
+    //     the excess through flat/unchanged (the old behavior) desyncs
+    //     every argument at and after the array position -- confirmed via
+    //     `CRATONVM_DBG_MH_DISPATCH` live tracing on
+    //     `JRubyScriptTemplateTests`/`rubygems/version.rb`'s
+    //     `@version.sub(regex, "")`: the terminal `NormalInvokeSite.invoke`
+    //     dispatch received 6 flat args `[ctx, self, receiver, regex, BLOCK,
+    //     replacement]` against a 5-param `(ctx, self, receiver, args[],
+    //     block)` target -- the block landed in the array's slot, one
+    //     position early, pushing the real last argument out past it.
     let cid = match ctx.class_id_by_name(class) {
         Some(c) => c,
         None => return params.to_vec(),
@@ -7215,7 +7249,8 @@ fn collect_trailing_varargs(
         .declared_methods(cid)
         .iter()
         .any(|m| m.name == name && m.descriptor == desc && (m.access_flags & 0x0080) != 0);
-    if !is_varargs {
+    let arity_excess = params.len() > p;
+    if !is_varargs && !arity_excess {
         return params.to_vec();
     }
     let fixed = p - 1;

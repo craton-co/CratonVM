@@ -9578,6 +9578,125 @@ pub(crate) fn push_frame_and_fire_entry(thread: &mut JvmThread, frame: Frame) {
             );
         }
     }
+    // TEMP DIAGNOSTIC (CRATONVM_DBG_BYTECODE_DUMP, 2026-07-15
+    // JRubyScriptTemplateTests investigation, round 3): dump the raw
+    // bytecode + a best-effort mnemonic disassembly for every frame whose
+    // class name matches the runtime-generated JRuby snippet under
+    // investigation (`uri_3a_classloader....rubygems.version`, the
+    // URI-mangled class name JRuby's IR-to-bytecode compiler produces for
+    // `rubygems/version.rb`'s method bodies). These snippets are
+    // synthesized at runtime -- there is no static .class file `javap` can
+    // decompile -- so this is the only way to see the literal opcode
+    // sequence CratonVM is actually executing around the `ivarGet`/
+    // `invoke:sub` invokedynamic call sites.
+    if crate::runtime::env_cache::dbg_bytecode_dump() {
+        let last = thread.frames.len() - 1;
+        let frame_ref = &thread.frames[last];
+        let cn = frame_ref.class_name();
+        if cn.contains("version") {
+            let mn = frame_ref.method_name();
+            let md = frame_ref.method_descriptor();
+            let code = &frame_ref.code;
+            eprintln!(
+                "[BYTECODE-DUMP] {}.{}{} ({} bytes)",
+                cn,
+                mn,
+                md,
+                code.len()
+            );
+            let mut pc = 0usize;
+            while pc < code.len() {
+                let op = code[pc];
+                let (mnemonic, extra_len) = opcode_mnemonic_and_operand_len(op, code, pc);
+                let operand_bytes: Vec<u8> =
+                    code[pc + 1..(pc + 1 + extra_len).min(code.len())].to_vec();
+                eprintln!(
+                    "  {:4}: {:02x} {:<20} operands={:?}",
+                    pc, op, mnemonic, operand_bytes
+                );
+                pc += 1 + extra_len;
+            }
+        }
+    }
+}
+
+/// Best-effort JVMS opcode mnemonic + trailing-operand-byte-count lookup,
+/// covering the opcodes relevant to a call-site-shaped bytecode sequence
+/// (stack shuffles, loads/stores, field/invoke family, branches, `ldc`/
+/// `new`/`checkcast`, returns). Not a complete disassembler -- unknown
+/// opcodes report `extra_len=0` (may misalign the dump past that point);
+/// good enough for the temporary `CRATONVM_DBG_BYTECODE_DUMP` diagnostic
+/// above, which only needs to identify a stack-shape opcode (`dup`,
+/// `dup_x1`, `swap`, `aload`, ...) near a known indy call site's operand
+/// bytes (which ARE handled precisely, so the scan re-syncs at each
+/// `invokedynamic`/`invokestatic`/etc. it passes).
+fn opcode_mnemonic_and_operand_len(op: u8, code: &[u8], pc: usize) -> (&'static str, usize) {
+    match op {
+        0x00 => ("nop", 0),
+        0x01 => ("aconst_null", 0),
+        0x02..=0x08 => ("iconst/lconst/fconst/dconst", 0),
+        0x10 => ("bipush", 1),
+        0x11 => ("sipush", 2),
+        0x12 => ("ldc", 1),
+        0x13 => ("ldc_w", 2),
+        0x14 => ("ldc2_w", 2),
+        0x15 => ("iload", 1),
+        0x16 => ("lload", 1),
+        0x17 => ("fload", 1),
+        0x18 => ("dload", 1),
+        0x19 => ("aload", 1),
+        0x1a..=0x1d => ("iload_N", 0),
+        0x1e..=0x21 => ("lload_N", 0),
+        0x22..=0x25 => ("fload_N", 0),
+        0x26..=0x29 => ("dload_N", 0),
+        0x2a..=0x2d => ("aload_N", 0),
+        0x36 => ("istore", 1),
+        0x37 => ("lstore", 1),
+        0x38 => ("fstore", 1),
+        0x39 => ("dstore", 1),
+        0x3a => ("astore", 1),
+        0x3b..=0x3e => ("istore_N", 0),
+        0x3f..=0x42 => ("lstore_N", 0),
+        0x43..=0x46 => ("fstore_N", 0),
+        0x47..=0x4a => ("dstore_N", 0),
+        0x4b..=0x4e => ("astore_N", 0),
+        0x57 => ("pop", 0),
+        0x58 => ("pop2", 0),
+        0x59 => ("dup", 0),
+        0x5a => ("dup_x1", 0),
+        0x5b => ("dup_x2", 0),
+        0x5c => ("dup2", 0),
+        0x5d => ("dup2_x1", 0),
+        0x5e => ("dup2_x2", 0),
+        0x5f => ("swap", 0),
+        0xa7 => ("goto", 2),
+        0xa8 => ("jsr", 2),
+        0xac..=0xb1 => ("Xreturn", 0),
+        0xb2 => ("getstatic", 2),
+        0xb3 => ("putstatic", 2),
+        0xb4 => ("getfield", 2),
+        0xb5 => ("putfield", 2),
+        0xb6 => ("invokevirtual", 2),
+        0xb7 => ("invokespecial", 2),
+        0xb8 => ("invokestatic", 2),
+        0xb9 => ("invokeinterface", 4),
+        0xba => ("invokedynamic", 4),
+        0xbb => ("new", 2),
+        0xbc => ("newarray", 1),
+        0xbd => ("anewarray", 2),
+        0xbe => ("arraylength", 0),
+        0xbf => ("athrow", 0),
+        0xc0 => ("checkcast", 2),
+        0xc1 => ("instanceof", 2),
+        0x99..=0x9e => ("if_icmp/ifxx", 2),
+        0x9f..=0xa4 => ("if_icmpXX", 2),
+        0xa5 | 0xa6 => ("if_acmpXX", 2),
+        0xc6 | 0xc7 => ("ifnull/ifnonnull", 2),
+        _ => {
+            let _ = (code, pc);
+            ("?", 0)
+        }
+    }
 }
 
 /// Convert a [`Value`] to the JVMTI-flavoured [`LocalValue`].
