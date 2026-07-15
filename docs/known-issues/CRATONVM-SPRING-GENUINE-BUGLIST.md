@@ -358,16 +358,52 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     CratonVM hit the hang on ~2/13 attempts, always on the `Jdk` connector, never the other 3 (which
     don't route through this raw-socket path). Fixed both blocking sites; verified 15/15 clean on the
     same probe post-fix, `cargo test -p cratonvm-native-builtins --lib` 2996/0.
-    **Still OPEN**: the full `ClientHttpConnectorTests` class (which also exercises Reactor Netty,
-    Jetty, and Apache HttpComponents — real, independent libraries with their own native I/O) still
-    intermittently hangs after this fix, in the identical `StepVerifier`/`waitTaskEvent` shape.
-    Near-certainly a similarly-shaped but structurally separate STW-cooperation gap in ONE of those
-    other 3 connectors' own blocking call paths (or CratonVM's support code for them) — not
-    reachable from `net_phase_e.rs`. **Next step**: bisect which of the 4 connectors is still
-    hanging (rerun with a filtered `MethodSource` exercising one `Named<ClientHttpConnector>` at a
-    time — the `FullMatrixProbe`-style technique in the fix's worktree
-    `/data/data/wt-jdkclient-patch-hang-20260715/probes/` generalizes directly), then audit that
-    connector's blocking native call sites for the same missing `begin_blocking_region` pattern.
+    ~~**Still OPEN residual investigated 2026-07-15**~~ (`fix/httpconn-residual-20260715`, commit
+    `91cb806c`). Bisected the "which of the other 3 connectors" question with a
+    `FullMatrixProbe`-style stress harness plus a from-scratch JUnit launcher driving the real
+    `ClientHttpConnectorTests` class (49 sub-tests) directly under CratonVM, both stress-run
+    dozens of times with `sudo gdb -p <pid> --batch -ex 'thread apply all bt'` snapshots captured
+    live on reproduced hangs (Jetty `TRACE`, Jdk `OPTIONS`/`DELETE` all reproduced the shape).
+    **Found and fixed two genuine instances of the same missing-`begin_blocking_region` bug
+    pattern**, but in the *shared* `java.net.Socket`/`java.net.ServerSocket` implementation
+    (`native-builtins/src/plain_socket.rs`, JDK13+'s `NioSocketImpl` backing both classes) rather
+    than in any one connector's own code — `java.net.ServerSocket.accept()` is what MockWebServer
+    itself uses to accept every connection for all 4 connector cases:
+      - `socket_accept()`: `listener.accept()` (both the `SO_TIMEOUT` busy-poll branch and the
+        unbounded branch) was never bracketed in `begin_blocking_region`/`end_blocking_region`.
+      - `socket_connect()`: worse than just missing the STW bracket — `connect()`/`connect_timeout()`
+        ran *inside* `with_socket()`'s closure, which holds the single global socket-registry
+        write lock for the call's duration, serializing every other blocking `Socket` op
+        process-wide for as long as the connect takes.
+    Applied the same fix defensively to `native-io/src/socket_channel.rs`'s blocking-mode
+    `SocketChannel` paths (`sc_connect_inner`'s `allow_block` branch, `sc_read`/`sc_write`), which
+    match the identical pattern but were not directly confirmed as hit by these connectors (all
+    3 remaining connectors configure their channels non-blocking).
+    **However, direct gdb evidence shows this missing-wrap pattern is NOT what actually causes the
+    residual hangs.** Every reproduced hang (both pre- and post-fix, including from the real
+    `ClientHttpConnectorTests` class itself) showed: zero threads parked in an unwrapped blocking
+    `accept`/`connect`/`read`/`write` syscall; zero `"STW cross-thread JIT takeover is still
+    waiting for cooperative mutators"` warnings; and thread counts that *dropped* between
+    successive snapshots 4s apart (proving forward progress, not a permanent deadlock). What IS
+    reproducibly visible at every capture: one thread executing `vm/src/runtime/interpreter.rs`'s
+    JIT-to-interpreter transition (`jit_invoke_virtual_mic` → `invoke_on_class_shared_inner` →
+    `execute()` at `interpreter.rs:4163`) deep-cloning a method's `CodeAttribute` — specifically its
+    `LineNumberEntry`/`LocalVariableEntry` vectors (`reader/src/attribute.rs::clone()`) — taking
+    multiple seconds, in one capture while another thread waited on a `ConcurrentHashMap` per-bin
+    monitor (`native_chm_compute` → `monitor_enter_gc_safe`, itself correctly GC-safe) presumably
+    held by a thread doing the same slow clone. This looks like severe, non-deterministic
+    interpreter/attribute-cloning + lock-contention slowness under the heavy thread-pool
+    accumulation the 45-sub-test class produces in one process (76+ live threads by sub-test 6),
+    not a deadlock — StepVerifier's wait just outlasts whatever timeout the harness enforces.
+    **Verification**: `cargo test -p cratonvm-native-builtins --lib` 2996/0 and
+    `cargo test -p cratonvm-native-io --lib` 349/0 unchanged (no regression). Stress comparison
+    of the fix vs. pre-fix binary was inconclusive/confounded (both showed hangs at broadly
+    similar rates under concurrent-load conditions on the shared build host) — the fix is landed
+    because it closes a real, verified bug of the exact hypothesized pattern, not because it was
+    confirmed to eliminate this residual. **Still OPEN**: the interpreter/attribute-cloning
+    slowness above is the real next step, flagged separately for a dedicated investigation (not a
+    quick missing-wrap fix — needs profiling why `CodeAttribute` line-number/local-variable data is
+    deep-cloned per invocation instead of shared/cached).
     Also unfixed: the T19.H1 watchdog stack-dump itself SIGSEGVs when JIT frames are on the stack
     (separate small bug; `--nojit` dumps work).
 *   `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` —

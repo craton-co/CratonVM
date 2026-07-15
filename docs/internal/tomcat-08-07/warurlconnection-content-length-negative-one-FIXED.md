@@ -1,6 +1,6 @@
 # TestWarURLConnection — getContentLength() returns -1 instead of the real size
 
-**Status (2026-07-15): REOPENED.** The fix below (commit `09a505435`,
+**Superseded reopening report (2026-07-15).** The fix below (commit `09a505435`,
 confirmed present in the exact binary tested — `war_nested_jar_bytes` is in
 the built `native-builtins/src/net_phase_e.rs`) does not resolve the bug on
 this Windows box: a fresh rerun on `dev` @ `f23a3f42a` reproduces the
@@ -16,6 +16,24 @@ locate the nested jar, a leading candidate is Windows path syntax
 match `war_nested_jar_bytes` uses to recognize the `war:file:<path>*/...`
 shape — the fix may only have been validated on Linux. Needs a Windows-
 specific repro/trace before assuming a plain regression.
+
+## Closure verification (2026-07-15)
+
+**Status: FIXED / stale reopen retired.** The original native fix remains on
+`origin/dev` at `a9b838c4e`, and no later change touches its
+`JarURLConnection` resolver. A fresh Windows release build from that exact
+revision, with a dedicated worktree target, ran the supplied Tomcat fixture
+four times: `TestWarURLConnection` passed three times with the default JIT and
+once with `--nojit` (`OK (1 test)` every time). The reported
+`expected:<137> but was:<-1>` result is not reproducible.
+
+The former `TestHandlerIntegration.testToURI` annotation-scanning timeout is
+not a `WarURLConnection`/content-length residual: HotSpot passes it in 8.88s,
+while CratonVM still exceeds the focused 60s guard in
+`DataInputStream.readUTF()` during deployment. It belongs to the separately
+tracked embedded-server deployment throughput wall in
+`docs/internal/tomcat-suite-bugs/04-embedded-server-throughput-wall-OPEN.md`,
+not this fixed URL-content contract.
 
 **Original status:** FIXED. **Severity:** medium. **HotSpot:** PASS (fresh-verified).
 

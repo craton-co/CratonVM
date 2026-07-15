@@ -9094,22 +9094,35 @@ fn native_dos_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(None)
 }
 
+/// Write one byte through the wrapped stream and bump `written`.
+///
+/// GC-safety (DOM18 stale-canary backtrace, 2026-07-15): the `write(I)V`
+/// invoke can run a moving GC. `this` is pinned across it and re-read for
+/// the `written` update, and the CURRENT address is returned — multi-byte
+/// writers MUST rebind their local to the returned ref before the next call
+/// (the pre-fix `writeUTF` loop handed a stale `this` to every iteration
+/// after a GC, tripping CRATONVM_DBG_STALE_OBJREF in the WildFly Host
+/// Controller).
 fn dos_write_one(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     b: i32,
-) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
     let inner = match ctx.get_field(this, DOS_FIELD_OUT) {
         Value::Object(Some(s)) => s,
-        _ => return Ok(()),
+        _ => return Ok(this),
     };
-    ctx.invoke_virtual(inner, "write", "(I)V", &[Value::Int(b & 0xFF)])?;
+    let this_pin = ctx.pin_native_root(this);
+    let r = ctx.invoke_virtual(inner, "write", "(I)V", &[Value::Int(b & 0xFF)]);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    r?;
     let written = match ctx.get_field_by_name(this, DOS_WRITTEN_FIELD) {
         Value::Int(w) => w,
         _ => 0,
     };
     ctx.set_field_by_name(this, DOS_WRITTEN_FIELD, Value::Int(written + 1));
-    Ok(())
+    Ok(this)
 }
 
 fn native_dos_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9173,12 +9186,22 @@ fn native_dos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
-    for i in 0..len {
-        if let Value::Int(b) = ctx.get_array_element(buf, off + i) {
-            dos_write_one(ctx, this, b)?;
+    // GC-safety: each byte write can run a moving GC — rebind `this` to
+    // dos_write_one's returned (refreshed) ref and re-read `buf` through a
+    // pin every iteration.
+    let buf_pin = ctx.pin_native_root(buf);
+    let result = (|| -> MethodCallResult {
+        let mut this = this;
+        for i in 0..len {
+            let cur_buf = ctx.read_native_pin(buf_pin, buf);
+            if let Value::Int(b) = ctx.get_array_element(cur_buf, off + i) {
+                this = dos_write_one(ctx, this, b)?;
+            }
         }
-    }
-    Ok(None)
+        Ok(None)
+    })();
+    ctx.unpin_native_roots(buf_pin);
+    result
 }
 
 fn native_dos_write_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9209,7 +9232,7 @@ fn native_dos_write_short(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    dos_write_one(ctx, this, (v >> 8) & 0xFF)?;
+    let this = dos_write_one(ctx, this, (v >> 8) & 0xFF)?;
     dos_write_one(ctx, this, v & 0xFF)?;
     Ok(None)
 }
@@ -9223,9 +9246,9 @@ fn native_dos_write_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    dos_write_one(ctx, this, (v >> 24) & 0xFF)?;
-    dos_write_one(ctx, this, (v >> 16) & 0xFF)?;
-    dos_write_one(ctx, this, (v >> 8) & 0xFF)?;
+    let this = dos_write_one(ctx, this, (v >> 24) & 0xFF)?;
+    let this = dos_write_one(ctx, this, (v >> 16) & 0xFF)?;
+    let this = dos_write_one(ctx, this, (v >> 8) & 0xFF)?;
     dos_write_one(ctx, this, v & 0xFF)?;
     Ok(None)
 }
@@ -9239,8 +9262,9 @@ fn native_dos_write_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
+    let mut this = this;
     for shift in (0..8).rev() {
-        dos_write_one(ctx, this, ((v >> (shift * 8)) & 0xFF) as i32)?;
+        this = dos_write_one(ctx, this, ((v >> (shift * 8)) & 0xFF) as i32)?;
     }
     Ok(None)
 }
@@ -9290,12 +9314,13 @@ fn native_dos_write_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         .into());
     }
     let len = bytes.len();
-    // Write 2-byte big-endian length.
-    dos_write_one(ctx, this, ((len >> 8) & 0xFF) as i32)?;
-    dos_write_one(ctx, this, (len & 0xFF) as i32)?;
+    // Write 2-byte big-endian length. GC-safety: rebind `this` to each
+    // call's returned (refreshed) ref — see dos_write_one.
+    let this = dos_write_one(ctx, this, ((len >> 8) & 0xFF) as i32)?;
+    let mut this = dos_write_one(ctx, this, (len & 0xFF) as i32)?;
     // Write the encoded payload byte-by-byte.
     for &b in &bytes {
-        dos_write_one(ctx, this, b as i32)?;
+        this = dos_write_one(ctx, this, b as i32)?;
     }
     Ok(None)
 }
