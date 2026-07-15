@@ -4255,8 +4255,12 @@ fn make_drop_arguments_adapter(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         .or_else(|| mh_read_desc(ctx, orig_mh))
         .unwrap_or_default();
     let widened_desc = widen_descriptor(ctx, &inner_desc, extra_classes, pos);
-    // Encode `pos` into MH_CLASS so dispatch can recover it.
-    let pos_str = pos.to_string();
+    // Encode `pos:extra_n` into MH_CLASS so dispatch can recover BOTH
+    // the drop position and the exact number of dropped values directly,
+    // instead of re-deriving drop count later from an arg-count
+    // difference (see the dispatch-side comment on why that heuristic
+    // was wrong for chained/nested combinators).
+    let pos_str = format!("{pos}:{extra_n}");
     // GC-safety: `alloc_method_handle` allocates a new MethodHandle object,
     // which can trigger a collection that relocates `orig_mh`/`extra_classes`
     // (both captured well before this point and read again below). Pin them
@@ -5956,6 +5960,24 @@ pub(crate) fn mh_dispatch(
             "[MH_DISPATCH] runtime={runtime_class} class={class} name={name} kind={kind} bound={bound:?} argc={}",
             extra_args.len()
         );
+        // T2.9.X-dbg: dump each dynamic arg's runtime class (or the raw
+        // primitive) so a wrong-value / wrong-position bug in a combinator
+        // chain (dropArguments/insertArguments/foldArguments/...) is
+        // visible directly, not just the argc.
+        let arg_descs: Vec<String> = extra_args
+            .iter()
+            .map(|v| match v {
+                Value::Object(Some(o)) => {
+                    let cn = ctx
+                        .class_name_of_id(ctx.class_id_of_object(*o))
+                        .unwrap_or_else(|| "?".to_string());
+                    format!("{:p}:{}", o.as_ptr(), cn)
+                }
+                Value::Object(None) => "null".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        eprintln!("[MH_DISPATCH_ARGS] {arg_descs:?}");
         if kind == MH_KIND_GUARD {
             if let Value::Object(Some(wrapper)) = bound {
                 eprintln!(
@@ -6154,9 +6176,30 @@ pub(crate) fn mh_dispatch(
         MH_KIND_DROP => {
             // C26: dropArgumentsTrusted wrapper. Unwrap to inner MH (in
             // MH_BOUND) and forward only the inner MH's expected args.
-            // Inner arity is derived from the inner MH's effective type. The
-            // drop position is encoded in MH_CLASS as "<pos>" decimal; if parse
-            // fails, drop from the head.
+            //
+            // The drop position AND count are encoded in MH_CLASS as
+            // "pos:count" (set by `make_drop_arguments_adapter` at
+            // construction time -- see its own comment). This USED to
+            // re-derive `drop_n` at dispatch time as
+            // `extra_args.len() - inner_expected` (inner_expected computed
+            // by re-parsing the INNER handle's reported descriptor/kind).
+            // That heuristic silently produces the wrong `drop_n` (and then
+            // a wrong, silently-clamped `pos`) whenever this DROP adapter is
+            // itself nested inside further combinators (JRuby's
+            // `org.jruby.ir.targets.indy.InvokeSite` composes SIX
+            // `dropArguments` + SIX `insertArguments` calls per call site) --
+            // any drift in what the inner handle's descriptor reports as its
+            // effective arity (e.g. a receiver-detection edge case, or an
+            // inner adapter whose own widened `type` field doesn't exactly
+            // match its TRUE effective arity) throws off the subtraction,
+            // which then throws off every downstream drop in the chain.
+            // Confirmed via `CRATONVM_DBG_INDY_GENERIC` tracing on
+            // `rubygems/version.rb`'s `@version.sub(regex, "")` call
+            // (reached through exactly this `InvokeSite` machinery): the
+            // receiver slot held `self` instead of `@version`'s string, and
+            // a stray `Regexp` literal landed in the replacement-string/
+            // block slots -- a classic "wrong args kept as the `pos` prefix"
+            // symptom of a silently-mis-clamped `pos`/`drop_n` pair.
             let inner = match bound {
                 Value::Object(Some(r)) => r,
                 _ => return Ok(Some(Value::Object(None))),
@@ -6177,11 +6220,29 @@ pub(crate) fn mh_dispatch(
                 } else {
                     0
                 };
-            let pos: usize = mh_read_class(ctx, mh)
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(0);
-            // Drop `extra_args.len() - inner_expected` args starting at `pos`.
-            let drop_n = extra_args.len().saturating_sub(inner_expected);
+            let class_str = mh_read_class(ctx, mh);
+            let (pos, drop_n): (usize, usize) = class_str
+                .as_deref()
+                .and_then(|s| {
+                    let mut parts = s.splitn(2, ':');
+                    let p = parts.next()?.parse::<usize>().ok()?;
+                    let n = parts.next()?.parse::<usize>().ok()?;
+                    Some((p, n))
+                })
+                // Defensive fallback for a DROP handle whose MH_CLASS wasn't
+                // encoded in the "pos:count" format (shouldn't happen via
+                // `make_drop_arguments_adapter`, but avoid a hard failure on
+                // an unexpected encoding): fall back to the old
+                // arg-count-difference heuristic.
+                .unwrap_or_else(|| {
+                    let p = class_str
+                        .as_deref()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let n = extra_args.len().saturating_sub(inner_expected);
+                    (p, n)
+                });
+            let drop_n = drop_n.min(extra_args.len());
             let pos = pos.min(extra_args.len().saturating_sub(drop_n));
             let mut trimmed: Vec<Value> = Vec::with_capacity(inner_expected);
             trimmed.extend_from_slice(&extra_args[..pos]);
@@ -9094,6 +9155,61 @@ pub(crate) fn native_ibg_generate_named_function_invoker(
 mod tests {
     use super::*;
     use crate::test_utils::MockNativeContext;
+
+    // MH_KIND_DROP dispatch must trim the dynamic args using the EXACT
+    // `pos:count` encoded at construction time (see MH_KIND_RETURN_FILTER's
+    // sibling doc comment on `make_drop_arguments_adapter` for the full
+    // story) rather than re-deriving the drop count later from
+    // `extra_args.len() - inner_expected`. Regression coverage for the
+    // JRubyScriptTemplateTests investigation (2026-07-15): a bare
+    // `dropArguments(leaf, pos, valueTypes)` adapter, dispatched with the
+    // widened arg list, must forward ONLY the kept (non-dropped) argument
+    // to `leaf`, regardless of what values sit in the dropped slots.
+    #[test]
+    fn drop_arguments_dispatch_keeps_correct_slot_not_adjacent_ones() {
+        let mut ctx = MockNativeContext::new();
+        // Leaf: identity(x) = x -- a plain 1-arg handle, so the dispatch
+        // result directly tells us which argument survived the drop.
+        let leaf = alloc_method_handle(
+            &mut ctx,
+            "java/lang/invoke/MethodHandles",
+            "identity",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            MH_KIND_IDENTITY,
+        );
+        // Simulates `dropArguments(leaf, 1, [Object.class, Object.class])`:
+        // a 3-param adapter where params[1..3] are dropped and param[0] is
+        // the one forwarded to `leaf`. Built directly (bypassing
+        // `make_drop_arguments_adapter`'s `[Ljava/lang/Class;` machinery)
+        // to isolate the dispatch-side fix under test.
+        let adapter = alloc_method_handle(
+            &mut ctx,
+            "1:2",
+            "drop",
+            "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            MH_KIND_DROP,
+        );
+        ctx.set_field(adapter, MH_BOUND, Value::Object(Some(leaf)));
+
+        // Three distinct sentinel objects so a wrong-position bug (e.g. a
+        // dropped arg silently reaching `leaf` instead of the kept one)
+        // is unmistakable rather than accidentally passing.
+        let kept = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0);
+        let dropped1 = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0);
+        let dropped2 = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0);
+        let args = [
+            Value::Object(Some(kept)),
+            Value::Object(Some(dropped1)),
+            Value::Object(Some(dropped2)),
+        ];
+        let result = mh_dispatch(&mut ctx, adapter, &args).unwrap();
+        assert_eq!(
+            result,
+            Some(Value::Object(Some(kept))),
+            "dropArguments(leaf, pos=1, count=2) must keep only the arg at \
+             pos 0 and forward it to leaf, regardless of the dropped args"
+        );
+    }
 
     // C13: alloc_method_handle must populate the real-JDK
     // MethodHandle.type:MethodType field so JDK code paths that read
