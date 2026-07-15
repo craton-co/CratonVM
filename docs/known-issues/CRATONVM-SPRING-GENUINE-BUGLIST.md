@@ -484,38 +484,90 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     HotSpot's 13s.** The next step for that specific goal is a separate investigation into what
     dominates per-test wall-clock time in this class — likely embedded-server bootstrap/socket/
     thread costs — ideally run on an uncontended host to get a clean baseline.
-*   ~~`web.reactive.result.view.script.JRubyScriptTemplateTests`~~ **FIXED (2026-07-15, commit
-    `d8ae2b96`).** Root cause was NOT the leading stale-`ObjectRef` hypothesis below (that
-    investigation misdiagnosed the bug against a stale `jruby-complete-9.1.17.0.jar` decompile; the
-    ACTUAL test classpath uses `jruby-base`/`jruby-stdlib` 10.0.2.0, whose `BlockCallback`
-    interface differs materially). The real bug: `org.jruby.runtime.BlockCallback` in JRuby 10.x
-    declares one abstract SAM `call(ThreadContext, IRubyObject[], Block)` plus five same-named
-    DEFAULT overloads, including `call(ThreadContext, IRubyObject, Block)` (scalar) which should
-    wrap its argument into a 1-element array and re-invoke the real SAM.
-    `interpreter::lambda_args_sam_compatible` (`vm/src/runtime/interpreter.rs`) unconditionally
-    skipped array-typed SAM parameters (`!pd.starts_with('L')` is true for `[...`, so the
-    "generic/erased — never second-guess" catch-all swallowed them), so it could never tell the
-    scalar DEFAULT `call` apart from the array-taking abstract SAM. `try_lambda_dispatch` then fed
-    the raw scalar (a `RubySymbol`, e.g. `:foo` from `Enumerable#partition`'s per-element block
-    callback) straight into the array-typed lambda body, so
-    `RubyEnumerable.packEnumValues(ThreadContext, IRubyObject[])` executed `arraylength` against a
-    bare `RubySymbol` — the `[GC-ARRAY-GUARD]` hit — silently returning 0 instead of throwing,
-    which produced the empty `"@#{key} = nil"` → `"@ = nil"` corruption that a nested `eval()`
-    rejected as a `SyntaxError` during `rubygems/specification.rb` bootstrap. Fix: when a SAM
-    parameter descriptor is array-typed, require the actual argument to be null, missing, or a
-    genuine array; a present non-array object there now correctly returns `false` (overloaded
-    default), so `try_lambda_dispatch` falls through to the real default method instead of
-    misdispatching. A related, narrower GC-safety hardening (pin `obj_ref`/`call_args` across
-    `lambda_args_sam_compatible`'s class-loading-capable helpers, mirroring the existing
-    `invoke_virtual` fix in `d64fab85`) landed alongside it in commit `6d652338` — legitimate but,
-    on its own, insufficient for this bug. **Evidence**: minimal `ScriptEngineManager` repro
-    (`[:foo,:bar].map {|key| "@#{key} = nil"}.join`) now produces the correct interpolated output
-    matching HotSpot; the `[GC-ARRAY-GUARD]` warning count for a full `JRubyScriptTemplateTests`
-    run dropped from 6 to 0; `cargo test -p cratonvm-vm --lib --release` unchanged at
-    2203 passed / 9 pre-existing `--release`-only `lock_order` failures. **Residual (separate,
-    newly-exposed, NOT a regression)**: the test class still fails after this fix, now via a
-    previously-unreached `NullPointerException` in JRuby's own indy-based
-    `org.jruby.ir.targets.indy.IsTrueSite.init` bootstrap (`rubygems/version.rb`'s
-    `canonical_segments`) — masked until this fix let bootstrap progress past `specification.rb`;
-    not investigated further under this fix, flagged for follow-up.
+*   ~~`web.reactive.result.view.script.JRubyScriptTemplateTests`~~ **PARTIALLY FIXED
+    (2026-07-15) -- 2 of (at least) 3 chained bugs closed, test class still FAILS.** JRuby's own
+    bootstrap (`rubygems/specification.rb` / `rubygems/version.rb`) turned out to hit a CHAIN of
+    independent CratonVM bugs, each masking the next -- fixing one just exposes the next further
+    into the same bootstrap. Root-caused and fixed so far:
+
+    1. **FIXED, commit `d8ae2b96`.** `org.jruby.runtime.BlockCallback` in JRuby 10.x (the ACTUAL
+       test classpath is `jruby-base`/`jruby-stdlib` 10.0.2.0 -- an earlier pass in this
+       investigation misdiagnosed against a stale `jruby-complete-9.1.17.0.jar` decompile and
+       chased an unrelated GC-safety gap first) declares one abstract SAM
+       `call(ThreadContext, IRubyObject[], Block)` plus five same-named DEFAULT overloads,
+       including `call(ThreadContext, IRubyObject, Block)` (scalar) which should wrap its
+       argument into a 1-element array and re-invoke the real SAM.
+       `interpreter::lambda_args_sam_compatible` (`vm/src/runtime/interpreter.rs`)
+       unconditionally skipped array-typed SAM parameters (`!pd.starts_with('L')` is true for
+       `[...`, so the "generic/erased — never second-guess" catch-all swallowed them), so it
+       could never tell the scalar DEFAULT `call` apart from the array-taking abstract SAM.
+       `try_lambda_dispatch` then fed the raw scalar (a `RubySymbol`, e.g. `:foo` from
+       `Enumerable#partition`'s per-element block callback) straight into the array-typed
+       lambda body, so `RubyEnumerable.packEnumValues(ThreadContext, IRubyObject[])` executed
+       `arraylength` against a bare `RubySymbol` — the `[GC-ARRAY-GUARD]` hit — silently
+       returning 0 instead of throwing, which produced the empty `"@#{key} = nil"` →
+       `"@ = nil"` corruption that a nested `eval()` rejected as a `SyntaxError`. Fix: when a
+       SAM parameter descriptor is array-typed, require the actual argument to be null,
+       missing, or a genuine array. A related, narrower GC-safety hardening (pin
+       `obj_ref`/`call_args` across `lambda_args_sam_compatible`'s class-loading-capable
+       helpers, mirroring the existing `invoke_virtual` fix in `d64fab85`) landed alongside it
+       in commit `6d652338` — legitimate but, on its own, insufficient for this bug.
+
+    2. **FIXED, commit `3af9ab62`.** Fixing (1) let bootstrap progress past the `SyntaxError`
+       and immediately into a `NullPointerException` in JRuby's own indy-based
+       `org.jruby.ir.targets.indy.IsTrueSite.init` (`rubygems/version.rb`'s
+       `canonical_segments`, `@canonical_segments ||= ...`'s truthiness test).
+       `MethodHandles.filterReturnValue` (`native-builtins/src/lang_invoke.rs`) was a no-op
+       stub ("simplified: return the target MH unchanged", silently dropping the filter
+       handle). JRuby's `VariableSite.ivar` ivar-getter call-site targets rely on
+       `filterReturnValue` to substitute the runtime's `nil` singleton for the raw Java `null`
+       that `IRubyObject.getInstanceVariable` genuinely returns for an unset ivar (normal at
+       that raw layer). With the filter dropped, `mh.invoke()` returned the raw `null`
+       straight through, and `IsTrueSite.init` crashed calling `.getRuntime()` on it. Fix:
+       added `MH_KIND_RETURN_FILTER` + `mh_dispatch_return_filter`, mirroring the existing
+       `MH_KIND_FILTER`/`MH_KIND_CATCH` adapter pattern — invoke target, pass its result
+       through the filter handle, return the filter's result.
+
+    **Evidence for (1)+(2)**: minimal `ScriptEngineManager` repro
+    (`[:foo,:bar].map {|key| "@#{key} = nil"}.join`, and separately `require 'erb'; require
+    'ostruct'` for (2)) now produces correct output / no longer NPEs; the `[GC-ARRAY-GUARD]`
+    warning count for a full `JRubyScriptTemplateTests` run dropped from 6 to 0;
+    `cargo test -p cratonvm-vm --lib --release` unchanged at 2203 passed / 9 pre-existing
+    `--release`-only `lock_order` failures; `cargo test -p cratonvm-native-builtins --lib
+    --release` unchanged at 2997 passed / 0 failed.
+
+    **OPEN — bug 3, current blocker, NOT fixed.** Past (1)+(2), the same minimal repro (and the
+    full test class) now hits `ArgumentError: wrong number of arguments (given 0, expected
+    1..2)` at `rubygems/version.rb:413` (`canonical_segments`'s `partition_segments(...)` /
+    the preceding `@version.sub(regex, "")` call), raised from deep inside REAL gem-dependency
+    resolution (`Gem::Dependency#to_spec` → `#to_specs` → `#matching_specs` →
+    `Specification.find_all_by_name` → `Requirement#satisfied_by?` → `RubyComparable#>=` →
+    `Version#<=>` → `#canonical_segments`) — i.e. this is reached only once (1) and (2) let
+    bootstrap progress far enough to start resolving real gem versions. Traced via
+    `CRATONVM_DBG_INDY_GENERIC=1` to `org.jruby.ir.targets.simple.NormalInvokeSite.bootstrap`'s
+    `invoke:sub(ThreadContext, IRubyObject, IRubyObject, IRubyObject, IRubyObject)` call site:
+    the operand stack legitimately holds exactly 5 values when `bootstrap_generic`
+    (`vm/src/runtime/invokedynamic.rs`) pops them (no stack-depth mismatch — added a
+    `CRATONVM_DBG_INDY_GENERIC`-gated depth log to confirm), but the VALUES are wrong: the
+    receiver slot holds the `Gem::Version` instance itself (`self`) instead of `@version`'s
+    string value, and a second `Regexp` literal (seemingly meant for a *different*,
+    conditionally-executed `.sub!` call on the next source line) ends up in the
+    replacement-string/block argument slots instead of the frozen `""` string. This points
+    upstream of `bootstrap_generic`'s own (verified-correct) pop loop, into how earlier
+    nested `invokedynamic` sites (ivar-get, `RegexpObjectSite`, `StringBootstrap.fstring`) or
+    JRuby's own IR-interpreter call-site linkage populate that operand stack.
+
+    **Why this looks like a fundamentally larger scope, not one more targeted site**:
+    `org.jruby.ir.targets.indy.InvokeSite` — JRuby's call-linkage base class for essentially
+    every ordinary Ruby method invocation (both `(1)`'s `BlockCallback` sites and `(2)`'s
+    `VariableSite` sites are comparatively narrow siblings of this) — composes its real target
+    handles from, per its own decompiled bytecode: `MethodHandles.dropArguments` (6 call
+    sites), `insertArguments` (6 call sites), `foldArguments` (1), `filterReturnValue` (1 — the
+    same combinator fixed in (2), reused here in a different composition), and `guardWithTest`
+    (1), all interacting to build a lazily-specializing polymorphic inline cache. Isolating
+    which exact composition (or combination) misbehaves for THIS call shape would need
+    systematically verifying each of `dropArguments`/`insertArguments`/`foldArguments`
+    (`native-builtins/src/lang_invoke.rs`) against real JDK semantics for arbitrary
+    argument-count/position combinations, not a single targeted fix — flagged for a dedicated
+    follow-up investigation rather than continued ad-hoc tracing here.
 *   ~~Batch-context `<clinit>` contamination~~ — RETRACTED, see above (host environment issue: missing /tmp + missing ~/jdk25 symlink, not CratonVM).
