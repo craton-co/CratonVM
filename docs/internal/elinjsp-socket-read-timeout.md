@@ -1,20 +1,17 @@
-# TestELInJsp — 4/25 failures with client-side SocketTimeoutException
+# TestELInJsp — historical SocketTimeoutException residuals (retired)
 
-**Status:** PARTIALLY FIXED (2026-07-13) — the STW cross-thread JIT takeover
-mechanism that caused `testBug45427` to fail is root-caused and fixed;
-`testBug45427` now PASSES reliably. A separate, still-open residual remains
-(see below), shared with
-[stw-crossthread-jit-takeover-hang-cluster.md](stw-crossthread-jit-takeover-hang-cluster.md).
-## Closure update (2026-07-14)
+**Historical status (2026-07-13):** this note initially recorded the STW
+takeover failure and two later JSP/socket residuals. It is retained solely as
+the investigation history; no known issue remains.
 
-**Status: RESOLVED and retired.** A clean helper-only Tomcat classpath
-eliminated the false scan-storm reproduction: `TestELInJsp#testBug61854a`
-passes in 76.9s. The remaining genuine JSP compilation failure
-(`testBug49555`) was traced to `Class.getCanonicalName()` incorrectly
-rewriting the literal `$` in `TesterFunctions$Inner$Class`; the corrected
-`InnerClasses`-based canonical and simple-name derivation now matches
-HotSpot and the test passes in 76.9s. The linked WebSocket Future defect is
-also fixed and its full class passes (`OK (2 tests)`, 16.3s).
+## Closure update (2026-07-15)
+
+**Status: RESOLVED and retired.** The `Class.getCanonicalName()` repair,
+STW takeover work, and async socket fixes are on `dev`. Fresh Azure release
+validation with a unique binary passed all three issue-specific contracts:
+`TestELInJsp#testBug45427`, `#testBug49555`, and `#testBug61854a`.
+The last test used the built examples-webapp libraries required by its JSTL
+fixture; it completed in about four seconds rather than timing out.
 
 **Severity:** closed. **HotSpot:** PASS (fresh-verified).
 
