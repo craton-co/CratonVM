@@ -2032,70 +2032,110 @@ impl SharedVm {
                 if data.is_none() {
                     // Iterator-based copy using virtual dispatch on the
                     // receiver's actual class.
-                    let recv_cid = ctx.class_id_of_object(this);
-                    let recv_class = ctx
-                        .class_name_of_id(recv_cid)
-                        .unwrap_or_else(|| "java/util/AbstractCollection".to_string());
-                    let size_v =
-                        ctx.invoke(&recv_class, "size", "()I", &[Value::Object(Some(this))])?;
-                    let size = match size_v {
-                        Some(Value::Int(n)) => n.max(0) as usize,
-                        _ => 0,
+                    //
+                    // GC-safety (DOM17 stale-canary backtrace, 2026-07-15):
+                    // every `ctx.invoke` below can run a moving GC, and the
+                    // pre-fix loop re-used `this`, the template array, the
+                    // target array, and the iterator raw across those windows
+                    // — the WildFly Host Controller tripped
+                    // CRATONVM_DBG_STALE_OBJREF passing the stale iterator to
+                    // `next()`. Pin each and re-read through the pin before
+                    // every post-window use.
+                    let pin_base = ctx.pin_native_root(this);
+                    let template_pin = match template {
+                        Value::Object(Some(arr)) => Some((ctx.pin_native_root(arr), arr)),
+                        _ => None,
                     };
-                    let target = match template {
-                        Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
-                        // Template too small: `Collection.toArray(T[])` must return
-                        // a NEW array of the template's RUNTIME type, not a bare
-                        // `Object[]`. An array's heap header stores its component
-                        // class id, so `class_id_of_object(arr)` IS the component
-                        // id `new_ref_array` wants — preserving multi-dimensional
-                        // element types (`Value[][]` for H2 SortOrder.sort).
-                        Value::Object(Some(arr)) => {
-                            let comp = ctx.class_id_of_object(arr);
-                            ctx.new_ref_array(comp, size)
-                        }
-                        _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, size),
-                    };
-                    let it_v = ctx.invoke(
-                        &recv_class,
-                        "iterator",
-                        "()Ljava/util/Iterator;",
-                        &[Value::Object(Some(this))],
-                    )?;
-                    let it = match it_v {
-                        Some(Value::Object(Some(o))) => o,
-                        _ => return Ok(Some(Value::Object(Some(target)))),
-                    };
-                    let it_cid = ctx.class_id_of_object(it);
-                    let it_class = ctx
-                        .class_name_of_id(it_cid)
-                        .unwrap_or_else(|| "java/util/Iterator".to_string());
-                    for i in 0..size {
-                        let has =
-                            ctx.invoke(&it_class, "hasNext", "()Z", &[Value::Object(Some(it))])?;
-                        if !matches!(has, Some(Value::Int(1))) {
-                            break;
-                        }
-                        let nxt = ctx.invoke(
-                            &it_class,
-                            "next",
-                            "()Ljava/lang/Object;",
-                            &[Value::Object(Some(it))],
+                    let result = (|| -> cratonvm_types::error::MethodCallResult {
+                        let recv_cid = ctx.class_id_of_object(this);
+                        let recv_class = ctx
+                            .class_name_of_id(recv_cid)
+                            .unwrap_or_else(|| "java/util/AbstractCollection".to_string());
+                        let size_v =
+                            ctx.invoke(&recv_class, "size", "()I", &[Value::Object(Some(this))])?;
+                        let size = match size_v {
+                            Some(Value::Int(n)) => n.max(0) as usize,
+                            _ => 0,
+                        };
+                        let target = match template_pin {
+                            // Template too small: `Collection.toArray(T[])` must
+                            // return a NEW array of the template's RUNTIME type,
+                            // not a bare `Object[]`. An array's heap header stores
+                            // its component class id, so `class_id_of_object(arr)`
+                            // IS the component id `new_ref_array` wants —
+                            // preserving multi-dimensional element types
+                            // (`Value[][]` for H2 SortOrder.sort).
+                            Some((h, orig)) => {
+                                let arr = ctx.read_native_pin(h, orig);
+                                if ctx.array_length(arr) >= size {
+                                    arr
+                                } else {
+                                    let comp = ctx.class_id_of_object(arr);
+                                    ctx.new_ref_array(comp, size)
+                                }
+                            }
+                            _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, size),
+                        };
+                        let target_pin = ctx.pin_native_root(target);
+                        let cur_this = ctx.read_native_pin(pin_base, this);
+                        let it_v = ctx.invoke(
+                            &recv_class,
+                            "iterator",
+                            "()Ljava/util/Iterator;",
+                            &[Value::Object(Some(cur_this))],
                         )?;
-                        let v = nxt.unwrap_or(Value::Object(None));
-                        ctx.set_array_element(target, i, v);
-                    }
-                    let target_len = ctx.array_length(target);
-                    if target_len > size {
-                        ctx.set_array_element(target, size, Value::Object(None));
-                    }
-                    return Ok(Some(Value::Object(Some(target))));
+                        let it = match it_v {
+                            Some(Value::Object(Some(o))) => o,
+                            _ => {
+                                let target = ctx.read_native_pin(target_pin, target);
+                                return Ok(Some(Value::Object(Some(target))));
+                            }
+                        };
+                        let it_pin = ctx.pin_native_root(it);
+                        let it_cid = ctx.class_id_of_object(it);
+                        let it_class = ctx
+                            .class_name_of_id(it_cid)
+                            .unwrap_or_else(|| "java/util/Iterator".to_string());
+                        for i in 0..size {
+                            let cur_it = ctx.read_native_pin(it_pin, it);
+                            let has = ctx.invoke(
+                                &it_class,
+                                "hasNext",
+                                "()Z",
+                                &[Value::Object(Some(cur_it))],
+                            )?;
+                            if !matches!(has, Some(Value::Int(1))) {
+                                break;
+                            }
+                            let cur_it = ctx.read_native_pin(it_pin, it);
+                            let nxt = ctx.invoke(
+                                &it_class,
+                                "next",
+                                "()Ljava/lang/Object;",
+                                &[Value::Object(Some(cur_it))],
+                            )?;
+                            let v = nxt.unwrap_or(Value::Object(None));
+                            let cur_target = ctx.read_native_pin(target_pin, target);
+                            ctx.set_array_element(cur_target, i, v);
+                        }
+                        let target = ctx.read_native_pin(target_pin, target);
+                        let target_len = ctx.array_length(target);
+                        if target_len > size {
+                            ctx.set_array_element(target, size, Value::Object(None));
+                        }
+                        Ok(Some(Value::Object(Some(target))))
+                    })();
+                    ctx.unpin_native_roots(pin_base);
+                    return result;
                 }
                 // ArrayList-shaped: use `size` field directly.
                 let size = match ctx.get_field_by_name(this, "size") {
                     Value::Int(s) => s.max(0) as usize,
                     _ => 0,
                 };
+                // GC-safety: allocating `target` below can move `elementData`
+                // — pin it BEFORE the allocation and re-read after.
+                let d_pin = data.map(|d| (ctx.pin_native_root(d), d));
                 let target = match template {
                     Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
                     // Template too small: allocate a NEW array of the template's
@@ -2108,12 +2148,14 @@ impl SharedVm {
                     }
                     _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, size),
                 };
-                if let Some(d) = data {
+                if let Some((h, orig)) = d_pin {
+                    let d = ctx.read_native_pin(h, orig);
                     let d_len = ctx.array_length(d);
                     let copy = size.min(d_len);
                     for i in 0..copy {
                         ctx.set_array_element(target, i, ctx.get_array_element(d, i));
                     }
+                    ctx.unpin_native_roots(h);
                 }
                 let target_len = ctx.array_length(target);
                 if target_len > size {

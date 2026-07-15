@@ -2777,6 +2777,21 @@ mod root_snapshot_cache_tests {
 /// then applies the pointer map to update its own frame references.
 pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
     use std::sync::atomic::Ordering;
+    // CRATONVM_DBG_BLOCKED_ACCESS: reaching an interpreter safepoint with the
+    // thread's own `in_blocked_region` flag still raised means every STW
+    // census is excluding a RUNNING mutator — a moving GC can complete under
+    // its feet, and nothing ever applies its accumulated blocked-fixup. This
+    // catches stuck flags from any raise site whose wake/error path skipped
+    // `check_post_block_gc` (the monitor_wait early-return bug class). No-op
+    // when the gate is off.
+    if cratonvm_gc::blocked_access_debug::enabled()
+        && thread.gc_block_state.in_blocked_region.load(Ordering::Acquire)
+    {
+        cratonvm_gc::blocked_access_debug::report_blocked_violation(
+            "interpreter safepoint reached with in_blocked_region raised",
+            0,
+        );
+    }
     // bc math-ec 0x4 (CRATONVM_DBG_MEMWATCH): O(1) poll of one absolute
     // watched address at full safepoint frequency — catches the corrupting
     // write within one safepoint window, with the live Java stack. Off ⇒
@@ -4470,9 +4485,12 @@ pub fn execute(
                         // Map well-known interfaces -> canonical concrete
                         // class whose natives we register.
                         let canonical: &'static str = match &*class_name_owned {
-                            "java/util/Set" | "java/util/Collection" | "java/lang/Iterable" => {
-                                "java/util/HashSet"
-                            }
+                            "java/util/Set" | "java/util/Collection" => "java/util/HashSet",
+                            // Iterable has no collection shape of its own. Keep
+                            // synthetic List-style receivers on the established
+                            // ArrayList bridge after lambda proxies have already
+                            // had a chance to dispatch their SAM implementation.
+                            "java/lang/Iterable" => "java/util/ArrayList",
                             "java/util/List" => "java/util/ArrayList",
                             "java/util/Map" => "java/util/HashMap",
                             "java/util/Iterator" => "java/util/HashMap$KeyItr",
@@ -23088,6 +23106,19 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    // Map.forEach is a default method whose JDK implementation iterates an
+    // entrySet. CratonVM's immutable-map wrapper intentionally stores a
+    // snapshot backing rather than the JDK's MapN layout, so running that body
+    // can materialize a HashSet and hash a cyclic map entry before a caller's
+    // own nesting guard runs. The native bridge snapshots concrete map entries
+    // directly and preserves the Map.forEach contract for every map backend.
+    if class_name == "java/util/Map"
+        && method_name == "forEach"
+        && method_descriptor == "(Ljava/util/function/BiConsumer;)V"
+    {
+        return true;
+    }
+
     if class_name == "java/util/Iterator" && matches!(method_name, "hasNext" | "next" | "remove") {
         return true;
     }
@@ -26089,6 +26120,20 @@ fn populate_invoke_cache(
             Ok(r) => r,
             Err(_) => return,
         };
+
+    // A ConstantPool Methodref is not a call-site identity: the same
+    // `Object.equals(Object)` entry can be used by several bytecode offsets
+    // in one method with unrelated receiver shapes.  Keep this highly
+    // polymorphic JDK operation out of the CP-indexed monomorphic cache until
+    // the cache key carries a bytecode offset as well.  Caching it can reuse
+    // Brave's `WeakKey.equals` target for a later `TraceContext.equals` call.
+    if !is_special
+        && class_name.as_ref() == "java/lang/Object"
+        && method_name.as_ref() == "equals"
+        && descriptor.as_ref() == "(Ljava/lang/Object;)Z"
+    {
+        return;
+    }
 
     let loader_owner_override = if crate::runtime::env_cache::loader_aware_resolution() {
         lookup_loader_initiated(shared, caller_class_id, &class_name)
@@ -31894,6 +31939,16 @@ fn execute_invokevirtual_vtable_fast(
 
     // Step 3 — peek the receiver. The receiver sits `num_params_slots`
     // down the operand stack from the top.
+    // `cp_index` alone is not a call-site identity. Do not install a
+    // monomorphic target for a shared `Object.equals` Methodref; the same
+    // entry can be used at receiver-polymorphic bytecode offsets.
+    if method_class_name.as_ref() == "java/lang/Object"
+        && method_name.as_ref() == "equals"
+        && method_descriptor.as_ref() == "(Ljava/lang/Object;)Z"
+    {
+        return Ok(CachedCallResult::CacheMiss);
+    }
+
     let num_params = num_params_slots;
     let receiver_val = thread.frames[frame_idx].stack.peek_at(num_params);
     if crate::runtime::env_cache::dbg_jetty2() && &*method_name == "getClasspath" {
@@ -33323,11 +33378,22 @@ fn populate_virtual_invoke_cache(
     }
 
     // Resolve method reference from constant pool
-    let (_class_name, method_name, descriptor, num_params) =
+    let (class_name, method_name, descriptor, num_params) =
         match resolve_method_ref(shared, caller_class_id, cp_index) {
             Ok(r) => r,
             Err(_) => return,
         };
+
+    // See the matching guard in `populate_invoke_cache`: a shared
+    // `Object.equals(Object)` Methodref is not safely cacheable by constant
+    // pool index alone because one method can invoke it at several distinct
+    // receiver-polymorphic bytecode offsets.
+    if class_name.as_ref() == "java/lang/Object"
+        && method_name.as_ref() == "equals"
+        && descriptor.as_ref() == "(Ljava/lang/Object;)Z"
+    {
+        return;
+    }
 
     if crate::runtime::env_cache::dbg_vdisp()
         && (method_name.as_ref() == "hashCode"
@@ -34845,6 +34911,20 @@ mod tests {
             "java/util/concurrent/Semaphore",
             "await",
             "()V"
+        ));
+    }
+
+    #[test]
+    fn map_for_each_force_native_preserves_cyclic_map_iteration() {
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/util/Map",
+            "forEach",
+            "(Ljava/util/function/BiConsumer;)V"
+        ));
+        assert!(!force_native_over_real_jdk_bytecode(
+            "java/util/Map",
+            "forEach",
+            "(Ljava/util/function/Consumer;)V"
         ));
     }
 

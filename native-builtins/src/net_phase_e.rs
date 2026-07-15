@@ -3908,6 +3908,10 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // This native bypasses ServerSocket's field initializers.  Preserve
+        // the real object's synchronization invariant before its bytecode
+        // options path reaches getImpl().
+        let this = re1_init_socket_locks(ctx, this);
         ss_set(ctx, this, |s| {
             s.port = -1;
             s.backlog = 50;
@@ -3919,6 +3923,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let this = re1_init_socket_locks(ctx, this);
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         re2_bind_listener(ctx, this, "0.0.0.0", port, 50)
     });
@@ -3931,6 +3936,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "<init>", "(II)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let this = re1_init_socket_locks(ctx, this);
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(50);
         re2_bind_listener(ctx, this, "0.0.0.0", port, backlog)
@@ -3938,6 +3944,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "<init>", "(IILjava/net/InetAddress;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let this = re1_init_socket_locks(ctx, this);
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(50);
         let host = match args.get(3) {
@@ -4013,6 +4020,20 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(1)))
     });
 
+
+    // The RE2 constructors own listener state outside the real ServerSocket
+    // implementation.  JGroups configures this option before bind, where it
+    // must be accepted without entering the real getImpl() bytecode path.
+    r.register(ss, "setReceiveBufferSize", "(I)V", |_ctx, args| {
+        let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        if size <= 0 {
+            return Err(iae(format!("negative receive buffer size: {size}")));
+        }
+        Ok(None)
+    });
+    r.register(ss, "getReceiveBufferSize", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(8192)))
+    });
     r.register(ss, "close", "()V", re2_server_socket_close);
 
     r.register(ss, "isBound", "()Z", |ctx, args| {
@@ -4810,6 +4831,10 @@ fn http_decode_chunked(mut data: &[u8]) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
+fn re5_dbg() -> bool {
+    std::env::var_os("CRATONVM_DBG_RE5").is_some()
+}
+
 fn http_exchange_plain(
     host: &str,
     port: u16,
@@ -4818,13 +4843,54 @@ fn http_exchange_plain(
     headers: &[(String, String)],
     body: &[u8],
 ) -> std::io::Result<HttpResponse> {
-    let mut stream = TcpStream::connect((host, port))?;
+    let dbg = re5_dbg();
+    let t0 = if dbg { Some(Instant::now()) } else { None };
+    if dbg {
+        eprintln!("[RE5-DBG] {method} {host}:{port}{path} connecting...");
+    }
+    let connect_result = TcpStream::connect((host, port));
+    if dbg {
+        eprintln!(
+            "[RE5-DBG] {method} {host}:{port}{path} connect -> {:?} ({:?} elapsed)",
+            connect_result.as_ref().map(|_| "OK").map_err(|e| e.kind()),
+            t0.map(|t| t.elapsed())
+        );
+    }
+    let mut stream = connect_result?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     let req = http_build_request(method, host, port, path, headers, body, 80);
-    stream.write_all(&req)?;
+    if dbg {
+        eprintln!(
+            "[RE5-DBG] {method} {host}:{port}{path} writing {} bytes (body {} bytes): {:?}",
+            req.len(),
+            body.len(),
+            String::from_utf8_lossy(&req[..req.len().min(200)])
+        );
+    }
+    let write_result = stream.write_all(&req);
+    if dbg {
+        eprintln!(
+            "[RE5-DBG] {method} {host}:{port}{path} write_all -> {:?} ({:?} elapsed)",
+            write_result.as_ref().map(|_| "OK").map_err(|e| e.kind()),
+            t0.map(|t| t.elapsed())
+        );
+    }
+    write_result?;
     stream.flush()?;
-    http_read_response(stream, method.eq_ignore_ascii_case("HEAD"))
+    if dbg {
+        eprintln!("[RE5-DBG] {method} {host}:{port}{path} flushed, reading response...");
+    }
+    let read_result = http_read_response(stream, method.eq_ignore_ascii_case("HEAD"));
+    if dbg {
+        eprintln!(
+            "[RE5-DBG] {method} {host}:{port}{path} read_response -> status={:?} err={:?} ({:?} elapsed)",
+            read_result.as_ref().ok().map(|r| r.status),
+            read_result.as_ref().err().map(|e| e.kind()),
+            t0.map(|t| t.elapsed())
+        );
+    }
+    read_result
 }
 
 fn http_exchange_tls(
@@ -7515,7 +7581,19 @@ fn re5_collect_publisher_body(
         return Err(e);
     }
 
+    // STW cross-thread JIT-takeover deadlock fix, same family as the
+    // http_perform_request fix in re5_do_request (see that comment for the
+    // full mechanism): re5_collect_publisher_body's condvar wait blocks this
+    // thread for up to RE5_PUBLISHER_WAIT waiting for a notify delivered by
+    // a DIFFERENT Java thread (the Reactor scheduler thread driving the
+    // Publisher, calling back into re5_body_collector_on_next/on_complete).
+    // That signalling thread cooperates normally with an STW pause (it's
+    // ordinary bytecode, hits interpreter safepoints); this thread, stuck in
+    // a raw Rust condvar wait, does not -- so a concurrent STW request
+    // starves waiting on THIS thread while the notify THIS thread needs
+    // waits on the OTHER thread's own cooperation with that same pause.
     let deadline = Instant::now() + RE5_PUBLISHER_WAIT;
+    ctx.begin_blocking_region();
     let mut state = collector.state.lock().unwrap();
     while !state.completed && state.error.is_none() {
         let now = Instant::now();
@@ -7529,6 +7607,7 @@ fn re5_collect_publisher_body(
             break;
         }
     }
+    ctx.end_blocking_region();
 
     let timed_out = !state.completed && state.error.is_none();
     let error = state.error.clone();
@@ -7539,6 +7618,12 @@ fn re5_collect_publisher_body(
         ctx.remove_global_root(sub_global);
     }
 
+    if re5_dbg() {
+        eprintln!(
+            "[RE5-DBG] re5_collect_publisher_body id={id} timed_out={timed_out} bytes={} error={:?}",
+            out.len(), error
+        );
+    }
     if timed_out {
         return Err(ioex("HttpRequest body publisher did not complete"));
     }
@@ -7580,6 +7665,9 @@ fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let handler_tag = re5_handler_tag(ctx, handler_val);
     let method = read_field_string_or(ctx, req, 0, "GET");
     let uri = read_field_string_or(ctx, req, 1, "");
+    if re5_dbg() {
+        eprintln!("[RE5-DBG] re5_do_request ENTER method={method} uri={uri}");
+    }
     let body_val = ctx.get_field(req, 2);
     let body = re5_request_body_bytes(ctx, body_val)?;
     let hdrs_val = ctx.get_field(req, 3);
@@ -7594,8 +7682,54 @@ fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         (None, Some(Value::Object(Some(h)))) => Some((ctx.pin_native_root(h), h)),
         _ => None,
     };
-    let resp = http_perform_request(&method, &uri, &headers, &body, 10)
-        .map_err(|e| ioex(format!("HttpClient request failed: {e}")))?;
+    if re5_dbg() {
+        eprintln!(
+            "[RE5-DBG] re5_do_request method={method} uri={uri} body_len={} calling http_perform_request...",
+            body.len()
+        );
+    }
+    // STW cross-thread JIT-takeover deadlock fix (found investigating
+    // reactive ClientHttpConnectorTests intermittent hangs, 2026-07-15): the
+    // raw TcpStream connect/write/read cycle inside `http_perform_request`
+    // blocks this thread in a genuine OS syscall for up to 30s (its own
+    // socket-level read timeout) without cooperating with a concurrent
+    // Stop-The-World pause -- unlike every OTHER blocking native I/O call in
+    // this file (see `re1_socket_read_stream`/`re1_socket_write_stream`
+    // above), which correctly brackets the syscall with
+    // `begin_blocking_region`/`end_blocking_region` so the GC barrier
+    // excludes this thread from `expected` while it cannot reach a
+    // safepoint. Without that, a concurrent STW request (e.g. a JIT
+    // recompile or GC pause triggered by unrelated activity in the SAME
+    // process) waits up to its full round budget for this thread to
+    // cooperate -- while the STW pause is simultaneously what freezes the
+    // real Java thread on the OTHER end of the socket (MockWebServer's own
+    // response-writing dispatcher, ordinary bytecode running in this same
+    // JVM process) that this thread is blocked waiting to hear from. Live
+    // capture: `CRATONVM_DBG_RE5=1` showed a `DELETE` request's `write_all`
+    // succeed in under 200us, then `read_response` block for the full 30s
+    // socket timeout and fail with `WouldBlock`, with a
+    // "STW cross-thread JIT takeover is still waiting for cooperative
+    // mutators rounds=64 pending=1 taken=0" warning firing mid-block --
+    // confirmed HotSpot-only-divergent (8/8 clean runs of the identical
+    // 32-request sequential-MockWebServer-cycle probe on HotSpot; CratonVM
+    // hit it on ~2/13 attempts, always on this JDK-connector code path,
+    // never on the Reactor-Netty/Jetty/HttpComponents connectors that don't
+    // route through this raw-socket implementation).
+    ctx.begin_blocking_region();
+    let perform_result = http_perform_request(&method, &uri, &headers, &body, 10);
+    ctx.end_blocking_region();
+    let resp = perform_result.map_err(|e| {
+        if re5_dbg() {
+            eprintln!("[RE5-DBG] re5_do_request method={method} uri={uri} http_perform_request FAILED: {e}");
+        }
+        ioex(format!("HttpClient request failed: {e}"))
+    })?;
+    if re5_dbg() {
+        eprintln!(
+            "[RE5-DBG] re5_do_request method={method} uri={uri} http_perform_request OK status={}",
+            resp.status
+        );
+    }
     let out = match real_handler {
         None => {
             let tag = handler_tag.unwrap_or_else(|| "inputstream".to_string());

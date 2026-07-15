@@ -1,6 +1,25 @@
-# `Collections.sort`/`Arrays.sort` native fast path: lambda-implemented `Comparable` falsely rejected, reported as `<unknown>` class
+# RESOLVED: `Collections.sort`/`Arrays.sort` lambda-implemented `Comparable`
 
-**Status: OPEN**
+**Status: RESOLVED 2026-07-15**
+
+## Resolution
+
+Hidden lambda-proxy classes are intentionally absent from `class_manager`.
+The natural-order native paths now resolve a proxy's functional interface via
+`lambda_functional_interface` before walking its super-interfaces, so a
+lambda implementing an interface that extends `Comparable` passes the same
+preflight as an ordinary object. Diagnostics also synthesize the proxy's
+host-based lambda name instead of degrading to `<unknown>`.
+
+The sort merge follows the JDK's right-vs-left natural-order probe. This keeps
+ordinary Comparable behavior unchanged while honoring concrete precedence
+when the opposing lambda inherits a zero-returning interface default method.
+
+Validation on the final isolated release executable:
+
+- `ObservationHandlerGroupsTests`: 2/2 PASS with JIT on and off.
+- `TracingAndMeterObservationHandlerGroupTests`: 4/4 PASS with JIT on and off.
+- `cargo test --release -p cratonvm-native-collections --test mock_arraylist arrays_sort_`: 2/2 PASS.
 
 ## Symptom
 

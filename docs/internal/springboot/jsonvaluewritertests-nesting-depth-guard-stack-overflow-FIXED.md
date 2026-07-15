@@ -1,6 +1,26 @@
-# `JsonValueWriterTests` CRASHES: native `EXCEPTION_STACK_OVERFLOW` — self-referential-collection nesting-depth guard likely not stopping recursion
+## Resolution (2026-07-15)
 
-**Status: OPEN.** CRITICAL severity — this is a process-fatal native crash
+**Status: FIXED / RETIRED.** The failure was not an `ArrayDeque` depth-count
+bug. A cyclic map reached the real `Map.forEach` default body, which built an
+entry-set iterator and hashed a self-referential entry before
+`JsonValueWriter` could reach its own depth guard. CratonVM now forces the
+registered `Map.forEach` bridge and snapshots concrete map entries without
+hashing that cyclic value. The same closure found a second masked case:
+`Iterable` method-reference lambdas were intercepted by an ArrayList-shaped
+interface iterator bridge and silently yielded no elements. `Iterable` now
+uses normal lambda dispatch, with the synthetic collection fallback retained.
+
+Validation on the rebuilt release VM (`bin-jsonvalue-nesting-closure-20260715-003.exe`):
+
+- The exact cyclic-map and cyclic-Iterable methods pass with JIT off and on.
+- The complete `JsonValueWriterTests` class passes in both modes: 33 tests,
+  0 failed, 0 aborted (one expected Windows-disabled test skipped).
+
+## Historical incident
+
+# `JsonValueWriterTests` CRASHED: native `EXCEPTION_STACK_OVERFLOW` — self-referential-collection nesting-depth guard initially appeared not to stop recursion
+
+**Original status: OPEN.** CRITICAL severity — this was a process-fatal native crash
 (not a test `FAIL` or Java `StackOverflowError`), 0 tests executed/reported.
 Found triaging the `crashfail-20260714` shard run (`core/spring-boot`,
 shard2).

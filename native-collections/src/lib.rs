@@ -1160,6 +1160,40 @@ impl<'a> ChmMonitorGuard<'a> {
             _borrow: std::marker::PhantomData,
         }
     }
+
+    /// GC-safe variant of [`ChmMonitorGuard::acquire`]: a contended wait runs
+    /// under the blocking-region protocol (`NativeContext::monitor_enter_gc_safe`
+    /// → `monitor_enter_blocking`: TLAB retire, root-snapshot deposit,
+    /// `GcBarrier::enter_blocked`, `check_post_block_gc` on wake), so a
+    /// concurrent stop-the-world COMPLETES instead of deadlocking against a
+    /// safepoint-parked segment owner. The plain `acquire` blocks as a counted
+    /// mutator, which wedged the whole VM whenever the owner was already
+    /// parked at the STW barrier — the WildFly `parallel-extension-add` boot
+    /// hang (5/8 no-JIT boots: ~40 threads hammering the same management-
+    /// registry CHM, gdb-confirmed three contenders inside `native_chm_put`
+    /// → `acquire` → `monitor_enter` while the initiator spun at
+    /// `rounds=64 pending=3 taken=0`).
+    ///
+    /// Because the wait can now span a completed moving GC, the segment may
+    /// relocate: the guard unlocks the returned (current) address, and the
+    /// caller MUST use the returned `ObjectRef` — and re-read every other raw
+    /// `ObjectRef`/`Value` local it captured before this call through a pin
+    /// (`pin_value`/`read_pinned_elem`) — for everything after this call.
+    fn acquire_gc_safe(ctx: &mut dyn NativeContext, seg: ObjectRef) -> (Self, ObjectRef) {
+        let fixed = ctx.monitor_enter_gc_safe(seg);
+        // SAFETY: identical lifetime-erasure contract to `acquire` above.
+        let ctx_ptr: *mut dyn NativeContext = ctx;
+        let ctx_ptr_static: *mut (dyn NativeContext + 'static) =
+            unsafe { core::mem::transmute(ctx_ptr) };
+        (
+            ChmMonitorGuard {
+                ctx: ctx_ptr_static,
+                seg: fixed,
+                _borrow: std::marker::PhantomData,
+            },
+            fixed,
+        )
+    }
 }
 
 impl<'a> Drop for ChmMonitorGuard<'a> {
@@ -9435,9 +9469,7 @@ fn native_arrays_sort_objects(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     for v in &items {
         if let Value::Object(Some(obj)) = v {
             if !implements_comparable(ctx, *obj) {
-                let cname = ctx
-                    .class_name_of_id(ctx.class_id_of_object(*obj))
-                    .unwrap_or_else(|| "<unknown>".to_string());
+                let cname = object_class_name(ctx, *obj);
                 return Err(cratonvm_types::error::RuntimeError::ClassCastException {
                     message: format!(
                         "element of class {} does not implement java.lang.Comparable",
@@ -9473,7 +9505,11 @@ fn native_arrays_sort_objects(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         let ib = if let Value::Int(v) = b { *v as usize } else { 0 };
         let ea = read_pinned_elem(c, elem_handles[ia], items[ia]);
         let eb = read_pinned_elem(c, elem_handles[ib], items[ib]);
-        compare_via_compare_to(c, &ea, &eb)
+        // JDK natural-order sorting probes the right run against the left
+        // while identifying/merging ordered runs. That is equivalent for a
+        // normal antisymmetric Comparable, but matters when an inherited
+        // interface default returns 0 and a concrete peer supplies ordering.
+        compare_via_compare_to(c, &eb, &ea).map(i32::saturating_neg)
     });
     if let Err(e) = sort_result {
         ctx.unpin_native_roots(arr_pin);
@@ -9496,6 +9532,15 @@ fn native_arrays_sort_objects(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 fn implements_comparable(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
     let mut cid = ctx.class_id_of_object(obj);
     for _ in 0..64 {
+        // Lambda proxy classes live outside `class_manager`, so their direct
+        // interfaces must be resolved through the lambda registry first.
+        if let Some(iface_name) = ctx.lambda_functional_interface(cid) {
+            if let Some(iface) = ctx.class_id_by_name(&iface_name) {
+                if iface_extends_comparable(ctx, iface) {
+                    return true;
+                }
+            }
+        }
         for iface in ctx.class_interfaces(cid) {
             if iface_extends_comparable(ctx, iface) {
                 return true;
@@ -9507,6 +9552,15 @@ fn implements_comparable(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
         }
     }
     false
+}
+
+/// Return a useful identity for diagnostics, including hidden lambda proxies.
+fn object_class_name(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
+    let cid = ctx.class_id_of_object(obj);
+    ctx.class_name_of_id(cid)
+        .or_else(|| ctx.lambda_proxy_host(cid).map(|host| format!("{host}$$Lambda/0x{:x}", cid.as_u32())))
+        .or_else(|| ctx.lambda_functional_interface(cid).map(|iface| format!("lambda implementing {iface}")))
+        .unwrap_or_else(|| "<unknown>".to_string())
 }
 
 /// True iff `iface` IS `java/lang/Comparable` or transitively extends it.
@@ -9556,10 +9610,7 @@ fn compare_via_compare_to(
             // the original set when the elements aren't comparable) would not catch a
             // `NoSuchMethodError` and the real failure would escape (spring-bug-04).
             if !implements_comparable(ctx, *ao) {
-                let cname = ctx
-                    .class_name_of_id(ctx.class_id_of_object(*ao))
-                    .unwrap_or_else(|| "<unknown>".to_string())
-                    .replace('/', ".");
+                let cname = object_class_name(ctx, *ao).replace('/', ".");
                 return Err(cratonvm_types::error::RuntimeError::ClassCastException {
                     message: format!("class {cname} cannot be cast to class java.lang.Comparable"),
                 }
@@ -9854,9 +9905,7 @@ fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     for v in &items {
         if let Value::Object(Some(obj)) = v {
             if !implements_comparable(ctx, *obj) {
-                let cname = ctx
-                    .class_name_of_id(ctx.class_id_of_object(*obj))
-                    .unwrap_or_else(|| "<unknown>".to_string());
+                let cname = object_class_name(ctx, *obj);
                 return Err(cratonvm_types::error::RuntimeError::ClassCastException {
                     message: format!(
                         "element of class {} does not implement java.lang.Comparable",
@@ -9891,7 +9940,9 @@ fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         let ib = if let Value::Int(v) = b { *v as usize } else { 0 };
         let ea = read_pinned_elem(c, elem_handles[ia], items[ia]);
         let eb = read_pinned_elem(c, elem_handles[ib], items[ib]);
-        compare_via_compare_to(c, &ea, &eb)
+        // See Arrays.sort(Object[]) above: retain the JDK's right-vs-left
+        // natural-order probe for default-method Comparable implementations.
+        compare_via_compare_to(c, &eb, &ea).map(i32::saturating_neg)
     });
     if let Err(e) = sort_result {
         ctx.unpin_native_roots(data_pin);
@@ -10243,7 +10294,14 @@ fn native_map_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    let entries = map_collect_entries(ctx, this);
+    // `Map.forEach` is a default interface method. Running the real JDK body
+    // on a synthetic immutable map falls back through `entrySet()` and a
+    // HashSet view, which hashes every entry while constructing its iterator.
+    // That is observably wrong for a map whose value refers back to the map:
+    // iteration must hand the value to the consumer, not evaluate its
+    // `hashCode()`. Use the concrete-backend collector so this bridge is also
+    // safe for LinkedHashMap, TreeMap, immutable wrappers, and foreign maps.
+    let entries = collect_entries_any(ctx, this);
     // GC-SAFETY: the BiConsumer `accept` allocates → moving young GC relocates
     // `action` and every key/value; pin all and re-read from the handles before
     // each dispatch.
@@ -19341,19 +19399,14 @@ fn register_interface_natives(registry: &mut NativeMethodRegistry) {
         native_collection_to_array_generator,
     );
 
-    // --- java/lang/Iterable ---
-    registry.register(
-        "java/lang/Iterable",
-        "iterator",
-        "()Ljava/util/Iterator;",
-        native_al_iterator,
-    );
-    registry.register(
-        "java/lang/Iterable",
-        "forEach",
-        "(Ljava/util/function/Consumer;)V",
-        native_al_for_each,
-    );
+    // Do not register ArrayList-shaped bridges directly on `Iterable`.
+    // A method-reference lambda such as `list::iterator` implements Iterable
+    // too, but its receiver is the lambda proxy rather than an ArrayList. A
+    // direct interface native would therefore manufacture an iterator over the
+    // proxy's fields and silently report no elements. Leaving Iterable to the
+    // interpreter lets its lambda-SAM rescue dispatch the real implementation;
+    // synthetic collection receivers still reach the ArrayList fallback from
+    // the no-Code interface-dispatch path.
 
     // --- forEach on Collection / List / Set ---
     registry.register(
@@ -19387,6 +19440,12 @@ fn register_interface_natives(registry: &mut NativeMethodRegistry) {
 
     // --- java/util/Map ---
     registry.register("java/util/Map", "size", "()I", native_map_size);
+    registry.register(
+        "java/util/Map",
+        "forEach",
+        "(Ljava/util/function/BiConsumer;)V",
+        native_map_for_each,
+    );
     registry.register(
         "java/util/Map",
         "get",
@@ -32546,16 +32605,32 @@ fn native_chm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // GC-safety: same pinned-slice iteration as `native_chm_put_all` — the
+    // collected entries are reused across GC-triggering hashing/puts and
+    // GC-pausable segment-lock waits; `this` is pinned BEFORE the
+    // GC-triggering collection.
+    let this_pin = ctx.pin_native_root(this);
     let src_entries = collect_entries_any(ctx, source);
     let _resize_flag = ChmResizeLockGuard::enter();
-    for (key, value) in src_entries {
-        let hash = chm_key_hash(ctx, &key)?;
-        if let Some(seg) = chm_segment_for(ctx, this, hash) {
-            let _guard = ChmMonitorGuard::acquire(ctx, seg);
-            native_map_put(ctx, &[Value::Object(Some(seg)), key, value])?;
+    let flat: Vec<Value> = src_entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    let (_, flat_pins) = pin_value_slice(ctx, &flat);
+    let result = (|| -> MethodCallResult {
+        for i in 0..src_entries.len() {
+            let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
+            let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
+            let hash = chm_key_hash(ctx, &key)?;
+            let this = ctx.read_native_pin(this_pin, this);
+            if let Some(seg) = chm_segment_for(ctx, this, hash) {
+                let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
+                let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
+                let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
+                native_map_put(ctx, &[Value::Object(Some(seg)), key, value])?;
+            }
         }
-    }
-    Ok(None)
+        Ok(None)
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 // --- Core read operations (lock-free) ---
@@ -32787,15 +32862,29 @@ fn native_chm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         }
         .into());
     }
-    let hash = chm_key_hash(ctx, &key)?;
-    match chm_segment_for(ctx, this, hash) {
-        Some(seg) => {
-            let _resize_flag = ChmResizeLockGuard::enter();
-            let _guard = ChmMonitorGuard::acquire(ctx, seg);
-            native_map_put(ctx, &[Value::Object(Some(seg)), key, value])
+    // GC-safety: `chm_key_hash` invokes arbitrary `hashCode()` bytecode and
+    // `acquire_gc_safe`'s contended wait can span a completed moving GC, so
+    // every raw local captured above must be pinned and re-read before use.
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let value_pin = pin_value(ctx, value);
+    let result = (|| -> MethodCallResult {
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let hash = chm_key_hash(ctx, &key)?;
+        let this = ctx.read_native_pin(this_pin, this);
+        match chm_segment_for(ctx, this, hash) {
+            Some(seg) => {
+                let _resize_flag = ChmResizeLockGuard::enter();
+                let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
+                let key = read_pinned_elem(ctx, key_pin, key);
+                let value = read_pinned_elem(ctx, value_pin, value);
+                native_map_put(ctx, &[Value::Object(Some(seg)), key, value])
+            }
+            None => Ok(Some(Value::Object(None))),
         }
-        None => Ok(Some(Value::Object(None))),
-    }
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn native_chm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -32809,15 +32898,26 @@ fn native_chm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // SimpleAliasRegistry.removeAlias(null) returned silently instead of NPE
     // (SimpleAliasRegistryTests.removeNullAlias).
     chm_reject_null_key(&key)?;
-    let hash = chm_key_hash(ctx, &key)?;
-    match chm_segment_for(ctx, this, hash) {
-        Some(seg) => {
-            let _resize_flag = ChmResizeLockGuard::enter();
-            let _guard = ChmMonitorGuard::acquire(ctx, seg);
-            native_map_remove(ctx, &[Value::Object(Some(seg)), key])
+    // GC-safety: pin across hashCode() dispatch and the (GC-pausable)
+    // segment-lock wait — see `native_chm_put`.
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let result = (|| -> MethodCallResult {
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let hash = chm_key_hash(ctx, &key)?;
+        let this = ctx.read_native_pin(this_pin, this);
+        match chm_segment_for(ctx, this, hash) {
+            Some(seg) => {
+                let _resize_flag = ChmResizeLockGuard::enter();
+                let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
+                let key = read_pinned_elem(ctx, key_pin, key);
+                native_map_remove(ctx, &[Value::Object(Some(seg)), key])
+            }
+            None => Ok(Some(Value::Object(None))),
         }
-        None => Ok(Some(Value::Object(None))),
-    }
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn native_chm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -32841,12 +32941,14 @@ fn native_chm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         let key = read_pinned_elem(ctx, key_pin, key);
         let hash = chm_key_hash(ctx, &key)?;
         let this = ctx.read_native_pin(this_pin, this);
-        let key = read_pinned_elem(ctx, key_pin, key);
-        let value = read_pinned_elem(ctx, value_pin, value);
         match chm_segment_for(ctx, this, hash) {
             Some(seg) => {
                 let _resize_flag = ChmResizeLockGuard::enter();
-                let _guard = ChmMonitorGuard::acquire(ctx, seg);
+                // GC-pausable contended wait — re-read the pinned locals
+                // AFTER acquiring (see `acquire_gc_safe`'s doc).
+                let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
+                let key = read_pinned_elem(ctx, key_pin, key);
+                let value = read_pinned_elem(ctx, value_pin, value);
                 native_map_put_if_absent(ctx, &[Value::Object(Some(seg)), key, value])
             }
             None => Ok(Some(Value::Object(None))),
@@ -32889,13 +32991,41 @@ fn native_chm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let key = read_pinned_elem(ctx, key_pin, key);
     let hash = chm_key_hash(ctx, &key)?;
     let this = ctx.read_native_pin(roots_base, this);
-    let key = read_pinned_elem(ctx, key_pin, key);
-    let func = read_pinned_elem(ctx, func_pin, func);
     let result = match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
-            let _resize_flag = ChmResizeLockGuard::enter();
-            let _guard = ChmMonitorGuard::acquire(ctx, seg);
-            native_map_compute_if_absent(ctx, &[Value::Object(Some(seg)), key, func])
+            // JDK-exact lock-free fast path: `computeIfAbsent` on a PRESENT
+            // key returns the existing value WITHOUT locking. Real CHM locks
+            // a single bin, so a mapping callback that takes unrelated locks
+            // (WildFly's registry callbacks take the management-registry
+            // write lock) never orders against other keys' operations; our
+            // segment monitor is far coarser, and locking it just to discover
+            // the key already exists created a segment-monitor ↔ registry-
+            // RWLock cycle that wedged `parallel-extension-add` boots (the
+            // mode-2 wedge: gdb showed writers starving at
+            // stamped_lock::rw_write_lock while a read-lock holder waited in
+            // acquire_gc_safe on the same segment).
+            let key_now = read_pinned_elem(ctx, key_pin, key);
+            match chm_seg_get(ctx, seg, key_now)? {
+                Some(existing) if !matches!(existing, Value::Object(None)) => Ok(Some(existing)),
+                _ => {
+                    let this = ctx.read_native_pin(roots_base, this);
+                    match chm_segment_for(ctx, this, hash) {
+                        Some(seg) => {
+                            let _resize_flag = ChmResizeLockGuard::enter();
+                            // GC-pausable contended wait — re-read the pinned
+                            // locals AFTER acquiring (see `acquire_gc_safe`).
+                            let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
+                            let key = read_pinned_elem(ctx, key_pin, key);
+                            let func = read_pinned_elem(ctx, func_pin, func);
+                            native_map_compute_if_absent(
+                                ctx,
+                                &[Value::Object(Some(seg)), key, func],
+                            )
+                        }
+                        None => Ok(Some(Value::Object(None))),
+                    }
+                }
+            }
         }
         None => Ok(Some(Value::Object(None))),
     };
@@ -32923,12 +33053,14 @@ fn native_chm_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let key = read_pinned_elem(ctx, key_pin, key);
     let hash = chm_key_hash(ctx, &key)?;
     let this = ctx.read_native_pin(roots_base, this);
-    let key = read_pinned_elem(ctx, key_pin, key);
-    let func = read_pinned_elem(ctx, func_pin, func);
     let result = match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
-            let _guard = ChmMonitorGuard::acquire(ctx, seg);
+            // GC-pausable contended wait — re-read the pinned locals AFTER
+            // acquiring (see `acquire_gc_safe`'s doc).
+            let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
+            let key = read_pinned_elem(ctx, key_pin, key);
+            let func = read_pinned_elem(ctx, func_pin, func);
             native_map_compute(ctx, &[Value::Object(Some(seg)), key, func])
         }
         None => Ok(Some(Value::Object(None))),
@@ -32959,13 +33091,35 @@ fn native_chm_compute_if_present(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let key = read_pinned_elem(ctx, key_pin, key);
     let hash = chm_key_hash(ctx, &key)?;
     let this = ctx.read_native_pin(roots_base, this);
-    let key = read_pinned_elem(ctx, key_pin, key);
-    let func = read_pinned_elem(ctx, func_pin, func);
     let result = match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
-            let _resize_flag = ChmResizeLockGuard::enter();
-            let _guard = ChmMonitorGuard::acquire(ctx, seg);
-            native_map_compute_if_present(ctx, &[Value::Object(Some(seg)), key, func])
+            // JDK-exact lock-free fast path: `computeIfPresent` on an ABSENT
+            // key returns null WITHOUT locking (real CHM's lock-free tabAt
+            // probe). See `native_chm_compute_if_absent` for why avoiding the
+            // segment monitor here matters (callback-under-coarse-lock
+            // ordering cycles).
+            let key_now = read_pinned_elem(ctx, key_pin, key);
+            match chm_seg_get(ctx, seg, key_now)? {
+                None => Ok(Some(Value::Object(None))),
+                Some(_) => {
+                    let this = ctx.read_native_pin(roots_base, this);
+                    match chm_segment_for(ctx, this, hash) {
+                        Some(seg) => {
+                            let _resize_flag = ChmResizeLockGuard::enter();
+                            // GC-pausable contended wait — re-read the pinned
+                            // locals AFTER acquiring (see `acquire_gc_safe`).
+                            let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
+                            let key = read_pinned_elem(ctx, key_pin, key);
+                            let func = read_pinned_elem(ctx, func_pin, func);
+                            native_map_compute_if_present(
+                                ctx,
+                                &[Value::Object(Some(seg)), key, func],
+                            )
+                        }
+                        None => Ok(Some(Value::Object(None))),
+                    }
+                }
+            }
         }
         None => Ok(Some(Value::Object(None))),
     };
@@ -33000,13 +33154,15 @@ fn native_chm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let key = read_pinned_elem(ctx, key_pin, key);
     let hash = chm_key_hash(ctx, &key)?;
     let this = ctx.read_native_pin(roots_base, this);
-    let key = read_pinned_elem(ctx, key_pin, key);
-    let value = read_pinned_elem(ctx, value_pin, value);
-    let func = read_pinned_elem(ctx, func_pin, func);
     let result = match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
-            let _guard = ChmMonitorGuard::acquire(ctx, seg);
+            // GC-pausable contended wait — re-read the pinned locals AFTER
+            // acquiring (see `acquire_gc_safe`'s doc).
+            let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
+            let key = read_pinned_elem(ctx, key_pin, key);
+            let value = read_pinned_elem(ctx, value_pin, value);
+            let func = read_pinned_elem(ctx, func_pin, func);
             native_map_merge(ctx, &[Value::Object(Some(seg)), key, value, func])
         }
         None => Ok(Some(Value::Object(None))),
@@ -33045,11 +33201,28 @@ fn native_chm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(None),
     };
     let _resize_flag = ChmResizeLockGuard::enter();
-    for seg in chm_all_segments(ctx, this) {
-        let _guard = ChmMonitorGuard::acquire(ctx, seg);
-        native_map_clear(ctx, &[Value::Object(Some(seg))])?;
-    }
-    Ok(None)
+    // GC-safety: each per-segment lock wait is GC-pausable, so the segments
+    // collected up front must survive (and be re-read) across iterations.
+    // `this_pin` doubles as the unconditional unpin base.
+    let this_pin = ctx.pin_native_root(this);
+    let segs: Vec<Value> = chm_all_segments(ctx, this)
+        .into_iter()
+        .map(|s| Value::Object(Some(s)))
+        .collect();
+    let (_, seg_pins) = pin_value_slice(ctx, &segs);
+    let result = (|| -> MethodCallResult {
+        for i in 0..segs.len() {
+            let seg = match read_pinned_elem(ctx, seg_pins[i], segs[i]) {
+                Value::Object(Some(s)) => s,
+                _ => continue,
+            };
+            let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
+            native_map_clear(ctx, &[Value::Object(Some(seg))])?;
+        }
+        Ok(None)
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn native_chm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -33065,15 +33238,32 @@ fn native_chm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // `collect_entries_any` (not the HashMap-only `map_collect_entries`) so a
     // TreeMap / LinkedHashMap / real-JDK unmodifiable-map source is copied in
     // full rather than read as an empty bucket table.
+    //
+    // GC-safety: the collected entries are raw `Value`s reused across
+    // GC-triggering hashing/puts and GC-pausable lock waits — pin the whole
+    // flattened slice (plus `this`, pinned BEFORE the GC-triggering
+    // collection) and re-read each element right before use.
+    let this_pin = ctx.pin_native_root(this);
     let entries = collect_entries_any(ctx, source);
-    for (key, value) in entries {
-        let hash = chm_key_hash(ctx, &key)?;
-        if let Some(seg) = chm_segment_for(ctx, this, hash) {
-            let _guard = ChmMonitorGuard::acquire(ctx, seg);
-            native_map_put(ctx, &[Value::Object(Some(seg)), key, value])?;
+    let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    let (_, flat_pins) = pin_value_slice(ctx, &flat);
+    let result = (|| -> MethodCallResult {
+        for i in 0..entries.len() {
+            let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
+            let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
+            let hash = chm_key_hash(ctx, &key)?;
+            let this = ctx.read_native_pin(this_pin, this);
+            if let Some(seg) = chm_segment_for(ctx, this, hash) {
+                let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
+                let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
+                let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
+                native_map_put(ctx, &[Value::Object(Some(seg)), key, value])?;
+            }
         }
-    }
-    Ok(None)
+        Ok(None)
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn native_chm_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -33083,11 +33273,30 @@ fn native_chm_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     let func = args.get(1).copied().unwrap_or(Value::Object(None));
     let _resize_flag = ChmResizeLockGuard::enter();
-    for seg in chm_all_segments(ctx, this) {
-        let _guard = ChmMonitorGuard::acquire(ctx, seg);
-        native_map_replace_all(ctx, &[Value::Object(Some(seg)), func])?;
-    }
-    Ok(None)
+    // GC-safety: pinned-slice iteration — each per-segment lock wait is
+    // GC-pausable (see `native_chm_clear`). `this_pin` doubles as the
+    // unconditional unpin base.
+    let this_pin = ctx.pin_native_root(this);
+    let func_pin = pin_value(ctx, func);
+    let segs: Vec<Value> = chm_all_segments(ctx, this)
+        .into_iter()
+        .map(|s| Value::Object(Some(s)))
+        .collect();
+    let (_, seg_pins) = pin_value_slice(ctx, &segs);
+    let result = (|| -> MethodCallResult {
+        for i in 0..segs.len() {
+            let seg = match read_pinned_elem(ctx, seg_pins[i], segs[i]) {
+                Value::Object(Some(s)) => s,
+                _ => continue,
+            };
+            let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
+            let func = read_pinned_elem(ctx, func_pin, func);
+            native_map_replace_all(ctx, &[Value::Object(Some(seg)), func])?;
+        }
+        Ok(None)
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn native_chm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -33327,22 +33536,43 @@ fn native_chm_remove_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let expected_val = args.get(2).copied().unwrap_or(Value::Object(None));
     chm_reject_null_key(&key)?;
-    let hash = chm_key_hash(ctx, &key)?;
-    match chm_segment_for(ctx, this, hash) {
-        Some(seg) => {
-            let _resize_flag = ChmResizeLockGuard::enter();
-            let _guard = ChmMonitorGuard::acquire(ctx, seg);
-            let current = native_map_get(ctx, &[Value::Object(Some(seg)), key])?
-                .unwrap_or(Value::Object(None));
-            if values_equal(ctx, &current, &expected_val) {
-                native_map_remove(ctx, &[Value::Object(Some(seg)), key])?;
-                Ok(Some(Value::Int(1)))
-            } else {
-                Ok(Some(Value::Int(0)))
+    // GC-safety: pin across hashCode()/equals() dispatch and the
+    // GC-pausable segment-lock wait — see `native_chm_put`.
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let expected_pin = pin_value(ctx, expected_val);
+    let result = (|| -> MethodCallResult {
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let hash = chm_key_hash(ctx, &key)?;
+        let this = ctx.read_native_pin(this_pin, this);
+        match chm_segment_for(ctx, this, hash) {
+            Some(seg) => {
+                let _resize_flag = ChmResizeLockGuard::enter();
+                let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
+                let seg_pin = ctx.pin_native_root(seg);
+                let key = read_pinned_elem(ctx, key_pin, key);
+                let current = native_map_get(ctx, &[Value::Object(Some(seg)), key])?
+                    .unwrap_or(Value::Object(None));
+                let current_pin = pin_value(ctx, current);
+                let expected_val = read_pinned_elem(ctx, expected_pin, expected_val);
+                let current = read_pinned_elem(ctx, current_pin, current);
+                let eq = values_equal(ctx, &current, &expected_val);
+                let r = if eq {
+                    let seg = ctx.read_native_pin(seg_pin, seg);
+                    let key = read_pinned_elem(ctx, key_pin, key);
+                    native_map_remove(ctx, &[Value::Object(Some(seg)), key])?;
+                    Ok(Some(Value::Int(1)))
+                } else {
+                    Ok(Some(Value::Int(0)))
+                };
+                ctx.unpin_native_roots(seg_pin);
+                r
             }
+            None => Ok(Some(Value::Int(0))),
         }
-        None => Ok(Some(Value::Int(0))),
-    }
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn native_chm_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -33359,23 +33589,43 @@ fn native_chm_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
         .into());
     }
-    let hash = chm_key_hash(ctx, &key)?;
-    match chm_segment_for(ctx, this, hash) {
-        Some(seg) => {
-            let _resize_flag = ChmResizeLockGuard::enter();
-            let _guard = ChmMonitorGuard::acquire(ctx, seg);
-            let current = native_map_get(ctx, &[Value::Object(Some(seg)), key])?
-                .unwrap_or(Value::Object(None));
-            match current {
-                Value::Object(None) => Ok(Some(Value::Object(None))),
-                _ => {
-                    native_map_put(ctx, &[Value::Object(Some(seg)), key, new_val])?;
-                    Ok(Some(current))
-                }
+    // GC-safety: pin across hashCode() dispatch, the GC-pausable segment-lock
+    // wait, and the GC-capable put (the returned `current` must be the
+    // relocated address, not the pre-put one) — see `native_chm_put`.
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let new_val_pin = pin_value(ctx, new_val);
+    let result = (|| -> MethodCallResult {
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let hash = chm_key_hash(ctx, &key)?;
+        let this = ctx.read_native_pin(this_pin, this);
+        match chm_segment_for(ctx, this, hash) {
+            Some(seg) => {
+                let _resize_flag = ChmResizeLockGuard::enter();
+                let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
+                let seg_pin = ctx.pin_native_root(seg);
+                let key = read_pinned_elem(ctx, key_pin, key);
+                let current = native_map_get(ctx, &[Value::Object(Some(seg)), key])?
+                    .unwrap_or(Value::Object(None));
+                let current_pin = pin_value(ctx, current);
+                let r = match current {
+                    Value::Object(None) => Ok(Some(Value::Object(None))),
+                    _ => {
+                        let seg = ctx.read_native_pin(seg_pin, seg);
+                        let key = read_pinned_elem(ctx, key_pin, key);
+                        let new_val = read_pinned_elem(ctx, new_val_pin, new_val);
+                        native_map_put(ctx, &[Value::Object(Some(seg)), key, new_val])?;
+                        Ok(Some(read_pinned_elem(ctx, current_pin, current)))
+                    }
+                };
+                ctx.unpin_native_roots(seg_pin);
+                r
             }
+            None => Ok(Some(Value::Object(None))),
         }
-        None => Ok(Some(Value::Object(None))),
-    }
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn native_chm_replace_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -33396,22 +33646,45 @@ fn native_chm_replace_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         }
         .into());
     }
-    let hash = chm_key_hash(ctx, &key)?;
-    match chm_segment_for(ctx, this, hash) {
-        Some(seg) => {
-            let _resize_flag = ChmResizeLockGuard::enter();
-            let _guard = ChmMonitorGuard::acquire(ctx, seg);
-            let current = native_map_get(ctx, &[Value::Object(Some(seg)), key])?
-                .unwrap_or(Value::Object(None));
-            if values_equal(ctx, &current, &old_val) {
-                native_map_put(ctx, &[Value::Object(Some(seg)), key, new_val])?;
-                Ok(Some(Value::Int(1)))
-            } else {
-                Ok(Some(Value::Int(0)))
+    // GC-safety: pin across hashCode()/equals() dispatch and the
+    // GC-pausable segment-lock wait — see `native_chm_put`.
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let old_pin = pin_value(ctx, old_val);
+    let new_pin = pin_value(ctx, new_val);
+    let result = (|| -> MethodCallResult {
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let hash = chm_key_hash(ctx, &key)?;
+        let this = ctx.read_native_pin(this_pin, this);
+        match chm_segment_for(ctx, this, hash) {
+            Some(seg) => {
+                let _resize_flag = ChmResizeLockGuard::enter();
+                let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
+                let seg_pin = ctx.pin_native_root(seg);
+                let key = read_pinned_elem(ctx, key_pin, key);
+                let current = native_map_get(ctx, &[Value::Object(Some(seg)), key])?
+                    .unwrap_or(Value::Object(None));
+                let current_pin = pin_value(ctx, current);
+                let old_val = read_pinned_elem(ctx, old_pin, old_val);
+                let current = read_pinned_elem(ctx, current_pin, current);
+                let eq = values_equal(ctx, &current, &old_val);
+                let r = if eq {
+                    let seg = ctx.read_native_pin(seg_pin, seg);
+                    let key = read_pinned_elem(ctx, key_pin, key);
+                    let new_val = read_pinned_elem(ctx, new_pin, new_val);
+                    native_map_put(ctx, &[Value::Object(Some(seg)), key, new_val])?;
+                    Ok(Some(Value::Int(1)))
+                } else {
+                    Ok(Some(Value::Int(0)))
+                };
+                ctx.unpin_native_roots(seg_pin);
+                r
             }
+            None => Ok(Some(Value::Int(0))),
         }
-        None => Ok(Some(Value::Int(0))),
-    }
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn native_chm_for_each_parallel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -42910,6 +43183,20 @@ mod tests {
         assert!(
             r.find(c, "stream", "()Ljava/util/stream/Stream;").is_some(),
             "AL stream"
+        );
+    }
+
+    #[test]
+    fn map_for_each_interface_native_registered() {
+        let r = build_registry();
+        assert!(
+            r.find(
+                "java/util/Map",
+                "forEach",
+                "(Ljava/util/function/BiConsumer;)V"
+            )
+            .is_some(),
+            "Map.forEach must have a native bridge for immutable-map snapshots"
         );
     }
 

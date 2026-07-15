@@ -37888,91 +37888,6 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
         native_spring_default_document_loader_create_document_builder_factory,
     );
 
-    // EUREKA-LOGBACK-CLEANUP: Spring Boot's `LogbackLoggingSystem.cleanUp`
-    // crashes every Spring Boot app (eureka-server is the canonical
-    // reproducer) on `prepareEnvironment` because `LoggerContext.<init>`
-    // is registered as a no-op (see `register_slf4j_natives` /
-    // `register_spring_boot_logback_apply`) and the inherited
-    // `objectMap` / `propertyMap` / `sm` fields stay null. The real-JDK
-    // bytecode for `ContextBase.removeObject` etc. then NPEs as
-    // `Cannot invoke remove on null`. Register null-tolerant stubs on
-    // the concrete `LoggerContext` (receiver class for vtable dispatch)
-    // AND on `ContextBase` (declaring class for slow-path lookup).
-    // Paired with the `check_override` allow-list entries in
-    // `vm/src/vm/vm_exec.rs`.
-    registry.register(
-        "ch/qos/logback/classic/LoggerContext",
-        "<init>",
-        "()V",
-        native_noop_with_this,
-    );
-    for class_name in [
-        "ch/qos/logback/classic/LoggerContext",
-        "ch/qos/logback/core/ContextBase",
-    ] {
-        registry.register(
-            class_name,
-            "removeObject",
-            "(Ljava/lang/String;)V",
-            native_noop_with_this,
-        );
-        registry.register(
-            class_name,
-            "putObject",
-            "(Ljava/lang/String;Ljava/lang/Object;)V",
-            native_noop_with_this,
-        );
-        registry.register(
-            class_name,
-            "getObject",
-            "(Ljava/lang/String;)Ljava/lang/Object;",
-            |_, _| Ok(Some(Value::Object(None))),
-        );
-        registry.register(
-            class_name,
-            "putProperty",
-            "(Ljava/lang/String;Ljava/lang/String;)V",
-            native_noop_with_this,
-        );
-        registry.register(
-            class_name,
-            "getProperty",
-            "(Ljava/lang/String;)Ljava/lang/String;",
-            |_, _| Ok(Some(Value::Object(None))),
-        );
-    }
-    registry.register(
-        "ch/qos/logback/classic/LoggerContext",
-        "getStatusManager",
-        "()Lch/qos/logback/core/status/StatusManager;",
-        |ctx, _| {
-            let sm = alloc_concurrent_synthetic(ctx, "ch/qos/logback/core/BasicStatusManager", 4);
-            Ok(Some(Value::Object(Some(sm))))
-        },
-    );
-    registry.register(
-        "ch/qos/logback/core/BasicStatusManager",
-        "clear",
-        "()V",
-        native_noop_with_this,
-    );
-    registry.register(
-        "ch/qos/logback/classic/LoggerContext",
-        "getTurboFilterList",
-        "()Lch/qos/logback/classic/spi/TurboFilterList;",
-        |ctx, _| {
-            let tfl =
-                alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/spi/TurboFilterList", 2);
-            Ok(Some(Value::Object(Some(tfl))))
-        },
-    );
-    registry.register(
-        "ch/qos/logback/classic/spi/TurboFilterList",
-        "remove",
-        "(Ljava/lang/Object;)Z",
-        |_, _| Ok(Some(Value::Int(0))),
-    );
-
     // EUREKA-RB-CANDIDATE: see comment on the `check_override` allow-list
     // entry in `vm_exec.rs` — `ResourceBundle$Control.getCandidateLocales`
     // crashes with `NullPointerException: key must not be null` on our
@@ -70913,8 +70828,13 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
                 .ensure_class_initialized("ch/qos/logback/classic/LoggerContext")
                 .is_ok()
             {
-                let f = alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/LoggerContext", 1);
-                return Ok(Some(Value::Object(Some(f))));
+                if let Some(Value::Object(Some(context))) = ctx.new_object_initialized(
+                    "ch/qos/logback/classic/LoggerContext",
+                    "()V",
+                    &[],
+                )? {
+                    return Ok(Some(Value::Object(Some(context))));
+                }
             }
             let f = alloc_concurrent_synthetic(ctx, "org/slf4j/ILoggerFactory", 0);
             Ok(Some(Value::Object(Some(f))))
@@ -71207,13 +71127,9 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // is on the fat-jar classpath we return a real-classed
     // `LoggerContext` instance so Spring Boot's
     // `LoggingSystemFactory.LogbackLoggingSystem.beforeInitialize()`
-    // class check passes. The instance's fields (`loggerCache` etc.)
-    // are never initialized through logback's real `<init>` chain, so
-    // we register a `getLogger(String)` native that bypasses the real
-    // bytecode (which NPEs on the uninitialized `loggerCache`
-    // HashMap) and hands back a synthetic SLF4J Logger.
+    // class check passes. The instance is initialized through Logback's real
+    // constructor; `getLogger(String)` remains a lightweight logging bridge.
     let lb_ctx = "ch/qos/logback/classic/LoggerContext";
-    registry.register(lb_ctx, "<init>", "()V", native_noop_with_this);
     registry.register(
         lb_ctx,
         "getLogger",
@@ -71253,6 +71169,11 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     registry.register(lb_ctx, "reset", "()V", |_, _| Ok(None));
     registry.register(lb_ctx, "isStarted", "()Z", |_, _| Ok(Some(Value::Int(1))));
 
+    /* Historical rationale for the removed construction-bypass shims.
+     * LoggerContext now runs its real constructor, so Java owns ContextBase,
+     * BasicStatusManager, and TurboFilterList state again. Do not restore the
+     * old overrides below.
+     *
     // ContextBase is the parent class of LoggerContext. Its real
     // bytecode `getObject(String)` / `putObject(String, Object)` /
     // `getCopyOfPropertyMap` reads a `HashMap` field that is null
@@ -71262,42 +71183,6 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // so we need these accessor natives to short-circuit before the
     // null-map dereference. Returning null from getObject is the
     // documented "not present" contract; putObject becomes a no-op.
-    let cb = "ch/qos/logback/core/ContextBase";
-    registry.register(
-        cb,
-        "getObject",
-        "(Ljava/lang/String;)Ljava/lang/Object;",
-        |_, _| Ok(Some(Value::Object(None))),
-    );
-    registry.register(
-        cb,
-        "putObject",
-        "(Ljava/lang/String;Ljava/lang/Object;)V",
-        |_, _| Ok(None),
-    );
-    registry.register(
-        cb,
-        "getProperty",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        |_, _| Ok(Some(Value::Object(None))),
-    );
-    registry.register(
-        cb,
-        "putProperty",
-        "(Ljava/lang/String;Ljava/lang/String;)V",
-        |_, _| Ok(None),
-    );
-    registry.register(cb, "getCopyOfPropertyMap", "()Ljava/util/Map;", |ctx, _| {
-        let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 2);
-        Ok(Some(Value::Object(Some(map))))
-    });
-    registry.register(cb, "getName", "()Ljava/lang/String;", |ctx, _| {
-        Ok(Some(Value::Object(Some(ctx.create_string("default")))))
-    });
-    registry.register(cb, "setName", "(Ljava/lang/String;)V", |_, _| Ok(None));
-    registry.register(cb, "start", "()V", |_, _| Ok(None));
-    registry.register(cb, "stop", "()V", |_, _| Ok(None));
-    registry.register(cb, "isStarted", "()Z", |_, _| Ok(Some(Value::Int(1))));
 
     // ContextBase.getStatusManager / LoggerContext.getStatusManager — the
     // real bytecode reads a `BasicStatusManager` field set in <init>,
@@ -71307,66 +71192,11 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // `getStatusManager().add(InfoStatus)` — NPE on null. Hand back a
     // synthetic BasicStatusManager whose interface methods (add/clear/
     // getCount/getCopyOfStatusList/etc.) are wired to safe no-ops below.
-    fn make_basic_status_manager(ctx: &mut dyn NativeContext) -> Value {
-        let bsm = alloc_concurrent_synthetic(ctx, "ch/qos/logback/core/BasicStatusManager", 0);
-        Value::Object(Some(bsm))
-    }
-    registry.register(
-        cb,
-        "getStatusManager",
-        "()Lch/qos/logback/core/status/StatusManager;",
-        |ctx, _| Ok(Some(make_basic_status_manager(ctx))),
-    );
-    registry.register(
-        lb_ctx,
-        "getStatusManager",
-        "()Lch/qos/logback/core/status/StatusManager;",
-        |ctx, _| Ok(Some(make_basic_status_manager(ctx))),
-    );
 
     // BasicStatusManager surface — interface dispatch resolves to the
     // receiver's runtime class. Provide no-op natives so any caller
     // (Spring Boot, Joran, logback internals) that obtains the manager
     // via getStatusManager() can invoke its methods without NPE.
-    let bsm_cls = "ch/qos/logback/core/BasicStatusManager";
-    registry.register(
-        bsm_cls,
-        "add",
-        "(Lch/qos/logback/core/status/Status;)V",
-        |_, _| Ok(None),
-    );
-    registry.register(
-        bsm_cls,
-        "add",
-        "(Lch/qos/logback/core/status/StatusListener;)Z",
-        |_, _| Ok(Some(Value::Int(1))),
-    );
-    registry.register(
-        bsm_cls,
-        "remove",
-        "(Lch/qos/logback/core/status/StatusListener;)V",
-        |_, _| Ok(None),
-    );
-    registry.register(bsm_cls, "clear", "()V", |_, _| Ok(None));
-    registry.register(bsm_cls, "getCount", "()I", |_, _| Ok(Some(Value::Int(0))));
-    registry.register(
-        bsm_cls,
-        "getCopyOfStatusList",
-        "()Ljava/util/List;",
-        |ctx, _| {
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            Ok(Some(Value::Object(Some(list))))
-        },
-    );
-    registry.register(
-        bsm_cls,
-        "getCopyOfStatusListenerList",
-        "()Ljava/util/List;",
-        |ctx, _| {
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            Ok(Some(Value::Object(Some(list))))
-        },
-    );
 
     // LoggerContext.getTurboFilterList — Spring Boot's
     // LogbackLoggingSystem.beforeInitialize line 123 does
@@ -71374,26 +71204,6 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // is null because we bypass logback's <init>. Return a synthetic
     // TurboFilterList with `add(Object)` no-op so Spring's filter
     // registration succeeds silently.
-    registry.register(
-        lb_ctx,
-        "getTurboFilterList",
-        "()Lch/qos/logback/classic/spi/TurboFilterList;",
-        |ctx, _| {
-            let tfl =
-                alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/spi/TurboFilterList", 0);
-            Ok(Some(Value::Object(Some(tfl))))
-        },
-    );
-    let tfl_cls = "ch/qos/logback/classic/spi/TurboFilterList";
-    registry.register(tfl_cls, "add", "(Ljava/lang/Object;)Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(tfl_cls, "remove", "(Ljava/lang/Object;)Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(tfl_cls, "clear", "()V", |_, _| Ok(None));
-    registry.register(tfl_cls, "size", "()I", |_, _| Ok(Some(Value::Int(0))));
-    registry.register(tfl_cls, "isEmpty", "()Z", |_, _| Ok(Some(Value::Int(1))));
 
     // Logback Logger surface — paired with the LoggerContext.getLogger
     // native above. Mirrors the SLF4J Logger no-ops registered higher
@@ -71402,6 +71212,7 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // LogAdapter$Slf4jAdapter takes the SLF4J Logger interface so it
     // already routes through the SLF4J no-ops; user code that casts
     // to logback's Logger needs these).
+     */
     let lb_lg = "ch/qos/logback/classic/Logger";
     registry.register(lb_lg, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = match args.first() {
@@ -72396,8 +72207,11 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
 
     // --- Logback (ch.qos.logback) ---
     let lb_factory = "ch/qos/logback/classic/LoggerContext";
+    /* Historical rationale for the removed constructor/context-state shims.
+     * LoggerContext now uses its bytecode constructor in every registration
+     * mode, so ContextBase owns its real maps and status manager.
+     *
     // LoggerContext constructor — no fields to initialize. NEW-6.
-    registry.register(lb_factory, "<init>", "()V", native_noop_with_this);
     // ContextBase.removeObject/putObject/getObject — the LoggerContext
     // constructor override above leaves the `objectMap`/`propertyMap` fields
     // null. Spring Boot's `LogbackLoggingSystem.cleanUp` invokes
@@ -72407,102 +72221,14 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     // SimpleApplicationEventMulticaster), so override these accessors with
     // no-ops since our synthetic Logback Logger doesn't track per-context
     // properties anyway.
-    registry.register(
-        "ch/qos/logback/core/ContextBase",
-        "removeObject",
-        "(Ljava/lang/String;)V",
-        native_noop_with_this,
-    );
-    registry.register(
-        "ch/qos/logback/core/ContextBase",
-        "putObject",
-        "(Ljava/lang/String;Ljava/lang/Object;)V",
-        native_noop_with_this,
-    );
-    registry.register(
-        "ch/qos/logback/core/ContextBase",
-        "getObject",
-        "(Ljava/lang/String;)Ljava/lang/Object;",
-        |_, _| Ok(Some(Value::Object(None))),
-    );
-    registry.register(
-        "ch/qos/logback/core/ContextBase",
-        "putProperty",
-        "(Ljava/lang/String;Ljava/lang/String;)V",
-        native_noop_with_this,
-    );
-    registry.register(
-        "ch/qos/logback/core/ContextBase",
-        "getProperty",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        |_, _| Ok(Some(Value::Object(None))),
-    );
     // Same overrides on the concrete subclass — invokevirtual resolution
     // may not see ContextBase methods when the receiver class declares
     // overrides; register on LoggerContext as well. Also stub the helper
     // accessors LogbackLoggingSystem.cleanUp() chains through so the
     // null `objectMap`/`propertyMap` fields are never dereferenced.
-    registry.register(
-        "ch/qos/logback/classic/LoggerContext",
-        "removeObject",
-        "(Ljava/lang/String;)V",
-        native_noop_with_this,
-    );
-    registry.register(
-        "ch/qos/logback/classic/LoggerContext",
-        "putObject",
-        "(Ljava/lang/String;Ljava/lang/Object;)V",
-        native_noop_with_this,
-    );
-    registry.register(
-        "ch/qos/logback/classic/LoggerContext",
-        "getObject",
-        "(Ljava/lang/String;)Ljava/lang/Object;",
-        |_, _| Ok(Some(Value::Object(None))),
-    );
-    registry.register(
-        "ch/qos/logback/classic/LoggerContext",
-        "putProperty",
-        "(Ljava/lang/String;Ljava/lang/String;)V",
-        native_noop_with_this,
-    );
-    registry.register(
-        "ch/qos/logback/classic/LoggerContext",
-        "getProperty",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        |_, _| Ok(Some(Value::Object(None))),
-    );
-    registry.register(
-        "ch/qos/logback/classic/LoggerContext",
-        "getStatusManager",
-        "()Lch/qos/logback/core/status/StatusManager;",
-        |ctx, _| {
-            let sm = alloc_concurrent_synthetic(ctx, "ch/qos/logback/core/BasicStatusManager", 4);
-            Ok(Some(Value::Object(Some(sm))))
-        },
-    );
-    registry.register(
-        "ch/qos/logback/core/BasicStatusManager",
-        "clear",
-        "()V",
-        native_noop_with_this,
-    );
-    registry.register(
-        "ch/qos/logback/classic/LoggerContext",
-        "getTurboFilterList",
-        "()Lch/qos/logback/classic/spi/TurboFilterList;",
-        |ctx, _| {
-            let tfl =
-                alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/spi/TurboFilterList", 2);
-            Ok(Some(Value::Object(Some(tfl))))
-        },
-    );
-    registry.register(
-        "ch/qos/logback/classic/spi/TurboFilterList",
-        "remove",
-        "(Ljava/lang/Object;)Z",
-        |_, _| Ok(Some(Value::Int(0))),
-    );
+     */
+    // Keep only the lightweight Logger bridge; do not override LoggerContext
+    // construction or its ContextBase state.
     registry.register(
         lb_factory,
         "getLogger",
@@ -72546,6 +72272,53 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     registry.register(lb_logger, "isInfoEnabled", "()Z", |_, _| {
         Ok(Some(Value::Int(1)))
     });
+}
+
+#[cfg(test)]
+mod logback_construction_registration_tests {
+    use super::*;
+
+    #[test]
+    fn logback_context_construction_and_state_are_not_native_overridden() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        register_slf4j_natives(&mut registry);
+
+        for (class_name, method_name, descriptor) in [
+            (
+                "ch/qos/logback/classic/LoggerContext",
+                "<init>",
+                "()V",
+            ),
+            (
+                "ch/qos/logback/core/ContextBase",
+                "getObject",
+                "(Ljava/lang/String;)Ljava/lang/Object;",
+            ),
+            (
+                "ch/qos/logback/core/ContextBase",
+                "putObject",
+                "(Ljava/lang/String;Ljava/lang/Object;)V",
+            ),
+            (
+                "ch/qos/logback/classic/LoggerContext",
+                "getStatusManager",
+                "()Lch/qos/logback/core/status/StatusManager;",
+            ),
+            (
+                "ch/qos/logback/classic/LoggerContext",
+                "getTurboFilterList",
+                "()Lch/qos/logback/classic/spi/TurboFilterList;",
+            ),
+        ] {
+            assert!(
+                registry
+                    .find(class_name, method_name, descriptor)
+                    .is_none(),
+                "{class_name}.{method_name}{descriptor} must use real Logback bytecode"
+            );
+        }
+    }
 }
 
 fn slf4j_log_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -77759,27 +77532,41 @@ fn register_reflect_array_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
-fn native_array_get_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// Validate the target accepted by `java.lang.reflect.Array` before using an
+/// array accessor.  A non-null ordinary object used to reach the generic
+/// heap-array fallback, which reads slot zero as though it were element zero.
+/// Besides violating the reflection contract, that made `Array.set` spin when
+/// HSQLDB passed its zero-field `RangeGroupEmpty` singleton.
+fn reflect_array_arg(
+    ctx: &dyn NativeContext,
+    args: &[Value],
+) -> Result<ObjectRef, MethodCallFailed> {
     let arr = match args.first() {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "Array argument is null".to_string(),
+            }
+            .into())
+        }
     };
+    if !ctx.object_is_array(arr) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Array argument is not an array".to_string(),
+        }
+        .into());
+    }
+    Ok(arr)
+}
+
+fn native_array_get_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let arr = reflect_array_arg(ctx, args)?;
     Ok(Some(Value::Int(ctx.array_length(arr) as i32)))
 }
 
 fn native_array_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     use cratonvm_types::ArrayElementType;
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => {
-            return Err(
-                cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                    message: "Array argument is null".to_string(),
-                }
-                .into(),
-            )
-        }
-    };
+    let arr = reflect_array_arg(ctx, args)?;
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
@@ -77876,13 +77663,47 @@ fn unbox_for_array_set(
     ctx: &dyn NativeContext,
     elem: cratonvm_types::ArrayElementType,
     v: Value,
-) -> Value {
+) -> Result<Value, MethodCallFailed> {
     use cratonvm_types::ArrayElementType;
+    if elem == ArrayElementType::Reference {
+        return Ok(v);
+    }
     let raw = match v {
-        Value::Object(Some(o)) => ctx.get_field(o, 0),
+        Value::Object(Some(o)) => {
+            // `Array.set` must reject arbitrary objects for primitive arrays.
+            // Reading slot zero before this check used the layout of a
+            // `RangeGroupEmpty` instance as if it were a boxed primitive and
+            // caused the HSQLDB startup loop documented in SPB-JDBC-HSQLDB.1.
+            let class_name = ctx
+                .class_name_of_id(ctx.class_id_of_object(o))
+                .unwrap_or_default();
+            if !matches!(
+                class_name.as_str(),
+                "java/lang/Boolean"
+                    | "java/lang/Byte"
+                    | "java/lang/Character"
+                    | "java/lang/Short"
+                    | "java/lang/Integer"
+                    | "java/lang/Long"
+                    | "java/lang/Float"
+                    | "java/lang/Double"
+            ) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "Array.set value is not a boxed primitive".to_string(),
+                }
+                .into());
+            }
+            ctx.get_field(o, 0)
+        }
+        Value::Object(None) => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "Array.set cannot store null in a primitive array".to_string(),
+            }
+            .into())
+        }
         other => other,
     };
-    match elem {
+    Ok(match elem {
         ArrayElementType::Boolean
         | ArrayElementType::Byte
         | ArrayElementType::Char
@@ -77908,22 +77729,12 @@ fn unbox_for_array_set(
             Value::Int(n) => Value::Double(n as f64),
             _ => Value::Double(0.0),
         },
-        ArrayElementType::Reference => v,
-    }
+        ArrayElementType::Reference => unreachable!("reference arrays return before unboxing"),
+    })
 }
 
 fn native_array_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => {
-            return Err(
-                cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                    message: "Array argument is null".to_string(),
-                }
-                .into(),
-            )
-        }
-    };
+    let arr = reflect_array_arg(ctx, args)?;
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
@@ -77933,16 +77744,13 @@ fn native_array_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // into the matching primitive Value before writing.  For reference
     // arrays the value is passed through as-is.
     let elem = ctx.heap_element_type_of(arr);
-    let val = unbox_for_array_set(ctx, elem, raw);
+    let val = unbox_for_array_set(ctx, elem, raw)?;
     ctx.set_array_element(arr, idx, val);
     Ok(None)
 }
 
 fn native_array_get_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
+    let arr = reflect_array_arg(ctx, args)?;
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
@@ -77951,10 +77759,7 @@ fn native_array_get_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn native_array_set_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
+    let arr = reflect_array_arg(ctx, args)?;
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
@@ -77965,10 +77770,7 @@ fn native_array_set_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn native_array_get_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Long(0))),
-    };
+    let arr = reflect_array_arg(ctx, args)?;
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
@@ -77977,10 +77779,7 @@ fn native_array_get_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn native_array_set_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
+    let arr = reflect_array_arg(ctx, args)?;
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
@@ -77991,10 +77790,7 @@ fn native_array_set_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn native_array_get_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Float(0.0))),
-    };
+    let arr = reflect_array_arg(ctx, args)?;
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
@@ -78003,10 +77799,7 @@ fn native_array_get_float(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_array_set_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
+    let arr = reflect_array_arg(ctx, args)?;
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
@@ -78017,10 +77810,7 @@ fn native_array_set_float(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_array_get_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Double(0.0))),
-    };
+    let arr = reflect_array_arg(ctx, args)?;
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
@@ -78029,10 +77819,7 @@ fn native_array_get_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_array_set_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
+    let arr = reflect_array_arg(ctx, args)?;
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
