@@ -339,10 +339,37 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
 **RETRACTED 2026-07-15**: the "batch-context `<clinit>` contamination" theorized below (classes failing only in batched suite runs, passing solo) was investigated further and is **NOT a CratonVM bug**. Root cause was Azure-host environment corruption, confirmed live: (1) `/home/victor/jdk25` (the symlink itself) had vanished mid-session — every `--java-home ~/jdk25` invocation failed with `path does not exist`, producing zero test output, easily misread as a VM hang; (2) separately, `/tmp` (the directory itself, not just stale contents) had vanished — `Tomcat.initBaseDir()` threw `IllegalStateException: Unable to create the directory [/tmp]`, which looks exactly like a filesystem native bug but is the OS directory missing. After `ln -sf /data/data/jdk25-real ~/jdk25` and `mkdir -p /tmp && chmod 1777 /tmp`, the exact same 8-class batch that previously showed `SseIntegrationTests` failing 9/48 (deterministically, 3/3 reruns) now passes 42/48 with 6 aborted, byte-for-byte matching the HotSpot baseline shape, and `DefaultRenderingBuilderTests` never reproduced its `ExceptionInInitializerError` again across 3 clean reruns of the identical batch order on the identical binary. See `azure-host-disk-full-flapping-20260715.md` memory (Claude's memory system) for the full host instability catalog.
 
 **Remaining OPEN reactive residuals:**
-*   `http.client.reactive.ClientHttpConnectorTests` — TIMEOUT. `StepVerifier` in `basic()` waits forever;
-    at dump time the Jetty client pool and MockWebServer-side threads are idle and no
-    okhttp/MockWebServer accept thread is visible. Also: the T19.H1 watchdog stack-dump itself SIGSEGVs
-    when JIT frames are on the stacks (separate small bug; `--nojit` dumps work).
+*   `http.client.reactive.ClientHttpConnectorTests` — **PARTIALLY FIXED 2026-07-15**
+    (`fix/jdkclient-patch-hang-20260715`, commit `8e47b8a9`). Root-caused ONE genuine mechanism: the
+    `java.net.http.HttpClient` native implementation (RE.5, `net_phase_e.rs`) performs its
+    "async" `sendAsync()` synchronously on the calling thread via raw `TcpStream`
+    connect/write/read (30s socket timeout) and a request-body `Publisher`-draining condvar wait
+    (10s), neither of which was bracketed with `begin_blocking_region()`/`end_blocking_region()` —
+    unlike every other blocking native I/O call in the same file. A concurrent Stop-The-World pause
+    (GC/JIT takeover) then waits indefinitely on this uncooperative thread, while the SAME pause is
+    what freezes the real Java thread on the other end of the socket (e.g. MockWebServer's response
+    dispatcher) that this thread is blocked waiting to hear from — a genuine deadlock. Live capture
+    (`CRATONVM_DBG_RE5=1`, new diagnostic) caught it in the act: a `DELETE` request's write
+    succeeded, then the response read blocked the full 30s and failed with `WouldBlock`, with a
+    `"STW cross-thread JIT takeover is still waiting for cooperative mutators rounds=64 pending=1
+    taken=0"` warning firing mid-block. Confirmed CratonVM-specific and connector-specific:
+    HotSpot ran the identical 32-request sequential-`MockWebServer` probe (`ReactorNetty`/`Jetty`/
+    `HttpComponents`/`Jdk` × 8 HTTP methods each, reusing one connector instance per type) 8/8 clean;
+    CratonVM hit the hang on ~2/13 attempts, always on the `Jdk` connector, never the other 3 (which
+    don't route through this raw-socket path). Fixed both blocking sites; verified 15/15 clean on the
+    same probe post-fix, `cargo test -p cratonvm-native-builtins --lib` 2996/0.
+    **Still OPEN**: the full `ClientHttpConnectorTests` class (which also exercises Reactor Netty,
+    Jetty, and Apache HttpComponents — real, independent libraries with their own native I/O) still
+    intermittently hangs after this fix, in the identical `StepVerifier`/`waitTaskEvent` shape.
+    Near-certainly a similarly-shaped but structurally separate STW-cooperation gap in ONE of those
+    other 3 connectors' own blocking call paths (or CratonVM's support code for them) — not
+    reachable from `net_phase_e.rs`. **Next step**: bisect which of the 4 connectors is still
+    hanging (rerun with a filtered `MethodSource` exercising one `Named<ClientHttpConnector>` at a
+    time — the `FullMatrixProbe`-style technique in the fix's worktree
+    `/data/data/wt-jdkclient-patch-hang-20260715/probes/` generalizes directly), then audit that
+    connector's blocking native call sites for the same missing `begin_blocking_region` pattern.
+    Also unfixed: the T19.H1 watchdog stack-dump itself SIGSEGVs when JIT frames are on the stack
+    (separate small bug; `--nojit` dumps work).
 *   `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` — pathological
     slowness, see section 2 above.
 *   `web.reactive.result.view.script.JRubyScriptTemplateTests` — JRuby-on-CratonVM: Ruby
