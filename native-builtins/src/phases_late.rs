@@ -9835,13 +9835,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         } else {
             ".tmp".to_string()
         };
-        let temp_dir = std::env::temp_dir();
-        let name = format!("{}{}{}", prefix, std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(), suffix);
-        let full_path = temp_dir.join(name);
-        let path_str = full_path.to_string_lossy().to_string();
-        // Create the file
-        let _ = std::fs::File::create(&full_path);
+        let temp_dir = jdk_temp_dir(ctx.get_system_property("java.io.tmpdir"));
+        let path_str = jdk_create_temp_file(&temp_dir, &prefix, &suffix)?;
         let result = p57_alloc_path(ctx, &path_str);
         Ok(Some(Value::Object(Some(result))))
     });
@@ -9853,7 +9848,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let prefix_ref = obj_arg(args, 0)?;
             let prefix = ctx.read_string(prefix_ref).unwrap_or_default();
-            let temp_dir = std::env::temp_dir();
+            let temp_dir = jdk_temp_dir(ctx.get_system_property("java.io.tmpdir"));
             let name = format!(
                 "{}{}",
                 prefix,
@@ -9863,7 +9858,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     .as_nanos()
             );
             let full_path = temp_dir.join(name);
-            let _ = std::fs::create_dir_all(&full_path);
+            std::fs::create_dir_all(&full_path).map_err(|e| p57_io_error(&e))?;
             let path_str = full_path.to_string_lossy().to_string();
             let result = p57_alloc_path(ctx, &path_str);
             Ok(Some(Value::Object(Some(result))))
@@ -13393,6 +13388,55 @@ fn p57_io_error(e: &std::io::Error) -> cratonvm_types::error::MethodCallFailed {
     .into()
 }
 
+/// Default temp directory per the JDK contract: honor the `java.io.tmpdir`
+/// system property (seeded from the platform default at VM init, overridable
+/// with `-Djava.io.tmpdir=...`), falling back to the platform default when the
+/// property is absent or empty. Temp-file natives must NOT read
+/// `std::env::temp_dir()` directly — that ignores `-Djava.io.tmpdir`, so
+/// harnesses could not redirect temp files off a full `/tmp` (mockk
+/// `BootJarLoader` silently downgraded to its agent-less mode and every
+/// mock.hashCode() then recursed to StackOverflowError, 2026-07-15).
+fn jdk_temp_dir(tmpdir_prop: Option<String>) -> std::path::PathBuf {
+    match tmpdir_prop {
+        Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::env::temp_dir(),
+    }
+}
+
+/// Create a fresh, empty temp file exclusively (`O_CREAT|O_EXCL`) inside
+/// `dir`, returning its full path. Failures MUST surface as `IOException` —
+/// that is the `File.createTempFile`/`Files.createTempFile` contract, and
+/// callers rely on the exception for fallback logic (mockk's `BootJarLoader`
+/// falls back to a CWD jar when the temp dir is unusable; the old
+/// `let _ = std::fs::File::create(..)` swallowed the error and the divergence
+/// only surfaced much later as an unrelated-looking failure).
+fn jdk_create_temp_file(
+    dir: &std::path::Path,
+    prefix: &str,
+    suffix: &str,
+) -> Result<String, cratonvm_types::error::MethodCallFailed> {
+    for _ in 0..16 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let full = dir.join(format!("{prefix}{nanos}{suffix}"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&full)
+        {
+            Ok(_) => return Ok(full.to_string_lossy().into_owned()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(p57_io_error(&e)),
+        }
+    }
+    Err(RuntimeError::IOException {
+        message: format!("Unable to create temporary file in {}", dir.display()),
+    }
+    .into())
+}
+
 /// Read a path (host file or jar-FS entry) into a UTF-8 string.
 fn p57_read_to_string(p: &str) -> std::io::Result<String> {
     let bytes = match vfs_read(p) {
@@ -16746,14 +16790,8 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                 }
                 _ => ".tmp".into(),
             };
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let tmp_dir = std::env::temp_dir();
-            let file_name = format!("{}{}{}", prefix, nanos, suffix);
-            let full = tmp_dir.join(&file_name).to_string_lossy().into_owned();
-            let _ = std::fs::File::create(&full);
+            let tmp_dir = jdk_temp_dir(ctx.get_system_property("java.io.tmpdir"));
+            let full = jdk_create_temp_file(&tmp_dir, &prefix, &suffix)?;
             Ok(Some(Value::Object(Some(file_alloc(ctx, &full)))))
         },
     );
@@ -16773,19 +16811,10 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                 _ => ".tmp".into(),
             };
             let dir_path = match args.get(2) {
-                Some(Value::Object(Some(f))) => file_read_path(ctx, *f),
-                _ => std::env::temp_dir().to_string_lossy().into_owned(),
+                Some(Value::Object(Some(f))) => std::path::PathBuf::from(file_read_path(ctx, *f)),
+                _ => jdk_temp_dir(ctx.get_system_property("java.io.tmpdir")),
             };
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let file_name = format!("{}{}{}", prefix, nanos, suffix);
-            let full = std::path::PathBuf::from(&dir_path)
-                .join(&file_name)
-                .to_string_lossy()
-                .into_owned();
-            let _ = std::fs::File::create(&full);
+            let full = jdk_create_temp_file(&dir_path, &prefix, &suffix)?;
             Ok(Some(Value::Object(Some(file_alloc(ctx, &full)))))
         },
     );
