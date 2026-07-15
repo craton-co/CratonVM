@@ -5,7 +5,18 @@ mechanism that caused `testBug45427` to fail is root-caused and fixed;
 `testBug45427` now PASSES reliably. A separate, still-open residual remains
 (see below), shared with
 [stw-crossthread-jit-takeover-hang-cluster.md](stw-crossthread-jit-takeover-hang-cluster.md).
-**Severity:** medium. **HotSpot:** PASS (fresh-verified).
+## Closure update (2026-07-14)
+
+**Status: RESOLVED and retired.** A clean helper-only Tomcat classpath
+eliminated the false scan-storm reproduction: `TestELInJsp#testBug61854a`
+passes in 76.9s. The remaining genuine JSP compilation failure
+(`testBug49555`) was traced to `Class.getCanonicalName()` incorrectly
+rewriting the literal `$` in `TesterFunctions$Inner$Class`; the corrected
+`InnerClasses`-based canonical and simple-name derivation now matches
+HotSpot and the test passes in 76.9s. The linked WebSocket Future defect is
+also fixed and its full class passes (`OK (2 tests)`, 16.3s).
+
+**Severity:** closed. **HotSpot:** PASS (fresh-verified).
 
 ## Root cause #1 (FIXED) — STW takeover self-inflicted scan storm
 
