@@ -71,3 +71,26 @@ Re-run the no-JIT and JIT domain probes against a dev build containing `21c5d6f6
 `b1ac28f3` on a host with load ≤ cores, with generous (≥900 s) timeouts, and confirm
 `domain/servers/server-{one,two}/log/server.log` each contain `WFLYSRV0025`. Everything else in this
 record is fixed and verified.
+
+## 2026-07-15 addendum: second stale site fixed live (toArray iterator); next blocker named (managed-server async-future stall)
+
+Two of the backtrace-enabled stale-canary domain probes (DOM13/DOM17, logs under
+`/data/wt-wfgc-20260715/probes/logs/` on the Azure host) caught a SECOND, unrelated stale-ref site in
+the Host Controller during extension init: `real_jdk_to_array_typed` (`vm/src/vm/vm_init.rs`) — the
+`toArray(T[])` iterator fallback re-used `this`/template/target/iterator raw across its repeated
+GC-capable `ctx.invoke` calls (`size`/`iterator`/`hasNext`/`next`), and the ArrayList-shaped path read
+`elementData` after the target allocation could move it. **FIXED** (`94145eaf`, pinned per the
+Family-1 contract; `cargo test -p cratonvm-vm --lib`: 2217 passed). Other probes (DOM10/DOM16) ran the
+identical config with zero firings — the site is timing-dependent, so future stale-canary runs should
+always set `RUST_BACKTRACE=1`.
+
+The remaining "both servers reach WFLYSRV0025" gap now has a concrete, named blocker: a live
+sudo-gdb attach on a stalled `Server:server-one` process (`/data/tmp/server-one-stall.threads`) shows
+its Controller Boot Thread parked in `monitor_wait` under
+`async_future_wait_keepalive` (`native-builtins/src/wildfly_core.rs:1537`) — an async future that is
+never completed — while two peer threads sit in interpreter `monitorenter` and every
+XNIO/MSC/remoting carrier idles normally. The server processes reach `WFLYSRV0049 starting` +
+root-service start, register with the HC (`WFLYHC0020`), then wedge there deterministically
+(~210 console lines each, identical across probes and timeouts up to 1500 s, JIT and no-JIT alike).
+This is a NEW, separate defect in the synthetic WildFly async-future/remoting sync — the next
+investigation for this record, with the gdb dump above as its starting evidence.
