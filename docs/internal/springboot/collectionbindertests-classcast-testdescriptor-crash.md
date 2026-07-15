@@ -181,7 +181,7 @@ before `77f8b37e5` (parent `0063b0b0e`).
   same general *shape* (wrong-type-from-collection cast crash), root cause
   already fixed+regression-tested (`e7e3bb91f`); this is a plausible but
   unconfirmed sibling, not a reversion of that fix.
-- [`brave-baggagefields-classcast-summary-printing.md`](../../known-issues/springboot/brave-baggagefields-classcast-summary-printing.md) —
+- [`brave-baggagefields-classcast-summary-printing-FIXED.md`](brave-baggagefields-classcast-summary-printing-FIXED.md) —
   another "clean" (non-memory-corrupt) `ClassCastException` during JUnit's
   own summary-printing path, different mechanism (stale `Collections`
   static field), same general symptom category (a CCE that surfaces deep
