@@ -390,52 +390,61 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     CratonVM hit the hang on ~2/13 attempts, always on the `Jdk` connector, never the other 3 (which
     don't route through this raw-socket path). Fixed both blocking sites; verified 15/15 clean on the
     same probe post-fix, `cargo test -p cratonvm-native-builtins --lib` 2996/0.
-    ~~**Still OPEN residual investigated 2026-07-15**~~ (`fix/httpconn-residual-20260715`, commit
-    `91cb806c`). Bisected the "which of the other 3 connectors" question with a
-    `FullMatrixProbe`-style stress harness plus a from-scratch JUnit launcher driving the real
-    `ClientHttpConnectorTests` class (49 sub-tests) directly under CratonVM, both stress-run
-    dozens of times with `sudo gdb -p <pid> --batch -ex 'thread apply all bt'` snapshots captured
-    live on reproduced hangs (Jetty `TRACE`, Jdk `OPTIONS`/`DELETE` all reproduced the shape).
-    **Found and fixed two genuine instances of the same missing-`begin_blocking_region` bug
-    pattern**, but in the *shared* `java.net.Socket`/`java.net.ServerSocket` implementation
+    ~~**Residual investigated + partially fixed 2026-07-15**~~ (`fix/httpconn-residual-20260715`,
+    commits `91cb806c` + `3d1449a7`). Bisected the "which of the other 3 connectors" question with
+    a `FullMatrixProbe`-style stress harness plus a from-scratch JUnit launcher driving the real
+    `ClientHttpConnectorTests` class (49 sub-tests) directly under CratonVM.
+
+    **Round 1 (`91cb806c`) — found and fixed two genuine missing-`begin_blocking_region` bugs**,
+    but in the *shared* `java.net.Socket`/`java.net.ServerSocket` implementation
     (`native-builtins/src/plain_socket.rs`, JDK13+'s `NioSocketImpl` backing both classes) rather
     than in any one connector's own code — `java.net.ServerSocket.accept()` is what MockWebServer
-    itself uses to accept every connection for all 4 connector cases:
-      - `socket_accept()`: `listener.accept()` (both the `SO_TIMEOUT` busy-poll branch and the
-        unbounded branch) was never bracketed in `begin_blocking_region`/`end_blocking_region`.
-      - `socket_connect()`: worse than just missing the STW bracket — `connect()`/`connect_timeout()`
-        ran *inside* `with_socket()`'s closure, which holds the single global socket-registry
-        write lock for the call's duration, serializing every other blocking `Socket` op
-        process-wide for as long as the connect takes.
-    Applied the same fix defensively to `native-io/src/socket_channel.rs`'s blocking-mode
-    `SocketChannel` paths (`sc_connect_inner`'s `allow_block` branch, `sc_read`/`sc_write`), which
-    match the identical pattern but were not directly confirmed as hit by these connectors (all
-    3 remaining connectors configure their channels non-blocking).
-    **However, direct gdb evidence shows this missing-wrap pattern is NOT what actually causes the
-    residual hangs.** Every reproduced hang (both pre- and post-fix, including from the real
-    `ClientHttpConnectorTests` class itself) showed: zero threads parked in an unwrapped blocking
-    `accept`/`connect`/`read`/`write` syscall; zero `"STW cross-thread JIT takeover is still
-    waiting for cooperative mutators"` warnings; and thread counts that *dropped* between
-    successive snapshots 4s apart (proving forward progress, not a permanent deadlock). What IS
-    reproducibly visible at every capture: one thread executing `vm/src/runtime/interpreter.rs`'s
-    JIT-to-interpreter transition (`jit_invoke_virtual_mic` → `invoke_on_class_shared_inner` →
-    `execute()` at `interpreter.rs:4163`) deep-cloning a method's `CodeAttribute` — specifically its
-    `LineNumberEntry`/`LocalVariableEntry` vectors (`reader/src/attribute.rs::clone()`) — taking
-    multiple seconds, in one capture while another thread waited on a `ConcurrentHashMap` per-bin
-    monitor (`native_chm_compute` → `monitor_enter_gc_safe`, itself correctly GC-safe) presumably
-    held by a thread doing the same slow clone. This looks like severe, non-deterministic
-    interpreter/attribute-cloning + lock-contention slowness under the heavy thread-pool
-    accumulation the 45-sub-test class produces in one process (76+ live threads by sub-test 6),
-    not a deadlock — StepVerifier's wait just outlasts whatever timeout the harness enforces.
-    **Verification**: `cargo test -p cratonvm-native-builtins --lib` 2996/0 and
-    `cargo test -p cratonvm-native-io --lib` 349/0 unchanged (no regression). Stress comparison
-    of the fix vs. pre-fix binary was inconclusive/confounded (both showed hangs at broadly
-    similar rates under concurrent-load conditions on the shared build host) — the fix is landed
-    because it closes a real, verified bug of the exact hypothesized pattern, not because it was
-    confirmed to eliminate this residual. **Still OPEN**: the interpreter/attribute-cloning
-    slowness above is the real next step, flagged separately for a dedicated investigation (not a
-    quick missing-wrap fix — needs profiling why `CodeAttribute` line-number/local-variable data is
-    deep-cloned per invocation instead of shared/cached).
+    itself uses to accept every connection for all 4 connector cases (`socket_accept()`'s
+    `listener.accept()` was never bracketed; `socket_connect()` additionally ran its blocking
+    `connect()` *inside* the global socket-registry write-lock closure). Also applied defensively
+    to `native-io/src/socket_channel.rs`'s blocking-mode `SocketChannel` paths. Direct gdb evidence
+    showed this was NOT what caused the residual hangs on its own (no thread ever caught parked in
+    an unwrapped blocking syscall) — real bugs, correctly fixed, but not sufficient alone.
+
+    **Round 2 (`3d1449a7`) — found and fixed the actual dominant mechanism.** Live `perf record -g
+    --call-graph dwarf` + `sudo gdb -p <pid> --batch -ex 'thread apply all bt'` sampling (multiple
+    independent captures, both from the ad hoc probe and the real `ClientHttpConnectorTests` class)
+    consistently caught a worker thread pegged at ~90-100% CPU for 20-25+ seconds straight (verified
+    via `top -H` per-thread CPU-time deltas across samples, not just a single snapshot), its top
+    frame cycling through `force_native_over_real_jdk_bytecode` — a ~55-branch/~1400-line
+    sequential string-comparison special-case dispatcher, reached via
+    `intercept_force_registered_native` → `execute_invokevirtual_cached`/`execute_invokestatic_cached`
+    — while the caller executed a tight Java-level spin/poll loop typical of Reactor/Netty/Jetty's
+    lock-free scheduling. This is the SAME function already flagged as consuming ~51% of all
+    executed instructions on method-call-heavy workloads in
+    `docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md` (2026-07-13) — that
+    session measured call *frequency* but not per-call cost, and judged a fast-reject allowlist too
+    risky to hand-write (a first attempt missed a case hiding in a nested helper). This fix instead
+    memoizes the check exactly (no approximation, so no risk of silently changing behaviour):
+    `CachedBytecodeMethod` gains a `force_native_cache: OnceLock<bool>` field, populated once per
+    invoke-cache entry and read thereafter, cutting the recheck from every cached dispatch hit to
+    once per unique callsite. (A direct earlier hypothesis — that a `CodeAttribute` deep-clone in
+    `interpreter.rs`'s `execute()` was the multi-second cost — was investigated with hard timing
+    instrumentation and REFUTED: individual clones measured consistently sub-millisecond, even
+    during a 30s+ hung run; that was a genuine but much smaller waste, not the driver, and was
+    reverted rather than landed as an unverified guess.)
+
+    **Verification**: `cargo test -p cratonvm-native-builtins --lib` 2997/0 and
+    `cargo test -p cratonvm-vm --lib` 2218/0, both unchanged (no regression). Live re-capture
+    post-fix confirms `force_native_over_real_jdk_bytecode` no longer appears in hot-thread
+    snapshots. Clean (single test run at a time, no concurrent host load) 15-run stress comparison
+    of `ClientHttpConnectorTests` end-to-end, 30s hang timeout:
+      - pre-fix (dev tip before this fix): **9/15 hangs (60%)**
+      - post-fix (this commit): **4/15 hangs (27%)**
+    A real, substantial, cleanly-measured improvement (~2.2x hang-rate reduction) — but **not a
+    full fix**. **Still OPEN**: a second, structurally different bottleneck remains. Post-fix
+    hot-thread captures now show sustained CPU-bound activity in `try_lambda_dispatch`
+    (`interpreter.rs`), specifically `shared.lambda_proxies.read()` — an `RwLock<HashMap<ClassId,
+    LambdaCallSite>>` consulted on *every* lambda/`invokedynamic` dispatch with no callsite-level
+    cache (unlike `invokevirtual`/`invokestatic`, which have exactly this kind of cache already).
+    Reactive-stream code is lambda-heavy (`.map`/`.flatMap`/subscriber callbacks per operator), so
+    this is plausibly a genuine architectural gap rather than a quick memoization fix — needs its
+    own investigation into whether invokedynamic call sites can get an analogous IC.
     Also unfixed: the T19.H1 watchdog stack-dump itself SIGSEGVs when JIT frames are on the stack
     (separate small bug; `--nojit` dumps work).
 *   ~~`web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` —
@@ -513,38 +522,90 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     HotSpot's 13s.** The next step for that specific goal is a separate investigation into what
     dominates per-test wall-clock time in this class — likely embedded-server bootstrap/socket/
     thread costs — ideally run on an uncontended host to get a clean baseline.
-*   ~~`web.reactive.result.view.script.JRubyScriptTemplateTests`~~ **FIXED (2026-07-15, commit
-    `d8ae2b96`).** Root cause was NOT the leading stale-`ObjectRef` hypothesis below (that
-    investigation misdiagnosed the bug against a stale `jruby-complete-9.1.17.0.jar` decompile; the
-    ACTUAL test classpath uses `jruby-base`/`jruby-stdlib` 10.0.2.0, whose `BlockCallback`
-    interface differs materially). The real bug: `org.jruby.runtime.BlockCallback` in JRuby 10.x
-    declares one abstract SAM `call(ThreadContext, IRubyObject[], Block)` plus five same-named
-    DEFAULT overloads, including `call(ThreadContext, IRubyObject, Block)` (scalar) which should
-    wrap its argument into a 1-element array and re-invoke the real SAM.
-    `interpreter::lambda_args_sam_compatible` (`vm/src/runtime/interpreter.rs`) unconditionally
-    skipped array-typed SAM parameters (`!pd.starts_with('L')` is true for `[...`, so the
-    "generic/erased — never second-guess" catch-all swallowed them), so it could never tell the
-    scalar DEFAULT `call` apart from the array-taking abstract SAM. `try_lambda_dispatch` then fed
-    the raw scalar (a `RubySymbol`, e.g. `:foo` from `Enumerable#partition`'s per-element block
-    callback) straight into the array-typed lambda body, so
-    `RubyEnumerable.packEnumValues(ThreadContext, IRubyObject[])` executed `arraylength` against a
-    bare `RubySymbol` — the `[GC-ARRAY-GUARD]` hit — silently returning 0 instead of throwing,
-    which produced the empty `"@#{key} = nil"` → `"@ = nil"` corruption that a nested `eval()`
-    rejected as a `SyntaxError` during `rubygems/specification.rb` bootstrap. Fix: when a SAM
-    parameter descriptor is array-typed, require the actual argument to be null, missing, or a
-    genuine array; a present non-array object there now correctly returns `false` (overloaded
-    default), so `try_lambda_dispatch` falls through to the real default method instead of
-    misdispatching. A related, narrower GC-safety hardening (pin `obj_ref`/`call_args` across
-    `lambda_args_sam_compatible`'s class-loading-capable helpers, mirroring the existing
-    `invoke_virtual` fix in `d64fab85`) landed alongside it in commit `6d652338` — legitimate but,
-    on its own, insufficient for this bug. **Evidence**: minimal `ScriptEngineManager` repro
-    (`[:foo,:bar].map {|key| "@#{key} = nil"}.join`) now produces the correct interpolated output
-    matching HotSpot; the `[GC-ARRAY-GUARD]` warning count for a full `JRubyScriptTemplateTests`
-    run dropped from 6 to 0; `cargo test -p cratonvm-vm --lib --release` unchanged at
-    2203 passed / 9 pre-existing `--release`-only `lock_order` failures. **Residual (separate,
-    newly-exposed, NOT a regression)**: the test class still fails after this fix, now via a
-    previously-unreached `NullPointerException` in JRuby's own indy-based
-    `org.jruby.ir.targets.indy.IsTrueSite.init` bootstrap (`rubygems/version.rb`'s
-    `canonical_segments`) — masked until this fix let bootstrap progress past `specification.rb`;
-    not investigated further under this fix, flagged for follow-up.
+*   ~~`web.reactive.result.view.script.JRubyScriptTemplateTests`~~ **PARTIALLY FIXED
+    (2026-07-15) -- 2 of (at least) 3 chained bugs closed, test class still FAILS.** JRuby's own
+    bootstrap (`rubygems/specification.rb` / `rubygems/version.rb`) turned out to hit a CHAIN of
+    independent CratonVM bugs, each masking the next -- fixing one just exposes the next further
+    into the same bootstrap. Root-caused and fixed so far:
+
+    1. **FIXED, commit `d8ae2b96`.** `org.jruby.runtime.BlockCallback` in JRuby 10.x (the ACTUAL
+       test classpath is `jruby-base`/`jruby-stdlib` 10.0.2.0 -- an earlier pass in this
+       investigation misdiagnosed against a stale `jruby-complete-9.1.17.0.jar` decompile and
+       chased an unrelated GC-safety gap first) declares one abstract SAM
+       `call(ThreadContext, IRubyObject[], Block)` plus five same-named DEFAULT overloads,
+       including `call(ThreadContext, IRubyObject, Block)` (scalar) which should wrap its
+       argument into a 1-element array and re-invoke the real SAM.
+       `interpreter::lambda_args_sam_compatible` (`vm/src/runtime/interpreter.rs`)
+       unconditionally skipped array-typed SAM parameters (`!pd.starts_with('L')` is true for
+       `[...`, so the "generic/erased — never second-guess" catch-all swallowed them), so it
+       could never tell the scalar DEFAULT `call` apart from the array-taking abstract SAM.
+       `try_lambda_dispatch` then fed the raw scalar (a `RubySymbol`, e.g. `:foo` from
+       `Enumerable#partition`'s per-element block callback) straight into the array-typed
+       lambda body, so `RubyEnumerable.packEnumValues(ThreadContext, IRubyObject[])` executed
+       `arraylength` against a bare `RubySymbol` — the `[GC-ARRAY-GUARD]` hit — silently
+       returning 0 instead of throwing, which produced the empty `"@#{key} = nil"` →
+       `"@ = nil"` corruption that a nested `eval()` rejected as a `SyntaxError`. Fix: when a
+       SAM parameter descriptor is array-typed, require the actual argument to be null,
+       missing, or a genuine array. A related, narrower GC-safety hardening (pin
+       `obj_ref`/`call_args` across `lambda_args_sam_compatible`'s class-loading-capable
+       helpers, mirroring the existing `invoke_virtual` fix in `d64fab85`) landed alongside it
+       in commit `6d652338` — legitimate but, on its own, insufficient for this bug.
+
+    2. **FIXED, commit `3af9ab62`.** Fixing (1) let bootstrap progress past the `SyntaxError`
+       and immediately into a `NullPointerException` in JRuby's own indy-based
+       `org.jruby.ir.targets.indy.IsTrueSite.init` (`rubygems/version.rb`'s
+       `canonical_segments`, `@canonical_segments ||= ...`'s truthiness test).
+       `MethodHandles.filterReturnValue` (`native-builtins/src/lang_invoke.rs`) was a no-op
+       stub ("simplified: return the target MH unchanged", silently dropping the filter
+       handle). JRuby's `VariableSite.ivar` ivar-getter call-site targets rely on
+       `filterReturnValue` to substitute the runtime's `nil` singleton for the raw Java `null`
+       that `IRubyObject.getInstanceVariable` genuinely returns for an unset ivar (normal at
+       that raw layer). With the filter dropped, `mh.invoke()` returned the raw `null`
+       straight through, and `IsTrueSite.init` crashed calling `.getRuntime()` on it. Fix:
+       added `MH_KIND_RETURN_FILTER` + `mh_dispatch_return_filter`, mirroring the existing
+       `MH_KIND_FILTER`/`MH_KIND_CATCH` adapter pattern — invoke target, pass its result
+       through the filter handle, return the filter's result.
+
+    **Evidence for (1)+(2)**: minimal `ScriptEngineManager` repro
+    (`[:foo,:bar].map {|key| "@#{key} = nil"}.join`, and separately `require 'erb'; require
+    'ostruct'` for (2)) now produces correct output / no longer NPEs; the `[GC-ARRAY-GUARD]`
+    warning count for a full `JRubyScriptTemplateTests` run dropped from 6 to 0;
+    `cargo test -p cratonvm-vm --lib --release` unchanged at 2203 passed / 9 pre-existing
+    `--release`-only `lock_order` failures; `cargo test -p cratonvm-native-builtins --lib
+    --release` unchanged at 2997 passed / 0 failed.
+
+    **OPEN — bug 3, current blocker, NOT fixed.** Past (1)+(2), the same minimal repro (and the
+    full test class) now hits `ArgumentError: wrong number of arguments (given 0, expected
+    1..2)` at `rubygems/version.rb:413` (`canonical_segments`'s `partition_segments(...)` /
+    the preceding `@version.sub(regex, "")` call), raised from deep inside REAL gem-dependency
+    resolution (`Gem::Dependency#to_spec` → `#to_specs` → `#matching_specs` →
+    `Specification.find_all_by_name` → `Requirement#satisfied_by?` → `RubyComparable#>=` →
+    `Version#<=>` → `#canonical_segments`) — i.e. this is reached only once (1) and (2) let
+    bootstrap progress far enough to start resolving real gem versions. Traced via
+    `CRATONVM_DBG_INDY_GENERIC=1` to `org.jruby.ir.targets.simple.NormalInvokeSite.bootstrap`'s
+    `invoke:sub(ThreadContext, IRubyObject, IRubyObject, IRubyObject, IRubyObject)` call site:
+    the operand stack legitimately holds exactly 5 values when `bootstrap_generic`
+    (`vm/src/runtime/invokedynamic.rs`) pops them (no stack-depth mismatch — added a
+    `CRATONVM_DBG_INDY_GENERIC`-gated depth log to confirm), but the VALUES are wrong: the
+    receiver slot holds the `Gem::Version` instance itself (`self`) instead of `@version`'s
+    string value, and a second `Regexp` literal (seemingly meant for a *different*,
+    conditionally-executed `.sub!` call on the next source line) ends up in the
+    replacement-string/block argument slots instead of the frozen `""` string. This points
+    upstream of `bootstrap_generic`'s own (verified-correct) pop loop, into how earlier
+    nested `invokedynamic` sites (ivar-get, `RegexpObjectSite`, `StringBootstrap.fstring`) or
+    JRuby's own IR-interpreter call-site linkage populate that operand stack.
+
+    **Why this looks like a fundamentally larger scope, not one more targeted site**:
+    `org.jruby.ir.targets.indy.InvokeSite` — JRuby's call-linkage base class for essentially
+    every ordinary Ruby method invocation (both `(1)`'s `BlockCallback` sites and `(2)`'s
+    `VariableSite` sites are comparatively narrow siblings of this) — composes its real target
+    handles from, per its own decompiled bytecode: `MethodHandles.dropArguments` (6 call
+    sites), `insertArguments` (6 call sites), `foldArguments` (1), `filterReturnValue` (1 — the
+    same combinator fixed in (2), reused here in a different composition), and `guardWithTest`
+    (1), all interacting to build a lazily-specializing polymorphic inline cache. Isolating
+    which exact composition (or combination) misbehaves for THIS call shape would need
+    systematically verifying each of `dropArguments`/`insertArguments`/`foldArguments`
+    (`native-builtins/src/lang_invoke.rs`) against real JDK semantics for arbitrary
+    argument-count/position combinations, not a single targeted fix — flagged for a dedicated
+    follow-up investigation rather than continued ad-hoc tracing here.
 *   ~~Batch-context `<clinit>` contamination~~ — RETRACTED, see above (host environment issue: missing /tmp + missing ~/jdk25 symlink, not CratonVM).

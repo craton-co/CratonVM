@@ -686,6 +686,27 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
+
+        // TOMCAT-JNDIREALM-RDN.1 (2026-07-15) — the real-network
+        // TestJNDIRealmIntegration matrix passes 76/76 interpreted (and on
+        // HotSpot) but fails 15/76 with the default JIT. The failures are the
+        // RFC 4514 special-character credential cases plus the escaped
+        // semicolon OU cases; both reduce to the in-memory LDAP server's RDN
+        // matching path. Package bisection reduced the producer to
+        // com/unboundid/ldap/sdk/, and method bisection showed that interpreting
+        // only RDN.getNameValuePairs restores the complete 76/76 matrix while
+        // every neighbouring RDN comparison/normalisation method remains JIT
+        // eligible. Keep this small accessor interpreted under the conservative
+        // policy until the JIT's array-backed SortedSet return path is
+        // root-caused. It remains explicitly liftable for diagnosis with
+        // CRATONVM_JIT_ALLOW_PACKAGES=com/unboundid/ldap/sdk/.
+        if class_name == "com/unboundid/ldap/sdk/RDN"
+            && method_name == "getNameValuePairs"
+            && !package_allowed("com/unboundid/ldap/sdk/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
         if callee_saved_gpr_local_homes_enabled()
             && is_known_miscompile(class_name, method_name)
             && !package_allowed(class_name, allow_packages)
@@ -2993,6 +3014,56 @@ mod tests {
             check(
                 "org/yaml/snakeyaml/emitter/Emitter",
                 "emit",
+                false,
+                true,
+                SkipPolicy::Aggressive,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unboundid_rdn_name_value_pairs_skipped_conservatively() {
+        assert_eq!(
+            check(
+                "com/unboundid/ldap/sdk/RDN",
+                "getNameValuePairs",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            Some(SkipReason::RustJvmTestFixture)
+        );
+        assert_eq!(
+            check(
+                "com/unboundid/ldap/sdk/RDN",
+                "compare",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            None,
+            "the Tomcat LDAP guard must stay exact to RDN.getNameValuePairs"
+        );
+    }
+
+    #[test]
+    fn unboundid_rdn_name_value_pairs_lifts_with_allow_packages() {
+        assert_eq!(
+            check_with(
+                "com/unboundid/ldap/sdk/RDN",
+                "getNameValuePairs",
+                false,
+                true,
+                SkipPolicy::Conservative,
+                &["com/unboundid/ldap/sdk/"],
+            ),
+            None
+        );
+        assert_eq!(
+            check(
+                "com/unboundid/ldap/sdk/RDN",
+                "getNameValuePairs",
                 false,
                 true,
                 SkipPolicy::Aggressive,
