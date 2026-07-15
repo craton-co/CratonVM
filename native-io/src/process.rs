@@ -1400,21 +1400,7 @@ fn native_process_to_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Value::Long(p) => p,
         _ => -1,
     };
-    match ctx.new_object_initialized(
-        "java/lang/ProcessHandleImpl",
-        "(JJ)V",
-        &[Value::Long(pid), Value::Long(0)],
-    ) {
-        Ok(Some(v)) => Ok(Some(v)),
-        _ => {
-            // Pure-synthetic fallback: no real ProcessHandleImpl class was
-            // loadable at all, so fall back to the 1-field synthetic
-            // `java/lang/ProcessHandle` layout `ProcessHandle.current()`
-            // already uses in phases_late.rs (field 0 = pid).
-            let handle = alloc_process_handle(ctx, Value::Long(pid));
-            Ok(Some(Value::Object(Some(handle))))
-        }
-    }
+    Ok(Some(Value::Object(Some(build_process_handle(ctx, pid)))))
 }
 
 /// Build a 1-field `java/lang/ProcessHandle` (field 0 = pid) — the exact
@@ -1438,6 +1424,126 @@ fn alloc_process_handle(ctx: &mut dyn NativeContext, pid: Value) -> ObjectRef {
     };
     ctx.set_field(obj, 0, pid);
     obj
+}
+
+/// Build a ProcessHandle for a bare pid, preferring a real
+/// java.lang.ProcessHandleImpl(pid, startTime) and falling back to the
+/// 1-field synthetic java/lang/ProcessHandle layout when no real class is
+/// loadable. Shared by Process.toHandle() and Process.descendants().
+fn build_process_handle(ctx: &mut dyn NativeContext, pid: i64) -> ObjectRef {
+    match ctx.new_object_initialized(
+        "java/lang/ProcessHandleImpl",
+        "(JJ)V",
+        &[Value::Long(pid), Value::Long(0)],
+    ) {
+        Ok(Some(Value::Object(Some(handle)))) => handle,
+        _ => alloc_process_handle(ctx, Value::Long(pid)),
+    }
+}
+
+/// Direct child pids of `pid`, sourced from /proc/<pid>/task/*/children —
+/// every thread's children file is read since a child can be reparented to
+/// any thread of a multi-threaded parent. Empty on non-Linux targets (no
+/// portable equivalent; matches this module's existing Linux-only process
+/// introspection, see native_unix_fork_and_exec).
+#[cfg(target_os = "linux")]
+fn direct_child_pids(pid: i64) -> Vec<i64> {
+    let mut children = Vec::new();
+    let task_dir = format!("/proc/{pid}/task");
+    let Ok(entries) = std::fs::read_dir(&task_dir) else {
+        return children;
+    };
+    for entry in entries.flatten() {
+        let children_path = entry.path().join("children");
+        if let Ok(content) = std::fs::read_to_string(&children_path) {
+            for tok in content.split_whitespace() {
+                if let Ok(cpid) = tok.parse::<i64>() {
+                    children.push(cpid);
+                }
+            }
+        }
+    }
+    children
+}
+
+#[cfg(not(target_os = "linux"))]
+fn direct_child_pids(_pid: i64) -> Vec<i64> {
+    Vec::new()
+}
+
+/// Every live descendant (children, grandchildren, ...) of `pid`, in
+/// breadth-first discovery order — the same "descendants" contract as
+/// java.lang.Process.descendants()/ProcessHandle.descendants().
+fn collect_descendant_pids(pid: i64) -> Vec<i64> {
+    let mut result = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(pid);
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(pid);
+    while let Some(cur) = queue.pop_front() {
+        for child in direct_child_pids(cur) {
+            if seen.insert(child) {
+                result.push(child);
+                queue.push_back(child);
+            }
+        }
+    }
+    result
+}
+
+/// java.lang.Process.descendants() -> Stream<ProcessHandle> (JDK 9+).
+///
+/// Was entirely unregistered, so keycloak-test-framework's
+/// ProcessUtils.getKeycloakPid() (which calls
+/// keycloakProcess.descendants().toList() to tell apart the kc.sh wrapper
+/// script's pid from the exec'd java process's pid) threw NoSuchMethodError
+/// before a single test could start its managed Keycloak server — see
+/// docs/known-issues/keycloak/pom-xml-declaration-char-corruption-breaks-quarkus-maven-bootstrap.md
+/// (this was the next missing-native gap surfaced once that doc's actual
+/// bug, and the ProcessBuilder LinkedList-command bug above, were fixed).
+///
+/// Builds a real ArrayList<ProcessHandle> and returns list.stream(),
+/// mirroring native_jarfile_stream's ArrayList-then-.stream() pattern
+/// (zip_real_jar.rs) rather than hand-rolling a Stream implementation.
+fn native_process_descendants(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("Process.descendants: null this".to_string()),
+            }
+            .into())
+        }
+    };
+    let pid = match ctx.get_field(this, PROC_FIELD_PID) {
+        Value::Long(p) => p,
+        _ => -1,
+    };
+    let descendant_pids = collect_descendant_pids(pid);
+
+    let al_class = "java/util/ArrayList";
+    let al_cid = ctx.ensure_class_initialized(al_class).map_err(|_| {
+        MethodCallFailed::InternalError(VmError::Internal {
+            message: format!("{al_class}: not loaded"),
+        })
+    })?;
+    let list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
+    ctx.invoke(al_class, "<init>", "()V", &[Value::Object(Some(list))])?;
+    for cpid in descendant_pids {
+        let handle = build_process_handle(ctx, cpid);
+        ctx.invoke(
+            al_class,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(list)), Value::Object(Some(handle))],
+        )?;
+    }
+    ctx.invoke(
+        al_class,
+        "stream",
+        "()Ljava/util/stream/Stream;",
+        &[Value::Object(Some(list))],
+    )
 }
 
 fn pipe_io_err(err: impl std::fmt::Display) -> MethodCallFailed {
@@ -2020,6 +2126,12 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
             "()Ljava/io/OutputStream;",
             native_process_get_output_stream,
         );
+        registry.register(
+            proc_cls,
+            "descendants",
+            "()Ljava/util/stream/Stream;",
+            native_process_descendants,
+        );
     }
 
     registry.register(
@@ -2082,6 +2194,19 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
         "close",
         "()V",
         native_pipe_input_close,
+    );
+    // readAllBytes() is registered generically for java/io/InputStream
+    // (native-io/src/lib.rs), but the synthetic Process pipe stream's class
+    // chain never reaches java/io/InputStream (same receiver-driven-dispatch
+    // gap the SYNTHETIC_PROCESS_CLASS dual-registration above works around
+    // for java/lang/Process) -- register it directly here too. Surfaced by
+    // keycloak-test-framework's DistributionKeycloakServer.getErrorOutput(),
+    // which calls keycloakProcess.getErrorStream().readAllBytes().
+    registry.register(
+        SYNTHETIC_PROCESS_INPUT_STREAM,
+        "readAllBytes",
+        "()[B",
+        crate::native_is_read_all_bytes,
     );
 
     // ProcessBuilder.start — route through the real spawn path.  This
@@ -2164,6 +2289,31 @@ fn native_process_builder_start(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                     let n = (size.max(0) as usize).min(cap);
                     for i in 0..n {
                         if let Value::Object(Some(s)) = ctx.get_array_element(data_arr, i) {
+                            cmd_strings.push(ctx.read_string(s).unwrap_or_default());
+                        }
+                    }
+                }
+            }
+            // Generic fallback via the List public API (size()/get(int)) for
+            // any List<String> implementation that isn't ArrayList-shaped --
+            // e.g. keycloak-test-framework's DistributionKeycloakServer
+            // .startKeycloak() builds its command with new LinkedList<>(),
+            // which has neither an elementData field nor a plain backing
+            // array at slot 0 (its real layout is first/last Node links),
+            // so the ArrayList-shaped read above silently found nothing and
+            // this native threw "ProcessBuilder: no command specified" even
+            // though the command list was genuinely populated. One virtual
+            // dispatch per element, so only used when the fast path above
+            // came up empty.
+            if cmd_strings.is_empty() {
+                if let Ok(Some(Value::Int(n))) = ctx.invoke_virtual(cmd_obj, "size", "()I", &[]) {
+                    for i in 0..n {
+                        if let Ok(Some(Value::Object(Some(s)))) = ctx.invoke_virtual(
+                            cmd_obj,
+                            "get",
+                            "(I)Ljava/lang/Object;",
+                            &[Value::Int(i)],
+                        ) {
                             cmd_strings.push(ctx.read_string(s).unwrap_or_default());
                         }
                     }

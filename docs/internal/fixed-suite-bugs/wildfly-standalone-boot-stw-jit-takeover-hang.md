@@ -408,3 +408,159 @@ confirming the same root-cause class this doc found for `ReentrantReadWriteLock`
 `docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md` — tracks the `CCE_CRASH`/`SEGV`
 long-tail family still causing WildFly boot failures; genuinely open, not closed by anything in this
 doc.
+
+## Addendum 2026-07-14 (fourth session): TIMEOUT_NO_WARN re-verified after a same-day regression; two more real bugs found and fixed
+
+Picked this up right after the "Final resolution" section above closed the doc. Independently re-verified
+that conclusion and found it still holds -- but only after fixing a fresh, unrelated, same-day regression
+that would otherwise have made re-verification impossible (100% of boots crashed before ever reaching the
+part of boot this doc is about).
+
+### The doc's own "Final resolution" pre-dates a same-day regression that briefly broke ALL boots
+
+Building a baseline release binary from this session's assigned fork point (`origin/dev @ 523ca9ba`,
+2026-07-14 ~19:51 UTC) and running it against the isolated repro crashed **100% deterministically**
+(20/20, and every manual retry) with:
+
+```
+[cratonvm] main-vm run() returned Err: Exception in thread "main" java/lang/IllegalStateException: Can't register delegate.
+  ... at java/lang/management/ManagementFactory.getPlatformMBeanServer(...)
+Caused by: java/lang/NullPointerException: Cannot read the array length because "this._ca_array" is null
+  ... at javax/management/ObjectName.getCanonicalKeyPropertyListString(...)
+```
+
+`git bisect` (automated, build+repro at each step) isolated this to commit `d8092acb`
+("fix-tests-real-jdk-contracts", 2026-07-14 17:09:46 UTC) -- landed **48 minutes before** this doc's own
+"Final resolution" closing commit (`2c18948f`, 17:57:48 UTC). The closing session's own 15-run CPU-aware
+sample shows a mixed `CCE_CRASH`/`SLOW_ACTIVE`/`SEGV`/`OK` distribution with no mention of this crash,
+which is inconsistent with their binary actually including `d8092acb` (a deterministic, unconditional
+crash would show as 100% of that specific type, not mixed) -- their binary almost certainly was built from
+a fork point that predates it. **Their "Final resolution" conclusion (TIMEOUT_NO_WARN was a measurement
+artifact) is not contradicted by this** -- it just did not have the chance to re-break on this specific
+regression, which is independent of anything either of them investigated.
+
+Root cause: `vm/src/vm/vm_init.rs`'s real-JDK-mode registration arms started unconditionally forcing
+`native_methods.set_drop_synthetic_stubs(true)` (previously an opt-in-only mechanism via
+`CRATONVM_NO_STUBS`, per the field's own doc comment in `native-api/src/registry.rs`). This silently
+dropped several `register_*` clusters that are tagged `SyntheticStub` but are actually permanent bridges
+needed in BOTH modes (no working real-bytecode fallback exists for them):
+
+- `native-builtins/src/jmx.rs`: the entire `java.lang.management`/JMX native surface. Dropping
+  `register_management_factory_platform_server_stub` let real bytecode run for
+  `ManagementFactory.getPlatformMBeanServer()` for the first time ever in this VM -- exposing a genuine,
+  previously-unexercised interpreter gap deep in `com.sun.jmx.mbeanserver.*` (real `ObjectName`
+  construction NPEs). Not investigated further (out of scope -- see "Not investigated" below); fixed by
+  retagging the whole cluster (13 of 14 `register_*` functions in the file) back to `Bridge`, so the
+  untested real-bytecode path is never taken. `register_mbean_server_factory_synthetic` correctly stays
+  `SyntheticStub` (real synthetic-JDK-only, never called in real mode, per its own pre-existing doc
+  comment).
+- `native-builtins/src/lib.rs`: `register_function_identity_natives`
+  (`java.util.function.Function$Identity`) -- a purely VM-internal synthetic stand-in for the real
+  lambda-based `Function.identity()`, with zero real bytecode to fall back to at all.
+  `UnsatisfiedLinkError: Function$Identity.andThen` the instant the stub was dropped.
+
+Fixed on `dev` (merged same-day as multiple *other* concurrent sessions independently retagging different
+mis-categorized clusters the same way -- `d9e693d7` String.getBytes/Charset, `f62d2073` Properties,
+`776b8cb0` a second, independent fix to the exact same `register_vm_management_impl` this session also
+retagged, merged as a same-comment collision). `set_drop_synthetic_stubs(true)` itself stays enabled by
+default for real-JDK mode, matching that established, now-clear convention, rather than reverting the
+whole mechanism.
+
+### Family-1 stale-ObjectRef-across-GC: root-caused via CRATONVM_DBG_STALE_OBJREF + a Linux backtrace, and a poisoning-cascade amplifier found
+
+This session's real assignment: chase the [[wildfly-standalone-boot-attributeaccess-cce-register-invisible-root]]
+doc's "Separate finding" lead (a Windows session's `CRATONVM_DBG_STALE_OBJREF` capture during
+`parallel-extension-add`, 9/20 firing rate, unattributed backtrace due to Windows symbol resolution
+failing). On Linux, `RUST_BACKTRACE=1` resolves cleanly. A 20-attempt diagnostic loop (post-JMX-fix
+binary) hit this assertion **20/20** -- every single boot -- confirming it is real, common, and load-bearing
+for the TIMEOUT_NO_WARN shape: **every one of the 20 panics left the process hung (`rc=124`, timeout, not
+crashed)**, because the panic fires on a background `parallel-extension-add` worker thread and Rust's
+default panic behavior (unwind, not abort) only kills that one thread -- the VM's own per-native-call
+`catch_unwind` wrapper (`safe_native_call_impl`) converts it to a caught error rather than propagating a
+process-level crash.
+
+Deduped by innermost native-crate backtrace frame (`native-collections`/`native-builtins`), 20 panics
+mapped to ~10 distinct call sites, dominated by `native-collections/src/lib.rs`'s `LinkedHashMap`
+machinery (`lhm_find_node`, `native_stream_for_each`, `native_stream_all_match`,
+`invoke_deferred_stream_lambda`, `native_path_address_from_elements`, and others). A **genuinely
+concurrent same-day session** (dev `2d45ef40`, "8 more stale-ObjectRef-across-GC sites found via
+live-log mining") landed a comprehensive fix for most of these independently, via the exact same mining
+technique this doc's "How to apply" guidance already suggested (mining the WFLYCTL0153 investigation's
+preserved `HIT_staleobjref_*.log` backtraces) -- this session's own overlapping `lhm_find_node` fix was
+dropped in favor of that one during the `dev` merge (functionally identical pin/re-read pattern, no real
+conflict).
+
+**Not covered by that session, and fixed here**: `native-collections/src/lib.rs`'s overlay-table global
+`Mutex` accessors (`lhm_overlay()`/`lhm_ptr_cache()`/`ll_overlay()`) still used naive `.lock().unwrap()`
+at 6 call sites reachable from ordinary `get`/`put`/`remove` operations -- as opposed to the GC's own
+root-scan pass, which `dev eb13200b` already hardened back in June. A `std::sync::Mutex` poisons
+*permanently* once any thread panics while holding it. Live-captured directly in one diagnostic run: a
+single `CRATONVM_DBG_STALE_OBJREF` panic inside `lhm_find_node`'s callers, immediately followed by
+**5 more panics on completely unrelated worker threads**, all `PoisonError` on
+`lhm_overlay()`/`lhm_ptr_cache()`, while the boot log sat silent exactly at
+`DEBUG [org.jboss.as.connector] Initializing Connector Extension` -- the precise symptom this doc's own
+prior addendum described ("the log tail consistently stops mid-sequential-extension-init ... right after
+'Initializing Connector Extension'"). This is a real, additional, well-evidenced mechanism by which a
+*single* Family-1 stale-ObjectRef bug (this codebase's most recurring defect class, not fully closed even
+after 50+ prior fixes) can cascade into dozens of unrelated worker threads failing, matching the
+TIMEOUT_NO_WARN shape exactly. Applied this file's own already-established poison-recovery idiom
+(`.lock().unwrap_or_else(|e| e.into_inner())`, already used at 8 other call sites in this same file since
+June) to the remaining 6 naive sites, so a future/still-open Family-1 panic degrades to one bad lookup
+instead of cascading VM-wide.
+
+### Verification
+
+CPU-activity-aware repro loop (this doc's own "Final resolution" methodology), 20-run batches, Azure Linux
+host, moderate-to-idle load (`uptime` load average 1.7-2.3 on 16 cores):
+
+| Binary | OK | STW_HANG | CCE_CRASH | GENUINE_STALL | SLOW_ACTIVE | SEGV |
+|---|---|---|---|---|---|---|
+| Post-JMX-fix, pre-poison-fix | 1 | 0 | 6 | 0 | 4 | 5 |
+| Final (JMX + Function$Identity + poison-lock fixes) | 1 | 0 | 8 | 0 | 10 | 1 |
+
+**`GENUINE_STALL: 0/20` in both batches** -- consistent with the "Final resolution" section's own
+conclusion, now re-confirmed on current `dev` after fixing the same-day regression that would otherwise
+have made this unverifiable. `CCE_CRASH` and `SEGV` are the already-separately-tracked
+register-invisible-JIT-root / stale-ObjectRef long-tail family
+(`docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md`,
+`wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`) -- not this doc's concern, not
+reopened here. `SLOW_ACTIVE` (still consuming CPU, not stuck) is expected interpreter overhead under host
+contention, matching this doc's existing conclusion.
+
+`cargo test -p cratonvm-native-builtins --lib` (2994/0/6 ignored), `-p cratonvm-native-collections --lib`
+(72/0), `-p cratonvm-vm --lib` (2217/0/111 ignored) all pass, identical to pre-fix baselines.
+
+### Not investigated (honest residuals, not chased further here)
+
+- **The real-bytecode JMX gap** (`ObjectName`/`Repository`/`DefaultMBeanServerInterceptor` construction
+  failing under real interpretation) is now avoided (native intercepts the call again) but not
+  root-caused. If a future session wants CratonVM to actually run real JMX bytecode in real-JDK mode
+  (rather than the synthetic `alloc_mbean_server` shim), that gap needs a dedicated investigation.
+- **`lambda_arg_provably_not_instance`** (`vm/src/runtime/interpreter.rs:19024`, inside
+  `checkcast_lambda_instantiated_args`/`coerce_lambda_args`): the single largest remaining
+  `CRATONVM_DBG_STALE_OBJREF` contributor in this session's post-JMX-fix, pre-`2d45ef40`-merge sample
+  (8/20, via `native_stream_for_each`/`native_stream_all_match`/`invoke_deferred_stream_lambda`, all
+  panicking on the exact same line dereferencing `obj_ref` on its very first use inside the function).
+  Traced the pinning chain up through `coerce_lambda_args` and `checkcast_lambda_instantiated_args` and
+  could not find an obvious staleness window in either -- `obj_ref` is read fresh from
+  `thread.native_pin_roots[h]` immediately before the call, with no intervening GC-triggering step, yet
+  still panics on first dereference. This function has a documented "no GC, no stale `obj_ref`" invariant
+  (only consults already-loaded classes) that the evidence says is violated somewhere in its own call
+  chain (`lambda_proxy_satisfies`/`synthetic_implements`/`proxy_instance_satisfies_target`/
+  `annotation_proxy_satisfies_target`), or the true corruption predates entry into
+  `coerce_lambda_args` entirely. Flagged prominently rather than risking an unverified fix to a function
+  whose signature (`shared: &SharedVm`, no mutable pin access) does not obviously support the established
+  pin/re-read idiom without a larger refactor. Worth a dedicated live-gdb session.
+- **634 other `SyntheticStub` natives still get silently dropped** in real-JDK mode per a
+  `CRATONVM_DBG_DROPPED_STUBS=1` census on the final binary (none crashed in the specific runs sampled
+  here) -- the same long-tail pattern already documented for the stale-ObjectRef family. Not mined
+  further; `CRATONVM_DBG_DROPPED_STUBS` is a cheap, permanent diagnostic (see
+  `native-api/src/registry.rs`) for whoever hits the next one.
+
+### Status
+
+Doc stays **CLOSED / moved to `fixed-suite-bugs`** -- the specific symptom it tracks (silent boot stall,
+`TIMEOUT_NO_WARN`) is re-confirmed at 0/20 `GENUINE_STALL` on current `dev`, consistent with the "Final
+resolution" section. This addendum documents the same-day regression that briefly made that conclusion
+untestable, the fix for it, and an additional real (if partial) contributing mechanism (the poisoning
+cascade) fixed along the way. Fix commits: `6a0eedd8`/`cfd80297` (merged `dev`, `ab423500`).
