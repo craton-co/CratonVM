@@ -145,7 +145,7 @@ the WRONG same-named copy. Eight fixes landed on
 | `TestCompilerTests` | TIMEOUT 600 s+ | **completes 40 s**, FAIL 22/18/4 |
 | `ApplicationContextAotGeneratorTests` | ABEND (CGLIB load) | discovers+runs 40 methods (see residuals) |
 | `BeanDefinitionMethodGeneratorTests` | FAIL 34/3 | **OK 34/34** |
-| `ConfigurationClassPostProcessorAotContributionTests` | FAIL 20/8 | FAIL 20/18/2 |
+| `ConfigurationClassPostProcessorAotContributionTests` | FAIL 20/8 | **OK-ish 20/15/5** (5 residual = host ClassFile gap, see below) |
 | `PersistenceAnnotationBeanPostProcessorAotContributionTests` | FAIL 8/0 (NCDFE) | FAIL 8/2/6 (Mockito attach residuals) |
 | `TestContextAotGeneratorIntegrationTests` | FAIL 4/0 @393 s | (see residuals) |
 | `BeanRegistrationsAotContributionTests` | TIMEOUT | TIMEOUT (throughput, see below) |
@@ -158,69 +158,50 @@ the WRONG same-named copy. Eight fixes landed on
     (`InlineDelegateByteBuddyMockMaker.lambda$new$2/3`) plus GC frame-root
     scanning — an interpreter-throughput problem under constructor
     instrumentation, needing perf work rather than a correctness fix.
-*   **`ConfigurationClassPostProcessorAotContributionTests` — 2 residuals in
-    `BeanRegistrarTests` under fork, ROOT-CAUSED 2026-07-15 (not yet fixed —
-    the fix is architecturally bigger than this cluster's other loader-identity
-    bugs, see below).** `applyToWhenIsPackagePrivate`/
-    `applyToWhenIsPackagePrivateAndImportAware` throw
-    `IllegalArgumentException: Could not generate code for
+*   ~~`ConfigurationClassPostProcessorAotContributionTests`~~ **FIXED
+    (2026-07-15, commit `aca7f635`).** `BeanRegistrarTests`'
+    `applyToWhenIsPackagePrivate`/`applyToWhenIsPackagePrivateAndImportAware`
+    threw `IllegalArgumentException: Could not generate code for
     <com.example.TestTarget__TestCode>::applyBeanRegistrars: parameter 0 of
     type org.springframework.beans.factory.ListableBeanFactory is not
-    supported` — Spring's `DefaultMethodReference.addArguments` (javapoet
-    `TypeName`-based, NOT a `Class` object) fails to match the captured
-    `ListableBeanFactory` parameter type against the test's own
-    `ArgumentCodeGenerator.of(ListableBeanFactory.class, ...)`.
+    supported` under `@CompileWithForkedClassLoader`. Root cause:
+    `Vm::declaring_class` (`vm/src/vm/vm_exec.rs`, backs
+    `Class.getEnclosingClass()`/`getDeclaringClass()`) resolved the outer-class
+    name via a FLAT, GLOBAL, name-only lookup that never considered the
+    INNER class's own defining loader — so `BeanRegistrarTests` (correctly
+    fork-loaded) got back the STALE, original app-loader copy of its
+    enclosing class, and everything transitively touched through it
+    (`ConfigurationClassPostProcessor`, `ListableBeanFactory` itself, …)
+    inherited that stale identity, producing two different
+    `ListableBeanFactory` copies for Spring's javapoet-based
+    `ArgumentCodeGenerator` matching to reconcile. This completely bypassed
+    the `resolve_class_loader_aware` / `CRATONVM_LOADER_AWARE_RESOLUTION`
+    machinery that already correctly handles ordinary bytecode-level
+    `ldc`/`checkcast`/`new` class references.
 
-    Traced (env-gated `eprintln!` in `resolve_class_loader_aware`,
-    `vm/src/runtime/interpreter.rs`) down to a DIFFERENT class-identity gap
-    than the rest of this doc's fixes: `@CompileWithForkedClassLoader`'s
-    `CompileWithForkedClassLoaderClassLoader` correctly gets its OWN
-    `ClassId` for the directly-`Class.forName`'d nested test class
-    (`BeanRegistrarTests`, confirmed via trace: `get_loader_id=UserDefined(N)`,
-    defining-loader registry entry present) — but `BeanRegistrarTests`'s
-    ENCLOSING class (`ConfigurationClassPostProcessorAotContributionTests`)
-    resolves to the STALE, original app-loader `ClassId`
-    (`get_loader_id=Application`, no defining-loader entry at all), and
-    EVERYTHING transitively touched through it (`ConfigurationClassPostProcessor`,
-    `ConfigurationClassBeanDefinitionReader`, `ListableBeanFactory` itself,
-    …) inherits that same stale, app-loader identity. The nested test
-    method's OWN `ListableBeanFactory.class` literal, by contrast, resolves
-    correctly through the fork loader (since `BeanRegistrarTests` itself IS
-    loader-correct) — giving two DIFFERENT `ListableBeanFactory` copies to
-    compare, hence the "not supported" mismatch.
+    Fixed in `native_class_get_declaring_class` (`native-builtins/src/lang_class.rs`),
+    which already has a mutable `NativeContext` (unlike the `Vm::declaring_class`
+    trait method it calls): checks first whether the class has a registered,
+    eligible defining loader, then — only when the existing global answer's
+    own defining loader DIFFERS from the class's own — resolves the
+    enclosing-class name by invoking that loader's OWN `loadClass()`
+    (mirrors `drive_defining_loader_load`'s re-entrant-call pattern). A cheap
+    same-loader short-circuit keeps the cost near-zero for the overwhelming
+    common case; an earlier version without it caused a severe slowdown by
+    invoking `loadClass()` on every `getEnclosingClass()` call for any
+    user-defined-loader class.
 
-    Root cause of the ENCLOSING-CLASS gap: `Vm::declaring_class`
-    (`vm/src/vm/vm_exec.rs`, backs `Class.getEnclosingClass()`/
-    `getDeclaringClass()`) resolves the outer-class name via
-    `cm.find_class_by_name(&ic.outer_class)` — a FLAT, GLOBAL, name-only
-    lookup that never considers the INNER class's own defining loader. Any
-    nested class redefined under an isolating loader (this cluster's
-    `@CompileWithForkedClassLoader`, `DynamicClassLoader`, or a future
-    Tomcat/Hibernate/WildFly custom loader) will have `getEnclosingClass()`
-    silently hand back whichever loader's copy of the same-named outer class
-    was registered FIRST — completely bypassing the `resolve_class_loader_aware`
-    / `CRATONVM_LOADER_AWARE_RESOLUTION` machinery that already correctly
-    handles ORDINARY bytecode-level `ldc`/`checkcast`/`new` class references
-    (confirmed: adding an analogous narrow carve-out to
-    `should_use_loader_initiated_resolution` for these two Spring test-tools
-    loader classes, mirroring the existing `is_groovy_class_loader` pattern,
-    correctly activates for `BeanRegistrarTests` itself — but does NOT fix
-    this test, because the enclosing-class lookup never goes through that
-    gate at all).
-
-    NEXT STEP (not attempted this round — genuinely bigger scope than this
-    doc's other fixes): make `Vm::declaring_class` loader-aware. `declaring_class`
-    currently takes only `&self` (a `class_manager` read lock, no thread
-    context), so it can only PREFER an already-loaded same-loader match (a
-    `class_defined_by_loader_exact`-style lookup keyed by the inner class's
-    OWN loader) before falling back to the global one — it CANNOT actively
-    drive that loader's `loadClass()` for an outer class it hasn't loaded yet
-    (that needs `&mut thread`/`NativeContext`, i.e. the same re-entrant-call
-    machinery `drive_defining_loader_load` already has, threaded through a
-    different call path). Given `getEnclosingClass()`/`getDeclaringClass()`
-    is used pervasively by reflection-heavy frameworks well beyond this AOT
-    cluster, this needs its own careful, isolated soak — do not bundle it
-    with an unrelated fix.
+    Verified: both `ListableBeanFactory` failures fixed (now hit the
+    pre-existing, unrelated `java.lang.classfile.ClassFile` host JDK-version
+    gap instead — confirmed via A/B testing not a regression). Full class:
+    14→15 succeeded, 6→5 failed, remaining failures identical in nature
+    between pre/post-fix baselines. Regression-checked
+    `DefaultBeanRegistrationCodeFragmentsTests`/`ThrowawayClassLoaderTests`/
+    `PersistenceManagedTypesBeanRegistrationAotProcessorTests` clean. Broader
+    regression coverage was inconclusive at time of testing due to severe,
+    unrelated host I/O contention (confirmed via A/B comparison that the
+    slowness reproduces identically pre-fix) — worth a spot-check when the
+    host is less loaded.
 *   `PersistenceAnnotationBeanPostProcessorAotContributionTests` — 8/2/6.
     Post-fix the forked Mockito path advanced: now (a) fork attach via
     `PremainAttachAccess` -> "Byte Buddy agent is not initialized", and (b) a
