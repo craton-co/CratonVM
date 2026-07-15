@@ -11026,6 +11026,7 @@ mod deopt_step3_tests {
             num_params: 0,
             is_synchronized: false,
             is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
         })
     }
 
@@ -11045,6 +11046,7 @@ mod deopt_step3_tests {
             num_params: 0,
             is_synchronized: true,
             is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
         })
     }
 
@@ -11539,6 +11541,7 @@ mod deopt_step3_tests {
             num_params: 0,
             is_synchronized: false,
             is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
         });
         let key = "DespecFuC.loop:()V";
         cratonvm_jit::deopt::despec_clear_for_test();
@@ -19883,6 +19886,7 @@ fn try_invoke_cached_lambda_impl(
                 num_params: count_method_params(descriptor) as u16,
                 is_synchronized: false,
                 is_static: false,
+                force_native_cache: std::sync::OnceLock::new(),
             });
             drop(cm);
             LAMBDA_IMPL_BYTECODE_CACHE.with(|cache| cache.borrow_mut().insert(key, Arc::clone(&c)));
@@ -24632,7 +24636,29 @@ pub(crate) fn should_force_registered_native_over_bytecode(
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
-    force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor)
+    should_force_registered_native_over_bytecode_precomputed(
+        shared,
+        force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor),
+        class_name,
+        method_name,
+        method_descriptor,
+    )
+}
+
+/// Same decision as [`should_force_registered_native_over_bytecode`], but
+/// takes the pure/deterministic `force_native_over_real_jdk_bytecode` result
+/// as a precomputed input rather than recomputing it. Lets a cached-dispatch
+/// call site (which can memoize that ~55-branch check once per invoke-cache
+/// entry, see `CachedBytecodeMethod::force_native_cache`) skip straight to
+/// the cheap, mutable-state-dependent redefine check.
+fn should_force_registered_native_over_bytecode_precomputed(
+    shared: &SharedVm,
+    force_native: bool,
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    force_native
         && (!native_shadow_suppressed_by_redefine(shared, class_name)
             || redefine_immune_forced_native(class_name, method_name, method_descriptor))
 }
@@ -24709,6 +24735,90 @@ fn intercept_force_registered_native(
         .find(class_name, method_name, method_descriptor)?;
     if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
         eprintln!("[ccs-probe] intercept_force_registered_native: dispatching native callback");
+    }
+    let ret_type = crate::jit::return_type(method_descriptor);
+    Some((|| {
+        let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
+        if let Some(value) = result.filter(|_| ret_type != b'V') {
+            push_invoke_return_value(
+                &mut thread.frames[frame_idx].stack,
+                coerce_value_for_return(value, ret_type),
+            )?;
+            crate::vm::native_return_pushed_to_stack(shared, thread);
+        }
+        Ok(CachedCallResult::Handled)
+    })())
+}
+
+/// Perf variant of [`intercept_force_registered_native`] for the cached/hot
+/// dispatch paths (`execute_invokevirtual_cached`, `execute_invokestatic_cached`)
+/// that already hold an `Arc<CachedBytecodeMethod>` for this callsite. The
+/// original re-evaluated `force_native_over_real_jdk_bytecode`'s ~55-branch
+/// sequential string-comparison gauntlet from scratch on *every single*
+/// cached-invoke hit -- this was independently identified as a real
+/// interpreter-throughput bottleneck (~51% of all executed instructions on
+/// method-call-heavy workloads, see `docs/known-issues/tomcat-08-07/
+/// silent-hang-no-signature-cluster.md`) and reproduced live via `perf`/`gdb`
+/// during the `ClientHttpConnectorTests` investigation (2026-07-15): one
+/// interpreter thread pegged at ~100% CPU for 25+ seconds cycling through
+/// this exact call chain while executing a tight Java-level spin/poll loop
+/// typical of Reactor/Netty/Jetty's lock-free scheduling. This variant reads
+/// `cached.force_native_cache`, computing the pure part exactly once per
+/// invoke-cache entry (memoized `OnceLock`, shared via the entry's `Arc`)
+/// instead of on every hit; the mutable-state-dependent redefine check is
+/// still re-evaluated every call (cheap, and must stay live).
+fn intercept_force_registered_native_cached(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    cached: &CachedBytecodeMethod,
+    args: &[Value],
+) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    let class_name = cached.class_name.as_ref();
+    let method_name = cached.method_name.as_ref();
+    let method_descriptor = cached.method_descriptor.as_ref();
+    let force_native = *cached.force_native_cache.get_or_init(|| {
+        force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor)
+    });
+    if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
+        eprintln!(
+            "[ccs-probe] intercept_force_registered_native_cached: class={} method={}{} \
+             force={}",
+            class_name, method_name, method_descriptor, force_native,
+        );
+    }
+    // A JVMTI agent that redefined this class (e.g. a Mockito inline mock)
+    // makes its woven bytecode authoritative — cede to it instead of forcing
+    // the native, so the instrumentation advice runs. Reflection-metadata
+    // natives are exempt (see `redefine_immune_reflection_native`): the real
+    // bytecode cannot reproduce them under CratonVM.
+    if !should_force_registered_native_over_bytecode_precomputed(
+        shared,
+        force_native,
+        class_name,
+        method_name,
+        method_descriptor,
+    ) {
+        return None;
+    }
+    // A genuinely real, bytecode-constructed `ThreadPoolExecutor` (its own
+    // real `<init>` ran, so its real `workers` field is populated) must keep
+    // running its own real `execute()` -- only CratonVM's synthetic 2-field
+    // `Executors.new*ThreadPool()` objects need the forced native. See
+    // docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md.
+    if class_name == "java/util/concurrent/ThreadPoolExecutor"
+        && method_name == "execute"
+        && threadpool_executor_has_real_workers(shared, &args[0])
+    {
+        return None;
+    }
+    let cb = shared
+        .native_methods
+        .find(class_name, method_name, method_descriptor)?;
+    if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
+        eprintln!(
+            "[ccs-probe] intercept_force_registered_native_cached: dispatching native callback"
+        );
     }
     let ret_type = crate::jit::return_type(method_descriptor);
     Some((|| {
@@ -26583,6 +26693,7 @@ fn populate_invoke_cache(
         num_params: num_params as u16, // Widening: parameter count conversion
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
+        force_native_cache: std::sync::OnceLock::new(),
     };
 
     // WP2.4-F1: snapshot the redefine generation BEFORE dropping the
@@ -27008,13 +27119,11 @@ fn execute_invokestatic_cached(
                 &mut args_vec
             };
 
-            if let Some(res) = intercept_force_registered_native(
+            if let Some(res) = intercept_force_registered_native_cached(
                 shared,
                 thread,
                 frame_idx,
-                cached.class_name.as_ref(),
-                cached.method_name.as_ref(),
-                cached.method_descriptor.as_ref(),
+                &cached,
                 args_slice,
             ) {
                 return res;
@@ -29231,6 +29340,7 @@ fn try_jit_upgrade_with_gate(
                 num_params: num_params as u16, // Widening: parameter count conversion
                 is_synchronized: method.is_synchronized(),
                 is_static: method.is_static(),
+                force_native_cache: std::sync::OnceLock::new(),
             };
             drop(cm);
 
@@ -30003,6 +30113,7 @@ fn try_jit_compile_callee_slow(
         num_params: num_params as u16, // Widening: parameter count conversion
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
+        force_native_cache: std::sync::OnceLock::new(),
     };
     drop(cm);
 
@@ -33075,13 +33186,11 @@ fn execute_invokevirtual_cached(
                         return Ok(CachedCallResult::Handled);
                     }
 
-                    if let Some(res) = intercept_force_registered_native(
+                    if let Some(res) = intercept_force_registered_native_cached(
                         shared,
                         thread,
                         frame_idx,
-                        cached.class_name.as_ref(),
-                        cached.method_name.as_ref(),
-                        cached.method_descriptor.as_ref(),
+                        &cached,
                         args_slice,
                     ) {
                         return res;
@@ -33479,13 +33588,11 @@ fn execute_invokevirtual_cached(
                 return res;
             }
 
-            if let Some(res) = intercept_force_registered_native(
+            if let Some(res) = intercept_force_registered_native_cached(
                 shared,
                 thread,
                 frame_idx,
-                cached.class_name.as_ref(),
-                cached.method_name.as_ref(),
-                cached.method_descriptor.as_ref(),
+                &cached,
                 args_slice,
             ) {
                 return res;
@@ -34230,6 +34337,7 @@ fn populate_virtual_invoke_cache(
         num_params: num_params as u16, // Widening: parameter count conversion
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
+        force_native_cache: std::sync::OnceLock::new(),
     };
 
     // WP2.4-F1: snapshot before dropping the class_manager read-lock so
@@ -38149,6 +38257,7 @@ mod tests {
             num_params: 0,
             is_synchronized: false,
             is_static: false,
+            force_native_cache: std::sync::OnceLock::new(),
         });
         let key: PromotedInvokeKey = (ClassId::new(9999), 17, false, Some(ClassId::new(12345)));
         vm.shared.shared_resolution.insert_promoted_invoke(
