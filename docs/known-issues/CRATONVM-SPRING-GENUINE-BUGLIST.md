@@ -214,70 +214,101 @@ the WRONG same-named copy. Eight fixes landed on
     NEW ByteBuddy generics failure past the dispatcher: `IllegalArgumentException:
     Cannot resolve T from class ...EntityManagerFactory$MockitoMock$...`.
 *   **ByteBuddy repeat-redefine `NoSuchMethodError` family — investigated
-    extensively 2026-07-15, NOT FIXED, root cause not fully isolated.**
-    Standalone repro (`BBProbe4.java`, no Spring/JUnit needed, in
-    `/data/data/aot-fix-runs-20260715/bbprobe/` on the Azure worktree host):
-    4 sequential independent `ForkLoader` (a minimal
-    `@CompileWithForkedClassLoader`-style loader) instances each run
-    `Mockito.mock(SampleService.class)` in the same process. Fork 1 fails
-    cold (`Byte Buddy agent is not initialized` — a separate, already-known
-    cold-self-attach quirk; a second attempt in a fresh fork succeeds), fork
-    2 succeeds, but fork 3 and every fork after it deterministically fail
+    exhaustively across two extended sessions 2026-07-15, still NOT FIXED,
+    but the failure mechanism is now precisely characterized.** Standalone
+    repro (`BBProbe4.java`, no Spring/JUnit needed, in
+    `/data/data/aot-fix-runs-20260715/bbprobe/`): 4 sequential independent
+    `ForkLoader` instances each run `Mockito.mock(SampleService.class)`.
+    Fork 1 fails cold (separate, known `Byte Buddy agent is not
+    initialized` quirk), fork 2 succeeds, fork 3+ deterministically fails
     with `NoSuchMethodError:
     net/bytebuddy/description/type/TypeDescription$Generic$OfNonGenericType
-    $ForLoadedType.size()I` thrown from inside ByteBuddy's own
-    `FilterableList$AbstractBase.filter()` (surfacing to Java code as
+    $ForLoadedType.size()I` from inside ByteBuddy's own
+    `FilterableList$AbstractBase.filter()` (surfaces to Java as
     `NullPointerException: methods is null` once Mockito's `PluginLoader`
-    wraps it). Confirmed via `javap -v` disassembly of
-    `FilterableList$AbstractBase.class` that the failing instruction (`this
-    .size()`, JVMS-resolved as a self-reference to
-    `FilterableList$AbstractBase.size():()I`, abstract there — real dispatch
-    must resolve through whichever concrete `FilterableList` subtype is the
-    actual receiver) is unambiguous, ruling out a misread bytecode operand.
-    Also ruled out: **JIT tier-up** (the bug reproduces byte-for-byte
-    identically with `CRATONVM_DISABLE_JIT=1`, so this is an interpreter-level
-    bug, not a JIT inline-cache/megamorphic-dispatch issue). Spent a full
-    round of env-gated `eprintln!` tracing in
-    `vm/src/vm/vm_exec.rs::invoke_on_class_shared_inner` (its
-    interface/abstract retarget logic and `is_subclass_of` check) and in
-    `vm/src/runtime/interpreter.rs::execute_invokevirtual_cached` (the
-    monomorphic inline-cache entry point) — reproduced other genuine
-    findings along the way (some ByteBuddy support classes, e.g.
-    `TypeList$ForLoadedTypes`/`TypeList$Empty`, really do get loaded with
-    two distinct `ClassId`s simultaneously across forks, proving actual
-    class redefinition happens for at least some ByteBuddy-internal
-    classes, not just application classes) but **never once observed the
-    failing `FilterableList$AbstractBase.filter()` call reach either
-    `invoke_on_class_shared_inner` or `execute_invokevirtual_cached`/
-    `execute_invokevirtual_vtable_fast`**, even under the broadest possible
-    trace condition (any entry whose calling frame's method name is
-    `"filter"`, with `CRATONVM_DISABLE_JIT=1` to rule out a JIT-only path).
-    Also individually verified: (1) `execute_invokevirtual_cached`'s
-    `VirtualBytecode`/`VirtualNative`/`Intrinsic` match arms all correctly
-    validate the live receiver's `class_id_of()` against the cached
-    `receiver_class_id` before serving a cached target, falling back to
-    `CacheMiss` on any mismatch — so a stale monomorphic inline-cache entry
-    cannot explain a wrong dispatch by itself. **Open question for the next
-    session:** since the failing call never appears in either traced
-    dispatch layer, it must go through a third, untraced mechanism entirely
-    (a different frame-execution path gated by `is_jdk_class`/`use_fast_path`
-    was noticed in passing — `Instruction`-enum-decoded dispatch vs. the
-    raw-byte fast loop — but both were confirmed to still call through
-    `execute_invokevirtual_cached`, so this alone doesn't explain the gap).
-    Next steps: trace one level higher (`execute_frame`'s own opcode-dispatch
-    entry, before it even reaches the 0xb6/`Instruction::Invokevirtual` arms)
-    to confirm `filter()`'s frame is genuinely being interpreted at all
-    during the failing call, or attach `gdb` live at the moment of the WARN
-    (the process is short-lived — pair with a `sudo gdb -p <pid> -batch`
-    poll-and-pounce, see `[[wildfly-gc-barrier-main-vm-non-daemon-join-hang]]`
-    in memory for the technique) to get a real stack trace instead of
-    guessing from static reads. Suspected (not confirmed) to be the same
-    root cause as `PersistenceAnnotationBeanPostProcessorAotContributionTests`'s
-    ByteBuddy-generics residual above and possibly
-    `BeanDefinitionMethodGeneratorTests`'s bisected-but-separately-fixed
-    9-vs-10-cycle finding, given the shared "only after N repeated
-    fork/redefine cycles" signature — but this has NOT been confirmed, only
-    hypothesized.
+    wraps it).
+
+    **The exact failing call chain (captured via a full interpreter-frame
+    stack dump at the moment of failure):** Mockito's own
+    `InstrumentationMemberAccessor.<clinit>` builds a dynamic ByteBuddy
+    proxy type (`DynamicType.Builder...make()`) →
+    `SubclassDynamicTypeBuilder.applyConstructorStrategy()` →
+    `ConstructorStrategy.Default$5.doExtractConstructors(TypeDescription)`.
+    Disassembled (`javap -v`) that method's bytecode: it calls
+    `instrumentedType.getSuperClass().getDeclaredMethods()` (returning a
+    `MethodList`) then `.filter(isConstructor().and(isVisibleTo(...)))` on
+    it (`invokeinterface net/bytebuddy/description/method/MethodList.filter`).
+    Disassembled `TypeDescription.Generic.OfNonGenericType.
+    getDeclaredMethods()` too: it constructs and returns `new
+    MethodList$TypeSubstituting(this, asErasure().getDeclaredMethods(),
+    visitor)` — so the receiver reaching `.filter()` (and therefore `this`
+    inside the inherited `FilterableList$AbstractBase.filter()` bytecode,
+    where `this.size()` is the failing instruction at bytecode offset 5)
+    should unambiguously be a `MethodList$TypeSubstituting` instance. It is
+    not: `class_id_of()` on that receiver instead resolves to
+    `TypeDescription$Generic$OfNonGenericType$ForLoadedType` — the exact
+    concrete type of `instrumentedType`'s OWN superclass description, an
+    object that was alive on the operand stack just two bytecode
+    instructions earlier in the very same `doExtractConstructors` method
+    (used to build the `isVisibleTo(...)` matcher argument). This is
+    reproducible byte-for-byte across repeated runs (not a GC-timing
+    heisenbug).
+
+    **Definitively ruled out, each with concrete evidence:**
+    1. **JIT tier-up / megamorphic inline cache** — reproduces identically
+       with `CRATONVM_DISABLE_JIT=1`; this is a pure interpreter bug.
+    2. **`invoke_on_class_shared_inner`'s interface/abstract retarget logic
+       and `is_subclass_of`** (`vm/src/vm/vm_exec.rs`) — env-gated tracing
+       showed this call passes through this function with the WRONG class
+       already substituted (i.e. the corruption happens upstream of this
+       function's own retarget decision, not within it).
+    3. **`execute_invokevirtual_cached`'s monomorphic inline cache**
+       (`vm/src/runtime/interpreter.rs`) — every `CachedInvokeTarget` arm
+       (`VirtualBytecode`/`VirtualNative`/`Intrinsic`) correctly validates
+       the live receiver's `class_id_of()` against the cached
+       `receiver_class_id` before use; a stale entry cannot explain a wrong
+       dispatch. Also confirmed this specific call never reaches this
+       function's cache-consult path at all (traced with the broadest
+       possible condition — any caller frame named `"filter"` — zero hits).
+    4. **`ClassLoaderId::UserDefined(u32)` reuse/collision** — confirmed via
+       `native-builtins/src/classloader.rs`'s `allocate_loader_id()` that
+       loader ids are a monotonic, never-recycled counter; each
+       `ForkLoader` gets a permanently unique id (observed ids 4, 6, 8
+       across forks 2-4 in one run).
+    5. **`SharedVm::initiating_resolution_cache`** (the per-`ClassLoaderId`,
+       per-class-name memoized `loadClass()` result cache consulted by
+       `lookup_loader_initiated`/`resolve_class_loader_aware`, which backs
+       the `new` bytecode's class resolution) — traced reads AND writes for
+       every class name in the failure chain
+       (`MethodList$TypeSubstituting`, `MethodList$ForLoadedMethods`,
+       `MethodList$Explicit`, `TypeDescription$Generic$OfNonGenericType`
+       `$ForLoadedType`/`$ForErasure`): every single name resolves to a
+       correct, internally-consistent, non-colliding `ClassId` per loader,
+       with zero cross-loader contamination visible anywhere. This cache is
+       NOT the bug (a real, similar-shaped bug in a DIFFERENT structure was
+       already fixed earlier this session — see the `BeanDefinitionMethod
+       GeneratorTests` orphaned-defining-loader fix above — but this
+       specific cache has no analogous defect).
+
+    **Two live hypotheses for a future session, neither yet tested:**
+    (a) resolution of the bare `net/bytebuddy/description/method/MethodList`
+    **interface** name itself (the literal constant-pool target of the
+    failing `invokeinterface`, resolved via `execute_invoke_kind`/
+    `resolve_method_ref`'s interface-dispatch path — NOT the `new`-bytecode
+    path already cleared above) and whatever logic retargets an interface
+    method onto the receiver's concrete class in that specific code path;
+    (b) an **operand-stack slot mixup** in the interpreter's `invokeinterface`
+    handling for this specific call shape — the wrong class showing up is
+    suspiciously exactly `instrumentedType`'s own type, an object alive on
+    the stack moments earlier in the same method, which smells like the
+    interpreter reading a stale/adjacent stack slot as the receiver rather
+    than a class-resolution problem at all. **Recommended next steps:**
+    dump the FULL operand stack (not just the receiver slot) at the exact
+    moment of this `invokeinterface` call, or attach `gdb` live (`sudo gdb
+    -p <pid> -batch -ex 'thread apply all bt'` — process is short-lived,
+    pair with a brief artificial pause) to get ground truth instead of more
+    static tracing.
+
 *   `PersistenceManagedTypesBeanRegistrationAotProcessorTests` — **NOT a
     CratonVM bug: host environment gap.** Both `processEntityManagerWithPackagesToScan`
     and `contributeJpaHints` hit `NoClassDefFoundError: java/lang/classfile/ClassFile`
