@@ -497,6 +497,46 @@ fn should_skip_jit_internal(
         return Some(SkipReason::RustJvmTestFixture);
     }
 
+
+    // HIB-LONGTAIL.1 (2026-07-15): Hibernate's H2-backed collection loading
+    // runs correctly in the interpreter, but JITting the H2 SQL/MVStore,
+    // ANTLR-runtime, and most of java.util together turns ordinary 9-second
+    // HotSpot tests into multi-minute CratonVM runs. The three package control
+    // returns the class to the 120-second JUnit budget; each narrower control
+    // leaves the regression. Keep the proven interaction interpreted under the
+    // conservative policy until the shared generated-code throughput issue is
+    // root-caused. Each package remains available for bisection through
+    // CRATONVM_JIT_ALLOW_PACKAGES. `java.util.regex` is deliberately excluded:
+    // DefaultCatalogAndSchemaTest's AssertJ checks repeatedly compile patterns,
+    // and interpreting Pattern.compile turns that finite check into a watchdog
+    // timeout while its JIT path is stable.
+    if class_name.starts_with("org/h2/")
+        || class_name.starts_with("org/antlr/v4/runtime/")
+        || (class_name.starts_with("java/util/")
+            && !class_name.starts_with("java/util/regex/"))
+    {
+        return Some(SkipReason::RustJvmTestFixture);
+    }
+
+    // HIB-LONGTAIL.2 (2026-07-15): compiled AttributesImpl.ensureCapacity
+    // passes a corrupted int count to anewarray during Hibernate's qualified
+    // table bootstrap (observed Object[1677721600]). The interpreter executes
+    // the method correctly; keep just this small growth helper interpreted.
+    if class_name == "org/xml/sax/helpers/AttributesImpl" && method_name == "ensureCapacity" {
+        return Some(SkipReason::RustJvmTestFixture);
+    }
+
+    // HIB-LONGTAIL.3 (2026-07-15): when Hibernate bytecode is explicitly
+    // promoted for bisection, the optimized constructor path can return a
+    // GenerationTargetToScript whose ScriptTargetOutput field was never
+    // initialized. Schema creation then fails in accept(String). Preserve the
+    // constructor's interpreter semantics; its small body is cold and this
+    // does not suppress the rest of Hibernate's JIT eligibility.
+    if class_name == "org/hibernate/tool/schema/internal/exec/GenerationTargetToScript"
+        && method_name == "<init>"
+    {
+        return Some(SkipReason::RustJvmTestFixture);
+    }
     // T1.1.g — the historical blanket bans for `java/util/*` and
     // `cratonvm/*` were narrowed to targeted per-method exclusions.
     // Those targeted exclusions guarded the callee-saved-GPR local-home

@@ -6672,6 +6672,22 @@ pub(crate) fn mh_dispatch(
                             .map(|(i, arg)| read_pinned_mh_arg(ctx, adapted_handles[i], *arg))
                             .collect();
                         let receiver = ctx.read_native_pin(recv_pin, receiver);
+                        if std::env::var_os("CRATONVM_DBG_MH_DISPATCH").is_some() {
+                            let last_desc = match adapted.last() {
+                                Some(Value::Object(Some(o))) if ctx.object_is_array(*o) => {
+                                    format!("array[len={}]", ctx.array_length(*o))
+                                }
+                                Some(Value::Object(Some(_))) => "obj".to_string(),
+                                Some(Value::Object(None)) => "null".to_string(),
+                                Some(other) => format!("{other:?}"),
+                                None => "<none>".to_string(),
+                            };
+                            eprintln!(
+                                "[MH_VIRTUAL_ADAPTED] class={class} name={name} desc={desc:?} collected_len={} adapted_len={} last={last_desc}",
+                                collected.len(),
+                                adapted.len()
+                            );
+                        }
                         let mut full_args = Vec::with_capacity(1 + adapted.len());
                         full_args.push(Value::Object(Some(receiver)));
                         full_args.extend_from_slice(&adapted);
@@ -7183,23 +7199,32 @@ fn collect_trailing_varargs(
     params: &[Value],
 ) -> Vec<Value> {
     // Cheap pre-checks BEFORE the allocating `declared_methods` lookup, so the
-    // hot path (every static/virtual MethodHandle dispatch — Groovy/Gradle/
+    // hot path (every static/virtual MethodHandle dispatch -- Groovy/Gradle/
     // Jackson/SpEL-compiled) pays only a descriptor parse, not a full
     // declared-methods scan.
     let (ptypes, _) = crate::lang_class::parse_descriptor_param_and_return(desc);
     let p = ptypes.len();
-    let last = match ptypes.last() {
-        // Varargs ALWAYS has an array as its last parameter; if not, this can't
-        // be a varargs collection — return untouched.
-        Some(t) if t.starts_with('[') => t.clone(),
-        _ => return params.to_vec(),
+    // Locate the array-typed parameter. Real JDK varargs requires it to be
+    // the syntactically LAST parameter (JLS) -- but JRuby's Ruby-call
+    // convention routinely appends a trailing `Block` parameter AFTER the
+    // args array (e.g. `InvokeSite#invoke(ThreadContext, IRubyObject caller,
+    // IRubyObject self, IRubyObject[] args, Block)`), so search for the
+    // array anywhere in the descriptor rather than assuming index `p - 1`.
+    let array_idx = match ptypes.iter().position(|t| t.starts_with('[')) {
+        Some(idx) => idx,
+        // No array parameter at all -- this can't be a varargs/collect
+        // target, return untouched.
+        None => return params.to_vec(),
     };
-    // Already packed: exactly P args and the trailing one is an array (or null).
-    // Covers a correct `invokeExact`/pre-packed call AND e.g.
-    // `#formatPrimitiveVarargs('fmt', new int[]{1})`. No collection needed
-    // regardless of varargs-ness, so skip the method-table lookup entirely.
+    let last = ptypes[array_idx].clone();
+    let trailing_types = &ptypes[array_idx + 1..];
+    // Already packed: exactly P args and the array-position value is itself
+    // an array (or null). Covers a correct `invokeExact`/pre-packed call AND
+    // e.g. `#formatPrimitiveVarargs('fmt', new int[]{1})`. No collection
+    // needed regardless of varargs-ness, so skip the method-table lookup
+    // entirely.
     if params.len() == p {
-        match params.last() {
+        match params.get(array_idx) {
             Some(Value::Object(Some(arr))) if ctx.object_is_array(*arr) => return params.to_vec(),
             Some(Value::Object(None)) => return params.to_vec(),
             _ => {}
@@ -7214,10 +7239,10 @@ fn collect_trailing_varargs(
     //     dispatch, ...). This was the ONLY trigger originally.
     //
     //  2. `params.len() > p` -- MORE flat argument values were supplied than
-    //     the target descriptor declares params for, and the last declared
-    //     param is an array type. This covers a target method whose trailing
-    //     array parameter is an ORDINARY (non-varargs) `T[]` -- e.g. JRuby
-    //     10.x's `org.jruby.ir.targets.indy.InvokeSite`/`NormalInvokeSite
+    //     the target descriptor declares params for, and SOME declared param
+    //     is an array type. This covers a target method whose array
+    //     parameter is an ORDINARY (non-varargs) `T[]` -- e.g. JRuby 10.x's
+    //     `org.jruby.ir.targets.indy.InvokeSite`/`NormalInvokeSite
     //     .invoke(ThreadContext, IRubyObject, IRubyObject, IRubyObject[],
     //     Block)` (confirmed via `javap` -- both real overloads take a plain
     //     array, neither is declared `IRubyObject...`, so ACC_VARARGS is
@@ -7228,8 +7253,8 @@ fn collect_trailing_varargs(
     //     `pos` -- verified by direct value tracing, not the bug) and never
     //     calls `MethodHandle.asCollector`/anything else that would pack
     //     them -- so by the time dispatch reaches the target method's own
-    //     descriptor, arity strictly exceeds the declared param count with a
-    //     trailing array type declared. In a signature-polymorphic
+    //     descriptor, arity strictly exceeds the declared param count with
+    //     an array type declared somewhere in it. In a signature-polymorphic
     //     MethodHandle-mediated call this arity/type mismatch has exactly
     //     one legal resolution (collect the excess into the array); passing
     //     the excess through flat/unchanged (the old behavior) desyncs
@@ -7250,20 +7275,81 @@ fn collect_trailing_varargs(
         .iter()
         .any(|m| m.name == name && m.descriptor == desc && (m.access_flags & 0x0080) != 0);
     let arity_excess = params.len() > p;
-    if !is_varargs && !arity_excess {
+    // A second, narrower trigger alongside `arity_excess`: EXACTLY `p` args
+    // were supplied (no excess) but the value that naively lands at the
+    // array's declared position isn't itself an array (or null) -- a bare
+    // scalar sitting in an array-typed descriptor slot. Confirmed via the
+    // SAME `JRubyScriptTemplateTests` trace as `arity_excess` above: right
+    // after the `.sub()` call's 6-flat-args case (fixed by `arity_excess`),
+    // the very next call in the same chain --
+    // `org.jruby.ir.targets.indy.SelfInvokeSite.invoke(ThreadContext,
+    // IRubyObject, IRubyObject[], Block)` -- arrived with exactly 4 flat
+    // args (matching `p` exactly) where the array-typed 3rd param held a
+    // single bare `IRubyObject` instead of a 1-element array, later
+    // surfacing as `ArgumentError: wrong number of arguments (given 0,
+    // expected 1)` inside the interpreted Ruby method `checkArity` found it
+    // was calling. A single supplied value destined for a 1-element array
+    // needs the exact same wrap-into-array treatment as an excess of
+    // supplied values, just with `excess == 0`.
+    let array_slot_is_wrapped = match params.get(array_idx) {
+        Some(Value::Object(Some(arr))) => ctx.object_is_array(*arr),
+        Some(Value::Object(None)) => true,
+        _ => false,
+    };
+    let scalar_needs_wrap = params.len() == p && !array_slot_is_wrapped;
+    if !is_varargs && !arity_excess && !scalar_needs_wrap {
         return params.to_vec();
     }
-    let fixed = p - 1;
-    if params.len() < fixed {
-        // Fewer args than the leading fixed params — let `invoke` surface the
-        // arity error rather than fabricate a result.
+    if params.len() < array_idx + trailing_types.len() {
+        // Fewer args than the leading-fixed + trailing-fixed params could
+        // ever accommodate -- let `invoke` surface the arity error rather
+        // than fabricate a result.
         return params.to_vec();
     }
+    // The tail region (`params[array_idx..]`) needs to split into "values
+    // that collect into the array" and "values that satisfy the trailing
+    // fixed params declared AFTER the array" (e.g. a trailing `Block`). A
+    // naive positional split (last N values = trailing fixed params) is
+    // WRONG here: those trailing values can end up spliced into the MIDDLE
+    // of the tail region by an earlier, independently-correct
+    // `MethodHandles.insertArguments` step whose `pos` was computed against
+    // the COLLAPSED arity it expected -- CratonVM never actually collapses
+    // until this function runs, so a value meant to land after the array
+    // ends up interleaved among the to-be-collected values instead (exactly
+    // the `[..., Regexp, Block, replacement]` shape traced above: `Block`
+    // sitting between the two values that belong in the array). Recover the
+    // correct split by matching each trailing declared type against its
+    // RUNTIME class within the tail, pulling matched values out (in the
+    // trailing params' declared order) and leaving the rest, in their
+    // original relative order, to collect into the array.
+    let tail = &params[array_idx..];
+    let mut taken = vec![false; tail.len()];
+    let mut trailing_values: Vec<Value> = Vec::with_capacity(trailing_types.len());
+    for tt in trailing_types {
+        let want_class = tt.trim_start_matches('L').trim_end_matches(';');
+        let found = tail.iter().enumerate().find(|(i, v)| {
+            !taken[*i]
+                && matches!(v, Value::Object(Some(o))
+                    if ctx.class_name_of_id(ctx.class_id_of_object(*o)).as_deref() == Some(want_class))
+        }).map(|(i, _)| i);
+        let idx = found.or_else(|| (0..tail.len()).rev().find(|i| !taken[*i]));
+        if let Some(i) = idx {
+            taken[i] = true;
+            trailing_values.push(tail[i]);
+        }
+    }
+    let collected: Vec<Value> = tail
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !taken[*i])
+        .map(|(_, v)| *v)
+        .collect();
     let component = &last[1..]; // strip one leading '['
-    let array = build_varargs_array(ctx, component, &params[fixed..]);
-    let mut out = Vec::with_capacity(fixed + 1);
-    out.extend_from_slice(&params[..fixed]);
+    let array = build_varargs_array(ctx, component, &collected);
+    let mut out = Vec::with_capacity(array_idx + 1 + trailing_values.len());
+    out.extend_from_slice(&params[..array_idx]);
     out.push(Value::Object(array));
+    out.extend_from_slice(&trailing_values);
     out
 }
 

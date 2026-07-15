@@ -7132,14 +7132,32 @@ fn resync_view_set(ctx: &mut dyn NativeContext, set: ObjectRef) {
             ctx.set_field(entry, 0, k);
             ctx.set_field(entry, 1, v);
             ctx.set_field(entry, 2, Value::Object(Some(source)));
-            let _ = native_map_put(
-                ctx,
-                &[
-                    Value::Object(Some(backing)),
-                    Value::Object(Some(entry)),
-                    sentinel,
-                ],
-            );
+            // An entry's Java hash is key.hashCode() ^ value.hashCode().
+            // Calling native_map_put here therefore invokes PersistentSet's
+            // hashCode while Hibernate is initializing its batch queue, which
+            // recursively reloads the same collection. Entry-set views must
+            // use identity buckets, as native_map_entry_set does.
+            let backing = ctx.read_native_pin(roots_base, backing);
+            let (buckets, size, capacity) = map_state(ctx, backing);
+            if let Some(buckets) = buckets {
+                let buckets_pin = ctx.pin_native_root(buckets);
+                let entry_pin = ctx.pin_native_root(entry);
+                let hash = ctx.identity_hash_code(entry);
+                let index = map_bucket_index(hash, capacity);
+                let head = match ctx.get_array_element(buckets, index) {
+                    Value::Object(head) => head,
+                    _ => None,
+                };
+                let node = map_alloc_node(ctx, entry, sentinel, hash, head);
+                let backing = ctx.read_native_pin(roots_base, backing);
+                let buckets = ctx.read_native_pin(buckets_pin, buckets);
+                ctx.set_array_element(buckets, index, Value::Object(Some(node)));
+                set_map_size(ctx, backing, size + 1);
+                ctx.unpin_native_roots(entry_pin);
+                ctx.unpin_native_roots(buckets_pin);
+            }
+            ctx.unpin_native_roots(value_pin);
+            ctx.unpin_native_roots(key_pin);
         }
     } else {
         let keys = collect_keys_any(ctx, source);
@@ -12140,7 +12158,7 @@ fn stream_read_chain(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<LazyOp> {
 fn stream_source_elems(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     let this_pin = ctx.pin_native_root(this);
     let this_cur = ctx.read_native_pin(this_pin, this);
-    materialize_lazy_stream(ctx, this_cur);
+    let _ = materialize_lazy_stream(ctx, this_cur);
     let this_cur = ctx.read_native_pin(this_pin, this);
     let elems = match ctx.get_field(this_cur, STREAM_FIELD_ELEMENTS) {
         Value::Object(Some(arr)) => {
