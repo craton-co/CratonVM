@@ -213,6 +213,71 @@ the WRONG same-named copy. Eight fixes landed on
     `PremainAttachAccess` -> "Byte Buddy agent is not initialized", and (b) a
     NEW ByteBuddy generics failure past the dispatcher: `IllegalArgumentException:
     Cannot resolve T from class ...EntityManagerFactory$MockitoMock$...`.
+*   **ByteBuddy repeat-redefine `NoSuchMethodError` family — investigated
+    extensively 2026-07-15, NOT FIXED, root cause not fully isolated.**
+    Standalone repro (`BBProbe4.java`, no Spring/JUnit needed, in
+    `/data/data/aot-fix-runs-20260715/bbprobe/` on the Azure worktree host):
+    4 sequential independent `ForkLoader` (a minimal
+    `@CompileWithForkedClassLoader`-style loader) instances each run
+    `Mockito.mock(SampleService.class)` in the same process. Fork 1 fails
+    cold (`Byte Buddy agent is not initialized` — a separate, already-known
+    cold-self-attach quirk; a second attempt in a fresh fork succeeds), fork
+    2 succeeds, but fork 3 and every fork after it deterministically fail
+    with `NoSuchMethodError:
+    net/bytebuddy/description/type/TypeDescription$Generic$OfNonGenericType
+    $ForLoadedType.size()I` thrown from inside ByteBuddy's own
+    `FilterableList$AbstractBase.filter()` (surfacing to Java code as
+    `NullPointerException: methods is null` once Mockito's `PluginLoader`
+    wraps it). Confirmed via `javap -v` disassembly of
+    `FilterableList$AbstractBase.class` that the failing instruction (`this
+    .size()`, JVMS-resolved as a self-reference to
+    `FilterableList$AbstractBase.size():()I`, abstract there — real dispatch
+    must resolve through whichever concrete `FilterableList` subtype is the
+    actual receiver) is unambiguous, ruling out a misread bytecode operand.
+    Also ruled out: **JIT tier-up** (the bug reproduces byte-for-byte
+    identically with `CRATONVM_DISABLE_JIT=1`, so this is an interpreter-level
+    bug, not a JIT inline-cache/megamorphic-dispatch issue). Spent a full
+    round of env-gated `eprintln!` tracing in
+    `vm/src/vm/vm_exec.rs::invoke_on_class_shared_inner` (its
+    interface/abstract retarget logic and `is_subclass_of` check) and in
+    `vm/src/runtime/interpreter.rs::execute_invokevirtual_cached` (the
+    monomorphic inline-cache entry point) — reproduced other genuine
+    findings along the way (some ByteBuddy support classes, e.g.
+    `TypeList$ForLoadedTypes`/`TypeList$Empty`, really do get loaded with
+    two distinct `ClassId`s simultaneously across forks, proving actual
+    class redefinition happens for at least some ByteBuddy-internal
+    classes, not just application classes) but **never once observed the
+    failing `FilterableList$AbstractBase.filter()` call reach either
+    `invoke_on_class_shared_inner` or `execute_invokevirtual_cached`/
+    `execute_invokevirtual_vtable_fast`**, even under the broadest possible
+    trace condition (any entry whose calling frame's method name is
+    `"filter"`, with `CRATONVM_DISABLE_JIT=1` to rule out a JIT-only path).
+    Also individually verified: (1) `execute_invokevirtual_cached`'s
+    `VirtualBytecode`/`VirtualNative`/`Intrinsic` match arms all correctly
+    validate the live receiver's `class_id_of()` against the cached
+    `receiver_class_id` before serving a cached target, falling back to
+    `CacheMiss` on any mismatch — so a stale monomorphic inline-cache entry
+    cannot explain a wrong dispatch by itself. **Open question for the next
+    session:** since the failing call never appears in either traced
+    dispatch layer, it must go through a third, untraced mechanism entirely
+    (a different frame-execution path gated by `is_jdk_class`/`use_fast_path`
+    was noticed in passing — `Instruction`-enum-decoded dispatch vs. the
+    raw-byte fast loop — but both were confirmed to still call through
+    `execute_invokevirtual_cached`, so this alone doesn't explain the gap).
+    Next steps: trace one level higher (`execute_frame`'s own opcode-dispatch
+    entry, before it even reaches the 0xb6/`Instruction::Invokevirtual` arms)
+    to confirm `filter()`'s frame is genuinely being interpreted at all
+    during the failing call, or attach `gdb` live at the moment of the WARN
+    (the process is short-lived — pair with a `sudo gdb -p <pid> -batch`
+    poll-and-pounce, see `[[wildfly-gc-barrier-main-vm-non-daemon-join-hang]]`
+    in memory for the technique) to get a real stack trace instead of
+    guessing from static reads. Suspected (not confirmed) to be the same
+    root cause as `PersistenceAnnotationBeanPostProcessorAotContributionTests`'s
+    ByteBuddy-generics residual above and possibly
+    `BeanDefinitionMethodGeneratorTests`'s bisected-but-separately-fixed
+    9-vs-10-cycle finding, given the shared "only after N repeated
+    fork/redefine cycles" signature — but this has NOT been confirmed, only
+    hypothesized.
 *   `PersistenceManagedTypesBeanRegistrationAotProcessorTests` — **NOT a
     CratonVM bug: host environment gap.** Both `processEntityManagerWithPackagesToScan`
     and `contributeJpaHints` hit `NoClassDefFoundError: java/lang/classfile/ClassFile`
