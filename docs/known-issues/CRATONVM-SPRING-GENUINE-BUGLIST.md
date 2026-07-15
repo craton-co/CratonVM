@@ -1,5 +1,5 @@
 # CratonVM Spring Suite — Consolidated Open Bugs
-**Latest Update: July 15, 2026**
+**Latest Update: July 14, 2026**
 
 ## Executive Summary
 Multiple major bug clusters have been successfully resolved (including the JIT SIGSEGV in Groovy, the `java.home` Locale regression, the `Semaphore` deadlock, and dozens of classloader visibility/AOT fixes).
@@ -39,22 +39,14 @@ These classes had blocking VM crashes fixed, but now fail on new, distinct resid
   *   **Reactor Netty**: `IllegalStateException: failed to create a child event loop`
 
 ### AOT / In-Memory Javac Residuals
-The original 1500-second infinite hangs have largely shifted into execution
-failures after recent file-manager and compiler fixes. The most recent
-11-class AOT-cluster batch on the pre-merge `dev` baseline (`b7971c50`) still
-contained the residuals below; the source branch was subsequently fast-forwarded
-to `3a6bd4a6` for follow-up work, but that newer commit has not yet had a fresh
-full AOT batch.
+The original 1500-second infinite hangs have largely shifted into execution failures after recent file-manager and compiler fixes.
 *   **Still Hanging (TIMEOUT at 600s)**:
   *   `beans.factory.aot.BeanRegistrationsAotContributionTests`
   *   `test.context.aot.TestClassScannerTests`
   *   `core.test.tools.TestCompilerTests`
 *   **Residual Failures (Reaches execution but fails)**:
   *   `beans.factory.annotation.AutowiredAnnotationBeanRegistrationAotContributionTests`
-*   `beans.factory.aot.BeanDefinitionMethodGeneratorTests` — retained pending
-    a fresh batch: its direct failing method passed when invoked reflectively
-    on the same release VM and Spring classpath, contradicting the older batch
-    summary.
+  *   `beans.factory.aot.BeanDefinitionMethodGeneratorTests`
   *   `beans.factory.aot.BeanDefinitionPropertiesCodeGeneratorTests`
   *   `beans.factory.aot.InstanceSupplierCodeGeneratorTests`
   *   `context.annotation.CommonAnnotationBeanRegistrationAotContributionTests`
@@ -65,34 +57,6 @@ full AOT batch.
 *   **WritableContent Residual**:
   *   `web.service.registry.GroupsMetadataValueDelegateTests`: VM Abort fixed; now fails with `IllegalStateException: WritableContent did not append any content`.
 
-#### July 15 AOT evidence and rejected hypotheses
-
-* `TestCompilerTests` still reached the 90-second watchdog while javac scanned
-  system modules. Its captured stack was in `ClassFinder.scanModulePaths`,
-  through Spring's `DynamicJavaFileManager`, ending in
-  `JavacFileManager.inferBinaryName` or `getJavaFileForInput` depending on the
-  diagnostic build. A 600-second diagnostic also failed to complete.
-* The broad `WritableContent` symptom is **not** a generic lambda, captured
-  method-reference, or `ThrowingConsumer<Appendable>` dispatch failure. A
-  focused probe passed both `SourceFile.of(javaFile::writeTo)` and the complete
-  `JavaFile::writeTo → ThrowingConsumer → AppendableConsumerInputStreamSource`
-  generated-files path on the same release VM. The residual therefore remains
-  open in the real generated-code graph rather than in the generic callback
-  mechanism.
-* A direct invocation of
-  `BeanDefinitionMethodGeneratorTests.generateBeanDefinitionMethodWhenHasInstancePostProcessorGeneratesMethod`
-  completed successfully on that release VM. This is useful reconciliation
-  evidence, but does not prove the class fixed because the full batch had
-  reported four method failures and has not been rerun after the check.
-* Two JRT/javac performance experiments were rejected and are not committed:
-  directly reading `JrtPath.path` did not clear the watchdog, and directly
-  constructing `JRTFileObject`s advanced execution but ultimately recurred in
-  package resolution and timed out. The branch contains no experimental VM
-  source changes from these probes.
-
-No AOT item was removed in this update: no full-class or full-cluster rerun
-has yet proven an AOT residual fixed.
-
 ---
 
 ## 3. Untriaged Clusters & Per-Class Details
@@ -101,4 +65,65 @@ The following tests are genuinely open (FAIL, ABEND, or TIMEOUT). *Note: 21 clas
 
 **AOP / Beans**
 *   `aop.scope.ScopedProxyBeanRegistrationAotProcessorTests` - FAIL (`BeanCreationException` / `CompilationException`)
-*   `aot.nativex.fea
+*   `aot.nativex.feature.ThrowawayClassLoaderTests` - FAIL (`InputStream closed` AssertionError)
+*   `beans.PropertyDescriptorUtilsPropertyResolutionTests` - FAIL (AssertJ multiple failures)
+*   `beans.factory.DefaultListableBeanFactoryTests` - FAIL (`BeanCreationException` during autowiring)
+*   `beans.factory.aot.BeanDefinitionPropertyValueCodeGeneratorDelegatesTests` - LOADERR (`OutOfMemoryError: Java heap space`)
+*   `beans.factory.aot.InstanceSupplierCodeGeneratorKotlinTests` - FAIL (`CompilationException`)
+*   `beans.factory.xml.XmlBeanFactoryTests` - ABEND (Uncaptured exception in main-vm)
+
+**Context / Core**
+*   `context.annotation.ConfigurationClassPostConstructAndAutowiringTests` - FAIL (`UnsatisfiedDependencyException`)
+*   `context.annotation.ConfigurationClassPostProcessorTests` - ABEND (CGLIB enhancer crash)
+*   `context.annotation.Spr15275Tests` - FAIL (AssertionError)
+*   `context.annotation.Spr6602Tests` - FAIL (AssertionFailedError)
+*   `core.GenericTypeResolverTests` - FAIL (AssertionFailedError)
+*   `core.annotation.MergedAnnotationsTests` - FAIL (AssertionError)
+*   `core.codec.ResourceRegionEncoderTests` - ABEND (Crashes immediately before test execution)
+*   `core.convert.converter.DefaultConversionServiceTests` - ABEND (rc=139)
+
+**Expression / HTTP / JDBC / JMS / Scheduling**
+*   `expression.spel.EvaluationTests` - FAIL (AssertionError)
+*   `http.codec.multipart.DefaultPartHttpMessageReaderTests` - ABEND (rc=139)
+*   `http.codec.multipart.MultipartHttpMessageWriterTests` - ABEND (rc=139)
+*   `jms.listener.MessageListenerContainerObservationTests` - ABEND (rc=139)
+*   `scheduling.quartz.QuartzSupportTests` - TIMEOUT (Hard timeout)
+
+**Groovy / Jython / Scripting Cluster**
+*   `context.groovy.GroovyBeanDefinitionReaderTests` - ABEND (rc=139)
+*   `scripting.config.ScriptingDefaultsTests` - ABEND (rc=139)
+*   `scripting.groovy.GroovyAspectIntegrationTests` - ABEND (rc=139)
+*   `scripting.groovy.GroovyAspectTests` - ABEND (rc=139)
+*   `web.reactive.result.view.FragmentViewResolutionResultHandlerTests` - ABEND (Jython linkage error: `failed to parse StackMapTable`)
+*   `web.reactive.result.view.script.JRubyScriptTemplateTests` - ABEND (rc=139)
+*   `web.reactive.result.view.script.JythonScriptTemplateTests` - FAIL (`Failed to evaluate script`)
+*   `web.servlet.mvc.method.annotation.FragmentRenderingStreamTests` - ABEND (Jython linkage error: `failed to parse StackMapTable`)
+*   `web.servlet.view.DefaultFragmentsRenderingTests` - FAIL (`Failed to evaluate script`)
+*   `web.servlet.view.script.JRubyScriptTemplateTests` - FAIL (`Failed to evaluate script`)
+*   `web.servlet.view.script.JythonScriptTemplateTests` - FAIL (AssertionFailedError)
+
+**ORM / JPA**
+*   `orm.jpa.persistenceunit.PersistenceManagedTypesBeanRegistrationAotProcessorTests` - FAIL (`CompilationException`)
+*   `orm.jpa.support.InjectionCodeGeneratorTests` - FAIL (`CompilationException`)
+*   `orm.jpa.support.PersistenceInjectionTests` - FAIL (AssertionFailedError)
+
+**Test Framework / Mocking**
+*   `test.context.aot.AotIntegrationTests` - FAIL (`ArrayIndexOutOfBoundsException: null`)
+*   `test.context.junit.jupiter.event.ParallelApplicationEventsIntegrationTests` - FAIL (AssertionError in event statistics)
+*   `test.web.servlet.assertj.MockMvcTesterIntegrationTests` - FAIL (AssertionError in debug streams)
+*   `test.web.servlet.htmlunit.MockWebResponseBuilderTests` - FAIL (AssertionFailedError)
+*   `util.function.SingletonSupplierTests` - FAIL (AssertionError)
+
+**Web / WebFlux / WebSockets**
+*   `web.context.ContextLoaderTests` - ABEND (Exception in main-vm)
+*   `web.reactive.result.method.annotation.CoroutinesIntegrationTests` - ABEND (rc=139)
+*   `web.reactive.result.method.annotation.JacksonHintsIntegrationTests` - ABEND (rc=139)
+*   `web.reactive.result.method.annotation.MessageReaderArgumentResolverTests` - ABEND (rc=134)
+*   `web.reactive.result.method.annotation.MessageWriterResultHandlerTests` - ABEND (rc=139)
+*   `web.reactive.result.method.annotation.ProtobufIntegrationTests` - ABEND (rc=1)
+*   `web.reactive.result.method.annotation.RequestMappingExceptionHandlingIntegrationTests` - ABEND (rc=139)
+*   `web.reactive.result.view.ViewResolutionResultHandlerTests` - FAIL (Expected `ResponseStatusException`, actual `onComplete()`)
+*   `web.server.session.WebSessionIntegrationTests` - ABEND (rc=139)
+*   `web.servlet.config.MvcNamespaceTests` - ABEND (rc=139)
+*   `web.servlet.config.annotation.ViewResolutionIntegrationTests` - ABEND (rc=139)
+*   `web.socket.config.MessageBrokerBeanDefinitionParserTests` - FAIL (AssertionFailedError)
