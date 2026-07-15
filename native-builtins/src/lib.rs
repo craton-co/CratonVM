@@ -37890,22 +37890,13 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
 
     // EUREKA-LOGBACK-CLEANUP: Spring Boot's `LogbackLoggingSystem.cleanUp`
     // crashes every Spring Boot app (eureka-server is the canonical
-    // reproducer) on `prepareEnvironment` because `LoggerContext.<init>`
-    // is registered as a no-op (see `register_slf4j_natives` /
-    // `register_spring_boot_logback_apply`) and the inherited
-    // `objectMap` / `propertyMap` / `sm` fields stay null. The real-JDK
-    // bytecode for `ContextBase.removeObject` etc. then NPEs as
-    // `Cannot invoke remove on null`. Register null-tolerant stubs on
+    // reproducer) on `prepareEnvironment` when an unconstructed
+    // `LoggerContext` leaves inherited maps/status fields null. Keep
+    // null-tolerant fallbacks on
     // the concrete `LoggerContext` (receiver class for vtable dispatch)
     // AND on `ContextBase` (declaring class for slow-path lookup).
     // Paired with the `check_override` allow-list entries in
     // `vm/src/vm/vm_exec.rs`.
-    registry.register(
-        "ch/qos/logback/classic/LoggerContext",
-        "<init>",
-        "()V",
-        native_noop_with_this,
-    );
     for class_name in [
         "ch/qos/logback/classic/LoggerContext",
         "ch/qos/logback/core/ContextBase",
@@ -70913,8 +70904,13 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
                 .ensure_class_initialized("ch/qos/logback/classic/LoggerContext")
                 .is_ok()
             {
-                let f = alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/LoggerContext", 1);
-                return Ok(Some(Value::Object(Some(f))));
+                if let Some(Value::Object(Some(context))) = ctx.new_object_initialized(
+                    "ch/qos/logback/classic/LoggerContext",
+                    "()V",
+                    &[],
+                )? {
+                    return Ok(Some(Value::Object(Some(context))));
+                }
             }
             let f = alloc_concurrent_synthetic(ctx, "org/slf4j/ILoggerFactory", 0);
             Ok(Some(Value::Object(Some(f))))
@@ -71207,13 +71203,9 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // is on the fat-jar classpath we return a real-classed
     // `LoggerContext` instance so Spring Boot's
     // `LoggingSystemFactory.LogbackLoggingSystem.beforeInitialize()`
-    // class check passes. The instance's fields (`loggerCache` etc.)
-    // are never initialized through logback's real `<init>` chain, so
-    // we register a `getLogger(String)` native that bypasses the real
-    // bytecode (which NPEs on the uninitialized `loggerCache`
-    // HashMap) and hands back a synthetic SLF4J Logger.
+    // class check passes. The instance is initialized through Logback's real
+    // constructor; `getLogger(String)` remains a lightweight logging bridge.
     let lb_ctx = "ch/qos/logback/classic/LoggerContext";
-    registry.register(lb_ctx, "<init>", "()V", native_noop_with_this);
     registry.register(
         lb_ctx,
         "getLogger",
