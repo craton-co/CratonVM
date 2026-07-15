@@ -809,6 +809,37 @@ fn jit_code_ranges() -> &'static std::sync::Mutex<Vec<(usize, usize, usize)>> {
     JIT_CODE_RANGES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
+/// PERF (2026-07-15, RequestMappingMessageConversionIntegrationTests bootstrap
+/// slowness, round 2): monotonically-increasing generation counter, bumped
+/// whenever the registered code-range set changes. `native_stack_has_jit_frame`
+/// (`vm/src/jit/conservative_roots.rs`) used to call `snapshot_code_ranges_into`
+/// — a full lock + Vec copy + `sort_unstable()` over the ENTIRE set — on every
+/// single call, even though it caches the result in a thread-local buffer.
+/// That "cache" was write-only: it got clobbered and fully rebuilt every call
+/// regardless of whether the underlying set had changed since the previous
+/// call. Since `native_stack_has_jit_frame` runs on the per-native-call
+/// root-snapshot path (see the comment on that function) and the set of
+/// registered ranges only grows (compiled code is retained, not freed, per the
+/// `JIT_CODE_RANGES` doc comment above), this was an O(n log n) cost paid on
+/// EVERY native call, with n = total JIT-compiled methods ever registered —
+/// i.e. the cost of every native call grew as the process JIT-compiled more
+/// code, for the lifetime of the process. Exposed dramatically by the
+/// 2026-07-15 invoke-cache fix (this same file's caller-side history): making
+/// JDK-internal bytecode actually tier up to JIT (previously it barely did)
+/// multiplied the number of registered code ranges, which multiplied this
+/// per-call sort cost right along with it. Callers now compare this counter
+/// against a cached "last-seen" value and skip the resnapshot/resort entirely
+/// when nothing changed (the overwhelmingly common case within one scan burst).
+static JIT_CODE_RANGES_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Current code-range-set generation. Callers that cache a sorted snapshot
+/// (e.g. `native_stack_has_jit_frame`'s thread-local buffer) can skip a
+/// resnapshot/resort when this hasn't advanced since their last read.
+pub fn jit_code_ranges_generation() -> u64 {
+    JIT_CODE_RANGES_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Register `[entry, entry+len)` → `cm_ptr` (the `Arc<CompiledMethod>` inner
 /// address). No-op for empty/zero ranges. Stage 5.
 pub fn register_jit_code_range(entry: usize, len: usize, cm_ptr: usize) {
@@ -817,6 +848,10 @@ pub fn register_jit_code_range(entry: usize, len: usize, cm_ptr: usize) {
     }
     if let Ok(mut v) = jit_code_ranges().lock() {
         v.push((entry, entry + len, cm_ptr));
+        // Release: any cached snapshot taken with Acquire after this point must
+        // see the push above (ordinary Mutex unlock already provides this, but
+        // the counter itself is read outside the lock by cache-check callers).
+        JIT_CODE_RANGES_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -829,6 +864,7 @@ pub fn unregister_jit_code_range(entry: usize) {
     }
     if let Ok(mut v) = jit_code_ranges().lock() {
         v.retain(|&(e, _, _)| e != entry);
+        JIT_CODE_RANGES_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 

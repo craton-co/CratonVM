@@ -450,14 +450,44 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
       - pre-fix (dev tip before this fix): **9/15 hangs (60%)**
       - post-fix (this commit): **4/15 hangs (27%)**
     A real, substantial, cleanly-measured improvement (~2.2x hang-rate reduction) — but **not a
-    full fix**. **Still OPEN**: a second, structurally different bottleneck remains. Post-fix
-    hot-thread captures now show sustained CPU-bound activity in `try_lambda_dispatch`
-    (`interpreter.rs`), specifically `shared.lambda_proxies.read()` — an `RwLock<HashMap<ClassId,
-    LambdaCallSite>>` consulted on *every* lambda/`invokedynamic` dispatch with no callsite-level
-    cache (unlike `invokevirtual`/`invokestatic`, which have exactly this kind of cache already).
-    Reactive-stream code is lambda-heavy (`.map`/`.flatMap`/subscriber callbacks per operator), so
-    this is plausibly a genuine architectural gap rather than a quick memoization fix — needs its
-    own investigation into whether invokedynamic call sites can get an analogous IC.
+    full fix**.
+
+    **Follow-up investigation (same day): checked whether `try_lambda_dispatch`'s
+    `shared.lambda_proxies.read()` is a second concentrated bottleneck of the same shape —
+    it is NOT, ruled out with quantified evidence.** The initial post-fix hot-thread capture that
+    first surfaced `lambda_proxies.read()` was one sample; before proposing the same
+    per-callsite-memoization fix again, gathered 41+ independent live captures across many
+    freshly-reproduced hangs (`sudo gdb -p <pid> --batch -ex bt`, `top -H` to identify the
+    genuinely CPU-bound thread first, catching each hang within seconds of it starting) and
+    tallied the leaf/near-leaf frames. Result: `lambda_proxies` appears in only **1 of 41+**
+    samples — statistically indistinguishable from noise, not a concentration. The actual
+    breakdown (28-sample batch): `hashbrown` hashmap probing 5, `parking_lot` lock/unlock spread
+    across *many different* locks (invoke-cache, resolution-cache, JIT profile counters, GC arena)
+    4, `mimalloc` allocator internals (`mi_page_malloc_zero`/`mi_block_set_next`) 3,
+    `Arc`/`Weak` drop (refcount decrement + dealloc) 3, `epoll_wait` (legitimate NIO selector
+    parks, not a bug — the thread is blocked waiting for I/O, not spinning) 2, `is_stale`
+    (invoke-cache redefine-generation check) 1, `SipHash finish()` 1. No single function
+    concentrates anywhere near the ~100%-of-samples signature `force_native_over_real_jdk_bytecode`
+    showed before its fix. This is a genuinely diffuse, distributed cost — general hashmap/hashing
+    overhead, allocator throughput, and many small independent lock acquisitions under a workload
+    that allocates and dispatches heavily (Reactor's operator chains create many short-lived
+    lambda/wrapper/Subscription objects; 76+ live threads by sub-test 6 means many threads paying
+    this simultaneously) — not a second missing-cache bug of the same shape as the two already
+    fixed. Did not implement a speculative `lambda_proxies` cache: the evidence does not support it
+    as worth the risk/complexity of touching more interpreter dispatch code for an expected marginal
+    (not measurable-with-confidence) return.
+
+    **Current status**: `ClientHttpConnectorTests` is measurably, substantially more reliable after
+    the two rounds of fixes above (9/15 → 4/15 clean hang rate) but not fully closed. The remaining
+    ~27% is consistent with the same "accumulated per-call interpreter dispatch/allocation overhead
+    compounding on method-call-heavy code" conclusion the 2026-07-13
+    `silent-hang-no-signature-cluster` investigation reached independently on a different test
+    class — this looks like the same underlying interpreter-throughput ceiling, not a
+    `ClientHttpConnectorTests`-specific bug. Closing it further needs a genuine interpreter/
+    allocator throughput initiative (e.g. profiling `mimalloc` allocation-path cost under this
+    object-churn pattern, or auditing the several distinct locks that showed up for reducible
+    contention individually), not another single-function fix — out of scope for a "residual"
+    investigation.
     Also unfixed: the T19.H1 watchdog stack-dump itself SIGSEGVs when JIT frames are on the stack
     (separate small bug; `--nojit` dumps work).
 *   ~~`web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` —
