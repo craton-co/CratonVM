@@ -9387,11 +9387,42 @@ fn native_arrays_sort_objects(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     }
 
     // Stable merge sort (O(n log n)) with fallible comparator.
-    merge_sort_fallible(ctx, &mut items, |c, a, b| compare_via_compare_to(c, a, b))?;
-
-    for (i, val) in items.iter().enumerate() {
-        ctx.set_array_element(arr, i, *val);
+    //
+    // GC-SAFETY (Family-1 stale-ObjectRef fix, mirroring native_collections_sort's
+    // established idiom): `compare_via_compare_to` dispatches the elements'
+    // `compareTo` via `invoke_virtual` up to O(n log n) times, and each dispatch
+    // can run arbitrary user bytecode and trigger a moving GC. `arr` was held
+    // raw across the whole sort and reused directly afterward by the
+    // `set_array_element` write-back loop below -- and every entry in `items`
+    // is a raw `ObjectRef` snapshot taken once before the sort and never
+    // refreshed, so a GC triggered by comparing any OTHER pair can relocate an
+    // element already sitting in `items`, leaving both the eventual write-back
+    // and the *next* `compare_via_compare_to` dispatch on that element
+    // operating on a stale/dangling reference. Pin `arr` and every element (via
+    // the same index-array trick as `native_collections_sort`, which keeps
+    // `items`/`elem_handles` index-stable while only the `idx` permutation is
+    // shuffled by the merge), refresh each right before use.
+    let arr_pin = ctx.pin_native_root(arr);
+    let (_, elem_handles) = pin_value_slice(ctx, &items);
+    let mut idx: Vec<Value> = (0..items.len() as i32).map(Value::Int).collect();
+    let sort_result = merge_sort_fallible(ctx, &mut idx, |c, a, b| {
+        let ia = if let Value::Int(v) = a { *v as usize } else { 0 };
+        let ib = if let Value::Int(v) = b { *v as usize } else { 0 };
+        let ea = read_pinned_elem(c, elem_handles[ia], items[ia]);
+        let eb = read_pinned_elem(c, elem_handles[ib], items[ib]);
+        compare_via_compare_to(c, &ea, &eb)
+    });
+    if let Err(e) = sort_result {
+        ctx.unpin_native_roots(arr_pin);
+        return Err(e);
     }
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    for (out, slot) in idx.iter().enumerate() {
+        let i = if let Value::Int(v) = slot { *v as usize } else { 0 };
+        let val = read_pinned_elem(ctx, elem_handles[i], items[i]);
+        ctx.set_array_element(arr, out, val);
+    }
+    ctx.unpin_native_roots(arr_pin);
     Ok(None)
 }
 
