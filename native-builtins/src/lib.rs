@@ -9003,7 +9003,25 @@ fn native_thread_get_context_class_loader(
     if let Some(Value::Object(Some(this))) = args.first() {
         match ctx.get_field_by_name(*this, "contextClassLoader") {
             Value::Object(Some(loader)) => {
-                return Ok(Some(Value::Object(Some(loader))));
+                // A stale/mis-slotted Thread field can contain an unrelated
+                // heap object (observed as String.findResources during
+                // Mockito plugin discovery). Never expose that as a loader:
+                // Java callers immediately virtual-dispatch on the result.
+                // Do not route this check through `Class.isInstance`: during
+                // early real-JDK bootstrap its mirror metadata can be stale
+                // enough to admit a String.  The VM's actual class hierarchy
+                // is the authoritative type relation here.
+                let is_loader = ctx
+                    .class_id_by_name("java/lang/ClassLoader")
+                    .map(|loader_class_id| {
+                        let actual_class_id = ctx.class_id_of_object(loader);
+                        actual_class_id == loader_class_id
+                            || ctx.is_subclass(actual_class_id, loader_class_id)
+                    })
+                    .unwrap_or(false);
+                if is_loader {
+                    return Ok(Some(Value::Object(Some(loader))));
+                }
             }
             _ => {
                 if thread_context_loader_is_explicit_null(ctx, *this) {
@@ -11463,6 +11481,103 @@ fn native_antlr_default_error_strategy_sync(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
+    Ok(None)
+}
+
+// ANTLR's inline recovery should classify EOF after a statement as a missing
+// delimiter when the sole expected token is that delimiter.  The interpreter
+// reaches the same recovery state but reports an InputMismatchException
+// instead, which prevents clients such as Hibernate's import-script listener
+// from turning the syntax error into their domain exception.  Keep the normal
+// ANTLR message for every other mismatch and correct only this EOF insertion
+// boundary.
+fn native_antlr_default_error_strategy_report_input_mismatch(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let strategy = obj_arg(args, 0)?;
+    let parser = obj_arg(args, 1)?;
+    let mismatch = obj_arg(args, 2)?;
+    let names = antlr_names_for_object(ctx, parser);
+    let prefix = if names.pc == GROOVY_ANTLR_PC {
+        "groovyjarjarantlr4/v4/runtime"
+    } else {
+        "org/antlr/v4/runtime"
+    };
+    let token_desc = format!("L{prefix}/Token;");
+    let interval_set_desc = format!("L{prefix}/misc/IntervalSet;");
+    let vocabulary_desc = format!("L{prefix}/Vocabulary;");
+    let recognition_desc = format!("L{prefix}/RecognitionException;");
+
+    let offending = match ctx.invoke_virtual(
+        mismatch,
+        "getOffendingToken",
+        &format!("(){token_desc}"),
+        &[],
+    )? {
+        Some(Value::Object(Some(token))) => token,
+        _ => return Ok(None),
+    };
+    let expected = match ctx.invoke_virtual(
+        mismatch,
+        "getExpectedTokens",
+        &format!("(){interval_set_desc}"),
+        &[],
+    )? {
+        Some(Value::Object(Some(set))) => set,
+        _ => return Ok(None),
+    };
+    let token_type = match ctx.invoke_virtual(offending, "getType", "()I", &[])? {
+        Some(Value::Int(value)) => value,
+        _ => 0,
+    };
+    let expected_size = match ctx.invoke_virtual(expected, "size", "()I", &[])? {
+        Some(Value::Int(value)) => value,
+        _ => 0,
+    };
+    let vocabulary = match ctx.invoke_virtual(
+        parser,
+        "getVocabulary",
+        &format!("(){vocabulary_desc}"),
+        &[],
+    )? {
+        Some(Value::Object(Some(vocabulary))) => vocabulary,
+        _ => return Ok(None),
+    };
+    let expected_text = match ctx.invoke_virtual(
+        expected,
+        "toString",
+        &format!("({vocabulary_desc})Ljava/lang/String;"),
+        &[Value::Object(Some(vocabulary))],
+    )? {
+        Some(Value::Object(Some(text))) => ctx.read_string(text).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let token_text = match ctx.invoke_virtual(
+        strategy,
+        "getTokenErrorDisplay",
+        &format!("({token_desc})Ljava/lang/String;"),
+        &[Value::Object(Some(offending))],
+    )? {
+        Some(Value::Object(Some(text))) => ctx.read_string(text).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let message = if token_type == -1 && expected_size == 1 {
+        format!("missing {expected_text} at {token_text}")
+    } else {
+        format!("mismatched input {token_text} expecting {expected_text}")
+    };
+    let message = ctx.create_string(&message);
+    ctx.invoke_virtual(
+        parser,
+        "notifyErrorListeners",
+        &format!("({token_desc}Ljava/lang/String;{recognition_desc})V"),
+        &[
+            Value::Object(Some(offending)),
+            Value::Object(Some(message)),
+            Value::Object(Some(mismatch)),
+        ],
+    )?;
     Ok(None)
 }
 
@@ -17840,7 +17955,13 @@ fn register_antlr_prediction_context_intrinsics(registry: &mut NativeMethodRegis
             &format!("({parser_desc})V"),
             native_antlr_default_error_strategy_sync,
         );
-
+        let mismatch_desc = format!("L{prefix}/InputMismatchException;");
+        registry.register(
+            &default_error_strategy,
+            "reportInputMismatch",
+            &format!("({parser_desc}{mismatch_desc})V"),
+            native_antlr_default_error_strategy_report_input_mismatch,
+        );
         let semantic_context = format!("{prefix}/atn/SemanticContext");
         let semantic_context_desc = format!("L{prefix}/atn/SemanticContext;");
         let semantic_combine_desc =
@@ -25573,6 +25694,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // JBoss Modules' Java-version gate can reach regex while Pattern/Matcher are
     // still synthetic stubs. Real-JDK mode drops these legacy layout natives via
     // `NativeMethodRegistry::set_drop_real_layout_synthetic`.
+    let regex_category = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     registry.register(
         "java/util/regex/Pattern",
         "compile",
@@ -25585,6 +25708,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;I)Ljava/util/regex/Pattern;",
         native_pattern_compile_flags,
     );
+    registry.set_category(regex_category);
     registry.register(
         "java/util/regex/Pattern",
         "matcher",
@@ -34427,12 +34551,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         native_juli_filehandler_clean,
     );
 
-    // KC26: Handler / ExtHandler / QuarkusDelayedHandler no-op stubs.
-    // These fire when our post-clinit fixup populates DELAYED_HANDLER with
-    // a synthetic object whose fields are all null. The close/flush/publish
-    // calls must not NPE on null internal arrays.
+    // KC26: ExtHandler / QuarkusDelayedHandler no-op stubs. These fire when
+    // our post-clinit fixup populates DELAYED_HANDLER with a synthetic object
+    // whose fields are all null. Do not register these on java.util.logging.Handler:
+    // native lookup is inherited by real FileHandler subclasses, where it would
+    // suppress their publish/flush bytecode and silently drop JULI output.
     for handler_class in &[
-        "java/util/logging/Handler",
         "org/jboss/logmanager/ExtHandler",
         "io/quarkus/bootstrap/logging/QuarkusDelayedHandler",
     ] {
@@ -35007,6 +35131,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "findResources",
         "(Ljava/lang/String;)Ljava/util/Enumeration;",
         classloader::ucl_find_resources,
+    );
+    registry.register(
+        "java/net/URLClassLoader",
+        "addURL",
+        "(Ljava/net/URL;)V",
+        classloader::ucl_add_url_real,
     );
     // URLClassLoader.findClass — the real bytecode resolves via the shimmed
     // `ucp` (URLClassPath) and so throws CNFE for everything. Serve it from the
@@ -37724,6 +37854,19 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     });
     registry.register(
         "java/util/logging/Handler",
+        "setLevel",
+        "(Ljava/util/logging/Level;)V",
+        |ctx, args| {
+            ctx.set_field_by_name(
+                obj_arg(args, 0)?,
+                "logLevel",
+                args.get(1).copied().unwrap_or(Value::Object(None)),
+            );
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/util/logging/Handler",
         "getLevel",
         "()Ljava/util/logging/Level;",
         |ctx, args| Ok(Some(ctx.get_field_by_name(obj_arg(args, 0)?, "logLevel"))),
@@ -37774,6 +37917,25 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
             }
             Ok(Some(Value::Int(1)))
         },
+    );
+    registry.register(
+        "java/util/logging/Handler",
+        "setFormatter",
+        "(Ljava/util/logging/Formatter;)V",
+        |ctx, args| {
+            ctx.set_field_by_name(
+                obj_arg(args, 0)?,
+                "formatter",
+                args.get(1).copied().unwrap_or(Value::Object(None)),
+            );
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/util/logging/Handler",
+        "getFormatter",
+        "()Ljava/util/logging/Formatter;",
+        |ctx, args| Ok(Some(ctx.get_field_by_name(obj_arg(args, 0)?, "formatter"))),
     );
     register_log4j_stacklocator_bridge(registry);
 
@@ -53035,13 +53197,76 @@ fn r3_br_pending_chars() -> &'static parking_lot::Mutex<std::collections::HashMa
 }
 
 fn native_pattern_compile(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_pattern_compile_cached(ctx, args, 0)
+}
+
+fn native_pattern_compile_flags(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let flags = match args.get(1) {
+        Some(Value::Int(f)) => *f,
+        _ => 0,
+    };
+    native_pattern_compile_cached(ctx, args, flags)
+}
+
+fn real_pattern_cache() -> &'static Mutex<std::collections::HashMap<(usize, String, i32), usize>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<(usize, String, i32), usize>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn native_pattern_compile_cached(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    flags: i32,
+) -> MethodCallResult {
     let source_obj = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Real JDK mode: construct through the actual private constructor once,
+    // then return the immutable Pattern from a moving-GC-aware global root.
+    if pattern_realjdk_field_indices(ctx).is_some() {
+        let source = ctx.read_string(source_obj).unwrap_or_default();
+        let key = (ctx.vm_identity(), source, flags);
+        if let Ok(cache) = real_pattern_cache().lock() {
+            if let Some(handle) = cache.get(&key) {
+                if let Some(pattern) = ctx.resolve_global_root(*handle) {
+                    return Ok(Some(Value::Object(Some(pattern))));
+                }
+            }
+        }
+        let pattern = ctx.new_object_initialized(
+            "java/util/regex/Pattern",
+            "(Ljava/lang/String;I)V",
+            &[Value::Object(Some(source_obj)), Value::Int(flags)],
+        )?;
+        if let Some(Value::Object(Some(pattern))) = pattern {
+            let root = ctx.add_global_root(pattern);
+            if root != 0 {
+                if let Ok(mut cache) = real_pattern_cache().lock() {
+                    // Bound the process-local cache; entries are per-VM and
+                    // Pattern is immutable, so evicting an old global root is
+                    // semantically invisible to callers.
+                    if cache.len() >= 1024 {
+                        if let Some((old_key, old_root)) = cache
+                            .iter()
+                            .find(|((vm, _, _), _)| *vm == key.0)
+                            .map(|(k, v)| (k.clone(), *v))
+                        {
+                            cache.remove(&old_key);
+                            let _ = ctx.remove_global_root(old_root);
+                        }
+                    }
+                    cache.insert(key, root);
+                }
+            }
+            return Ok(Some(Value::Object(Some(pattern))));
+        }
+        return Ok(pattern);
+    }
     // Validate the pattern compiles
     let source = ctx.read_string(source_obj).unwrap_or_default();
-    let _ = compile_java_regex(&source, 0)?;
+    let _ = compile_java_regex(&source, flags)?;
 
     // Allocate with the real `java/util/regex/Pattern` class_id so the
     // interpreter dispatcher knows the receiver's class — otherwise
@@ -53050,30 +53275,6 @@ fn native_pattern_compile(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // already-loaded id (no clinit side-effects); only force loading if
     // Pattern hasn't been touched yet; fall back to ClassId(0) on
     // failure.
-    let pat_cid = ctx
-        .class_id_by_name("java/util/regex/Pattern")
-        .or_else(|| ctx.ensure_class_initialized("java/util/regex/Pattern").ok())
-        .unwrap_or(cratonvm_types::ClassId::new(0));
-    let n = ctx.class_num_total_fields(pat_cid).max(PAT_NUM_FIELDS);
-    let pat = ctx.alloc_object(pat_cid, n);
-    ctx.set_field(pat, PAT_FIELD_SOURCE, Value::Object(Some(source_obj)));
-    ctx.set_field(pat, PAT_FIELD_FLAGS, Value::Int(0));
-    Ok(Some(Value::Object(Some(pat))))
-}
-
-fn native_pattern_compile_flags(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let source_obj = match args.first() {
-        Some(Value::Object(Some(r))) => *r,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let flags = match args.get(1) {
-        Some(Value::Int(f)) => *f,
-        _ => 0,
-    };
-    let source = ctx.read_string(source_obj).unwrap_or_default();
-    let _ = compile_java_regex(&source, flags)?;
-
-    // See `native_pattern_compile` for why we use the real Pattern class_id.
     let pat_cid = ctx
         .class_id_by_name("java/util/regex/Pattern")
         .or_else(|| ctx.ensure_class_initialized("java/util/regex/Pattern").ok())
@@ -66764,6 +66965,7 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
     let es = "java/util/concurrent/ExecutorService";
     let exec = "java/util/concurrent/Executors";
     let tp = "java/util/concurrent/ThreadPoolExecutor";
+    let aes = "java/util/concurrent/AbstractExecutorService";
     let tf = "java/util/concurrent/ThreadFactory";
 
     // Executors factory methods — return synthetic executor objects
@@ -66835,6 +67037,18 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         es,
+        "submit",
+        "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
+        native_es_submit_callable,
+    );
+    registry.register(
+        aes,
+        "submit",
+        "(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;",
+        native_es_submit_runnable,
+    );
+    registry.register(
+        aes,
         "submit",
         "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
         native_es_submit_callable,
@@ -66929,10 +67143,8 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         if let Some(Value::Object(Some(runnable))) = args.get(1) {
             ctx.invoke_virtual(*runnable, "run", "()V", &[])?;
         }
-        let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2);
         let result_val = args.get(2).copied().unwrap_or(Value::Object(None));
-        ctx.set_field(future, FUT_FIELD_RESULT, result_val);
-        ctx.set_field(future, FUT_FIELD_DONE, Value::Int(1));
+        let future = completed_executor_future(ctx, result_val)?;
         Ok(Some(Value::Object(Some(future))))
     };
     registry.register(
@@ -66947,6 +67159,12 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/Future;",
         submit_rt_closure,
     );
+    registry.register(
+        aes,
+        "submit",
+        "(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/Future;",
+        submit_rt_closure,
+    );
 
     // RD.6: invokeAll(Collection<Callable>) -> List<Future> — run sequentially.
     let invoke_all_closure = |ctx: &mut dyn NativeContext, args: &[Value]| -> MethodCallResult {
@@ -66956,58 +67174,34 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         };
         let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
         cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
-        let iter_val = ctx.invoke_virtual(coll, "iterator", "()Ljava/util/Iterator;", &[])?;
-        if let Some(Value::Object(Some(iter))) = iter_val {
-            loop {
-                let has_next = ctx.invoke_virtual(iter, "hasNext", "()Z", &[])?;
-                if has_next != Some(Value::Int(1)) {
-                    break;
-                }
-                let callable_val = ctx
-                    .invoke_virtual(iter, "next", "()Ljava/lang/Object;", &[])?
-                    .unwrap_or(Value::Object(None));
-                let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2);
-                if let Value::Object(Some(c)) = callable_val {
+        let task_count = match cratonvm_native_collections::native_al_size(
+            ctx,
+            &[Value::Object(Some(coll))],
+        )? {
+            Some(Value::Int(size)) => size,
+            _ => 0,
+        };
+        for index in 0..task_count {
+                let callable_val = cratonvm_native_collections::native_al_get(
+                    ctx,
+                    &[Value::Object(Some(coll)), Value::Int(index)],
+                )?
+                .unwrap_or(Value::Object(None));
+                let future = if let Value::Object(Some(c)) = callable_val {
                     match ctx.invoke_virtual(c, "call", "()Ljava/lang/Object;", &[]) {
-                        Ok(r) => {
-                            ctx.set_field(
-                                future,
-                                FUT_FIELD_RESULT,
-                                r.unwrap_or(Value::Object(None)),
-                            );
-                            ctx.set_field(future, FUT_FIELD_DONE, Value::Int(1));
-                        }
-                        Err(e) => {
-                            let t = cf_capture_throwable(ctx, &e);
-                            ctx.set_field(future, FUT_FIELD_RESULT, t);
-                            ctx.set_field(future, FUT_FIELD_DONE, Value::Int(2));
-                        }
+                        Ok(r) => completed_executor_future(ctx, r.unwrap_or(Value::Object(None)))?,
+                        Err(e) => failed_executor_future(ctx, &e)?,
                     }
                 } else {
-                    ctx.set_field(future, FUT_FIELD_DONE, Value::Int(1));
-                }
-                ctx.invoke_virtual(
-                    list,
-                    "add",
-                    "(Ljava/lang/Object;)Z",
-                    &[Value::Object(Some(future))],
+                    completed_executor_future(ctx, Value::Object(None))?
+                };
+                cratonvm_native_collections::native_al_add(
+                    ctx,
+                    &[Value::Object(Some(list)), Value::Object(Some(future))],
                 )?;
-            }
         }
         Ok(Some(Value::Object(Some(list))))
     };
-    registry.register(
-        es,
-        "invokeAll",
-        "(Ljava/util/Collection;)Ljava/util/List;",
-        invoke_all_closure,
-    );
-    registry.register(
-        tp,
-        "invokeAll",
-        "(Ljava/util/Collection;)Ljava/util/List;",
-        invoke_all_closure,
-    );
 
     // RD.6: invokeAny(Collection<Callable>) — returns the first successful result.
     let invoke_any_closure = |ctx: &mut dyn NativeContext, args: &[Value]| -> MethodCallResult {
@@ -67057,6 +67251,12 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/Collection;)Ljava/lang/Object;",
         invoke_any_closure,
     );
+    registry.register(
+        aes,
+        "invokeAny",
+        "(Ljava/util/Collection;)Ljava/lang/Object;",
+        invoke_any_closure,
+    );
 }
 
 // Executor = 2-field synthetic (field 0 = pool size, field 1 = shutdown flag)
@@ -67065,6 +67265,68 @@ const EXEC_FIELD_SHUTDOWN: usize = 1;
 // Future = 2-field synthetic (field 0 = result value, field 1 = done flag)
 pub(crate) const FUT_FIELD_RESULT: usize = 0;
 pub(crate) const FUT_FIELD_DONE: usize = 1;
+
+/// Executor compatibility paths run work inline. Return a real, completed
+/// `CompletableFuture` instead of a two-slot object carrying FutureTask's real
+/// class: concrete FutureTask methods execute JDK bytecode and cannot observe
+/// the placeholder fields.
+fn completed_executor_future(
+    ctx: &mut dyn NativeContext,
+    result: Value,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let future = match ctx.new_object_initialized("java/util/concurrent/CompletableFuture", "()V", &[])? {
+        Some(Value::Object(Some(future))) => future,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "could not allocate executor completion future".to_string(),
+            }
+            .into())
+        }
+    };
+    ctx.invoke_virtual(
+        future,
+        "complete",
+        "(Ljava/lang/Object;)Z",
+        &[result],
+    )?;
+    Ok(future)
+}
+
+fn failed_executor_future(
+    ctx: &mut dyn NativeContext,
+    error: &MethodCallFailed,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let future = match ctx.new_object_initialized("java/util/concurrent/CompletableFuture", "()V", &[])? {
+        Some(Value::Object(Some(future))) => future,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "could not allocate executor completion future".to_string(),
+            }
+            .into())
+        }
+    };
+    let message = ctx.create_string(&format!("{error}"));
+    let throwable = match ctx.new_object_initialized(
+        "java/lang/RuntimeException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(message))],
+    )? {
+        Some(Value::Object(Some(throwable))) => throwable,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "could not allocate executor failure throwable".to_string(),
+            }
+            .into())
+        }
+    };
+    ctx.invoke_virtual(
+        future,
+        "completeExceptionally",
+        "(Ljava/lang/Throwable;)Z",
+        &[Value::Object(Some(throwable))],
+    )?;
+    Ok(future)
+}
 
 fn native_new_single_thread(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let exec = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
@@ -67092,54 +67354,20 @@ fn native_new_cached_pool(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
 }
 
 fn native_es_submit_runnable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // A genuinely-real ThreadPoolExecutor (e.g. one `new`'d directly by app
-    // code, or the internal async worker pool below) shares this exact class
-    // name with CratonVM's synthetic 2-field placeholder — dispatch straight
-    // to its real bytecode instead of the single-threaded synthetic model, via
-    // `invoke_virtual_bytecode_only` (plain `invoke_virtual` would recurse
-    // back into this same native). See that method's doc for the rationale.
-    if let Some(Value::Object(Some(this))) = args.first() {
-        if executor_has_real_workers(ctx, *this) {
-            return ctx.invoke_virtual_bytecode_only(
-                *this,
-                "submit",
-                "(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;",
-                &args[1..],
-            );
-        }
-    }
     // Execute the Runnable immediately (single-threaded model)
     if let Some(Value::Object(Some(runnable))) = args.get(1) {
         let _ = ctx.invoke_virtual(*runnable, "run", "()V", &[]);
     }
-    let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2);
-    ctx.set_field(future, FUT_FIELD_RESULT, Value::Object(None));
-    ctx.set_field(future, FUT_FIELD_DONE, Value::Int(1));
+    let future = completed_executor_future(ctx, Value::Object(None))?;
     Ok(Some(Value::Object(Some(future))))
 }
 
 fn native_es_submit_callable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // See `native_es_submit_runnable` above — same real-vs-synthetic split.
-    if let Some(Value::Object(Some(this))) = args.first() {
-        if executor_has_real_workers(ctx, *this) {
-            return ctx.invoke_virtual_bytecode_only(
-                *this,
-                "submit",
-                "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
-                &args[1..],
-            );
-        }
-    }
-    let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2);
+    let mut result = Value::Object(None);
     if let Some(Value::Object(Some(callable))) = args.get(1) {
-        let result = ctx.invoke_virtual(*callable, "call", "()Ljava/lang/Object;", &[])?;
-        ctx.set_field(
-            future,
-            FUT_FIELD_RESULT,
-            result.unwrap_or(Value::Object(None)),
-        );
+        result = ctx.invoke_virtual(*callable, "call", "()Ljava/lang/Object;", &[])?.unwrap_or(Value::Object(None));
     }
-    ctx.set_field(future, FUT_FIELD_DONE, Value::Int(1));
+    let future = completed_executor_future(ctx, result)?;
     Ok(Some(Value::Object(Some(future))))
 }
 

@@ -15878,7 +15878,8 @@ pub(crate) fn aastore_element_assignable(
 // ---------------------------------------------------------------------------
 
 /// WP2.5 — walks the superclass chain of `class_id` looking for
-/// `java/lang/reflect/Proxy$Instance`. Returns `true` if found within
+/// `java/lang/reflect/Proxy$Instance` or the real-JDK
+/// `java/lang/reflect/Proxy` base class. Returns `true` if found within
 /// `MAX_DEPTH` hops.
 ///
 /// Used by the cast/instanceof and dispatch hooks below to extend their
@@ -15895,9 +15896,10 @@ pub(crate) fn aastore_element_assignable(
 /// `load_class("Proxy$Instance")` on the slow path. Walking by name is
 /// simpler, lock-scoped, and depth-bounded against pathological cycles
 /// in user-loaded class graphs.
-fn class_chain_reaches_proxy_instance(shared: &SharedVm, class_id: ClassId) -> bool {
+pub(crate) fn class_chain_reaches_proxy_instance(shared: &SharedVm, class_id: ClassId) -> bool {
     const MAX_DEPTH: usize = 32;
     const PROXY_INSTANCE: &str = "java/lang/reflect/Proxy$Instance";
+    const REAL_PROXY_BASE: &str = "java/lang/reflect/Proxy";
 
     let cm = shared.class_manager.read();
     let mut current = Some(class_id);
@@ -15910,7 +15912,7 @@ fn class_chain_reaches_proxy_instance(shared: &SharedVm, class_id: ClassId) -> b
             Some(c) => c,
             None => return false,
         };
-        if &*class.name == PROXY_INSTANCE {
+        if &*class.name == PROXY_INSTANCE || &*class.name == REAL_PROXY_BASE {
             return true;
         }
         // Stop early once we hit Object — Proxy$Instance sits below it
@@ -18856,13 +18858,11 @@ fn execute_invoke_kind(
         return res;
     }
 
-    // `URLClassLoader.findClass` called from inside a subclass override (e.g.
-    // Jasper's `JasperLoader.loadClass` → `findClass`) names the subclass in its
-    // CP methodref, so the static-class force-native gate above misses it. Force
-    // `ucl_find_class` when the resolved declaring class is `URLClassLoader`
-    // (the real bytecode's shimmed `ucp` would otherwise throw CNF for every
-    // runtime-compiled JSP servlet).
-    if let Some(res) = intercept_urlclassloader_subclass_find_class(
+    // Inherited URLClassLoader methods invoked through a subclass-owned
+    // constant-pool entry evade the static-class native gate.  Intercept the
+    // resolved base methods so real-JDK URLClassPath shims never discard local
+    // resources or custom URLStreamHandler-backed URLs.
+    if let Some(res) = intercept_urlclassloader_subclass_native_method(
         shared,
         thread,
         frame_idx,
@@ -24396,6 +24396,50 @@ fn force_native_over_real_jdk_bytecode(
     matches!(
         (class_name, method_name, method_descriptor),
         ("java/lang/ClassLoader", "setDefaultAssertionStatus", "(Z)V")
+            // ServiceLoader-based JDK facilities (including AttachProvider)
+            // obtain their loader through Class.getClassLoader().  The real
+            // body reads host-layout fields, while CratonVM's native validates
+            // and returns the VM-owned loader; without this override a stale
+            // String-shaped slot reaches ClassLoader.findResources.
+            | ("java/lang/Class", "getClassLoader", "()Ljava/lang/ClassLoader;")
+            // Startup javaagents receive a real-JDK
+            // sun.instrument.InstrumentationImpl.  Its constructor calls
+            // VM-private initialization that CratonVM does not expose; the
+            // registered constructor is intentionally a no-op because the
+            // observable Instrumentation operations are supplied by our
+            // native bridge.  It must therefore beat the real bytecode just
+            // like the other layout-backed native overrides in this table.
+            | (
+                "sun/instrument/InstrumentationImpl",
+                "<init>",
+                "(JLjava/lang/String;ZZ)V",
+            )
+            | (
+                "java/lang/Thread",
+                "getContextClassLoader",
+                "()Ljava/lang/ClassLoader;",
+            )
+            | (
+                "java/lang/Thread",
+                "setContextClassLoader",
+                "(Ljava/lang/ClassLoader;)V",
+            )
+            | (
+                "com/sun/tools/attach/VirtualMachine",
+                "attach",
+                "(Ljava/lang/String;)Lcom/sun/tools/attach/VirtualMachine;",
+            )
+            | (
+                "com/sun/tools/attach/VirtualMachine",
+                "loadAgent",
+                "(Ljava/lang/String;Ljava/lang/String;)V",
+            )
+            | (
+                "com/sun/tools/attach/VirtualMachine",
+                "loadAgent",
+                "(Ljava/lang/String;)V",
+            )
+            | ("com/sun/tools/attach/VirtualMachine", "detach", "()V")
             | (
                 "java/lang/ClassLoader",
                 "loadClass",
@@ -24638,7 +24682,7 @@ fn force_native_over_real_jdk_bytecode(
         // delegates to the base classpath (where `<init>` already registered the
         // loader's URLs), matching HotSpot.
         || (class_name == "java/net/URLClassLoader"
-            && (matches!(method_name, "findClass" | "findResource" | "findResources")
+            && (matches!(method_name, "findClass" | "findResource" | "findResources" | "addURL")
                 || (method_name == "<init>"
                     && matches!(
                         method_descriptor,
@@ -24850,6 +24894,41 @@ fn intercept_force_registered_native(
     method_descriptor: &str,
     args: &[Value],
 ) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    // `Class.getClassLoader()` is a concrete JDK method, but Class mirrors in
+    // this VM use an internal layout and their real `classLoader` field can be
+    // a stale non-loader object.  Dispatch by the receiver's *runtime* class
+    // before the normal declaring-class gate: JDK calls reached through an
+    // inherited/cached method reference can otherwise bypass the static
+    // allowlist and hand ServiceLoader a String as its loader.
+    if method_name == "getClassLoader"
+        && method_descriptor == "()Ljava/lang/ClassLoader;"
+        && matches!(
+            args.first(),
+            Some(Value::Object(Some(receiver))) if {
+                let receiver_cid = shared.heap.class_id_of(*receiver);
+                shared
+                    .class_manager
+                    .read()
+                    .get_class(receiver_cid)
+                    .map(|class| &*class.name == "java/lang/Class")
+                    .unwrap_or(false)
+            }
+        )
+    {
+        let callback = shared.native_methods.find(
+            "java/lang/Class",
+            "getClassLoader",
+            "()Ljava/lang/ClassLoader;",
+        )?;
+        return Some((|| {
+            let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
+            if let Some(value) = result {
+                push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
+                crate::vm::native_return_pushed_to_stack(shared, thread);
+            }
+            Ok(CachedCallResult::Handled)
+        })());
+    }
     if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
         eprintln!(
             "[ccs-probe] intercept_force_registered_native: class={} method={}{} \
@@ -25095,7 +25174,7 @@ fn intercept_jython_pymodule_findattr(
 /// native via the `declaring_name`-keyed `force_native_over_real_jdk_bytecode`
 /// entry, so repeat dispatches stay native too.
 #[inline]
-fn intercept_urlclassloader_subclass_find_class(
+fn intercept_urlclassloader_subclass_native_method(
     shared: &SharedVm,
     thread: &mut JvmThread,
     frame_idx: usize,
@@ -25106,8 +25185,11 @@ fn intercept_urlclassloader_subclass_find_class(
     args: &[Value],
 ) -> Option<Result<CachedCallResult, MethodCallFailed>> {
     if is_special
-        || method_name != "findClass"
-        || method_descriptor != "(Ljava/lang/String;)Ljava/lang/Class;"
+        || !matches!(
+            (method_name, method_descriptor),
+            ("findClass", "(Ljava/lang/String;)Ljava/lang/Class;")
+                | ("addURL", "(Ljava/net/URL;)V")
+        )
     {
         return None;
     }
@@ -27780,8 +27862,8 @@ fn compile_osr_artifact(
                         // `build_helpers` — which registers the jit-crate
                         // atomic — only AFTER this construction block, so the
                         // first OSR compile in a process would read 0 there.)
-                        let entry = crate::jit::helpers::jit_integer_value_of_direct
-                            as *const () as usize;
+                        let entry =
+                            crate::jit::helpers::jit_integer_value_of_direct as *const () as usize;
                         direct_calls2.push((
                             pc,
                             crate::jit::JitDirectCall {
@@ -27803,8 +27885,8 @@ fn compile_osr_artifact(
                         && mn == "intValue"
                         && desc == "()I"
                     {
-                        let entry = crate::jit::helpers::jit_integer_int_value_direct
-                            as *const () as usize;
+                        let entry =
+                            crate::jit::helpers::jit_integer_int_value_direct as *const () as usize;
                         direct_calls2.push((
                             pc,
                             crate::jit::JitDirectCall {
@@ -30845,6 +30927,37 @@ fn background_compile_task(
     if crate::classloading::any_class_redefined() {
         return fail(0);
     }
+    // Keep asynchronous tiering aligned with the foreground admission paths.
+    // Without this gate, methods rejected by the conservative skip list are
+    // repeatedly queued by the tier manager. The final compiler gate then
+    // declines each task, but the hot interpreter path keeps paying for the
+    // failed background attempts. Hibernate's package-level fail-closed
+    // policy made that retry loop large enough to turn ordinary suite classes
+    // into timeout candidates.
+    let policy = if shared.config.jit_aggressive_compilation {
+        crate::jit::skip_list::SkipPolicy::Aggressive
+    } else {
+        crate::jit::skip_list::SkipPolicy::Conservative
+    };
+    let is_interface_default = {
+        let cm = shared.class_manager.read();
+        cm.get_loaded_class_id(&task.method_key.class_name)
+            .and_then(|id| cm.get_class(id))
+            .map_or(false, |class| class.is_interface())
+    };
+    if crate::jit::skip_list::should_skip_jit_with_init(
+        &task.method_key.class_name,
+        &task.method_key.method_name,
+        is_interface_default,
+        std::thread::current().name().is_some(),
+        policy,
+        crate::jit::skip_list::allow_packages_from_env(),
+        crate::jit::skip_list::InitComplexity::Unknown,
+    )
+    .is_some()
+    {
+        return fail(0);
+    }
     if task.osr_bci.is_some() && crate::jit::tiered::is_osr_denied(&task.method_key) {
         return fail(0);
     }
@@ -32719,9 +32832,11 @@ fn execute_invokevirtual_vtable_fast(
             // `findClass` (runtime-compiled `org.apache.jsp.*_jsp`) is the
             // canonical case. Only when the receiver inherits (does not override)
             // `findClass` — checked via the resolved declaring class.
-            if &*method_name == "findClass"
-                && &*method_descriptor == "(Ljava/lang/String;)Ljava/lang/Class;"
-                && &**rcv_name != "java/net/URLClassLoader"
+            if matches!(
+                (&*method_name, &*method_descriptor),
+                ("findClass", "(Ljava/lang/String;)Ljava/lang/Class;")
+                    | ("addURL", "(Ljava/net/URL;)V")
+            ) && &**rcv_name != "java/net/URLClassLoader"
                 && crate::classloading::find_method_recursive(
                     receiver_class_id,
                     &method_name,

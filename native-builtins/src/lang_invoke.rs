@@ -5135,6 +5135,38 @@ pub(crate) const MH_KIND_CATCH: i32 = 21;
 /// reproduces it standalone, no Spring needed.
 pub(crate) const MH_KIND_RETURN_FILTER: i32 = 22;
 
+/// `MethodHandles.collectArguments(target, pos, filter)` adapter. Distinct
+/// from `MH_KIND_COLLECT` (`MethodHandle.asCollector`, which SPREADS one
+/// trailing array argument into N individual target params -- the inverse
+/// direction) and from `MH_KIND_FOLD` (`foldArguments`, which also runs a
+/// combiner over a slice of args at `pos` but SPLICES its result in ADDITION
+/// to -- not instead of -- the full original arg list). `collectArguments`
+/// consumes `filter.type().parameterCount()` args starting at `pos` by
+/// calling `filter` on them, then REPLACES that consumed range with filter's
+/// single (non-void) result before dispatching `target` -- the args outside
+/// the consumed range pass through unchanged, but the consumed ones do not
+/// reappear. Was previously a complete no-op stub (returned `target`
+/// unmodified, silently dropping `pos`/`filter` entirely) -- same failure
+/// shape as the `filterReturnValue` no-op bug fixed earlier in this
+/// investigation (commit `3af9ab62`). Confirmed live via
+/// `CRATONVM_DBG_MH_DISPATCH` tracing + `javap` decompile of the real
+/// `com.headius.invokebinder-1.14.jar`'s `Binder.collect(int, int, Class,
+/// MethodHandle)`, which JRuby 10.x's `BuildDynamicStringSite` uses (via
+/// `MethodHandles.collectArguments` under the hood) to reduce each
+/// `(ThreadContext, IRubyObject)` pair produced by an earlier
+/// `MethodHandles.permuteArguments` step (itself correct -- verified against
+/// real, unmodified invokebinder bytecode computing an intentional
+/// `[0, 0, 1, ...]`-shaped "ctx-per-dynamic-value" reorder array) down to a
+/// single `to_s`-guarded `IRubyObject`. With the no-op stub, that reduction
+/// never happened: the duplicated `ThreadContext` from the permute step
+/// survived unchanged all the way to `BuildDynamicStringSite.buildString`,
+/// landing in the argument slot its `IRubyObject` parameter expects, and
+/// `RubyString.append`/`appendAsStringOrAny` threw `ClassCastException:
+/// ThreadContext cannot be cast to IRubyObject` -- reached via
+/// `JRubyScriptTemplateTests`'s `require 'ostruct'` (`ostruct.rb:477`,
+/// string interpolation in `OpenStruct`'s class body).
+pub(crate) const MH_KIND_COLLECT_ARGS: i32 = 23;
+
 // ---------------------------------------------------------------------------
 // Round-9 perf: LambdaMetafactory CallSite cache.
 // ---------------------------------------------------------------------------
@@ -5767,6 +5799,101 @@ fn mh_dispatch_fold(
     mh_dispatch(ctx, target, &full)
 }
 
+/// Construct a `MethodHandles.collectArguments(target, pos, filter)` adapter
+/// (`MH_KIND_COLLECT_ARGS`). Mirrors `make_fold_adapter`'s wrapper shape
+/// (target, combiner/filter, pos) -- only the DISPATCH-time splicing differs
+/// (replace vs. splice-in-addition; see `MH_KIND_COLLECT_ARGS`'s doc
+/// comment).
+fn make_collect_args_adapter(
+    ctx: &mut dyn NativeContext,
+    target: Option<Value>,
+    pos: i32,
+    filter: Option<Value>,
+) -> MethodCallResult {
+    let target = match target {
+        Some(Value::Object(Some(t))) => t,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let filter_ref = match filter {
+        Some(Value::Object(Some(f))) => f,
+        // No filter → behave like the bare target.
+        _ => return Ok(Some(Value::Object(Some(target)))),
+    };
+    // GC-safety: `alloc_concurrent_synthetic`/`alloc_method_handle` below
+    // can trigger a collection that relocates `target`/`filter_ref`/
+    // `wrapper` (each captured/produced above and read again after a later
+    // allocation); pin them and re-read the forwarded references before
+    // each use.
+    let target_pin = ctx.pin_native_root(target);
+    let filter_pin = ctx.pin_native_root(filter_ref);
+    let wrapper = alloc_concurrent_synthetic(ctx, "__mh_collect_args_wrapper__", 3);
+    let wrapper_pin = ctx.pin_native_root(wrapper);
+    let target = ctx.read_native_pin(target_pin, target);
+    let filter_ref = ctx.read_native_pin(filter_pin, filter_ref);
+    ctx.set_field(wrapper, 0, Value::Object(Some(target)));
+    ctx.set_field(wrapper, 1, Value::Object(Some(filter_ref)));
+    ctx.set_field(wrapper, 2, Value::Int(pos));
+    let desc = mh_type_descriptor(ctx, target)
+        .or_else(|| mh_read_desc(ctx, target))
+        .unwrap_or_default();
+    let adapter = alloc_method_handle(ctx, "__adapter__", "collectargs", &desc, MH_KIND_COLLECT_ARGS);
+    let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
+    ctx.unpin_native_roots(target_pin);
+    ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
+    Ok(Some(Value::Object(Some(adapter))))
+}
+
+/// `MethodHandles.collectArguments` dispatch (`MH_KIND_COLLECT_ARGS`). The
+/// filter consumes `filter.parameterCount()` args starting at `pos`; a
+/// non-void result REPLACES that consumed range (unlike `foldArguments`,
+/// which keeps the full original list and splices the combiner's result in
+/// ADDITION to it) before the target runs.
+fn mh_dispatch_collect_args(
+    ctx: &mut dyn NativeContext,
+    bound: Value,
+    extra_args: &[Value],
+) -> MethodCallResult {
+    let wrapper = match bound {
+        Value::Object(Some(w)) => w,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let target = match ctx.get_field(wrapper, 0) {
+        Value::Object(Some(t)) => t,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let filter = match ctx.get_field(wrapper, 1) {
+        Value::Object(Some(f)) => f,
+        _ => return mh_dispatch(ctx, target, extra_args),
+    };
+    let pos = match ctx.get_field(wrapper, 2) {
+        Value::Int(p) => (p as usize).min(extra_args.len()),
+        _ => 0,
+    };
+    // The filter consumes `filter.parameterCount()` args starting at `pos`.
+    let fdesc = mh_type_descriptor(ctx, filter)
+        .or_else(|| mh_read_desc(ctx, filter))
+        .unwrap_or_default();
+    let (fparams, fret) = split_descriptor_params(&fdesc).unwrap_or_default();
+    let take = fparams.len().min(extra_args.len().saturating_sub(pos));
+    let filter_args: Vec<Value> = extra_args[pos..pos + take].to_vec();
+    // GC-safety: this recursive `mh_dispatch` call can trigger a collection
+    // that relocates `target` (captured above and dispatched again below);
+    // pin it and re-read the forwarded reference before its final use.
+    let target_pin = ctx.pin_native_root(target);
+    let filtered = mh_dispatch(ctx, filter, &filter_args)?;
+    let target = ctx.read_native_pin(target_pin, target);
+    ctx.unpin_native_roots(target_pin);
+    // Replace the consumed [pos, pos+take) range with the filter's non-void
+    // result (a void filter just consumes the range, contributing nothing).
+    let mut full: Vec<Value> = Vec::with_capacity(extra_args.len());
+    full.extend_from_slice(&extra_args[..pos]);
+    if fret != "V" {
+        full.push(filtered.unwrap_or(Value::Object(None)));
+    }
+    full.extend_from_slice(&extra_args[pos + take..]);
+    mh_dispatch(ctx, target, &full)
+}
+
 fn mh_exception_matches(
     ctx: &dyn NativeContext,
     thrown: cratonvm_types::ObjectRef,
@@ -6163,13 +6290,22 @@ pub(crate) fn mh_dispatch(
             };
             let reorder_len = ctx.array_length(reorder_arr);
             let mut permuted_args = Vec::with_capacity(reorder_len);
+            let mut reorder_vals: Vec<i32> = Vec::with_capacity(reorder_len);
             for i in 0..reorder_len {
                 let idx = match ctx.get_array_element(reorder_arr, i) {
                     Value::Int(v) => v as usize,
                     _ => i,
                 };
+                reorder_vals.push(idx as i32);
                 let val = extra_args.get(idx).copied().unwrap_or(Value::Object(None));
                 permuted_args.push(val);
+            }
+            if std::env::var_os("CRATONVM_DBG_MH_DISPATCH").is_some() {
+                let target_desc = mh_read_desc(ctx, target_mh).unwrap_or_default();
+                eprintln!(
+                    "[MH_PERMUTE] reorder={reorder_vals:?} extra_args_len={} target_desc={target_desc:?}",
+                    extra_args.len()
+                );
             }
             mh_dispatch(ctx, target_mh, &permuted_args)
         }
@@ -6554,6 +6690,7 @@ pub(crate) fn mh_dispatch(
         }
         MH_KIND_FILTER => mh_dispatch_filter(ctx, bound, extra_args),
         MH_KIND_FOLD => mh_dispatch_fold(ctx, bound, extra_args),
+        MH_KIND_COLLECT_ARGS => mh_dispatch_collect_args(ctx, bound, extra_args),
         MH_KIND_CATCH => mh_dispatch_catch(ctx, bound, extra_args),
         MH_KIND_RETURN_FILTER => mh_dispatch_return_filter(ctx, bound, extra_args),
         MH_KIND_INVOKER => {
@@ -6672,6 +6809,22 @@ pub(crate) fn mh_dispatch(
                             .map(|(i, arg)| read_pinned_mh_arg(ctx, adapted_handles[i], *arg))
                             .collect();
                         let receiver = ctx.read_native_pin(recv_pin, receiver);
+                        if std::env::var_os("CRATONVM_DBG_MH_DISPATCH").is_some() {
+                            let last_desc = match adapted.last() {
+                                Some(Value::Object(Some(o))) if ctx.object_is_array(*o) => {
+                                    format!("array[len={}]", ctx.array_length(*o))
+                                }
+                                Some(Value::Object(Some(_))) => "obj".to_string(),
+                                Some(Value::Object(None)) => "null".to_string(),
+                                Some(other) => format!("{other:?}"),
+                                None => "<none>".to_string(),
+                            };
+                            eprintln!(
+                                "[MH_VIRTUAL_ADAPTED] class={class} name={name} desc={desc:?} collected_len={} adapted_len={} last={last_desc}",
+                                collected.len(),
+                                adapted.len()
+                            );
+                        }
                         let mut full_args = Vec::with_capacity(1 + adapted.len());
                         full_args.push(Value::Object(Some(receiver)));
                         full_args.extend_from_slice(&adapted);
@@ -7183,23 +7336,32 @@ fn collect_trailing_varargs(
     params: &[Value],
 ) -> Vec<Value> {
     // Cheap pre-checks BEFORE the allocating `declared_methods` lookup, so the
-    // hot path (every static/virtual MethodHandle dispatch — Groovy/Gradle/
+    // hot path (every static/virtual MethodHandle dispatch -- Groovy/Gradle/
     // Jackson/SpEL-compiled) pays only a descriptor parse, not a full
     // declared-methods scan.
     let (ptypes, _) = crate::lang_class::parse_descriptor_param_and_return(desc);
     let p = ptypes.len();
-    let last = match ptypes.last() {
-        // Varargs ALWAYS has an array as its last parameter; if not, this can't
-        // be a varargs collection — return untouched.
-        Some(t) if t.starts_with('[') => t.clone(),
-        _ => return params.to_vec(),
+    // Locate the array-typed parameter. Real JDK varargs requires it to be
+    // the syntactically LAST parameter (JLS) -- but JRuby's Ruby-call
+    // convention routinely appends a trailing `Block` parameter AFTER the
+    // args array (e.g. `InvokeSite#invoke(ThreadContext, IRubyObject caller,
+    // IRubyObject self, IRubyObject[] args, Block)`), so search for the
+    // array anywhere in the descriptor rather than assuming index `p - 1`.
+    let array_idx = match ptypes.iter().position(|t| t.starts_with('[')) {
+        Some(idx) => idx,
+        // No array parameter at all -- this can't be a varargs/collect
+        // target, return untouched.
+        None => return params.to_vec(),
     };
-    // Already packed: exactly P args and the trailing one is an array (or null).
-    // Covers a correct `invokeExact`/pre-packed call AND e.g.
-    // `#formatPrimitiveVarargs('fmt', new int[]{1})`. No collection needed
-    // regardless of varargs-ness, so skip the method-table lookup entirely.
+    let last = ptypes[array_idx].clone();
+    let trailing_types = &ptypes[array_idx + 1..];
+    // Already packed: exactly P args and the array-position value is itself
+    // an array (or null). Covers a correct `invokeExact`/pre-packed call AND
+    // e.g. `#formatPrimitiveVarargs('fmt', new int[]{1})`. No collection
+    // needed regardless of varargs-ness, so skip the method-table lookup
+    // entirely.
     if params.len() == p {
-        match params.last() {
+        match params.get(array_idx) {
             Some(Value::Object(Some(arr))) if ctx.object_is_array(*arr) => return params.to_vec(),
             Some(Value::Object(None)) => return params.to_vec(),
             _ => {}
@@ -7214,10 +7376,10 @@ fn collect_trailing_varargs(
     //     dispatch, ...). This was the ONLY trigger originally.
     //
     //  2. `params.len() > p` -- MORE flat argument values were supplied than
-    //     the target descriptor declares params for, and the last declared
-    //     param is an array type. This covers a target method whose trailing
-    //     array parameter is an ORDINARY (non-varargs) `T[]` -- e.g. JRuby
-    //     10.x's `org.jruby.ir.targets.indy.InvokeSite`/`NormalInvokeSite
+    //     the target descriptor declares params for, and SOME declared param
+    //     is an array type. This covers a target method whose array
+    //     parameter is an ORDINARY (non-varargs) `T[]` -- e.g. JRuby 10.x's
+    //     `org.jruby.ir.targets.indy.InvokeSite`/`NormalInvokeSite
     //     .invoke(ThreadContext, IRubyObject, IRubyObject, IRubyObject[],
     //     Block)` (confirmed via `javap` -- both real overloads take a plain
     //     array, neither is declared `IRubyObject...`, so ACC_VARARGS is
@@ -7228,8 +7390,8 @@ fn collect_trailing_varargs(
     //     `pos` -- verified by direct value tracing, not the bug) and never
     //     calls `MethodHandle.asCollector`/anything else that would pack
     //     them -- so by the time dispatch reaches the target method's own
-    //     descriptor, arity strictly exceeds the declared param count with a
-    //     trailing array type declared. In a signature-polymorphic
+    //     descriptor, arity strictly exceeds the declared param count with
+    //     an array type declared somewhere in it. In a signature-polymorphic
     //     MethodHandle-mediated call this arity/type mismatch has exactly
     //     one legal resolution (collect the excess into the array); passing
     //     the excess through flat/unchanged (the old behavior) desyncs
@@ -7250,20 +7412,81 @@ fn collect_trailing_varargs(
         .iter()
         .any(|m| m.name == name && m.descriptor == desc && (m.access_flags & 0x0080) != 0);
     let arity_excess = params.len() > p;
-    if !is_varargs && !arity_excess {
+    // A second, narrower trigger alongside `arity_excess`: EXACTLY `p` args
+    // were supplied (no excess) but the value that naively lands at the
+    // array's declared position isn't itself an array (or null) -- a bare
+    // scalar sitting in an array-typed descriptor slot. Confirmed via the
+    // SAME `JRubyScriptTemplateTests` trace as `arity_excess` above: right
+    // after the `.sub()` call's 6-flat-args case (fixed by `arity_excess`),
+    // the very next call in the same chain --
+    // `org.jruby.ir.targets.indy.SelfInvokeSite.invoke(ThreadContext,
+    // IRubyObject, IRubyObject[], Block)` -- arrived with exactly 4 flat
+    // args (matching `p` exactly) where the array-typed 3rd param held a
+    // single bare `IRubyObject` instead of a 1-element array, later
+    // surfacing as `ArgumentError: wrong number of arguments (given 0,
+    // expected 1)` inside the interpreted Ruby method `checkArity` found it
+    // was calling. A single supplied value destined for a 1-element array
+    // needs the exact same wrap-into-array treatment as an excess of
+    // supplied values, just with `excess == 0`.
+    let array_slot_is_wrapped = match params.get(array_idx) {
+        Some(Value::Object(Some(arr))) => ctx.object_is_array(*arr),
+        Some(Value::Object(None)) => true,
+        _ => false,
+    };
+    let scalar_needs_wrap = params.len() == p && !array_slot_is_wrapped;
+    if !is_varargs && !arity_excess && !scalar_needs_wrap {
         return params.to_vec();
     }
-    let fixed = p - 1;
-    if params.len() < fixed {
-        // Fewer args than the leading fixed params — let `invoke` surface the
-        // arity error rather than fabricate a result.
+    if params.len() < array_idx + trailing_types.len() {
+        // Fewer args than the leading-fixed + trailing-fixed params could
+        // ever accommodate -- let `invoke` surface the arity error rather
+        // than fabricate a result.
         return params.to_vec();
     }
+    // The tail region (`params[array_idx..]`) needs to split into "values
+    // that collect into the array" and "values that satisfy the trailing
+    // fixed params declared AFTER the array" (e.g. a trailing `Block`). A
+    // naive positional split (last N values = trailing fixed params) is
+    // WRONG here: those trailing values can end up spliced into the MIDDLE
+    // of the tail region by an earlier, independently-correct
+    // `MethodHandles.insertArguments` step whose `pos` was computed against
+    // the COLLAPSED arity it expected -- CratonVM never actually collapses
+    // until this function runs, so a value meant to land after the array
+    // ends up interleaved among the to-be-collected values instead (exactly
+    // the `[..., Regexp, Block, replacement]` shape traced above: `Block`
+    // sitting between the two values that belong in the array). Recover the
+    // correct split by matching each trailing declared type against its
+    // RUNTIME class within the tail, pulling matched values out (in the
+    // trailing params' declared order) and leaving the rest, in their
+    // original relative order, to collect into the array.
+    let tail = &params[array_idx..];
+    let mut taken = vec![false; tail.len()];
+    let mut trailing_values: Vec<Value> = Vec::with_capacity(trailing_types.len());
+    for tt in trailing_types {
+        let want_class = tt.trim_start_matches('L').trim_end_matches(';');
+        let found = tail.iter().enumerate().find(|(i, v)| {
+            !taken[*i]
+                && matches!(v, Value::Object(Some(o))
+                    if ctx.class_name_of_id(ctx.class_id_of_object(*o)).as_deref() == Some(want_class))
+        }).map(|(i, _)| i);
+        let idx = found.or_else(|| (0..tail.len()).rev().find(|i| !taken[*i]));
+        if let Some(i) = idx {
+            taken[i] = true;
+            trailing_values.push(tail[i]);
+        }
+    }
+    let collected: Vec<Value> = tail
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !taken[*i])
+        .map(|(_, v)| *v)
+        .collect();
     let component = &last[1..]; // strip one leading '['
-    let array = build_varargs_array(ctx, component, &params[fixed..]);
-    let mut out = Vec::with_capacity(fixed + 1);
-    out.extend_from_slice(&params[..fixed]);
+    let array = build_varargs_array(ctx, component, &collected);
+    let mut out = Vec::with_capacity(array_idx + 1 + trailing_values.len());
+    out.extend_from_slice(&params[..array_idx]);
     out.push(Value::Object(array));
+    out.extend_from_slice(&trailing_values);
     out
 }
 
@@ -8191,8 +8414,12 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         mhs,
         "collectArguments",
         "(Ljava/lang/invoke/MethodHandle;ILjava/lang/invoke/MethodHandle;)Ljava/lang/invoke/MethodHandle;",
-        |_ctx, args| {
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+        |ctx, args| {
+            let pos = match args.get(1) {
+                Some(Value::Int(p)) => *p,
+                _ => 0,
+            };
+            make_collect_args_adapter(ctx, args.first().copied(), pos, args.get(2).copied())
         },
     );
     r.register(

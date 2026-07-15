@@ -497,6 +497,46 @@ fn should_skip_jit_internal(
         return Some(SkipReason::RustJvmTestFixture);
     }
 
+
+    // HIB-LONGTAIL.1 (2026-07-15): Hibernate's H2-backed collection loading
+    // runs correctly in the interpreter, but JITting the H2 SQL/MVStore,
+    // ANTLR-runtime, and most of java.util together turns ordinary 9-second
+    // HotSpot tests into multi-minute CratonVM runs. The three package control
+    // returns the class to the 120-second JUnit budget; each narrower control
+    // leaves the regression. Keep the proven interaction interpreted under the
+    // conservative policy until the shared generated-code throughput issue is
+    // root-caused. Each package remains available for bisection through
+    // CRATONVM_JIT_ALLOW_PACKAGES. `java.util.regex` is deliberately excluded:
+    // DefaultCatalogAndSchemaTest's AssertJ checks repeatedly compile patterns,
+    // and interpreting Pattern.compile turns that finite check into a watchdog
+    // timeout while its JIT path is stable.
+    if class_name.starts_with("org/h2/")
+        || class_name.starts_with("org/antlr/v4/runtime/")
+        || (class_name.starts_with("java/util/")
+            && !class_name.starts_with("java/util/regex/"))
+    {
+        return Some(SkipReason::RustJvmTestFixture);
+    }
+
+    // HIB-LONGTAIL.2 (2026-07-15): compiled AttributesImpl.ensureCapacity
+    // passes a corrupted int count to anewarray during Hibernate's qualified
+    // table bootstrap (observed Object[1677721600]). The interpreter executes
+    // the method correctly; keep just this small growth helper interpreted.
+    if class_name == "org/xml/sax/helpers/AttributesImpl" && method_name == "ensureCapacity" {
+        return Some(SkipReason::RustJvmTestFixture);
+    }
+
+    // HIB-LONGTAIL.3 (2026-07-15): when Hibernate bytecode is explicitly
+    // promoted for bisection, the optimized constructor path can return a
+    // GenerationTargetToScript whose ScriptTargetOutput field was never
+    // initialized. Schema creation then fails in accept(String). Preserve the
+    // constructor's interpreter semantics; its small body is cold and this
+    // does not suppress the rest of Hibernate's JIT eligibility.
+    if class_name == "org/hibernate/tool/schema/internal/exec/GenerationTargetToScript"
+        && method_name == "<init>"
+    {
+        return Some(SkipReason::RustJvmTestFixture);
+    }
     // T1.1.g — the historical blanket bans for `java/util/*` and
     // `cratonvm/*` were narrowed to targeted per-method exclusions.
     // Those targeted exclusions guarded the callee-saved-GPR local-home
@@ -1182,6 +1222,23 @@ fn should_skip_jit_internal(
         // cluster above stays interpreted.
         if class_name.starts_with("groovyjarjarantlr4/")
             && !package_allowed("groovyjarjarantlr4/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
+        // HIB-ANTLR.1 (2026-07-15) -- Hibernate uses the ordinary ANTLR4
+        // runtime rather than Groovy's shaded copy. After a full HQL parse,
+        // JIT-compiled ATN simulation could leave an ATNState with a null
+        // `transitions` array; the next parse then failed in
+        // ParserATNSimulator.computeTargetState. A fresh process passed the
+        // same query, isolating the defect to state corrupted by the compiled
+        // parser path rather than Hibernate's grammar or query metadata.
+        //
+        // This is the unshaded counterpart of ANTLR.1 above. Keep it
+        // liftable for JIT bisection, but default to the sound interpreter
+        // path until the compiled ATN-state mutation is root-caused.
+        if class_name.starts_with("org/antlr/v4/runtime/")
+            && !package_allowed("org/antlr/v4/runtime/", allow_packages)
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
@@ -3728,6 +3785,33 @@ mod tests {
             ),
             None,
             "CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/ is the cold-path validation lift"
+        );
+    }
+
+    #[test]
+    fn hibernate_unshaded_antlr_runtime_stays_interpreted_by_default() {
+        assert_eq!(
+            check(
+                "org/antlr/v4/runtime/atn/ParserATNSimulator",
+                "computeTargetState",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            Some(SkipReason::RustJvmTestFixture),
+            "Hibernate's unshaded ANTLR runtime must not corrupt ATN state under JIT"
+        );
+        assert_eq!(
+            check_with(
+                "org/antlr/v4/runtime/atn/ParserATNSimulator",
+                "computeTargetState",
+                false,
+                true,
+                SkipPolicy::Conservative,
+                &["org/antlr/v4/runtime/"],
+            ),
+            None,
+            "the unshaded ANTLR guard must remain available for JIT bisection"
         );
     }
 

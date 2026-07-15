@@ -438,29 +438,12 @@ fn build_instrumentation_mirror(
     };
     let inst_obj = shared.heap.alloc_object(class_id, num_fields);
 
-    // The real-JDK constructor takes
-    // `(JLjava/lang/String;ZZ)V` (id, agentArgs, isRetransformable,
-    // isRedefineClasses). A constructor failure aborts the requested agent.
-    let init_descriptor = "(JLjava/lang/String;ZZ)V";
-    let agent_args_str = agent.agent_args.clone().unwrap_or_default();
-    crate::vm::invoke_or_native(
-        shared,
-        thread,
-        class_internal,
-        "<init>",
-        init_descriptor,
-        &[
-            Value::Object(Some(inst_obj)),
-            Value::Long(0), // synthetic native-side id
-            Value::Object(Some(crate::vm::create_java_string(shared, &agent_args_str))),
-            Value::Int(if agent.can_retransform { 1 } else { 0 }),
-            Value::Int(if agent.can_redefine { 1 } else { 0 }),
-        ],
-    )
-    .map_err(|err| AgentLoadError::InstrumentationUnavailable {
-        class: agent.premain_class.clone(),
-        cause: format!("failed to initialize {class_internal}: {err}"),
-    })?;
+    // The real-JDK constructor enters VM-private instrumentation setup.  The
+    // mirror is instead backed by CratonVM's Instrumentation operations, so it
+    // must remain a bare allocation: executing the JDK constructor can neither
+    // initialize a real JVMTI environment nor establish its native state.
+    let _ = thread;
+    let _ = agent;
 
     Ok(inst_obj)
 }

@@ -172,6 +172,18 @@ pub fn register_h2_parser_fastpaths(registry: &mut NativeMethodRegistry) {
         "(Lorg/h2/engine/SessionLocal;)Lorg/h2/value/Value;",
         h2_cardinality_expression_get_value,
     );
+    // Hibernate's JSON-array unnest SQL uses two `system_range(1, 1000)`
+    // sources.  H2's stock cache only covers 0..99, so the remaining 900
+    // immutable BIGINT values are allocated again for every candidate row of
+    // the nested range join.  Retain a modest cache in H2's own static field:
+    // this is a faithful extension of H2's existing immutable-value cache and
+    // avoids a million short-lived ValueBigint/Row allocations per query.
+    registry.register(
+        "org/h2/value/ValueBigint",
+        "get",
+        "(J)Lorg/h2/value/ValueBigint;",
+        h2_value_bigint_get,
+    );
     registry.register(
         "org/h2/command/ParserBase",
         "setTokenIndex",
@@ -501,6 +513,29 @@ fn h2_comparison_compare(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let left = h2_object_arg(args, 1, "Comparison.compare left is null")?;
     let right = h2_object_arg(args, 2, "Comparison.compare right is null")?;
     let compare_type = h2_int_arg(args, 3, "Comparison.compare type is invalid")?;
+    // Range joins compare H2's immutable ValueInteger / ValueBigint instances
+    // millions of times.  Their primitive payloads are already in the common
+    // integral domain, so `SessionLocal.compareWithNull` would only enter the
+    // generic conversion machinery before producing this same ordering.
+    if let (Some(left), Some(right)) = (h2_integral_value(ctx, left), h2_integral_value(ctx, right))
+    {
+        let matches = match compare_type {
+            0 => left == right,
+            1 => left != right,
+            2 => left < right,
+            3 => left > right,
+            4 => left <= right,
+            5 => left >= right,
+            6 => left == right,
+            7 => left != right,
+            _ => false,
+        };
+        return Ok(Some(h2_static_value(
+            ctx,
+            "org/h2/value/ValueBoolean",
+            if matches { "TRUE" } else { "FALSE" },
+        )?));
+    }
     let result = match compare_type {
         0 | 1 | 2 | 3 | 4 | 5 => {
             let comparison = match ctx.invoke_virtual(
@@ -954,6 +989,109 @@ fn h2_cardinality_expression_get_value(
         )?,
         "ValueInteger.get",
     )?))
+}
+
+/// Return the exact payload of H2's immutable integer value classes.
+///
+/// This intentionally does not cover decimals, floating point, or any value
+/// that requires a `CastDataProvider`; those retain H2's normal conversion
+/// path in `h2_comparison_compare`.
+fn h2_integral_value(ctx: &dyn NativeContext, value: ObjectRef) -> Option<i64> {
+    let class_name = ctx.class_name_of_id(ctx.class_id_of_object(value))?;
+    match class_name.as_str() {
+        "org/h2/value/ValueInteger" => match ctx.get_field_by_name(value, "value") {
+            Value::Int(value) => Some(i64::from(value)),
+            _ => None,
+        },
+        "org/h2/value/ValueBigint" => match ctx.get_field_by_name(value, "value") {
+            Value::Long(value) => Some(value),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Bounded extension of H2's `ValueBigint.STATIC_CACHE`.
+///
+/// H2 treats `ValueBigint` as immutable and already interns 0..99.  The
+/// additional values are kept in exactly that static array, rather than in a
+/// Rust-side table, so their lifetime and GC visibility remain ordinary Java
+/// semantics.  Values outside this small hot range use H2's normal soft cache.
+fn h2_value_bigint_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    const HOT_RANGE_LIMIT: usize = 1_001;
+    let value = match args {
+        [Value::Long(value)] => *value,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    if (0..HOT_RANGE_LIMIT as i64).contains(&value) {
+        let class_id = match ctx.ensure_class_initialized("org/h2/value/ValueBigint") {
+            Ok(class_id) => class_id,
+            Err(error) => return Err(error),
+        };
+        let cache_field = match ctx.static_field_index_by_name(class_id, "STATIC_CACHE") {
+            Some(field) => field,
+            None => return Ok(Some(Value::Object(None))),
+        };
+        let cache = match ctx.get_static_field(class_id, cache_field) {
+            Value::Object(Some(cache)) => cache,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let old_cache_pin = ctx.pin_native_root(cache);
+        let cache = if ctx.array_length(cache) < HOT_RANGE_LIMIT {
+            let expanded = ctx.new_array(ArrayElementType::Reference, HOT_RANGE_LIMIT);
+            let expanded_pin = ctx.pin_native_root(expanded);
+            let previous = ctx.read_native_pin(old_cache_pin, cache);
+            for index in 0..ctx.array_length(previous) {
+                let expanded_live = ctx.read_native_pin(expanded_pin, expanded);
+                ctx.set_array_element(expanded_live, index, ctx.get_array_element(previous, index));
+            }
+            let expanded = ctx.read_native_pin(expanded_pin, expanded);
+            ctx.set_static_field(class_id, cache_field, Value::Object(Some(expanded)));
+            ctx.unpin_native_roots(expanded_pin);
+            expanded
+        } else {
+            ctx.read_native_pin(old_cache_pin, cache)
+        };
+        ctx.unpin_native_roots(old_cache_pin);
+        let cache_pin = ctx.pin_native_root(cache);
+        let index = value as usize;
+        if let Value::Object(Some(cached)) = ctx.get_array_element(cache, index) {
+            ctx.unpin_native_roots(cache_pin);
+            return Ok(Some(Value::Object(Some(cached))));
+        }
+
+        let value_obj = match ctx.new_object_initialized(
+            "org/h2/value/ValueBigint",
+            "(J)V",
+            &[Value::Long(value)],
+        )? {
+            Some(Value::Object(Some(value_obj))) => value_obj,
+            _ => {
+                ctx.unpin_native_roots(cache_pin);
+                return Ok(Some(Value::Object(None)));
+            }
+        };
+        let cache = ctx.read_native_pin(cache_pin, cache);
+        ctx.set_array_element(cache, index, Value::Object(Some(value_obj)));
+        ctx.unpin_native_roots(cache_pin);
+        return Ok(Some(Value::Object(Some(value_obj))));
+    }
+
+    let value_obj = match ctx.new_object_initialized(
+        "org/h2/value/ValueBigint",
+        "(J)V",
+        &[Value::Long(value)],
+    )? {
+        Some(Value::Object(Some(value_obj))) => value_obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    ctx.invoke(
+        "org/h2/value/Value",
+        "cache",
+        "(Lorg/h2/value/Value;)Lorg/h2/value/Value;",
+        &[Value::Object(Some(value_obj))],
+    )
 }
 
 fn h2_utils_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
