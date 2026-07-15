@@ -3742,13 +3742,19 @@ fn s2_bb_as_char_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     ctx.set_field_by_name(vb, "limit", Value::Int(rem_chars as i32));
     ctx.set_field_by_name(vb, "capacity", Value::Int(rem_chars as i32));
     ctx.set_field_by_name(vb, "mark", Value::Int(-1));
-    // Synthetic-mode fallback (older paths still indexed-slot based).
-    ctx.set_field(vb, BB_ARRAY, Value::Object(Some(chars_arr)));
-    ctx.set_field(vb, BB_POS, Value::Int(0));
-    ctx.set_field(vb, BB_LIMIT, Value::Int(rem_chars as i32));
-    ctx.set_field(vb, BB_CAP, Value::Int(rem_chars as i32));
-    ctx.set_field(vb, BB_MARK, Value::Int(-1));
-    ctx.set_field(vb, BB_ORDER, Value::Int(order));
+    // Heap CharBuffers use ARRAY_CHAR_BASE_OFFSET (16) as their address.
+    // Do not unconditionally write the old indexed overlay: in real-JDK
+    // layout its slot 4 is Buffer.address, so BB_MARK=-1 made bulk get()
+    // call Unsafe.copyMemory with an invalid source offset.
+    ctx.set_field_by_name(vb, "address", Value::Long(16));
+    if s2_bb_synthetic_layout(ctx, vb) {
+        ctx.set_field(vb, BB_ARRAY, Value::Object(Some(chars_arr)));
+        ctx.set_field(vb, BB_POS, Value::Int(0));
+        ctx.set_field(vb, BB_LIMIT, Value::Int(rem_chars as i32));
+        ctx.set_field(vb, BB_CAP, Value::Int(rem_chars as i32));
+        ctx.set_field(vb, BB_MARK, Value::Int(-1));
+        ctx.set_field(vb, BB_ORDER, Value::Int(order));
+    }
     Ok(Some(Value::Object(Some(vb))))
 }
 
