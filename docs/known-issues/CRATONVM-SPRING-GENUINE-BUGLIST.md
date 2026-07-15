@@ -1,5 +1,5 @@
 # CratonVM Spring Suite — Consolidated Open Bugs
-**Latest Update: July 14, 2026**
+**Latest Update: July 15, 2026**
 
 ## Executive Summary
 Multiple major bug clusters have been successfully resolved (including the JIT SIGSEGV in Groovy, the `java.home` Locale regression, the `Semaphore` deadlock, and dozens of classloader visibility/AOT fixes).
@@ -11,30 +11,81 @@ This document tracks the **genuine remaining failures**.
 ## 1. Deep-Dive Investigations (Root-Caused, Pending Fix)
 
 *   **Mockito `spy()` StackOverflowError** (`context.annotation.ImportSelectorTests`)
-  *   **Status**: **OPEN** (Fails 4/9 tests)
-  *   **Root Cause**: Mockito's `spy()` inline mock maker retransforms the class hierarchy; the `ThreadLocal`-based `MockMethodAdvice$SelfCallInfo.checkSelfCall` guard fails to match on CratonVM, causing infinite recursion.
-  *   **Next Step**: Instrument `MockMethodDispatcher.get()` for distinct Class/Advice instances across the redefined hierarchy.
-  *   **2026-07-15 (reactive-cluster session, mockk sibling analysis)**: the same self-call SOE family
-    blocks ~10 Kotlin reactive test classes via **mockk** (not Mockito): `WebTestClientExtensionsTests`,
+  *   **Status**: **OPEN** (5/9 methods SOE, reconfirmed 2026-07-15 on a binary containing the mockk
+    fix below — this is a **different root cause** than the mockk sibling, which is now FIXED).
+  *   **2026-07-15 root-cause sharpening (supersedes the older hypotheses below)**: full recursion
+    cycle captured (`KRUN_STACK=1`, log at `/data/tmp/mockk-tmp/importsel2.log` on the Azure host):
+    `MockMethodAdvice.handle` (intercepting `DefaultSingletonBeanRegistry.registerSingleton` on the
+    spy) -> `CallsRealMethods.answer` -> `InterceptedInvocation.callRealMethod` ->
+    `SerializableRealMethodCall.invoke` -> `MockMethodAdvice.tryInvoke` ->
+    `ModuleMemberAccessor`/`InstrumentationMemberAccessor.invoke` (MethodHandle-based) which
+    dispatches VIRTUALLY and lands in the subclass override
+    `DefaultListableBeanFactory.registerSingleton:1491` -> its `super.registerSingleton` ->
+    `DefaultSingletonBeanRegistry.registerSingleton:142` -> intercepted AGAIN -> same cycle forever.
+    On HotSpot the super-method frame is never intercepted: `MockMethodAdvice.enter` first checks
+    `dispatcher.isOverridden(mock, origin)` (a ByteBuddy `MethodGraph` compiled over
+    `instance.getClass()`) and bails to real code when the runtime class overrides `origin`. Prime
+    suspect: `isOverridden` computing `false` under CratonVM (reflection/MethodGraph disagreement
+    about the retransformed hierarchy) — NOT the ThreadLocal guard (CratonVM ThreadLocal semantics
+    probe-verified correct, TLProbe 2026-07-15).
+  *   ~~**Old hypothesis**: the `ThreadLocal`-based `MockMethodAdvice$SelfCallInfo.checkSelfCall`
+    guard fails to match on CratonVM~~ — never verified; ThreadLocal itself ruled out.
+  *   **Next step**: standalone probe that spies a 2-level hierarchy (subclass override calling
+    `super.<same method>`), invokes the parent method through the spy, and instruments what
+    `MockMethodAdvice.isOverridden` computes on CratonVM vs HotSpot.
+
+*   **mockk `hashCode()` StackOverflowError — ~10 Kotlin reactive classes** — **FIXED (2026-07-15,
+    dev `9dce07a5`)**, plus a host-environment trap that will bite again if undocumented:
+  *   Affected classes (all previously 100% SOE): `WebTestClientExtensionsTests`,
     `WebClientExtensionsTests`, `ServerResponseExtensionsTests`, `ServerRequestExtensionsTests`,
-    `RenderingResponseExtensionsTests`, `ClientResponseExtensionsTests`, `RSocketRequesterExtensionsTests`,
-    `WebClientObservationTests`, `CoExchangeFilterFunctionTests`, `InvocableHandlerMethodKotlinTests`. All
-    fail identically on **pure origin/dev** (pre-existing, not a regression). Sharpened via mockk 1.14.5
-    decompile + probes: the recursion is `mock.hashCode()` -> `JvmMockKProxyInterceptor.intercept` ->
-    `JvmMockKDispatcher.get(id, mock)` returns the advice -> `BaseAdvice.handle` -> `BaseAdvice.handler`
-    -> `handlers.get(mock)`, where `handlers` is a plain `Collections.synchronizedMap(LinkedHashMap)` (NOT
-    identity-keyed -- confirmed from the no-arg `SynchronizedMockHandlersMap()` ctor bytecode), so
-    `LinkedHashMap.get(mock)` calls `mock.hashCode()` again -> infinite. This recursion exists in the
-    bytecode on BOTH VMs, yet HotSpot terminates -- so **CratonVM routes the ByteBuddy-generated mock's
-    `hashCode()` through the interceptor where HotSpot dispatches to the real `Object.hashCode`**.
-    **ThreadLocal is RULED OUT** (TLProbe on v13: identity-preserved, get-twice-same, withInitial, remove,
-    guard-flip all correct). So the sibling "ThreadLocal guard fails to match" hypothesis above is likely
-    WRONG for both -- the real divergence is ByteBuddy method-resolution/vtable: which methods of the
-    generated mock subclass are instrumented vs left as real super-calls. The `SelfCallEliminator.isSelf`
-    guard runs too LATE (inside `handler`, AFTER `handlers.get(mock)` already triggered the recursive
-    `hashCode`). **Next step**: instrument, on a minimal mockk/Mockito mock, WHICH methods route to the
-    interceptor on CratonVM vs HotSpot (esp. `hashCode`/`equals`/`toString`); the fix is almost certainly
-    in how CratonVM resolves the mock subclass's inherited-vs-overridden method dispatch.
+    `RenderingResponseExtensionsTests`, `ClientResponseExtensionsTests`,
+    `RSocketRequesterExtensionsTests`, `WebClientObservationTests`, `CoExchangeFilterFunctionTests`,
+    `InvocableHandlerMethodKotlinTests`.
+  *   **True root cause (NOT method dispatch)**: mockk only recurses in its **agent-less** mode.
+    `JvmMockKAgentFactory$init$Initializer` picks the handler map via
+    `MockHandlerMap.create(instrumentation != null)`: with instrumentation ->
+    `WeakMockHandlersMap` (identity-keyed `JvmMockKWeakMap`, never calls `hashCode()`); without ->
+    `SynchronizedMockHandlersMap` (plain `Collections.synchronizedMap(LinkedHashMap)`). The
+    generated mock subclass intercepts `hashCode()` on BOTH VMs by design (`SubclassInstrumentation`
+    uses `ElementMatchers.any()`), so in agent-less mode `handlers.get(mock)` -> `mock.hashCode()`
+    -> interceptor -> `handlers.get(mock)` -> SOE. The earlier claim "CratonVM routes the mock's
+    `hashCode()` through the interceptor where HotSpot dispatches to the real `Object.hashCode`"
+    was WRONG — both VMs intercept it; HotSpot survives only because it normally has instrumentation
+    and the identity-keyed map. (Reproduced the identical SOE **on HotSpot jdk25** by letting the
+    boot jar fail.)
+  *   **Why CratonVM ended up agent-less**: the Azure host's root fs (`/tmp`) flaps at ~100% full;
+    mockk's `BootJarLoader` writes its dispatcher boot jar via `File.createTempFile` +
+    `JarOutputStream`, the jar write hits ENOSPC, mockk logs "Can't inject boot jar." at TRACE only
+    and silently downgrades. Two genuine CratonVM parity bugs then sealed the failure:
+    **(1)** the `File.createTempFile` (both overloads), `Files.createTempFile` and
+    `Files.createTempDirectory` natives read `std::env::temp_dir()` directly and **ignored
+    `-Djava.io.tmpdir`**, so the standard redirect escape hatch was a no-op; **(2)** they swallowed
+    creation errors (`let _ = std::fs::File::create(..)`) instead of throwing `IOException` (real-JDK
+    contract; mockk falls back to a CWD boot jar when `createTempFile` throws). Both fixed in
+    `9dce07a5` (`native-builtins/src/phases_late.rs`, helpers `jdk_temp_dir` /
+    `jdk_create_temp_file`).
+  *   **Host-env trap (still live)**: with `/tmp` full, HotSpot fails these classes too, just
+    differently — the attach socket `/tmp/.java_pid<pid>` cannot be created, so
+    `ByteBuddyAgent.install()` throws (mockk does NOT catch it) ->
+    `ExceptionInInitializerError: io.mockk.impl.JvmMockKGateway`. Any suite run comparing the two
+    VMs during a full-`/tmp` window is comparing two env failures. CratonVM implements
+    `Instrumentation` internally (no attach socket), so post-fix CratonVM passes where host HotSpot
+    currently cannot. **Harness requirement on this host: run mockk/Mockito-heavy classes with
+    `-Djava.io.tmpdir=/data/tmp/<writable>`** (honored by CratonVM as of this fix).
+  *   Verification (fixed binary + `-Djava.io.tmpdir=/data/tmp/mockk-tmp`, KRun):
+    WebTestClient 10/10, ServerRequest 29/29, ServerResponse 13/13, ClientResponse 16/16,
+    RenderingResponse 1/1, RSocketRequester 13/13, WebClientObservation 9/9,
+    CoExchangeFilterFunction 1/1, InvocableHandlerMethodKotlin 40/40 — all OK. A/B control: unfixed
+    binary, identical flags -> 10/10 SOE.
+  *   Residual: `WebClientExtensionsTests` 20/32 (SOE gone). The 12 failures are two separate,
+    pre-existing families: (a) `IllegalStateException: Unable to create proxy for sealed class
+    interface org.springframework.http.HttpStatusCode, no subclasses available` — mockk resolves
+    `KClass.sealedSubclasses` (kotlin-reflect metadata family); (b) mockk `verify` matcher failures
+    (`... was not called`), same family as the tracked `RestClientExtensionsTests` residual.
+  *   Probe kit: `/data/data/wt-mockk-dispatch-20260715/probes/` — `MkProbe.java` (agent-init +
+    hashCode chain with a printing `MockKAgentLogFactory`; the init TRACE lines name the exact
+    failing step), `BootProbe.java` (boot-jar append + null-loader `forName`), `TmpProbe.java`
+    (`java.io.tmpdir` honoring).
 *   **`@Import` attribute CCE across `@CompileWithForkedClassLoader`** (`web.service.registry.ImportHttpServiceRegistrarTests`)
   *   **Status**: **OPEN** (2/5 methods: `basicListingWithAot`, `basicScanWithAot` — `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;` at `ConfigurationClassParser$SourceClass.getAnnotationAttributes`)
   *   **2026-07-15 update**: reproduces SOLO in ~1s (`/data/tmp/aotfix-runs/MethodRun.java` single-method launcher on the Azure host). The 2026-07-14 SoftReference/GC-relocation hypothesis is now DOUBTED: this failure survived eight classloader-identity fixes, and three focused probes (plain `@Import` reflection, forked-loader variant, `@Import` as meta-annotation on a repeatable annotation type — `ImportProbe2.java`) all PASS. The divergence is somewhere in the full `ConfigurationClassParser`/`MergedAnnotations` path for the repeatable `@ImportHttpServices` container under a forked loader.
@@ -224,11 +275,7 @@ resolved the wrong view and completed instead of erroring. Scheme detection now 
 parser (first stop char among `:/?#` must be `:`, ALPHA-start + alphanum/`+`/`-`/`.` name — the same
 rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is now 11/11 OK.
 
-Classes that FAIL in *batched* suite runs but pass solo at HotSpot parity (batch-context
-contamination — a prior class in the shared VM poisons a `<clinit>`; not yet root-caused, likely one
-more cross-class-state bug): `SseIntegrationTests` (solo 48 found / 42 succ / 6 aborted == HotSpot),
-`WebSocketIntegrationTests` (solo 72/72), `DefaultRenderingBuilderTests` (solo 11/11, batched shows
-`ExceptionInInitializerError` → `NoClassDefFoundError: ViewResolverSupport` on the redirect tests).
+**RETRACTED 2026-07-15**: the "batch-context `<clinit>` contamination" theorized below (classes failing only in batched suite runs, passing solo) was investigated further and is **NOT a CratonVM bug**. Root cause was Azure-host environment corruption, confirmed live: (1) `/home/victor/jdk25` (the symlink itself) had vanished mid-session — every `--java-home ~/jdk25` invocation failed with `path does not exist`, producing zero test output, easily misread as a VM hang; (2) separately, `/tmp` (the directory itself, not just stale contents) had vanished — `Tomcat.initBaseDir()` threw `IllegalStateException: Unable to create the directory [/tmp]`, which looks exactly like a filesystem native bug but is the OS directory missing. After `ln -sf /data/data/jdk25-real ~/jdk25` and `mkdir -p /tmp && chmod 1777 /tmp`, the exact same 8-class batch that previously showed `SseIntegrationTests` failing 9/48 (deterministically, 3/3 reruns) now passes 42/48 with 6 aborted, byte-for-byte matching the HotSpot baseline shape, and `DefaultRenderingBuilderTests` never reproduced its `ExceptionInInitializerError` again across 3 clean reruns of the identical batch order on the identical binary. See `azure-host-disk-full-flapping-20260715.md` memory (Claude's memory system) for the full host instability catalog.
 
 **Remaining OPEN reactive residuals:**
 *   `http.client.reactive.ClientHttpConnectorTests` — TIMEOUT. `StepVerifier` in `basic()` waits forever;
@@ -241,5 +288,4 @@ more cross-class-state bug): `SseIntegrationTests` (solo 48 found / 42 succ / 6 
     `Symbol#to_s`/string interpolation returns empty inside `eval` heredocs
     (`rubygems/specification.rb` generates `@ = nil` from `"@#{key} = nil"`), so the engine bootstrap
     fails with a SyntaxError. Not reactive-specific; JRuby's embedding is its own bug family.
-*   Batch-context `<clinit>` contamination (see above) — affects SSE/WebSocket/DefaultRenderingBuilder
-    only when many reactive classes share one VM; every one of them is green solo.
+*   ~~Batch-context `<clinit>` contamination~~ — RETRACTED, see above (host environment issue: missing /tmp + missing ~/jdk25 symlink, not CratonVM).
