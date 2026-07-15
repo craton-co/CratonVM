@@ -80,10 +80,10 @@ function ConvertTo-SafeName([string]$Value) {
   return ($Value -replace '[^A-Za-z0-9_.-]', '_')
 }
 
-function ConvertTo-SafeFileStem([string]$Value) {
+function ConvertTo-SafeFileStem([string]$Value, [int]$MaxLength = 96) {
   $safe = ConvertTo-SafeName $Value
-  $maxLength = 96
-  if ($safe.Length -le $maxLength) { return $safe }
+  if ($MaxLength -lt 16) { $MaxLength = 16 }
+  if ($safe.Length -le $MaxLength) { return $safe }
   $sha = [System.Security.Cryptography.SHA256]::Create()
   try {
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($safe)
@@ -91,7 +91,7 @@ function ConvertTo-SafeFileStem([string]$Value) {
   } finally {
     $sha.Dispose()
   }
-  $prefixLength = $maxLength - $hash.Length - 1
+  $prefixLength = $MaxLength - $hash.Length - 1
   return "$($safe.Substring(0, $prefixLength))-$hash"
 }
 
@@ -543,17 +543,37 @@ function Resolve-Jdk {
   return 'C:\Program Files\Java\jdk-25'
 }
 
+function Get-EffectiveClassTimeoutSec {
+  param([object]$ClassRow, [int]$BaseTimeoutSec)
+  # This HSQLDB integration class creates and exercises several database-backed
+  # application contexts.  After the Array.set fix it completes under Craton,
+  # but its validated JIT-on time is about 14 minutes.  Keep the suite's
+  # ordinary 300-second default for other classes while preventing this known
+  # slow class from being reported as the old RangeGroupEmpty hang.
+  if ($ClassRow.module -eq 'module/spring-boot-session-jdbc' -and
+      $ClassRow.class -eq 'org.springframework.boot.session.jdbc.autoconfigure.JdbcSessionAutoConfigurationTests') {
+    return [Math]::Max($BaseTimeoutSec, 900)
+  }
+  return $BaseTimeoutSec
+}
+
 function New-ProcessRecord {
-  param([object]$ClassRow, [string]$ModeOut, [object]$LaunchSpec, [string]$ExePath, [string]$JavaExe, [string]$JdkPath, [bool]$NoJit, [int]$Retries = 0)
+  param([object]$ClassRow, [string]$ModeOut, [object]$LaunchSpec, [string]$ExePath, [string]$JavaExe, [string]$JdkPath, [bool]$NoJit, [int]$Timeout, [int]$Retries = 0)
   $module = [string]$ClassRow.module
   $class = [string]$ClassRow.class
   $workingDirectory = $script:SpringBootDir
   $modulePath = $module -replace '/', [System.IO.Path]::DirectorySeparatorChar
   $moduleRoot = Join-Path $script:SpringBootDir $modulePath
   if (Test-Path $moduleRoot) { $workingDirectory = $moduleRoot }
-  $safe = ConvertTo-SafeFileStem "$module.$class"
   $logDir = Join-Path $ModeOut 'logs'
   New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+  # `WriteAllText` still observes the legacy MAX_PATH limit on some Windows
+  # PowerShell/.NET Framework combinations.  Worktree and run names are both
+  # intentionally unique and can be long, so size the per-class stem from the
+  # actual log-directory prefix rather than assuming the historical 96-char
+  # cap always leaves room for the extension.
+  $maxStemLength = [Math]::Max(16, 240 - $logDir.Length - '.out.log'.Length - 1)
+  $safe = ConvertTo-SafeFileStem "$module.$class" -MaxLength $maxStemLength
   $outFile = Join-Path $logDir "$safe.out.log"
   $errFile = Join-Path $logDir "$safe.err.log"
 
@@ -565,7 +585,12 @@ function New-ProcessRecord {
     else { $args += @('-cp', $LaunchSpec.value, 'SbRunner', $class) }
   } else {
     $file = $ExePath
-    $args = @('--java-home', $JdkPath, '--stack-dump-on-timeout', '0', '--Xmx', $MaxHeap)
+    $args = @('--java-home', $JdkPath, '--Xmx', $MaxHeap)
+    # The suite normally disables the VM watchdog because it owns the
+    # per-class timeout.  Preserve that default, but let a caller provide a
+    # real watchdog value through -CratonArgs for a diagnostic run.
+    $hasWatchdogArg = @($CratonArgs | Where-Object { $_ -match '^--stack-dump-on-timeout(?:=|$)' }).Count -gt 0
+    if (-not $hasWatchdogArg) { $args += @('--stack-dump-on-timeout', '0') }
     if ($NoJit) { $args += '--nojit' }
     if ($CratonArgs.Count -gt 0) { $args += $CratonArgs }
     $args += @('-Dfile.encoding=UTF-8', '-Djava.awt.headless=true')
@@ -589,7 +614,7 @@ function New-ProcessRecord {
     stdoutTask = $proc.StandardOutput.ReadToEndAsync()
     stderrTask = $proc.StandardError.ReadToEndAsync()
     module = $module; class = $class; start = Get-Date
-    outFile = $outFile; errFile = $errFile; retries = $Retries
+    outFile = $outFile; errFile = $errFile; timeoutSec = $Timeout; retries = $Retries
   }
 }
 
@@ -707,7 +732,7 @@ function Invoke-Mode {
         $outputs = Read-ProcessOutputs $record
         Complete-ProcessRecord -Record $record -ResultPath $results -ExitCode $code -Seconds ([Math]::Round($elapsed, 3)) -Stdout $outputs.stdout -Stderr $outputs.stderr
         try { $record.proc.Dispose() } catch {}
-      } elseif ($elapsed -ge $TimeoutSec) {
+      } elseif ($elapsed -ge $record.timeoutSec) {
         try { $record.proc.Kill($true) } catch { try { $record.proc.Kill() } catch {} }
         try { $record.proc.WaitForExit(5000) | Out-Null } catch {}
         $outputs = Read-ProcessOutputs $record
@@ -721,7 +746,9 @@ function Invoke-Mode {
   foreach ($classRow in $todo) {
     while ($script:RunningRecords.Count -ge $Parallel) { Drain-Running; if ($script:RunningRecords.Count -ge $Parallel) { Start-Sleep -Milliseconds 200 } }
     $launch = Get-LaunchSpec -ClassRow $classRow
-    $script:RunningRecords.Add((New-ProcessRecord -ClassRow $classRow -ModeOut $modeOut -LaunchSpec $launch -ExePath $craton -JavaExe $java -JdkPath $jdk -NoJit:($Jit -eq 'off')))
+    $classTimeoutSec = Get-EffectiveClassTimeoutSec -ClassRow $classRow -BaseTimeoutSec $TimeoutSec
+    if ($classTimeoutSec -ne $TimeoutSec) { Write-Info "timeout override=${classTimeoutSec}s $($classRow.module).$($classRow.class)" }
+    $script:RunningRecords.Add((New-ProcessRecord -ClassRow $classRow -ModeOut $modeOut -LaunchSpec $launch -ExePath $craton -JavaExe $java -JdkPath $jdk -NoJit:($Jit -eq 'off') -Timeout $classTimeoutSec))
   }
   while ($script:RunningRecords.Count -gt 0) { Drain-Running; if ($script:RunningRecords.Count -gt 0) { Start-Sleep -Milliseconds 200 } }
   Remove-Variable -Name RunningRecords -Scope Script -ErrorAction SilentlyContinue

@@ -77751,27 +77751,41 @@ fn register_reflect_array_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
-fn native_array_get_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// Validate the target accepted by `java.lang.reflect.Array` before using an
+/// array accessor.  A non-null ordinary object used to reach the generic
+/// heap-array fallback, which reads slot zero as though it were element zero.
+/// Besides violating the reflection contract, that made `Array.set` spin when
+/// HSQLDB passed its zero-field `RangeGroupEmpty` singleton.
+fn reflect_array_arg(
+    ctx: &dyn NativeContext,
+    args: &[Value],
+) -> Result<ObjectRef, MethodCallFailed> {
     let arr = match args.first() {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "Array argument is null".to_string(),
+            }
+            .into())
+        }
     };
+    if !ctx.object_is_array(arr) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Array argument is not an array".to_string(),
+        }
+        .into());
+    }
+    Ok(arr)
+}
+
+fn native_array_get_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let arr = reflect_array_arg(ctx, args)?;
     Ok(Some(Value::Int(ctx.array_length(arr) as i32)))
 }
 
 fn native_array_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     use cratonvm_types::ArrayElementType;
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => {
-            return Err(
-                cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                    message: "Array argument is null".to_string(),
-                }
-                .into(),
-            )
-        }
-    };
+    let arr = reflect_array_arg(ctx, args)?;
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
@@ -77868,13 +77882,47 @@ fn unbox_for_array_set(
     ctx: &dyn NativeContext,
     elem: cratonvm_types::ArrayElementType,
     v: Value,
-) -> Value {
+) -> Result<Value, MethodCallFailed> {
     use cratonvm_types::ArrayElementType;
+    if elem == ArrayElementType::Reference {
+        return Ok(v);
+    }
     let raw = match v {
-        Value::Object(Some(o)) => ctx.get_field(o, 0),
+        Value::Object(Some(o)) => {
+            // `Array.set` must reject arbitrary objects for primitive arrays.
+            // Reading slot zero before this check used the layout of a
+            // `RangeGroupEmpty` instance as if it were a boxed primitive and
+            // caused the HSQLDB startup loop documented in SPB-JDBC-HSQLDB.1.
+            let class_name = ctx
+                .class_name_of_id(ctx.class_id_of_object(o))
+                .unwrap_or_default();
+            if !matches!(
+                class_name.as_str(),
+                "java/lang/Boolean"
+                    | "java/lang/Byte"
+                    | "java/lang/Character"
+                    | "java/lang/Short"
+                    | "java/lang/Integer"
+                    | "java/lang/Long"
+                    | "java/lang/Float"
+                    | "java/lang/Double"
+            ) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "Array.set value is not a boxed primitive".to_string(),
+                }
+                .into());
+            }
+            ctx.get_field(o, 0)
+        }
+        Value::Object(None) => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "Array.set cannot store null in a primitive array".to_string(),
+            }
+            .into())
+        }
         other => other,
     };
-    match elem {
+    Ok(match elem {
         ArrayElementType::Boolean
         | ArrayElementType::Byte
         | ArrayElementType::Char
@@ -77900,22 +77948,12 @@ fn unbox_for_array_set(
             Value::Int(n) => Value::Double(n as f64),
             _ => Value::Double(0.0),
         },
-        ArrayElementType::Reference => v,
-    }
+        ArrayElementType::Reference => unreachable!("reference arrays return before unboxing"),
+    })
 }
 
 fn native_array_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => {
-            return Err(
-                cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                    message: "Array argument is null".to_string(),
-                }
-                .into(),
-            )
-        }
-    };
+    let arr = reflect_array_arg(ctx, args)?;
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
@@ -77925,16 +77963,13 @@ fn native_array_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // into the matching primitive Value before writing.  For reference
     // arrays the value is passed through as-is.
     let elem = ctx.heap_element_type_of(arr);
-    let val = unbox_for_array_set(ctx, elem, raw);
+    let val = unbox_for_array_set(ctx, elem, raw)?;
     ctx.set_array_element(arr, idx, val);
     Ok(None)
 }
 
 fn native_array_get_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
+    let arr = reflect_array_arg(ctx, args)?;
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
@@ -77943,10 +77978,7 @@ fn native_array_get_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn native_array_set_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
+    let arr = reflect_array_arg(ctx, args)?;
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
@@ -77957,10 +77989,7 @@ fn native_array_set_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn native_array_get_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Long(0))),
-    };
+    let arr = reflect_array_arg(ctx, args)?;
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
@@ -77969,10 +77998,7 @@ fn native_array_get_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn native_array_set_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
+    let arr = reflect_array_arg(ctx, args)?;
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
@@ -77983,10 +78009,7 @@ fn native_array_set_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn native_array_get_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Float(0.0))),
-    };
+    let arr = reflect_array_arg(ctx, args)?;
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
@@ -77995,10 +78018,7 @@ fn native_array_get_float(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_array_set_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
+    let arr = reflect_array_arg(ctx, args)?;
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
@@ -78009,10 +78029,7 @@ fn native_array_set_float(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_array_get_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Double(0.0))),
-    };
+    let arr = reflect_array_arg(ctx, args)?;
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
@@ -78021,10 +78038,7 @@ fn native_array_get_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_array_set_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
+    let arr = reflect_array_arg(ctx, args)?;
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
