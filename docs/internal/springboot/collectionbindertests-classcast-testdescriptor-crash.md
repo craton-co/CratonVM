@@ -1,8 +1,38 @@
 # `CollectionBinderTests` CRASHES the whole process: `String cannot be cast to org.junit.platform.engine.TestDescriptor`
 
-**Status: OPEN.** CRITICAL severity — this is a process-fatal crash (not a
-test `FAIL`), 0 tests executed/reported. Found triaging the
-`crashfail-20260714` shard run (`core/spring-boot`, shard1).
+**Status: FIXED (verified 2026-07-15) and retired to `docs/internal`.** The
+historical process-fatal JUnit-engine-reporting crash no longer reproduces on
+current `dev`. A freshly-built isolated CratonVM binary completed the full
+37-test class cleanly in five independent JIT-enabled runs, as well as in a
+JIT-disabled control and a HotSpot control. The original crash executed zero
+tests; every verification run completed all 37 with zero failures, aborts,
+skips, or failed containers.
+
+## Resolution and verification (2026-07-15)
+
+The original report recorded a single crash from an earlier `crashfail` shard
+and an explicitly unconfirmed HashMap native-dispatch hypothesis. It did not
+identify a primary exception or establish a causal code change, so this
+retirement deliberately does **not** attribute the resolution to a guessed
+commit.
+
+Current `dev` was built from scratch in an isolated worktree and target
+directory. The uniquely named binary
+`cratonvm-springboot-collectionbinder-closure-20260715.exe` was then run
+against the existing Spring Boot checkout with the suite runner. Results:
+
+| Mode | Runs | Result |
+|---|---:|---|
+| CratonVM, JIT on | 5 | 37/37 tests passed in every run (8.3-17.1 s) |
+| CratonVM, `--nojit` | 1 | 37/37 tests passed (10.0 s) |
+| HotSpot control | 1 | 37/37 tests passed (3.3 s) |
+
+The first JIT-on run also enabled `CRATONVM_DBG_CCE=1`; it completed normally
+without the formerly process-fatal `String cannot be cast to
+org.junit.platform.engine.TestDescriptor` path. This is a direct re-run of
+the precise class named by this note, not a static-only closure. With no
+residual failure in the original JIT mode or its controls, the issue is
+retired.
 
 ## Symptom
 
@@ -43,7 +73,7 @@ the log; stdout log is empty — nothing was ever printed to stdout, no test
 result lines at all). `results.tsv`: `rc=1`, `status=CRASH`,
 `tests=0 failed=0 aborted=0 skipped=0`, elapsed `11.818s`.
 
-## Analysis
+## Historical analysis (hypothesis only; not a confirmed root cause)
 
 **This is not a failure inside a `CollectionBinderTests` test method.** The
 stack trace is JUnit Platform's *own internal machinery*, and specifically
@@ -107,7 +137,7 @@ environmental); finding it requires re-running with instrumentation that
 intercepts the original `TestExecutionResult` before the reporting path
 crashes.
 
-## What's missing (could not be done in this session)
+## Historical limitation (resolved by the 2026-07-15 rerun)
 
 The `apps\spring-boot` Spring Boot checkout is **not present in this
 worktree** (`C:\craton\CratonVM-spring-boot-crashfail-20260714\apps\spring-boot`
@@ -151,7 +181,7 @@ before `77f8b37e5` (parent `0063b0b0e`).
   same general *shape* (wrong-type-from-collection cast crash), root cause
   already fixed+regression-tested (`e7e3bb91f`); this is a plausible but
   unconfirmed sibling, not a reversion of that fix.
-- [`brave-baggagefields-classcast-summary-printing.md`](brave-baggagefields-classcast-summary-printing.md) —
+- [`brave-baggagefields-classcast-summary-printing.md`](../../known-issues/springboot/brave-baggagefields-classcast-summary-printing.md) —
   another "clean" (non-memory-corrupt) `ClassCastException` during JUnit's
   own summary-printing path, different mechanism (stale `Collections`
   static field), same general symptom category (a CCE that surfaces deep
