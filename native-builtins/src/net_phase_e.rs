@@ -2982,7 +2982,11 @@ fn native_socket_input_stream_read_one(
     let owner =
         stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
     let one = ctx.new_array(ArrayElementType::Byte, 1);
-    let r = re1_socket_read_stream(ctx, owner, one, 0, 1)?;
+    let one_pin = ctx.pin_native_root(one);
+    let r = re1_socket_read_stream(ctx, owner, one, 0, 1);
+    let one = ctx.read_native_pin(one_pin, one);
+    ctx.unpin_native_roots(one_pin);
+    let r = r?;
     match r {
         Some(Value::Int(-1)) => Ok(Some(Value::Int(-1))),
         Some(Value::Int(_)) => {
