@@ -1,6 +1,21 @@
 # JULI logging subsystem — resolved 4-class cluster
 
-**Status:** FIXED on 2026-07-11. **Severity:** medium (test/logging
+**Status (2026-07-15): PARTIALLY REOPENED.** 3 of 4 classes
+(`TestAsyncFileHandlerOverflow`, `TestFileHandler`, `TestThreadNameCache`)
+are confirmed PASS on a fresh `dev` @ `f23a3f42a` rerun — those fixes hold.
+`TestPerWebappJuliIntegration.testPerWebappHandlersIsolation` still
+reproduces the exact original bare-assertion failure:
+```
+1) testPerWebappHandlersIsolation(org.apache.juli.TestPerWebappJuliIntegration)
+java.lang.AssertionError
+	at org.junit.Assert.assertNotNull(Assert.java:713)
+	at org.apache.juli.TestPerWebappJuliIntegration.testPerWebappHandlersIsolation(TestPerWebappJuliIntegration.java:83)
+```
+Not confounded by the known Windows test-fixture gap (no `StandardRoot`/
+`child container failed` marker in this run's log) — this looks like a
+genuine, still-open residual distinct from whatever fixed the other 3.
+
+**Original status:** FIXED on 2026-07-11. **Severity:** medium (test/logging
 infrastructure correctness; no crash).
 
 ## Resolution

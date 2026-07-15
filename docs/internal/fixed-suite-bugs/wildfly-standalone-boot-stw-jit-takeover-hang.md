@@ -564,3 +564,40 @@ Doc stays **CLOSED / moved to `fixed-suite-bugs`** -- the specific symptom it tr
 resolution" section. This addendum documents the same-day regression that briefly made that conclusion
 untestable, the fix for it, and an additional real (if partial) contributing mechanism (the poisoning
 cascade) fixed along the way. Fix commits: `6a0eedd8`/`cfd80297` (merged `dev`, `ab423500`).
+
+## 2026-07-15 follow-up: the warning RECURRED on dev `a783d31f` (6/20 boots, `--nojit` included) — the remaining counted-blocker population was the ConcurrentHashMap segment-monitor family; FIXED
+
+The "0 occurrences across 50+ verification attempts" above did not hold on the full-extension
+standalone boot under shared-host load: plain repro batches on `a783d31f` hit the exact
+`rounds=64 pending=N taken=0` warning in 3/12 JIT and 3/8 `--nojit` boots (the `--nojit` occurrences
+also disprove any JIT-specific reading of the warning: `taken=0` there simply means "no JIT peers to
+take over"; the wedge is purely counted cooperative mutators that never arrive).
+
+Root-caused live with `CRATONVM_DBG_STW_CENSUS=1` + sudo gdb attach on a wedged boot
+(`/data/wt-wfgc-20260715/probes/logs/GDB_hunt_*.{log,threads}` on the Azure host): every pending
+thread sat in `native_chm_put → ChmMonitorGuard::acquire → NativeContext::monitor_enter →
+Monitor::block_enter` — the plain, census-COUNTED monitor path — contending a ConcurrentHashMap
+segment monitor whose owner was parked at the STW barrier. This is exactly the class this doc's
+original fix anticipated: the 2026-07-13 change added `monitor_enter_gc_safe` but converted only the
+CountDownLatch polling-loop site "with live evidence"; the CHM mutator family was the rest of the
+live population.
+
+**Fix** (branch `fix/wildfly-gc-pin-stream-20260715`, commits `7831ce2c` + `b1ac28f3`, merged to dev):
+all 14 live `ChmMonitorGuard::acquire` sites now use an `acquire_gc_safe` variant
+(blocking-region-protocol wait; relocated-segment return; per-site pin/re-read of every spanning
+local), plus JDK-exact lock-free compute fast paths (`computeIfAbsent` present-key /
+`computeIfPresent` absent-key return without the segment monitor) — the latter also dissolves a
+Java-level segment-monitor ↔ registry-RWLock ordering cycle that surfaced as a *silent* wedge once
+the barrier deadlock stopped masking it (real JDK bin-granularity never orders different keys against
+each other; our 16-way segments do).
+
+Post-fix: the warning appears in **0 of 49** standalone boots (12+10 chmfix, 12+10 fastpath, plus
+canary batches), versus 6/20 pre-fix on the same host. Boot-completion *rates* across those batches
+are not cleanly comparable (host load ranged 6→19 over the day; an 11 s boot at load 6 can blow a
+90 s timeout at load 19), so the warning-marker count is the controlled metric.
+
+Residual: the absent-key `computeIfAbsent` mapper still runs under the segment monitor (JDK runs it
+under a bin lock — same semantics, coarser collision domain here). If counted-blocker wedges recur,
+audit the remaining ~65 `NativeContext::monitor_enter` native call sites the same way (the census
+dump + gdb-attach recipe above localizes the population in one wedged boot), or take CHM segmentation
+finer.

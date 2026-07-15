@@ -1,6 +1,29 @@
 # Logback `LoggerContext.loggerContextListenerList` (a `final` field) turns null after N successful resets — heap/GC corruption, not a construction bug
 
-**Status: OPEN**
+**Status: FIXED/RETIRED 2026-07-15**
+
+## Resolution
+
+The original heap/GC diagnosis was incorrect. CratonVM registered
+`LoggerContext.<init>()V` as a no-op in two native-bridge paths, while the
+SLF4J `StaticLoggerBinder` native allocated a real-classed `LoggerContext`
+directly instead of invoking its constructor. Consequently the object had the
+real 27-slot layout but its final `loggerContextListenerList` field (slot 17)
+was never initialized.
+
+The binder now calls `NativeContext::new_object_initialized` for
+`LoggerContext`, and the two no-op constructor registrations were removed.
+
+Verified with Spring Boot 4.2.0-SNAPSHOT and Logback 1.5.34 using the unique
+`cratonvm-springboot-logback-listenerfield-realctor-20260715-001.exe` binary:
+
+- `BannerTests`: 6/6 pass with `--nojit`.
+- `BannerTests`: 6/6 pass with JIT enabled.
+- `SimpleMainTests` and `ConfigurationPropertiesTests` no longer emit the
+  `loggerContextListenerList` NPE. Their remaining assertion/configuration
+  failures are unrelated residuals outside this retired cluster.
+
+The native-builtins crate also passes `cargo check` after the change.
 
 ## Symptom
 
@@ -62,7 +85,7 @@ substantially larger):
 The variable partial-pass counts (0/6, 1/5, 2/114, 4/16, 12/16-pass...) are
 the key clue — see Analysis.
 
-## Analysis
+## Historical analysis (superseded)
 
 ### The field is declared `final` — it cannot legally become null after construction
 
