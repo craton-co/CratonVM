@@ -87,8 +87,14 @@ This document tracks the **genuine remaining failures**.
     failing step), `BootProbe.java` (boot-jar append + null-loader `forName`), `TmpProbe.java`
     (`java.io.tmpdir` honoring).
 *   **`@Import` attribute CCE across `@CompileWithForkedClassLoader`** (`web.service.registry.ImportHttpServiceRegistrarTests`)
-  *   **Status**: **OPEN** (2/5 methods: `basicListingWithAot`, `basicScanWithAot` — `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;` at `ConfigurationClassParser$SourceClass.getAnnotationAttributes`)
+  *   **Status**: **OPEN** (2/5 methods: `basicListingWithAot`, `basicScanWithAot` — `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;` at `ConfigurationClassParser$SourceClass.getAnnotationAttributes:1119`, `String[] classNames = (String[]) annotationAttributes.get(attribute);`)
   *   **2026-07-15 update**: reproduces SOLO in ~1s (`/data/tmp/aotfix-runs/MethodRun.java` single-method launcher on the Azure host). The 2026-07-14 SoftReference/GC-relocation hypothesis is now DOUBTED: this failure survived eight classloader-identity fixes, and three focused probes (plain `@Import` reflection, forked-loader variant, `@Import` as meta-annotation on a repeatable annotation type — `ImportProbe2.java`) all PASS. The divergence is somewhere in the full `ConfigurationClassParser`/`MergedAnnotations` path for the repeatable `@ImportHttpServices` container under a forked loader.
+  *   **2026-07-15 second update — CratonVM's native annotation layer RULED OUT, narrowed to Spring's own `AnnotationTypeMapping` caching.** The failing lookup is `collectImports` examining `@ImportHttpServices` itself as a `SourceClass`, asking "is `@ImportHttpServices` meta-annotated with `@Import`?" and requesting `Import`'s `value()` attribute with `classValuesAsString=true` (Spring's `TypeMappedAnnotation.adapt()` expects a `Class[]`→`String[]` conversion here). Two CratonVM-internal traces already present in the codebase (`CRATONVM_IAE_TRACE`, `CRATONVM_ANN_PROXY_DISPATCH_TRACE` in `native-builtins/src/lang_class.rs` / `vm/src/vm/vm_exec.rs::annotation_proxy_dispatch_impl`) were used, plus one new element-level trace (temporary, reverted) confirming the FULL chain from raw classfile annotation bytes through to the reflective proxy dispatch is correct:
+      - `container_loader=SOME` for both `ListingConfig` and `ImportHttpServices` (both correctly recognized as fork-loaded, so `resolve_annotation_class_via_loader` is used, not the stale global store).
+      - `annotation_element_to_java_typed`'s `Array` branch builds a genuine 1-element `Class[]` array for `@Import`'s `value` (`elem_cname=java/lang/Class`, no `TypeNotPresentException` sentinel collapse — that hypothesis, and the "insufficient loader scoping" hypothesis, are both REFUTED for this specific bug).
+      - `annotation_proxy_dispatch_impl`'s element-accessor walk (the code that answers a reflective `Method.invoke()` on the annotation's `$ProxyN`) returns exactly that array back to the Java caller: `[ANN-PROXY-DISPATCH-VAL] ... type_desc=.../Import; returning cid=12 name="java/lang/Class" is_array=true array_len=1` — i.e. CratonVM hands Spring a **correct** 1-element `Class[]`.
+
+      Since the value crossing the native/Java boundary is provably correct, the bug is NOT in CratonVM's annotation-parsing or reflection-dispatch layers — it must be inside Spring's OWN `TypeMappedAnnotation`/`AnnotationTypeMapping` Java code, specifically `getValueFromMetaAnnotation`'s `useMergedValues` branch (`this.mapping.getMappedAnnotationValue(attributeIndex, forMirrorResolution)`), which is a SEPARATE retrieval path from the raw reflective `AnnotationUtils.invokeAnnotationMethod` fallback and was NOT exercised by the traces above (those traces fire on the raw-reflection path; `getMappedAnnotationValue` may resolve the value some other way — e.g. via a cached/mirrored `Method` reference — before ever reaching a `Method.invoke()` call). NEXT STEP: trace (or `javap`/read) `AnnotationTypeMapping.getMappedAnnotationValue` and its mirror-set resolution to find where a correct 1-element array could become a bare `Class` — prime suspect is `Method`-object IDENTITY comparison (mirror-set caching keyed on a `Method` from one loader vs. a `Method` from another) given this cluster's established loader-identity bug theme, though this would be the first instance of that theme manifesting via `java.lang.reflect.Method` identity rather than `Class` identity.
 *   **STOMP Message Hang** (`web.socket.messaging.StompWebSocketIntegrationTests`)
   *   **Status**: **OPEN** (TIMEOUT) — functional gap in STOMP routing/delivery, not a VM deadlock.
 
@@ -346,52 +352,61 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     CratonVM hit the hang on ~2/13 attempts, always on the `Jdk` connector, never the other 3 (which
     don't route through this raw-socket path). Fixed both blocking sites; verified 15/15 clean on the
     same probe post-fix, `cargo test -p cratonvm-native-builtins --lib` 2996/0.
-    ~~**Still OPEN residual investigated 2026-07-15**~~ (`fix/httpconn-residual-20260715`, commit
-    `91cb806c`). Bisected the "which of the other 3 connectors" question with a
-    `FullMatrixProbe`-style stress harness plus a from-scratch JUnit launcher driving the real
-    `ClientHttpConnectorTests` class (49 sub-tests) directly under CratonVM, both stress-run
-    dozens of times with `sudo gdb -p <pid> --batch -ex 'thread apply all bt'` snapshots captured
-    live on reproduced hangs (Jetty `TRACE`, Jdk `OPTIONS`/`DELETE` all reproduced the shape).
-    **Found and fixed two genuine instances of the same missing-`begin_blocking_region` bug
-    pattern**, but in the *shared* `java.net.Socket`/`java.net.ServerSocket` implementation
+    ~~**Residual investigated + partially fixed 2026-07-15**~~ (`fix/httpconn-residual-20260715`,
+    commits `91cb806c` + `3d1449a7`). Bisected the "which of the other 3 connectors" question with
+    a `FullMatrixProbe`-style stress harness plus a from-scratch JUnit launcher driving the real
+    `ClientHttpConnectorTests` class (49 sub-tests) directly under CratonVM.
+
+    **Round 1 (`91cb806c`) — found and fixed two genuine missing-`begin_blocking_region` bugs**,
+    but in the *shared* `java.net.Socket`/`java.net.ServerSocket` implementation
     (`native-builtins/src/plain_socket.rs`, JDK13+'s `NioSocketImpl` backing both classes) rather
     than in any one connector's own code — `java.net.ServerSocket.accept()` is what MockWebServer
-    itself uses to accept every connection for all 4 connector cases:
-      - `socket_accept()`: `listener.accept()` (both the `SO_TIMEOUT` busy-poll branch and the
-        unbounded branch) was never bracketed in `begin_blocking_region`/`end_blocking_region`.
-      - `socket_connect()`: worse than just missing the STW bracket — `connect()`/`connect_timeout()`
-        ran *inside* `with_socket()`'s closure, which holds the single global socket-registry
-        write lock for the call's duration, serializing every other blocking `Socket` op
-        process-wide for as long as the connect takes.
-    Applied the same fix defensively to `native-io/src/socket_channel.rs`'s blocking-mode
-    `SocketChannel` paths (`sc_connect_inner`'s `allow_block` branch, `sc_read`/`sc_write`), which
-    match the identical pattern but were not directly confirmed as hit by these connectors (all
-    3 remaining connectors configure their channels non-blocking).
-    **However, direct gdb evidence shows this missing-wrap pattern is NOT what actually causes the
-    residual hangs.** Every reproduced hang (both pre- and post-fix, including from the real
-    `ClientHttpConnectorTests` class itself) showed: zero threads parked in an unwrapped blocking
-    `accept`/`connect`/`read`/`write` syscall; zero `"STW cross-thread JIT takeover is still
-    waiting for cooperative mutators"` warnings; and thread counts that *dropped* between
-    successive snapshots 4s apart (proving forward progress, not a permanent deadlock). What IS
-    reproducibly visible at every capture: one thread executing `vm/src/runtime/interpreter.rs`'s
-    JIT-to-interpreter transition (`jit_invoke_virtual_mic` → `invoke_on_class_shared_inner` →
-    `execute()` at `interpreter.rs:4163`) deep-cloning a method's `CodeAttribute` — specifically its
-    `LineNumberEntry`/`LocalVariableEntry` vectors (`reader/src/attribute.rs::clone()`) — taking
-    multiple seconds, in one capture while another thread waited on a `ConcurrentHashMap` per-bin
-    monitor (`native_chm_compute` → `monitor_enter_gc_safe`, itself correctly GC-safe) presumably
-    held by a thread doing the same slow clone. This looks like severe, non-deterministic
-    interpreter/attribute-cloning + lock-contention slowness under the heavy thread-pool
-    accumulation the 45-sub-test class produces in one process (76+ live threads by sub-test 6),
-    not a deadlock — StepVerifier's wait just outlasts whatever timeout the harness enforces.
-    **Verification**: `cargo test -p cratonvm-native-builtins --lib` 2996/0 and
-    `cargo test -p cratonvm-native-io --lib` 349/0 unchanged (no regression). Stress comparison
-    of the fix vs. pre-fix binary was inconclusive/confounded (both showed hangs at broadly
-    similar rates under concurrent-load conditions on the shared build host) — the fix is landed
-    because it closes a real, verified bug of the exact hypothesized pattern, not because it was
-    confirmed to eliminate this residual. **Still OPEN**: the interpreter/attribute-cloning
-    slowness above is the real next step, flagged separately for a dedicated investigation (not a
-    quick missing-wrap fix — needs profiling why `CodeAttribute` line-number/local-variable data is
-    deep-cloned per invocation instead of shared/cached).
+    itself uses to accept every connection for all 4 connector cases (`socket_accept()`'s
+    `listener.accept()` was never bracketed; `socket_connect()` additionally ran its blocking
+    `connect()` *inside* the global socket-registry write-lock closure). Also applied defensively
+    to `native-io/src/socket_channel.rs`'s blocking-mode `SocketChannel` paths. Direct gdb evidence
+    showed this was NOT what caused the residual hangs on its own (no thread ever caught parked in
+    an unwrapped blocking syscall) — real bugs, correctly fixed, but not sufficient alone.
+
+    **Round 2 (`3d1449a7`) — found and fixed the actual dominant mechanism.** Live `perf record -g
+    --call-graph dwarf` + `sudo gdb -p <pid> --batch -ex 'thread apply all bt'` sampling (multiple
+    independent captures, both from the ad hoc probe and the real `ClientHttpConnectorTests` class)
+    consistently caught a worker thread pegged at ~90-100% CPU for 20-25+ seconds straight (verified
+    via `top -H` per-thread CPU-time deltas across samples, not just a single snapshot), its top
+    frame cycling through `force_native_over_real_jdk_bytecode` — a ~55-branch/~1400-line
+    sequential string-comparison special-case dispatcher, reached via
+    `intercept_force_registered_native` → `execute_invokevirtual_cached`/`execute_invokestatic_cached`
+    — while the caller executed a tight Java-level spin/poll loop typical of Reactor/Netty/Jetty's
+    lock-free scheduling. This is the SAME function already flagged as consuming ~51% of all
+    executed instructions on method-call-heavy workloads in
+    `docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md` (2026-07-13) — that
+    session measured call *frequency* but not per-call cost, and judged a fast-reject allowlist too
+    risky to hand-write (a first attempt missed a case hiding in a nested helper). This fix instead
+    memoizes the check exactly (no approximation, so no risk of silently changing behaviour):
+    `CachedBytecodeMethod` gains a `force_native_cache: OnceLock<bool>` field, populated once per
+    invoke-cache entry and read thereafter, cutting the recheck from every cached dispatch hit to
+    once per unique callsite. (A direct earlier hypothesis — that a `CodeAttribute` deep-clone in
+    `interpreter.rs`'s `execute()` was the multi-second cost — was investigated with hard timing
+    instrumentation and REFUTED: individual clones measured consistently sub-millisecond, even
+    during a 30s+ hung run; that was a genuine but much smaller waste, not the driver, and was
+    reverted rather than landed as an unverified guess.)
+
+    **Verification**: `cargo test -p cratonvm-native-builtins --lib` 2997/0 and
+    `cargo test -p cratonvm-vm --lib` 2218/0, both unchanged (no regression). Live re-capture
+    post-fix confirms `force_native_over_real_jdk_bytecode` no longer appears in hot-thread
+    snapshots. Clean (single test run at a time, no concurrent host load) 15-run stress comparison
+    of `ClientHttpConnectorTests` end-to-end, 30s hang timeout:
+      - pre-fix (dev tip before this fix): **9/15 hangs (60%)**
+      - post-fix (this commit): **4/15 hangs (27%)**
+    A real, substantial, cleanly-measured improvement (~2.2x hang-rate reduction) — but **not a
+    full fix**. **Still OPEN**: a second, structurally different bottleneck remains. Post-fix
+    hot-thread captures now show sustained CPU-bound activity in `try_lambda_dispatch`
+    (`interpreter.rs`), specifically `shared.lambda_proxies.read()` — an `RwLock<HashMap<ClassId,
+    LambdaCallSite>>` consulted on *every* lambda/`invokedynamic` dispatch with no callsite-level
+    cache (unlike `invokevirtual`/`invokestatic`, which have exactly this kind of cache already).
+    Reactive-stream code is lambda-heavy (`.map`/`.flatMap`/subscriber callbacks per operator), so
+    this is plausibly a genuine architectural gap rather than a quick memoization fix — needs its
+    own investigation into whether invokedynamic call sites can get an analogous IC.
     Also unfixed: the T19.H1 watchdog stack-dump itself SIGSEGVs when JIT frames are on the stack
     (separate small bug; `--nojit` dumps work).
 *   ~~`web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` —
