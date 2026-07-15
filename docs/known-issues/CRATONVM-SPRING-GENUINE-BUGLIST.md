@@ -664,38 +664,73 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     `--release`-only `lock_order` failures; `cargo test -p cratonvm-native-builtins --lib
     --release` unchanged at 2997 passed / 0 failed.
 
-    **OPEN — bug 3, current blocker, NOT fixed.** Past (1)+(2), the same minimal repro (and the
-    full test class) now hits `ArgumentError: wrong number of arguments (given 0, expected
-    1..2)` at `rubygems/version.rb:413` (`canonical_segments`'s `partition_segments(...)` /
-    the preceding `@version.sub(regex, "")` call), raised from deep inside REAL gem-dependency
-    resolution (`Gem::Dependency#to_spec` → `#to_specs` → `#matching_specs` →
-    `Specification.find_all_by_name` → `Requirement#satisfied_by?` → `RubyComparable#>=` →
-    `Version#<=>` → `#canonical_segments`) — i.e. this is reached only once (1) and (2) let
-    bootstrap progress far enough to start resolving real gem versions. Traced via
-    `CRATONVM_DBG_INDY_GENERIC=1` to `org.jruby.ir.targets.simple.NormalInvokeSite.bootstrap`'s
-    `invoke:sub(ThreadContext, IRubyObject, IRubyObject, IRubyObject, IRubyObject)` call site:
-    the operand stack legitimately holds exactly 5 values when `bootstrap_generic`
-    (`vm/src/runtime/invokedynamic.rs`) pops them (no stack-depth mismatch — added a
-    `CRATONVM_DBG_INDY_GENERIC`-gated depth log to confirm), but the VALUES are wrong: the
-    receiver slot holds the `Gem::Version` instance itself (`self`) instead of `@version`'s
-    string value, and a second `Regexp` literal (seemingly meant for a *different*,
-    conditionally-executed `.sub!` call on the next source line) ends up in the
-    replacement-string/block argument slots instead of the frozen `""` string. This points
-    upstream of `bootstrap_generic`'s own (verified-correct) pop loop, into how earlier
-    nested `invokedynamic` sites (ivar-get, `RegexpObjectSite`, `StringBootstrap.fstring`) or
-    JRuby's own IR-interpreter call-site linkage populate that operand stack.
+    **OPEN — bug 3, current blocker, NOT fixed (updated 2026-07-15, round 2).** Past (1)+(2),
+    the same minimal repro (and the full test class) still hits `ArgumentError: wrong number of
+    arguments (given 0, expected 1..2)` at `rubygems/version.rb:413` (`canonical_segments`'s
+    `@version.sub(regex, "")` call), raised from deep inside REAL gem-dependency resolution
+    (`Gem::Dependency#to_spec` → `#to_specs` → `#matching_specs` → `Specification.find_all_by_name`
+    → `Requirement#satisfied_by?` → `RubyComparable#>=` → `Version#<=>` → `#canonical_segments`) —
+    reached only once (1) and (2) let bootstrap progress far enough to resolve real gem versions.
 
-    **Why this looks like a fundamentally larger scope, not one more targeted site**:
-    `org.jruby.ir.targets.indy.InvokeSite` — JRuby's call-linkage base class for essentially
-    every ordinary Ruby method invocation (both `(1)`'s `BlockCallback` sites and `(2)`'s
-    `VariableSite` sites are comparatively narrow siblings of this) — composes its real target
-    handles from, per its own decompiled bytecode: `MethodHandles.dropArguments` (6 call
-    sites), `insertArguments` (6 call sites), `foldArguments` (1), `filterReturnValue` (1 — the
-    same combinator fixed in (2), reused here in a different composition), and `guardWithTest`
-    (1), all interacting to build a lazily-specializing polymorphic inline cache. Isolating
-    which exact composition (or combination) misbehaves for THIS call shape would need
-    systematically verifying each of `dropArguments`/`insertArguments`/`foldArguments`
-    (`native-builtins/src/lang_invoke.rs`) against real JDK semantics for arbitrary
-    argument-count/position combinations, not a single targeted fix — flagged for a dedicated
-    follow-up investigation rather than continued ad-hoc tracing here.
+    **Round 1** traced via `CRATONVM_DBG_INDY_GENERIC=1` to
+    `org.jruby.ir.targets.simple.NormalInvokeSite.bootstrap`'s
+    `invoke:sub(ThreadContext, IRubyObject, IRubyObject, IRubyObject, IRubyObject)` call site: the
+    operand stack legitimately holds exactly 5 values when `bootstrap_generic`
+    (`vm/src/runtime/invokedynamic.rs`) pops them (no stack-depth mismatch), but the VALUES are
+    wrong: the receiver slot holds the `Gem::Version` instance itself (`self`) instead of
+    `@version`'s string value, and a stray `Regexp` literal lands in the replacement-string/block
+    argument slots instead of the frozen `""` string.
+
+    **Round 1 fix (genuine but did not close this)**: `MethodHandles.dropArguments`
+    (`native-builtins/src/lang_invoke.rs`, `MH_KIND_DROP`) computed how many arguments to discard
+    as `extra_args.len() - inner_expected`, re-deriving `inner_expected` at DISPATCH time by
+    re-parsing the wrapped inner handle's reported descriptor — fragile for nested/chained
+    `dropArguments` (JRuby's `InvokeSite` composes SIX `dropArguments` calls per call site, several
+    nested). Fixed to store the exact drop count explicitly at construction time (`"pos:count"`
+    encoded in `MH_CLASS`) instead of re-deriving it — commit `6a77cd93`, with a new regression
+    test (`drop_arguments_dispatch_keeps_correct_slot_not_adjacent_ones`, previously zero
+    MethodHandle-combinator-dispatch test coverage existed in this file). Verified as a genuine,
+    independent correctness fix (`cargo test -p cratonvm-native-builtins --lib --release`: 2998
+    passed / 0 failed) — but the minimal repro still hits the IDENTICAL `ArgumentError` afterward:
+    `dropArguments` is not even exercised on this specific call's path.
+
+    **Round 2 — full combinator-chain tracing (added `MH_DISPATCH_ARGS`, alongside the existing
+    `CRATONVM_DBG_MH_DISPATCH`, to print every dispatch step's actual argument VALUES, not just
+    argc).** Walked the ENTIRE chain for the specific `ivarGet:@version` call that produces the
+    wrong receiver:
+    `guardWithTest(test=insertArguments(testRealClass, classId), target=filterReturnValue(target=
+    RubyObject5.var0-getter, filter=insertArguments(Helpers.nullToNil, nilSingleton)),
+    fallback=...)`, dispatched with `[self]`. EVERY step computes the mathematically correct
+    value: `testRealClass(classId, self)` → true; `var0(self)` → `@version`'s real `FString`
+    value; `nullToNil(FString, nil)` → the same `FString` (non-null passthrough); the WHOLE chain's
+    logged `"indy-generic] target MH invoke result"` is correctly that `FString`. `guardWithTest`,
+    `insertArguments` (both occurrences), and `filterReturnValue` (this investigation's own
+    round-1 fix, commit `3af9ab62`) all forward/receive exactly the args JDK semantics require —
+    no combinator in this chain is at fault.
+
+    Despite the computation being correct, the FOLLOWING `invoke:sub` call's popped operand-stack
+    values show BOTH `self` (the ORIGINAL, pre-`ivarGet` value) AND the correctly-computed `FString`
+    result present as separate stack slots (`self` at the position `FString` should occupy, and
+    every value after it shifted one slot right) — i.e. the `ivarGet` `invokedynamic` instruction's
+    result push did not correctly REPLACE `self` on the operand stack; `self` and the result both
+    ended up present. `bootstrap_generic`'s own pop/push mechanics were re-read line-by-line and are
+    correct (`ValueStack::pop_compact` is a genuine decrement-then-read, not a peek). This rules
+    OUT every MethodHandle combinator AND `bootstrap_generic`'s own stack bookkeeping as the fault;
+    the extra `self` most likely comes from an ORDINARY (non-`invokedynamic`) bytecode instruction
+    — a `dup`/extra `aload` — in JRuby's own dynamically-IR-compiled snippet for this call
+    instruction, which CratonVM's core opcode interpreter (not the MethodHandle/indy subsystem)
+    executes. This snippet is synthesized at runtime by JRuby's own IR-to-bytecode compiler (not
+    present as a static `.class` file `javap` can decompile), so confirming the exact instruction
+    responsible would need bytecode-level dumping/disassembly of runtime-generated method bodies —
+    a different, larger investigation than MethodHandle-combinator auditing (which this round
+    conclusively ruled out via direct argument-value tracing, not by assumption).
+
+    **Evidence for round 2**: `cargo test -p cratonvm-native-builtins --lib --release` unchanged at
+    2998 passed (2997 baseline + the round-1 regression test) / 0 failed; `cargo test -p
+    cratonvm-vm --lib --release` unchanged at 2205 passed / 9 pre-existing `--release`-only
+    `lock_order` failures; minimal repro (`require 'erb'; require 'ostruct'`) and the full
+    `JRubyScriptTemplateTests` class both still fail with the identical `ArgumentError` at
+    `rubygems/version.rb:413` after every fix landed so far. `JRubyScriptTemplateTests` remains
+    FAILING end-to-end — flagged for a dedicated follow-up with bytecode-level tracing of the
+    runtime-generated `canonical_segments` snippet's actual dup/aload/astore instruction sequence.
 *   ~~Batch-context `<clinit>` contamination~~ — RETRACTED, see above (host environment issue: missing /tmp + missing ~/jdk25 symlink, not CratonVM).
