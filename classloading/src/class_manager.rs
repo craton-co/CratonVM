@@ -13923,9 +13923,6 @@ fn note_bootstrap_appended_jar(path: &str) {
             }
         }
     }
-    if std::env::var_os("CRATONVM_DBG_BOOTAPPEND").is_some() {
-        eprintln!("[DBG_BOOTAPPEND] noted jar {} with {} classes", path, names.len());
-    }
     if names.is_empty() {
         return;
     }

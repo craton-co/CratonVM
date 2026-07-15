@@ -1315,6 +1315,23 @@ fn classloader_parent(ctx: &mut dyn NativeContext, loader: ObjectRef) -> Option<
 /// found it too (HotSpot throws ClassNotFoundException). That made
 /// `ClassUtils.isCacheSafe(composite, siblingLoader)` wrongly true via its
 /// `isLoadable` fallback. ClassUtilsTests.isCacheSafe.
+/// Whether a BUILT-IN loader (application/platform -- anything CratonVM does
+/// not classify as user-defined) appears in `loader`'s parent chain,
+/// including `loader` itself. A `false` answer means the chain terminates at
+/// the bootstrap (null) without ever passing a built-in loader, so per
+/// JVMS 5.3 only bootstrap classes are resolvable through delegation.
+fn builtin_loader_reachable(ctx: &mut dyn NativeContext, loader: ObjectRef) -> bool {
+    let mut cur = Some(loader);
+    for _ in 0..256 {
+        let Some(l) = cur else { break };
+        if !is_user_defined_loader(ctx, l) {
+            return true;
+        }
+        cur = classloader_parent(ctx, l);
+    }
+    false
+}
+
 fn loader_can_see_defining(
     ctx: &mut dyn NativeContext,
     loader: ObjectRef,
@@ -1429,6 +1446,21 @@ fn cl_load_class_base_delegation(
         // asserts its injected MockMethodDispatcher has a null loader).
         && !cratonvm_classloading::is_bootstrap_appended_class(&internal)
         && receiver_has_find_class_override;
+    // JVMS 5.3-faithful scoping of the flat-store fallback (same gate as the
+    // defer logic above): CratonVM's global store stands in for "the app
+    // classpath, reachable through the parent chain". A loader whose REAL
+    // parent chain never passes through a built-in loader (e.g.
+    // `new ClassLoader(null) {}`, or a loader parented to such) can only see
+    // bootstrap classes on HotSpot; answering an application class from the
+    // flat store bypasses the loader's own fallback logic (seen:
+    // ThrowawayClassLoader.loadClassFromResource never ran because
+    // super.loadClass resolved the probe class globally, failing its
+    // stream-closing contract test). Loaders with a findClass override keep
+    // their step-6 rescue below, so only override-less chains change.
+    let scoped_user_chain = cl_bootstrap_scoped()
+        && !is_bootstrap_class_name(&internal)
+        && !cratonvm_classloading::is_bootstrap_appended_class(&internal)
+        && !builtin_loader_reachable(ctx, this);
     // JVM spec §5.3.2 — parent-first delegation:
     // 1. Check if this loader already loaded the class (findLoadedClass)
     let loader_type = match ctx.get_field(this, CL_LOADER_TYPE) {
@@ -1517,13 +1549,13 @@ fn cl_load_class_base_delegation(
             }
         }
         // For built-in parent loaders (bootstrap/platform/app), use standard delegation
-        if parent_type != LOADER_CUSTOM && !defer_to_find_class {
+        if parent_type != LOADER_CUSTOM && !defer_to_find_class && !scoped_user_chain {
             // Standard delegation handles bootstrap → extension → app
             if let Some(mirror) = resolve_global_if_visible(ctx, this, &internal) {
                 return Ok(Some(Value::Object(Some(mirror))));
             }
         }
-    } else if !defer_to_find_class {
+    } else if !defer_to_find_class && !scoped_user_chain {
         // No parent (or null parent) → delegate directly to bootstrap loader
         // Bootstrap delegation: use the standard class loading chain
         if let Some(mirror) = resolve_global_if_visible(ctx, this, &internal) {
@@ -1535,7 +1567,7 @@ fn cl_load_class_base_delegation(
     //    (this covers bootstrap → extension → application delegation).
     //    Skipped when deferring to a custom `findClass` override (HIB-CV-24) so
     //    the supplied loader runs before CratonVM's global store answers.
-    if !defer_to_find_class {
+    if !defer_to_find_class && !scoped_user_chain {
         if let Some(mirror) = resolve_global_if_visible(ctx, this, &internal) {
             return Ok(Some(Value::Object(Some(mirror))));
         }

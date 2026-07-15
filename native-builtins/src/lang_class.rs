@@ -1722,9 +1722,32 @@ pub(crate) fn native_class_for_name(
         let lookup_loader = if loader_class_name_debug
             == "org/springframework/core/test/tools/DynamicClassLoader"
         {
-            match ctx.get_field_by_name(loader, "parent") {
-                Value::Object(Some(parent)) => parent,
-                _ => loader,
+            // Only reroute when the parent is the FORKED test loader: in that
+            // configuration DynamicClassLoader's constructor defines every
+            // generated class into the fork (defineDynamicClass), so the
+            // fork's namespace is authoritative. A plain per-compile
+            // DynamicClassLoader (parent = app/test loader) defines classes
+            // ITSELF — both its lazily-defined generated classes and classes
+            // third parties (CGLIB's ReflectUtils.defineClass fallback) push
+            // into it — and rerouting to the app parent hid those,
+            // CNFE-failing the Class.forName(name, true, loader) that CGLIB
+            // issues right after a successful define.
+            let parent_is_fork = match ctx.get_field_by_name(loader, "parent") {
+                Value::Object(Some(parent)) => {
+                    let pid = ctx.class_id_of_object(parent);
+                    ctx.class_name_of_id(pid).is_some_and(|n| {
+                        n == "org/springframework/core/test/tools/CompileWithForkedClassLoaderClassLoader"
+                    })
+                }
+                _ => false,
+            };
+            if parent_is_fork {
+                match ctx.get_field_by_name(loader, "parent") {
+                    Value::Object(Some(parent)) => parent,
+                    _ => loader,
+                }
+            } else {
+                loader
             }
         } else {
             loader
