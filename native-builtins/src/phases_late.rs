@@ -9919,15 +9919,35 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // `catalina.webresources` cluster — `preVisitDirectory` does
             // `Files.copy(dir, …)`). Branch on the source kind; tolerate an
             // already-existing target dir (mirrors the file path's overwrite).
-            let src_is_dir = std::fs::symlink_metadata(&src_path)
-                .map(|m| m.is_dir())
-                .unwrap_or(false);
-            let result = if let Some((jar, entry)) = jarfs_decode(&dst_path) {
+            // Classify the SOURCE too: `src_path` may itself be a jarfs-encoded
+            // entry (e.g. a Path from `FileSystems.newFileSystem(zipPath, ...)`,
+            // as used by Quarkus's `ZipUtils.unzip`/`copyFromZip` to extract a
+            // mounted zip's contents to the real filesystem). Previously this
+            // only special-cased a jarfs DESTINATION and always read the source
+            // via `std::fs::symlink_metadata`/`std::fs::copy`, which treats the
+            // jarfs-encoded source string as a literal OS path — it never is
+            // one, so both calls failed with a raw `NotFound` ("No such file or
+            // directory (os error 2)"), surfacing as `IllegalStateException:
+            // IOException: No such file or directory (os error 2)` even though
+            // `Files.isDirectory`/`isRegularFile` on the same Path (which DO
+            // classify via `vfs_classify`/`jarfs_classify`) reported correctly.
+            let src_jarfs = jarfs_decode(&src_path);
+            let src_is_dir = if let Some((ref jar, ref entry)) = src_jarfs {
+                matches!(jarfs_classify(jar, entry), JarFsKind::Dir)
+            } else {
+                std::fs::symlink_metadata(&src_path)
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false)
+            };
+            let result = if let Some((dst_jar, dst_entry)) = jarfs_decode(&dst_path) {
                 if src_is_dir {
-                    jarfs_create_dir_entry(&jar, &entry)
+                    jarfs_create_dir_entry(&dst_jar, &dst_entry)
+                } else if let Some((src_jar, src_entry)) = &src_jarfs {
+                    jarfs_read_entry(src_jar, src_entry)
+                        .and_then(|bytes| jarfs_write_file_entry(&dst_jar, &dst_entry, &bytes))
                 } else {
                     std::fs::read(&src_path)
-                        .and_then(|bytes| jarfs_write_file_entry(&jar, &entry, &bytes))
+                        .and_then(|bytes| jarfs_write_file_entry(&dst_jar, &dst_entry, &bytes))
                 }
             } else if src_is_dir {
                 match std::fs::create_dir(&dst_path) {
@@ -9935,6 +9955,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
                     Err(e) => Err(e),
                 }
+            } else if let Some((src_jar, src_entry)) = &src_jarfs {
+                jarfs_read_entry(src_jar, src_entry)
+                    .and_then(|bytes| std::fs::write(&dst_path, &bytes))
             } else {
                 std::fs::copy(&src_path, &dst_path).map(|_| ())
             };
