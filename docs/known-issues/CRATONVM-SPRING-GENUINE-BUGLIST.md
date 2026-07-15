@@ -722,7 +722,7 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     apparently not for this native-call conservative-scan site), which is a substantially larger
     effort than a bug-fix session: expect a dedicated investigation, not a quick follow-up.
 *   ~~`web.reactive.result.view.script.JRubyScriptTemplateTests`~~ **PARTIALLY FIXED
-    (2026-07-15) -- 4 of (at least) 5 chained bugs closed, test class still FAILS.** JRuby's own
+    (2026-07-15) -- 5 of (at least) 6 chained bugs closed, test class still FAILS.** JRuby's own
     bootstrap (`rubygems/specification.rb` / `rubygems/version.rb`) turned out to hit a CHAIN of
     independent CratonVM bugs, each masking the next -- fixing one just exposes the next further
     into the same bootstrap. Root-caused and fixed so far:
@@ -922,14 +922,72 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     `op_ge` arity bug and the `SelfInvokeSite` scalar-wrap bug are gone, `Gem::Version` comparison
     now works end-to-end -- into `require 'ostruct'`, hitting a new, unrelated failure.
 
-    **OPEN -- bug 5, current blocker, NOT fixed (found 2026-07-15, round 4).** After bugs 3+4,
-    `JRubyScriptTemplateTests` still FAILS, now with `java.lang.ArrayIndexOutOfBoundsException` in
-    `org.jruby.ir.targets.indy.BuildDynamicStringSite.<init>` (`BuildDynamicStringSite.java:62`),
-    raised while interpreting `ostruct.rb:477` (inside `OpenStruct`'s class body, iterating
-    `RubyArray#each`). This is a Ruby STRING-INTERPOLATION construction site (JRuby's `"#{...}"`
-    dynamic-string bytecode-generation machinery) -- a different JRuby subsystem entirely from
-    the argument-collection/marshaling family bugs 1/3/4 all turned out to belong to. Not yet
-    investigated. `JRubyScriptTemplateTests` remains FAILING end-to-end -- flagged for a
-    dedicated follow-up root-causing `BuildDynamicStringSite`'s construction against whatever
-    value/count CratonVM is supplying it.
+    5. **FIXED, commit `d250607f`.** Root cause: `bootstrap_generic`
+       (`vm/src/runtime/invokedynamic.rs` -- the generic, uncached fallback used to link any
+       indy call site not specially handled) builds the BOOTSTRAP METHOD's own argument list
+       FLAT (`[lookup, name, methodType, static_arg_1, ..., static_arg_N]`), correct for the
+       common bootstrap shapes seen elsewhere (`(Lookup,String,MethodType)`, or fixed-arity
+       extra args) but wrong for a bootstrap method whose LAST formal parameter is `Object[]`,
+       collecting ALL extra constant-pool bootstrap arguments (JVMS-legal; mirrors a Java
+       varargs method) -- exactly JRuby 10.x's string-interpolation bootstrap,
+       `BuildDynamicStringSite.buildDString(Lookup, String, MethodType, Object[])` (confirmed
+       via `javap`). Without packing, the declared `Object[] bsmArgs` parameter received
+       `bsm_args[3]` -- the FIRST static bootstrap arg, a scalar, not an array;
+       `BuildDynamicStringSite`'s own constructor then computes `bsmArgs.length - 6` as a
+       metadata offset, CratonVM's `arraylength`-of-non-array guard silently returns 0 for the
+       scalar, the offset goes negative, and the next `aaload` throws
+       `ArrayIndexOutOfBoundsException` at `<init>` -- reached via `JRubyScriptTemplateTests`'s
+       `require 'ostruct'` (`ostruct.rb:477`, inside `OpenStruct`'s class body). Fixed by adding
+       `descriptor_param_count_and_last_is_object_array` (deliberately narrower than
+       `native-builtins`'s `collect_trailing_varargs` -- per JVMS this bootstrap-method
+       collecting parameter is always both syntactically LAST and always exactly `Object[]`, so
+       none of that function's Block-after-array ordering complication applies here) and, when
+       the bootstrap descriptor's last param is `[Ljava/lang/Object;` and more static args were
+       supplied than declared params, packing the excess into a real `Object[]` (boxing
+       primitive `Value`s via `Integer/Long/Float/Double.valueOf` -- `Object[]` elements must be
+       references) before invoking. Verified: `<init>` no longer throws
+       `ArrayIndexOutOfBoundsException` in any of 9 repeated `JRubyScriptTemplateTests` runs.
+       `cargo test -p cratonvm-native-builtins --lib --release -- --test-threads=1`: 2999
+       passed / 0 failed; `cargo test -p cratonvm-vm --lib --release`: 2205 passed / 9
+       pre-existing `--release`-only `lock_order` failures, unrelated.
+
+    **Evidence for bug 5**: with the fix applied, `BuildDynamicStringSite` construction itself
+    (the `<init>` crash) is reliably gone across repeated runs -- but a DIFFERENT, downstream bug
+    in the SAME class's runtime dispatch then surfaces (see bug 6 below), so
+    `JRubyScriptTemplateTests` still does not pass reliably yet. One isolated run DID pass
+    end-to-end (found=1 succ=1 fail=0 status=OK) before bug 6 was characterized, confirming the
+    remaining gap is narrow, but 8 of 9 repeated runs since have hit bug 6's `ClassCastException`
+    -- NOT claiming the class passes; treating the single pass as most likely a timing-dependent
+    window rather than a reliable state.
+
+    **OPEN -- bug 6, current blocker, NOT fixed (found 2026-07-15, round 5).** After bug 5's fix,
+    `BuildDynamicStringSite` construction succeeds, but its RUNTIME string-building dispatch
+    then throws `java.lang.ClassCastException: org.jruby.runtime.ThreadContext cannot be cast to
+    org.jruby.runtime.builtin.IRubyObject` inside `RubyString.append` <- `RubyString
+    .appendAsStringOrAny` <- `BuildDynamicStringSite.buildString` (one of its many
+    arity-specialized overloads -- `javap` shows dedicated fixed-arity `buildString` overloads
+    for up to ~5 dynamic interpolated values, plus a genuine `buildString(ThreadContext,
+    IRubyObject...)` varargs fallback for more). Live `CRATONVM_DBG_MH_DISPATCH` tracing (same
+    `ostruct.rb:477` site, a single-value `"#{key}"`-shaped interpolation) shows the FINAL
+    dispatch to `buildString`'s 5-param overload `(ThreadContext, IRubyObject, ByteListAndCodeRange,
+    Encoding, int)` receiving 6 flat args
+    `[ThreadContext, ThreadContext, ByteListAndCodeRange, Encoding, Integer, RubySymbol]` -- the
+    dynamic value (`RubySymbol`, correctly present as the call site's own sole input arg) has
+    been pushed to the very END instead of landing in the 2nd (IRubyObject) slot, and `ThreadContext`
+    is DUPLICATED into that slot instead. Traced upstream to the FIRST combinator in the chain: a
+    `MethodHandles.permuteArguments` (`MH_KIND_PERMUTE`) step whose incoming 2-element args
+    (`[ThreadContext, RubySymbol]`, matching the call site's own 2-param shape) are reordered via
+    its reorder `int[]` into a 3-element `[ThreadContext, ThreadContext, RubySymbol]` -- i.e. the
+    reorder array appears to read as `[0, 0, 1]`, duplicating index 0 instead of (most likely)
+    mapping index 1 (the dynamic value) into its correct downstream position. `mhs_permute
+    _arguments`'s construction code (`native-builtins/src/lang_invoke.rs`) and `MH_KIND_PERMUTE`'s
+    dispatch arm were both read and look like a faithful, unconditional pass-through of whatever
+    reorder array the caller supplies -- so the leading hypothesis is that the reorder `int[]`
+    ITSELF is being constructed with the wrong values by whatever bytecode/native path builds it
+    (not yet identified), rather than a bug in how CratonVM applies a correct reorder array. This
+    is a DIFFERENT combinator (`permute`) from the array-collection family bugs 3/4/5 all
+    belonged to -- not yet root-caused or fixed. `JRubyScriptTemplateTests` remains FAILING
+    end-to-end (reliably, in 8 of 9 repeated runs after bug 5's fix) -- flagged for a dedicated
+    follow-up tracing where/how this specific `permuteArguments` call's reorder array is
+    constructed.
 *   ~~Batch-context `<clinit>` contamination~~ — RETRACTED, see above (host environment issue: missing /tmp + missing ~/jdk25 symlink, not CratonVM).
