@@ -592,3 +592,108 @@ itself is now better evidenced as a cross-thread GC-root-visibility race rather 
 JIT-only `SB-CRASH-04` gap the original investigation named — that attribution should be treated as
 superseded by this section, not as still-authoritative. Whoever picks this up next should start from the
 `via_pin=true` finding above rather than re-chasing individual unpinned-local sites.
+
+## 2026-07-15 follow-up (second session): "excluded-while-running" DISPROVED by a purpose-built canary; two boot-wedge mechanisms in the same window root-caused and FIXED; CCE re-measured far lower
+
+Investigated 2026-07-15, isolated worktree `/data/wt-wfgc-20260715` (Azure host), branch
+`fix/wildfly-gc-pin-stream-20260715`, forked from `origin/dev @ a783d31f`. Probe artifacts (logs,
+summary.txt, cores) under `/data/wt-wfgc-20260715/probes/` on that host.
+
+### New tool: `CRATONVM_DBG_BLOCKED_ACCESS` — and what it disproved
+
+The previous section left the residual characterized as a likely "cross-thread GC-root-visibility/timing
+race" — a thread whose `in_blocked_region` flag makes the STW census exclude it while it actually keeps
+running (its pins invisible to both the root scan and `fold_pointer_map_into_blocked`). This session
+built a dedicated detector (`gc/src/blocked_access_debug.rs`): with
+`CRATONVM_DBG_BLOCKED_ACCESS=warn|1`, any heap-header access (via the `GenerationalHeap::get_header`
+funnel), any `pin_native_root`/`pin_native_object_values` push, and any interpreter-safepoint arrival
+performed by a thread whose OWN `in_blocked_region` flag is raised is reported with a backtrace (or
+panics). Registration is per-thread via `ThreadRegistry::set_os_tid_current`; default-off, one
+cached-bool branch when off.
+
+**Result: zero reports across 16 instrumented boots — including one boot that produced this doc's
+exact `WFLYCTL0079`/`AttributeDefinition` CCE while the canary was live.** The excluded-while-running
+mechanism does not occur in this workload; the previous section's leading hypothesis is disproved as
+the CCE's cause. (A static audit of every VM-side raise/clear pairing done alongside — monitor paths,
+park, join, class-init wait, JNI foreign attach, blocking-region begin/end — found them all correctly
+paired post-GCAUDIT-0711, consistent with the canary's silence.)
+
+### The same boot window's dominant failures were two OTHER, now-fixed mechanisms
+
+Re-running this doc's standard repro recipe on `a783d31f` produced almost no CCEs (see below) but a
+much higher rate of full boot WEDGES, in two distinguishable modes, both root-caused live this session:
+
+1. **STW-barrier deadlock via census-counted CHM segment-monitor contenders** (the
+   `STW cross-thread JIT takeover is still waiting for cooperative mutators rounds=64 pending=N taken=0`
+   warning — reproduced 6/20 plain boots on `a783d31f`, *including under `--nojit`*, disproving the
+   "JIT takeover" attribution in that warning's name). gdb-attach on a wedged boot +
+   `CRATONVM_DBG_STW_CENSUS=1` identified the pending threads exactly: contenders inside
+   `native_chm_put → ChmMonitorGuard::acquire → NativeContext::monitor_enter` — the plain,
+   census-COUNTED monitor path — while the segment owner was parked at the barrier. The 2026-07-13
+   session had already built the escape hatch (`monitor_enter_gc_safe`) but applied it to a single
+   CountDownLatch site; the ConcurrentHashMap mutator family was the remaining live population.
+   **FIXED** by converting all 14 live `ChmMonitorGuard::acquire` sites to a new `acquire_gc_safe`
+   (blocking-region protocol; returned/relocated segment ref; every spanning local pinned and
+   re-read). Post-fix: **0/49 runs show the warning** (vs 6/20 pre-fix).
+2. **A Java-level lock-order cycle our CHM's coarse segment lock creates where real JDK bin-level
+   granularity cannot** (the silent wedge that remained once mode 1 stopped masking it): compute-family
+   callbacks run user code under the segment monitor; WildFly's registry callbacks take the
+   management-registry write lock (`stamped_lock.rs::rw_write_lock`), while registry read-lock holders
+   contend the same *segment* (different keys — different bins on HotSpot, so this graph is acyclic
+   there). gdb showed 4 threads starving in `rw_write_lock` with a compute contender parked on the
+   segment. **FIXED** by implementing real CHM's lock-free probes: `computeIfAbsent` on a PRESENT key
+   and `computeIfPresent` on an ABSENT key now return without touching the segment monitor
+   (JDK-exact). The absent-key `computeIfAbsent` still runs its mapper under the segment monitor
+   (JDK runs it under the bin lock; atomicity preserved) — a residual, far narrower cross-key window
+   real JDK does not have; if wedges recur, finer segment granularity is the next step.
+
+While converting, several **pre-existing unpinned windows in the same CHM mutators** were also fixed
+(`this`/`key`/`value` across `chm_key_hash`'s `hashCode()` dispatch; `values_equal`'s `equals()`
+dispatch; the returned `current` across a put; `putAll`/copy-constructor entry vectors across
+GC-triggering iteration). These are direct candidate mechanisms for this doc's CCE family — a stale
+value stored under a moved-during-hashing window is read back later by an innocent thread as a
+wrong-but-valid object (exactly the `via_pin=true` reader-side signature: the pin machinery worked;
+the *stored value* was already wrong).
+
+### CCE rate on current dev is already far below this doc's 5/12
+
+Matched plain JIT batches: **1 CCE / 19 boots** on `a783d31f`+StreamDecoder-fix (0/12 batch A + 1/7
+canary batch C), vs 5/12 measured by the previous section two dev-days earlier. The intervening dev
+commits (`12bf61c6`, `8665d1ad`, `cf45bb80` — Stream/ArrayList pin fixes on the exact deferred-lambda
+path the live captures blamed) plus this session's CHM pin fixes are the plausible causes. The one
+captured CCE fired with the blocked-access canary live and silent (see above).
+
+### The SIGSEGV bucket is the already-tracked JIT frame-slot/oop-map family — core preserved
+
+3/12 baseline JIT boots SIGSEGV'd (0 under `--nojit`, all batches). One core was captured under the
+canary binary and analyzed:
+`/data/wt-wfgc-20260715/probes/cores/C_jitca_5-core.Thread.3097910.1784092895` (binary
+`probes/cratonvm-wfgc-canary-20260715`, debug info intact). Signature: JIT-compiled code loads a frame
+slot `-0x8(%rbp)` containing `0x360` (a small integer, not a pointer), passes its own null check, and
+faults reading `0x15(%rax)` at `si_addr=0x375` — a frame slot the compiled code types as an oop holding
+a non-oop value. This is the open register-invisible/oop-map family
+(`docs/feature-designs/precise-jit-maps-default.md`, SB-CRASH-04); per standing policy no targeted
+patch was attempted. The core is the first saved-artifact reproduction with symbols for that roadmap
+work.
+
+### Verification
+
+- `cargo test --lib`: cratonvm-vm 2217/0 (baseline had 9 pre-existing failures), cratonvm-native-builtins
+  2995/0 (baseline had 4), cratonvm-native-collections 72/0, cratonvm-native-io 349/0, cratonvm-gc
+  875/876 (the one failure is `satb_pre_barrier_captured_during_concurrent_phase`, a pre-existing
+  parallel-run flake; passes 3/3 in isolation).
+- Barrier-wedge warning (`rounds=64 ... taken=0`): 6/20 plain boots pre-fix → 0 across every post-fix
+  run.
+- Standalone hang RATES this session are not cleanly comparable batch-to-batch: the shared host's load
+  ranged 6→19 across the day (an OK boot takes ~11 s at load 6 and can exceed a 90 s timeout at load
+  19), so marker-based metrics (warning lines, CCE lines, canary lines) are the reliable signals here.
+
+### Updated status
+
+The original `AttributeAccess`/`WFLYCTL0079` CCE remains formally OPEN (1/19 ≠ 0, and the mechanism of
+the historical `via_pin=true` captures is still not positively identified — though the field of
+candidates is now: stale-at-store CHM windows [fixed this session], NOT excluded-while-running
+[disproved], NOT the census accounting [audited sound]). The boot-wedge failure modes that dominated
+this window are fixed; the SIGSEGV family stays with the precise-maps roadmap. Whoever re-measures next
+should use marker-based counts on a quiet host and treat any fresh CCE as highest-value live capture
+(run with `CRATONVM_DBG_BLOCKED_ACCESS=warn CRATONVM_DBG_STALE_OBJREF=1`).
