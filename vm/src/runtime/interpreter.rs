@@ -4485,9 +4485,12 @@ pub fn execute(
                         // Map well-known interfaces -> canonical concrete
                         // class whose natives we register.
                         let canonical: &'static str = match &*class_name_owned {
-                            "java/util/Set" | "java/util/Collection" | "java/lang/Iterable" => {
-                                "java/util/HashSet"
-                            }
+                            "java/util/Set" | "java/util/Collection" => "java/util/HashSet",
+                            // Iterable has no collection shape of its own. Keep
+                            // synthetic List-style receivers on the established
+                            // ArrayList bridge after lambda proxies have already
+                            // had a chance to dispatch their SAM implementation.
+                            "java/lang/Iterable" => "java/util/ArrayList",
                             "java/util/List" => "java/util/ArrayList",
                             "java/util/Map" => "java/util/HashMap",
                             "java/util/Iterator" => "java/util/HashMap$KeyItr",
@@ -23103,6 +23106,19 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    // Map.forEach is a default method whose JDK implementation iterates an
+    // entrySet. CratonVM's immutable-map wrapper intentionally stores a
+    // snapshot backing rather than the JDK's MapN layout, so running that body
+    // can materialize a HashSet and hash a cyclic map entry before a caller's
+    // own nesting guard runs. The native bridge snapshots concrete map entries
+    // directly and preserves the Map.forEach contract for every map backend.
+    if class_name == "java/util/Map"
+        && method_name == "forEach"
+        && method_descriptor == "(Ljava/util/function/BiConsumer;)V"
+    {
+        return true;
+    }
+
     if class_name == "java/util/Iterator" && matches!(method_name, "hasNext" | "next" | "remove") {
         return true;
     }
@@ -34895,6 +34911,20 @@ mod tests {
             "java/util/concurrent/Semaphore",
             "await",
             "()V"
+        ));
+    }
+
+    #[test]
+    fn map_for_each_force_native_preserves_cyclic_map_iteration() {
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/util/Map",
+            "forEach",
+            "(Ljava/util/function/BiConsumer;)V"
+        ));
+        assert!(!force_native_over_real_jdk_bytecode(
+            "java/util/Map",
+            "forEach",
+            "(Ljava/util/function/Consumer;)V"
         ));
     }
 
