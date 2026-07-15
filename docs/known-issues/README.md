@@ -1036,12 +1036,10 @@ now **also FIXED** (2026-07-06); the historical JIT-only decode-error note is
 retired, the current open follow-up is the `RealmModelTest` Liquibase-phase
 timeout, and the sibling `--nojit` STW shutdown hang is fixed and retired to
 [`docs/internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md).
-Not CratonVM bugs: 543 FAILs (`testsuite/integration-arquillian/tests/base`
-+ `tests/other/sssd`, exhaustively confirmed - 543/544 exact match, the 544th
-is the System Rules finding above) are "Not found frontend container:
-auth-server-undertow" - an Arquillian environment/container-provisioning gap
-in this harness, not a VM defect (would fail identically on real HotSpot run
-the same way). 25 additional CRASHes (`scim/core`, `ssf/*`,
+The former Arquillian `auth-server-undertow` container-provisioning gap is
+fixed in the per-class runner: it now forwards the effective Maven Surefire
+bootstrap configuration. See the [retired record](../internal/fixed-suite-bugs/keycloak-arquillian-auth-server-undertow-container-not-found-FIXED.md).
+25 additional CRASHes (`scim/core`, `ssf/*`,
 `test-framework/*`, `tests/webauthn`, 2x`tests/clustering`) were a harness
 classpath gap (missing `junit:junit`, fixed alongside the JUnit Platform
 launcher fix above), not a VM bug.

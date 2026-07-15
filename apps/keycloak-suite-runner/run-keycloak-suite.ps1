@@ -734,7 +734,93 @@ function Resolve-Jdk {
   return 'C:\Program Files\Java\jdk-25'
 }
 
+function Get-ArquillianBootstrapProperties([string]$Module) {
+  if (-not $Module.StartsWith('testsuite/integration-arquillian/tests/', [System.StringComparison]::OrdinalIgnoreCase)) {
+    return @()
+  }
+
+  # Arquillian does not discover this descriptor from the regular test
+  # classpath. Maven Surefire supplies it explicitly via -Darquillian.xml.
+  # The direct KcRunner path must preserve that contract or Arquillian builds
+  # an empty ContainerRegistry and every class fails before its first test.
+  $modulePath = $Module -replace '/', [System.IO.Path]::DirectorySeparatorChar
+  $moduleRoot = Join-Path $script:KeycloakDir $modulePath
+  $descriptor = Join-Path $moduleRoot 'target/dependency/arquillian.xml'
+  if (-not (Test-Path $descriptor)) {
+    $baseRoot = Join-Path $script:KeycloakDir ('testsuite{0}integration-arquillian{0}tests{0}base' -f [System.IO.Path]::DirectorySeparatorChar)
+    $baseDescriptor = Join-Path $baseRoot 'target/dependency/arquillian.xml'
+    if (Test-Path $baseDescriptor) { $descriptor = $baseDescriptor }
+  }
+  if (-not (Test-Path $descriptor)) {
+    Die "Arquillian descriptor missing for $Module. Build its Maven test resources first (for example: mvn -pl $Module -am -DskipTests test-compile)."
+  }
+
+  $properties = New-Object System.Collections.Generic.List[string]
+  $properties.Add("-Darquillian.xml=$([System.IO.Path]::GetFullPath($descriptor))")
+
+  # The Arquillian descriptor is only half of the Surefire contract. Its
+  # placeholders and enabled-container expressions are resolved from the
+  # module's effective Surefire systemPropertyVariables. Materialize that
+  # configuration once per module and cache it with the other runner state.
+  $cacheDir = Join-Path $script:WorkRoot 'arquillian-bootstrap'
+  New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+  $safe = ConvertTo-SafeFileStem $Module
+  $effectivePom = Join-Path $cacheDir "$safe.effective-pom.xml"
+  if ($RefreshClasspaths -or -not (Test-Path $effectivePom)) {
+    $mvn = Resolve-MavenExe
+    $outLog = Join-Path $cacheDir "$safe.effective-pom.out.log"
+    $errLog = Join-Path $cacheDir "$safe.effective-pom.err.log"
+    Write-Info "building effective Maven POM for Arquillian bootstrap: $Module"
+    $record = Start-RedirectedProcess -FilePath $mvn -Arguments @(
+      '-pl', $Module,
+      '-DskipTests',
+      "-Doutput=$effectivePom",
+      'help:effective-pom'
+    ) -WorkingDirectory $script:KeycloakDir -StdoutPath $outLog -StderrPath $errLog
+    $exit = Complete-RedirectedProcess $record
+    # Some leaf modules (notably the legacy SSSD tests) are only selected
+    # through their aggregator. Maven can still produce their effective POM
+    # when run from the module itself, so retain that direct-module fallback.
+    if ($exit -ne 0 -and (Test-Path $moduleRoot)) {
+      Write-Info "retrying effective Maven POM from Arquillian module root: $Module"
+      $record = Start-RedirectedProcess -FilePath $mvn -Arguments @(
+        '-DskipTests',
+        "-Doutput=$effectivePom",
+        'help:effective-pom'
+      ) -WorkingDirectory $moduleRoot -StdoutPath $outLog -StderrPath $errLog
+      $exit = Complete-RedirectedProcess $record
+    }
+    if ($exit -ne 0) {
+      Die "Maven help:effective-pom failed for Arquillian module $Module (exit $exit). Logs: $outLog $errLog"
+    }
+  }
+
+  [xml]$pom = Get-Content -Path $effectivePom -Raw
+  $nodes = @($pom.SelectNodes("//*[local-name()='plugin'][*[local-name()='artifactId' and text()='maven-surefire-plugin']]/*[local-name()='configuration']/*[local-name()='systemPropertyVariables']"))
+  if ($nodes.Count -eq 0) {
+    Die "effective Maven POM has no Surefire systemPropertyVariables for Arquillian module ${Module}: $effectivePom"
+  }
+  $seen = @{ 'arquillian.xml' = $true }
+  foreach ($node in $nodes) {
+    foreach ($entry in $node.ChildNodes) {
+      if ($entry.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
+      $name = $entry.LocalName
+      $value = $entry.InnerText.Trim()
+      if (-not $name -or -not $value -or $value -match '\$\{') { continue }
+      if ($seen.ContainsKey($name)) { continue }
+      $properties.Add("-D$name=$value")
+      $seen[$name] = $true
+    }
+  }
+
+  return $properties.ToArray()
+}
+
 function Get-ModuleSystemProperties([string]$Module) {
+  $arquillianProperties = @(Get-ArquillianBootstrapProperties -Module $Module)
+  if ($arquillianProperties.Count -gt 0) {
+    return $arquillianProperties
+  }
   # testsuite/model classes derive from KeycloakModelTest, whose static
   # initializer requires keycloak.model.parameters to name at least one
   # org.keycloak.testsuite.model.parameters.* class or it crashes with a

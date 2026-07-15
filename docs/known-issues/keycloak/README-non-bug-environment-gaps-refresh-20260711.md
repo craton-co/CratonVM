@@ -5,17 +5,11 @@ fully accounted for. Most of the volume is **not** new CratonVM bugs — it's a 
 environment/harness gaps repeating across many classes. The genuinely new/still-open bugs from this rerun each
 have their own doc in this folder (see list at the bottom); this doc just closes the loop on everything else.
 
-## 1. Arquillian `auth-server-undertow` container-provisioning gap — ~543 classes (541 `testsuite/integration-arquillian/tests/base` + 2 `testsuite/integration-arquillian/tests/other/sssd`)
+## 1. Arquillian `auth-server-undertow` container-provisioning gap — FIXED (2026-07-15)
 
-```
-java.lang.IllegalStateException: Not found frontend container: auth-server-undertow
-  org.keycloak.testsuite.arquillian.AuthServerTestEnricher.initializeSuiteContext(AuthServerTestEnricher.java:233)
-```
-
-Every class under `testsuite/integration-arquillian` needs a fully-configured Arquillian container adapter
-(`auth-server-undertow`) that this harness/environment doesn't provision. Not a CratonVM bug — this is an
-Arquillian container-configuration prerequisite, would fail identically under any JVM without the right
-Arquillian setup.
+The per-class runner now materializes the effective Maven Surefire configuration and supplies the transformed
+Arquillian descriptor. The focused HotSpot probe executes all five tests with all three containers successful.
+The retired record is [here](../../internal/fixed-suite-bugs/keycloak-arquillian-auth-server-undertow-container-not-found-FIXED.md).
 
 ## 2. `keycloak-test-framework-remote-providers` Maven artifact-resolution gap — ~345 classes (341 `tests/base` + 4 `tests/webauthn`)
 
