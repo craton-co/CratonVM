@@ -27580,6 +27580,10 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // shims here too (not only in synthetic phase 67) so the real-JDK dispatch
     // force routes have concrete native targets.
     crate::phases_late::register_p67_foreign_memory(registry);
+    // Keep the full MemorySegment bridge in the always-on real-JDK registry.
+    // Phase 67 covers layout/linker bootstrapping; this adds heap array
+    // segments and indexed access used by Elasticsearch native vectors.
+    crate::panama::register_pe_memory_segment(registry);
     // WP1.4: SharedSecrets.getJavaXxxAccess() factories for the
     // JDK Access interfaces plus the per-interface method natives
     // (currentCarrierThread, doIntersectionPrivilege, copyMethod,
@@ -31711,8 +31715,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljdk/internal/loader/NativeLibraries$NativeLibraryImpl;Ljava/lang/String;ZZ)Z",
         |ctx, args| {
             let impl_obj = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Int(1))),
+                Some(Value::Object(Some(o))) => Some(*o),
+                _ => None,
             };
             let name = match args.get(1) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
@@ -31722,7 +31726,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Ok(lib_index) => lib_index + 1,
                 Err(_) => 0,
             };
-            ctx.set_field_by_name(impl_obj, "handle", Value::Long(handle));
+            if let Some(impl_obj) = impl_obj {
+                ctx.set_field_by_name(impl_obj, "handle", Value::Long(handle));
+            }
             Ok(Some(Value::Int(1)))
         },
     );
@@ -49713,7 +49719,29 @@ fn native_reference_wait_pending(
 /// This is a fallback for when the interpreter's specialized MH dispatch doesn't apply.
 /// The real dispatch happens in the interpreter via CachedInvokeTarget; this native
 /// fallback returns null for now (MH-heavy code paths use the interpreter's dispatch).
-fn native_method_handle_invoke(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_method_handle_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real-JDK Linker returns a synthetic DowncallHandle that is assignable
+    // to MethodHandle. Some signature-polymorphic void call sites resolve the
+    // inherited MethodHandle entry first and reach this fallback instead of
+    // the specialized interpreter route. Do not turn those native calls into
+    // a silent null return: route by the receiver's runtime class.
+    if let Some(Value::Object(Some(receiver))) = args.first() {
+        let receiver_class = ctx.class_name_of_id(ctx.class_id_of_object(*receiver));
+        let has_downcall_layout = matches!(ctx.get_field(*receiver, 0), Value::Long(ptr) if ptr != 0)
+            && match ctx.get_field(*receiver, 1) {
+                Value::Object(Some(descriptor)) => {
+                    ctx.class_name_of_id(ctx.class_id_of_object(descriptor))
+                        .as_deref()
+                        == Some("java/lang/foreign/FunctionDescriptor")
+                }
+                _ => false,
+            };
+        let is_downcall = receiver_class.as_deref() == Some("java/lang/foreign/DowncallHandle")
+            || has_downcall_layout;
+        if is_downcall {
+            return crate::panama::pe_downcall_invoke(ctx, args);
+        }
+    }
     // Signature-polymorphic methods are typically handled by the interpreter directly.
     // If we reach here, it means the call wasn't intercepted. Return null.
     Ok(Some(Value::Object(None)))

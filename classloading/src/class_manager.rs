@@ -1855,6 +1855,55 @@ impl ClassManager {
     /// delegation order (Bootstrap → Extension → Application); custom
     /// loaders are then linearly scanned (rare path — only relevant once
     /// `URLClassLoader`-style user loaders are wired up).
+    /// Loader-faithful variant of [`Self::get_loaded_class_id`]: resolves
+    /// `name` as the given requesting loader would, mirroring
+    /// `ClassStoreHierarchy::lookup`. A user-defined loader that defines its
+    /// OWN copy of `name` (loader-aware gate on) resolves to that copy, not
+    /// to a same-named class from the built-in chain or an unrelated loader.
+    /// Use this whenever a requesting-class context exists; the bare
+    /// name-only lookup returns an arbitrary copy when names collide across
+    /// loaders.
+    pub fn get_loaded_class_id_for_requester(
+        &self,
+        name: &str,
+        requesting_loader: ClassLoaderId,
+    ) -> Option<ClassId> {
+        match requesting_loader {
+            ClassLoaderId::Bootstrap | ClassLoaderId::Extension | ClassLoaderId::Application => {
+                for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
+                    if let Some(id) = loaded_classes_probe(&self.loaded_classes, *loader_id, name)
+                    {
+                        return Some(id);
+                    }
+                    // A built-in loader never delegates DOWN to its children.
+                    if *loader_id == requesting_loader {
+                        break;
+                    }
+                }
+                None
+            }
+            ClassLoaderId::UserDefined(_) => {
+                // An overriding user loader's own definition wins (JVMS
+                // §5.4.3 initiating-loader semantics) — same order as
+                // `ClassStoreHierarchy::lookup`.
+                if loader_aware_resolution() {
+                    if let Some(id) =
+                        loaded_classes_probe(&self.loaded_classes, requesting_loader, name)
+                    {
+                        return Some(id);
+                    }
+                }
+                for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
+                    if let Some(id) = loaded_classes_probe(&self.loaded_classes, *loader_id, name)
+                    {
+                        return Some(id);
+                    }
+                }
+                loaded_classes_probe(&self.loaded_classes, requesting_loader, name)
+            }
+        }
+    }
+
     pub fn get_loaded_class_id(&self, name: &str) -> Option<ClassId> {
         // C34 audit fix (HIGH): zero-allocation probe via
         // `loaded_classes_probe` (hashbrown `raw_entry`). Previously this
@@ -5220,6 +5269,7 @@ impl ClassManager {
     pub fn extend_bootstrap_classpath(&mut self, paths: &[String]) {
         for path in paths {
             self.bootstrap.add_path(path);
+            note_bootstrap_appended_jar(path);
         }
         // See [`Self::extend_application_classpath`]: a new bootstrap entry can
         // satisfy a name previously memoized as absent.
@@ -13835,4 +13885,62 @@ mod tests {
         fire_jit_invalidate_hook(0);
         // No assertion beyond "doesn't panic".
     }
+}
+
+
+/// Internal names of classes provided by jars appended at runtime via
+/// `Instrumentation.appendToBootstrapClassLoaderSearch` (Mockito injects its
+/// `MockMethodDispatcher` this way and asserts a null defining loader).
+/// `ClassLoader.loadClass`'s native parent-first delegation consults this so
+/// an overriding user loader (e.g. Spring's `@CompileWithForkedClassLoader`
+/// fork, which re-defines every resolvable name from resources) still lets
+/// the BOOTSTRAP loader serve these classes -- exactly what HotSpot does,
+/// since parent delegation always runs before `findClass`.
+static BOOTSTRAP_APPENDED_CLASSES: std::sync::OnceLock<
+    std::sync::RwLock<FxHashSet<String>>,
+> = std::sync::OnceLock::new();
+
+fn bootstrap_appended_classes() -> &'static std::sync::RwLock<FxHashSet<String>> {
+    BOOTSTRAP_APPENDED_CLASSES.get_or_init(|| std::sync::RwLock::new(FxHashSet::default()))
+}
+
+/// Record every `.class` entry of an appended bootstrap-search jar.
+fn note_bootstrap_appended_jar(path: &str) {
+    let Ok(file) = std::fs::File::open(path) else {
+        return;
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(std::io::BufReader::new(file)) else {
+        return;
+    };
+    let mut names: Vec<String> = Vec::new();
+    for i in 0..archive.len() {
+        if let Ok(entry) = archive.by_index_raw(i) {
+            let name = entry.name();
+            if let Some(stripped) = name.strip_suffix(".class") {
+                if !stripped.starts_with("META-INF") {
+                    names.push(stripped.to_string());
+                }
+            }
+        }
+    }
+    if names.is_empty() {
+        return;
+    }
+    let mut set = bootstrap_appended_classes()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    for n in names {
+        set.insert(n);
+    }
+}
+
+/// Whether `internal` (slash-form) names a class made loadable by a jar
+/// appended to the BOOTSTRAP search at runtime.
+pub fn is_bootstrap_appended_class(internal: &str) -> bool {
+    let Some(lock) = BOOTSTRAP_APPENDED_CLASSES.get() else {
+        return false;
+    };
+    lock.read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(internal)
 }

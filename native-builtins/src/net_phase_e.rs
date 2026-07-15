@@ -698,6 +698,11 @@ const HS_STARTED: usize = 1;
 const HS_CONTEXTS: usize = 2;
 const HS_SERVER_ID: usize = 3;
 const HS_PORT: usize = 4;
+const HS_IMPL_CLASS: &str = "sun/net/httpserver/HttpServerImpl";
+/// Executor supplied through `HttpServer.setExecutor`. It is retained so the
+/// public `getExecutor` contract is coherent even though the native server's
+/// VM dispatcher owns the actual request-draining threads.
+const HS_EXECUTOR: usize = 5;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -2785,6 +2790,30 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(None))),
             };
             let s = ctx.read_string(s_obj).unwrap_or_default();
+            // URI.create(String) translates URI(String) parse failures to
+            // IllegalArgumentException, but valid results must keep make_uri's
+            // field layout for the URI accessors used by Keycloak.
+            if let Some((pos, reason)) = crate::uri_scheme_name_fail_index(&s) {
+                return Err(iae(format!("{reason} at index {pos}: {s}")));
+            }
+            let strict_uri_chars = std::env::var("CRATONVM_URI_STRICT_CHARS")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            let illegal = if strict_uri_chars {
+                crate::uri_first_illegal_index(&s)
+            } else {
+                s.char_indices()
+                    .find(|(_, c)| (*c as u32) < 0x20 || (*c as u32) == 0x7f)
+                    .map(|(i, _)| i)
+            };
+            if let Some(pos) = illegal {
+                return Err(iae(format!("Illegal character in URI at index {pos}: {s}")));
+            }
+            if let Some(pos) = crate::uri_empty_ssp_fail_index(&s) {
+                return Err(iae(format!(
+                    "Expected scheme-specific part at index {pos}: {s}"
+                )));
+            }
             Ok(Some(Value::Object(Some(make_uri(ctx, &s)))))
         },
     );
@@ -10412,6 +10441,9 @@ fn re10_start_server(server_id: i32) -> std::io::Result<()> {
 
 fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     let hs = "com/sun/net/httpserver/HttpServer";
+    // The JDK factory contract returns this concrete implementation, not the
+    // abstract public API class. Native bridges are aliased to it after all
+    // registrations below so virtual dispatch retains the concrete receiver.
 
     // VM-thread dispatch loop runner (see re10_spawn_dispatcher).
     r.register(HS_LOOP_CLASS, "run", "()V", re10_serve_loop_run);
@@ -10442,7 +10474,10 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
                 bound_port: AtomicI32::new(bound_port),
             });
             server_registry().lock().insert(server_id, state);
-            let srv = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpServer", 5);
+            // The public class is abstract, but this native-backed server owns
+            // the concrete implementation. Keep state for every abstract
+            // method we bridge below, including the optional Executor.
+            let srv = alloc_concurrent_synthetic(ctx, HS_IMPL_CLASS, 6);
             // Fully-resolved echo (matches HotSpot: `getAddress()` returns
             // the socket's ACTUAL bound address, not the caller's original
             // hostname string) — see `alloc_inet_socket_address_resolved`.
@@ -10454,8 +10489,44 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             ctx.set_field(srv, HS_CONTEXTS, Value::Object(None));
             ctx.set_field(srv, HS_SERVER_ID, Value::Int(server_id));
             ctx.set_field(srv, HS_PORT, Value::Int(bound_port));
+            ctx.set_field(srv, HS_EXECUTOR, Value::Object(None));
             let _ = backlog;
             Ok(Some(Value::Object(Some(srv))))
+        },
+    );
+
+    // `HttpServer` declares these methods abstract. `create` returns the
+    // native-backed receiver above, so both calls must be registered here;
+    // otherwise virtual dispatch resolves the abstract declaration and throws
+    // `AbstractMethodError: ... has no Code attribute` before a server can
+    // start (Keycloak's shared startHttpServer helper exercises this path).
+    r.register(
+        hs,
+        "setExecutor",
+        "(Ljava/util/concurrent/Executor;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if ctx.get_field(this, HS_STARTED).as_int().unwrap_or(0) != 0 {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "server already started".to_string(),
+                }
+                .into());
+            }
+            ctx.set_field(
+                this,
+                HS_EXECUTOR,
+                args.get(1).copied().unwrap_or(Value::Object(None)),
+            );
+            Ok(None)
+        },
+    );
+    r.register(
+        hs,
+        "getExecutor",
+        "()Ljava/util/concurrent/Executor;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, HS_EXECUTOR)))
         },
     );
 
@@ -10775,6 +10846,11 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     });
     r.register(rb, "flush", "()V", |_ctx, _args| Ok(None));
     r.register(rb, "close", "()V", |_ctx, _args| Ok(None));
+
+    // Native dispatch is keyed by the receiver class rather than Java
+    // inheritance. Mirror the complete public HttpServer bridge surface onto
+    // the concrete class returned by the factory, including set/getExecutor.
+    r.alias_class(hs, HS_IMPL_CLASS);
 }
 
 // ---------------------------------------------------------------------------
@@ -11569,6 +11645,29 @@ mod tests {
                     .find("java/net/http/HttpClient$Builder", method, descriptor)
                     .is_some(),
                 "missing {method}{descriptor}"
+            );
+        }
+    }
+
+    #[test]
+    fn re10_http_server_executor_bridges_are_concrete_receiver_registrations() {
+        let mut registry = NativeMethodRegistry::new();
+        register_re10_http_server(&mut registry);
+        for class in [
+            "com/sun/net/httpserver/HttpServer",
+            "sun/net/httpserver/HttpServerImpl",
+        ] {
+            assert!(
+                registry
+                    .find(class, "setExecutor", "(Ljava/util/concurrent/Executor;)V")
+                    .is_some(),
+                "missing {class}.setExecutor bridge"
+            );
+            assert!(
+                registry
+                    .find(class, "getExecutor", "()Ljava/util/concurrent/Executor;")
+                    .is_some(),
+                "missing {class}.getExecutor bridge"
             );
         }
     }

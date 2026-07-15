@@ -5852,6 +5852,31 @@ pub(crate) fn mh_dispatch(
     mh: cratonvm_types::ObjectRef,
     extra_args: &[Value],
 ) -> MethodCallResult {
+    // A real-JDK guard/invoker adapter can ultimately target a synthetic
+    // foreign downcall. Those compact handles store the function address in
+    // field 0 rather than the MethodHandle metadata slots, so dispatch them
+    // directly before trying to decode the generic MethodHandle layout.
+    if ctx.class_name_of_id(ctx.class_id_of_object(mh)).as_deref()
+        == Some("java/lang/foreign/DowncallHandle")
+    {
+        if std::env::var_os("CRATONVM_DBG_MH_DISPATCH").is_some() {
+            let arg_slots: Vec<Value> = extra_args
+                .iter()
+                .map(|value| match value {
+                    Value::Object(Some(obj)) => ctx.get_field(*obj, 0),
+                    other => *other,
+                })
+                .collect();
+            eprintln!(
+                "[MH_DOWNCALL] fn={:?} args={arg_slots:?}",
+                ctx.get_field(mh, 0)
+            );
+        }
+        let mut args = Vec::with_capacity(extra_args.len() + 1);
+        args.push(Value::Object(Some(mh)));
+        args.extend_from_slice(extra_args);
+        return crate::panama::pe_downcall_invoke(ctx, &args);
+    }
     let class = match mh_read_class(ctx, mh) {
         Some(c) => c,
         None => return Ok(Some(Value::Object(None))),
@@ -5863,6 +5888,25 @@ pub(crate) fn mh_dispatch(
         _ => MH_KIND_VIRTUAL,
     };
     let bound = ctx.get_field(mh, MH_BOUND);
+    if std::env::var_os("CRATONVM_DBG_MH_DISPATCH").is_some() {
+        let runtime_class = ctx
+            .class_name_of_id(ctx.class_id_of_object(mh))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        eprintln!(
+            "[MH_DISPATCH] runtime={runtime_class} class={class} name={name} kind={kind} bound={bound:?} argc={}",
+            extra_args.len()
+        );
+        if kind == MH_KIND_GUARD {
+            if let Value::Object(Some(wrapper)) = bound {
+                eprintln!(
+                    "[MH_GUARD] test={:?} target={:?} fallback={:?}",
+                    ctx.get_field(wrapper, 0),
+                    ctx.get_field(wrapper, 1),
+                    ctx.get_field(wrapper, 2),
+                );
+            }
+        }
+    }
 
     match kind {
         MH_KIND_STATIC => {
@@ -5915,9 +5959,9 @@ pub(crate) fn mh_dispatch(
                                                      // params align 1:1 with extra_args (no receiver), so this is exact.
                                                      // invokeExact does NOT pre-adapt, so unboxing here covers both the
                                                      // invoke and invokeExact paths (Jackson 3 uses invokeExact).
-            // GC-safety: `adapt_invoke_args`/the `<init>` invocation below
-            // can both allocate; pin `new_obj` and re-read the forwarded
-            // reference before it's returned.
+                                                     // GC-safety: `adapt_invoke_args`/the `<init>` invocation below
+                                                     // can both allocate; pin `new_obj` and re-read the forwarded
+                                                     // reference before it's returned.
             let new_obj_pin = ctx.pin_native_root(new_obj);
             let adapted = adapt_invoke_args(ctx, extra_args, &desc);
             let new_obj = ctx.read_native_pin(new_obj_pin, new_obj);
@@ -7544,6 +7588,20 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
         "asType",
         "(Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
+            // Panama downcalls use a compact synthetic layout whose field 0 is
+            // the native function address. Their MethodHandle type is derived
+            // from the FunctionDescriptor, so assigning the inherited real-JDK
+            // type field here would overwrite that address and turn a later
+            // void invokeExact into a silent no-op.
+            if let Some(Value::Object(Some(this))) = args.first() {
+                if ctx
+                    .class_name_of_id(ctx.class_id_of_object(*this))
+                    .as_deref()
+                    == Some("java/lang/foreign/DowncallHandle")
+                {
+                    return Ok(Some(args[0]));
+                }
+            }
             if let (Some(Value::Object(Some(this))), Some(Value::Object(Some(mt)))) =
                 (args.first(), args.get(1))
             {

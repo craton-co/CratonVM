@@ -3163,6 +3163,22 @@ pub(crate) fn native_classloader_define_class1(
     let bytes = read_byte_array_define_class_slice(ctx, byte_array, offset, length)?;
     validate_classfile_header(&name, "defineClass1", &bytes)?;
 
+    // Bootstrap-appended-jar classes (Instrumentation.appendToBootstrapClassLoaderSearch,
+    // e.g. Mockito's MockMethodDispatcher) belong to the BOOTSTRAP loader. On
+    // HotSpot a user loader's parent delegation reaches the appended boot
+    // search before its own findClass runs, so findClass never defines a
+    // per-loader copy. CratonVM's real-JDK platform-loader delegation misses
+    // the appended jar (its BuiltinClassLoader path never consults the flat
+    // store), the JDK loadClass bytecode falls through to findClass, and the
+    // duplicate copy's <clinit> then fails Mockito's null-loader assertion.
+    // Serve the already-defined bootstrap copy instead — same observable
+    // outcome as HotSpot's delegation order.
+    if cratonvm_classloading::is_bootstrap_appended_class(&name) {
+        if let Some(cid) = ctx.class_id_by_name(&name) {
+            return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
+        }
+    }
+
     // Loader id from arg 0 (synthetic ClassLoader); 0 = app loader.
     let loader_id = match args.first() {
         Some(Value::Object(Some(loader_obj))) => {
