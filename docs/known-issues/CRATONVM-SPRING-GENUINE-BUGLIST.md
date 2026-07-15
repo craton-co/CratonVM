@@ -227,10 +227,23 @@ the WRONG same-named copy. Eight fixes landed on
     environment produced it. Fix is environmental (point `--java-home` at a
     JDK 24+ install, or install one) — not a code change, and out of scope
     for this document until a suitable JDK is available on the run host.
-*   `InstanceSupplierCodeGeneratorKotlinTests` — 4/0/5, all
-    `ClassCastException: kotlin.reflect...protobuf.SmallSortedMap$Entry cannot
-    be cast to java.lang.reflect.Field / AnnotationSpec` (separate
-    heap/collection-identity family, kotlin-reflect metadata parsing).
+*   `InstanceSupplierCodeGeneratorKotlinTests` — **CLOSED 2026-07-15,
+    already fixed by unrelated prior work; doc entry was stale.** Re-run
+    against current dev (`eb5336f2`) shows `found=4 succ=4 fail=0 status=OK`
+    — the `ClassCastException:
+    kotlin.reflect...protobuf.SmallSortedMap$Entry cannot be cast to
+    java.lang.reflect.Field / AnnotationSpec` recorded here on 2026-07-14
+    no longer reproduces. To attribute the fix, re-ran the identical test
+    against a from-scratch baseline binary built at `d497cf21` (the commit
+    immediately before the `declaring_class` loader-awareness fix,
+    `aca7f635`, landed) — it ALSO passes 4/4, ruling out `aca7f635` as the
+    fix and confirming this was already resolved by some other change
+    that landed between the 2026-07-14 23:15 doc entry and `d497cf21`
+    (most likely one of the several native/GC/classloader fixes merged
+    into dev earlier on 2026-07-15 — kotlin-reflect's metadata parsing
+    walks `Class`/`Field`/enclosing-class machinery heavily, any of which
+    could have been the actual fix). No code change was needed; verified
+    via two independent binary builds under identical harness conditions.
 *   `TestCompilerTests` — **3 of 4 residuals FIXED 2026-07-15 (commit
     `0ee485a2`).** All three `CompilationException: Unable to compile source`
     residuals (`compiledCodeCanAccessExistingPackagePrivateClassIfAnnotated`,
