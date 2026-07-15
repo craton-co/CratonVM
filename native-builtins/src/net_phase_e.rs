@@ -3879,6 +3879,10 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // This native bypasses ServerSocket's field initializers.  Preserve
+        // the real object's synchronization invariant before its bytecode
+        // options path reaches getImpl().
+        let this = re1_init_socket_locks(ctx, this);
         ss_set(ctx, this, |s| {
             s.port = -1;
             s.backlog = 50;
@@ -3890,6 +3894,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let this = re1_init_socket_locks(ctx, this);
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         re2_bind_listener(ctx, this, "0.0.0.0", port, 50)
     });
@@ -3902,6 +3907,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "<init>", "(II)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let this = re1_init_socket_locks(ctx, this);
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(50);
         re2_bind_listener(ctx, this, "0.0.0.0", port, backlog)
@@ -3909,6 +3915,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "<init>", "(IILjava/net/InetAddress;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let this = re1_init_socket_locks(ctx, this);
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(50);
         let host = match args.get(3) {
@@ -3984,6 +3991,20 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(1)))
     });
 
+
+    // The RE2 constructors own listener state outside the real ServerSocket
+    // implementation.  JGroups configures this option before bind, where it
+    // must be accepted without entering the real getImpl() bytecode path.
+    r.register(ss, "setReceiveBufferSize", "(I)V", |_ctx, args| {
+        let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        if size <= 0 {
+            return Err(iae(format!("negative receive buffer size: {size}")));
+        }
+        Ok(None)
+    });
+    r.register(ss, "getReceiveBufferSize", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(8192)))
+    });
     r.register(ss, "close", "()V", re2_server_socket_close);
 
     r.register(ss, "isBound", "()Z", |ctx, args| {
