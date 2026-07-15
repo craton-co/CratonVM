@@ -13544,6 +13544,21 @@ fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
+    // GC-safety: `this` is a plain Rust copy of the interpreter's args slice,
+    // invisible to the collector. `resync_values_view` allocates (a
+    // values()-view resync mints a new backing array, an entrySet resync
+    // mints a SimpleEntry per element) and can trigger a moving GC before
+    // this function ever pins anything -- leaving `this` stale for
+    // resync_values_view's own first dereference (values_view_source ->
+    // al_state -> heap_kind_of), which then decodes a stale/reused array
+    // header as "inconsistent" and segfaults or silently corrupts the
+    // resulting stream. Pin `this` up front and refresh both before and
+    // after resync_values_view (which can itself move `this` again via its
+    // own allocations). Confirmed live via CRATONVM_DBG_STALE_OBJREF under
+    // concurrent stream map/flatMap stress at -Xmx32m; see
+    // docs/known-issues/stream-arraylist-gc-pressure-heap-corruption.md.
+    let this_pin = ctx.pin_native_root(this);
+    let this = ctx.read_native_pin(this_pin, this);
     resync_values_view(ctx, this);
     // `al_state` returns an empty ArrayList (Some, size 0) — not None — for a
     // non-ArrayList collection like RegularEnumSet, so the old `Some` branch
@@ -13555,7 +13570,7 @@ fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // turn the stale refs into unrelated Objects. This is particularly visible
     // while SmallRye builds nested config mappings from ArrayList-backed source
     // lists. Count before allocation, then re-snapshot from the pinned list.
-    let this_pin = ctx.pin_native_root(this);
+    let this = ctx.read_native_pin(this_pin, this);
     let len = al_or_collection_elements(ctx, this).len();
     let stream = alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS);
     let stream_pin = ctx.pin_native_root(stream);

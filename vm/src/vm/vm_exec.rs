@@ -6827,6 +6827,26 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     args,
                 )
         }) {
+            // GC-safety: by the time we get here, `args` may already be
+            // several GC-triggering calls old -- the caller's own
+            // pin+refresh happened before invoke_virtual was entered, and
+            // load_and_forward/recover_stale_lambda_receiver_from_native_pins/
+            // lambda_proxies.read()/lambda_args_sam_compatible above can all
+            // run before this point. `args` is a plain Rust slice, invisible
+            // to the collector, so a moving GC anywhere in that span leaves
+            // it holding a stale ObjectRef. Re-pin every object arg and
+            // refresh from the pins right before building `full_args` --
+            // handing a stale ref to coerce_lambda_args/
+            // checkcast_lambda_instantiated_args only pins the STALE address,
+            // which the GC has no way to recover. Confirmed live via
+            // CRATONVM_DBG_STALE_OBJREF under concurrent stream map/flatMap
+            // stress at -Xmx32m; see
+            // docs/known-issues/stream-arraylist-gc-pressure-heap-corruption.md.
+            let args_pin_base = self.thread.native_pin_roots.len();
+            let args_pins = pin_native_object_values(self.thread, args);
+            let args = reread_native_object_values(self.thread, args, &args_pins);
+            self.thread.native_pin_roots.truncate(args_pin_base);
+
             // Lambda dispatch: read captured values from proxy fields, then
             // prepend them to the invocation args.
             let num_captures = lcs.capture_types.len();
@@ -6834,7 +6854,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             for i in 0..num_captures {
                 full_args.push(self.shared.heap.get_field(receiver, i));
             }
-            full_args.extend_from_slice(args);
+            full_args.extend_from_slice(&args);
 
             // Coerce args between SAM and impl descriptors (box/unbox
             // primitives at the SAM boundary so impl sees matched types).
