@@ -14,6 +14,27 @@ This document tracks the **genuine remaining failures**.
   *   **Status**: **OPEN** (Fails 4/9 tests)
   *   **Root Cause**: Mockito's `spy()` inline mock maker retransforms the class hierarchy; the `ThreadLocal`-based `MockMethodAdvice$SelfCallInfo.checkSelfCall` guard fails to match on CratonVM, causing infinite recursion.
   *   **Next Step**: Instrument `MockMethodDispatcher.get()` for distinct Class/Advice instances across the redefined hierarchy.
+  *   **2026-07-15 (reactive-cluster session, mockk sibling analysis)**: the same self-call SOE family
+    blocks ~10 Kotlin reactive test classes via **mockk** (not Mockito): `WebTestClientExtensionsTests`,
+    `WebClientExtensionsTests`, `ServerResponseExtensionsTests`, `ServerRequestExtensionsTests`,
+    `RenderingResponseExtensionsTests`, `ClientResponseExtensionsTests`, `RSocketRequesterExtensionsTests`,
+    `WebClientObservationTests`, `CoExchangeFilterFunctionTests`, `InvocableHandlerMethodKotlinTests`. All
+    fail identically on **pure origin/dev** (pre-existing, not a regression). Sharpened via mockk 1.14.5
+    decompile + probes: the recursion is `mock.hashCode()` -> `JvmMockKProxyInterceptor.intercept` ->
+    `JvmMockKDispatcher.get(id, mock)` returns the advice -> `BaseAdvice.handle` -> `BaseAdvice.handler`
+    -> `handlers.get(mock)`, where `handlers` is a plain `Collections.synchronizedMap(LinkedHashMap)` (NOT
+    identity-keyed -- confirmed from the no-arg `SynchronizedMockHandlersMap()` ctor bytecode), so
+    `LinkedHashMap.get(mock)` calls `mock.hashCode()` again -> infinite. This recursion exists in the
+    bytecode on BOTH VMs, yet HotSpot terminates -- so **CratonVM routes the ByteBuddy-generated mock's
+    `hashCode()` through the interceptor where HotSpot dispatches to the real `Object.hashCode`**.
+    **ThreadLocal is RULED OUT** (TLProbe on v13: identity-preserved, get-twice-same, withInitial, remove,
+    guard-flip all correct). So the sibling "ThreadLocal guard fails to match" hypothesis above is likely
+    WRONG for both -- the real divergence is ByteBuddy method-resolution/vtable: which methods of the
+    generated mock subclass are instrumented vs left as real super-calls. The `SelfCallEliminator.isSelf`
+    guard runs too LATE (inside `handler`, AFTER `handlers.get(mock)` already triggered the recursive
+    `hashCode`). **Next step**: instrument, on a minimal mockk/Mockito mock, WHICH methods route to the
+    interceptor on CratonVM vs HotSpot (esp. `hashCode`/`equals`/`toString`); the fix is almost certainly
+    in how CratonVM resolves the mock subclass's inherited-vs-overridden method dispatch.
 *   **`@Import` attribute CCE across `@CompileWithForkedClassLoader`** (`web.service.registry.ImportHttpServiceRegistrarTests`)
   *   **Status**: **OPEN** (2/5 methods: `basicListingWithAot`, `basicScanWithAot` — `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;` at `ConfigurationClassParser$SourceClass.getAnnotationAttributes`)
   *   **2026-07-15 update**: reproduces SOLO in ~1s (`/data/tmp/aotfix-runs/MethodRun.java` single-method launcher on the Azure host). The 2026-07-14 SoftReference/GC-relocation hypothesis is now DOUBTED: this failure survived eight classloader-identity fixes, and three focused probes (plain `@Import` reflection, forked-loader variant, `@Import` as meta-annotation on a repeatable annotation type — `ImportProbe2.java`) all PASS. The divergence is somewhere in the full `ConfigurationClassParser`/`MergedAnnotations` path for the repeatable `@ImportHttpServices` container under a forked loader.
