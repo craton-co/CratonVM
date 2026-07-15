@@ -1797,11 +1797,21 @@ pub(crate) fn native_class_for_name(
                 if initialize {
                     if let Value::Object(Some(mirror_ref)) = mirror {
                         if let Some(cid) = ctx.class_id_from_mirror(mirror_ref) {
-                            if let Some(bin_name) = ctx.class_name_of_id(cid) {
-                                // Propagate ExceptionInInitializerError / linkage
-                                // errors raised by `<clinit>`, matching HotSpot.
-                                ctx.ensure_class_initialized(&bin_name)?;
-                            }
+                            // `loadClass` has already resolved this exact class through
+                            // the requested loader.  Initializing it by name again loses
+                            // that loader identity and falls back to the flat application
+                            // store, which cannot see a freshly defined CGLIB proxy in a
+                            // filtered/user loader.  Initialize the resolved ClassId
+                            // directly, as Class.forName0 does on the JVM.
+                            ctx.initialize_class(cid).map_err(|message| {
+                                cratonvm_types::error::MethodCallFailed::InternalError(
+                                    cratonvm_types::error::VmError::Internal {
+                                        message: format!(
+                                            "Class.forName: class initialization failed: {message}"
+                                        ),
+                                    },
+                                )
+                            })?;
                         }
                     }
                 }
