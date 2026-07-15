@@ -37888,82 +37888,6 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
         native_spring_default_document_loader_create_document_builder_factory,
     );
 
-    // EUREKA-LOGBACK-CLEANUP: Spring Boot's `LogbackLoggingSystem.cleanUp`
-    // crashes every Spring Boot app (eureka-server is the canonical
-    // reproducer) on `prepareEnvironment` when an unconstructed
-    // `LoggerContext` leaves inherited maps/status fields null. Keep
-    // null-tolerant fallbacks on
-    // the concrete `LoggerContext` (receiver class for vtable dispatch)
-    // AND on `ContextBase` (declaring class for slow-path lookup).
-    // Paired with the `check_override` allow-list entries in
-    // `vm/src/vm/vm_exec.rs`.
-    for class_name in [
-        "ch/qos/logback/classic/LoggerContext",
-        "ch/qos/logback/core/ContextBase",
-    ] {
-        registry.register(
-            class_name,
-            "removeObject",
-            "(Ljava/lang/String;)V",
-            native_noop_with_this,
-        );
-        registry.register(
-            class_name,
-            "putObject",
-            "(Ljava/lang/String;Ljava/lang/Object;)V",
-            native_noop_with_this,
-        );
-        registry.register(
-            class_name,
-            "getObject",
-            "(Ljava/lang/String;)Ljava/lang/Object;",
-            |_, _| Ok(Some(Value::Object(None))),
-        );
-        registry.register(
-            class_name,
-            "putProperty",
-            "(Ljava/lang/String;Ljava/lang/String;)V",
-            native_noop_with_this,
-        );
-        registry.register(
-            class_name,
-            "getProperty",
-            "(Ljava/lang/String;)Ljava/lang/String;",
-            |_, _| Ok(Some(Value::Object(None))),
-        );
-    }
-    registry.register(
-        "ch/qos/logback/classic/LoggerContext",
-        "getStatusManager",
-        "()Lch/qos/logback/core/status/StatusManager;",
-        |ctx, _| {
-            let sm = alloc_concurrent_synthetic(ctx, "ch/qos/logback/core/BasicStatusManager", 4);
-            Ok(Some(Value::Object(Some(sm))))
-        },
-    );
-    registry.register(
-        "ch/qos/logback/core/BasicStatusManager",
-        "clear",
-        "()V",
-        native_noop_with_this,
-    );
-    registry.register(
-        "ch/qos/logback/classic/LoggerContext",
-        "getTurboFilterList",
-        "()Lch/qos/logback/classic/spi/TurboFilterList;",
-        |ctx, _| {
-            let tfl =
-                alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/spi/TurboFilterList", 2);
-            Ok(Some(Value::Object(Some(tfl))))
-        },
-    );
-    registry.register(
-        "ch/qos/logback/classic/spi/TurboFilterList",
-        "remove",
-        "(Ljava/lang/Object;)Z",
-        |_, _| Ok(Some(Value::Int(0))),
-    );
-
     // EUREKA-RB-CANDIDATE: see comment on the `check_override` allow-list
     // entry in `vm_exec.rs` — `ResourceBundle$Control.getCandidateLocales`
     // crashes with `NullPointerException: key must not be null` on our
@@ -71245,6 +71169,11 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     registry.register(lb_ctx, "reset", "()V", |_, _| Ok(None));
     registry.register(lb_ctx, "isStarted", "()Z", |_, _| Ok(Some(Value::Int(1))));
 
+    /* Historical rationale for the removed construction-bypass shims.
+     * LoggerContext now runs its real constructor, so Java owns ContextBase,
+     * BasicStatusManager, and TurboFilterList state again. Do not restore the
+     * old overrides below.
+     *
     // ContextBase is the parent class of LoggerContext. Its real
     // bytecode `getObject(String)` / `putObject(String, Object)` /
     // `getCopyOfPropertyMap` reads a `HashMap` field that is null
@@ -71254,42 +71183,6 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // so we need these accessor natives to short-circuit before the
     // null-map dereference. Returning null from getObject is the
     // documented "not present" contract; putObject becomes a no-op.
-    let cb = "ch/qos/logback/core/ContextBase";
-    registry.register(
-        cb,
-        "getObject",
-        "(Ljava/lang/String;)Ljava/lang/Object;",
-        |_, _| Ok(Some(Value::Object(None))),
-    );
-    registry.register(
-        cb,
-        "putObject",
-        "(Ljava/lang/String;Ljava/lang/Object;)V",
-        |_, _| Ok(None),
-    );
-    registry.register(
-        cb,
-        "getProperty",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        |_, _| Ok(Some(Value::Object(None))),
-    );
-    registry.register(
-        cb,
-        "putProperty",
-        "(Ljava/lang/String;Ljava/lang/String;)V",
-        |_, _| Ok(None),
-    );
-    registry.register(cb, "getCopyOfPropertyMap", "()Ljava/util/Map;", |ctx, _| {
-        let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 2);
-        Ok(Some(Value::Object(Some(map))))
-    });
-    registry.register(cb, "getName", "()Ljava/lang/String;", |ctx, _| {
-        Ok(Some(Value::Object(Some(ctx.create_string("default")))))
-    });
-    registry.register(cb, "setName", "(Ljava/lang/String;)V", |_, _| Ok(None));
-    registry.register(cb, "start", "()V", |_, _| Ok(None));
-    registry.register(cb, "stop", "()V", |_, _| Ok(None));
-    registry.register(cb, "isStarted", "()Z", |_, _| Ok(Some(Value::Int(1))));
 
     // ContextBase.getStatusManager / LoggerContext.getStatusManager — the
     // real bytecode reads a `BasicStatusManager` field set in <init>,
@@ -71299,66 +71192,11 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // `getStatusManager().add(InfoStatus)` — NPE on null. Hand back a
     // synthetic BasicStatusManager whose interface methods (add/clear/
     // getCount/getCopyOfStatusList/etc.) are wired to safe no-ops below.
-    fn make_basic_status_manager(ctx: &mut dyn NativeContext) -> Value {
-        let bsm = alloc_concurrent_synthetic(ctx, "ch/qos/logback/core/BasicStatusManager", 0);
-        Value::Object(Some(bsm))
-    }
-    registry.register(
-        cb,
-        "getStatusManager",
-        "()Lch/qos/logback/core/status/StatusManager;",
-        |ctx, _| Ok(Some(make_basic_status_manager(ctx))),
-    );
-    registry.register(
-        lb_ctx,
-        "getStatusManager",
-        "()Lch/qos/logback/core/status/StatusManager;",
-        |ctx, _| Ok(Some(make_basic_status_manager(ctx))),
-    );
 
     // BasicStatusManager surface — interface dispatch resolves to the
     // receiver's runtime class. Provide no-op natives so any caller
     // (Spring Boot, Joran, logback internals) that obtains the manager
     // via getStatusManager() can invoke its methods without NPE.
-    let bsm_cls = "ch/qos/logback/core/BasicStatusManager";
-    registry.register(
-        bsm_cls,
-        "add",
-        "(Lch/qos/logback/core/status/Status;)V",
-        |_, _| Ok(None),
-    );
-    registry.register(
-        bsm_cls,
-        "add",
-        "(Lch/qos/logback/core/status/StatusListener;)Z",
-        |_, _| Ok(Some(Value::Int(1))),
-    );
-    registry.register(
-        bsm_cls,
-        "remove",
-        "(Lch/qos/logback/core/status/StatusListener;)V",
-        |_, _| Ok(None),
-    );
-    registry.register(bsm_cls, "clear", "()V", |_, _| Ok(None));
-    registry.register(bsm_cls, "getCount", "()I", |_, _| Ok(Some(Value::Int(0))));
-    registry.register(
-        bsm_cls,
-        "getCopyOfStatusList",
-        "()Ljava/util/List;",
-        |ctx, _| {
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            Ok(Some(Value::Object(Some(list))))
-        },
-    );
-    registry.register(
-        bsm_cls,
-        "getCopyOfStatusListenerList",
-        "()Ljava/util/List;",
-        |ctx, _| {
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            Ok(Some(Value::Object(Some(list))))
-        },
-    );
 
     // LoggerContext.getTurboFilterList — Spring Boot's
     // LogbackLoggingSystem.beforeInitialize line 123 does
@@ -71366,26 +71204,6 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // is null because we bypass logback's <init>. Return a synthetic
     // TurboFilterList with `add(Object)` no-op so Spring's filter
     // registration succeeds silently.
-    registry.register(
-        lb_ctx,
-        "getTurboFilterList",
-        "()Lch/qos/logback/classic/spi/TurboFilterList;",
-        |ctx, _| {
-            let tfl =
-                alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/spi/TurboFilterList", 0);
-            Ok(Some(Value::Object(Some(tfl))))
-        },
-    );
-    let tfl_cls = "ch/qos/logback/classic/spi/TurboFilterList";
-    registry.register(tfl_cls, "add", "(Ljava/lang/Object;)Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(tfl_cls, "remove", "(Ljava/lang/Object;)Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(tfl_cls, "clear", "()V", |_, _| Ok(None));
-    registry.register(tfl_cls, "size", "()I", |_, _| Ok(Some(Value::Int(0))));
-    registry.register(tfl_cls, "isEmpty", "()Z", |_, _| Ok(Some(Value::Int(1))));
 
     // Logback Logger surface — paired with the LoggerContext.getLogger
     // native above. Mirrors the SLF4J Logger no-ops registered higher
@@ -71394,6 +71212,7 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // LogAdapter$Slf4jAdapter takes the SLF4J Logger interface so it
     // already routes through the SLF4J no-ops; user code that casts
     // to logback's Logger needs these).
+     */
     let lb_lg = "ch/qos/logback/classic/Logger";
     registry.register(lb_lg, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = match args.first() {
@@ -72388,8 +72207,11 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
 
     // --- Logback (ch.qos.logback) ---
     let lb_factory = "ch/qos/logback/classic/LoggerContext";
+    /* Historical rationale for the removed constructor/context-state shims.
+     * LoggerContext now uses its bytecode constructor in every registration
+     * mode, so ContextBase owns its real maps and status manager.
+     *
     // LoggerContext constructor — no fields to initialize. NEW-6.
-    registry.register(lb_factory, "<init>", "()V", native_noop_with_this);
     // ContextBase.removeObject/putObject/getObject — the LoggerContext
     // constructor override above leaves the `objectMap`/`propertyMap` fields
     // null. Spring Boot's `LogbackLoggingSystem.cleanUp` invokes
@@ -72399,102 +72221,14 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     // SimpleApplicationEventMulticaster), so override these accessors with
     // no-ops since our synthetic Logback Logger doesn't track per-context
     // properties anyway.
-    registry.register(
-        "ch/qos/logback/core/ContextBase",
-        "removeObject",
-        "(Ljava/lang/String;)V",
-        native_noop_with_this,
-    );
-    registry.register(
-        "ch/qos/logback/core/ContextBase",
-        "putObject",
-        "(Ljava/lang/String;Ljava/lang/Object;)V",
-        native_noop_with_this,
-    );
-    registry.register(
-        "ch/qos/logback/core/ContextBase",
-        "getObject",
-        "(Ljava/lang/String;)Ljava/lang/Object;",
-        |_, _| Ok(Some(Value::Object(None))),
-    );
-    registry.register(
-        "ch/qos/logback/core/ContextBase",
-        "putProperty",
-        "(Ljava/lang/String;Ljava/lang/String;)V",
-        native_noop_with_this,
-    );
-    registry.register(
-        "ch/qos/logback/core/ContextBase",
-        "getProperty",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        |_, _| Ok(Some(Value::Object(None))),
-    );
     // Same overrides on the concrete subclass — invokevirtual resolution
     // may not see ContextBase methods when the receiver class declares
     // overrides; register on LoggerContext as well. Also stub the helper
     // accessors LogbackLoggingSystem.cleanUp() chains through so the
     // null `objectMap`/`propertyMap` fields are never dereferenced.
-    registry.register(
-        "ch/qos/logback/classic/LoggerContext",
-        "removeObject",
-        "(Ljava/lang/String;)V",
-        native_noop_with_this,
-    );
-    registry.register(
-        "ch/qos/logback/classic/LoggerContext",
-        "putObject",
-        "(Ljava/lang/String;Ljava/lang/Object;)V",
-        native_noop_with_this,
-    );
-    registry.register(
-        "ch/qos/logback/classic/LoggerContext",
-        "getObject",
-        "(Ljava/lang/String;)Ljava/lang/Object;",
-        |_, _| Ok(Some(Value::Object(None))),
-    );
-    registry.register(
-        "ch/qos/logback/classic/LoggerContext",
-        "putProperty",
-        "(Ljava/lang/String;Ljava/lang/String;)V",
-        native_noop_with_this,
-    );
-    registry.register(
-        "ch/qos/logback/classic/LoggerContext",
-        "getProperty",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        |_, _| Ok(Some(Value::Object(None))),
-    );
-    registry.register(
-        "ch/qos/logback/classic/LoggerContext",
-        "getStatusManager",
-        "()Lch/qos/logback/core/status/StatusManager;",
-        |ctx, _| {
-            let sm = alloc_concurrent_synthetic(ctx, "ch/qos/logback/core/BasicStatusManager", 4);
-            Ok(Some(Value::Object(Some(sm))))
-        },
-    );
-    registry.register(
-        "ch/qos/logback/core/BasicStatusManager",
-        "clear",
-        "()V",
-        native_noop_with_this,
-    );
-    registry.register(
-        "ch/qos/logback/classic/LoggerContext",
-        "getTurboFilterList",
-        "()Lch/qos/logback/classic/spi/TurboFilterList;",
-        |ctx, _| {
-            let tfl =
-                alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/spi/TurboFilterList", 2);
-            Ok(Some(Value::Object(Some(tfl))))
-        },
-    );
-    registry.register(
-        "ch/qos/logback/classic/spi/TurboFilterList",
-        "remove",
-        "(Ljava/lang/Object;)Z",
-        |_, _| Ok(Some(Value::Int(0))),
-    );
+     */
+    // Keep only the lightweight Logger bridge; do not override LoggerContext
+    // construction or its ContextBase state.
     registry.register(
         lb_factory,
         "getLogger",
@@ -72538,6 +72272,53 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     registry.register(lb_logger, "isInfoEnabled", "()Z", |_, _| {
         Ok(Some(Value::Int(1)))
     });
+}
+
+#[cfg(test)]
+mod logback_construction_registration_tests {
+    use super::*;
+
+    #[test]
+    fn logback_context_construction_and_state_are_not_native_overridden() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        register_slf4j_natives(&mut registry);
+
+        for (class_name, method_name, descriptor) in [
+            (
+                "ch/qos/logback/classic/LoggerContext",
+                "<init>",
+                "()V",
+            ),
+            (
+                "ch/qos/logback/core/ContextBase",
+                "getObject",
+                "(Ljava/lang/String;)Ljava/lang/Object;",
+            ),
+            (
+                "ch/qos/logback/core/ContextBase",
+                "putObject",
+                "(Ljava/lang/String;Ljava/lang/Object;)V",
+            ),
+            (
+                "ch/qos/logback/classic/LoggerContext",
+                "getStatusManager",
+                "()Lch/qos/logback/core/status/StatusManager;",
+            ),
+            (
+                "ch/qos/logback/classic/LoggerContext",
+                "getTurboFilterList",
+                "()Lch/qos/logback/classic/spi/TurboFilterList;",
+            ),
+        ] {
+            assert!(
+                registry
+                    .find(class_name, method_name, descriptor)
+                    .is_none(),
+                "{class_name}.{method_name}{descriptor} must use real Logback bytecode"
+            );
+        }
+    }
 }
 
 fn slf4j_log_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
