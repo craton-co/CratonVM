@@ -1089,7 +1089,22 @@ fn sc_connect_inner(
         // cloud-metadata IPs like 169.254.169.254) and (2) applies the
         // configured connect timeout (default 30 s) so a black-hole target
         // can't pin the VM thread for the OS-default ~2 minutes.
-        let stream = match crate::outbound_policy::policy_connect(&target) {
+        //
+        // GC/STW-cooperation: `policy_connect` performs a genuine OS-level
+        // blocking `connect()` (up to the configured timeout). This is the
+        // path taken whenever a `SocketChannel` is used in its default
+        // blocking mode (i.e. before `configureBlocking(false)` is called,
+        // or via `sun.nio.ch.SocketAdaptor.connect()` — see
+        // `sc_blocking_connect` above) — unlike the non-blocking branch
+        // below, which never blocks the OS thread. Bracket it in
+        // `begin_blocking_region`/`end_blocking_region` so a concurrent STW
+        // pause (JIT takeover or GC) does not count this thread as an
+        // expected cooperator and wait on it forever. Same pattern as
+        // `socket_accept`/`socket_connect` in `plain_socket.rs`.
+        ctx.begin_blocking_region();
+        let connect_result = crate::outbound_policy::policy_connect(&target);
+        ctx.end_blocking_region();
+        let stream = match connect_result {
             Ok(s) => s,
             Err(crate::outbound_policy::PolicyConnectError::Denied(reason)) => {
                 return Err(ioex(format!("connect denied by outbound policy: {reason}")));
@@ -1379,14 +1394,33 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     }
     let mut buf = vec![0u8; len as usize];
 
+    // GC/STW-cooperation: when the channel is in its default *blocking*
+    // mode (`configureBlocking(false)` never called — see F_BLOCKING /
+    // `sc_connect_inner`'s `allow_block` branch), the underlying
+    // `TcpStream` is left in genuine OS-blocking mode too, so `s.read()`
+    // inside `try_read_nb` below can block indefinitely for data rather
+    // than returning EAGAIN. Bracket the call in
+    // `begin_blocking_region`/`end_blocking_region` unconditionally (cheap
+    // for the common non-blocking case, where the call returns immediately)
+    // so a concurrent STW pause never waits on a thread parked here. Same
+    // pattern as `re1_socket_read_stream` in `net_phase_e.rs`.
+    ctx.begin_blocking_region();
     let n_opt = {
         let map = tcp_registry().read();
         match map.get(&id) {
             Some(TcpHandle::Stream(s)) => {
-                try_read_nb(s, &mut buf).map_err(|e| map_err("read", e))?
+                let r = try_read_nb(s, &mut buf).map_err(|e| map_err("read", e));
+                ctx.end_blocking_region();
+                r?
             }
-            Some(TcpHandle::Connecting(_)) => return Ok(Some(Value::Int(0))),
-            _ => return Err(ioex("read: channel not a stream")),
+            Some(TcpHandle::Connecting(_)) => {
+                ctx.end_blocking_region();
+                return Ok(Some(Value::Int(0)));
+            }
+            _ => {
+                ctx.end_blocking_region();
+                return Err(ioex("read: channel not a stream"));
+            }
         }
     };
 
@@ -1416,14 +1450,27 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if data.is_empty() {
         return Ok(Some(Value::Int(0)));
     }
+    // GC/STW-cooperation: same reasoning as `sc_read` above — a
+    // blocking-mode channel's `TcpStream` can genuinely block in
+    // `try_write_nb`'s `s.write()` (e.g. a full socket send buffer with a
+    // slow/stalled peer), so bracket it unconditionally.
+    ctx.begin_blocking_region();
     let n_opt = {
         let map = tcp_registry().read();
         match map.get(&id) {
             Some(TcpHandle::Stream(s)) => {
-                try_write_nb(s, &data).map_err(|e| map_err("write", e))?
+                let r = try_write_nb(s, &data).map_err(|e| map_err("write", e));
+                ctx.end_blocking_region();
+                r?
             }
-            Some(TcpHandle::Connecting(_)) => return Ok(Some(Value::Int(0))),
-            _ => return Err(ioex("write: channel not a stream")),
+            Some(TcpHandle::Connecting(_)) => {
+                ctx.end_blocking_region();
+                return Ok(Some(Value::Int(0)));
+            }
+            _ => {
+                ctx.end_blocking_region();
+                return Err(ioex("write: channel not a stream"));
+            }
         }
     };
 

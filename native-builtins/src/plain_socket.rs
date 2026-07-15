@@ -330,14 +330,44 @@ fn socket_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let sa = SocketAddr::new(ip, port as u16);
     let fd = read_fd(ctx, this);
     let sock_addr = SockAddr::from(sa);
+    // `connect()`/`connect_timeout()` is a genuine OS-level blocking call
+    // (up to `timeout_ms`, or unbounded when no timeout is set). Two
+    // problems if we run it inside `with_socket`'s closure as before:
+    //
+    //   1. `with_socket` holds `registry().write()` — the single global
+    //      lock every other `java.net.Socket`-family op (`accept`, `read`,
+    //      `write`, ...) needs — for as long as the closure runs. Blocking
+    //      inside it serializes ALL synthetic blocking-Socket I/O
+    //      process-wide until this connect resolves (the same class of
+    //      self-deadlock `socket_accept`'s doc comment warns about, and
+    //      exactly the failure mode if the peer this is connecting to is
+    //      itself served by a `read`/`write`/`accept` on this process).
+    //   2. It never bracketed the blocking syscall in
+    //      `begin_blocking_region`/`end_blocking_region`, so a concurrent
+    //      STW pause (JIT takeover or GC) counts this thread as an expected
+    //      cooperator and waits on it forever — see `socket_accept` above
+    //      and `re1_socket_read_stream` in `net_phase_e.rs` for the same
+    //      pattern.
+    //
+    // Fix both: clone the fd out under a short lock (mirrors
+    // `socket_accept`), connect on the clone with the registry lock
+    // released and the thread marked excluded from STW, then commit the
+    // connected clone back into the registry slot.
+    let cloned = with_socket(fd, |s| {
+        s.socket
+            .try_clone()
+            .map_err(|e| ioex(format!("socketConnect: {e}")))
+    })?;
+    ctx.begin_blocking_region();
+    let result = if timeout_ms > 0 {
+        cloned.connect_timeout(&sock_addr, Duration::from_millis(timeout_ms as u64))
+    } else {
+        cloned.connect(&sock_addr)
+    };
+    ctx.end_blocking_region();
+    result.map_err(|e| ioex(format!("socketConnect: {e}")))?;
     with_socket(fd, |s| {
-        let result = if timeout_ms > 0 {
-            s.socket
-                .connect_timeout(&sock_addr, Duration::from_millis(timeout_ms as u64))
-        } else {
-            s.socket.connect(&sock_addr)
-        };
-        result.map_err(|e| ioex(format!("socketConnect: {e}")))?;
+        s.socket = cloned;
         s.is_connected = true;
         Ok(None)
     })
@@ -415,7 +445,23 @@ fn socket_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             .map_err(|e| ioex(format!("socketAccept: {e}")))?;
         (clone, s.so_timeout_ms)
     };
-    let accepted: (Socket, SockAddr) = if let Some(t) = timeout {
+    // GC/STW-cooperation: `listener.accept()` below (both the timed
+    // busy-poll loop and the unbounded branch) is a genuine OS-level
+    // blocking call — the calling Java thread parks here for up to
+    // SO_TIMEOUT (or indefinitely with no timeout) with no interpreter
+    // safepoint reached. Without `begin_blocking_region`/`end_blocking_region`
+    // a concurrent STW pause (JIT takeover or GC) counts this thread in its
+    // `expected` cooperator set and waits forever, and if what unblocks the
+    // accept (a peer Java thread's `connect()`) itself pauses cooperatively
+    // at the same STW, the two threads deadlock each other through the STW
+    // barrier. `new_impl` is a live `ObjectRef` read before the block and
+    // used again afterwards (`write_fd`/`set_field_by_name`), so it must
+    // ride through `end_blocking_region_refs` in case a GC compacts the
+    // heap while we're parked in `accept()`. See `re1_socket_read_stream`
+    // in `net_phase_e.rs` for the same pattern on the read side.
+    let mut blocked_refs = [Value::Object(Some(new_impl))];
+    ctx.begin_blocking_region();
+    let accept_result: Result<(Socket, SockAddr), MethodCallFailed> = if let Some(t) = timeout {
         // Set non-blocking + busy-poll the (already cloned-out) listener
         // until either accept succeeds or the deadline passes. The clone is
         // local, so no registry lock is held while we sleep.
@@ -444,13 +490,13 @@ fn socket_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         // here), but kept for parity with the previous behavior.
         let _ = listener.set_nonblocking(false);
         match got {
-            Some(p) => p,
+            Some(p) => Ok(p),
             None => {
                 let kind = match last_err {
                     Some(e) => format!("{e}"),
                     None => "accept timed out".to_string(),
                 };
-                return Err(ioex(format!("socketAccept: {kind}")));
+                Err(ioex(format!("socketAccept: {kind}")))
             }
         }
     } else {
@@ -458,9 +504,14 @@ fn socket_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         // a local handle dup'd out above.
         listener
             .accept()
-            .map_err(|e| ioex(format!("socketAccept: {e}")))?
+            .map_err(|e| ioex(format!("socketAccept: {e}")))
     };
-    let (new_sock, peer) = accepted;
+    ctx.end_blocking_region_refs(&mut blocked_refs);
+    let new_impl = match blocked_refs[0] {
+        Value::Object(Some(o)) => o,
+        _ => new_impl,
+    };
+    let (new_sock, peer) = accept_result?;
     let _ = new_sock.set_nonblocking(false);
     let new_state = SocketState {
         socket: new_sock,

@@ -87,8 +87,14 @@ This document tracks the **genuine remaining failures**.
     failing step), `BootProbe.java` (boot-jar append + null-loader `forName`), `TmpProbe.java`
     (`java.io.tmpdir` honoring).
 *   **`@Import` attribute CCE across `@CompileWithForkedClassLoader`** (`web.service.registry.ImportHttpServiceRegistrarTests`)
-  *   **Status**: **OPEN** (2/5 methods: `basicListingWithAot`, `basicScanWithAot` — `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;` at `ConfigurationClassParser$SourceClass.getAnnotationAttributes`)
+  *   **Status**: **OPEN** (2/5 methods: `basicListingWithAot`, `basicScanWithAot` — `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;` at `ConfigurationClassParser$SourceClass.getAnnotationAttributes:1119`, `String[] classNames = (String[]) annotationAttributes.get(attribute);`)
   *   **2026-07-15 update**: reproduces SOLO in ~1s (`/data/tmp/aotfix-runs/MethodRun.java` single-method launcher on the Azure host). The 2026-07-14 SoftReference/GC-relocation hypothesis is now DOUBTED: this failure survived eight classloader-identity fixes, and three focused probes (plain `@Import` reflection, forked-loader variant, `@Import` as meta-annotation on a repeatable annotation type — `ImportProbe2.java`) all PASS. The divergence is somewhere in the full `ConfigurationClassParser`/`MergedAnnotations` path for the repeatable `@ImportHttpServices` container under a forked loader.
+  *   **2026-07-15 second update — CratonVM's native annotation layer RULED OUT, narrowed to Spring's own `AnnotationTypeMapping` caching.** The failing lookup is `collectImports` examining `@ImportHttpServices` itself as a `SourceClass`, asking "is `@ImportHttpServices` meta-annotated with `@Import`?" and requesting `Import`'s `value()` attribute with `classValuesAsString=true` (Spring's `TypeMappedAnnotation.adapt()` expects a `Class[]`→`String[]` conversion here). Two CratonVM-internal traces already present in the codebase (`CRATONVM_IAE_TRACE`, `CRATONVM_ANN_PROXY_DISPATCH_TRACE` in `native-builtins/src/lang_class.rs` / `vm/src/vm/vm_exec.rs::annotation_proxy_dispatch_impl`) were used, plus one new element-level trace (temporary, reverted) confirming the FULL chain from raw classfile annotation bytes through to the reflective proxy dispatch is correct:
+      - `container_loader=SOME` for both `ListingConfig` and `ImportHttpServices` (both correctly recognized as fork-loaded, so `resolve_annotation_class_via_loader` is used, not the stale global store).
+      - `annotation_element_to_java_typed`'s `Array` branch builds a genuine 1-element `Class[]` array for `@Import`'s `value` (`elem_cname=java/lang/Class`, no `TypeNotPresentException` sentinel collapse — that hypothesis, and the "insufficient loader scoping" hypothesis, are both REFUTED for this specific bug).
+      - `annotation_proxy_dispatch_impl`'s element-accessor walk (the code that answers a reflective `Method.invoke()` on the annotation's `$ProxyN`) returns exactly that array back to the Java caller: `[ANN-PROXY-DISPATCH-VAL] ... type_desc=.../Import; returning cid=12 name="java/lang/Class" is_array=true array_len=1` — i.e. CratonVM hands Spring a **correct** 1-element `Class[]`.
+
+      Since the value crossing the native/Java boundary is provably correct, the bug is NOT in CratonVM's annotation-parsing or reflection-dispatch layers — it must be inside Spring's OWN `TypeMappedAnnotation`/`AnnotationTypeMapping` Java code, specifically `getValueFromMetaAnnotation`'s `useMergedValues` branch (`this.mapping.getMappedAnnotationValue(attributeIndex, forMirrorResolution)`), which is a SEPARATE retrieval path from the raw reflective `AnnotationUtils.invokeAnnotationMethod` fallback and was NOT exercised by the traces above (those traces fire on the raw-reflection path; `getMappedAnnotationValue` may resolve the value some other way — e.g. via a cached/mirrored `Method` reference — before ever reaching a `Method.invoke()` call). NEXT STEP: trace (or `javap`/read) `AnnotationTypeMapping.getMappedAnnotationValue` and its mirror-set resolution to find where a correct 1-element array could become a bare `Class` — prime suspect is `Method`-object IDENTITY comparison (mirror-set caching keyed on a `Method` from one loader vs. a `Method` from another) given this cluster's established loader-identity bug theme, though this would be the first instance of that theme manifesting via `java.lang.reflect.Method` identity rather than `Class` identity.
 *   **STOMP Message Hang** (`web.socket.messaging.StompWebSocketIntegrationTests`)
   *   **Status**: **OPEN** (TIMEOUT) — functional gap in STOMP routing/delivery, not a VM deadlock.
 
@@ -142,10 +148,10 @@ the WRONG same-named copy. Eight fixes landed on
 | `ScopedProxyBeanRegistrationAotProcessorTests` | FAIL (3 methods) | **OK 5/5** |
 | `PersistenceManagedTypesBeanRegistrationAotProcessorTests` | FAIL | FAIL 2/0 (host lacks JDK 24+, see below — not a VM bug) |
 | `TestClassScannerTests` | TIMEOUT 600 s | **completes 177 s** (7/7 or flaky 7/6) |
-| `TestCompilerTests` | TIMEOUT 600 s+ | **completes 40 s**, FAIL 22/18/4 |
+| `TestCompilerTests` | TIMEOUT 600 s+ | **completes 40 s**, FAIL 22/21/1 (3 of 4 fixed) |
 | `ApplicationContextAotGeneratorTests` | ABEND (CGLIB load) | discovers+runs 40 methods (see residuals) |
 | `BeanDefinitionMethodGeneratorTests` | FAIL 34/3 | **OK 34/34** |
-| `ConfigurationClassPostProcessorAotContributionTests` | FAIL 20/8 | FAIL 20/18/2 |
+| `ConfigurationClassPostProcessorAotContributionTests` | FAIL 20/8 | **OK-ish 20/15/5** (5 residual = host ClassFile gap, see below) |
 | `PersistenceAnnotationBeanPostProcessorAotContributionTests` | FAIL 8/0 (NCDFE) | FAIL 8/2/6 (Mockito attach residuals) |
 | `TestContextAotGeneratorIntegrationTests` | FAIL 4/0 @393 s | (see residuals) |
 | `BeanRegistrationsAotContributionTests` | TIMEOUT | TIMEOUT (throughput, see below) |
@@ -158,69 +164,50 @@ the WRONG same-named copy. Eight fixes landed on
     (`InlineDelegateByteBuddyMockMaker.lambda$new$2/3`) plus GC frame-root
     scanning — an interpreter-throughput problem under constructor
     instrumentation, needing perf work rather than a correctness fix.
-*   **`ConfigurationClassPostProcessorAotContributionTests` — 2 residuals in
-    `BeanRegistrarTests` under fork, ROOT-CAUSED 2026-07-15 (not yet fixed —
-    the fix is architecturally bigger than this cluster's other loader-identity
-    bugs, see below).** `applyToWhenIsPackagePrivate`/
-    `applyToWhenIsPackagePrivateAndImportAware` throw
-    `IllegalArgumentException: Could not generate code for
+*   ~~`ConfigurationClassPostProcessorAotContributionTests`~~ **FIXED
+    (2026-07-15, commit `aca7f635`).** `BeanRegistrarTests`'
+    `applyToWhenIsPackagePrivate`/`applyToWhenIsPackagePrivateAndImportAware`
+    threw `IllegalArgumentException: Could not generate code for
     <com.example.TestTarget__TestCode>::applyBeanRegistrars: parameter 0 of
     type org.springframework.beans.factory.ListableBeanFactory is not
-    supported` — Spring's `DefaultMethodReference.addArguments` (javapoet
-    `TypeName`-based, NOT a `Class` object) fails to match the captured
-    `ListableBeanFactory` parameter type against the test's own
-    `ArgumentCodeGenerator.of(ListableBeanFactory.class, ...)`.
+    supported` under `@CompileWithForkedClassLoader`. Root cause:
+    `Vm::declaring_class` (`vm/src/vm/vm_exec.rs`, backs
+    `Class.getEnclosingClass()`/`getDeclaringClass()`) resolved the outer-class
+    name via a FLAT, GLOBAL, name-only lookup that never considered the
+    INNER class's own defining loader — so `BeanRegistrarTests` (correctly
+    fork-loaded) got back the STALE, original app-loader copy of its
+    enclosing class, and everything transitively touched through it
+    (`ConfigurationClassPostProcessor`, `ListableBeanFactory` itself, …)
+    inherited that stale identity, producing two different
+    `ListableBeanFactory` copies for Spring's javapoet-based
+    `ArgumentCodeGenerator` matching to reconcile. This completely bypassed
+    the `resolve_class_loader_aware` / `CRATONVM_LOADER_AWARE_RESOLUTION`
+    machinery that already correctly handles ordinary bytecode-level
+    `ldc`/`checkcast`/`new` class references.
 
-    Traced (env-gated `eprintln!` in `resolve_class_loader_aware`,
-    `vm/src/runtime/interpreter.rs`) down to a DIFFERENT class-identity gap
-    than the rest of this doc's fixes: `@CompileWithForkedClassLoader`'s
-    `CompileWithForkedClassLoaderClassLoader` correctly gets its OWN
-    `ClassId` for the directly-`Class.forName`'d nested test class
-    (`BeanRegistrarTests`, confirmed via trace: `get_loader_id=UserDefined(N)`,
-    defining-loader registry entry present) — but `BeanRegistrarTests`'s
-    ENCLOSING class (`ConfigurationClassPostProcessorAotContributionTests`)
-    resolves to the STALE, original app-loader `ClassId`
-    (`get_loader_id=Application`, no defining-loader entry at all), and
-    EVERYTHING transitively touched through it (`ConfigurationClassPostProcessor`,
-    `ConfigurationClassBeanDefinitionReader`, `ListableBeanFactory` itself,
-    …) inherits that same stale, app-loader identity. The nested test
-    method's OWN `ListableBeanFactory.class` literal, by contrast, resolves
-    correctly through the fork loader (since `BeanRegistrarTests` itself IS
-    loader-correct) — giving two DIFFERENT `ListableBeanFactory` copies to
-    compare, hence the "not supported" mismatch.
+    Fixed in `native_class_get_declaring_class` (`native-builtins/src/lang_class.rs`),
+    which already has a mutable `NativeContext` (unlike the `Vm::declaring_class`
+    trait method it calls): checks first whether the class has a registered,
+    eligible defining loader, then — only when the existing global answer's
+    own defining loader DIFFERS from the class's own — resolves the
+    enclosing-class name by invoking that loader's OWN `loadClass()`
+    (mirrors `drive_defining_loader_load`'s re-entrant-call pattern). A cheap
+    same-loader short-circuit keeps the cost near-zero for the overwhelming
+    common case; an earlier version without it caused a severe slowdown by
+    invoking `loadClass()` on every `getEnclosingClass()` call for any
+    user-defined-loader class.
 
-    Root cause of the ENCLOSING-CLASS gap: `Vm::declaring_class`
-    (`vm/src/vm/vm_exec.rs`, backs `Class.getEnclosingClass()`/
-    `getDeclaringClass()`) resolves the outer-class name via
-    `cm.find_class_by_name(&ic.outer_class)` — a FLAT, GLOBAL, name-only
-    lookup that never considers the INNER class's own defining loader. Any
-    nested class redefined under an isolating loader (this cluster's
-    `@CompileWithForkedClassLoader`, `DynamicClassLoader`, or a future
-    Tomcat/Hibernate/WildFly custom loader) will have `getEnclosingClass()`
-    silently hand back whichever loader's copy of the same-named outer class
-    was registered FIRST — completely bypassing the `resolve_class_loader_aware`
-    / `CRATONVM_LOADER_AWARE_RESOLUTION` machinery that already correctly
-    handles ORDINARY bytecode-level `ldc`/`checkcast`/`new` class references
-    (confirmed: adding an analogous narrow carve-out to
-    `should_use_loader_initiated_resolution` for these two Spring test-tools
-    loader classes, mirroring the existing `is_groovy_class_loader` pattern,
-    correctly activates for `BeanRegistrarTests` itself — but does NOT fix
-    this test, because the enclosing-class lookup never goes through that
-    gate at all).
-
-    NEXT STEP (not attempted this round — genuinely bigger scope than this
-    doc's other fixes): make `Vm::declaring_class` loader-aware. `declaring_class`
-    currently takes only `&self` (a `class_manager` read lock, no thread
-    context), so it can only PREFER an already-loaded same-loader match (a
-    `class_defined_by_loader_exact`-style lookup keyed by the inner class's
-    OWN loader) before falling back to the global one — it CANNOT actively
-    drive that loader's `loadClass()` for an outer class it hasn't loaded yet
-    (that needs `&mut thread`/`NativeContext`, i.e. the same re-entrant-call
-    machinery `drive_defining_loader_load` already has, threaded through a
-    different call path). Given `getEnclosingClass()`/`getDeclaringClass()`
-    is used pervasively by reflection-heavy frameworks well beyond this AOT
-    cluster, this needs its own careful, isolated soak — do not bundle it
-    with an unrelated fix.
+    Verified: both `ListableBeanFactory` failures fixed (now hit the
+    pre-existing, unrelated `java.lang.classfile.ClassFile` host JDK-version
+    gap instead — confirmed via A/B testing not a regression). Full class:
+    14→15 succeeded, 6→5 failed, remaining failures identical in nature
+    between pre/post-fix baselines. Regression-checked
+    `DefaultBeanRegistrationCodeFragmentsTests`/`ThrowawayClassLoaderTests`/
+    `PersistenceManagedTypesBeanRegistrationAotProcessorTests` clean. Broader
+    regression coverage was inconclusive at time of testing due to severe,
+    unrelated host I/O contention (confirmed via A/B comparison that the
+    slowness reproduces identically pre-fix) — worth a spot-check when the
+    host is less loaded.
 *   `PersistenceAnnotationBeanPostProcessorAotContributionTests` — 8/2/6.
     Post-fix the forked Mockito path advanced: now (a) fork attach via
     `PremainAttachAccess` -> "Byte Buddy agent is not initialized", and (b) a
@@ -244,9 +231,47 @@ the WRONG same-named copy. Eight fixes landed on
     `ClassCastException: kotlin.reflect...protobuf.SmallSortedMap$Entry cannot
     be cast to java.lang.reflect.Field / AnnotationSpec` (separate
     heap/collection-identity family, kotlin-reflect metadata parsing).
-*   `TestCompilerTests` — 4 residuals: package-private access via
-    `@CompileWithTargetClassAccess`-style flows + additional-class references
-    (`CompilationException: Unable to compile source`).
+*   `TestCompilerTests` — **3 of 4 residuals FIXED 2026-07-15 (commit
+    `0ee485a2`).** All three `CompilationException: Unable to compile source`
+    residuals (`compiledCodeCanAccessExistingPackagePrivateClassIfAnnotated`,
+    `compiledCodeCanReferenceAdditionalClassInSamePackage`,
+    `compiledCodeCanReferenceAdditionalClassInDifferentPackage`) shared one
+    root cause: `native_javac_file_manager_list`
+    (`native-builtins/src/lib.rs`, the native override backing
+    `JavaFileManager.list()` for TestCompiler's in-process javac) had a
+    hardcoded short-circuit returning an EMPTY list for `CLASS_PATH`
+    listings of the `com`/`com.example`/`com.example.*` packages (alongside
+    the legitimate `java.*`/`javax.*` bootstrap-classpath exclusion) —
+    presumably added because `com.example` is TestCompiler's own scratch
+    namespace for dynamically generated, in-memory-only classes. That
+    blanket rule also hid genuine, pre-compiled-to-disk fixtures in the
+    same package (`com.example.PublicInterface`/`PackagePrivate` in
+    spring-core-test's own test-classes directory) from javac's symbol
+    resolution, surfacing as "cannot find symbol: class PublicInterface"
+    even though `getJavaFileForInput` (direct by-name lookup, never
+    short-circuited) always found it fine — confirmed via a standalone
+    `StandardJavaFileManager` probe, plus separate probes ruling out any
+    lower-level `File.listFiles()`/`Files.newDirectoryStream()` bug (both
+    correctly enumerate the same directory). Removed `com`/`com.example`
+    from the short-circuit; only `java.*`/`javax.*` remain fast-pathed to
+    empty (JVMS-correct — those never live on the application classpath).
+    Verified 22/18/4 → 22/21/1; regression-checked
+    `BeanDefinitionMethodGeneratorTests` (heavy TestCompiler/`com.example`
+    user) clean at 34/34.
+
+    **Remaining 1 residual — DIFFERENT, pre-existing bug, NOT fixed:**
+    `compiledCodeCannotAccessExistingPackagePrivateClassIfNotAnnotated`
+    expects an `IllegalAccessError` when code in a fresh `DynamicClassLoader`
+    (a DIFFERENT defining loader than the one that defined the
+    package-private `PackagePrivate`, same package NAME but different
+    runtime package per JVMS §5.4.4) accesses it WITHOUT
+    `@CompileWithForkedClassLoader` — but no exception is thrown; access
+    silently succeeds. This already failed with this exact `AssertionError`
+    (not `CompilationException`) BEFORE the fix above, so it is unaffected
+    by it. Points at CratonVM's runtime package-private access check not
+    correctly comparing DEFINING LOADERS across a same-named-package,
+    different-loader pair — a genuinely separate investigation (runtime
+    access control, not compile-time symbol resolution).
 *   ~~`aot.nativex.feature.ThrowawayClassLoaderTests`~~ **FIXED (2026-07-15,
     commit `56a98cc4`)**. `native-builtins/src/classloader_real.rs`'s
     `cl_real_load_class_base` — the REAL-JDK-mode counterpart of the
@@ -303,10 +328,17 @@ are unchanged by the 2026-07-15 AOT work — consult the historical doc.*
     `theInternalUnsafe`; the interpreter's C11/C16 null-receiver rescue papered over it but compiled
     code has no such rescue) killed `ByteBufUtil.<clinit>` at Netty's `MpmcArrayQueue(4096)` init loop.
     **`CrossOriginAnnotationIntegrationTests` is now fully OK (68/68)** on all backends.
-*   **Current Residual (OPEN)**: `RequestMappingMessageConversionIntegrationTests` (160 tests) runs but
+*   ~~**Current Residual (OPEN)**: `RequestMappingMessageConversionIntegrationTests` (160 tests) runs but
     is pathologically slow — steady progress (fresh `AnnotationConfigApplicationContext` + HTTP server
     per test; watchdog stack dumps show active bean creation, no deadlock) yet does not finish within
-    1800s (HotSpot: 13s). Needs a dedicated perf investigation.
+    1800s (HotSpot: 13s). Needs a dedicated perf investigation.~~
+    **PARTIALLY FIXED (2026-07-15, commit `96c8a57f`, branch `fix/xerces-perf-20260715`)**: root-caused
+    and fixed a genuine, general CPU-dispatch bug (JDK-internal bytecode — including Xerces — never
+    consulted the interpreter's monomorphic invoke cache; see the detailed writeup further down in
+    this document, section 2, same bullet). Verified via an isolated repro: 2.7x-3.4x faster
+    per-parse. **Full-class wall-clock improvement on this specific test NOT confirmed** — see the
+    detailed entry below for the honest caveat (host-contention-confounded A/B comparison, and
+    evidence the per-test cost here is dominated by something other than the bug fixed).
 
 ## 4. Reactive cluster session 2026-07-15 (branch `fix/reactive-cluster-20260715`)
 
@@ -358,20 +390,65 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     CratonVM hit the hang on ~2/13 attempts, always on the `Jdk` connector, never the other 3 (which
     don't route through this raw-socket path). Fixed both blocking sites; verified 15/15 clean on the
     same probe post-fix, `cargo test -p cratonvm-native-builtins --lib` 2996/0.
-    **Still OPEN**: the full `ClientHttpConnectorTests` class (which also exercises Reactor Netty,
-    Jetty, and Apache HttpComponents — real, independent libraries with their own native I/O) still
-    intermittently hangs after this fix, in the identical `StepVerifier`/`waitTaskEvent` shape.
-    Near-certainly a similarly-shaped but structurally separate STW-cooperation gap in ONE of those
-    other 3 connectors' own blocking call paths (or CratonVM's support code for them) — not
-    reachable from `net_phase_e.rs`. **Next step**: bisect which of the 4 connectors is still
-    hanging (rerun with a filtered `MethodSource` exercising one `Named<ClientHttpConnector>` at a
-    time — the `FullMatrixProbe`-style technique in the fix's worktree
-    `/data/data/wt-jdkclient-patch-hang-20260715/probes/` generalizes directly), then audit that
-    connector's blocking native call sites for the same missing `begin_blocking_region` pattern.
+    ~~**Residual investigated + partially fixed 2026-07-15**~~ (`fix/httpconn-residual-20260715`,
+    commits `91cb806c` + `3d1449a7`). Bisected the "which of the other 3 connectors" question with
+    a `FullMatrixProbe`-style stress harness plus a from-scratch JUnit launcher driving the real
+    `ClientHttpConnectorTests` class (49 sub-tests) directly under CratonVM.
+
+    **Round 1 (`91cb806c`) — found and fixed two genuine missing-`begin_blocking_region` bugs**,
+    but in the *shared* `java.net.Socket`/`java.net.ServerSocket` implementation
+    (`native-builtins/src/plain_socket.rs`, JDK13+'s `NioSocketImpl` backing both classes) rather
+    than in any one connector's own code — `java.net.ServerSocket.accept()` is what MockWebServer
+    itself uses to accept every connection for all 4 connector cases (`socket_accept()`'s
+    `listener.accept()` was never bracketed; `socket_connect()` additionally ran its blocking
+    `connect()` *inside* the global socket-registry write-lock closure). Also applied defensively
+    to `native-io/src/socket_channel.rs`'s blocking-mode `SocketChannel` paths. Direct gdb evidence
+    showed this was NOT what caused the residual hangs on its own (no thread ever caught parked in
+    an unwrapped blocking syscall) — real bugs, correctly fixed, but not sufficient alone.
+
+    **Round 2 (`3d1449a7`) — found and fixed the actual dominant mechanism.** Live `perf record -g
+    --call-graph dwarf` + `sudo gdb -p <pid> --batch -ex 'thread apply all bt'` sampling (multiple
+    independent captures, both from the ad hoc probe and the real `ClientHttpConnectorTests` class)
+    consistently caught a worker thread pegged at ~90-100% CPU for 20-25+ seconds straight (verified
+    via `top -H` per-thread CPU-time deltas across samples, not just a single snapshot), its top
+    frame cycling through `force_native_over_real_jdk_bytecode` — a ~55-branch/~1400-line
+    sequential string-comparison special-case dispatcher, reached via
+    `intercept_force_registered_native` → `execute_invokevirtual_cached`/`execute_invokestatic_cached`
+    — while the caller executed a tight Java-level spin/poll loop typical of Reactor/Netty/Jetty's
+    lock-free scheduling. This is the SAME function already flagged as consuming ~51% of all
+    executed instructions on method-call-heavy workloads in
+    `docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md` (2026-07-13) — that
+    session measured call *frequency* but not per-call cost, and judged a fast-reject allowlist too
+    risky to hand-write (a first attempt missed a case hiding in a nested helper). This fix instead
+    memoizes the check exactly (no approximation, so no risk of silently changing behaviour):
+    `CachedBytecodeMethod` gains a `force_native_cache: OnceLock<bool>` field, populated once per
+    invoke-cache entry and read thereafter, cutting the recheck from every cached dispatch hit to
+    once per unique callsite. (A direct earlier hypothesis — that a `CodeAttribute` deep-clone in
+    `interpreter.rs`'s `execute()` was the multi-second cost — was investigated with hard timing
+    instrumentation and REFUTED: individual clones measured consistently sub-millisecond, even
+    during a 30s+ hung run; that was a genuine but much smaller waste, not the driver, and was
+    reverted rather than landed as an unverified guess.)
+
+    **Verification**: `cargo test -p cratonvm-native-builtins --lib` 2997/0 and
+    `cargo test -p cratonvm-vm --lib` 2218/0, both unchanged (no regression). Live re-capture
+    post-fix confirms `force_native_over_real_jdk_bytecode` no longer appears in hot-thread
+    snapshots. Clean (single test run at a time, no concurrent host load) 15-run stress comparison
+    of `ClientHttpConnectorTests` end-to-end, 30s hang timeout:
+      - pre-fix (dev tip before this fix): **9/15 hangs (60%)**
+      - post-fix (this commit): **4/15 hangs (27%)**
+    A real, substantial, cleanly-measured improvement (~2.2x hang-rate reduction) — but **not a
+    full fix**. **Still OPEN**: a second, structurally different bottleneck remains. Post-fix
+    hot-thread captures now show sustained CPU-bound activity in `try_lambda_dispatch`
+    (`interpreter.rs`), specifically `shared.lambda_proxies.read()` — an `RwLock<HashMap<ClassId,
+    LambdaCallSite>>` consulted on *every* lambda/`invokedynamic` dispatch with no callsite-level
+    cache (unlike `invokevirtual`/`invokestatic`, which have exactly this kind of cache already).
+    Reactive-stream code is lambda-heavy (`.map`/`.flatMap`/subscriber callbacks per operator), so
+    this is plausibly a genuine architectural gap rather than a quick memoization fix — needs its
+    own investigation into whether invokedynamic call sites can get an analogous IC.
     Also unfixed: the T19.H1 watchdog stack-dump itself SIGSEGVs when JIT frames are on the stack
     (separate small bug; `--nojit` dumps work).
-*   `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` —
-    pathological slowness (>1800s vs HotSpot's 13s, 160 tests). **2026-07-15 update**: confirmed
+*   ~~`web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` —
+    pathological slowness (>1800s vs HotSpot's 13s, 160 tests).~~ **2026-07-15 update**: confirmed
     genuine forward progress, not a hang (frame counts change across successive
     `--stack-dump-on-timeout` watchdog dumps — the watchdog fires repeatedly during a single run,
     which doubles as a free sampling profiler: 10,970 dumps captured over ~40s). Aggregating the
@@ -381,55 +458,154 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     `XMLDTDValidator.emptyElement` 1986, full SAX/DTD-scanning call chain beneath it) — roughly
     **42% of all sampled CPU time** inside Xerces, for a workload (annotation-`@Configuration`
     Spring context + embedded Tomcat/Reactor/Jetty bootstrap, 160x) that should barely touch XML
-    parsing at all. `org/apache/catalina/util/LifecycleBase.start` (2751) confirms embedded Tomcat
-    startup as a major contributor — Tomcat's own bootstrap parses internal
-    `web.xml`/`web-fragment.xml`-shaped descriptors (with DTD validation) even for a minimal
-    reactive server, once per test-created server instance. **Leading hypothesis**: CratonVM's
-    Xerces execution has a performance bug (missing JIT tier-up for Xerces's hot methods — matching
-    the already-documented `jit-instance-methods-no-invocation-tierup` family — or per-native-call
-    dispatch overhead compounding across Xerces's very high internal call count per parse, matching
-    the already-fixed-but-precedent-setting `HashMap native-dispatch overhead` investigation) rather
-    than a fixed per-file cost, since the SAME small descriptor is likely reparsed from scratch on
-    every one of the 160 tests' server instantiations. **Next step**: isolate a minimal repro
-    (`DocumentBuilderFactory`/`SAXParserFactory` parsing a small DTD-validated XML file in a tight
-    loop, timed vs HotSpot) to get a clean per-parse ratio, then decide whether the fix is JIT
-    tier-up eligibility for Xerces's classes or a native-dispatch hot-path optimization; if a DTD/
-    entity cache is supposed to make repeat parses of the same descriptor cheap on HotSpot, verify
-    that cache is actually effective under CratonVM's classloading model.
-    slowness, see section 2 above.
-*   `web.reactive.result.view.script.JRubyScriptTemplateTests` — JRuby-on-CratonVM: JRuby's own
-    bundled `rubygems/specification.rb` bootstrap fails with a Ruby-level `SyntaxError` from code it
-    generates itself: `#{@@nil_attributes.map {|key| "@#{key} = nil" }.join "; "}` (a Ruby
-    string interpolation reading a `.map {|key| ...}` block parameter, inside JRuby's own
-    precompiled-to-JVM-bytecode stdlib) interpolates `key` as EMPTY instead of the Symbol's name,
-    producing malformed generated Ruby source (`"@ = nil; @ = nil; ..."`) that a second, inner
-    `Kernel#eval` then rejects. **2026-07-15 update**: minimal standalone repro isolated (no Spring
-    needed — `ScriptEngineManager().getEngineByName("jruby").eval(...)` alone triggers it during
-    JRuby's own lazy bootstrap, before any user script runs); confirmed CratonVM-specific
-    (`Symbol#to_s` and simple top-level `"#{key}"` interpolation both work correctly in isolation —
-    the bug is specific to a block-parameter interpolated inside JRuby's own PRE-COMPILED bytecode,
-    not JRuby's general interpolation mechanism). Found a concrete, reproducible clue: 5
-    `[GC-ARRAY-GUARD] array_length(non-array)` warnings fire (`class_id=1013` in one run,
-    consistently 5 of them — matching `@@nil_attributes`' likely element count) at the EXACT moment
-    the interpolation corrupts, from `gc/src/gen_heap.rs:2314`'s defensive guard (a raw JVM
-    `arraylength` bytecode instruction executing against a heap object CratonVM's GC does NOT
-    consider an array — silently returns 0 instead of crashing). `CRATONVM_DBG_STALE_OBJREF=1`
-    was tried but did NOT visibly fire for this repro (inconclusive either way — this assertion has
-    known coverage gaps for other bug families, per `stream-arraylist-gc-pressure-heap-corruption-
-    found-20260714.md`). **Leading hypothesis, not confirmed**: a stale/wrong `ObjectRef` — the
-    JVM bytecode JRuby's own compiler emitted for this interpolation legitimately expects an array
-    (its own internal representation of the block-parameter/interpolation-piece list), but by the
-    time the `arraylength` instruction executes, the reference has been relocated/reused to point at
-    a non-array object — matching the broader stale-ObjectRef bug family already extensively
-    tracked in this codebase (see `wildfly-parallel-boot-stale-objectref-residual.md`,
-    `stale-objectref-static-sweep-20260711.md`) but not yet localized to a specific call site here.
-    **Next step**: reproduce under `RUST_BACKTRACE=1` + the `CRATONVM_GC_ARRAY_GUARD_BT=1` backtrace
-    (already captured once — the backtrace bottoms out in the raw interpreter `arraylength` opcode
-    handler, `interpreter.rs:8638`, giving no further attribution on its own) combined with a
-    JRuby-side decompile of the exact bytecode `specification.rb`'s `set_nil_attributes_to_nil`
-    heredoc-eval compiles to (JRuby ships this stdlib file pre-compiled; extract the `.class`
-    equivalent from the `jruby-stdlib` jar with `javap` to see the literal `arraylength`
-    instruction's context) to identify which allocation/GC event upstream could relocate the
-    reference this instruction reads. Not reactive-specific; a fix here likely benefits any JRuby
-    (or generally: any dynamic-bytecode-generating library that emits `arraylength`) workload.
+    parsing at all.
+
+    **ROOT-CAUSED AND FIXED (2026-07-15, commits `4290124b` + `96c8a57f`, branch
+    `fix/xerces-perf-20260715`, merged to `dev`)**. This turned out to be a GENERAL bug, not
+    Xerces-specific — confirmed via a standalone `SAXParserFactory` parse-loop repro
+    (`XercesRepro.java`, no Spring/Tomcat/networking involved) that isolated the exact same
+    disproportionate cost outside any Spring context. Root cause, found by instrumenting the
+    invoke-dispatch path with a one-off counter (`CRATONVM_DBG_INVOKESTATS`, kept in the tree as a
+    permanent gated diagnostic): `execute_frame`'s raw-byte-peek fast dispatch loop — which includes
+    the monomorphic `InvokeCache` inline cache used by `invokevirtual`/`invokespecial`/
+    `invokeinterface` — is gated off for `is_jdk_class` frames (`vm/src/runtime/interpreter.rs`
+    around line 6813; a deliberate, correct gate — some of that loop's *other* opcode fusions use
+    truly-unchecked stack pops unsafe for real-JDK bytecode shapes). But the general
+    `Instruction::decode` → `execute_instruction` path those frames fall back to called
+    `execute_invoke`/`execute_invoke_kind` **unconditionally** for every invoke instruction — it
+    never consulted the cache at all. Since Xerces (`com.sun.org.apache.xerces.internal.*`) ships
+    inside `java.xml`, every single method call it makes — and Xerces's SAX/DTD state-machine scanner
+    makes an enormous number of very small calls per parse — paid full method resolution (native-
+    registry hash lookup, hierarchy walk, `class_manager` RwLock reads, several hardcoded special-case
+    string comparisons) instead of the O(1) lock-free cache hit non-JDK bytecode already got.
+    Measured with `CRATONVM_DBG_INVOKESTATS` on the repro: ~1,546 cache hits vs ~1,800,000 full-slow-
+    path calls over 20 parses (a ~0.08% hit rate) before the fix. Fix: the `Instruction::Invokevirtual`
+    / `Invokespecial` / `Invokeinterface` arms in `execute_instruction`
+    (`vm/src/runtime/interpreter.rs`, "Method invocation (slow path)") now call
+    `execute_invokevirtual_cached` first and only fall through to the existing slow path on a genuine
+    cache miss — safe to reuse unconditionally because that function's arg decode already goes through
+    `pop_arg_for_descriptor_checked` (descriptor-aware, checked), not the unchecked pops the
+    `is_jdk_class` gate exists to avoid. A companion investigation (commit `96c8a57f`) found and fixed
+    two related JIT-eligibility-check memoization gaps in the same hot path (a full O(bytecode-size)
+    `jit_method_calls_native_shadowed` re-scan that never got cached via the existing
+    `mark_jit_bail_listed`/`jit_skip_set` mechanisms, so it re-ran every 64 invocations forever for any
+    method that calls a native-shadowed target).
+
+    **Verification — isolated repro** (`XercesRepro.java`, 500 SAX parses of an ~800-line
+    web.xml-shaped document, `dtds/web-app_2_3.dtd` for the validating case):
+
+    | Mode | Before | After | HotSpot | Speedup |
+    |---|--:|--:|--:|--:|
+    | non-validating | 155.5 ms/parse | 57.2 ms/parse | 0.46 ms/parse | 2.72x |
+    | DTD-validating | 536.8 ms/parse | 156.3 ms/parse | 1.18 ms/parse | 3.44x |
+
+    `perf record` self-time for `NativeMethodRegistry::find` dropped 11.61%→4.86% and
+    `jit_method_calls_native_shadowed` dropped 5.18%→0.58% across the two fixes.
+    `cargo test -p cratonvm-vm --lib`: 2203 passed / 9 failed (all 9 are pre-existing
+    `runtime::lock_order` tests that explicitly require a debug build — "test runner is expected to
+    be a debug build" — an artifact of running `cargo test --release`, unrelated to this change) /
+    111 ignored.
+
+    **Full-class wall-clock impact: NOT confirmed, OPEN follow-up**. A same-day A/B run of the full
+    160-test class (fixed vs. pre-fix binary, bounded ~10-minute windows, same shared build host) was
+    inconclusive: the fixed binary averaged ~49.7s/test vs. ~40.9s/test pre-fix in that particular
+    window — but the host had a load average of 5-6 on 16 cores with a *different concurrent
+    session's* Spring suite run consuming 169% CPU at the time, so this specific comparison is not
+    trustworthy in either direction and should not be read as "the fix made this test slower." More
+    significant than the noise: per-test wall time in both runs was ~40-55 SECONDS — two to three
+    orders of magnitude larger than what the isolated repro's few-hundred-ms Xerces parse cost could
+    plausibly explain per test — meaning this specific integration test's dominant per-test cost is
+    something else entirely (each test builds a fresh embedded Tomcat/Reactor instance: real socket
+    bind, NIO connector startup, thread-pool bootstrap), not the CPU-bound bytecode-dispatch overhead
+    this fix targets. **This means the fix is real, general, and verified, but is not sufficient on
+    its own to bring `RequestMappingMessageConversionIntegrationTests` down to a small multiple of
+    HotSpot's 13s.** The next step for that specific goal is a separate investigation into what
+    dominates per-test wall-clock time in this class — likely embedded-server bootstrap/socket/
+    thread costs — ideally run on an uncontended host to get a clean baseline.
+*   ~~`web.reactive.result.view.script.JRubyScriptTemplateTests`~~ **PARTIALLY FIXED
+    (2026-07-15) -- 2 of (at least) 3 chained bugs closed, test class still FAILS.** JRuby's own
+    bootstrap (`rubygems/specification.rb` / `rubygems/version.rb`) turned out to hit a CHAIN of
+    independent CratonVM bugs, each masking the next -- fixing one just exposes the next further
+    into the same bootstrap. Root-caused and fixed so far:
+
+    1. **FIXED, commit `d8ae2b96`.** `org.jruby.runtime.BlockCallback` in JRuby 10.x (the ACTUAL
+       test classpath is `jruby-base`/`jruby-stdlib` 10.0.2.0 -- an earlier pass in this
+       investigation misdiagnosed against a stale `jruby-complete-9.1.17.0.jar` decompile and
+       chased an unrelated GC-safety gap first) declares one abstract SAM
+       `call(ThreadContext, IRubyObject[], Block)` plus five same-named DEFAULT overloads,
+       including `call(ThreadContext, IRubyObject, Block)` (scalar) which should wrap its
+       argument into a 1-element array and re-invoke the real SAM.
+       `interpreter::lambda_args_sam_compatible` (`vm/src/runtime/interpreter.rs`)
+       unconditionally skipped array-typed SAM parameters (`!pd.starts_with('L')` is true for
+       `[...`, so the "generic/erased — never second-guess" catch-all swallowed them), so it
+       could never tell the scalar DEFAULT `call` apart from the array-taking abstract SAM.
+       `try_lambda_dispatch` then fed the raw scalar (a `RubySymbol`, e.g. `:foo` from
+       `Enumerable#partition`'s per-element block callback) straight into the array-typed
+       lambda body, so `RubyEnumerable.packEnumValues(ThreadContext, IRubyObject[])` executed
+       `arraylength` against a bare `RubySymbol` — the `[GC-ARRAY-GUARD]` hit — silently
+       returning 0 instead of throwing, which produced the empty `"@#{key} = nil"` →
+       `"@ = nil"` corruption that a nested `eval()` rejected as a `SyntaxError`. Fix: when a
+       SAM parameter descriptor is array-typed, require the actual argument to be null,
+       missing, or a genuine array. A related, narrower GC-safety hardening (pin
+       `obj_ref`/`call_args` across `lambda_args_sam_compatible`'s class-loading-capable
+       helpers, mirroring the existing `invoke_virtual` fix in `d64fab85`) landed alongside it
+       in commit `6d652338` — legitimate but, on its own, insufficient for this bug.
+
+    2. **FIXED, commit `3af9ab62`.** Fixing (1) let bootstrap progress past the `SyntaxError`
+       and immediately into a `NullPointerException` in JRuby's own indy-based
+       `org.jruby.ir.targets.indy.IsTrueSite.init` (`rubygems/version.rb`'s
+       `canonical_segments`, `@canonical_segments ||= ...`'s truthiness test).
+       `MethodHandles.filterReturnValue` (`native-builtins/src/lang_invoke.rs`) was a no-op
+       stub ("simplified: return the target MH unchanged", silently dropping the filter
+       handle). JRuby's `VariableSite.ivar` ivar-getter call-site targets rely on
+       `filterReturnValue` to substitute the runtime's `nil` singleton for the raw Java `null`
+       that `IRubyObject.getInstanceVariable` genuinely returns for an unset ivar (normal at
+       that raw layer). With the filter dropped, `mh.invoke()` returned the raw `null`
+       straight through, and `IsTrueSite.init` crashed calling `.getRuntime()` on it. Fix:
+       added `MH_KIND_RETURN_FILTER` + `mh_dispatch_return_filter`, mirroring the existing
+       `MH_KIND_FILTER`/`MH_KIND_CATCH` adapter pattern — invoke target, pass its result
+       through the filter handle, return the filter's result.
+
+    **Evidence for (1)+(2)**: minimal `ScriptEngineManager` repro
+    (`[:foo,:bar].map {|key| "@#{key} = nil"}.join`, and separately `require 'erb'; require
+    'ostruct'` for (2)) now produces correct output / no longer NPEs; the `[GC-ARRAY-GUARD]`
+    warning count for a full `JRubyScriptTemplateTests` run dropped from 6 to 0;
+    `cargo test -p cratonvm-vm --lib --release` unchanged at 2203 passed / 9 pre-existing
+    `--release`-only `lock_order` failures; `cargo test -p cratonvm-native-builtins --lib
+    --release` unchanged at 2997 passed / 0 failed.
+
+    **OPEN — bug 3, current blocker, NOT fixed.** Past (1)+(2), the same minimal repro (and the
+    full test class) now hits `ArgumentError: wrong number of arguments (given 0, expected
+    1..2)` at `rubygems/version.rb:413` (`canonical_segments`'s `partition_segments(...)` /
+    the preceding `@version.sub(regex, "")` call), raised from deep inside REAL gem-dependency
+    resolution (`Gem::Dependency#to_spec` → `#to_specs` → `#matching_specs` →
+    `Specification.find_all_by_name` → `Requirement#satisfied_by?` → `RubyComparable#>=` →
+    `Version#<=>` → `#canonical_segments`) — i.e. this is reached only once (1) and (2) let
+    bootstrap progress far enough to start resolving real gem versions. Traced via
+    `CRATONVM_DBG_INDY_GENERIC=1` to `org.jruby.ir.targets.simple.NormalInvokeSite.bootstrap`'s
+    `invoke:sub(ThreadContext, IRubyObject, IRubyObject, IRubyObject, IRubyObject)` call site:
+    the operand stack legitimately holds exactly 5 values when `bootstrap_generic`
+    (`vm/src/runtime/invokedynamic.rs`) pops them (no stack-depth mismatch — added a
+    `CRATONVM_DBG_INDY_GENERIC`-gated depth log to confirm), but the VALUES are wrong: the
+    receiver slot holds the `Gem::Version` instance itself (`self`) instead of `@version`'s
+    string value, and a second `Regexp` literal (seemingly meant for a *different*,
+    conditionally-executed `.sub!` call on the next source line) ends up in the
+    replacement-string/block argument slots instead of the frozen `""` string. This points
+    upstream of `bootstrap_generic`'s own (verified-correct) pop loop, into how earlier
+    nested `invokedynamic` sites (ivar-get, `RegexpObjectSite`, `StringBootstrap.fstring`) or
+    JRuby's own IR-interpreter call-site linkage populate that operand stack.
+
+    **Why this looks like a fundamentally larger scope, not one more targeted site**:
+    `org.jruby.ir.targets.indy.InvokeSite` — JRuby's call-linkage base class for essentially
+    every ordinary Ruby method invocation (both `(1)`'s `BlockCallback` sites and `(2)`'s
+    `VariableSite` sites are comparatively narrow siblings of this) — composes its real target
+    handles from, per its own decompiled bytecode: `MethodHandles.dropArguments` (6 call
+    sites), `insertArguments` (6 call sites), `foldArguments` (1), `filterReturnValue` (1 — the
+    same combinator fixed in (2), reused here in a different composition), and `guardWithTest`
+    (1), all interacting to build a lazily-specializing polymorphic inline cache. Isolating
+    which exact composition (or combination) misbehaves for THIS call shape would need
+    systematically verifying each of `dropArguments`/`insertArguments`/`foldArguments`
+    (`native-builtins/src/lang_invoke.rs`) against real JDK semantics for arbitrary
+    argument-count/position combinations, not a single targeted fix — flagged for a dedicated
+    follow-up investigation rather than continued ad-hoc tracing here.
 *   ~~Batch-context `<clinit>` contamination~~ — RETRACTED, see above (host environment issue: missing /tmp + missing ~/jdk25 symlink, not CratonVM).

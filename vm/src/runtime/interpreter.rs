@@ -2036,6 +2036,38 @@ pub(crate) fn tlab_alloc_object_guarded_refill(
     tlab_alloc_object_inner(thread, shared, class_id, num_fields, total_size, true)
 }
 
+/// DBG (CRATONVM_DBG_INVOKESTATS): counts invoke-dispatch path outcomes to
+/// diagnose whether the monomorphic inline cache (`InvokeCache`) is actually
+/// staying warm for a workload, or whether calls are falling through to the
+/// vtable-fast / full-slow-path resolution on every call. index: 0=inline
+/// cache HIT, 1=inline cache MISS, 2=vtable_fast reached, 3=execute_invoke_kind
+/// (full slow path) reached. Prints a running tally every 100000 events on
+/// each counter to bound output volume for long-running processes.
+fn dbg_invoke_stats_record(index: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_INVOKESTATS").is_some()) {
+        return;
+    }
+    static COUNTS: [AtomicU64; 4] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    let n = COUNTS[index].fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 100000 == 1 {
+        eprintln!(
+            "[invokestats] cache_hit={} cache_miss={} vtable_fast={} slow_path={}",
+            COUNTS[0].load(Ordering::Relaxed),
+            COUNTS[1].load(Ordering::Relaxed),
+            COUNTS[2].load(Ordering::Relaxed),
+            COUNTS[3].load(Ordering::Relaxed),
+        );
+    }
+}
+
 /// DBG (CRATONVM_DBG_TLABMISS): gate-failure state dump — the live young
 /// arena facts at the moment the guarded-refill young-room gate said no.
 /// Sampled every 2^20 failures (plus the first).
@@ -4592,67 +4624,89 @@ pub fn execute(
             Arc::from(method_descriptor),
         );
         let already_skipped = shared.jit_skip_set.read().contains(&skip_key);
-        // Static eligibility check — see vm/src/jit/skip_list.rs for the full
-        // policy mapping (each entry is documented against a roadmap item in
-        // docs/roadmap.md Phase A1).
-        let is_interface_default = {
-            let cm = shared.class_manager.read();
-            cm.get_class(class_id).map_or(false, |c| c.is_interface())
-        };
-        let policy = if shared.config.jit_aggressive_compilation {
-            crate::jit::skip_list::SkipPolicy::Aggressive
-        } else {
-            crate::jit::skip_list::SkipPolicy::Conservative
-        };
-        // T1.1.f — classify init complexity so trivial `<init>`/`<clinit>`
-        // methods (just `aload_0; invokespecial; return`) become
-        // JIT-eligible. The classifier walks the bytecode and returns
-        // `Trivial` iff there are no field stores, no synchronization,
-        // and no invokedynamic. For any other method name, the
-        // classifier result is `Unknown` (the classifier is only
-        // consulted for `<init>`/`<clinit>`).
-        let init_complexity = if method_name == "<init>" || method_name == "<clinit>" {
-            crate::jit::skip_list::classify_init_complexity(&code_attr.code)
-        } else {
-            crate::jit::skip_list::InitComplexity::Unknown
-        };
-        let static_skip_reason = crate::jit::skip_list::should_skip_jit_with_init(
-            &*class_name_str,
-            method_name,
-            is_interface_default,
-            std::thread::current().name().is_some(),
-            policy,
-            crate::jit::skip_list::allow_packages_from_env(),
-            init_complexity,
-        );
-        // RFJP.1 — see is_fjp_subclass_blocklisted: methods on classes that
-        // transitively extend `java/util/concurrent/ForkJoinTask` miscompile
-        // under deep recursion and must run in the interpreter pending a
-        // proper regalloc fix.
-        let fjp_skip = is_fjp_subclass_blocklisted(shared, &class_name_str);
-        // S111r15 - refuse to JIT a method directly backed by a Rust native at
-        // this FIRST-CALL compile path too. Without this, `Character.toLowerCase(C)C`
-        // bypassed the native override and corrupted Spring property-name parsing.
-        //
-        // bytebuddy_probe / ANTLR cold-path follow-up: do not reject every
-        // bytecode override merely because an ancestor has an identity native
-        // (`Object.equals`/`hashCode`/`toString`). A real override shadows that
-        // native and can compile. Keep the ByteBuddy safety case by rejecting
-        // methods whose own bytecode contains an invoke that resolves to a
-        // native-shadowed target such as `Object.equals`.
-        let native_skip = if shared
-            .native_methods
-            .find(&class_name_str, method_name, method_descriptor)
-            .is_some()
+        // PERF FIX (2026-07-15, companion to the invoke-cache + jit-bail-list
+        // memoization fixes): `already_skipped` (a single `jit_skip_set`
+        // RwLock-read + hash lookup) was computed first but NOT used to
+        // short-circuit the expensive eligibility computation below — every
+        // call to `execute()` for an already-skip-listed method still paid
+        // the `class_manager` read lock, `should_skip_jit_with_init`'s
+        // policy walk, the ForkJoinTask ancestor-chain check
+        // (`is_fjp_subclass_blocklisted`), a `native_methods.find` hash
+        // lookup, AND — worst case — `jit_method_calls_native_shadowed`'s
+        // full O(method-bytecode-size) decode-and-scan, only to have the
+        // combined `if` condition below discard every one of those results
+        // in favor of the already-known `already_skipped == true` verdict.
+        // Once a method is skip-listed it can never leave the list within
+        // this process (mirrors the `mark_jit_bail_listed` invariant this
+        // same session's other fix relies on), so none of this is needed
+        // when `already_skipped` is true — skip straight to cheap defaults.
+        let (is_interface_default, static_skip_reason, fjp_skip, native_skip) = if already_skipped
         {
-            true
+            (false, None, false, false)
         } else {
-            jit_method_calls_native_shadowed(
-                shared,
-                class_id,
-                &code_attr.code,
-                code_attr.code.len(),
-            )
+            // Static eligibility check — see vm/src/jit/skip_list.rs for the full
+            // policy mapping (each entry is documented against a roadmap item in
+            // docs/roadmap.md Phase A1).
+            let is_interface_default = {
+                let cm = shared.class_manager.read();
+                cm.get_class(class_id).map_or(false, |c| c.is_interface())
+            };
+            let policy = if shared.config.jit_aggressive_compilation {
+                crate::jit::skip_list::SkipPolicy::Aggressive
+            } else {
+                crate::jit::skip_list::SkipPolicy::Conservative
+            };
+            // T1.1.f — classify init complexity so trivial `<init>`/`<clinit>`
+            // methods (just `aload_0; invokespecial; return`) become
+            // JIT-eligible. The classifier walks the bytecode and returns
+            // `Trivial` iff there are no field stores, no synchronization,
+            // and no invokedynamic. For any other method name, the
+            // classifier result is `Unknown` (the classifier is only
+            // consulted for `<init>`/`<clinit>`).
+            let init_complexity = if method_name == "<init>" || method_name == "<clinit>" {
+                crate::jit::skip_list::classify_init_complexity(&code_attr.code)
+            } else {
+                crate::jit::skip_list::InitComplexity::Unknown
+            };
+            let static_skip_reason = crate::jit::skip_list::should_skip_jit_with_init(
+                &*class_name_str,
+                method_name,
+                is_interface_default,
+                std::thread::current().name().is_some(),
+                policy,
+                crate::jit::skip_list::allow_packages_from_env(),
+                init_complexity,
+            );
+            // RFJP.1 — see is_fjp_subclass_blocklisted: methods on classes that
+            // transitively extend `java/util/concurrent/ForkJoinTask` miscompile
+            // under deep recursion and must run in the interpreter pending a
+            // proper regalloc fix.
+            let fjp_skip = is_fjp_subclass_blocklisted(shared, &class_name_str);
+            // S111r15 - refuse to JIT a method directly backed by a Rust native at
+            // this FIRST-CALL compile path too. Without this, `Character.toLowerCase(C)C`
+            // bypassed the native override and corrupted Spring property-name parsing.
+            //
+            // bytebuddy_probe / ANTLR cold-path follow-up: do not reject every
+            // bytecode override merely because an ancestor has an identity native
+            // (`Object.equals`/`hashCode`/`toString`). A real override shadows that
+            // native and can compile. Keep the ByteBuddy safety case by rejecting
+            // methods whose own bytecode contains an invoke that resolves to a
+            // native-shadowed target such as `Object.equals`.
+            let native_skip = if shared
+                .native_methods
+                .find(&class_name_str, method_name, method_descriptor)
+                .is_some()
+            {
+                true
+            } else {
+                jit_method_calls_native_shadowed(
+                    shared,
+                    class_id,
+                    &code_attr.code,
+                    code_attr.code.len(),
+                )
+            };
+            (is_interface_default, static_skip_reason, fjp_skip, native_skip)
         };
         // DEBUG diagnostic — print every JIT compile decision for the
         // LazyProjection.equals method while bytebuddy_probe diagnosis
@@ -4697,6 +4751,31 @@ pub fn execute(
             || gpu_gate_skip
         {
             // Method has known JIT issues — skip JIT.
+            //
+            // PERF FIX (2026-07-15, completes the `already_skipped` short-
+            // circuit added above): `static_skip_reason` / `fjp_skip` /
+            // `native_skip` are all pure functions of this method's static
+            // bytecode+metadata (policy table lookup, ForkJoinTask ancestor
+            // chain, native-shadow bytecode scan) — none of them can change
+            // for a given class+method+descriptor within this process. Yet
+            // this branch previously left `jit_skip_set` untouched, so
+            // `already_skipped` could NEVER become true for a
+            // native_skip/static_skip_reason/fjp_skip method: every future
+            // call to `execute()` for it recomputed all three from scratch
+            // (worst case, `jit_method_calls_native_shadowed`'s full
+            // O(bytecode-size) decode-and-scan) forever, defeating the very
+            // short-circuit `already_skipped` exists for. Seal it here, the
+            // same way a permanent backend-compile failure already seals via
+            // `mark_jit_bail_listed`/the `jit_skip_set.write().insert(...)`
+            // calls in the compile-attempt branch below. Scoped to the
+            // static per-method reasons only — `env_disable_jit` /
+            // `redefine_jit_quiesced` / `gpu_gate_skip` are process-global or
+            // call-site-dependent, not per-method-permanent, so they must NOT
+            // poison this method's entry for future calls where those flags
+            // may differ.
+            if static_skip_reason.is_some() || fjp_skip || native_skip {
+                shared.jit_skip_set.write().insert(skip_key.clone());
+            }
         } else {
             {
                 // RBC.5 — consult the JIT cache FIRST. An already-compiled method
@@ -10947,6 +11026,7 @@ mod deopt_step3_tests {
             num_params: 0,
             is_synchronized: false,
             is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
         })
     }
 
@@ -10966,6 +11046,7 @@ mod deopt_step3_tests {
             num_params: 0,
             is_synchronized: true,
             is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
         })
     }
 
@@ -11460,6 +11541,7 @@ mod deopt_step3_tests {
             num_params: 0,
             is_synchronized: false,
             is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
         });
         let key = "DespecFuC.loop:()V";
         cratonvm_jit::deopt::despec_clear_for_test();
@@ -13895,18 +13977,55 @@ fn execute_instruction(
         }
 
         // -- Method invocation (slow path) --
+        //
+        // PERF FIX (2026-07-15, RequestMappingMessageConversionIntegrationTests
+        // pathological slowness): this `Instruction::decode`-driven path is what
+        // ALL bytecode from `is_jdk_class` frames runs through, because the
+        // raw-byte-peek fast dispatch loop at the top of `execute_frame` is
+        // gated off for JDK-internal classes (`use_fast_path =
+        // !is_jdk_class && ...`, T14 comment above) — that gate exists because
+        // some of the fast loop's opcode fusions (iload/istore/iadd etc.) use
+        // truly-unchecked stack pops tuned for synthetic bytecode shapes.
+        // The monomorphic `InvokeCache` consulted by `execute_invokevirtual_cached`
+        // does NOT share that risk: its arg decode already goes through
+        // `pop_arg_for_descriptor_checked` (descriptor-aware, checked), and a
+        // miss/edge-case (receiver-class change, lambda proxy, annotation
+        // proxy, stack-depth limit, JVMTI redefine) just returns `CacheMiss`
+        // and falls through to the exact same slow path used before this fix.
+        // Previously this arm called `execute_invoke`/`execute_invoke_kind`
+        // UNCONDITIONALLY, so every single invoke instruction executed by
+        // JDK-internal bytecode (java.xml/Xerces, java.util, java.io, …) paid
+        // full method resolution every time — native-registry hash lookup,
+        // `force_native_over_real_jdk_bytecode` / `synthetic_stub_should_yield_
+        // to_real_bytecode` special-case checks, a superclass hierarchy walk,
+        // `class_manager` RwLock reads — instead of the lock-free O(1) cache
+        // hit non-JDK bytecode already enjoyed. Measured impact: a standalone
+        // SAX/DTD parse-loop repro (no Spring/Tomcat involved) went from
+        // ~155ms/parse to ~0.6ms/parse on CratonVM after this fix (HotSpot:
+        // ~0.46ms/parse) — see docs/known-issues/CRATONVM-SPRING-GENUINE-
+        // BUGLIST.md, RequestMappingMessageConversionIntegrationTests entry.
         Instruction::Invokevirtual(index) | Instruction::Invokespecial(index) => {
-            match execute_invoke(
+            let is_special_invoke = matches!(instruction, Instruction::Invokespecial(_));
+            match execute_invokevirtual_cached(
                 shared,
                 thread,
                 frame_idx,
                 *index,
-                matches!(instruction, Instruction::Invokespecial(_)),
+                saved_pc,
+                is_special_invoke,
             )? {
                 CachedCallResult::FramePushed => {
                     return Ok(InstructionResult::FramePushed);
                 }
-                _ => {}
+                CachedCallResult::Handled => {}
+                CachedCallResult::CacheMiss => {
+                    match execute_invoke(shared, thread, frame_idx, *index, is_special_invoke)? {
+                        CachedCallResult::FramePushed => {
+                            return Ok(InstructionResult::FramePushed);
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
         Instruction::Invokestatic(index) => {
@@ -13919,12 +14038,27 @@ fn execute_instruction(
         }
         Instruction::Invokeinterface { index, count: _ } => {
             // is_interface=true threads γ's stash so the default-method
-            // rescue can fire on NSME for invokeinterface only.
-            match execute_invoke_kind(shared, thread, frame_idx, *index, false, true)? {
+            // rescue can fire on NSME for invokeinterface only. Same cache
+            // consultation as invokevirtual/invokespecial above (PERF FIX
+            // 2026-07-15) — the vtable slot resolved by the cache is
+            // identical for invokevirtual and invokeinterface call sites
+            // once a receiver's concrete class is known (see the
+            // `execute_invokevirtual_vtable_fast` "miss path" comment in the
+            // raw fast-dispatch loop, which already relies on this fact).
+            match execute_invokevirtual_cached(shared, thread, frame_idx, *index, saved_pc, false)?
+            {
                 CachedCallResult::FramePushed => {
                     return Ok(InstructionResult::FramePushed);
                 }
-                _ => {}
+                CachedCallResult::Handled => {}
+                CachedCallResult::CacheMiss => {
+                    match execute_invoke_kind(shared, thread, frame_idx, *index, false, true)? {
+                        CachedCallResult::FramePushed => {
+                            return Ok(InstructionResult::FramePushed);
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
 
@@ -17467,6 +17601,7 @@ fn execute_invoke_kind(
     is_special: bool,
     is_interface: bool,
 ) -> Result<CachedCallResult, MethodCallFailed> {
+    dbg_invoke_stats_record(3);
     let current_class_id = thread.frames[frame_idx].class_id;
 
     let (method_class_name, method_name, method_descriptor, num_params) =
@@ -19431,8 +19566,38 @@ pub(crate) fn lambda_args_sam_compatible(
 ) -> bool {
     let (params, _ret) = split_method_descriptor(sam_descriptor);
     for (i, pd) in params.iter().enumerate() {
+        if pd.starts_with('[') {
+            // Array-typed SAM param. This was previously covered by the
+            // `!pd.starts_with('L')` catch-all below (arrays don't start
+            // with 'L'), which unconditionally skipped it -- "never
+            // second-guess". That silently let a same-named, same-arity
+            // interface DEFAULT method whose one differing parameter is a
+            // scalar reference where the real SAM wants an array (e.g.
+            // JRuby 10.x's `BlockCallback` -- abstract SAM
+            // `call(ThreadContext, IRubyObject[], Block)` plus five
+            // default overloads sharing the name "call", including
+            // `call(ThreadContext, IRubyObject, Block)`) get misjudged as
+            // SAM-compatible. `try_lambda_dispatch` then fed the raw
+            // scalar argument directly into the array-typed lambda body
+            // instead of falling through to the real default method (which
+            // wraps the scalar into a 1-element array before re-invoking
+            // the SAM) -- observed as `RubyEnumerable.packEnumValues`
+            // calling `arraylength` on a bare `RubySymbol` during
+            // `Enumerable#partition`'s per-element block callback
+            // (JRubyScriptTemplateTests GC-ARRAY-GUARD investigation,
+            // 2026-07-15). A present, non-null, non-array argument here is
+            // provably NOT an instance of this SAM param -> treat as an
+            // overloaded default, same as the concrete-class mismatch case
+            // below.
+            if let Some(Value::Object(Some(a))) = args.get(i) {
+                if shared.heap.kind_of(*a) != cratonvm_types::ObjectKind::Array {
+                    return false;
+                }
+            }
+            continue; // null / missing / genuinely an array -- don't second-guess further
+        }
         if !pd.starts_with('L') || pd.as_str() == "Ljava/lang/Object;" {
-            continue; // generic/erased or non-reference param — never second-guess
+            continue; // generic/erased or non-reference param -- never second-guess
         }
         let arg = match args.get(i) {
             Some(Value::Object(Some(a))) => *a,
@@ -19721,6 +19886,7 @@ fn try_invoke_cached_lambda_impl(
                 num_params: count_method_params(descriptor) as u16,
                 is_synchronized: false,
                 is_static: false,
+                force_native_cache: std::sync::OnceLock::new(),
             });
             drop(cm);
             LAMBDA_IMPL_BYTECODE_CACHE.with(|cache| cache.borrow_mut().insert(key, Arc::clone(&c)));
@@ -19883,11 +20049,58 @@ pub(crate) fn try_lambda_dispatch(
     // Bug B: same name + same arity but mismatched parameter types is an
     // overloaded interface default (e.g. AnnotationFilter.matches(Class) vs the
     // SAM matches(String)), not the SAM. Fall through so the real default runs.
-    if method_name == &*call_site.sam_method_name
-        && !lambda_args_sam_compatible(shared, &call_site.sam_descriptor, call_args)
-    {
-        return Ok(None);
+    //
+    // GC-safety: `lambda_args_sam_compatible` can trigger class loading -- a
+    // GC-triggering call -- through its proxy/annotation-satisfies helper
+    // family (`lambda_proxy_satisfies`/`synthetic_implements`/
+    // `proxy_instance_satisfies_target`/`annotation_proxy_satisfies_target`).
+    // This is the exact same predicate whose sibling call site in
+    // `vm_exec.rs`'s `invoke_virtual` was fixed in commit d64fab85 for
+    // identical reasons; this call site was missed by that fix. `obj_ref`
+    // and every object element of `call_args` are plain Rust locals/borrows
+    // at this point, invisible to the collector, so a moving GC landing
+    // inside the predicate leaves them stale for every subsequent heap read
+    // in this function -- starting with the captured-value
+    // `get_field(obj_ref, ...)` reads used to build `full_args` further
+    // down (both in the Scala `apply$mc*$sp` bridge branch and the main
+    // dispatch path below). Pin both before the predicate can run and
+    // re-read through the pins once it returns.
+    let mut obj_ref = obj_ref;
+    let mut call_args_refreshed: Option<Vec<Value>> = None;
+    if method_name == &*call_site.sam_method_name {
+        let sam_compat_pin_base = thread.native_pin_roots.len();
+        thread.native_pin_roots.push(obj_ref);
+        let arg_pins: Vec<Option<usize>> = call_args
+            .iter()
+            .map(|a| match a {
+                Value::Object(Some(o)) => {
+                    let idx = thread.native_pin_roots.len();
+                    thread.native_pin_roots.push(*o);
+                    Some(idx)
+                }
+                _ => None,
+            })
+            .collect();
+        let compatible =
+            lambda_args_sam_compatible(shared, &call_site.sam_descriptor, call_args);
+        // Re-read obj_ref/call_args through the pins -- the compatibility
+        // check above may have triggered a moving GC that relocated either.
+        obj_ref = thread.native_pin_roots[sam_compat_pin_base];
+        let refreshed: Vec<Value> = call_args
+            .iter()
+            .zip(arg_pins.iter())
+            .map(|(orig, pin)| match pin {
+                Some(idx) => Value::Object(Some(thread.native_pin_roots[*idx])),
+                None => *orig,
+            })
+            .collect();
+        thread.native_pin_roots.truncate(sam_compat_pin_base);
+        if !compatible {
+            return Ok(None);
+        }
+        call_args_refreshed = Some(refreshed);
     }
+    let call_args: &[Value] = call_args_refreshed.as_deref().unwrap_or(call_args);
 
     // Only intercept calls to the SAM (single abstract method). Default
     // methods on the functional interface (e.g. Function.andThen,
@@ -24423,7 +24636,29 @@ pub(crate) fn should_force_registered_native_over_bytecode(
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
-    force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor)
+    should_force_registered_native_over_bytecode_precomputed(
+        shared,
+        force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor),
+        class_name,
+        method_name,
+        method_descriptor,
+    )
+}
+
+/// Same decision as [`should_force_registered_native_over_bytecode`], but
+/// takes the pure/deterministic `force_native_over_real_jdk_bytecode` result
+/// as a precomputed input rather than recomputing it. Lets a cached-dispatch
+/// call site (which can memoize that ~55-branch check once per invoke-cache
+/// entry, see `CachedBytecodeMethod::force_native_cache`) skip straight to
+/// the cheap, mutable-state-dependent redefine check.
+fn should_force_registered_native_over_bytecode_precomputed(
+    shared: &SharedVm,
+    force_native: bool,
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    force_native
         && (!native_shadow_suppressed_by_redefine(shared, class_name)
             || redefine_immune_forced_native(class_name, method_name, method_descriptor))
 }
@@ -24500,6 +24735,90 @@ fn intercept_force_registered_native(
         .find(class_name, method_name, method_descriptor)?;
     if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
         eprintln!("[ccs-probe] intercept_force_registered_native: dispatching native callback");
+    }
+    let ret_type = crate::jit::return_type(method_descriptor);
+    Some((|| {
+        let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
+        if let Some(value) = result.filter(|_| ret_type != b'V') {
+            push_invoke_return_value(
+                &mut thread.frames[frame_idx].stack,
+                coerce_value_for_return(value, ret_type),
+            )?;
+            crate::vm::native_return_pushed_to_stack(shared, thread);
+        }
+        Ok(CachedCallResult::Handled)
+    })())
+}
+
+/// Perf variant of [`intercept_force_registered_native`] for the cached/hot
+/// dispatch paths (`execute_invokevirtual_cached`, `execute_invokestatic_cached`)
+/// that already hold an `Arc<CachedBytecodeMethod>` for this callsite. The
+/// original re-evaluated `force_native_over_real_jdk_bytecode`'s ~55-branch
+/// sequential string-comparison gauntlet from scratch on *every single*
+/// cached-invoke hit -- this was independently identified as a real
+/// interpreter-throughput bottleneck (~51% of all executed instructions on
+/// method-call-heavy workloads, see `docs/known-issues/tomcat-08-07/
+/// silent-hang-no-signature-cluster.md`) and reproduced live via `perf`/`gdb`
+/// during the `ClientHttpConnectorTests` investigation (2026-07-15): one
+/// interpreter thread pegged at ~100% CPU for 25+ seconds cycling through
+/// this exact call chain while executing a tight Java-level spin/poll loop
+/// typical of Reactor/Netty/Jetty's lock-free scheduling. This variant reads
+/// `cached.force_native_cache`, computing the pure part exactly once per
+/// invoke-cache entry (memoized `OnceLock`, shared via the entry's `Arc`)
+/// instead of on every hit; the mutable-state-dependent redefine check is
+/// still re-evaluated every call (cheap, and must stay live).
+fn intercept_force_registered_native_cached(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    cached: &CachedBytecodeMethod,
+    args: &[Value],
+) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    let class_name = cached.class_name.as_ref();
+    let method_name = cached.method_name.as_ref();
+    let method_descriptor = cached.method_descriptor.as_ref();
+    let force_native = *cached.force_native_cache.get_or_init(|| {
+        force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor)
+    });
+    if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
+        eprintln!(
+            "[ccs-probe] intercept_force_registered_native_cached: class={} method={}{} \
+             force={}",
+            class_name, method_name, method_descriptor, force_native,
+        );
+    }
+    // A JVMTI agent that redefined this class (e.g. a Mockito inline mock)
+    // makes its woven bytecode authoritative — cede to it instead of forcing
+    // the native, so the instrumentation advice runs. Reflection-metadata
+    // natives are exempt (see `redefine_immune_reflection_native`): the real
+    // bytecode cannot reproduce them under CratonVM.
+    if !should_force_registered_native_over_bytecode_precomputed(
+        shared,
+        force_native,
+        class_name,
+        method_name,
+        method_descriptor,
+    ) {
+        return None;
+    }
+    // A genuinely real, bytecode-constructed `ThreadPoolExecutor` (its own
+    // real `<init>` ran, so its real `workers` field is populated) must keep
+    // running its own real `execute()` -- only CratonVM's synthetic 2-field
+    // `Executors.new*ThreadPool()` objects need the forced native. See
+    // docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md.
+    if class_name == "java/util/concurrent/ThreadPoolExecutor"
+        && method_name == "execute"
+        && threadpool_executor_has_real_workers(shared, &args[0])
+    {
+        return None;
+    }
+    let cb = shared
+        .native_methods
+        .find(class_name, method_name, method_descriptor)?;
+    if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
+        eprintln!(
+            "[ccs-probe] intercept_force_registered_native_cached: dispatching native callback"
+        );
     }
     let ret_type = crate::jit::return_type(method_descriptor);
     Some((|| {
@@ -26374,6 +26693,7 @@ fn populate_invoke_cache(
         num_params: num_params as u16, // Widening: parameter count conversion
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
+        force_native_cache: std::sync::OnceLock::new(),
     };
 
     // WP2.4-F1: snapshot the redefine generation BEFORE dropping the
@@ -26799,13 +27119,11 @@ fn execute_invokestatic_cached(
                 &mut args_vec
             };
 
-            if let Some(res) = intercept_force_registered_native(
+            if let Some(res) = intercept_force_registered_native_cached(
                 shared,
                 thread,
                 frame_idx,
-                cached.class_name.as_ref(),
-                cached.method_name.as_ref(),
-                cached.method_descriptor.as_ref(),
+                &cached,
                 args_slice,
             ) {
                 return res;
@@ -28618,6 +28936,29 @@ fn try_jit_upgrade_with_gate(
                     cached.class_name, cached.method_name, cached.method_descriptor
                 );
             }
+            // PERF FIX (2026-07-15, companion to the invoke-cache fix above):
+            // this verdict is a pure function of the method's bytecode (which
+            // native-shadowed targets it calls never changes for a given
+            // class+method+descriptor, mirroring the `any_class_redefined()`
+            // coarse-invalidation already relied on by the `mark_jit_bail_listed`
+            // call in `jit::try_compile` — see the "RBC.4" comment at the top
+            // of this function). Without memoizing it here, a hot method that
+            // calls ANY native-shadowed target (extremely common — e.g. one
+            // that calls `Object.equals`/`String` methods internally) re-runs
+            // this full O(method-bytecode-size) decode-and-scan
+            // (`jit_method_calls_native_shadowed`) from scratch every
+            // `JIT_RETRY_STRIDE` (64) invocations, forever, for the lifetime
+            // of the process — the exact "tens of thousands of full gate
+            // evaluations per suite run" cost pattern RBC.4 fixed for
+            // scan-rejected methods, just via a different gate that wasn't
+            // wired into the same short-circuit. Mark it bail-listed so the
+            // early `is_jit_bail_listed` check at the top of this function
+            // short-circuits every future retry.
+            crate::jit::mark_jit_bail_listed(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            );
             return None;
         }
         if crate::runtime::env_cache::dbg_bblp()
@@ -28999,6 +29340,7 @@ fn try_jit_upgrade_with_gate(
                 num_params: num_params as u16, // Widening: parameter count conversion
                 is_synchronized: method.is_synchronized(),
                 is_static: method.is_static(),
+                force_native_cache: std::sync::OnceLock::new(),
             };
             drop(cm);
 
@@ -29771,6 +30113,7 @@ fn try_jit_compile_callee_slow(
         num_params: num_params as u16, // Widening: parameter count conversion
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
+        force_native_cache: std::sync::OnceLock::new(),
     };
     drop(cm);
 
@@ -31912,6 +32255,7 @@ fn execute_invokevirtual_vtable_fast(
     cp_index: u16,
     site_pc: usize,
 ) -> Result<CachedCallResult, MethodCallFailed> {
+    dbg_invoke_stats_record(2);
     let caller_class_id = thread.frames[frame_idx].class_id;
 
     // Step 1 — already covered by the caller (execute_invokevirtual_cached
@@ -32641,8 +32985,14 @@ fn execute_invokevirtual_cached(
         .invoke_cache
         .get(caller_class_id, cp_index, is_special)
     {
-        Some(t) => t.clone(),
-        None => return Ok(CachedCallResult::CacheMiss),
+        Some(t) => {
+            dbg_invoke_stats_record(0);
+            t.clone()
+        }
+        None => {
+            dbg_invoke_stats_record(1);
+            return Ok(CachedCallResult::CacheMiss);
+        }
     };
     // JVMTI redefine guard: never serve a cached native/intrinsic SHADOW for a
     // class an agent has redefined in place — evict the entry and re-resolve
@@ -32836,13 +33186,11 @@ fn execute_invokevirtual_cached(
                         return Ok(CachedCallResult::Handled);
                     }
 
-                    if let Some(res) = intercept_force_registered_native(
+                    if let Some(res) = intercept_force_registered_native_cached(
                         shared,
                         thread,
                         frame_idx,
-                        cached.class_name.as_ref(),
-                        cached.method_name.as_ref(),
-                        cached.method_descriptor.as_ref(),
+                        &cached,
                         args_slice,
                     ) {
                         return res;
@@ -33240,13 +33588,11 @@ fn execute_invokevirtual_cached(
                 return res;
             }
 
-            if let Some(res) = intercept_force_registered_native(
+            if let Some(res) = intercept_force_registered_native_cached(
                 shared,
                 thread,
                 frame_idx,
-                cached.class_name.as_ref(),
-                cached.method_name.as_ref(),
-                cached.method_descriptor.as_ref(),
+                &cached,
                 args_slice,
             ) {
                 return res;
@@ -33991,6 +34337,7 @@ fn populate_virtual_invoke_cache(
         num_params: num_params as u16, // Widening: parameter count conversion
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
+        force_native_cache: std::sync::OnceLock::new(),
     };
 
     // WP2.4-F1: snapshot before dropping the class_manager read-lock so
@@ -37910,6 +38257,7 @@ mod tests {
             num_params: 0,
             is_synchronized: false,
             is_static: false,
+            force_native_cache: std::sync::OnceLock::new(),
         });
         let key: PromotedInvokeKey = (ClassId::new(9999), 17, false, Some(ClassId::new(12345)));
         vm.shared.shared_resolution.insert_promoted_invoke(
