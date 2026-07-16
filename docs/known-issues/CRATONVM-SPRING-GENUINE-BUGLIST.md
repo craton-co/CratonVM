@@ -2407,3 +2407,88 @@ time pressure without the ability to fully verify it.
 Landed: branch `fix/testtemplate-cce-20260716`, commits `8a5c2274`
 (the GC fix) and a follow-up MockCtx compile-break fix, rebased onto `dev`
 tip `6c517cd9` before push.
+
+### 5.5 `RequestMappingMessageConversionIntegrationTests` 2/160 HTTP 500 residual (section 5) — investigated, does NOT reproduce on current `dev`; treating as already-resolved (2026-07-16)
+
+Follow-up on section 5's own "not yet root-caused" note: **2 HTTP 500s
+(`HttpServerErrorException$InternalServerError`) on the `[3] Reactor Netty`
+and `[4] Tomcat` server backends**. Investigated from scratch, dedicated
+session, fresh worktree (`/data/data/wt-reqmapping-http500-20260716`, branch
+`fix/reqmapping-http500-20260716`), fresh release binary
+(`vmfix-reqmapping-http500-20260716`) off `dev` tip `6178c36f`
+(`--enable-native-access=ALL-UNNAMED`, real JDK 25).
+
+**Could not reproduce, at all, after exhaustive per-test-invocation
+verification.** A full-class `KRun` pass completed in 560s with `fail=0`
+(`status=OK`), but with a lower `found` count than expected (found=83 of a
+theoretical 160 test-template invocations) — not trusted at face value, so
+built a custom `VerboseRun.java` JUnit-Platform-Launcher harness
+(`DiscoverySelectors.selectMethod(class, name, HttpServer.class.getName())`
++ a `TestExecutionListener` printing `TSTART`/`TEND` for every leaf
+`test-template-invocation`) and ran **every one of the 40
+`@ParameterizedHttpServerTest` methods individually across all 4 backends**
+(small batches of 2-5 methods per fresh JVM, to sidestep an unrelated,
+already-documented, low-frequency GC race — see below). Result: **160/160
+individual method×backend combinations `SUCCESSFUL`, zero `FAILED`, zero
+`HttpServerErrorException`**, across 9 separate JVM invocations including
+both suspect-looking methods (`personResponseBodyWithCompletableFuture`,
+`personTransformWithCompletableFuture` — CompletableFuture-based bodies,
+the most plausible executor-identity-dispatch suspects) and the
+threading/timing-sensitive ones (`personTransformWithFluxDelayed`, the
+XML-marshalling `*Xml` variants, `resource`).
+
+**Conclusion: this residual is already fixed on current `dev`, most likely
+as a side effect of one or both of two unrelated fix sessions that landed
+*after* section 5's original report** (dev tip `22dfc55e`, 2026-07-15) **and
+before this investigation's tip** (`6178c36f`/`704aedd3`, 2026-07-16):
+commit `19a5025f` (section 5.1, `Thread.getId()` hardcoded-to-`1` fix) and
+commit `9850617b` (section 5.2, `AbstractExecutorService.submit()`
+real-vs-synthetic-executor redispatch fix for Netty's
+`AbstractEventExecutor`). Both land squarely on the real-thread /
+executor-identity mechanics that a backend-specific (Reactor Netty and
+Tomcat are this class's only two backends with real, JDK-executor-backed
+thread pools; Jetty/Jetty Core are not) failure in a
+CompletableFuture-touching message-conversion test would plausibly hit;
+neither fix was targeted at this class, so the resolution was not
+independently re-verified end-to-end before now. Not re-attempted as a
+target-the-old-tip bisection (would need a second ~30 min release build
+under this session's severe host contention) given the 160/160
+current-tip pass rate is already strong, direct evidence.
+
+**One unrelated, already-known, already-partially-fixed instability
+surfaced during this sweep and cost real time before being correctly
+attributed — noted here so the next session doesn't re-chase it.** Two of
+the batched multi-method runs crashed mid-run with
+`java.lang.ArrayIndexOutOfBoundsException` in
+`org/junit/platform/commons/util/ExceptionUtils.<clinit>`, cascading into
+`NoSuchMethodError`/`AbstractMethodError` on JUnit Platform's own
+hierarchical-executor lambda dispatch. This is **not** a new bug: it is the
+same "register-invisible root" family documented in section 5.4
+(`TestTemplateInvocationContext` CCE, `obj_cid=0` bare-`Object` signature)
+and in `docs/internal/springboot/testengine-getid-abstractmethoderror-
+young-gc-forwarding-gap-FIXED.md` (confirmed present on `origin/dev` as of
+this session's final `git fetch`, tip `704aedd3`) — a rare (~1/45-1/64),
+partially-fixed GC-root-visibility race unrelated to message conversion.
+Worked around by keeping JVM batches small (2-5 methods, 8-20 test
+invocations) rather than chasing it; every crash recovered cleanly on retry
+with zero real test failures.
+
+**Regression suites** (dev tip `6178c36f`, same binary):
+`cargo test -p cratonvm-native-builtins --lib --release`: **3000 passed, 0
+failed, 6 ignored** (clean baseline match). `cargo test -p cratonvm-vm --lib
+--release`: **2199 passed, 17 failed** — first attempt was OOM-killed by
+this severely overloaded shared host (`load average` 140-230,
+<code>/</code> at 100%, only ~2 GB RAM free with 2000+ concurrent users) and
+retried clean; the 17 failures exactly match this doc's own
+already-documented pre-existing baseline (7 `jit::skip_list::tests::*` +
+9 `runtime::lock_order::tests::*`, both already attributed to unrelated
+sessions in section 5/5.4, plus one host-contention flake,
+`jit_getfield_never_tears_against_concurrent_jit_putfield_int`) — no new
+regressions.
+
+**No code change landed** — nothing to fix; this entry exists to close the
+loop on section 5's "not yet root-caused" note with evidence, and to
+prevent a future session from re-opening a hunt for a bug that no longer
+reproduces. If it resurfaces, re-check first whether `19a5025f`/`9850617b`
+are still present on whatever tip is being tested before assuming a
+regression.
