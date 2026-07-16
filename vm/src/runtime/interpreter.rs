@@ -23274,6 +23274,33 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // SSLContext's real-JDK bodies delegate through a provider-owned
+    // SSLContextSpi. CratonVM stores configured key/trust material on the
+    // public context object instead, so the native path must own the complete
+    // init-to-engine handoff for a server identity to reach Tomcat's engine.
+    if class_name == "javax/net/ssl/SSLContext"
+        && matches!(
+            (method_name, method_descriptor),
+            ("init", "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V")
+                | ("createSSLEngine", "()Ljavax/net/ssl/SSLEngine;")
+                | ("createSSLEngine", "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;")
+        )
+    {
+        return true;
+    }
+    // The real KeyManagerFactory delegates to a provider SPI that cannot
+    // materialize CratonVM's registry-backed JKS keys. The native bridge keeps
+    // the per-entry password with the originating KeyStore and exposes a
+    // functional X509KeyManager to SSLContext.init.
+    if class_name == "javax/net/ssl/KeyManagerFactory"
+        && matches!(
+            (method_name, method_descriptor),
+            ("init", "(Ljava/security/KeyStore;[C)V")
+                | ("getKeyManagers", "()[Ljavax/net/ssl/KeyManager;")
+        )
+    {
+        return true;
+    }
 
     // File-attribute values are carried by a private five-slot synthetic
     // object, not by the real JDK's zero-field interface or platform-private
@@ -25823,26 +25850,15 @@ fn try_stackless_invoke(
         if let Some(value) = result {
             // Signature-polymorphic MethodHandle natives are registered with an
             // erased Object return and therefore box primitive results. The
-            // current bytecode descriptor is concrete; unbox a matching wrapper
-            // before the typed return-slot coercion (notably Panama float
-            // downcalls, which otherwise became 0.0f).
+            // current bytecode descriptor is concrete, so use the common
+            // call-site adapter before the typed return-slot coercion. This must
+            // cover every primitive: Netty uses invokeExact(Thread)Z here, while
+            // Panama exercises the float path that originally motivated it.
             let value = if class_name == "java/lang/invoke/MethodHandle"
-                && ret_type == b'F'
-                && matches!(value, Value::Object(Some(_)))
+                && matches!(method_name, "invoke" | "invokeExact" | "invokeBasic")
             {
-                match value {
-                    Value::Object(Some(obj))
-                        if shared
-                            .class_manager
-                            .read()
-                            .get_class(shared.heap.class_id_of(obj))
-                            .map(|class| class.name.as_ref() == "java/lang/Float")
-                            .unwrap_or(false) =>
-                    {
-                        shared.heap.get_field(obj, 0)
-                    }
-                    other => other,
-                }
+                crate::vm::unbox_poly_return(shared, Some(value), descriptor)
+                    .unwrap_or(Value::Object(None))
             } else {
                 value
             };
