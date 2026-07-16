@@ -12338,6 +12338,39 @@ pub(crate) fn native_method_get_generic_return_type(
     Ok(Some(method_return_type_value(ctx, this)))
 }
 
+/// Process-global cache for `Method`/`Constructor.getTypeParameters()`
+/// arrays, keyed by (VM instance, declaring class, method name+descriptor)
+/// -- NOT by the `this` mirror's own `ObjectRef`, since distinct reflective
+/// Method objects for the same method must still resolve to the SAME
+/// `TypeVariable` instances (see below).
+///
+/// HotSpot's `Executable.getTypeParameters()` is backed by a `genericInfo`
+/// field memoized once per Method object, so repeated calls -- including
+/// calls made *indirectly*, e.g. by something resolving a `TypeVariable`'s
+/// `getGenericDeclaration().getTypeParameters()` back to itself -- return
+/// identity-stable `TypeVariableImpl`s. Without this cache, every call here
+/// built a brand-new synthetic `TypeVariable`, so a type variable handed out
+/// by `getGenericReturnType()`/`getGenericParameterTypes()` (which resolves
+/// its own uses via `resolve_declared_type_variable` re-invoking
+/// `getTypeParameters()`, see `generics.rs`) was never identity-equal to the
+/// "official" one this method itself returns. ByteBuddy's
+/// `TypeVariableSource.AbstractBase.findVariable` walk (used when generating
+/// a Mockito mock's overriding methods) filters `getTypeVariables()` and can
+/// fail this resolution when identity/consistency assumptions elsewhere in
+/// its pipeline are violated -- surfacing as `IllegalArgumentException:
+/// Cannot resolve T from class ...$MockitoMock$...` for any interface with a
+/// generic method (e.g. `jakarta.persistence.EntityManagerFactory.<T> T
+/// unwrap(Class<T>)`).
+///
+/// The array itself is kept alive and remapped across moving GCs via the
+/// existing `register_var_handle_root`/`read_var_handle_root` permanent
+/// native-root mechanism (generic over any `ObjectRef` despite the
+/// VarHandle-specific name).
+fn method_type_params_cache() -> &'static Mutex<FxHashMap<(usize, ClassId, String, String), i32>> {
+    static C: OnceLock<Mutex<FxHashMap<(usize, ClassId, String, String), i32>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
 /// Method.getTypeParameters() вЂ” returns TypeVariable[] from method signature.
 pub(crate) fn native_method_get_type_parameters(
     ctx: &mut dyn NativeContext,
@@ -12357,6 +12390,21 @@ pub(crate) fn native_method_get_type_parameters(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
+    let cache_key = (
+        ctx.vm_identity(),
+        class_id,
+        method_name.clone(),
+        method_desc.clone(),
+    );
+    if let Some(&ident) = method_type_params_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cache_key)
+    {
+        if let Some(cached) = ctx.read_var_handle_root(ident) {
+            return Ok(Some(Value::Object(Some(cached))));
+        }
+    }
     if let Some(sig_str) = ctx.method_signature(class_id, &method_name, &method_desc) {
         if let Some(method_sig) = crate::generics::parse_method_signature(&sig_str) {
             if !method_sig.type_params.is_empty() {
@@ -12367,6 +12415,12 @@ pub(crate) fn native_method_get_type_parameters(
                         crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)));
                     ctx.set_array_element(arr, i, tv);
                 }
+                ctx.register_var_handle_root(arr);
+                let ident = ctx.identity_hash_code(arr);
+                method_type_params_cache()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(cache_key, ident);
                 return Ok(Some(Value::Object(Some(arr))));
             }
         }
