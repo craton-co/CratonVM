@@ -3598,13 +3598,21 @@ fn bdru_register_bean_definition(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let bean_name_obj = ctx.create_string(&name);
     let bd = ctx.read_native_pin(bd_pin, bd);
     let registry = ctx.read_native_pin(registry_pin, registry);
-    ctx.unpin_native_roots(bd_pin);
-    let _ = ctx.invoke_virtual(
+    let registration = ctx.invoke_virtual(
         registry,
         "registerBeanDefinition",
         "(Ljava/lang/String;Lorg/springframework/beans/factory/config/BeanDefinition;)V",
         &[Value::Object(Some(bean_name_obj)), Value::Object(Some(bd))],
     );
+    // The delegate's exception is part of the public registration contract:
+    // in particular, a duplicate name with overriding disabled must surface as
+    // BeanDefinitionOverrideException. Swallowing it made the caller proceed
+    // as though the second configuration had registered successfully.
+    ctx.unpin_native_roots(bd_pin);
+    if let Err(error) = registration {
+        ctx.unpin_native_roots(holder_pin);
+        return Err(error);
+    }
 
     // Register the holder's aliases under the bean name. The real static
     // `BeanDefinitionReaderUtils.registerBeanDefinition` does, after the

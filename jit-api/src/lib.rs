@@ -45,6 +45,24 @@ pub struct CachedBytecodeMethod {
     pub num_params: u16,
     pub is_synchronized: bool,
     pub is_static: bool,
+    /// Perf (2026-07-15, `ClientHttpConnectorTests` interpreter-throughput
+    /// investigation): memoizes the pure/deterministic part of
+    /// `force_native_over_real_jdk_bytecode(class_name, method_name,
+    /// method_descriptor)` (a ~1400-line sequential string-comparison
+    /// special-case dispatcher in `vm/src/runtime/interpreter.rs`, already
+    /// documented as consuming ~51% of all executed instructions on
+    /// method-call-heavy workloads -- see
+    /// `docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md`).
+    /// This entry is `Arc`-shared across every cache hit for its callsite,
+    /// so populating it once here and reading it thereafter turns an
+    /// O(~55 string comparisons) recheck on every cached
+    /// `invokevirtual`/`invokestatic` dispatch into an O(1) read after the
+    /// first hit. The redefine-dependent wrapper around this pure check
+    /// (`should_force_registered_native_over_bytecode`) is NOT cached here
+    /// -- it depends on mutable per-class redefine state that can change
+    /// after this entry is populated, so it is still re-evaluated on every
+    /// hit (cheap: a single generation-counter read plus a short allowlist).
+    pub force_native_cache: std::sync::OnceLock<bool>,
 }
 
 /// JEP 358 (helpful NPE) — operation-kind codes carried out-of-band from a

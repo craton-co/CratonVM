@@ -147,7 +147,7 @@ fn redefine_round_trip_replaces_method_body_and_bumps_generation() {
     // Class bytes cache updated to the new bytes.
     let cached = cm
         .class_bytes_cache
-        .get("Foo")
+        .get(&cid)
         .expect("class_bytes_cache must hold latest bytes");
     assert_eq!(cached, &v2);
 

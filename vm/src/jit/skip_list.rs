@@ -497,6 +497,48 @@ fn should_skip_jit_internal(
         return Some(SkipReason::RustJvmTestFixture);
     }
 
+
+    // HIB-LONGTAIL.1 (2026-07-15): Hibernate's H2-backed collection loading
+    // runs correctly in the interpreter, but JITting the H2 SQL/MVStore,
+    // ANTLR-runtime, and most of java.util together turns ordinary 9-second
+    // HotSpot tests into multi-minute CratonVM runs. The three package control
+    // returns the class to the 120-second JUnit budget; each narrower control
+    // leaves the regression. Keep the proven interaction interpreted under the
+    // conservative policy until the shared generated-code throughput issue is
+    // root-caused. Each package remains available for bisection through
+    // CRATONVM_JIT_ALLOW_PACKAGES. `java.util.regex` is deliberately excluded:
+    // DefaultCatalogAndSchemaTest's AssertJ checks repeatedly compile patterns,
+    // and interpreting Pattern.compile turns that finite check into a watchdog
+    // timeout while its JIT path is stable.
+    if (class_name.starts_with("org/h2/") && !package_allowed("org/h2/", allow_packages))
+        || (class_name.starts_with("org/antlr/v4/runtime/")
+            && !package_allowed("org/antlr/v4/runtime/", allow_packages))
+        || (class_name.starts_with("java/util/")
+            && !class_name.starts_with("java/util/regex/")
+            && !package_allowed("java/util/", allow_packages))
+    {
+        return Some(SkipReason::RustJvmTestFixture);
+    }
+
+    // HIB-LONGTAIL.2 (2026-07-15): compiled AttributesImpl.ensureCapacity
+    // passes a corrupted int count to anewarray during Hibernate's qualified
+    // table bootstrap (observed Object[1677721600]). The interpreter executes
+    // the method correctly; keep just this small growth helper interpreted.
+    if class_name == "org/xml/sax/helpers/AttributesImpl" && method_name == "ensureCapacity" {
+        return Some(SkipReason::RustJvmTestFixture);
+    }
+
+    // HIB-LONGTAIL.3 (2026-07-15): when Hibernate bytecode is explicitly
+    // promoted for bisection, the optimized constructor path can return a
+    // GenerationTargetToScript whose ScriptTargetOutput field was never
+    // initialized. Schema creation then fails in accept(String). Preserve the
+    // constructor's interpreter semantics; its small body is cold and this
+    // does not suppress the rest of Hibernate's JIT eligibility.
+    if class_name == "org/hibernate/tool/schema/internal/exec/GenerationTargetToScript"
+        && method_name == "<init>"
+    {
+        return Some(SkipReason::RustJvmTestFixture);
+    }
     // T1.1.g — the historical blanket bans for `java/util/*` and
     // `cratonvm/*` were narrowed to targeted per-method exclusions.
     // Those targeted exclusions guarded the callee-saved-GPR local-home
@@ -686,6 +728,27 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
+
+        // TOMCAT-JNDIREALM-RDN.1 (2026-07-15) — the real-network
+        // TestJNDIRealmIntegration matrix passes 76/76 interpreted (and on
+        // HotSpot) but fails 15/76 with the default JIT. The failures are the
+        // RFC 4514 special-character credential cases plus the escaped
+        // semicolon OU cases; both reduce to the in-memory LDAP server's RDN
+        // matching path. Package bisection reduced the producer to
+        // com/unboundid/ldap/sdk/, and method bisection showed that interpreting
+        // only RDN.getNameValuePairs restores the complete 76/76 matrix while
+        // every neighbouring RDN comparison/normalisation method remains JIT
+        // eligible. Keep this small accessor interpreted under the conservative
+        // policy until the JIT's array-backed SortedSet return path is
+        // root-caused. It remains explicitly liftable for diagnosis with
+        // CRATONVM_JIT_ALLOW_PACKAGES=com/unboundid/ldap/sdk/.
+        if class_name == "com/unboundid/ldap/sdk/RDN"
+            && method_name == "getNameValuePairs"
+            && !package_allowed("com/unboundid/ldap/sdk/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
         if callee_saved_gpr_local_homes_enabled()
             && is_known_miscompile(class_name, method_name)
             && !package_allowed(class_name, allow_packages)
@@ -1161,6 +1224,23 @@ fn should_skip_jit_internal(
         // cluster above stays interpreted.
         if class_name.starts_with("groovyjarjarantlr4/")
             && !package_allowed("groovyjarjarantlr4/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
+        // HIB-ANTLR.1 (2026-07-15) -- Hibernate uses the ordinary ANTLR4
+        // runtime rather than Groovy's shaded copy. After a full HQL parse,
+        // JIT-compiled ATN simulation could leave an ATNState with a null
+        // `transitions` array; the next parse then failed in
+        // ParserATNSimulator.computeTargetState. A fresh process passed the
+        // same query, isolating the defect to state corrupted by the compiled
+        // parser path rather than Hibernate's grammar or query metadata.
+        //
+        // This is the unshaded counterpart of ANTLR.1 above. Keep it
+        // liftable for JIT bisection, but default to the sound interpreter
+        // path until the compiled ATN-state mutation is root-caused.
+        if class_name.starts_with("org/antlr/v4/runtime/")
+            && !package_allowed("org/antlr/v4/runtime/", allow_packages)
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
@@ -3002,6 +3082,56 @@ mod tests {
     }
 
     #[test]
+    fn unboundid_rdn_name_value_pairs_skipped_conservatively() {
+        assert_eq!(
+            check(
+                "com/unboundid/ldap/sdk/RDN",
+                "getNameValuePairs",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            Some(SkipReason::RustJvmTestFixture)
+        );
+        assert_eq!(
+            check(
+                "com/unboundid/ldap/sdk/RDN",
+                "compare",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            None,
+            "the Tomcat LDAP guard must stay exact to RDN.getNameValuePairs"
+        );
+    }
+
+    #[test]
+    fn unboundid_rdn_name_value_pairs_lifts_with_allow_packages() {
+        assert_eq!(
+            check_with(
+                "com/unboundid/ldap/sdk/RDN",
+                "getNameValuePairs",
+                false,
+                true,
+                SkipPolicy::Conservative,
+                &["com/unboundid/ldap/sdk/"],
+            ),
+            None
+        );
+        assert_eq!(
+            check(
+                "com/unboundid/ldap/sdk/RDN",
+                "getNameValuePairs",
+                false,
+                true,
+                SkipPolicy::Aggressive,
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn hibernate_temporal_residual_package_skipped_conservatively() {
         for cls in [
             "org/hibernate/dialect/H2Dialect",
@@ -3657,6 +3787,33 @@ mod tests {
             ),
             None,
             "CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/ is the cold-path validation lift"
+        );
+    }
+
+    #[test]
+    fn hibernate_unshaded_antlr_runtime_stays_interpreted_by_default() {
+        assert_eq!(
+            check(
+                "org/antlr/v4/runtime/atn/ParserATNSimulator",
+                "computeTargetState",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            Some(SkipReason::RustJvmTestFixture),
+            "Hibernate's unshaded ANTLR runtime must not corrupt ATN state under JIT"
+        );
+        assert_eq!(
+            check_with(
+                "org/antlr/v4/runtime/atn/ParserATNSimulator",
+                "computeTargetState",
+                false,
+                true,
+                SkipPolicy::Conservative,
+                &["org/antlr/v4/runtime/"],
+            ),
+            None,
+            "the unshaded ANTLR guard must remain available for JIT bisection"
         );
     }
 

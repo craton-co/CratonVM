@@ -194,6 +194,14 @@ pub static SWEEP_BAD_FORWARD_HITS: AtomicU64 = AtomicU64::new(0);
 /// allocated from, so out-of-extent headers are rejected without marking.
 pub static SWEEP_BAD_EXTENT_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// Conservative root candidates may be interior heap addresses.  Only the
+/// opt-in A2 forensic mode reports rejected candidates; normal collection
+/// silently discards an address that is not an object start.
+#[inline]
+fn emit_conservative_candidate_diagnostic(hit: u64, a2_enabled: bool) -> bool {
+    a2_enabled && hit < 8
+}
+
 /// DoHead walk-desync hardening — count of selective-promotion UNWIND events:
 /// the evacuation walk saw a grid anomaly (zero span, implausible header,
 /// free-block overshoot, or a span crossing a free hole) and dropped the
@@ -3272,7 +3280,18 @@ impl GenerationalHeap {
             // here because the moving Phase-5 check below is skipped.
             let major_requested = crate::gc_quiescence::take_major_gc_request();
             let old_capacity = self.old_gen_capacity();
-            if old_capacity > 0
+            // CRATONVM_OLD_SWEEP_JIT=0 opts out of the in-place old sweep on
+            // this conservative-roots path (diagnostic escape hatch / A-B
+            // bisection knob for suspected live-object reclaims — the young
+            // sweep survives an imperfect root set via conservative
+            // over-marking and side-mark containment, but this old sweep
+            // frees purely on GC_FLAG_MARKED, so any root-set gap frees a
+            // LIVE promoted object). Read once per GC cycle — not hot.
+            let old_sweep_enabled = std::env::var("CRATONVM_OLD_SWEEP_JIT")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            if old_sweep_enabled
+                && old_capacity > 0
                 && (self.old_gen_used() >= old_capacity * 75 / 100 || major_requested)
             {
                 let old_freed = self.sweep_old_gen_non_moving(roots);
@@ -4630,7 +4649,7 @@ impl GenerationalHeap {
             let total = gen_object_total_size(header);
             if total < HEADER_SIZE || addr + total > from_end {
                 let n = SWEEP_BAD_EXTENT_HITS.fetch_add(1, Ordering::Relaxed);
-                if n < 8 {
+                if emit_conservative_candidate_diagnostic(n, crate::a2dbg::enabled()) {
                     // Attribution diagnostic: dump the words around the
                     // rejected "header" so the upstream corruptor face is
                     // identifiable (stale packed-pointer reuse shows heap
@@ -4646,8 +4665,8 @@ impl GenerationalHeap {
                         w += 8;
                     }
                     tracing::warn!(
-                        "mark_young: rejecting object at {:#x} with implausible extent \
-                         {} (kind={}, array_len={}, num_slots={}) — corrupt header, \
+                        "mark_young: ignoring conservative candidate at {:#x} with implausible extent \
+                         {} (kind={}, array_len={}, num_slots={}); safe reject, \
                          not marked/scanned; context {}",
                         addr,
                         total,
@@ -7013,6 +7032,19 @@ impl GenerationalHeap {
                 if header.gc_flags & GC_FLAG_MARKED != 0 {
                     header.gc_flags &= !GC_FLAG_MARKED;
                 } else {
+                    // A2 forensic breadcrumb (CRATONVM_DBG_A2): preserve the
+                    // victim's pre-free identity so a later zero-header /
+                    // wild-receiver access at this address can be attributed
+                    // to THIS sweep having freed a still-referenced object
+                    // (the DoHead freed-while-live investigation).
+                    if crate::a2dbg::enabled() {
+                        crate::a2dbg::record_old_sweep_free(
+                            obj_ptr as usize,
+                            header.class_id.as_u32(),
+                            header.num_slots,
+                            total_size,
+                        );
+                    }
                     unsafe { old_gen.free(obj_ptr, total_size) };
                 }
             }
@@ -8890,26 +8922,30 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
         // skipped region (recovered by the next major-GC compaction)
         // instead of aborting the whole arena sweep.
         if header.array_length != 0 {
-            tracing::warn!(
+            if crate::a2dbg::enabled() {
+                tracing::warn!(
                 "GC: inconsistent header — kind=Object but array_length={} (num_slots={}, \
                  class_id={}); inline-alloc forgot to set kind=Array. Treating as corrupt \
                  so the walker can re-sync.",
                 header.array_length,
                 header.num_slots,
                 header.class_id.as_u32(),
-            );
+                );
+            }
             return 0;
         }
         // Defensive cap on num_slots: no real class has 1<<24 fields, and a
         // value above this is almost certainly garbage from an uninitialised
         // region.  Same fallthrough — walker re-syncs.
         if header.num_slots > (1 << 24) {
-            tracing::warn!(
+            if crate::a2dbg::enabled() {
+                tracing::warn!(
                 "GC: implausible num_slots {} on kind=Object header (class_id={}); \
                  treating as corrupt so the walker can re-sync.",
                 header.num_slots,
                 header.class_id.as_u32(),
-            );
+                );
+            }
             return 0;
         }
         HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
@@ -9555,6 +9591,13 @@ mod tests {
         assert!(heap
             .is_object_address(invalid_element.as_ptr() as usize)
             .is_none());
+    }
+
+    #[test]
+    fn conservative_candidate_diagnostics_require_a2_mode() {
+        assert!(!emit_conservative_candidate_diagnostic(0, false));
+        assert!(!emit_conservative_candidate_diagnostic(8, true));
+        assert!(emit_conservative_candidate_diagnostic(7, true));
     }
 
     /// Test-only `StopTheWorldToken`. The single-threaded test harness

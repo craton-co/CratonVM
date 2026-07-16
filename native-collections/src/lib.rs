@@ -4729,6 +4729,93 @@ fn register_hibernate_persistent_map_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/BiConsumer;)V",
         native_hibernate_persistent_map_for_each,
     );
+    // `List.sort` is an interface default method.  Hibernate's PersistentList
+    // inherits it, where the JDK implementation mutates the backing List via
+    // a ListIterator proxy.  Under the real-JDK bridge that proxy can reorder
+    // the values without reaching PersistentList.set(), leaving the collection
+    // unmarked and suppressing its custom SQL updates at flush time.  Route the
+    // inherited method through the wrapper's own set() contract instead.
+    r.register(
+        "org/hibernate/collection/spi/PersistentList",
+        "sort",
+        "(Ljava/util/Comparator;)V",
+        native_hibernate_persistent_list_sort,
+    );
+}
+
+fn native_hibernate_persistent_list_sort(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let list = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let comparator = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        // A null comparator uses the List contract's natural ordering.  Do it
+        // in this implementation rather than dispatching `sort(null)` back to
+        // the same PersistentList override.
+        Some(Value::Object(None)) | None => None,
+        _ => return Ok(None),
+    };
+    let elems = collect_collection_elements_or_real(ctx, list);
+    if elems.len() <= 1 {
+        return Ok(None);
+    }
+    let list_pin = ctx.pin_native_root(list);
+    let cmp_pin = comparator.map(|comparator| ctx.pin_native_root(comparator));
+    let (_, elem_handles) = pin_value_slice(ctx, &elems);
+    let mut order: Vec<Value> = (0..elems.len() as i32).map(Value::Int).collect();
+    let sort_result = merge_sort_fallible(ctx, &mut order, |c, a, b| {
+        let ia = match a {
+            Value::Int(i) => *i as usize,
+            _ => 0,
+        };
+        let ib = match b {
+            Value::Int(i) => *i as usize,
+            _ => 0,
+        };
+        let left = read_pinned_elem(c, elem_handles[ia], elems[ia]);
+        let right = read_pinned_elem(c, elem_handles[ib], elems[ib]);
+        let result = match (comparator, cmp_pin) {
+            (Some(comparator), Some(cmp_pin)) => {
+                let comparator = c.read_native_pin(cmp_pin, comparator);
+                comparator_compare(c, comparator, left, right)?
+            }
+            _ => natural_compare(c, &left, &right)?,
+        };
+        match result {
+            Some(Value::Int(v)) => Ok(v),
+            _ => Ok(0),
+        }
+    });
+    if let Err(e) = sort_result {
+        if let Some(cmp_pin) = cmp_pin {
+            ctx.unpin_native_roots(cmp_pin);
+        }
+        ctx.unpin_native_roots(list_pin);
+        return Err(e);
+    }
+    for (index, source) in order.iter().enumerate() {
+        let source = match source {
+            Value::Int(i) => *i as usize,
+            _ => 0,
+        };
+        let list = ctx.read_native_pin(list_pin, list);
+        let value = read_pinned_elem(ctx, elem_handles[source], elems[source]);
+        ctx.invoke_virtual(
+            list,
+            "set",
+            "(ILjava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Int(index as i32), value],
+        )?;
+    }
+    if let Some(cmp_pin) = cmp_pin {
+        ctx.unpin_native_roots(cmp_pin);
+    }
+    ctx.unpin_native_roots(list_pin);
+    Ok(None)
 }
 
 fn register_hashmap_natives(r: &mut NativeMethodRegistry) {
@@ -5597,9 +5684,7 @@ fn native_map_put_evict_pinned(
             if dbg_hmput() {
                 eprintln!(
                     "[HMPUT] map_keys_equal(node_key={:?}, key={:?}) = {}",
-                    node_key,
-                    key_for_eq,
-                    eq
+                    node_key, key_for_eq, eq
                 );
             }
             if eq {
@@ -6050,9 +6135,9 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(state) = table.get(&object_key) {
-                return Ok(Some(Value::Int(
-                    state.entries.contains_key(&int_key) as i32,
-                )));
+                return Ok(Some(
+                    Value::Int(state.entries.contains_key(&int_key) as i32),
+                ));
             }
         }
     }
@@ -7132,14 +7217,32 @@ fn resync_view_set(ctx: &mut dyn NativeContext, set: ObjectRef) {
             ctx.set_field(entry, 0, k);
             ctx.set_field(entry, 1, v);
             ctx.set_field(entry, 2, Value::Object(Some(source)));
-            let _ = native_map_put(
-                ctx,
-                &[
-                    Value::Object(Some(backing)),
-                    Value::Object(Some(entry)),
-                    sentinel,
-                ],
-            );
+            // An entry's Java hash is key.hashCode() ^ value.hashCode().
+            // Calling native_map_put here therefore invokes PersistentSet's
+            // hashCode while Hibernate is initializing its batch queue, which
+            // recursively reloads the same collection. Entry-set views must
+            // use identity buckets, as native_map_entry_set does.
+            let backing = ctx.read_native_pin(roots_base, backing);
+            let (buckets, size, capacity) = map_state(ctx, backing);
+            if let Some(buckets) = buckets {
+                let buckets_pin = ctx.pin_native_root(buckets);
+                let entry_pin = ctx.pin_native_root(entry);
+                let hash = ctx.identity_hash_code(entry);
+                let index = map_bucket_index(hash, capacity);
+                let head = match ctx.get_array_element(buckets, index) {
+                    Value::Object(head) => head,
+                    _ => None,
+                };
+                let node = map_alloc_node(ctx, entry, sentinel, hash, head);
+                let backing = ctx.read_native_pin(roots_base, backing);
+                let buckets = ctx.read_native_pin(buckets_pin, buckets);
+                ctx.set_array_element(buckets, index, Value::Object(Some(node)));
+                set_map_size(ctx, backing, size + 1);
+                ctx.unpin_native_roots(entry_pin);
+                ctx.unpin_native_roots(buckets_pin);
+            }
+            ctx.unpin_native_roots(value_pin);
+            ctx.unpin_native_roots(key_pin);
         }
     } else {
         let keys = collect_keys_any(ctx, source);
@@ -11655,10 +11758,7 @@ fn make_set_of(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult
     for (index, elem) in elems.iter().enumerate() {
         let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
         let elem = read_pinned_elem(ctx, elem_handles[index], *elem);
-        if let Err(err) = native_map_put(
-            ctx,
-            &[Value::Object(Some(backing_map)), elem, sentinel],
-        ) {
+        if let Err(err) = native_map_put(ctx, &[Value::Object(Some(backing_map)), elem, sentinel]) {
             ctx.unpin_native_roots(if elem_base == usize::MAX {
                 set_pin
             } else {
@@ -12140,7 +12240,7 @@ fn stream_read_chain(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<LazyOp> {
 fn stream_source_elems(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     let this_pin = ctx.pin_native_root(this);
     let this_cur = ctx.read_native_pin(this_pin, this);
-    materialize_lazy_stream(ctx, this_cur);
+    let _ = materialize_lazy_stream(ctx, this_cur);
     let this_cur = ctx.read_native_pin(this_pin, this);
     let elems = match ctx.get_field(this_cur, STREAM_FIELD_ELEMENTS) {
         Value::Object(Some(arr)) => {
@@ -14554,48 +14654,48 @@ fn native_stream_sorted_cmp(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         let this = ctx.read_native_pin(this_pin, this);
         let elems = stream_elements(ctx, this)?;
 
-    // GC-SAFETY: the Comparator dispatch (and any key-extractor `apply`) allocates
-    // and re-enters Java → a moving young GC relocates the comparator and the
-    // materialized elements out from under these bare Rust locals. Pin both, sort
-    // an index permutation, and re-read the comparator + the two compared elements
-    // from their pin handles on every comparison; build the result by re-reading
-    // in sorted order. Stable merge sort — O(n log n); the comparison is fallible
-    // (a comparator that throws short-circuits) and a non-Int return is "equal".
-    let (_, elem_handles) = pin_value_slice(ctx, &elems);
-    let mut idx: Vec<Value> = (0..elems.len() as i32).map(Value::Int).collect();
-    let sort_res = merge_sort_fallible(ctx, &mut idx, |c, a, b| {
-        let ia = if let Value::Int(v) = a {
-            *v as usize
-        } else {
-            0
-        };
-        let ib = if let Value::Int(v) = b {
-            *v as usize
-        } else {
-            0
-        };
-        let ea = read_pinned_elem(c, elem_handles[ia], elems[ia]);
-        let eb = read_pinned_elem(c, elem_handles[ib], elems[ib]);
-        let cmp = c.read_native_pin(cmp_pin, comparator);
-        match comparator_compare(c, cmp, ea, eb)? {
-            Some(Value::Int(v)) => Ok(v),
-            _ => Ok(0),
-        }
-    });
-    let sorted: Vec<Value> = idx
-        .iter()
-        .map(|v| {
-            let i = if let Value::Int(x) = v {
-                *x as usize
+        // GC-SAFETY: the Comparator dispatch (and any key-extractor `apply`) allocates
+        // and re-enters Java → a moving young GC relocates the comparator and the
+        // materialized elements out from under these bare Rust locals. Pin both, sort
+        // an index permutation, and re-read the comparator + the two compared elements
+        // from their pin handles on every comparison; build the result by re-reading
+        // in sorted order. Stable merge sort — O(n log n); the comparison is fallible
+        // (a comparator that throws short-circuits) and a non-Int return is "equal".
+        let (_, elem_handles) = pin_value_slice(ctx, &elems);
+        let mut idx: Vec<Value> = (0..elems.len() as i32).map(Value::Int).collect();
+        let sort_res = merge_sort_fallible(ctx, &mut idx, |c, a, b| {
+            let ia = if let Value::Int(v) = a {
+                *v as usize
             } else {
                 0
             };
-            read_pinned_elem(ctx, elem_handles[i], elems[i])
-        })
-        .collect();
-    sort_res?;
-    let this = ctx.read_native_pin(this_pin, this);
-    make_derived_stream(ctx, this, &sorted)
+            let ib = if let Value::Int(v) = b {
+                *v as usize
+            } else {
+                0
+            };
+            let ea = read_pinned_elem(c, elem_handles[ia], elems[ia]);
+            let eb = read_pinned_elem(c, elem_handles[ib], elems[ib]);
+            let cmp = c.read_native_pin(cmp_pin, comparator);
+            match comparator_compare(c, cmp, ea, eb)? {
+                Some(Value::Int(v)) => Ok(v),
+                _ => Ok(0),
+            }
+        });
+        let sorted: Vec<Value> = idx
+            .iter()
+            .map(|v| {
+                let i = if let Value::Int(x) = v {
+                    *x as usize
+                } else {
+                    0
+                };
+                read_pinned_elem(ctx, elem_handles[i], elems[i])
+            })
+            .collect();
+        sort_res?;
+        let this = ctx.read_native_pin(this_pin, this);
+        make_derived_stream(ctx, this, &sorted)
     })();
     ctx.unpin_native_roots(this_pin);
     result
@@ -21069,7 +21169,11 @@ fn native_sj_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         };
         ctx.set_array_element(elts_arr, size as usize, Value::Object(Some(elt_obj)));
         ctx.set_field(this, layout.size, Value::Int(size + 1));
-        ctx.set_field(this, layout.len, Value::Int(base_len + elt_str.len() as i32));
+        ctx.set_field(
+            this,
+            layout.len,
+            Value::Int(base_len + elt_str.len() as i32),
+        );
         return Ok(Some(Value::Object(Some(this))));
     }
 
@@ -28870,7 +28974,8 @@ fn native_tm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     };
     // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed `data`
     // (the Comparator invocation inside it can trigger a moving GC).
-    let (tm_search_result, _this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    let (tm_search_result, _this, data, _key) =
+        tm_binary_search(ctx, this, data, size, &comparator, &key)?;
     match tm_search_result {
         Ok(idx) => Ok(Some(ctx.get_array_element(data, idx * 2 + 1))),
         Err(_) => Ok(Some(Value::Object(None))),
@@ -28934,7 +29039,9 @@ fn native_tm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(d) => d,
         None => return Ok(Some(Value::Int(0))),
     };
-    let found = tm_binary_search(ctx, this, data, size, &comparator, &key)?.0.is_ok();
+    let found = tm_binary_search(ctx, this, data, size, &comparator, &key)?
+        .0
+        .is_ok();
     Ok(Some(Value::Int(i32::from(found))))
 }
 
@@ -29126,7 +29233,8 @@ fn native_tm_ceiling_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
     // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed `data`
     // (the Comparator invocation inside it can trigger a moving GC).
-    let (tm_search_result, _this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    let (tm_search_result, _this, data, _key) =
+        tm_binary_search(ctx, this, data, size, &comparator, &key)?;
     match tm_search_result {
         Ok(idx) => Ok(Some(ctx.get_array_element(data, idx * 2))),
         Err(pos) => {
@@ -29166,7 +29274,8 @@ fn native_tm_floor_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed `data`
     // (the Comparator invocation inside it can trigger a moving GC).
-    let (tm_search_result, _this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    let (tm_search_result, _this, data, _key) =
+        tm_binary_search(ctx, this, data, size, &comparator, &key)?;
     match tm_search_result {
         Ok(idx) => Ok(Some(ctx.get_array_element(data, idx * 2))),
         Err(pos) => {
@@ -29209,7 +29318,8 @@ fn native_tm_higher_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed `data`
     // (the Comparator invocation inside it can trigger a moving GC).
-    let (tm_search_result, _this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    let (tm_search_result, _this, data, _key) =
+        tm_binary_search(ctx, this, data, size, &comparator, &key)?;
     match tm_search_result {
         Ok(idx) => {
             let next = idx + 1;
@@ -29259,7 +29369,8 @@ fn native_tm_lower_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed `data`
     // (the Comparator invocation inside it can trigger a moving GC).
-    let (tm_search_result, _this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    let (tm_search_result, _this, data, _key) =
+        tm_binary_search(ctx, this, data, size, &comparator, &key)?;
     match tm_search_result {
         Ok(idx) => {
             if idx > 0 {
@@ -29333,7 +29444,8 @@ fn native_tm_ceiling_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed `data`
     // (the Comparator invocation inside it can trigger a moving GC).
-    let (tm_search_result, _this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    let (tm_search_result, _this, data, _key) =
+        tm_binary_search(ctx, this, data, size, &comparator, &key)?;
     match tm_search_result {
         Ok(idx) => Ok(Some(tm_array_entry(ctx, data, idx))),
         Err(pos) => {
@@ -29376,7 +29488,8 @@ fn native_tm_floor_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
     // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed `data`
     // (the Comparator invocation inside it can trigger a moving GC).
-    let (tm_search_result, _this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    let (tm_search_result, _this, data, _key) =
+        tm_binary_search(ctx, this, data, size, &comparator, &key)?;
     match tm_search_result {
         Ok(idx) => Ok(Some(tm_array_entry(ctx, data, idx))),
         Err(pos) => {
@@ -29422,7 +29535,8 @@ fn native_tm_higher_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed `data`
     // (the Comparator invocation inside it can trigger a moving GC).
-    let (tm_search_result, _this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    let (tm_search_result, _this, data, _key) =
+        tm_binary_search(ctx, this, data, size, &comparator, &key)?;
     match tm_search_result {
         Ok(idx) => {
             let next = idx + 1;
@@ -29475,7 +29589,8 @@ fn native_tm_lower_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
     // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed `data`
     // (the Comparator invocation inside it can trigger a moving GC).
-    let (tm_search_result, _this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    let (tm_search_result, _this, data, _key) =
+        tm_binary_search(ctx, this, data, size, &comparator, &key)?;
     match tm_search_result {
         Ok(idx) => {
             if idx > 0 {
@@ -29780,7 +29895,8 @@ fn native_tm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     // Family-1 stale-ObjectRef fix: use tm_binary_search's refreshed `data`
     // (the Comparator invocation inside it can trigger a moving GC).
-    let (tm_search_result, _this, data, _key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
+    let (tm_search_result, _this, data, _key) =
+        tm_binary_search(ctx, this, data, size, &comparator, &key)?;
     match tm_search_result {
         Ok(idx) => Ok(Some(ctx.get_array_element(data, idx * 2 + 1))),
         Err(_) => Ok(Some(default)),
@@ -30382,7 +30498,9 @@ fn native_ts_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(d) => d,
         None => return Ok(Some(Value::Int(0))),
     };
-    let found = ts_binary_search(ctx, this, data, size, &comparator, &elem)?.0.is_ok();
+    let found = ts_binary_search(ctx, this, data, size, &comparator, &elem)?
+        .0
+        .is_ok();
     Ok(Some(Value::Int(i32::from(found))))
 }
 
@@ -30612,7 +30730,8 @@ fn native_ts_ceiling(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     // Family-1 stale-ObjectRef fix: use ts_binary_search's refreshed `data`
     // (the Comparator invocation inside it can trigger a moving GC).
-    let (ts_search_result, _this, data, _elem) = ts_binary_search(ctx, this, data, size, &comparator, &elem)?;
+    let (ts_search_result, _this, data, _elem) =
+        ts_binary_search(ctx, this, data, size, &comparator, &elem)?;
     match ts_search_result {
         Ok(idx) => Ok(Some(ctx.get_array_element(data, idx))),
         Err(pos) => {
@@ -30638,7 +30757,8 @@ fn native_ts_floor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     // Family-1 stale-ObjectRef fix: use ts_binary_search's refreshed `data`
     // (the Comparator invocation inside it can trigger a moving GC).
-    let (ts_search_result, _this, data, _elem) = ts_binary_search(ctx, this, data, size, &comparator, &elem)?;
+    let (ts_search_result, _this, data, _elem) =
+        ts_binary_search(ctx, this, data, size, &comparator, &elem)?;
     match ts_search_result {
         Ok(idx) => Ok(Some(ctx.get_array_element(data, idx))),
         Err(pos) => {
@@ -30664,7 +30784,8 @@ fn native_ts_higher(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     // Family-1 stale-ObjectRef fix: use ts_binary_search's refreshed `data`
     // (the Comparator invocation inside it can trigger a moving GC).
-    let (ts_search_result, _this, data, _elem) = ts_binary_search(ctx, this, data, size, &comparator, &elem)?;
+    let (ts_search_result, _this, data, _elem) =
+        ts_binary_search(ctx, this, data, size, &comparator, &elem)?;
     match ts_search_result {
         Ok(idx) => {
             let next = idx + 1;
@@ -30697,7 +30818,8 @@ fn native_ts_lower(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     // Family-1 stale-ObjectRef fix: use ts_binary_search's refreshed `data`
     // (the Comparator invocation inside it can trigger a moving GC).
-    let (ts_search_result, _this, data, _elem) = ts_binary_search(ctx, this, data, size, &comparator, &elem)?;
+    let (ts_search_result, _this, data, _elem) =
+        ts_binary_search(ctx, this, data, size, &comparator, &elem)?;
     match ts_search_result {
         Ok(idx) => {
             if idx > 0 {
@@ -30786,7 +30908,8 @@ fn native_ts_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         // Family-1 stale-ObjectRef fix: `owner`/`data` are used again below
         // (ts_remove_at, ts_set_slot) after the Comparator-invoking search
         // (`last` isn't reused here so its refreshed copy is discarded).
-        let (search, owner, data, _last) = ts_binary_search(ctx, owner, data, size, &comparator, &last)?;
+        let (search, owner, data, _last) =
+            ts_binary_search(ctx, owner, data, size, &comparator, &last)?;
         if let Ok(idx) = search {
             ts_remove_at(ctx, data, size, idx);
             ts_set_slot(ctx, owner, TS_FIELD_SIZE, Value::Int(size - 1));
@@ -34810,7 +34933,10 @@ const UNMOD_FIELD_IMMUTABLE: usize = 1;
 fn is_unmod_set_class(name: &str) -> bool {
     matches!(
         name,
-        UNMOD_SET_CLASS | UNMOD_SORTED_SET_CLASS | UNMOD_NAVIGABLE_SET_CLASS | UNMOD_ENTRY_SET_CLASS
+        UNMOD_SET_CLASS
+            | UNMOD_SORTED_SET_CLASS
+            | UNMOD_NAVIGABLE_SET_CLASS
+            | UNMOD_ENTRY_SET_CLASS
     )
 }
 
@@ -35742,7 +35868,12 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
     {
         let c = UNMOD_ENTRY_ITR_CLASS;
         r.register(c, "hasNext", "()Z", native_unmod_itr_has_next);
-        r.register(c, "next", "()Ljava/lang/Object;", native_unmod_entry_itr_next);
+        r.register(
+            c,
+            "next",
+            "()Ljava/lang/Object;",
+            native_unmod_entry_itr_next,
+        );
         r.register(c, "remove", "()V", native_unmod_throw);
     }
 
@@ -35767,7 +35898,12 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             native_unmod_throw,
         );
-        r.register(c, "toString", "()Ljava/lang/String;", native_unmod_to_string);
+        r.register(
+            c,
+            "toString",
+            "()Ljava/lang/String;",
+            native_unmod_to_string,
+        );
         r.register(c, "hashCode", "()I", native_unmod_hash_code);
         r.register(c, "equals", "(Ljava/lang/Object;)Z", native_unmod_equals);
     }
@@ -35990,7 +36126,10 @@ fn native_unmod_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// `UnmodifiableEntrySet.iterator()` — like `native_unmod_iterator`, but
 /// wraps the backing iterator in `UnmodifiableEntryItr` so each yielded
 /// `Map.Entry` is itself wrapped (see `native_unmod_entry_itr_next`).
-fn native_unmod_entry_set_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_unmod_entry_set_iterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let inner = unmod_delegate(ctx, args, "iterator", "()Ljava/util/Iterator;")?;
     if let Some(Value::Object(Some(itr))) = inner {
         let w = alloc_unmod_wrapper(ctx, UNMOD_ENTRY_ITR_CLASS, itr);
@@ -36017,7 +36156,10 @@ fn native_unmod_entry_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// the iterator does before invoking the consumer, so `action.accept(entry)`
 /// calling `entry.setValue(...)` still throws instead of mutating the
 /// backing map.
-fn native_unmod_entry_set_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_unmod_entry_set_for_each(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let (this, consumer) = match (args.first(), args.get(1)) {
         (Some(Value::Object(Some(t))), Some(Value::Object(Some(c)))) => (*t, *c),
         _ => return Ok(None),

@@ -2576,7 +2576,49 @@ impl NativeThreadBlocker for VmNativeThreadBlocker {
     }
 }
 
+/// Read the real-JDK `java.lang.Thread.tid` field from a Thread mirror.
+///
+/// `tid` is `final`, assigned once in the constructor from a process-wide
+/// monotonic counter, and never reused across Thread objects — making it an
+/// aliasing-proof identity key where the mirror's heap address is not (the
+/// collector recycles a dead mirror's address for new allocations; see the
+/// DoHead engine-start `IllegalThreadStateException` incident). Returns
+/// `None` for synthetic-layout threads (no `tid` field in the hierarchy),
+/// for mirrors whose constructor hasn't assigned it yet (reads 0), or when
+/// the slot doesn't read back as a `Long` (don't trust a corrupt layout).
+pub(crate) fn read_java_thread_tid(shared: &SharedVm, thread_obj: ObjectRef) -> Option<u64> {
+    // Callers pass mirrors that can be stale (an unpark racing a moving GC);
+    // don't dereference anything that isn't a live heap address.
+    shared.heap.is_heap_addr(thread_obj.as_ptr() as usize)?;
+    let header = shared.heap.get_header(thread_obj);
+    let slot = {
+        let cm = shared.class_manager.read();
+        resolve_field_index_in_hierarchy(header.class_id, "tid", &cm.class_store)?
+    };
+    match shared.heap.get_field(thread_obj, slot) {
+        Value::Long(v) if v > 0 => Some(v as u64),
+        _ => None,
+    }
+}
+
 fn resolve_thread_id_from_thread_obj(shared: &SharedVm, thread_obj: ObjectRef) -> Option<ThreadId> {
+    // Real-JDK mirrors: resolve by the unique Java `Thread.tid` first — immune
+    // to the mirror-address recycling that makes the pointer walk misreport a
+    // freshly constructed Thread as RUNNABLE/TERMINATED (a dead thread's
+    // retained entry at the same recycled address) and misroute
+    // interrupt/unpark wakeups. The tid-guarded pointer walk below covers
+    // mirrors registered mid-construction (entry recorded before the ctor
+    // assigned `tid`), backfilling the index for subsequent O(1) hits.
+    if let Some(java_tid) = read_java_thread_tid(shared, thread_obj) {
+        if let Some(id) = shared.thread_registry.find_thread_id_by_java_tid(java_tid) {
+            return Some(id);
+        }
+        return shared
+            .thread_registry
+            .find_thread_id_by_thread_obj_tid_checked(thread_obj, java_tid);
+    }
+    // Synthetic-layout / pre-ctor mirrors: legacy pointer walk, then the
+    // synthetic convention of the registry id stored as a Long at slot 2.
     shared
         .thread_registry
         .find_thread_id_by_thread_obj(thread_obj)
@@ -5159,6 +5201,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             Some(thread_obj),
             is_daemon,
         );
+        // Record the mirror's Java `Thread.tid` (fully constructed by
+        // `start()` time) so identity lookups take the aliasing-proof tid
+        // index instead of comparing the mirror's recyclable heap address.
+        if let Some(java_tid) = read_java_thread_tid(self.shared, thread_obj) {
+            self.shared
+                .thread_registry
+                .set_java_thread_obj_with_tid(tid, thread_obj, java_tid);
+        }
 
         // Record JFR thread start event
         {
@@ -5803,11 +5853,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
         // Register immediately so any recursive call to
         // `current_thread_object` during holder/group construction
-        // observes the in-progress object and doesn't loop.
+        // observes the in-progress object and doesn't loop. The mirror's
+        // Java `tid` is usually still 0 here (ctor not run yet) — the
+        // tid-guarded lookup path backfills it on first use.
         self.thread.java_thread_obj = Some(thread_obj);
-        self.shared
-            .thread_registry
-            .set_java_thread_obj(self.thread.thread_id, thread_obj);
+        let java_tid = read_java_thread_tid(self.shared, thread_obj).unwrap_or(0);
+        self.shared.thread_registry.set_java_thread_obj_with_tid(
+            self.thread.thread_id,
+            thread_obj,
+            java_tid,
+        );
 
         let name_str = super::create_java_string(self.shared, &self.thread.name);
         // Re-sync after the string allocation (may have moved the mirror).
@@ -6000,10 +6055,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // Cross-thread query (e.g. `ThreadPoolExecutor` checking a worker):
         // resolve the target's registry id and read its shared interrupt flag.
         // Unknown / not-yet-registered threads default to false, matching the
-        // registry's "missing means absent" convention.
-        self.shared
-            .thread_registry
-            .find_thread_id_by_thread_obj(thread_obj)
+        // registry's "missing means absent" convention. Resolution goes
+        // through the tid-keyed resolver — a raw pointer walk here can alias
+        // a recycled mirror address to a dead thread's entry.
+        resolve_thread_id_from_thread_obj(self.shared, thread_obj)
             .and_then(|tid| self.shared.thread_registry.get_interrupted_flag(tid))
             .map(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
             .unwrap_or(false)
@@ -6196,9 +6251,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if self.shared.thread_registry.thread_name(tid).is_none() {
             return false;
         }
+        let java_tid = read_java_thread_tid(self.shared, java_thread_obj).unwrap_or(0);
         self.shared
             .thread_registry
-            .set_java_thread_obj(tid, java_thread_obj);
+            .set_java_thread_obj_with_tid(tid, java_thread_obj, java_tid);
         true
     }
 
@@ -7353,7 +7409,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // Check for java.lang.reflect.Proxy dynamic proxy dispatch.
             // When Java code calls any method on a Proxy$Instance object, we
             // intercept and forward to the InvocationHandler.invoke().
-            if class_name == "java/lang/reflect/Proxy$Instance" {
+            if class_name == "java/lang/reflect/Proxy$Instance"
+                || crate::runtime::interpreter::class_chain_reaches_proxy_instance(
+                    self.shared,
+                    receiver_class_id,
+                )
+            {
                 return proxy_invoke_handler(self, receiver, method_name, descriptor, args);
             }
 
@@ -8270,8 +8331,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn class_bytes(&self, class_id: ClassId) -> Option<Vec<u8>> {
         let cm = self.shared.class_manager.read();
-        let name = cm.class_store.get(class_id)?.name.to_string();
-        cm.class_bytes_cache.get(&name).cloned()
+        cm.class_bytes_cache.get(&class_id).cloned()
     }
 
     fn find_all_resource_urls(&self, name: &str) -> Vec<String> {
@@ -10164,6 +10224,21 @@ pub(super) fn proxy_invoke_handler(
         }
     };
 
+    // A real JDK annotation is a generated `$ProxyN` whose handler is our
+    // synthetic AnnotationProxy. Its primitive members must leave this native
+    // virtual-dispatch boundary as raw JVM Values, not boxed wrappers.
+    if class_name_is(
+        ctx.shared,
+        handler_ref,
+        "java/lang/annotation/AnnotationProxy",
+    ) {
+        return proxy_unbox_primitive_return(
+            ctx.shared,
+            descriptor,
+            proxy_annotation_handler_invoke(ctx.shared, handler_ref, method_name, args),
+        );
+    }
+
     // WP2.5 вЂ” build the Method object using **field-name-based** writes
     // so the JDK-real layout (which has many inherited fields from
     // AccessibleObject and Executable before `name`/`returnType`/...)
@@ -10458,6 +10533,70 @@ fn class_name_is(shared: &SharedVm, obj: ObjectRef, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Return the result of an annotation handler as the proxied method's JVM
+/// return value. Annotation element values are stored as Java wrappers, while
+/// the generated `$ProxyN` method has a primitive JVM return descriptor. Keep
+/// the boundary here (rather than in the individual callers) so native and
+/// interpreter proxy dispatch cannot accidentally hand an `Integer` reference
+/// to code expecting an `int`.
+fn proxy_unbox_primitive_return(
+    shared: &SharedVm,
+    descriptor: &str,
+    result: MethodCallResult,
+) -> MethodCallResult {
+    let Some(value) = result? else {
+        return Ok(None);
+    };
+    let ret = descriptor
+        .rsplit(')')
+        .next()
+        .unwrap_or("L")
+        .chars()
+        .next()
+        .unwrap_or('L');
+    match ret {
+        'I' | 'Z' | 'B' | 'C' | 'S' | 'J' | 'F' | 'D' => {
+            if let Value::Object(Some(wrapper)) = value {
+                Ok(Some(shared.heap.get_field(wrapper, 0)))
+            } else {
+                Ok(Some(value))
+            }
+        }
+        _ => Ok(Some(value)),
+    }
+}
+
+/// Dispatch a real JDK `$ProxyN` annotation method through its synthetic
+/// AnnotationProxy handler. `equals` needs the other real proxy unwrapped so
+/// annotation equality compares its members rather than proxy identity.
+fn proxy_annotation_handler_invoke(
+    shared: &SharedVm,
+    handler_ref: ObjectRef,
+    method_name: &str,
+    args: &[Value],
+) -> MethodCallResult {
+    if method_name == "equals" {
+        if let Some(Value::Object(Some(other))) = args.first().copied() {
+            if let Value::Object(Some(other_handler)) = shared.heap.get_field(other, 0) {
+                if class_name_is(
+                    shared,
+                    other_handler,
+                    "java/lang/annotation/AnnotationProxy",
+                ) {
+                    let routed = [Value::Object(Some(other_handler))];
+                    return annotation_proxy_dispatch_impl(
+                        shared,
+                        handler_ref,
+                        method_name,
+                        &routed,
+                    );
+                }
+            }
+        }
+    }
+    annotation_proxy_dispatch_impl(shared, handler_ref, method_name, args)
+}
+
 pub(crate) fn proxy_invoke_handler_shared(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -10482,29 +10621,11 @@ pub(crate) fn proxy_invoke_handler_shared(
     // unchanged. getClass() is intercepted earlier (the proxy hook returns the
     // real `$ProxyN` mirror), so it never reaches here.
     if class_name_is(shared, handler_ref, "java/lang/annotation/AnnotationProxy") {
-        // For equals(Object), unwrap a real-proxy argument to its
-        // AnnotationProxy handler so annotation equality compares member data,
-        // not proxy reference identity.
-        if method_name == "equals" {
-            if let Some(Value::Object(Some(other))) = args.first().copied() {
-                if let Value::Object(Some(other_handler)) = shared.heap.get_field(other, 0) {
-                    if class_name_is(
-                        shared,
-                        other_handler,
-                        "java/lang/annotation/AnnotationProxy",
-                    ) {
-                        let routed = [Value::Object(Some(other_handler))];
-                        return annotation_proxy_dispatch_impl(
-                            shared,
-                            handler_ref,
-                            method_name,
-                            &routed,
-                        );
-                    }
-                }
-            }
-        }
-        return annotation_proxy_dispatch_impl(shared, handler_ref, method_name, args);
+        return proxy_unbox_primitive_return(
+            shared,
+            descriptor,
+            proxy_annotation_handler_invoke(shared, handler_ref, method_name, args),
+        );
     }
 
     // WP2.5 вЂ” build the Method object using **field-name-based** writes.
@@ -12467,6 +12588,58 @@ fn invoke_on_class_shared_inner(
     } else {
         class_id
     };
+    // `VirtualMachine.attach` is a concrete JDK method, so the normal
+    // real-bytecode preference would enter AttachProvider discovery before
+    // reaching the registered in-process self-attach native.  Byte Buddy
+    // invokes this exact surface reflectively for Mockito's inline maker.
+    // Resolve it here, after the reflective Method target is known but before
+    // bytecode selection, so it cannot dispatch through the unsupported
+    // socket/provider protocol.
+    let class_name = {
+        let cm = shared.class_manager.read();
+        cm.get_class(class_id)
+            .map(|class| class.name.to_string())
+            .unwrap_or_default()
+    };
+    if class_name == "com/sun/tools/attach/VirtualMachine"
+        && matches!(
+            (method_name, descriptor),
+            (
+                "attach",
+                "(Ljava/lang/String;)Lcom/sun/tools/attach/VirtualMachine;"
+            ) | ("loadAgent", "(Ljava/lang/String;Ljava/lang/String;)V")
+                | ("loadAgent", "(Ljava/lang/String;)V")
+                | ("detach", "()V")
+        )
+    {
+        if let Some(callback) = shared
+            .native_methods
+            .find(&class_name, method_name, descriptor)
+        {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|value| coerce_native_return(value, descriptor));
+        }
+    }
+    // The real-JDK Thread methods read the host field layout directly.  A
+    // CratonVM Thread can instead carry a stale/mis-slotted value there, which
+    // made Mockito plugin discovery dispatch `getResources` on a String.
+    // The registered natives resolve the VM-owned context-loader state and
+    // must win over those concrete bodies.
+    if class_name == "java/lang/Thread"
+        && matches!(
+            (method_name, descriptor),
+            ("getContextClassLoader", "()Ljava/lang/ClassLoader;")
+                | ("setContextClassLoader", "(Ljava/lang/ClassLoader;)V")
+        )
+    {
+        if let Some(callback) = shared
+            .native_methods
+            .find(&class_name, method_name, descriptor)
+        {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|value| coerce_native_return(value, descriptor));
+        }
+    }
     // Find the method (walking the superclass chain)
     let (is_native, is_synchronized, is_static, declaring_class_id) = {
         let cm = shared.class_manager.read();
@@ -12823,6 +12996,8 @@ fn invoke_on_class_shared_inner(
                                 || (method_name == "findResources"
                                     && descriptor
                                         == "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                                || (method_name == "addURL"
+                                    && descriptor == "(Ljava/net/URL;)V")
                                 || (method_name == "<init>"
                                     && matches!(
                                         descriptor,
