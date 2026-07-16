@@ -44,11 +44,7 @@
 > .StompWebSocketIntegrationTests` (STOMP message never arrives — functional
 > gap, not investigated); `orm.jpa.support
 > .PersistenceAnnotationBeanPostProcessorAotContributionTests` (ByteBuddy
-> fork-attach + generics residuals); `context.aot
-> .ApplicationContextAotGeneratorTests` and `test.context.aot
-> .TestContextAotGeneratorIntegrationTests` (never given a dedicated
-> post-loader-identity-fix triage — status unknown, being re-characterized
-> now); `beans.factory.aot.BeanRegistrationsAotContributionTests`
+> fork-attach + generics residuals); `beans.factory.aot.BeanRegistrationsAotContributionTests`
 > (confirmed genuinely perf-bound — steady progress, 100% CPU, not a
 > deadlock — needs interpreter-throughput work, not a discrete fix);
 > `RequestMappingMessageConversionIntegrationTests` (partially fixed, 5
@@ -59,6 +55,30 @@
 > and `PersistenceManagedTypesBeanRegistrationAotProcessorTests`' residual
 > failures both need a JDK 24+ (`java.lang.classfile.ClassFile`, JEP 484)
 > that isn't installed on the investigation host.
+>
+> **2026-07-16 update**: `context.aot.ApplicationContextAotGeneratorTests` and
+> `test.context.aot.TestContextAotGeneratorIntegrationTests` — the two AOT-cluster
+> classes that had never gotten a dedicated post-loader-identity-fix triage — are
+> now re-characterized (dedicated session, dev tip `6c517cd9`, full numbers and
+> stack traces in [`CRATONVM-SPRING-GENUINE-BUGLIST.md`](CRATONVM-SPRING-GENUINE-BUGLIST.md)
+> §2's "2026-07-16 dedicated re-triage" bullet — that doc is the authoritative
+> source, this is a pointer/summary). `TestContextAotGeneratorIntegrationTests` no
+> longer hangs (393 s → 8.3 s) but still FAILs 4/4, each a distinct cause: one is
+> the already-tracked `ImportHttpServiceRegistrarTests`-family `ClassCastException`
+> (attribution only), the other three (a `GroovySystem.<clinit>` `ArrayStoreException`,
+> a SnakeYAML parse failure on a `$Nested` test class whose raw resource bytes are
+> confirmed byte-identical to HotSpot, and a NEW loader-identity `ClassCastException`
+> site in Spring's own `AotServices` SPI loader) are newly characterized but not
+> fixed. `ApplicationContextAotGeneratorTests` is worse than its last (unsubstantiated)
+> status implied: it 100%-reproducibly `LOADERR`s with `found=0` before discovering
+> any test method, from a GC heap-corruption cascade (all-zero-header stale pointers
+> hitting several unrelated JUnit-Platform/javac-internal classes within
+> milliseconds of each other) that reproduces identically under JIT and `--nojit`
+> and at 2 GB and 8 GB heap — ruling out the two most similar already-fixed bugs
+> in this codebase (`spring-bug-10`'s JIT shadow-stack race, RESOLVED 2026-06-21;
+> the `stream-arraylist-gc-pressure` fix, landed 2026-07-16 and already in this
+> build) as the cause. This is a new, open, 100%-reproducible GC bug — no VM code
+> was changed for either class this session; both are documented, not fixed.
 
 # Spring TIMEOUT cluster — 1500s diagnostic rerun (hung vs. slow)
 
