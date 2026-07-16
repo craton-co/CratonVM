@@ -16038,9 +16038,23 @@ fn invoke_on_class_shared_inner(
             }
         };
         let obj = monitor_enter_synchronized_method(shared, thread, obj, sync_args);
+        // GC-safety (WildFly domain-server boot stall, 2026-07-16): the guard
+        // outlives the WHOLE method body — arbitrarily many moving GCs — so a
+        // raw `obj` copy goes stale and `Drop`'s `exit(stale)` raises the
+        // "does not own the monitor" IMSE while the REAL monitor stays locked
+        // forever (both managed servers leaked a monitor within their first
+        // second of boot; every later `synchronized` contender — including
+        // the handler that completes the boot future via the synchronized
+        // `AsyncFutureTask.setResult` — then blocked permanently). Pin the
+        // object for the guard's lifetime; `Drop` re-reads the pin for the
+        // current address before releasing.
+        let monitor_pin = thread.native_pin_roots.len();
+        thread.native_pin_roots.push(obj);
         Some(SynchronizedMethodGuard {
             monitor_pool: &shared.monitors,
             obj,
+            monitor_pin,
+            thread: thread as *mut JvmThread,
             thread_id: thread.thread_id,
         })
     } else {
@@ -16434,13 +16448,39 @@ fn invoke_on_class_shared_inner(
 /// the call leaked the monitor entirely because the line never executed).
 struct SynchronizedMethodGuard<'a> {
     monitor_pool: &'a crate::threading::monitor::MonitorTable,
+    /// Address of the monitor object AT ENTRY. Only the fallback when the
+    /// pin below is unreadable — a moving GC during the method body makes
+    /// this stale, which is exactly why `Drop` reads the pin instead.
     obj: ObjectRef,
+    /// Index of this guard's entry in `thread.native_pin_roots` — the pin
+    /// keeps the monitor object rooted AND remapped across every GC in the
+    /// method body, so `Drop` releases the RELOCATED object, not the
+    /// entry-time address (the WildFly domain-server leaked-monitor boot
+    /// stall — see the construction site's comment).
+    monitor_pin: usize,
+    /// Owning thread, for the pin read in `Drop`. Same lifetime-erasure
+    /// contract as `ChmMonitorGuard`: the guard is a stack local of the
+    /// invoke function that exclusively borrows `thread`; it never escapes,
+    /// and it drops (normal path or unwind) only after the method-body
+    /// borrow of `thread` has ended.
+    thread: *mut JvmThread,
     thread_id: ThreadId,
 }
 
 impl Drop for SynchronizedMethodGuard<'_> {
     fn drop(&mut self) {
-        if let Err(e) = self.monitor_pool.exit(self.obj, self.thread_id) {
+        // SAFETY: see the `thread` field's contract above.
+        let obj = unsafe {
+            let thread = &mut *self.thread;
+            let cur = thread
+                .native_pin_roots
+                .get(self.monitor_pin)
+                .copied()
+                .unwrap_or(self.obj);
+            thread.native_pin_roots.truncate(self.monitor_pin);
+            cur
+        };
+        if let Err(e) = self.monitor_pool.exit(obj, self.thread_id) {
             tracing::warn!(
                 thread_id = ?self.thread_id,
                 error = ?e,
