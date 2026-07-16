@@ -8327,7 +8327,7 @@ pub extern "C" fn jit_ldc_string(vm_ptr: i64, bytes: *const u8, len: usize) -> i
     // by the compiled-entry trampoline.
     let text = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(bytes, len)) };
     let shared = unsafe { &*(vm_ptr as *const SharedVm) };
-    crate::vm::vm_object::create_java_string(shared, text).as_ptr() as i64
+    crate::vm::create_java_string(shared, text).as_ptr() as i64
 }
 
 /// Stage 3 (precise oop maps) — record the EXACT RBP of the JIT frame that is

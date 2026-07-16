@@ -5609,6 +5609,9 @@ pub fn execute(
                         // allocate `Box<JitPICSlot>` per
                         // polymorphic call site in `invoke_info`).
                         ldc_info_early,
+                        Vec::new(), // ldc_string_info — not yet wired for this
+                        // early-compile path (mirrors the mic_slots/pic_slots
+                        // "not yet allocated here" placeholders above).
                         ldc2w_info_early,
                         std::collections::HashMap::new(), // branch_hints
                         std::collections::HashMap::new(), // loop_unroll_hints
@@ -28560,6 +28563,9 @@ fn compile_osr_artifact(
                 // this codepath emits the slow-path helper for
                 // every invokevirtual/invokeinterface.
                 ldc_info2,
+                Vec::new(), // ldc_string_info — not yet wired for this
+                // OSR-recompile path (mirrors the mic_slots/pic_slots
+                // "not yet allocated here" placeholders above).
                 ldc2w_info2,
                 std::collections::HashMap::new(), // branch_hints
                 std::collections::HashMap::new(), // loop_unroll_hints
