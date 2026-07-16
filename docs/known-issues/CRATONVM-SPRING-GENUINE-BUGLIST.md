@@ -1213,3 +1213,103 @@ Verified (dev tip after `19a5025f`): `cargo test -p cratonvm-native-builtins --l
 failed (all 9 are the pre-existing `jit::skip_list::tests::*` failures section 5 already
 attributed to an unrelated concurrent Hibernate-longtail session — confirmed unchanged, not
 caused by this fix).
+
+
+### 5.2 CompletableFuture/Netty-Future `ClassCastException` — root-caused and FIXED (2026-07-16)
+
+Closes the "flagged for dedicated follow-up" item from 5.1 above.
+
+**Reproduction.** Rather than rely on JRun's own stack-trace capture (Reactor's
+`StepVerifier`/`onError` signal path does not preserve the original exception's real stack trace
+as a Java `cause` chain, only a message string — this genuinely blocked the initial investigation),
+added a temporary diagnostic directly in the interpreter's `checkcast` handler
+(`vm/src/runtime/interpreter.rs`, gated behind a new `CRATONVM_DBG_CCE_TRACE` env var, reverted
+before landing the real fix) that dumps the live call-frame stack at the exact moment a checkcast
+to a `netty`-named class fails. This immediately surfaced the real throw site:
+
+```
+[cce-trace] checkcast FAILED: obj=java.util.concurrent.CompletableFuture target=io.netty.util.concurrent.Future
+[cce-trace]   frame[108] class=io/netty/util/concurrent/AbstractEventExecutor method=submit(Ljava/lang/Runnable;)Lio/netty/util/concurrent/Future;
+[cce-trace]   frame[107] class=reactor/netty/resources/ColocatedEventLoopGroup method=<init>(Lio/netty/channel/EventLoopGroup;)V
+```
+
+`javap -c -p` on `io.netty.util.concurrent.AbstractEventExecutor` confirmed its `submit(Runnable)`
+override does `invokespecial AbstractExecutorService.submit(Runnable)` (to get the default
+implementation) then `checkcast io/netty/util/concurrent/Future` on the result. The real JDK's
+`AbstractExecutorService.submit()` internally calls `newTaskFor(runnable)` — a method
+`AbstractEventExecutor` overrides to hand back a Netty `PromiseTask` (which implements Netty's
+`Future`) instead of a plain JDK `FutureTask`.
+
+**Root cause.** `native_es_submit_runnable`/`native_es_submit_callable` (`native-builtins/src/lib.rs`)
+are registered on `ExecutorService`, `AbstractExecutorService`, and `ThreadPoolExecutor` alike, and
+unconditionally ran CratonVM's synthetic single-threaded-immediate-execution model, handing back a
+plain `CompletableFuture` via `completed_executor_future()` — regardless of whether the receiver
+was one of CratonVM's own synthetic placeholder executors or a genuinely-real bytecode object. Per
+this VM's established rule that `invokespecial` always prefers a registered native over real
+bytecode, `AbstractEventExecutor`'s `invokespecial AbstractExecutorService.submit(...)` landed on
+the synthetic native instead of the real `AbstractExecutorService.submit()` bytecode, silently
+bypassing the `newTaskFor()` override and producing a `CompletableFuture` where the caller
+immediately `checkcast`s to `io.netty.util.concurrent.Future`.
+
+This is exactly the real-vs-synthetic ambiguity `execute()`/`shutdown()` already guard against
+(`executor_has_real_workers()` + `invoke_special_bytecode_only` redispatch to real bytecode) — in
+fact `invoke_special_bytecode_only`'s own doc comment explicitly lists `submit` as part of "the
+canonical example" of natives needing this guard, but the guard was never actually applied to
+`submit()` itself, only to `execute`/`shutdown`.
+
+`executor_has_real_workers()` could not simply be reused: it disambiguates only the
+`ThreadPoolExecutor` class-name collision (CratonVM's own synthetic placeholder is deliberately
+stamped with the real `ThreadPoolExecutor` class name so field writes/native dispatch line up) via
+a per-instance `workers` field probe. Netty's `AbstractEventExecutor`/`SingleThreadEventExecutor`
+are not `ThreadPoolExecutor`s at all and have no `workers` field, so the existing check would
+misreport them as synthetic.
+
+**Fix.** Added a generalized `executor_is_real(ctx, exec)` helper: resolve the receiver's actual
+runtime class name (unwrapping the `Executors$DelegatedExecutorService`-style `e` field indirection
+first, same as before); for the ambiguous `ThreadPoolExecutor` case keep the existing `workers`
+field probe; for the bare interface markers `ExecutorService`/`ScheduledExecutorService`/`Executor`
+(used only by CratonVM's own wrapper placeholders in `phases_late.rs` — no real object's runtime
+class can ever literally be an interface) always report synthetic; any other concrete class name
+reaching this code path (Netty's classes, a real `ForkJoinPool`, a user subclass, ...) is
+necessarily real, since CratonVM never fabricates a synthetic executor under any other class name
+— confirmed by grepping every `alloc_concurrent_synthetic(ctx, "java/util/concurrent/...", ...)`
+call site in the tree. `native_es_submit_runnable`/`native_es_submit_callable` now check
+`executor_is_real()` first and, for a real receiver, redispatch via
+`invoke_special_bytecode_only("java/util/concurrent/AbstractExecutorService", "submit", ..., args)`
+— matching the `invokespecial` call site and letting the receiver's real `newTaskFor()` override
+run, exactly mirroring the established `execute()`/`shutdown()` pattern.
+
+**Verification.**
+- `ClientHttpConnectorTests`: 0 `CompletableFuture`/`Netty-Future` `ClassCastException`s across 20
+  clean runs (was 11 deterministic failures every run), 0 hangs. Pass rate 42-44/49 per run (was
+  33/49); the residual 5-7 failures per run are pre-existing and unrelated to this bug: missing
+  `bytebuddy`/`assertj` on this ad hoc harness's classpath (4-5 failures, a harness gap not a VM
+  bug), an occasional Jetty `EofException` connection-flake, an unrelated enum `valueOf()`
+  `ClassCastException` (a known separate synthetic-enum gap), and one flaky `StepVerifier`
+  exception-identity assertion.
+- `ReactorClientHttpConnectorTests` (the class 5.1 specifically named for a definitive pre/post
+  check): 5/5 across 5 clean runs, both pre- and post-rebase-to-dev-tip.
+- `RSocketClientToServerIntegrationTests`: 12/12 across 3 clean runs, both pre- and
+  post-rebase-to-dev-tip (was 1/12 in section 5's original report, then regressed further to 0/12
+  under the same `CompletableFuture`/Netty-`Future` signature — RSocket's TCP transport also
+  routes through Netty's `AbstractEventExecutor.submit()`).
+- `cargo test -p cratonvm-native-builtins --lib`: 2999/0 (unchanged).
+- `cargo test -p cratonvm-jit --lib`: 905/0 (unchanged).
+- `cargo test -p cratonvm-vm --lib`: 2197 passed / 18 failed. 9 are the pre-existing
+  `jit::skip_list::tests::*` failures already attributed (section 5) to an unrelated concurrent
+  Hibernate-longtail session. The other 9 are new `runtime::lock_order::tests::*` failures,
+  confirmed unrelated to this fix: that module (added by an unrelated concurrent commit,
+  `3dd488a9`, "env-gated runtime opt-in for lock-order enforcement in release builds") gates its
+  enforcement behind `cfg!(debug_assertions)`, and this verification pass ran `cargo test
+  --release` (debug assertions off) rather than a debug build — a pre-existing test/build-profile
+  mismatch in that unrelated module, not caused by or related to executor/native dispatch.
+
+Landed: commit `9850617b` on `dev` (rebased cleanly onto dev tip `436ec59b` before push, re-verified
+against the post-rebase binary).
+
+**Current true state of `ClientHttpConnectorTests`**: 0% hangs, 0 `CompletableFuture`/Netty-`Future`
+cast failures, 42-44/49 (86-90%) passing per run — up from 33/49 (67%) in 5.1 and the original
+21/21-hang regression in section 5. The remaining ~5-7 failures per run are all pre-existing,
+independently-tracked gaps (harness classpath completeness, an unrelated enum dispatch bug, and
+test-infra flakiness), none of them the `AbstractExecutorService`/Netty-`Future` bug this section
+closes out.
