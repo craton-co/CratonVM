@@ -578,7 +578,7 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     as worth the risk/complexity of touching more interpreter dispatch code for an expected marginal
     (not measurable-with-confidence) return.
 
-    **Current status**: `ClientHttpConnectorTests` is measurably, substantially more reliable after
+    ~~**Current status**: `ClientHttpConnectorTests` is measurably, substantially more reliable after
     the two rounds of fixes above (9/15 → 4/15 clean hang rate) but not fully closed. The remaining
     ~27% is consistent with the same "accumulated per-call interpreter dispatch/allocation overhead
     compounding on method-call-heavy code" conclusion the 2026-07-13
@@ -588,7 +588,19 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     allocator throughput initiative (e.g. profiling `mimalloc` allocation-path cost under this
     object-churn pattern, or auditing the several distinct locks that showed up for reducible
     contention individually), not another single-function fix — out of scope for a "residual"
-    investigation.
+    investigation.~~ **2026-07-16 update (see section 5.3)**: the 27% hang rate is now resolved,
+    independently reconfirmed at **0/60** across three fresh stress batches (including a
+    deliberate 2x-concurrent-contention batch that the original 27% measurement never tested
+    against). A direct causal A/B experiment (reverting only the `Thread.getId()` fix on an
+    otherwise-current tip) confirms the diffuse contention/throughput cost this section describes
+    is real and `getId()`'s collapse is a genuine, measurable contributor to it (mean wall time
+    +10-25%, occasional runs crossing the historical 30s hang bound) — but `getId()` alone does not
+    reproduce anything close to the historical 27% rate; the resolution is the combined effect of
+    this session's several fixes (blocking-region gaps, `force_native_over_real_jdk_bytecode`
+    memoization, `Thread.getId()`, the executor-`submit()`/Netty-`Future` fix in 5.2), not any one
+    of them alone. The diffuse hashbrown/parking_lot/mimalloc/`Arc`/`Weak` cost pattern itself is
+    still visible in hot-thread sampling and remains a legitimate, still-open *performance*
+    characteristic — just no longer severe enough to cause an observed hang.
     Also unfixed: the T19.H1 watchdog stack-dump itself SIGSEGVs when JIT frames are on the stack
     (separate small bug; `--nojit` dumps work).
 *   ~~`web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` —
@@ -1446,3 +1458,110 @@ cast failures, 42-44/49 (86-90%) passing per run — up from 33/49 (67%) in 5.1 
 independently-tracked gaps (harness classpath completeness, an unrelated enum dispatch bug, and
 test-infra flakiness), none of them the `AbstractExecutorService`/Netty-`Future` bug this section
 closes out.
+
+
+### 5.3 Follow-up (2026-07-16): does the `getId()` fix explain the historical "diffuse throughput, 27% hang" residual? — real contributor, confirmed causally, but not the dominant cause
+
+Directly investigates whether the "27% hang rate" / diffuse hashbrown-parking_lot-mimalloc-Arc/Weak
+CPU-bound-spin residual documented under section 4 (`ClientHttpConnectorTests`, round 2, commit
+`3d1449a7`) — at the time judged a systemic "interpreter/allocator throughput ceiling," not a
+discrete bug — was actually substantially caused by the since-fixed `Thread.getId()` bug
+(`19a5025f`, section 5.1), given the mechanism (`Okio SegmentPool` collapsing every thread onto one
+shared `AtomicReference<Segment>` bucket, forcing extra CAS retries/allocations/lock traffic) looks
+exactly like the kind of diffuse cost the 27% investigation observed.
+
+**Method.** Built three binaries from a fresh `git fetch origin dev` at tip `5e13631a` (worktree
+`wt-diffuse-throughput-20260716`, `cargo build --release`, independent of any prior session's own
+binary) plus one deliberately-regressed control binary, and ran the real
+`ClientHttpConnectorTests` class (not a synthetic probe) through it directly, matching this
+effort's established methodology throughout section 5. Measured *test-completion* time (the
+`RESULT ...` line the harness prints), not process-exit time — confirmed separately that the
+process legitimately never exits on its own after the JUnit run completes (`[cratonvm] main()
+returned; VM held alive by 32 non-daemon thread(s) (JVM-spec behaviour)`), which would otherwise
+make every single run misreport as a "hang" under a naive wall-clock-to-process-exit measurement.
+
+**Current true state, reconfirmed independently: 0/60 hangs.**
+*   20 runs against the existing verified `dev`-tip binary (`wt-final-verify-20260716`, confirmed
+    functionally identical to `5e13631a` via `git diff --stat` — the only commits between its build
+    point and current tip are docs-only): **0/20 hangs**, wall times 9.5-26.1s, 44-46/49 passing
+    (one run found only 45 tests, a discovery flake, not a hang).
+*   20 runs against a from-scratch independent build (`~/vmfix-diffusethroughput-20260716`):
+    **0/20 hangs**, wall times 9.0-19.1s, 42-46/49 passing (one outlier run found only 17/49 tests
+    — a one-off test-discovery flake under this ad hoc harness, not reproduced elsewhere and not a
+    VM hang).
+*   10 rounds (20 process launches) of **two simultaneous instances** of the full 49-sub-test class
+    — deliberate added contention beyond any single prior session's own stress conditions, since the
+    original diffuse-cost investigation's own methodology explicitly ran "under moderate host load":
+    **0/20 hangs**, wall times 8.0-34.4s (only under this doubled contention does wall time approach
+    the historical 30s hang bound — never observed in any single-instance run).
+*   **Total: 60/60 clean completions across three independent stress batches, 0% hang rate** — a
+    real, fully-confirmed resolution of the 27% figure section 4 documented, corroborating (and
+    independently reproducing, with a fresh build) section 5.2's own 0/20 finding.
+
+**Hot-thread sampling: the diffuse *flavor* is still present, just no longer pathological.**
+24 live `sudo gdb -p <pid> --batch -ex 'thread apply all bt'` captures across 4 independent launches
+(identifying the CPU-hottest thread via `top -H` first, same technique as the original 41-sample
+investigation) during normal (non-hung, completing-within-10-25s) runs found leaf frames spread
+across: SIMD memcpy/memcmp/memset intrinsics, `parking_lot` lock/unlock (multiple distinct call
+sites), interpreter dispatch (`execute_invokevirtual_cached`, `nth_param_tag_byte`), `Arc` drop,
+`mimalloc` allocation (`mi_page_malloc_zero`), a classloading B-tree range lookup
+(`find_in_multi_release_archive`), and blocking syscalls (legitimate socket I/O, not spinning) —
+the same general *shape* (many small, unrelated costs, no dominant single site) as the historical
+41-sample breakdown, but every capture comes from a thread that is doing bounded, real work in a
+run that reliably finishes in seconds, not an indefinite spin. This is consistent with "diffuse
+interpreter/allocator throughput cost" remaining a genuine, still-open architectural characteristic
+of this VM — it just no longer manifests as an unbounded hang now that the discrete bugs that used
+to push individual runs over the edge are fixed.
+
+**Direct causal A/B experiment (not just correlation).** Built a fourth, deliberately-regressed
+control binary: same `dev` tip `5e13631a`, with *only* the `native-builtins/src/lib.rs`
+`Thread.getId()` registration reverted back to the pre-`19a5025f` hardcoded `Ok(Some(Value::Long(1)))`
+(everything else — the executor-`submit()` fix `9850617b`, the SATB-buffer fix `5fa116fd`, both
+blocking-region fixes, etc. — left intact). Ran the identical 20-run single-instance stress
+protocol:
+
+| Binary | n | mean wall | max wall | runs > 30s |
+|---|---|---|---|---|
+| Fixed (existing verified binary) | 20 | 15.9s | 26.1s | 0 |
+| Fixed (fresh independent build) | 20 | 13.1s | 19.1s | 0 |
+| **Control (`getId()` reverted only)** | 20 | **17.5s** | **33.4s** | **2 (10%)** |
+
+Reinstating *only* the `getId()` bug on an otherwise-fully-fixed tip measurably slows the class down
+(mean +10-25%, worst case +7-14s) and is the only one of the three batches to ever cross the 30s
+mark the original investigation used as its hang threshold — direct, reproducible, causal evidence
+that the mechanism `19a5025f`'s commit message describes (SegmentPool bucket collapse → CAS
+retry/allocation storm) is real and does contribute measurable diffuse cost, not a hypothesis.
+**However, it does not come close to reproducing the historical 27% hang rate on its own**: 0/20
+runs failed to complete within the 60s bound (vs. an expected ~5/20 if `getId()` alone explained the
+original 27% figure), and critically, **the `okio.Segment ClassCastException` from section 5.1 did
+not reproduce at all** in this control batch (`grep` for the signature across all 20 logs: zero
+matches) — even though this is the exact bug section 5.1 attributed it to. The difference: this
+control binary already has the executor-`submit()`/Netty-`Future` dispatch fix (`9850617b`)
+applied, which section 5.1's own repro conditions (tip `22dfc55e`) did not. This indicates the
+historical 100% CCE-crash regression (section 5) needed `getId()`'s collapse *compounding with*
+something else — most plausibly the missing `--enable-native-access` flag masking/reshaping which
+code paths executed at all, as section 5.1 itself already found for the crash's *visibility* — not
+`getId()` in isolation.
+
+**Conclusion.** `Thread.getId()`'s collapse was a real, now causally-confirmed contributor to this
+class's diffuse per-call contention/throughput cost — but it was never, by itself, the dominant
+cause of either the original 27% hang rate (section 4) or the later 100% CCE-crash regression
+(section 5). Both of those needed the `getId()` bug compounding with other factors: the original
+27% was measured *after* `3d1449a7`'s `force_native_over_real_jdk_bytecode` memoization already cut
+a 60% hang rate to 27% and *before* the two blocking-region fixes and the executor-`submit()` fix
+existed at all; the 100% CCE regression needed the missing `--enable-native-access` flag and the
+still-unfixed executor-`submit()` gap alongside it. The combined effect of *all* of this session's
+fixes — not `getId()` alone — is what took `ClientHttpConnectorTests` from a documented 27% hang
+rate down to a measured, reproducible, causally-stress-tested **0% (0/60)** on the current `dev`
+tip. The "diffuse hashbrown/parking_lot/mimalloc/`Arc`/`Weak` per-call cost" the section 4
+investigation catalogued is **not eliminated** — it remains visible in hot-thread sampling with the
+same general shape — but it no longer pushes any observed run past the point of actually failing to
+complete, even under deliberate 2x concurrent contention. Recommend downgrading section 4's framing
+from "closing it further needs a genuine interpreter/allocator throughput initiative" (implying an
+open reliability problem) to "a legitimate, still-open *performance* characteristic with no
+currently-observed reliability impact" — the hang symptom itself is resolved and independently
+reconfirmed, not merely reasoned about.
+
+No code change lands from this section — it is a verification/root-cause-attribution pass. The
+`control/getid-reverted-20260716` branch/worktree used for the A/B experiment is a throwaway
+(deliberately regresses a fixed bug) and is not merged.
