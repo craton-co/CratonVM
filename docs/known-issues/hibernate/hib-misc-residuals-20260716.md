@@ -222,6 +222,92 @@ the compile-time cost directly, then evaluate a scoped fix (e.g.
 short-process detection, always-async compilation, or a higher default
 `c1_threshold`) against the full benchmark suite before changing defaults.
 
+**Update 2026-07-16 (follow-up session, branch
+`fix/jit-compile-time-tax-20260716`, merged to dev): partial mitigation
+landed, full resolution still OPEN.** Did the next step this doc called
+for: added a `CRATONVM_DBG_TIER_ENQUEUE` diagnostic to
+`jit/src/tiered.rs`'s `should_compile_inner` (prints method key + tier +
+invocation count + process-elapsed-ms on every compile-task enqueue) and
+used it to confirm the mechanism directly instead of by wall-clock
+inference alone. Raised `CompilationPolicy`'s defaults from
+`c1_threshold=200/c2_threshold=5000` to `c1_threshold=1500/c2_threshold=20000`
+(`osr_threshold` untouched — a hot loop that has already run
+`osr_threshold` back-edges is self-evidently still running, unlike a
+one-shot bootstrap method counted by plain invocation count; both
+remain `CRATONVM_TIER_C1_THRESHOLD`/`CRATONVM_TIER_C2_THRESHOLD`
+env-overridable as before).
+
+This is a real, validated, safe mitigation — but empirically **not a
+full fix**:
+
+1. **No steady-state throughput regression.** A same-binary A/B
+   (`CRATONVM_TIER_C1_THRESHOLD=200 CRATONVM_TIER_C2_THRESHOLD=5000` env
+   override, i.e. the old defaults, vs the new unset-env defaults) on a
+   standalone `fib(32)` recursive workload measured 581ms vs 591ms —
+   within noise. `vm/benches/vm_benchmarks.rs`'s `jit_hot_loop_dispatch`,
+   `specjvm_compiler_throughput`, `interpreter_fibonacci`, and
+   `shootout_binary_trees` all report normal, healthy numbers after the
+   change. This tracks analytically too: `jit_hot_loop_dispatch`
+   pre-warms (crossing whichever threshold is set) *outside* its timed
+   measurement window, and genuinely hot/long-running workloads blow
+   past even the raised bar quickly relative to their total lifetime.
+
+2. **The raised threshold delays and reduces compile volume for this
+   workload but does not suppress it, and does not reliably fix
+   `LockTest`'s timeout.** The new diagnostic shows a solo `LockTest` run
+   (post-merge binary, moderate host load ~10-30) still triggered **341
+   compile-task enqueues across 128 distinct methods** —
+   `java/lang/reflect/Modifier.isStatic`/`.isPrivate`/`.isFinal`/`.isPublic`,
+   several `org/junit/platform/commons/util/ReflectionUtils`/`Preconditions`
+   methods, and numerous `org/h2/...` internals — all legitimately called
+   thousands of times by JUnit5's reflection-heavy test discovery and
+   H2/Hibernate's JDBC round-trips even within one short test-class
+   process. Raising the bar 7.5x (200 → 1500) delays when these cross the
+   line but does not stop them from eventually doing so. The sibling
+   bisection's extreme `CRATONVM_TIER_C1_THRESHOLD=100000` (500x the
+   original) was what fully suppressed compilation and produced a clean
+   pass — a threshold that high risks becoming indistinguishable from
+   disabling the JIT outright for small/medium workloads, which is not
+   something to default to without much broader validation than this
+   session could perform.
+
+   Five solo `LockTest` reruns with the new defaults (JIT nominally on,
+   no env overrides): **all 5 failed** the internal 5000ms timeout, with
+   overshoot varying 21232-27885ms across 4 runs taken at very heavy host
+   contention (`uptime` load average 184-215, 175+ concurrent users) and
+   7387ms on a 6th, later run at milder contention (load average ~10-30,
+   post-merge-rebuild). A same-window real-HotSpot solo run passed
+   cleanly both times it was tried (5706ms flat, 15/15, zero timeout),
+   confirming the residual gap is CratonVM-specific and not purely host
+   noise. A `--nojit` run on the *same* fix binary, same host, passed
+   cleanly (9631ms, 15/15) — proving interpreter-only execution
+   comfortably fits the budget and confirming JIT-related overhead
+   (compilation and/or the ongoing per-invocation tiered-profiling
+   bookkeeping that runs even for methods that never end up compiling)
+   is still the dominant remaining cost, just not fully eliminated by
+   this threshold raise alone.
+
+**Conclusion: landed the threshold raise as a genuine, low-risk,
+validated partial mitigation** (real CPU waste eliminated for every
+method that no longer crosses the lower 200-invocation bar at all; zero
+observed regression to steady-state/long-running throughput), **but
+`LockTest` and `CriteriaBuilderNonStandardFunctionsTest` remain OPEN** —
+neither passes reliably under default settings after this change. A
+full fix needs either a much more aggressive threshold (with the
+throughput risk above validated away across a broader benchmark set) or
+a fundamentally different heuristic — e.g. weighing a method's
+*remaining* expected call volume rather than just its cumulative count,
+or making the per-invocation tiered-bookkeeping itself cheaper/lock-free
+— both bigger undertakings than this follow-up session's time budget
+allowed. Left OPEN for a future session with more time and, ideally, a
+quieter host: this session's host load swung from 6.9 to 215 over the
+course of testing, which by itself makes wall-clock pass/fail signal for
+a 5-second-budget test hard to trust in isolation — though the
+`--nojit`-vs-JIT-on same-binary, same-host comparison above is the most
+trustworthy signal gathered this round, and it points at JIT-on overhead
+(compile activity and/or bookkeeping), not host noise, as the residual
+cause.
+
 ## `CriteriaBuilderNonStandardFunctionsTest` — RESOLVED: original symptom stale, residual is JIT compile-time tax (2026-07-16)
 
 `org.hibernate.orm.test.query.criteria.CriteriaBuilderNonStandardFunctionsTest`
@@ -341,6 +427,24 @@ worth a follow-up look: `al_slots_for`'s per-call, uncached
 (caught live via gdb mid-stall) — a small per-`ClassId` cache there is a
 plausible, low-risk contribution to closing part of the general throughput
 gap, independent of the JIT-tax question.
+
+**Update 2026-07-16 (follow-up session): same partial-mitigation-not-full-fix
+outcome as the `LockTest` entry above.** The `fix/jit-compile-time-tax-20260716`
+threshold raise (`c1_threshold` 200 -> 1500, `c2_threshold` 5000 -> 20000,
+see that entry for the full validation writeup) was tested against this
+class too: a solo run on the pre-merge fix binary still hit the 120s
+`TimeoutException` (`ms=148340`, 17/18 ok, 1 failed — same shape as
+before), with the new `CRATONVM_DBG_TIER_ENQUEUE` diagnostic showing zero
+compile-task enqueues *in that specific run* — but the `LockTest` entry's
+later post-merge run showed the "zero enqueues" reading is not a reliable
+sign of true suppression by itself (it can also mean the process was so
+starved of CPU under extreme host contention that no method reached even
+the raised 1500-invocation bar; a calmer run on the same binary reached
+1500+ for 128 distinct methods). Given that ambiguity, this class's result
+should be read the same way as `LockTest`'s: the threshold raise is a real,
+validated, safe mitigation with no steady-state throughput regression, but
+it does **not** reliably fix this class's timeout either. Remains OPEN,
+tracked jointly with `LockTest` at the JIT-policy level.
 
 ## Already-expected ABORTED entries (matches HotSpot, not a defect)
 

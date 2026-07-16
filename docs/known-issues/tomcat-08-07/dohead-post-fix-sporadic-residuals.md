@@ -1,6 +1,52 @@
 # DoHead family — post-fix sporadic residual singletons (catalogue)
 
-**Status:** OPEN (low priority, low rate). **Severity:** low. **Context:**
+## 2026-07-16 closure attempt checkpoint
+
+**Status: OPEN.** This note must stay in `docs/known-issues`: the current
+two-process / 1 GiB Windows stress oracle still produces sporadic HTTP/2
+mid-frame EOFs. In the final observed eight-class batch,
+`TestHttpServletDoHeadInvalidWrite0ValidWrite1` failed twice and
+`TestHttpServletDoHeadInvalidWrite0ValidWrite511` failed once, each with
+`End of input stream with [9] bytes left`, out of 288 parameterizations.
+Each was in `testDoHeadHttp2`; the server log had no application exception.
+Immediate isolated reruns of `0 -> 1`, `0 -> 511`, and `1 -> 1023` passed,
+including a two-process rerun of `1 -> {1023,1024}`. This is a low-rate
+runtime transport residual, not a completed closure.
+
+### Changes in this checkpoint
+
+1. Prevented a late synthetic `URI.toURL()` registration from replacing the
+   real URL-aware implementation. That removed
+   `NoSuchMethodError: java/lang/Object.toExternalForm()` and the associated
+   dropped HTTP/2 responses. The exact `1023 -> 512` class passed 288/288 and
+   the focused `511/512/513/1024` group passed 1,152/1,152.
+2. Pinned `URLClassLoader` construction inputs through allocating
+   initialization steps, including `ucp` creation, to address the observed
+   `WebappLoader.buildClassPath` null-`ucp` path under moving GC.
+3. Made in-flight selector close wakeups return normally instead of throwing
+   `ClosedSelectorException` into Tomcat `Poller.destroy`. The focused native
+   selector suite passed 24/24, and the full `1 -> *` pressure batch no longer
+   showed the LifecycleException.
+4. Rooted scalar and gathering `SocketChannel` Java buffers across native I/O
+   and reload them before buffer updates. `cargo check -p cratonvm-native-io`
+   passes. The gathering-write change has not yet been built into a fresh
+   release binary or credited as a fix for the remaining EOF residual.
+
+### Evidence and next gate
+
+- `cargo test -p cratonvm-native-builtins --lib`: 2,998 local and 2,999
+  isolated-Azure passes before this checkpoint's final socket changes.
+- `cargo test -p cratonvm-native-io --lib selector -- --test-threads=1`:
+  24 passed after the selector change.
+- Four early two-process batches passed 9,216 parameterized cases. A later
+  batch exposed the selector, header, and HTTP/2 residuals; the first two were
+  removed by the changes above, while EOF remains sporadic.
+
+Do not archive or move this document until a newly built binary containing the
+gathering-write root fix completes the full 64-class two-process matrix without
+transport, header, selector, loader, or native-stack residuals.
+
+**Historical status:** OPEN (low priority, low rate). **Severity:** low. **Context:**
 after the 2026-07-15 fixes (thread-identity aliasing + dying-thread
 card-buffer loss, see
 `docs/internal/tomcat-08-07/dohead-residual-http2-midrun-hang-FIXED.md`),
