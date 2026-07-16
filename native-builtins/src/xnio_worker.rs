@@ -829,7 +829,12 @@ fn pop_pending_accept(id: u64) -> Option<TcpStream> {
 /// Allocate the Java `Xnio` mirror (singleton) — lazily created.
 fn alloc_xnio_mirror(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, CLS_XNIO, XNIO_NUM_SLOTS);
+    // Family-1 fix (cce0079): `create_string` allocates and can move the
+    // still-unrooted `obj` — refresh before the stores/return.
+    let obj_pin = ctx.pin_native_root(obj);
     let name = ctx.create_string("nio");
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(obj_pin);
     ctx.set_field(obj, XNIO_FIELD_NAME, Value::Object(Some(name)));
     ctx.set_field(obj, XNIO_FIELD_PROVIDER_HANDLE, Value::Long(1));
     obj
@@ -843,7 +848,14 @@ fn alloc_worker_mirror(
     worker: &Arc<XnioWorker>,
 ) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, class, WORKER_NUM_SLOTS);
+    // Family-1 fix (cce0079): `create_string` allocates and can move the
+    // still-unrooted `obj` — refresh before the stores and the
+    // identity-hash registry insert (`remember_worker_object` on a stale
+    // ref registers the WRONG key, so every later `read_worker` misses).
+    let obj_pin = ctx.pin_native_root(obj);
     let name = ctx.create_string(&worker.name);
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(obj_pin);
     ctx.set_field(obj, WORKER_FIELD_NAME, Value::Object(Some(name)));
     ctx.set_field(obj, WORKER_FIELD_IO_THREADS_ARR, Value::Object(None));
     ctx.set_field(
@@ -949,15 +961,22 @@ fn decode_xnio_bind_address(
     ctx: &mut dyn NativeContext,
     addr: ObjectRef,
 ) -> Result<(String, u16), MethodCallFailed> {
+    // Family-1 fix (cce0079): both `invoke_virtual`s below are GC-capable —
+    // refresh `addr` after each, or the follow-up dispatch/field reads
+    // operate on a stale receiver.
+    let addr_pin = ctx.pin_native_root(addr);
     let port_via_method = match ctx.invoke_virtual(addr, "getPort", "()I", &[]) {
         Ok(Some(Value::Int(v))) if (0..=u16::MAX as i32).contains(&v) => Some(v as u16),
         _ => None,
     };
+    let addr = ctx.read_native_pin(addr_pin, addr);
     let host_via_method =
         match ctx.invoke_virtual(addr, "getHostString", "()Ljava/lang/String;", &[]) {
             Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
             _ => None,
         };
+    let addr = ctx.read_native_pin(addr_pin, addr);
+    ctx.unpin_native_roots(addr_pin);
     if let Some(port) = port_via_method {
         let host = host_via_method.unwrap_or_else(|| "0.0.0.0".to_string());
         return Ok((
@@ -1011,7 +1030,24 @@ fn alloc_accepting_channel_mirror(
     accept_listener: Value,
     listener_id: u64,
 ) -> ObjectRef {
+    // Family-1 fix (cce0079): the mirror alloc can move all three inputs —
+    // pin and refresh them, or the field stores below write pre-GC
+    // addresses (a stale acceptListener slot dispatches the accept on the
+    // wrong object).
+    let worker_pin = ctx.pin_native_root(worker);
+    let la_pin = ctx.pin_native_root(local_address);
+    let al_pin = match accept_listener {
+        Value::Object(Some(o)) => Some(ctx.pin_native_root(o)),
+        _ => None,
+    };
     let obj = alloc_concurrent_synthetic(ctx, CLS_ACCEPTING_CHANNEL, ACCEPT_NUM_SLOTS);
+    let worker = ctx.read_native_pin(worker_pin, worker);
+    let local_address = ctx.read_native_pin(la_pin, local_address);
+    let accept_listener = match (accept_listener, al_pin) {
+        (Value::Object(Some(o)), Some(h)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+        (v, _) => v,
+    };
+    ctx.unpin_native_roots(worker_pin);
     ctx.set_field(
         obj,
         ACCEPT_FIELD_LOCAL_ADDRESS,
@@ -1046,7 +1082,24 @@ fn native_xnio_create_tcp_connection_server(
     let worker = obj_arg(args, 0)?;
     let bind_addr = obj_arg(args, 1)?;
     let accept_listener = args.get(2).copied().unwrap_or(Value::Object(None));
-    let (host, port) = decode_xnio_bind_address(ctx, bind_addr)?;
+    // Family-1 fix (cce0079): `decode_xnio_bind_address` dispatches
+    // getPort/getHostString (GC-capable) — refresh all three inputs before
+    // handing them to the mirror alloc.
+    let worker_pin = ctx.pin_native_root(worker);
+    let ba_pin = ctx.pin_native_root(bind_addr);
+    let al_pin = match accept_listener {
+        Value::Object(Some(o)) => Some(ctx.pin_native_root(o)),
+        _ => None,
+    };
+    let decoded = decode_xnio_bind_address(ctx, bind_addr);
+    let worker = ctx.read_native_pin(worker_pin, worker);
+    let bind_addr = ctx.read_native_pin(ba_pin, bind_addr);
+    let accept_listener = match (accept_listener, al_pin) {
+        (Value::Object(Some(o)), Some(h)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+        (v, _) => v,
+    };
+    ctx.unpin_native_roots(worker_pin);
+    let (host, port) = decoded?;
     let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| {
         mcf_io(format!(
             "XnioWorker.createTcpConnectionServer bind {host}:{port}: {e}"
@@ -1068,14 +1121,22 @@ fn start_accept_pump(
     channel: ObjectRef,
     listener_id: u64,
 ) -> MethodCallResult {
+    // Family-1 fix (cce0079): the pump alloc can move `channel` (whose
+    // pre-GC address would then be stored into the pump's channel field —
+    // the accept loop later reads that field and operates on the wrong
+    // object), and `create_string` can move the still-unrooted `pump`
+    // BEFORE the old code ever pinned it. Pin `channel` first, pin `pump`
+    // immediately after its alloc, refresh at each step.
+    let channel_pin = ctx.pin_native_root(channel);
     let pump = alloc_concurrent_synthetic(ctx, CLS_ACCEPT_PUMP, ACCEPT_PUMP_NUM_SLOTS);
+    let channel = ctx.read_native_pin(channel_pin, channel);
+    let pump_pin = ctx.pin_native_root(pump);
     ctx.set_field(
         pump,
         ACCEPT_PUMP_FIELD_CHANNEL,
         Value::Object(Some(channel)),
     );
     let name = ctx.create_string(&format!("cratonvm-xnio-accept-{listener_id}"));
-    let pump_pin = ctx.pin_native_root(pump);
     let name_pin = ctx.pin_native_root(name);
     let pump = ctx.read_native_pin(pump_pin, pump);
     let name = ctx.read_native_pin(name_pin, name);
@@ -1084,12 +1145,17 @@ fn start_accept_pump(
         "(Ljava/lang/Runnable;Ljava/lang/String;)V",
         &[Value::Object(Some(pump)), Value::Object(Some(name))],
     );
-    ctx.unpin_native_roots(pump_pin);
+    ctx.unpin_native_roots(channel_pin);
     let thread = match thread? {
         Some(Value::Object(Some(thread))) => thread,
         _ => return Ok(None),
     };
+    // `setDaemon` is a Java dispatch (GC-capable) — refresh `thread` before
+    // `start`.
+    let thread_pin = ctx.pin_native_root(thread);
     let _ = ctx.invoke_virtual(thread, "setDaemon", "(Z)V", &[Value::Int(1)]);
+    let thread = ctx.read_native_pin(thread_pin, thread);
+    ctx.unpin_native_roots(thread_pin);
     let _ = ctx.invoke_virtual(thread, "start", "()V", &[]);
     Ok(None)
 }
@@ -1149,8 +1215,11 @@ fn ensure_source_poller_started(ctx: &mut dyn NativeContext) {
     }
 
     let poller = alloc_concurrent_synthetic(ctx, CLS_SOURCE_POLLER, SOURCE_POLLER_NUM_SLOTS);
-    let name = ctx.create_string(&format!("cratonvm-xnio-source-poll-{vm}"));
+    // Family-1 fix (cce0079): pin `poller` BEFORE `create_string` — the
+    // string alloc can move the still-unrooted poller, and the old
+    // pin-after-alloc ordering then pinned an already-stale address.
     let poller_pin = ctx.pin_native_root(poller);
+    let name = ctx.create_string(&format!("cratonvm-xnio-source-poll-{vm}"));
     let name_pin = ctx.pin_native_root(name);
     let poller = ctx.read_native_pin(poller_pin, poller);
     let name = ctx.read_native_pin(name_pin, name);
@@ -1172,7 +1241,12 @@ fn ensure_source_poller_started(ctx: &mut dyn NativeContext) {
             return;
         }
     };
+    // `setDaemon` is a Java dispatch (GC-capable) — refresh `thread` before
+    // `start` (Family-1 fix, cce0079).
+    let thread_pin = ctx.pin_native_root(thread);
     let _ = ctx.invoke_virtual(thread, "setDaemon", "(Z)V", &[Value::Int(1)]);
+    let thread = ctx.read_native_pin(thread_pin, thread);
+    ctx.unpin_native_roots(thread_pin);
     let _ = ctx.invoke_virtual(thread, "start", "()V", &[]);
 }
 
@@ -1676,21 +1750,50 @@ fn native_iot_open_tcp_stream_connection(
     let open_listener = args.get(3).copied().unwrap_or(Value::Object(None));
     let bind_listener = args.get(4).copied().unwrap_or(Value::Object(None));
 
-    let (host, port) = decode_xnio_bind_address(ctx, destination)?;
-    let stream = TcpStream::connect((host.as_str(), port)).map_err(|e| {
-        mcf_io(format!(
-            "XnioIoThread.openTcpStreamConnection: connect {host}:{port} failed: {e}"
-        ))
-    })?;
+    // Family-1 fix (cce0079): the two listeners cross `decode`'s dispatches,
+    // every alloc below, AND `ensure_source_poller_started` before they are
+    // finally used as `handleEvent` receivers — pin them at entry and read
+    // the current addresses at dispatch time. `pin_base` is the lowest live
+    // handle; truncating it on every exit releases the whole set.
+    let ol_pin = match open_listener {
+        Value::Object(Some(o)) => Some(ctx.pin_native_root(o)),
+        _ => None,
+    };
+    let bl_pin = match bind_listener {
+        Value::Object(Some(o)) => Some(ctx.pin_native_root(o)),
+        _ => None,
+    };
+    let io_thread_pin = ctx.pin_native_root(io_thread);
+    let pin_base = ol_pin.or(bl_pin).unwrap_or(io_thread_pin);
+
+    let (host, port) = match decode_xnio_bind_address(ctx, destination) {
+        Ok(t) => t,
+        Err(e) => {
+            ctx.unpin_native_roots(pin_base);
+            return Err(e);
+        }
+    };
+    let stream = match TcpStream::connect((host.as_str(), port)) {
+        Ok(s) => s,
+        Err(e) => {
+            ctx.unpin_native_roots(pin_base);
+            return Err(mcf_io(format!(
+                "XnioIoThread.openTcpStreamConnection: connect {host}:{port} failed: {e}"
+            )));
+        }
+    };
     let local_addr = stream.local_addr().ok();
     let peer_addr = stream.peer_addr().ok();
-    let io_thread_pin = ctx.pin_native_root(io_thread);
     let _ = stream.set_nonblocking(true);
-    let source_stream = stream.try_clone().map_err(|e| {
-        mcf_io(format!(
-            "XnioIoThread.openTcpStreamConnection: clone stream failed: {e}"
-        ))
-    })?;
+    let source_stream = match stream.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            ctx.unpin_native_roots(pin_base);
+            return Err(mcf_io(format!(
+                "XnioIoThread.openTcpStreamConnection: clone stream failed: {e}"
+            )));
+        }
+    };
 
     let source_id = register_source_channel(ConduitTransport::Tcp(source_stream));
     let sink_id = register_sink_channel(ConduitTransport::Tcp(stream));
@@ -1704,12 +1807,17 @@ fn native_iot_open_tcp_stream_connection(
         "java/util/concurrent/atomic/AtomicReference",
         "()V",
         &[],
-    )? {
-        Some(Value::Object(Some(o))) => o,
-        _ => {
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        Ok(_) => {
+            ctx.unpin_native_roots(pin_base);
             return Err(mcf_runtime(
                 "StreamConnection: failed to allocate close listener ref",
-            ))
+            ));
+        }
+        Err(e) => {
+            ctx.unpin_native_roots(pin_base);
+            return Err(e);
         }
     };
     let close_pin = ctx.pin_native_root(close_ref);
@@ -1738,30 +1846,38 @@ fn native_iot_open_tcp_stream_connection(
     remember_stream_connection_addresses(ctx, conn, local_addr, peer_addr);
     ensure_source_poller_started(ctx);
 
-    if let Value::Object(Some(listener)) = bind_listener {
+    // `ensure_source_poller_started` allocates and starts a thread — refresh
+    // `conn` and each listener through their pins at dispatch time, and
+    // again between the two dispatches (the first listener runs arbitrary
+    // Java).
+    let mut conn = ctx.read_native_pin(conn_pin, conn);
+    if let (Value::Object(Some(listener)), Some(h)) = (bind_listener, bl_pin) {
+        let listener = ctx.read_native_pin(h, listener);
         let _ = ctx.invoke_virtual(
             listener,
             "handleEvent",
             "(Ljava/nio/channels/Channel;)V",
             &[Value::Object(Some(conn))],
         );
+        conn = ctx.read_native_pin(conn_pin, conn);
     }
-    if let Value::Object(Some(listener)) = open_listener {
+    if let (Value::Object(Some(listener)), Some(h)) = (open_listener, ol_pin) {
+        let listener = ctx.read_native_pin(h, listener);
         let _ = ctx.invoke_virtual(
             listener,
             "handleEvent",
             "(Ljava/nio/channels/Channel;)V",
             &[Value::Object(Some(conn))],
         );
+        conn = ctx.read_native_pin(conn_pin, conn);
     }
 
-    let conn = ctx.read_native_pin(conn_pin, conn);
     let future = ctx.new_object_initialized(
         "org/xnio/FinishedIoFuture",
         "(Ljava/lang/Object;)V",
         &[Value::Object(Some(conn))],
     );
-    ctx.unpin_native_roots(io_thread_pin);
+    ctx.unpin_native_roots(pin_base);
     future
 }
 

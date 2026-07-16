@@ -107,6 +107,20 @@ fn arrstore_enabled() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_ARRSTORE").is_some())
 }
 
+/// Cached `CRATONVM_DBG_CCE_BT` gate (WildFly `parallel-extension-add` CCE
+/// family): print receiver identity (class + address, and `via_pin` where
+/// applicable) at the moment a `ClassCastException` is constructed, so a
+/// wrong-object read can be correlated against GC cycle logs and the
+/// `CRATONVM_DBG_STALE_OBJREF` quarantine ring. The native-collections
+/// natural-order sites have a matching hook (with native backtrace) behind
+/// the same variable.
+#[inline]
+pub fn dbg_cce_bt_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_CCE_BT").is_some())
+}
+
 /// Cached `CRATONVM_DBG_NO_REFPROC` gate (bc math-ec 0x4): skip ALL post-GC
 /// reference processing — subsystem-level exclusion experiment.
 #[inline]
@@ -14961,6 +14975,18 @@ fn execute_instruction(
                         // FQN exactly as on HotSpot.
                         let obj_binary = obj_class_name.replace('/', ".");
                         let target_binary = target_class_name.replace('/', ".");
+                        // CRATONVM_DBG_CCE_BT: identify the failing receiver
+                        // (address + classes) at the moment a checkcast CCE
+                        // is constructed — attribution for the WildFly
+                        // `parallel-extension-add` stale-object CCE family,
+                        // correlated against GC logs / the
+                        // CRATONVM_DBG_STALE_OBJREF quarantine ring.
+                        if crate::runtime::interpreter::dbg_cce_bt_enabled() {
+                            eprintln!(
+                                "CRATONVM_DBG_CCE_BT: site=checkcast obj={obj_binary} @0x{:x} target={target_binary}",
+                                obj_ref.as_ptr() as usize
+                            );
+                        }
                         return Err(RuntimeError::ClassCastException {
                             message: format!("{obj_binary} cannot be cast to {target_binary}"),
                         }
@@ -19388,6 +19414,20 @@ fn checkcast_lambda_instantiated_args(
                 .and_then(|d| d.strip_suffix(';'))
                 .unwrap_or(inst_tok)
                 .replace('/', ".");
+            // CRATONVM_DBG_CCE_BT: same attribution hook as the `checkcast`
+            // opcode, plus whether this argument was read through the pinned
+            // path (`via_pin`) — re-establishing the 2026-07-15 session's
+            // temporary instrumentation permanently (that session measured
+            // via_pin=true on every captured stale read here).
+            if crate::runtime::interpreter::dbg_cce_bt_enabled() {
+                let via_pin = handles.get(idx).copied().flatten().is_some();
+                eprintln!(
+                    "CRATONVM_DBG_CCE_BT: site=lambda_instantiated_args obj={} @0x{:x} target={} via_pin={via_pin}",
+                    obj_class_name.replace('/', "."),
+                    obj_ref.as_ptr() as usize,
+                    target_binary
+                );
+            }
             // Same dotted-name shape as the `checkcast` opcode (tools such as
             // mockk's `JvmAutoHinter` parse this text).
             return Err(RuntimeError::ClassCastException {
@@ -19467,12 +19507,32 @@ fn lambda_arg_provably_not_instance(shared: &SharedVm, obj_ref: ObjectRef, desc_
     } else {
         false
     };
+    // AOTSVC-1: the checks above only prove a match via ClassId identity
+    // (`is_sub`) or an exact defining-loader-namespace lookup
+    // (`loader_scoped_is_sub`, which requires the object's OWN loader to have
+    // already resolved `target` under its own namespace). Neither covers the
+    // case exercised by `AotServices.factories().load(...)`-style SPI
+    // discovery (Spring's `SpringFactoriesLoader.instantiateFactory`):
+    // `ClassUtils.forName(implementationName, TCCL)` + `Constructor.newInstance`
+    // allocate the service object using the EXACT ClassId resolved through the
+    // caller's classloader argument, but never drive that same loader's
+    // `loadClass` for the interface types the service implements — so
+    // `class_defined_by_loader_exact(target, obj's loader)` can miss even
+    // though the object's own `interfaces` list (populated at define/link time
+    // from its own class file) already carries a same-named entry. This is the
+    // identical name-vs-identity gap `loader_aware_name_assignable` already
+    // closes for the ordinary bytecode `checkcast` opcode — reuse it here so
+    // direct lambda dispatch (which bypasses that opcode, see this function's
+    // caller) gets the same loader-faithful answer instead of a false
+    // `ClassCastException` for a same-named, different-loader interface copy
+    // (e.g. `TestRuntimeHintsRegistrar` under `@CompileWithForkedClassLoader`).
     if is_sub
         || loader_scoped_is_sub
         || lambda_proxy_satisfies(shared, obj_class_id, target_cid)
         || synthetic_implements(shared, obj_class_id, target)
         || proxy_instance_satisfies_target(shared, obj_ref, target)
         || annotation_proxy_satisfies_target(shared, obj_ref, target)
+        || loader_aware_name_assignable(shared, obj_class_id, target_cid, target)
     {
         return false;
     }
@@ -23250,6 +23310,104 @@ fn force_native_over_real_jdk_bytecode(
     hotpath_counts::bump(&hotpath_counts::FORCE_NATIVE_CALLS);
     if is_undertow_native_override(class_name, method_name, method_descriptor) {
         return true;
+    }
+    // Tomcat application methods are never registered native overrides apart
+    // from the audited bridges below. Reject the large compatibility table
+    // early on its hot scanner paths.
+    if (class_name.starts_with("org/apache/")
+        && !matches!(
+            class_name,
+            "org/apache/maven/surefire/booter/ForkedBooter"
+                | "org/apache/tomcat/util/buf/CharChunk"
+                | "org/apache/tomcat/util/buf/AbstractChunk"
+                | "org/apache/tomcat/util/bcel/classfile/Constant"
+        ))
+        || class_name == "java/net/URI"
+    {
+        return false;
+    }
+    if class_name == "org/apache/tomcat/util/buf/CharChunk"
+        && matches!(
+            (method_name, method_descriptor),
+            ("toString", "()Ljava/lang/String;")
+                | ("endsWith", "(Ljava/lang/String;)Z")
+                | ("indexOf", "(C)I")
+        )
+    {
+        return true;
+    }
+    if class_name == "org/apache/tomcat/util/buf/AbstractChunk"
+        && method_name == "indexOf"
+        && method_descriptor == "(Ljava/lang/String;III)I"
+    {
+        return true;
+    }
+    if class_name == "org/apache/tomcat/util/bcel/classfile/Constant"
+        && method_name == "readConstant"
+        && method_descriptor
+            == "(Ljava/io/DataInput;)Lorg/apache/tomcat/util/bcel/classfile/Constant;"
+    {
+        return true;
+    }
+    if class_name == "java/io/BufferedInputStream"
+        && method_name == "read"
+        && matches!(method_descriptor, "([BII)I" | "()I")
+    {
+        return true;
+    }
+    if class_name == "java/io/DataInputStream"
+        && matches!(
+            (method_name, method_descriptor),
+            ("readUTF", "()Ljava/lang/String;")
+                | ("readByte", "()B")
+                | ("readUnsignedByte", "()I")
+                | ("readUnsignedShort", "()I")
+                | ("readInt", "()I")
+                | ("readLong", "()J")
+                | ("readFloat", "()F")
+                | ("readDouble", "()D")
+                | ("skipBytes", "(I)I")
+        )
+    {
+        return true;
+    }
+    if class_name == "java/io/FileInputStream"
+        && method_name == "read"
+        && method_descriptor == "([BII)I"
+    {
+        return true;
+    }
+    if class_name == "java/io/File"
+        && matches!(
+            (method_name, method_descriptor),
+            ("isDirectory", "()Z")
+                | ("list", "()[Ljava/lang/String;")
+                | ("getName", "()Ljava/lang/String;")
+                | ("canRead", "()Z")
+        )
+    {
+        return true;
+    }
+    if class_name == "java/lang/String"
+        && !matches!(
+            (method_name, method_descriptor),
+            (
+                "replaceAll",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"
+            ) | (
+                "replaceFirst",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"
+            ) | ("matches", "(Ljava/lang/String;)Z")
+                | (
+                    "replace",
+                    "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;"
+                )
+                | ("substring", "(II)Ljava/lang/String;")
+                | ("<init>", "([BLjava/lang/String;)V")
+                | ("<init>", "([BIILjava/lang/String;)V")
+        )
+    {
+        return false;
     }
     if is_class_mirror_native_override(class_name, method_name, method_descriptor) {
         return true;
@@ -29588,12 +29746,24 @@ fn try_jit_upgrade_with_gate(
     // retry and stayed interpreted forever — the dominant cause of the
     // BC-suite 34-64× interpreter gap. String/Class ldc returns None →
     // compile bails (matches the OSR path's `_ => return None`).
-    let ldc_resolver = |cp_idx: u16| -> Option<i64> {
+    let ldc_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitLdcConstant> {
         let cm = shared.class_manager.read();
         let class = cm.get_class(class_id)?;
         match class.constant_pool.get(cp_idx)? {
-            ConstantPoolEntry::Integer(v) => Some(*v as i64), // Cast: JIT ABI — i64 register convention
-            ConstantPoolEntry::Float(v) => Some(v.to_bits() as i64), // Cast: JIT ABI -- float bits to i64
+            ConstantPoolEntry::Integer(v) => {
+                Some(cratonvm_jit::JitLdcConstant::Immediate(*v as i64))
+            }
+            ConstantPoolEntry::Float(v) => {
+                Some(cratonvm_jit::JitLdcConstant::Immediate(v.to_bits() as i64))
+            }
+            ConstantPoolEntry::StringReference { string_index }
+                if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
+            {
+                class
+                    .constant_pool
+                    .get_utf8(*string_index)
+                    .map(|s| cratonvm_jit::JitLdcConstant::String(s.to_string()))
+            }
             _ => None,
         }
     };
@@ -29907,12 +30077,24 @@ fn try_jit_upgrade_with_gate(
             // Integer.MIN_VALUE) failed codegen at the 0x12 arm and stayed
             // interpreted forever. String/Class ldc returns None → compile
             // bails (matches the OSR path's behaviour).
-            let c_ldc_resolver = |cp_idx: u16| -> Option<i64> {
+            let c_ldc_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitLdcConstant> {
                 let cm = shared.class_manager.read();
                 let class = cm.get_class(callee_cid)?;
                 match class.constant_pool.get(cp_idx)? {
-                    ConstantPoolEntry::Integer(v) => Some(*v as i64), // Cast: JIT ABI — i64 register convention
-                    ConstantPoolEntry::Float(v) => Some(v.to_bits() as i64), // Cast: JIT ABI -- float bits to i64
+                    ConstantPoolEntry::Integer(v) => {
+                        Some(cratonvm_jit::JitLdcConstant::Immediate(*v as i64))
+                    }
+                    ConstantPoolEntry::Float(v) => {
+                        Some(cratonvm_jit::JitLdcConstant::Immediate(v.to_bits() as i64))
+                    }
+                    ConstantPoolEntry::StringReference { string_index }
+                        if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
+                    {
+                        class
+                            .constant_pool
+                            .get_utf8(*string_index)
+                            .map(|s| cratonvm_jit::JitLdcConstant::String(s.to_string()))
+                    }
                     _ => None,
                 }
             };
@@ -30683,12 +30865,24 @@ fn try_jit_compile_callee_slow(
 
     // RBC.2 — `ldc`/`ldc_w` int/float constants; see the matching resolver
     // in `try_jit_upgrade_with_gate`. String/Class ldc → None → compile bail.
-    let ldc_resolver = |cp_idx: u16| -> Option<i64> {
+    let ldc_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitLdcConstant> {
         let cm = shared.class_manager.read();
         let class = cm.get_class(cid)?;
         match class.constant_pool.get(cp_idx)? {
-            ConstantPoolEntry::Integer(v) => Some(*v as i64), // Cast: JIT ABI — i64 register convention
-            ConstantPoolEntry::Float(v) => Some(v.to_bits() as i64), // Cast: JIT ABI -- float bits to i64
+            ConstantPoolEntry::Integer(v) => {
+                Some(cratonvm_jit::JitLdcConstant::Immediate(*v as i64))
+            }
+            ConstantPoolEntry::Float(v) => {
+                Some(cratonvm_jit::JitLdcConstant::Immediate(v.to_bits() as i64))
+            }
+            ConstantPoolEntry::StringReference { string_index }
+                if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
+            {
+                class
+                    .constant_pool
+                    .get_utf8(*string_index)
+                    .map(|s| cratonvm_jit::JitLdcConstant::String(s.to_string()))
+            }
             _ => None,
         }
     };
@@ -35515,6 +35709,30 @@ fn dump_imse_holdcount_state(shared: &SharedVm, thread: &JvmThread, exc: ObjectR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tomcat_scanner_uses_only_audited_native_bridges() {
+        assert!(!force_native_over_real_jdk_bytecode(
+            "org/apache/catalina/connector/Response",
+            "toAbsolute",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/io/DataInputStream",
+            "readInt",
+            "()I",
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/io/FileInputStream",
+            "read",
+            "([BII)I",
+        ));
+        assert!(!force_native_over_real_jdk_bytecode(
+            "org/apache/tomcat/unittest/TesterRequest",
+            "getRequestURI",
+            "()Ljava/lang/String;",
+        ));
+    }
 
     /// Perf/starvation fix (2026-07-13) — `stw_takeover_should_scan` must scan
     /// every round through the fast window (catching a genuinely in-JIT peer

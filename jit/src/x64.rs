@@ -7438,6 +7438,10 @@ struct Compiler {
     loop_unroll_hints: FxHashMap<usize, usize>,
     /// Resolved ldc/ldc_w constants: (bytecode_pc, i64 value).
     ldc_info: Vec<(usize, i64)>,
+    /// String ldc sites: (bytecode_pc, stable UTF-8 pointer, byte length).
+    /// The bytes are owned by the compiled method; code materializes the Java
+    /// object through `helpers.ldc_string` instead of baking an ObjectRef.
+    ldc_string_info: Vec<(usize, *const u8, usize)>,
     /// Resolved ldc2_w constants: (bytecode_pc, i64 value).
     ldc2w_info: Vec<(usize, i64)>,
     /// Runtime helper function pointers for JIT callbacks.
@@ -7752,6 +7756,7 @@ struct Compiler {
     anewarray_info_idx: FxHashMap<usize, usize>,
     typecheck_info_idx: FxHashMap<usize, usize>,
     ldc_info_idx: FxHashMap<usize, usize>,
+    ldc_string_info_idx: FxHashMap<usize, usize>,
     ldc2w_info_idx: FxHashMap<usize, usize>,
 
     /// Memo for `magic_signed_div32`: constant divisor → computed
@@ -8376,8 +8381,8 @@ impl Compiler {
         let raw_local_assignments = alloc_result.assignments;
         let raw_used_callee_saved = alloc_result.used_callee_saved;
         let raw_local_assignments_len = raw_local_assignments.len();
-        let gpr_local_homes_enabled = callee_saved_gpr_local_homes_enabled()
-            || KERNEL_REG_HOMES_ACTIVE.with(|c| c.get());
+        let gpr_local_homes_enabled =
+            callee_saved_gpr_local_homes_enabled() || KERNEL_REG_HOMES_ACTIVE.with(|c| c.get());
         let local_assignments = if gpr_local_homes_enabled {
             raw_local_assignments
         } else {
@@ -8551,6 +8556,7 @@ impl Compiler {
             branch_hints: FxHashMap::default(),
             loop_unroll_hints: FxHashMap::default(),
             ldc_info: Vec::new(),
+            ldc_string_info: Vec::new(),
             ldc2w_info: Vec::new(),
             branch_target_stack_depth: FxHashMap::default(),
             failed: false,
@@ -8617,6 +8623,7 @@ impl Compiler {
             anewarray_info_idx: FxHashMap::default(),
             typecheck_info_idx: FxHashMap::default(),
             ldc_info_idx: FxHashMap::default(),
+            ldc_string_info_idx: FxHashMap::default(),
             ldc2w_info_idx: FxHashMap::default(),
             magic_div_memo: FxHashMap::default(),
             // Set by `compile_with_param_slots` after construction; empty/0
@@ -8696,6 +8703,11 @@ impl Compiler {
         self.ldc_info_idx.reserve(self.ldc_info.len());
         for (i, e) in self.ldc_info.iter().enumerate() {
             self.ldc_info_idx.insert(e.0, i);
+        }
+        self.ldc_string_info_idx.clear();
+        self.ldc_string_info_idx.reserve(self.ldc_string_info.len());
+        for (i, e) in self.ldc_string_info.iter().enumerate() {
+            self.ldc_string_info_idx.insert(e.0, i);
         }
         self.ldc2w_info_idx.clear();
         self.ldc2w_info_idx.reserve(self.ldc2w_info.len());
@@ -17396,7 +17408,7 @@ impl Compiler {
                     let null_patch = self.buf.pos();
                     self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
                     self.deopt_stubs.push((null_patch, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
-                    // MOV R10D, DWORD [RAX + ARRAY_LENGTH_OFFSET] — array length
+                                                                // MOV R10D, DWORD [RAX + ARRAY_LENGTH_OFFSET] — array length
                     self.buf
                         .emit(&[0x44, 0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // Cast: x86-64 register encoding
                                                                                // Load loop bound into ECX
@@ -17988,6 +18000,19 @@ impl Compiler {
                 // ldc — load int/float/string constant from CP (1-byte index)
                 0x12 => {
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
+                    if let Some(&idx) = self.ldc_string_info_idx.get(&pc) {
+                        let (_, bytes, len) = self.ldc_string_info[idx];
+                        self.emit_pre_safepoint_spill();
+                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                        self.emit_mov_imm64(ARG_REGS[1], bytes as i64);
+                        self.emit_mov_imm64(ARG_REGS[2], len as i64);
+                        self.emit_call_absolute(self.helpers.ldc_string);
+                        self.emit_oop_map_for_safepoint();
+                        self.push_from_rax();
+                        self.mark_top_as_oop();
+                        pc += 2;
+                        continue;
+                    }
                     let val = self.ldc_info_idx.get(&pc).map(|&i| self.ldc_info[i].1);
                     match val {
                         Some(v) => {
@@ -18002,6 +18027,19 @@ impl Compiler {
                 // ldc_w — load int/float/string constant from CP (2-byte index)
                 0x13 => {
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
+                    if let Some(&idx) = self.ldc_string_info_idx.get(&pc) {
+                        let (_, bytes, len) = self.ldc_string_info[idx];
+                        self.emit_pre_safepoint_spill();
+                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                        self.emit_mov_imm64(ARG_REGS[1], bytes as i64);
+                        self.emit_mov_imm64(ARG_REGS[2], len as i64);
+                        self.emit_call_absolute(self.helpers.ldc_string);
+                        self.emit_oop_map_for_safepoint();
+                        self.push_from_rax();
+                        self.mark_top_as_oop();
+                        pc += 3;
+                        continue;
+                    }
                     let val = self.ldc_info_idx.get(&pc).map(|&i| self.ldc_info[i].1);
                     match val {
                         Some(v) => {
@@ -20929,7 +20967,14 @@ impl Compiler {
                             // `jit_putfield_object` helper.
                             if let Some(&(c_off, _)) =
                                 self.compact_field_off.get(&pc).filter(|_| {
-                                    cratonvm_types::compact_ref_fields_enabled()
+                                    // Keep compact reference stores behind the
+                                    // same opt-in as legacy inline putfield.
+                                    // A stale/misclassified compact receiver
+                                    // otherwise lets this bare 8-byte store
+                                    // scribble a Value cell during Tomcat's
+                                    // repeated webapp start/stop cycles.
+                                    inline_putfield_enabled()
+                                        && cratonvm_types::compact_ref_fields_enabled()
                                         && self.helpers.region_bounds_addr != 0
                                 })
                             {
@@ -26143,6 +26188,7 @@ pub fn compile(
         mic_slots,
         pic_slots,
         ldc_info,
+        Vec::new(),
         ldc2w_info,
         branch_hints,
         loop_unroll_hints,
@@ -26202,6 +26248,7 @@ pub fn compile_with_param_slots(
     // `Vec::new()` and the cascade is simply not emitted at any pc.
     pic_slots: Vec<(usize, *const super::JitPICSlot)>,
     ldc_info: Vec<(usize, i64)>,
+    ldc_string_info: Vec<(usize, *const u8, usize)>,
     ldc2w_info: Vec<(usize, i64)>,
     branch_hints: HashMap<usize, bool>,
     loop_unroll_hints: HashMap<usize, usize>,
@@ -26238,6 +26285,7 @@ pub fn compile_with_param_slots(
     // this is always consistent with an invokedynamic-free method there).
     indy_info: Vec<(usize, usize, u8)>,
 ) -> Option<CompiledMethod> {
+    let needs_heap = needs_heap || !ldc_string_info.is_empty();
     let verified_max_stack = PENDING_VERIFIED_MAX_STACK.with(|c| c.borrow_mut().take());
     // Consume the pure-kernel GPR local-homes request FIRST so an early bail
     // below can never leak it into an unrelated later compile on this thread.
@@ -26875,6 +26923,7 @@ pub fn compile_with_param_slots(
     compiler.branch_hints = branch_hints.into_iter().collect();
     compiler.loop_unroll_hints = loop_unroll_hints.into_iter().collect();
     compiler.ldc_info = ldc_info;
+    compiler.ldc_string_info = ldc_string_info;
     compiler.ldc2w_info = ldc2w_info;
     compiler.fp_hoist_info = fp_hoist_info;
     compiler.fp_strength_reduction_pcs = fp_strength_reduction_pcs;
@@ -27774,6 +27823,7 @@ mod tests {
             self_call_stack_guard: 0,
             region_bounds_addr: 0,
             native_stack_floor_fn: 0,
+            ldc_string: sentinel,
         }
     }
 
