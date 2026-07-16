@@ -1393,6 +1393,9 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         return Ok(Some(Value::Int(0)));
     }
     let mut buf = vec![0u8; len as usize];
+    // The OS read below may enter a GC-blocking region. Keep the Java buffer
+    // rooted and reload it before writing the received bytes back.
+    let bb_pin = ctx.pin_native_root(bb);
 
     // GC/STW-cooperation: when the channel is in its default *blocking*
     // mode (`configureBlocking(false)` never called — see F_BLOCKING /
@@ -1405,34 +1408,48 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // so a concurrent STW pause never waits on a thread parked here. Same
     // pattern as `re1_socket_read_stream` in `net_phase_e.rs`.
     ctx.begin_blocking_region();
-    let n_opt = {
+    let read_result = {
         let map = tcp_registry().read();
         match map.get(&id) {
             Some(TcpHandle::Stream(s)) => {
                 let r = try_read_nb(s, &mut buf).map_err(|e| map_err("read", e));
                 ctx.end_blocking_region();
-                r?
+                r
             }
             Some(TcpHandle::Connecting(_)) => {
                 ctx.end_blocking_region();
+                ctx.unpin_native_roots(bb_pin);
                 return Ok(Some(Value::Int(0)));
             }
             _ => {
                 ctx.end_blocking_region();
+                ctx.unpin_native_roots(bb_pin);
                 return Err(ioex("read: channel not a stream"));
             }
         }
     };
 
+    let n_opt = match read_result {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(bb_pin);
+            return Err(e);
+        }
+    };
     let n = match n_opt {
         Some(v) => v,
-        None => return Ok(Some(Value::Int(0))), // EAGAIN — JDK convention
+        None => {
+            ctx.unpin_native_roots(bb_pin);
+            return Ok(Some(Value::Int(0)));
+        }
     };
     if n > 0 {
         crate::net::socket_capture('r', id, &buf[..n as usize]);
+        let bb = ctx.read_native_pin(bb_pin, bb);
         let written = buffer_write_bytes(ctx, bb, &buf[..n as usize]);
         buffer_advance(ctx, bb, written);
     }
+    ctx.unpin_native_roots(bb_pin);
     Ok(Some(Value::Int(n)))
 }
 
@@ -1450,38 +1467,55 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if data.is_empty() {
         return Ok(Some(Value::Int(0)));
     }
+    // The OS write below may enter a GC-blocking region. Keep the Java buffer
+    // rooted until its position has been advanced after the write completes.
+    let bb_pin = ctx.pin_native_root(bb);
     // GC/STW-cooperation: same reasoning as `sc_read` above — a
     // blocking-mode channel's `TcpStream` can genuinely block in
     // `try_write_nb`'s `s.write()` (e.g. a full socket send buffer with a
     // slow/stalled peer), so bracket it unconditionally.
     ctx.begin_blocking_region();
-    let n_opt = {
+    let write_result = {
         let map = tcp_registry().read();
         match map.get(&id) {
             Some(TcpHandle::Stream(s)) => {
                 let r = try_write_nb(s, &data).map_err(|e| map_err("write", e));
                 ctx.end_blocking_region();
-                r?
+                r
             }
             Some(TcpHandle::Connecting(_)) => {
                 ctx.end_blocking_region();
+                ctx.unpin_native_roots(bb_pin);
                 return Ok(Some(Value::Int(0)));
             }
             _ => {
                 ctx.end_blocking_region();
+                ctx.unpin_native_roots(bb_pin);
                 return Err(ioex("write: channel not a stream"));
             }
         }
     };
 
+    let n_opt = match write_result {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(bb_pin);
+            return Err(e);
+        }
+    };
     let n = match n_opt {
         Some(v) => v,
-        None => return Ok(Some(Value::Int(0))), // EAGAIN
+        None => {
+            ctx.unpin_native_roots(bb_pin);
+            return Ok(Some(Value::Int(0)));
+        }
     };
     if n > 0 {
         crate::net::socket_capture('w', id, &data[..n as usize]);
+        let bb = ctx.read_native_pin(bb_pin, bb);
         buffer_advance(ctx, bb, n);
     }
+    ctx.unpin_native_roots(bb_pin);
     Ok(Some(Value::Int(n)))
 }
 
@@ -1540,50 +1574,82 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // so we can advance its position by the bytes actually consumed.
     let arr_len = ctx.array_length(srcs) as i32;
     let (start, end) = vec_window(args, arr_len);
-    let mut chunks: Vec<(ObjectRef, Vec<u8>)> = Vec::new();
+    let mut chunks = Vec::new();
     let mut total: usize = 0;
     for i in start..end {
         if let Value::Object(Some(bb)) = ctx.get_array_element(srcs, i as usize) {
             let bytes = buffer_read_bytes(ctx, bb).unwrap_or_default();
             total += bytes.len();
-            chunks.push((bb, bytes));
+            let pin = ctx.pin_native_root(bb);
+            chunks.push((pin, bb, bytes));
         }
     }
     if total == 0 {
+        for (pin, _, _) in chunks {
+            ctx.unpin_native_roots(pin);
+        }
         return Ok(Some(Value::Long(0)));
     }
     let mut data = Vec::with_capacity(total);
-    for (_, bytes) in &chunks {
+    for (_, _, bytes) in &chunks {
         data.extend_from_slice(bytes);
     }
 
-    let n_opt = {
+    let write_result = {
         let map = tcp_registry().read();
         match map.get(&id) {
             Some(TcpHandle::Stream(s)) => {
-                try_write_nb(s, &data).map_err(|e| map_err("write(gathering)", e))?
+                try_write_nb(s, &data).map_err(|e| map_err("write(gathering)", e))
             }
-            Some(TcpHandle::Connecting(_)) => return Ok(Some(Value::Long(0))),
-            _ => return Err(ioex("write(gathering): channel not a stream")),
+            Some(TcpHandle::Connecting(_)) => {
+                for (pin, _, _) in &chunks {
+                    ctx.unpin_native_roots(*pin);
+                }
+                return Ok(Some(Value::Long(0)));
+            }
+            _ => {
+                for (pin, _, _) in &chunks {
+                    ctx.unpin_native_roots(*pin);
+                }
+                return Err(ioex("write(gathering): channel not a stream"));
+            }
+        }
+    };
+    let n_opt = match write_result {
+        Ok(v) => v,
+        Err(e) => {
+            for (pin, _, _) in &chunks {
+                ctx.unpin_native_roots(*pin);
+            }
+            return Err(e);
         }
     };
     let n = match n_opt {
         Some(v) => v,
-        None => return Ok(Some(Value::Long(0))), // EAGAIN — JDK convention
+        None => {
+            for (pin, _, _) in &chunks {
+                ctx.unpin_native_roots(*pin);
+            }
+            return Ok(Some(Value::Long(0)));
+        }
     };
     if n > 0 {
         crate::net::socket_capture('w', id, &data[..n as usize]);
         // Distribute the written count across the source buffers, advancing
         // each position by the portion of its bytes that made it out.
         let mut remaining = n;
-        for (bb, bytes) in &chunks {
+        for (pin, bb, bytes) in &chunks {
             if remaining <= 0 {
                 break;
             }
             let consume = (bytes.len() as i32).min(remaining);
-            buffer_advance(ctx, *bb, consume);
+            let bb = ctx.read_native_pin(*pin, *bb);
+            buffer_advance(ctx, bb, consume);
             remaining -= consume;
         }
+    }
+    for (pin, _, _) in chunks {
+        ctx.unpin_native_roots(pin);
     }
     Ok(Some(Value::Long(n as i64)))
 }
