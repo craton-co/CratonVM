@@ -85,3 +85,47 @@ Worth folding into whichever session picks up this cluster's "per-class
 profiling" next step -- the JIT-compile-tax bisection methodology (disable
 JIT vs raise compile thresholds vs default) is a fast, cheap first cut that
 could be run against the other 7 classes here before deeper profiling.
+
+## Follow-up (2026-07-16, later session): threshold-raise fix landed on dev, checked against this cluster -- inconclusive, do not assume it helps
+
+`fix/jit-compile-time-tax-20260716` (merged to dev) raised
+`jit/src/tiered.rs`'s `CompilationPolicy` defaults from
+`c1_threshold=200/c2_threshold=5000` to `c1_threshold=1500/c2_threshold=20000`
+-- see the `LockTest`/`CriteriaBuilderNonStandardFunctionsTest` entries in
+[hib-misc-residuals-20260716.md](hib-misc-residuals-20260716.md) for the
+full validation writeup. Short version: it's a real, safe, validated
+mitigation (no steady-state throughput regression on a `fib(32)` A/B or the
+`vm/benches/vm_benchmarks.rs` suite) but it did **not** reliably fix either
+of those two classes -- a solo `LockTest` run on the fixed binary still
+triggered 341 compile-task enqueues across 128 distinct methods (JUnit5
+reflection-discovery + H2 internals called thousands of times even within
+one short process), and `CriteriaBuilderNonStandardFunctionsTest` still hit
+its 120s `TimeoutException`.
+
+A spot-check of one class from this cluster was attempted --
+`org.hibernate.orm.test.batch.BatchTest` -- but was **inconclusive**: the
+solo run was launched under a 200s `timeout` wrapper that turned out to be
+shorter than this class's own previously-recorded ~320s
+(`testBatchInsertUpdate` = 320518ms in the table above), so the process was
+killed before producing any `@@RESULT`/`@@FAIL` line. Re-running with a
+longer wrapper (400s+) was not done this round due to time constraints, so
+this cluster's classes remain **unchecked** against the threshold-raise fix.
+`ScannerTest` was not re-attempted either (the `hib-misc-residuals` doc's
+`--nojit` corroboration attempt against it already hit the same
+`could not interpret url` packaging/classpath harness limitation tracked in
+that doc's `JarVisitorTest` entry, unrelated to the JIT).
+
+Given the `LockTest`/`CriteriaBuilderNonStandardFunctionsTest` result above
+(fix does not suppress compilation for reflection-heavy workloads, just
+delays it), there is no reason to assume the threshold raise resolves any
+of these 7 classes either -- if anything the evidence points the other way
+(these classes' methods almost certainly also cross 1500 invocations well
+within their multi-hundred-second runtimes). Leaving this cluster's
+individual classes unchecked and OPEN rather than claiming a benefit that
+wasn't demonstrated. Next session picking this up should rerun the
+JIT-compile-tax bisection (`--nojit` / raised-threshold / default) against
+2-3 of these classes with a `timeout` wrapper generously longer than each
+class's own previously-recorded elapsed time, using the new
+`CRATONVM_DBG_TIER_ENQUEUE` diagnostic (added by the fix, in
+`jit/src/tiered.rs`) to confirm compile activity directly rather than
+inferring it from pass/fail alone.
