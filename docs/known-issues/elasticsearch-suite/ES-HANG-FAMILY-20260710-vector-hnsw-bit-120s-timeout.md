@@ -115,3 +115,64 @@ CP=$(tr -d '\r' < "$ES/server/build/craton-testcp.txt" | tr '\n' ':' | sed 's/:$
   -Des.path.home="$ES" -Djava.awt.headless=true \
   -cp "$CP" org.junit.runner.JUnitCore org.elasticsearch.index.codec.vectors.ES815HnswBitVectorsFormatTests
 ```
+
+## 2026-07-16 follow-up: profiled the residual interpreter throughput gap — no single fixable hotspot found
+
+Investigated whether the ~40-90x HNSW-bit slowdown (documented above) has one
+isolated, fixable root cause, using `perf record -g -F 999` against a live
+`ES815HnswBitVectorsFormatTests` run (worktree
+`/data/victor-worktrees/perf-hnswbit-20260716`, branch
+`perf/es-hnswbit-throughput-20260716`, binary
+`cratonvm-perf-hnswbit-20260716`).
+
+**Caveat on this specific run:** the Azure host was under extreme, sustained
+multi-tenant contention while profiling (load average climbed from ~73 to
+~280+ on 16 cores, 70-140 concurrent users over about an hour) — `perf`
+attributed ~61% of samples to unresolved kernel addresses (`[k] 0x...`),
+almost certainly scheduler/context-switch noise from that contention rather
+than genuine CratonVM work, plus 923 lost samples out of ~399K. The
+userspace (non-kernel) portion of the profile is still informative, but a
+re-run under a quiet host would sharpen the percentages.
+
+**Finding: the userspace self-time is spread thin across many small
+functions, not concentrated in one hotspot.** The top individual
+`cratonvm_vm`/`cratonvm_gc` symbols, none exceeding ~2% self-time each:
+
+- `runtime::interpreter::execute_frame` (2.10%) — core interpreter dispatch loop
+- `runtime::interpreter::update_root_snapshot` (1.82%) — per-frame GC root-tracking maintenance
+- `cratonvm_gc::gen_heap::GenerationalHeap::is_object_address` (1.58%) — GC address-range validity check
+- `runtime::frame::Frame::scan_local_objects_inner` (0.71%) — GC local-slot root scanning
+- `native_api::registry::NativeMethodRegistry::find` (0.54%) — native-method dispatch lookup
+- `_mi_page_malloc_zero` / `mi_free` (0.54% / 0.26%) — mimalloc allocation churn
+- `runtime::interpreter::execute_instruction`, `execute_invokevirtual_cached`,
+  `resolve_field_ref`, `cratonvm_gc::vm_heap::VmHeap::is_object_address`,
+  `classloading::resolution::InvokeCache::get`,
+  `classloading::class::find_method_recursive`,
+  `execute_invokevirtual_vtable_fast`, `execute_invoke_kind`,
+  `resolve_method_ref`, `force_native_over_real_jdk_bytecode`,
+  `Frame::pop_and_recycle_frame_with_reason`, `try_stackless_invoke`,
+  `vm_exec::safe_native_call_impl`, `Frame::new_pooled_cached`,
+  `execute_invokestatic_cached` — each 0.18-0.53%.
+
+Checked the one apparent duplication (`GenerationalHeap::is_object_address`
+1.58% + `VmHeap::is_object_address` 0.43%, ~2% combined): `VmHeap::is_object_address`
+(`gc/src/vm_heap.rs:452`) is a legitimate one-level dispatch wrapper over the
+GC-backend enum (Generational/G1/ZGC) used by JIT frame root scanning, not a
+redundant/avoidable double-check — not a bug.
+
+**Conclusion:** this is not a single fixable defect. It is the cumulative,
+distributed cost of fully-interpreted execution — GC root-tracking, method/
+field-resolution caching, frame pooling, and native-dispatch decision logic
+that every bytecode dispatch pays in the interpreter but a JIT-compiled or
+real-JDK path does not. This matches the earlier `CRATONVM_JIT_THRESHOLD`
+experiment (lowering it only bought ~20%, since these hot methods'
+NeighborArray/HnswGraphBuilder call counts per test run are too low to
+reach the tier-up threshold, and even compiling them wouldn't eliminate this
+per-dispatch bookkeeping cost for whatever remains interpreted around them).
+
+Closing this gap further would require a broader, cross-cutting interpreter
+throughput initiative (reducing the per-bytecode cost of GC root tracking,
+dispatch caching, and frame management project-wide), not a scoped bug fix
+— out of scope for this known-issue doc. Leaving the doc's residual OPEN
+item as-is; a future perf initiative should re-profile on an idle host for
+a cleaner signal before deciding where to invest.
