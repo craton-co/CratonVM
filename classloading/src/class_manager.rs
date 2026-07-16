@@ -2728,6 +2728,57 @@ impl ClassManager {
     /// 1. Check if already loaded by any loader
     /// 2. Ask bootstrap → extension → application to find the class
     /// 3. Parse, recursively load superclass/interfaces, and register
+    /// Loader-faithful fast-path lookup for the requester-less, pure
+    /// parent-delegation loaders (`load_class` / `SharedVm::load_class_concurrent`).
+    ///
+    /// Prefers [`Self::get_loaded_class_id_for_requester`] with `Application`
+    /// as the requester, which probes only the built-in delegation chain
+    /// (bootstrap -> extension -> application) -- exactly the set of
+    /// answers `find_class_bytes_delegated` (the real, from-classpath slow
+    /// path these callers fall back to) can itself ever produce.
+    ///
+    /// Runtime-package-identity bug fix: the bare [`Self::get_loaded_class_id`]
+    /// additionally falls back to an arbitrary lone user-defined loader's own
+    /// copy of `name` when no built-in loader has defined it (see that fn's
+    /// "context.groovy fix" doc comment) -- the right default for genuinely
+    /// requester-less reflection-style lookups, but unsound as this
+    /// function's PRIMARY answer: a class that legitimately exists on the
+    /// real classpath (so `find_class_bytes_delegated` would find it) must
+    /// resolve to its own freshly-loaded built-in-loader copy, never to an
+    /// unrelated user-defined loader's redefinition that happens to share
+    /// the name (JVMS §5.3: defining loader is part of a class's identity).
+    /// Concretely: Spring's `TestCompiler` (Application loader) executing
+    /// `new TestCompiler$Problems()` byte-code must resolve to the ordinary
+    /// Application-classpath `Problems`, never to a *different*
+    /// `TestCompiler$Problems` that some earlier, unrelated
+    /// `@CompileWithForkedClassLoader` test forked into its own
+    /// `DynamicClassLoader` in the same run.
+    ///
+    /// That said, the lone-user-loader fallback is also the ONLY way
+    /// purely in-memory, never-backed-by-a-`.class`-file classes (e.g.
+    /// `java.lang.reflect.Proxy`-generated annotation proxies) are ever
+    /// re-resolved by name after their first definition -- there is no
+    /// classpath scan that could find them. So the fallback is used here
+    /// too, but only as a LAST RESORT, gated on `find_class_bytes_delegated`
+    /// genuinely failing to find real bytes for `name` -- i.e. only when no
+    /// better, classpath-backed answer could possibly exist.
+    pub fn resolve_fast_path_class_id(&self, name: &str) -> Option<ClassId> {
+        if let Some(id) =
+            self.get_loaded_class_id_for_requester(name, ClassLoaderId::Application)
+        {
+            return Some(id);
+        }
+        let candidate = self.get_loaded_class_id(name)?;
+        let is_user_loader_answer = matches!(
+            self.class_store.get(candidate).map(|c| c.loader_id),
+            Some(ClassLoaderId::UserDefined(_))
+        );
+        if is_user_loader_answer && self.find_class_bytes_delegated(name).is_err() {
+            return Some(candidate);
+        }
+        None
+    }
+
     pub fn load_class(&mut self, name: &str) -> Result<ClassId, VmError> {
         if std::env::var_os("CRATONVM_DBG_LOADCLASS").is_some() && name.contains("GroupsMetadata") {
             let bt = std::backtrace::Backtrace::force_capture();
@@ -2746,8 +2797,10 @@ impl ClassManager {
         if name.starts_with('[') {
             return self.synthesize_array_class(name);
         }
-        // Fast path: loader-aware lookup via loaded_classes
-        if let Some(id) = self.get_loaded_class_id(name) {
+        // Fast path: loader-aware lookup via loaded_classes. See
+        // `resolve_fast_path_class_id`'s doc comment for the runtime-
+        // package-identity bug this guards against.
+        if let Some(id) = self.resolve_fast_path_class_id(name) {
             // If the class is a synthetic stub (no methods, no bytecode), try
             // to upgrade it to a real class from the classpath. This handles
             // the case where wrapper types like java/lang/Boolean are created
@@ -6035,6 +6088,26 @@ impl ClassManager {
             class.bootstrap_methods = bootstrap_methods;
             class.annotations = annotations;
             class.signature = signature;
+            // JVMS 5.3 runtime-package identity bug fix: the synthetic
+            // stub this class started as was minted with SOME default
+            // `loader_id` (e.g. `ClassLoaderId::Bootstrap`, see
+            // `create_synthetic_stub`), which is frequently NOT the
+            // loader that actually supplied the real bytecode we just
+            // parsed -- `loader_id` (this fn's parameter) came straight
+            // out of `find_class_bytes_delegated`'s parent-delegation
+            // search (bootstrap -> extension -> application) and is
+            // authoritative for where these bytes were actually found.
+            // Every other field below is refreshed from the real class
+            // file on upgrade; `loader_id` was the one exception, left
+            // permanently wrong (e.g. stuck at `Bootstrap` for an
+            // ordinary Application-classpath class). That divergence
+            // was invisible until a same-runtime-package check
+            // (JVMS 5.3: defining loader + package name) started
+            // comparing `loader_id` across classes that are, from
+            // Java's perspective, defined by the very same
+            // `ClassLoader` object -- see `check_class_access` /
+            // `same_runtime_package` in `access_control.rs`.
+            class.loader_id = loader_id;
             class.is_synthetic_stub = false;
             // Reset *both* initialization representations so verification and
             // the real `<clinit>` run after a stub-to-bytecode upgrade.  The

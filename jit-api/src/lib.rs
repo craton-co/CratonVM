@@ -380,6 +380,12 @@ pub struct JitRuntimeHelpers {
     /// unconditional helper CALL. Appended at the END of the struct so all
     /// prior golden offsets stay stable.
     pub native_stack_floor_fn: usize,
+    /// Materializes an interned Java String for a compiled `ldc` site.
+    /// Signature: `extern "C" fn(vm_ptr, utf8_ptr, utf8_len) -> i64`.
+    /// The helper performs the string-pool lookup on every execution so the
+    /// returned reference remains valid after a relocating collection; JIT code
+    /// must never bake a managed-object address as an immediate.
+    pub ldc_string: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -522,6 +528,7 @@ helper_fields! {
     (region_bounds_addr,             FieldKind::Offset),
     // Leaf floor-query helper for the inline self-recursion check.
     (native_stack_floor_fn,          FieldKind::OptionalPtr),
+    (ldc_string,                     FieldKind::RequiredPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -547,7 +554,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 50,
+    JitRuntimeHelpers::NUM_FIELDS == 51,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );

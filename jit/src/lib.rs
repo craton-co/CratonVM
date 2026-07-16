@@ -2592,6 +2592,16 @@ pub struct InlineSite {
     pub elided_invoke_pcs: Vec<usize>,
 }
 
+/// A constant-pool value that the JIT can materialize safely.
+///
+/// String literals deliberately carry their UTF-8 bytes rather than a Java
+/// `ObjectRef`: the latter can relocate between compiled invocations.
+#[derive(Clone, Debug)]
+pub enum JitLdcConstant {
+    Immediate(i64),
+    String(String),
+}
+
 /// Compile-time resolved field layout of `java/lang/String`, for the
 /// String call-site intrinsics (`length`/`charAt`/`hashCode`/`isEmpty`/
 /// `equals`/`compareTo`/`indexOf`, implemented by a later wave).
@@ -5222,6 +5232,14 @@ pub fn jit_direct_call_requires_dispatch(
     method_name: &str,
     descriptor: &str,
 ) -> bool {
+    // TOMCAT-SILENT-HANG.5: direct JIT-to-JIT calls into ClassParser's
+    // readInterfaces scan edge corrupt a later allocation header. Keep this
+    // edge on invoke_dispatch so its rooting and return protocol applies.
+    if class_name == "org/apache/tomcat/util/bcel/classfile/ClassParser"
+        && method_name == "readInterfaces"
+    {
+        return true;
+    }
     let key = JitCompileMethodKey::new(class_name, method_name, descriptor);
     jit_recursive_cycle_methods().read().contains(&key)
 }
@@ -5262,7 +5280,7 @@ pub fn try_compile(
     // resolvers that cannot compute them must return `(_, _, true, true)`
     // so the post-init helper call stays in place.
     cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
-    cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<i64>>,
+    cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<JitLdcConstant>>,
     cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<(i64, bool)>>, // inc 35: (bits, is_double)
     profile: Option<&profile::MethodProfile>,
     helpers: &JitRuntimeHelpers,
@@ -5581,7 +5599,7 @@ fn try_compile_inner(
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
     // (class_id, num_fields, has_nonzero_tag_primitive_init, has_finalizer) — see `try_compile`.
     cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
-    cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<i64>>,
+    cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<JitLdcConstant>>,
     cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<(i64, bool)>>, // inc 35: (bits, is_double)
     profile: Option<&profile::MethodProfile>,
     helpers: &JitRuntimeHelpers,
@@ -6384,11 +6402,19 @@ fn try_compile_inner(
     // With no resolver at all, `ldc_info` stays empty and the 0x12/0x13
     // codegen arm bails per-site instead.
     let mut ldc_info: Vec<(usize, i64)> = Vec::new();
+    let mut ldc_string_info: Vec<(usize, *const u8, usize)> = Vec::new();
     if !scan.ldc_ops.is_empty() {
         if let Some(resolver) = cp_ldc_resolver {
             for &(pc, cp_idx) in &scan.ldc_ops {
-                let val = match resolver(cp_idx) {
-                    Some(v) => v,
+                match resolver(cp_idx) {
+                    Some(JitLdcConstant::Immediate(v)) => ldc_info.push((pc, v)),
+                    Some(JitLdcConstant::String(text)) => {
+                        let boxed: Box<str> = text.into_boxed_str();
+                        let ptr = boxed.as_ptr();
+                        let len = boxed.len();
+                        owned_strings.push(boxed);
+                        ldc_string_info.push((pc, ptr, len));
+                    }
                     None => {
                         // RBC.7 — same permanent-bail class as RBC.4 (scan
                         // reject) / RBC.6 (athrow+handler): this resolver's
@@ -6407,8 +6433,7 @@ fn try_compile_inner(
                         *backend_attempted = true;
                         return None;
                     }
-                };
-                ldc_info.push((pc, val));
+                }
             }
         }
     }
@@ -6547,8 +6572,8 @@ fn try_compile_inner(
                         && method_name == "valueOf"
                         && descriptor == "(I)Ljava/lang/Integer;"
                     {
-                        let entry = INTEGER_VALUE_OF_DIRECT_FN
-                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let entry =
+                            INTEGER_VALUE_OF_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
                         if entry != 0 {
                             needs_heap = true;
                             direct_calls.push((
@@ -7012,6 +7037,7 @@ fn try_compile_inner(
         mic_slots,
         pic_slots,
         ldc_info,
+        ldc_string_info,
         ldc2w_info,
         branch_hints,
         loop_unroll_hints,
@@ -10435,6 +10461,20 @@ mod tests {
         );
 
         clear_jit_recursive_cycle_methods_for_test();
+    }
+
+    #[test]
+    fn tomcat_bcel_read_interfaces_direct_calls_use_dispatch() {
+        assert!(jit_direct_call_requires_dispatch(
+            "org/apache/tomcat/util/bcel/classfile/ClassParser",
+            "readInterfaces",
+            "()V",
+        ));
+        assert!(!jit_direct_call_requires_dispatch(
+            "org/apache/tomcat/util/bcel/classfile/ClassParser",
+            "readFields",
+            "()V",
+        ));
     }
 
     #[test]

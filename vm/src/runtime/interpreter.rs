@@ -5331,19 +5331,49 @@ pub fn execute(
                             if let Some(name) = name_opt {
                                 let load_result = shared.load_class_concurrent(&name);
                                 if let Ok(target_id) = load_result {
-                                    let num_fields = shared
-                                        .class_manager
-                                        .read()
-                                        .get_class(target_id)
-                                        .map(|c| c.num_total_fields)
-                                        .unwrap_or(0);
-                                    new_info.push((
-                                        pc_new,
-                                        target_id.as_u32(),
-                                        num_fields,
-                                        true,
-                                        true,
-                                    ));
+                                    // JVMS 5.4.4 / 6.5 `new`: don't bake an
+                                    // inlined fast-path allocation for a `new`
+                                    // site the accessor is not permitted to
+                                    // reach (see the matching check added to
+                                    // `Instruction::New` above). Falling back
+                                    // to the sentinel entry -- exactly what
+                                    // the load-failure arm below already does
+                                    // -- makes the JIT skip this site and
+                                    // defer to the interpreter, which performs
+                                    // the real access check and throws
+                                    // `IllegalAccessError`. Without this, a
+                                    // method that gets tiered up to JIT before
+                                    // its first *interpreted* execution could
+                                    // silently bypass access control.
+                                    let accessible = {
+                                        let cm_lock = shared.class_manager.read();
+                                        match (cm_lock.get_class(class_id), cm_lock.get_class(target_id)) {
+                                            (Some(accessor), Some(target)) => {
+                                                crate::classloading::access_control::check_class_access(accessor, target).is_ok()
+                                            }
+                                            // Defensive: if either class can't be looked up here,
+                                            // don't invent a denial -- let the interpreter's own
+                                            // check (which always has both classes) be authoritative.
+                                            _ => true,
+                                        }
+                                    };
+                                    if accessible {
+                                        let num_fields = shared
+                                            .class_manager
+                                            .read()
+                                            .get_class(target_id)
+                                            .map(|c| c.num_total_fields)
+                                            .unwrap_or(0);
+                                        new_info.push((
+                                            pc_new,
+                                            target_id.as_u32(),
+                                            num_fields,
+                                            true,
+                                            true,
+                                        ));
+                                    } else {
+                                        new_info.push((pc_new, 0, 0, true, true));
+                                    }
                                 } else {
                                     new_info.push((pc_new, 0, 0, true, true));
                                 }
@@ -5579,6 +5609,9 @@ pub fn execute(
                         // allocate `Box<JitPICSlot>` per
                         // polymorphic call site in `invoke_info`).
                         ldc_info_early,
+                        Vec::new(), // ldc_string_info — not yet wired for this
+                        // early-compile path (mirrors the mic_slots/pic_slots
+                        // "not yet allocated here" placeholders above).
                         ldc2w_info_early,
                         std::collections::HashMap::new(), // branch_hints
                         std::collections::HashMap::new(), // loop_unroll_hints
@@ -14253,6 +14286,27 @@ fn execute_instruction(
             let target_class_id =
                 resolve_class_loader_aware(shared, thread, referencing_class_id, &class_name)
                     .map_err(|e| convert_class_not_found(shared, thread, &class_name, e))?;
+
+            // JVMS 6.5 `new`, run-time exceptions: IllegalAccessError if the
+            // referencing class does not have permission to access the
+            // resolved class (JVMS 5.4.4 -- public, or same *runtime*
+            // package as the referencing class). `check_class_access`
+            // compares runtime package identity as the JVMS 5.3 tuple
+            // (defining class loader, package name), so a package-private
+            // class defined by a DIFFERENT `ClassLoader` instance is
+            // correctly rejected even when the package NAME matches --
+            // while ordinary same-loader package-private instantiation
+            // (by far the common case) is unaffected.
+            {
+                let cm = shared.class_manager.read();
+                if let (Some(accessor), Some(target)) = (
+                    cm.get_class(referencing_class_id),
+                    cm.get_class(target_class_id),
+                ) {
+                    crate::classloading::access_control::check_class_access(accessor, target)?;
+                }
+            }
+
             ensure_class_initialized_shared(shared, thread, target_class_id)?;
 
             let num_fields = shared
@@ -23376,6 +23430,104 @@ fn force_native_over_real_jdk_bytecode(
     if is_undertow_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
+    // Tomcat application methods are never registered native overrides apart
+    // from the audited bridges below. Reject the large compatibility table
+    // early on its hot scanner paths.
+    if (class_name.starts_with("org/apache/")
+        && !matches!(
+            class_name,
+            "org/apache/maven/surefire/booter/ForkedBooter"
+                | "org/apache/tomcat/util/buf/CharChunk"
+                | "org/apache/tomcat/util/buf/AbstractChunk"
+                | "org/apache/tomcat/util/bcel/classfile/Constant"
+        ))
+        || class_name == "java/net/URI"
+    {
+        return false;
+    }
+    if class_name == "org/apache/tomcat/util/buf/CharChunk"
+        && matches!(
+            (method_name, method_descriptor),
+            ("toString", "()Ljava/lang/String;")
+                | ("endsWith", "(Ljava/lang/String;)Z")
+                | ("indexOf", "(C)I")
+        )
+    {
+        return true;
+    }
+    if class_name == "org/apache/tomcat/util/buf/AbstractChunk"
+        && method_name == "indexOf"
+        && method_descriptor == "(Ljava/lang/String;III)I"
+    {
+        return true;
+    }
+    if class_name == "org/apache/tomcat/util/bcel/classfile/Constant"
+        && method_name == "readConstant"
+        && method_descriptor
+            == "(Ljava/io/DataInput;)Lorg/apache/tomcat/util/bcel/classfile/Constant;"
+    {
+        return true;
+    }
+    if class_name == "java/io/BufferedInputStream"
+        && method_name == "read"
+        && matches!(method_descriptor, "([BII)I" | "()I")
+    {
+        return true;
+    }
+    if class_name == "java/io/DataInputStream"
+        && matches!(
+            (method_name, method_descriptor),
+            ("readUTF", "()Ljava/lang/String;")
+                | ("readByte", "()B")
+                | ("readUnsignedByte", "()I")
+                | ("readUnsignedShort", "()I")
+                | ("readInt", "()I")
+                | ("readLong", "()J")
+                | ("readFloat", "()F")
+                | ("readDouble", "()D")
+                | ("skipBytes", "(I)I")
+        )
+    {
+        return true;
+    }
+    if class_name == "java/io/FileInputStream"
+        && method_name == "read"
+        && method_descriptor == "([BII)I"
+    {
+        return true;
+    }
+    if class_name == "java/io/File"
+        && matches!(
+            (method_name, method_descriptor),
+            ("isDirectory", "()Z")
+                | ("list", "()[Ljava/lang/String;")
+                | ("getName", "()Ljava/lang/String;")
+                | ("canRead", "()Z")
+        )
+    {
+        return true;
+    }
+    if class_name == "java/lang/String"
+        && !matches!(
+            (method_name, method_descriptor),
+            (
+                "replaceAll",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"
+            ) | (
+                "replaceFirst",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"
+            ) | ("matches", "(Ljava/lang/String;)Z")
+                | (
+                    "replace",
+                    "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;"
+                )
+                | ("substring", "(II)Ljava/lang/String;")
+                | ("<init>", "([BLjava/lang/String;)V")
+                | ("<init>", "([BIILjava/lang/String;)V")
+        )
+    {
+        return false;
+    }
     if is_class_mirror_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
@@ -28411,13 +28563,32 @@ fn compile_osr_artifact(
                     if let Some(name) = name_opt {
                         let load_result = shared.load_class_concurrent(&name);
                         if let Ok(target_id) = load_result {
-                            let num_fields = shared
-                                .class_manager
-                                .read()
-                                .get_class(target_id)
-                                .map(|c| c.num_total_fields)
-                                .unwrap_or(0);
-                            new_info2.push((pc_new, target_id.as_u32(), num_fields, true, true));
+                            // JVMS 5.4.4 / 6.5 `new` access check -- mirrors
+                            // the `new_info` site above (same rationale: an
+                            // inaccessible `new` site must not be baked into
+                            // an inlined JIT fast path; fall back to the
+                            // sentinel entry so the interpreter's real check
+                            // (`Instruction::New`) is what actually fires).
+                            let accessible = {
+                                let cm_lock = shared.class_manager.read();
+                                match (cm_lock.get_class(class_id), cm_lock.get_class(target_id)) {
+                                    (Some(accessor), Some(target)) => {
+                                        crate::classloading::access_control::check_class_access(accessor, target).is_ok()
+                                    }
+                                    _ => true,
+                                }
+                            };
+                            if accessible {
+                                let num_fields = shared
+                                    .class_manager
+                                    .read()
+                                    .get_class(target_id)
+                                    .map(|c| c.num_total_fields)
+                                    .unwrap_or(0);
+                                new_info2.push((pc_new, target_id.as_u32(), num_fields, true, true));
+                            } else {
+                                new_info2.push((pc_new, 0, 0, true, true));
+                            }
                         } else {
                             new_info2.push((pc_new, 0, 0, true, true));
                         }
@@ -28508,6 +28679,9 @@ fn compile_osr_artifact(
                 // this codepath emits the slow-path helper for
                 // every invokevirtual/invokeinterface.
                 ldc_info2,
+                Vec::new(), // ldc_string_info — not yet wired for this
+                // OSR-recompile path (mirrors the mic_slots/pic_slots
+                // "not yet allocated here" placeholders above).
                 ldc2w_info2,
                 std::collections::HashMap::new(), // branch_hints
                 std::collections::HashMap::new(), // loop_unroll_hints
@@ -29694,12 +29868,24 @@ fn try_jit_upgrade_with_gate(
     // retry and stayed interpreted forever — the dominant cause of the
     // BC-suite 34-64× interpreter gap. String/Class ldc returns None →
     // compile bails (matches the OSR path's `_ => return None`).
-    let ldc_resolver = |cp_idx: u16| -> Option<i64> {
+    let ldc_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitLdcConstant> {
         let cm = shared.class_manager.read();
         let class = cm.get_class(class_id)?;
         match class.constant_pool.get(cp_idx)? {
-            ConstantPoolEntry::Integer(v) => Some(*v as i64), // Cast: JIT ABI — i64 register convention
-            ConstantPoolEntry::Float(v) => Some(v.to_bits() as i64), // Cast: JIT ABI -- float bits to i64
+            ConstantPoolEntry::Integer(v) => {
+                Some(cratonvm_jit::JitLdcConstant::Immediate(*v as i64))
+            }
+            ConstantPoolEntry::Float(v) => {
+                Some(cratonvm_jit::JitLdcConstant::Immediate(v.to_bits() as i64))
+            }
+            ConstantPoolEntry::StringReference { string_index }
+                if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
+            {
+                class
+                    .constant_pool
+                    .get_utf8(*string_index)
+                    .map(|s| cratonvm_jit::JitLdcConstant::String(s.to_string()))
+            }
             _ => None,
         }
     };
@@ -30013,12 +30199,24 @@ fn try_jit_upgrade_with_gate(
             // Integer.MIN_VALUE) failed codegen at the 0x12 arm and stayed
             // interpreted forever. String/Class ldc returns None → compile
             // bails (matches the OSR path's behaviour).
-            let c_ldc_resolver = |cp_idx: u16| -> Option<i64> {
+            let c_ldc_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitLdcConstant> {
                 let cm = shared.class_manager.read();
                 let class = cm.get_class(callee_cid)?;
                 match class.constant_pool.get(cp_idx)? {
-                    ConstantPoolEntry::Integer(v) => Some(*v as i64), // Cast: JIT ABI — i64 register convention
-                    ConstantPoolEntry::Float(v) => Some(v.to_bits() as i64), // Cast: JIT ABI -- float bits to i64
+                    ConstantPoolEntry::Integer(v) => {
+                        Some(cratonvm_jit::JitLdcConstant::Immediate(*v as i64))
+                    }
+                    ConstantPoolEntry::Float(v) => {
+                        Some(cratonvm_jit::JitLdcConstant::Immediate(v.to_bits() as i64))
+                    }
+                    ConstantPoolEntry::StringReference { string_index }
+                        if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
+                    {
+                        class
+                            .constant_pool
+                            .get_utf8(*string_index)
+                            .map(|s| cratonvm_jit::JitLdcConstant::String(s.to_string()))
+                    }
                     _ => None,
                 }
             };
@@ -30789,12 +30987,24 @@ fn try_jit_compile_callee_slow(
 
     // RBC.2 — `ldc`/`ldc_w` int/float constants; see the matching resolver
     // in `try_jit_upgrade_with_gate`. String/Class ldc → None → compile bail.
-    let ldc_resolver = |cp_idx: u16| -> Option<i64> {
+    let ldc_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitLdcConstant> {
         let cm = shared.class_manager.read();
         let class = cm.get_class(cid)?;
         match class.constant_pool.get(cp_idx)? {
-            ConstantPoolEntry::Integer(v) => Some(*v as i64), // Cast: JIT ABI — i64 register convention
-            ConstantPoolEntry::Float(v) => Some(v.to_bits() as i64), // Cast: JIT ABI -- float bits to i64
+            ConstantPoolEntry::Integer(v) => {
+                Some(cratonvm_jit::JitLdcConstant::Immediate(*v as i64))
+            }
+            ConstantPoolEntry::Float(v) => {
+                Some(cratonvm_jit::JitLdcConstant::Immediate(v.to_bits() as i64))
+            }
+            ConstantPoolEntry::StringReference { string_index }
+                if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
+            {
+                class
+                    .constant_pool
+                    .get_utf8(*string_index)
+                    .map(|s| cratonvm_jit::JitLdcConstant::String(s.to_string()))
+            }
             _ => None,
         }
     };
@@ -35621,6 +35831,30 @@ fn dump_imse_holdcount_state(shared: &SharedVm, thread: &JvmThread, exc: ObjectR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tomcat_scanner_uses_only_audited_native_bridges() {
+        assert!(!force_native_over_real_jdk_bytecode(
+            "org/apache/catalina/connector/Response",
+            "toAbsolute",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/io/DataInputStream",
+            "readInt",
+            "()I",
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/io/FileInputStream",
+            "read",
+            "([BII)I",
+        ));
+        assert!(!force_native_over_real_jdk_bytecode(
+            "org/apache/tomcat/unittest/TesterRequest",
+            "getRequestURI",
+            "()Ljava/lang/String;",
+        ));
+    }
 
     /// Perf/starvation fix (2026-07-13) — `stw_takeover_should_scan` must scan
     /// every round through the fast window (catching a genuinely in-JIT peer
