@@ -1,3 +1,65 @@
+> **2026-07-16 rollup (read this first):** the vast majority of this doc's
+> findings are now **FIXED and merged to `dev`**, mostly via a large,
+> separate 2026-07-15/07-16 investigation
+> ([`CRATONVM-SPRING-GENUINE-BUGLIST.md`](CRATONVM-SPRING-GENUINE-BUGLIST.md),
+> branch `fix/spring-aot-cluster-20260715` + `fix/reactive-cluster-20260715`)
+> that root-caused the whole 9-class "AOT hang cluster" below to a FAMILY of
+> classloader-identity bugs under `@CompileWithForkedClassLoader`/
+> `DynamicClassLoader`, not the workload-volume hypothesis this doc's
+> 2026-07-13 section originally landed on. That doc is now the
+> up-to-date, actively-maintained source of truth for this whole area —
+> consult it for the authoritative current per-class table. This doc is kept
+> for its historical investigation narrative (ruled-out hypotheses, repro
+> techniques) but its **status line and per-class tables below are stale**;
+> see the accurate current-status list immediately below instead of trusting
+> "Bucket 1"/"Bucket 2"/"still hangs" language further down.
+>
+> **Confirmed FIXED and merged to `dev`** (do not re-investigate): the
+> `java.home`/`Locale` bootstrap regression (`f62d2073`); the
+> `CopyOnWriteArrayList` "this.lock is null" NPE (`68c44f62`); the
+> `Semaphore.release()` STW-barrier deadlock (`b6fffebf`/`9ca83d62`); the
+> `Objects.toString(Object[, String])` identity-vs-virtual-dispatch bug
+> (`7b1d6ff3`+); the `GroovyScriptFactoryTests` JIT-codegen SIGSEGV
+> (`2724ea5b`); `ServletAnnotationControllerHandlerMethodTests` (`cd90774e`,
+> `72a9ad40`, now 241/241); the `Files.walkFileTree`
+> zero-field-`BasicFileAttributes` bug (`7ae137e4`); the whole AOT
+> classloader-identity family (8+ fixes, `7c5aa7ce`..`d972fd43`, see the
+> other doc) — `AutowiredAnnotationBeanRegistrationAotContributionTests`,
+> `CommonAnnotationBeanRegistrationAotContributionTests`,
+> `BeanDefinitionPropertiesCodeGeneratorTests`,
+> `InstanceSupplierCodeGeneratorTests`, `BeanDefinitionMethodGeneratorTests`,
+> `GroupsMetadataValueDelegateTests` (the `WritableContent` residual is also
+> now fixed, 8/8 OK), `ScopedProxyBeanRegistrationAotProcessorTests`,
+> `ThrowawayClassLoaderTests`, and (via a different, `d8092acb`-family fix)
+> the missing-`ApiVersionStrategy`-bean + backend-specific WebFlux failures
+> under `CrossOriginAnnotationIntegrationTests` (now 68/68 on all 4
+> backends).
+>
+> **Still genuinely OPEN** (tracked as active tasks in this session,
+> 2026-07-16): `context.annotation.ImportSelectorTests` (Mockito `spy()`
+> `StackOverflowError`, root cause narrowed to `MockMethodAdvice
+> .isOverridden`); `web.service.registry.ImportHttpServiceRegistrarTests`
+> (`ClassCastException`, narrowed to Spring's own `AnnotationTypeMapping
+> .getMappedAnnotationValue`); `web.socket.messaging
+> .StompWebSocketIntegrationTests` (STOMP message never arrives — functional
+> gap, not investigated); `orm.jpa.support
+> .PersistenceAnnotationBeanPostProcessorAotContributionTests` (ByteBuddy
+> fork-attach + generics residuals); `context.aot
+> .ApplicationContextAotGeneratorTests` and `test.context.aot
+> .TestContextAotGeneratorIntegrationTests` (never given a dedicated
+> post-loader-identity-fix triage — status unknown, being re-characterized
+> now); `beans.factory.aot.BeanRegistrationsAotContributionTests`
+> (confirmed genuinely perf-bound — steady progress, 100% CPU, not a
+> deadlock — needs interpreter-throughput work, not a discrete fix);
+> `RequestMappingMessageConversionIntegrationTests` (partially fixed, 5
+> bugs landed, but still doesn't finish — real remaining bottleneck is
+> conservative/non-precise GC root scanning on the interpreter's native-call
+> path, an architectural item, not a quick fix). Two items are environmental,
+> not CratonVM bugs: `ConfigurationClassPostProcessorAotContributionTests`'
+> and `PersistenceManagedTypesBeanRegistrationAotProcessorTests`' residual
+> failures both need a JDK 24+ (`java.lang.classfile.ClassFile`, JEP 484)
+> that isn't installed on the investigation host.
+
 # Spring TIMEOUT cluster — 1500s diagnostic rerun (hung vs. slow)
 
 | | |
