@@ -43621,7 +43621,15 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // instead of the non-functional bare-interface stub it used to
         // return (see that handler's doc comment for the full story).
         if let Some(Value::Object(Some(ks))) = args.get(1) {
-            crate::keystore::keystore_set_pending_km_identity(ctx, *ks);
+            let key_password = args
+                .get(2)
+                .map(|value| crate::keystore::read_password(ctx, value))
+                .unwrap_or_default();
+            crate::keystore::keystore_set_pending_km_identity_with_password(
+                ctx,
+                *ks,
+                &key_password,
+            );
             let ks_id = crate::keystore::keystore_id_from_object(ctx, *ks);
             if ks_id != 0 {
                 let this = obj_arg(args, 0)?;

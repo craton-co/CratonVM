@@ -1067,6 +1067,32 @@ fn safe_native_call_impl(
     thread.native_pending_return = None;
     match &mut out {
         Ok(Some(v)) => {
+            // cce0079: RETURN-value counterpart to the argument
+            // `load_and_forward` barrier at the top of this function — a
+            // native whose last GC-capable call preceded its final read can
+            // return an already-evacuated ref (the long-tail Family-1
+            // stale-at-return shape); heal it here exactly like arguments
+            // are healed on entry (the forwarding marker in from-space
+            // stays readable until the memory is actually reused). Under
+            // CRATONVM_DBG_STALE_OBJREF, name the producing native so the
+            // site can be fixed at the source.
+            if let Value::Object(Some(o)) = v {
+                let healed = shared.heap.load_and_forward(*o);
+                if healed.as_ptr() != o.as_ptr()
+                    && cratonvm_gc::stale_objref_debug::enabled()
+                {
+                    let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
+                        .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+                    tracing::warn!(
+                        "CRATONVM_DBG_STALE_OBJREF: native {} returned a stale \
+                         (already-evacuated) ref 0x{:x} — healed to 0x{:x}",
+                        callee,
+                        o.as_ptr() as usize,
+                        healed.as_ptr() as usize,
+                    );
+                }
+                *o = healed;
+            }
             if let Some(o) = value_as_validated_object_ref(shared, *v) {
                 thread.native_pending_return = Some(o);
             }
@@ -2629,6 +2655,16 @@ fn resolve_thread_id_from_thread_obj(shared: &SharedVm, thread_obj: ObjectRef) -
 }
 
 impl<'a> NativeContext for NativeContextImpl<'a> {
+    // See the `NativeContext::refresh_root_snapshot` doc comment
+    // (native-api/src/registry.rs) for the full rationale — this closes the
+    // "pinned a long-lived batch, then drove long re-entrant/JIT-heavy
+    // execution without ever blocking or self-initiating GC" gap by reusing
+    // the existing blocking-path deposit mechanism without actually
+    // blocking.
+    fn refresh_root_snapshot(&mut self) {
+        self.deposit_root_snapshot();
+    }
+
     fn load_class(&mut self, name: &str) -> MethodCallResult {
         let class_id = self.shared.load_class_concurrent(name)?;
         let mirror = super::get_or_create_class_mirror(self.shared, class_id);
@@ -12690,6 +12726,24 @@ fn invoke_on_class_shared_inner(
                                 (method_name, descriptor),
                                 ("<init>", "(Ljava/io/InputStream;)V") | ("skip", "(J)J")
                             ))
+                        // SSLContext's native bridge owns per-context key/trust
+                        // material; a real provider SPI bypasses that handoff.
+                        || (class_name == "javax/net/ssl/SSLContext"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("init", "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V")
+                                    | ("createSSLEngine", "()Ljavax/net/ssl/SSLEngine;")
+                                    | ("createSSLEngine", "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;")
+                            ))
+                        // KeyManagerFactory must retain the per-entry JKS
+                        // password and build a registry-backed X509 manager;
+                        // the provider SPI cannot represent that native state.
+                        || (class_name == "javax/net/ssl/KeyManagerFactory"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("init", "(Ljava/security/KeyStore;[C)V")
+                                    | ("getKeyManagers", "()[Ljavax/net/ssl/KeyManager;")
+                            ))
                         // `java.util.Base64` and its Encoder/Decoder methods
                         // are concrete JDK bytecode.  CratonVM supplies the
                         // complete family as native intrinsics so they can
@@ -13913,55 +13967,6 @@ fn invoke_on_class_shared_inner(
                                 | "java/nio/channels/spi/AbstractSelectableChannel"
                             )
                             && matches!(method_name, "register" | "configureBlocking"))
-                        // Round 60: Tomcat StandardContext init/start failure bypass.
-                        // The real-JDK bytecode for StandardContext.initInternal /
-                        // startInternal (and Spring Boot's TomcatEmbeddedContext
-                        // override) walks Catalina internals (NamingResources,
-                        // ResourceRoot, WebappLoader, annotation scanning) that
-                        // hit gaps in our environment — surfacing as a chain of
-                        // "Failed to initialize component" / "A child container
-                        // failed during start" LifecycleExceptions with the
-                        // original cause discarded by ContainerBase. Force the
-                        // no-op natives (registered in
-                        // `net_phase_e::register_re4_url_http`) so LifecycleBase
-                        // wraps a successful no-op in normal state transitions
-                        // (INITIALIZING→INITIALIZED, STARTING_PREP→STARTING→
-                        // STARTED) and the demo can advance past the LifecycleException.
-                        || (matches!(
-                                class_name,
-                                "org/apache/catalina/core/StandardContext"
-                                | "org/springframework/boot/tomcat/TomcatEmbeddedContext"
-                                | "org/springframework/boot/web/embedded/tomcat/TomcatEmbeddedContext"
-                            )
-                            && matches!(method_name, "initInternal" | "startInternal"))
-                        // Round 60: ContainerBase$StartChild.call() — the Callable
-                        // submitted by ContainerBase.startInternal for each child
-                        // container. Force the native no-op so the child start
-                        // succeeds at the Future level and the engine/host
-                        // lifecycle advances.
-                        || (class_name == "org/apache/catalina/core/ContainerBase$StartChild"
-                            && method_name == "call")
-                        // Round 60: Connector.startInternal / AbstractProtocol.start —
-                        // protocol-handler startup NPEs in Thread.priority because
-                        // our synthetic Thread layout doesn't have `holder.group`.
-                        // No-op so LifecycleBase completes state transitions; the
-                        // demo doesn't serve real requests under CratonVM.
-                        || (class_name == "org/apache/catalina/connector/Connector"
-                            && method_name == "startInternal")
-                        || (class_name == "org/apache/coyote/AbstractProtocol"
-                            && method_name == "start")
-                        // Round 60: TomcatWebServer.start() — full lifecycle
-                        // drive that our environment can't complete (synthetic
-                        // Thread layout missing `holder.group` NPEs the
-                        // connector start). No-op so Spring Boot advances.
-                        || (matches!(
-                                class_name,
-                                "org/springframework/boot/tomcat/TomcatWebServer"
-                                | "org/springframework/boot/web/embedded/tomcat/TomcatWebServer"
-                            )
-                            && matches!(method_name, "start" | "initialize"))
-                        || (class_name == "org/apache/catalina/startup/Tomcat"
-                            && method_name == "start")
                         // (real-cdi-bean-container Step 3) The getApplicationStartup()
                         // force-override is removed: the real
                         // `ApplicationStartup.DEFAULT` getter now always runs.
@@ -17197,6 +17202,24 @@ mod tests {
         let shared = test_shared();
         let r = unbox_poly_return(&shared, Some(Value::Int(1)), "()Z");
         assert_eq!(r, Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn poly_return_unboxes_boolean_wrapper_for_invoke_exact_call_site() {
+        let shared = test_shared();
+        let (boolean_cid, _) =
+            add_real_class_with_field_descriptors(&shared, "java/lang/Boolean", &["Z"]);
+        let boolean = shared.heap.alloc_object(boolean_cid, 1);
+        shared.heap.set_field(boolean, 0, Value::Int(1));
+
+        assert_eq!(
+            unbox_poly_return(
+                &shared,
+                Some(Value::Object(Some(boolean))),
+                "(Ljava/lang/Thread;)Z",
+            ),
+            Some(Value::Int(1))
+        );
     }
 
     #[test]

@@ -472,6 +472,12 @@ impl NativeContext for MockCtx {
     /// not enumerated here continue to receive `None` (the synthetic
     /// fallback), which is correct for HashMap / LHM / TreeMap natives
     /// that read named state through their side-table overlays anyway.
+    // Drive-by test fix (cce0079): the trait gained
+    // `resolve_field_index_by_class_id` without this mock being updated —
+    // the integration-test target did not compile on dev.
+    fn resolve_field_index_by_class_id(&self, _c: ClassId, _f: &str) -> Option<usize> {
+        None
+    }
     fn resolve_field_index(&self, class_name: &str, field_name: &str) -> Option<usize> {
         match (class_name, field_name) {
             // Real-JDK ArrayList: modCount, elementData, size.

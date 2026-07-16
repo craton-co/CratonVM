@@ -313,6 +313,55 @@ pub trait NativeContext {
         true
     }
 
+    /// Force-refresh this thread's deposited GC root snapshot (the same
+    /// mechanism `NativeContextImpl::deposit_root_snapshot` uses before a
+    /// blocking call) without actually blocking.
+    ///
+    /// Background: a peer-initiated stop-the-world collection has two ways
+    /// to see a thread's roots — (1) a live conservative register/stack scan
+    /// if that thread is forcibly frozen while executing JIT-compiled code
+    /// (`jit::xt_root_scan`), which does NOT know about `native_pin_roots`
+    /// (a native-side `Vec` living on the Rust heap, not the JIT frame), or
+    /// (2) this thread's last-deposited snapshot
+    /// (`collect_all_root_snapshots`/`root_snapshots_for_os_tids`), which
+    /// DOES include `native_pin_roots` but is only refreshed at specific
+    /// checkpoints: a cooperative interpreter safepoint arrival, entry into
+    /// a blocking native region, or this thread itself initiating a GC.
+    /// JIT-compiled code has no periodic cooperative safepoint poll at all
+    /// (see the comment on `jit::helpers::jit_safepoint_flush_satb`) — it
+    /// only touches those checkpoints via specific GC-triggering runtime
+    /// helpers, which a hot loop making only fast-path allocations may never
+    /// call.
+    ///
+    /// A native method that pins a long-lived batch of objects (e.g. a
+    /// materialized `Stream` of elements, each pinned once up front) and then
+    /// drives per-element re-entrant Java execution that can run for a long
+    /// time and/or tier up into JIT — without itself ever blocking or
+    /// initiating GC — leaves a window where neither mechanism above sees
+    /// those pins: not (1), because `native_pin_roots` isn't scanned that
+    /// way, and not (2), because nothing has refreshed the deposit since
+    /// before the pins were pushed. A peer thread's GC during that window
+    /// can reclaim a still-pinned object; the next read through the pin
+    /// (correctly re-validated, `via_pin=true`) observes a stale/reused
+    /// address. Confirmed live for JUnit 5's `TestTemplateExecutor`/
+    /// `ParameterizedTestExtension` dynamic-test dispatch (`ClassCastException:
+    /// java.lang.Object cannot be cast to
+    /// org.junit.jupiter.api.extension.TestTemplateInvocationContext`,
+    /// `obj_cid=0` — see `docs/known-issues/
+    /// wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`,
+    /// which documents the same family from WildFly's `parallel-extension-add`
+    /// boot step) — one more independent occurrence of that already-tracked
+    /// "register-invisible root" / cross-thread GC-root-visibility family,
+    /// now with this specific closeable checkpoint gap identified.
+    ///
+    /// Calling this right after establishing such a batch of pins (and
+    /// optionally again periodically across a long per-element loop) closes
+    /// that window by (re-)publishing a fresh deposit — the exact same
+    /// mechanism already relied on for peers parked in a blocking region —
+    /// without requiring this thread to actually block. Default impl is a
+    /// no-op: test/mock contexts have no cross-thread GC to defend against.
+    fn refresh_root_snapshot(&mut self) {}
+
     /// Load a class by name. Returns the ClassId.
     fn load_class(&mut self, name: &str) -> MethodCallResult;
 

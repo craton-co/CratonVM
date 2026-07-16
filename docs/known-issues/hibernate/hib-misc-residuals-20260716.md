@@ -5,21 +5,106 @@ The remaining 13 non-passed classes (of 20 total) not covered by the
 Source: full 4548-class rerun, real-JDK, JIT-on, `dev@2f02e939d`,
 `TIMEOUT=1200`, local Windows host.
 
-## `DefaultCatalogAndSchemaTest` — HANG (rc=124)
+## `DefaultCatalogAndSchemaTest` — OPEN: real, deterministic reflection/GC corruption in JAXB model-building (re-investigated 2026-07-16)
 
 `org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest`
 
-**Status:** OPEN, needs isolated re-verification. This is the exact class
-from an earlier this-session cluster that was run 4 times identically and
-produced PASS/PASS/HANG/CRASH — originally mis-hypothesized as a
-"global-temp-table race," later refuted with the true root cause identified
-as the JIT guarded-inline-getfield fast path corrupting `getfield` results
-(fixed by `93b33576`, flipping `guarded_inline_getfield_enabled()` to
-opt-in default-off). Seeing this class HANG again in a fresh run suggests
-either a distinct, still-open flakiness source, or that the class remains
-inherently non-deterministic under some other condition not yet identified.
-Needs several solo reruns (`--nojit` and JIT-on) to determine whether this
-is reproducible or another one-off flake.
+**Status:** OPEN — confirmed NOT a one-off flake, NOT the old getfield
+regression, and NOT the HIB-CV-33 GC-sweep corruptor. Re-investigated
+against the frozen `dev@dcb24161` baseline on the shared Azure Linux host
+(15+ solo reruns across `--nojit`, JIT-on, and
+`CRATONVM_DBG_FORCE_MOVING=1`): the class fails **100% deterministically**
+(15/15, host load ranging 8–70 across runs, so not load-dependent either) —
+but the failure shape is not the originally-reported `HANG (rc=124)`. It
+completes quickly (40–90s) with `rc=0` and a **silent zero-test discovery
+failure**:
+```
+@@RESULT 0 ...DefaultCatalogAndSchemaTest found=0 started=0 ok=0 failed=0 aborted=0 skipped=0 ms=... loaderror=java.lang.NullPointerException
+```
+The underlying exception varies by exact harness bootstrap class used
+(`Cannot invoke "EngineExecutionListener.executionStarted(...)" because
+"this.delegate" is null` via the `CratonRunner` harness; `AbstractMethodError:
+TestEngine.getId()...has no Code attribute` via a minimal standalone
+`Launcher.execute()` probe) — both are **the same underlying cause seen
+through different victims**: `CRATONVM_DBG_NOCODE=1`/`CRATONVM_DBG_STALE_RECV=1`
+show the AME's receiver reads back as a zeroed header
+(`recv_cid=0 recv_class=java/lang/Object`), and the interpreter logs
+`Stale pointer detected in invokevirtual receiver (ptr=..., all-zero
+header)` immediately before it. A genuine `rc=124` timeout was also
+observed once under extreme host contention (load average 60+), so the
+originally-reported HANG can still occur too — it is a secondary/rarer
+presentation of the same underlying corruption, not a separate bug.
+
+**A one genuine hang WAS reproduced** during this investigation (rc=124,
+60s timeout, host load 60.76 at the time) — corroborating the original
+doc's `HANG (rc=124)` report as a real (if less common) presentation of
+this same defect under heavy contention, not an unrelated environmental
+fluke.
+
+**Ruled out:**
+- The already-fixed JIT guarded-inline-getfield regression (`93b33576`) —
+  reproduces identically with `--nojit`, so JIT is not involved.
+- The HIB-CV-33/HIB-CV-22 non-moving-young-sweep GC corruptor — reproduces
+  identically under `CRATONVM_DBG_FORCE_MOVING=1`, which forces the moving
+  collector that fix relies on.
+- Simple GC/heap pressure — reproduces identically with `--Xmx 2048m`.
+- Not systemic to the harness or binary generally — two control classes
+  (`LockTest`, `JarVisitorTest`) run against the exact same binary/load show
+  **zero** occurrences of this signature.
+
+**Root cause (partially fixed this session, 2026-07-16):** `CRATONVM_DBG_STALE_RECV=1`
+traces every occurrence into
+`org.glassfish.jaxb.runtime.v2.model.impl.ClassInfoImpl.findGetterSetterProperties`
+— JAXB's reflection-heavy getter/setter/annotation scan over this test's
+many HBM-XML-mapped entity classes (this class alone exercises legacy
+`<hibernate-mappings/>` XML mapping in addition to annotations, per the
+`HHH90000028` deprecation warnings in its own log, unlike the two control
+classes). This is the same "unrooted native `ObjectRef` accumulated across
+an allocating call" family as several already-fixed sibling bugs in
+`native-builtins/src/lang_class.rs` (see
+`docs/internal/fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md`'s
+"residual gap" list, and
+`docs/internal/fixed-suite-bugs/wildfly-standalone-managed-server-boot-fails-under-surefire-fork.md`'s
+6-site long-tail). Found and fixed **3 more, previously-unswept sites**
+(commit `db047d38`, merged to `dev` at `6178c36f`):
+1. `collect_public_fields`/`collect_public_methods` (backing
+   `Class.getFields()`/`getMethods()`) pushed freshly-created Field/Method
+   mirror `ObjectRef`s into a plain, unrooted `Vec` during the
+   class-hierarchy walk — a GC triggered by the Nth
+   `create_field_object`/`create_method_object` call could reclaim the
+   first N-1 already-created mirrors. Fixed by collecting only
+   `FieldMetadata`/`MethodMetadata` during the walk and materializing the
+   array in one `build_mirror_array` pass (which pins the destination
+   array across every allocating call).
+2. `native_method_get_parameter_annotations` left its outer
+   `Annotation[][]` array unpinned across a loop whose body
+   (`build_annotation_array_for`) allocates before `set_array_element` ran.
+3. `create_annotation_proxy` left the freshly-allocated proxy object
+   itself unpinned across many allocating calls (string/class-mirror/method
+   lookups) between allocation and the point it becomes reachable from a
+   Java root.
+
+**Verified real but insufficient:** `CRATONVM_DBG_STALE_RECV=1` on the
+fixed binary shows the first corruption in `findGetterSetterProperties`
+moved from bytecode offset `pc=170` to `pc=64` in an earlier build then to
+receiving a **different** local variable later in the same method
+(`java/util/Map.keySet()` instead of `ClassInfoImpl.nav()`) — i.e. the fix
+demonstrably reduced/deferred the corruption, confirming these are real
+bugs, but **at least one more unrooted site remains** in the same method's
+continued reflection/annotation scanning. `DefaultCatalogAndSchemaTest`
+itself still reproduces the `found=0`/`loaderror=NullPointerException`
+failure 100% of the time even on the merged-and-rebuilt `dev` tip.
+
+**Next step for a follow-up session:** re-run
+`CRATONVM_DBG_STALE_RECV=1` against current `dev` on this exact class,
+find the (now later, still-unidentified) call site inside
+`ClassInfoImpl.findGetterSetterProperties`'s continued execution after the
+property-Map lookup, and audit it for the same pin/re-read pattern. Given
+the "different receiver each time" progression, a systematic sweep of
+remaining `lang_class.rs` natives that allocate-then-use an `ObjectRef`
+without `pin_native_root` (matching the audit already done for the
+sibling constructor helpers) is likely higher-leverage than continuing to
+chase individual call sites one at a time.
 
 ## `JarVisitorTest` — RESOLVED: confirmed harness-artifact + underlying non-issue (2026-07-16)
 
@@ -137,7 +222,7 @@ the compile-time cost directly, then evaluate a scoped fix (e.g.
 short-process detection, always-async compilation, or a higher default
 `c1_threshold`) against the full benchmark suite before changing defaults.
 
-## `CriteriaBuilderNonStandardFunctionsTest` — real constraint violation
+## `CriteriaBuilderNonStandardFunctionsTest` — RESOLVED: original symptom stale, residual is JIT compile-time tax (2026-07-16)
 
 `org.hibernate.orm.test.query.criteria.CriteriaBuilderNonStandardFunctionsTest`
 
@@ -146,11 +231,116 @@ org.hibernate.exception.ConstraintViolationException: could not execute batch
 [Unique index or primary key violation: "PUBLIC.CONSTRAINT_35E3F7 PRIMARY KEY ON ...
 ```
 
-**Status:** OPEN, not a timeout — a genuine wrong-behavior symptom (20
-found / 17 ok / 1 failed / 2 skipped). Worth checking whether this is
-test-order dependent (a prior test in the same run leaving unexpected state
-that collides on a primary key) versus a real id-generation double-issue
-bug. Not yet root-caused.
+**Status:** investigated 2026-07-16 against the frozen `dev@dcb24161` baseline
+(shared Azure Linux host). **Not test-order dependent** — reproduces solo, in
+complete isolation, on the very first attempt and every attempt thereafter
+(13+ solo reruns). The class's `@BeforeEach` persists 5 `EntityOfBasics` rows
+with **explicit, manually-assigned ids (1-5)** — there is no `@GeneratedValue`
+id generator anywhere in this test, so the doc's original "real
+id-generation double-issue bug" hypothesis is ruled out categorically
+regardless of any other finding below; a collision could only ever come from
+a duplicate/leftover row at those exact fixed ids.
+
+**The originally-captured `ConstraintViolationException`/PRIMARY KEY symptom
+did not reproduce even once** across 13 solo reruns on this baseline
+(default heap, `--Xmx 96m`, JIT-on, `--nojit`, high-JIT-threshold — see
+below). `dev@dcb24161` already includes the same-day
+[`1c4aaa06` "close stream ArrayList GC pressure corruption"](../../internal/fixed-suite-bugs/stream-arraylist-gc-pressure-heap-corruption-FIXED.md)
+fix, merged just before this investigation. That fix closed a family of bugs
+where GC-pressure-triggered corruption of `ArrayList`-backed collections
+(stale/duplicated conservative roots, missed old-to-young remembered-set
+entries) produced spurious duplicate elements — exactly the shape that would
+turn one `persist()` into two INSERTs of the same row inside one JDBC batch,
+i.e. a duplicate-PK batch failure. This is circumstantial (no before/after
+A-B on the exact pre-fix binary was possible this session — no such binary
+was available), but is the most plausible explanation for why the original
+symptom is now unreproducible: it was very likely the same bug family,
+already fixed.
+
+**What reproduces instead, consistently:** `TimeoutException:
+prepareData(org.hibernate.testing.orm.junit.SessionFactoryScope) timed out
+after 120 seconds`, with the *identical* found/ok/failed/skipped shape as the
+original entry (20 found / 18 started / **17 ok / 1 failed** / 2 skipped) —
+i.e. this looks like the same underlying event the original run captured,
+just manifesting as a timeout instead of an exception because it took even
+longer on this host. Full stack trace (`-Dcraton.trace=1`) shows this is
+JUnit5's `SameThreadTimeoutInvocation` — **not a preemptive/async timeout**;
+it measures wall-clock and only reports `TimeoutException` after the
+underlying call actually returns/throws, discarding whatever the real
+underlying outcome was if it also exceeded 120s. So a run that would have
+reported `ConstraintViolationException` at, say, 140s instead reports
+`TimeoutException` and hides the real exception — one plausible unification
+of both symptoms under a single "prepareData is occasionally very slow"
+root mechanism.
+
+**HotSpot comparison** (`/home/victor/jdk25/bin/java`, identical classpath/
+props via `common.args`): **5/5 clean runs**, 6.8-8.1s each, run back-to-back
+under the *exact same* crushing host contention as the CratonVM runs below
+(`uptime` load average 28-53 on 16 cores throughout this investigation, from
+~50+ other concurrent sessions on this shared box). CratonVM JIT-on: 100% of
+default-config solo reruns either barely passed (~123-127s total) or hit the
+120s `TimeoutException` (~150-165s total) — i.e. CratonVM is *at minimum*
+~15x slower than HotSpot for this class even on a "passing" run, before any
+timeout is even considered, on this host.
+
+**Live gdb capture during an actual stall** (poll-and-pounce technique per
+[wildfly-gc-barrier-boot-hang-and-harness-fixes.md](../../internal/fixed-suite-bugs/wildfly-gc-barrier-boot-hang-and-harness-fixes.md):
+background the run, poll the log for a >12s output-idle gap, `sudo gdb -p
+<pid> -ex 'thread apply all bt'` the instant it's detected). Result: **no
+deadlock** — only one thread (`main-vm`) was doing anything; the other three
+(`Hibernate Conne`, `junit-jupiter-t`, and the joining `main` thread) were
+parked/idle as expected. `main-vm` was genuinely CPU-bound, live inside
+`native_al_itr_next -> al_state -> al_slots_for -> is_subclass_of` (an
+ArrayList iterator's native `next()`, resolving whether the receiver is a
+`java.util.Vector` for field-slot purposes), which allocates and grows a
+fresh, uncached `FxHashSet` on **every single call** (`native-collections/src/lib.rs`
+`al_slots_for`, `classloading/src/class.rs`'s `is_subclass_of`/
+`is_subclass_of_inner`). This is a real, narrow inefficiency worth a look —
+every ArrayList/Vector-layout native access pays a full class-hierarchy walk
+with a fresh hashmap allocation instead of a per-`ClassId` cached answer —
+but it was not proven to be *the* dominant cost below, only *a* genuine
+CPU-bound hot path caught live during a stall.
+
+**Root cause, confirmed via bisection (same methodology as this file's
+`LockTest` entry, found earlier the same day): JIT compilation-time tax, not
+a data-corruption bug, not GC pauses, not raw interpreted throughput.**
+- `--nojit` (interpreter only): **3/3 clean runs**, 18/18 ok, 29.5-30.7s
+  each — no timeout, ever, despite host load climbing to 42-48 during these
+  runs.
+- JIT nominally on, but tiered-compilation thresholds raised so compilation
+  never triggers during this short run
+  (`CRATONVM_TIER_C1_THRESHOLD=100000 CRATONVM_TIER_C2_THRESHOLD=1000000`):
+  **2/2 clean runs**, 18/18 ok, 31.6-32.9s each — load average 48-53 during
+  these runs (the heaviest contention seen all session), still clean.
+- Default JIT-on config: 0/6 clean in the runs immediately preceding this
+  bisection (barely-passing-slow or `TimeoutException`), at *lower*
+  observed load averages (22-42) than the bisection runs that passed
+  cleanly.
+
+Both bisections converge on the same conclusion the `LockTest` entry reached
+independently: CratonVM's compilation itself (not the JIT-compiled code
+running afterward) costs enough wall-clock/CPU under this host's contention
+to blow a short-lived process's time budget, and disabling or deferring
+compilation removes the failure entirely. This is the **same mechanism**,
+not a separate bug — see that entry above for the shared root-cause status
+(OPEN at the JIT-policy level: raising `c1_threshold`/making compilation
+async is a plausible fix but a cross-cutting change needing broader
+benchmark-suite validation, deliberately not changed blind this session).
+
+**Reclassifying:** this is not a distinct wrong-behavior/id-generation bug.
+Moving out of "genuine wrong-behavior symptom" — it belongs with
+[the 120s-timeout cluster](hib-120s-junit-timeout-cluster-20260716.md) (same
+`TimeoutException(...)` shape, same "one test absorbs a one-time
+SessionFactory-bootstrap cost that occasionally exceeds 120s" shape) and
+with this file's own `LockTest` entry (same JIT-compile-tax root mechanism,
+confirmed via the identical bisection). No code change made this session —
+the underlying JIT-policy fix is intentionally left to the session handling
+that broader, already-tracked investigation. The one concrete, narrow lead
+worth a follow-up look: `al_slots_for`'s per-call, uncached
+`is_subclass(cid, vector_id)` check in `native-collections/src/lib.rs`
+(caught live via gdb mid-stall) — a small per-`ClassId` cache there is a
+plausible, low-risk contribution to closing part of the general throughput
+gap, independent of the JIT-tax question.
 
 ## Already-expected ABORTED entries (matches HotSpot, not a defect)
 
@@ -189,10 +379,68 @@ dialect-gated partial skips:
   gated by a Hibernate-internal default rather than `@CustomEnhancementContext`
   or a dialect check. No fix needed.
 
-One exception: `org.hibernate.orm.test.type.temporal.ZonedDateTimeTest`
-shows a captured signature this run —
-`java.lang.InternalError: java.lang.CloneNotSupportedException` — on top of
-the usual partial-abort shape (608 found / 404 ok / 204 aborted). Worth a
-quick look to confirm this is the same expected-skip mechanism surfacing a
-different message, versus a distinct new issue riding along with the
-expected skips.
+One exception: `org.hibernate.orm.test.type.temporal.ZonedDateTimeTest` —
+investigated 2026-07-16 against the frozen `dev@dcb24161` baseline (shared
+Azure Linux host). **Not yet confirmed same-mechanism; keep OPEN, and a
+separate, more severe defect surfaced during the attempt.**
+
+**HotSpot comparison** (`/home/victor/jdk25/bin/java`, identical classpath/
+props via `common.args`): solo run completes cleanly in 29.2s — 608 found /
+404 ok / 204 aborted / 0 failed, the identical shape reported for CratonVM.
+A full-text scan of the entire raw output (all WARN/INFO Hibernate logging
+included, via `-Dcraton.trace=1`) contains **zero** occurrences of
+"exception" (case-insensitive) anywhere. HotSpot's 204 aborted tests here
+are 100% silent assumption-based skips, exactly like the other
+`@CustomEnhancementContext`/dialect-gated entries in this list — there is no
+HotSpot-side message of any kind to compare against.
+
+**CratonVM comparison: could not obtain a completed run on this host.** 4
+independent solo attempts — JIT-on, JIT-on with `RUST_LOG=error`, `--nojit`,
+and `nice -n 19` — all deterministically hit a severe livelock instead of
+completing: tens of millions of repeated `Stale pointer detected in
+invokevirtual receiver (ptr=..., all-zero header) — falling back to CP class
+java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionNode`
+warnings (`vm/src/runtime/interpreter.rs`), against **the same object
+address sustained across checks taken minutes apart** — ruling out ordinary
+slow-but-progressing execution across the class's 608 parameterized
+iterations, which would churn through many different addresses. None of the
+4 attempts reached a single `@@RESULT` within bounded timeouts up to 300s
+(30-40M+ log lines emitted, no forward progress). A 5th attempt pinned to a
+single core (`taskset -c 0`) avoided the livelock but hit a different,
+unrelated harness bug instead (NPE: "Cannot invoke
+`EngineExecutionListener.getClass()` because `listener` is null" during
+JUnit class discovery/loading, found=0).
+
+This reproduces identically on the sibling `LocalDateTimeTest` (also in this
+same "already-expected" list, sharing the same `AbstractJavaTimeTypeTests`
+base): same livelock signature, same non-terminating spam, no `@@RESULT`.
+Both classes' shared `Timezones.withDefaultTimeZone()` helper
+(`hibernate-core/src/test/java/.../type/temporal/Timezones.java`) creates a
+brand-new `Executors.newSingleThreadExecutor()` + submits a `Future` on
+**every one of the class's ~608 iterations**, which is far heavier
+AQS/`ConditionNode`/thread-pool churn per run than any other class
+currently tracked in this doc — the likely reason this specific livelock
+only manifests for this pair of classes.
+
+**Conclusion so far:** since HotSpot's abort mechanism for this class is
+provably silent, the original hedge ("same expected-skip mechanism
+surfacing a different message") cannot be literally correct — there is no
+HotSpot message to be "the same" as. Whatever produced the original
+`InternalError: CloneNotSupportedException` capture in CratonVM must be a
+CratonVM-only artifact, not shared HotSpot behavior; it is **not** confirmed
+to belong in this "matches HotSpot, not a defect" section, and
+`ZonedDateTimeTest` should be treated as OPEN, not closed, until it can
+actually be re-verified. Root-causing the original signature itself was not
+possible this session because CratonVM never got far enough to reproduce it
+(the livelock above pre-empts it entirely on this host).
+
+**Separately flagged:** the livelock itself (AQS `ConditionNode`
+stale-pointer detection never resolving under heavy `ExecutorService`/
+`Future` churn) is a distinct, newly-discovered, clearly-reproducible defect
+in its own right — 4/4 reproduction rate, unrelated to JIT-vs-interpreter
+choice — that blocks any solo verification of this whole temporal-test pair
+on a contended host, and needs its own dedicated investigation (in the
+spirit of this project's existing "stale-objref"/root-coverage-gap bug
+family) with the `CRATONVM_DBG_SWEEP_ZERO`/`CRATONVM_DBG_STALE_RECV` probes
+already built into `interpreter.rs` for this exact scenario, ideally on a
+quiet host to get an uncontaminated signal.

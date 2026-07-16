@@ -64,3 +64,24 @@ over a correctness one.
   baseline).
 - Per-class profiling (`CRATONVM_DBG_JIT_DISASM`, GC pause counters) to
   narrow "systemic slowness" down to a specific subsystem.
+
+## Related finding (2026-07-16): CriteriaBuilderNonStandardFunctionsTest joins this shape, root cause narrowed to JIT compile-time tax
+
+Investigated as a separately-filed "real constraint violation" residual
+(see [hib-misc-residuals-20260716.md](hib-misc-residuals-20260716.md)'s
+CriteriaBuilderNonStandardFunctionsTest entry for the full writeup). Same
+symptom shape as this cluster (prepareData(...) TimeoutException after
+120s, ok = found - 1). Bisected via --nojit (3/3 clean) and via
+JIT-nominally-on-but-thresholds-raised-so-compilation-never-triggers (2/2
+clean) versus default JIT-on (0/6 clean immediately prior) -- both
+bisections converge on JIT compilation-time tax in a short-lived process,
+the same mechanism this file's sibling LockTest entry (in
+hib-misc-residuals-20260716.md) found independently the same day. Live gdb
+capture during one stall also caught a genuine, narrow, uncached
+per-call class-hierarchy-walk allocation (native-collections/src/lib.rs's
+al_slots_for -> classloading/src/class.rs's is_subclass_of) as a
+contributing CPU-bound hot path, though not proven to be the dominant cost.
+Worth folding into whichever session picks up this cluster's "per-class
+profiling" next step -- the JIT-compile-tax bisection methodology (disable
+JIT vs raise compile thresholds vs default) is a fast, cheap first cut that
+could be run against the other 7 classes here before deeper profiling.

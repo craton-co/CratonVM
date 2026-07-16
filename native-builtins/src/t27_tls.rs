@@ -5155,7 +5155,23 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                         &state.enabled_ciphers,
                     )?
                 }
-                None => default_engine_client_config(&state.alpn_protocols)?,
+                None => {
+                    let trust_roots = state
+                        .trust_roots_override
+                        .clone()
+                        .or_else(take_selected_context_trust_roots);
+                    if trust_roots.is_some() {
+                        let roots = root_store_for_trust_roots(trust_roots.as_ref());
+                        build_client_config_ciphers(
+                            roots,
+                            &alpn_strs,
+                            None,
+                            &state.enabled_ciphers,
+                        )?
+                    } else {
+                        default_engine_client_config(&state.alpn_protocols)?
+                    }
+                }
             },
         };
         let host = state
@@ -6719,6 +6735,14 @@ fn do_unwrap(
                         );
                     }
                     if conn.is_handshaking() {
+                        // rustls has already queued the fatal TLS alert. On a
+                        // server engine, let the handshake driver observe NEED_WRAP
+                        // and flush it before the channel closes; otherwise Netty
+                        // reports only ClosedChannelException to the client.
+                        if matches!(&*conn, EngineConn::Server(_)) {
+                            offset = rec_end;
+                            break;
+                        }
                         return Err(crate::phases_early::throw_jca_exc(
                             ctx,
                             "javax/net/ssl/SSLHandshakeException",
@@ -7052,8 +7076,19 @@ pub(crate) fn set_engine_identity_override(
     let trust_roots = take_selected_context_trust_roots();
     with_engine(id, |s| {
         s.identity_override = Some((cert_pem, key_pem));
-        s.trust_roots_override = trust_roots;
+        if let Some(trust_roots) = trust_roots {
+            s.trust_roots_override = Some(trust_roots);
+        }
     });
+}
+
+/// Copy trust roots selected by the creating SSLContext even when it has no
+/// identity. Pure client contexts otherwise fall back to platform roots when
+/// their engine begins the handshake.
+pub(crate) fn set_engine_trust_roots_override(engine_obj: ObjectRef) {
+    let id = engine_id_or_alloc(engine_obj);
+    let trust_roots = take_selected_context_trust_roots();
+    with_engine(id, |s| s.trust_roots_override = trust_roots);
 }
 
 /// Record which `SSLContext` (by its GC-stable key) created this engine, so

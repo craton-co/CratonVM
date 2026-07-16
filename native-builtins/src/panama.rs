@@ -857,11 +857,25 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         "ofAddress",
         "(J)Ljava/lang/foreign/MemorySegment;",
         |ctx, args| {
+            let addr = match args.first() {
+                Some(Value::Long(n)) => *n,
+                _ => 0,
+            };
             // Gate raw-address wrapping behind native access: turning an
             // arbitrary caller-supplied long into an addressable segment is
             // equivalent to arbitrary process-memory access once paired with
             // reinterpret/get/set. Refuse unless native access is enabled.
-            if !native_access_enabled() {
+            //
+            // EXCEPTION: address 0 (`MemorySegment.NULL`, a zero-length
+            // segment that can never be dereferenced) is always permitted,
+            // matching real JDK. `MemorySegment`'s own <clinit> builds `NULL`
+            // via `ofAddress(0)` before any user code runs and before any
+            // module has had a chance to request native access; gating that
+            // internal bootstrap call poisons the class forever (a <clinit>
+            // failure is a permanent NoClassDefFoundError for every
+            // subsequent use, per JVMS 5.5) even though HotSpot never denies
+            // access to the harmless null segment.
+            if addr != 0 && !native_access_enabled() {
                 return Err(RuntimeError::IllegalCallerException {
                     message: "Native access is not enabled for this module \
                               (MemorySegment.ofAddress denied)"
@@ -869,10 +883,6 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let addr = match args.first() {
-                Some(Value::Long(n)) => *n,
-                _ => 0,
-            };
             let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
             ctx.set_field(seg, 0, Value::Long(addr));
             ctx.set_field(seg, 1, Value::Long(0)); // unknown size
