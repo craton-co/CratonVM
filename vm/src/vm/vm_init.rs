@@ -3629,7 +3629,24 @@ impl SharedVm {
         // Fast path: read lock only — no contention for already-loaded classes.
         // Bind the result to a local so the `RwLockReadGuard` is dropped at
         // the semicolon, not extended to the end of an `if let` block.
-        let fast_id = self.class_manager.read().get_loaded_class_id(name);
+        //
+        // Runtime-package-identity bug fix: was the bare, requester-less
+        // `get_loaded_class_id(name)`, which -- when no BUILT-IN loader
+        // (bootstrap/extension/application) has defined `name` yet -- falls
+        // back to returning an arbitrary lone user-defined loader's own
+        // copy if exactly one such loader happens to have defined it (see
+        // that fn's doc comment). This function's own slow path below
+        // ultimately delegates via `ClassManager::load_class`, which can
+        // only ever produce a Bootstrap/Extension/Application-loaded
+        // class -- never an unrelated user-defined loader's redefinition
+        // -- so a fast-path cache hit returning one answers a question
+        // this function was never asked and hands back the WRONG class
+        // (JVMS §5.3: defining loader is part of a class's identity).
+        // `get_loaded_class_id_for_requester(name, Application)` probes
+        // only the built-in delegation chain, matching what the slow path
+        // can actually produce: a hit here is always right, a miss falls
+        // through to the real load below instead of a stray loader's class.
+        let fast_id = self.class_manager.read().resolve_fast_path_class_id(name);
         if let Some(id) = fast_id {
             // Check if it's a synthetic stub that needs upgrading
             let is_synthetic = self
@@ -3661,10 +3678,12 @@ impl SharedVm {
             .lock()
             .expect("class-loading mutex poisoned: a thread panicked while loading a class");
 
-        // Double-check: another thread may have loaded it while we waited for the lock
+        // Double-check: another thread may have loaded it while we waited for the lock.
+        // Same loader-faithful lookup as the fast path above -- see that
+        // comment for why the bare `get_loaded_class_id` is unsound here.
         {
             let cm = self.class_manager.read();
-            if let Some(id) = cm.get_loaded_class_id(name) {
+            if let Some(id) = cm.resolve_fast_path_class_id(name) {
                 let is_synthetic = cm
                     .class_store
                     .get(id)
@@ -3682,9 +3701,12 @@ impl SharedVm {
                 .wait_timeout(loading, std::time::Duration::from_secs(30))
                 .expect("class-loading condvar poisoned: a thread panicked while loading a class")
                 .0;
-            // Re-check after waking — class may now be loaded
+            // Re-check after waking — class may now be loaded. Same
+            // loader-faithful lookup as the fast path above (see that
+            // comment) -- a lone unrelated user-defined loader's copy must
+            // not be handed back here either.
             let cm = self.class_manager.read();
-            if let Some(id) = cm.get_loaded_class_id(name) {
+            if let Some(id) = cm.resolve_fast_path_class_id(name) {
                 let is_synthetic = cm
                     .class_store
                     .get(id)
@@ -4181,6 +4203,38 @@ impl SharedVm {
     /// Increments [`Self::stack_dump_ack_count`] so the watchdog can
     /// tell how many runtime threads responded before it gives up and
     /// calls `std::process::abort`.
+    ///
+    /// JIT-frame caveat (2026-07-16 investigation of the
+    /// `docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md` "T19.H1
+    /// watchdog SIGSEGVs on JIT frames" note): `thread.frames` is the
+    /// interpreter's own logical frame stack. A method dispatched straight
+    /// to already-JIT-compiled machine code (`execute_invokestatic_cached`
+    /// / `execute_jit_call` et al. in `runtime/interpreter.rs`) never gets
+    /// a `Frame` pushed here at all — the call is a synchronous jump into
+    /// native code with no interpreter bookkeeping in between. That frame
+    /// is therefore invisible to this walker: reproduction while
+    /// root-causing this bug confirmed a thread parked deep inside a
+    /// long-running JIT-compiled method dumps as either zero acks (if it
+    /// never returns to the interpreter dispatch loop before the grace
+    /// period elapses) or a misleadingly shallow frame count (if it does),
+    /// never a fabricated/garbage frame — but a reader unaware of the gap
+    /// can easily misdiagnose "1 shallow frame" as "this thread is stuck
+    /// at a trivial call site" when it may be many JIT call-levels deep.
+    /// The two hardening changes below close the *reliability* half of
+    /// that report even though a live SIGSEGV could not be reproduced on
+    /// this revision after extensive targeted testing (single JIT calls,
+    /// OSR-adjacent long single-invocation loops, deep JIT<->interpreter
+    /// recursion, and multi-threaded runs with one thread parked in JIT):
+    /// 1. Each frame is formatted behind `catch_unwind` so a panic while
+    ///    rendering one (malformed) frame can never abort the watchdog
+    ///    thread before it reaches its own `process::abort()` — that
+    ///    would otherwise turn an intended, informative crash-with-dump
+    ///    into a silent hang (no dump, no abort, no notification).
+    /// 2. When JIT is active for this thread and the walk comes up
+    ///    shorter than the interpreter's own call chain, a note is
+    ///    appended pointing at the gap and at `--nojit` as a workaround,
+    ///    instead of leaving the reader to assume a shallow dump means a
+    ///    shallow call stack.
     pub fn dump_current_thread_frames(&self, thread: &JvmThread) {
         use std::io::Write;
 
@@ -4199,21 +4253,51 @@ impl SharedVm {
         let _ = handle.write_all(header.as_bytes());
 
         for (depth, frame) in thread.frames.iter().enumerate() {
-            // Truncate user-visible strings defensively — a corrupted
-            // method name could otherwise produce megabytes of output.
-            let class_name = truncate_ascii(frame.class_name(), 240);
-            let method_name = truncate_ascii(frame.method_name(), 240);
-            let desc = truncate_ascii(frame.method_descriptor(), 240);
-            let source = frame
-                .source_file()
-                .map(|s| truncate_ascii(s, 240))
-                .unwrap_or_else(|| "<unknown>".to_string());
-            let line = format!(
-                "tid={tid} depth={depth} class={class_name} method={method_name} desc={desc} pc={pc} last_pc={last} source={source}\n",
-                pc = frame.pc,
-                last = frame.last_instr_pc,
+            // Defense-in-depth: a single malformed/corrupted frame (e.g. a
+            // truncated class/method name that trips an unexpected panic
+            // path inside formatting) must not prevent the watchdog from
+            // reaching its `process::abort()` below — that would silently
+            // turn a diagnosable crash into an unexplained hang instead.
+            let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Truncate user-visible strings defensively — a corrupted
+                // method name could otherwise produce megabytes of output.
+                let class_name = truncate_ascii(frame.class_name(), 240);
+                let method_name = truncate_ascii(frame.method_name(), 240);
+                let desc = truncate_ascii(frame.method_descriptor(), 240);
+                let source = frame
+                    .source_file()
+                    .map(|s| truncate_ascii(s, 240))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                format!(
+                    "tid={tid} depth={depth} class={class_name} method={method_name} desc={desc} pc={pc} last_pc={last} source={source}\n",
+                    pc = frame.pc,
+                    last = frame.last_instr_pc,
+                )
+            }))
+            .unwrap_or_else(|_| {
+                format!("tid={tid} depth={depth} <frame dump panicked; skipped>\n")
+            });
+            let _ = handle.write_all(rendered.as_bytes());
+        }
+
+        // JIT-frame visibility note (see doc comment above): this thread
+        // has at least one active JIT call on its native stack right now
+        // (it reached this dump from a dispatch callback nested inside
+        // JIT-compiled code — the common all-interpreter case has JIT
+        // depth 0 here). One or more call levels between the frames shown
+        // above are therefore JIT-compiled and invisible to this walker.
+        // Flag it explicitly rather than leaving the reader to assume the
+        // frames shown are the whole call chain.
+        if crate::jit::conservative_roots::current_thread_jit_depth() != 0 {
+            let note = format!(
+                "tid={tid} note=thread has {depth} active JIT call(s) on its native \
+                 stack; one or more call levels are JIT-compiled machine code and are \
+                 not represented in the {frame_count} frame(s) above (see \
+                 execute_invokestatic_cached/execute_jit_call in runtime/interpreter.rs) — \
+                 rerun with --nojit for a full interpreted stack if needed\n",
+                depth = crate::jit::conservative_roots::current_thread_jit_depth(),
             );
-            let _ = handle.write_all(line.as_bytes());
+            let _ = handle.write_all(note.as_bytes());
         }
 
         let footer = format!("--- T19.H1 end dump tid={tid} ---\n");
@@ -4253,17 +4337,32 @@ pub fn set_wait_site_snapshot(thread: &JvmThread) {
         "--- T19.H1 stack dump (wait-site): tid={tid} name={name:?} frames={fc} ---\n"
     ));
     for (depth, frame) in thread.frames.iter().enumerate() {
-        let class_name = truncate_ascii(frame.class_name(), 240);
-        let method_name = truncate_ascii(frame.method_name(), 240);
-        let desc = truncate_ascii(frame.method_descriptor(), 240);
-        let source = frame
-            .source_file()
-            .map(|s| truncate_ascii(s, 240))
-            .unwrap_or_else(|| "<unknown>".to_string());
+        // See the matching guard in `dump_current_thread_frames` above: a
+        // panic while rendering a single frame must not abort this
+        // (rare, timeout-triggered) snapshot build and leave the wait-site
+        // dump silently empty for the rest of the thread's parked lifetime.
+        let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let class_name = truncate_ascii(frame.class_name(), 240);
+            let method_name = truncate_ascii(frame.method_name(), 240);
+            let desc = truncate_ascii(frame.method_descriptor(), 240);
+            let source = frame
+                .source_file()
+                .map(|s| truncate_ascii(s, 240))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            format!(
+                "tid={tid} depth={depth} class={class_name} method={method_name} desc={desc} pc={pc} last_pc={last} source={source}\n",
+                pc = frame.pc,
+                last = frame.last_instr_pc,
+            )
+        }))
+        .unwrap_or_else(|_| format!("tid={tid} depth={depth} <frame dump panicked; skipped>\n"));
+        buf.push_str(&rendered);
+    }
+    if crate::jit::conservative_roots::current_thread_jit_depth() != 0 {
         buf.push_str(&format!(
-            "tid={tid} depth={depth} class={class_name} method={method_name} desc={desc} pc={pc} last_pc={last} source={source}\n",
-            pc = frame.pc,
-            last = frame.last_instr_pc,
+            "tid={tid} note=thread has active JIT call(s) on its native stack; \
+             one or more call levels are JIT-compiled machine code and are not \
+             represented above\n"
         ));
     }
     buf.push_str(&format!("--- T19.H1 end dump tid={tid} (wait-site) ---\n"));

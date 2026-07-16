@@ -5,21 +5,106 @@ The remaining 13 non-passed classes (of 20 total) not covered by the
 Source: full 4548-class rerun, real-JDK, JIT-on, `dev@2f02e939d`,
 `TIMEOUT=1200`, local Windows host.
 
-## `DefaultCatalogAndSchemaTest` — HANG (rc=124)
+## `DefaultCatalogAndSchemaTest` — OPEN: real, deterministic reflection/GC corruption in JAXB model-building (re-investigated 2026-07-16)
 
 `org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest`
 
-**Status:** OPEN, needs isolated re-verification. This is the exact class
-from an earlier this-session cluster that was run 4 times identically and
-produced PASS/PASS/HANG/CRASH — originally mis-hypothesized as a
-"global-temp-table race," later refuted with the true root cause identified
-as the JIT guarded-inline-getfield fast path corrupting `getfield` results
-(fixed by `93b33576`, flipping `guarded_inline_getfield_enabled()` to
-opt-in default-off). Seeing this class HANG again in a fresh run suggests
-either a distinct, still-open flakiness source, or that the class remains
-inherently non-deterministic under some other condition not yet identified.
-Needs several solo reruns (`--nojit` and JIT-on) to determine whether this
-is reproducible or another one-off flake.
+**Status:** OPEN — confirmed NOT a one-off flake, NOT the old getfield
+regression, and NOT the HIB-CV-33 GC-sweep corruptor. Re-investigated
+against the frozen `dev@dcb24161` baseline on the shared Azure Linux host
+(15+ solo reruns across `--nojit`, JIT-on, and
+`CRATONVM_DBG_FORCE_MOVING=1`): the class fails **100% deterministically**
+(15/15, host load ranging 8–70 across runs, so not load-dependent either) —
+but the failure shape is not the originally-reported `HANG (rc=124)`. It
+completes quickly (40–90s) with `rc=0` and a **silent zero-test discovery
+failure**:
+```
+@@RESULT 0 ...DefaultCatalogAndSchemaTest found=0 started=0 ok=0 failed=0 aborted=0 skipped=0 ms=... loaderror=java.lang.NullPointerException
+```
+The underlying exception varies by exact harness bootstrap class used
+(`Cannot invoke "EngineExecutionListener.executionStarted(...)" because
+"this.delegate" is null` via the `CratonRunner` harness; `AbstractMethodError:
+TestEngine.getId()...has no Code attribute` via a minimal standalone
+`Launcher.execute()` probe) — both are **the same underlying cause seen
+through different victims**: `CRATONVM_DBG_NOCODE=1`/`CRATONVM_DBG_STALE_RECV=1`
+show the AME's receiver reads back as a zeroed header
+(`recv_cid=0 recv_class=java/lang/Object`), and the interpreter logs
+`Stale pointer detected in invokevirtual receiver (ptr=..., all-zero
+header)` immediately before it. A genuine `rc=124` timeout was also
+observed once under extreme host contention (load average 60+), so the
+originally-reported HANG can still occur too — it is a secondary/rarer
+presentation of the same underlying corruption, not a separate bug.
+
+**A one genuine hang WAS reproduced** during this investigation (rc=124,
+60s timeout, host load 60.76 at the time) — corroborating the original
+doc's `HANG (rc=124)` report as a real (if less common) presentation of
+this same defect under heavy contention, not an unrelated environmental
+fluke.
+
+**Ruled out:**
+- The already-fixed JIT guarded-inline-getfield regression (`93b33576`) —
+  reproduces identically with `--nojit`, so JIT is not involved.
+- The HIB-CV-33/HIB-CV-22 non-moving-young-sweep GC corruptor — reproduces
+  identically under `CRATONVM_DBG_FORCE_MOVING=1`, which forces the moving
+  collector that fix relies on.
+- Simple GC/heap pressure — reproduces identically with `--Xmx 2048m`.
+- Not systemic to the harness or binary generally — two control classes
+  (`LockTest`, `JarVisitorTest`) run against the exact same binary/load show
+  **zero** occurrences of this signature.
+
+**Root cause (partially fixed this session, 2026-07-16):** `CRATONVM_DBG_STALE_RECV=1`
+traces every occurrence into
+`org.glassfish.jaxb.runtime.v2.model.impl.ClassInfoImpl.findGetterSetterProperties`
+— JAXB's reflection-heavy getter/setter/annotation scan over this test's
+many HBM-XML-mapped entity classes (this class alone exercises legacy
+`<hibernate-mappings/>` XML mapping in addition to annotations, per the
+`HHH90000028` deprecation warnings in its own log, unlike the two control
+classes). This is the same "unrooted native `ObjectRef` accumulated across
+an allocating call" family as several already-fixed sibling bugs in
+`native-builtins/src/lang_class.rs` (see
+`docs/internal/fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md`'s
+"residual gap" list, and
+`docs/internal/fixed-suite-bugs/wildfly-standalone-managed-server-boot-fails-under-surefire-fork.md`'s
+6-site long-tail). Found and fixed **3 more, previously-unswept sites**
+(commit `db047d38`, merged to `dev` at `6178c36f`):
+1. `collect_public_fields`/`collect_public_methods` (backing
+   `Class.getFields()`/`getMethods()`) pushed freshly-created Field/Method
+   mirror `ObjectRef`s into a plain, unrooted `Vec` during the
+   class-hierarchy walk — a GC triggered by the Nth
+   `create_field_object`/`create_method_object` call could reclaim the
+   first N-1 already-created mirrors. Fixed by collecting only
+   `FieldMetadata`/`MethodMetadata` during the walk and materializing the
+   array in one `build_mirror_array` pass (which pins the destination
+   array across every allocating call).
+2. `native_method_get_parameter_annotations` left its outer
+   `Annotation[][]` array unpinned across a loop whose body
+   (`build_annotation_array_for`) allocates before `set_array_element` ran.
+3. `create_annotation_proxy` left the freshly-allocated proxy object
+   itself unpinned across many allocating calls (string/class-mirror/method
+   lookups) between allocation and the point it becomes reachable from a
+   Java root.
+
+**Verified real but insufficient:** `CRATONVM_DBG_STALE_RECV=1` on the
+fixed binary shows the first corruption in `findGetterSetterProperties`
+moved from bytecode offset `pc=170` to `pc=64` in an earlier build then to
+receiving a **different** local variable later in the same method
+(`java/util/Map.keySet()` instead of `ClassInfoImpl.nav()`) — i.e. the fix
+demonstrably reduced/deferred the corruption, confirming these are real
+bugs, but **at least one more unrooted site remains** in the same method's
+continued reflection/annotation scanning. `DefaultCatalogAndSchemaTest`
+itself still reproduces the `found=0`/`loaderror=NullPointerException`
+failure 100% of the time even on the merged-and-rebuilt `dev` tip.
+
+**Next step for a follow-up session:** re-run
+`CRATONVM_DBG_STALE_RECV=1` against current `dev` on this exact class,
+find the (now later, still-unidentified) call site inside
+`ClassInfoImpl.findGetterSetterProperties`'s continued execution after the
+property-Map lookup, and audit it for the same pin/re-read pattern. Given
+the "different receiver each time" progression, a systematic sweep of
+remaining `lang_class.rs` natives that allocate-then-use an `ObjectRef`
+without `pin_native_root` (matching the audit already done for the
+sibling constructor helpers) is likely higher-leverage than continuing to
+chase individual call sites one at a time.
 
 ## `JarVisitorTest` — RESOLVED: confirmed harness-artifact + underlying non-issue (2026-07-16)
 
@@ -136,6 +221,92 @@ run to identify exactly which method(s) cross `c1_threshold` and confirm
 the compile-time cost directly, then evaluate a scoped fix (e.g.
 short-process detection, always-async compilation, or a higher default
 `c1_threshold`) against the full benchmark suite before changing defaults.
+
+**Update 2026-07-16 (follow-up session, branch
+`fix/jit-compile-time-tax-20260716`, merged to dev): partial mitigation
+landed, full resolution still OPEN.** Did the next step this doc called
+for: added a `CRATONVM_DBG_TIER_ENQUEUE` diagnostic to
+`jit/src/tiered.rs`'s `should_compile_inner` (prints method key + tier +
+invocation count + process-elapsed-ms on every compile-task enqueue) and
+used it to confirm the mechanism directly instead of by wall-clock
+inference alone. Raised `CompilationPolicy`'s defaults from
+`c1_threshold=200/c2_threshold=5000` to `c1_threshold=1500/c2_threshold=20000`
+(`osr_threshold` untouched — a hot loop that has already run
+`osr_threshold` back-edges is self-evidently still running, unlike a
+one-shot bootstrap method counted by plain invocation count; both
+remain `CRATONVM_TIER_C1_THRESHOLD`/`CRATONVM_TIER_C2_THRESHOLD`
+env-overridable as before).
+
+This is a real, validated, safe mitigation — but empirically **not a
+full fix**:
+
+1. **No steady-state throughput regression.** A same-binary A/B
+   (`CRATONVM_TIER_C1_THRESHOLD=200 CRATONVM_TIER_C2_THRESHOLD=5000` env
+   override, i.e. the old defaults, vs the new unset-env defaults) on a
+   standalone `fib(32)` recursive workload measured 581ms vs 591ms —
+   within noise. `vm/benches/vm_benchmarks.rs`'s `jit_hot_loop_dispatch`,
+   `specjvm_compiler_throughput`, `interpreter_fibonacci`, and
+   `shootout_binary_trees` all report normal, healthy numbers after the
+   change. This tracks analytically too: `jit_hot_loop_dispatch`
+   pre-warms (crossing whichever threshold is set) *outside* its timed
+   measurement window, and genuinely hot/long-running workloads blow
+   past even the raised bar quickly relative to their total lifetime.
+
+2. **The raised threshold delays and reduces compile volume for this
+   workload but does not suppress it, and does not reliably fix
+   `LockTest`'s timeout.** The new diagnostic shows a solo `LockTest` run
+   (post-merge binary, moderate host load ~10-30) still triggered **341
+   compile-task enqueues across 128 distinct methods** —
+   `java/lang/reflect/Modifier.isStatic`/`.isPrivate`/`.isFinal`/`.isPublic`,
+   several `org/junit/platform/commons/util/ReflectionUtils`/`Preconditions`
+   methods, and numerous `org/h2/...` internals — all legitimately called
+   thousands of times by JUnit5's reflection-heavy test discovery and
+   H2/Hibernate's JDBC round-trips even within one short test-class
+   process. Raising the bar 7.5x (200 → 1500) delays when these cross the
+   line but does not stop them from eventually doing so. The sibling
+   bisection's extreme `CRATONVM_TIER_C1_THRESHOLD=100000` (500x the
+   original) was what fully suppressed compilation and produced a clean
+   pass — a threshold that high risks becoming indistinguishable from
+   disabling the JIT outright for small/medium workloads, which is not
+   something to default to without much broader validation than this
+   session could perform.
+
+   Five solo `LockTest` reruns with the new defaults (JIT nominally on,
+   no env overrides): **all 5 failed** the internal 5000ms timeout, with
+   overshoot varying 21232-27885ms across 4 runs taken at very heavy host
+   contention (`uptime` load average 184-215, 175+ concurrent users) and
+   7387ms on a 6th, later run at milder contention (load average ~10-30,
+   post-merge-rebuild). A same-window real-HotSpot solo run passed
+   cleanly both times it was tried (5706ms flat, 15/15, zero timeout),
+   confirming the residual gap is CratonVM-specific and not purely host
+   noise. A `--nojit` run on the *same* fix binary, same host, passed
+   cleanly (9631ms, 15/15) — proving interpreter-only execution
+   comfortably fits the budget and confirming JIT-related overhead
+   (compilation and/or the ongoing per-invocation tiered-profiling
+   bookkeeping that runs even for methods that never end up compiling)
+   is still the dominant remaining cost, just not fully eliminated by
+   this threshold raise alone.
+
+**Conclusion: landed the threshold raise as a genuine, low-risk,
+validated partial mitigation** (real CPU waste eliminated for every
+method that no longer crosses the lower 200-invocation bar at all; zero
+observed regression to steady-state/long-running throughput), **but
+`LockTest` and `CriteriaBuilderNonStandardFunctionsTest` remain OPEN** —
+neither passes reliably under default settings after this change. A
+full fix needs either a much more aggressive threshold (with the
+throughput risk above validated away across a broader benchmark set) or
+a fundamentally different heuristic — e.g. weighing a method's
+*remaining* expected call volume rather than just its cumulative count,
+or making the per-invocation tiered-bookkeeping itself cheaper/lock-free
+— both bigger undertakings than this follow-up session's time budget
+allowed. Left OPEN for a future session with more time and, ideally, a
+quieter host: this session's host load swung from 6.9 to 215 over the
+course of testing, which by itself makes wall-clock pass/fail signal for
+a 5-second-budget test hard to trust in isolation — though the
+`--nojit`-vs-JIT-on same-binary, same-host comparison above is the most
+trustworthy signal gathered this round, and it points at JIT-on overhead
+(compile activity and/or bookkeeping), not host noise, as the residual
+cause.
 
 ## `CriteriaBuilderNonStandardFunctionsTest` — RESOLVED: original symptom stale, residual is JIT compile-time tax (2026-07-16)
 
@@ -256,6 +427,24 @@ worth a follow-up look: `al_slots_for`'s per-call, uncached
 (caught live via gdb mid-stall) — a small per-`ClassId` cache there is a
 plausible, low-risk contribution to closing part of the general throughput
 gap, independent of the JIT-tax question.
+
+**Update 2026-07-16 (follow-up session): same partial-mitigation-not-full-fix
+outcome as the `LockTest` entry above.** The `fix/jit-compile-time-tax-20260716`
+threshold raise (`c1_threshold` 200 -> 1500, `c2_threshold` 5000 -> 20000,
+see that entry for the full validation writeup) was tested against this
+class too: a solo run on the pre-merge fix binary still hit the 120s
+`TimeoutException` (`ms=148340`, 17/18 ok, 1 failed — same shape as
+before), with the new `CRATONVM_DBG_TIER_ENQUEUE` diagnostic showing zero
+compile-task enqueues *in that specific run* — but the `LockTest` entry's
+later post-merge run showed the "zero enqueues" reading is not a reliable
+sign of true suppression by itself (it can also mean the process was so
+starved of CPU under extreme host contention that no method reached even
+the raised 1500-invocation bar; a calmer run on the same binary reached
+1500+ for 128 distinct methods). Given that ambiguity, this class's result
+should be read the same way as `LockTest`'s: the threshold raise is a real,
+validated, safe mitigation with no steady-state throughput regression, but
+it does **not** reliably fix this class's timeout either. Remains OPEN,
+tracked jointly with `LockTest` at the JIT-policy level.
 
 ## Already-expected ABORTED entries (matches HotSpot, not a defect)
 

@@ -4806,6 +4806,15 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         "([BII)I",
         native_fis_read_bytes,
     );
+    // The real JDK public bulk-read wrapper delegates to readBytes. Annotation
+    // scanning reaches this signature directly, so route it to the same native
+    // implementation when selected by the interpreter bridge policy.
+    registry.register(
+        "java/io/FileInputStream",
+        "read",
+        "([BII)I",
+        native_fis_read_bytes,
+    );
     registry.register("java/io/FileInputStream", "skip0", "(J)J", native_fis_skip);
     registry.register(
         "java/io/FileInputStream",
@@ -8450,6 +8459,10 @@ fn dis_read_exact(
         Value::Object(Some(s)) => s,
         _ => return Err(eof_exception()),
     };
+    // Family-1 fix (cce0079): `inner` is dispatched repeatedly below — each
+    // `read` can trigger a moving GC, so refresh it per iteration like `buf`.
+    let inner_pin = ctx.pin_native_root(inner);
+    let mut inner = inner;
     let buf = ctx.new_array(ArrayElementType::Byte, len);
     let buf_pin = ctx.pin_native_root(buf);
     let mut buf = buf;
@@ -8469,11 +8482,12 @@ fn dis_read_exact(
             Ok(Some(Value::Int(n))) => n,
             Ok(_) => -1,
             Err(e) => {
-                ctx.unpin_native_roots(buf_pin);
+                ctx.unpin_native_roots(inner_pin);
                 return Err(e);
             }
         };
         buf = ctx.read_native_pin(buf_pin, buf);
+        inner = ctx.read_native_pin(inner_pin, inner);
         if n == 0 {
             // Contract-violating zero-progress read: fall back to a scalar
             // single-byte read so a misbehaving stream still makes forward
@@ -8483,28 +8497,29 @@ fn dis_read_exact(
                 Ok(Some(Value::Int(v))) if v >= 0 => v,
                 Ok(_) => -1,
                 Err(e) => {
-                    ctx.unpin_native_roots(buf_pin);
+                    ctx.unpin_native_roots(inner_pin);
                     return Err(e);
                 }
             };
             if scalar < 0 {
-                ctx.unpin_native_roots(buf_pin);
+                ctx.unpin_native_roots(inner_pin);
                 return Err(eof_exception());
             }
             buf = ctx.read_native_pin(buf_pin, buf);
+            inner = ctx.read_native_pin(inner_pin, inner);
             ctx.set_array_element(buf, total, Value::Int(scalar));
             total += 1;
             continue;
         }
         if n < 0 {
-            ctx.unpin_native_roots(buf_pin);
+            ctx.unpin_native_roots(inner_pin);
             return Err(eof_exception());
         }
         total += n as usize;
     }
     let mut out = vec![0u8; len];
     ctx.read_byte_array_into(buf, 0, &mut out);
-    ctx.unpin_native_roots(buf_pin);
+    ctx.unpin_native_roots(inner_pin);
     Ok(out)
 }
 
@@ -8683,8 +8698,20 @@ fn native_dis_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let len_bytes = dis_read_exact(ctx, this, 2)?;
+    // Family-1 fix (cce0079): the first `dis_read_exact` dispatches
+    // `InputStream.read` (GC-capable) — refresh `this` before the second
+    // call (canary-caught live during WildFly `Currency.<clinit>`).
+    let this_pin = ctx.pin_native_root(this);
+    let len_bytes = match dis_read_exact(ctx, this, 2) {
+        Ok(b) => b,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
     let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     let bytes = dis_read_exact(ctx, this, len)?;
     let s = decode_modified_utf8(&bytes).map_err(|e| {
         cratonvm_types::error::RuntimeError::IOException {
@@ -9163,7 +9190,13 @@ fn native_dos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(None),
     };
     if let Value::Object(Some(inner)) = ctx.get_field(this, DOS_FIELD_OUT) {
+        // Family-1 fix (cce0079): the `flush` dispatch is GC-capable —
+        // refresh `inner` before the `close` dispatch, or close() runs on a
+        // stale/wrong stream (leaking the real one).
+        let inner_pin = ctx.pin_native_root(inner);
         let _ = ctx.invoke_virtual_declared("java/io/OutputStream", inner, "flush", "()V", &[]);
+        let inner = ctx.read_native_pin(inner_pin, inner);
+        ctx.unpin_native_roots(inner_pin);
         ctx.invoke_virtual_declared("java/io/OutputStream", inner, "close", "()V", &[])?;
     }
     Ok(None)

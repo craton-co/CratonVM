@@ -1,6 +1,22 @@
 # WildFly standalone boot: `ClassCastException: java.lang.Object cannot be cast to org.jboss.as.controller.registry.AttributeAccess` during `parallel-extension-add` — register-invisible JIT root family, confirmed occurrence
 
-Status: OPEN — two independent 2026-07-14/2026-07-15 follow-ups (both below)
+Status: ROOT CAUSE FOUND AND FIXED 2026-07-16 — standalone CCE rate 0/14 post-fix (vs ~50%
+baseline); a narrow domain-no-JIT long-tail residual remains OPEN (see the 2026-07-16 section at
+the end). The dominant mechanism was NEVER a register-invisible JIT root: the moving young GC's
+object-start walk silently truncated at the first TLAB GAP-filler gap on effectively EVERY boot,
+after which `forward_object` refused to evacuate every young object above the breakout (returning
+each root/reference unmoved) — mass-dangling references into recycled memory. Every earlier
+symptom in this doc (the CCE cast-target menagerie, `via_pin=true`, JIT-independence, canary
+firings at scattered reader sites) is explained by that one defect. Full root-cause writeup,
+evidence chain, fix layers, and the companion ~35-site native-collections stale-at-store wave:
+`docs/internal/fixed-suite-bugs/wildfly-cce0079-young-start-set-truncation-FIXED.md`.
+
+Historical analysis below is retained verbatim; read it knowing its "register-invisible JIT
+root" and "cross-thread GC-root-visibility race" attributions were superseded by the walk
+truncation — those hypotheses were reasonable readings of reader-side evidence for what was
+actually a batch-scale GC forwarding gap.
+
+Original 2026-07-13 status: OPEN — two independent 2026-07-14/2026-07-15 follow-ups (both below)
 narrow this further without closing it. The 2026-07-14 revalidation ruled out
 the default-on full-GPR safepoint spill (`02b91823`), both JIT/root-scan
 caches, and broadened STW peer scanning as fixes. The 2026-07-15 follow-up
@@ -754,3 +770,55 @@ incoming `696c7382` "handle lambda comparable sorting" commit is NOT resolved �
 comparison (cherry-pick `2ad5068e` onto `b5c8f43f` and A/B the domain-boot CCE rate). Also note: dev
 at `d1be7310` carries 7 failing `jit::skip_list` unit tests from another session (verified failing on
 pristine `d1be7310`, unrelated to this branch).
+
+## 2026-07-16 (second session): ROOT CAUSE FOUND AND FIXED — moving young GC's object-start walk truncation; `696c7382` exonerated; residual narrowed to a domain-no-JIT long-tail
+
+Worktree `/data/wt-cce0079-20260716` (Azure host), branch `fix/wildfly-cce0079-close-20260716`,
+forked from `origin/dev @ dcb24161`. Full writeup with the evidence chain and fix layers:
+`docs/internal/fixed-suite-bugs/wildfly-cce0079-young-start-set-truncation-FIXED.md`. Summary:
+
+- **Attribution answered first**: `696c7382` is exonerated by ancestry — it is already contained in
+  `b5c8f43f`, the base the previous section measured 0/42 on, so it cannot be the Comparable-CCE
+  regression. (Message-format analysis also showed the Comparable CCE comes from
+  `native-collections`' `compare_via_compare_to` — `class X cannot be cast to class ...` — while
+  the `AttributeAccess`-family CCEs come from the interpreter checkcast — `X cannot be cast to Y` —
+  both downstream symptoms of the same corruption.)
+- **Root cause**: `collect_garbage_inner`'s moving-path `young_object_starts` walk assumed a
+  contiguous bump-allocated young space and `break`'d at the first implausible header. Young space
+  legitimately contains free-list gaps, reserved TLAB tails, and sub-`HEADER_SIZE` GAP-filler
+  sentinels; the walk hit one a few MB in on EVERY boot (warning present in 100% of baseline logs)
+  and silently dropped every later young object from the start set. `forward_object_impl` treats
+  "not in the start set" as a conservative interior word and returns the address UNMOVED — for
+  every root (precise frames and native pins included) and every scanned reference slot — so live
+  objects above the breakout were never evacuated and every reference to them dangled into recycled
+  memory after the swap. This explains every prior observation at once: the arbitrary cast-target
+  menagerie, `--nojit` reproduction, `via_pin=true` (pins remap through `pointer_map`, but
+  un-forwarded objects never enter it), silent wedges (poisoned executor/queue state), and why
+  per-site pin fixes never moved the rate.
+- **Fix layers**: gap-aware walk (free-list + `jit_tlab_skip_offsets` merge + Bug-D GAP-filler
+  stride) + a skip-this-cycle fail-safe if the walk still can't complete. The fail-safe was
+  measured to matter: an intermediate build diverted such cycles to the non-moving sweep instead
+  and reproduced the HIB-CV-22/32/33 live-object reclaim within 145 ms — on the precise-root path
+  the ONLY sound degraded mode is skipping the cycle (over-retain).
+- **Validation**: standalone JIT boots 0/14 CCE post-fix (vs ~50% on the same-day baseline), full
+  `WFLYSRV0025` boots on a loaded shared host; domain no-JIT probes progress to both-servers
+  registered + HC `WFLYSRV0025` + (DC_001) server-two `WFLYSRV0025`.
+- **Companion fixes landed in the same branch**: ~35 genuine Family-1 stale-at-store sites across
+  `native-collections` (TreeMap put replace-branch, PriorityQueue sift paths, ArrayDeque/
+  LinkedList/CopyOnWriteArrayList adds/removes/lookups, HashSet bulk ops, LinkedHashMap eviction
+  key, map view write-throughs — several with monitor-leak side effects), the XNIO conduit/worker
+  layer (sink resume/suspend across listener dispatch, channel-alloc registry keys, TCP
+  open/accept listener chains), and DataInput/OutputStream natives (`dis_read_utf`,
+  `dis_read_exact` inner-stream loop, `dos_close`). Diagnostics landed: the
+  `CRATONVM_DBG_STALE_OBJREF_CYCLES` quarantine ring, `CRATONVM_DBG_CCE_BT` receiver
+  identity at CCE construction, stale-value store checks in the `set_field`/`set_array_element`
+  funnels, and an always-on RETURN-value `load_and_forward` healing barrier at the native-call
+  funnel (names stale-returning natives under the debug flag).
+- **Still OPEN (the remaining scope of this doc)**: a low-rate long-tail in the domain no-JIT
+  window — captured so far: a stale String feeding interpreter `aastore` in
+  `SubsystemResourceDescriptionResolver.<init>` (producer not yet identified; the new return
+  barrier + store canaries target exactly this) and a `cid=0`-receiver CCE in
+  `AddStepHandler.recordCapabilitiesAndRequirements` (read far outside any quarantine window).
+  The SIGSEGV bucket under JIT remains the separately-tracked SB-CRASH-04/precise-maps roadmap
+  family (fresh symbol-bearing cores harvested to
+  `/data/wt-cce0079-20260716/probes/cores/SF2_00{1,6}-core.*`).

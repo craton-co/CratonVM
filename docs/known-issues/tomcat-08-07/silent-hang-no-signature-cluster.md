@@ -8,6 +8,39 @@ suite timeout. **Severity:** medium (was high/indefinite-hang; now
 bounded-but-slow in the affected code paths). **HotSpot:** PASS on all 3
 (fresh-verified).
 
+## Checkpoint update (2026-07-16)
+
+**Status remains OPEN.** This checkpoint closes several verified scanner and
+JIT-safety contributors, but it does **not** retire this note because only one
+of the three final class-level proofs has completed on the current branch.
+
+- `org.apache.catalina.startup.TestContextConfig` completed successfully in
+  **951.751 s**: `OK (8 tests)`. This is a focused positive result, not yet the
+  final post-merge rerun.
+- `org.apache.catalina.connector.TestResponsePerformance` remains the blocking
+  residual. Its hot `Response.toAbsolute()` path calls simple request accessors
+  returning `ldc` String literals; diagnostics showed these methods were
+  permanently JIT-bailing, leaving a million-iteration benchmark interpreted.
+  A prior forced-native experiment was discarded because it was slower than the
+  URI comparator. The safe replacement now carries literal bytes in the
+  compiled-method metadata and materializes the interned String through the VM
+  on every compiled execution; it never embeds a movable Java object address in
+  generated code. The JIT crate compiles with this path. A VM-wide cargo check
+  could not complete in this checkpoint because another active build owns the
+  shared target's `libffi-sys` output directory (`Access is denied`), so no
+  Response timing claim is made yet.
+- `org.apache.jasper.compiler.TestValidator` has not been rerun after the
+  latest scanner/JIT changes and remains open.
+
+The scanner-side fixes in this branch also restrict Tomcat native overrides to
+the explicitly audited bridges, register `FileInputStream.read([BII)I`, keep
+the real JDK `WeakHashMap` bytecode rather than a synthetic layout, avoid the
+unsafe direct JIT call in BCEL `ClassParser.readInterfaces`, and gate compact
+reference putfield stores on the inline-field feature. These changes are
+covered by focused JIT tests; all three Tomcat classes still require a clean
+post-merge release build and focused rerun before this document may move to
+`docs/internal`.
+
 ## Summary
 
 Three classes HANG at the full 1200s timeout without printing any
