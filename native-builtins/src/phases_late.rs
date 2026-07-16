@@ -32091,7 +32091,9 @@ pub(crate) fn register_phase63_natives(registry: &mut NativeMethodRegistry) {
 
 pub(crate) fn register_p63_weak_hash_map(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // Same synthetic fallback as the early registration: a real JDK
+    // WeakHashMap must use its bytecode-backed layout.
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let whm = "java/util/WeakHashMap";
     r.register(whm, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;

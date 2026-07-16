@@ -6313,7 +6313,9 @@ pub(crate) fn register_identity_hashmap_natives(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 pub(crate) fn register_weak_hashmap_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+    // The real JDK class has bytecode and a different physical layout. Keep
+    // this three-slot implementation for the synthetic fallback only.
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let c = "java/util/WeakHashMap";
     r.register(c, "<init>", "()V", native_em_init);
     r.register(c, "<init>", "(I)V", native_em_init);
@@ -17616,26 +17618,11 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         let s = crate::net_phase_e::uri_raw_string(ctx, this);
         Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
     });
-    r.register(uri, "toURL", "()Ljava/net/URL;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // Create a URL from the raw string (see residual-3 fix note above),
-        // but preserve the real JDK contract for relative URIs: URI.toURL()
-        // must throw IllegalArgumentException("URI is not absolute") rather
-        // than manufacture a null/relative URL. Spring's ResourceUtils relies
-        // on that exception to fall back from URI.toURL() to new URL(...), and
-        // then to classpath resource resolution for unresolved placeholders.
-        let raw = crate::net_phase_e::uri_raw_string(ctx, this);
-        if !raw.contains(':') {
-            return Err(RuntimeError::IllegalArgumentException {
-                message: "URI is not absolute".to_string(),
-            }
-            .into());
-        }
-        let raw_obj = ctx.create_string(&raw);
-        let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 1);
-        ctx.set_field(url_obj, 0, Value::Object(Some(raw_obj)));
-        Ok(Some(Value::Object(Some(url_obj))))
-    });
+    // `URI.toURL()` is registered by `net_phase_e` with the real URL-aware
+    // implementation. Do not override it here: this late phase used to
+    // replace it with a one-slot synthetic URL, so URL consumers eventually
+    // dispatched `toExternalForm()` on a plain Object and intermittently
+    // dropped Tomcat HTTP/2 responses.
     // equals/hashCode: this registration (phase54, registered LAST — see the
     // `register_phase54_natives` call site in lib.rs) wins over the identical
     // pair in `net_phase_e.rs`, so it is the one actually in effect for

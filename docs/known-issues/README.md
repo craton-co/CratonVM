@@ -4,6 +4,39 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-16 WildFly boot CCE family ROOT CAUSE FIXED — moving young GC's object-start walk truncated at the first TLAB gap, mass-dangling references (was misattributed for weeks as "register-invisible JIT roots" / per-site missed pins)
+
+FIXED (full writeup): [`wildfly-cce0079-young-start-set-truncation-FIXED.md`](../internal/fixed-suite-bugs/wildfly-cce0079-young-start-set-truncation-FIXED.md)
+— the `WFLYCTL0079` / `ClassCastException: java.lang.Object cannot be cast to X` family during
+`parallel-extension-add` (`AttributeAccess`/`AttributeDefinition`/`Comparable`/`Function`/`Map`/…
+cast targets), the `via_pin=true` mystery, and a swath of "silent wedge" boot failures all traced
+to ONE defect: `collect_garbage_inner`'s moving-path `young_object_starts` walk `break`'d at the
+first free-list/TLAB/GAP-filler gap (warning present in 100% of baseline logs) and
+`forward_object` then refused to evacuate every young object above the breakout — for precise
+roots and native pins included. Fixed with a gap-aware walk + a skip-cycle fail-safe (measured:
+diverting to the non-moving sweep instead reclaims live objects on the precise-root path —
+HIB-CV-22/32/33). Standalone CCE rate 0/14 post-fix vs ~50% baseline. Landed alongside: ~35
+audited Family-1 stale-at-store fixes (native-collections TreeMap/PriorityQueue/ArrayDeque/
+LinkedList/COWAL/HashSet-bulk/LinkedHashMap-eviction + lookup family), XNIO conduit/worker
+fixes (listener dispatch, channel-alloc registry keys), DataInput/OutputStream fixes, an
+always-on RETURN-value `load_and_forward` healing barrier at the native-call funnel, and new
+diagnostics (`CRATONVM_DBG_STALE_OBJREF_CYCLES` quarantine ring, `CRATONVM_DBG_CCE_BT`,
+store-funnel stale-value checks). A narrow domain-no-JIT long-tail residual remains OPEN in
+[`wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`](wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md)
+(2026-07-16 section); the JIT SIGSEGV bucket stays with the SB-CRASH-04/precise-maps roadmap.
+Timeline correction (merge-time finding): the truncating walk itself was introduced the same
+morning by `1c4aaa06`, so the 100%-rate collapse was a same-day regression amplifier on top of
+the older lower-rate family (which the ~35 pin fixes + the return barrier address); `fb15be63`
+independently landed the GAP-filler stride portion — this branch adds the free-list/TLAB merge,
+walk-completeness tracking, and the skip-cycle fail-safe on top. Details in the FIXED writeup.
+
+RETIRED with the same wave:
+[`wildfly-domain-hc0053-server-inventory-timeout-RESOLVED.md`](../internal/fixed-suite-bugs/wildfly-domain-hc0053-server-inventory-timeout-RESOLVED.md)
+— the multi-session WildFly domain-boot record (inventory transport → StreamDecoder →
+async-future/XNIO AB-BA deadlock → blocked on this CCE family) captured its final closing
+artifact: BOTH managed servers reaching `WFLYSRV0025` in one clean run (`DM_001`: server-one
+70.1s, server-two 84.2s, zero failure markers in the domain console log).
+
 ## 2026-07-15 Keycloak `WelcomePageTest` zipfs `Files.copy` bug FIXED (two stacked path-layout bugs); teardown hang re-verified NOT reproducing
 
 FIXED (moved to `docs/internal/fixed-suite-bugs/`): [`zipfs-files-copy-wrapped-path-FIXED.md`](../internal/fixed-suite-bugs/zipfs-files-copy-wrapped-path-FIXED.md)
@@ -86,7 +119,7 @@ causes with concrete fix directions:
 - [`springboot/structured-logging-map-entry-getkey-lambda-dispatch-precedence.md`](springboot/structured-logging-map-entry-getkey-lambda-dispatch-precedence.md) — `Map.Entry::getKey`/`getValue` method references over a synthetic wrapper entry resolve to the wrong native override (interface-level generic beats the wrapper's own delegating native); confirmed with a standalone repro (5 classes).
 - [`springboot/applicationcontextrunnertests-lazy-cglib-classnotfound-crash.md`](springboot/applicationcontextrunnertests-lazy-cglib-classnotfound-crash.md) — Spring's `@Lazy`-injection CGLIB proxy naming (`$$SpringCGLIB$$`) isn't recognized as a recoverable classloading miss, so an expected `ClassNotFoundException` escapes as an internal error and aborts the whole process (3 fatal CRASH classes; likely affects `@Lazy` injection broadly, not just these 3).
 
-The remaining four are OPEN with strong, evidence-backed hypotheses not yet confirmed by live bisection: `jit-dispatch-depth-guard-shallow-stackoverflow-cluster.md`, `comparable-classcast-lambda-proxy-unknown-class.md`, `collectionbindertests-classcast-testdescriptor-crash.md`, and `jsonvaluewritertests-nesting-depth-guard-stack-overflow.md` (a genuine native `EXCEPTION_STACK_OVERFLOW`, not a caught Java one). The Reactor Netty `HttpClientSecure` crash was fixed 2026-07-16; its archive is [`internal/fixed-suite-bugs/reactor-nettyhttpclient-httpclientsecure-null-provider-crash-FIXED.md`](../internal/fixed-suite-bugs/reactor-nettyhttpclient-httpclientsecure-null-provider-crash-FIXED.md). The Logback `LoggerContext` final-field cluster was fixed 2026-07-15 by restoring real constructor invocation; its archive is [`internal/springboot/logback-loggercontext-listenerlist-final-field-corruption-FIXED.md`](../internal/springboot/logback-loggercontext-listenerlist-final-field-corruption-FIXED.md). None overlap with previously-retired clusters.
+The remaining five are OPEN with strong, evidence-backed hypotheses not yet confirmed by live bisection: `jit-dispatch-depth-guard-shallow-stackoverflow-cluster.md`, `comparable-classcast-lambda-proxy-unknown-class.md`, `collectionbindertests-classcast-testdescriptor-crash.md`, `jsonvaluewritertests-nesting-depth-guard-stack-overflow.md` (a genuine native `EXCEPTION_STACK_OVERFLOW`, not a caught Java one), and `reactor-nettyhttpclient-httpclientsecure-null-provider-crash.md`. The Logback `LoggerContext` final-field cluster was fixed 2026-07-15 by restoring real constructor invocation; its archive is [`internal/springboot/logback-loggercontext-listenerlist-final-field-corruption-FIXED.md`](../internal/springboot/logback-loggercontext-listenerlist-final-field-corruption-FIXED.md). None overlap with previously-retired clusters.
 
 ## 2026-07-13 WildFly `AttributeAccess` CCE confirmed as register-invisible-JIT-root family; NEW "Family 1" stale-ObjectRef residual found alongside it
 

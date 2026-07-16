@@ -4971,9 +4971,9 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                             OBJECT_NATIVE_DISPATCH_CACHE.with(|cache| {
                                 cache.borrow_mut().insert(info_key, entry);
                             });
-                            if let Some(result) =
-                                call_object_native_raw(vm, thread, info, receiver, args_slice, entry)
-                            {
+                            if let Some(result) = call_object_native_raw(
+                                vm, thread, info, receiver, args_slice, entry,
+                            ) {
                                 return result;
                             }
                         }
@@ -5329,9 +5329,7 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
         std::slice::from_ref(&arg),
     ) {
         Ok(value) => value,
-        Err(error) => {
-            return handle_jit_dispatch_error(vm, thread, error, &INTEGER_VALUE_OF_INFO)
-        }
+        Err(error) => return handle_jit_dispatch_error(vm, thread, error, &INTEGER_VALUE_OF_INFO),
     };
     match result {
         Some(Value::Object(Some(object))) => {
@@ -5526,10 +5524,9 @@ fn hashmap_native_callback(info: &JitInvokeInfo) -> Option<cratonvm_native_api::
 #[inline]
 fn matcher_native_arg_count(info: &JitInvokeInfo) -> Option<usize> {
     match (info.method_name, info.descriptor) {
-        ("find", "()Z")
-        | ("start", "()I")
-        | ("end", "()I")
-        | ("group", "()Ljava/lang/String;") => Some(1),
+        ("find", "()Z") | ("start", "()I") | ("end", "()I") | ("group", "()Ljava/lang/String;") => {
+            Some(1)
+        }
         ("find", "(I)Z")
         | ("start", "(I)I")
         | ("end", "(I)I")
@@ -6020,14 +6017,9 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     if !crate::classloading::any_class_redefined() {
         if let Some(callback) = matcher_native_callback(info) {
             if is_exact_matcher_class(vm, receiver_class_id) {
-                if let Some(result) = call_matcher_native_raw(
-                    vm,
-                    thread,
-                    info,
-                    receiver_ref,
-                    args_slice,
-                    callback,
-                ) {
+                if let Some(result) =
+                    call_matcher_native_raw(vm, thread, info, receiver_ref, args_slice, callback)
+                {
                     return result;
                 }
             }
@@ -8208,9 +8200,7 @@ pub fn build_helpers() -> JitRuntimeHelpers {
     // same no-ABI-change registration pattern as the savebase watch helpers
     // above. See `jit_integer_value_of_direct` / `jit_integer_int_value_direct`
     // and the recognition in `jit::try_compile`.
-    cratonvm_jit::set_integer_value_of_direct_fn(
-        jit_integer_value_of_direct as *const () as usize,
-    );
+    cratonvm_jit::set_integer_value_of_direct_fn(jit_integer_value_of_direct as *const () as usize);
     cratonvm_jit::set_integer_int_value_direct_fn(
         jit_integer_int_value_direct as *const () as usize,
     );
@@ -8316,7 +8306,28 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         // Inline self-recursion check — leaf floor-query helper (see the
         // jit-api field doc; prologue-called once per self-recursive method).
         native_stack_floor_fn: jit_native_stack_floor as *const () as usize,
+        ldc_string: jit_ldc_string as *const () as usize,
     }
+}
+
+/// GC-safe materialization for a compiled `ldc "..."` instruction.
+///
+/// The literal bytes live in the owning `CompiledMethod`; this helper consults
+/// the VM string pool on every execution. Keeping the object reference out of
+/// generated code is essential: the pool is rewritten after a moving GC, while
+/// an immediate object address would become stale on the next invocation.
+#[no_mangle]
+pub extern "C" fn jit_ldc_string(vm_ptr: i64, bytes: *const u8, len: usize) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    if vm_ptr == 0 || bytes.is_null() {
+        return 0;
+    }
+    // SAFETY: the JIT compiler owns the literal bytes for the lifetime of its
+    // compiled method, and `vm_ptr` is the hidden SharedVm argument installed
+    // by the compiled-entry trampoline.
+    let text = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(bytes, len)) };
+    let shared = unsafe { &*(vm_ptr as *const SharedVm) };
+    crate::vm::vm_object::create_java_string(shared, text).as_ptr() as i64
 }
 
 /// Stage 3 (precise oop maps) — record the EXACT RBP of the JIT frame that is

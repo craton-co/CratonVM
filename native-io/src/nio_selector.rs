@@ -897,6 +897,16 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
         if err.kind() == ErrorKind::Interrupted {
             return Ok(0);
         }
+        // Closing from another thread may invalidate the epoll fd while this
+        // select is asleep. It is an in-flight close wakeup, not an I/O error.
+        if selectors()
+            .read()
+            .get(&id)
+            .map(|s| !s.lock().open)
+            .unwrap_or(true)
+        {
+            return Ok(0);
+        }
         return Err(ioex(format!("epoll_wait: {err}")));
     }
 
@@ -908,7 +918,10 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
     };
     let mut st = s.lock();
     if !st.open {
-        return Err(closed_selector());
+        // The close raced a select already executing in epoll_wait. The JDK
+        // wakes that existing operation; it must not surface as a teardown
+        // failure. A later select still fails in the entry check above.
+        return Ok(0);
     }
 
     // Reset all readyOps before re-application.
@@ -1173,7 +1186,7 @@ fn kernel_select_windows(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFail
                     if let Some(s) = regs.get(&id) {
                         let mut st = s.lock();
                         if !st.open {
-                            return Err(closed_selector());
+                            return Ok(0);
                         }
                         if st.woken {
                             st.woken = false;
@@ -1202,7 +1215,11 @@ fn kernel_select_windows(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFail
     };
     let mut st = s.lock();
     if !st.open {
-        return Err(closed_selector());
+        // A close may race a select that had already entered WSAPoll. The
+        // JDK wakes that in-flight select and lets it return; only a select
+        // that begins after closure throws ClosedSelectorException. Propagating
+        // an exception here leaks the teardown race into Tomcat's Poller.
+        return Ok(0);
     }
 
     let mut count = 0;
@@ -1382,7 +1399,8 @@ fn kernel_select_poll(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed>
     };
     let mut st = s.lock();
     if !st.open {
-        return Err(closed_selector());
+        // Same in-flight-close rule as the Linux and Windows selector paths.
+        return Ok(0);
     }
 
     let mut count = 0;
