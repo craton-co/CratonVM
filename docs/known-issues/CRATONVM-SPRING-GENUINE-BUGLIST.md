@@ -11,7 +11,18 @@ This document tracks the **genuine remaining failures**.
 ## 1. Deep-Dive Investigations (Root-Caused, Pending Fix)
 
 *   **Mockito `spy()` StackOverflowError** (`context.annotation.ImportSelectorTests`)
-  *   **Status**: **OPEN** — symptom shape changed 2026-07-16. On a fresh `dev` tip (`6c517cd9`), the
+  *   **Status**: **FIXED (verified 2026-07-16, joint verification session)**. The heap-corruption
+    failure mode described below (`importSelectorsWithNestedGroup`,
+    `importSelectorsWithNestedGroupSameDeferredImport`) was an instance of the same cross-cutting
+    young-GC exact-walk bug independently root-caused and fixed by an unrelated concurrent session's
+    commit `fb15be63` ("fix(gc): GAP_FILLER_CLASS_ID not special-cased in new young-GC exact-walk
+    loops") — see `CRATONVM-SPRING-TIMEOUT-CLUSTER-1500S-RERUN.md`'s **2026-07-16 joint verification**
+    addendum to the `ImportSelectorTests` section for the full rebuild-and-rerun confirmation
+    (`found=9 succ=9 fail=0`, all 9 methods including both previously-crashing ones now pass, zero
+    corruption-signature log lines). Not this session's fix; attributing correctly rather than
+    claiming credit. Full history of the original investigation kept below for context.
+  *   **2026-07-16 pre-fix status (superseded above, kept for history)**: symptom shape changed
+    2026-07-16. On a fresh `dev` tip (`6c517cd9`), the
     original isolated repro (`SpyDLBFProbe.java`: `spy(new DefaultListableBeanFactory())` + one
     `registerSingleton()` call) **no longer reproduces**, and 3 of the 5 real `spy()` sub-tests
     (`importSelectors`, `importSelectorsWithGroup`, `importSelectorsSeparateWithGroup`) now **pass**
@@ -190,7 +201,7 @@ the WRONG same-named copy. Eight fixes landed on
 | `PersistenceManagedTypesBeanRegistrationAotProcessorTests` | FAIL | FAIL 2/0 (host lacks JDK 24+, see below — not a VM bug) |
 | `TestClassScannerTests` | TIMEOUT 600 s | **completes 177 s** (7/7 or flaky 7/6) |
 | `TestCompilerTests` | TIMEOUT 600 s+ | **completes 40 s**, FAIL 22/21/1 (3 of 4 fixed) |
-| `ApplicationContextAotGeneratorTests` | ABEND (CGLIB load) | **2026-07-16 re-triage: LOADERR found=0** — NEW GC heap-corruption bug, see below (regresses the earlier "discovers+runs 40 methods" note, which was never characterized) |
+| `ApplicationContextAotGeneratorTests` | ABEND (CGLIB load) | **2026-07-16 joint verification: LOADERR FIXED** — `found=40 succ=25 fail=15`, 0 corruption-signature lines, see below |
 | `BeanDefinitionMethodGeneratorTests` | FAIL 34/3 | **OK 34/34** |
 | `ConfigurationClassPostProcessorAotContributionTests` | FAIL 20/8 | **OK-ish 20/15/5** (5 residual = host ClassFile gap, see below) |
 | `PersistenceAnnotationBeanPostProcessorAotContributionTests` | FAIL 8/0 (NCDFE) | **2026-07-16 re-triage: FAIL 8/2/6** (was briefly hidden behind an unrelated GC crash, see below — now the SAME shape as before, 1 pre-existing cold-attach + 5 narrowed ByteBuddy-generics residual) |
@@ -620,6 +631,51 @@ the WRONG same-named copy. Eight fixes landed on
     of this class alone, real JDK 25, any heap size — no batching or multi-class
     load needed, which should make this considerably easier to bisect than
     `spring-bug-10` was.
+
+    **2026-07-16 joint verification addendum — FIXED, confirmed by rebuild+rerun.**
+    A separate, concurrent 2026-07-16 session investigating
+    `PersistenceAnnotationBeanPostProcessorAotContributionTests` (see that entry
+    above) hit an identical-looking stale-ObjectRef/all-zero-header crash and
+    traced it to an unrelated dev commit, `fb15be63` ("fix(gc): GAP_FILLER_CLASS_ID
+    not special-cased in new young-GC exact-walk loops"), landed 2026-07-16 while
+    both investigations were in progress. This task was to verify that fix also
+    closes *this* class's LOADERR (the two symptom writeups above are effectively
+    identical: all-zero-header stale pointers hitting JUnit-Platform/javac
+    internals within milliseconds, reproducing under both JIT and `--nojit`, at
+    every heap size tried). Fresh worktree `/data/data/wt-gcbug-verify-20260716`,
+    `origin/dev` tip `47151b27` (has `fb15be63` as an ancestor; confirmed via
+    `git merge-base --is-ancestor`), full `cargo build --release` (35m48s under
+    heavy host contention — unrelated to the fix, just Azure-host load), real JDK
+    25, `CRATONVM_DEFAULT_HEAP_MAX_MB=2048`, same `KRun` single-class launcher and
+    classpath as the original triage. Result:
+    ```
+    RESULT org.springframework.context.aot.ApplicationContextAotGeneratorTests found=40 succ=25 fail=15 skip=0 abort=0 ms=573026 status=FAIL
+    ```
+    **The LOADERR is gone.** Test discovery now finds all 40 methods (matching the
+    HotSpot baseline's 40/40 shape) and the full run completes end-to-end — no
+    `NoSuchMethodError`, no `EngineExecutionListener`/`this.delegate` NPE, no VM
+    abort. Grepping the full run log for the corruption signature (`Stale pointer
+    detected`, `GC-ARRAY-GUARD`, `implausible extent`, `LOADERR`) returns **zero
+    matches**. The class is slow under CratonVM (573 s vs. HotSpot's 155.9 s —
+    a throughput question, not correctness, and not investigated further here) but
+    otherwise behaves like a normal JUnit run. The 15 failures that remain are
+    ordinary, catchable test failures, not VM-level corruption: all 15
+    `FAILCAUSE`s are either `org.springframework.core.test.tools.CompilationException:
+    Unable to compile source` or `org.springframework.beans.factory.aot.AotBeanProcessingException:
+    Error processing bean ... failed to generate code for bean definition`, all on
+    CGLIB-proxy-configuration test methods (`processAheadOfTimeWhenHasCglibProxy*`,
+    `processAheadOfTimeUsesCglibClassForFactoryMethod`,
+    `processAheadOfTimeExposeUserClassForCglibProxy`) — the same ByteBuddy/CGLIB
+    generics-resolution AOT-codegen residual family already tracked for the
+    sibling `PersistenceAnnotationBeanPostProcessorAotContributionTests` class
+    above. **Not this session's fix; attributing correctly.** No code change was
+    needed or made — this entry is a verification-only confirmation. Full second
+    corroborating data point (in addition to the `PersistenceAnnotationBeanPostProcessorAotContributionTests`
+    0/3-crashes-after / 6/6-crashes-before result) that `fb15be63` closes this
+    cross-cutting young-GC exact-walk family. See
+    `CRATONVM-SPRING-TIMEOUT-CLUSTER-1500S-RERUN.md`'s **2026-07-16 joint
+    verification** addendum to the `ImportSelectorTests` section for the sibling
+    `context.annotation.ImportSelectorTests` result (also fully clean, `9/9` pass).
 
     **`TestContextAotGeneratorIntegrationTests` — genuine improvement, still
     4/4 FAIL, 4 distinct causes, none newly fixed this session.** The doc's old

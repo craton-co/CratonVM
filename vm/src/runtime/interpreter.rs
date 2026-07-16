@@ -5331,19 +5331,49 @@ pub fn execute(
                             if let Some(name) = name_opt {
                                 let load_result = shared.load_class_concurrent(&name);
                                 if let Ok(target_id) = load_result {
-                                    let num_fields = shared
-                                        .class_manager
-                                        .read()
-                                        .get_class(target_id)
-                                        .map(|c| c.num_total_fields)
-                                        .unwrap_or(0);
-                                    new_info.push((
-                                        pc_new,
-                                        target_id.as_u32(),
-                                        num_fields,
-                                        true,
-                                        true,
-                                    ));
+                                    // JVMS 5.4.4 / 6.5 `new`: don't bake an
+                                    // inlined fast-path allocation for a `new`
+                                    // site the accessor is not permitted to
+                                    // reach (see the matching check added to
+                                    // `Instruction::New` above). Falling back
+                                    // to the sentinel entry -- exactly what
+                                    // the load-failure arm below already does
+                                    // -- makes the JIT skip this site and
+                                    // defer to the interpreter, which performs
+                                    // the real access check and throws
+                                    // `IllegalAccessError`. Without this, a
+                                    // method that gets tiered up to JIT before
+                                    // its first *interpreted* execution could
+                                    // silently bypass access control.
+                                    let accessible = {
+                                        let cm_lock = shared.class_manager.read();
+                                        match (cm_lock.get_class(class_id), cm_lock.get_class(target_id)) {
+                                            (Some(accessor), Some(target)) => {
+                                                crate::classloading::access_control::check_class_access(accessor, target).is_ok()
+                                            }
+                                            // Defensive: if either class can't be looked up here,
+                                            // don't invent a denial -- let the interpreter's own
+                                            // check (which always has both classes) be authoritative.
+                                            _ => true,
+                                        }
+                                    };
+                                    if accessible {
+                                        let num_fields = shared
+                                            .class_manager
+                                            .read()
+                                            .get_class(target_id)
+                                            .map(|c| c.num_total_fields)
+                                            .unwrap_or(0);
+                                        new_info.push((
+                                            pc_new,
+                                            target_id.as_u32(),
+                                            num_fields,
+                                            true,
+                                            true,
+                                        ));
+                                    } else {
+                                        new_info.push((pc_new, 0, 0, true, true));
+                                    }
                                 } else {
                                     new_info.push((pc_new, 0, 0, true, true));
                                 }
@@ -5579,11 +5609,9 @@ pub fn execute(
                         // allocate `Box<JitPICSlot>` per
                         // polymorphic call site in `invoke_info`).
                         ldc_info_early,
-                        Vec::new(), // ldc_string_info -- BUILD FIX (2026-07-16):
-                        // this early-compile call site predates the
-                        // ldc_string_info parameter added elsewhere on dev;
-                        // this path doesn't collect string-constant JIT info,
-                        // matching the other Vec::new() placeholders above.
+                        Vec::new(), // ldc_string_info — not yet wired for this
+                        // early-compile path (mirrors the mic_slots/pic_slots
+                        // "not yet allocated here" placeholders above).
                         ldc2w_info_early,
                         std::collections::HashMap::new(), // branch_hints
                         std::collections::HashMap::new(), // loop_unroll_hints
@@ -14258,6 +14286,27 @@ fn execute_instruction(
             let target_class_id =
                 resolve_class_loader_aware(shared, thread, referencing_class_id, &class_name)
                     .map_err(|e| convert_class_not_found(shared, thread, &class_name, e))?;
+
+            // JVMS 6.5 `new`, run-time exceptions: IllegalAccessError if the
+            // referencing class does not have permission to access the
+            // resolved class (JVMS 5.4.4 -- public, or same *runtime*
+            // package as the referencing class). `check_class_access`
+            // compares runtime package identity as the JVMS 5.3 tuple
+            // (defining class loader, package name), so a package-private
+            // class defined by a DIFFERENT `ClassLoader` instance is
+            // correctly rejected even when the package NAME matches --
+            // while ordinary same-loader package-private instantiation
+            // (by far the common case) is unaffected.
+            {
+                let cm = shared.class_manager.read();
+                if let (Some(accessor), Some(target)) = (
+                    cm.get_class(referencing_class_id),
+                    cm.get_class(target_class_id),
+                ) {
+                    crate::classloading::access_control::check_class_access(accessor, target)?;
+                }
+            }
+
             ensure_class_initialized_shared(shared, thread, target_class_id)?;
 
             let num_fields = shared
@@ -28427,13 +28476,32 @@ fn compile_osr_artifact(
                     if let Some(name) = name_opt {
                         let load_result = shared.load_class_concurrent(&name);
                         if let Ok(target_id) = load_result {
-                            let num_fields = shared
-                                .class_manager
-                                .read()
-                                .get_class(target_id)
-                                .map(|c| c.num_total_fields)
-                                .unwrap_or(0);
-                            new_info2.push((pc_new, target_id.as_u32(), num_fields, true, true));
+                            // JVMS 5.4.4 / 6.5 `new` access check -- mirrors
+                            // the `new_info` site above (same rationale: an
+                            // inaccessible `new` site must not be baked into
+                            // an inlined JIT fast path; fall back to the
+                            // sentinel entry so the interpreter's real check
+                            // (`Instruction::New`) is what actually fires).
+                            let accessible = {
+                                let cm_lock = shared.class_manager.read();
+                                match (cm_lock.get_class(class_id), cm_lock.get_class(target_id)) {
+                                    (Some(accessor), Some(target)) => {
+                                        crate::classloading::access_control::check_class_access(accessor, target).is_ok()
+                                    }
+                                    _ => true,
+                                }
+                            };
+                            if accessible {
+                                let num_fields = shared
+                                    .class_manager
+                                    .read()
+                                    .get_class(target_id)
+                                    .map(|c| c.num_total_fields)
+                                    .unwrap_or(0);
+                                new_info2.push((pc_new, target_id.as_u32(), num_fields, true, true));
+                            } else {
+                                new_info2.push((pc_new, 0, 0, true, true));
+                            }
                         } else {
                             new_info2.push((pc_new, 0, 0, true, true));
                         }
@@ -28524,9 +28592,9 @@ fn compile_osr_artifact(
                 // this codepath emits the slow-path helper for
                 // every invokevirtual/invokeinterface.
                 ldc_info2,
-                Vec::new(), // ldc_string_info -- BUILD FIX (2026-07-16): this
-                // OSR-recompile call site predates the ldc_string_info
-                // parameter added elsewhere on dev; not collected here.
+                Vec::new(), // ldc_string_info — not yet wired for this
+                // OSR-recompile path (mirrors the mic_slots/pic_slots
+                // "not yet allocated here" placeholders above).
                 ldc2w_info2,
                 std::collections::HashMap::new(), // branch_hints
                 std::collections::HashMap::new(), // loop_unroll_hints

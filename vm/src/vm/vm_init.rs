@@ -3629,7 +3629,24 @@ impl SharedVm {
         // Fast path: read lock only — no contention for already-loaded classes.
         // Bind the result to a local so the `RwLockReadGuard` is dropped at
         // the semicolon, not extended to the end of an `if let` block.
-        let fast_id = self.class_manager.read().get_loaded_class_id(name);
+        //
+        // Runtime-package-identity bug fix: was the bare, requester-less
+        // `get_loaded_class_id(name)`, which -- when no BUILT-IN loader
+        // (bootstrap/extension/application) has defined `name` yet -- falls
+        // back to returning an arbitrary lone user-defined loader's own
+        // copy if exactly one such loader happens to have defined it (see
+        // that fn's doc comment). This function's own slow path below
+        // ultimately delegates via `ClassManager::load_class`, which can
+        // only ever produce a Bootstrap/Extension/Application-loaded
+        // class -- never an unrelated user-defined loader's redefinition
+        // -- so a fast-path cache hit returning one answers a question
+        // this function was never asked and hands back the WRONG class
+        // (JVMS §5.3: defining loader is part of a class's identity).
+        // `get_loaded_class_id_for_requester(name, Application)` probes
+        // only the built-in delegation chain, matching what the slow path
+        // can actually produce: a hit here is always right, a miss falls
+        // through to the real load below instead of a stray loader's class.
+        let fast_id = self.class_manager.read().resolve_fast_path_class_id(name);
         if let Some(id) = fast_id {
             // Check if it's a synthetic stub that needs upgrading
             let is_synthetic = self
@@ -3661,10 +3678,12 @@ impl SharedVm {
             .lock()
             .expect("class-loading mutex poisoned: a thread panicked while loading a class");
 
-        // Double-check: another thread may have loaded it while we waited for the lock
+        // Double-check: another thread may have loaded it while we waited for the lock.
+        // Same loader-faithful lookup as the fast path above -- see that
+        // comment for why the bare `get_loaded_class_id` is unsound here.
         {
             let cm = self.class_manager.read();
-            if let Some(id) = cm.get_loaded_class_id(name) {
+            if let Some(id) = cm.resolve_fast_path_class_id(name) {
                 let is_synthetic = cm
                     .class_store
                     .get(id)
@@ -3682,9 +3701,12 @@ impl SharedVm {
                 .wait_timeout(loading, std::time::Duration::from_secs(30))
                 .expect("class-loading condvar poisoned: a thread panicked while loading a class")
                 .0;
-            // Re-check after waking — class may now be loaded
+            // Re-check after waking — class may now be loaded. Same
+            // loader-faithful lookup as the fast path above (see that
+            // comment) -- a lone unrelated user-defined loader's copy must
+            // not be handed back here either.
             let cm = self.class_manager.read();
-            if let Some(id) = cm.get_loaded_class_id(name) {
+            if let Some(id) = cm.resolve_fast_path_class_id(name) {
                 let is_synthetic = cm
                     .class_store
                     .get(id)
