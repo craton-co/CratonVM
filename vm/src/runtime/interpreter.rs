@@ -13193,7 +13193,7 @@ fn execute_instruction(
         Instruction::Getstatic(index) => {
             let current_class_id = thread.frames[frame_idx].class_id;
             let field = {
-                let res = resolve_field_ref(shared, current_class_id, *index);
+                let res = resolve_field_ref_loader_aware(shared, thread, current_class_id, *index);
                 match res {
                     Ok(f) => f,
                     Err(e) => {
@@ -13345,7 +13345,7 @@ fn execute_instruction(
         Instruction::Putstatic(index) => {
             let current_class_id = thread.frames[frame_idx].class_id;
             let field = {
-                let res = resolve_field_ref(shared, current_class_id, *index);
+                let res = resolve_field_ref_loader_aware(shared, thread, current_class_id, *index);
                 match res {
                     Ok(f) => f,
                     Err(e) => {
@@ -16897,6 +16897,122 @@ fn resolve_field_ref(
         None => shared.load_class_concurrent(&field_class_name)?,
     };
 
+    resolve_field_in_class(
+        shared,
+        current_class_id,
+        cp_index,
+        field_class_id,
+        field_class_name,
+        field_name,
+    )
+}
+
+/// Loader-aware variant of [`resolve_field_ref`] for use at call sites that
+/// have a `&mut JvmThread` available (the primary `getstatic`/`putstatic`
+/// opcode handlers).
+///
+/// `resolve_field_ref`'s field-owning-class lookup only consults the
+/// `initiating_resolution_cache`/`class_defined_by_loader_exact` fast paths
+/// inside [`lookup_loader_initiated`] and, on a miss, falls straight to the
+/// flat, loader-blind [`SharedVm::load_class_concurrent`] — unlike
+/// [`resolve_class_loader_aware`] (used for `CONSTANT_Class` references:
+/// `ldc`/`new`/`checkcast`/`instanceof`), it never drives the referencing
+/// class's OWN defining loader's `loadClass()` on a cache miss. Under
+/// `@CompileWithForkedClassLoader`-style scenarios this silently binds a
+/// `getstatic` in a freshly fork-loaded class to some OTHER (earlier-loaded,
+/// typically application-loader) copy of the same-named field-owning class —
+/// e.g. a fork-loaded `TypeMappedAnnotation`'s `getstatic
+/// MergedAnnotation$Adapt.CLASS_TO_STRING` binding to the application
+/// loader's `Adapt.CLASS_TO_STRING` singleton, which then compares `!=` (by
+/// reference) against a *correctly* fork-loaded `Adapt` array built
+/// elsewhere in the same call chain — silently corrupting `Adapt.isIn(...)`
+/// and, downstream, `ConfigurationClassParser$SourceClass
+/// .getAnnotationAttributes`'s `Class[]`→`String[]` conversion (manifests as
+/// `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;`).
+///
+/// This variant uses the full, re-entrant [`resolve_class_loader_aware`]
+/// resolution for the field-owning class instead, so a cache miss for a
+/// user-loader-owned referencing class drives that loader's own `loadClass`
+/// (JVMS §5.4.3 initiating-loader semantics) before ever falling back to the
+/// global store. Behaviour is unchanged whenever the referencing class is
+/// NOT user-loader-owned (gate off, or a built-in defining loader) — that
+/// case still resolves via the same global `load_class_concurrent` path.
+fn resolve_field_ref_loader_aware(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    current_class_id: ClassId,
+    cp_index: u16,
+) -> Result<ResolvedField, MethodCallFailed> {
+    // Check cache first — identical fast path to `resolve_field_ref`.
+    if let Some(cached) = shared
+        .resolution_cache
+        .read()
+        .get_field(current_class_id, cp_index)
+    {
+        return Ok(cached.clone());
+    }
+
+    let (field_class_name, field_name) = {
+        let cm = shared.class_manager.read();
+        let class = cm
+            .get_class(current_class_id)
+            .ok_or_else(|| VmError::Internal {
+                message: "current class not found".to_string(),
+            })?;
+        let (class_idx, nat_idx) = match class.constant_pool.get(cp_index) {
+            Some(ConstantPoolEntry::FieldReference {
+                class_index,
+                name_and_type_index,
+            }) => (*class_index, *name_and_type_index),
+            _ => {
+                return Err(VmError::Internal {
+                    message: format!("invalid field ref at cp#{cp_index}"),
+                }
+                .into());
+            }
+        };
+        let class_name = class
+            .constant_pool
+            .get_class_name(class_idx)
+            .ok_or_else(|| VmError::Internal {
+                message: format!("invalid class ref at cp#{class_idx}"),
+            })?
+            .to_string();
+        let (field_name, _descriptor) =
+            class
+                .constant_pool
+                .get_name_and_type(nat_idx)
+                .ok_or_else(|| VmError::Internal {
+                    message: format!("invalid name_and_type at cp#{nat_idx}"),
+                })?;
+        (class_name, field_name.to_string())
+    };
+
+    let field_class_id =
+        resolve_class_loader_aware(shared, thread, current_class_id, &field_class_name)?;
+
+    resolve_field_in_class(
+        shared,
+        current_class_id,
+        cp_index,
+        field_class_id,
+        field_class_name,
+        field_name,
+    )
+}
+
+/// Shared tail of [`resolve_field_ref`] / [`resolve_field_ref_loader_aware`]:
+/// given an already-resolved field-owning `field_class_id`, look up
+/// `field_name` (own fields first, then the superclass/superinterface chain),
+/// cache the result under `(current_class_id, cp_index)`, and return it.
+fn resolve_field_in_class(
+    shared: &SharedVm,
+    current_class_id: ClassId,
+    cp_index: u16,
+    field_class_id: ClassId,
+    field_class_name: String,
+    field_name: String,
+) -> Result<ResolvedField, MethodCallFailed> {
     // First check: is this a static field? Look in the declaring class's own fields.
     //
     // Lock-order discipline (the H2 TestScript class-resolution DEADLOCK):
