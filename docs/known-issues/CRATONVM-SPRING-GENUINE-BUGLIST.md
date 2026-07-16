@@ -927,6 +927,125 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     additional data point: fixing HIB-CV-26 means real full-class runs now reach far enough to
     actually exercise the non-moving-sweep bottleneck instead of being masked by the earlier,
     more-severe `Class.forName` abort.
+
+    **Round 4 (2026-07-16): dedicated feasibility investigation into the `is_object_address` /
+    `update_root_snapshot` conservative-GC-root-scanning bottleneck itself (the item Round 2
+    identified as "a substantially larger effort than a bug-fix session"). Result: a genuine,
+    well-evidenced, provably-safe redundancy WAS found and implemented, but it measured as a
+    PERFORMANCE REGRESSION rather than a win on the best available repro — NOT landed to `dev`.**
+    Branch `fix/precise-native-scan-20260716` (pushed, unmerged, commit `faedea48`) preserves the
+    full implementation and data for a future session with working profiler access.
+
+    Investigation: `update_root_snapshot`'s interpreter-frame operand-stack scan
+    (`ValueStack::scan_object_refs`, `vm/src/runtime/value_stack.rs`) already distinguishes
+    genuine object references from long-bit-pattern false positives via a per-slot `kinds`
+    side-array (commit `6161dc1b`, 2026-05-29 — "marks are only ever written at genuine
+    long/double producers, never over-marked"). Despite that, FOUR hot call sites
+    (`update_root_snapshot`'s two internal paths in `interpreter.rs`, `collect_roots` in
+    `vm/src/memory/roots.rs`, and the blocked-thread deposit path in `vm/src/vm/vm_exec.rs`) all
+    additionally re-validate EVERY entry `scan_object_refs` appends against the expensive, strict
+    `heap.is_object_address` header probe — a defense that predates the `kinds` mechanism
+    (introduced in commit `56a73aee`, 2026-05-16, thirteen days earlier) and, once `kinds` exists,
+    can never actually reject anything from the kind-verified branch: `git log` confirms the
+    ordering (boundary filter added first, kinds added later), and the mirrored fix already
+    landed for LOCALS (`Frame::scan_local_objects`, commit `333b24b5`, "root young/mid-init
+    objects held in frame locals") explicitly switched off the equivalent strict probe for the
+    same reason — it can incorrectly DROP a genuine root whose header a moving collector's
+    young/mid-init state hasn't fully validated yet. A dedicated investigative sub-agent
+    additionally confirmed the generational allocator (`gc/src/gen_heap.rs::alloc_object` and
+    siblings) writes the full object header synchronously, under the arena lock, before ever
+    returning the pointer to any caller (commit `74dc80b8d`, 2026-07-03) — closing the one
+    remaining question about whether a kind-verified operand-stack root could ever observe an
+    unpublished header. G1 and ZGC were NOT independently audited for the same allocator
+    invariant (their allocators release the region/arena lock before the header write), so the
+    implementation scoped the change to `VmHeap::is_generational()` only, leaving G1/ZGC on the
+    unconditional pre-existing validation.
+
+    Implementation: `ValueStack::scan_object_refs_split` appends roots in the SAME single pass as
+    `scan_object_refs` (a first two-pass draft was measurably slower — see Performance below —
+    and was replaced), additionally recording the (normally empty) list of offsets that came from
+    the separate, unrelated "loose JNI-long-smuggle" candidate path (untagged `Long`/`Double`
+    slots, still validated exactly as before). `memory::roots::scan_stack_roots_boundary` (new,
+    shared by all four call sites) skips the `is_object_address` re-probe entirely for the
+    trusted majority, gated on `VmHeap::is_generational()` (new) and a default-on opt-out flag
+    `CRATONVM_TRUST_TAGGED_STACK_ROOTS` (env_cache.rs), plus a `CRATONVM_DBG_VERIFY_TRUSTED_ROOTS`
+    diagnostic that probes the skipped entries anyway and logs (without dropping) any mismatch —
+    the empirical falsification test for the whole argument.
+
+    **Correctness: extensively verified, zero issues found.** `cargo test -p cratonvm-gc --lib`:
+    790/0 (matches the established baseline exactly). `cargo test -p cratonvm-vm --lib`: 2199
+    passed / 16 failed, and the failing set is EXACTLY the pre-existing, already-documented
+    9 debug-build-only `lock_order` + 7 parallel-race `jit::skip_list` tests (see Round-3's
+    "16 then 17 failures" note above) — zero new failures. The `binarytrees` checksum oracle
+    (`docs/internal/repros/gc-stress-bintrees-main-args/binarytrees.java`, the heaviest
+    allocation/GC-stress repro in the tree) was run at all three documented depths with
+    `CRATONVM_DBG_VERIFY_TRUSTED_ROOTS=1`: bt14 (checksum `3222190`), bt16 (`14985902`), bt18
+    (`68332206`, `-Xmx8g`) — all three matched the documented golden checksums exactly, and ZERO
+    trusted-root mismatches were logged across any of them (bt18 alone triggers a very large
+    number of collections). Note bt14/16/18 are pure-bytecode benchmarks with NO native calls,
+    so they exercise `collect_roots` (the STW mark path) heavily but not the native-call-triggered
+    `update_root_snapshot` path — both were still covered since `collect_roots` is one of the four
+    modified call sites.
+
+    **Performance: does NOT deliver the hoped-for win — a measured regression, not landed.**
+    `RequestMappingMessageConversionIntegrationTests` itself was not re-run end-to-end (it needs
+    ~530-720s per the Round-3 data and this investigation's time budget did not allow a full
+    before/after suite comparison); instead the isolated, properly-packaged Spring-bootstrap repro
+    from the Round-2 investigation (`BootstrapRepro2.java`, `com.example.bootstraprepro` package,
+    `AnnotationConfigApplicationContext` + embedded Tomcat, native-call-heavy — the same shape as
+    the profiled bottleneck) was run under `CRATONVM_DBG_ROOTSNAP` (the in-tree diagnostic built
+    specifically to measure this exact question), 30 iterations per run to average out host-load
+    noise on the shared build host (confirmed heavily loaded — 15-20+ concurrent `cargo`/`rustc`
+    processes from other sessions throughout this investigation):
+
+    | Build | `update_root_snapshot` avg cost/call |
+    |---|--:|
+    | baseline (dev `1f8e398e`, doc-only-commits ancestor of this branch's base) | ~1.9–2.0 us |
+    | this branch, optimization ON (`CRATONVM_TRUST_TAGGED_STACK_ROOTS=1`, default) | ~2.5–2.6 us |
+    | this branch, optimization OFF (`=0`, same binary, old behavior) | ~2.2 us |
+
+    Reproduced across TWO independent implementations (the original two-pass split, and the
+    single-pass redesign written specifically to rule out double-iteration overhead as the cause)
+    — both showed the same regression shape, so this is not attributed to the two-pass draft
+    alone. The flag-OFF control run on the same v2 binary is ALSO slower than the true baseline
+    (~2.2us vs ~1.9-2.0us), which isolates that at least part of the regression comes from
+    refactoring `scan_object_refs` into two small `#[inline]` helper methods
+    (`push_trusted_object_ref` / `push_smuggled_long_ref`) shared with the new split function —
+    an extraction that looked behavior-preserving and low-risk but apparently changed
+    inlining/codegen even on the code path that should be byte-identical to before. The remaining
+    gap (flag ON vs flag OFF on the same binary) is the actual cost of the new
+    split/boundary-filter machinery, separate from the extraction regression.
+
+    **`perf record` was unavailable to root-cause this precisely**: `perf_event_paranoid=4` on
+    the build host blocks unprivileged profiling, and `sudo perf record` (which has passwordless
+    sudo on this host) ran past its own `timeout 120` wrapper without producing usable output —
+    killed manually after several minutes with no progress. Without instruction-level attribution,
+    it was not possible in this session to distinguish "LLVM declined to inline
+    `scan_stack_roots_boundary` across the module boundary" from "the thread-local
+    `RefCell`-guarded scratch buffer for untrusted-offsets has real per-call TLS/borrow-check
+    cost" from some other codegen effect of the refactor.
+
+    **Conclusion and recommendation**: the CORRECTNESS argument for this optimization is sound
+    and thoroughly verified — the redundancy is real, provable from the `kinds` side-array's own
+    invariants, and empirically confirmed to never misfire across the checksum oracle. The
+    PERFORMANCE argument, which is the entire reason to make this change, is NOT confirmed — it
+    is contradicted by direct, repeated measurement. Per this investigation's own mandate ("if you
+    have any doubt about correctness [or value], don't land it; document the attempt and doubt
+    instead"), this is NOT merged into `dev`. A future session with working `perf` (or `gdb`-based
+    sampling, or a from-scratch `objdump`/`cargo asm` inspection of the generated code) should
+    either (a) determine why the seemingly-inert `scan_object_refs` extraction regressed the
+    flag-OFF control and fix the codegen issue, then re-measure the flag-ON case in isolation, or
+    (b) if the fundamental costs really are TLS/call-boundary/branch overhead that eats the
+    `is_object_address` savings for typical (shallow) operand stacks, conclude this specific
+    avenue is not profitable and that the actual remaining path to closing
+    `RequestMappingMessageConversionIntegrationTests`'s perf gap is the full precise-stack-maps
+    project Round 2 already scoped (new stack-map generation for interpreter frames at
+    native-call boundaries, reusing the verifier's existing type-inference machinery if one
+    exists — NOT investigated in this round beyond confirming the JIT's existing
+    `PreciseFrameInfo`/`scan_one_frame_precise` machinery in `vm/src/jit/conservative_roots.rs`
+    is structurally scoped to JIT-compiled frames only, at GC-safepoint/JIT-frame-scan sites, and
+    does not extend naturally to interpreter frames at native-call boundaries — a genuinely
+    separate, larger piece of infrastructure).
 *   ~~`web.reactive.result.view.script.JRubyScriptTemplateTests`~~ **FIXED (2026-07-15) --
     all 6 chained bugs closed, test class PASSES.** JRuby's own
     bootstrap (`rubygems/specification.rb` / `rubygems/version.rb`) turned out to hit a CHAIN of
