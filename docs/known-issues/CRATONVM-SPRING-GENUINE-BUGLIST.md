@@ -866,6 +866,67 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     (real, pre-existing, already has a safe recovery path but the false-positive rate itself — and
     whatever per-resync cost compounds into non-completion on a slow/loaded run — is unexplained and
     worth its own dedicated investigation).
+
+    ~~`Class.forName`/`HIB-CV-26` unrecoverable-internal-error-on-nested-clinit-failure~~
+    **FIXED (2026-07-16), commit `43e130fa` (merged to `dev` at `ba51b880`).** Root cause was
+    TWO stacked defects, both in the class-initialization-failure-wrapping machinery, not just
+    the `Class.forName` call site:
+    1. `NativeContext::initialize_class` (`native-api/src/registry.rs`) had a lossy
+       `Result<(), String>` signature. Its one real implementation
+       (`vm/src/vm/vm_exec.rs`) called the interpreter's `ensure_class_initialized_shared`
+       (which already correctly wraps a `<clinit>` exception as a catchable
+       `MethodCallFailed::ExceptionThrown(ExceptionInInitializerError)` per JVMS §5.5) and then
+       *discarded* that distinction, flattening both `ExceptionThrown` and `InternalError` into
+       a bare string. All 5 native-builtins call sites (`Class.forName` in `lang_class.rs`,
+       `Constructor.newInstance` also in `lang_class.rs`, and two independent
+       `Lookup.ensureInitialized` registrations in `lang_invoke.rs` / `classloader.rs`) then
+       re-wrapped that string as an unrecoverable `VmError::Internal` — turning an ordinary,
+       catchable `<clinit>` exception into a VM abort every time. Fix: changed the trait method
+       to return `Result<(), MethodCallFailed>` (mirroring the already-correct sibling
+       `ensure_class_initialized_with_class_id`) and pass the interpreter's result straight
+       through; all 5 call sites now propagate via `?` instead of hand-rolling a
+       `VmError::Internal`.
+    2. Verifying fix #1 surfaced a second, closely related bug in
+       `ensure_class_initialized_shared` itself (`vm/src/vm/vm_util.rs`, two occurrences): when
+       a class is re-triggered for initialization after already being marked
+       `ClassState::InitializationError` (JVMS §5.5's "already failed to initialize" case —
+       e.g. a caller that `catch`es the first `ExceptionInInitializerError` and retries), the
+       function returned `MethodCallFailed::InternalError(VmError::Linkage(NoClassDefFoundError))`
+       — also uncatchable, so a caught-and-retried `Class.forName` crashed the VM on the
+       *second* call. Fixed by routing both occurrences through the existing
+       `raise_no_class_def_found` helper (`vm/src/runtime/exceptions.rs`), which constructs the
+       real, catchable `NoClassDefFoundError` object. One of the two occurrences is reached
+       while still holding the `class_manager` write-lock guard (`cm`) that the local `class:
+       &mut Class` borrow is tied to; `raise_no_class_def_found` itself needs to read/write that
+       same `RwLock` to allocate the exception object, so an explicit `drop(cm)` was added
+       immediately before the call to avoid a self-deadlock (the borrow's last use is the
+       preceding `class.name.to_string()`, so NLL allows the drop).
+
+    Verified with a standalone repro (`Class.forName("java.lang.foreign.MemorySegment")`,
+    `--java-home <jdk25>`, no `--enable-native-access`, so `MemorySegment.<clinit>` throws
+    `IllegalCallerException` exactly as in the original finding): uncaught now prints a normal
+    `Exception in thread "main" java/lang/ExceptionInInitializerError` trace and exits 1 (was: VM
+    abort); wrapped in `try/catch (ExceptionInInitializerError)` it recovers cleanly and control
+    continues; a second `Class.forName` call on the now-poisoned class throws (and catches as)
+    `NoClassDefFoundError` instead of crashing. `cargo test -p cratonvm-native-builtins --lib
+    --release`: 2999 passed / 0 failed. `cargo test -p cratonvm-vm --lib --release`: 2199 passed
+    / 16 failed — the same pre-existing `lock_order` debug-build-only + `jit::skip_list`
+    parallel-race flakiness documented above, zero new failures.
+
+    Also re-ran `RequestMappingMessageConversionIntegrationTests` (`spring-webflux`) without
+    `--enable-native-access` as an end-to-end check: it no longer dies instantly at
+    `MemorySegment.<clinit>` — it now runs for several minutes and gets through ~26 Tomcat-backed
+    test methods (consistent with the "~29 Tomcat-backend tests" ceiling already documented
+    above for this class) before hitting a `SIGSEGV` in `gc/src/gen_heap.rs`'s non-moving-sweep
+    path, preceded by 2000+ "implausible object size" / corruption-resync warnings — i.e. it now
+    runs into follow-up item (2) above (the pre-existing, already-filed, separate non-moving-sweep
+    false-positive-corruption issue), not a HIB-CV-26 regression. This host was also running
+    several other sessions' builds/tests concurrently at the time (including at least one other
+    unrelated binary segfaulting minutes earlier), so heavy contention is a plausible contributor;
+    not re-tested in isolation due to time. Flagged here so whoever picks up item (2) has this
+    additional data point: fixing HIB-CV-26 means real full-class runs now reach far enough to
+    actually exercise the non-moving-sweep bottleneck instead of being masked by the earlier,
+    more-severe `Class.forName` abort.
 *   ~~`web.reactive.result.view.script.JRubyScriptTemplateTests`~~ **FIXED (2026-07-15) --
     all 6 chained bugs closed, test class PASSES.** JRuby's own
     bootstrap (`rubygems/specification.rb` / `rubygems/version.rb`) turned out to hit a CHAIN of
