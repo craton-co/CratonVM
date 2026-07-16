@@ -3229,12 +3229,15 @@ impl GenerationalHeap {
         // moving-young as unavailable and uses the conservative/non-moving
         // fallback instead.
         let moving_young_requested = crate::gc_quiescence::moving_young_enabled();
+        let fail_closed_non_moving = crate::gc_quiescence::is_active()
+            && std::env::var_os("CRATONVM_ALLOW_MOVING_YOUNG").is_none();
         let force_non_moving_jit_roots = crate::gc_quiescence::force_non_moving_jit_roots();
         let coverage_incomplete = crate::gc_quiescence::moving_young_coverage_incomplete();
         let divert_for_incomplete_moving_coverage =
             moving_young_requested && (force_non_moving_jit_roots || coverage_incomplete);
         let moving_young = moving_young_requested && !divert_for_incomplete_moving_coverage;
-        let divert_non_moving = (has_conservative_roots && !moving_young_requested)
+        let divert_non_moving = fail_closed_non_moving
+            || (has_conservative_roots && !moving_young_requested)
             || honor_promotion_oom_risk
             || divert_for_incomplete_moving_coverage
             || explicit_full_gc;
@@ -3601,6 +3604,27 @@ impl GenerationalHeap {
         // -------------------------------------------------------------------
 
         let bytes_before = young_from.used();
+        // Conservative JIT/native stack scans can produce aligned interior
+        // addresses inside young objects. Build an exact pre-forwarding object
+        // start set so only allocator-written headers can ever receive a
+        // forwarding pointer; an interior false positive must merely be ignored.
+        let mut young_object_starts: FxHashSet<usize> = FxHashSet::default();
+        let young_base = young_from.base_ptr() as usize;
+        let young_used = young_from.used();
+        let mut young_cursor = 0usize;
+        while young_cursor < young_used {
+            let obj_ptr = (young_base + young_cursor) as *mut u8;
+            // SAFETY: moving young space is bump-allocated contiguously; the
+            // cursor always advances by a validated object extent.
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            let size = gen_object_total_size(header);
+            if size < HEADER_SIZE || young_cursor.checked_add(size).is_none_or(|end| end > young_used) {
+                tracing::warn!(young_cursor, young_used, "GC: young object-start walk stopped at an implausible extent");
+                break;
+            }
+            young_object_starts.insert(obj_ptr as usize);
+            young_cursor += size;
+        }
         let mut objects_copied: usize = 0;
         // Read & clear the promote-on-pressure flag set by the previous
         // minor GC. When true, every survivor of THIS cycle is promoted
@@ -3625,6 +3649,11 @@ impl GenerationalHeap {
         let mut extra_roots: Vec<(ObjectRef, usize, usize)> = Vec::new();
         // (old_gen_obj, slot_index, _) for each old→young reference slot
         Self::scan_dirty_cards(card_table, &old_gen, &young_from, &mut extra_roots);
+        // Card marking is a fast path only. A missed barrier must retain an
+        // object for one extra collection, never reclaim a reachable child.
+        if Self::full_old_rset_scan_enabled() {
+            Self::scan_all_old_to_young(&old_gen, &young_from, &mut extra_roots);
+        }
 
         // Phase 1: Forward all root objects
         for root in roots.iter_mut() {
@@ -3634,6 +3663,7 @@ impl GenerationalHeap {
             }
             let new_ptr = Self::forward_object(
                 &young_from,
+                &young_object_starts,
                 &mut young_to,
                 &mut old_gen,
                 old_ptr,
@@ -3680,6 +3710,7 @@ impl GenerationalHeap {
                     if young_from.contains(ref_ptr) {
                         let new_ptr = Self::forward_object(
                             &young_from,
+                            &young_object_starts,
                             &mut young_to,
                             &mut old_gen,
                             ref_ptr,
@@ -3710,6 +3741,7 @@ impl GenerationalHeap {
                     if young_from.contains(ref_ptr) {
                         let new_ptr = Self::forward_object(
                             &young_from,
+                            &young_object_starts,
                             &mut young_to,
                             &mut old_gen,
                             ref_ptr,
@@ -3736,6 +3768,7 @@ impl GenerationalHeap {
                     if young_from.contains(ref_ptr) {
                         let new_ptr = Self::forward_object(
                             &young_from,
+                            &young_object_starts,
                             &mut young_to,
                             &mut old_gen,
                             ref_ptr,
@@ -3807,6 +3840,7 @@ impl GenerationalHeap {
                         if young_from.contains(ref_ptr) {
                             Some(Self::forward_object(
                                 &young_from,
+                                &young_object_starts,
                                 &mut young_to,
                                 &mut old_gen,
                                 ref_ptr,
@@ -3831,6 +3865,7 @@ impl GenerationalHeap {
                         if young_from.contains(lp) {
                             Self::forward_object(
                                 &young_from,
+                                &young_object_starts,
                                 &mut young_to,
                                 &mut old_gen,
                                 lp,
@@ -3887,6 +3922,7 @@ impl GenerationalHeap {
                         if young_from.contains(ref_ptr) {
                             let new_ref_ptr = Self::forward_object(
                                 &young_from,
+                                &young_object_starts,
                                 &mut young_to,
                                 &mut old_gen,
                                 ref_ptr,
@@ -3917,6 +3953,7 @@ impl GenerationalHeap {
                         if young_from.contains(lp) {
                             let new_lp = Self::forward_object(
                                 &young_from,
+                                &young_object_starts,
                                 &mut young_to,
                                 &mut old_gen,
                                 lp,
@@ -3951,6 +3988,7 @@ impl GenerationalHeap {
             }
             let new_ptr = Self::forward_object(
                 &young_from,
+                &young_object_starts,
                 &mut young_to,
                 &mut old_gen,
                 old_ptr,
@@ -3980,6 +4018,7 @@ impl GenerationalHeap {
                             if young_from.contains(ref_ptr) {
                                 Some(Self::forward_object(
                                     &young_from,
+                                    &young_object_starts,
                                     &mut young_to,
                                     &mut old_gen,
                                     ref_ptr,
@@ -4015,6 +4054,7 @@ impl GenerationalHeap {
                             if young_from.contains(ref_ptr) {
                                 let new_ref_ptr = Self::forward_object(
                                     &young_from,
+                                    &young_object_starts,
                                     &mut young_to,
                                     &mut old_gen,
                                     ref_ptr,
@@ -4564,6 +4604,43 @@ impl GenerationalHeap {
         let in_young =
             |addr: usize| -> bool { addr >= from_base && addr < from_end && (addr & 0x7) == 0 };
 
+
+        // Build exact young-object bases before marking. The stack/JIT root
+        // scan is conservative and can yield aligned interior words; treating
+        // those as objects makes the side-mark channel retain the interior
+        // address rather than its containing object, so the later sweep can
+        // reclaim the real object.
+        let mut young_object_ranges: Vec<(usize, usize)> = Vec::new();
+        let exact_skips = merge_skips(young_from.free_blocks_sorted());
+        let mut exact_free_iter = exact_skips.iter().peekable();
+        let mut exact_cursor = 0usize;
+        while exact_cursor < young_from.used() {
+            if skip_free_blocks(&mut exact_cursor, &mut exact_free_iter).0 {
+                continue;
+            }
+            let ptr = (from_base + exact_cursor) as *mut u8;
+            // SAFETY: free/TLAB ranges were skipped; this cursor is on an
+            // allocator-written object boundary in the young arena.
+            let header = unsafe { &*(ptr as *const ObjectHeader) };
+            let total = gen_object_total_size(header);
+            if total < HEADER_SIZE
+                || exact_cursor
+                    .checked_add(total)
+                    .is_none_or(|end| end > young_from.used())
+            {
+                tracing::warn!(exact_cursor, used = young_from.used(), "GC: exact young-object walk stopped at an implausible extent");
+                break;
+            }
+            if let Some(&&(off, _)) = exact_free_iter.peek() {
+                if off > exact_cursor && off < exact_cursor + total {
+                    tracing::warn!(exact_cursor, off, "GC: exact young-object walk crossed a free/TLAB range");
+                    break;
+                }
+            }
+            young_object_ranges.push((ptr as usize, ptr as usize + total));
+            exact_cursor += total;
+        }
+
         // ----- Mark phase -------------------------------------------------
         //
         // BFS over young-gen objects. The worklist holds young object
@@ -4602,6 +4679,18 @@ impl GenerationalHeap {
             if !in_young(addr) {
                 return;
             }
+            let insertion = young_object_ranges.partition_point(|(start, _)| *start <= addr);
+            let Some(&(base, end)) = insertion
+                .checked_sub(1)
+                .and_then(|idx| young_object_ranges.get(idx))
+            else {
+                return;
+            };
+            if addr >= end {
+                return;
+            }
+            let addr = base;
+            let ptr = base as *mut u8;
             // SAFETY: `in_young` confirmed `addr` is an 8-byte-aligned
             // address inside the live from-space region, so reading an
             // ObjectHeader there is valid.
@@ -4786,7 +4875,7 @@ impl GenerationalHeap {
         // runs clean under the full scan, an old→young edge is provably being
         // lost by the card path (barrier miss, drain loss, or scan consumption)
         // — the young-GC live-object-reclaim investigation's discriminator.
-        let full_old_scan = std::env::var_os("CRATONVM_SWEEP_FULL_OLD_SCAN").is_some();
+        let full_old_scan = Self::full_old_rset_scan_enabled();
         if full_old_scan {
             for (optr, _sz) in old_gen.walk_objects() {
                 // SAFETY: `walk_objects` yields valid live old-gen object starts.
@@ -7570,6 +7659,7 @@ impl GenerationalHeap {
     #[allow(clippy::too_many_arguments)]
     fn forward_object(
         young_from: &Arena,
+        young_object_starts: &FxHashSet<usize>,
         young_to: &mut Arena,
         old_gen: &mut OldGen,
         old_ptr: *mut u8,
@@ -7584,6 +7674,7 @@ impl GenerationalHeap {
         // (the value-source for every minor-GC reference write).
         let r = Self::forward_object_impl(
             young_from,
+            young_object_starts,
             young_to,
             old_gen,
             old_ptr,
@@ -7604,6 +7695,7 @@ impl GenerationalHeap {
     #[allow(clippy::too_many_arguments)]
     fn forward_object_impl(
         young_from: &Arena,
+        young_object_starts: &FxHashSet<usize>,
         young_to: &mut Arena,
         old_gen: &mut OldGen,
         old_ptr: *mut u8,
@@ -7612,6 +7704,11 @@ impl GenerationalHeap {
         promoted_worklist: &mut Vec<*mut u8>,
         force_promote_all: bool,
     ) -> *mut u8 {
+        if !young_object_starts.contains(&(old_ptr as usize)) {
+            // Exact pre-GC membership rejects aligned interior words from
+            // conservative roots before forwarding writes through them.
+            return old_ptr;
+        }
         // SAFETY: `old_ptr` points to a live young-gen object; its header is
         // valid. Build an owned *copy* of the header rather than holding a
         // shared `&ObjectHeader`: later in this function we install the
@@ -8025,6 +8122,40 @@ impl GenerationalHeap {
         debug_assert!(young_from.contains(old_ptr));
 
         new_ptr
+    }
+
+    /// The remembered-set fast path is backed by a complete old-to-young
+    /// scan. A missed write barrier has historically manifested as silently
+    /// emptied Stream/ArrayList results under small-heap concurrency; retaining
+    /// an object for one extra minor GC is safe, reclaiming it is not.
+    #[inline]
+    fn full_old_rset_scan_enabled() -> bool {
+        static CARD_TABLE_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        !*CARD_TABLE_ONLY
+            .get_or_init(|| std::env::var_os("CRATONVM_CARD_TABLE_ONLY").is_some())
+    }
+
+    /// Append all old-to-young slots using the same slot encoding as the card
+    /// scanner. Duplicates from the card fast path are harmless: forwarding is
+    /// idempotent.
+    fn scan_all_old_to_young(
+        old_gen: &OldGen,
+        young_from: &Arena,
+        extra_roots: &mut Vec<(ObjectRef, usize, usize)>,
+    ) {
+        for (obj_ptr, _total_size) in old_gen.walk_objects() {
+            // SAFETY: the old-generation walk yields initialized object starts.
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            // SAFETY: the object/header pair remains valid during this STW scan.
+            unsafe {
+                for_each_ref_slot(obj_ptr, header, |raw, slot_idx| {
+                    if !raw.is_null() && young_from.contains(raw) {
+                        let obj_ref = ObjectRef::from_raw(obj_ptr);
+                        extra_roots.push((obj_ref, slot_idx, 0));
+                    }
+                });
+            }
+        }
     }
 
     /// Scan dirty cards in the card table for old→young references.
@@ -10475,6 +10606,39 @@ mod tests {
                 assert_eq!(heap.get_field(new_young, 0).as_int(), Some(999));
             }
             _ => panic!("Expected promoted object to still reference young object"),
+        }
+    }
+
+    #[test]
+    fn full_old_rset_scan_preserves_unbarriered_old_to_young_ref() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        let old_obj = heap.alloc_object(ClassId::new(0), 1);
+        let mut roots = vec![old_obj];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        let promoted = roots[0];
+        assert!(heap.is_in_old(promoted.as_ptr()));
+
+        let young = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(young, 0, Value::Int(31337));
+        // Model a raw store which bypasses the remembered-set barrier.
+        unsafe {
+            std::ptr::write(
+                promoted.as_ptr().add(HEADER_SIZE) as *mut Value,
+                Value::Object(Some(young)),
+            );
+        }
+
+        let mut gc_roots = vec![promoted];
+        heap.collect_garbage(&stw(), &mut gc_roots, &monitors);
+        match heap.get_field(gc_roots[0], 0) {
+            Value::Object(Some(survivor)) => {
+                assert_eq!(heap.get_field(survivor, 0).as_int(), Some(31337));
+            }
+            other => panic!("full old scan lost unbarriered young ref: {other:?}"),
         }
     }
 

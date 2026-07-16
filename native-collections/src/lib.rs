@@ -12323,12 +12323,19 @@ fn stream_make_lazy_derived(
     let new_chain = ctx.read_native_pin(new_chain_pin, new_chain);
     ctx.set_array_element(new_chain, src_len, Value::Object(Some(rec)));
     let stream = alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS_LAZY);
+    // `stream_inherit_close_handlers` can allocate while it reads/copies the
+    // upstream handlers. The derived stream has already become the owner of
+    // the new op chain by then, so root it before the first store and always
+    // return its current address after that call. A raw local here let a
+    // moving young GC strand the just-built Stream and its LazyOp chain.
+    let stream_pin = ctx.pin_native_root(stream);
+    let stream_cur = ctx.read_native_pin(stream_pin, stream);
     let source_cur = read_pinned_elem(ctx, source_pin, source);
     let new_chain = ctx.read_native_pin(new_chain_pin, new_chain);
-    ctx.set_field(stream, STREAM_FIELD_ELEMENTS, source_cur);
-    ctx.set_field(stream, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
+    ctx.set_field(stream_cur, STREAM_FIELD_ELEMENTS, source_cur);
+    ctx.set_field(stream_cur, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
     ctx.set_field(
-        stream,
+        stream_cur,
         STREAM_FIELD_OP_CHAIN,
         Value::Object(Some(new_chain)),
     );
@@ -12337,18 +12344,21 @@ fn stream_make_lazy_derived(
     if let Some(spl) = src_lazy_spl {
         let spl_cur = ctx.read_native_pin(spl_pin, spl);
         ctx.set_field(
-            stream,
+            stream_cur,
             STREAM_FIELD_LAZY_SPLITERATOR,
             Value::Object(Some(spl_cur)),
         );
     }
     let src_cur = ctx.read_native_pin(src_pin, src);
-    stream_inherit_close_handlers(ctx, src_cur, stream);
+    let stream_cur = ctx.read_native_pin(stream_pin, stream);
+    stream_inherit_close_handlers(ctx, src_cur, stream_cur);
+    let stream_cur = ctx.read_native_pin(stream_pin, stream);
     if spl_pin != usize::MAX {
         ctx.unpin_native_roots(spl_pin);
     }
+    ctx.unpin_native_roots(stream_pin);
     ctx.unpin_native_roots(src_pin);
-    Ok(Some(Value::Object(Some(stream))))
+    Ok(Some(Value::Object(Some(stream_cur))))
 }
 
 /// `true` iff `this` is one of our synthetic stream interface objects.
