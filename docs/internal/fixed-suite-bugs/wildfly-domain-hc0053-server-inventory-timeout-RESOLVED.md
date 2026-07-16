@@ -1,6 +1,21 @@
 # WildFly domain boot: `WFLYHC0053` inventory transport resolved; async-future deadlock FIXED; residual now downstream
 
-Status: OPEN, narrowed a third time — but the defect this doc's title names is now FIXED. The
+Status: **RESOLVED 2026-07-16 — closing artifact captured.** Run `DM_001`
+(probe harness `/data/wt-cce0079-20260716/probes/`, merged binary of branch
+`fix/wildfly-cce0079-close-20260716`, domain no-JIT, plain flags) produced
+BOTH managed servers fully started in one clean run —
+`[Server:server-one] WFLYSRV0025 ... started in 70105ms` and
+`[Server:server-two] WFLYSRV0025 ... started in 84155ms` — with **zero**
+occurrences of `WFLYHC0053`, `Invalid command byte`, any `ClassCastException`,
+or any stale-canary marker anywhere in the domain console log, on a shared
+host under heavy load. This was the last verification bar this record set
+for itself; every defect chronicled below (inventory-transport stale read,
+StreamDecoder buffers, async-future/XNIO AB-BA deadlock, and the blocking
+`WFLYCTL0079` CCE family — root-caused as the young-GC walk truncation, see
+`docs/internal/fixed-suite-bugs/wildfly-cce0079-young-start-set-truncation-FIXED.md`)
+is fixed and merged to dev (`f0ea8321`).
+
+Original status text follows for the record: OPEN, narrowed a third time — but the defect this doc's title names is now FIXED. The
 `WFLYHC0053` inventory timeout is fixed (2026-07-14), the StreamDecoder stale-buffer residual is fixed
 (2026-07-15, `21c5d6f6`), and the named blocker from the 2026-07-15 follow-up — the
 `async_future_wait_keepalive` stall in `native-builtins/src/wildfly_core.rs:1537` that permanently wedged
