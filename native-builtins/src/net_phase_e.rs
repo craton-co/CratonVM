@@ -4020,7 +4020,6 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(1)))
     });
 
-
     // The RE2 constructors own listener state outside the real ServerSocket
     // implementation.  JGroups configures this option before bind, where it
     // must be accepted without entering the real getImpl() bytecode path.
@@ -6846,120 +6845,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(None),
     );
 
-    // Round 60 — bypass StandardContext init/start failure.
-    //
-    // After getWebServer() succeeds, Spring Boot calls TomcatWebServer.start()
-    // which drives the Tomcat lifecycle: Engine → Host → Context. The Context
-    // (TomcatEmbeddedContext extends StandardContext) fails during init/start
-    // with a chain of LifecycleException → ExecutionException → … with no
-    // root cause preserved (Tomcat's ContainerBase wraps child failures as
-    // bare LifecycleException with only a message). The original failure is
-    // most likely a missing servlet/filter init resource or a NullPointerException
-    // from real-JDK gaps in our environment (JNDI / annotation scanning / etc.).
-    //
-    // Pragmatic fix: no-op StandardContext.initInternal()V and startInternal()V.
-    // LifecycleBase wraps these calls in state transitions
-    // (INITIALIZING → INITIALIZED, STARTING_PREP → STARTING → STARTED), so a
-    // successful no-op lets the lifecycle complete cleanly. The servlet
-    // container itself won't dispatch requests, but the boot succeeds past
-    // the LifecycleException and the demo can advance.
-    fn ctx_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-        Ok(None)
-    }
-    // 2026-06-11 — REMOVED the base `org/apache/catalina/core/StandardContext`
-    // initInternal/startInternal no-ops. They were a Spring-Boot-era shim, but
-    // `StandardContext` is the concrete context the *Tomcat test suite* (and
-    // standalone Tomcat) uses, so no-opping it stopped every embedded server
-    // from actually starting its web application — the real bytecode runs fine
-    // here (verified via the apps/tomcat suite). Spring Boot stays short-
-    // circuited at `TomcatWebServer.start`/`initialize` (below) and via the
-    // `TomcatEmbeddedContext` subclass no-ops kept here, so this is Spring-Boot
-    // neutral while unblocking the Tomcat suite. See CRATONVM_BUGS/BUG-C-*.
-    // Spring Boot's TomcatEmbeddedContext overrides startInternal — cover both
-    // common package locations so the dispatch hits the native regardless of
-    // which subclass the SB version uses.
-    r.register(
-        "org/springframework/boot/tomcat/TomcatEmbeddedContext",
-        "startInternal",
-        "()V",
-        ctx_noop,
-    );
-    r.register(
-        "org/springframework/boot/web/embedded/tomcat/TomcatEmbeddedContext",
-        "startInternal",
-        "()V",
-        ctx_noop,
-    );
-
-    // Round 60 cont. — short-circuit ContainerBase$StartChild.call() which
-    // wraps `child.start()` in a Callable submitted to an executor. The
-    // failure surfaces as ExecutionException chained into a LifecycleException
-    // ("A child container failed during start") with the original cause
-    // discarded. By making the Callable a no-op that returns null, the
-    // Future completes successfully and the engine/host advance.
-    // 2026-06-11 — REMOVED the `ContainerBase$StartChild.call` no-op. It made
-    // every child-container start (Engine→Host→Context) a no-op when Tomcat
-    // uses the parallel start-stop executor, so the context/connector never
-    // actually started under the Tomcat test suite. The real Callable runs the
-    // child's lifecycle, which works under CratonVM. (Was a Spring-Boot shim;
-    // Spring Boot remains short-circuited at TomcatWebServer.start/initialize.)
-
-    // 2026-05-28 — REMOVED synthetic Connector.startInternal / AbstractProtocol.start
-    // no-op stubs that violated the no-synthetic-stubs policy
-    // (`memory/feedback_no_synthetic_stubs.md`). The previous shims returned
-    // Ok(None) without advancing the lifecycle state, which then caused
-    // LifecycleBase.start() to throw "invalid Lifecycle transition [after_start]
-    // ... in state [STARTING_PREP]" — the exact symptom we were trying to mask.
-    //
-    // The real Tomcat bytecode must run; bugs are fixed at their root in the VM.
-
-    // Round 60 cont. — short-circuit TomcatWebServer.start() entirely.
-    // We've already constructed the TomcatWebServer in getWebServer(), and
-    // start() drives the full Catalina lifecycle which our environment can't
-    // complete (Thread.holder.group is null, NamingResources native lookups
-    // fail, etc.). Replacing start() with a no-op returns control to Spring
-    // Boot's ServletWebServerApplicationContext.startWebServer with no
-    // exception so the demo advances past the embedded-Tomcat phase.
-    fn tomcat_web_server_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-        Ok(None)
-    }
-    r.register(
-        "org/springframework/boot/tomcat/TomcatWebServer",
-        "start",
-        "()V",
-        tomcat_web_server_noop,
-    );
-    r.register(
-        "org/springframework/boot/web/embedded/tomcat/TomcatWebServer",
-        "start",
-        "()V",
-        tomcat_web_server_noop,
-    );
-    // initialize() is the one that actually drives Tomcat.start() and the
-    // protocol-handler chain — make it a no-op too. (Spring Boot calls
-    // initialize() from the constructor before returning the WebServer.)
-    r.register(
-        "org/springframework/boot/tomcat/TomcatWebServer",
-        "initialize",
-        "()V",
-        tomcat_web_server_noop,
-    );
-    r.register(
-        "org/springframework/boot/web/embedded/tomcat/TomcatWebServer",
-        "initialize",
-        "()V",
-        tomcat_web_server_noop,
-    );
-    // 2026-06-11 — REMOVED the `org/apache/catalina/startup/Tomcat.start()`
-    // no-op. This is the Catalina-root entry point the *Tomcat test suite*
-    // (`TomcatBaseTest`) and standalone Tomcat call directly; no-opping it made
-    // `tomcat.start()` return without starting the server/service/engine/
-    // connector (all stayed in lifecycle state NEW), so every embedded-server
-    // test hung connecting to a server that never bound. Spring Boot does not
-    // call `Tomcat.start()` (it drives `TomcatWebServer`, still no-op'd above),
-    // so removing this is Spring-Boot neutral. The real lifecycle runs fine
-    // under CratonVM. See CRATONVM_BUGS/BUG-C-*.
-
     // residual-4 fix: the two `AbstractFileResolvingResource.customizeConnection`
     // no-ops above were REMOVED. They made `customizeConnection` a complete
     // no-op for every caller — including `AbstractFileResolvingResource.exists()`/
@@ -8757,7 +8642,12 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // onto the engine, so the rustls handshake presents THIS context's
             // cert (server cert, or client cert for mTLS) instead of the global.
             if let Ok(sslctx) = obj_arg(args, 0) {
-                if let Some((cert, key)) = crate::t27_tls::ctx_identity(ctx, sslctx) {
+                let identity = crate::t27_tls::ctx_identity(ctx, sslctx);
+                // A client context commonly has only trust material. Capture
+                // its roots before the next context creation can replace the
+                // thread-local selection used by the rustls engine.
+                crate::t27_tls::set_engine_trust_roots_override(eng);
+                if let Some((cert, key)) = identity {
                     crate::t27_tls::set_engine_identity_override(eng, cert, key);
                 }
                 // Remember which SSLContext created this engine so the
@@ -8768,6 +8658,20 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(eng))))
         });
     }
+    // Netty's JdkSslClientContext reads this immediately after SSLContext.init.
+    // Our bridged real-JDK SSLContext has no contextSpi, so the Java method
+    // would otherwise dereference null despite the usable native TLS context.
+    // The synthetic facade matches the server session-context contract below.
+    r.register(
+        ctx_cls,
+        "getClientSessionContext",
+        "()Ljavax/net/ssl/SSLSessionContext;",
+        |ctx, _args| {
+            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+
     // getServerSessionContext() — Tomcat caches it and may set cache size /
     // timeout; return a synthetic SSLSessionContext (setters are no-ops).
     r.register(
@@ -11766,6 +11670,24 @@ mod tests {
         let (stream, _) = listener.accept().unwrap();
         let req = parse_http_request(stream).unwrap();
         assert_eq!(req.body, b"hi");
+    }
+
+    #[test]
+    fn re6_ssl_context_session_accessors_are_registered() {
+        let mut registry = NativeMethodRegistry::new();
+        register_re6_ssl_context(&mut registry);
+        for method in ["getClientSessionContext", "getServerSessionContext"] {
+            assert!(
+                registry
+                    .find(
+                        "javax/net/ssl/SSLContext",
+                        method,
+                        "()Ljavax/net/ssl/SSLSessionContext;",
+                    )
+                    .is_some(),
+                "missing {method} native"
+            );
+        }
     }
 
     #[test]

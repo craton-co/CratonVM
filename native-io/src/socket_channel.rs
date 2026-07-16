@@ -878,6 +878,33 @@ fn sc_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(this) = obj_or_none(args, 0) {
         if let Some(id) = read_reg_id(ctx, this) {
+            // Diagnostic (CRATONVM_DBG_SC_CLOSE=1, added 2026-07-16 during the
+            // StompWebSocketIntegrationTests investigation): trace every
+            // SocketChannel.close() with local/peer address + wall-clock time.
+            // Confirmed the server side closes a just-upgraded WebSocket
+            // connection (via this exact native) within ~40ms-2s of the
+            // handshake completing, before the client's first post-handshake
+            // frame write — root cause of that class's TIMEOUT still open, see
+            // docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md. Kept as a
+            // permanent opt-in hook (zero cost when unset) for whoever
+            // continues that investigation, matching CRATONVM_DBG_NET /
+            // CRATONVM_DBG_STALE_RECV etc.
+            if std::env::var_os("CRATONVM_DBG_SC_CLOSE").is_some() {
+                let (local, peer) = match tcp_registry().read().get(&id) {
+                    Some(TcpHandle::Stream(s)) => (
+                        s.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+                        s.peer_addr().map(|a| a.to_string()).unwrap_or_default(),
+                    ),
+                    _ => (String::new(), String::new()),
+                };
+                let ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                eprintln!(
+                    "[SC_CLOSE] t={ms} id={id:#x} local={local} peer={peer}"
+                );
+            }
             // Force the write-side FIN now. A selector this channel was
             // registered with holds a `try_clone()`d duplicate of the socket
             // (see `nio_selector::selector_register`); on Windows, closing only
