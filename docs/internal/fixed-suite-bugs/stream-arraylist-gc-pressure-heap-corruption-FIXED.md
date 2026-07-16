@@ -1,6 +1,22 @@
-# Stream/ArrayList under extreme concurrent GC pressure: heap corruption (small-heap only), NOT fixed by the Stream/Comparator ObjectRef pin
+# Stream/ArrayList under extreme concurrent GC pressure: heap corruption (FIXED)
 
-Status: OPEN (partially fixed, root cause now strongly suspected — see 2026-07-15 update). Found by
+## Resolution (2026-07-16)
+
+Status: FIXED and archived. The 32 MB heap failure combined four GC-safety gaps, not a remaining Stream API semantic defect.
+
+- A full old-generation fallback scan now retains old-to-young edges missed by the card-table fast path.
+- A terminal worker publishes its root snapshot before its barrier transition, closing the STW missing-arrival race.
+- The non-moving sweep maps aligned conservative interior roots to their exact containing young object before side-marking.
+- A derived lazy Stream is rooted and refreshed across close-handler inheritance, which can allocate.
+
+JIT-active young collections use the non-moving path by default because moving collection cannot safely rewrite conservative and derived raw JIT references. CRATONVM_ALLOW_MOVING_YOUNG=1 is diagnostic-only.
+
+Azure validation: two JIT and two no-JIT 24-thread repro runs all reported badSize=0, errors=0, RESULT=OK; cargo test -p cratonvm-gc --lib passed 791 of 791.
+
+## Original investigation
+
+
+Historical status: OPEN (partially fixed, root cause now strongly suspected — see 2026-07-15 update). Found by
 accident 2026-07-14 while verifying dev commit `671c8df3`
 ("fix(native-collections): pin Stream/Comparator ObjectRefs across GC-triggering calls"). Distinct,
 separate residual, not resolved by that fix. **2026-07-14 update:** root-caused and fixed one real,
