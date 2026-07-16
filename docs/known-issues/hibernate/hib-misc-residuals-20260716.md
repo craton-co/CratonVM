@@ -21,23 +21,36 @@ inherently non-deterministic under some other condition not yet identified.
 Needs several solo reruns (`--nojit` and JIT-on) to determine whether this
 is reproducible or another one-off flake.
 
-## `JarVisitorTest` — CRASH, rc=0, ms=0
+## `JarVisitorTest` — RESOLVED: confirmed harness-artifact + underlying non-issue (2026-07-16)
 
 `org.hibernate.orm.test.bootstrap.scanning.JarVisitorTest`
 
-**Status:** Needs re-verification before treating as a real crash. The
-result row is `process-died rc=0 ms=0` — an exit code of 0 with zero
-elapsed time is the known harness-artifact shape previously seen during
-mid-run disk-space exhaustion (`LOADERR`-family artifacts), not a genuine
-non-zero-exit crash. Given this run coincided with a disk-space incident on
-this same local host (see the [known-issues README](README.md) data-loss
-note), this is suspected to be a harness/environment artifact rather than a
-real CratonVM defect, but has not yet been confirmed via solo rerun.
-`ScannerTest`, a sibling in the same `bootstrap.scanning` package previously
-associated with a now-fixed "loader-blind jar scanning" bug, shows a
-genuine 120s-timeout FAIL in this same run (tracked in the timeout cluster
-doc) rather than the old `orm.xml doesn't exist` symptom — consistent with
-that older bug staying fixed.
+**Status:** ✅ CLOSED, not a CratonVM bug. Re-verified via 10 solo reruns
+(5x `--nojit` + 5x JIT-on, `timeout 120`) against the frozen `dev@dcb24161`
+baseline: **10/10 runs completed cleanly**, `rc=0`, elapsed 887ms–1913ms
+(never 0ms), each producing a deterministic, well-formed
+`@@FAIL ... AssertionError: Unable to setup packaging test : could not
+interpret url`. This confirms the original `rc=0/ms=0` "CRASH" row was
+indeed a harness/logging artifact (as suspected) — a genuinely healthy run
+never produces that shape. However, the test does not "pass cleanly"
+either: it fails deterministically for a reason unrelated to CratonVM.
+Root-caused to `PackagingTestCase`'s static initializer, which requires its
+own classloader-resource path to contain `target`/`bin`/`out/test`
+(Gradle/Maven/IntelliJ build-output conventions) to locate a build dir for
+ShrinkWrap fixtures; the `hib-suite-runner` harness's classpath
+(`hib-libs/test-classes`) contains none of those substrings. Verified this
+reproduces identically under real HotSpot JDK 25 given the same classpath
+layout (a standalone probe against the real `java` binary shows
+`contains target/bin/out-of-test` all false) — i.e. this is a harness
+classpath-configuration limitation, not a CratonVM defect, and no CratonVM
+code change applies. Also verified (running `JarVisitorTest` + `ScannerTest`
+together in one process) that CratonVM correctly produces
+`NoClassDefFoundError` on `ScannerTest`'s subsequent load of the
+already-failed `PackagingTestCase` class (369ms, no hang) — ruling out a
+class-init-failure-mishandling explanation for the separate `ScannerTest`
+120s-timeout entry (tracked in the timeout cluster doc, unaffected, still
+open with its own cause). Full writeup + evidence:
+[hib-jarvisitortest-packagingtestcase-classpath-layout-NOT-A-BUG.md](../../internal/hib-jarvisitortest-packagingtestcase-classpath-layout-NOT-A-BUG.md).
 
 ## `LockTest` — real timing-sensitive assertion failure
 
