@@ -200,7 +200,7 @@ the WRONG same-named copy. Eight fixes landed on
 | `ScopedProxyBeanRegistrationAotProcessorTests` | FAIL (3 methods) | **OK 5/5** |
 | `PersistenceManagedTypesBeanRegistrationAotProcessorTests` | FAIL | FAIL 2/0 (host lacks JDK 24+, see below — not a VM bug) |
 | `TestClassScannerTests` | TIMEOUT 600 s | **completes 177 s** (7/7 or flaky 7/6) |
-| `TestCompilerTests` | TIMEOUT 600 s+ | **completes 40 s**, FAIL 22/21/1 (3 of 4 fixed) |
+| `TestCompilerTests` | TIMEOUT 600 s+ | **completes 40 s**, **OK 22/22 (2026-07-16, all 4 residuals now fixed)** |
 | `ApplicationContextAotGeneratorTests` | ABEND (CGLIB load) | **2026-07-16 joint verification: LOADERR FIXED** — `found=40 succ=25 fail=15`, 0 corruption-signature lines, see below |
 | `BeanDefinitionMethodGeneratorTests` | FAIL 34/3 | **OK 34/34** |
 | `ConfigurationClassPostProcessorAotContributionTests` | FAIL 20/8 | **OK-ish 20/15/5** (5 residual = host ClassFile gap, see below) |
@@ -507,19 +507,78 @@ the WRONG same-named copy. Eight fixes landed on
     `BeanDefinitionMethodGeneratorTests` (heavy TestCompiler/`com.example`
     user) clean at 34/34.
 
-    **Remaining 1 residual — DIFFERENT, pre-existing bug, NOT fixed:**
+    **Remaining 1 residual — DIFFERENT, pre-existing bug — FIXED
+    2026-07-16 (commits `f62f1772`, `4deeb6ce`).**
     `compiledCodeCannotAccessExistingPackagePrivateClassIfNotAnnotated`
     expects an `IllegalAccessError` when code in a fresh `DynamicClassLoader`
     (a DIFFERENT defining loader than the one that defined the
     package-private `PackagePrivate`, same package NAME but different
     runtime package per JVMS §5.4.4) accesses it WITHOUT
-    `@CompileWithForkedClassLoader` — but no exception is thrown; access
-    silently succeeds. This already failed with this exact `AssertionError`
-    (not `CompilationException`) BEFORE the fix above, so it is unaffected
-    by it. Points at CratonVM's runtime package-private access check not
-    correctly comparing DEFINING LOADERS across a same-named-package,
-    different-loader pair — a genuinely separate investigation (runtime
-    access control, not compile-time symbol resolution).
+    `@CompileWithForkedClassLoader` — but no exception was thrown; access
+    silently succeeded. This already failed with this exact `AssertionError`
+    (not `CompilationException`) BEFORE the fix above, so it was unaffected
+    by it — a genuinely separate investigation (runtime access control, not
+    compile-time symbol resolution).
+
+    Root cause was NOT a broken loader comparison: `check_class_access` /
+    `same_runtime_package` (`classloading/src/access_control.rs`) already
+    correctly implemented JVMS §5.3/§5.4.4 runtime-package identity
+    (defining loader + package name), with existing unit-test coverage
+    including an H5 loader-spoofing test — it was simply never CALLED from
+    the bytecode interpreter's `new` handler. Only the unrelated JPMS
+    module-boundary check fired, which no-ops whenever no named modules are
+    registered (the ordinary classpath case, as here). Wired
+    `check_class_access` into `Instruction::New`
+    (`vm/src/runtime/interpreter.rs`), plus the two JIT compile-time `new`-site
+    resolvers that independently re-resolve classes for their inlined/
+    single-pass allocation fast paths, so a denied site now falls back to the
+    interpreter's real check instead of silently baking in the inaccessible
+    allocation.
+
+    Wiring the check in immediately surfaced a SECOND, previously-invisible
+    bug: `ClassManager`'s requester-less fast-path class lookup
+    (`get_loaded_class_id`) falls back to returning an arbitrary lone
+    user-defined loader's copy of a name when no built-in loader
+    (bootstrap/extension/application) has defined it yet — a deliberate,
+    useful heuristic for names with no backing `.class` file (e.g.
+    `Proxy`-generated classes), but unsound as `load_class`/
+    `load_class_concurrent`'s PRIMARY answer: a name that genuinely exists on
+    the real classpath must resolve to its own freshly-loaded built-in-loader
+    copy, never an unrelated user-defined loader's redefinition. Concretely,
+    Spring's `TestCompiler` (Application loader) instantiating `new
+    Problems()` was resolving to a *different* `TestCompiler$Problems`
+    defined by an earlier, unrelated `@CompileWithForkedClassLoader` test's
+    own `DynamicClassLoader` — same simple name, wrong runtime class. Added
+    `ClassManager::resolve_fast_path_class_id`, which prefers the
+    loader-faithful `get_loaded_class_id_for_requester(name, Application)`
+    (built-in chain only) and falls back to the ambiguous lone-user-loader
+    answer only when a real classpath scan
+    (`find_class_bytes_delegated`) confirms no built-in-loader copy could
+    exist — preserving `Proxy`-class resolution while fixing the
+    stray-loader bug. A third, related latent gap surfaced in the same
+    investigation: `ClassManager::upgrade_synthetic_class` (stub-to-real
+    upgrade) refreshed every other `Class` field from the freshly parsed
+    class file but never updated `loader_id`, leaving it stuck at whatever
+    the synthetic stub was minted with (often Bootstrap) even after
+    upgrading to real Application-loaded bytecode. Fixed alongside.
+
+    Verified: `TestCompilerTests` 22/21/1 → **22/22**. Regression:
+    `cargo test -p cratonvm-vm --lib --release` 2200 passed / 16 failed (all
+    16 pre-existing and unrelated — `runtime::lock_order` tests gated on a
+    debug build or an env-opt-in not set in this invocation, and
+    `jit::skip_list` JIT-tier-eligibility tests, neither touching
+    classloading); `cargo test -p cratonvm-native-builtins --lib --release`
+    3000 passed / 0 failed. Spot-checked `CompiledTests` 14/14,
+    `DynamicJavaFileManagerTests` 11/11, `DynamicClassFileObjectTests` 3/3
+    (all TestCompiler-adjacent, package-private-access-heavy) clean. A
+    cross-module spot-check of `BeanDefinitionMethodGeneratorTests` via this
+    same ad-hoc single-class harness hit an unrelated, non-deterministic
+    harness/classpath artifact (`ClassCastException`/`AbstractMethodError`)
+    that reproduces identically on an unmodified dev-tip baseline binary —
+    confirmed pre-existing, not a regression from this fix; the module's
+    proper Gradle-driven suite run (34/34, per the entry above) is
+    unaffected since it doesn't go through this improvised classpath
+    composition.
 *   ~~`aot.nativex.feature.ThrowawayClassLoaderTests`~~ **FIXED (2026-07-15,
     commit `56a98cc4`)**. `native-builtins/src/classloader_real.rs`'s
     `cl_real_load_class_base` — the REAL-JDK-mode counterpart of the
