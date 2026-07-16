@@ -30,6 +30,13 @@ the older lower-rate family (which the ~35 pin fixes + the return barrier addres
 independently landed the GAP-filler stride portion — this branch adds the free-list/TLAB merge,
 walk-completeness tracking, and the skip-cycle fail-safe on top. Details in the FIXED writeup.
 
+RETIRED with the same wave:
+[`wildfly-domain-hc0053-server-inventory-timeout-RESOLVED.md`](../internal/fixed-suite-bugs/wildfly-domain-hc0053-server-inventory-timeout-RESOLVED.md)
+— the multi-session WildFly domain-boot record (inventory transport → StreamDecoder →
+async-future/XNIO AB-BA deadlock → blocked on this CCE family) captured its final closing
+artifact: BOTH managed servers reaching `WFLYSRV0025` in one clean run (`DM_001`: server-one
+70.1s, server-two 84.2s, zero failure markers in the domain console log).
+
 ## 2026-07-15 Keycloak `WelcomePageTest` zipfs `Files.copy` bug FIXED (two stacked path-layout bugs); teardown hang re-verified NOT reproducing
 
 FIXED (moved to `docs/internal/fixed-suite-bugs/`): [`zipfs-files-copy-wrapped-path-FIXED.md`](../internal/fixed-suite-bugs/zipfs-files-copy-wrapped-path-FIXED.md)
