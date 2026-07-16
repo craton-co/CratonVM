@@ -1067,6 +1067,32 @@ fn safe_native_call_impl(
     thread.native_pending_return = None;
     match &mut out {
         Ok(Some(v)) => {
+            // cce0079: RETURN-value counterpart to the argument
+            // `load_and_forward` barrier at the top of this function — a
+            // native whose last GC-capable call preceded its final read can
+            // return an already-evacuated ref (the long-tail Family-1
+            // stale-at-return shape); heal it here exactly like arguments
+            // are healed on entry (the forwarding marker in from-space
+            // stays readable until the memory is actually reused). Under
+            // CRATONVM_DBG_STALE_OBJREF, name the producing native so the
+            // site can be fixed at the source.
+            if let Value::Object(Some(o)) = v {
+                let healed = shared.heap.load_and_forward(*o);
+                if healed.as_ptr() != o.as_ptr()
+                    && cratonvm_gc::stale_objref_debug::enabled()
+                {
+                    let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
+                        .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+                    tracing::warn!(
+                        "CRATONVM_DBG_STALE_OBJREF: native {} returned a stale \
+                         (already-evacuated) ref 0x{:x} — healed to 0x{:x}",
+                        callee,
+                        o.as_ptr() as usize,
+                        healed.as_ptr() as usize,
+                    );
+                }
+                *o = healed;
+            }
             if let Some(o) = value_as_validated_object_ref(shared, *v) {
                 thread.native_pending_return = Some(o);
             }

@@ -107,6 +107,20 @@ fn arrstore_enabled() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_ARRSTORE").is_some())
 }
 
+/// Cached `CRATONVM_DBG_CCE_BT` gate (WildFly `parallel-extension-add` CCE
+/// family): print receiver identity (class + address, and `via_pin` where
+/// applicable) at the moment a `ClassCastException` is constructed, so a
+/// wrong-object read can be correlated against GC cycle logs and the
+/// `CRATONVM_DBG_STALE_OBJREF` quarantine ring. The native-collections
+/// natural-order sites have a matching hook (with native backtrace) behind
+/// the same variable.
+#[inline]
+pub fn dbg_cce_bt_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_CCE_BT").is_some())
+}
+
 /// Cached `CRATONVM_DBG_NO_REFPROC` gate (bc math-ec 0x4): skip ALL post-GC
 /// reference processing — subsystem-level exclusion experiment.
 #[inline]
@@ -14910,6 +14924,18 @@ fn execute_instruction(
                         // FQN exactly as on HotSpot.
                         let obj_binary = obj_class_name.replace('/', ".");
                         let target_binary = target_class_name.replace('/', ".");
+                        // CRATONVM_DBG_CCE_BT: identify the failing receiver
+                        // (address + classes) at the moment a checkcast CCE
+                        // is constructed — attribution for the WildFly
+                        // `parallel-extension-add` stale-object CCE family,
+                        // correlated against GC logs / the
+                        // CRATONVM_DBG_STALE_OBJREF quarantine ring.
+                        if crate::runtime::interpreter::dbg_cce_bt_enabled() {
+                            eprintln!(
+                                "CRATONVM_DBG_CCE_BT: site=checkcast obj={obj_binary} @0x{:x} target={target_binary}",
+                                obj_ref.as_ptr() as usize
+                            );
+                        }
                         return Err(RuntimeError::ClassCastException {
                             message: format!("{obj_binary} cannot be cast to {target_binary}"),
                         }
@@ -19337,6 +19363,20 @@ fn checkcast_lambda_instantiated_args(
                 .and_then(|d| d.strip_suffix(';'))
                 .unwrap_or(inst_tok)
                 .replace('/', ".");
+            // CRATONVM_DBG_CCE_BT: same attribution hook as the `checkcast`
+            // opcode, plus whether this argument was read through the pinned
+            // path (`via_pin`) — re-establishing the 2026-07-15 session's
+            // temporary instrumentation permanently (that session measured
+            // via_pin=true on every captured stale read here).
+            if crate::runtime::interpreter::dbg_cce_bt_enabled() {
+                let via_pin = handles.get(idx).copied().flatten().is_some();
+                eprintln!(
+                    "CRATONVM_DBG_CCE_BT: site=lambda_instantiated_args obj={} @0x{:x} target={} via_pin={via_pin}",
+                    obj_class_name.replace('/', "."),
+                    obj_ref.as_ptr() as usize,
+                    target_binary
+                );
+            }
             // Same dotted-name shape as the `checkcast` opcode (tools such as
             // mockk's `JvmAutoHinter` parse this text).
             return Err(RuntimeError::ClassCastException {

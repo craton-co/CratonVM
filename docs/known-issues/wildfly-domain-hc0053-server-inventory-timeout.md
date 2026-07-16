@@ -218,7 +218,7 @@ touching the interpreted listener bytecode itself.
      rather than a memory kill, but this was not conclusively isolated before the host's disk state made
      further clean attempts unproductive.
 
-### Updated status
+### Updated status (superseded — see 2026-07-16 second session below)
 
 The defect this doc's title and the 2026-07-15 follow-up named — the `async_future_wait_keepalive`
 stall / permanent managed-server wedge — is **FIXED and verified** (root cause identified with live
@@ -232,4 +232,36 @@ condition, not a code defect). Whoever revisits this next should either (a) re-r
 mount hosts the WildFly install/build output, expecting the fix already landed here to hold, or (b) if
 both-servers-together is still desired as an explicit closing artifact, treat it as blocked on the
 `WFLYCTL0079` family closing first, not as separate open work in this doc.
+
+## 2026-07-16 (second session): the `WFLYCTL0079` blocker's ROOT CAUSE found and fixed; server-two `WFLYSRV0025` reproduced on the fixed build; residual long-tail sites being closed with new producer-side diagnostics
+
+Worktree `/data/wt-cce0079-20260716` (Azure host), branch `fix/wildfly-cce0079-close-20260716`,
+forked from `origin/dev @ dcb24161`. Full writeup:
+`docs/internal/fixed-suite-bugs/wildfly-cce0079-young-start-set-truncation-FIXED.md`.
+
+- The `WFLYCTL0079`/CCE family that this doc's closing artifact was blocked on turned out to be a
+  **single dominant GC defect**: the moving young collector's object-start walk broke at the first
+  un-striden TLAB GAP-filler sentinel and silently dropped every young object above the breakout from
+  the forwardable set — `forward_object` then returned every affected root/reference UNMOVED, so whole
+  swaths of live young objects were never evacuated and every reference to them dangled into recycled
+  memory after the semispace swap. The walk-stop warning appears in **100% of baseline boot logs**;
+  fixed by making the walk gap-aware (free-list + TLAB skips + GAP-filler stride) with a
+  skip-this-cycle fail-safe.
+- Post-fix, WildFly *standalone* boots show **0 CCE across 14 valid probes** (vs ~50% baseline), with
+  full `WFLYSRV0025` boots reproducing on a loaded shared host.
+- Domain no-JIT probes now reliably reach both-servers-registered, the Host Controller's own
+  `WFLYSRV0025`, and — on run `DC_001` (fix4 binary, stale-canary active) — **`Server:server-two`
+  reached its own `WFLYSRV0025`** (92.9 s), replicating the 2026-07-15 single-server proof on the
+  new build.
+- The remaining gap to both-servers-in-one-run is a residual long-tail of Family-1 stale-ref
+  producers that only fire in the domain no-JIT window (captured live this session:
+  `xnio_conduits` sink resume/suspend, `dis_read_utf`/`dis_read_exact`, channel-alloc registry
+  keys, TCP open/accept listener dispatch — all fixed; plus at least one still-open producer
+  feeding an `aastore` in `SubsystemResourceDescriptionResolver.<init>` and a
+  `cid=0`-receiver CCE in `AddStepHandler.recordCapabilitiesAndRequirements`). Two new
+  producer-side diagnostics were landed to close these: stale-value checks at the
+  `set_field`/`set_array_element` funnels (under `CRATONVM_DBG_STALE_OBJREF`) and a
+  RETURN-value `load_and_forward` healing barrier at the native-call funnel (always on — the
+  symmetric counterpart to the existing argument barrier), which both heals stale-at-return
+  natives outright and names them under the debug flag.
 

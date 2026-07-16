@@ -4,6 +4,27 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-16 WildFly boot CCE family ROOT CAUSE FIXED — moving young GC's object-start walk truncated at the first TLAB gap, mass-dangling references (was misattributed for weeks as "register-invisible JIT roots" / per-site missed pins)
+
+FIXED (full writeup): [`wildfly-cce0079-young-start-set-truncation-FIXED.md`](../internal/fixed-suite-bugs/wildfly-cce0079-young-start-set-truncation-FIXED.md)
+— the `WFLYCTL0079` / `ClassCastException: java.lang.Object cannot be cast to X` family during
+`parallel-extension-add` (`AttributeAccess`/`AttributeDefinition`/`Comparable`/`Function`/`Map`/…
+cast targets), the `via_pin=true` mystery, and a swath of "silent wedge" boot failures all traced
+to ONE defect: `collect_garbage_inner`'s moving-path `young_object_starts` walk `break`'d at the
+first free-list/TLAB/GAP-filler gap (warning present in 100% of baseline logs) and
+`forward_object` then refused to evacuate every young object above the breakout — for precise
+roots and native pins included. Fixed with a gap-aware walk + a skip-cycle fail-safe (measured:
+diverting to the non-moving sweep instead reclaims live objects on the precise-root path —
+HIB-CV-22/32/33). Standalone CCE rate 0/14 post-fix vs ~50% baseline. Landed alongside: ~35
+audited Family-1 stale-at-store fixes (native-collections TreeMap/PriorityQueue/ArrayDeque/
+LinkedList/COWAL/HashSet-bulk/LinkedHashMap-eviction + lookup family), XNIO conduit/worker
+fixes (listener dispatch, channel-alloc registry keys), DataInput/OutputStream fixes, an
+always-on RETURN-value `load_and_forward` healing barrier at the native-call funnel, and new
+diagnostics (`CRATONVM_DBG_STALE_OBJREF_CYCLES` quarantine ring, `CRATONVM_DBG_CCE_BT`,
+store-funnel stale-value checks). A narrow domain-no-JIT long-tail residual remains OPEN in
+[`wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`](wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md)
+(2026-07-16 section); the JIT SIGSEGV bucket stays with the SB-CRASH-04/precise-maps roadmap.
+
 ## 2026-07-15 Keycloak `WelcomePageTest` zipfs `Files.copy` bug FIXED (two stacked path-layout bugs); teardown hang re-verified NOT reproducing
 
 FIXED (moved to `docs/internal/fixed-suite-bugs/`): [`zipfs-files-copy-wrapped-path-FIXED.md`](../internal/fixed-suite-bugs/zipfs-files-copy-wrapped-path-FIXED.md)

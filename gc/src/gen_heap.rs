@@ -25,7 +25,7 @@
 //! the free list.
 
 use std::backtrace::Backtrace;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
@@ -535,21 +535,24 @@ pub struct GenerationalHeap {
     young_to: Mutex<Arena>,
     /// Old generation (promoted objects).
     old_gen: Mutex<OldGen>,
-    /// `CRATONVM_DBG_STALE_OBJREF` quarantine arena.
+    /// `CRATONVM_DBG_STALE_OBJREF` quarantine ring of evacuated arenas.
     ///
-    /// Starts at zero capacity (no cost when the flag is unset). The first
-    /// time [`crate::stale_objref_debug::enabled`] reads true, `collect_garbage_inner`
-    /// grows it to match `young_from`'s capacity and, from then on, routes
-    /// each cycle's just-evacuated (all-garbage) `young_from` arena through
-    /// here instead of resetting it immediately: a stale native `ObjectRef`
-    /// held across that GC still resolves to a header showing
-    /// `is_forwarded() == true` for one *extra* full minor-GC cycle, which
-    /// [`Self::get_header`] turns into a hard panic instead of the object
-    /// silently reading back all-zero (or, worse, a same-slot-reused
-    /// unrelated object) once that memory is actually reclaimed. See
+    /// Empty (no cost) when the flag is unset. While
+    /// [`crate::stale_objref_debug::enabled`] reads true,
+    /// `collect_garbage_inner` routes each cycle's just-evacuated
+    /// (all-garbage) `young_from` arena through this ring instead of
+    /// resetting it immediately: a stale native `ObjectRef` held across that
+    /// GC still resolves to a header showing `is_forwarded() == true` for
+    /// [`crate::stale_objref_debug::quarantine_cycles`] extra full minor-GC
+    /// cycles (`CRATONVM_DBG_STALE_OBJREF_CYCLES`, default 1 — the original
+    /// single-arena behaviour), which [`Self::get_header`] turns into a hard
+    /// panic instead of the object silently reading back all-zero (or,
+    /// worse, a same-slot-reused unrelated object) once that memory is
+    /// actually reclaimed. Ordered oldest-first; the front arena's grace
+    /// period has elapsed and its memory is the next to be reused. See
     /// docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md
     /// and docs/internal/wildfly-stale-objectref-debug-assertion-scoping.md.
-    quarantine: Mutex<Arena>,
+    quarantine: Mutex<VecDeque<Arena>>,
     /// Lock-free cached address bounds `[base, end)` of the three storage
     /// regions (young from-space, young to-space, old gen), published whenever
     /// the regions are (re)allocated so [`is_object_address`] can do its
@@ -726,7 +729,7 @@ impl GenerationalHeap {
             young_from: Mutex::new(Arena::new(young_semi_size)),
             young_to: Mutex::new(Arena::new(young_semi_size)),
             old_gen: Mutex::new(old_gen),
-            quarantine: Mutex::new(Arena::new(0)),
+            quarantine: Mutex::new(VecDeque::new()),
             region_bounds: [
                 (AtomicUsize::new(0), AtomicUsize::new(0)),
                 (AtomicUsize::new(0), AtomicUsize::new(0)),
@@ -2079,6 +2082,16 @@ impl GenerationalHeap {
                 );
             }
         }
+        // CRATONVM_DBG_STALE_OBJREF (cce0079): a stale VALUE stored into a
+        // reference field is otherwise silent (only the receiver's header is
+        // read below) — surface the store site itself while the quarantine
+        // holds the forwarding marker (producer-side attribution; matches
+        // the equivalent check in `set_array_element`).
+        if crate::stale_objref_debug::enabled() {
+            if let Value::Object(Some(v)) = value {
+                let _ = self.get_header(v);
+            }
+        }
         // KC16 SIGSEGV audit: runtime bounds check.  Silently drop writes
         // that fall past the object's declared layout (layout mismatch
         // between synthetic and real JDK class shapes) rather than
@@ -2550,6 +2563,17 @@ impl GenerationalHeap {
             let a = p.as_ptr() as usize;
             if a != 0 && a < 0x1_0000 && std::env::var_os("CRATONVM_DBG_BADREF").is_some() {
                 eprintln!("[BADREF:set_array_element] idx={} ptr=0x{:x}", index, a);
+            }
+        }
+        // CRATONVM_DBG_STALE_OBJREF (cce0079): a stale VALUE stored into a
+        // reference array is otherwise silent (only the ARRAY's header is
+        // read below) — the wrong object then surfaces at an arbitrarily
+        // later read as a CCE. With the quarantine active, read the value's
+        // header too so the store site itself trips the loud forwarded-
+        // header panic (producer-side attribution).
+        if crate::stale_objref_debug::enabled() {
+            if let Value::Object(Some(v)) = value {
+                let _ = self.get_header(v);
             }
         }
         let header = self.get_header(obj_ref);
@@ -3051,6 +3075,92 @@ impl GenerationalHeap {
         self.collect_garbage_inner(roots, &[], monitors).0
     }
 
+    /// Run one complete NON-MOVING young collection cycle (the divert path of
+    /// `collect_garbage_inner`): young mark-sweep, threshold-gated in-place
+    /// old sweep, and the monitor-registry remap for selective promotions.
+    /// Extracted so the moving path can ALSO divert here mid-flight when its
+    /// young object-start walk cannot complete (see the cce0079 walk fix in
+    /// `collect_garbage_inner`) — a moving cycle with a partial start set
+    /// would silently fail to evacuate every object past the walk breakout,
+    /// dangling every reference to them once the semispaces swap.
+    fn run_non_moving_young_cycle(
+        &self,
+        roots: &mut [ObjectRef],
+        finalizer_addrs: &[usize],
+        monitors: &dyn MonitorCleanup,
+    ) -> (GcResult, Vec<usize>) {
+        let mut result = self.sweep_young_non_moving(roots, finalizer_addrs);
+        // The JIT-active path cannot use the ordinary old-gen compactor:
+        // conservative JIT stack/register roots cannot be rewritten when an
+        // old object moves.  Previously this early return therefore skipped
+        // old collection altogether.  Long allocation-heavy runs eventually
+        // filled old space with dead objects promoted by the selective young
+        // sweep (or spilled there by an allocation slow path), making depth
+        // 20 Binary Trees OOM despite a small live tree.  Sweep old space in
+        // place once it reaches the same pressure threshold as the compacting
+        // path.  The shared marker retains every conservative root, while
+        // the non-moving sweep only returns unreachable blocks to OldGen's
+        // free lists and never invalidates a raw JIT pointer.
+        // In this path a pending System.gc() must still sweep old gen,
+        // even below the normal occupancy threshold. Consume the request
+        // here because the moving Phase-5 check below is skipped.
+        let major_requested = crate::gc_quiescence::take_major_gc_request();
+        let old_capacity = self.old_gen_capacity();
+        // CRATONVM_OLD_SWEEP_JIT=0 opts out of the in-place old sweep on
+        // this conservative-roots path (diagnostic escape hatch / A-B
+        // bisection knob for suspected live-object reclaims — the young
+        // sweep survives an imperfect root set via conservative
+        // over-marking and side-mark containment, but this old sweep
+        // frees purely on GC_FLAG_MARKED, so any root-set gap frees a
+        // LIVE promoted object). Read once per GC cycle — not hot.
+        let old_sweep_enabled = std::env::var("CRATONVM_OLD_SWEEP_JIT")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if old_sweep_enabled
+            && old_capacity > 0
+            && (self.old_gen_used() >= old_capacity * 75 / 100 || major_requested)
+        {
+            let old_freed = self.sweep_old_gen_non_moving(roots);
+            result.0.stats.bytes_freed += old_freed;
+            self.stats
+                .bytes_freed_old
+                .fetch_add(old_freed as u64, Ordering::Relaxed);
+            self.stats.major_gc_count.fetch_add(1, Ordering::Relaxed);
+        }
+        // BUG-V fix: the non-moving sweep still *relocates* objects via
+        // selective promotion (young→old, see `selective_on` in
+        // `sweep_young_non_moving`). Those relocations land in
+        // `result.0.pointer_map`, and the moving path below remaps the
+        // monitor registry with exactly that map at the
+        // `monitors.remap_after_gc(&pointer_map)` call. This early return
+        // used to skip it, so a `synchronized`-inflated object that got
+        // selectively promoted kept its monitor-registry entry keyed to its
+        // *old* young address while its copied mark word (at the new old-gen
+        // address) still read INFLATED. The next `enter`/`lookup_inflated`
+        // at the new address missed the registry → `inflate_locked`
+        // returned the "mark inflated but registry entry missing" Err → the
+        // `.expect(...)` panicked (monitor.rs registry/mark-word desync).
+        // Re-key the registry here, identically to the moving path.
+        monitors.remap_after_gc(&result.0.pointer_map);
+        // DBG (CRATONVM_DBG_YOUNGSTATE): post-collection young/old arena
+        // state — the bimodal-bt18 discriminator (is young allocatable
+        // after this sweep, and from which structure?).
+        if std::env::var_os("CRATONVM_DBG_YOUNGSTATE").is_some() {
+            let from = self.young_from.lock();
+            let og = self.old_gen.lock();
+            eprintln!(
+                "[youngstate] post-sweep used={}/{} free_list={} largest_free={} old={}/{}",
+                from.used(),
+                from.capacity(),
+                from.free_list_bytes(),
+                from.largest_free_block(),
+                og.used(),
+                og.capacity(),
+            );
+        }
+        return result;
+    }
+
     fn collect_garbage_inner(
         &self,
         roots: &mut [ObjectRef],
@@ -3266,76 +3376,7 @@ impl GenerationalHeap {
                 moving_young,
                 force_non_moving_jit_roots,
             );
-            let mut result = self.sweep_young_non_moving(roots, finalizer_addrs);
-            // The JIT-active path cannot use the ordinary old-gen compactor:
-            // conservative JIT stack/register roots cannot be rewritten when an
-            // old object moves.  Previously this early return therefore skipped
-            // old collection altogether.  Long allocation-heavy runs eventually
-            // filled old space with dead objects promoted by the selective young
-            // sweep (or spilled there by an allocation slow path), making depth
-            // 20 Binary Trees OOM despite a small live tree.  Sweep old space in
-            // place once it reaches the same pressure threshold as the compacting
-            // path.  The shared marker retains every conservative root, while
-            // the non-moving sweep only returns unreachable blocks to OldGen's
-            // free lists and never invalidates a raw JIT pointer.
-            // In this path a pending System.gc() must still sweep old gen,
-            // even below the normal occupancy threshold. Consume the request
-            // here because the moving Phase-5 check below is skipped.
-            let major_requested = crate::gc_quiescence::take_major_gc_request();
-            let old_capacity = self.old_gen_capacity();
-            // CRATONVM_OLD_SWEEP_JIT=0 opts out of the in-place old sweep on
-            // this conservative-roots path (diagnostic escape hatch / A-B
-            // bisection knob for suspected live-object reclaims — the young
-            // sweep survives an imperfect root set via conservative
-            // over-marking and side-mark containment, but this old sweep
-            // frees purely on GC_FLAG_MARKED, so any root-set gap frees a
-            // LIVE promoted object). Read once per GC cycle — not hot.
-            let old_sweep_enabled = std::env::var("CRATONVM_OLD_SWEEP_JIT")
-                .map(|v| v != "0")
-                .unwrap_or(true);
-            if old_sweep_enabled
-                && old_capacity > 0
-                && (self.old_gen_used() >= old_capacity * 75 / 100 || major_requested)
-            {
-                let old_freed = self.sweep_old_gen_non_moving(roots);
-                result.0.stats.bytes_freed += old_freed;
-                self.stats
-                    .bytes_freed_old
-                    .fetch_add(old_freed as u64, Ordering::Relaxed);
-                self.stats.major_gc_count.fetch_add(1, Ordering::Relaxed);
-            }
-            // BUG-V fix: the non-moving sweep still *relocates* objects via
-            // selective promotion (young→old, see `selective_on` in
-            // `sweep_young_non_moving`). Those relocations land in
-            // `result.0.pointer_map`, and the moving path below remaps the
-            // monitor registry with exactly that map at the
-            // `monitors.remap_after_gc(&pointer_map)` call. This early return
-            // used to skip it, so a `synchronized`-inflated object that got
-            // selectively promoted kept its monitor-registry entry keyed to its
-            // *old* young address while its copied mark word (at the new old-gen
-            // address) still read INFLATED. The next `enter`/`lookup_inflated`
-            // at the new address missed the registry → `inflate_locked`
-            // returned the "mark inflated but registry entry missing" Err → the
-            // `.expect(...)` panicked (monitor.rs registry/mark-word desync).
-            // Re-key the registry here, identically to the moving path.
-            monitors.remap_after_gc(&result.0.pointer_map);
-            // DBG (CRATONVM_DBG_YOUNGSTATE): post-collection young/old arena
-            // state — the bimodal-bt18 discriminator (is young allocatable
-            // after this sweep, and from which structure?).
-            if std::env::var_os("CRATONVM_DBG_YOUNGSTATE").is_some() {
-                let from = self.young_from.lock();
-                let og = self.old_gen.lock();
-                eprintln!(
-                    "[youngstate] post-sweep used={}/{} free_list={} largest_free={} old={}/{}",
-                    from.used(),
-                    from.capacity(),
-                    from.free_list_bytes(),
-                    from.largest_free_block(),
-                    og.used(),
-                    og.capacity(),
-                );
-            }
-            return result;
+            return self.run_non_moving_young_cycle(roots, finalizer_addrs, monitors);
         }
 
         let mut young_from = self.young_from.lock();
@@ -3608,22 +3649,133 @@ impl GenerationalHeap {
         // addresses inside young objects. Build an exact pre-forwarding object
         // start set so only allocator-written headers can ever receive a
         // forwarding pointer; an interior false positive must merely be ignored.
+        //
+        // cce0079 ROOT FIX (2026-07-16): this walk previously assumed a
+        // contiguous bump-allocated young space and BREAK'd at the first
+        // implausible header. But young_from legitimately contains free-list
+        // and TLAB gap ranges (zeroed, headerless) — under WildFly's
+        // ~40-thread `parallel-extension-add` the walk reliably hit one a few
+        // MB in and silently dropped EVERY later young object from the start
+        // set. `forward_object_impl` treats "not in the start set" as a
+        // conservative interior word and returns the address UNMOVED — for
+        // every root (precise roots and native pins included) and every
+        // scanned reference slot — so entire swaths of live young objects
+        // were never evacuated and every reference to them dangled into
+        // recycled memory after the semispace swap. That is the mechanism
+        // behind the WildFly boot `ClassCastException: java.lang.Object
+        // cannot be cast to X` / stale-ObjectRef family (canary-confirmed
+        // live via the CRATONVM_DBG_STALE_OBJREF quarantine ring: the walk
+        // warning printed seconds before stale reads surfaced in
+        // native_map_get bucket contents and EnhancedQueueExecutor node
+        // fields). Walk the same free-list-aware grid as the non-moving
+        // exact walk (`skip_free_blocks`); if the walk STILL cannot complete
+        // (genuinely corrupt header), the moving collector is unsound this
+        // cycle — divert to the non-moving sweep, which tolerates a partial
+        // view (conservative over-marking, never relocates).
         let mut young_object_starts: FxHashSet<usize> = FxHashSet::default();
         let young_base = young_from.base_ptr() as usize;
         let young_used = young_from.used();
+        let mut start_walk_complete = true;
+        // Merge the free-block list with un-retired TLAB tails (reserved,
+        // never on the free list — the exact gap class this walk was
+        // breaking on) — the same skip set the non-moving exact walk builds
+        // via its local `merge_skips`. Both inputs are ascending & disjoint.
+        let start_skips = {
+            let mut v = young_from.free_blocks_sorted();
+            v.extend(self.jit_tlab_skip_offsets(young_base, young_base + young_used));
+            v.sort_by_key(|&(off, _)| off);
+            v
+        };
+        let mut start_free_iter = start_skips.iter().peekable();
         let mut young_cursor = 0usize;
         while young_cursor < young_used {
+            if skip_free_blocks(&mut young_cursor, &mut start_free_iter).0 {
+                continue;
+            }
             let obj_ptr = (young_base + young_cursor) as *mut u8;
-            // SAFETY: moving young space is bump-allocated contiguously; the
-            // cursor always advances by a validated object extent.
+            // SAFETY: free/TLAB ranges were skipped; the cursor is on an
+            // allocator-written object boundary in the young arena.
             let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            // Bug-D (2026-06-12) parity with every other young walk: stride
+            // over a GAP-filler sentinel (a sub-`HEADER_SIZE` TLAB tail,
+            // `install_tail_filler`) BEFORE `gen_object_total_size` — its
+            // `num_slots` offset lies outside the gap, so parsing it as an
+            // object reads garbage and the walk would abort. This was the
+            // gap class that actually broke this walk in the WildFly repro
+            // (cursor a few MB in, at the first thread's retired TLAB tail).
+            if header.class_id.as_u32() == crate::tlab::GAP_FILLER_CLASS_ID.as_u32() {
+                // SAFETY: offset 4 lies within the >=8-byte gap.
+                let gap =
+                    unsafe { std::ptr::read((obj_ptr as *const u8).add(4) as *const u32) } as usize;
+                if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && young_cursor + gap <= young_used {
+                    young_cursor += gap;
+                    continue;
+                }
+                tracing::warn!(
+                    young_cursor,
+                    young_used,
+                    gap,
+                    "GC: young object-start walk hit a corrupt GAP-filler — \
+                     diverting this cycle to the non-moving sweep"
+                );
+                start_walk_complete = false;
+                break;
+            }
             let size = gen_object_total_size(header);
             if size < HEADER_SIZE || young_cursor.checked_add(size).is_none_or(|end| end > young_used) {
-                tracing::warn!(young_cursor, young_used, "GC: young object-start walk stopped at an implausible extent");
+                tracing::warn!(
+                    young_cursor,
+                    young_used,
+                    "GC: young object-start walk stopped at an implausible extent — \
+                     diverting this cycle to the non-moving sweep"
+                );
+                start_walk_complete = false;
                 break;
+            }
+            if let Some(&&(off, _)) = start_free_iter.peek() {
+                if off > young_cursor && off < young_cursor + size {
+                    tracing::warn!(
+                        young_cursor,
+                        off,
+                        "GC: young object-start walk crossed a free/TLAB range — \
+                         diverting this cycle to the non-moving sweep"
+                    );
+                    start_walk_complete = false;
+                    break;
+                }
             }
             young_object_starts.insert(obj_ptr as usize);
             young_cursor += size;
+        }
+        if !start_walk_complete {
+            // A partial start set makes the moving cycle unsound (see the
+            // comment above). The non-moving sweep is NOT a safe fallback
+            // here either: on this precise-root path it lacks the
+            // conservative over-marking it needs and reclaims still-live
+            // young objects (the HIB-CV-22/32/33 family — measured live in
+            // this investigation: one diverted cycle produced all-zero-header
+            // reads on live receivers 145 ms later). The only sound choice
+            // is to SKIP this young collection entirely: over-retain for one
+            // cycle, let the allocation slow paths spill to old gen, and
+            // retry on the next trigger (by which point the unparseable
+            // layout — normally a transient un-tail-filled gap — is gone).
+            // Nothing destructive has happened yet: only the pre-collection
+            // bounds publish and the card-buffer drain, both idempotent.
+            tracing::warn!(
+                "GC: young object-start walk incomplete — skipping this young \
+                 collection (over-retain; retried next cycle)"
+            );
+            return (
+                GcResult {
+                    stats: crate::gc::GcStats {
+                        objects_copied: 0,
+                        bytes_copied: 0,
+                        bytes_freed: 0,
+                    },
+                    pointer_map: HashMap::new(),
+                },
+                Vec::new(),
+            );
         }
         let mut objects_copied: usize = 0;
         // Read & clear the promote-on-pressure flag set by the previous
@@ -4253,22 +4405,35 @@ impl GenerationalHeap {
         //
         // CRATONVM_DBG_STALE_OBJREF: instead of resetting (zeroing) the
         // just-evacuated `young_from` immediately, route it through the
-        // quarantine arena for one extra cycle so a stale native `ObjectRef`
-        // held into it still resolves to a forwarded header (caught by
-        // `get_header`) rather than reading back all-zero. `quarantine`
-        // currently holds whatever was routed through it LAST cycle (or is
-        // empty, the very first time) — its one-cycle grace period has
-        // elapsed, so it's safe to reset (and grow, if `young_from` has since
-        // expanded) before taking this cycle's garbage in. The final external
-        // effect — which arena ends up serving as `young_from`/`young_to` for
-        // the NEXT cycle — is identical to the plain `young_from.reset()`
-        // this replaces; only the mechanics of clearing memory differ.
+        // quarantine ring for `quarantine_cycles()` extra cycles so a stale
+        // native `ObjectRef` held into it still resolves to a forwarded
+        // header (caught by `get_header`) rather than reading back all-zero.
+        // The ring is ordered oldest-first: once it is full, the FRONT arena
+        // (whose grace period has elapsed) is popped, reset (and grown, if
+        // `young_from` has since expanded), and reused as the fresh arena;
+        // the just-evacuated `young_from` is pushed onto the BACK to start
+        // its own grace period. With the default single-cycle ring the final
+        // external effect — which arena ends up serving as
+        // `young_from`/`young_to` for the NEXT cycle — is identical to the
+        // plain `young_from.reset()` this replaces; only the mechanics of
+        // clearing memory differ.
         if crate::stale_objref_debug::enabled() {
-            quarantine.reset();
-            if quarantine.capacity() < young_from.capacity() {
-                quarantine.grow(young_from.capacity());
+            let cycles = crate::stale_objref_debug::quarantine_cycles();
+            let mut reuse = if quarantine.len() >= cycles {
+                let mut oldest = quarantine
+                    .pop_front()
+                    .expect("quarantine ring checked non-empty");
+                oldest.reset();
+                oldest
+            } else {
+                Arena::new(0)
+            };
+            if reuse.capacity() < young_from.capacity() {
+                reuse.grow(young_from.capacity());
             }
-            std::mem::swap(&mut *young_from, &mut *quarantine);
+            std::mem::swap(&mut *young_from, &mut reuse);
+            // `reuse` now holds this cycle's just-evacuated from-space.
+            quarantine.push_back(reuse);
         } else {
             young_from.reset();
         }
