@@ -1146,3 +1146,70 @@ session's own investigation. This is exactly the "concurrent fix + concurrent fi
 failure mode this verification pass was commissioned to check for. **Recommend NOT treating the
 `ClientHttpConnectorTests`/reactive-connector residual as merely "diffuse throughput, 27% hang,
 accepted" going forward — re-open it as a correctness regression, not a perf residual.**
+
+
+### 5.1 Follow-up (2026-07-16): the "combined-fix regression" was refuted; real independent bug found + fixed for one of the two signatures
+
+Investigated both real findings from section 5 above with the same rigor as the original
+`3d1449a7` session. Bottom line: **neither `ClassCastException` was caused by any of the three
+2026-07-15 concurrent fix sessions.** Both are pre-existing CratonVM bugs, invisible until this
+verification pass because no prior test harness (this investigation's own, nor any of the three
+fixing sessions' own verification) had ever passed `--enable-native-access=ALL-UNNAMED` to the
+launcher — so `java.lang.foreign.MemorySegment`'s clinit always failed early with
+`IllegalCallerException`, and depending on exactly where that failure was first triggered,
+either got silently tolerated (the common case, logged as a `<clinit> failed` warning and
+ignored) or occasionally produced a hard `Class.forName` failure that aborted the whole run
+before any real test executed — masking whatever happened downstream, including both bugs below.
+
+**`okio.Segment` `ClassCastException` — root-caused and FIXED.** Reverted exactly `3d1449a7`'s
+diff from `22dfc55e` (clean `git revert`, nothing else touched), rebuilt, reran with
+`--enable-native-access=ALL-UNNAMED`: **the identical crash + 100% hang still reproduced**,
+proving `3d1449a7` innocent. Went one step further and reproduced the identical crash on
+`b5c8f43f` — the commit immediately *before* any of the three 2026-07-15 sessions touched
+anything. Root cause: `java/lang/Thread.getId()` (`native-builtins/src/lib.rs`) was hardcoded to
+return the constant `1` for every thread in the process. Okio's `SegmentPool` (okio-jvm 3.x,
+used by MockWebServer/OkHttp) shards its lock-free segment free-list across
+`HASH_BUCKET_COUNT = highestOneBit(availableProcessors()*2-1)` (16 on this host)
+`AtomicReference<Segment>` buckets via `Thread.currentThread().getId() & (HASH_BUCKET_COUNT-1)`.
+With `getId()` always `1`, every thread collapsed onto the identical bucket, concentrating the
+entire process's segment-pool churn onto one shared `AtomicReference` and exposing a race under
+that artificially extreme contention. `Thread.threadId()` (the JDK 19+ replacement, registered
+separately in `phases_late.rs`) already did this correctly via `ctx.thread_id()`; fixed the
+legacy `getId()` to match. Verified via a standalone probe: threads now get distinct real IDs.
+**Result: 100% → 0% hangs** (10/10 clean completions with `--enable-native-access=ALL-UNNAMED`,
+vs. the 21/21 hangs section 5 documented). Landed: commit `19a5025f` (also fixes the
+`cratonvm-jit` test-fixture compile break from section 5's first finding — 11 sites in
+`jit/src/lib.rs` never got `3d1449a7`'s `force_native_cache` field because that commit's sweep
+was driven by `cargo build --release` errors, which don't compile `#[cfg(test)]` code; verified
+`cargo test -p cratonvm-jit --lib`: 905/0, was: compile error).
+
+**`CompletableFuture`/`io.netty.util.concurrent.Future` `ClassCastException` — confirmed real,
+independent, NOT resolved.** With the hang eliminated, `ClientHttpConnectorTests` now completes
+cleanly every time but with `33/49` passing (was `44/49` on a lucky non-hung pre-fix run) — the
+16 failures split into 5 already-known/classpath-related (1 `NoClassDefFoundError: ByteBuddy`,
+3 `NoClassDefFoundError: AssertJ Assumptions`, 1 unrelated `IOException`) plus **11 genuinely new
+failures**, all `ClassCastException: java.util.concurrent.CompletableFuture cannot be cast to
+io.netty.util.concurrent.Future`, all on Reactor Netty sub-tests. Checked whether this also
+pre-exists: 3 clean (non-hung) runs of the true pre-everything baseline (`b5c8f43f`, also with
+`--enable-native-access=ALL-UNNAMED`) show **zero** occurrences of this failure — only the same 5
+known ones. Unlike the `okio.Segment` bug, this one does NOT clearly reproduce on the pre-session
+baseline in the samples gathered, so it cannot yet be ruled either "definitely pre-existing but
+previously masked by the hang" or "a genuine interaction surfaced by the `getId()` fix restoring
+real thread identity" — the sample size (3 clean baseline runs) is too small to be confident
+either way, and this was NOT root-caused (searched `native-builtins/src/*.rs` for any
+Netty-`Future` bridging code and found none — this looks like a bytecode/lambda-dispatch-level
+type-confusion, not a missing native override, plausibly connected to the JRuby session's
+MethodHandle/invokedynamic dispatch changes as section 5 already speculated, but not verified).
+**Flagged for dedicated follow-up, not force-fixed here** — same standard this investigation has
+applied throughout: land what's verified, document what isn't.
+
+**Current true state of `ClientHttpConnectorTests`**: 0% hangs (was 100%), 33/49 (67%) passing
+per run, consistently reproducible. A real, large improvement over the section-5 regression
+report, not yet a full fix — 11 sub-tests fail deterministically on the `CompletableFuture`/
+Netty-`Future` cast bug above.
+
+Verified (dev tip after `19a5025f`): `cargo test -p cratonvm-native-builtins --lib` 2999/0,
+`cargo test -p cratonvm-jit --lib` 905/0, `cargo test -p cratonvm-vm --lib` 2212 passed / 9
+failed (all 9 are the pre-existing `jit::skip_list::tests::*` failures section 5 already
+attributed to an unrelated concurrent Hibernate-longtail session — confirmed unchanged, not
+caused by this fix).
