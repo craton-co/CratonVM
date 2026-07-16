@@ -52,7 +52,7 @@ class-init-failure-mishandling explanation for the separate `ScannerTest`
 open with its own cause). Full writeup + evidence:
 [hib-jarvisitortest-packagingtestcase-classpath-layout-NOT-A-BUG.md](../../internal/hib-jarvisitortest-packagingtestcase-classpath-layout-NOT-A-BUG.md).
 
-## `LockTest` — real timing-sensitive assertion failure
+## `LockTest` — real timing-sensitive assertion failure (root mechanism isolated 2026-07-16, still OPEN)
 
 `org.hibernate.orm.test.jpa.lock.LockTest`
 
@@ -60,11 +60,82 @@ open with its own cause). Full writeup + evidence:
 org.opentest4j.AssertionFailedError: execution exceeded timeout of 5000 ms by 2180 ms
 ```
 
-**Status:** OPEN. 23 found / 14 ok / 1 failed / 8 skipped. Similar shape to
-the 120s-timeout cluster (a real completion that's too slow) but against a
-much tighter 5-second internal timeout specific to a lock-acquisition test,
-so plausibly the same systemic throughput gap manifesting on a
-tighter-margin test rather than a separate cause.
+**Status:** OPEN, but the mechanism is now well isolated (2026-07-16,
+against the frozen `dev@dcb24161` baseline on the shared Azure Linux host).
+Reproduced solo repeatedly: the single failing method is always
+`testFindWithPessimisticWriteLockTimeoutException` (`LockTest.java:127`).
+The overshoot is **not stable** — 2180ms (original, quiet local Windows
+host) vs 13.5s/19.4s/22.4s/25.8s across 4 solo reruns on this heavily
+shared/contended Azure host (`uptime` load average 9–15 on 16 cores from
+~10 other concurrent sessions) — overshoot tracks host contention, so raw
+overshoot magnitude is not a reliable metric on this host, only pass/fail.
+
+**HotSpot comparison.** Whole-class solo run on real HotSpot
+(`/home/victor/jdk25/bin/java`, same classpath/props as `common.args`):
+6093ms wall, **15/15 started tests pass**, no timeout. CratonVM whole-class
+solo run: 29–41s wall, 14/15 pass, this one method always fails. That's a
+~5–7x class-level ratio, consistent with the 120s-cluster's suspected
+systemic gap — but a targeted apples-to-apples check (a custom
+`SingleMethodRunner` using `DiscoverySelectors.selectMethod`, isolating just
+this one method in a cold JVM so both sides pay the same one-time JPA/EMF +
+schema-bootstrap cost) tells a different story:
+- HotSpot, isolated: test body ≈5.0s (itself borderline — fails by 9ms
+  when cold/isolated, but comfortably passes inside the warm full-class
+  run). The `assertTimeout(5s)` wrapper covers the *entire* nested
+  transaction workflow including EMF bootstrap, not just the lock wait, so
+  it's inherently tight even on HotSpot when cold.
+- CratonVM JIT-on, isolated: test body ≈30.8s (**~6.2x** HotSpot).
+- CratonVM `--nojit`, isolated: test body ≈8.2s (**~1.6x** HotSpot) —
+  much closer to parity.
+
+**Root cause narrowed: JIT compilation-time tax, not GC pauses or raw
+interpreted throughput.** Two independent bisections on the *whole-class*
+solo run confirm this precisely:
+1. `--nojit` (interpreter only): **15/15 pass**, 12.7s total — faster
+   *and* correct.
+2. JIT left nominally on, but tiered-compilation thresholds raised so high
+   compilation never triggers during this short run
+   (`CRATONVM_TIER_C1_THRESHOLD=100000 CRATONVM_TIER_C2_THRESHOLD=1000000`):
+   **15/15 pass**, 11.8s total — the fastest of all CratonVM configurations
+   tried.
+
+Both bisections converge: the failure only happens when CratonVM's JIT
+actually *compiles* something mid-run. This looks like a "JIT warmup tax
+exceeds payback" problem specific to short-lived, one-shot JVM processes
+(one Hibernate test class per process): the default tiered thresholds
+(`c1_threshold=200`, from `jit/src/tiered.rs`) are eager enough that H2/
+Hibernate-internal hot methods cross the C1 threshold during this test
+class's run, and CratonVM's compilation itself (not the compiled code
+running) costs enough wall-clock/CPU to blow the tight 5s budget — likely
+worse on this host because compiler-thread work competes with the main
+thread for cores under the observed heavy contention.
+
+This is a **distinct mechanism** from the 120s-cluster's working hypothesis
+(steady-state JIT dispatch / GC pause / native-call throughput during
+*already-compiled* execution) — this is compilation-*latency*, paid once,
+in a short-lived process. Attempted corroboration against 2 of the 7
+120s-cluster classes with `--nojit` (`ScannerTest`, `SmokeTests`) was
+inconclusive: both hit unrelated harness/environment errors solo
+(`ScannerTest`: `could not interpret url` packaging setup issue, same as
+the now-closed `JarVisitorTest` classpath limitation; `SmokeTests`: NPE in
+`EngineExecutionListener` — an unrelated harness-listener wiring problem
+under `--nojit`), not a clean pass/fail signal either way, so the
+same-root-cause question versus the 120s cluster remains open.
+
+**Not fixed this session.** Raising the global tiered-compilation
+thresholds (or otherwise making compilation less eager / fully
+asynchronous so it never stalls the invoking thread) is a plausible fix,
+but it's a cross-cutting JIT policy change with a large blast radius
+(other, longer-running benchmarks in the suite may rely on the current
+eagerness for their own throughput) — not something to change blind in
+this session without broader regression testing across the perf/bench
+suite. Leaving OPEN for a session that can run that wider validation.
+Next step for that session: instrument `jit/src/tiered.rs` compile
+decisions (method key + tier + wall-clock cost) during a solo `LockTest`
+run to identify exactly which method(s) cross `c1_threshold` and confirm
+the compile-time cost directly, then evaluate a scoped fix (e.g.
+short-process detection, always-async compilation, or a higher default
+`c1_threshold`) against the full benchmark suite before changing defaults.
 
 ## `CriteriaBuilderNonStandardFunctionsTest` — real constraint violation
 
