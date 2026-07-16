@@ -697,3 +697,60 @@ candidates is now: stale-at-store CHM windows [fixed this session], NOT excluded
 this window are fixed; the SIGSEGV family stays with the precise-maps roadmap. Whoever re-measures next
 should use marker-based counts on a quiet host and treat any fresh CCE as highest-value live capture
 (run with `CRATONVM_DBG_BLOCKED_ACCESS=warn CRATONVM_DBG_STALE_OBJREF=1`).
+
+## 2026-07-16 continuation: leaked-monitor bug found and FIXED via the watchdog technique; the domain-server stall persists past it; Comparable-CCE recurrence on the newest dev base
+
+Follow-up to the 2026-07-15 session-2 work above, chasing the managed-server domain boot stall (the
+one remaining blocker after the CHM/STW fixes). Probe artifacts remain under
+`/data/wt-wfgc-20260715/probes/` on the Azure host.
+
+### Found + FIXED: `SynchronizedMethodGuard` released a stale monitor address (dev `2ad5068e`)
+
+A `CRATONVM_DEFAULT_WATCHDOG_SEC=400` + `CRATONVM_DBG_MONENTER=1` domain probe (DOM20) showed every
+domain process — both managed servers AND the Host Controller — logging
+`implicit monitorexit on synchronized-method exit failed ... IllegalMonitorStateException: thread ...
+does not own the monitor for object at 0x...` within seconds of boot. Root cause: the
+ACC_SYNCHRONIZED RAII guard in `vm/src/vm/vm_exec.rs` (`SynchronizedMethodGuard`) captured a raw
+`ObjectRef` at monitor entry and released THAT copy in `Drop`. The guard spans the entire method body
+— arbitrarily many moving GCs — and a raw Rust struct field is invisible to every GC remap path
+(unlike `frame.monitor_on_exit`, which all four paths cover), so after any moving collection inside a
+synchronized method the Drop-time exit targeted the stale entry address (thin-arm IMSE) and the REAL
+monitor stayed locked forever. Any later `synchronized` contender on the leaked object — including
+the management-handler path that completes the server boot future via the synchronized
+`AsyncFutureTask.setResult` — blocked permanently. Fixed by pinning the monitor object in
+`native_pin_roots` for the guard lifetime; `Drop` re-reads the pin (current address), truncates it,
+then exits — raw `*mut JvmThread` in the guard per the `ChmMonitorGuard` lifetime-erasure precedent.
+`cargo test -p cratonvm-vm --lib`: 2218 passed. Merged+pushed as dev `94992a49`.
+
+Post-fix verification (DOM23/DOM24 no-JIT domain probes): `implicit monitorexit` failures went from
+2-4 per run to **0 in every run**.
+
+### The server stall is NOT closed by that fix
+
+With clean monitors, the managed servers still wedge at the same point (~210 console lines each,
+right after `WFLYSRV0049 starting` + root-service start, during HC↔server registration/boot-ops
+sync). The Controller Boot Thread spins in `async_future_wait_keepalive`
+(`native-builtins/src/wildfly_core.rs:1537`, the 5 ms-wait status-poll loop for
+`ActiveOperationImpl`/`ServerBootOperationsService$FutureBootUpdates`) — the awaited future is never
+completed. Pre-fix gdb evidence: `/data/tmp/server-one-stall.threads` (Controller Boot in the wait
+loop, two peers at interpreter `monitorenter`, all carriers idle). Note the `EQE_PENDING`
+deferred-Runnable queue in `wildfly_core.rs` (Round 89) is drained only at `AsyncFutureTask.await()`
+ENTRY, not inside the payload-result wait loop — if the future-completing handler is ever
+`execute()`-d onto an EnhancedQueueExecutor after the boot thread has entered the loop, it is never
+run (untested hypothesis; the next diagnostic step is a watchdog probe on the FIXED binary to re-read
+the wait-site Java frames now that leaked-monitor noise is gone — a DOM25 run with
+`CRATONVM_DEFAULT_WATCHDOG_SEC=400 CRATONVM_DBG_MONENTER=1` was queued but not completed when this
+session stopped).
+
+### Comparable-CCE recurrence on the newest dev base — attribution UNRESOLVED
+
+On the newest dev base (my `2ad5068e` merged with `d1be7310`), the Host Controller died at
+`parallel-extension-add` with this doc's exact family shape —
+`WFLYCTL0079: Failed initializing module org.jboss.as.clustering.jgroups` ←
+`java.lang.ClassCastException: class java.lang.Object cannot be cast to class java.lang.Comparable`
+(no deeper frames) — in roughly 2 of 6 no-JIT domain boots (DOM21, DOM24_1), versus 0/42 post-fix
+runs on the pre-`d1be7310` base. Whether this is the old family recurring or a regression from the
+incoming `696c7382` "handle lambda comparable sorting" commit is NOT resolved — needs a matched-rate
+comparison (cherry-pick `2ad5068e` onto `b5c8f43f` and A/B the domain-boot CCE rate). Also note: dev
+at `d1be7310` carries 7 failing `jit::skip_list` unit tests from another session (verified failing on
+pristine `d1be7310`, unrelated to this branch).
