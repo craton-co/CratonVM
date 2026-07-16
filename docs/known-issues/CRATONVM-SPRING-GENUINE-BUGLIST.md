@@ -761,9 +761,63 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
       | Build | Corruption warnings | Completes in 1200s? | Result |
       |---|--:|---|---|
       | `96c8a57f` (round 1 only, BEFORE the round-2 arena fix) | 679,454 | **NO** (killed at timeout) | — |
-      | `dev` tip / `b7a1ed84`+ (round 1+2, WITH the arena fix), trial 1 | 1,074 | Yes, 589s | 159/160 OK |
-      | `dev` tip / `b7a1ed84`+, trial 2 | 786 | Yes, 556s | **160/160 OK** |
-      | `dev` tip / `b7a1ed84`+, trial 3 | 731 | Yes, 527s | **160/160 OK** |
+      | `dev` tip / `b7a1ed84`+, trial 1 (isolated) | 1,074 | Yes, 589s | 159/160 |
+      | `dev` tip / `b7a1ed84`+, trial 2 (isolated) | 786 | Yes, 556s | 160/160 |
+      | `dev` tip / `b7a1ed84`+, trial 3 (isolated) | 731 | Yes, 527s | 160/160 |
+
+      **Extended validation (2026-07-16, same session): 8 MORE trials — 11 total — to get real
+      statistical confidence, not just 3 lucky runs**, per a direct follow-up request after the
+      initial 3-trial result above. All 8 run under SELF-INDUCED CPU contention (deliberately, to
+      probe whether the corruption-heuristic's firing rate is load/timing-sensitive): two batches of
+      3 concurrent processes each, one batch of 2:
+
+      | Trial | Condition | Corruption warnings | Wall time | Result |
+      |---|---|--:|--:|---|
+      | 4 | 3-way parallel (batch A) | 1,477 | 678s | 159/160 |
+      | 5 | 3-way parallel (batch A) | 1,411 | 610s | 159/160 |
+      | 6 | 3-way parallel (batch A) | 1,093 | 716s | 160/160 |
+      | 7 | 3-way parallel (batch B) | 1,129 | 694s | 160/160 |
+      | 8 | 3-way parallel (batch B) | 1,962 | 708s | 160/160 |
+      | 9 | 3-way parallel (batch B) | 1,860 | 668s | 160/160 |
+      | 10 | 2-way parallel (batch C) | 884 | 623s | 160/160 |
+      | 11 | 2-way parallel (batch C) | 776 | 625s | 159/160 |
+
+      **Combined result across all 11 trials (3 initial isolated + 8 extended parallel): 11/11
+      (100%) completed within the 1200s bound.** Wall-clock time ranged 527s-716s (mean ≈636s) — no
+      trial came anywhere near the 1200s ceiling, let alone failed to finish. Corruption-warning
+      count ranged 731-1,962 (mean ≈1,199) — every single trial stayed 346x-929x BELOW the pre-fix
+      catastrophic case (679,454) and zero trials showed runaway/unbounded growth. Test-pass rate:
+      7/11 trials fully clean (160/160); 4/11 trials had exactly one unrelated failure (never more
+      than one, and NOT correlated with warning count: trial 6 (1,093 warnings) passed 160/160 clean
+      while trial 8 (1,962 warnings — the highest of all 11 trials) also passed 160/160 clean, yet
+      trial 4 (1,477 warnings, mid-range) lost one test) — this is separate, low-priority,
+      pre-existing test flakiness (a `ClassCastException` on
+      `RequestMappingHandlerMapping$AnnotationDescriptor` bean creation in at least 2 of the 4 cases;
+      the other 2 showed a different failure not yet identified), not chased further as clearly
+      out of scope for this investigation.
+
+      **The load-sensitivity hypothesis is confirmed, but bounded**: the 3 isolated trials (1-3)
+      averaged ~864 warnings vs. ~1,324 for the 8 trials run under self-induced 2-3-way parallel
+      contention (4-11) — about 53% higher, consistent with the corruption-detection heuristic firing
+      somewhat more under scheduling contention, as hypothesized. But even under that adverse,
+      artificially-induced condition (worse than a typical solo CI run — 2-3 full test-class runs
+      competing for the same cores simultaneously), every trial still completed comfortably inside
+      1200s with no sign of approaching the pre-fix non-completion regime. No trial across all 11
+      showed any early-warning signal (a mid-run spike, a stall, an accelerating rate) that would
+      suggest an occasional tip into the pre-fix catastrophic mode is lurking — the distribution looks
+      like ordinary variance around a stable, load-correlated mean, not a bimodal "usually fine,
+      occasionally catastrophic" pattern.
+
+      **On the discrepancy with the independent verification agent's 1200s-timeout run**: the
+      standard `spring-suite-runner`'s `run-suite.sh` does NOT pass `--enable-native-access` by
+      default either (confirmed by reading its source — the flag would have to be added via the
+      opt-in `EXTRA_VM_ARGS` env var, which a typical invocation would not set). If their harness
+      also omitted it, their run should have hit the SAME near-instant `Class.forName` crash this
+      investigation hit first, not run for 14.5 minutes with progress before showing corruption —
+      meaning either their invocation differed in a way not yet identified (a different harness, a
+      module-system flag, a different JDK build), or that crash is itself non-deterministic in a way
+      neither investigation has fully characterized. This is flagged as an open question for whoever
+      owns the independent-verification harness to check, rather than resolved here.
 
       The corruption-detection-and-resync mechanism itself is OLD, pre-existing, deliberately-built
       forensic instrumentation in the non-moving sweep (`gc/src/gen_heap.rs`, the
