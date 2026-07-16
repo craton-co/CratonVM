@@ -68,17 +68,6 @@ test-order dependent (a prior test in the same run leaving unexpected state
 that collides on a primary key) versus a real id-generation double-issue
 bug. Not yet root-caused.
 
-## `ManyToManyAssociationClassGeneratedIdTest` — new ABORTED entry
-
-`org.hibernate.orm.test.manytomanyassociationclass.surrogateid.generated.ManyToManyAssociationClassGeneratedIdTest`
-
-**Status:** New, not present in the 2026-07-11 audit's ABORTED list (which
-only had `type.temporal.*` and `bytecode.enhancement.basic.*` entries).
-6 found / 3 ok / 3 aborted / 0 skipped, no error signature captured. Needs a
-solo rerun with full stdout/stderr capture to see the actual abort reason —
-could be a legitimate dialect-gated skip (matching the shape of the other
-ABORTED entries below) or something new.
-
 ## Already-expected ABORTED entries (matches HotSpot, not a defect)
 
 Per [hib-bytecode-enhancement-loader-faithful-linking.md](../../internal/fixed-suite-bugs/hib-bytecode-enhancement-loader-faithful-linking-FIXED.md)
@@ -91,6 +80,30 @@ dialect-gated partial skips:
 - `org.hibernate.orm.test.type.temporal.LocalDateTimeTest`
 - `org.hibernate.orm.test.type.temporal.OffsetDateTimeTest`
 - `org.hibernate.orm.test.type.temporal.OffsetTimeTest`
+- `org.hibernate.orm.test.manytomanyassociationclass.surrogateid.generated.ManyToManyAssociationClassGeneratedIdTest`
+  (2026-07-16, confirmed) — 6 found / 3 ok / 3 aborted / 0 skipped. Root
+  cause found via a custom `TestExecutionListener` (`AbortTraceRunner`,
+  mirrors `CratonRunner`'s launcher setup but also captures
+  `TestExecutionResult.getThrowable()` for ABORTED results, since
+  `SummaryGeneratingListener.getFailures()` only covers FAILED). The 3
+  aborted methods (`testRemoveAndAddEqualElement`,
+  `testRemoveAndAddEqualCollection`, `testRemoveAndAddEqualElementNonKeyModified`
+  — the three overridden in this subclass) all call
+  `skipForGraphQueue(scope)`, which does
+  `assumeFalse(getConfiguredQueueType() == QueueType.GRAPH, ...)`. Hibernate
+  ORM 8's `QueueType.fromSetting(null)` defaults to `GRAPH`
+  (`hibernate.flush.queue.type` is unset by the harness), so this assumption
+  is expected to fail and skip these 3 legacy-ordering-specific methods by
+  design, independent of the JVM. Confirmed by running the identical class
+  through a standalone JUnit5 launcher directly on
+  `/home/victor/jdk25/bin/java` (real HotSpot, same classpath as
+  `common.args`): also 6 found / 3 ok / 3 aborted, same 3 methods, byte-for-byte
+  identical abort message on both VMs:
+  `org.opentest4j.TestAbortedException: Assumption failed: Legacy
+  insert-before-delete ordering is not expected with the graph action queue`.
+  Not a CratonVM defect — same shape as the other entries in this list, just
+  gated by a Hibernate-internal default rather than `@CustomEnhancementContext`
+  or a dialect check. No fix needed.
 
 One exception: `org.hibernate.orm.test.type.temporal.ZonedDateTimeTest`
 shows a captured signature this run —
