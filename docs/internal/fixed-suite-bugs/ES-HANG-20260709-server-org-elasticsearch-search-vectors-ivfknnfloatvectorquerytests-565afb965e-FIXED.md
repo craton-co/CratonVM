@@ -1,3 +1,52 @@
+# 2026-07-16: FIXED — root cause was a `GAP_FILLER_CLASS_ID` young-GC exact-walk regression (same-day sibling commit), not the GC-audit finding 1(a)/1(b) STW/monitor race this doc previously tracked
+
+**Status: FIXED.** `testRandomWithFilter` (this doc's hang target) now
+passes cleanly and reliably. See the full root-cause and verification
+write-up in the sibling
+[DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests doc](../../known-issues/elasticsearch-suite/ES-HANG-20260709-server-org-elasticsearch-search-vectors-diversifyingchildrenivfknnfloatslicedvectorquerytests-3ff8aa1c4b.md)'s
+2026-07-16 section (same underlying bug, same fix, both classes share the
+Lucene `IndexWriter`/`TaskExecutor` code path this doc's own 2026-07-10
+sections already identified as the shared trigger).
+
+Summary: a same-day sibling commit (`1c4aaa06`, "close stream ArrayList
+pressure corruption") added two new "exact young-object walk" loops to
+`gc/src/gen_heap.rs` that didn't special-case the `GAP_FILLER_CLASS_ID`
+TLAB-tail sentinel — misparsing it aborted the exact-walk early and left
+every object allocated afterward invisible to the young-gen mark phase,
+so the non-moving sweep reclaimed live objects as garbage. This explains
+the mass "stale pointer / all-zero header" corruption bursts and the
+resulting deadlock/timeout signature this doc originally attributed (2026-
+07-10 sections below) to the GC-audit's finding 1 (STW/monitor race) — that
+attribution is **superseded**: this cluster's actual proximate cause was a
+much simpler, freshly-introduced regression, not the long-standing
+monitor/evacuation race (which remains separately tracked, unaffected by
+this fix, for the `InetAddressRandomBinaryDocValuesRangeQueryTests`
+manifestation — see `docs/internal/gc-audit-2026-07-10-open-findings.md`
+finding 1(b)).
+
+Fixed on branch `fix/es-ivfknn-hang-20260716`, worktree
+`/data/wt/wt-es-ivfknn-20260716` (Azure host). Verification (4 consecutive
+runs, direct invocation, this doc's own seed `B17AC9D3E1F2A0C4`):
+`testRandomWithFilter` `OK (1 test)` in ~20-22s each, zero corruption
+warnings (was: deterministic hang/timeout before the fix). Also re-verified
+this doc's own previously-flagged-but-never-investigated failures
+(2026-07-10 section below): `testScoreEuclidean`, `testScoreCosine`, and
+`testSkewedIndex` all now pass individually and as part of the full class.
+
+**One new, unrelated finding while re-verifying the full class** (not a
+regression from this fix, not present in the single-method runs this doc's
+own recipe targets): `testMergeAwayAllValues` fails deterministically via a
+`posix_madvise` `EINVAL` through the Panama FFI native-downcall path.
+Confirmed absent on real HotSpot (same seed, same classpath) — a genuine,
+separate CratonVM bug in a different subsystem. Filed as its own doc:
+[`ES-FAIL-20260716-testMergeAwayAllValues-posix-madvise-einval.md`](../../known-issues/elasticsearch-suite/ES-FAIL-20260716-testMergeAwayAllValues-posix-madvise-einval.md).
+
+Moving this doc to `docs/internal/` since its own named subject
+(`testRandomWithFilter`) and its own previously-flagged residual failures
+are now all fixed/resolved.
+
+---
+
 # ES HANG - server org.elasticsearch.search.vectors.IVFKnnFloatVectorQueryTests
 
 Status: OPEN
