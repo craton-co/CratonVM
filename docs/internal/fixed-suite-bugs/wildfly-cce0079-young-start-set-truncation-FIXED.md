@@ -10,6 +10,19 @@ family during `parallel-extension-add`, including the `AttributeAccess`,
 `AttributeDefinition`, `Comparable`, `Function`, and `Map` cast-target
 variants) — see verification below.
 
+**Timeline correction (learned at merge time)**: the `young_object_starts`
+walk this doc root-causes was introduced the SAME MORNING by `1c4aaa06`
+("close stream ArrayList pressure corruption") — so the 100%-of-boots
+truncation measured here was a same-day regression amplifier on top of the
+older, lower-rate CCE family (the 5/12 → 1/19 rates chronicled in the
+known-issues doc predate the walk and are the Family-1 long-tail this
+branch's ~35 pin fixes + the return-healing barrier address). A concurrent
+session independently landed the GAP-filler stride on dev as `fb15be63`;
+this branch's walk fix additionally merges the free-list/TLAB skip set,
+tracks walk completeness, and adds the sound skip-cycle fail-safe (without
+the flag, a corrupt-filler `break` still silently truncates the forwardable
+set — the original hazard in a rarer edge).
+
 ## Root cause
 
 `gc/src/gen_heap.rs::collect_garbage_inner`, moving (Cheney) young path: the

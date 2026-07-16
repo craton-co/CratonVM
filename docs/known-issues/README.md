@@ -24,6 +24,11 @@ diagnostics (`CRATONVM_DBG_STALE_OBJREF_CYCLES` quarantine ring, `CRATONVM_DBG_C
 store-funnel stale-value checks). A narrow domain-no-JIT long-tail residual remains OPEN in
 [`wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`](wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md)
 (2026-07-16 section); the JIT SIGSEGV bucket stays with the SB-CRASH-04/precise-maps roadmap.
+Timeline correction (merge-time finding): the truncating walk itself was introduced the same
+morning by `1c4aaa06`, so the 100%-rate collapse was a same-day regression amplifier on top of
+the older lower-rate family (which the ~35 pin fixes + the return barrier address); `fb15be63`
+independently landed the GAP-filler stride portion — this branch adds the free-list/TLAB merge,
+walk-completeness tracking, and the skip-cycle fail-safe on top. Details in the FIXED writeup.
 
 ## 2026-07-15 Keycloak `WelcomePageTest` zipfs `Files.copy` bug FIXED (two stacked path-layout bugs); teardown hang re-verified NOT reproducing
 
