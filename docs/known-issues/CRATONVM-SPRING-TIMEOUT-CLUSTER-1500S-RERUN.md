@@ -44,11 +44,7 @@
 > .StompWebSocketIntegrationTests` (STOMP message never arrives — functional
 > gap, not investigated); `orm.jpa.support
 > .PersistenceAnnotationBeanPostProcessorAotContributionTests` (ByteBuddy
-> fork-attach + generics residuals); `context.aot
-> .ApplicationContextAotGeneratorTests` and `test.context.aot
-> .TestContextAotGeneratorIntegrationTests` (never given a dedicated
-> post-loader-identity-fix triage — status unknown, being re-characterized
-> now); `beans.factory.aot.BeanRegistrationsAotContributionTests`
+> fork-attach + generics residuals); `beans.factory.aot.BeanRegistrationsAotContributionTests`
 > (confirmed genuinely perf-bound — steady progress, 100% CPU, not a
 > deadlock — needs interpreter-throughput work, not a discrete fix);
 > `RequestMappingMessageConversionIntegrationTests` (partially fixed, 5
@@ -59,6 +55,30 @@
 > and `PersistenceManagedTypesBeanRegistrationAotProcessorTests`' residual
 > failures both need a JDK 24+ (`java.lang.classfile.ClassFile`, JEP 484)
 > that isn't installed on the investigation host.
+>
+> **2026-07-16 update**: `context.aot.ApplicationContextAotGeneratorTests` and
+> `test.context.aot.TestContextAotGeneratorIntegrationTests` — the two AOT-cluster
+> classes that had never gotten a dedicated post-loader-identity-fix triage — are
+> now re-characterized (dedicated session, dev tip `6c517cd9`, full numbers and
+> stack traces in [`CRATONVM-SPRING-GENUINE-BUGLIST.md`](CRATONVM-SPRING-GENUINE-BUGLIST.md)
+> §2's "2026-07-16 dedicated re-triage" bullet — that doc is the authoritative
+> source, this is a pointer/summary). `TestContextAotGeneratorIntegrationTests` no
+> longer hangs (393 s → 8.3 s) but still FAILs 4/4, each a distinct cause: one is
+> the already-tracked `ImportHttpServiceRegistrarTests`-family `ClassCastException`
+> (attribution only), the other three (a `GroovySystem.<clinit>` `ArrayStoreException`,
+> a SnakeYAML parse failure on a `$Nested` test class whose raw resource bytes are
+> confirmed byte-identical to HotSpot, and a NEW loader-identity `ClassCastException`
+> site in Spring's own `AotServices` SPI loader) are newly characterized but not
+> fixed. `ApplicationContextAotGeneratorTests` is worse than its last (unsubstantiated)
+> status implied: it 100%-reproducibly `LOADERR`s with `found=0` before discovering
+> any test method, from a GC heap-corruption cascade (all-zero-header stale pointers
+> hitting several unrelated JUnit-Platform/javac-internal classes within
+> milliseconds of each other) that reproduces identically under JIT and `--nojit`
+> and at 2 GB and 8 GB heap — ruling out the two most similar already-fixed bugs
+> in this codebase (`spring-bug-10`'s JIT shadow-stack race, RESOLVED 2026-06-21;
+> the `stream-arraylist-gc-pressure` fix, landed 2026-07-16 and already in this
+> build) as the cause. This is a new, open, 100%-reproducible GC bug — no VM code
+> was changed for either class this session; both are documented, not fixed.
 
 # Spring TIMEOUT cluster — 1500s diagnostic rerun (hung vs. slow)
 
@@ -511,6 +531,163 @@ patch directly), and every specific hypothesis narrow enough to safely fix
 was empirically refuted this session. A confident fix needs the
 `MockMethodDispatcher.get()` identity instrumentation described above
 first.
+
+## 2026-07-16 local investigation — `ImportSelectorTests`: original repro no longer reproduces, but the real class exposes a NEW, more severe failure mode on 2/5 `spy()` sub-tests (still OPEN, new root cause needed)
+
+Worktree `cratonvm-importselector-20260716` on the Azure host, branch
+`fix/importselector-spy-soe-20260716-141435`, dev tip `6c517cd9` (fetched
+fresh; no local/uncommitted changes anywhere else in the host's shared
+checkout affect this worktree). Binary `cvm-importselector-baseline`
+(release build). Java home `/data/data/jdk25-real`.
+
+**Task**: continue the 2026-07-13/07-15 investigation (see the two sections
+above and `CRATONVM-SPRING-GENUINE-BUGLIST.md`'s entry) — reconcile the
+tension between "the raw `MethodGraph.Compiler` computation is correct in
+isolation" and "the live recursion behaves as if `isOverridden`/the
+self-call guard never terminates", then fix it.
+
+**Step 1 — rerun the existing isolated repro (`SpyDLBFProbe.java`) first,
+per standing instructions.** It **no longer reproduces**: 2/2 clean runs,
+`spy(new DefaultListableBeanFactory())` + one `spy.registerSingleton("x",
+"y")` call returns normally every time, no `StackOverflowError`, no crash.
+This is a real change from the 2026-07-13 finding (same probe, same
+mechanism, reliably reproduced `StackOverflowError` in ~139s back then). No
+code was changed to produce this — it's the state of `dev` as fetched. Not
+yet bisected to a specific commit; nothing in the intervening `dev` history
+between the two investigations obviously touches Mockito/ThreadLocal/
+reflection (same caveat as the 07-13 note), so this may be an incidental
+side effect of unrelated GC/interpreter work rather than a deliberate fix.
+
+**Step 2 — rerun the real `ImportSelectorTests` class.** First attempt used
+the shared `/data/tmp/aotfix-runs/combined_cp_dedup.txt` classpath (per the
+documented fast-iteration workflow) and got a **contaminated classpath**:
+it concatenates `cratonvm-testcp.txt` dumps from ~20+ different worktrees
+built at different times, and contains two different `byte-buddy` versions
+(1.18.3 and 1.18.8) on one classpath simultaneously. This produced
+`AbstractMethodError: method org/junit/platform/engine/TestEngine.getId()
+...has no Code attribute` and a `ClassCastException` inside JUnit Platform's
+own launcher — both classpath-contamination artifacts, **not** CratonVM
+bugs, and not the bug under investigation. **Fix**: use a single spring
+module's own freshly-generated classpath instead, e.g.
+`/data/data/wt-osr-other516-20260708-2131/apps/spring-framework/spring-context/build/cratonvm-testcp.txt`
+— single `byte-buddy-1.18.3`, single `mockito-core-5.23.0`, single
+`junit-platform-launcher-6.1.1`. **Future sessions reusing the
+`aotfix-runs`/`mockk-tmp` shared classpath dumps should prefer a
+single-module `cratonvm-testcp.txt` over the multi-worktree combined dump**
+unless the multi-module combined classpath is specifically needed (e.g.
+`integration-tests`).
+
+With the clean classpath, running all 9 methods in one JVM (`MethodRun`)
+still aborts before finishing (see Step 3) — so sub-tests were run
+individually instead (`MethodRun ImportSelectorTests <methodName>`), which
+is also a more precise signal per-method regardless.
+
+**Result: 3 of the 5 `spy()`-using sub-tests now PASS cleanly** —
+`importSelectors`, `importSelectorsWithGroup`,
+`importSelectorsSeparateWithGroup` all report `1 tests successful` with no
+warnings beyond the usual harmless `[CCE] enhance:` CGLIB logging and
+speculative-slot GC guard messages. This matches the isolated-probe result:
+whatever caused the unconditional self-call-guard recursion for a single
+`registerSingleton` call in isolation appears to no longer be triggered for
+these three test bodies either.
+
+**The remaining 2 of 5 — `importSelectorsWithNestedGroup` and
+`importSelectorsWithNestedGroupSameDeferredImport` — still fail, but via a
+NEW and more severe failure mode than the original clean
+`StackOverflowError`.** Both deterministically abort (`SIGABRT`, exit 134)
+after ~23-25 seconds, every run, preceded by:
+```
+GC: young object-start walk stopped at an implausible extent  young_cursor=2209856 young_used=<varies>
+[GC-ARRAY-GUARD] array_length(non-array): kind_byte=0 class_id=0 elem_byte=0 stored_len=0 obj=<addr> (#1/5; set CRATONVM_GC_ARRAY_GUARD_BT=1 for backtrace)
+Stale pointer detected in invokevirtual receiver (ptr=<addr>, all-zero header) — falling back to CP class java/util/Set
+```
+followed by a cascade of "stale pointer"/"out-of-bounds field" guard
+messages against zeroed-out object headers, then the abort. In one rerun
+with `RUST_BACKTRACE=1 CRATONVM_GC_ARRAY_GUARD_BT=1`, the corruption instead
+surfaced as a **different terminal error** (`AbstractMethodError: method
+java/lang/CharSequence.length()I has no Code attribute`) while JUnit's own
+`MutableTestExecutionSummary.printTo` tried to format the (by-then already
+corrupted) test summary — i.e. the corruption is real heap damage that
+manifests differently run-to-run depending on what code happens to touch
+the damaged region next, not a single deterministic exception type.
+
+**Ruled out this session**: heap-size/GC-pressure as the driving variable.
+Reran `importSelectorsWithNestedGroup` with `--Xmx 512m` (vs. CratonVM's
+default, much smaller) — the corruption point was **byte-for-byte
+identical**: `young_cursor=2209856` in both runs, despite `young_used`
+differing (`67113352` at 512m vs. a smaller value at default). A heap-
+pressure/GC-timing bug would be expected to move that offset (or not
+trigger at all) under a much larger heap; an identical cursor value
+regardless of heap size means this is a **deterministic correctness bug
+tied to a specific allocation count/pattern**, not a rare collection-timing
+race. (This is also evidence — not proof — that it's a *different* bug from
+the open, heap-size-sensitive
+`stream-arraylist-gc-pressure-heap-corruption-found-20260714.md` /
+`-Xmx32m` finding; worth a cross-check by whoever owns that doc. NOTE: a
+concurrent 2026-07-16 session investigating `ApplicationContextAotGeneratorTests`
+/ `TestContextAotGeneratorIntegrationTests` — see
+`CRATONVM-SPRING-GENUINE-BUGLIST.md`'s "2026-07-16 dedicated re-triage"
+bullet — independently found what looks like the SAME class of bug
+(all-zero-header stale pointers hitting several unrelated JUnit-Platform/
+javac-internal classes within milliseconds of each other, reproducing
+identically under JIT and `--nojit` and across heap sizes), on a completely
+different test class with no Mockito `spy()` involved at all. This strongly
+suggests a general, currently-open, cross-cutting GC heap-corruption bug —
+not something specific to Mockito `spy()` or `ImportSelectorTests` — worth
+a joint investigation rather than two separate ones.)
+
+**Not root-caused to a specific Rust source line this session** — ran out
+of budget after the build (13.5 min release build under host contention),
+the classpath-contamination detour, and the heap-size differential test.
+**Working theory** (consistent with, but not proof of, the 2026-07-15
+`isOverridden`/self-call-guard hypotheses in the sections above and in
+`CRATONVM-SPRING-GENUINE-BUGLIST.md`): this is very likely **the same
+underlying guard-doesn't-terminate bug**, not a new one — the simple probe
+and 3/5 real sub-tests no longer hit it (or hit it 0 times), but the two
+"nested group" tests exercise a deeper/wider `spy()` interaction (more
+distinct import selectors × grouped/deferred processing × `inOrder(...)`
+verification touching more distinct advised methods) that still triggers
+some bounded-but-large number of unwanted recursive
+re-interceptions — enough to allocate heavily and corrupt the young
+generation, but for reasons not yet understood, no longer enough (or no
+longer of the right shape) to hit CratonVM's own Java-level stack-depth
+check and throw a clean, catchable `StackOverflowError` the way it used to.
+This theory is **not confirmed** — it needs a rebuild with a call counter
+on the recursive advice-entry path (or `KRUN_STACK=1` on one of the two
+still-failing sub-tests) to see whether recursion is happening at all before
+concluding it's the same mechanism just running longer. Given the
+independent AOT-cluster finding above, it's equally plausible this is a
+general GC bug unrelated to Mockito that any sufficiently allocation-heavy,
+reflection/bytecode-generation-heavy workload can trigger.
+
+**Concrete next steps for whoever picks this up**:
+1. Get a `KRUN_STACK=1` (or equivalent) live trace specifically on
+   `importSelectorsWithNestedGroup` — confirm whether the same
+   `DefaultListableBeanFactory.registerSingleton` ⇄
+   `DefaultSingletonBeanRegistry.registerSingleton` cycle from the 2026-07-13
+   trace is still occurring (just failing to terminate for longer / more
+   iterations before corrupting memory), or whether this is now a
+   completely different call shape (e.g. a different pair of overridden
+   methods, given nested/grouped deferred imports invoke more distinct
+   `DefaultListableBeanFactory` methods through the spy).
+2. Use `CRATONVM_GC_ARRAY_GUARD_BT=1` for a backtrace at the first guard
+   trip, and the `CRATONVM_DBG_A2` forensic probe referenced in
+   `gc/src/gen_heap.rs`'s corruption-diagnostic comment (dumps whether a
+   rejected address was ever header-written by an allocator, and by which
+   allocation path — interpreter TLAB, `gen_heap`, JIT inline-alloc, or
+   TLAB-tail-filler) to identify which allocator produced the corrupt
+   object at the reproducibly-identical `young_cursor=2209856` offset.
+3. Coordinate with whoever owns the `ApplicationContextAotGeneratorTests`
+   2026-07-16 re-triage (same day, same symptom shape, different test
+   class) — if the two converge on one root cause, this becomes a single,
+   higher-priority, cross-cutting GC bug rather than two separate
+   Spring-suite residuals.
+4. If the `KRUN_STACK` trace in step 1 confirms the same Mockito cycle, the
+   actual fix target is still the `MockMethodDispatcher.get()`/
+   `isOverridden` identity question from the 2026-07-15 `GENUINE-BUGLIST.md`
+   entry and the "leading, unconfirmed hypothesis" above — this session did
+   not add new evidence toward or against that specific hypothesis, only
+   toward the observable symptom shape changing.
 
 ## 2026-07-13 local investigation — `web.service.registry.*` residuals (both root-caused, neither fixed — still OPEN)
 
@@ -1388,7 +1565,7 @@ rather than a coincidence:
 | `web.service.registry.ImportHttpServiceRegistrarTests` | FAIL, root-caused 2026-07-13, reconfirmed unchanged 2026-07-14 (still OPEN) | 763s (25s on the 2026-07-14 isolated rerun) | 3/5 | `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;` in `ConfigurationClassParser$SourceClass.getAnnotationAttributes` — see dedicated section below |
 | `web.service.registry.GroupsMetadataValueDelegateTests` | **ABEND FIXED 2026-07-14** (`9bca11f5`); now FAIL on a new, distinct residual (still OPEN) | 1039s (25s combined w/ above on the 2026-07-14 rerun) | 0/8 | was fatal VM error `class file error: class not found: .../GroupsMetadata__TestCode` (FIXED); now `IllegalStateException: WritableContent did not append any content` — see dedicated section below |
 | `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` | FAIL → **TIMEOUT as of 2026-07-13** | 1132s → 600s×2 | 0/160 → 0/0 | `BeanCreationException`: no `ApiVersionStrategy` bean (same as `CrossOriginAnnotationIntegrationTests`) → **bean bug fixed**, now TIMEOUTs the same way, see [2026-07-13 update #5](#2026-07-13-local-investigation-5--missing-apiversionstrategy-bean-resolved-both-classes-now-hit-a-different-new-deadlock-still-open) |
-| `context.annotation.ImportSelectorTests` | FAIL, root-caused 2026-07-13 (still OPEN) | 1456s (734s on the 2026-07-13 rebuild) | 4/9 | `StackOverflowError` — Mockito `spy()` recursion, not Spring; see dedicated section below |
+| `context.annotation.ImportSelectorTests` | FAIL, root-caused 2026-07-13, **partially improved + new failure mode found 2026-07-16** (still OPEN) | 1456s (734s on the 2026-07-13 rebuild) | 4/9 → **7/9 individually** (2 now crash instead of cleanly failing) | Was `StackOverflowError` (Mockito `spy()` recursion); on 2026-07-16's `dev` tip the isolated repro no longer reproduces and 3 of the 5 `spy()` sub-tests pass, but the 2 "nested group" sub-tests now hit a deterministic native heap-corruption crash instead — see dedicated section below |
 
 Notable sub-clusters within this bucket (candidates for shared root cause):
 
