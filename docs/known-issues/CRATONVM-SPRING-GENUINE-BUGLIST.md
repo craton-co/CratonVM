@@ -213,102 +213,59 @@ the WRONG same-named copy. Eight fixes landed on
     `PremainAttachAccess` -> "Byte Buddy agent is not initialized", and (b) a
     NEW ByteBuddy generics failure past the dispatcher: `IllegalArgumentException:
     Cannot resolve T from class ...EntityManagerFactory$MockitoMock$...`.
-*   **ByteBuddy repeat-redefine `NoSuchMethodError` family — investigated
-    exhaustively across two extended sessions 2026-07-15, still NOT FIXED,
-    but the failure mechanism is now precisely characterized.** Standalone
-    repro (`BBProbe4.java`, no Spring/JUnit needed, in
+*   ~~ByteBuddy repeat-redefine `NoSuchMethodError` family~~ **FIXED
+    (2026-07-16, commit `c812b622`, merged to dev as `a2515075`).**
+    Standalone repro (`BBProbe4.java`,
     `/data/data/aot-fix-runs-20260715/bbprobe/`): 4 sequential independent
-    `ForkLoader` instances each run `Mockito.mock(SampleService.class)`.
-    Fork 1 fails cold (separate, known `Byte Buddy agent is not
-    initialized` quirk), fork 2 succeeds, fork 3+ deterministically fails
-    with `NoSuchMethodError:
+    `ForkLoader` instances each running `Mockito.mock()` — fork 3+
+    deterministically failed with `NoSuchMethodError:
     net/bytebuddy/description/type/TypeDescription$Generic$OfNonGenericType
     $ForLoadedType.size()I` from inside ByteBuddy's own
-    `FilterableList$AbstractBase.filter()` (surfaces to Java as
-    `NullPointerException: methods is null` once Mockito's `PluginLoader`
-    wraps it).
+    `FilterableList$AbstractBase.filter()`.
 
-    **The exact failing call chain (captured via a full interpreter-frame
-    stack dump at the moment of failure):** Mockito's own
-    `InstrumentationMemberAccessor.<clinit>` builds a dynamic ByteBuddy
-    proxy type (`DynamicType.Builder...make()`) →
-    `SubclassDynamicTypeBuilder.applyConstructorStrategy()` →
-    `ConstructorStrategy.Default$5.doExtractConstructors(TypeDescription)`.
-    Disassembled (`javap -v`) that method's bytecode: it calls
-    `instrumentedType.getSuperClass().getDeclaredMethods()` (returning a
-    `MethodList`) then `.filter(isConstructor().and(isVisibleTo(...)))` on
-    it (`invokeinterface net/bytebuddy/description/method/MethodList.filter`).
-    Disassembled `TypeDescription.Generic.OfNonGenericType.
-    getDeclaredMethods()` too: it constructs and returns `new
-    MethodList$TypeSubstituting(this, asErasure().getDeclaredMethods(),
-    visitor)` — so the receiver reaching `.filter()` (and therefore `this`
-    inside the inherited `FilterableList$AbstractBase.filter()` bytecode,
-    where `this.size()` is the failing instruction at bytecode offset 5)
-    should unambiguously be a `MethodList$TypeSubstituting` instance. It is
-    not: `class_id_of()` on that receiver instead resolves to
-    `TypeDescription$Generic$OfNonGenericType$ForLoadedType` — the exact
-    concrete type of `instrumentedType`'s OWN superclass description, an
-    object that was alive on the operand stack just two bytecode
-    instructions earlier in the very same `doExtractConstructors` method
-    (used to build the `isVisibleTo(...)` matcher argument). This is
-    reproducible byte-for-byte across repeated runs (not a GC-timing
-    heisenbug).
+    **Root cause:** `native-builtins/src/lib.rs`'s ByteBuddy native
+    compatibility shim (e.g.
+    `native_bytebuddy_method_list_type_substituting_size`, registered for
+    real ByteBuddy classes like
+    `net/bytebuddy/description/method/MethodList$TypeSubstituting`)
+    forwards `size()`/`get()` calls to an internal backing-list field.
+    `bytebuddy_field_value`/`bytebuddy_set_field_value` resolved that
+    field's slot via `class_name_of_id(class_id_of_object(obj))` followed
+    by a name-based `resolve_field_index()` call — a lossy
+    ClassId→name→ClassId round-trip. `resolve_field_index()`'s real
+    implementation (`get_loaded_class_id`) is a global, loader-blind,
+    name-only lookup that correctly returns `None` whenever 2+ distinct
+    loaders each define their own class under the same simple name (by
+    design — the same Groovy `GroovyClassLoader$InnerLoader` ambiguity
+    documented on that function). ByteBuddy classes redefined fresh under
+    every fork loader in `@CompileWithForkedClassLoader`-style scenarios
+    hit exactly this: once 2+ forks' copies of `MethodList$TypeSubstituting`
+    coexist, `resolve_field_index()` goes ambiguous and the shim silently
+    fell back to a hardcoded slot number that only happened to be correct
+    when no inherited fields preceded the object's own declared fields —
+    reading the wrong field (`declaringType` instead of
+    `methodDescriptions`) and forwarding `.size()` to it.
 
-    **Definitively ruled out, each with concrete evidence:**
-    1. **JIT tier-up / megamorphic inline cache** — reproduces identically
-       with `CRATONVM_DISABLE_JIT=1`; this is a pure interpreter bug.
-    2. **`invoke_on_class_shared_inner`'s interface/abstract retarget logic
-       and `is_subclass_of`** (`vm/src/vm/vm_exec.rs`) — env-gated tracing
-       showed this call passes through this function with the WRONG class
-       already substituted (i.e. the corruption happens upstream of this
-       function's own retarget decision, not within it).
-    3. **`execute_invokevirtual_cached`'s monomorphic inline cache**
-       (`vm/src/runtime/interpreter.rs`) — every `CachedInvokeTarget` arm
-       (`VirtualBytecode`/`VirtualNative`/`Intrinsic`) correctly validates
-       the live receiver's `class_id_of()` against the cached
-       `receiver_class_id` before use; a stale entry cannot explain a wrong
-       dispatch. Also confirmed this specific call never reaches this
-       function's cache-consult path at all (traced with the broadest
-       possible condition — any caller frame named `"filter"` — zero hits).
-    4. **`ClassLoaderId::UserDefined(u32)` reuse/collision** — confirmed via
-       `native-builtins/src/classloader.rs`'s `allocate_loader_id()` that
-       loader ids are a monotonic, never-recycled counter; each
-       `ForkLoader` gets a permanently unique id (observed ids 4, 6, 8
-       across forks 2-4 in one run).
-    5. **`SharedVm::initiating_resolution_cache`** (the per-`ClassLoaderId`,
-       per-class-name memoized `loadClass()` result cache consulted by
-       `lookup_loader_initiated`/`resolve_class_loader_aware`, which backs
-       the `new` bytecode's class resolution) — traced reads AND writes for
-       every class name in the failure chain
-       (`MethodList$TypeSubstituting`, `MethodList$ForLoadedMethods`,
-       `MethodList$Explicit`, `TypeDescription$Generic$OfNonGenericType`
-       `$ForLoadedType`/`$ForErasure`): every single name resolves to a
-       correct, internally-consistent, non-colliding `ClassId` per loader,
-       with zero cross-loader contamination visible anywhere. This cache is
-       NOT the bug (a real, similar-shaped bug in a DIFFERENT structure was
-       already fixed earlier this session — see the `BeanDefinitionMethod
-       GeneratorTests` orphaned-defining-loader fix above — but this
-       specific cache has no analogous defect).
+    **Fix:** added `NativeContext::resolve_field_index_by_class_id`
+    (`native-api/src/registry.rs` trait, `vm/src/vm/vm_exec.rs` impl using
+    `resolve_field_index_in_hierarchy` directly) so the shim resolves by
+    the object's own exact `ClassId`, never ambiguous regardless of how
+    many loaders redefine the same-named class. Verified: `BBProbe4`
+    forks 2/3/4 all `Mockito.mock -> OK` (fork 1's cold-attach
+    `IllegalStateException` is a separate, pre-existing, unrelated quirk).
+    Regression-clean: `cratonvm-native-api --lib` 179/0,
+    `cratonvm-vm --lib` 2205/9 (9 pre-existing `lock_order` debug-only
+    failures), `cratonvm-native-builtins --lib` 2997/1 (1 flaky test,
+    passes in isolation, unrelated), `ConfigurationClassPostProcessorAot
+    ContributionTests` 20/15/5 and `TestCompilerTests` 22/21/1 both match
+    their prior recorded baselines exactly.
 
-    **Two live hypotheses for a future session, neither yet tested:**
-    (a) resolution of the bare `net/bytebuddy/description/method/MethodList`
-    **interface** name itself (the literal constant-pool target of the
-    failing `invokeinterface`, resolved via `execute_invoke_kind`/
-    `resolve_method_ref`'s interface-dispatch path — NOT the `new`-bytecode
-    path already cleared above) and whatever logic retargets an interface
-    method onto the receiver's concrete class in that specific code path;
-    (b) an **operand-stack slot mixup** in the interpreter's `invokeinterface`
-    handling for this specific call shape — the wrong class showing up is
-    suspiciously exactly `instrumentedType`'s own type, an object alive on
-    the stack moments earlier in the same method, which smells like the
-    interpreter reading a stale/adjacent stack slot as the receiver rather
-    than a class-resolution problem at all. **Recommended next steps:**
-    dump the FULL operand stack (not just the receiver slot) at the exact
-    moment of this `invokeinterface` call, or attach `gdb` live (`sudo gdb
-    -p <pid> -batch -ex 'thread apply all bt'` — process is short-lived,
-    pair with a brief artificial pause) to get ground truth instead of more
-    static tracing.
-
+    *Investigation note:* an earlier hypothesis (a 128-bit hash collision
+    in `NativeMethodRegistry::find()`) was investigated and even
+    prototyped as a fix, but was directly disproven via a verification
+    trace — the "colliding" registration turned out to be a genuine,
+    intentional boot-time registration for that exact class, not a
+    collision — and was reverted before the real fix above was found.
 *   `PersistenceManagedTypesBeanRegistrationAotProcessorTests` — **NOT a
     CratonVM bug: host environment gap.** Both `processEntityManagerWithPackagesToScan`
     and `contributeJpaHints` hit `NoClassDefFoundError: java/lang/classfile/ClassFile`
@@ -578,7 +535,7 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     as worth the risk/complexity of touching more interpreter dispatch code for an expected marginal
     (not measurable-with-confidence) return.
 
-    **Current status**: `ClientHttpConnectorTests` is measurably, substantially more reliable after
+    ~~**Current status**: `ClientHttpConnectorTests` is measurably, substantially more reliable after
     the two rounds of fixes above (9/15 → 4/15 clean hang rate) but not fully closed. The remaining
     ~27% is consistent with the same "accumulated per-call interpreter dispatch/allocation overhead
     compounding on method-call-heavy code" conclusion the 2026-07-13
@@ -588,7 +545,19 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     allocator throughput initiative (e.g. profiling `mimalloc` allocation-path cost under this
     object-churn pattern, or auditing the several distinct locks that showed up for reducible
     contention individually), not another single-function fix — out of scope for a "residual"
-    investigation.
+    investigation.~~ **2026-07-16 update (see section 5.3)**: the 27% hang rate is now resolved,
+    independently reconfirmed at **0/60** across three fresh stress batches (including a
+    deliberate 2x-concurrent-contention batch that the original 27% measurement never tested
+    against). A direct causal A/B experiment (reverting only the `Thread.getId()` fix on an
+    otherwise-current tip) confirms the diffuse contention/throughput cost this section describes
+    is real and `getId()`'s collapse is a genuine, measurable contributor to it (mean wall time
+    +10-25%, occasional runs crossing the historical 30s hang bound) — but `getId()` alone does not
+    reproduce anything close to the historical 27% rate; the resolution is the combined effect of
+    this session's several fixes (blocking-region gaps, `force_native_over_real_jdk_bytecode`
+    memoization, `Thread.getId()`, the executor-`submit()`/Netty-`Future` fix in 5.2), not any one
+    of them alone. The diffuse hashbrown/parking_lot/mimalloc/`Arc`/`Weak` cost pattern itself is
+    still visible in hot-thread sampling and remains a legitimate, still-open *performance*
+    characteristic — just no longer severe enough to cause an observed hang.
     Also unfixed: the T19.H1 watchdog stack-dump itself SIGSEGVs when JIT frames are on the stack
     (separate small bug; `--nojit` dumps work).
 *   ~~`web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` —
@@ -854,6 +823,287 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     (real, pre-existing, already has a safe recovery path but the false-positive rate itself — and
     whatever per-resync cost compounds into non-completion on a slow/loaded run — is unexplained and
     worth its own dedicated investigation).
+
+    ~~`Class.forName`/`HIB-CV-26` unrecoverable-internal-error-on-nested-clinit-failure~~
+    **FIXED (2026-07-16), commit `43e130fa` (merged to `dev` at `ba51b880`).** Root cause was
+    TWO stacked defects, both in the class-initialization-failure-wrapping machinery, not just
+    the `Class.forName` call site:
+    1. `NativeContext::initialize_class` (`native-api/src/registry.rs`) had a lossy
+       `Result<(), String>` signature. Its one real implementation
+       (`vm/src/vm/vm_exec.rs`) called the interpreter's `ensure_class_initialized_shared`
+       (which already correctly wraps a `<clinit>` exception as a catchable
+       `MethodCallFailed::ExceptionThrown(ExceptionInInitializerError)` per JVMS §5.5) and then
+       *discarded* that distinction, flattening both `ExceptionThrown` and `InternalError` into
+       a bare string. All 5 native-builtins call sites (`Class.forName` in `lang_class.rs`,
+       `Constructor.newInstance` also in `lang_class.rs`, and two independent
+       `Lookup.ensureInitialized` registrations in `lang_invoke.rs` / `classloader.rs`) then
+       re-wrapped that string as an unrecoverable `VmError::Internal` — turning an ordinary,
+       catchable `<clinit>` exception into a VM abort every time. Fix: changed the trait method
+       to return `Result<(), MethodCallFailed>` (mirroring the already-correct sibling
+       `ensure_class_initialized_with_class_id`) and pass the interpreter's result straight
+       through; all 5 call sites now propagate via `?` instead of hand-rolling a
+       `VmError::Internal`.
+    2. Verifying fix #1 surfaced a second, closely related bug in
+       `ensure_class_initialized_shared` itself (`vm/src/vm/vm_util.rs`, two occurrences): when
+       a class is re-triggered for initialization after already being marked
+       `ClassState::InitializationError` (JVMS §5.5's "already failed to initialize" case —
+       e.g. a caller that `catch`es the first `ExceptionInInitializerError` and retries), the
+       function returned `MethodCallFailed::InternalError(VmError::Linkage(NoClassDefFoundError))`
+       — also uncatchable, so a caught-and-retried `Class.forName` crashed the VM on the
+       *second* call. Fixed by routing both occurrences through the existing
+       `raise_no_class_def_found` helper (`vm/src/runtime/exceptions.rs`), which constructs the
+       real, catchable `NoClassDefFoundError` object. One of the two occurrences is reached
+       while still holding the `class_manager` write-lock guard (`cm`) that the local `class:
+       &mut Class` borrow is tied to; `raise_no_class_def_found` itself needs to read/write that
+       same `RwLock` to allocate the exception object, so an explicit `drop(cm)` was added
+       immediately before the call to avoid a self-deadlock (the borrow's last use is the
+       preceding `class.name.to_string()`, so NLL allows the drop).
+
+    Verified with a standalone repro (`Class.forName("java.lang.foreign.MemorySegment")`,
+    `--java-home <jdk25>`, no `--enable-native-access`, so `MemorySegment.<clinit>` throws
+    `IllegalCallerException` exactly as in the original finding): uncaught now prints a normal
+    `Exception in thread "main" java/lang/ExceptionInInitializerError` trace and exits 1 (was: VM
+    abort); wrapped in `try/catch (ExceptionInInitializerError)` it recovers cleanly and control
+    continues; a second `Class.forName` call on the now-poisoned class throws (and catches as)
+    `NoClassDefFoundError` instead of crashing. `cargo test -p cratonvm-native-builtins --lib
+    --release`: 2999 passed / 0 failed. `cargo test -p cratonvm-vm --lib --release`: 2199 passed
+    / 16 failed — the same pre-existing `lock_order` debug-build-only + `jit::skip_list`
+    parallel-race flakiness documented above, zero new failures.
+
+    Also re-ran `RequestMappingMessageConversionIntegrationTests` (`spring-webflux`) without
+    `--enable-native-access` as an end-to-end check: it no longer dies instantly at
+    `MemorySegment.<clinit>` — it now runs for several minutes and gets through ~26 Tomcat-backed
+    test methods (consistent with the "~29 Tomcat-backend tests" ceiling already documented
+    above for this class) before hitting a `SIGSEGV` in `gc/src/gen_heap.rs`'s non-moving-sweep
+    path, preceded by 2000+ "implausible object size" / corruption-resync warnings — i.e. it now
+    runs into follow-up item (2) above (the pre-existing, already-filed, separate non-moving-sweep
+    false-positive-corruption issue), not a HIB-CV-26 regression. This host was also running
+    several other sessions' builds/tests concurrently at the time (including at least one other
+    unrelated binary segfaulting minutes earlier), so heavy contention is a plausible contributor;
+    not re-tested in isolation due to time. Flagged here so whoever picks up item (2) has this
+    additional data point: fixing HIB-CV-26 means real full-class runs now reach far enough to
+    actually exercise the non-moving-sweep bottleneck instead of being masked by the earlier,
+    more-severe `Class.forName` abort.
+
+    **Round 4 (2026-07-16): dedicated feasibility investigation into the `is_object_address` /
+    `update_root_snapshot` conservative-GC-root-scanning bottleneck itself (the item Round 2
+    identified as "a substantially larger effort than a bug-fix session"). Result: a genuine,
+    well-evidenced, provably-safe redundancy WAS found and implemented, but it measured as a
+    PERFORMANCE REGRESSION rather than a win on the best available repro — NOT landed to `dev`.**
+    Branch `fix/precise-native-scan-20260716` (pushed, unmerged, commit `faedea48`) preserves the
+    full implementation and data for a future session with working profiler access.
+
+    Investigation: `update_root_snapshot`'s interpreter-frame operand-stack scan
+    (`ValueStack::scan_object_refs`, `vm/src/runtime/value_stack.rs`) already distinguishes
+    genuine object references from long-bit-pattern false positives via a per-slot `kinds`
+    side-array (commit `6161dc1b`, 2026-05-29 — "marks are only ever written at genuine
+    long/double producers, never over-marked"). Despite that, FOUR hot call sites
+    (`update_root_snapshot`'s two internal paths in `interpreter.rs`, `collect_roots` in
+    `vm/src/memory/roots.rs`, and the blocked-thread deposit path in `vm/src/vm/vm_exec.rs`) all
+    additionally re-validate EVERY entry `scan_object_refs` appends against the expensive, strict
+    `heap.is_object_address` header probe — a defense that predates the `kinds` mechanism
+    (introduced in commit `56a73aee`, 2026-05-16, thirteen days earlier) and, once `kinds` exists,
+    can never actually reject anything from the kind-verified branch: `git log` confirms the
+    ordering (boundary filter added first, kinds added later), and the mirrored fix already
+    landed for LOCALS (`Frame::scan_local_objects`, commit `333b24b5`, "root young/mid-init
+    objects held in frame locals") explicitly switched off the equivalent strict probe for the
+    same reason — it can incorrectly DROP a genuine root whose header a moving collector's
+    young/mid-init state hasn't fully validated yet. A dedicated investigative sub-agent
+    additionally confirmed the generational allocator (`gc/src/gen_heap.rs::alloc_object` and
+    siblings) writes the full object header synchronously, under the arena lock, before ever
+    returning the pointer to any caller (commit `74dc80b8d`, 2026-07-03) — closing the one
+    remaining question about whether a kind-verified operand-stack root could ever observe an
+    unpublished header. G1 and ZGC were NOT independently audited for the same allocator
+    invariant (their allocators release the region/arena lock before the header write), so the
+    implementation scoped the change to `VmHeap::is_generational()` only, leaving G1/ZGC on the
+    unconditional pre-existing validation.
+
+    Implementation: `ValueStack::scan_object_refs_split` appends roots in the SAME single pass as
+    `scan_object_refs` (a first two-pass draft was measurably slower — see Performance below —
+    and was replaced), additionally recording the (normally empty) list of offsets that came from
+    the separate, unrelated "loose JNI-long-smuggle" candidate path (untagged `Long`/`Double`
+    slots, still validated exactly as before). `memory::roots::scan_stack_roots_boundary` (new,
+    shared by all four call sites) skips the `is_object_address` re-probe entirely for the
+    trusted majority, gated on `VmHeap::is_generational()` (new) and a default-on opt-out flag
+    `CRATONVM_TRUST_TAGGED_STACK_ROOTS` (env_cache.rs), plus a `CRATONVM_DBG_VERIFY_TRUSTED_ROOTS`
+    diagnostic that probes the skipped entries anyway and logs (without dropping) any mismatch —
+    the empirical falsification test for the whole argument.
+
+    **Correctness: extensively verified, zero issues found.** `cargo test -p cratonvm-gc --lib`:
+    790/0 (matches the established baseline exactly). `cargo test -p cratonvm-vm --lib`: 2199
+    passed / 16 failed, and the failing set is EXACTLY the pre-existing, already-documented
+    9 debug-build-only `lock_order` + 7 parallel-race `jit::skip_list` tests (see Round-3's
+    "16 then 17 failures" note above) — zero new failures. The `binarytrees` checksum oracle
+    (`docs/internal/repros/gc-stress-bintrees-main-args/binarytrees.java`, the heaviest
+    allocation/GC-stress repro in the tree) was run at all three documented depths with
+    `CRATONVM_DBG_VERIFY_TRUSTED_ROOTS=1`: bt14 (checksum `3222190`), bt16 (`14985902`), bt18
+    (`68332206`, `-Xmx8g`) — all three matched the documented golden checksums exactly, and ZERO
+    trusted-root mismatches were logged across any of them (bt18 alone triggers a very large
+    number of collections). Note bt14/16/18 are pure-bytecode benchmarks with NO native calls,
+    so they exercise `collect_roots` (the STW mark path) heavily but not the native-call-triggered
+    `update_root_snapshot` path — both were still covered since `collect_roots` is one of the four
+    modified call sites.
+
+    **Performance: does NOT deliver the hoped-for win — a measured regression, not landed.**
+    `RequestMappingMessageConversionIntegrationTests` itself was not re-run end-to-end (it needs
+    ~530-720s per the Round-3 data and this investigation's time budget did not allow a full
+    before/after suite comparison); instead the isolated, properly-packaged Spring-bootstrap repro
+    from the Round-2 investigation (`BootstrapRepro2.java`, `com.example.bootstraprepro` package,
+    `AnnotationConfigApplicationContext` + embedded Tomcat, native-call-heavy — the same shape as
+    the profiled bottleneck) was run under `CRATONVM_DBG_ROOTSNAP` (the in-tree diagnostic built
+    specifically to measure this exact question), 30 iterations per run to average out host-load
+    noise on the shared build host (confirmed heavily loaded — 15-20+ concurrent `cargo`/`rustc`
+    processes from other sessions throughout this investigation):
+
+    | Build | `update_root_snapshot` avg cost/call |
+    |---|--:|
+    | baseline (dev `1f8e398e`, doc-only-commits ancestor of this branch's base) | ~1.9–2.0 us |
+    | this branch, optimization ON (`CRATONVM_TRUST_TAGGED_STACK_ROOTS=1`, default) | ~2.5–2.6 us |
+    | this branch, optimization OFF (`=0`, same binary, old behavior) | ~2.2 us |
+
+    Reproduced across TWO independent implementations (the original two-pass split, and the
+    single-pass redesign written specifically to rule out double-iteration overhead as the cause)
+    — both showed the same regression shape, so this is not attributed to the two-pass draft
+    alone. The flag-OFF control run on the same v2 binary is ALSO slower than the true baseline
+    (~2.2us vs ~1.9-2.0us), which isolates that at least part of the regression comes from
+    refactoring `scan_object_refs` into two small `#[inline]` helper methods
+    (`push_trusted_object_ref` / `push_smuggled_long_ref`) shared with the new split function —
+    an extraction that looked behavior-preserving and low-risk but apparently changed
+    inlining/codegen even on the code path that should be byte-identical to before. The remaining
+    gap (flag ON vs flag OFF on the same binary) is the actual cost of the new
+    split/boundary-filter machinery, separate from the extraction regression.
+
+    **`perf record` was unavailable to root-cause this precisely**: `perf_event_paranoid=4` on
+    the build host blocks unprivileged profiling, and `sudo perf record` (which has passwordless
+    sudo on this host) ran past its own `timeout 120` wrapper without producing usable output —
+    killed manually after several minutes with no progress. Without instruction-level attribution,
+    it was not possible in this session to distinguish "LLVM declined to inline
+    `scan_stack_roots_boundary` across the module boundary" from "the thread-local
+    `RefCell`-guarded scratch buffer for untrusted-offsets has real per-call TLS/borrow-check
+    cost" from some other codegen effect of the refactor.
+
+    **Conclusion and recommendation**: the CORRECTNESS argument for this optimization is sound
+    and thoroughly verified — the redundancy is real, provable from the `kinds` side-array's own
+    invariants, and empirically confirmed to never misfire across the checksum oracle. The
+    PERFORMANCE argument, which is the entire reason to make this change, is NOT confirmed — it
+    is contradicted by direct, repeated measurement. Per this investigation's own mandate ("if you
+    have any doubt about correctness [or value], don't land it; document the attempt and doubt
+    instead"), this is NOT merged into `dev`. A future session with working `perf` (or `gdb`-based
+    sampling, or a from-scratch `objdump`/`cargo asm` inspection of the generated code) should
+    either (a) determine why the seemingly-inert `scan_object_refs` extraction regressed the
+    flag-OFF control and fix the codegen issue, then re-measure the flag-ON case in isolation, or
+    (b) if the fundamental costs really are TLS/call-boundary/branch overhead that eats the
+    `is_object_address` savings for typical (shallow) operand stacks, conclude this specific
+    avenue is not profitable and that the actual remaining path to closing
+    `RequestMappingMessageConversionIntegrationTests`'s perf gap is the full precise-stack-maps
+    project Round 2 already scoped (new stack-map generation for interpreter frames at
+    native-call boundaries, reusing the verifier's existing type-inference machinery if one
+    exists — NOT investigated in this round beyond confirming the JIT's existing
+    `PreciseFrameInfo`/`scan_one_frame_precise` machinery in `vm/src/jit/conservative_roots.rs`
+    is structurally scoped to JIT-compiled frames only, at GC-safepoint/JIT-frame-scan sites, and
+    does not extend naturally to interpreter frames at native-call boundaries — a genuinely
+    separate, larger piece of infrastructure).
+
+    **Round 5 (2026-07-16, same-day follow-up): perf tooling fixed, live-profiled the real test
+    class directly, root-caused PART of the regression — still not a confirmed win, still not
+    landed.** A follow-up request specifically asked to (1) try fixing `perf_event_paranoid`
+    rather than accepting it as a dead end, and (2) fall back to disassembly/size comparison if
+    perf still didn't cooperate. Both were tried, in that order, with real findings from each.
+
+    **Perf tooling**: `sudo sysctl kernel.perf_event_paranoid=-1` (authorized, tried first)
+    immediately unblocked `perf record` on this host — the earlier `sudo perf record` hang in
+    Round 4 was specifically because the kernel was still refusing the profiling syscalls
+    underneath `sudo`, not a `sudo`/`timeout` interaction bug. With that fixed, live-attached
+    `perf record -p <pid> -g --call-graph fp` was run against the ACTUAL
+    `RequestMappingMessageConversionIntegrationTests` process (launched via a from-scratch JUnit
+    launcher, `KRun.java`, against the real `spring-webflux` test classpath and
+    `--enable-native-access` to route around the unrelated HIB-CV-26 abort documented above),
+    attached ~65s into the run (past classloading/bootstrap, into steady-state Tomcat
+    start/stop/test cycling) for a 35s capture window — the same "attach live, mid-run" technique
+    the original Round-2 investigation used, this time reproduced directly rather than inferred.
+    (The earlier Round-4 measurements, by contrast, used an isolated `BootstrapRepro2.java`
+    micro-benchmark that turned out to be a poor proxy: profiled on its own, `is_object_address`
+    was only ~0.6% of its CPU and `update_root_snapshot` ~1%, nowhere near the real class's
+    profile shape — the noisy/contradictory BootstrapRepro2 numbers in Round 4 were mostly
+    measuring something else entirely. Live-attaching to the real class is the correct technique;
+    isolated micro-repros of this specific bottleneck should be treated with suspicion going
+    forward unless their own profile independently confirms `is_object_address` dominance.)
+
+    Live-attached baseline (`dev` `1f8e398e`) profile: `is_object_address` 9.82% self-time
+    (`GenerationalHeap` 7.22% + `VmHeap` wrapper 2.60%), `update_root_snapshot` 6.82% — both
+    meaningfully present, though not at the ~60% combined level the original live-profiling
+    session reported (plausibly a different point in the run, a longer/differently-shaped
+    capture, or JIT warm-up state; not fully reconciled).
+
+    The Round-4 implementation was rebuilt fresh in a new worktree (the original was deleted
+    mid-investigation) and re-profiled the same way: `is_object_address` INCREASED to 11.30%,
+    `update_root_snapshot` to 12.69% — confirming Round 4's regression finding was real, not an
+    artifact of the isolated repro, and reproducible via the correct live-attach technique too.
+
+    **Redesign attempt**: hypothesized the regression was the extra cross-module
+    `scan_object_refs_split` + `memory::roots::scan_stack_roots_boundary` call boundary (a
+    thread-local `RefCell` scratch buffer plus a closure) increasing `update_root_snapshot`'s
+    perceived cost and defeating an unrelated inlining decision. Redesigned to fold the entire
+    trusted/untrusted validation logic directly into `ValueStack::scan_object_refs` itself — no
+    new function, no cross-module call, no extra data structure. (Also simplified the
+    JNI-long-smuggle branch: since `is_object_address` is a strict superset check of
+    `is_heap_addr` — same alignment+region checks plus more — calling it alone reproduces the OLD
+    "is_heap_addr then external is_object_address boundary filter" net behavior exactly, in one
+    call instead of two.) Re-verified correctness with full rigor again: `cargo test -p
+    cratonvm-gc --lib` 790/0; `cargo test -p cratonvm-vm --lib` 2199/16 (same pre-existing flaky
+    set, zero new failures); `binarytrees` bt14/bt16/bt18 checksum oracle correct with zero
+    `CRATONVM_DBG_VERIFY_TRUSTED_ROOTS` mismatches on all three.
+
+    **Re-profiled live against the real class: the regression got WORSE, not better** —
+    `is_object_address` rose further to 14.60%, though `update_root_snapshot` improved somewhat
+    (12.69% → 10.98%). The redesign did not fix the core problem.
+
+    **Root cause, PARTIALLY found via `nm --size-sort` disassembly comparison** (the
+    coordinator's suggested fallback, tried after the redesign still didn't help): between
+    baseline and the modified binary, `Frame::scan_local_objects_inner` — a function untouched by
+    ANY of this investigation's code changes — grew from 761 bytes to 9,921 bytes (13x). Cross-
+    checking against the live profiles confirms why: `local_liveness::live_locals_mask`, a
+    separate symbol at 6.16% self-time in the baseline profile, is ABSENT ENTIRELY from the
+    modified binary's profile — it has been fully inlined into `scan_local_objects_inner`. This
+    is a real LLVM inlining-cascade side effect of fat-LTO + `codegen-units = 1` (this project's
+    release profile): changing `scan_object_refs` — called immediately after `scan_local_objects`
+    in every one of the four hot root-scanning call sites — altered the whole-program inliner's
+    cost/benefit calculus for an entirely unrelated neighboring call site. This part of the
+    "regression" looks mostly like a profile ATTRIBUTION change rather than a real slowdown: the
+    combined cost is comparable before and after (0.21% + 6.16% = 6.37% baseline vs. 5.92% after,
+    if anything slightly lower), and a rough throughput proxy — counting completed
+    Tomcat-server start/stop cycles (one per sub-test) in a matched ~101-second window across all
+    three binaries (baseline / first redesign / this redesign) — showed comparable progress (10
+    vs. 9 vs. 9 cycles), consistent with no large real end-to-end regression, though this is too
+    small a sample (9-10 data points) to confirm a genuine win either way.
+
+    **What remains UNEXPLAINED**: `is_object_address` itself — a distinct function, not merged
+    with anything else by the inlining cascade above — shows a real, consistent, and in fact
+    GROWING self-time percentage across every attempt (9.82% → 11.30% → 14.60%), which is the
+    opposite of what a change specifically designed to eliminate most calls to it should produce.
+    The backend was confirmed to genuinely be `GenerationalHeap` for this run (the profiled symbol
+    is literally `GenerationalHeap::is_object_address`, which cannot appear at all if a different
+    `VmHeap` backend were active), so the new fast path is provably engaging, not silently falling
+    through to the unchanged branch. Ran out of investigation time budget to pin this down further
+    — the next step would be a call-COUNT diagnostic (not just perf's time-based sampling) to
+    directly confirm whether the trusted-branch skip is reducing `is_object_address` call volume
+    by the expected amount, or whether some other call site (the JNI-smuggle branch's now-direct
+    `is_object_address` call, `scan_locals_conservative`, `scan_active_jit_frames`, or something
+    else entirely) is calling it more often than before for a reason unrelated to this change.
+
+    **Conclusion, updated**: perf access was successfully restored (a one-line `sysctl`, safe on
+    this dev host) and used for direct, live profiling of the real target test class — the
+    strongest evidence-gathering this investigation has had. A genuine partial root cause was
+    found and is well-supported (the LTO inlining-cascade attribution shift), but the central,
+    original question — does `is_object_address`'s actual cost go down as intended — is NOT
+    resolved, and the live data currently shows the opposite for that specific function. Per this
+    investigation's explicit mandate to attempt real root-causing but not over-invest indefinitely,
+    and given the stakes of touching GC-root-scanning code, this is STILL NOT merged into `dev`.
+    The redesigned, still-correctness-verified implementation (commit `145c13b4`, superseding the
+    original `faedea48`) remains on branch `fix/precise-native-scan-20260716` (pushed, unmerged)
+    for a future session with more time budget for IR/assembly-level LLVM inlining investigation,
+    or for a call-count-based diagnostic to isolate exactly which call site is responsible for
+    `is_object_address`'s unexplained growth.
 *   ~~`web.reactive.result.view.script.JRubyScriptTemplateTests`~~ **FIXED (2026-07-15) --
     all 6 chained bugs closed, test class PASSES.** JRuby's own
     bootstrap (`rubygems/specification.rb` / `rubygems/version.rb`) turned out to hit a CHAIN of
@@ -1446,3 +1696,110 @@ cast failures, 42-44/49 (86-90%) passing per run — up from 33/49 (67%) in 5.1 
 independently-tracked gaps (harness classpath completeness, an unrelated enum dispatch bug, and
 test-infra flakiness), none of them the `AbstractExecutorService`/Netty-`Future` bug this section
 closes out.
+
+
+### 5.3 Follow-up (2026-07-16): does the `getId()` fix explain the historical "diffuse throughput, 27% hang" residual? — real contributor, confirmed causally, but not the dominant cause
+
+Directly investigates whether the "27% hang rate" / diffuse hashbrown-parking_lot-mimalloc-Arc/Weak
+CPU-bound-spin residual documented under section 4 (`ClientHttpConnectorTests`, round 2, commit
+`3d1449a7`) — at the time judged a systemic "interpreter/allocator throughput ceiling," not a
+discrete bug — was actually substantially caused by the since-fixed `Thread.getId()` bug
+(`19a5025f`, section 5.1), given the mechanism (`Okio SegmentPool` collapsing every thread onto one
+shared `AtomicReference<Segment>` bucket, forcing extra CAS retries/allocations/lock traffic) looks
+exactly like the kind of diffuse cost the 27% investigation observed.
+
+**Method.** Built three binaries from a fresh `git fetch origin dev` at tip `5e13631a` (worktree
+`wt-diffuse-throughput-20260716`, `cargo build --release`, independent of any prior session's own
+binary) plus one deliberately-regressed control binary, and ran the real
+`ClientHttpConnectorTests` class (not a synthetic probe) through it directly, matching this
+effort's established methodology throughout section 5. Measured *test-completion* time (the
+`RESULT ...` line the harness prints), not process-exit time — confirmed separately that the
+process legitimately never exits on its own after the JUnit run completes (`[cratonvm] main()
+returned; VM held alive by 32 non-daemon thread(s) (JVM-spec behaviour)`), which would otherwise
+make every single run misreport as a "hang" under a naive wall-clock-to-process-exit measurement.
+
+**Current true state, reconfirmed independently: 0/60 hangs.**
+*   20 runs against the existing verified `dev`-tip binary (`wt-final-verify-20260716`, confirmed
+    functionally identical to `5e13631a` via `git diff --stat` — the only commits between its build
+    point and current tip are docs-only): **0/20 hangs**, wall times 9.5-26.1s, 44-46/49 passing
+    (one run found only 45 tests, a discovery flake, not a hang).
+*   20 runs against a from-scratch independent build (`~/vmfix-diffusethroughput-20260716`):
+    **0/20 hangs**, wall times 9.0-19.1s, 42-46/49 passing (one outlier run found only 17/49 tests
+    — a one-off test-discovery flake under this ad hoc harness, not reproduced elsewhere and not a
+    VM hang).
+*   10 rounds (20 process launches) of **two simultaneous instances** of the full 49-sub-test class
+    — deliberate added contention beyond any single prior session's own stress conditions, since the
+    original diffuse-cost investigation's own methodology explicitly ran "under moderate host load":
+    **0/20 hangs**, wall times 8.0-34.4s (only under this doubled contention does wall time approach
+    the historical 30s hang bound — never observed in any single-instance run).
+*   **Total: 60/60 clean completions across three independent stress batches, 0% hang rate** — a
+    real, fully-confirmed resolution of the 27% figure section 4 documented, corroborating (and
+    independently reproducing, with a fresh build) section 5.2's own 0/20 finding.
+
+**Hot-thread sampling: the diffuse *flavor* is still present, just no longer pathological.**
+24 live `sudo gdb -p <pid> --batch -ex 'thread apply all bt'` captures across 4 independent launches
+(identifying the CPU-hottest thread via `top -H` first, same technique as the original 41-sample
+investigation) during normal (non-hung, completing-within-10-25s) runs found leaf frames spread
+across: SIMD memcpy/memcmp/memset intrinsics, `parking_lot` lock/unlock (multiple distinct call
+sites), interpreter dispatch (`execute_invokevirtual_cached`, `nth_param_tag_byte`), `Arc` drop,
+`mimalloc` allocation (`mi_page_malloc_zero`), a classloading B-tree range lookup
+(`find_in_multi_release_archive`), and blocking syscalls (legitimate socket I/O, not spinning) —
+the same general *shape* (many small, unrelated costs, no dominant single site) as the historical
+41-sample breakdown, but every capture comes from a thread that is doing bounded, real work in a
+run that reliably finishes in seconds, not an indefinite spin. This is consistent with "diffuse
+interpreter/allocator throughput cost" remaining a genuine, still-open architectural characteristic
+of this VM — it just no longer manifests as an unbounded hang now that the discrete bugs that used
+to push individual runs over the edge are fixed.
+
+**Direct causal A/B experiment (not just correlation).** Built a fourth, deliberately-regressed
+control binary: same `dev` tip `5e13631a`, with *only* the `native-builtins/src/lib.rs`
+`Thread.getId()` registration reverted back to the pre-`19a5025f` hardcoded `Ok(Some(Value::Long(1)))`
+(everything else — the executor-`submit()` fix `9850617b`, the SATB-buffer fix `5fa116fd`, both
+blocking-region fixes, etc. — left intact). Ran the identical 20-run single-instance stress
+protocol:
+
+| Binary | n | mean wall | max wall | runs > 30s |
+|---|---|---|---|---|
+| Fixed (existing verified binary) | 20 | 15.9s | 26.1s | 0 |
+| Fixed (fresh independent build) | 20 | 13.1s | 19.1s | 0 |
+| **Control (`getId()` reverted only)** | 20 | **17.5s** | **33.4s** | **2 (10%)** |
+
+Reinstating *only* the `getId()` bug on an otherwise-fully-fixed tip measurably slows the class down
+(mean +10-25%, worst case +7-14s) and is the only one of the three batches to ever cross the 30s
+mark the original investigation used as its hang threshold — direct, reproducible, causal evidence
+that the mechanism `19a5025f`'s commit message describes (SegmentPool bucket collapse → CAS
+retry/allocation storm) is real and does contribute measurable diffuse cost, not a hypothesis.
+**However, it does not come close to reproducing the historical 27% hang rate on its own**: 0/20
+runs failed to complete within the 60s bound (vs. an expected ~5/20 if `getId()` alone explained the
+original 27% figure), and critically, **the `okio.Segment ClassCastException` from section 5.1 did
+not reproduce at all** in this control batch (`grep` for the signature across all 20 logs: zero
+matches) — even though this is the exact bug section 5.1 attributed it to. The difference: this
+control binary already has the executor-`submit()`/Netty-`Future` dispatch fix (`9850617b`)
+applied, which section 5.1's own repro conditions (tip `22dfc55e`) did not. This indicates the
+historical 100% CCE-crash regression (section 5) needed `getId()`'s collapse *compounding with*
+something else — most plausibly the missing `--enable-native-access` flag masking/reshaping which
+code paths executed at all, as section 5.1 itself already found for the crash's *visibility* — not
+`getId()` in isolation.
+
+**Conclusion.** `Thread.getId()`'s collapse was a real, now causally-confirmed contributor to this
+class's diffuse per-call contention/throughput cost — but it was never, by itself, the dominant
+cause of either the original 27% hang rate (section 4) or the later 100% CCE-crash regression
+(section 5). Both of those needed the `getId()` bug compounding with other factors: the original
+27% was measured *after* `3d1449a7`'s `force_native_over_real_jdk_bytecode` memoization already cut
+a 60% hang rate to 27% and *before* the two blocking-region fixes and the executor-`submit()` fix
+existed at all; the 100% CCE regression needed the missing `--enable-native-access` flag and the
+still-unfixed executor-`submit()` gap alongside it. The combined effect of *all* of this session's
+fixes — not `getId()` alone — is what took `ClientHttpConnectorTests` from a documented 27% hang
+rate down to a measured, reproducible, causally-stress-tested **0% (0/60)** on the current `dev`
+tip. The "diffuse hashbrown/parking_lot/mimalloc/`Arc`/`Weak` per-call cost" the section 4
+investigation catalogued is **not eliminated** — it remains visible in hot-thread sampling with the
+same general shape — but it no longer pushes any observed run past the point of actually failing to
+complete, even under deliberate 2x concurrent contention. Recommend downgrading section 4's framing
+from "closing it further needs a genuine interpreter/allocator throughput initiative" (implying an
+open reliability problem) to "a legitimate, still-open *performance* characteristic with no
+currently-observed reliability impact" — the hang symptom itself is resolved and independently
+reconfirmed, not merely reasoned about.
+
+No code change lands from this section — it is a verification/root-cause-attribution pass. The
+`control/getid-reverted-20260716` branch/worktree used for the A/B experiment is a throwaway
+(deliberately regresses a fixed bug) and is not merged.

@@ -2817,7 +2817,10 @@ pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
     // `check_post_block_gc` (the monitor_wait early-return bug class). No-op
     // when the gate is off.
     if cratonvm_gc::blocked_access_debug::enabled()
-        && thread.gc_block_state.in_blocked_region.load(Ordering::Acquire)
+        && thread
+            .gc_block_state
+            .in_blocked_region
+            .load(Ordering::Acquire)
     {
         cratonvm_gc::blocked_access_debug::report_blocked_violation(
             "interpreter safepoint reached with in_blocked_region raised",
@@ -4640,8 +4643,7 @@ pub fn execute(
         // this process (mirrors the `mark_jit_bail_listed` invariant this
         // same session's other fix relies on), so none of this is needed
         // when `already_skipped` is true — skip straight to cheap defaults.
-        let (is_interface_default, static_skip_reason, fjp_skip, native_skip) = if already_skipped
-        {
+        let (is_interface_default, static_skip_reason, fjp_skip, native_skip) = if already_skipped {
             (false, None, false, false)
         } else {
             // Static eligibility check — see vm/src/jit/skip_list.rs for the full
@@ -4706,7 +4708,12 @@ pub fn execute(
                     code_attr.code.len(),
                 )
             };
-            (is_interface_default, static_skip_reason, fjp_skip, native_skip)
+            (
+                is_interface_default,
+                static_skip_reason,
+                fjp_skip,
+                native_skip,
+            )
         };
         // DEBUG diagnostic — print every JIT compile decision for the
         // LazyProjection.equals method while bytebuddy_probe diagnosis
@@ -9597,13 +9604,7 @@ pub(crate) fn push_frame_and_fire_entry(thread: &mut JvmThread, frame: Frame) {
             let mn = frame_ref.method_name();
             let md = frame_ref.method_descriptor();
             let code = &frame_ref.code;
-            eprintln!(
-                "[BYTECODE-DUMP] {}.{}{} ({} bytes)",
-                cn,
-                mn,
-                md,
-                code.len()
-            );
+            eprintln!("[BYTECODE-DUMP] {}.{}{} ({} bytes)", cn, mn, md, code.len());
             let mut pc = 0usize;
             while pc < code.len() {
                 let op = code[pc];
@@ -20235,8 +20236,7 @@ pub(crate) fn try_lambda_dispatch(
                 _ => None,
             })
             .collect();
-        let compatible =
-            lambda_args_sam_compatible(shared, &call_site.sam_descriptor, call_args);
+        let compatible = lambda_args_sam_compatible(shared, &call_site.sam_descriptor, call_args);
         // Re-read obj_ref/call_args through the pins -- the compatibility
         // check above may have triggered a moving GC that relocated either.
         obj_ref = thread.native_pin_roots[sam_compat_pin_base];
@@ -23140,12 +23140,66 @@ pub(crate) mod hotpath_counts {
     }
 }
 
+pub(crate) fn is_undertow_native_override(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    matches!(
+        (class_name, method_name, method_descriptor),
+        (
+            "io/undertow/Undertow",
+            "builder",
+            "()Lio/undertow/Undertow$Builder;"
+        ) | ("io/undertow/Undertow", "start", "()V")
+            | ("io/undertow/Undertow", "stop", "()V")
+            | (
+                "io/undertow/Undertow$Builder",
+                "addHttpListener",
+                "(ILjava/lang/String;)Lio/undertow/Undertow$Builder;"
+            )
+            | (
+                "io/undertow/Undertow$Builder",
+                "addHttpsListener",
+                "(ILjava/lang/String;Ljavax/net/ssl/SSLContext;)Lio/undertow/Undertow$Builder;"
+            )
+            | (
+                "io/undertow/Undertow$Builder",
+                "setHandler",
+                "(Lio/undertow/server/HttpHandler;)Lio/undertow/Undertow$Builder;"
+            )
+            | (
+                "io/undertow/Undertow$Builder",
+                "setSocketOption",
+                "(Lorg/xnio/Option;Ljava/lang/Object;)Lio/undertow/Undertow$Builder;"
+            )
+            | (
+                "io/undertow/Undertow$Builder",
+                "setWorkerThreads",
+                "(I)Lio/undertow/Undertow$Builder;"
+            )
+            | (
+                "io/undertow/Undertow$Builder",
+                "setIoThreads",
+                "(I)Lio/undertow/Undertow$Builder;"
+            )
+            | (
+                "io/undertow/Undertow$Builder",
+                "build",
+                "()Lio/undertow/Undertow;"
+            )
+    )
+}
+
 fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
     hotpath_counts::bump(&hotpath_counts::FORCE_NATIVE_CALLS);
+    if is_undertow_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
     if is_class_mirror_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
@@ -27356,11 +27410,7 @@ fn execute_invokestatic_cached(
             };
 
             if let Some(res) = intercept_force_registered_native_cached(
-                shared,
-                thread,
-                frame_idx,
-                &cached,
-                args_slice,
+                shared, thread, frame_idx, &cached, args_slice,
             ) {
                 return res;
             }
@@ -33456,11 +33506,7 @@ fn execute_invokevirtual_cached(
                     }
 
                     if let Some(res) = intercept_force_registered_native_cached(
-                        shared,
-                        thread,
-                        frame_idx,
-                        &cached,
-                        args_slice,
+                        shared, thread, frame_idx, &cached, args_slice,
                     ) {
                         return res;
                     }
@@ -33858,11 +33904,7 @@ fn execute_invokevirtual_cached(
             }
 
             if let Some(res) = intercept_force_registered_native_cached(
-                shared,
-                thread,
-                frame_idx,
-                &cached,
-                args_slice,
+                shared, thread, frame_idx, &cached, args_slice,
             ) {
                 return res;
             }

@@ -1810,15 +1810,23 @@ pub(crate) fn native_class_for_name(
                             // store, which cannot see a freshly defined CGLIB proxy in a
                             // filtered/user loader.  Initialize the resolved ClassId
                             // directly, as Class.forName0 does on the JVM.
-                            ctx.initialize_class(cid).map_err(|message| {
-                                cratonvm_types::error::MethodCallFailed::InternalError(
-                                    cratonvm_types::error::VmError::Internal {
-                                        message: format!(
-                                            "Class.forName: class initialization failed: {message}"
-                                        ),
-                                    },
-                                )
-                            })?;
+                            //
+                            // HIB-CV-26 fix (2026-07-16): `initialize_class`
+                            // now returns the real `MethodCallFailed` instead
+                            // of a flattened `String`, so a `<clinit>`
+                            // exception propagates as-is here — already
+                            // wrapped as a catchable
+                            // `ExceptionInInitializerError`/
+                            // `NoClassDefFoundError` by
+                            // `ensure_class_initialized_shared` per JVMS
+                            // §5.5. Previously every nested clinit failure
+                            // (e.g. `MemorySegment.<clinit>` throwing
+                            // `IllegalCallerException` without
+                            // `--enable-native-access`) was re-wrapped as an
+                            // unrecoverable `VmError::Internal` here, which
+                            // aborted the whole VM instead of letting Java
+                            // code catch the exception.
+                            ctx.initialize_class(cid)?;
                         }
                     }
                 }
@@ -8238,13 +8246,13 @@ pub(crate) fn native_constructor_new_instance(
     // `<clinit>`, and reflective construction otherwise throws
     // `InterpreterError: Unititialized class: no static`.
     if let Some(cid) = declaring_cid {
-        ctx.initialize_class(cid).map_err(|message| {
-            cratonvm_types::error::MethodCallFailed::InternalError(
-                cratonvm_types::error::VmError::Internal {
-                    message: format!("Constructor.newInstance: class init failed: {message}"),
-                },
-            )
-        })?;
+        // HIB-CV-26 fix (2026-07-16): propagate the real `<clinit>` failure
+        // (already a catchable `ExceptionInInitializerError`/
+        // `NoClassDefFoundError` per JVMS §5.5, or a genuine internal error)
+        // instead of re-wrapping it as an unrecoverable `VmError::Internal`.
+        // Matches real JDK `Constructor.newInstance` semantics, which
+        // throws `ExceptionInInitializerError` for a failed initializer.
+        ctx.initialize_class(cid)?;
     }
 
     // Parse parameter types

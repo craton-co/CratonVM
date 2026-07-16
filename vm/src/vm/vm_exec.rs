@@ -3630,6 +3630,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
     }
 
+    fn resolve_field_index_by_class_id(&self, class_id: ClassId, field_name: &str) -> Option<usize> {
+        let cm = self.shared.class_manager.read();
+        resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
+    }
+
     fn copy_from_native_memory(&self, addr: i64, out: &mut [u8]) -> bool {
         // NIO-SERVER-SOCKET: `Unsafe.allocateMemory` returns synthetic arena
         // handles (base 0x10_0000_0000), not real pointers. A
@@ -4615,7 +4620,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             MethodHandleKind::from_tag(impl_ref_kind).unwrap_or(MethodHandleKind::InvokeStatic);
         let proxy_class_id = self.shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
-                functional_interface_id: None,
+            functional_interface_id: None,
             functional_interface: Arc::from(functional_interface),
             sam_method_name: Arc::from(sam_method_name),
             sam_descriptor: Arc::from(sam_descriptor),
@@ -6963,8 +6968,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // Lambda dispatch: read captured values from proxy fields, then
             // prepend them to the invocation args.
             let num_captures = lcs.capture_types.len();
-            let mut full_args: Vec<Value> =
-                Vec::with_capacity(num_captures + refreshed_args.len());
+            let mut full_args: Vec<Value> = Vec::with_capacity(num_captures + refreshed_args.len());
             for i in 0..num_captures {
                 full_args.push(self.shared.heap.get_field(receiver, i));
             }
@@ -8265,25 +8269,25 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
-    fn initialize_class(&mut self, class_id: ClassId) -> Result<(), String> {
+    fn initialize_class(&mut self, class_id: ClassId) -> Result<(), MethodCallFailed> {
         // NEW-8: force the class's <clinit> to run now. The interpreter's
         // `ensure_class_initialized_shared` handles thread-safe init and
         // skips classes that are already initialized.
-        match crate::vm::vm_util::ensure_class_initialized_shared(
-            &self.shared,
-            self.thread,
-            class_id,
-        ) {
-            Ok(()) => Ok(()),
-            Err(crate::error::MethodCallFailed::ExceptionThrown(_)) => {
-                // <clinit> raised a Java exception. Return a string
-                // summary; the caller (defineHiddenClass) surfaces it
-                // as an IllegalStateException tagged
-                // "ExceptionInInitializerError".
-                Err("class initialization raised an exception".to_string())
-            }
-            Err(crate::error::MethodCallFailed::InternalError(e)) => Err(format!("{e:?}")),
-        }
+        //
+        // HIB-CV-26 fix (2026-07-16): pass the result straight through
+        // instead of collapsing it into a `String`. `<clinit>` failures
+        // already come back from `ensure_class_initialized_shared` with
+        // the correct two-layer identity: a Java exception raised by a
+        // static initializer is already wrapped as a catchable
+        // `ExceptionInInitializerError`/`NoClassDefFoundError`
+        // (`MethodCallFailed::ExceptionThrown`) per JVMS §5.5, and only a
+        // genuine VM bug is `MethodCallFailed::InternalError`. Flattening
+        // both into a string here (as the old code did) forced every
+        // caller of `initialize_class` — including `Class.forName` — to
+        // re-wrap ordinary `<clinit>` exceptions as an unrecoverable
+        // `VmError::Internal`, aborting the whole VM instead of letting
+        // Java code catch them.
+        crate::vm::vm_util::ensure_class_initialized_shared(&self.shared, self.thread, class_id)
     }
 
     fn service_providers_from_modules(&self, service_class: &str) -> Vec<String> {
@@ -14292,6 +14296,11 @@ fn invoke_on_class_shared_inner(
                         // registered native stores count in a synthetic holder
                         // and waits on the object monitor. Keep this slow-path
                         // gate in sync with force_native_over_real_jdk_bytecode.
+                        || crate::runtime::interpreter::is_undertow_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
                         || crate::runtime::interpreter::is_count_down_latch_native_override(
                             class_name,
                             method_name,

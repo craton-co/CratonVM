@@ -1340,6 +1340,10 @@ impl NativeContext for MockNativeContext {
         mock_undertow_exchange_field_slot(Some(class_name), field_name)
     }
 
+    fn resolve_field_index_by_class_id(&self, class_id: ClassId, field_name: &str) -> Option<usize> {
+        mock_undertow_exchange_field_slot(self.class_name_of_id(class_id).as_deref(), field_name)
+    }
+
     fn method_exists(&self, _class_name: &str, _method_name: &str, _descriptor: &str) -> bool {
         false
     }

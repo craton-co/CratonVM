@@ -281,6 +281,26 @@ pub struct SourceChannel {
     pub read_ready: AtomicBool,
     pub read_suspended: AtomicBool,
     pub shutdown: AtomicBool,
+    /// HC0053 follow-up (2026-07-16): non-reentrant dispatch guard. Real
+    /// XNIO always services a channel's listener from exactly one IO
+    /// thread; here, the dedicated source-poller thread
+    /// (`native_source_poller_run`) and a paired sink's direct
+    /// `resumeWrites`-triggered notify (`notify_paired_source_readable*`)
+    /// can both race to invoke this same source's read listener from two
+    /// different native threads. The real (interpreted) listener code —
+    /// e.g. `org.xnio.streams.BufferPipeInputStream`'s push/pop path —
+    /// synchronizes on more than one object without a globally consistent
+    /// order (it never needs one under real XNIO's single-thread-per-
+    /// channel guarantee), so two concurrent invocations can lock-order-
+    /// invert and deadlock permanently (observed: one invocation holding
+    /// the pipe's internal queue monitor while blocked entering the
+    /// `BufferPipeInputStream` monitor, the other holding that monitor
+    /// while blocked entering the queue's). This flag makes dispatch
+    /// non-reentrant instead: a notifier that finds dispatch already in
+    /// progress skips firing this round rather than invoking concurrently;
+    /// the poller's next tick (or the caller's own retry-with-delays loop)
+    /// fires it once the in-flight dispatch completes.
+    pub dispatching: AtomicBool,
 }
 
 /// One live sink (write-side) conduit channel.
@@ -518,6 +538,7 @@ pub fn register_source_channel(transport: ConduitTransport) -> u64 {
         read_ready: AtomicBool::new(false),
         read_suspended: AtomicBool::new(false),
         shutdown: AtomicBool::new(false),
+        dispatching: AtomicBool::new(false),
     });
     source_channels()
         .lock()
@@ -1194,12 +1215,43 @@ fn notify_source_readable_with_delays(
             continue;
         }
         ctx.set_field(source, SRC_FIELD_READ_READY_FLAG, Value::Int(1));
-        if let Some(ch) = get_source_channel(id) {
+        let channel = get_source_channel(id);
+        if let Some(ch) = &channel {
             ch.read_ready.store(true, Ordering::Release);
         }
+        // HC0053 follow-up: non-reentrant dispatch guard (see
+        // `SourceChannel::dispatching`). If another native thread is
+        // already inside this source's listener (the source-poller thread
+        // and a paired sink's direct resumeWrites-notify race for the same
+        // source), skip firing this round instead of invoking concurrently
+        // — the next poller tick or retry-with-delays call will fire it
+        // once the in-flight dispatch completes.
+        let guard = channel.as_ref().and_then(|ch| {
+            (ch.dispatching
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok())
+            .then(|| DispatchGuard { flag: &ch.dispatching })
+        });
+        if channel.is_some() && guard.is_none() {
+            xnio_tcp_dbg!("notify_source id={id} skipped_reentrant_dispatch");
+            return;
+        }
         let fired = invoke_source_read_listener(ctx, source);
+        drop(guard);
         xnio_tcp_dbg!("notify_source id={id} fired_listener={fired}");
         return;
+    }
+}
+
+/// RAII reset for `SourceChannel::dispatching` — clears the flag on every
+/// exit path (normal return or unwind) once acquired via CAS above.
+struct DispatchGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl Drop for DispatchGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
     }
 }
 

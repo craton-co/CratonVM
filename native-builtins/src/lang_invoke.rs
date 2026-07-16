@@ -3300,13 +3300,12 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
             // across the call and re-read before reuse. See
             // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
             let target_class_pin = ctx.pin_native_root(target_class);
-            ctx.initialize_class(class_id).map_err(|message| {
-                cratonvm_types::error::MethodCallFailed::InternalError(
-                    cratonvm_types::error::VmError::Internal {
-                        message: format!("Lookup.ensureInitialized failed: {message}"),
-                    },
-                )
-            })?;
+            // HIB-CV-26 fix (2026-07-16): propagate the real `<clinit>`
+            // failure instead of re-wrapping it as an unrecoverable
+            // `VmError::Internal` — matches real JDK
+            // `Lookup.ensureInitialized`, which throws
+            // `ExceptionInInitializerError` for a failed initializer.
+            ctx.initialize_class(class_id)?;
             let target_class = ctx.read_native_pin(target_class_pin, target_class);
             ctx.unpin_native_roots(target_class_pin);
             Ok(Some(Value::Object(Some(target_class))))
