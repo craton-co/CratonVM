@@ -1,39 +1,45 @@
-# Hibernate ORM test suite — known issues index (2026-07-11 full-suite audit)
+# Hibernate ORM test suite — known issues index (2026-07-16 full-suite rerun)
 
-Source: full 4548-class Hibernate ORM 8.0 test suite run on the Azure remote
-host (`20.83.144.174`), `dev` merged to `44f16ee2`+ (see individual docs for
-exact commits), real-JDK, JIT on, 4 shards, `TIMEOUT=300`. Result:
-`PASS=4095 (90.0%) FAIL=267 HANG=90 NOTESTS=91 ABORTED=5 CRASH=0`. Zero
-crashes suite-wide — a strong signal the recent JIT `getfield` SIGSEGV
-regression fix ([hib-global-temptable-nondeterministic-sigsegv-20260710-RESOLVED.md](../../internal/fixed-suite-bugs/hib-global-temptable-nondeterministic-sigsegv-20260710-RESOLVED.md))
-holds at full scale.
+Source: full 4548-class Hibernate ORM 8.0 test suite run on this local Windows
+host, `dev` merged to `2f02e939d`, real-JDK, JIT on, 4 shards, `TIMEOUT=1200`.
+Result: `PASS=4437 (97.6%) FAIL=10 HANG=1 CRASH=1 ABORTED=8 NOTESTS=91`. This is
+a large improvement over the 2026-07-11 audit baseline (`PASS=4095, 90.0%`),
+reflecting the large number of concurrent fix branches merged into `dev`
+since (statistics-counter cluster, sql.exec cluster, enhancement/setter
+cluster, ANTLR entity-graph NPE cluster, immutable-collection and
+cascade-multipath hang clusters, connections/proxy serialization cluster,
+boot-models XML/Jandex cluster, and the assertion-longtail catalog — see
+`docs/internal/fixed-suite-bugs/` for the individual write-ups). Every
+cluster from the 2026-07-11 audit is now archived there as FIXED/RESOLVED.
 
-The 453-class non-passed list is saved as the new canonical baseline at
-`apps/hib-suite-runner/nonpassed.txt` (also `nonpassed453.txt`) for future
+**Data-loss note:** the exact 2026-07-11 453-class and later 224-class
+non-passed baselines (`apps/hib-suite-runner/nonpassed*.txt`) were lost to
+local-disk-exhaustion file corruption discovered 2026-07-16 (511/683 files in
+`apps/hib-suite-runner`, including `rerun.sh`, `common.args`,
+`CratonRunner.java/.class`, and `testlist.txt`, were silently truncated to
+zero bytes). The harness driver files were recovered from an intact
+`hib-suite-runner.tar` backup (2026-06-28/29 vintage); the non-passed class
+*lists* themselves were not in that backup and could not be recovered. This
+full-suite rerun was run specifically to regenerate an accurate current
+baseline rather than trust a stale/partial list.
+
+The new 20-class non-passed list is saved as the canonical baseline at
+`apps/hib-suite-runner/nonpassed.txt` (also `nonpassed20.txt`) for future
 regression tracking — not committed (`apps/` is gitignored).
 
-A HotSpot baseline comparison on the same 453 classes was started
-(`out-hotspot453-20260711-231558` on the remote host) but ran very slowly
-under heavy concurrent host load; docs below note where HotSpot confirmation
-is still pending vs. already checked. Clusters whose symptom is a real
-Java-level dispatch/reflection/classloading error specific to CratonVM's
-implementation (not a Hibernate/H2 semantic gap) are treated as
-CratonVM-specific by inspection even without a completed HotSpot run, since
-these error shapes are not the kind of thing that would ever reproduce on a
-correct JVM.
+## Residual clusters (this rerun)
 
-## Clusters (this audit), ranked by class count
+- [hib-120s-junit-timeout-cluster-20260716.md](hib-120s-junit-timeout-cluster-20260716.md) — 7 classes, all failing with `TimeoutException ... timed out after 120 seconds` against Hibernate's own internal per-test `@Timeout(120)` JUnit annotation (not the outer harness timeout). One systemic cause suspected rather than 7 unrelated bugs — needs a HotSpot timing comparison to confirm CratonVM-specific slowness vs. genuine flakiness.
+- [hib-misc-residuals-20260716.md](hib-misc-residuals-20260716.md) — remaining 13 non-passed classes not in the timeout cluster: `DefaultCatalogAndSchemaTest` (HANG, recurrence of a previously-investigated flaky class), `JarVisitorTest` (CRASH, rc=0/ms=0 harness-artifact shape), `LockTest` (real timing-sensitive AssertionFailedError), `CriteriaBuilderNonStandardFunctionsTest` (real `ConstraintViolationException`, not a timeout), `ManyToManyAssociationClassGeneratedIdTest` (new ABORTED entry, not previously catalogued), and the 6 already-known-expected ABORTED entries (`type.temporal.*` x5, `bytecode.enhancement.basic.*` x2 minus the new one) matching HotSpot per prior audits.
 
-- [hib-bytecode-enhancement-propertyaccessexception-setter-cluster.md](hib-bytecode-enhancement-propertyaccessexception-setter-cluster.md) — 19 classes. Loader-faithful bytecode-enhancement setter/reflection gap.
-- [hib-entitygraph-antlr-rulenode-npe-cluster.md](hib-entitygraph-antlr-rulenode-npe-cluster.md) — 14 classes. ANTLR parse-tree NPE in legacy entity-graph string-syntax parsing.
-- [hib-immutable-entitywithmutablecollection-hang-cluster.md](hib-immutable-entitywithmutablecollection-hang-cluster.md) — 17 classes (+`ImmutableTest`), all HANG, 100% hit rate. Immutable entity + mutable collection interaction.
-- [hib-cascade-multipathcircle-hang-cluster.md](hib-cascade-multipathcircle-hang-cluster.md) — 12 classes, all HANG, 100% hit rate. Circular-cascade save/delete graph.
-- [hib-misc-singleton-failures.md](hib-misc-singleton-failures.md) — ~12 classes across several small independent clusters (`InvalidMappingException` XML-mapping parse, `SyntaxException` HQL boolean-negation, `SQLGrammarException` x2 including a possible in-process-javac regression, `UnknownNamedQueryException`, `CannotContainSubGraphException`, `FailureExpectedExtension$ExpectedFailureDidNotFail` — the latter is not a defect). The four serialization EOF residuals are fixed and archived with the related connection/proxy cluster.
-- [hib-generic-timeout-hang-longtail.md](hib-generic-timeout-hang-longtail.md) — 61 scattered HANG classes not in the two dedicated hang clusters. Likely a mix of genuine slowness and host-load artifacts; this session has repeatedly observed several of these flip between PASS/FAIL/HANG/CRASH across reruns — not individually triaged, needs a quiet-host recheck.
-- [hibernate-assertionfailederror-longtail-triage-FIXED.md](../../internal/fixed-suite-bugs/hibernate-assertionfailederror-longtail-triage-FIXED.md) — archived 2026-07-15 after complete current-binary validation of the scattered assertion, timeout, schema-generation, and one-off catalog.
+## Already tracked elsewhere (all FIXED/RESOLVED as of this rerun)
+
+See `docs/internal/fixed-suite-bugs/` for the full archive of the 2026-07-11
+audit clusters, all confirmed fixed or resolved by the time of this rerun:
+statistics-counters-zero, bytecode-enhancement-propertyaccessexception,
+entitygraph-antlr-rulenode-npe, immutable-entitywithmutablecollection-hang,
+cascade-multipathcircle-hang, boot-models-xml-qname-jandex,
+connections-proxy-serializationexception, generic-timeout-hang-longtail,
+assertionfailederror-longtail-triage, proxyclassreuse-loader-blind-class-resolution.
+
 - [hib-notests-abstract-baseclass-list.md](../../internal/hib-notests-abstract-baseclass-list.md) — 91 classes, NOT a bug (abstract base classes with 0 discoverable tests, matches HotSpot).
-
-## Already tracked elsewhere (not re-documented here)
-
-- `bootstrap.scanning.{JarVisitorTest,ScannerTest,PackagedEntityManagerTest}` jar-scanning `orm.xml doesn't exist` — [hib-proxyclassreuse-loader-blind-class-resolution.md](../hib-proxyclassreuse-loader-blind-class-resolution.md).
-- `type.temporal.*` ABORTED entries (`InstantTests`, `LocalDateTimeTest`) and `bytecode.enhancement.basic.{InheritedTest,MappedSuperclassTest}` ABORTED — expected `@CustomEnhancementContext`/dialect-gated partial skips, matches HotSpot per [hib-bytecode-enhancement-loader-faithful-linking.md](../hib-bytecode-enhancement-loader-faithful-linking.md).
