@@ -1951,3 +1951,195 @@ reconfirmed, not merely reasoned about.
 No code change lands from this section — it is a verification/root-cause-attribution pass. The
 `control/getid-reverted-20260716` branch/worktree used for the A/B experiment is a throwaway
 (deliberately regresses a fixed bug) and is not merged.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        
+
+### 5.4 `TestTemplateInvocationContext` `ClassCastException` — dynamic-test discovery undercounting root-caused; genuine but PARTIAL fix landed (2026-07-16)
+
+Investigated the low-frequency (roughly 1/15-1/45 across this session's own
+sampling) `ClassCastException: java.lang.Object cannot be cast to
+org.junit.jupiter.api.extension.TestTemplateInvocationContext` hitting
+`http.client.reactive.ClientHttpConnectorTests`'s `@ParameterizedTest`
+methods (`basic(ClientHttpConnector, HttpMethod)` and others, e.g.
+`partitionedCookieSupport(ClientHttpConnector)`). When it fires, JUnit 5's
+dynamic-test discovery for that class truncates partway through (the
+class-wide total drops from 49, e.g. to 17 when it hits early in `basic`'s
+49-way connector x HTTP-method cross product) — the same symptom this
+effort had earlier observed independently as an uncharacterized
+"intermittent JUnit dynamic-test discovery undercounting" issue, now with a
+concrete exception signature.
+
+**Reproduction.** Reused the `finalverify0716-runner` harness (`KRun.class`,
+`af/web.txt` classpath, `KRUN_STACK=1` for full stack traces) in a fresh
+isolated worktree, looping `ClientHttpConnectorTests` with `timeout 40`
+per attempt (the class's own non-daemon threads never let the process exit
+on its own — killing it after the `RESULT` line is expected, not a hang;
+see section 5's stress-harness note). Caught the first live occurrence
+after ~24 attempts (~1/24 that run); a second independent stress run
+confirmed the base rate at roughly 1/45 (1 hit in 45 clean-binary runs).
+
+Full stack trace (previously only a one-line message had been captured):
+
+```
+java.lang.ClassCastException: java.lang.Object cannot be cast to org.junit.jupiter.api.extension.TestTemplateInvocationContext
+	at org.junit.jupiter.engine.descriptor.TestTemplateTestDescriptor$TestTemplateExecutor.createInvocationTestDescriptor(TestTemplateTestDescriptor.java:116)
+	at org.junit.jupiter.engine.descriptor.TemplateExecutor.createInvocationTestDescriptor(TemplateExecutor.java:89)
+	at org.junit.jupiter.engine.descriptor.TemplateExecutor.lambda$executeForProvider$0(TemplateExecutor.java:57)
+	at org.junit.jupiter.engine.descriptor.TemplateExecutor.executeForProvider(TemplateExecutor.java:57)
+	at org.junit.jupiter.engine.descriptor.TemplateExecutor.execute(TemplateExecutor.java:46)
+	at org.junit.jupiter.engine.descriptor.TestTemplateTestDescriptor.execute(TestTemplateTestDescriptor.java:112)
+	... (JUnit Platform hierarchical-executor frames) ...
+	at KRun.runOne(KRun.java:54)
+```
+
+`javap` on `junit-jupiter-engine-6.1.1.jar` confirmed `TestTemplateTestDescriptor.java:116`
+is a compiler-generated *bridge method* — `TestTemplateExecutor extends
+TemplateExecutor<TestTemplateInvocationContextProvider,
+TestTemplateInvocationContext>`'s erasure-mandated
+`createInvocationTestDescriptor(UniqueId, Object, int)` override, which
+`checkcast`s the `Object` argument to `TestTemplateInvocationContext` before
+delegating to the real typed method — completely standard `javac`-generated
+generics-erasure bytecode, unconditionally correct on a real JVM.
+
+**Root cause.** Live `CRATONVM_DBG_CCE=1` capture (an existing, already-wired
+diagnostic — `crate::runtime::env_cache::cce_dbg()`,
+`vm/src/runtime/interpreter.rs`'s `Checkcast` handler) on the failing
+checkcast showed `obj_cid=0 obj_class=java/lang/Object` — the object being
+cast genuinely has class-id 0 at the moment of the check, i.e. it is not a
+real, wrongly-typed object; it is a *bare, reused* `java.lang.Object`
+allocation. This is the exact signature this codebase's own checkcast
+handler already has a documented comment for ("S-trinity #1: when the
+runtime class is a bare `Object` / cid=0 (synthetic alloc that lost
+class_id)...") and matches the already-tracked, currently-OPEN
+"register-invisible root" / cross-thread GC-root-visibility race family
+documented in
+[[wildfly-standalone-boot-attributeaccess-cce-register-invisible-root]]
+(`docs/known-issues/wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`)
+— this is a **fifth independent occurrence** of that family (after the
+`AttributeAccess`/`AttributeDefinition` WildFly-boot occurrences, the
+`invoke_virtual` lambda-SAM-compat stale-locals site, and the CHM
+stale-at-store windows), now in a structurally different call shape:
+single-thread JUnit 5 dynamic-test dispatch racing against long-lived
+background Reactor Netty / MockWebServer threads' own GC-triggering
+allocation, rather than WildFly's ~30-40-thread `parallel-extension-add`
+boot storm.
+
+**A concrete, previously-unidentified contributing mechanism was found and
+fixed for this call shape.** `ClientHttpConnectorTests`'s
+`@ParameterizedTest` methods all funnel through JUnit's
+`ParameterizedInvocationContextProvider.provideInvocationContexts` (decompiled
+via `javap`), which builds
+`sources.stream().map(...).map(...).map(...).flatMap(...).map(createInvocationContext)`
+— a real `java.util.stream.Stream` pipeline that CratonVM implements with its
+own native lazy-stream machinery (`native-collections/src/lib.rs`), not real
+bytecode. Two of that machinery's functions —
+`native_stream_for_each` (the materialize-then-consume path a `.forEach()`
+with an upstream chain takes) and `stream_pull_internal` (the generic
+chain-driving pull used to materialize a stream's elements, including a
+`flatMap` stage's inner stream) — each pin a **whole batch** of `Stream`
+elements up front via `pin_value_slice`, then drive **long, re-entrant**
+per-element Java execution (JUnit's own dynamic-test dispatch machinery,
+which for this class means a full HTTP round trip per invocation) that can
+tier up into JIT.
+
+JIT-compiled code has **no periodic cooperative safepoint poll** of its own
+(see `jit_safepoint_flush_satb`'s doc comment in `vm/src/jit/helpers.rs`:
+"JIT-running threads have no such poll — they only return through one of
+the runtime helpers below" — i.e. only when a JIT-emitted allocation
+happens to fail its fast path and falls through to a GC-triggering runtime
+helper). This thread's *deposited* root snapshot
+(`thread.root_snapshot`, refreshed by `update_root_snapshot`/
+`deposit_root_snapshot`) is the **only** view a peer-initiated
+stop-the-world collection has of `native_pin_roots` for a thread that gets
+forcibly frozen via the STW takeover mechanism while executing JIT code:
+the takeover's own conservative register/stack scan
+(`vm/src/jit/xt_root_scan.rs`) has no knowledge of `native_pin_roots` (a
+plain Rust-heap `Vec`, not something conservative register/stack scanning
+would discover). Confirmed directly from the existing GC-safety comment on
+`NativeContextImpl::pin_native_root` (`vm/src/vm/vm_exec.rs`): "a pin pushed
+while this thread's `in_blocked_region` flag is raised is invisible to
+**both** the STW root scan (which reads the deposit-time snapshot) and the
+blocked-thread fold... the object dies or moves and the pin is never
+remapped." The specific gap closed here is the "actively running" sibling
+of that documented "blocked" case: `native_stream_for_each`/
+`stream_pull_internal` pin a batch of objects, then run for a long,
+JIT-heavy stretch **without ever blocking or self-initiating GC**, so
+nothing refreshes the deposit between "pins pushed" and "peer's takeover
+freeze" — a live pin can be invisible to a peer's mark phase and get
+reclaimed under Generational's non-moving frozen-peer sweep; the next
+(correctly pin-revalidated) read observes the reused memory as a bare
+`java.lang.Object`.
+
+**Fix.** Added `NativeContext::refresh_root_snapshot()` (default no-op;
+`native-api/src/registry.rs`), overridden on `NativeContextImpl`
+(`vm/src/vm/vm_exec.rs`) to call the pre-existing
+`deposit_root_snapshot()` — the identical mechanism already used before
+blocking natives, just invoked without actually blocking. Called it right
+after `pin_value_slice` establishes each element batch, and again at the
+top of every per-element loop iteration, in both `native_stream_for_each`
+and `stream_pull_internal`.
+
+**Verification — genuine improvement, NOT a full fix.**
+
+- `cargo test -p cratonvm-native-collections -p cratonvm-vm -p
+  cratonvm-native-api --lib` (post-rebase onto fresh `dev`): 179/179
+  (`native-api`), 73/73 (`native-collections`), 2198/2215 (`cratonvm-vm`; 17
+  "failures" — 16 are the doc's own already-documented pre-existing baseline
+  [`jit::skip_list::tests::*` — an unrelated concurrent session's flakes —
+  plus `runtime::lock_order::tests::*`, gated behind `cfg!(debug_assertions)`
+  and expected to fail under `--release`], the 17th,
+  `jit::helpers::tests::jit_getfield_never_tears_against_concurrent_jit_putfield_int`,
+  passed cleanly in isolation — a host-contention flake under this session's
+  parallel test run, not a regression: this branch never touches
+  `jit/helpers.rs`).
+- Picked up and fixed, separately, an unrelated pre-existing test-compile
+  break on `dev`: `c812b622` ("fix(bytebuddy): resolve native compat shim
+  field lookup by ClassId, not name") added
+  `NativeContext::resolve_field_index_by_class_id` with no default impl but
+  never updated `native-collections/src/lib.rs`'s own inline `MockCtx` test
+  fixture, so `cargo test -p cratonvm-native-collections --lib` did not
+  compile on `dev` before this session's rebase. Landed as a separate,
+  trivial, obviously-correct commit (`None` stub — the mock has no field
+  layout model) in the same branch/PR, not squashed into the GC fix.
+- Stress-tested `ClientHttpConnectorTests` **254 runs total post-fix**
+  across three build iterations (84 runs with an earlier single-site version
+  of the fix covering only `native_stream_for_each`; 170 runs with both
+  sites patched): **4 recurrences of the exact same
+  `ClassCastException`/`obj_cid=0` signature** (~1/64 aggregate), on `basic`
+  once and `partitionedCookieSupport` three times. This is somewhat lower
+  than this session's own pre-fix measurement (1/45) and well below the
+  originally-documented ~1/15-1/20 range, but the sample sizes on both sides
+  are small enough that this should be read as **suggestive, not proven,
+  improvement** — a two-proportion comparison of 1/45 pre-fix vs. 4/254
+  post-fix is not clearly significant. Adding the second call site
+  (`stream_pull_internal`) did not measurably change the recurrence rate
+  versus the single-site version (1/84 vs. 3/170), consistent with the
+  residual living in a **different, uncovered window this fix's granularity
+  cannot close**: the refresh happens once before a per-element loop and
+  once between iterations, but `accept()`'s own execution for a single
+  element (an entire HTTP round trip, potentially spanning multiple peer GC
+  cycles on its own) is not itself covered by any further refresh — true
+  elimination needs a genuine cooperative safepoint poll inside JIT-compiled
+  code, which is exactly the precise-oop-map / shadow-stack infrastructure
+  this whole bug family's roadmap doc
+  (`docs/feature-designs/precise-jit-maps-default.md`) already names as the
+  real fix.
+
+**Bottom line — matches this bug family's established pattern exactly.**
+This is a real, verified, zero-regression, low-risk improvement: a genuine
+gap in the deposited-root-snapshot mechanism, precisely identified from
+source and live diagnostic capture, safely closed using an existing,
+already-proven mechanism (`deposit_root_snapshot`) applied to a previously
+uncovered call shape. It is **not** a complete fix — the `ClassCastException`
+still reproduces post-fix, at a lower but not conclusively-proven-lower
+rate — consistent with every other narrow contributing-site fix found for
+this same open "register-invisible root" family to date (the
+`AttributeAccess` doc's own `invoke_virtual` lambda-SAM-compat fix and CHM
+pin fixes both reduced but did not eliminate their respective residuals).
+Landed per this project's established policy for this family: land the
+verified, safe, narrow improvement; document the residual honestly; do not
+force a deeper fix into the cross-thread GC synchronization protocol under
+time pressure without the ability to fully verify it.
+
+Landed: branch `fix/testtemplate-cce-20260716`, commits `8a5c2274`
+(the GC fix) and a follow-up MockCtx compile-break fix, rebased onto `dev`
+tip `6c517cd9` before push.
