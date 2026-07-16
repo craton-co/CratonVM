@@ -455,14 +455,12 @@ pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyS
                 // Some producers encode the encrypted record directly;
                 // SunPKCS12 retains the SecretBag sequence and wraps that
                 // record in the `[0]` OCTET STRING payload.
-                let epki_der = if yasna::parse_ber(
-                    &other.bag_value,
-                    p12::EncryptedPrivateKeyInfo::parse,
-                )
-                .is_ok()
-                {
-                    Some(other.bag_value.clone())
-                } else {
+                let epki_der =
+                    if yasna::parse_ber(&other.bag_value, p12::EncryptedPrivateKeyInfo::parse)
+                        .is_ok()
+                    {
+                        Some(other.bag_value.clone())
+                    } else {
                         yasna::parse_ber(&other.bag_value, |r| {
                             r.read_sequence(|r| {
                                 let _secret_type = r.next().read_oid()?;
@@ -471,7 +469,7 @@ pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyS
                             })
                         })
                         .ok()
-                };
+                    };
                 let secret = epki_der
                     .as_deref()
                     .and_then(|epki_der| {
@@ -487,14 +485,14 @@ pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyS
                     })
                     .and_then(|secret_info| {
                         yasna::parse_ber(&secret_info, |r| {
-                        r.read_sequence(|r| {
-                            let _version = r.next().read_u8()?;
-                            let _algorithm = p12::AlgorithmIdentifier::parse(r.next())?;
-                            r.next().read_bytes()
+                            r.read_sequence(|r| {
+                                let _version = r.next().read_u8()?;
+                                let _algorithm = p12::AlgorithmIdentifier::parse(r.next())?;
+                                r.next().read_bytes()
+                            })
                         })
-                    })
-                    .ok()
-                });
+                        .ok()
+                    });
                 if let Some(key_bytes) = secret {
                     let alias = friendly.unwrap_or_else(|| hex_lower(&local_id));
                     secret_keys.push((alias, key_bytes));
@@ -742,9 +740,9 @@ fn write_jks(store: &LoadedKeyStore, password: &[u8]) -> Vec<u8> {
     let mut body: Vec<u8> = Vec::new();
     body.extend_from_slice(&JKS_MAGIC.to_be_bytes());
     body.extend_from_slice(&2u32.to_be_bytes()); // version 2
-    // JKS has no compatible representation for SecretKeyEntry.  Keep the
-    // entry available in memory, but omit it from this legacy wire format.
-    // (PKCS#12 callers are still loaded from their original SecretBag.)
+                                                 // JKS has no compatible representation for SecretKeyEntry.  Keep the
+                                                 // entry available in memory, but omit it from this legacy wire format.
+                                                 // (PKCS#12 callers are still loaded from their original SecretBag.)
     let mut aliases: Vec<&String> = store
         .entries
         .iter()
@@ -922,6 +920,13 @@ fn jks_recover_key(epki_der: &[u8], password_bytes: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     Some(plain)
+}
+
+/// Whether a JKS key entry is still wrapped in Sun's KeyProtector envelope.
+fn is_jks_encrypted_private_key(der: &[u8]) -> bool {
+    const JKS_KEY_PROTECTOR_OID: &[u8] = b"\x06\x0a\x2b\x06\x01\x04\x01\x2a\x02\x11\x01\x01";
+    der.windows(JKS_KEY_PROTECTOR_OID.len())
+        .any(|window| window == JKS_KEY_PROTECTOR_OID)
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -1228,7 +1233,7 @@ fn this_arg(args: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
     }
 }
 
-fn read_password(ctx: &mut dyn NativeContext, v: &Value) -> Vec<u8> {
+pub(crate) fn read_password(ctx: &mut dyn NativeContext, v: &Value) -> Vec<u8> {
     if let Value::Object(Some(arr)) = v {
         let len = ctx.array_length(*arr);
         let mut out = Vec::with_capacity(len);
@@ -1389,12 +1394,11 @@ fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     for entry in store.entries.values() {
         match &entry.kind {
             EntryKind::PrivateKey { key_der, chain } => {
-                if std::env::var_os("CRATONVM_DBG_TLS_HS").is_some() {
-                    eprintln!("[dbg-tls-hs] install_identity_from_der CALLER=engineLoad(byte-stream) key_len={}", key_der.len());
-                }
-                crate::t27_tls::install_identity_from_der(key_der, chain);
-                if first_key_identity.is_none() {
-                    first_key_identity = Some((key_der.clone(), chain.clone()));
+                if !is_jks_encrypted_private_key(key_der) {
+                    crate::t27_tls::install_identity_from_der(key_der, chain);
+                    if first_key_identity.is_none() {
+                        first_key_identity = Some((key_der.clone(), chain.clone()));
+                    }
                 }
                 // The chain's root (last cert) is a trust anchor too — a
                 // keystore holding a self-signed identity (the common test
@@ -1440,6 +1444,15 @@ fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
 fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
+    let password = args
+        .get(2)
+        .map(|v| read_password(ctx, v))
+        .unwrap_or_default();
+    // A JKS store may be loaded without its per-entry key password (Tomcat's
+    // `Ssl` configuration supplies that password later through getKey). Unlock
+    // the entry at the API boundary that actually receives it, so consumers
+    // never receive an EncryptedPrivateKeyInfo masquerading as PKCS#8.
+    keystore_unlock_private_keys(id, &password);
     let alias = args
         .get(1)
         .and_then(|v| read_string_arg(ctx, v))
@@ -1636,9 +1649,12 @@ fn engine_is_key_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         .unwrap_or_default();
     let yes = keystore_lookup(id)
         .and_then(|s| {
-            s.entries
-                .get(&alias)
-                .map(|e| matches!(e.kind, EntryKind::PrivateKey { .. } | EntryKind::SecretKey { .. }))
+            s.entries.get(&alias).map(|e| {
+                matches!(
+                    e.kind,
+                    EntryKind::PrivateKey { .. } | EntryKind::SecretKey { .. }
+                )
+            })
         })
         .unwrap_or(false);
     Ok(Some(Value::Int(if yes { 1 } else { 0 })))
@@ -1967,15 +1983,29 @@ pub(crate) fn keystore_set_pending_km_identity(
     ctx: &mut dyn NativeContext,
     keystore_obj: ObjectRef,
 ) {
+    keystore_set_pending_km_identity_with_password(ctx, keystore_obj, &[]);
+}
+
+/// Same as [`keystore_set_pending_km_identity`], with the KeyManagerFactory's
+/// per-entry password. JKS permits a key password distinct from the store-load
+/// password; Spring/Tomcat use that arrangement for their `test.jks` fixture.
+pub(crate) fn keystore_set_pending_km_identity_with_password(
+    ctx: &mut dyn NativeContext,
+    keystore_obj: ObjectRef,
+    password: &[u8],
+) {
     let spi = unwrap_keystore_spi(ctx, keystore_obj);
     let id = get_store_id(ctx, spi);
     if id == 0 {
         return;
     }
-    let ident = store_identity_pem_map().lock().unwrap().get(&id).cloned();
-    if let Some((cert, key)) = ident {
-        crate::t27_tls::set_pending_km_identity(cert, key);
-        return;
+    keystore_unlock_private_keys(id, password);
+    if password.is_empty() {
+        let ident = store_identity_pem_map().lock().unwrap().get(&id).cloned();
+        if let Some((cert, key)) = ident {
+            crate::t27_tls::set_pending_km_identity(cert, key);
+            return;
+        }
     }
     // FIX (httpserver-pkcs12-20260706): store_identity_pem_map is a
     // load-time snapshot (populated only by engineLoad's entries scan). A
@@ -1990,10 +2020,38 @@ pub(crate) fn keystore_set_pending_km_identity(
     // handshake failed immediately.
     if let Some((key_der, chain)) = keystore_get_first_private_key(id) {
         let (cert_pem, key_pem) = crate::t27_tls::der_identity_to_pem(&key_der, &chain);
+        store_identity_pem_map()
+            .lock()
+            .unwrap()
+            .insert(id, (cert_pem.clone(), key_pem.clone()));
         crate::t27_tls::set_pending_km_identity(cert_pem, key_pem);
     }
 }
 
+/// Materialize JKS private-key entries when their per-entry password becomes
+/// available. `jks_recover_key` authenticates the plaintext, so it is safe to
+/// attempt this on PKCS#8/P12 entries too: non-JKS data simply remains intact.
+fn keystore_unlock_private_keys(id: i32, password: &[u8]) {
+    if password.is_empty() {
+        return;
+    }
+    let mut stores = registry().write();
+    let Some(store) = stores.stores.get_mut(&id) else {
+        return;
+    };
+    let mut installed_identity = false;
+    for entry in store.entries.values_mut() {
+        if let EntryKind::PrivateKey { key_der, chain } = &mut entry.kind {
+            if let Some(plain) = jks_recover_key(key_der, password) {
+                *key_der = plain;
+                if !installed_identity {
+                    crate::t27_tls::install_identity_from_der(key_der, chain);
+                    installed_identity = true;
+                }
+            }
+        }
+    }
+}
 /// Fetch the PKCS#8 DER + cert chain of the first `PrivateKey` entry in a
 /// registered store, scanning the LIVE registry rather than the load-time
 /// snapshot `store_identity_pem_map` relies on. See

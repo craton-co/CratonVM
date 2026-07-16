@@ -11,8 +11,21 @@ This document tracks the **genuine remaining failures**.
 ## 1. Deep-Dive Investigations (Root-Caused, Pending Fix)
 
 *   **Mockito `spy()` StackOverflowError** (`context.annotation.ImportSelectorTests`)
-  *   **Status**: **OPEN** (5/9 methods SOE, reconfirmed 2026-07-15 on a binary containing the mockk
-    fix below — this is a **different root cause** than the mockk sibling, which is now FIXED).
+  *   **Status**: **OPEN** — symptom shape changed 2026-07-16. On a fresh `dev` tip (`6c517cd9`), the
+    original isolated repro (`SpyDLBFProbe.java`: `spy(new DefaultListableBeanFactory())` + one
+    `registerSingleton()` call) **no longer reproduces**, and 3 of the 5 real `spy()` sub-tests
+    (`importSelectors`, `importSelectorsWithGroup`, `importSelectorsSeparateWithGroup`) now **pass**
+    individually. The remaining 2 (`importSelectorsWithNestedGroup`,
+    `importSelectorsWithNestedGroupSameDeferredImport`) still fail, but via a **new, more severe
+    failure mode**: a deterministic native heap-corruption abort (`GC: young object-start walk
+    stopped at an implausible extent`, `GC-ARRAY-GUARD` trips, stale zeroed object headers) instead
+    of a clean catchable `StackOverflowError`. Confirmed heap-size-independent (identical corruption
+    offset at default heap and `--Xmx 512m`), so it's a deterministic correctness bug, not a GC-timing
+    race. Not yet root-caused to a Rust source line or confirmed to share the same underlying cause
+    as the `isOverridden` hypothesis below — full writeup, ruled-out list, and next steps in
+    `CRATONVM-SPRING-TIMEOUT-CLUSTER-1500S-RERUN.md`'s **2026-07-16** `ImportSelectorTests` section.
+  *   **2026-07-15 status (superseded above, kept for history)**: 5/9 methods SOE, reconfirmed 2026-07-15 on a binary containing the mockk
+    fix below — this is a **different root cause** than the mockk sibling, which is now FIXED.
   *   **2026-07-15 root-cause sharpening (supersedes the older hypotheses below)**: full recursion
     cycle captured (`KRUN_STACK=1`, log at `/data/tmp/mockk-tmp/importsel2.log` on the Azure host):
     `MockMethodAdvice.handle` (intercepting `DefaultSingletonBeanRegistry.registerSingleton` on the
@@ -94,9 +107,37 @@ This document tracks the **genuine remaining failures**.
       - `annotation_element_to_java_typed`'s `Array` branch builds a genuine 1-element `Class[]` array for `@Import`'s `value` (`elem_cname=java/lang/Class`, no `TypeNotPresentException` sentinel collapse — that hypothesis, and the "insufficient loader scoping" hypothesis, are both REFUTED for this specific bug).
       - `annotation_proxy_dispatch_impl`'s element-accessor walk (the code that answers a reflective `Method.invoke()` on the annotation's `$ProxyN`) returns exactly that array back to the Java caller: `[ANN-PROXY-DISPATCH-VAL] ... type_desc=.../Import; returning cid=12 name="java/lang/Class" is_array=true array_len=1` — i.e. CratonVM hands Spring a **correct** 1-element `Class[]`.
 
-      Since the value crossing the native/Java boundary is provably correct, the bug is NOT in CratonVM's annotation-parsing or reflection-dispatch layers — it must be inside Spring's OWN `TypeMappedAnnotation`/`AnnotationTypeMapping` Java code, specifically `getValueFromMetaAnnotation`'s `useMergedValues` branch (`this.mapping.getMappedAnnotationValue(attributeIndex, forMirrorResolution)`), which is a SEPARATE retrieval path from the raw reflective `AnnotationUtils.invokeAnnotationMethod` fallback and was NOT exercised by the traces above (those traces fire on the raw-reflection path; `getMappedAnnotationValue` may resolve the value some other way — e.g. via a cached/mirrored `Method` reference — before ever reaching a `Method.invoke()` call). NEXT STEP: trace (or `javap`/read) `AnnotationTypeMapping.getMappedAnnotationValue` and its mirror-set resolution to find where a correct 1-element array could become a bare `Class` — prime suspect is `Method`-object IDENTITY comparison (mirror-set caching keyed on a `Method` from one loader vs. a `Method` from another) given this cluster's established loader-identity bug theme, though this would be the first instance of that theme manifesting via `java.lang.reflect.Method` identity rather than `Class` identity.
+      Since the value crossing the native/Java boundary is provably correct, the bug is NOT in CratonVM's annotation-parsing or reflection-dispatch layers — it must be inside Spring's OWN `TypeMappedAnnotation`/`AnnotationTypeMapping` Java code, specifically `getValueFromMetaAnnotation`'s `useMergedValues` branch (`this.mapping.getMappedAnnotationValue(attributeIndex, forMirrorResolution)`), which is a SEPARATE retrieval path from the raw reflective `AnnotationUtils.invokeAnnotationMethod` fallback and was NOT exercised by the traces above (those traces fire on the raw-reflection path; `getMappedAnnotationValue` may resolve the value some other way — e.g. via a cached/mirrored `Method` reference — before ever reaching a `Method.invoke()` call). ~~NEXT STEP: trace (or `javap`/read) `AnnotationTypeMapping.getMappedAnnotationValue` and its mirror-set resolution to find where a correct 1-element array could become a bare `Class` — prime suspect is `Method`-object IDENTITY comparison...~~
+
+  *   **2026-07-16 update — ROOT-CAUSED PRECISELY via live Java-source instrumentation; the `Method`-identity hypothesis above is REFUTED; a targeted VM fix was attempted and REVERTED after it caused heap corruption. Still OPEN, but now with an exact, reproducible, one-line failure signature and a well-scoped (but not-yet-safe) fix direction.**
+
+      **Method used**: rather than guessing further from CratonVM-side traces, patched Spring's OWN source (`TypeMappedAnnotation.java`, `AnnotationTypeMapping.java`, `MergedAnnotation.java`, `ConfigurationClassParser.java` — copies under `/data/tmp/importhttpsvc-repro/patch-src/` on the Azure host, env-var-gated `System.err.println` trace calls only, no logic changes), recompiled just those files with `javac` against the existing `combined_cp.txt` classpath (`/data/tmp/aotfix-runs/combined_cp.txt`, still valid — points at `/data/data/wt-osr-other516-20260708-2131/apps/spring-framework/*/build/classes`), and reran the existing `KRun`-based repro (`/data/tmp/hib-cv-26-krun/KRun.java`, a generic JUnit5 `Launcher` wrapper — copies at `/data/tmp/importhttpsvc-repro/`) with the patched classes prepended to the classpath. This let the trace fire from inside REAL Spring bytecode at the exact failing call, both under JIT and `--nojit` (confirmed identical — this is NOT a JIT bug).
+
+      **`getMappedAnnotationValue` hypothesis directly refuted.** Traced every `TypeMappedAnnotation.getValue`/`.adapt`/`.getTypeForMapOptions`/`AnnotationTypeMapping.getMappedAnnotationValue` call for `Import.value()` across the whole run: every single one resolves and adapts a genuine 1-element `Class[]` correctly — `Method` identity, `getReturnType()`, `Method.invoke()` results, everything checked out. The instrumented run **still reproduces the identical CCE** even with this whole path proven clean, meaning the divergence isn't there at all.
+
+      **Actual root cause: `MergedAnnotation.Adapt` enum-constant identity split across two class-loaders.** `SourceClass.getAnnotationAttributes` → `AnnotatedTypeMetadata.getAnnotationAttributes(name, true)` → `TypeMappedAnnotation.asMap(factory, Adapt.values(true, true))`. Traced `Adapt.CLASS_TO_STRING.isIn(adaptations)` (`MergedAnnotation.java`'s `Adapt` enum, `protected final boolean isIn(Adapt... adaptations) { for (Adapt c : adaptations) if (c == this) return true; ...}` — reference-identity comparison) directly: `Arrays.toString(adaptations)` prints `[CLASS_TO_STRING, ANNOTATION_TO_MAP]` (i.e. the array DOES logically contain `CLASS_TO_STRING`), yet `isIn()` returns **`false`**. Adding an identity/loader trace inside `isIn()` itself nailed it exactly:
+      ```
+      this=CLASS_TO_STRING@41429 this.getClass()=...@41436 thisLoader=jdk.internal.loader.ClassLoaders$AppClassLoader@c1
+        | candidate=CLASS_TO_STRING@49136 candidate.getClass()=...@49132
+          candidateLoader=CompileWithForkedClassLoaderClassLoader@7324
+        candidate.name()=CLASS_TO_STRING this.name()=CLASS_TO_STRING candidate.equals(this)=false ==?false
+      ```
+      `this` (the `Adapt.CLASS_TO_STRING` singleton `getTypeForMapOptions`'s own `getstatic` resolves to) is the **application-loader's** copy of `MergedAnnotation$Adapt`; `candidate` (built moments earlier by `Adapt.values()`, called from `AnnotatedElementUtils`/`AnnotatedTypeMetadata` processing the SAME fork-loaded `ImportHttpServices`/`Import` classes) is the **fork-loader's** copy. Two distinct, non-identical `Class` objects for the same-named nested enum, silently mixed within one logical operation — so `Adapt.CLASS_TO_STRING.isIn(adaptations)` returns `false` even though `classValuesAsString=true` was correctly threaded all the way down. `getTypeForMapOptions` then picks `Object.class` instead of `String[].class`, `getAdaptType`'s `type==Object.class` branch resolves the target type from `attribute.getReturnType()` directly (bypassing the `Class[]`→`String[]` conversion branch entirely), and the RAW `Class[]` (well-formed, correct, 1-element) ends up stored in the attributes map under `"value"` untouched — which is what `ConfigurationClassParser$SourceClass.getAnnotationAttributes`'s `(String[]) annotationAttributes.get(attribute)` then fails to cast.
+
+      *(Note: the exact `java.lang.Class cannot be cast to [Ljava.lang.String;` — singular `Class`, not `[Ljava.lang.Class;` — wording comes from a DIFFERENT, single-attribute annotation elsewhere in the same `collectImports` recursion also hitting this same `Adapt.isIn()` bug on a scalar-`Class`-valued attribute, not from `Import.value()` itself degrading from array to scalar; the mechanism — `Adapt.CLASS_TO_STRING.isIn()` returning a false negative due to cross-loader identity — is the same either way and was confirmed via the `getTypeForMapOptions`/`adapt` traces to be the single failure point common to both call sites.)*
+
+      **CratonVM-side root cause, pinpointed**: `resolve_field_ref` (`vm/src/runtime/interpreter.rs`, backs `getstatic`/`getfield`/`putstatic`/`putfield`) resolves a field reference's OWNING CLASS via `lookup_loader_initiated(shared, current_class_id, &field_class_name)` (a loader-aware CACHE lookup only) and, on a miss, falls straight to the flat, loader-blind `shared.load_class_concurrent(&field_class_name)` — i.e. "whichever copy loaded first, globally, wins." This is a strictly weaker resolution than `resolve_class_loader_aware` (used for `CONSTANT_Class` references — `ldc`/`new`/`checkcast`/`instanceof` — same file), which on a `lookup_loader_initiated` miss additionally drives the REFERENCING class's own defining loader's `loadClass()` re-entrantly (`drive_defining_loader_load`) before falling back globally. Since `TypeMappedAnnotation` (executing the `getstatic Adapt.CLASS_TO_STRING`) is itself fork-loaded in this scenario but its `MergedAnnotation$Adapt` field-class resolution hits the weaker path, it silently binds to the application loader's (first-loaded, globally-cached) `Adapt` class instead of its own fork's — while `Adapt.values()` (a self-referential `getstatic` from WITHIN `Adapt`'s own bytecode, always trivially correct) resolves the fork's own `Adapt` — producing exactly the observed cross-loader mismatch.
+
+      **Fix attempted and REVERTED (unsafe): `resolve_field_ref_loader_aware`.** Added a second entry point mirroring `resolve_class_loader_aware`'s full two-tier resolution (extracted the field-lookup tail of `resolve_field_ref` into a shared `resolve_field_in_class` helper reused by both), wired it into the `Instruction::Getstatic`/`Instruction::Putstatic` opcode handlers only (the two sites with a `&mut JvmThread` available and no other call-site impact). **Rebuilt clean, but the fixed binary corrupts heap state on the very same repro**: `RESULT ... found=0 ... status=LOADERR`, with `ClassId(0)`/`class_name=java/lang/Object`/`real_field_count=Some(0)` out-of-bounds field warnings, `Stale pointer detected in invokevirtual receiver (... all-zero header)`, and a spurious `NoSuchMethodError: java/lang/Object.lambda$executeRecursively$5()V` — all symptoms of a GC-safety violation, reproduced identically on 2 separate runs. The unmodified baseline binary (same classpath, same `KRun` harness) is unaffected. Not root-caused further this session — best-supported hypothesis: `Instruction::Getstatic`/`Putstatic`'s dispatch loop does not currently expect a nested, potentially-GC-triggering Java call (`drive_defining_loader_load`'s re-entrant `ctx.invoke_virtual(loader_obj, "loadClass", ...)`) to happen THIS early/THIS often in ordinary field access — unlike `new`/`checkcast`, which are rarer and already tolerate a nested resolve — so some GC-root-publishing or safepoint invariant that the `CONSTANT_Class` opcodes already satisfy is being skipped for the field-opcode path. Reverted cleanly (`git checkout -- vm/src/runtime/interpreter.rs` in the worktree, no commit was made); zero risk to `dev`.
+
+      **Repro assets** (Azure host `20.83.144.174`, persisted, reusable — none of this needs to be regenerated): `/data/tmp/importhttpsvc-repro/` — `KRun.java`/`MethodRun.java`/`ImportProbe3.java` (drivers), `combined_cp.txt` (full spring-framework test-runtime classpath, `javac`/`java` argument-list-too-long on this classpath size — use `@run_args_clean.txt`-style `javac`/VM argfiles, NOT `-cp`/`CLASSPATH` directly, both blow past Linux's combined argv+envp limit), `patch-src/org/springframework/{core/annotation/{TypeMappedAnnotation,AnnotationTypeMapping,MergedAnnotation}.java,context/annotation/ConfigurationClassParser.java}` (instrumented copies, env-gated on `CV_TMA_TRACE`/`CV_CCP_TRACE`/`CV_ADAPT_TRACE`), `patch-out/` (compiled instrumented classes — prepend to classpath, ahead of `combined_cp.txt`, to reproduce the traces). Baseline (unfixed) binary: `/data/tmp/cratonvm-aotfix10-postmerge.bin`. My attempted-and-reverted fix's full diff (for reference, do not reapply as-is — it regresses): `/data/tmp/importhttpsvc-repro/adapt-fix.diff`.
+
+      **Next step for whoever picks this up**: the diagnosis is solid and the fix DIRECTION (make `getstatic`/`putstatic`'s field-owning-class resolution as loader-faithful as `CONSTANT_Class` resolution already is) is very likely correct — what's missing is making the re-entrant `loadClass()` invocation safe from inside the field-opcode fast path. Two directions worth trying: (a) find and satisfy whatever GC-safety precondition `resolve_class_loader_aware`'s existing callers (`ldc`/`new`/`checkcast`/`instanceof` opcode handlers) already establish before calling it, and replicate it in the `Getstatic`/`Putstatic` handlers; or (b) avoid the re-entrant call entirely — mirror the EXISTING, already-safe, non-reentrant `retarget_instance_field_to_receiver` pattern (same file) for STATIC fields: resolve the field the OLD (fast, safe) way first, then — only if the referencing class is user-loader-owned — do a purely in-memory, non-reentrant re-check against `class_manager`'s already-known loader→class registrations (no `loadClass()` invoke at all) and retarget if a same-named-but-different class is found for that loader, accepting that a genuinely cold (never-yet-resolved) case might still fall through uncorrected rather than risk unsafe re-entrancy.
 *   **STOMP Message Hang** (`web.socket.messaging.StompWebSocketIntegrationTests`)
-  *   **Status**: **OPEN** (TIMEOUT) — functional gap in STOMP routing/delivery, not a VM deadlock.
+  *   **Status**: **OPEN** (TIMEOUT) — NOT actually an infinite hang (2026-07-16 finding, see below); root-caused to a genuine networking defect, still unfixed.
+  *   **2026-07-16 update**: the class does not hang forever. Isolated to just the `sendMessageToController` sub-test (the other 7 `@ParameterizedWebSocketTest` methods commented out in a scratch copy) it finishes in ~30s with a normal FAIL, both parameterizations (`server=Jetty` and `server=Tomcat`, both `client=Standard`). Root cause: the client's very first write after the WS handshake -- the STOMP `CONNECT` frame -- gets a genuine OS-level EPIPE/"Broken pipe" (confirmed via `AsynchronousSocketChannel`'s real, non-synthetic Future-write path, `native-io/src/async_socket.rs::aio_asc_write_future`). Tomcat's own client-side `blockingSendTimeout` (default 20000ms) is what turns this into an assertion failure rather than a true hang -- 20s x 16 parameterizations (8 methods x 2 servers) in the full class comfortably exceeds the suite's 600s per-class ceiling, which is why it buckets as TIMEOUT. **This fully explains the TIMEOUT symptom without any VM-level concurrency bug** (the 2026-07-14 "hang" gdb snapshot below just caught the process mid-run on a live, correctly-timed wait; `LockSupport.parkNanos`/`parkUntil`'s timeout plumbing was re-audited and is correct).
+      A new opt-in diagnostic, `CRATONVM_DBG_SC_CLOSE=1` (`native-io/src/socket_channel.rs::sc_close`, commit `dd1cddec`, merged to `dev`), traced every real `SocketChannel.close()` with local/peer address + timestamp and correlated it against a millisecond-stamped client-side trace: **the embedded Tomcat/Jetty server closes its just-accepted connection within ~40ms-2s of completing the WS upgrade handshake**, for BOTH server backends, before the client's first post-handshake frame write. `SocketChannel.close()` belongs exclusively to the server-side servlet-container transport (the client uses a separate `AsynchronousSocketChannel` native module), so this unambiguously implicates the **server** side closing a just-upgraded connection -- most likely each container's standard HTTP/1.1 keep-alive/"must-close" determination (normally suppressed for a `101 Switching Protocols` hand-off) firing because CratonVM doesn't correctly preserve whatever signal Tomcat/Jetty rely on to recognize the connection was upgraded. No CratonVM-specific native code intercepts the JDK/Servlet upgrade APIs at all (`HttpUpgradeHandler`/`UpgradeToken`/`isUpgrade`: zero hits repo-wide), so the defect is in a lower-level primitive real Tomcat/Jetty bytecode depends on, not yet pinned to the exact call site. `WebSocketConfigurationTests`/`WebSocketHandshakeTests` (same base class, but neither writes a message right after the handshake) are unaffected, which narrows the trigger specifically to "write immediately after handshake."
+      **Not fixed** -- needs one more round of tracing (a Java-side stack capture at the moment of `sc_close`, e.g. via `NativeContext::thread_stack_trace` plumbed through to `native-io`, or a `Filter`/interceptor-based capture from the Java side) to find the exact Tomcat/Jetty call site issuing the premature `close()`. Full writeup: `docs/known-issues/CRATONVM-SPRING-TIMEOUT-CLUSTER-1500S-RERUN.md`'s "2026-07-16 follow-up" section.
 
 ---
 
@@ -149,11 +190,11 @@ the WRONG same-named copy. Eight fixes landed on
 | `PersistenceManagedTypesBeanRegistrationAotProcessorTests` | FAIL | FAIL 2/0 (host lacks JDK 24+, see below — not a VM bug) |
 | `TestClassScannerTests` | TIMEOUT 600 s | **completes 177 s** (7/7 or flaky 7/6) |
 | `TestCompilerTests` | TIMEOUT 600 s+ | **completes 40 s**, FAIL 22/21/1 (3 of 4 fixed) |
-| `ApplicationContextAotGeneratorTests` | ABEND (CGLIB load) | discovers+runs 40 methods (see residuals) |
+| `ApplicationContextAotGeneratorTests` | ABEND (CGLIB load) | **2026-07-16 re-triage: LOADERR found=0** — NEW GC heap-corruption bug, see below (regresses the earlier "discovers+runs 40 methods" note, which was never characterized) |
 | `BeanDefinitionMethodGeneratorTests` | FAIL 34/3 | **OK 34/34** |
 | `ConfigurationClassPostProcessorAotContributionTests` | FAIL 20/8 | **OK-ish 20/15/5** (5 residual = host ClassFile gap, see below) |
 | `PersistenceAnnotationBeanPostProcessorAotContributionTests` | FAIL 8/0 (NCDFE) | FAIL 8/2/6 (Mockito attach residuals) |
-| `TestContextAotGeneratorIntegrationTests` | FAIL 4/0 @393 s | (see residuals) |
+| `TestContextAotGeneratorIntegrationTests` | FAIL 4/0 @393 s | **2026-07-16 re-triage: FAIL 4/0 @8.3 s** (was a genuine ~393 s slowdown, now fast; 4 distinct root causes, see below) |
 | `BeanRegistrationsAotContributionTests` | TIMEOUT | TIMEOUT (throughput, see below) |
 
 ### Remaining OPEN residuals in the AOT cluster
@@ -369,6 +410,154 @@ the WRONG same-named copy. Eight fixes landed on
     `PersistenceAnnotationBeanPostProcessorAotContributionTests` ByteBuddy
     `NoSuchMethodError` family (confirmed unaffected, still 8/2/6 after this
     fix); that remains open and unrelated.
+
+*   **`ApplicationContextAotGeneratorTests` and `TestContextAotGeneratorIntegrationTests`
+    — 2026-07-16 dedicated re-triage (post loader-identity-fix wave).** These two were
+    the only two of the original 9-class AOT hang cluster never individually
+    re-characterized after `fix/spring-aot-cluster-20260715` landed. Fresh
+    build, dev tip `6c517cd9`, worktree `/data/data/wt-aotgen-triage-20260716-141727`
+    on the Azure host, real JDK 25 (`~/jdk25`), `CRATONVM_DEFAULT_HEAP_MAX_MB=2048`,
+    900s+ ceilings, `KRun` single-class launcher (module testcp).
+
+    **`ApplicationContextAotGeneratorTests` — NEW, OPEN, genuine GC/heap-corruption
+    bug. Status: `LOADERR found=0/succ=0/fail=0` at 30-95 s (never even reaches test
+    discovery)**, not the "discovers+runs 40 methods" the table previously implied
+    (that note was never substantiated — this re-triage shows it does not hold on
+    current dev). HotSpot baseline (already on file): **40/40 OK, 155.9 s**.
+
+    100% reproducible across every configuration tried (4/4 runs, identical
+    signature every time):
+    - default (JIT on, 2048 MB heap) — LOADERR at ms=42593
+    - `CRATONVM_DBG_STALE_OBJREF=1` (JIT on, 2048 MB) — LOADERR at ms=30318,
+      **the assertion never fires** (see below)
+    - `--nojit` (interpreter-only, 2048 MB) — **identical** LOADERR at ms=30318,
+      same objects, same classes
+    - 8192 MB heap (JIT on) — **identical** LOADERR, just later (ms=95522, more
+      allocation needed before the triggering GC cycle)
+
+    Symptom: a burst of `cratonvm::gc::guard` "out-of-bounds field read/write
+    dropped" warnings (`class_id=ClassId(0) class_name=java/lang/Object
+    real_field_count=Some(0)` — the classic all-zero-header signature) followed by
+    `cratonvm_vm::runtime::interpreter: Stale pointer detected in invokevirtual
+    receiver (ptr=…, all-zero header) — falling back to CP class …`, hitting
+    **several unrelated JUnit Platform / javac internals almost simultaneously**
+    (sub-millisecond apart): `org/junit/platform/engine/support/hierarchical/
+    ThrowableCollector`, `…HierarchicalTestExecutorService`, `org/junit/platform/
+    launcher/core/OutcomeDelayingEngineExecutionListener`, `org/junit/platform/
+    engine/support/store/NamespacedHierarchicalStore`, and (under `--nojit`, where
+    the corrupted set is even larger) `com/sun/tools/javac/main/JavaCompiler`,
+    `com/sun/tools/javac/api/JavacTaskImpl`, `java/lang/String`,
+    `org/junit/jupiter/engine/execution/JupiterEngineExecutionContext`. The
+    cascade always ends the same way: a `NoSuchMethodError` on
+    `java/lang/Object.lambda$executeRecursively$5()V` (a zeroed object dispatched
+    as bare `Object`), then the launcher itself LOADERRs with `Cannot invoke
+    "EngineExecutionListener.executionStarted(TestDescriptor)" because
+    "this.delegate" is null`.
+
+    **Ruled out** (both are real, already-fixed mechanisms in this exact bug
+    family, confirmed NOT the cause here):
+    - The June `spring-bug-10` "GC root-undercount race" (RESOLVED 2026-06-21 via
+      default-on precise JIT oop maps + pin-aware shadow reload) was specifically
+      a *JIT shadow-stack register-root* bug. Ruled out because this reproduces
+      **identically under `--nojit`** (pure interpreter, no JIT frames, no shadow
+      stack involved at all).
+    - The 2026-07-16 `stream-arraylist-gc-pressure-heap-corruption` fix (commit
+      `1c4aaa06`, already an ancestor of this build) closed a *card-table
+      old-to-young / terminal-worker-barrier / lazy-Stream-rooting* gap
+      specific to `ArrayList`/`Stream`. Ruled out because (a) that fix is
+      already in this build's history and the bug still reproduces, and (b) the
+      corrupted objects here are JUnit-Platform/javac internals, not
+      `ArrayList`/`Stream`.
+    - Simple heap pressure: ruled out by the 8192 MB run reproducing identically
+      (just later).
+
+    `CRATONVM_DBG_STALE_OBJREF=1` **not firing** is itself a data point: the
+    corruption's mechanism reaches the interpreter's invokevirtual-receiver
+    fallback without tripping that assertion's checkpoint, so whatever zeroes
+    these objects is either outside the paths that assertion instruments, or the
+    forwarding/quarantine record is already gone by the time of the bad read
+    (the same ambiguity the stream-arraylist doc's original investigation
+    flagged for its own unfixed residual). Given TestCompiler's in-process real
+    javac shows up in the corrupted set, and the timing (a tight several-millisecond
+    burst hitting many unrelated classes at once, consistent with a whole
+    region/arena being invalidated rather than one stale object), the most
+    promising next-step hypothesis is a GC cycle firing during/immediately after
+    in-process javac's own heavy allocation that fails to root live JUnit-engine
+    objects on the calling thread — but this needs the same kind of dedicated,
+    instrumented investigation (hardware watchpoints, `CRATONVM_DBG_SHADOW*`-style
+    tracing) that closed `spring-bug-10`, which is out of scope for this triage
+    session. **Not fixed.** Repro is 100% reliable with a single `KRun` invocation
+    of this class alone, real JDK 25, any heap size — no batching or multi-class
+    load needed, which should make this considerably easier to bisect than
+    `spring-bug-10` was.
+
+    **`TestContextAotGeneratorIntegrationTests` — genuine improvement, still
+    4/4 FAIL, 4 distinct causes, none newly fixed this session.** The doc's old
+    "FAIL 4/0 @393 s" data point is stale on two counts: it now completes in
+    **8.3 s** (the loader-identity fix wave clearly helped enormously — this was
+    a Bucket-1 "still hangs" class as recently as 2026-07-13), and re-running with
+    `KRUN_STACK=1` shows the 4 failures have 4 unrelated causes:
+    1. `processAheadOfTimeWithWebTests` — `ClassCastException: java.lang.Class
+       cannot be cast to [Ljava.lang.String;`, same signature (same exception
+       type, same shape) as the **already-tracked, already deeply-investigated,
+       still-OPEN** `web.service.registry.ImportHttpServiceRegistrarTests`
+       residual documented above (§1: narrowed to Spring's own
+       `AnnotationTypeMapping.getMappedAnnotationValue`, NOT CratonVM's
+       annotation/reflection layer). Attribution only — not re-investigated or
+       re-fixed here; see that entry for the full root-cause narrative.
+    2. `processAheadOfTimeWithXmlTests` — `ExceptionInInitializerError` from
+       `GroovyBeanDefinitionReader.<init>` caused by `ArrayStoreException:
+       arraycopy: source element at index 1 is not assignable to destination
+       component type` inside `groovy/lang/GroovySystem`'s `<clinit>`. This is
+       **NOT** the already-fixed `GroovySystem.<clinit>` NPE (`docs/internal/
+       spring/spring-boot-groovy-indy-mockito-mock-dispatch.md`, a `Module`
+       descriptor-null issue) — different exception type, different mechanism.
+       Newly observed; not investigated further (no known attribution) — needs
+       its own session.
+    3. `processAheadOfTimeWithBasicTests` (`BasicSpringJupiterTests$NestedTests`)
+       — `org.yaml.snakeyaml.parser.ParserException: while parsing a block node …
+       expected the node content, but found '<block mapping start>'` reading
+       `test1.yaml` (`test1:\n  prop: yaml\n`, 20 bytes). **Ruled out raw
+       resource-stream truncation**: a standalone probe
+       (`YamlProbe.java`, `getResourceAsStream().readAllBytes()` on the exact
+       same classpath resource) returns **byte-identical** content (`len=20`,
+       identical byte array) under CratonVM and HotSpot side by side — so the
+       underlying classpath-resource I/O is correct. The divergence must be
+       further up Spring's own read path (`Resource.consumeContent` →
+       `YamlProcessor.process` → SnakeYAML's `Yaml$1.next`/`Composer`/
+       `ParserImpl`), specifically in the `@CompileWithForkedClassLoader`/AOT
+       context-loading path used only by this `$NestedTests` case (the sibling
+       `WebTests`/`XmlTests` are top-level classes; this is the only `$Nested`
+       one of the three). Leading unconfirmed hypothesis: the forked/dynamic
+       classloader's resource resolution returns a stream whose read position
+       has already been advanced by an earlier partial read (e.g. an AOT
+       hint-scanning pass or a `Resource.exists()`/existence probe that doesn't
+       get a fresh stream) — but this is not confirmed; needs tracing which
+       exact `Resource`/stream object SnakeYAML actually receives. Newly
+       observed; not fixed.
+    4. `endToEndTests` — `ClassCastException:
+       org.springframework.test.context.hint.StandardTestRuntimeHints cannot be
+       cast to org.springframework.test.context.aot.TestRuntimeHintsRegistrar`,
+       thrown from the checkcast JIT/interp inserts inside
+       `TestContextAotGenerator.processAheadOfTime`'s
+       `this.testRuntimeHintsRegistrars.forEach(registrar -> …)` lambda. Same
+       *family* as this doc's whole loader-identity fix wave (a same-named class
+       loaded/resolved through two different loaders fails an
+       `instanceof`/checkcast), but a **NEW site**: `TestRuntimeHintsRegistrar`
+       instances are discovered via Spring's own `AotServices.factories().load(…)`
+       SPI (constructor of `TestContextAotGenerator`, not `java.util.ServiceLoader`
+       and not any of the 8 previously-fixed sites — `LambdaCallSite`,
+       `loader_namespace_id`, field/method/parameter annotation types,
+       `appendToBootstrapClassLoaderSearch`, `defineClass1`, `Class.forName`
+       reroute, JVMS 5.3 chain-scoping). Not fixed this session (would need the
+       same kind of targeted loader-aware-resolution audit as the earlier 8
+       fixes, applied to `AotServices`'s reflective instantiation/cast path —
+       out of scope for this triage's remaining budget).
+
+    None of the 4 `TestContextAotGeneratorIntegrationTests` failures are fixed
+    in this session; #1 is attributed to an existing tracked residual, #2–#4 are
+    newly characterized and documented for a future session. No regressions
+    were introduced (no code changes were made to the VM in this triage).
 
 ---
 

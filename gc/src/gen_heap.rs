@@ -3617,6 +3617,21 @@ impl GenerationalHeap {
             // SAFETY: moving young space is bump-allocated contiguously; the
             // cursor always advances by a validated object extent.
             let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            // Skip a GAP-filler sentinel (Bug-D, 2026-06-12): its on-disk
+            // layout is NOT a real ObjectHeader (offset 4 holds the raw gap
+            // length, not header fields), so it must never reach
+            // gen_object_total_size — see the established pattern at the
+            // non-moving sweep's identical walk below.
+            if header.class_id.as_u32() == crate::tlab::GAP_FILLER_CLASS_ID.as_u32() {
+                // SAFETY: offset 4 lies within the >=8-byte gap.
+                let gap = unsafe { std::ptr::read((obj_ptr as *const u8).add(4) as *const u32) } as usize;
+                if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && young_cursor + gap <= young_used {
+                    young_cursor += gap;
+                    continue;
+                }
+                tracing::warn!(young_cursor, young_used, "GC: young object-start walk found an implausible GAP-filler sentinel");
+                break;
+            }
             let size = gen_object_total_size(header);
             if size < HEADER_SIZE || young_cursor.checked_add(size).is_none_or(|end| end > young_used) {
                 tracing::warn!(young_cursor, young_used, "GC: young object-start walk stopped at an implausible extent");
@@ -4622,6 +4637,21 @@ impl GenerationalHeap {
             // SAFETY: free/TLAB ranges were skipped; this cursor is on an
             // allocator-written object boundary in the young arena.
             let header = unsafe { &*(ptr as *const ObjectHeader) };
+            // Skip a GAP-filler sentinel (Bug-D, 2026-06-12) before treating
+            // this as a normal header — its layout overlays a raw gap length
+            // at offset 4, not real header fields (see the established
+            // pattern elsewhere in this file, e.g. the selective-promotion
+            // walk above).
+            if header.class_id.as_u32() == crate::tlab::GAP_FILLER_CLASS_ID.as_u32() {
+                // SAFETY: offset 4 lies within the >=8-byte gap.
+                let gap = unsafe { std::ptr::read((ptr as *const u8).add(4) as *const u32) } as usize;
+                if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && exact_cursor + gap <= young_from.used() {
+                    exact_cursor += gap;
+                    continue;
+                }
+                tracing::warn!(exact_cursor, "GC: exact young-object walk found an implausible GAP-filler sentinel");
+                break;
+            }
             let total = gen_object_total_size(header);
             if total < HEADER_SIZE
                 || exact_cursor

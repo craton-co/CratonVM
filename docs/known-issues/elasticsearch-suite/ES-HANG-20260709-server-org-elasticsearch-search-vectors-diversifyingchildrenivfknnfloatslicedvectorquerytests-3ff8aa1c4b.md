@@ -1,3 +1,120 @@
+# 2026-07-16 continuation: root cause of the underlying corruption/hang FOUND and FIXED (`GAP_FILLER_CLASS_ID` young-GC exact-walk regression); `testSlicesDense` perf remains a separate, unchanged, OPEN issue
+
+**Status update: the correctness/hang mechanism behind this cluster's
+non-deterministic corruption and watchdog aborts is FIXED. `testSlicesDense`
+itself remains open, but ONLY as the pre-existing performance issue this
+doc already characterized (2026-07-13 section below) — not as a hang or a
+correctness bug.**
+
+Investigated in isolated worktree `/data/wt/wt-es-ivfknn-20260716` on the
+Azure host (`victor@20.83.144.174`), forked from `origin/dev` at `04e70345`
+(which already included the `fe76025e7` array-ctor-reference fix from the
+2026-07-13 section below, plus everything since — the STW-barrier redesign,
+`SynchronizedMethodGuard` stale-monitor fix, CHM pin fixes, and same-day
+sibling commit `1c4aaa06` "close stream ArrayList pressure corruption").
+
+## Re-baseline: `testSlicesSparseWithFilter` (the 2026-07-13 fix's own
+verification target) had REGRESSED back to a deterministic hang
+
+Re-running this doc's own 2026-07-13 confirmation recipe
+(`testSlicesSparseWithFilter`, same seed, direct invocation, JIT on)
+against fresh `origin/dev` hit the 90s watchdog **3/3**, preceded by a mass
+burst of `gen_heap::get_field` out-of-bounds / "Stale pointer detected...
+all-zero header" warnings across dozens of unrelated live objects
+(`java/lang/Thread`, `ArrayList`, `IndexWriter`, `IndexReader`, `List`, …) —
+reproduced identically under `--nojit`, so not JIT-specific. This is a
+**regression**, not the same bug this doc already tracks: the 2026-07-13 fix
+itself was not reverted, but a same-day sibling commit broke a different,
+adjacent mechanism.
+
+## Root cause: `1c4aaa06` ("fix(gc): close stream ArrayList pressure
+corruption", landed on `dev` hours before this session, fixing an unrelated,
+already-tracked bug) added two new "exact young-object walk" loops in
+`gc/src/gen_heap.rs` — one for the moving-young path
+(`young_object_starts`), one for the non-moving sweep
+(`young_object_ranges`) — to build a precise object-start set so
+conservative root candidates can't corrupt the wrong slot. **Neither new
+loop special-cased the `GAP_FILLER_CLASS_ID` TLAB-tail sentinel** (Bug-D,
+2026-06-12), an established pattern already handled correctly at 7 other
+call sites in the same file (e.g. the selective-promotion walk, `~line
+5243`). A `GAP_FILLER_CLASS_ID` sentinel's on-disk layout is NOT a real
+`ObjectHeader` — offset 4 holds the raw gap length, not header fields — so
+feeding it straight into `gen_object_total_size` (as both new loops did)
+misparses it as either a size that overshoots the arena or an implausible
+`total < HEADER_SIZE`, and the loop **`break`s early**, permanently. Every
+object allocated *after* that point in address order then falls outside the
+exact set: `mark_young`'s binary-search lookup returns `None` for genuinely
+live objects located past the break, so the non-moving sweep reclaims them
+as garbage — mass corruption of live, in-use objects across every class
+that happened to be allocated after whichever thread's retired TLAB tail
+the walk stumbled on first. This exactly explains the doc's
+long-standing, previously-"believed-benign" observation of
+`gen_heap::get_field` OOB WARN bursts firing in a tight cluster and then
+stopping (the corruption event itself is a single, brief burst at GC time —
+what happens *afterward*, when other threads dereference the now-garbage
+addresses, is the mass "stale pointer / all-zero header" cascade and the
+eventual deadlock/timeout).
+
+**Fixed**: both new exact-walk loops now check
+`header.class_id.as_u32() == GAP_FILLER_CLASS_ID.as_u32()` before calling
+`gen_object_total_size`, read the sentinel's raw gap length from offset 4,
+and skip over it — mirroring the established pattern used elsewhere in this
+file. Branch `fix/es-ivfknn-hang-20260716`, worktree
+`/data/wt/wt-es-ivfknn-20260716`, binary
+`/data/wt/target-es-ivfknn-20260716/release/cratonvm-es-ivfknn-20260716-fix1`.
+
+## Verification
+
+- `testSlicesSparseWithFilter`: 0/3 corruption bursts post-fix (was 3/3
+  pre-fix); passes cleanly (`OK (1 test)`, ~147s under host contention, 300s
+  watchdog, zero `implausible extent`/`GAP-filler sentinel`/`Stale pointer`
+  warnings).
+- **`testRandomWithFilter`** (the sibling
+  [IVFKnnFloatVectorQueryTests doc](../../internal/fixed-suite-bugs/ES-HANG-20260709-server-org-elasticsearch-search-vectors-ivfknnfloatvectorquerytests-565afb965e-FIXED.md)'s
+  own hang target): now passes cleanly **4/4** (~20-22s each, zero
+  corruption warnings) — see that doc for the full write-up; it is being
+  marked FIXED and moved to `docs/internal/fixed-suite-bugs/`.
+- `testSlicesDense` (this doc's original 2026-07-09 subject): **still hits
+  a long watchdog** (700s and 1800s both tried) with **zero** GAP-filler/
+  implausible-extent warnings — this fix does not touch it. The only WARN
+  burst observed is the same `class_id=ClassId(0) num_slots=0
+  java/lang/Object` shape the 2026-07-09 original report already flagged
+  and already characterized as believed-benign speculative probing (fires
+  once, early, then the process keeps running); consistent with the
+  2026-07-13 section below's conclusion that `testSlicesDense`'s slowness is
+  a genuine CratonVM interpreter/JIT throughput characteristic on this
+  reflection/exception-handling-heavy path, not a hang or a data-corruption
+  bug. **Unchanged status: still a performance investigation, not a
+  correctness one** — see that section for the still-valid guidance for
+  whoever picks this up next.
+
+## Not the same mechanism as the GC audit's finding 1(b)
+
+Before finding the actual cause above, this looked like a strong candidate
+match for
+[`docs/internal/gc-audit-2026-07-10-open-findings.md`](../../internal/gc-audit-2026-07-10-open-findings.md)
+finding 1(b) (the monitor-vs-evacuation / missed-marking-root residual that
+doc's own text cross-references this exact cluster against). It is not:
+finding 1(b)'s own forensics (the `[MONEXIT-IMSE]` capture, the
+`InetAddressRandomBinaryDocValuesRangeQueryTests` repro) point at a
+different, still-unresolved missed-root mechanism on a **different** test
+class, unaffected by this fix (not re-verified here — out of scope for this
+doc). This cluster's hang had a much simpler, freshly-introduced cause (a
+same-day regression, not a long-standing race) that happened to produce a
+superficially similar symptom (the same `gen_heap::get_field` OOB WARN
+family). Do not treat this fix as closing finding 1(b) generally.
+
+## New, separate finding while re-verifying (not this doc's concern)
+
+Running the sibling doc's full test class (not just the single named
+method) surfaced an unrelated, previously-undocumented failure,
+`testMergeAwayAllValues` (a real `posix_madvise` `EINVAL` via the Panama FFI
+downcall path — confirmed absent on real HotSpot, so a genuine CratonVM
+bug, but in a completely different subsystem). Filed separately:
+[`ES-FAIL-20260716-testMergeAwayAllValues-posix-madvise-einval.md`](ES-FAIL-20260716-testMergeAwayAllValues-posix-madvise-einval.md).
+
+---
+
 # 2026-07-13 follow-up: array-constructor-reference lambda bug found + fixed
 # (real, verified, but NOT yet confirmed as this doc's residual root cause)
 
