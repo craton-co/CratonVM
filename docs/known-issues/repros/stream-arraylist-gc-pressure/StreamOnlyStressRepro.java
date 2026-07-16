@@ -6,7 +6,7 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
- * Reconstructed repro for docs/known-issues/stream-arraylist-gc-pressure-heap-corruption.md.
+ * Reconstructed repro for docs/internal/fixed-suite-bugs/stream-arraylist-gc-pressure-heap-corruption-FIXED.md.
  * 24 threads x 3000 iterations; each iteration builds a fresh 30-element ArrayList<P> then:
  *   1) particles.stream().map(alloc).flatMap(alloc -> Stream.of(3 strings)).collect(toUnmodifiableList())
  *      -- expects size 90 (30 * 3); a size mismatch throws IllegalStateException("bad size N").
