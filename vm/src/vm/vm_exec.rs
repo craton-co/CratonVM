@@ -4615,7 +4615,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             MethodHandleKind::from_tag(impl_ref_kind).unwrap_or(MethodHandleKind::InvokeStatic);
         let proxy_class_id = self.shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
-                functional_interface_id: None,
+            functional_interface_id: None,
             functional_interface: Arc::from(functional_interface),
             sam_method_name: Arc::from(sam_method_name),
             sam_descriptor: Arc::from(sam_descriptor),
@@ -6963,8 +6963,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // Lambda dispatch: read captured values from proxy fields, then
             // prepend them to the invocation args.
             let num_captures = lcs.capture_types.len();
-            let mut full_args: Vec<Value> =
-                Vec::with_capacity(num_captures + refreshed_args.len());
+            let mut full_args: Vec<Value> = Vec::with_capacity(num_captures + refreshed_args.len());
             for i in 0..num_captures {
                 full_args.push(self.shared.heap.get_field(receiver, i));
             }
@@ -14292,6 +14291,11 @@ fn invoke_on_class_shared_inner(
                         // registered native stores count in a synthetic holder
                         // and waits on the object monitor. Keep this slow-path
                         // gate in sync with force_native_over_real_jdk_bytecode.
+                        || crate::runtime::interpreter::is_undertow_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
                         || crate::runtime::interpreter::is_count_down_latch_native_override(
                             class_name,
                             method_name,
