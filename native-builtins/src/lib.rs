@@ -39353,8 +39353,26 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     );
     registry.register("java/lang/Thread", "start0", "()V", native_thread_start0);
     registry.register("java/lang/Thread", "start", "()V", native_thread_start0);
-    registry.register("java/lang/Thread", "getId", "()J", |_, _| {
-        Ok(Some(Value::Long(1)))
+    // Real bug fix (2026-07-16, ClientHttpConnectorTests okio.Segment
+    // ClassCastException investigation): `getId()` was hardcoded to always
+    // return `1` for EVERY thread in the process. Okio's `SegmentPool`
+    // (okio-jvm 3.x) shards its free-list into `HASH_BUCKET_COUNT`
+    // `AtomicReference<Segment>` buckets, selecting one via
+    // `Thread.currentThread().getId() & (HASH_BUCKET_COUNT - 1)` --
+    // with every thread hashing to the identical bucket, ALL of the
+    // process's segment-pool traffic (every socket read/write across every
+    // connection) collapsed onto one shared `AtomicReference`, producing
+    // extreme contention that exposed a race and surfaced as
+    // `ClassCastException: java.lang.Object cannot be cast to okio.Segment`
+    // at `SegmentPool.take()` (a `getAndSet` racing to return a value that
+    // was neither the expected `Segment`/`null`/the `LOCK` sentinel).
+    // `Thread.threadId()` (JDK 19+, `phases_late.rs`) already does this
+    // correctly via `ctx.thread_id()` -- mirror that exact pattern here so
+    // the legacy, still-widely-called `getId()` returns a real per-thread
+    // identity instead of a constant. `.max(1)` matches `threadId()`'s own
+    // "avoid returning 0 before a positive VM thread id is assigned" guard.
+    registry.register("java/lang/Thread", "getId", "()J", |ctx, _| {
+        Ok(Some(Value::Long(ctx.thread_id().max(1) as i64)))
     });
     // Thread.getState() and Thread.threadState() both return Thread$State.
     // In JDK 25, getState() delegates to threadState() which reads
