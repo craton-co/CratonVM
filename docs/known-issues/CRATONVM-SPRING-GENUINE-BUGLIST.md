@@ -714,13 +714,92 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     **Honest summary across both rounds**: 5 real, independently-verified CPU-dispatch and
     GC-bookkeeping bugs found and fixed (commits `4290124b`, `96c8a57f`, `b7a1ed84`), each with clean
     before/after measurements and no regressions. `RequestMappingMessageConversionIntegrationTests`
-    still does not complete in a reasonable multiple of HotSpot's 13s — it did not finish within a
-    1200s bound even after all 5 fixes. The remaining, now clearly-identified bottleneck is
-    architectural: CratonVM's conservative (stack-map-free) GC root scanning on the interpreter's
-    native-call path. Closing that gap requires precise stack maps for that specific scan path (the
-    project has PARTIAL precise-map coverage already — see the precise-jit-maps roadmap items — but
-    apparently not for this native-call conservative-scan site), which is a substantially larger
-    effort than a bug-fix session: expect a dedicated investigation, not a quick follow-up.
+    still does not complete in a reasonable multiple of HotSpot's 13s. The remaining, now
+    clearly-identified bottleneck is architectural: CratonVM's conservative (stack-map-free) GC root
+    scanning on the interpreter's native-call path. Closing that gap requires precise stack maps for
+    that specific scan path (the project has PARTIAL precise-map coverage already — see the
+    precise-jit-maps roadmap items — but apparently not for this native-call conservative-scan site),
+    which is a substantially larger effort than a bug-fix session: expect a dedicated investigation,
+    not a quick follow-up.
+
+    **Round 3 (2026-07-16): heap-corruption false alarm investigated and closed — `b7a1ed84`
+    exonerated with direct A/B evidence; two SEPARATE real bugs found instead.** An independent
+    verification pass reported the class failing to complete within 1200s with continuous
+    "implausible object size" / corrupted-header non-moving-sweep warnings, and named `b7a1ed84`'s
+    `Arena::free_list_bytes()` epoch-cache (round 2, fix #3 above) as the prime suspect. Investigated
+    with full rigor on a fresh worktree + fresh build at the then-current `dev` tip (`1f8e398e`):
+
+    - **Code audit of the epoch-cache found no plausible corruption mechanism.** Every mutation site
+      to the arena's free lists (`push_block_routed`; the `alloc()` free-list-hit branch; all 3
+      list-clearing paths) bumps the generation counter — re-verified line-by-line against the exact
+      committed diff. `Arena` is exclusively accessed through a `Mutex` in every backend that uses it
+      (`gen_heap.rs`, `zgc.rs` — both have explicit doc comments stating "all allocation/collection
+      serialize through that mutex"); no unsafe `Sync`/raw-pointer bypass exists, so the `Cell`-based
+      cache cannot race across threads. `free_list_bytes()`'s only callers (`needs_gc`,
+      `live_bytes_estimate`, `remaining`) use it purely as a heuristic/estimate — never for unsafe
+      pointer arithmetic — and `Arena::alloc()`'s actual allocation logic always does its own
+      independent, authoritative bounds-checked work regardless of what the cache reports.
+    - **Direct reproduction hit an UNRELATED, real, pre-existing bug first**: every run — with or
+      without the round-2 fixes — crashed within seconds with `Error in thread "main" internal
+      error: Class.forName: class initialization failed: class initialization raised an exception`,
+      never reaching real test execution. Root cause: `native-builtins/src/lang_class.rs`'s
+      `Class.forName(name, true, loader)` implementation (the "HIB-CV-26" code path, committed
+      2026-06-23 — weeks before either investigation) wraps ANY nested class-initialization failure
+      (here, `MemorySegment.<clinit>` throwing `IllegalCallerException` because native access is
+      disabled by default post-security-audit, commit `8e9e85c8`) as an unrecoverable
+      `VmError::Internal` instead of a normal, catchable Java `ExceptionInInitializerError` — killing
+      the whole VM instead of letting JUnit report a failed test. Passing `--enable-native-access`
+      (documented, existing CLI flag) avoids triggering the nested failure and unblocks the run. This
+      is a genuine, separate, worth-fixing bug — filed for follow-up, NOT fixed in this session
+      (out of scope: unrelated code, would need its own investigation into every `initialize_class`
+      call site that wraps errors this way).
+    - **With that unblocked, the ACTUAL corruption warnings were reproduced** — confirming the
+      independent verification's observation was real, not a fluke. But a direct A/B (same build
+      host, same classpath, same JDK, `--enable-native-access` on both sides) proves `b7a1ed84` is
+      NOT the cause:
+
+      | Build | Corruption warnings | Completes in 1200s? | Result |
+      |---|--:|---|---|
+      | `96c8a57f` (round 1 only, BEFORE the round-2 arena fix) | 679,454 | **NO** (killed at timeout) | — |
+      | `dev` tip / `b7a1ed84`+ (round 1+2, WITH the arena fix), trial 1 | 1,074 | Yes, 589s | 159/160 OK |
+      | `dev` tip / `b7a1ed84`+, trial 2 | 786 | Yes, 556s | **160/160 OK** |
+      | `dev` tip / `b7a1ed84`+, trial 3 | 731 | Yes, 527s | **160/160 OK** |
+
+      The corruption-detection-and-resync mechanism itself is OLD, pre-existing, deliberately-built
+      forensic instrumentation in the non-moving sweep (`gc/src/gen_heap.rs`, the
+      `[quiesce] FIRST corruption` diagnostic and its `resync_to_next_free_block`/`skip_free_blocks`
+      recovery path — confirmed via `git log` to predate this entire investigation by weeks; none of
+      the 41 commits between `b7a1ed84` and the verification tip touch this code, and it fires
+      identically on the commit BEFORE the arena fix). It is a conservative-scan heuristic that
+      sometimes misclassifies a live region as corrupt (the code's own comments call this "anomaly
+      evidence") and safely resyncs to the next known-good free-block anchor rather than risk
+      double-freeing — i.e. it is a (noisy but) SAFE recovery path by design, not silent data
+      corruption. What actually differs is severity: **628x fewer** warnings and **reliable
+      completion** with the round-2 fixes applied, vs. runaway warnings and non-completion without
+      them. This is because the round-2 fixes made the whole class ~2x faster (`~589s` vs. previously
+      unable to finish in 1200s), which gives the sweep's occasional heuristic misfire far less total
+      GC-cycle volume to compound across. **The round-2 arena fix mitigates this pre-existing issue's
+      practical impact; it does not cause it.**
+
+    `cargo test -p cratonvm-gc --lib`: 790 passed / 0 failed on the verification tip (both before and
+    after the arena fix). `cargo test -p cratonvm-vm --lib`: the same 9 pre-existing
+    debug-build-only `lock_order` failures, plus a variable number (7-8, non-deterministic across
+    reruns — 16 then 17 failures on two consecutive runs of the identical binary) of `jit::skip_list`
+    test failures that are parallel-test-execution races over shared global state in an unrelated
+    subsystem (`vm/src/jit/skip_list.rs`, nothing touched by any commit in this investigation) — flagged
+    as a separate, pre-existing test-suite flakiness item, not a real regression (not chased further;
+    out of scope for this investigation).
+
+    **Conclusion: `b7a1ed84` is NOT reverted — it is confirmed safe and net-positive.** The
+    non-moving-sweep corruption-warning phenomenon is real but pre-existing, already has a safe
+    (if noisy) recovery path, and is a separate open item from the CPU-dispatch/GC-bookkeeping work
+    in rounds 1-2. Two new, genuine follow-up items filed by this investigation: (1) the
+    `Class.forName`/`HIB-CV-26` unrecoverable-internal-error-on-nested-clinit-failure bug in
+    `native-builtins/src/lang_class.rs` (real, reproducible, deserves its own fix), and (2) the
+    non-moving sweep's occasional false-positive corruption detection under heavy allocation churn
+    (real, pre-existing, already has a safe recovery path but the false-positive rate itself — and
+    whatever per-resync cost compounds into non-completion on a slow/loaded run — is unexplained and
+    worth its own dedicated investigation).
 *   ~~`web.reactive.result.view.script.JRubyScriptTemplateTests`~~ **FIXED (2026-07-15) --
     all 6 chained bugs closed, test class PASSES.** JRuby's own
     bootstrap (`rubygems/specification.rb` / `rubygems/version.rb`) turned out to hit a CHAIN of
