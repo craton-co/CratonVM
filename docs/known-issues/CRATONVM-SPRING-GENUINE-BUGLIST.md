@@ -1046,6 +1046,107 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     is structurally scoped to JIT-compiled frames only, at GC-safepoint/JIT-frame-scan sites, and
     does not extend naturally to interpreter frames at native-call boundaries — a genuinely
     separate, larger piece of infrastructure).
+
+    **Round 5 (2026-07-16, same-day follow-up): perf tooling fixed, live-profiled the real test
+    class directly, root-caused PART of the regression — still not a confirmed win, still not
+    landed.** A follow-up request specifically asked to (1) try fixing `perf_event_paranoid`
+    rather than accepting it as a dead end, and (2) fall back to disassembly/size comparison if
+    perf still didn't cooperate. Both were tried, in that order, with real findings from each.
+
+    **Perf tooling**: `sudo sysctl kernel.perf_event_paranoid=-1` (authorized, tried first)
+    immediately unblocked `perf record` on this host — the earlier `sudo perf record` hang in
+    Round 4 was specifically because the kernel was still refusing the profiling syscalls
+    underneath `sudo`, not a `sudo`/`timeout` interaction bug. With that fixed, live-attached
+    `perf record -p <pid> -g --call-graph fp` was run against the ACTUAL
+    `RequestMappingMessageConversionIntegrationTests` process (launched via a from-scratch JUnit
+    launcher, `KRun.java`, against the real `spring-webflux` test classpath and
+    `--enable-native-access` to route around the unrelated HIB-CV-26 abort documented above),
+    attached ~65s into the run (past classloading/bootstrap, into steady-state Tomcat
+    start/stop/test cycling) for a 35s capture window — the same "attach live, mid-run" technique
+    the original Round-2 investigation used, this time reproduced directly rather than inferred.
+    (The earlier Round-4 measurements, by contrast, used an isolated `BootstrapRepro2.java`
+    micro-benchmark that turned out to be a poor proxy: profiled on its own, `is_object_address`
+    was only ~0.6% of its CPU and `update_root_snapshot` ~1%, nowhere near the real class's
+    profile shape — the noisy/contradictory BootstrapRepro2 numbers in Round 4 were mostly
+    measuring something else entirely. Live-attaching to the real class is the correct technique;
+    isolated micro-repros of this specific bottleneck should be treated with suspicion going
+    forward unless their own profile independently confirms `is_object_address` dominance.)
+
+    Live-attached baseline (`dev` `1f8e398e`) profile: `is_object_address` 9.82% self-time
+    (`GenerationalHeap` 7.22% + `VmHeap` wrapper 2.60%), `update_root_snapshot` 6.82% — both
+    meaningfully present, though not at the ~60% combined level the original live-profiling
+    session reported (plausibly a different point in the run, a longer/differently-shaped
+    capture, or JIT warm-up state; not fully reconciled).
+
+    The Round-4 implementation was rebuilt fresh in a new worktree (the original was deleted
+    mid-investigation) and re-profiled the same way: `is_object_address` INCREASED to 11.30%,
+    `update_root_snapshot` to 12.69% — confirming Round 4's regression finding was real, not an
+    artifact of the isolated repro, and reproducible via the correct live-attach technique too.
+
+    **Redesign attempt**: hypothesized the regression was the extra cross-module
+    `scan_object_refs_split` + `memory::roots::scan_stack_roots_boundary` call boundary (a
+    thread-local `RefCell` scratch buffer plus a closure) increasing `update_root_snapshot`'s
+    perceived cost and defeating an unrelated inlining decision. Redesigned to fold the entire
+    trusted/untrusted validation logic directly into `ValueStack::scan_object_refs` itself — no
+    new function, no cross-module call, no extra data structure. (Also simplified the
+    JNI-long-smuggle branch: since `is_object_address` is a strict superset check of
+    `is_heap_addr` — same alignment+region checks plus more — calling it alone reproduces the OLD
+    "is_heap_addr then external is_object_address boundary filter" net behavior exactly, in one
+    call instead of two.) Re-verified correctness with full rigor again: `cargo test -p
+    cratonvm-gc --lib` 790/0; `cargo test -p cratonvm-vm --lib` 2199/16 (same pre-existing flaky
+    set, zero new failures); `binarytrees` bt14/bt16/bt18 checksum oracle correct with zero
+    `CRATONVM_DBG_VERIFY_TRUSTED_ROOTS` mismatches on all three.
+
+    **Re-profiled live against the real class: the regression got WORSE, not better** —
+    `is_object_address` rose further to 14.60%, though `update_root_snapshot` improved somewhat
+    (12.69% → 10.98%). The redesign did not fix the core problem.
+
+    **Root cause, PARTIALLY found via `nm --size-sort` disassembly comparison** (the
+    coordinator's suggested fallback, tried after the redesign still didn't help): between
+    baseline and the modified binary, `Frame::scan_local_objects_inner` — a function untouched by
+    ANY of this investigation's code changes — grew from 761 bytes to 9,921 bytes (13x). Cross-
+    checking against the live profiles confirms why: `local_liveness::live_locals_mask`, a
+    separate symbol at 6.16% self-time in the baseline profile, is ABSENT ENTIRELY from the
+    modified binary's profile — it has been fully inlined into `scan_local_objects_inner`. This
+    is a real LLVM inlining-cascade side effect of fat-LTO + `codegen-units = 1` (this project's
+    release profile): changing `scan_object_refs` — called immediately after `scan_local_objects`
+    in every one of the four hot root-scanning call sites — altered the whole-program inliner's
+    cost/benefit calculus for an entirely unrelated neighboring call site. This part of the
+    "regression" looks mostly like a profile ATTRIBUTION change rather than a real slowdown: the
+    combined cost is comparable before and after (0.21% + 6.16% = 6.37% baseline vs. 5.92% after,
+    if anything slightly lower), and a rough throughput proxy — counting completed
+    Tomcat-server start/stop cycles (one per sub-test) in a matched ~101-second window across all
+    three binaries (baseline / first redesign / this redesign) — showed comparable progress (10
+    vs. 9 vs. 9 cycles), consistent with no large real end-to-end regression, though this is too
+    small a sample (9-10 data points) to confirm a genuine win either way.
+
+    **What remains UNEXPLAINED**: `is_object_address` itself — a distinct function, not merged
+    with anything else by the inlining cascade above — shows a real, consistent, and in fact
+    GROWING self-time percentage across every attempt (9.82% → 11.30% → 14.60%), which is the
+    opposite of what a change specifically designed to eliminate most calls to it should produce.
+    The backend was confirmed to genuinely be `GenerationalHeap` for this run (the profiled symbol
+    is literally `GenerationalHeap::is_object_address`, which cannot appear at all if a different
+    `VmHeap` backend were active), so the new fast path is provably engaging, not silently falling
+    through to the unchanged branch. Ran out of investigation time budget to pin this down further
+    — the next step would be a call-COUNT diagnostic (not just perf's time-based sampling) to
+    directly confirm whether the trusted-branch skip is reducing `is_object_address` call volume
+    by the expected amount, or whether some other call site (the JNI-smuggle branch's now-direct
+    `is_object_address` call, `scan_locals_conservative`, `scan_active_jit_frames`, or something
+    else entirely) is calling it more often than before for a reason unrelated to this change.
+
+    **Conclusion, updated**: perf access was successfully restored (a one-line `sysctl`, safe on
+    this dev host) and used for direct, live profiling of the real target test class — the
+    strongest evidence-gathering this investigation has had. A genuine partial root cause was
+    found and is well-supported (the LTO inlining-cascade attribution shift), but the central,
+    original question — does `is_object_address`'s actual cost go down as intended — is NOT
+    resolved, and the live data currently shows the opposite for that specific function. Per this
+    investigation's explicit mandate to attempt real root-causing but not over-invest indefinitely,
+    and given the stakes of touching GC-root-scanning code, this is STILL NOT merged into `dev`.
+    The redesigned, still-correctness-verified implementation (commit `145c13b4`, superseding the
+    original `faedea48`) remains on branch `fix/precise-native-scan-20260716` (pushed, unmerged)
+    for a future session with more time budget for IR/assembly-level LLVM inlining investigation,
+    or for a call-count-based diagnostic to isolate exactly which call site is responsible for
+    `is_object_address`'s unexplained growth.
 *   ~~`web.reactive.result.view.script.JRubyScriptTemplateTests`~~ **FIXED (2026-07-15) --
     all 6 chained bugs closed, test class PASSES.** JRuby's own
     bootstrap (`rubygems/specification.rb` / `rubygems/version.rb`) turned out to hit a CHAIN of
