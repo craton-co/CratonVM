@@ -5579,6 +5579,11 @@ pub fn execute(
                         // allocate `Box<JitPICSlot>` per
                         // polymorphic call site in `invoke_info`).
                         ldc_info_early,
+                        Vec::new(), // ldc_string_info -- BUILD FIX (2026-07-16):
+                        // this early-compile call site predates the
+                        // ldc_string_info parameter added elsewhere on dev;
+                        // this path doesn't collect string-constant JIT info,
+                        // matching the other Vec::new() placeholders above.
                         ldc2w_info_early,
                         std::collections::HashMap::new(), // branch_hints
                         std::collections::HashMap::new(), // loop_unroll_hints
@@ -28519,6 +28524,9 @@ fn compile_osr_artifact(
                 // this codepath emits the slow-path helper for
                 // every invokevirtual/invokeinterface.
                 ldc_info2,
+                Vec::new(), // ldc_string_info -- BUILD FIX (2026-07-16): this
+                // OSR-recompile call site predates the ldc_string_info
+                // parameter added elsewhere on dev; not collected here.
                 ldc2w_info2,
                 std::collections::HashMap::new(), // branch_hints
                 std::collections::HashMap::new(), // loop_unroll_hints
