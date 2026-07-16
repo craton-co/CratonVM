@@ -51,3 +51,25 @@ pub fn enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| std::env::var_os("CRATONVM_DBG_STALE_OBJREF").is_some())
 }
+
+/// Number of minor-GC cycles each just-evacuated young from-space arena is
+/// kept intact (its forwarding markers still readable) before its memory is
+/// reused, when [`enabled`] is set: `CRATONVM_DBG_STALE_OBJREF_CYCLES`,
+/// default 1 (the original single-arena behaviour). A stale `ObjectRef` read
+/// N cycles after its object moved only trips the [`enabled`] panic while
+/// the old arena is still quarantined; with the default single cycle, any
+/// read arriving two or more minor GCs late silently resolves to recycled
+/// memory instead (the exact gap observed in the WildFly
+/// `parallel-extension-add` CCE family, where the canary stayed silent while
+/// the wrong-object read still happened). Costs `N x young-semispace` bytes
+/// while the flag is set; ignored entirely when it is not.
+pub fn quarantine_cycles() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CRATONVM_DBG_STALE_OBJREF_CYCLES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(1)
+    })
+}
