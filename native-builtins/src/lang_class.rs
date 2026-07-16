@@ -8446,15 +8446,30 @@ pub(crate) fn native_class_get_declared_constructor(
 // ---------------------------------------------------------------------------
 
 /// Collect all public fields from the class hierarchy (this class +
-/// superclasses + interfaces). Mirrors `Class.privateGetPublicFields()`.
+/// superclasses + interfaces) and materialize them as a `Field[]` array.
+/// Mirrors `Class.privateGetPublicFields()`.
 ///
 /// Per JDK semantics: for an interface, the superclass walk is skipped
 /// (matches `collect_public_methods`).
+///
+/// GC-safety (2026-07-16): the hierarchy walk only accumulates plain
+/// `FieldMetadata` values (no GC objects, nothing a moving collector can
+/// invalidate). Object materialization happens in one final pass through
+/// `build_mirror_array`, which pins the destination array across every
+/// allocating `create_field_object` call. The previous version pushed
+/// freshly-created `ObjectRef`s straight into an ordinary (unrooted) `Vec`
+/// *during* the walk -- on a class with many public fields/properties (e.g.
+/// JAXB's `ClassInfoImpl` walking a Hibernate entity hierarchy), a GC
+/// triggered by the Nth `create_field_object` call could relocate/reclaim
+/// the first N-1 already-created Field mirrors, since that Vec was not a
+/// GC root. This is the exact residual gap flagged (but never swept) in
+/// `docs/internal/fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md`
+/// ("collect_public_fields/methods (getFields/getMethods Vec-build)").
 fn collect_public_fields(
     ctx: &mut dyn NativeContext,
     class_id: cratonvm_types::ClassId,
-) -> Vec<cratonvm_types::ObjectRef> {
-    let mut result = Vec::new();
+) -> cratonvm_types::ObjectRef {
+    let mut metas: Vec<FieldMetadata> = Vec::new();
     let mut visited = std::collections::HashSet::new();
     let mut stack = vec![class_id];
 
@@ -8463,10 +8478,10 @@ fn collect_public_fields(
             continue;
         }
         let fields = ctx.declared_fields(cid);
-        for meta in &fields {
+        for meta in fields {
             if (meta.access_flags & 0x0001) != 0 {
                 // PUBLIC
-                result.push(create_field_object(ctx, meta));
+                metas.push(meta);
             }
         }
         // Walk superclass вЂ” skipped for interfaces (see
@@ -8481,7 +8496,9 @@ fn collect_public_fields(
             stack.push(iface_id);
         }
     }
-    result
+    build_mirror_array(ctx, metas.len(), |ctx, i| {
+        create_field_object(ctx, &metas[i])
+    })
 }
 
 /// Collect all public methods from the class hierarchy.
@@ -8505,8 +8522,8 @@ fn collect_public_fields(
 fn collect_public_methods(
     ctx: &mut dyn NativeContext,
     class_id: cratonvm_types::ClassId,
-) -> Vec<cratonvm_types::ObjectRef> {
-    let mut result = Vec::new();
+) -> cratonvm_types::ObjectRef {
+    let mut metas: Vec<MethodMetadata> = Vec::new();
     let mut visited = std::collections::HashSet::new();
     let mut stack = vec![class_id];
 
@@ -8518,13 +8535,13 @@ fn collect_public_methods(
         // walk the public method table on a synthetic-stub class (e.g.
         // java/lang/ClassLoader) still see the JDK-contracted methods.
         let methods = declared_methods_with_synthetic(ctx, cid);
-        for meta in &methods {
+        for meta in methods {
             if meta.name == "<init>" || meta.name == "<clinit>" {
                 continue;
             }
             if (meta.access_flags & 0x0001) != 0 {
                 // PUBLIC
-                result.push(create_method_object(ctx, meta));
+                metas.push(meta);
             }
         }
         // G2-fix: only walk the superclass chain for non-interface classes.
@@ -8539,7 +8556,11 @@ fn collect_public_methods(
             stack.push(iface_id);
         }
     }
-    result
+    // GC-safety (2026-07-16): see `collect_public_fields`'s doc comment --
+    // same fix, same residual-gap doc reference.
+    build_mirror_array(ctx, metas.len(), |ctx, i| {
+        create_method_object(ctx, &metas[i])
+    })
 }
 
 pub(crate) fn native_class_get_fields(
@@ -8562,11 +8583,7 @@ pub(crate) fn native_class_get_fields(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
-    let field_objs = collect_public_fields(ctx, class_id);
-    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), field_objs.len());
-    for (i, fobj) in field_objs.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Object(Some(*fobj)));
-    }
+    let arr = collect_public_fields(ctx, class_id);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -8698,11 +8715,7 @@ pub(crate) fn native_class_get_methods(
                 return Ok(Some(Value::Object(Some(arr))));
             }
         };
-        let method_objs = collect_public_methods(ctx, class_id);
-        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), method_objs.len());
-        for (i, mobj) in method_objs.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Object(Some(*mobj)));
-        }
+        let arr = collect_public_methods(ctx, class_id);
         Ok(Some(Value::Object(Some(arr))))
     })();
     GET_METHODS_DEPTH.with(|d| d.set(prev_depth));
@@ -10169,13 +10182,22 @@ fn create_annotation_proxy(
     ann: &cratonvm_native_api::AnnotationData,
     container_loader: Option<ObjectRef>,
 ) -> ObjectRef {
-    let proxy = alloc_concurrent_synthetic(
+    let mut proxy = alloc_concurrent_synthetic(
         ctx,
         "java/lang/annotation/AnnotationProxy",
         ANN_PROXY_FIELDS,
     );
+    // GC-safety (2026-07-16): `proxy` is a freshly-allocated object that is
+    // not yet reachable from any Java-visible root (it isn't returned to the
+    // interpreter until this function's end) -- every allocating call below
+    // (`create_string`, class loading/mirror resolution, `declared_methods`,
+    // annotation-element conversion) can trigger a GC that relocates it. Pin
+    // it for the whole function and re-read the forwarded reference before
+    // every use, matching the already-pinned `names_arr`/`values_arr` below.
+    let proxy_pin = ctx.pin_native_root(proxy);
     let desc_str = ctx.create_string(&ann.type_descriptor);
     let mut child_roots = vec![desc_str];
+    proxy = ctx.read_native_pin(proxy_pin, proxy);
     ctx.set_field(proxy, ANN_PROXY_TYPE_DESC, Value::Object(Some(desc_str)));
 
     let mut ann_class_id_opt = None;
@@ -10214,6 +10236,7 @@ fn create_annotation_proxy(
         if let Some((cid, mirror)) = cid_mirror {
             ann_class_id_opt = Some(cid);
             child_roots.push(mirror);
+            proxy = ctx.read_native_pin(proxy_pin, proxy);
             ctx.set_field(proxy, ANN_PROXY_TYPE_MIRROR, Value::Object(Some(mirror)));
         } else if std::env::var("CRATONVM_IAE_TRACE").is_ok() {
             eprintln!("ANN-PROXY-NULL-MIRROR: annotation={} type_descriptor={} class_name={class_name} вЂ” type mirror NOT set (class load failed)",
@@ -10342,6 +10365,7 @@ fn create_annotation_proxy(
     names_arr = ctx.read_native_pin(names_pin, names_arr);
     values_arr = ctx.read_native_pin(values_pin, values_arr);
     ctx.unpin_native_roots(names_pin);
+    proxy = ctx.read_native_pin(proxy_pin, proxy);
     ctx.set_field(proxy, ANN_PROXY_ELEM_NAMES, Value::Object(Some(names_arr)));
     ctx.set_field(
         proxy,
@@ -10358,13 +10382,17 @@ fn create_annotation_proxy(
     // The lightweight native unit-test context deliberately does not model
     // that global state, so retain the valid AnnotationProxy representation
     // there instead of reusing a loader ObjectRef from another mock VM.
+    proxy = ctx.read_native_pin(proxy_pin, proxy);
     if ctx.supports_real_proxy_generation() && real_annotations_enabled() {
         if let Some(ann_cid) = ann_class_id_opt {
             if let Some(real) = wrap_annotation_in_real_proxy(ctx, ann_cid, proxy) {
+                ctx.unpin_native_roots(proxy_pin);
                 return real;
             }
+            proxy = ctx.read_native_pin(proxy_pin, proxy);
         }
     }
+    ctx.unpin_native_roots(proxy_pin);
     remember_annotation_proxy_child_roots(proxy, child_roots);
     proxy
 }
@@ -11836,14 +11864,27 @@ pub(crate) fn native_method_get_parameter_annotations(
     let param_annotations = ctx.method_parameter_annotations(class_id, &method_name, &method_desc);
     let aligned_annotations =
         align_parameter_annotations(ctx, class_id, &method_name, &method_desc, param_annotations);
-    let outer = ctx.new_ref_array(outer_comp, aligned_annotations.len());
+    // GC-safety (2026-07-16): `outer` used to be filled by a loop whose body
+    // (`build_annotation_array_for`) allocates (each inner `Annotation[]` +
+    // its proxies) *before* `set_array_element` ran -- a GC triggered inside
+    // that call left the un-pinned `outer` `ObjectRef` stale, corrupting the
+    // whole `Annotation[][]` result. Pin `outer` across the loop and re-read
+    // the forwarded reference each iteration, matching `build_mirror_array`'s
+    // established pattern. This is the "getParameterAnnotations" residual gap
+    // flagged in
+    // `docs/internal/fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md`.
+    let mut outer = ctx.new_ref_array(outer_comp, aligned_annotations.len());
+    let outer_pin = ctx.pin_native_root(outer);
     for i in 0..aligned_annotations.len() {
         let anns = aligned_annotations
             .get(i)
             .map(|a| build_annotation_array_for(ctx, Some(class_id), a))
             .unwrap_or_else(|| ctx.new_ref_array(inner_comp, 0));
+        outer = ctx.read_native_pin(outer_pin, outer);
         ctx.set_array_element(outer, i, Value::Object(Some(anns)));
     }
+    outer = ctx.read_native_pin(outer_pin, outer);
+    ctx.unpin_native_roots(outer_pin);
     Ok(Some(Value::Object(Some(outer))))
 }
 
@@ -12338,6 +12379,39 @@ pub(crate) fn native_method_get_generic_return_type(
     Ok(Some(method_return_type_value(ctx, this)))
 }
 
+/// Process-global cache for `Method`/`Constructor.getTypeParameters()`
+/// arrays, keyed by (VM instance, declaring class, method name+descriptor)
+/// -- NOT by the `this` mirror's own `ObjectRef`, since distinct reflective
+/// Method objects for the same method must still resolve to the SAME
+/// `TypeVariable` instances (see below).
+///
+/// HotSpot's `Executable.getTypeParameters()` is backed by a `genericInfo`
+/// field memoized once per Method object, so repeated calls -- including
+/// calls made *indirectly*, e.g. by something resolving a `TypeVariable`'s
+/// `getGenericDeclaration().getTypeParameters()` back to itself -- return
+/// identity-stable `TypeVariableImpl`s. Without this cache, every call here
+/// built a brand-new synthetic `TypeVariable`, so a type variable handed out
+/// by `getGenericReturnType()`/`getGenericParameterTypes()` (which resolves
+/// its own uses via `resolve_declared_type_variable` re-invoking
+/// `getTypeParameters()`, see `generics.rs`) was never identity-equal to the
+/// "official" one this method itself returns. ByteBuddy's
+/// `TypeVariableSource.AbstractBase.findVariable` walk (used when generating
+/// a Mockito mock's overriding methods) filters `getTypeVariables()` and can
+/// fail this resolution when identity/consistency assumptions elsewhere in
+/// its pipeline are violated -- surfacing as `IllegalArgumentException:
+/// Cannot resolve T from class ...$MockitoMock$...` for any interface with a
+/// generic method (e.g. `jakarta.persistence.EntityManagerFactory.<T> T
+/// unwrap(Class<T>)`).
+///
+/// The array itself is kept alive and remapped across moving GCs via the
+/// existing `register_var_handle_root`/`read_var_handle_root` permanent
+/// native-root mechanism (generic over any `ObjectRef` despite the
+/// VarHandle-specific name).
+fn method_type_params_cache() -> &'static Mutex<FxHashMap<(usize, ClassId, String, String), i32>> {
+    static C: OnceLock<Mutex<FxHashMap<(usize, ClassId, String, String), i32>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
 /// Method.getTypeParameters() вЂ” returns TypeVariable[] from method signature.
 pub(crate) fn native_method_get_type_parameters(
     ctx: &mut dyn NativeContext,
@@ -12357,6 +12431,21 @@ pub(crate) fn native_method_get_type_parameters(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
+    let cache_key = (
+        ctx.vm_identity(),
+        class_id,
+        method_name.clone(),
+        method_desc.clone(),
+    );
+    if let Some(&ident) = method_type_params_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cache_key)
+    {
+        if let Some(cached) = ctx.read_var_handle_root(ident) {
+            return Ok(Some(Value::Object(Some(cached))));
+        }
+    }
     if let Some(sig_str) = ctx.method_signature(class_id, &method_name, &method_desc) {
         if let Some(method_sig) = crate::generics::parse_method_signature(&sig_str) {
             if !method_sig.type_params.is_empty() {
@@ -12367,6 +12456,12 @@ pub(crate) fn native_method_get_type_parameters(
                         crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)));
                     ctx.set_array_element(arr, i, tv);
                 }
+                ctx.register_var_handle_root(arr);
+                let ident = ctx.identity_hash_code(arr);
+                method_type_params_cache()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(cache_key, ident);
                 return Ok(Some(Value::Object(Some(arr))));
             }
         }
@@ -18756,11 +18851,12 @@ mod tests {
 
         let methods = collect_public_methods(&mut ctx, iface_cid);
         // Only `doIt` from the interface вЂ” Object methods are skipped.
+        let n = ctx.array_length(methods);
         assert_eq!(
-            methods.len(),
+            n,
             1,
             "G2: collect_public_methods on an interface must skip Object's superclass methods (got {} methods)",
-            methods.len(),
+            n,
         );
     }
 

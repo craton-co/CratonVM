@@ -39,12 +39,25 @@
 > 2026-07-16): `context.annotation.ImportSelectorTests` (Mockito `spy()`
 > `StackOverflowError`, root cause narrowed to `MockMethodAdvice
 > .isOverridden`); `web.service.registry.ImportHttpServiceRegistrarTests`
-> (`ClassCastException`, narrowed to Spring's own `AnnotationTypeMapping
-> .getMappedAnnotationValue`); `web.socket.messaging
+> (`ClassCastException`, root-caused precisely 2026-07-16 to a cross-loader
+> `MergedAnnotation$Adapt` enum-identity split — NOT `AnnotationTypeMapping
+> .getMappedAnnotationValue`/`Method` identity as this doc and
+> `CRATONVM-SPRING-GENUINE-BUGLIST.md` previously said; a targeted VM fix in
+> `resolve_field_ref`/`getstatic` was attempted and REVERTED after it caused
+> heap corruption — see `CRATONVM-SPRING-GENUINE-BUGLIST.md`'s dedicated
+> entry for the full narrative, repro assets, and next-step guidance);
+> `web.socket.messaging
 > .StompWebSocketIntegrationTests` (STOMP message never arrives — functional
 > gap, not investigated); `orm.jpa.support
-> .PersistenceAnnotationBeanPostProcessorAotContributionTests` (ByteBuddy
-> fork-attach + generics residuals); `beans.factory.aot.BeanRegistrationsAotContributionTests`
+> .PersistenceAnnotationBeanPostProcessorAotContributionTests` (2026-07-16
+> dedicated re-triage: back to its documented 8/2/6 shape after an unrelated
+> GC crash — since fixed by `fb15be63` — was briefly hiding it; 1 pre-existing
+> Mockito cold-attach failure + 5 ByteBuddy method-type-variable-resolution
+> failures, the latter narrowed further but still open; one genuine,
+> independently-useful `Method.getTypeParameters()` identity-stability fix
+> landed, `4cb070e5`, but did not resolve the ByteBuddy residual — see
+> `CRATONVM-SPRING-GENUINE-BUGLIST.md`'s entry for the full trace);
+> `beans.factory.aot.BeanRegistrationsAotContributionTests`
 > (confirmed genuinely perf-bound — steady progress, 100% CPU, not a
 > deadlock — needs interpreter-throughput work, not a discrete fix);
 > `RequestMappingMessageConversionIntegrationTests` (partially fixed, 5
@@ -699,6 +712,25 @@ added this session (commit `b34679e5`, kept in place): `CRATONVM_IAE_TRACE2`
 widened `CRATONVM_ANN_TRACE` gate covering `Import`/`ImportHttpServices`.
 
 ### `ImportHttpServiceRegistrarTests` — `ClassCastException`, root-caused, not fixed
+
+> **2026-07-16 update:** the exact root cause is now known — a cross-loader
+> `MergedAnnotation$Adapt` enum-identity split (`Adapt.CLASS_TO_STRING.isIn()`
+> returns a false negative comparing an application-loader `Adapt` constant
+> against a fork-loader one), traced live via instrumented Spring source
+> (not CratonVM's annotation/reflection layer, and NOT `AnnotationTypeMapping
+> .getMappedAnnotationValue`/`Method` identity as hypothesized below — that
+> path was traced and is clean). Pinned to `resolve_field_ref`
+> (`vm/src/runtime/interpreter.rs`) resolving a `getstatic`'s field-owning
+> class via a loader-blind fallback where `CONSTANT_Class` resolution
+> (`resolve_class_loader_aware`) already has a loader-faithful one. A fix
+> along those lines was implemented, built, and REVERTED after it corrupted
+> heap state (stale pointers / `ClassId(0)` / spurious `NoSuchMethodError`) —
+> likely a GC-safety precondition the field-opcode fast path doesn't
+> currently satisfy for a re-entrant `loadClass()` call. See
+> `CRATONVM-SPRING-GENUINE-BUGLIST.md`'s `@Import` attribute CCE entry for
+> the full trace evidence, the reverted diff's location, and next-step
+> guidance. The narrative below (SoftReference hypothesis, `Method`-identity
+> hypothesis) is superseded but kept for history.
 
 **Confirmed 3/5 pass, 2/5 fail** (`basicListingWithAot`, `basicScanWithAot`
 fail; `basicListing`, `basicScan`, `clientType` pass). The passing 3 call
