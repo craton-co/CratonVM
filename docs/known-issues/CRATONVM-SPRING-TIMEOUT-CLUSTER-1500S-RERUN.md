@@ -1656,7 +1656,7 @@ rather than a coincidence:
 | Class | Status | Elapsed | Pass/Total | First FAILCAUSE |
 |---|---|--:|--:|---|
 | `orm.jpa.support.InjectionCodeGeneratorTests` | FAIL → **TIMEOUT as of 2026-07-13** | 206s | 3/10 | `CompilationException: Unable to compile source` → now hangs instead, see [2026-07-13 update](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open) |
-| `web.socket.messaging.StompWebSocketIntegrationTests` | FAIL -> **TIMEOUT as of 2026-07-14** | 169s -> 600s+ (2x) | 0/16 -> 0/0 | `ServletException`/`UnsatisfiedDependencyException` (no `MessageHandler` bean) -> **bean/startup bug no longer reproduces**; 2026-07-16: NOT a real hang, root-caused to server-side `SocketChannel.close()` firing ~40ms-2s after the WS handshake (both Jetty+Tomcat), see the 2026-07-16 update below |
+| `web.socket.messaging.StompWebSocketIntegrationTests` | FAIL -> **TIMEOUT as of 2026-07-14** | 169s -> 600s+ (2x) | 0/16 -> 0/0 | `ServletException`/`UnsatisfiedDependencyException` (no `MessageHandler` bean) -> **bean/startup bug no longer reproduces**; 2026-07-16: NOT a real hang; ROOT-CAUSED (second follow-up) to the server dispatching the client's single STOMP CONNECT frame more than once, tripping Spring's own "Session already exists" guard -> STOMP ERROR + close (both Jetty+Tomcat) -- NOT an HTTP keep-alive/must-close issue as the first follow-up guessed. See the 2026-07-16 second follow-up section |
 | `web.reactive.result.method.annotation.CrossOriginAnnotationIntegrationTests` | FAIL → **TIMEOUT as of 2026-07-13** | 492s → 600s×2 (+1500s dedicated probe) | 0/68 → 0/0 | `BeanCreationException`: no `ApiVersionStrategy` bean → **bean bug fixed**, now deadlocks in `Semaphore.release()`'s monitor instead, see [2026-07-13 update #5](#2026-07-13-local-investigation-5--missing-apiversionstrategy-bean-resolved-both-classes-now-hit-a-different-new-deadlock-still-open) |
 | `web.servlet.mvc.method.annotation.ServletAnnotationControllerHandlerMethodTests` | **FIXED 2026-07-14** | 445s -> 149s | 211/241 -> **241/241** | Two native bugs, both fixed (`cd90774e`, `72a9ad40`): `PrintWriter.write(String)` bypassed subclass `write(String,int,int)` overrides (broke Spring test fixture auto-flush); `Matcher.group(int)` assumed cached text was always `java.lang.String`, threw spurious `NoSuchMethodError` on a general `CharSequence` (e.g. `AntPathMatcher`'s `MaxAttemptsCharSequence`) |
 | `beans.factory.aot.BeanDefinitionPropertiesCodeGeneratorTests` | FAIL → **TIMEOUT as of 2026-07-13** | 693s | 0/47 | `CompilationException: Unable to compile source` → now hangs instead, see [2026-07-13 update](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open) |
@@ -1889,6 +1889,214 @@ Not fixed this session — the exact Java-level trigger for the premature
 `close()` needs one more round of tracing. `CRATONVM_DBG_SC_CLOSE=1` is
 merged to `dev` (commit `dd1cddec`) as a zero-cost-when-unset diagnostic aid
 for that next round.
+
+## 2026-07-16 second follow-up — StompWebSocketIntegrationTests: ROOT-CAUSED to duplicate server-side dispatch of the client's single CONNECT frame; the "HTTP keep-alive/must-close" hypothesis above is REFUTED — OPEN, fix not yet safe to attempt
+
+Worktree `wt-stompws-callsite-20260716-221418` on the Azure host, branch
+`fix/stompws-callsite-20260716-221418`, synced to fresh `origin/dev`
+(`5d564ca7`). Task: pick up the "next step" from the follow-up above (a
+Java-side stack capture at the moment of `sc_close`) to find the exact
+Tomcat/Jetty call site.
+
+**Step 1 — added the stack capture, confirmed the finding still holds.**
+`NativeContext::capture_stack_trace(0)` (defined on the `NativeContext` trait
+itself, `native-api/src/registry.rs`) needs no `Thread` object handle at all —
+the earlier sessions search for a `thread_stack_trace`-style hook was solving
+the wrong problem; `capture_stack_trace` simply walks the CURRENT threads own
+live Java call stack, which is exactly the thread executing `sc_close`'s
+native body (the one that called `SocketChannel.close()`). Added inside the
+existing `CRATONVM_DBG_SC_CLOSE` gate in `sc_close`
+(`native-io/src/socket_channel.rs`), printing each frame innermost-first.
+Purely additive and zero-cost/zero-behavior-change when the env var is unset
+(regression-checked: `WebSocketConfigurationTests` 4/4 OK with the var unset,
+matching the prior sessions baseline; `WebSocketHandshakeTests` showed 4/6
+failures but ALL as `IOException: Blocking write timeout` from
+`WsRemoteEndpointImplBase` — a pre-existing, unrelated failure mode, not
+introduced by this change, confirmed by the code being entirely inside the
+unset env-var gate so it cannot execute in that run at all).
+
+**Step 2 — first stack capture (JIT on) initially suggested a totally
+different, alarming hypothesis (an in-place `Frame.getOpCode()` corruption
+turning a TEXT send into a CLOSE) — this was chased in detail and ultimately
+superseded, kept here for anyone retracing the path:**
+
+```
+[SC_CLOSE_STACK] (innermost first)
+  at org/eclipse/jetty/util/IO.close(IO.java:623)
+  ...
+  at org/eclipse/jetty/websocket/core/WebSocketCoreSession.abort(WebSocketCoreSession.java:561)
+  at org/eclipse/jetty/websocket/core/WebSocketCoreSession.closeConnection(WebSocketCoreSession.java:229)
+  at org/eclipse/jetty/websocket/core/WebSocketCoreSession.lambda$sendFrame$0(WebSocketCoreSession.java:516)
+  at org/eclipse/jetty/util/Callback$4.succeeded(Callback.java:202)
+  ... (WebSocketFlusher / IteratingCallback machinery) ...
+  at org/eclipse/jetty/websocket/core/WebSocketCoreSession.sendFrame(WebSocketCoreSession.java:519)
+  at org/eclipse/jetty/websocket/core/OutgoingFrames.sendFrame(OutgoingFrames.java:42)
+  at org/springframework/web/socket/adapter/jetty/JettyWebSocketSession.sendTextMessage(JettyWebSocketSession.java:203)
+  at org/springframework/web/socket/messaging/StompSubProtocolHandler.sendToClient(StompSubProtocolHandler.java:527)
+  at org/springframework/web/socket/messaging/StompSubProtocolHandler.handleMessageToClient(StompSubProtocolHandler.java:514)
+```
+
+`javap -p -c -constants` against the real `jetty-websocket-core-common-12.1.10.jar`
+(`WebSocketCoreSession.sendFrame(OutgoingEntry)` and
+`WebSocketSessionState.onOutgoingFrame(Frame)`) confirmed the callback is
+ONLY wrapped with an auto-close (`lambda$sendFrame$0` -> `closeConnection`)
+when `frame.getOpCode() == 8` (WS CLOSE). `javap` against
+`jetty-websocket-jetty-common-12.1.10.jar`s `WebSocketSession.sendText`
+confirmed it always constructs a brand-new, unshared `new Frame((byte)1)`
+(TEXT) with no pooling. This made it LOOK like a corrupted/misread opcode on
+a genuine TEXT send. **This hypothesis is REFUTED by step 3 below** — it was
+an artifact of catching one of (at least) two concurrent/racing close
+attempts; the "real" trigger, reproduced consistently under `--nojit`, is
+different (see next).
+
+**Step 3 — reran under `--nojit`: identical SC_CLOSE count (2 per run), but
+a completely different, unambiguous stack, present on BOTH backends:**
+
+```
+  at org/eclipse/jetty/websocket/core/WebSocketCoreSession.abort(...)
+  at org/eclipse/jetty/websocket/core/WebSocketCoreSession.closeConnection(...)
+  ... (legitimate synchronous WS CLOSE-frame send) ...
+  at org/eclipse/jetty/websocket/common/WebSocketSession.close(WebSocketSession.java:163)
+  at org/springframework/web/socket/adapter/jetty/JettyWebSocketSession.closeInternal(JettyWebSocketSession.java:223)
+  at org/springframework/web/socket/adapter/AbstractWebSocketSession.close(AbstractWebSocketSession.java:142)
+  at org/springframework/web/socket/handler/ConcurrentWebSocketSessionDecorator.close(...)
+  at org/springframework/web/socket/messaging/StompSubProtocolHandler.sendErrorMessage(StompSubProtocolHandler.java:420)
+  at org/springframework/web/socket/messaging/StompSubProtocolHandler.handleError(StompSubProtocolHandler.java:387)
+  at org/springframework/web/socket/messaging/StompSubProtocolHandler.handleMessageFromClient(StompSubProtocolHandler.java:370)
+  at org/springframework/web/socket/messaging/SubProtocolWebSocketHandler.handleMessage(...)
+  at .../JettyWebSocketHandlerAdapter.onWebSocketText(...)
+```
+
+This is Spring's **own, real, unmodified, working-as-designed** error path:
+`handleMessageFromClient`s inner `catch (Throwable ex) { ... handleError(session, ex, message); }`
+-> (no custom `errorHandler` configured in this test) `sendErrorMessage`
+-> sends a STOMP `ERROR` frame, then unconditionally `session.close(CloseStatus.PROTOCOL_ERROR)`
+in a `finally` block. Identical under JIT and `--nojit` — **not a JIT
+miscompile.**
+
+**Step 4 — instrumented Spring's real `StompSubProtocolHandler.java` source
+directly** (copied to `patch-src/`, temporary `System.getenv("CV_STOMP_TRACE")`-gated
+`System.err.println`s only, no logic changes; compiled with `javac` against
+the existing test classpath and prepended ahead of it — same technique as
+the `ImportHttpServiceRegistrarTests` investigation). This immediately found
+the real exception:
+
+```
+[CV_STOMP_TRACE] channel-send failure in session <id> command=CONNECT: java.lang.IllegalStateException: Session already exists
+```
+
+— i.e. Spring's `Assert.state(prevInfo == null, "Session already exists")`
+inside `handleMessageFromClient`s `isConnect` branch
+(`this.sessions.putIfAbsent(sessionId, info)` returned non-null). **This
+assertion is genuine, correct, by-design Spring protocol-correctness
+behavior for a duplicate CONNECT on the same session** — the defect is
+upstream: something is delivering the client's single CONNECT frame to
+`handleMessageFromClient` more than once.
+
+**Step 5 — confirmed the duplicate delivery directly.** Added entry-point
+tracing (`System.identityHashCode` of the `WebSocketMessage` and its
+payload, plus `decoder.decode(byteBuffer)`s returned message count) to the
+same patched source. Result, Jetty parameterization:
+
+```
+[CV_STOMP_TRACE] handleMessageFromClient ENTRY session=<id> msgIdentity=324636 payloadIdentity=324632 payload=CONNECT
+[CV_STOMP_TRACE] decoded 1 message(s) for session <id>
+[CV_STOMP_TRACE] handleMessageToClient session=<id> command=CONNECTED    <- normal CONNECTED reply sent
+[CV_STOMP_TRACE] handleMessageFromClient ENTRY session=<id> msgIdentity=325447 payloadIdentity=325442 payload=CONNECT   <- SECOND, independently-constructed dispatch
+[CV_STOMP_TRACE] decoded 1 message(s) for session <id>
+[CV_STOMP_TRACE] channel-send failure ... IllegalStateException: Session already exists
+```
+
+The client-side trace (`[STOMPTRACE] ... sending msg0=CONNECT`) fires exactly
+ONCE per session — client-side double-send is ruled out. The two server-side
+`ENTRY` calls have DIFFERENT `msgIdentity` AND DIFFERENT `payloadIdentity` —
+two genuinely separate `TextMessage`/`byte[]` objects, each independently
+decoded to exactly 1 STOMP message (so it's not `BufferingStompDecoder`
+returning duplicates from one buffer either) — meaning the WebSocket
+transport layer itself handed Jetty's frame parser the CONNECT bytes twice.
+
+**Correlated against physical socket reads via live `gdb`** (`break sc_read`
+with a `commands` counter, `--batch -x` script, no rebuild needed since the
+symbol `sc_read` — demangled — is present in the release binary): **exactly
+2 `sc_read` calls occur, both BEFORE either `handleMessageFromClient ENTRY`.**
+Only after both reads does the first dispatch fire (a clean decode+process
+cycle ending in the CONNECTED reply), and only afterward does the SECOND
+dispatch fire — with NO third `sc_read` call. This is most consistent with:
+the two physical `SocketChannel.read()` calls each returned a full,
+independent copy of the CONNECT frame's bytes (a duplicate-delivery at the
+native read layer, not a re-parse of one already-consumed buffer at the
+Java/Jetty level) — **not proven at the byte level this session** (would need
+a byte-count/checksum dump inside `sc_read` itself, e.g. via a rebuild with a
+targeted diagnostic, or a `gdb` script that reads the destination
+`ByteBuffer`s backing memory at the breakpoint) but the strongest
+remaining hypothesis given the evidence gathered.
+
+**Confirmed on BOTH backends, ruling out a Jetty-only or Tomcat-only parser
+bug as the sole explanation — same underlying trigger, different amplification
+per container.** Rerunning with `-Djava.io.tmpdir=/data/tmp/<writable>` (works
+around the pre-existing, unrelated `/tmp`-full-on-this-host issue that was
+blocking the Tomcat parameterization entirely) showed the IDENTICAL
+`ENTRY`x2 -> `Session already exists` pattern for the Jetty session. For the
+Tomcat session, however, the SAME `payloadIdentity` (i.e. the literal SAME
+cached message object, not a fresh duplicate) was redelivered to
+`handleMessageFromClient` **4088 times** in one run before the connection was
+finally torn down — a genuine, severe redelivery spin specific to Tomcat's
+own connection-handling retry logic, presumably triggered by the SAME
+duplicate-delivery/stuck-buffer-state condition but amplified very
+differently by each container's own read loop.
+
+**Not fixed this session.** The mechanism is precisely pinned at the
+Java/Spring level (duplicate dispatch of one incoming WebSocket frame,
+confirmed cross-backend, confirmed not a JIT bug, confirmed not caught by
+`CRATONVM_DBG_STALE_OBJREF`), but the exact native call site responsible for
+handing the SAME (or a duplicated copy of the) CONNECT frame bytes to each
+container's frame parser twice was not pinned to a specific Rust source line
+this session — doing so safely needs either (a) a targeted rebuild adding a
+byte-count/checksum diagnostic directly inside `sc_read`
+(`native-io/src/socket_channel.rs`) to prove/disprove "two physical reads
+return identical bytes", or (b) deeper live-`gdb` inspection of the
+destination `ByteBuffer`s backing memory at each `sc_read` breakpoint hit
+without a rebuild. Given this codebases own history of confident-but-wrong
+low-level I/O/GC fixes causing heap corruption (e.g. the `resolve_field_ref`
+attempt documented in `CRATONVM-SPRING-GENUINE-BUGLIST.md`s `@Import`
+attribute CCE entry), no fix was attempted without that byte-level
+confirmation.
+
+**Repro assets** (Azure host, persisted): worktree
+`/data/data/wt-stompws-callsite-20260716-221418` (branch
+`fix/stompws-callsite-20260716-221418`, contains only the `sc_close` stack-
+capture diagnostic, committed); run directory `/data/tmp/stompws-callsite-run/`
+— `MethodRun.java` (single-class JUnit5 launcher, copied from
+`/data/tmp/aotfix-runs/MethodRun.java`), `patch-src/`/`patch-out/` (the
+instrumented `StompSubProtocolHandler.java`, env-gated on `CV_STOMP_TRACE`,
+compile with `javac -cp "$(cat /data/tmp/stompws-cp.txt)" -d patch-out
+patch-src/.../StompSubProtocolHandler.java`, then prepend `patch-out` ahead
+of the rest of the classpath). Classpath dump: `/data/tmp/stompws-cp.txt`
+(single-module, from the earlier 2026-07-16 session, still valid). Binary:
+`/data/tmp/cvm-stompws-callsite.bin` (release, includes the `sc_close` stack
+capture; `CRATONVM_DBG_SC_CLOSE=1` to enable). `gdb` trace script:
+`/data/tmp/trace_sc_read.gdb` (`break sc_read` + a hit counter, `gdb -batch -x
+trace_sc_read.gdb --args <binary> ...`). Run logs:
+`/data/tmp/stompws-callsite-run{1..7}*.log`,
+`/data/tmp/stompws-callsite-gdb{1..4}*.log`.
+
+**Next step for whoever picks this up**: add a byte-level diagnostic to
+`sc_read` (`native-io/src/socket_channel.rs`) — print a short hash/hex-dump
+prefix of the bytes actually written into the destination buffer on each
+call, gated behind a new env var — and rerun the exact repro above (Jetty
+parameterization is enough; it reproduces with just 2 reads, no need to
+chase Tomcats redelivery-storm amplification first). If the two reads
+return identical bytes, the bug is a genuine duplicate-delivery / non-
+consuming-read defect somewhere between the OS `recv()` call and how
+`sc_read` reports/advances what it delivered to the Java-level
+`SocketChannel.read(ByteBuffer)` caller — compare against the already-fixed
+sibling bug classes in this exact area (`ByteBuffer.mark/reset` aliasing,
+`DirectByteBuffer.put` byte loss) for a plausible, already-understood
+mechanism to check first. If the two reads return DIFFERENT bytes (i.e. the
+duplication is NOT at the read layer), the investigation needs to move to
+Jetty's/Tomcat's own frame-parser/fill-and-parse loop to see why each
+container believes there are two independent, back-to-back CONNECT frames on
+the wire when the client only wrote one.
 
 ## Bucket 3 — Immediate crash, not a hang (0/25 — FIXED 2026-07-13)
 

@@ -7257,6 +7257,21 @@ struct Re5PublisherBodyState {
     bytes: Vec<u8>,
     completed: bool,
     error: Option<String>,
+    // Identity-preserving companion to `error`: a global GC root for the
+    // ORIGINAL Throwable the Flow.Subscriber's onError delivered (set
+    // alongside `error` by `re5_body_collector_on_error`, which runs on a
+    // different Java thread than the one waiting in
+    // `re5_collect_publisher_body`, hence a global root rather than a pin).
+    // Real HotSpot propagates a request-body-publisher failure through
+    // `HttpClient.sendAsync()`'s CompletableFuture as the SAME exception
+    // object the publisher threw (confirmed empirically: `ClientHttpConnectorTests
+    // .errorInRequestBody`'s `assertThat(throwable).isSameAs(error)` passes
+    // 3/3 clean under real JDK 25). Without this, `re5_collect_publisher_body`
+    // could only reconstruct a brand-new synthetic `IOException` from a text
+    // message, which can never satisfy an identity (`isSameAs`) assertion --
+    // not a timing flake, a structural identity loss for every request that
+    // fails this way on the `Jdk` connector.
+    error_obj_root: Option<usize>,
 }
 
 #[derive(Default)]
@@ -7415,12 +7430,28 @@ fn re5_body_collector_on_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
 fn re5_body_collector_on_error(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let msg = re5_throwable_text(ctx, args.get(1).copied().unwrap_or(Value::Object(None)));
+    let throwable_val = args.get(1).copied().unwrap_or(Value::Object(None));
+    let msg = re5_throwable_text(ctx, throwable_val);
+    // Root the actual Throwable object (if any) so `re5_collect_publisher_body`
+    // -- woken on a different thread, possibly after a GC moves it -- can
+    // rethrow the SAME object instead of only a text description. A global
+    // root (not a pin) is required: `on_error` and the collect/wait side run
+    // on different Java threads, so there is no shared native-call frame to
+    // pin against.
+    let error_obj_root = match throwable_val {
+        Value::Object(Some(obj)) => Some(ctx.add_global_root(obj)),
+        _ => None,
+    };
     if let Some(collector) = re5_lookup_body_collector(ctx, this) {
         let mut state = collector.state.lock().unwrap();
         state.error = Some(msg);
+        state.error_obj_root = error_obj_root;
         state.completed = true;
         collector.done.notify_all();
+    } else if let Some(handle) = error_obj_root {
+        // No collector (already timed out / removed) to hand the root to --
+        // avoid leaking it.
+        ctx.remove_global_root(handle);
     }
     Ok(None)
 }
@@ -7496,6 +7527,7 @@ fn re5_collect_publisher_body(
 
     let timed_out = !state.completed && state.error.is_none();
     let error = state.error.clone();
+    let error_obj_root = state.error_obj_root.take();
     let out = state.bytes.clone();
     drop(state);
     re5_body_collectors().lock().remove(&id);
@@ -7510,9 +7542,25 @@ fn re5_collect_publisher_body(
         );
     }
     if timed_out {
+        if let Some(handle) = error_obj_root {
+            ctx.remove_global_root(handle);
+        }
         return Err(ioex("HttpRequest body publisher did not complete"));
     }
-    if let Some(msg) = error {
+    if error.is_some() {
+        // Prefer rethrowing the ORIGINAL Throwable (identity-preserving,
+        // matching real JDK's observed behaviour) over synthesizing a new
+        // IOException from just its text. Resolution can fail if the root
+        // somehow never got set; fall back to the old text-only wrapping
+        // rather than silently swallowing the failure.
+        if let Some(handle) = error_obj_root {
+            let resolved = ctx.resolve_global_root(handle);
+            ctx.remove_global_root(handle);
+            if let Some(orig) = resolved {
+                return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(orig));
+            }
+        }
+        let msg = error.unwrap();
         return Err(ioex(format!("HttpRequest body publisher failed: {msg}")));
     }
     Ok(out)

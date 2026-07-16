@@ -145,10 +145,10 @@ This document tracks the **genuine remaining failures**.
 
       **Next step for whoever picks this up**: the diagnosis is solid and the fix DIRECTION (make `getstatic`/`putstatic`'s field-owning-class resolution as loader-faithful as `CONSTANT_Class` resolution already is) is very likely correct — what's missing is making the re-entrant `loadClass()` invocation safe from inside the field-opcode fast path. Two directions worth trying: (a) find and satisfy whatever GC-safety precondition `resolve_class_loader_aware`'s existing callers (`ldc`/`new`/`checkcast`/`instanceof` opcode handlers) already establish before calling it, and replicate it in the `Getstatic`/`Putstatic` handlers; or (b) avoid the re-entrant call entirely — mirror the EXISTING, already-safe, non-reentrant `retarget_instance_field_to_receiver` pattern (same file) for STATIC fields: resolve the field the OLD (fast, safe) way first, then — only if the referencing class is user-loader-owned — do a purely in-memory, non-reentrant re-check against `class_manager`'s already-known loader→class registrations (no `loadClass()` invoke at all) and retarget if a same-named-but-different class is found for that loader, accepting that a genuinely cold (never-yet-resolved) case might still fall through uncorrected rather than risk unsafe re-entrancy.
 *   **STOMP Message Hang** (`web.socket.messaging.StompWebSocketIntegrationTests`)
-  *   **Status**: **OPEN** (TIMEOUT) — NOT actually an infinite hang (2026-07-16 finding, see below); root-caused to a genuine networking defect, still unfixed.
-  *   **2026-07-16 update**: the class does not hang forever. Isolated to just the `sendMessageToController` sub-test (the other 7 `@ParameterizedWebSocketTest` methods commented out in a scratch copy) it finishes in ~30s with a normal FAIL, both parameterizations (`server=Jetty` and `server=Tomcat`, both `client=Standard`). Root cause: the client's very first write after the WS handshake -- the STOMP `CONNECT` frame -- gets a genuine OS-level EPIPE/"Broken pipe" (confirmed via `AsynchronousSocketChannel`'s real, non-synthetic Future-write path, `native-io/src/async_socket.rs::aio_asc_write_future`). Tomcat's own client-side `blockingSendTimeout` (default 20000ms) is what turns this into an assertion failure rather than a true hang -- 20s x 16 parameterizations (8 methods x 2 servers) in the full class comfortably exceeds the suite's 600s per-class ceiling, which is why it buckets as TIMEOUT. **This fully explains the TIMEOUT symptom without any VM-level concurrency bug** (the 2026-07-14 "hang" gdb snapshot below just caught the process mid-run on a live, correctly-timed wait; `LockSupport.parkNanos`/`parkUntil`'s timeout plumbing was re-audited and is correct).
-      A new opt-in diagnostic, `CRATONVM_DBG_SC_CLOSE=1` (`native-io/src/socket_channel.rs::sc_close`, commit `dd1cddec`, merged to `dev`), traced every real `SocketChannel.close()` with local/peer address + timestamp and correlated it against a millisecond-stamped client-side trace: **the embedded Tomcat/Jetty server closes its just-accepted connection within ~40ms-2s of completing the WS upgrade handshake**, for BOTH server backends, before the client's first post-handshake frame write. `SocketChannel.close()` belongs exclusively to the server-side servlet-container transport (the client uses a separate `AsynchronousSocketChannel` native module), so this unambiguously implicates the **server** side closing a just-upgraded connection -- most likely each container's standard HTTP/1.1 keep-alive/"must-close" determination (normally suppressed for a `101 Switching Protocols` hand-off) firing because CratonVM doesn't correctly preserve whatever signal Tomcat/Jetty rely on to recognize the connection was upgraded. No CratonVM-specific native code intercepts the JDK/Servlet upgrade APIs at all (`HttpUpgradeHandler`/`UpgradeToken`/`isUpgrade`: zero hits repo-wide), so the defect is in a lower-level primitive real Tomcat/Jetty bytecode depends on, not yet pinned to the exact call site. `WebSocketConfigurationTests`/`WebSocketHandshakeTests` (same base class, but neither writes a message right after the handshake) are unaffected, which narrows the trigger specifically to "write immediately after handshake."
-      **Not fixed** -- needs one more round of tracing (a Java-side stack capture at the moment of `sc_close`, e.g. via `NativeContext::thread_stack_trace` plumbed through to `native-io`, or a `Filter`/interceptor-based capture from the Java side) to find the exact Tomcat/Jetty call site issuing the premature `close()`. Full writeup: `docs/known-issues/CRATONVM-SPRING-TIMEOUT-CLUSTER-1500S-RERUN.md`'s "2026-07-16 follow-up" section.
+  *   **Status**: **OPEN** (FAIL, buckets as TIMEOUT) — root-caused precisely (2026-07-16 second follow-up): the server dispatches the client's single STOMP `CONNECT` frame to `StompSubProtocolHandler.handleMessageFromClient` **more than once**, tripping Spring's own (correct, by-design) `IllegalStateException: Session already exists` guard, which sends a STOMP `ERROR` frame and calls `session.close(CloseStatus.PROTOCOL_ERROR)` — this, not an HTTP/1.1 keep-alive/"must-close" misfire, is what closes the just-upgraded connection. Not yet fixed — see the **2026-07-16 second follow-up** section in `CRATONVM-SPRING-TIMEOUT-CLUSTER-1500S-RERUN.md` for the full evidence chain and next steps.
+  *   **2026-07-16 update** (superseded below, kept for history): the class does not hang forever. Isolated to just the `sendMessageToController` sub-test (the other 7 `@ParameterizedWebSocketTest` methods commented out in a scratch copy) it finishes in ~30s with a normal FAIL, both parameterizations (`server=Jetty` and `server=Tomcat`, both `client=Standard`). Root cause (at the time): the client's very first write after the WS handshake -- the STOMP `CONNECT` frame -- gets a genuine OS-level EPIPE/"Broken pipe" (confirmed via `AsynchronousSocketChannel`'s real, non-synthetic Future-write path, `native-io/src/async_socket.rs::aio_asc_write_future`). Tomcat's own client-side `blockingSendTimeout` (default 20000ms) is what turns this into an assertion failure rather than a true hang -- 20s x 16 parameterizations (8 methods x 2 servers) in the full class comfortably exceeds the suite's 600s per-class ceiling, which is why it buckets as TIMEOUT. **This fully explains the TIMEOUT symptom without any VM-level concurrency bug** (the 2026-07-14 "hang" gdb snapshot below just caught the process mid-run on a live, correctly-timed wait; `LockSupport.parkNanos`/`parkUntil`'s timeout plumbing was re-audited and is correct).
+      A new opt-in diagnostic, `CRATONVM_DBG_SC_CLOSE=1` (`native-io/src/socket_channel.rs::sc_close`, commit `dd1cddec`, merged to `dev`), traced every real `SocketChannel.close()` with local/peer address + timestamp and correlated it against a millisecond-stamped client-side trace: **the embedded Tomcat/Jetty server closes its just-accepted connection within ~40ms-2s of completing the WS upgrade handshake**, for BOTH server backends, before the client's first post-handshake frame write. `SocketChannel.close()` belongs exclusively to the server-side servlet-container transport (the client uses a separate `AsynchronousSocketChannel` native module), so this unambiguously implicates the **server** side closing a just-upgraded connection -- ~~most likely each container's standard HTTP/1.1 keep-alive/"must-close" determination (normally suppressed for a `101 Switching Protocols` hand-off) firing because CratonVM doesn't correctly preserve whatever signal Tomcat/Jetty rely on to recognize the connection was upgraded~~ **this hypothesis is REFUTED, see the 2026-07-16 second follow-up below.** `WebSocketConfigurationTests` (same base class, but doesn't write a message right after the handshake) is unaffected/regression-clean (4/4 OK, confirmed again this session); `WebSocketHandshakeTests` shows unrelated pre-existing `Blocking write timeout` failures (4/6) not investigated further this session and NOT a regression from any change made here (see the second follow-up's regression-check note).
+      **2026-07-16 second follow-up: ROOT-CAUSED.** Added a Java-level stack capture at the moment of `sc_close` (`NativeContext::capture_stack_trace`, no `Thread` handle needed — see the diagnostic commit) and instrumented Spring's own `StompSubProtocolHandler` source directly. Finding: the client writes its `CONNECT` frame exactly once (confirmed via client-side trace), but the server's `handleMessageFromClient` is invoked **twice** (Jetty) to **4000+ times** (Tomcat, a genuine redelivery spin) for that single frame, each time independently decoding a byte-identical "CONNECT" payload. The second (and later) deliveries hit Spring's `Assert.state(prevInfo == null, "Session already exists")` in the `isConnect` branch, which is **working exactly as designed** — the actual defect is the duplicate delivery, not Spring's reaction to it. Full evidence and next steps: `CRATONVM-SPRING-TIMEOUT-CLUSTER-1500S-RERUN.md`'s "2026-07-16 second follow-up" section. **Not fixed this session** — the duplicate-dispatch mechanism differs by backend (Jetty: two independently-constructed message objects, `sc_read` called exactly twice before either dispatch; Tomcat: thousands of redeliveries of the SAME cached message object) and pinning the exact Rust call site responsible needs more live-debugging time than was available.
 
 ---
 
@@ -200,7 +200,7 @@ the WRONG same-named copy. Eight fixes landed on
 | `ScopedProxyBeanRegistrationAotProcessorTests` | FAIL (3 methods) | **OK 5/5** |
 | `PersistenceManagedTypesBeanRegistrationAotProcessorTests` | FAIL | FAIL 2/0 (host lacks JDK 24+, see below — not a VM bug) |
 | `TestClassScannerTests` | TIMEOUT 600 s | **completes 177 s** (7/7 or flaky 7/6) |
-| `TestCompilerTests` | TIMEOUT 600 s+ | **completes 40 s**, FAIL 22/21/1 (3 of 4 fixed) |
+| `TestCompilerTests` | TIMEOUT 600 s+ | **completes 40 s**, **OK 22/22 (2026-07-16, all 4 residuals now fixed)** |
 | `ApplicationContextAotGeneratorTests` | ABEND (CGLIB load) | **2026-07-16 joint verification: LOADERR FIXED** — `found=40 succ=25 fail=15`, 0 corruption-signature lines, see below |
 | `BeanDefinitionMethodGeneratorTests` | FAIL 34/3 | **OK 34/34** |
 | `ConfigurationClassPostProcessorAotContributionTests` | FAIL 20/8 | **OK-ish 20/15/5** (5 residual = host ClassFile gap, see below) |
@@ -507,19 +507,78 @@ the WRONG same-named copy. Eight fixes landed on
     `BeanDefinitionMethodGeneratorTests` (heavy TestCompiler/`com.example`
     user) clean at 34/34.
 
-    **Remaining 1 residual — DIFFERENT, pre-existing bug, NOT fixed:**
+    **Remaining 1 residual — DIFFERENT, pre-existing bug — FIXED
+    2026-07-16 (commits `f62f1772`, `4deeb6ce`).**
     `compiledCodeCannotAccessExistingPackagePrivateClassIfNotAnnotated`
     expects an `IllegalAccessError` when code in a fresh `DynamicClassLoader`
     (a DIFFERENT defining loader than the one that defined the
     package-private `PackagePrivate`, same package NAME but different
     runtime package per JVMS §5.4.4) accesses it WITHOUT
-    `@CompileWithForkedClassLoader` — but no exception is thrown; access
-    silently succeeds. This already failed with this exact `AssertionError`
-    (not `CompilationException`) BEFORE the fix above, so it is unaffected
-    by it. Points at CratonVM's runtime package-private access check not
-    correctly comparing DEFINING LOADERS across a same-named-package,
-    different-loader pair — a genuinely separate investigation (runtime
-    access control, not compile-time symbol resolution).
+    `@CompileWithForkedClassLoader` — but no exception was thrown; access
+    silently succeeded. This already failed with this exact `AssertionError`
+    (not `CompilationException`) BEFORE the fix above, so it was unaffected
+    by it — a genuinely separate investigation (runtime access control, not
+    compile-time symbol resolution).
+
+    Root cause was NOT a broken loader comparison: `check_class_access` /
+    `same_runtime_package` (`classloading/src/access_control.rs`) already
+    correctly implemented JVMS §5.3/§5.4.4 runtime-package identity
+    (defining loader + package name), with existing unit-test coverage
+    including an H5 loader-spoofing test — it was simply never CALLED from
+    the bytecode interpreter's `new` handler. Only the unrelated JPMS
+    module-boundary check fired, which no-ops whenever no named modules are
+    registered (the ordinary classpath case, as here). Wired
+    `check_class_access` into `Instruction::New`
+    (`vm/src/runtime/interpreter.rs`), plus the two JIT compile-time `new`-site
+    resolvers that independently re-resolve classes for their inlined/
+    single-pass allocation fast paths, so a denied site now falls back to the
+    interpreter's real check instead of silently baking in the inaccessible
+    allocation.
+
+    Wiring the check in immediately surfaced a SECOND, previously-invisible
+    bug: `ClassManager`'s requester-less fast-path class lookup
+    (`get_loaded_class_id`) falls back to returning an arbitrary lone
+    user-defined loader's copy of a name when no built-in loader
+    (bootstrap/extension/application) has defined it yet — a deliberate,
+    useful heuristic for names with no backing `.class` file (e.g.
+    `Proxy`-generated classes), but unsound as `load_class`/
+    `load_class_concurrent`'s PRIMARY answer: a name that genuinely exists on
+    the real classpath must resolve to its own freshly-loaded built-in-loader
+    copy, never an unrelated user-defined loader's redefinition. Concretely,
+    Spring's `TestCompiler` (Application loader) instantiating `new
+    Problems()` was resolving to a *different* `TestCompiler$Problems`
+    defined by an earlier, unrelated `@CompileWithForkedClassLoader` test's
+    own `DynamicClassLoader` — same simple name, wrong runtime class. Added
+    `ClassManager::resolve_fast_path_class_id`, which prefers the
+    loader-faithful `get_loaded_class_id_for_requester(name, Application)`
+    (built-in chain only) and falls back to the ambiguous lone-user-loader
+    answer only when a real classpath scan
+    (`find_class_bytes_delegated`) confirms no built-in-loader copy could
+    exist — preserving `Proxy`-class resolution while fixing the
+    stray-loader bug. A third, related latent gap surfaced in the same
+    investigation: `ClassManager::upgrade_synthetic_class` (stub-to-real
+    upgrade) refreshed every other `Class` field from the freshly parsed
+    class file but never updated `loader_id`, leaving it stuck at whatever
+    the synthetic stub was minted with (often Bootstrap) even after
+    upgrading to real Application-loaded bytecode. Fixed alongside.
+
+    Verified: `TestCompilerTests` 22/21/1 → **22/22**. Regression:
+    `cargo test -p cratonvm-vm --lib --release` 2200 passed / 16 failed (all
+    16 pre-existing and unrelated — `runtime::lock_order` tests gated on a
+    debug build or an env-opt-in not set in this invocation, and
+    `jit::skip_list` JIT-tier-eligibility tests, neither touching
+    classloading); `cargo test -p cratonvm-native-builtins --lib --release`
+    3000 passed / 0 failed. Spot-checked `CompiledTests` 14/14,
+    `DynamicJavaFileManagerTests` 11/11, `DynamicClassFileObjectTests` 3/3
+    (all TestCompiler-adjacent, package-private-access-heavy) clean. A
+    cross-module spot-check of `BeanDefinitionMethodGeneratorTests` via this
+    same ad-hoc single-class harness hit an unrelated, non-deterministic
+    harness/classpath artifact (`ClassCastException`/`AbstractMethodError`)
+    that reproduces identically on an unmodified dev-tip baseline binary —
+    confirmed pre-existing, not a regression from this fix; the module's
+    proper Gradle-driven suite run (34/34, per the entry above) is
+    unaffected since it doesn't go through this improvised classpath
+    composition.
 *   ~~`aot.nativex.feature.ThrowawayClassLoaderTests`~~ **FIXED (2026-07-15,
     commit `56a98cc4`)**. `native-builtins/src/classloader_real.rs`'s
     `cl_real_load_class_base` — the REAL-JDK-mode counterpart of the
@@ -2548,3 +2607,185 @@ prevent a future session from re-opening a hunt for a bug that no longer
 reproduces. If it resurfaces, re-check first whether `19a5025f`/`9850617b`
 are still present on whatever tip is being tested before assuming a
 regression.
+
+
+### 5.6 Three named `ClientHttpConnectorTests` minor residuals (2026-07-16): StepVerifier identity FIXED, EofException confirmed CratonVM-specific but not fixed, enum CCE not reproduced
+
+Follow-up to 5.2's residual list: "an occasional Jetty `EofException` connection-flake,
+an unrelated enum `valueOf()` `ClassCastException` (a known separate synthetic-enum
+gap), and one flaky `StepVerifier` exception-identity assertion." Branch
+`fix/httpconn-minor-residuals-20260716`.
+
+**Harness housekeeping (two false-positive noise sources ruled out first)**: a large
+fraction of this session's early stress-run failures were NOT new bugs:
+1. Omitting `--enable-native-access=ALL-UNNAMED` (required per section 5.1) lets
+   `MemorySegment` clinit failures corrupt JUnit's ServiceLoader-based engine discovery
+   in confusing ways (`ClassCastException: Object cannot be cast to TestEngine`-family
+   symptoms, `AbstractMethodError ... has no Code attribute`).
+2. `--stack-dump-on-timeout 0` disables CratonVM's watchdog entirely (confirmed from
+   `vm-cli/src/main.rs`'s `resolve_watchdog_timeout`: `Some(0)` unconditionally maps to
+   `None`, regardless of any `CRATONVM_DEFAULT_WATCHDOG_SEC` env default). A
+   `timeout(1)`-wrapped run that already printed its `RESULT` line and is only being
+   reaped for lingering non-daemon Reactor-Netty threads (`"main() returned; VM held
+   alive by N non-daemon thread(s)"`) is NOT a hang — `run-suite.sh`'s own
+   `flush_batch` already records the `RESULT` regardless of the wrapper's exit code; an
+   ad hoc harness that checks the exit code first will misreport clean runs as timeouts.
+
+With both handled, the dominant remaining noise this session hit was a **severe,
+transient flare-up of the already-known, already-partially-fixed section-5.4
+"register-invisible-root" family** — `ClassCastException: Object cannot be cast to X`
+for whatever `X` a reused `cid=0` bare-Object checkcast happens to hit
+(`TestExecutionResult$Status`, `String`, `IllegalArgumentException: Could not create
+type` on `@ParameterizedTest` argument construction — never an enum type in any
+capture this session took), plus outright process crashes (`AbstractMethodError:
+TestEngine.getId() has no Code attribute`, SIGSEGV). This was root-caused (same day,
+independently, by a different concurrent session) to a genuinely NEW regression from
+same-day GC work — a missing `skip_free_blocks` call in the young-GC
+`young_object_starts` pre-forwarding walk (`gc/src/gen_heap.rs`) — and fixed via
+`fix/wildfly-cce0079-close-20260716`, merged to `dev` mid-session (see
+`docs/internal/springboot/testengine-getid-abstractmethoderror-young-gc-forwarding-gap-FIXED.md`).
+Recorded here because it dominated this session's raw failure counts and could
+otherwise be mistaken for one of the three items below by a future reader of raw logs.
+The shared build host was also independently in a severe resource crisis for large
+parts of this session (`/data/data`, where all worktrees live, hit **0 bytes free**
+at least twice, once aborting `cargo build`'s LLVM output stage outright and once
+blocking `git commit`; load average peaked over 160 on a 16-core box with 2000+
+concurrent sessions) — flagged only as context for why sample sizes below are smaller
+than planned, not as a CratonVM bug.
+
+**(c) StepVerifier exception-identity failure — ROOT-CAUSED AND FIXED.**
+`ClientHttpConnectorTests.errorInRequestBody(ClientHttpConnector)`:
+```java
+Exception error = new RuntimeException();
+Flux<DataBuffer> body = Flux.concat(stringBuffer("foo"), Mono.error(error));
+...
+StepVerifier.create(futureResponse)
+    .expectErrorSatisfies(throwable -> assertThat(throwable).isSameAs(error))
+    .verify();
+```
+failed deterministically on the `Jdk` connector parameterization (looks "flaky" only
+at the whole-class level, since which of the 4 parameterized connectors gets exercised
+varies run to run, and the section-5.4 noise above obscured many runs entirely):
+```
+java.lang.AssertionError: expectation "expectErrorSatisfies" failed (assertion failed
+on exception <java.io.IOException: HttpRequest body publisher failed:
+java.lang.RuntimeException>: ... to refer to the same object)
+```
+Confirmed CratonVM-specific via a direct HotSpot A/B (same classpath/harness, JDK 25):
+**8/8 clean HotSpot runs**, `found=49 succ=47 fail=0 abort=2` every time — zero
+occurrences of this failure on real HotSpot.
+
+Root cause: `JdkClientHttpConnector`'s `HttpClient.sendAsync()` is backed by
+CratonVM's own native Rust reimplementation (`native-builtins/src/net_phase_e.rs`'s
+RE.5 family — see section 4's original `sendAsync()` finding), not real JDK bytecode.
+`re5_body_collector_on_error` (the `Flow.Subscriber.onError` native callback that
+observes the request-body publisher's failure) converted the delivered `Throwable` to
+a plain Rust `String` (`re5_throwable_text`) and discarded the object; the waiting
+side, `re5_collect_publisher_body`, then synthesized a brand-new `java.io.IOException`
+from that string. This is a structural identity loss, not a timing race — every
+request whose body publisher fails and is routed through this path was guaranteed to
+fail an `isSameAs()` check on the propagated exception.
+
+Fix (commit `39f152bb`, merged to `dev` at `83418b1d`): `Re5PublisherBodyState` gains
+`error_obj_root: Option<usize>`, a **global** GC root (required because `on_error`
+fires on the Reactor scheduler thread, a different Java thread than the one waiting in
+`re5_collect_publisher_body`) for the original `Throwable`, captured alongside the
+existing text in `re5_body_collector_on_error`. `re5_collect_publisher_body` now
+resolves and rethrows the ORIGINAL object (`MethodCallFailed::ExceptionThrown(orig)`)
+instead of synthesizing an `IOException` wrapper, whenever the root resolves
+successfully — falling back to the old text-only `IOException` only if resolution
+somehow fails, so no failure mode is worse than before.
+
+**Verification**: `cargo test -p cratonvm-native-builtins --lib --release`: 3000
+passed / 0 failed / 6 ignored (clean, unchanged). `cargo test -p cratonvm-vm --lib
+--release`: 2200 passed / 16 failed — all 16 are the pre-existing
+`jit::skip_list::tests::*` (7, parallel-test-execution races over shared global state)
++ `runtime::lock_order::tests::*` (9, `cfg!(debug_assertions)`-gated, expected under
+`--release`) buckets this doc already attributes to unrelated sessions in 5.1/5.2/5.4
+— no new regressions, confirmed by full failure-list diff. Stress verification: across
+post-fix `ClientHttpConnectorTests` runs that reached real test execution (host
+instability capped this at a handful of clean samples — see housekeeping note above),
+**zero recurrences** of the `errorInRequestBody(Jdk)` identity failure, versus
+appearing in roughly half of pre-fix runs that reached the `Jdk` connector case (4/8 in
+one clean batch). Small post-fix sample size is an honest limitation, but the fix is
+an unconditional architectural correction (the old code path could never have passed
+this assertion; the new one always propagates the real object when available), not a
+probabilistic mitigation, so the mechanism-level confidence is high independent of
+sample count.
+
+**(a) Jetty `EofException` connection-flake — confirmed CratonVM-specific, NOT
+fixed.** Reproduced twice independently on the `basic(ClientHttpConnector, HttpMethod)`
+parameterized test (the connector×method cross product that makes up most of the
+class's 49 sub-tests), Jetty connector, two different HTTP methods (`PATCH` at index
+`[13]`, `TRACE` at index `[16]`):
+```
+java.lang.AssertionError: expectation "assertNext" failed (expected: onNext();
+actual: onError(org.eclipse.jetty.io.EofException: write(gathering): channel not
+connected))
+```
+Repro rate this session: 2 of roughly 35 CratonVM runs that reached real test
+execution (~6%). HotSpot A/B: 0 occurrences across 8 clean HotSpot runs (`fail=0`
+every time) — confirmed CratonVM-specific, not pre-existing Jetty/MockWebServer test
+flakiness (satisfies the task's suggested HotSpot-baseline check directly).
+
+Not root-caused this session — flagged as OPEN with a specific next-step hypothesis
+rather than force-fixed: Jetty's `HttpClient` pools/reuses connections across the
+class's ~49 sequential sub-test invocations on one shared connector instance (see the
+`autoCloseArguments = false` / "shared between parameterized test invocations" comment
+on `basic()`'s `@ParameterizedTest` annotation). "write(gathering): channel not
+connected" is Jetty's own error for attempting to write to a channel it already
+considers open but the OS/peer has actually closed — consistent with a **stale
+pooled-connection reuse race**: MockWebServer closes an idle keep-alive connection
+between two of the ~49 requests, and CratonVM's socket/channel readiness signalling
+(`native-io/src/socket_channel.rs`, `native-io/src/nio_selector.rs` — both touched by
+unrelated fixes earlier the same day per the `git merge` pulled into this branch, so
+re-verify against a fresh build before assuming this hypothesis still holds) does not
+correctly surface a half-closed peer to Jetty's pool-health check before the next
+reuse attempt, unlike real JDK's underlying socket implementation. This is a
+structurally different code path from the already-fixed `ServerSocket.accept()`/
+`socket_connect()` blocking-region gaps in section 4 (those are accept/connect-time;
+this would be a write-after-reuse-time gap on the client pooling side) — plausible but
+NOT confirmed via live capture (gdb/strace on a caught-in-the-act repro), which the
+severely resource-constrained shared host made impractical to obtain reliably this
+session. Recommend: reproduce with `CRATONVM_DBG_SC_CLOSE=1` (an existing diagnostic,
+confirmed present via `git log`, that traces `SocketChannel.close()` call sites) on a
+tight repeat-loop of just `basic[Jetty]` sub-tests, once host load allows a clean
+multi-hour capture session.
+
+**(b) Enum `valueOf()` `ClassCastException` — NOT REPRODUCED this session.** Searched
+`docs/known-issues/` and `git log` for prior synthetic-enum bugs before starting empirical
+repro, per the task's instructions. Candidates considered and ruled out as different
+call shapes: `ce3544ce` "Fix-enum-constant-subclass-isEnum" (anonymous enum-constant
+subclass `isEnum()`/`getEnumConstants()`, unrelated); `e9ed6693` "Round 73: ...
+Enum.<init>/name/ordinal use canonical Enum slot (subclass shadowing)" (field-slot
+resolution, unrelated); `ea96497e` (same-day) "`ImportHttpServiceRegistrarTests` CCE
+root-caused to cross-loader `Adapt` enum identity; VM fix attempted+reverted (heap
+corruption)" — closest analog in *mechanism* (cross-loader/cross-context enum
+identity) but a structurally different call site (`MergedAnnotation.Adapt.isIn()`, not
+`Enum.valueOf()`), and that session's attempted fix was reverted for causing heap
+corruption, so there is no landed pattern to reuse even if the mechanisms turn out to
+be related.
+
+Across roughly 35 CratonVM `ClientHttpConnectorTests` runs that reached real test
+execution this session (spanning both the noisy pre-GC-fix and cleaner post-GC-fix
+periods), **zero occurrences** of any `ClassCastException` naming an enum type or
+involving `Enum.valueOf` were captured. Every CCE actually observed was either the
+register-invisible-root family (5.4 — confirmed generic, never targets an enum type in
+any capture) or the now-fixed StepVerifier identity issue above (not itself a CCE).
+Status: could not reproduce with the repro budget available this session (further
+inflated by the concurrent host disk/load crisis capping usable sample throughput).
+Two honest possibilities, not distinguished by this session's evidence: (1) already
+resolved by one of the several enum- and reflection-adjacent fixes that landed on
+`dev` between whenever this residual was first observed and this session's tip
+(`db047d38` unrooted-ObjectRef reflection-native GC-safety fixes, `e9ed6693` Enum slot
+canonicalization, `0c0ee830` "root enum and hashmap lookups across GC" are all
+plausible candidates, none individually confirmed as the fix); or (2) rare enough
+(comfortably under 3%, going by a zero-in-35 sample) that this session's budget simply
+wasn't enough to catch it. Recommend: if it resurfaces, capture with `KRUN_STACK=1`
+for a full stack trace immediately (this doc had none for it before this session, and
+still has none) rather than assuming it is the same family as (a) or (c) above.
+
+**Current true state of `ClientHttpConnectorTests`**: one of three named residuals
+(StepVerifier identity) fixed and landed; one (Jetty `EofException`) confirmed
+CratonVM-specific and precisely characterized but not fixed; one (enum `valueOf()`
+CCE) not reproduced and left as an open question rather than a confirmed-open bug.

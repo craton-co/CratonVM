@@ -904,6 +904,24 @@ fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 eprintln!(
                     "[SC_CLOSE] t={ms} id={id:#x} local={local} peer={peer}"
                 );
+                // 2026-07-16 follow-up: pin the exact Java call site issuing
+                // this close(). `NativeContext::capture_stack_trace` needs no
+                // `Thread` object handle -- it walks the CURRENT thread's live
+                // Java call stack, which is exactly the thread executing this
+                // native (the one that called SocketChannel.close()). Gated
+                // behind the same env var; printed innermost-frame-first (the
+                // `close()` caller itself first, working outward) to match
+                // conventional stack-trace reading order -- `capture_stack_trace`
+                // itself returns outer->inner, so reverse it here.
+                let raw_trace = ctx.capture_stack_trace(0);
+                eprintln!("[SC_CLOSE_STACK] t={ms} id={id:#x} ({} frames)", raw_trace.len());
+                for entry in raw_trace.iter().rev() {
+                    let file = entry.source_file.as_deref().unwrap_or("?");
+                    eprintln!(
+                        "  at {}.{}({}:{})",
+                        entry.class_name, entry.method_name, file, entry.line_number
+                    );
+                }
             }
             // Force the write-side FIN now. A selector this channel was
             // registered with holds a `try_clone()`d duplicate of the socket
