@@ -11,8 +11,21 @@ This document tracks the **genuine remaining failures**.
 ## 1. Deep-Dive Investigations (Root-Caused, Pending Fix)
 
 *   **Mockito `spy()` StackOverflowError** (`context.annotation.ImportSelectorTests`)
-  *   **Status**: **OPEN** (5/9 methods SOE, reconfirmed 2026-07-15 on a binary containing the mockk
-    fix below — this is a **different root cause** than the mockk sibling, which is now FIXED).
+  *   **Status**: **OPEN** — symptom shape changed 2026-07-16. On a fresh `dev` tip (`6c517cd9`), the
+    original isolated repro (`SpyDLBFProbe.java`: `spy(new DefaultListableBeanFactory())` + one
+    `registerSingleton()` call) **no longer reproduces**, and 3 of the 5 real `spy()` sub-tests
+    (`importSelectors`, `importSelectorsWithGroup`, `importSelectorsSeparateWithGroup`) now **pass**
+    individually. The remaining 2 (`importSelectorsWithNestedGroup`,
+    `importSelectorsWithNestedGroupSameDeferredImport`) still fail, but via a **new, more severe
+    failure mode**: a deterministic native heap-corruption abort (`GC: young object-start walk
+    stopped at an implausible extent`, `GC-ARRAY-GUARD` trips, stale zeroed object headers) instead
+    of a clean catchable `StackOverflowError`. Confirmed heap-size-independent (identical corruption
+    offset at default heap and `--Xmx 512m`), so it's a deterministic correctness bug, not a GC-timing
+    race. Not yet root-caused to a Rust source line or confirmed to share the same underlying cause
+    as the `isOverridden` hypothesis below — full writeup, ruled-out list, and next steps in
+    `CRATONVM-SPRING-TIMEOUT-CLUSTER-1500S-RERUN.md`'s **2026-07-16** `ImportSelectorTests` section.
+  *   **2026-07-15 status (superseded above, kept for history)**: 5/9 methods SOE, reconfirmed 2026-07-15 on a binary containing the mockk
+    fix below — this is a **different root cause** than the mockk sibling, which is now FIXED.
   *   **2026-07-15 root-cause sharpening (supersedes the older hypotheses below)**: full recursion
     cycle captured (`KRUN_STACK=1`, log at `/data/tmp/mockk-tmp/importsel2.log` on the Azure host):
     `MockMethodAdvice.handle` (intercepting `DefaultSingletonBeanRegistry.registerSingleton` on the
