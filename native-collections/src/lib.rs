@@ -12253,21 +12253,33 @@ fn drain_spliterator_to_array_capped(
         }
     }
     let col = ctx.read_native_pin(col_pin, collector);
-    ctx.unpin_native_roots(spl_pin);
-    ctx.unpin_native_roots(col_pin);
     let len = match ctx.get_field(col, 1) {
         Value::Int(v) => v as usize,
         _ => 0,
     };
     let storage = match ctx.get_field(col, 0) {
         Value::Object(Some(a)) => a,
-        _ => return Ok(alloc_ref_array(ctx, 0)),
+        _ => {
+            ctx.unpin_native_roots(spl_pin);
+            return Ok(alloc_ref_array(ctx, 0));
+        }
     };
+    // Family-1 fix (cce0079): the `out` alloc below can trigger a moving GC.
+    // The previous code UNPINNED the collector before this point, so the
+    // collector + its storage array became garbage, the copy loop read a
+    // reclaimed array, and stale/recycled element refs were returned as the
+    // stream's contents — surfacing later as the WildFly domain-boot CCE /
+    // stale-canary firings in `native_stream_to_array_gen` and
+    // `get_array_element` (DE_002/DE_003 captures). Keep `storage` pinned
+    // across the alloc and copy from the refreshed address.
+    let storage_pin = ctx.pin_native_root(storage);
     let out = alloc_ref_array(ctx, len);
+    let storage = ctx.read_native_pin(storage_pin, storage);
     for i in 0..len {
         let v = ctx.get_array_element(storage, i);
         ctx.set_array_element(out, i, v);
     }
+    ctx.unpin_native_roots(spl_pin);
     Ok(out)
 }
 
