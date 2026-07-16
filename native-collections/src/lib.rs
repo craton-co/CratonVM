@@ -12635,11 +12635,20 @@ fn stream_pull_internal(
 
         let base = stream_source_elems(ctx, stream);
         let (_, base_pins) = pin_value_slice(ctx, &base);
+        // GC-SAFETY (register-invisible-root closeable gap -- see
+        // `NativeContext::refresh_root_snapshot`'s doc comment): same
+        // reasoning as `native_stream_for_each`'s materialized-`elements`
+        // pins. `emit`/`stream_process_chain` can re-enter Java through an
+        // arbitrarily long, JIT-tiering chain (a `flatMap` stage's inner
+        // stream is itself pulled through here), so this batch of pins needs
+        // the same up-front-plus-per-iteration deposit refresh.
+        ctx.refresh_root_snapshot();
         let mut state = stream_new_pull_state(chain.len());
         for (idx, v) in base.iter().copied().enumerate() {
             if stream_limit_saturated(&chain, &state, 0) {
                 return Ok(PullStep::Continue);
             }
+            ctx.refresh_root_snapshot();
             let v = read_pinned_elem(ctx, base_pins[idx], v);
             let mut emit_stopped = false;
             let step = {
@@ -14896,8 +14905,21 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // each from its handle before the (allocating) dispatch.
     let con_pin = ctx.pin_native_root(consumer);
     let (_, elem_handles) = pin_value_slice(ctx, &elements);
+    // GC-SAFETY (register-invisible-root closeable gap — see
+    // `NativeContext::refresh_root_snapshot`'s doc comment): the pins above
+    // are invisible to a peer-initiated STW collection until this thread's
+    // deposited root snapshot is refreshed, which does not happen on any
+    // fixed cadence once `accept` re-enters Java and (likely, given `accept`
+    // is about to run once per element here) tiers up into JIT — JIT-compiled
+    // code has no periodic cooperative safepoint poll of its own. `accept`
+    // can run arbitrarily long per element (e.g. a full network round trip),
+    // so refresh once up front to publish this batch immediately, then again
+    // at the top of every iteration to keep the deposit from going stale
+    // across a long-running consumer.
+    ctx.refresh_root_snapshot();
     let mut result = Ok(None);
     for (i, &elem) in elements.iter().enumerate() {
+        ctx.refresh_root_snapshot();
         let c = ctx.read_native_pin(con_pin, consumer);
         let e = read_pinned_elem(ctx, elem_handles[i], elem);
         if let Err(err) = ctx.invoke_virtual(c, "accept", "(Ljava/lang/Object;)V", &[e]) {

@@ -2629,6 +2629,16 @@ fn resolve_thread_id_from_thread_obj(shared: &SharedVm, thread_obj: ObjectRef) -
 }
 
 impl<'a> NativeContext for NativeContextImpl<'a> {
+    // See the `NativeContext::refresh_root_snapshot` doc comment
+    // (native-api/src/registry.rs) for the full rationale — this closes the
+    // "pinned a long-lived batch, then drove long re-entrant/JIT-heavy
+    // execution without ever blocking or self-initiating GC" gap by reusing
+    // the existing blocking-path deposit mechanism without actually
+    // blocking.
+    fn refresh_root_snapshot(&mut self) {
+        self.deposit_root_snapshot();
+    }
+
     fn load_class(&mut self, name: &str) -> MethodCallResult {
         let class_id = self.shared.load_class_concurrent(name)?;
         let mirror = super::get_or_create_class_mirror(self.shared, class_id);
