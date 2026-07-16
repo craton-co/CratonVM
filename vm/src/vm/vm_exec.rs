@@ -5675,6 +5675,18 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
             // CRIT (multi-thread STW deadlock / undercount): transition from
             // alive mutator to dead thread through the blocked-region protocol.
+            // Publish a complete root snapshot and the registry blocked flag
+            // before entering the terminal barrier transition. A GC request can
+            // otherwise land after `enter_blocked()` but before `mark_dead()`:
+            // the live-thread census counts this worker while `finish_after()`
+            // waits out that pause, leaving one permanently outstanding arrival.
+            // The snapshot makes the worker identity-excluded for every such
+            // request and lets the collector maintain its terminal roots.
+            NativeContextImpl {
+                shared: &shared_arc,
+                thread: &mut jvm_thread,
+            }
+            .deposit_root_snapshot();
             // `finish_after` serializes `mark_dead` with `request_stw_counted`,
             // so a GC initiator cannot observe this thread as both dead and
             // still included in `threads_blocked`.

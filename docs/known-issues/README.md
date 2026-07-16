@@ -54,24 +54,9 @@ meaningfully different (though related) characterization than the original doc's
 `SB-CRASH-04` attribution. See that doc's own 2026-07-15 follow-up section for the full evidence chain;
 still OPEN, deliberately not further patched (deep GC/threading infrastructure work).
 
-## 2026-07-14 Stream/ArrayList heap corruption under extreme small-heap GC pressure — two more unpinned sites found+fixed 2026-07-15, still OPEN (independent cross-confirmation of the cross-thread pin-visibility race above)
+## 2026-07-14 Stream/ArrayList heap corruption under extreme small-heap GC pressure - FIXED 2026-07-16
 
-Found while verifying dev commit `671c8df3` (Stream/Comparator `ObjectRef` pin fix). A 24-thread
-stress repro (`ArrayList<P>` build + `stream().map().flatMap().collect(toUnmodifiableList())` +
-`stream().map().filter().findFirst()`, 3000 iterations/thread) under `-Xmx32m` segfaults on the
-unfixed binary and, even after `671c8df3` and a follow-up `ArrayList.add`/`addAll` pin fix
-(`8665d1ad`), still corrupts. **2026-07-15 update:** fixed two more confirmed unpinned-across-GC
-sites — `invoke_virtual`'s lambda-checkcast path (same bug as, and superseded in favor of, the
-more thorough fix in the `WFLYCTL0079` entry above) and `native_al_stream` calling
-`resync_values_view` before pinning its own receiver. Both confirmed via clean
-`CRATONVM_DBG_STALE_OBJREF` panics / core-dump backtraces. **Neither closes the residual**: 30 runs
-at `-Xmx32m` with both fixes applied still corrupt at a similar rate, recurring at the exact same
-two call stacks — independent evidence, from a completely different repro (plain ArrayList/Stream,
-no WildFly involved), for the same conclusion the `WFLYCTL0079` investigation above reached: this
-is not simply more missed-pin sites. See
-[`stream-arraylist-gc-pressure-heap-corruption.md`](stream-arraylist-gc-pressure-heap-corruption.md)
-for the full analysis, including a ruled-out JIT inline-alloc header-race hypothesis and suggested
-next steps (live gdb watchpoint on a corrupted field across its full lifetime).
+The 24-thread 32 MB Stream/ArrayList repro is fixed and archived at docs/internal/fixed-suite-bugs/stream-arraylist-gc-pressure-heap-corruption-FIXED.md. The closure combines an old-to-young remembered-set fallback, terminal-worker STW publication, exact containment for conservative interior roots, a lazy-Stream pin, and a fail-closed non-moving JIT-active young-GC policy. Azure validation: two JIT and two no-JIT runs all reported RESULT=OK, plus 791 of 791 GC unit tests.
 
 ## 2026-07-14 WildFly standalone boot ObjectName `_ca_array` NPE FIXED (100% boot blocker, open since 2026-07-10's "Bug 3a")
 
