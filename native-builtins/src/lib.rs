@@ -67372,6 +67372,20 @@ fn native_new_cached_pool(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
 }
 
 fn native_es_submit_runnable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // BUG-CCE-0716: a genuinely-real receiver (real TPE, or any other real
+    // AbstractExecutorService subclass such as Netty's AbstractEventExecutor)
+    // must run the real bytecode body so an overridden `newTaskFor()`
+    // produces its own real Future subtype -- see `executor_is_real`'s doc.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if executor_is_real(ctx, *this) {
+            return ctx.invoke_special_bytecode_only(
+                "java/util/concurrent/AbstractExecutorService",
+                "submit",
+                "(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;",
+                args,
+            );
+        }
+    }
     // Execute the Runnable immediately (single-threaded model)
     if let Some(Value::Object(Some(runnable))) = args.get(1) {
         let _ = ctx.invoke_virtual(*runnable, "run", "()V", &[]);
@@ -67381,6 +67395,17 @@ fn native_es_submit_runnable(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn native_es_submit_callable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // BUG-CCE-0716: see native_es_submit_runnable's comment above.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if executor_is_real(ctx, *this) {
+            return ctx.invoke_special_bytecode_only(
+                "java/util/concurrent/AbstractExecutorService",
+                "submit",
+                "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
+                args,
+            );
+        }
+    }
     let mut result = Value::Object(None);
     if let Some(Value::Object(Some(callable))) = args.get(1) {
         result = ctx.invoke_virtual(*callable, "call", "()Ljava/lang/Object;", &[])?.unwrap_or(Value::Object(None));
@@ -67666,6 +67691,59 @@ fn async_worker_pool(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
 /// one) — i.e. it has a real `workers` field — rather than CratonVM's synthetic
 /// 2-field executor. Used to keep synthetic lifecycle stubs from writing slot
 /// fields of a real executor (which would corrupt real fields).
+/// Generalized real-vs-synthetic-receiver check for the `AbstractExecutorService`
+/// family (`submit`/`invokeAll`/... registered on `es`/`aes`/`tp` alike).
+///
+/// `executor_has_real_workers` (below) disambiguates ONLY the `ThreadPoolExecutor`
+/// name collision: CratonVM's own synthetic `Executors.newFixedThreadPool()` et
+/// al. placeholders are stamped with the real `ThreadPoolExecutor` class name, so
+/// a real bytecode-constructed TPE and a synthetic one are indistinguishable by
+/// class name alone there -- hence the per-instance `workers` field probe.
+///
+/// `submit()` is registered on `AbstractExecutorService` too, and its receiver
+/// is not necessarily a `ThreadPoolExecutor` at all: any real class that extends
+/// `AbstractExecutorService` directly (e.g. Netty's `AbstractEventExecutor` /
+/// `SingleThreadEventExecutor`, which override `newTaskFor()` to hand back a
+/// Netty `Future`/`Promise` instead of a JDK `FutureTask`) reaches this same
+/// native via `invokespecial AbstractExecutorService.submit(...)` from within
+/// their own overriding `submit()` -- see
+/// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md 5.2. Those classes have
+/// no `workers` field (that's TPE-specific), so the narrower check misreports
+/// them as synthetic and CratonVM's single-threaded-immediate-execution model
+/// silently replaces the real `newTaskFor()` override, handing back a plain
+/// `CompletableFuture` where the caller's real bytecode expects (and later
+/// `checkcast`s to) whatever `Future` subtype `newTaskFor()` actually produces.
+///
+/// CratonVM only ever fabricates synthetic placeholders under a small,
+/// enumerable set of class names (the concrete `ThreadPoolExecutor` collision
+/// above, plus the bare interface names `ExecutorService`,
+/// `ScheduledExecutorService`, and `Executor` used by the wrapper/unconfigurable
+/// synthetic executors in `phases_late.rs`) -- no real object's runtime class
+/// can ever literally BE an interface. So: resolve the receiver's concrete
+/// runtime class name; if it's one of those known synthetic markers, defer to
+/// the existing per-instance checks (or treat bare interfaces as always
+/// synthetic, since no real object can have that as its own class); any other
+/// concrete class name reaching this code path is necessarily real bytecode.
+pub(crate) fn executor_is_real(ctx: &mut dyn NativeContext, exec: ObjectRef) -> bool {
+    let target = match ctx.get_field_by_name(exec, "e") {
+        Value::Object(Some(inner)) => inner,
+        _ => exec,
+    };
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(target))
+        .unwrap_or_default();
+    match class_name.as_str() {
+        "java/util/concurrent/ThreadPoolExecutor" => matches!(
+            ctx.get_field_by_name(target, "workers"),
+            Value::Object(Some(_))
+        ),
+        "java/util/concurrent/ExecutorService"
+        | "java/util/concurrent/ScheduledExecutorService"
+        | "java/util/concurrent/Executor" => false,
+        _ => true,
+    }
+}
+
 pub(crate) fn executor_has_real_workers(ctx: &mut dyn NativeContext, exec: ObjectRef) -> bool {
     let tpe = match ctx.get_field_by_name(exec, "e") {
         Value::Object(Some(inner)) => inner,
