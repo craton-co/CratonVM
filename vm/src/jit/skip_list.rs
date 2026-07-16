@@ -510,10 +510,12 @@ fn should_skip_jit_internal(
     // DefaultCatalogAndSchemaTest's AssertJ checks repeatedly compile patterns,
     // and interpreting Pattern.compile turns that finite check into a watchdog
     // timeout while its JIT path is stable.
-    if class_name.starts_with("org/h2/")
-        || class_name.starts_with("org/antlr/v4/runtime/")
+    if (class_name.starts_with("org/h2/") && !package_allowed("org/h2/", allow_packages))
+        || (class_name.starts_with("org/antlr/v4/runtime/")
+            && !package_allowed("org/antlr/v4/runtime/", allow_packages))
         || (class_name.starts_with("java/util/")
-            && !class_name.starts_with("java/util/regex/"))
+            && !class_name.starts_with("java/util/regex/")
+            && !package_allowed("java/util/", allow_packages))
     {
         return Some(SkipReason::RustJvmTestFixture);
     }
