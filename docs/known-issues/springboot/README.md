@@ -32,6 +32,41 @@ smaller/individual differences not yet clustered.
 | [`collectionbindertests-classcast-testdescriptor-crash.md`](collectionbindertests-classcast-testdescriptor-crash.md) | 1 (fatal CRASH) | CRITICAL | OPEN — found 2026-07-14. `CollectionBinderTests` crashes the whole process with `ClassCastException: String cannot be cast to TestDescriptor` entirely inside JUnit Platform's own internal engine-failure-reporting path (0 tests ever ran) — a "wrong-type-from-native-collection" shape in the same family as the already-fixed `OnClassCondition` corruption, but a distinct, unconfirmed occurrence; leading suspect is the new `HASHMAP_NATIVE_DISPATCH_CACHE` fast path from the same-day `77f8b37e5` |
 | `JsonValueWriterTests` cyclic collection nesting guard | 1 (fatal CRASH) | CRITICAL | **FIXED 2026-07-15** — moved to [`../../internal/springboot/jsonvaluewritertests-nesting-depth-guard-stack-overflow-FIXED.md`](../../internal/springboot/jsonvaluewritertests-nesting-depth-guard-stack-overflow-FIXED.md); native `Map.forEach` now snapshots cyclic map entries without hashing them, and `Iterable` method-reference lambdas use their real iterator implementation |
 | `HttpClientSecure` null-provider crash | 2 (fatal CRASH) | HIGH | **FIXED 2026-07-16** — moved to [`../../internal/fixed-suite-bugs/reactor-nettyhttpclient-httpclientsecure-null-provider-crash-FIXED.md`](../../internal/fixed-suite-bugs/reactor-nettyhttpclient-httpclientsecure-null-provider-crash-FIXED.md); native client SSL session support, JKS key recovery, TLS alert delivery, real Tomcat lifecycle, and MethodHandle primitive-return handling now cover the former crash and residuals.
+| [`method-getexceptiontypes-null-jdk-dynamic-proxy-synthesized-method.md`](method-getexceptiontypes-null-jdk-dynamic-proxy-synthesized-method.md) | 3 (4 test methods) | MEDIUM | OPEN — found 2026-07-16 (`rerun-20260716`, shard3). `Method.getExceptionTypes()` returns `null` (JDK spec: never null) for the synthetic `Method` object `vm/src/vm/vm_exec.rs::proxy_invoke_handler` builds to pass into `InvocationHandler.invoke()` for JDK dynamic proxies — it never sets the `exceptionTypes` field, unlike the sibling `create_method_object` path which already fixed this exact gap. Hits every Spring Data repository call (`JdkDynamicAopProxy`) via `PersistenceExceptionTranslationInterceptor.invoke` → `ReflectionUtils.declaresException` |
+| `TestEngine.getId()` young-GC forwarding-walk truncation | 2 (fatal CRASH) | CRITICAL | **FIXED 2026-07-16** — moved to [`../../internal/springboot/testengine-getid-abstractmethoderror-young-gc-forwarding-gap-FIXED.md`](../../internal/springboot/testengine-getid-abstractmethoderror-young-gc-forwarding-gap-FIXED.md). Found and root-caused same-day as a new young-GC pre-forwarding walk (`gc/src/gen_heap.rs`) that only special-cased the `GAP_FILLER_CLASS_ID` sentinel, unlike the sibling `exact_cursor` walk which also consults the free-list via `skip_free_blocks` — dropping live young-gen objects from the forwarding set on unrecognized free/TLAB-remnant ranges. `fix/wildfly-cce0079-close-20260716` (adds the missing `skip_free_blocks` call) merged into `dev` the same day; verified fixed via rebuild + rerun (fatal crash gone) |
+| `BasicErrorControllerIntegrationTests` stale-pointer crash | 1 (fatal CRASH) | CRITICAL | **FIXED 2026-07-16** — moved to [`../../internal/springboot/basiccontroller-stale-pointer-invokevirtual-aqs-conditionnode-crash-FIXED.md`](../../internal/springboot/basiccontroller-stale-pointer-invokevirtual-aqs-conditionnode-crash-FIXED.md). Independent confirmation of the same young-GC forwarding-walk truncation bug as the `TestEngine.getId()` entry above. Verified fixed via rebuild + rerun after `fix/wildfly-cce0079-close-20260716` merged into `dev` (fatal `ClassCastException`/CRASH gone) |
+| [`wrong-receiver-virtual-dispatch-corruption-cluster.md`](wrong-receiver-virtual-dispatch-corruption-cluster.md) | 9 FAIL + 1 fatal CRASH | CRITICAL (Case 1) / HIGH unconfirmed (Case 2) | OPEN — found 2026-07-16. Case 1 (`String.setOption`, 9 classes, root-caused): `javax/net/ssl/SSLSocketFactory.createSocket()` (`native-builtins/src/tls.rs`) still hands out a bare 2-field synthetic `Socket` under `CRATONVM_REAL_NET_SOCKETS=1`; real `Socket.getImpl()` bytecode then reads garbage off the undersized object and dispatches onto a leftover `String` — a gap in a previously-fixed sibling bug (`javax/net/SocketFactory`, commit `bd03eb243`) that never covered the SSL variant. Case 2 (`File.get()`, 1 fatal CRASH) has the same symptom shape but is **not confirmed** to share Case 1's mechanism — filed for tracking, root cause still open |
+| [`tomcatservletwebserverfactory-cross-module-classnotfound-crash.md`](tomcatservletwebserverfactory-cross-module-classnotfound-crash.md) | 10 (fatal CRASH) | HIGH | OPEN — found 2026-07-16. A native shim (`native-builtins/src/net_phase_e.rs`, `ServletWebServerApplicationContext.getWebServerFactory()`) unconditionally allocates a hardcoded `TomcatServletWebServerFactory` regardless of servlet backend — added to route around a real Tomcat bean-registration bug, but fires identically for Jetty-only/generic-web-server modules where that class genuinely doesn't exist on the classpath (confirmed via real Gradle classpath dumps, not a suite-runner gap). The resulting class-not-found escapes as an uncaught internal error and aborts the process instead of throwing a catchable `NoClassDefFoundError` |
+
+## 2026-07-16 rerun of non-passed classes (post-dev-sync, 764 classes, 8 shards)
+
+Merged `origin/dev` into `feat/spring-boot-crashfail-20260714` (which had just
+been pushed as `dev` itself, then moved twice more the same session — typical
+for this shared host) and reran every class that was not `PASS` in the
+`crashfail-20260714` run (517 non-PASS + 247 classes from shard6, which never
+produced any results at all last time — the whole shard died silently),
+764 classes total, 8 fresh shards against the newly-merged+rebuilt binary.
+The merge itself brought in a huge amount of concurrent work — nearly all of
+this round's own residual docs from `crashfail-20260714` (the `CharBuffer`
+`getArray` AIOOBE, the Logback field corruption, the `@Lazy`/CGLIB crash, the
+lambda/Comparable gap, the JIT-dispatch-depth cluster, the Reactor Netty NPE)
+had independently been fixed by concurrent sessions the same day — see the
+`FIXED`/moved-to-`internal` rows above.
+
+Triaged the new CRASH/FAIL set from this rerun and filed 5 more docs (rows
+above, dated 2026-07-16). Two were the **same newly-discovered, critical GC
+regression** (`testengine-getid...`/`basiccontroller-stale-pointer...`) — a
+brand-new young-GC pre-forwarding walk added the same day silently dropping
+live objects from the forwarding set under certain free-list/TLAB-remnant
+shapes. The fix (`fix/wildfly-cce0079-close-20260716`) merged into `dev`
+while this investigation was still in progress; both docs were verified
+FIXED and moved to `internal/` the same session (rebuild + rerun confirmed
+the fatal crashes are gone). One (`wrong-receiver-virtual-dispatch...`)
+root-causes a gap in a previously-fixed sibling bug (SSL socket variant never
+covered). One (`tomcatservletwebserverfactory...`) is a hardcoded-Tomcat-shim
+bug affecting any non-Tomcat servlet module. One
+(`method-getexceptiontypes-null...`) is a narrow reflection-contract
+violation for JDK dynamic-proxy `Method` objects.
 
 ## 2026-07-14 crashfail run (post-dev-sync full rerun)
 
