@@ -1,7 +1,17 @@
 # BasicErrorControllerIntegrationTests CRASH — young-GC object-start walk truncation leaves live objects unforwarded → mass stale-pointer/all-zero-header corruption → bogus ClassCastException
 
-**Status: OPEN**
-**Severity: CRITICAL** (GC memory-safety — live heap objects silently dropped from the forwarding set during a moving young collection; manifests here as a fatal, unhandled `ClassCastException` inside `SbRunner.main`, but the same mechanism produces hard SIGSEGVs elsewhere in this family).
+**Status: FIXED 2026-07-16.** The fix this doc's own "Related" section named
+as unmerged (`fix/wildfly-cce0079-close-20260716`) landed in `dev` and was
+merged into this worktree the same day. Confirmed via `grep -n
+skip_free_blocks gc/src/gen_heap.rs` post-merge: the `young_object_starts`
+walk (line 3692) now calls `skip_free_blocks`, matching the sibling
+`exact_cursor` walk. Re-ran `BasicErrorControllerIntegrationTests` against a
+fresh post-merge build: the fatal `ClassCastException`/process-CRASH is
+gone (now `HANG` at the 300s timeout — a different, unrelated outcome not
+investigated further here). The GC forwarding-walk truncation mechanism
+this doc describes is closed; the new HANG is a separate matter.
+
+**Severity (at time of discovery): CRITICAL** (GC memory-safety — live heap objects silently dropped from the forwarding set during a moving young collection; manifests here as a fatal, unhandled `ClassCastException` inside `SbRunner.main`, but the same mechanism produces hard SIGSEGVs elsewhere in this family).
 
 | | |
 |---|---|

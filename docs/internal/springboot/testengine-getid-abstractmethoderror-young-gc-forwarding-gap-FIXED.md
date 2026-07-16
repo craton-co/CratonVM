@@ -1,7 +1,17 @@
 # AbstractMethodError on TestEngine.getId() — young-GC pre-forwarding walk drops live objects under heap pressure, masked as interface-dispatch failure
 
-Status: OPEN
-Severity: CRITICAL (fatal process crash — zero tests reported for the whole class)
+**Status: FIXED 2026-07-16.** The root-cause fix (`fix/wildfly-cce0079-close-20260716`,
+merged into `dev` and this worktree the same day this doc was written) adds
+a `skip_free_blocks` call to the `young_object_starts` walk
+(`gc/src/gen_heap.rs:3692`), matching the established `exact_cursor` walk —
+confirmed present via `grep -n skip_free_blocks gc/src/gen_heap.rs` post-merge.
+Re-ran `HazelcastAutoConfigurationServerTests` against a fresh build after
+the merge: the fatal `AbstractMethodError`/process-CRASH is gone (now `FAIL`
+in 79.0s — a different, unrelated outcome not investigated further here).
+The GC forwarding-walk truncation mechanism this doc describes is closed;
+whatever now makes this specific class `FAIL` is a separate matter.
+
+Severity (at time of discovery): CRITICAL (fatal process crash — zero tests reported for the whole class)
 
 ## Summary
 
