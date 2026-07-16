@@ -137,7 +137,7 @@ the compile-time cost directly, then evaluate a scoped fix (e.g.
 short-process detection, always-async compilation, or a higher default
 `c1_threshold`) against the full benchmark suite before changing defaults.
 
-## `CriteriaBuilderNonStandardFunctionsTest` — real constraint violation
+## `CriteriaBuilderNonStandardFunctionsTest` — RESOLVED: original symptom stale, residual is JIT compile-time tax (2026-07-16)
 
 `org.hibernate.orm.test.query.criteria.CriteriaBuilderNonStandardFunctionsTest`
 
@@ -146,11 +146,116 @@ org.hibernate.exception.ConstraintViolationException: could not execute batch
 [Unique index or primary key violation: "PUBLIC.CONSTRAINT_35E3F7 PRIMARY KEY ON ...
 ```
 
-**Status:** OPEN, not a timeout — a genuine wrong-behavior symptom (20
-found / 17 ok / 1 failed / 2 skipped). Worth checking whether this is
-test-order dependent (a prior test in the same run leaving unexpected state
-that collides on a primary key) versus a real id-generation double-issue
-bug. Not yet root-caused.
+**Status:** investigated 2026-07-16 against the frozen `dev@dcb24161` baseline
+(shared Azure Linux host). **Not test-order dependent** — reproduces solo, in
+complete isolation, on the very first attempt and every attempt thereafter
+(13+ solo reruns). The class's `@BeforeEach` persists 5 `EntityOfBasics` rows
+with **explicit, manually-assigned ids (1-5)** — there is no `@GeneratedValue`
+id generator anywhere in this test, so the doc's original "real
+id-generation double-issue bug" hypothesis is ruled out categorically
+regardless of any other finding below; a collision could only ever come from
+a duplicate/leftover row at those exact fixed ids.
+
+**The originally-captured `ConstraintViolationException`/PRIMARY KEY symptom
+did not reproduce even once** across 13 solo reruns on this baseline
+(default heap, `--Xmx 96m`, JIT-on, `--nojit`, high-JIT-threshold — see
+below). `dev@dcb24161` already includes the same-day
+[`1c4aaa06` "close stream ArrayList GC pressure corruption"](../../internal/fixed-suite-bugs/stream-arraylist-gc-pressure-heap-corruption-FIXED.md)
+fix, merged just before this investigation. That fix closed a family of bugs
+where GC-pressure-triggered corruption of `ArrayList`-backed collections
+(stale/duplicated conservative roots, missed old-to-young remembered-set
+entries) produced spurious duplicate elements — exactly the shape that would
+turn one `persist()` into two INSERTs of the same row inside one JDBC batch,
+i.e. a duplicate-PK batch failure. This is circumstantial (no before/after
+A-B on the exact pre-fix binary was possible this session — no such binary
+was available), but is the most plausible explanation for why the original
+symptom is now unreproducible: it was very likely the same bug family,
+already fixed.
+
+**What reproduces instead, consistently:** `TimeoutException:
+prepareData(org.hibernate.testing.orm.junit.SessionFactoryScope) timed out
+after 120 seconds`, with the *identical* found/ok/failed/skipped shape as the
+original entry (20 found / 18 started / **17 ok / 1 failed** / 2 skipped) —
+i.e. this looks like the same underlying event the original run captured,
+just manifesting as a timeout instead of an exception because it took even
+longer on this host. Full stack trace (`-Dcraton.trace=1`) shows this is
+JUnit5's `SameThreadTimeoutInvocation` — **not a preemptive/async timeout**;
+it measures wall-clock and only reports `TimeoutException` after the
+underlying call actually returns/throws, discarding whatever the real
+underlying outcome was if it also exceeded 120s. So a run that would have
+reported `ConstraintViolationException` at, say, 140s instead reports
+`TimeoutException` and hides the real exception — one plausible unification
+of both symptoms under a single "prepareData is occasionally very slow"
+root mechanism.
+
+**HotSpot comparison** (`/home/victor/jdk25/bin/java`, identical classpath/
+props via `common.args`): **5/5 clean runs**, 6.8-8.1s each, run back-to-back
+under the *exact same* crushing host contention as the CratonVM runs below
+(`uptime` load average 28-53 on 16 cores throughout this investigation, from
+~50+ other concurrent sessions on this shared box). CratonVM JIT-on: 100% of
+default-config solo reruns either barely passed (~123-127s total) or hit the
+120s `TimeoutException` (~150-165s total) — i.e. CratonVM is *at minimum*
+~15x slower than HotSpot for this class even on a "passing" run, before any
+timeout is even considered, on this host.
+
+**Live gdb capture during an actual stall** (poll-and-pounce technique per
+[wildfly-gc-barrier-boot-hang-and-harness-fixes.md](../../internal/fixed-suite-bugs/wildfly-gc-barrier-boot-hang-and-harness-fixes.md):
+background the run, poll the log for a >12s output-idle gap, `sudo gdb -p
+<pid> -ex 'thread apply all bt'` the instant it's detected). Result: **no
+deadlock** — only one thread (`main-vm`) was doing anything; the other three
+(`Hibernate Conne`, `junit-jupiter-t`, and the joining `main` thread) were
+parked/idle as expected. `main-vm` was genuinely CPU-bound, live inside
+`native_al_itr_next -> al_state -> al_slots_for -> is_subclass_of` (an
+ArrayList iterator's native `next()`, resolving whether the receiver is a
+`java.util.Vector` for field-slot purposes), which allocates and grows a
+fresh, uncached `FxHashSet` on **every single call** (`native-collections/src/lib.rs`
+`al_slots_for`, `classloading/src/class.rs`'s `is_subclass_of`/
+`is_subclass_of_inner`). This is a real, narrow inefficiency worth a look —
+every ArrayList/Vector-layout native access pays a full class-hierarchy walk
+with a fresh hashmap allocation instead of a per-`ClassId` cached answer —
+but it was not proven to be *the* dominant cost below, only *a* genuine
+CPU-bound hot path caught live during a stall.
+
+**Root cause, confirmed via bisection (same methodology as this file's
+`LockTest` entry, found earlier the same day): JIT compilation-time tax, not
+a data-corruption bug, not GC pauses, not raw interpreted throughput.**
+- `--nojit` (interpreter only): **3/3 clean runs**, 18/18 ok, 29.5-30.7s
+  each — no timeout, ever, despite host load climbing to 42-48 during these
+  runs.
+- JIT nominally on, but tiered-compilation thresholds raised so compilation
+  never triggers during this short run
+  (`CRATONVM_TIER_C1_THRESHOLD=100000 CRATONVM_TIER_C2_THRESHOLD=1000000`):
+  **2/2 clean runs**, 18/18 ok, 31.6-32.9s each — load average 48-53 during
+  these runs (the heaviest contention seen all session), still clean.
+- Default JIT-on config: 0/6 clean in the runs immediately preceding this
+  bisection (barely-passing-slow or `TimeoutException`), at *lower*
+  observed load averages (22-42) than the bisection runs that passed
+  cleanly.
+
+Both bisections converge on the same conclusion the `LockTest` entry reached
+independently: CratonVM's compilation itself (not the JIT-compiled code
+running afterward) costs enough wall-clock/CPU under this host's contention
+to blow a short-lived process's time budget, and disabling or deferring
+compilation removes the failure entirely. This is the **same mechanism**,
+not a separate bug — see that entry above for the shared root-cause status
+(OPEN at the JIT-policy level: raising `c1_threshold`/making compilation
+async is a plausible fix but a cross-cutting change needing broader
+benchmark-suite validation, deliberately not changed blind this session).
+
+**Reclassifying:** this is not a distinct wrong-behavior/id-generation bug.
+Moving out of "genuine wrong-behavior symptom" — it belongs with
+[the 120s-timeout cluster](hib-120s-junit-timeout-cluster-20260716.md) (same
+`TimeoutException(...)` shape, same "one test absorbs a one-time
+SessionFactory-bootstrap cost that occasionally exceeds 120s" shape) and
+with this file's own `LockTest` entry (same JIT-compile-tax root mechanism,
+confirmed via the identical bisection). No code change made this session —
+the underlying JIT-policy fix is intentionally left to the session handling
+that broader, already-tracked investigation. The one concrete, narrow lead
+worth a follow-up look: `al_slots_for`'s per-call, uncached
+`is_subclass(cid, vector_id)` check in `native-collections/src/lib.rs`
+(caught live via gdb mid-stall) — a small per-`ClassId` cache there is a
+plausible, low-risk contribution to closing part of the general throughput
+gap, independent of the JIT-tax question.
 
 ## Already-expected ABORTED entries (matches HotSpot, not a defect)
 
