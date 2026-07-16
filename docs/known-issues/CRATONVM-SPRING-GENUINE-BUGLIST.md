@@ -665,29 +665,85 @@ the WRONG same-named copy. Eight fixes landed on
        get a fresh stream) — but this is not confirmed; needs tracing which
        exact `Resource`/stream object SnakeYAML actually receives. Newly
        observed; not fixed.
-    4. `endToEndTests` — `ClassCastException:
+    4. ~~`endToEndTests` — `ClassCastException:
        org.springframework.test.context.hint.StandardTestRuntimeHints cannot be
-       cast to org.springframework.test.context.aot.TestRuntimeHintsRegistrar`,
-       thrown from the checkcast JIT/interp inserts inside
-       `TestContextAotGenerator.processAheadOfTime`'s
-       `this.testRuntimeHintsRegistrars.forEach(registrar -> …)` lambda. Same
-       *family* as this doc's whole loader-identity fix wave (a same-named class
-       loaded/resolved through two different loaders fails an
-       `instanceof`/checkcast), but a **NEW site**: `TestRuntimeHintsRegistrar`
-       instances are discovered via Spring's own `AotServices.factories().load(…)`
-       SPI (constructor of `TestContextAotGenerator`, not `java.util.ServiceLoader`
-       and not any of the 8 previously-fixed sites — `LambdaCallSite`,
-       `loader_namespace_id`, field/method/parameter annotation types,
-       `appendToBootstrapClassLoaderSearch`, `defineClass1`, `Class.forName`
-       reroute, JVMS 5.3 chain-scoping). Not fixed this session (would need the
-       same kind of targeted loader-aware-resolution audit as the earlier 8
-       fixes, applied to `AotServices`'s reflective instantiation/cast path —
-       out of scope for this triage's remaining budget).
+       cast to org.springframework.test.context.aot.TestRuntimeHintsRegistrar`~~
+       **FIXED (2026-07-16, branch `fix/aotservices-loaderid-20260716`).**
 
-    None of the 4 `TestContextAotGeneratorIntegrationTests` failures are fixed
-    in this session; #1 is attributed to an existing tracked residual, #2–#4 are
-    newly characterized and documented for a future session. No regressions
-    were introduced (no code changes were made to the VM in this triage).
+       Root cause: a **9th site** in the same loader-identity family as this
+       doc's 8-fix wave, but on a path none of those 8 touch. `TestRuntimeHintsRegistrar`
+       instances are discovered via Spring's own `AotServices.factories().load(…)`
+       SPI (constructor of `TestContextAotGenerator`), which resolves down to
+       `SpringFactoriesLoader.instantiateFactory`: `ClassUtils.forName(implementationName,
+       this.classLoader)` (`this.classLoader` is the caller's thread-context
+       classloader — the `@CompileWithForkedClassLoader` fork loader for this
+       test) followed by `Constructor.newInstance()`. That path allocates the
+       service object (`StandardTestRuntimeHints`) using the EXACT `ClassId` the
+       reflective `Class.forName` resolved — already loader-correct, matching the
+       `declaring_cid`-from-mirror pattern `native_constructor_new_instance`
+       (`native-builtins/src/lang_class.rs`) already uses for this exact reason.
+
+       The actual bug is on the CONSUMING side. `TestContextAotGenerator.
+       processAheadOfTime`'s `this.testRuntimeHintsRegistrars.forEach(registrar ->
+       …)` lambda has its `Consumer<TestRuntimeHintsRegistrar>` SAM parameter
+       narrowed from the erased `Object`, so CratonVM's direct lambda-dispatch
+       path (`try_lambda_dispatch`, which bypasses the JDK's synthetic
+       `accept(Object)` bridge and its bytecode `checkcast`) "replays" that cast
+       itself via `checkcast_lambda_instantiated_args` -->
+       `lambda_arg_provably_not_instance` (`vm/src/runtime/interpreter.rs`).
+       Unlike the ordinary bytecode `Instruction::Checkcast` opcode handler —
+       which falls back to `loader_aware_name_assignable` (a NAME-based walk of
+       the object's own superclass/interface chain, loader-identity-agnostic) —
+       `lambda_arg_provably_not_instance` only tried a global `ClassId`-identity
+       check (`get_loaded_class_id`, loader-blind, picks whichever same-named
+       class was registered first) and an exact defining-loader-namespace lookup
+       (`class_defined_by_loader_exact`, which misses here because the fork
+       loader was never separately driven to resolve `TestRuntimeHintsRegistrar`
+       by name on its own — it only received it transitively while defining
+       `StandardTestRuntimeHints`). Neither proved the match, so the "provably
+       not an instance" fallback fired and threw a false `ClassCastException`
+       for a same-named, different-loader interface copy the object's own
+       `interfaces` list already carried.
+
+       Fix (`vm/src/runtime/interpreter.rs`, `lambda_arg_provably_not_instance`):
+       added `loader_aware_name_assignable(shared, obj_class_id, target_cid,
+       target)` as one more disjunct before concluding a mismatch — reusing the
+       exact same helper the ordinary `checkcast` opcode already relies on, so
+       direct lambda dispatch gets the same loader-faithful answer.
+
+       Verified: `endToEndTests` no longer throws the `ClassCastException` —
+       KRun repro (real JDK 25, `TestContextAotGeneratorIntegrationTests`
+       standalone) now progresses past `TestContextAotGenerator`'s registrar
+       loop into AOT generation proper, and fails later for the **already-
+       documented, unrelated** `#3` SnakeYAML `ParserException` above (same
+       `test1.yaml` block-node parse failure, now also observed via
+       `BasicSpringJupiterSharedConfigTests` instead of `$NestedTests` — not
+       fixed, not caused by this change). Regression-checked clean:
+       `cratonvm-native-builtins --lib --release` 3000/0 (0 failed, 6 ignored);
+       `cratonvm-vm --lib --release` 2200 passed/16 failed, and an A/B rerun of
+       the identical 16 against the pre-fix binary reproduces the exact same 16
+       (9 `lock_order` debug-only-panic tests + 7 `jit::skip_list` tests, both
+       confirmed pre-existing and unrelated to loader resolution — not a
+       regression). AOT-cluster spot checks against the fixed binary, real JDK
+       25: `ConfigurationClassPostProcessorAotContributionTests` 20/20 OK (the
+       doc's previously-recorded 5 residuals were the host-JDK `java.lang.
+       classfile.ClassFile` gap noted elsewhere in this doc — JDK 25 has that
+       class, so they now pass too), `TestCompilerTests` 22/21/1 (matches
+       recorded baseline exactly, no change). `BeanDefinitionMethodGeneratorTests`
+       hit a GC/heap-corruption LOADERR (`out-of-bounds field read … class_id=
+       ClassId(0) class_name=java/lang/Object`, `Stale pointer detected in
+       invokevirtual receiver`, ending in a `NoSuchMethodError` on
+       `java/lang/Object.lambda$executeRecursively$5()V`) that reproduces
+       **identically on the unmodified pre-fix baseline binary** (same objects,
+       same time-adjacent pattern) — confirmed via direct A/B, not caused by
+       this change. It matches the signature of this doc's already-tracked, OPEN
+       `ApplicationContextAotGeneratorTests` GC-corruption bug (§2, 2026-07-16
+       re-triage) and appears to now also be reachable from this class under
+       heavy host load; needs its own dedicated session, out of scope here.
+
+    None of the other 3 `TestContextAotGeneratorIntegrationTests` failures are
+    fixed by this change; #1 remains attributed to an existing tracked residual,
+    #2–#3 remain open exactly as characterized above.
 
 ---
 

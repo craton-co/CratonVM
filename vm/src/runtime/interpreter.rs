@@ -19456,12 +19456,32 @@ fn lambda_arg_provably_not_instance(shared: &SharedVm, obj_ref: ObjectRef, desc_
     } else {
         false
     };
+    // AOTSVC-1: the checks above only prove a match via ClassId identity
+    // (`is_sub`) or an exact defining-loader-namespace lookup
+    // (`loader_scoped_is_sub`, which requires the object's OWN loader to have
+    // already resolved `target` under its own namespace). Neither covers the
+    // case exercised by `AotServices.factories().load(...)`-style SPI
+    // discovery (Spring's `SpringFactoriesLoader.instantiateFactory`):
+    // `ClassUtils.forName(implementationName, TCCL)` + `Constructor.newInstance`
+    // allocate the service object using the EXACT ClassId resolved through the
+    // caller's classloader argument, but never drive that same loader's
+    // `loadClass` for the interface types the service implements — so
+    // `class_defined_by_loader_exact(target, obj's loader)` can miss even
+    // though the object's own `interfaces` list (populated at define/link time
+    // from its own class file) already carries a same-named entry. This is the
+    // identical name-vs-identity gap `loader_aware_name_assignable` already
+    // closes for the ordinary bytecode `checkcast` opcode — reuse it here so
+    // direct lambda dispatch (which bypasses that opcode, see this function's
+    // caller) gets the same loader-faithful answer instead of a false
+    // `ClassCastException` for a same-named, different-loader interface copy
+    // (e.g. `TestRuntimeHintsRegistrar` under `@CompileWithForkedClassLoader`).
     if is_sub
         || loader_scoped_is_sub
         || lambda_proxy_satisfies(shared, obj_class_id, target_cid)
         || synthetic_implements(shared, obj_class_id, target)
         || proxy_instance_satisfies_target(shared, obj_ref, target)
         || annotation_proxy_satisfies_target(shared, obj_ref, target)
+        || loader_aware_name_assignable(shared, obj_class_id, target_cid, target)
     {
         return false;
     }
